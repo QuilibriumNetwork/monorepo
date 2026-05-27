@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 // Import KeyManager trait for get_signer
 use quil_keys::KeyManager as _;
 
+use quil_lifecycle::Supervisor;
+
 pub(crate) struct PeerInfoPublisherArgs {
     pub p2p_handle: quil_p2p::node::P2PHandle,
-    pub token: CancellationToken,
     pub peer_id: quil_p2p::PeerId,
     pub peer_priv_key_hex: String,
     pub announce_listen_multiaddr: String,
@@ -28,10 +28,9 @@ pub(crate) struct PeerInfoPublisherArgs {
     pub archive_mode: bool,
 }
 
-pub(crate) fn spawn(args: PeerInfoPublisherArgs) {
+pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisherArgs) {
     let PeerInfoPublisherArgs {
         p2p_handle,
-        token,
         peer_id,
         peer_priv_key_hex,
         announce_listen_multiaddr: pi_announce,
@@ -52,7 +51,6 @@ pub(crate) fn spawn(args: PeerInfoPublisherArgs) {
     } = args;
 
     let pi_handle = p2p_handle.clone();
-    let pi_token = token.clone();
 
     // Extract Ed448 seed and derive public key for signing PeerInfo.
     let pk_bytes = hex::decode(&peer_priv_key_hex).unwrap_or_default();
@@ -92,7 +90,7 @@ pub(crate) fn spawn(args: PeerInfoPublisherArgs) {
         });
     }
 
-    tokio::spawn(async move {
+    sup.run_until_cancelled("peer-info-publisher", move |_token| async move {
         let bitmask = vec![0x00, 0x00, 0x00, 0x00]; // GLOBAL_PEER_INFO
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -243,10 +241,7 @@ pub(crate) fn spawn(args: PeerInfoPublisherArgs) {
                 }
             }
 
-            tokio::select! {
-                _ = interval.tick() => {}
-                _ = pi_token.cancelled() => break,
-            }
+            interval.tick().await;
         }
     });
     info!("PeerInfo publisher started (5-minute interval)");

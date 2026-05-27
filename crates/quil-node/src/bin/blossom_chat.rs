@@ -43,7 +43,12 @@ async fn main() -> anyhow::Result<()> {
     info!(%peer_id, port = args.port, "Rust node started");
 
     let listen_addr = format!("/ip4/0.0.0.0/tcp/{}", args.port);
-    let (p2p_handle, mut msg_rx) = p2p_node.start(&listen_addr).await?;
+    let mut sup = quil_lifecycle::Supervisor::<anyhow::Error>::new();
+    let (p2p_handle, mut msg_rx) = p2p_node.start(&mut sup, &listen_addr).await?;
+    // This dev binary doesn't drive `sup.run()`; the swarm task is
+    // registered just to mirror production behavior. If a panic fires,
+    // it propagates into the supervisor where this binary never joins it.
+    let _sup = sup;
     info!("P2P swarm started");
 
     // Subscribe to test bitmask (80 zero bytes)

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
+
+use quil_lifecycle::Supervisor;
 
 pub(crate) struct RuntimeState {
     pub message_collector: Arc<quil_engine::message_collector::MessageCollector>,
@@ -15,11 +16,11 @@ pub(crate) struct RuntimeState {
 }
 
 pub(crate) fn init(
+    sup: &mut Supervisor<anyhow::Error>,
     hg_store: Arc<quil_store::RocksHypergraphStore>,
     shard_engines: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
     >>,
-    token: CancellationToken,
 ) -> RuntimeState {
     // ---------------------------------------------------------------
     // 5c. Message collector + consensus event loop
@@ -38,10 +39,16 @@ pub(crate) fn init(
         let hs = hg_store.clone();
         // Run in background — don't block P2P startup. The registry
         // populates asynchronously; consensus won't start until it's ready.
-        tokio::task::spawn_blocking(move || {
-            pr.refresh_from_store(&hs);
-            let count = pr.read(|r| r.distinct_provers());
-            tracing::info!(provers = count, "prover registry loaded (background)");
+        // Supervised as a startup task: a normal completion is expected
+        // and won't shut down the node; a panic or error will.
+        sup.spawn_startup_task("prover-registry-refresh", move |_token| async move {
+            tokio::task::spawn_blocking(move || {
+                pr.refresh_from_store(&hs);
+                let count = pr.read(|r| r.distinct_provers());
+                tracing::info!(provers = count, "prover registry loaded (background)");
+            })
+            .await
+            .map_err(anyhow::Error::from)
         });
     }
 
@@ -71,88 +78,81 @@ pub(crate) fn init(
     {
         let mut rx = global_event_distributor.subscribe("halt-state");
         let hs = halt_state.clone();
-        let cancel = token.clone();
-        tokio::spawn(async move {
+        sup.run_until_cancelled("halt-state-subscriber", move |_token| async move {
             loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => break,
-                    maybe_event = rx.recv() => {
-                        let Some(event) = maybe_event else { break };
-                        match (event.event_type, &event.data) {
-                            (
-                                quil_types::consensus::ControlEventType::CoverageHalt,
-                                quil_types::consensus::ControlEventData::Coverage { filter, duration },
-                            ) => {
-                                if hs.apply(&event) {
-                                    info!(
-                                        filter = hex::encode(filter),
-                                        duration_frames = *duration,
-                                        halted_count = hs.halted_count(),
-                                        "coverage halt entered"
-                                    );
-                                    quil_engine::metrics::inc_coverage_halts_entered();
-                                    quil_engine::metrics::set_halted_shards(hs.halted_count() as u64);
-                                }
-                            }
-                            (
-                                quil_types::consensus::ControlEventType::Halt,
-                                quil_types::consensus::ControlEventData::Alert { message },
-                            ) => {
-                                // Hard halt — ALL shards stop. This is
-                                // a fire alarm, not a per-shard
-                                // coverage issue. Permanent for this
-                                // process lifetime; operator must
-                                // restart after the alert is resolved.
-                                error!(
-                                    message = %message,
-                                    "GLOBAL ALERT — hard halt, stopping all shard engines"
-                                );
-                                hs.hard_halt();
-                            }
-                            (
-                                quil_types::consensus::ControlEventType::CoverageResume,
-                                quil_types::consensus::ControlEventData::Coverage { filter, .. },
-                            ) => {
-                                if hs.apply(&event) {
-                                    info!(
-                                        filter = hex::encode(filter),
-                                        halted_count = hs.halted_count(),
-                                        "coverage halt resumed"
-                                    );
-                                    quil_engine::metrics::inc_coverage_resumes();
-                                    quil_engine::metrics::set_halted_shards(hs.halted_count() as u64);
-                                }
-                            }
-                            (
-                                quil_types::consensus::ControlEventType::ShardSplitEligible,
-                                quil_types::consensus::ControlEventData::ShardSplit { filter, proposed },
-                            ) => {
-                                info!(
-                                    filter = hex::encode(filter),
-                                    proposed = proposed.len(),
-                                    "shard split eligible (orchestration pending)"
-                                );
-                            }
-                            (
-                                quil_types::consensus::ControlEventType::ShardMergeEligible,
-                                quil_types::consensus::ControlEventData::ShardMerge { filters, parent },
-                            ) => {
-                                info!(
-                                    filter_count = filters.len(),
-                                    parent = hex::encode(parent),
-                                    "shard merge eligible (orchestration pending)"
-                                );
-                            }
-                            (quil_types::consensus::ControlEventType::CoverageWarn, _) => {
-                                debug!("coverage warn");
-                                quil_engine::metrics::inc_coverage_warns();
-                            }
-                            _ => {}
+                let Some(event) = rx.recv().await else { break };
+                match (event.event_type, &event.data) {
+                    (
+                        quil_types::consensus::ControlEventType::CoverageHalt,
+                        quil_types::consensus::ControlEventData::Coverage { filter, duration },
+                    ) => {
+                        if hs.apply(&event) {
+                            info!(
+                                filter = hex::encode(filter),
+                                duration_frames = *duration,
+                                halted_count = hs.halted_count(),
+                                "coverage halt entered"
+                            );
+                            quil_engine::metrics::inc_coverage_halts_entered();
+                            quil_engine::metrics::set_halted_shards(hs.halted_count() as u64);
                         }
                     }
+                    (
+                        quil_types::consensus::ControlEventType::Halt,
+                        quil_types::consensus::ControlEventData::Alert { message },
+                    ) => {
+                        // Hard halt — ALL shards stop. This is a fire
+                        // alarm, not a per-shard coverage issue.
+                        // Permanent for this process lifetime; operator
+                        // must restart after the alert is resolved.
+                        error!(
+                            message = %message,
+                            "GLOBAL ALERT — hard halt, stopping all shard engines"
+                        );
+                        hs.hard_halt();
+                    }
+                    (
+                        quil_types::consensus::ControlEventType::CoverageResume,
+                        quil_types::consensus::ControlEventData::Coverage { filter, .. },
+                    ) => {
+                        if hs.apply(&event) {
+                            info!(
+                                filter = hex::encode(filter),
+                                halted_count = hs.halted_count(),
+                                "coverage halt resumed"
+                            );
+                            quil_engine::metrics::inc_coverage_resumes();
+                            quil_engine::metrics::set_halted_shards(hs.halted_count() as u64);
+                        }
+                    }
+                    (
+                        quil_types::consensus::ControlEventType::ShardSplitEligible,
+                        quil_types::consensus::ControlEventData::ShardSplit { filter, proposed },
+                    ) => {
+                        info!(
+                            filter = hex::encode(filter),
+                            proposed = proposed.len(),
+                            "shard split eligible (orchestration pending)"
+                        );
+                    }
+                    (
+                        quil_types::consensus::ControlEventType::ShardMergeEligible,
+                        quil_types::consensus::ControlEventData::ShardMerge { filters, parent },
+                    ) => {
+                        info!(
+                            filter_count = filters.len(),
+                            parent = hex::encode(parent),
+                            "shard merge eligible (orchestration pending)"
+                        );
+                    }
+                    (quil_types::consensus::ControlEventType::CoverageWarn, _) => {
+                        debug!("coverage warn");
+                        quil_engine::metrics::inc_coverage_warns();
+                    }
+                    _ => {}
                 }
             }
+            Ok(())
         });
     }
 
@@ -176,15 +176,13 @@ pub(crate) fn init(
     {
         let mut rx = halt_state.watch_any_halted();
         let engines = shard_engines.clone();
-        let cancel = token.clone();
         let remote_mgr_cell = remote_worker_manager_for_halt.clone();
         let halt_state_for_periodic = halt_state.clone();
-        tokio::spawn(async move {
+        sup.run_until_cancelled("halt-state-broadcaster", move |_token| async move {
             let mut periodic = tokio::time::interval(std::time::Duration::from_secs(30));
             periodic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => break,
                     res = rx.changed() => {
                         if res.is_err() { break; }
                         let halted = *rx.borrow();
@@ -226,6 +224,7 @@ pub(crate) fn init(
                     }
                 }
             }
+            Ok(())
         });
     }
 
@@ -233,7 +232,7 @@ pub(crate) fn init(
     // (the collector checks this flag on each add_message call)
     let mc_prover_only = message_collector.clone();
     let pof = prover_only_flag.clone();
-    tokio::spawn(async move {
+    sup.run_until_cancelled("prover-only-mode-poll", move |_token| async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;

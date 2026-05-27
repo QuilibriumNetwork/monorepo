@@ -1,9 +1,8 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
+
+use quil_lifecycle::{ShutdownReason, Supervisor};
 
 pub(crate) mod allocator_and_lifecycle;
 pub(crate) mod archive_sync;
@@ -18,14 +17,14 @@ pub(crate) mod runtime_state;
 pub(crate) mod storage;
 pub(crate) mod worker_manager;
 
-pub(crate) async fn run(
+pub(crate) async fn start(
+    mut sup: Supervisor<anyhow::Error>,
     config: &quil_config::Config,
     config_dir: &std::path::Path,
     archive_mode: bool,
     network: u8,
-    token: CancellationToken,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ShutdownReason<anyhow::Error>> {
     let storage = storage::init(config, archive_mode)?;
     let db_arc = storage.db_arc.clone();
     let clock_store = storage.clock_store.clone();
@@ -59,7 +58,7 @@ pub(crate) async fn run(
         consensus_loopback_tx,
         consensus_loopback_rx,
         listen_addr,
-    } = networking::init(config, config_dir, network, archive_mode).await?;
+    } = networking::init(&mut sup, config, config_dir, network, archive_mode).await?;
 
     // Frame tracking — single source of truth for "what frame is
     // this node on right now." Updated by the BlossomSub receive
@@ -137,9 +136,8 @@ pub(crate) async fn run(
     let pi_worker_manager: Arc<std::sync::OnceLock<
         Arc<dyn quil_engine::worker::WorkerManager>,
     >> = Arc::new(std::sync::OnceLock::new());
-    peer_info_publisher::spawn(peer_info_publisher::PeerInfoPublisherArgs {
+    peer_info_publisher::spawn(&mut sup, peer_info_publisher::PeerInfoPublisherArgs {
         p2p_handle: p2p_handle.clone(),
-        token: token.clone(),
         peer_id,
         peer_priv_key_hex: config.p2p.peer_priv_key.clone(),
         announce_listen_multiaddr: config.p2p.announce_listen_multiaddr.clone(),
@@ -167,13 +165,13 @@ pub(crate) async fn run(
         coverage_monitor,
         halt_state,
         remote_worker_manager_for_halt,
-    } = runtime_state::init(hg_store.clone(), shard_engines.clone(), token.clone());
+    } = runtime_state::init(&mut sup, hg_store.clone(), shard_engines.clone());
 
     let worker_manager: Arc<dyn quil_engine::worker::WorkerManager> = worker_manager::init(
+        &mut sup,
         worker_manager::WorkerManagerArgs {
             config: config.clone(),
             archive_mode,
-            token: token.clone(),
             p2p_handle: p2p_handle.clone(),
             db_arc: db_arc.clone(),
             clock_store: clock_store.clone(),
@@ -201,11 +199,10 @@ pub(crate) async fn run(
         timeout_aggregator,
         prover_lifecycle,
         frame_materializer,
-    } = allocator_and_lifecycle::init(allocator_and_lifecycle::LifecycleInitArgs {
+    } = allocator_and_lifecycle::init(&mut sup, allocator_and_lifecycle::LifecycleInitArgs {
         config: config.clone(),
         network,
         archive_mode,
-        token: token.clone(),
         worker_manager: worker_manager.clone(),
         prover_registry: prover_registry.clone(),
         prover_address,
@@ -289,18 +286,14 @@ pub(crate) async fn run(
     } else if network == 0 {
         let pool = archive_pool.clone();
         let static_ips = quil_engine::genesis::genesis_archive_static_ips();
-        if !static_ips.is_empty() {
-            tokio::spawn(async move {
-                for (peer_id, ip) in static_ips {
-                    let endpoint = format!("{}:8340", ip);
-                    pool.add(endpoint.clone()).await;
-                    tracing::debug!(
-                        peer = %peer_id,
-                        endpoint = %endpoint,
-                        "seeded archive pool with static genesis-archive mTLS endpoint"
-                    );
-                }
-            });
+        for (peer_id, ip) in static_ips {
+            let endpoint = format!("{}:8340", ip);
+            pool.add(endpoint.clone()).await;
+            tracing::debug!(
+                peer = %peer_id,
+                endpoint = %endpoint,
+                "seeded archive pool with static genesis-archive mTLS endpoint"
+            );
         }
     }
 
@@ -473,8 +466,7 @@ pub(crate) async fn run(
         let mut rx = global_event_distributor.subscribe("shard-orchestrator");
         let pp = prover_pipeline.clone();
         let cf_for_orch = current_frame.clone();
-        let cancel = token.clone();
-        tokio::spawn(async move {
+        sup.spawn("shard-orchestration-subscriber", move |cancel| async move {
             loop {
                 tokio::select! {
                     biased;
@@ -494,6 +486,7 @@ pub(crate) async fn run(
                                 let pp2 = pp.clone();
                                 let shard = filter.clone();
                                 let proposed = proposed.clone();
+                                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                                 tokio::spawn(async move {
                                     if let Err(e) = pp2.submit_shard_split(shard, proposed, frame).await {
                                         warn!(%e, "ShardSplit submission failed");
@@ -507,6 +500,7 @@ pub(crate) async fn run(
                                 let pp2 = pp.clone();
                                 let shards = filters.clone();
                                 let parent = parent.clone();
+                                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                                 tokio::spawn(async move {
                                     if let Err(e) = pp2.submit_shard_merge(shards, parent, frame).await {
                                         warn!(%e, "ShardMerge submission failed");
@@ -518,15 +512,15 @@ pub(crate) async fn run(
                     }
                 }
             }
+            Ok(())
         });
         info!("shard orchestration subscriber spawned");
     }
 
-    archive_sync::spawn_all(archive_sync::ArchiveSyncArgs {
+    archive_sync::spawn_all(&mut sup, archive_sync::ArchiveSyncArgs {
         mtls_seed,
         network,
         archive_mode,
-        token: token.clone(),
         archive_pool: archive_pool.clone(),
         clock_store: clock_store.clone(),
         hg_store: hg_store.clone(),
@@ -566,10 +560,9 @@ pub(crate) async fn run(
         quil_rpc::global_service::GLOBAL_MESSAGE_BROADCAST_CAPACITY,
     )
     .0;
-    message_loop::spawn(message_loop::MessageLoopArgs {
+    message_loop::spawn(&mut sup, message_loop::MessageLoopArgs {
         clock_store: clock_store.clone(),
         exec_manager: exec_manager.clone(),
-        token: token.clone(),
         msg_rx,
         consensus_loopback_rx,
         global_msg_tx: global_msg_tx.clone(),
@@ -604,11 +597,10 @@ pub(crate) async fn run(
     // ---------------------------------------------------------------
     // 7. gRPC service
     // ---------------------------------------------------------------
-    grpc::spawn_all(grpc::GrpcArgs {
+    grpc::spawn_all(&mut sup, grpc::GrpcArgs {
         config: config.clone(),
         network,
         archive_mode,
-        token: token.clone(),
         db_arc: db_arc.clone(),
         clock_store: clock_store.clone(),
         hg_store: hg_store.clone(),
@@ -637,11 +629,9 @@ pub(crate) async fn run(
     // ---------------------------------------------------------------
     // 8. Wait for shutdown
     // ---------------------------------------------------------------
-    token.cancelled().await;
+    let reason = sup.run().await;
     info!("master node shutting down");
-    p2p_handle.shutdown().await;
-    info!("shutdown complete");
 
-    Ok(())
+    Ok(reason)
 }
 

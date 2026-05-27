@@ -16,7 +16,6 @@ quil-keys = { path = "../quil-keys" }
 quil-p2p = { path = "../quil-p2p" }
 quil-consensus = { path = "../quil-consensus" }
 quil-execution = { path = "../quil-execution" }
-quil-lifecycle = { path = "../quil-lifecycle" }
 tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
 tokio-util = "0.7"
 tracing = "0.1"

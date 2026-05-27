@@ -1,18 +1,19 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 // Import KeyManager trait for get_public_key/get_signer methods
 use quil_keys::KeyManager as _;
 
-pub(crate) async fn run(
+use quil_lifecycle::{ShutdownReason, Supervisor};
+
+pub(crate) async fn start(
+    mut sup: Supervisor<anyhow::Error>,
     config: &quil_config::Config,
     core_id: u32,
     parent_process: u32,
-    token: CancellationToken,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ShutdownReason<anyhow::Error>> {
     info!(core_id, parent_process, "worker node starting");
 
     // Resolve the per-worker store path. Worker processes can NOT
@@ -293,7 +294,7 @@ pub(crate) async fn run(
         .map_err(|e| anyhow::anyhow!("worker p2p listen addr: {}", e))?;
         info!(core_id, listen = %worker_listen, "starting worker-owned p2p");
         let (handle, rx) = p2p_node
-            .start(&worker_listen)
+            .start(&mut sup, &worker_listen)
             .await
             .map_err(|e| anyhow::anyhow!("worker p2p start: {}", e))?;
         let handle = Arc::new(handle);
@@ -335,38 +336,40 @@ pub(crate) async fn run(
     // bitmask pattern; if no engine is active yet, the message is
     // silently dropped.
     if let Some((_handle, mut rx)) = worker_owned_p2p {
-        let route_token = token.clone();
         let route_worker = worker.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = route_token.cancelled() => break,
-                    maybe_msg = rx.recv() => {
-                        let Some(msg) = maybe_msg else { break };
-                        route_worker.route_message(&msg.data, &msg.bitmask);
+        sup.run_until_cancelled(
+            "worker-p2p-router",
+            move |_token| async move {
+                loop {
+                    match rx.recv().await {
+                        Some(msg) => route_worker.route_message(&msg.data, &msg.bitmask),
+                        None => break,
                     }
                 }
-            }
-            info!("worker p2p routing task stopped");
-        });
+                info!("worker p2p routing task stopped");
+                Ok(())
+            },
+        );
     }
 
     info!(core_id, "worker node initialized, starting event loop");
 
-    // Run the worker — blocks until cancelled or parent dies
-    let worker_for_stop = worker.clone();
-    tokio::select! {
-        result = worker.run() => {
-            if let Err(e) = result {
-                error!(core_id, error = %e, "worker node exited with error");
+    // Run the worker — uses plain `sup.spawn` (not `run_until_cancelled`)
+    // because the cancel branch must call `worker.stop()`; drop-on-cancel
+    // can't invoke a method.
+    let worker_run = worker.clone();
+    let worker_stop = worker.clone();
+    sup.spawn("worker-engine", move |token| async move {
+        tokio::select! {
+            result = worker_run.run() => result.map_err(anyhow::Error::from),
+            _ = token.cancelled() => {
+                worker_stop.stop();
+                Ok(())
             }
         }
-        _ = token.cancelled() => {
-            info!(core_id, "worker node received shutdown signal");
-            worker_for_stop.stop();
-        }
-    }
+    });
 
+    let reason = sup.run().await;
     info!(core_id, "worker node shut down");
-    Ok(())
+    Ok(reason)
 }

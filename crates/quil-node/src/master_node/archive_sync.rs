@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 // Import KeyManager trait for get_signer
 use quil_keys::KeyManager as _;
 
+use quil_lifecycle::Supervisor;
+
 pub(crate) struct ArchiveSyncArgs {
     pub mtls_seed: Option<[u8; 57]>,
     pub network: u8,
     pub archive_mode: bool,
-    pub token: CancellationToken,
     pub archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
     pub clock_store: Arc<quil_store::RocksClockStore>,
     pub hg_store: Arc<quil_store::RocksHypergraphStore>,
@@ -43,12 +43,11 @@ pub(crate) struct ArchiveSyncArgs {
     pub peer_id: quil_p2p::PeerId,
 }
 
-pub(crate) fn spawn_all(args: ArchiveSyncArgs) {
+pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncArgs) {
     let ArchiveSyncArgs {
         mtls_seed,
         network,
         archive_mode,
-        token,
         archive_pool,
         clock_store,
         hg_store,
@@ -266,13 +265,14 @@ pub(crate) fn spawn_all(args: ArchiveSyncArgs) {
             forward_fill: archive_mode,
             ..Default::default()
         };
-        quil_rpc::spawn_archive_poller(
-            archive_pool.clone(),
-            clock_store.clone(),
-            seed,
-            poller_config,
-            token.clone(),
-        );
+        {
+            let pool = archive_pool.clone();
+            let cs = clock_store.clone();
+            sup.run_until_cancelled("archive-poller", move |cancel| async move {
+                quil_rpc::run_archive_poller(pool, cs, seed, poller_config, cancel).await;
+                Ok(())
+            });
+        }
         info!("archive frame poller spawned (with execution pipeline)");
 
         // Periodic incremental HyperSync — refreshes prover registry every ~5 minutes.
@@ -282,7 +282,6 @@ pub(crate) fn spawn_all(args: ArchiveSyncArgs) {
             let sync_pool = archive_pool.clone();
             let sync_hg = hg_store.clone();
             let sync_pr = prover_registry.clone();
-            let sync_token = token.clone();
             let sync_pl = prover_lifecycle.clone();
             let sync_km = file_key_manager.clone();
             let sync_cs = clock_store.clone();
@@ -301,7 +300,7 @@ pub(crate) fn spawn_all(args: ArchiveSyncArgs) {
             let sync_lhf = last_global_head_frame.clone();
             let sync_archive_mode = archive_mode;
             let sync_db_for_consensus: Arc<dyn quil_types::store::KvDb> = db_arc.clone();
-            tokio::spawn(async move {
+            sup.spawn("archive-prover-tree-sync", move |sync_token| async move {
                 // Archive nodes ARE the source of truth — they don't wait
                 // for some other archive to be discovered before activating
                 // consensus. Without this bypass, a fresh testnet bootstrap
@@ -315,7 +314,7 @@ pub(crate) fn spawn_all(args: ArchiveSyncArgs) {
                 if !sync_archive_mode {
                     // Wait for initial archive discovery before starting
                     loop {
-                        if sync_token.is_cancelled() { return; }
+                        if sync_token.is_cancelled() { return Ok(()); }
                         if sync_pool.len().await > 0 { break; }
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     }
@@ -980,6 +979,7 @@ pub(crate) fn spawn_all(args: ArchiveSyncArgs) {
                         _ = sync_token.cancelled() => break,
                     }
                 }
+                Ok(())
             });
             info!("periodic prover tree sync task spawned (5-minute interval)");
         }
@@ -999,10 +999,9 @@ pub(crate) fn spawn_all(args: ArchiveSyncArgs) {
             let pool = archive_pool.clone();
             let lifecycle = prover_lifecycle.clone();
             let cf_for_refresh = current_frame.clone();
-            let cancel = token.clone();
             let seed_for_refresh = seed;
             let shards_store_for_refresh = shards_store.clone();
-            tokio::spawn(async move {
+            sup.spawn("archive-shard-info-refresh", move |cancel| async move {
                 const REFRESH_CADENCE_FRAMES: u64 = 60;
                 let mut last_refresh_frame: u64 = 0;
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -1056,6 +1055,7 @@ pub(crate) fn spawn_all(args: ArchiveSyncArgs) {
                     }
                 }
                 info!("shard_info refresh task stopped");
+                Ok(())
             });
             info!("shard_info refresh task spawned (frame-anchored, 60-frame cadence)");
         }

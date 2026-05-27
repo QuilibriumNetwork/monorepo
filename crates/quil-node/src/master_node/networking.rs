@@ -1,5 +1,7 @@
 use tracing::{info, warn};
 
+use quil_lifecycle::Supervisor;
+
 pub(crate) struct P2pHandles {
     pub p2p_handle: quil_p2p::node::P2PHandle,
     pub msg_rx: tokio::sync::mpsc::Receiver<quil_p2p::node::ReceivedMessage>,
@@ -10,6 +12,7 @@ pub(crate) struct P2pHandles {
 }
 
 pub(crate) async fn init(
+    sup: &mut Supervisor<anyhow::Error>,
     config: &quil_config::Config,
     config_dir: &std::path::Path,
     network: u8,
@@ -51,7 +54,7 @@ pub(crate) async fn init(
 
     info!(%peer_id, "starting P2P networking");
 
-    let (p2p_handle, msg_rx) = p2p_node.start(&listen_addr).await?;
+    let (p2p_handle, msg_rx) = p2p_node.start(sup, &listen_addr).await?;
     info!(listen = %listen_addr, "P2P swarm started");
 
     // Self-loopback channel for consensus messages — used by

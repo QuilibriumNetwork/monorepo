@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+use quil_lifecycle::Supervisor;
 
 pub(crate) struct GrpcArgs {
     pub config: quil_config::Config,
     pub network: u8,
     pub archive_mode: bool,
-    pub token: CancellationToken,
     pub db_arc: Arc<quil_store::RocksDb>,
     pub clock_store: Arc<quil_store::RocksClockStore>,
     pub hg_store: Arc<quil_store::RocksHypergraphStore>,
@@ -36,12 +36,14 @@ pub(crate) struct GrpcArgs {
     pub archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
 }
 
-pub(crate) fn spawn_all(args: GrpcArgs) -> anyhow::Result<()> {
+pub(crate) fn spawn_all(
+    sup: &mut Supervisor<anyhow::Error>,
+    args: GrpcArgs,
+) -> anyhow::Result<()> {
     let GrpcArgs {
         config,
         network,
         archive_mode,
-        token,
         db_arc,
         clock_store,
         hg_store,
@@ -382,6 +384,7 @@ pub(crate) fn spawn_all(args: GrpcArgs) -> anyhow::Result<()> {
                 }
                 let filters_for_task = filters.clone();
                 let worker_ids_for_task = worker_ids.clone();
+                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
                     if let Err(e) = pp.submit_join(filters_for_task, &worker_ids_for_task, frame).await {
                         tracing::warn!(error = %e, "request_join detached submit_join failed");
@@ -402,7 +405,7 @@ pub(crate) fn spawn_all(args: GrpcArgs) -> anyhow::Result<()> {
     {
         let wm = worker_manager.clone();
         let view = workers_view.clone();
-        tokio::spawn(async move {
+        sup.run_until_cancelled("workers-view-refresh", move |_token| async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
@@ -579,24 +582,18 @@ pub(crate) fn spawn_all(args: GrpcArgs) -> anyhow::Result<()> {
         } else { "0.0.0.0:8340".to_string() }
     };
 
-    let node_grpc_token = token.clone();
-    let peer_grpc_token = token.clone();
-
     if let Ok(addr) = grpc_addr.parse::<std::net::SocketAddr>() {
         let node_rpc_service = tonic::service::interceptor::InterceptedService::new(
             quil_types::proto::node::node_service_server::NodeServiceServer::new(node_rpc),
             quil_rpc::peer_auth_middleware::peer_auth_interceptor,
         );
-        tokio::spawn(async move {
+        sup.spawn("node-grpc-server", move |node_grpc_token| async move {
             info!(addr = %addr, "starting NodeService gRPC (plaintext, qclient-facing)");
-            let res = tonic::transport::Server::builder()
+            tonic::transport::Server::builder()
                 .add_service(node_rpc_service)
                 .serve_with_shutdown(addr, async move { node_grpc_token.cancelled().await; })
-                .await;
-            match res {
-                Ok(()) => info!("NodeService gRPC stopped"),
-                Err(e) => warn!(error = %e, "NodeService gRPC error"),
-            }
+                .await
+                .map_err(anyhow::Error::from)
         });
     } else {
         warn!(addr = %grpc_addr, "invalid NodeService listen address, server disabled");
@@ -663,13 +660,16 @@ pub(crate) fn spawn_all(args: GrpcArgs) -> anyhow::Result<()> {
                 peer_id_bytes,
                 publish: Arc::new(move |bitmask, data| {
                     let h = p2p_publish.clone();
+                    // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                     tokio::spawn(async move {
                         if let Err(e) = h.publish(bitmask, data).await {
                             warn!(error = %e, "pubsub-proxy publish failed");
                         }
                     });
                 }),
+                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 subscribe: Arc::new(move |bitmask| { let h = p2p_sub.clone(); tokio::spawn(async move { h.subscribe(bitmask).await; }); }),
+                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 unsubscribe: Arc::new(move |bitmask| { let h = p2p_unsub.clone(); tokio::spawn(async move { h.unsubscribe(bitmask).await; }); }),
                 peer_count: Arc::new(move || p2p_count.peer_count()),
                 get_peer_score: Arc::new(move |pid_bytes| {
@@ -682,12 +682,14 @@ pub(crate) fn spawn_all(args: GrpcArgs) -> anyhow::Result<()> {
                 set_peer_score: Arc::new(move |pid_bytes, score| {
                     let h = p2p_set_score.clone();
                     if let Ok(peer) = quil_p2p::PeerId::from_bytes(&pid_bytes) {
+                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                         tokio::spawn(async move { h.set_peer_score(peer, score).await; });
                     }
                 }),
                 add_peer_score: Arc::new(move |pid_bytes, delta| {
                     let h = p2p_add_score.clone();
                     if let Ok(peer) = quil_p2p::PeerId::from_bytes(&pid_bytes) {
+                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                         tokio::spawn(async move { h.add_peer_score(peer, delta).await; });
                     }
                 }),
@@ -732,12 +734,11 @@ pub(crate) fn spawn_all(args: GrpcArgs) -> anyhow::Result<()> {
         ))?;
         let tls_config = quil_rpc::build_quil_server_tls_config(&seed)
             .map_err(|e| anyhow::anyhow!("peer gRPC mTLS config init failed: {} — check `p2p.peerPrivKey`", e))?;
-        tokio::spawn(async move {
+        sup.spawn("peer-grpc-server", move |peer_grpc_token| async move {
             info!(addr = %addr, "starting peer gRPC (mTLS)");
-            let listener = match tokio::net::TcpListener::bind(addr).await {
-                Ok(l) => l,
-                Err(e) => { warn!(error = %e, "peer gRPC bind failed"); return; }
-            };
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(anyhow::Error::from)?;
             let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
             let incoming = async_stream::stream! {
                 loop {
@@ -764,11 +765,10 @@ pub(crate) fn spawn_all(args: GrpcArgs) -> anyhow::Result<()> {
                 info!("registering PubSubProxy on peer gRPC listener");
                 builder = builder.add_service(pp);
             }
-            let res = builder.serve_with_incoming_shutdown(incoming, async move { peer_grpc_token.cancelled().await; }).await;
-            match res {
-                Ok(()) => info!("peer gRPC stopped"),
-                Err(e) => warn!(error = %e, "peer gRPC error"),
-            }
+            builder
+                .serve_with_incoming_shutdown(incoming, async move { peer_grpc_token.cancelled().await; })
+                .await
+                .map_err(anyhow::Error::from)
         });
     } else {
         warn!(addr = %stream_addr, "invalid peer gRPC listen address, server disabled");

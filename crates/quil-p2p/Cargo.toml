@@ -8,6 +8,7 @@ description = "P2P networking with BlossomSub pubsub for the Quilibrium node"
 [dependencies]
 quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
+quil-lifecycle = { path = "../quil-lifecycle" }
 quil-crypto = { path = "../quil-crypto" }
 libp2p = { version = "0.54", features = [
     "tokio",
@@ -32,6 +33,7 @@ aes-gcm = "0.10"
 lru = "0.12"
 rand = "0.8"
 async-trait = "0.1"
+anyhow = "1"
 hex = "0.4"
 futures = "0.3"
 ed448-rust = { path = "../ed448-rust" }

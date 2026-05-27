@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 // Import KeyManager trait for get_signer
 use quil_keys::KeyManager as _;
 
+use quil_lifecycle::Supervisor;
+
 pub(crate) struct WorkerManagerArgs {
     pub config: quil_config::Config,
     pub archive_mode: bool,
-    pub token: CancellationToken,
     pub p2p_handle: quil_p2p::node::P2PHandle,
     pub db_arc: Arc<quil_store::RocksDb>,
     pub clock_store: Arc<quil_store::RocksClockStore>,
@@ -32,11 +32,13 @@ pub(crate) struct WorkerManagerArgs {
     pub pi_worker_manager: Arc<std::sync::OnceLock<Arc<dyn quil_engine::worker::WorkerManager>>>,
 }
 
-pub(crate) fn init(args: WorkerManagerArgs) -> Arc<dyn quil_engine::worker::WorkerManager> {
+pub(crate) fn init(
+    sup: &mut Supervisor<anyhow::Error>,
+    args: WorkerManagerArgs,
+) -> Arc<dyn quil_engine::worker::WorkerManager> {
     let WorkerManagerArgs {
         config,
         archive_mode,
-        token,
         p2p_handle,
         db_arc,
         clock_store,
@@ -128,6 +130,7 @@ pub(crate) fn init(args: WorkerManagerArgs) -> Arc<dyn quil_engine::worker::Work
                     match bundle.to_canonical_bytes() {
                         Ok(bytes) => {
                             let p2p = coverage_p2p.clone();
+                            // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                             tokio::spawn(async move {
                                 if let Err(e) = p2p
                                     .publish(
@@ -289,16 +292,12 @@ pub(crate) fn init(args: WorkerManagerArgs) -> Arc<dyn quil_engine::worker::Work
             // through `shard_engines` in the recv loop below.
             if let Some(mut master_rx) = thread_mgr.take_master_rx() {
                 let drain_p2p = p2p_handle.clone();
-                let drain_cancel = token.clone();
                 let drain_shard_engines = shard_engines.clone();
                 let drain_halt = halt_state.clone();
-                tokio::spawn(async move {
+                sup.run_until_cancelled("worker-master-drain", move |_token| async move {
                     loop {
-                        tokio::select! {
-                            _ = drain_cancel.cancelled() => break,
-                            event = master_rx.recv() => {
-                                let Some(event) = event else { break; };
-                                use quil_engine::thread_worker::WorkerToMaster;
+                        let Some(event) = master_rx.recv().await else { break };
+                        use quil_engine::thread_worker::WorkerToMaster;
                                 // Each publish is dispatched as a fire-and-forget
                                 // task: the swarm's `publish().await` can block on
                                 // an internal mesh send, and back-pressure here
@@ -367,6 +366,7 @@ pub(crate) fn init(args: WorkerManagerArgs) -> Arc<dyn quil_engine::worker::Work
                                             Ok(bytes) => {
                                                 let p2p = drain_p2p.clone();
                                                 let filter_owned = filter.clone();
+                                                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                                                 tokio::spawn(async move {
                                                     if let Err(e) = p2p
                                                         .publish(
@@ -394,6 +394,7 @@ pub(crate) fn init(args: WorkerManagerArgs) -> Arc<dyn quil_engine::worker::Work
                                             continue;
                                         }
                                         let p2p = drain_p2p.clone();
+                                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                                         tokio::spawn(async move {
                                             if let Err(e) = p2p
                                                 .publish(
@@ -415,6 +416,7 @@ pub(crate) fn init(args: WorkerManagerArgs) -> Arc<dyn quil_engine::worker::Work
                                             continue;
                                         }
                                         let p2p = drain_p2p.clone();
+                                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                                         tokio::spawn(async move {
                                             if let Err(e) = p2p
                                                 .publish(
@@ -435,6 +437,7 @@ pub(crate) fn init(args: WorkerManagerArgs) -> Arc<dyn quil_engine::worker::Work
                                             continue;
                                         }
                                         let p2p = drain_p2p.clone();
+                                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                                         tokio::spawn(async move {
                                             if let Err(e) = p2p
                                                 .publish(
@@ -472,6 +475,7 @@ pub(crate) fn init(args: WorkerManagerArgs) -> Arc<dyn quil_engine::worker::Work
                                         // dispatches never reach the engine.
                                         let p2p = drain_p2p.clone();
                                         let filter_for_sub = filter.clone();
+                                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                                         tokio::spawn(async move {
                                             p2p.subscribe(quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub)).await;
                                             p2p.subscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub)).await;
@@ -491,6 +495,7 @@ pub(crate) fn init(args: WorkerManagerArgs) -> Arc<dyn quil_engine::worker::Work
                                         }
                                         let p2p = drain_p2p.clone();
                                         let filter_for_sub = filter.clone();
+                                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                                         tokio::spawn(async move {
                                             p2p.unsubscribe(quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub)).await;
                                             p2p.unsubscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub)).await;
@@ -508,10 +513,9 @@ pub(crate) fn init(args: WorkerManagerArgs) -> Arc<dyn quil_engine::worker::Work
                                         // No-op — informational only.
                                     }
                                 }
-                            }
-                        }
                     }
                     info!("worker→master drain task stopped");
+                    Ok(())
                 });
             }
             // Restore persisted worker state (manually_managed flag +

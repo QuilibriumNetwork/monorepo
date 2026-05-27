@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+use quil_lifecycle::Supervisor;
 
 pub(crate) struct LifecycleHandles {
     pub worker_allocator: Arc<quil_engine::worker_allocator::WorkerAllocator>,
@@ -19,7 +20,6 @@ pub(crate) struct LifecycleInitArgs {
     pub config: quil_config::Config,
     pub network: u8,
     pub archive_mode: bool,
-    pub token: CancellationToken,
     pub worker_manager: Arc<dyn quil_engine::worker::WorkerManager>,
     pub prover_registry: Arc<quil_execution::SharedProverRegistry>,
     pub prover_address: [u8; 32],
@@ -35,12 +35,14 @@ pub(crate) struct LifecycleInitArgs {
     pub hg_store: Arc<quil_store::RocksHypergraphStore>,
 }
 
-pub(crate) fn init(args: LifecycleInitArgs) -> LifecycleHandles {
+pub(crate) fn init(
+    sup: &mut Supervisor<anyhow::Error>,
+    args: LifecycleInitArgs,
+) -> LifecycleHandles {
     let LifecycleInitArgs {
         config,
         network,
         archive_mode,
-        token,
         worker_manager,
         prover_registry,
         prover_address,
@@ -124,15 +126,14 @@ pub(crate) fn init(args: LifecycleInitArgs) -> LifecycleHandles {
         let wa_for_init = worker_allocator.clone();
         let pr_for_init = prover_registry.clone();
         let lhf_for_init = last_global_head_frame.clone();
-        let token_for_init = token.clone();
-        tokio::spawn(async move {
+        sup.spawn_startup_task("early-worker-reconcile", move |token_for_init| async move {
             // The background refresh at startup is spawn_blocking and
             // typically finishes in well under a second. Poll up to
             // ~5s for `distinct_provers() > 0`; on a fresh node with
             // an empty registry this just gives up silently and the
             // archive-poller path picks it up later.
             for _ in 0..50 {
-                if token_for_init.is_cancelled() { return; }
+                if token_for_init.is_cancelled() { return Ok(()); }
                 let count = pr_for_init.read(|r| r.distinct_provers());
                 if count > 0 { break; }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -149,6 +150,7 @@ pub(crate) fn init(args: LifecycleInitArgs) -> LifecycleHandles {
                     info!(frame, "early worker reconcile complete (off local registry)");
                 }
             }
+            Ok(())
         });
     }
 

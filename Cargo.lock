@@ -4108,7 +4108,6 @@ dependencies = [
  "quil-execution",
  "quil-hypergraph",
  "quil-keys",
- "quil-lifecycle",
  "quil-p2p",
  "quil-store",
  "quil-tries",
@@ -4221,10 +4220,6 @@ dependencies = [
 name = "quil-lifecycle"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-trait",
- "quil-types",
- "thiserror 2.0.12",
  "tokio",
  "tokio-util",
  "tracing",
@@ -4282,6 +4277,7 @@ name = "quil-p2p"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "anyhow",
  "async-trait",
  "bs58",
  "ed448-rust",
@@ -4294,6 +4290,7 @@ dependencies = [
  "prost-build",
  "quil-config",
  "quil-crypto",
+ "quil-lifecycle",
  "quil-types",
  "rand 0.8.5",
  "sha2 0.10.8",

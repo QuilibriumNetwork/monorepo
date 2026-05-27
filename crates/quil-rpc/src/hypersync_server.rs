@@ -452,6 +452,7 @@ impl HypergraphComparisonService for HyperSyncServer {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<HypergraphSyncResponse, Status>>(16);
 
+        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
         tokio::spawn(async move {
             // Cache tree per (phase, shard, snapshot_root) so multi-phase
             // streams don't reload, shards never cross-serve, and a

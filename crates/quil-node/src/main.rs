@@ -1,9 +1,11 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
+
+use quil_lifecycle::{ShutdownReason, Supervisor};
 
 mod logging;
 
@@ -110,7 +112,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
 
     // Load configuration first so logger paths / filters come from it.
@@ -146,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
         network: args.network,
     };
     if diagnostic::handle_diagnostic_flags(&diag_flags, &config)? {
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Install a Prometheus recorder. If `--prometheus-server` is given,
@@ -182,14 +184,18 @@ async fn main() -> anyhow::Result<()> {
     // is installed so `describe_*` calls attach to it.
     quil_engine::metrics::register_engine_metrics();
 
-    // Spawn upkeep: the recorder's histogram buckets need periodic
+    // Build the supervisor that owns every long-running task in the
+    // binary. Each spawned task is joined, so panics or task errors
+    // propagate up to `sup.run()` instead of being silently swallowed.
+    let mut sup = Supervisor::<anyhow::Error>::new()
+        .with_shutdown_timeout(Duration::from_secs(10));
+
+    // Metrics upkeep: the recorder's histogram buckets need periodic
     // run_upkeep() to evict old samples. Missing this results in
-    // ever-growing memory for histograms. Task dies with the process
-    // on shutdown — no explicit cancellation needed.
-    if let Some(ref h) = metrics_handle {
-        let h = h.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    // ever-growing memory for histograms.
+    if let Some(h) = metrics_handle.as_ref().cloned() {
+        sup.run_until_cancelled("metrics-upkeep", move |_token| async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
                 h.run_upkeep();
@@ -251,49 +257,63 @@ async fn main() -> anyhow::Result<()> {
         info!("signature check disabled, skipping");
     }
 
-    // Create cancellation token for coordinated shutdown
-    let token = CancellationToken::new();
-    let shutdown_token = token.clone();
-
-    // Handle Ctrl+C
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("received shutdown signal");
-        shutdown_token.cancel();
-    });
-
     // Handle --import-db before anything else.
     // Supports file path or "-" for stdin (pipe from Go exporter).
     // Pipe mode uses zero extra disk:
     //   ./node --export-db - | ./quil-node --import-db -
     if let Some(ref import_path) = args.import_db {
         diagnostic::run_import(import_path, &config)?;
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
-    // Select node mode
-    match (args.core, args.dht_only) {
+    // Hand off to the chosen node mode. It owns `sup` for its lifetime,
+    // registers its subsystems, runs the supervisor, and returns the
+    // `ShutdownReason` for `main` to translate into an exit code.
+    let reason = match (args.core, args.dht_only) {
         (_, true) => {
             info!("starting in DHT-only mode");
-            dht_node::run(&config, token).await
+            dht_node::start(sup, &config).await?
         }
         (0, false) => {
             // Archive mode comes from --archive OR engine.archiveMode.
             let archive_mode = args.archive || config.engine.archive_mode;
             info!(archive = archive_mode, "starting as master node");
-            master_node::run(
+            master_node::start(
+                sup,
                 &config,
                 &args.config,
                 archive_mode,
                 args.network,
-                token,
                 metrics_handle.clone(),
             )
-            .await
+            .await?
         }
         (core_id, false) => {
             info!(core_id, "starting as worker node");
-            worker_node::run(&config, core_id, args.parent_process, token).await
+            worker_node::start(sup, &config, core_id, args.parent_process).await?
+        }
+    };
+
+    match reason {
+        // POSIX convention: SIGINT-driven exit is 128 + SIGINT(2) = 130.
+        ShutdownReason::CtrlC => {
+            info!("shut down via ctrl-c");
+            Ok(ExitCode::from(130))
+        }
+        ShutdownReason::TaskExited(name) => {
+            error!(task = %name, "supervised task exited unexpectedly");
+            Err(anyhow::anyhow!(
+                "supervised task {name:?} exited unexpectedly"
+            ))
+        }
+        ShutdownReason::TaskError(name, e) => {
+            error!(task = %name, error = %e, "supervised task failed");
+            Err(e.context(format!("supervised task {name:?} failed")))
+        }
+        ShutdownReason::JoinError(name, e) => {
+            error!(task = %name, error = %e, "supervised task join failed");
+            Err(anyhow::Error::from(e)
+                .context(format!("supervised task {name:?} join failed")))
         }
     }
 }

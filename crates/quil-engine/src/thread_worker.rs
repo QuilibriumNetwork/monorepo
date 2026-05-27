@@ -411,6 +411,7 @@ impl ThreadWorkerManager {
                                             let filter_clone = filter.clone();
                                             let deps = consensus_deps.clone();
                                             let owned = worker_owned.clone();
+                                            // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
                                             tokio::spawn(async move {
                                                 info!(core_id, filter = hex::encode(&filter_clone), "app engine spawned");
 
@@ -486,6 +487,7 @@ impl ThreadWorkerManager {
                                                     let master_tx_events = master_tx_clone.clone();
                                                     let loopback_handle = app_handle.clone();
                                                     let _filter_for_events = filter_clone.clone();
+                                                    // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
                                                     tokio::spawn(async move {
                                                         while let Some(event) = event_rx.recv().await {
                                                             match event {
@@ -565,6 +567,7 @@ impl ThreadWorkerManager {
                                                     // Sharing a task via `tokio::select!` here was making
                                                     // the engine's own select starve under load.
                                                     let bls_signer = (deps.bls_signer_factory)();
+                                                    // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
                                                     let mut engine_handle = tokio::spawn(async move {
                                                         engine.run(bls_signer).await;
                                                     });

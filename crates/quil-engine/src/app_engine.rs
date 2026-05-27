@@ -1240,6 +1240,7 @@ impl AppConsensusEngine {
         };
 
         let filter_for_loop = filter.clone();
+        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
         tokio::spawn(async move {
             if let Err(e) = event_loop.run().await {
                 tracing::error!(
