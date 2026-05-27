@@ -119,37 +119,40 @@ tasks:
   build_node_arm64_linux:
     desc: Build the Quilibrium node binary for ARM64 Linux. Outputs to node/build.
     cmds:
-      - docker build --platform linux/arm64 -f docker/Dockerfile.source --output node/build/arm64_linux --target=node .
+      # --ulimit stack=-1:-1 keeps rustc from segfaulting under qemu when
+      # cross-building (e.g. arm64 image on an amd64 host or vice versa).
+      # No effect on native builds.
+      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output node/build/arm64_linux --target=node .
 
   build_qclient_arm64_linux:
     desc: Build the QClient node binary for ARM64 Linux. Outputs to client/build.
     cmds:
-      - docker build --platform linux/arm64 -f docker/Dockerfile.source --output client/build/arm64_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output client/build/arm64_linux --target=qclient .
 
   build_node_amd64_linux:
     desc: Build the Quilibrium node binary for AMD64 Linux. Outputs to node/build.
     cmds:
-      - docker build --platform linux/amd64 -f docker/Dockerfile.source --output node/build/amd64_linux --target=node .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output node/build/amd64_linux --target=node .
 
   build_conntest_amd64_linux:
     desc: Build the Quilibrium node connection test binary for AMD64 Linux. Outputs to conntest/build.
     cmds:
-      - docker build --platform linux/amd64 -f docker/Dockerfile.conntest.source --output conntest/build/amd64_linux --target=conntest .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.conntest.source --output conntest/build/amd64_linux --target=conntest .
 
   build_node_amd64_avx512_linux:
     desc: Build the Quilibrium node binary for AMD64 Linux with AVX-512 extensions. Outputs to node/build.
     cmds:
-      - docker build --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output node/build/amd64_avx512_linux --target=node .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output node/build/amd64_avx512_linux --target=node .
 
   build_qclient_amd64_linux:
     desc: Build the QClient node binary for AMD64 Linux. Outputs to client/build.
     cmds:
-      - docker build --platform linux/amd64 -f docker/Dockerfile.source --output client/build/amd64_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output client/build/amd64_linux --target=qclient .
 
   build_qclient_amd64_avx512_linux:
     desc: Build the QClient node binary for AMD64 Linux with AVX-512 extensions. Outputs to client/build.
     cmds:
-      - docker build --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output client/build/amd64_avx512_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output client/build/amd64_avx512_linux --target=qclient .
 
   build:source:
     desc: Build the Quilibrium docker image from source.
