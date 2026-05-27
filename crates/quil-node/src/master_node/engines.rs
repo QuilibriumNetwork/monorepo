@@ -6,7 +6,6 @@ use super::storage::StorageHandles;
 
 pub(crate) struct EngineHandles {
     pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
-    pub key_manager: Arc<dyn quil_types::crypto::KeyManager>,
     pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
 }
@@ -134,7 +133,6 @@ pub(crate) fn init_engines(storage: &StorageHandles) -> EngineHandles {
 
     EngineHandles {
         inclusion_prover,
-        key_manager,
         crdt,
         exec_manager,
     }
