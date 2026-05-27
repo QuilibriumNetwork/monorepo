@@ -226,4 +226,18 @@ mod tests {
         let d = adj.get_next_difficulty(1, IDEAL_FRAME_TIME * 2);
         assert_eq!(d, 100_000);
     }
+
+    /// Mainnet anchor wiring: anchor_frame=244200, anchor_time=1762862400000,
+    /// anchor_difficulty=80000. With these values the adjuster must NOT
+    /// return BOOTSTRAP_DIFFICULTY (50000) — it must use the real ASERTi3-2d
+    /// feedback loop.
+    #[test]
+    fn mainnet_anchor_does_not_bootstrap() {
+        let adj = AsertDifficultyAdjuster::new(244_200, 1_762_862_400_000, 80_000);
+        let frame = 244_201;
+        let ts = 1_762_862_400_000 + IDEAL_FRAME_TIME * 2;
+        let d = adj.get_next_difficulty(frame, ts);
+        assert_ne!(d, BOOTSTRAP_DIFFICULTY, "mainnet anchor must not hit bootstrap path");
+        assert_eq!(d, 80_000, "on-schedule frame should return anchor difficulty");
+    }
 }

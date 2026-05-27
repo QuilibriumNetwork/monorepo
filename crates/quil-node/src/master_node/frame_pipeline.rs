@@ -21,10 +21,8 @@ pub(crate) fn init() -> FramePipeline {
         bls_for_verify,
     );
 
-    let _difficulty = quil_engine::AsertDifficultyAdjuster::new(0, 0, 0);
     let fee_manager: Arc<dyn quil_types::consensus::DynamicFeeManager> =
         Arc::new(quil_engine::InMemoryDynamicFeeManager::new(360));
-    let _time_reel = quil_engine::GlobalTimeReel::new();
 
     info!("VDF frame prover ready (Wesolowski, 2048-bit)");
 

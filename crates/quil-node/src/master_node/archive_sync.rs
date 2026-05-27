@@ -287,7 +287,14 @@ pub(crate) fn spawn_all(args: ArchiveSyncArgs) {
             let sync_km = file_key_manager.clone();
             let sync_cs = clock_store.clone();
             let sync_fp = frame_prover.clone();
-            let sync_da = Arc::new(quil_engine::AsertDifficultyAdjuster::new(0, 0, 0));
+            let (anchor_frame, anchor_time, anchor_diff) = if network == 0 {
+                (244_200u64, 1_762_862_400_000i64, 80_000u32)
+            } else {
+                (0, 1_762_862_400_000, 80_000)
+            };
+            let sync_da = Arc::new(quil_engine::AsertDifficultyAdjuster::new(
+                anchor_frame, anchor_time, anchor_diff,
+            ));
             let sync_mc = message_collector.clone();
             let sync_bls_pub = bls_pubkey.clone();
             let sync_pa = prover_address;

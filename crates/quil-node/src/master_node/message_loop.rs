@@ -45,6 +45,7 @@ pub(crate) struct MessageLoopArgs {
     pub worker_manager: Arc<dyn quil_engine::worker::WorkerManager>,
     pub prover_address: [u8; 32],
     pub p2p_handle: quil_p2p::node::P2PHandle,
+    pub time_reel: Option<Arc<quil_engine::time_reel::GlobalTimeReel>>,
 }
 
 pub(crate) fn spawn(args: MessageLoopArgs) {
@@ -81,6 +82,7 @@ pub(crate) fn spawn(args: MessageLoopArgs) {
         worker_manager: wm_for_recv,
         prover_address: pa_for_recv,
         p2p_handle: p2p_for_recv,
+        time_reel: time_reel_for_recv,
     } = args;
 
     // Global bitmasks for BlossomSub topic subscriptions.
@@ -116,6 +118,9 @@ pub(crate) fn spawn(args: MessageLoopArgs) {
     let archive_mode_for_recv: bool = archive_mode_recv;
 
     tokio::spawn(async move {
+        let mut time_reel_rx = time_reel_for_recv
+            .as_ref()
+            .and_then(|tr| tr.take_event_rx());
         let mut frames_received: u64 = 0;
         let mut peer_infos_received: u64 = 0;
         let mut peer_info_digest_cache: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
@@ -596,6 +601,46 @@ pub(crate) fn spawn(args: MessageLoopArgs) {
                                                             awaiting = last_executed_frame + 1,
                                                             "archive: stored out-of-order frame, awaiting predecessor"
                                                         );
+                                                    }
+                                                    out
+                                                } else if let Some(ref reel) = time_reel_for_recv {
+                                                    if let Err(e) = reel.insert(Arc::new(frame.clone())) {
+                                                        debug!(
+                                                            frame = frame_num,
+                                                            error = %e,
+                                                            "time reel rejected frame",
+                                                        );
+                                                    }
+                                                    // Drain events — execute frames the reel promotes to head.
+                                                    let mut out = Vec::new();
+                                                    if let Some(ref mut rx) = time_reel_rx {
+                                                        while let Ok(event) = rx.try_recv() {
+                                                            match event.event_type {
+                                                                quil_engine::time_reel::TimeReelEventType::NewHead |
+                                                                quil_engine::time_reel::TimeReelEventType::ForkDetected => {
+                                                                    let head_num = event.frame.header.as_ref()
+                                                                        .map(|h| h.frame_number).unwrap_or(0);
+                                                                    if head_num > last_executed_frame {
+                                                                        last_executed_frame = head_num;
+                                                                        let f: quil_types::proto::global::GlobalFrame =
+                                                                            (*event.frame).clone();
+                                                                        out.push((head_num, f));
+                                                                    }
+                                                                    if event.event_type == quil_engine::time_reel::TimeReelEventType::ForkDetected {
+                                                                        info!(
+                                                                            new_head = head_num,
+                                                                            "time reel: fork detected, switching to new head"
+                                                                        );
+                                                                    }
+                                                                }
+                                                                quil_engine::time_reel::TimeReelEventType::EquivocationDetected => {
+                                                                    warn!(
+                                                                        msg = %event.message,
+                                                                        "time reel: equivocation detected"
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                     out
                                                 } else if frame_num > last_executed_frame {

@@ -599,6 +599,11 @@ pub(crate) async fn run(
         worker_manager: worker_manager.clone(),
         prover_address,
         p2p_handle: p2p_handle.clone(),
+        time_reel: if !archive_mode {
+            Some(Arc::new(quil_engine::time_reel::GlobalTimeReel::new(network)))
+        } else {
+            None
+        },
     });
 
     // ---------------------------------------------------------------
