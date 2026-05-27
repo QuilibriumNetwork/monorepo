@@ -264,15 +264,13 @@ pub(crate) fn spawn(args: MessageLoopArgs) {
                                 } else {
                                     format!("short({}B)", received.data.len())
                                 };
-                                if router_drops <= 10 || router_drops % 1000 == 0 {
-                                    info!(
-                                        topic,
-                                        type_prefix,
-                                        len = received.data.len(),
-                                        total_dropped = router_drops,
-                                        "router validator dropped message",
-                                    );
-                                }
+                                debug!(
+                                    topic,
+                                    type_prefix,
+                                    len = received.data.len(),
+                                    total_dropped = router_drops,
+                                    "router validator dropped message",
+                                );
                                 continue;
                             }
 
