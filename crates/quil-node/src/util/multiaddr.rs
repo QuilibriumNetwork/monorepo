@@ -133,3 +133,92 @@ pub(crate) fn extract_stream_addr(pubsub_ma: &str, stream_listen: &str) -> Optio
 
     Some(format!("/ip4/{}/{}/{}", ip, protocol, port))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::archive_multiaddr_to_host_port;
+
+    #[test]
+    fn archive_multiaddr_accepts_ip4() {
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/1.2.3.4/tcp/8340", 0),
+            Some("1.2.3.4:8340".into())
+        );
+    }
+
+    #[test]
+    fn archive_multiaddr_accepts_ip6() {
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip6/2001:db8::1/tcp/8340", 0),
+            Some("[2001:db8::1]:8340".into())
+        );
+    }
+
+    #[test]
+    fn archive_multiaddr_accepts_dns4() {
+        assert_eq!(
+            archive_multiaddr_to_host_port("/dns4/archive.example.com/tcp/8340", 0),
+            Some("archive.example.com:8340".into())
+        );
+    }
+
+    #[test]
+    fn archive_multiaddr_accepts_dns6() {
+        assert_eq!(
+            archive_multiaddr_to_host_port("/dns6/archive.example.com/tcp/8340", 0),
+            Some("archive.example.com:8340".into())
+        );
+    }
+
+    #[test]
+    fn archive_multiaddr_accepts_dns() {
+        assert_eq!(
+            archive_multiaddr_to_host_port("/dns/archive.example.com/tcp/8340", 0),
+            Some("archive.example.com:8340".into())
+        );
+    }
+
+    #[test]
+    fn archive_multiaddr_rejects_bare_host_port() {
+        assert_eq!(archive_multiaddr_to_host_port("archive.example.com:8340", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("1.2.3.4:8340", 0), None);
+    }
+
+    #[test]
+    fn archive_multiaddr_rejects_non_tcp() {
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/1.2.3.4/udp/8340", 0), None);
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/1.2.3.4/udp/8340/quic-v1", 0),
+            None
+        );
+    }
+
+    #[test]
+    fn archive_multiaddr_rejects_malformed() {
+        assert_eq!(archive_multiaddr_to_host_port("", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/1.2.3.4", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/ip4//tcp/8340", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/1.2.3.4/tcp/", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/1.2.3.4/tcp/notaport", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/dns4//tcp/8340", 0), None);
+    }
+
+    #[test]
+    fn archive_multiaddr_rejects_private_ip_on_mainnet() {
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/192.168.1.1/tcp/8340", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/10.0.0.1/tcp/8340", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/127.0.0.1/tcp/8340", 0), None);
+    }
+
+    #[test]
+    fn archive_multiaddr_allows_private_ip_on_devnet() {
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/192.168.1.1/tcp/8340", 1),
+            Some("192.168.1.1:8340".into())
+        );
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/127.0.0.1/tcp/8340", 1),
+            Some("127.0.0.1:8340".into())
+        );
+    }
+}
