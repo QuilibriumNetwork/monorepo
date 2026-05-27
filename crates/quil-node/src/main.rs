@@ -806,207 +806,44 @@ async fn run_master_node(
         info!("shard orchestration subscriber spawned");
     }
 
-    if let Some(seed) = mtls_seed {
-        let exec_mgr_for_poller = exec_manager.clone();
-        let wa_for_poller = worker_allocator.clone();
-        let pl_for_poller = prover_lifecycle.clone();
-        let pr_for_poller = prover_registry.clone();
-        let wm_for_poller = worker_manager.clone();
-        let cov_for_poller = coverage_monitor.clone();
-        let cf_for_poller = current_frame.clone();
-        let lhf_for_poller = last_global_head_frame.clone();
-        let pp_for_poller = prover_pipeline.clone();
-        let hg_for_poller = hg_store.clone();
-        let crdt_for_poller = crdt.clone();
-        let shards_store_for_poller: Arc<dyn quil_types::store::ShardsStore> =
-            shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
-        let archive_mode_poller = archive_mode;
-        let poller_config = quil_rpc::ArchivePollerConfig {
-            on_frame: Some(Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
-                let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
-                let frame_difficulty = frame.header.as_ref().map(|h| h.difficulty).unwrap_or(0);
-                // Skip bogus frames (no header or frame_number=0):
-                // `current_frame.observe(0)` is a no-op, and the
-                // lifecycle's evaluate guards against 0 anyway.
-                if frame_num == 0 {
-                    tracing::debug!(
-                        "archive poller: dropping frame with frame_number=0"
-                    );
-                    return;
-                }
-                cf_for_poller.observe(frame_num);
-                lhf_for_poller.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
+    master_node::archive_sync::spawn_all(master_node::archive_sync::ArchiveSyncArgs {
+        mtls_seed,
+        network,
+        archive_mode,
+        token: token.clone(),
+        archive_pool: archive_pool.clone(),
+        clock_store: clock_store.clone(),
+        hg_store: hg_store.clone(),
+        crdt: crdt.clone(),
+        shards_store: shards_store.clone(),
+        exec_manager: exec_manager.clone(),
+        worker_allocator: worker_allocator.clone(),
+        prover_lifecycle: prover_lifecycle.clone(),
+        prover_registry: prover_registry.clone(),
+        worker_manager: worker_manager.clone(),
+        coverage_monitor: coverage_monitor.clone(),
+        current_frame: current_frame.clone(),
+        last_global_head_frame: last_global_head_frame.clone(),
+        prover_pipeline: prover_pipeline.clone(),
+        file_key_manager: file_key_manager.clone(),
+        frame_prover: frame_prover.clone(),
+        message_collector: message_collector.clone(),
+        bls_pubkey: bls_pubkey.clone(),
+        prover_address,
+        p2p_handle: p2p_handle.clone(),
+        consensus_handle: consensus_handle.clone(),
+        vote_aggregator: vote_aggregator.clone(),
+        timeout_aggregator: timeout_aggregator.clone(),
+        db_arc: db_arc.clone(),
+        frame_materializer: frame_materializer.clone(),
+        consensus_loopback_tx: consensus_loopback_tx.clone(),
+        peer_id,
+    });
 
-                // Process frame messages through execution pipeline
-                match quil_engine::frame_processor::process_global_frame(
-                    &exec_mgr_for_poller,
-                    frame,
-                    &num_bigint::BigInt::from(1),
-                ) {
-                    Ok((applied, skipped)) => {
-                        if applied > 0 || skipped > 0 {
-                            info!(
-                                frame = frame_num,
-                                applied,
-                                skipped,
-                                "processed frame messages"
-                            );
-                        }
-                        // After per-bundle materialize calls flushed
-                        // their changesets to the in-memory CRDT (via
-                        // each engine's `state.commit`), persist the
-                        // resulting phase trees to the on-disk
-                        // hypergraph store. Without this commit, the
-                        // store still serves the previous frame's
-                        // trees and the registry refresh below sees
-                        // no new ProverJoin/Confirm/Leave writes.
-                        if applied > 0 {
-                            if let Err(e) = exec_mgr_for_poller.commit_frame(frame_num) {
-                                warn!(error = %e, frame = frame_num, "hypergraph commit failed");
-                            }
-                            pr_for_poller.refresh_from_store(&hg_for_poller);
-                        }
-                    }
-                    Err(e) => {
-                        warn!(frame = frame_num, error = %e, "frame processing failed");
-                    }
-                }
-
-                // Trigger worker allocation reconciliation. Skip in
-                // archive mode — archives don't run app-shard workers,
-                // so the reconciler has nothing to do and calling it
-                // would resurface the no-workers-spawned-yet pathways
-                // that produced phantom worker allocations on prior
-                // versions.
-                cov_for_poller.check(frame_num);
-                if !archive_mode_poller {
-                    if let Err(e) = wa_for_poller.on_new_frame(frame_num) {
-                        tracing::warn!(error = %e, "worker allocation failed");
-                    }
-                }
-
-                // Advance the lifecycle's "verified frame" marker. The
-                // initial prover-tree sync already proved our root
-                // matches the network (`commitments_match==true` —
-                // see the spawn at the bottom of `main.rs`). From
-                // that point on, every successfully-processed frame
-                // either applies new prover messages (and our tree
-                // moves with it) or is a no-op for prover state.
-                // Either way we stay in sync; drift is caught by the
-                // 5-minute periodic incremental sync.
-                //
-                // The earlier strict per-frame commitment check
-                // required `crdt.commit(frame_num)` to have run AND
-                // matched the frame's `prover_tree_commitment`, which
-                // only happened on the rare frames where we applied
-                // prover messages — leaving the lifecycle gate held
-                // perpetually for non-archive nodes.
-                pl_for_poller.set_prover_root_verified_frame(frame_num);
-
-                // Refresh the lifecycle's per-filter byte-size map
-                // before evaluating. Without this the proposer falls
-                // back to `summary.total_size` which is a prover-
-                // count proxy (sum of status_counts), not bytes —
-                // joins fire on shards with no actual data, and
-                // halt-risk priority can't tell apart "0 bytes
-                // because empty" from "real bytes." We walk the
-                // local hypergraph the same way the
-                // GetShardInfo RPC does (`local_app_shard_get_sizes`).
-                {
-                    use std::collections::HashMap;
-                    let get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(
-                        crdt_for_poller.clone(),
-                        shards_store_for_poller.clone(),
-                    );
-                    let mut sizes_by_filter: HashMap<Vec<u8>, u64> = HashMap::new();
-                    if let Ok(shards) = shards_store_for_poller.range_app_shards() {
-                        // Dedupe to one entry per parent shard_key
-                        // (range_app_shards returns one row per
-                        // sub-shard).
-                        let mut seen: std::collections::HashSet<Vec<u8>> =
-                            std::collections::HashSet::new();
-                        for s in shards {
-                            if !seen.insert(s.shard_key.clone()) {
-                                continue;
-                            }
-                            if let Ok(sub_sizes) = get_sizes(&s.shard_key, &s) {
-                                for entry in sub_sizes {
-                                    // `entry.size` is a big-endian
-                                    // byte representation of the
-                                    // shard's byte count. Saturate
-                                    // at u64::MAX for absurdly large
-                                    // shards rather than wrap.
-                                    let mut bytes: u64 = 0;
-                                    for &b in entry.size.iter() {
-                                        bytes = bytes
-                                            .saturating_mul(256)
-                                            .saturating_add(b as u64);
-                                    }
-                                    if bytes == 0 {
-                                        continue;
-                                    }
-                                    // Reconstruct the `bp` filter the
-                                    // proposer keys on: L2[32] +
-                                    // prefix bytes.
-                                    let l2 = if s.shard_key.len() >= 35 {
-                                        &s.shard_key[3..35]
-                                    } else if s.shard_key.len() > 3 {
-                                        &s.shard_key[3..]
-                                    } else {
-                                        &s.shard_key[..]
-                                    };
-                                    let mut bp = l2.to_vec();
-                                    for &p in &entry.prefix {
-                                        bp.push(p as u8);
-                                    }
-                                    sizes_by_filter.insert(bp, bytes);
-                                }
-                            }
-                        }
-                    }
-                    pl_for_poller.set_local_shard_sizes(sizes_by_filter);
-                }
-
-                // Skip lifecycle evaluation on archives — they don't
-                // propose joins/leaves, don't dispatch through the
-                // prover pipeline, and the evaluate() output would
-                // be ignored anyway since there are no workers to
-                // bind allocations to.
-                if !archive_mode_poller {
-                    match pl_for_poller.evaluate(
-                        frame_num,
-                        frame_difficulty as u64,
-                        pr_for_poller.as_ref() as &dyn quil_types::consensus::ProverRegistry,
-                        wm_for_poller.as_ref(),
-                    ) {
-                        Ok(actions) => {
-                            for action in actions {
-                                tracing::info!(frame = frame_num, ?action, "prover lifecycle action");
-                                pp_for_poller.dispatch(action);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "prover lifecycle evaluation skipped");
-                        }
-                    }
-                }
-            })),
-            forward_fill: archive_mode,
-            ..Default::default()
-        };
-        quil_rpc::spawn_archive_poller(
-            archive_pool.clone(),
-            clock_store.clone(),
-            seed,
-            poller_config,
-            token.clone(),
-        );
-        info!("archive frame poller spawned (with execution pipeline)");
-
-        // Periodic incremental HyperSync — refreshes prover registry every ~5 minutes.
-        // After initial full sync, subsequent syncs use commitment comparison
-        // and only fetch changed branches (seconds instead of 9 minutes).
-        {
+    #[allow(unreachable_code, dead_code, clippy::diverging_sub_expression)]
+    if false { if let Some(seed) = mtls_seed {
+        // (periodic sync block — moved to master_node/archive_sync.rs)
+        if false {
             let sync_pool = archive_pool.clone();
             let sync_hg = hg_store.clone();
             let sync_pr = prover_registry.clone();
@@ -1789,7 +1626,7 @@ async fn run_master_node(
         }
     } else {
         warn!("no Ed448 seed available — archive poller disabled (production archives require mTLS)");
-    }
+    } }
 
     // Broadcast channel for GlobalService::StreamGlobalMessages.
     // Construction here (before recv loop) so the recv loop can

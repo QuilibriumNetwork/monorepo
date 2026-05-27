@@ -1,4 +1,5 @@
 pub(crate) mod allocator_and_lifecycle;
+pub(crate) mod archive_sync;
 pub(crate) mod engines;
 pub(crate) mod frame_pipeline;
 pub(crate) mod keys;
