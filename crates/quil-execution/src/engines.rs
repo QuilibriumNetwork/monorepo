@@ -130,17 +130,38 @@ impl GlobalExecutionEngine {
         }
     }
 
+    /// Install only the `frame_prover` on the intrinsic. This is the
+    /// minimum that ProverJoin validation needs
+    /// (`verify_prover_join_vdf` in `GlobalIntrinsic::validate`); the
+    /// broader `install_frame_header_deps` also wires materializer-side
+    /// registry/issuance/kick deps and is only needed on nodes that
+    /// locally materialize global frames (archives). Non-archive
+    /// masters call this so the archive-poller callback can pass
+    /// ProverJoin validation without taking on archive-only
+    /// materialization.
+    pub fn install_frame_prover(
+        &mut self,
+        frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
+    ) {
+        if let Some(intrinsic) = self.intrinsic.take() {
+            self.intrinsic = Some(intrinsic.with_frame_prover(frame_prover));
+        }
+    }
+
     /// Create with full dependencies for real signature verification
     /// and state materialization.
     pub fn new_with_intrinsic(
         inclusion_prover: Arc<dyn InclusionProver>,
         key_manager: Arc<dyn quil_types::crypto::KeyManager>,
         crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+        clock_store: Arc<dyn quil_types::store::ClockStore>,
     ) -> Self {
         let state = Arc::new(crate::hypergraph_state::HypergraphState::new(crdt.clone()));
+        let intrinsic = crate::global_intrinsic::intrinsic::GlobalIntrinsic::new(key_manager)
+            .with_clock_store(clock_store);
         Self {
             inclusion_prover,
-            intrinsic: Some(crate::global_intrinsic::intrinsic::GlobalIntrinsic::new(key_manager)),
+            intrinsic: Some(intrinsic),
             crdt: Some(crdt),
             state: Some(state),
         }

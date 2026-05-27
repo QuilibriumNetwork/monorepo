@@ -52,6 +52,7 @@ impl ExecutionEngineManager {
                     inclusion_prover.clone(),
                     key_manager.clone(),
                     crdt.clone(),
+                    clock_store.clone(),
                 )),
             );
         }
@@ -157,6 +158,37 @@ impl ExecutionEngineManager {
             inclusion_prover,
             frame_prover,
         );
+        Ok(())
+    }
+
+    /// Install only the `frame_prover` onto the global engine's
+    /// intrinsic. Required on every node that drives global-frame
+    /// validation — including non-archive masters, whose archive-poller
+    /// callback invokes `process_global_frame` → `validate_message` →
+    /// the intrinsic's `TYPE_PROVER_JOIN` arm. Without this, ProverJoin
+    /// validation fails closed with "frame_prover not installed". The
+    /// broader `install_global_frame_header_deps` is archive-only
+    /// because it also wires materializer-side registry / issuance /
+    /// kick deps that non-archive masters don't need.
+    pub fn install_global_frame_prover(
+        &self,
+        frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
+    ) -> Result<()> {
+        let mut engines = self.engines.write().unwrap();
+        let engine = engines
+            .get_mut("global")
+            .ok_or_else(|| QuilError::NotFound("engine 'global' not found".into()))?;
+        let any = engine.as_any_mut().ok_or_else(|| {
+            QuilError::Internal(
+                "global engine does not support as_any_mut downcast".into(),
+            )
+        })?;
+        let global = any.downcast_mut::<GlobalExecutionEngine>().ok_or_else(|| {
+            QuilError::Internal(
+                "global engine is not a GlobalExecutionEngine".into(),
+            )
+        })?;
+        global.install_frame_prover(frame_prover);
         Ok(())
     }
 
