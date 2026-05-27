@@ -1541,6 +1541,62 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // verify_prover_join_vdf — regression for test #548
+    //
+    // Builds a real VDF multi-proof with the signer-side algorithm
+    // (SHA3-256 challenge over frame_output, matching Go's
+    // `sha3.Sum256` and Rust's prover_pipeline) and feeds it through
+    // the actual verifier. Pins the cross-implementation hash
+    // agreement; would have caught the original sha2/sha3 mismatch.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn verify_prover_join_vdf_accepts_real_proof() {
+        use quil_types::crypto::FrameProver;
+
+        let frame_prover = quil_crypto::WesolowskiFrameProver::new(2048);
+        let difficulty: u32 = 200;
+        let frame_output: &[u8] = b"deadbeef-test-frame-output";
+        let filters: Vec<Vec<u8>> = vec![vec![0x01u8; 32], vec![0x02u8; 48]];
+
+        let stub = sample_join(filters.clone());
+        let prover_address = validate_prover_join_structural(&stub, 105)
+            .unwrap()
+            .prover_address;
+
+        use sha3::Digest as _;
+        let challenge: [u8; 32] = sha3::Sha3_256::digest(frame_output).into();
+
+        let ids: Vec<Vec<u8>> = filters
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let mut id = Vec::with_capacity(32 + f.len() + 4);
+                id.extend_from_slice(&prover_address);
+                id.extend_from_slice(f);
+                id.extend_from_slice(&(i as u32).to_be_bytes());
+                id
+            })
+            .collect();
+        let id_refs: Vec<&[u8]> = ids.iter().map(|v| v.as_slice()).collect();
+
+        let mut proof = Vec::with_capacity(filters.len() * PROOF_CHUNK_SIZE);
+        for i in 0..filters.len() {
+            let chunk = frame_prover
+                .calculate_multi_proof(&challenge, difficulty, &id_refs, i as u32)
+                .unwrap();
+            assert_eq!(chunk.len(), PROOF_CHUNK_SIZE);
+            proof.extend_from_slice(&chunk);
+        }
+
+        let op = ProverJoin { proof, ..stub };
+
+        let ok = verify_prover_join_vdf(&op, 105, frame_output, difficulty, &frame_prover)
+            .expect("verify_prover_join_vdf returned an error");
+        assert!(ok, "real ProverJoin proof must verify (regression testfor #548)");
+    }
+
+    // -----------------------------------------------------------------
     // Tier-5 #11: 2.1 transition window in validate_confirm_timing
     // -----------------------------------------------------------------
 
