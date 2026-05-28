@@ -180,6 +180,14 @@ impl GlobalConsensusEngine {
         let activation = consensus_activation::activate_consensus(params)?;
         let handle = activation.handle;
 
+        // Drive the event loop. NOTE: this uses bare `tokio::spawn` —
+        // a panic inside `run_future` will print to stderr and leave
+        // this engine's handle pointing at a dead task. Production
+        // callers (master_node) should bypass this convenience method
+        // and register `activation.run_future` directly with the
+        // process supervisor so panics surface as `JoinError`.
+        tokio::spawn(activation.run_future);
+
         // Store for message routing.
         *self.consensus_handle.lock().unwrap() = Some(handle.clone());
 

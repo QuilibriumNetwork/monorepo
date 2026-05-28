@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // Import KeyManager trait for get_signer
 use quil_keys::KeyManager as _;
@@ -195,7 +195,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             if let Err(e) = pi_handle.publish(bitmask.clone(), encoded).await {
                 warn!(error = %e, "failed to publish PeerInfo");
             } else {
-                info!(
+                debug!(
                     capabilities = pi_caps.len(),
                     signed = pi_ed448_seed.is_some(),
                     pubkey_len = pi_ed448_pubkey.len(),
@@ -230,7 +230,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                                 if let Err(e) = pi_handle.publish(bitmask.clone(), kr).await {
                                     warn!(error = %e, "failed to publish KeyRegistry");
                                 } else {
-                                    info!("published KeyRegistry");
+                                    debug!("published KeyRegistry");
                                 }
                             }
                         }

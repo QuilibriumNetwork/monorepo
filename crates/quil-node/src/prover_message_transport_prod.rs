@@ -169,7 +169,9 @@ where
         let stream_addr = addr.replace(":8336", ":8340");
         let bytes = bundle_bytes.clone();
         let submit = submit.clone();
-        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
+        // Parallel fan-out: each handle's result is awaited below, so
+        // panics surface as JoinError and per-archive failures are
+        // logged individually. This is the correct use of bare spawn.
         handles.push(tokio::spawn(async move { submit(stream_addr, bytes).await }));
     }
     let mut ok_count = 0usize;

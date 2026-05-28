@@ -147,15 +147,34 @@ pub struct ConsensusComponents {
     pub startup_delay: Duration,
 }
 
+/// Outputs of [`ConsensusComponents::start`].
+///
+/// Caller is expected to:
+/// 1. Use `handle` to submit proposals, votes, QCs, TCs, timeouts.
+/// 2. Drive `run_future` to completion on a supervised task. Calling
+///    `tokio::spawn(run_future)` is a bug — a panic there leaves
+///    consensus dead with no visibility. Register the future with the
+///    supervisor instead, so panics surface as `JoinError` and the
+///    node shuts down cleanly.
+pub struct ConsensusStart {
+    pub handle: EventLoopHandle<GlobalState, GlobalVote>,
+    pub run_future: std::pin::Pin<
+        Box<dyn std::future::Future<Output = quil_types::error::Result<()>> + Send + 'static>,
+    >,
+}
+
 impl ConsensusComponents {
-    /// Start the consensus event loop with a trusted root state
-    /// (genesis or latest finalized frame).
+    /// Build the consensus event loop and return the handle + the
+    /// future that drives it.
+    ///
+    /// The caller MUST schedule `run_future` on a supervised task —
+    /// dropping it without driving it means the loop never starts.
     pub fn start(
         self,
         trusted_root: quil_consensus::models::CertifiedState<GlobalState>,
         finalizer: Arc<dyn quil_consensus::forest::Finalizer>,
         follower: Arc<dyn quil_consensus::forest::FollowerConsumer<GlobalState>>,
-    ) -> quil_types::error::Result<EventLoopHandle<GlobalState, GlobalVote>> {
+    ) -> quil_types::error::Result<ConsensusStart> {
         let forks = Forks::<GlobalState>::new(trusted_root, finalizer, follower)?;
 
         let handler = Arc::new(HotStuffEventHandler::new(
@@ -181,15 +200,11 @@ impl ConsensusComponents {
         // to skip the wait entirely.
         let (event_loop, handle) = EventLoop::new(handler, Instant::now() + self.startup_delay);
 
-        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/562
-        tokio::spawn(async move {
-            if let Err(e) = event_loop.run().await {
-                tracing::error!(error = %e, "consensus event loop exited with error");
-            }
-        });
-
-        info!("global consensus event loop running");
-        Ok(handle)
+        info!("global consensus event loop ready");
+        Ok(ConsensusStart {
+            handle,
+            run_future: Box::pin(async move { event_loop.run().await }),
+        })
     }
 }
 

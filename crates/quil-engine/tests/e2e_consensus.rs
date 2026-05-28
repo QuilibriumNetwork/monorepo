@@ -535,7 +535,10 @@ impl quil_engine::consensus_glue::ConsensusPublisher for InMemoryPublisher {
 
 pub struct NodeRig {
     pub prover: TestProver,
-    pub activation: quil_engine::consensus_activation::ConsensusActivation,
+    pub handle: quil_consensus::event_loop::EventLoopHandle<
+        quil_engine::consensus_types::GlobalState,
+        quil_engine::consensus_types::GlobalVote,
+    >,
     pub clock_store: Arc<InMemoryClockStore>,
     pub finalized: Arc<Mutex<Vec<u64>>>,
     pub vote_agg: Arc<quil_engine::vote_aggregation::VoteAggregation>,
@@ -711,6 +714,10 @@ pub fn build_node(
 
     let activation = quil_engine::consensus_activation::activate_consensus(params)
         .expect("activate_consensus");
+    // Drive the event loop. In production this is handed to the
+    // supervisor; tests spawn it directly since they don't run a
+    // supervisor.
+    tokio::spawn(activation.run_future);
 
     // Build vote + timeout aggregators (mirrors main.rs:2615-2638).
     let handle_cell: Arc<std::sync::OnceLock<
@@ -809,7 +816,7 @@ pub fn build_node(
 
     NodeRig {
         prover,
-        activation,
+        handle: activation.handle,
         clock_store,
         finalized,
         vote_agg,

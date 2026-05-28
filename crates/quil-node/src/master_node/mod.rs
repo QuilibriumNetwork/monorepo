@@ -25,6 +25,13 @@ pub(crate) async fn start(
     network: u8,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 ) -> anyhow::Result<ShutdownReason<anyhow::Error>> {
+    // Cloneable spawner for fire-and-forget tasks that can't await
+    // inline (sync trait impls, gRPC handlers, drain loops). Tasks
+    // submitted via this handle surface panics/errors to the
+    // supervisor instead of being silently swallowed by bare
+    // `tokio::spawn`.
+    let detached_spawner = sup.detached_spawner();
+
     let storage = storage::init(config, archive_mode)?;
     let db_arc = storage.db_arc.clone();
     let clock_store = storage.clock_store.clone();
@@ -189,6 +196,7 @@ pub(crate) async fn start(
             shard_engines: shard_engines.clone(),
             remote_worker_manager_for_halt: remote_worker_manager_for_halt.clone(),
             pi_worker_manager: pi_worker_manager.clone(),
+            spawner: detached_spawner.clone(),
         },
     );
 
@@ -466,6 +474,7 @@ pub(crate) async fn start(
         let mut rx = global_event_distributor.subscribe("shard-orchestrator");
         let pp = prover_pipeline.clone();
         let cf_for_orch = current_frame.clone();
+        let detached_spawner = detached_spawner.clone();
         sup.spawn("shard-orchestration-subscriber", move |cancel| async move {
             loop {
                 tokio::select! {
@@ -486,11 +495,11 @@ pub(crate) async fn start(
                                 let pp2 = pp.clone();
                                 let shard = filter.clone();
                                 let proposed = proposed.clone();
-                                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                                tokio::spawn(async move {
+                                detached_spawner.detach("shard-split-submit", async move {
                                     if let Err(e) = pp2.submit_shard_split(shard, proposed, frame).await {
                                         warn!(%e, "ShardSplit submission failed");
                                     }
+                                    Ok(())
                                 });
                             }
                             (
@@ -500,11 +509,11 @@ pub(crate) async fn start(
                                 let pp2 = pp.clone();
                                 let shards = filters.clone();
                                 let parent = parent.clone();
-                                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                                tokio::spawn(async move {
+                                detached_spawner.detach("shard-merge-submit", async move {
                                     if let Err(e) = pp2.submit_shard_merge(shards, parent, frame).await {
                                         warn!(%e, "ShardMerge submission failed");
                                     }
+                                    Ok(())
                                 });
                             }
                             _ => {}
@@ -548,6 +557,7 @@ pub(crate) async fn start(
         frame_materializer: frame_materializer.clone(),
         consensus_loopback_tx: consensus_loopback_tx.clone(),
         peer_id,
+        spawner: detached_spawner.clone(),
     });
 
 
@@ -597,6 +607,7 @@ pub(crate) async fn start(
         } else {
             None
         },
+        spawner: detached_spawner.clone(),
     });
 
     // ---------------------------------------------------------------
@@ -628,6 +639,7 @@ pub(crate) async fn start(
         metrics_handle: metrics_handle.clone(),
         global_msg_tx: global_msg_tx.clone(),
         archive_pool: archive_pool.clone(),
+        spawner: detached_spawner.clone(),
     })?;
 
 

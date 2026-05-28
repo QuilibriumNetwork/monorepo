@@ -46,6 +46,7 @@ pub(crate) struct MessageLoopArgs {
     pub prover_address: [u8; 32],
     pub p2p_handle: quil_p2p::node::P2PHandle,
     pub time_reel: Option<Arc<quil_engine::time_reel::GlobalTimeReel>>,
+    pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
 }
 
 pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) {
@@ -82,6 +83,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         prover_address: pa_for_recv,
         p2p_handle: p2p_for_recv,
         time_reel: time_reel_for_recv,
+        spawner,
     } = args;
 
     // Global bitmasks for BlossomSub topic subscriptions.
@@ -383,8 +385,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 {
                                                     let store = hg_store_for_recv.clone();
                                                     let cs = clock_store_recv.clone();
-                                                    // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                                                    tokio::spawn(async move {
+                                                    spawner.detach("prover-tree-bootstrap", async move {
                                                         use quil_types::proto::application::HypergraphPhaseSet::*;
                                                         // Pin sync against the most-recent verified
                                                         // frame's prover_tree_commitment (when
@@ -450,6 +451,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                                 "  active prover"
                                                             );
                                                         }
+                                                        Ok(())
                                                     });
                                                 }
                                             }
@@ -770,9 +772,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                                     agg.handle_proposal(&sp);
                                                                 }
                                                                 let h = handle.clone();
-                                                                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                                                                tokio::spawn(async move {
+                                                                spawner.detach("global-proposal-submit", async move {
                                                                     h.submit_proposal(sp).await;
+                                                                    Ok(())
                                                                 });
                                                             }
                                                             Err(e) => warn!(error = %e, "GlobalProposal bridge failed"),

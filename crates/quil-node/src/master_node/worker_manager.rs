@@ -30,6 +30,7 @@ pub(crate) struct WorkerManagerArgs {
     pub remote_worker_manager_for_halt:
         Arc<std::sync::OnceLock<Arc<quil_engine::remote_worker::RemoteWorkerManager>>>,
     pub pi_worker_manager: Arc<std::sync::OnceLock<Arc<dyn quil_engine::worker::WorkerManager>>>,
+    pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
 }
 
 pub(crate) fn init(
@@ -56,6 +57,7 @@ pub(crate) fn init(
         shard_engines,
         remote_worker_manager_for_halt,
         pi_worker_manager,
+        spawner,
     } = args;
 
     // Worker manager — either local threads or remote gRPC workers.
@@ -108,6 +110,7 @@ pub(crate) fn init(
             // on `GLOBAL_PROVER`. Spawning the actual publish keeps the
             // call non-blocking from the consensus side.
             let coverage_p2p = p2p_handle.clone();
+            let coverage_spawner = spawner.clone();
             let coverage_publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> =
                 Arc::new(move |header_canonical_bytes: Vec<u8>| {
                     let req = match quil_execution::message_envelope::CanonicalMessageRequest::wrap(
@@ -130,8 +133,7 @@ pub(crate) fn init(
                     match bundle.to_canonical_bytes() {
                         Ok(bytes) => {
                             let p2p = coverage_p2p.clone();
-                            // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                            tokio::spawn(async move {
+                            coverage_spawner.detach("coverage-publish", async move {
                                 if let Err(e) = p2p
                                     .publish(
                                         quil_engine::bitmasks::GLOBAL_PROVER.to_vec(),
@@ -141,6 +143,7 @@ pub(crate) fn init(
                                 {
                                     warn!(error = %e, "coverage publish: GLOBAL_PROVER publish failed");
                                 }
+                                Ok(())
                             });
                         }
                         Err(e) => warn!(error = %e, "coverage publish: bundle encode failed"),
@@ -294,6 +297,7 @@ pub(crate) fn init(
                 let drain_p2p = p2p_handle.clone();
                 let drain_shard_engines = shard_engines.clone();
                 let drain_halt = halt_state.clone();
+                let drain_spawner = spawner.clone();
                 sup.run_until_cancelled("worker-master-drain", move |_token| async move {
                     loop {
                         let Some(event) = master_rx.recv().await else { break };
@@ -366,8 +370,7 @@ pub(crate) fn init(
                                             Ok(bytes) => {
                                                 let p2p = drain_p2p.clone();
                                                 let filter_owned = filter.clone();
-                                                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                                                tokio::spawn(async move {
+                                                drain_spawner.detach("shard-finalize-publish", async move {
                                                     if let Err(e) = p2p
                                                         .publish(
                                                             quil_engine::bitmasks::GLOBAL_PROVER.to_vec(),
@@ -378,6 +381,7 @@ pub(crate) fn init(
                                                         warn!(core_id, filter = %hex::encode(&filter_owned),
                                                             error = %e, "GLOBAL_PROVER publish failed");
                                                     }
+                                                    Ok(())
                                                 });
                                             }
                                             Err(e) => warn!(core_id, error = %e,
@@ -394,8 +398,7 @@ pub(crate) fn init(
                                             continue;
                                         }
                                         let p2p = drain_p2p.clone();
-                                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                                        tokio::spawn(async move {
+                                        drain_spawner.detach("shard-frame-publish", async move {
                                             if let Err(e) = p2p
                                                 .publish(
                                                     quil_engine::bitmasks::shard_frame_bitmask(&filter),
@@ -406,6 +409,7 @@ pub(crate) fn init(
                                                 warn!(core_id, filter = %hex::encode(&filter),
                                                     error = %e, "shard frame publish failed");
                                             }
+                                            Ok(())
                                         });
                                     }
                                     WorkerToMaster::VoteProduced { core_id, filter, vote_data } => {
@@ -416,8 +420,7 @@ pub(crate) fn init(
                                             continue;
                                         }
                                         let p2p = drain_p2p.clone();
-                                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                                        tokio::spawn(async move {
+                                        drain_spawner.detach("shard-vote-publish", async move {
                                             if let Err(e) = p2p
                                                 .publish(
                                                     quil_engine::bitmasks::shard_consensus_bitmask(&filter),
@@ -428,6 +431,7 @@ pub(crate) fn init(
                                                 warn!(core_id, filter = %hex::encode(&filter),
                                                     error = %e, "shard vote publish failed");
                                             }
+                                            Ok(())
                                         });
                                     }
                                     WorkerToMaster::TimeoutProduced { core_id, filter, timeout_data } => {
@@ -437,8 +441,7 @@ pub(crate) fn init(
                                             continue;
                                         }
                                         let p2p = drain_p2p.clone();
-                                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                                        tokio::spawn(async move {
+                                        drain_spawner.detach("shard-timeout-publish", async move {
                                             if let Err(e) = p2p
                                                 .publish(
                                                     quil_engine::bitmasks::shard_consensus_bitmask(&filter),
@@ -449,6 +452,7 @@ pub(crate) fn init(
                                                 warn!(core_id, filter = %hex::encode(&filter),
                                                     error = %e, "shard timeout publish failed");
                                             }
+                                            Ok(())
                                         });
                                     }
                                     WorkerToMaster::ShardActivated { core_id, filter, handle } => {
@@ -475,12 +479,12 @@ pub(crate) fn init(
                                         // dispatches never reach the engine.
                                         let p2p = drain_p2p.clone();
                                         let filter_for_sub = filter.clone();
-                                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                                        tokio::spawn(async move {
+                                        drain_spawner.detach("shard-subscribe", async move {
                                             p2p.subscribe(quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub)).await;
                                             p2p.subscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub)).await;
                                             p2p.subscribe(quil_engine::bitmasks::shard_prover_bitmask(&filter_for_sub)).await;
                                             p2p.subscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&filter_for_sub)).await;
+                                            Ok(())
                                         });
                                         info!(
                                             core_id,
@@ -495,12 +499,12 @@ pub(crate) fn init(
                                         }
                                         let p2p = drain_p2p.clone();
                                         let filter_for_sub = filter.clone();
-                                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                                        tokio::spawn(async move {
+                                        drain_spawner.detach("shard-unsubscribe", async move {
                                             p2p.unsubscribe(quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub)).await;
                                             p2p.unsubscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub)).await;
                                             p2p.unsubscribe(quil_engine::bitmasks::shard_prover_bitmask(&filter_for_sub)).await;
                                             p2p.unsubscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&filter_for_sub)).await;
+                                            Ok(())
                                         });
                                         info!(
                                             core_id,

@@ -8,17 +8,21 @@ pub(crate) struct BlossomsubConsensusPublisher {
     /// messages).
     pub(crate) loopback_tx: tokio::sync::mpsc::Sender<quil_p2p::node::ReceivedMessage>,
     pub(crate) self_peer_id: Vec<u8>,
+    /// Supervisor-tracked fire-and-forget spawner. The trait API is
+    /// sync, so we can't await inline; detached tasks are tracked so
+    /// panics surface as `JoinError` instead of being swallowed.
+    pub(crate) spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
 }
 
 impl quil_engine::consensus_glue::ConsensusPublisher for BlossomsubConsensusPublisher {
     fn publish_frame(&self, data: Vec<u8>) {
         let handle = self.p2p_handle.clone();
         let bitmask = quil_engine::bitmasks::GLOBAL_FRAME.to_vec();
-        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-        tokio::spawn(async move {
+        self.spawner.detach("blossomsub-publish-frame", async move {
             if let Err(e) = handle.publish(bitmask, data).await {
                 tracing::warn!(error = %e, "publish_frame failed");
             }
+            Ok(())
         });
     }
 
@@ -34,8 +38,7 @@ impl quil_engine::consensus_glue::ConsensusPublisher for BlossomsubConsensusPubl
         let self_id = self.self_peer_id.clone();
         let data_for_loopback = data.clone();
         let bitmask_for_loopback = bitmask.clone();
-        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-        tokio::spawn(async move {
+        self.spawner.detach("blossomsub-loopback-consensus", async move {
             let _ = loopback
                 .send(quil_p2p::node::ReceivedMessage {
                     bitmask: bitmask_for_loopback,
@@ -43,12 +46,13 @@ impl quil_engine::consensus_glue::ConsensusPublisher for BlossomsubConsensusPubl
                     from: self_id,
                 })
                 .await;
+            Ok(())
         });
-        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-        tokio::spawn(async move {
+        self.spawner.detach("blossomsub-publish-consensus", async move {
             if let Err(e) = handle.publish(bitmask, data).await {
                 tracing::warn!(error = %e, "publish_consensus failed");
             }
+            Ok(())
         });
     }
 
@@ -60,15 +64,14 @@ impl quil_engine::consensus_glue::ConsensusPublisher for BlossomsubConsensusPubl
         // archive gRPC; the BlossomSub broadcast covers archive nodes.
         let handle = self.p2p_handle.clone();
         let bitmask = quil_engine::bitmasks::GLOBAL_PROVER.to_vec();
-        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-        tokio::spawn(async move {
+        self.spawner.detach("blossomsub-publish-prover", async move {
             // Decode the MessageRequest envelope so we can re-wrap
             // it inside a MessageBundle.
             let req = match quil_execution::message_envelope::CanonicalMessageRequest::from_canonical_bytes(&data) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(error = %e, "publish_prover_message: bad MessageRequest envelope");
-                    return;
+                    return Ok(());
                 }
             };
             let timestamp = std::time::SystemTime::now()
@@ -87,6 +90,7 @@ impl quil_engine::consensus_glue::ConsensusPublisher for BlossomsubConsensusPubl
                 }
                 Err(e) => tracing::error!(error = %e, "publish_prover_message: bundle encode failed"),
             }
+            Ok(())
         });
     }
 }

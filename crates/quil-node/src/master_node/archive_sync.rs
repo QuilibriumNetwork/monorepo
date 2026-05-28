@@ -41,6 +41,7 @@ pub(crate) struct ArchiveSyncArgs {
     pub frame_materializer: Option<Arc<quil_engine::frame_materializer::FrameMaterializer>>,
     pub consensus_loopback_tx: tokio::sync::mpsc::Sender<quil_p2p::node::ReceivedMessage>,
     pub peer_id: quil_p2p::PeerId,
+    pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
 }
 
 pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncArgs) {
@@ -75,6 +76,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         frame_materializer,
         consensus_loopback_tx,
         peer_id,
+        spawner,
     } = args;
 
     if let Some(seed) = mtls_seed {
@@ -519,6 +521,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         p2p_handle: sync_p2p.clone(),
                                         loopback_tx: consensus_loopback_tx.clone(),
                                         self_peer_id: peer_id.to_bytes(),
+                                        spawner: spawner.clone(),
                                     });
                                 // Build an on-finalized hook that prunes per-rank
                                 // aggregator state below the finalized watermark.
@@ -836,6 +839,22 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     },
                                 ) {
                                     Ok(activation) => {
+                                        // Register the consensus event loop with the
+                                        // supervisor BEFORE publishing the handle —
+                                        // otherwise a panic in the loop leaves the
+                                        // handle pointing at a dead task and we'd
+                                        // never know. `Ok(())` here means the loop
+                                        // exited cleanly via cancellation; anything
+                                        // else (Err or panic) shuts the node down.
+                                        let run_future = activation.run_future;
+                                        spawner.detach("global-consensus-event-loop", async move {
+                                            match run_future.await {
+                                                Ok(()) => Ok(()),
+                                                Err(e) => Err(anyhow::anyhow!(
+                                                    "consensus event loop exited with error: {}", e
+                                                )),
+                                            }
+                                        });
                                         if sync_ch.set(activation.handle).is_err() {
                                             warn!("consensus event loop already activated once");
                                         } else {

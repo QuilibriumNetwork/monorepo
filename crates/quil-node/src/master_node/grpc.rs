@@ -34,6 +34,7 @@ pub(crate) struct GrpcArgs {
         quil_types::proto::global::StreamGlobalMessagesResponse,
     >,
     pub archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
+    pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
 }
 
 pub(crate) fn spawn_all(
@@ -66,6 +67,7 @@ pub(crate) fn spawn_all(
         metrics_handle,
         global_msg_tx,
         archive_pool,
+        spawner,
     } = args;
 
     let grpc_addr = if config.listen_grpc_multiaddr.is_empty() {
@@ -359,6 +361,7 @@ pub(crate) fn spawn_all(
         worker_manager: Arc<dyn quil_engine::worker::WorkerManager>,
         prover_pipeline: Arc<quil_engine::prover_pipeline::ProverPipeline>,
         current_frame: Arc<quil_engine::current_frame::CurrentFrame>,
+        spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
     }
     impl quil_rpc::WorkerControl for WorkerControlBridge {
         fn set_manually_managed(&self, core_id: u32, manually_managed: bool) -> Result<(), String> {
@@ -370,6 +373,7 @@ pub(crate) fn spawn_all(
             let pp = self.prover_pipeline.clone();
             let wm = self.worker_manager.clone();
             let frame = self.current_frame.effective();
+            let join_spawner = self.spawner.clone();
             Box::pin(async move {
                 if frame == 0 { return Err("no frames received yet".into()); }
                 if filters.is_empty() { return Err("filters must be non-empty".into()); }
@@ -384,11 +388,11 @@ pub(crate) fn spawn_all(
                 }
                 let filters_for_task = filters.clone();
                 let worker_ids_for_task = worker_ids.clone();
-                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                tokio::spawn(async move {
+                join_spawner.detach("request-join-submit", async move {
                     if let Err(e) = pp.submit_join(filters_for_task, &worker_ids_for_task, frame).await {
                         tracing::warn!(error = %e, "request_join detached submit_join failed");
                     }
+                    Ok(())
                 });
                 Ok(())
             })
@@ -398,6 +402,7 @@ pub(crate) fn spawn_all(
         worker_manager: worker_manager.clone(),
         prover_pipeline: prover_pipeline.clone(),
         current_frame: current_frame.clone(),
+        spawner: spawner.clone(),
     }));
 
     let workers_view: Arc<std::sync::RwLock<Vec<quil_rpc::WorkerEntry>>> =
@@ -656,21 +661,36 @@ pub(crate) fn spawn_all(
             let p2p_bootstrap = p2p_for_proxy.clone();
             let p2p_discover = p2p_for_proxy.clone();
             let p2p_is_connected = p2p_for_proxy.clone();
+            let sp_pub = spawner.clone();
+            let sp_sub = spawner.clone();
+            let sp_unsub = spawner.clone();
+            let sp_set = spawner.clone();
+            let sp_add = spawner.clone();
             let shim = quil_rpc::pubsub_proxy::P2pHandleShim {
                 peer_id_bytes,
                 publish: Arc::new(move |bitmask, data| {
                     let h = p2p_publish.clone();
-                    // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                    tokio::spawn(async move {
+                    sp_pub.detach("pubsub-proxy-publish", async move {
                         if let Err(e) = h.publish(bitmask, data).await {
                             warn!(error = %e, "pubsub-proxy publish failed");
                         }
+                        Ok(())
                     });
                 }),
-                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                subscribe: Arc::new(move |bitmask| { let h = p2p_sub.clone(); tokio::spawn(async move { h.subscribe(bitmask).await; }); }),
-                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                unsubscribe: Arc::new(move |bitmask| { let h = p2p_unsub.clone(); tokio::spawn(async move { h.unsubscribe(bitmask).await; }); }),
+                subscribe: Arc::new(move |bitmask| {
+                    let h = p2p_sub.clone();
+                    sp_sub.detach("pubsub-proxy-subscribe", async move {
+                        h.subscribe(bitmask).await;
+                        Ok(())
+                    });
+                }),
+                unsubscribe: Arc::new(move |bitmask| {
+                    let h = p2p_unsub.clone();
+                    sp_unsub.detach("pubsub-proxy-unsubscribe", async move {
+                        h.unsubscribe(bitmask).await;
+                        Ok(())
+                    });
+                }),
                 peer_count: Arc::new(move || p2p_count.peer_count()),
                 get_peer_score: Arc::new(move |pid_bytes| {
                     let h = p2p_get_score.clone();
@@ -682,15 +702,19 @@ pub(crate) fn spawn_all(
                 set_peer_score: Arc::new(move |pid_bytes, score| {
                     let h = p2p_set_score.clone();
                     if let Ok(peer) = quil_p2p::PeerId::from_bytes(&pid_bytes) {
-                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                        tokio::spawn(async move { h.set_peer_score(peer, score).await; });
+                        sp_set.detach("pubsub-proxy-set-score", async move {
+                            h.set_peer_score(peer, score).await;
+                            Ok(())
+                        });
                     }
                 }),
                 add_peer_score: Arc::new(move |pid_bytes, delta| {
                     let h = p2p_add_score.clone();
                     if let Ok(peer) = quil_p2p::PeerId::from_bytes(&pid_bytes) {
-                        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                        tokio::spawn(async move { h.add_peer_score(peer, delta).await; });
+                        sp_add.detach("pubsub-proxy-add-score", async move {
+                            h.add_peer_score(peer, delta).await;
+                            Ok(())
+                        });
                     }
                 }),
                 reconnect: Arc::new(move |pid_bytes| {

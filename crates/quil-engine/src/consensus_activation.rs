@@ -84,12 +84,21 @@ pub struct ConsensusActivationParams {
 
 /// What `activate_consensus` produces: the event-loop handle plus
 /// reusable pieces the caller needs to wire inbound aggregation.
+///
+/// **Important**: `run_future` MUST be scheduled on a supervised task.
+/// Dropping it without driving it leaves the consensus loop unstarted;
+/// calling `tokio::spawn` directly buries panics. Register it with the
+/// supervisor (via `sup.spawn` or `DetachedSpawner::detach`) so a panic
+/// surfaces as `JoinError` and shuts the node down cleanly.
 pub struct ConsensusActivation {
     pub handle: GlobalEventLoopHandle,
     pub committee: Arc<ProverRegistryCommittee>,
     pub voting_provider: Arc<dyn quil_consensus::voting_provider::VotingProvider<GlobalState, GlobalVote>>,
     pub vote_domain: Vec<u8>,
     pub timeout_domain: Vec<u8>,
+    pub run_future: std::pin::Pin<
+        Box<dyn std::future::Future<Output = quil_types::error::Result<()>> + Send + 'static>,
+    >,
 }
 
 /// Start the consensus event loop.
@@ -332,14 +341,15 @@ pub fn activate_consensus(params: ConsensusActivationParams) -> Result<Consensus
         ),
     );
 
-    let handle = components.start(certified_root, finalizer, follower)?;
-    info!("HotStuff consensus event loop running");
+    let start = components.start(certified_root, finalizer, follower)?;
+    info!("HotStuff consensus event loop ready (caller must spawn run_future)");
     Ok(ConsensusActivation {
-        handle,
+        handle: start.handle,
         committee,
         voting_provider,
         vote_domain: vote_domain_for_return,
         timeout_domain: timeout_domain_for_return,
+        run_future: start.run_future,
     })
 }
 
