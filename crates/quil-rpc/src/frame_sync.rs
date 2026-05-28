@@ -216,161 +216,161 @@ impl Default for ArchivePollerConfig {
     }
 }
 
-/// Spawn a long-running task that polls a chosen archive endpoint for the
-/// current head, and forward-fills any gap from the previously seen head.
-pub fn spawn_archive_poller(
+/// Long-running task that polls a chosen archive endpoint for the current
+/// head, and forward-fills any gap from the previously seen head. The
+/// returned future runs until `cancel` fires; callers register it with
+/// their supervisor (e.g. `sup.spawn(...)`) so a panic propagates.
+pub async fn run_archive_poller(
     pool: Arc<ArchiveEndpointPool>,
     clock_store: Arc<RocksClockStore>,
     ed448_seed: [u8; 57],
     config: ArchivePollerConfig,
     cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        info!("archive frame poller started");
-        pool.wait_nonempty(&cancel).await;
-        if cancel.is_cancelled() {
-            return;
+) {
+    info!("archive frame poller started");
+    pool.wait_nonempty(&cancel).await;
+    if cancel.is_cancelled() {
+        return;
+    }
+
+    // Reuse a single client for as long as it works. Switch endpoints
+    // only when an RPC fails.
+    let mut current_client: Option<(String, ArchiveClient)> = None;
+    // Use the local store's latest as our starting "last seen", so a
+    // restart doesn't re-fetch frames we already have.
+    let mut last_frame: u64 = clock_store.get_latest_frame_number().unwrap_or(0);
+
+    let mut ticker = tokio::time::interval(config.poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {}
         }
 
-        // Reuse a single client for as long as it works. Switch endpoints
-        // only when an RPC fails.
-        let mut current_client: Option<(String, ArchiveClient)> = None;
-        // Use the local store's latest as our starting "last seen", so a
-        // restart doesn't re-fetch frames we already have.
-        let mut last_frame: u64 = clock_store.get_latest_frame_number().unwrap_or(0);
-
-        let mut ticker = tokio::time::interval(config.poll_interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = ticker.tick() => {}
-            }
-
-            // Acquire a working client.
-            if current_client.is_none() {
-                if let Some(addr) = pool.next().await {
-                    match ArchiveClient::connect_mtls(&addr, &ed448_seed).await {
-                        Ok(c) => {
-                            info!(%addr, "archive poller connected");
-                            current_client = Some((addr, c));
-                        }
-                        Err(e) => {
-                            debug!(%addr, error = %e, "poller connect failed");
-                            pool.blacklist(&addr).await;
-                            continue;
-                        }
+        // Acquire a working client.
+        if current_client.is_none() {
+            if let Some(addr) = pool.next().await {
+                match ArchiveClient::connect_mtls(&addr, &ed448_seed).await {
+                    Ok(c) => {
+                        info!(%addr, "archive poller connected");
+                        current_client = Some((addr, c));
                     }
-                } else {
-                    // Pool empty — wait for PeerInfo discovery to feed us.
-                    pool.wait_nonempty(&cancel).await;
-                    continue;
+                    Err(e) => {
+                        debug!(%addr, error = %e, "poller connect failed");
+                        pool.blacklist(&addr).await;
+                        continue;
+                    }
                 }
-            }
-
-            let Some((addr, ref mut client)) = current_client.as_mut().map(|(a, c)| (a.clone(), c))
-            else {
+            } else {
+                // Pool empty — wait for PeerInfo discovery to feed us.
+                pool.wait_nonempty(&cancel).await;
                 continue;
-            };
+            }
+        }
 
-            // 1. Fetch the latest frame.
-            let head = match tokio::time::timeout(
-                config.call_timeout,
-                client.get_global_frame(0),
-            )
-            .await
+        let Some((addr, ref mut client)) = current_client.as_mut().map(|(a, c)| (a.clone(), c))
+        else {
+            continue;
+        };
+
+        // 1. Fetch the latest frame.
+        let head = match tokio::time::timeout(
+            config.call_timeout,
+            client.get_global_frame(0),
+        )
+        .await
+        {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(ArchiveClientError::Rpc(s)))
+                if s.message().contains("not currently syncable") =>
             {
-                Ok(Ok(frame)) => frame,
-                Ok(Err(ArchiveClientError::Rpc(s)))
-                    if s.message().contains("not currently syncable") =>
-                {
-                    // This is an archive node that isn't currently syncable
-                    // (the operator may have flipped serving off). Try the
-                    // next endpoint, but don't blacklist — leave it for
-                    // future polls.
-                    debug!(%addr, "endpoint not currently syncable, rotating");
-                    current_client = None;
-                    continue;
-                }
-                Ok(Err(e)) => {
-                    warn!(%addr, error = %e, "archive head fetch failed");
-                    pool.blacklist(&addr).await;
-                    current_client = None;
-                    continue;
-                }
-                Err(_elapsed) => {
-                    warn!(%addr, "archive head fetch timed out");
-                    pool.blacklist(&addr).await;
-                    current_client = None;
-                    continue;
-                }
-            };
-            let new_number = head.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
-            if new_number == 0 || new_number <= last_frame {
-                // No progress.
+                // This is an archive node that isn't currently syncable
+                // (the operator may have flipped serving off). Try the
+                // next endpoint, but don't blacklist — leave it for
+                // future polls.
+                debug!(%addr, "endpoint not currently syncable, rotating");
+                current_client = None;
                 continue;
             }
-
-            // 2. Forward-fill any missed frames in (last_frame, new_number).
-            //    Archive nodes need the full history; everyone else
-            //    just wants to start from the current head.
-            if config.forward_fill && last_frame > 0 && new_number > last_frame + 1 {
-                let mut catchup_failed = false;
-                for fn_ in (last_frame + 1)..new_number {
-                    match tokio::time::timeout(
-                        config.call_timeout,
-                        client.get_global_frame(fn_),
-                    )
-                    .await
-                    {
-                        Ok(Ok(frame)) => {
-                            if let Err(e) = clock_store.put_global_frame(&frame, None) {
-                                warn!(error = %e, frame = fn_, "store catchup frame failed");
-                            }
-                            if let Some(ref cb) = config.on_frame {
-                                cb(&frame);
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            debug!(%addr, frame = fn_, error = %e, "catchup fetch error");
-                            catchup_failed = true;
-                            break;
-                        }
-                        Err(_) => {
-                            debug!(%addr, frame = fn_, "catchup timeout");
-                            catchup_failed = true;
-                            break;
-                        }
-                    }
-                }
-                if catchup_failed {
-                    // Drop the connection so we re-try with another endpoint
-                    // next tick. last_frame stays where it was so we'll try
-                    // the same gap again.
-                    current_client = None;
-                    continue;
-                }
-            }
-
-            // 3. Process the new head.
-            if let Err(e) = clock_store.put_global_frame(&head, None) {
-                warn!(error = %e, frame = new_number, "store head frame failed");
+            Ok(Err(e)) => {
+                warn!(%addr, error = %e, "archive head fetch failed");
+                pool.blacklist(&addr).await;
+                current_client = None;
                 continue;
             }
-            if let Some(ref cb) = config.on_frame {
-                cb(&head);
+            Err(_elapsed) => {
+                warn!(%addr, "archive head fetch timed out");
+                pool.blacklist(&addr).await;
+                current_client = None;
+                continue;
             }
-            info!(
-                head = new_number,
-                gap = new_number.saturating_sub(last_frame),
-                "advanced head"
-            );
-            last_frame = new_number;
+        };
+        let new_number = head.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+        if new_number == 0 || new_number <= last_frame {
+            // No progress.
+            continue;
         }
 
-        info!("archive frame poller stopped");
-    })
+        // 2. Forward-fill any missed frames in (last_frame, new_number).
+        //    Archive nodes need the full history; everyone else
+        //    just wants to start from the current head.
+        if config.forward_fill && last_frame > 0 && new_number > last_frame + 1 {
+            let mut catchup_failed = false;
+            for fn_ in (last_frame + 1)..new_number {
+                match tokio::time::timeout(
+                    config.call_timeout,
+                    client.get_global_frame(fn_),
+                )
+                .await
+                {
+                    Ok(Ok(frame)) => {
+                        if let Err(e) = clock_store.put_global_frame(&frame, None) {
+                            warn!(error = %e, frame = fn_, "store catchup frame failed");
+                        }
+                        if let Some(ref cb) = config.on_frame {
+                            cb(&frame);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        debug!(%addr, frame = fn_, error = %e, "catchup fetch error");
+                        catchup_failed = true;
+                        break;
+                    }
+                    Err(_) => {
+                        debug!(%addr, frame = fn_, "catchup timeout");
+                        catchup_failed = true;
+                        break;
+                    }
+                }
+            }
+            if catchup_failed {
+                // Drop the connection so we re-try with another endpoint
+                // next tick. last_frame stays where it was so we'll try
+                // the same gap again.
+                current_client = None;
+                continue;
+            }
+        }
+
+        // 3. Process the new head.
+        if let Err(e) = clock_store.put_global_frame(&head, None) {
+            warn!(error = %e, frame = new_number, "store head frame failed");
+            continue;
+        }
+        if let Some(ref cb) = config.on_frame {
+            cb(&head);
+        }
+        info!(
+            head = new_number,
+            gap = new_number.saturating_sub(last_frame),
+            "advanced head"
+        );
+        last_frame = new_number;
+    }
+
+    info!("archive frame poller stopped");
 }
 
 #[cfg(test)]

@@ -169,6 +169,7 @@ where
         let stream_addr = addr.replace(":8336", ":8340");
         let bytes = bundle_bytes.clone();
         let submit = submit.clone();
+        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
         handles.push(tokio::spawn(async move { submit(stream_addr, bytes).await }));
     }
     let mut ok_count = 0usize;

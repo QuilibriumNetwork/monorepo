@@ -181,6 +181,7 @@ impl ConsensusComponents {
         // to skip the wait entirely.
         let (event_loop, handle) = EventLoop::new(handler, Instant::now() + self.startup_delay);
 
+        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/562
         tokio::spawn(async move {
             if let Err(e) = event_loop.run().await {
                 tracing::error!(error = %e, "consensus event loop exited with error");

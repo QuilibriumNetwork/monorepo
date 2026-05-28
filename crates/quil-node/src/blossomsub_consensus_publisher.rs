@@ -14,6 +14,7 @@ impl quil_engine::consensus_glue::ConsensusPublisher for BlossomsubConsensusPubl
     fn publish_frame(&self, data: Vec<u8>) {
         let handle = self.p2p_handle.clone();
         let bitmask = quil_engine::bitmasks::GLOBAL_FRAME.to_vec();
+        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
         tokio::spawn(async move {
             if let Err(e) = handle.publish(bitmask, data).await {
                 tracing::warn!(error = %e, "publish_frame failed");
@@ -33,6 +34,7 @@ impl quil_engine::consensus_glue::ConsensusPublisher for BlossomsubConsensusPubl
         let self_id = self.self_peer_id.clone();
         let data_for_loopback = data.clone();
         let bitmask_for_loopback = bitmask.clone();
+        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
         tokio::spawn(async move {
             let _ = loopback
                 .send(quil_p2p::node::ReceivedMessage {
@@ -42,6 +44,7 @@ impl quil_engine::consensus_glue::ConsensusPublisher for BlossomsubConsensusPubl
                 })
                 .await;
         });
+        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
         tokio::spawn(async move {
             if let Err(e) = handle.publish(bitmask, data).await {
                 tracing::warn!(error = %e, "publish_consensus failed");
@@ -57,6 +60,7 @@ impl quil_engine::consensus_glue::ConsensusPublisher for BlossomsubConsensusPubl
         // archive gRPC; the BlossomSub broadcast covers archive nodes.
         let handle = self.p2p_handle.clone();
         let bitmask = quil_engine::bitmasks::GLOBAL_PROVER.to_vec();
+        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
         tokio::spawn(async move {
             // Decode the MessageRequest envelope so we can re-wrap
             // it inside a MessageBundle.

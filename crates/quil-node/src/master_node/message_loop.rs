@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+use quil_lifecycle::Supervisor;
 
 pub(crate) struct MessageLoopArgs {
     pub clock_store: Arc<quil_store::RocksClockStore>,
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
-    pub token: CancellationToken,
     pub msg_rx: tokio::sync::mpsc::Receiver<quil_p2p::node::ReceivedMessage>,
     pub consensus_loopback_rx: tokio::sync::mpsc::Receiver<quil_p2p::node::ReceivedMessage>,
     pub global_msg_tx: tokio::sync::broadcast::Sender<
@@ -48,11 +48,10 @@ pub(crate) struct MessageLoopArgs {
     pub time_reel: Option<Arc<quil_engine::time_reel::GlobalTimeReel>>,
 }
 
-pub(crate) fn spawn(args: MessageLoopArgs) {
+pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) {
     let MessageLoopArgs {
         clock_store: clock_store_recv,
         exec_manager: exec_mgr_for_recv,
-        token: recv_token,
         mut msg_rx,
         mut consensus_loopback_rx,
         global_msg_tx: gmtx_for_recv,
@@ -117,7 +116,7 @@ pub(crate) fn spawn(args: MessageLoopArgs) {
     let reward_issuer: Arc<quil_engine::OptRewardIssuance> = Arc::new(quil_engine::OptRewardIssuance);
     let archive_mode_for_recv: bool = archive_mode_recv;
 
-    tokio::spawn(async move {
+    sup.spawn("message-loop", move |recv_token| async move {
         let mut time_reel_rx = time_reel_for_recv
             .as_ref()
             .and_then(|tr| tr.take_event_rx());
@@ -384,6 +383,7 @@ pub(crate) fn spawn(args: MessageLoopArgs) {
                                                 {
                                                     let store = hg_store_for_recv.clone();
                                                     let cs = clock_store_recv.clone();
+                                                    // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                                                     tokio::spawn(async move {
                                                         use quil_types::proto::application::HypergraphPhaseSet::*;
                                                         // Pin sync against the most-recent verified
@@ -770,6 +770,7 @@ pub(crate) fn spawn(args: MessageLoopArgs) {
                                                                     agg.handle_proposal(&sp);
                                                                 }
                                                                 let h = handle.clone();
+                                                                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                                                                 tokio::spawn(async move {
                                                                     h.submit_proposal(sp).await;
                                                                 });
@@ -937,5 +938,6 @@ pub(crate) fn spawn(args: MessageLoopArgs) {
             peer_infos = peer_infos_received,
             "message receiver stopped"
         );
+        Ok(())
     });
 }

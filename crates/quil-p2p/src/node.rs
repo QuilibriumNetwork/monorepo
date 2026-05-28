@@ -270,8 +270,15 @@ impl P2PNode {
     }
 
     /// Start the P2P swarm.
+    ///
+    /// The swarm event loop is registered on the supplied supervisor as
+    /// `"p2p-swarm"` (or `name` if customized by the caller via a future
+    /// extension), so a panic inside the libp2p event loop propagates
+    /// through `Supervisor::run` and terminates the process — rather
+    /// than being silently swallowed by a detached `tokio::spawn`.
     pub async fn start(
         self,
+        sup: &mut quil_lifecycle::Supervisor<anyhow::Error>,
         listen_addr: &str,
     ) -> quil_types::error::Result<(P2PHandle, mpsc::Receiver<ReceivedMessage>)> {
         let listen_multiaddr: Multiaddr = listen_addr
@@ -453,15 +460,7 @@ impl P2PNode {
             std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
         let observed_addrs_writer = observed_addrs.clone();
 
-        // Bind the JoinHandle so we can surface panics. The event-loop
-        // task owns `cmd_rx` and the swarm; a panic anywhere inside it
-        // (e.g. a poisoned-lock `unwrap`, a libp2p invariant failure,
-        // an unexpected event-stream error) drops `cmd_rx`, after which
-        // every `cmd_tx.send().await` returns the misleading
-        // "p2p command channel closed (swarm shutting down?)" error.
-        // Without this, the panic is silently swallowed because the
-        // bare `tokio::spawn` discards the handle.
-        let swarm_task = tokio::spawn(async move {
+        sup.spawn("p2p-swarm", move |cancel_token| async move {
             debug!("P2P swarm event loop started");
             let mut bootstrapped = false;
             let mut discovery_timer = tokio::time::interval(Duration::from_secs(30));
@@ -484,6 +483,10 @@ impl P2PNode {
             let mut last_need_peers_query: Option<std::time::Instant> = None;
             loop {
                 tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        debug!("P2P swarm shutting down — supervisor cancelled");
+                        break;
+                    }
                     _ = discovery_timer.tick() => {
                         if bootstrapped && discovery_count < 30 {
                             discovery_count += 1;
@@ -865,44 +868,13 @@ impl P2PNode {
                     }
                 }
             }
+            Ok(())
         });
 
-        // Watcher: surface panics or unexpected exits from the swarm
-        // task. A clean break (Shutdown command or all senders dropped)
-        // is logged at info; a panic is logged at error with the panic
-        // payload so operators can see why coverage publishes started
-        // failing.
-        tokio::spawn(async move {
-            match swarm_task.await {
-                Ok(()) => {
-                    tracing::info!("P2P swarm event loop exited cleanly");
-                }
-                Err(join_err) if join_err.is_panic() => {
-                    let payload = join_err.into_panic();
-                    let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                        (*s).to_string()
-                    } else if let Some(s) = payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "<non-string panic payload>".to_string()
-                    };
-                    tracing::error!(
-                        panic = %msg,
-                        "P2P swarm event loop panicked — all subsequent \
-                         publish/subscribe/peer-score commands will fail \
-                         with 'p2p command channel closed'"
-                    );
-                }
-                Err(join_err) => {
-                    tracing::error!(
-                        error = %join_err,
-                        "P2P swarm event loop terminated with JoinError"
-                    );
-                }
-            }
-        });
-
-        Ok((P2PHandle { peer_id, cmd_tx, observed_addrs, peer_count }, msg_rx))
+        Ok((
+            P2PHandle { peer_id, cmd_tx, observed_addrs, peer_count },
+            msg_rx,
+        ))
     }
 }
 

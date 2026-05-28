@@ -95,7 +95,11 @@ async fn main() -> anyhow::Result<()> {
     } else {
         config.p2p.listen_multiaddr.clone()
     };
-    let (p2p_handle, mut msg_rx) = p2p_node.start(&listen_addr).await?;
+    let mut sup = quil_lifecycle::Supervisor::<anyhow::Error>::new();
+    let (p2p_handle, mut msg_rx) = p2p_node.start(&mut sup, &listen_addr).await?;
+    // Dev binary — keep `sup` alive so the registered swarm task isn't
+    // dropped; we don't drive `sup.run()` here.
+    let _sup = sup;
 
     // Must subscribe before publishing — BlossomSub rejects publish to
     // unsubscribed bitmasks.

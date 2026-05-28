@@ -257,6 +257,7 @@ impl WorkerOnlyNode {
         // 1. Start parent process monitor (if parent PID given)
         if let Some(parent_pid) = self.config.parent_pid {
             let cancel = self.cancel.clone();
+            // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
             tokio::spawn(async move {
                 monitor_parent_process(parent_pid, cancel).await;
             });
@@ -270,6 +271,7 @@ impl WorkerOnlyNode {
             .map_err(|e| QuilError::Internal(format!("bad listen addr: {}", e)))?;
 
         let server_cancel = self.cancel.clone();
+        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
         let server_handle = tokio::spawn(async move {
             info!("DataIPC gRPC server starting on {}", listen_addr);
             if let Err(e) = Server::builder()
@@ -291,6 +293,7 @@ impl WorkerOnlyNode {
             let master_endpoint = self.config.master_endpoint.clone();
             let worker_ref = self.clone();
             let stream_cancel = self.cancel.clone();
+            // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
             tokio::spawn(async move {
                 stream_global_messages_from_master(
                     &master_endpoint,
@@ -311,6 +314,7 @@ impl WorkerOnlyNode {
             if let Some(mut rx) = rx_opt {
                 let pump_cancel = self.cancel.clone();
                 let halt_flag = self.local_halted.clone();
+                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -455,6 +459,7 @@ impl WorkerOnlyNode {
 
         // Run engine in background
         let bls_signer = (self.bls_signer_factory)();
+        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
         tokio::spawn(async move {
             engine.run(bls_signer).await;
         });

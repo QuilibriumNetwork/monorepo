@@ -18,7 +18,7 @@ pub mod stub_services;
 pub use archive_client::{
     build_quil_client_config, ArchiveClient, ArchiveClientError, QuilTlsConnector,
 };
-pub use frame_sync::{spawn_archive_poller, ArchiveEndpointPool, ArchivePollerConfig};
+pub use frame_sync::{run_archive_poller, ArchiveEndpointPool, ArchivePollerConfig};
 pub use shard_info_refresh::{fetch_shard_sizes_from_archive, ShardInfoRefreshError};
 pub use global_service::{FrameLookup, GlobalRpcServer, SubmitHandler};
 pub use hypergraph_sync_probe::{

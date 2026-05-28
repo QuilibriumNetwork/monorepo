@@ -77,6 +77,7 @@ impl ProverPipeline {
                 // Guard against overlapping VDF computations — set before
                 // spawn so the next evaluate() sees it immediately.
                 me.lifecycle.set_proof_in_progress(true);
+                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
                     let result = me.submit_join(filters, &worker_ids, frame_number).await;
                     me.lifecycle.set_proof_in_progress(false);
@@ -87,6 +88,7 @@ impl ProverPipeline {
             }
             LifecycleAction::ConfirmJoins { filters, frame_number } => {
                 let me = self.clone();
+                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
                     if let Err(e) = me.submit_confirm(filters, frame_number).await {
                         warn!(frame = frame_number, %e, "ConfirmJoins submission failed");
@@ -95,6 +97,7 @@ impl ProverPipeline {
             }
             LifecycleAction::RejectJoins { filters, frame_number } => {
                 let me = self.clone();
+                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
                     if let Err(e) = me.submit_reject(filters, frame_number).await {
                         warn!(frame = frame_number, %e, "RejectJoins submission failed");
@@ -103,6 +106,7 @@ impl ProverPipeline {
             }
             LifecycleAction::ProposeLeave { filters, frame_number } => {
                 let me = self.clone();
+                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
                     if let Err(e) = me.submit_leave(filters, frame_number).await {
                         warn!(frame = frame_number, %e, "ProposeLeave submission failed");
@@ -111,6 +115,7 @@ impl ProverPipeline {
             }
             LifecycleAction::ConfirmLeaves { filters, frame_number } => {
                 let me = self.clone();
+                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
                     if let Err(e) = me.submit_confirm(filters, frame_number).await {
                         warn!(frame = frame_number, %e, "ConfirmLeaves submission failed");
@@ -119,6 +124,7 @@ impl ProverPipeline {
             }
             LifecycleAction::RejectLeaves { filters, frame_number } => {
                 let me = self.clone();
+                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
                     if let Err(e) = me.submit_reject(filters, frame_number).await {
                         warn!(frame = frame_number, %e, "RejectLeaves submission failed");
@@ -127,6 +133,7 @@ impl ProverPipeline {
             }
             LifecycleAction::ProposeSeniorityMerge { frame_number } => {
                 let me = self.clone();
+                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
                     if let Err(e) = me.submit_seniority_merge(frame_number).await {
                         warn!(frame = frame_number, %e, "ProposeSeniorityMerge submission failed");
