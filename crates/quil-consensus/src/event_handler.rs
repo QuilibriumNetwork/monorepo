@@ -136,6 +136,10 @@ pub struct HotStuffEventHandler<S: Unique, V: Unique> {
     /// without this guard the state producer runs twice and the
     /// second invocation drains an empty message-collector snapshot.
     last_proposed_rank: std::sync::atomic::AtomicU64,
+    /// Proposals whose parent state is not yet in the forks tree.
+    /// Keyed by the parent QC identity they're waiting for. Drained
+    /// after each successful state addition.
+    orphan_proposals: Mutex<std::collections::HashMap<Identity, Vec<SignedProposal<S, V>>>>,
 }
 
 impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
@@ -155,6 +159,7 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             committee,
             notifier,
             last_proposed_rank: std::sync::atomic::AtomicU64::new(0),
+            orphan_proposals: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -237,18 +242,40 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             return Ok(());
         }
 
-        // Add to forks.
+        // Add to forks. Missing-parent errors are benign — the
+        // proposal arrived before its parent. Cache it and retry
+        // when the parent lands (mirrors Go's cacheProposal path).
         {
             let mut forks = self.forks.lock().unwrap();
-            forks
-                .add_validated_state(proposal.proposal.state.clone())
-                .map_err(|e| {
-                    QuilError::Consensus(format!(
+            match forks.add_validated_state(proposal.proposal.state.clone()) {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("missing parent state") => {
+                    let parent_id = proposal.proposal.state.parent_qc_identity.clone();
+                    tracing::debug!(
+                        rank = proposal.proposal.state.rank,
+                        parent = %hex::encode(&parent_id),
+                        "caching orphan proposal (missing parent)"
+                    );
+                    self.orphan_proposals
+                        .lock()
+                        .unwrap()
+                        .entry(parent_id)
+                        .or_default()
+                        .push(proposal.clone());
+                    self.notifier.on_event_processed();
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(QuilError::Consensus(format!(
                         "cannot add proposal to forks ({}): {}",
                         hex::encode(&proposal.proposal.state.identifier), e
-                    ))
-                })?;
+                    )));
+                }
+            }
         }
+
+        // Drain orphans whose parent just landed.
+        self.drain_orphan_proposals(&proposal.proposal.state.identifier)?;
 
         // `State` only carries `parent_qc_rank` + `parent_qc_identity`,
         // not the full QC trait object — the parent-QC feed comes
@@ -379,6 +406,36 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
 
     fn current_rank(&self) -> u64 {
         self.pacemaker.lock().unwrap().current_rank()
+    }
+
+    fn drain_orphan_proposals(&self, parent_identity: &Identity) -> Result<()> {
+        let orphans = self.orphan_proposals
+            .lock()
+            .unwrap()
+            .remove(parent_identity);
+        if let Some(proposals) = orphans {
+            for orphan in proposals {
+                tracing::debug!(
+                    rank = orphan.proposal.state.rank,
+                    "retrying cached orphan proposal"
+                );
+                if let Err(e) = self.on_receive_proposal(&orphan) {
+                    tracing::debug!(
+                        rank = orphan.proposal.state.rank,
+                        error = %e,
+                        "orphan proposal retry failed, re-caching"
+                    );
+                    let parent_id = orphan.proposal.state.parent_qc_identity.clone();
+                    self.orphan_proposals
+                        .lock()
+                        .unwrap()
+                        .entry(parent_id)
+                        .or_default()
+                        .push(orphan);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn broadcast_timeout_state_if_authorized(&self) -> Result<()> {
