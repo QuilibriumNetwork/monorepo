@@ -299,6 +299,21 @@ pub fn build_env_filter(
 ) -> EnvFilter {
     let base = if debug { "debug" } else { "info" };
     let mut directives: Vec<String> = vec![base.to_string()];
+
+    // Third-party noise floor. Routine network failures from the QUIC
+    // UDP layer — unreachable IPv6 peers, NAT path closures, etc. —
+    // fire as warn from inside `quinn_udp` / `quinn_proto` and were
+    // operators' most common false-alarm logs. Cap them at `error`
+    // unless the user explicitly opts back in via config or CLI.
+    // libp2p subsystems are similarly chatty around connection
+    // teardown; cap them at `warn` so legitimate panics still surface.
+    directives.push("quinn_udp=error".to_string());
+    directives.push("quinn_proto=error".to_string());
+    directives.push("quinn=error".to_string());
+    directives.push("libp2p_quic=warn".to_string());
+    directives.push("libp2p_tcp=warn".to_string());
+    directives.push("libp2p_swarm=warn".to_string());
+
     for (component, level) in config_filters {
         directives.push(format!("{}={}", component, level));
     }
