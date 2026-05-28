@@ -301,8 +301,10 @@ pub fn encode_canonical_peer_info(
     }
     w.write_bytes(public_key);
     w.write_bytes(signature);
-    if info.last_received_frame > 0 || info.last_global_head_frame > 0 {
+    if info.last_received_frame != 0 {
         w.write_u64(info.last_received_frame);
+    }
+    if info.last_global_head_frame != 0 {
         w.write_u64(info.last_global_head_frame);
     }
     w.buf
