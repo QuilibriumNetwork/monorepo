@@ -140,6 +140,22 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let mut consensus_msgs_received: u64 = 0;
         let mut prover_msgs_received: u64 = 0;
         let mut router_drops: u64 = 0;
+        // Per-topic drop counters so we can tell which validator is
+        // doing the rejecting. Without these, all four global
+        // validators' drops are lumped into `router_drops` and we
+        // can't distinguish a peer-info flood from a frame flood
+        // from per-shard noise.
+        let mut router_drops_peer_info: u64 = 0;
+        let mut router_drops_prover: u64 = 0;
+        let mut router_drops_frame: u64 = 0;
+        let mut router_drops_consensus: u64 = 0;
+        let mut router_drops_alert: u64 = 0;
+        let mut router_drops_other: u64 = 0;
+        // Per-reason aggregation (validator reject string -> count).
+        // Bounded by the static set of `&'static str` reasons the
+        // validators emit; size <= ~20 keys in practice.
+        let mut router_drops_by_reason: std::collections::HashMap<&'static str, u64> =
+            std::collections::HashMap::new();
         let mut status_timer = tokio::time::interval(std::time::Duration::from_secs(30));
         status_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Track the highest frame number we've fully executed (through
@@ -204,6 +220,25 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         consensus_msgs = consensus_msgs_received,
                         prover_msgs = prover_msgs_received,
                         router_drops,
+                        rdrop_peer_info = router_drops_peer_info,
+                        rdrop_prover = router_drops_prover,
+                        rdrop_frame = router_drops_frame,
+                        rdrop_consensus = router_drops_consensus,
+                        rdrop_alert = router_drops_alert,
+                        rdrop_other = router_drops_other,
+                        rdrop_reasons = %{
+                            // Render as `reason1=N,reason2=M,...` sorted
+                            // descending by count so the most-common
+                            // cause is first. Bounded to top 8 to keep
+                            // the log line under control.
+                            let mut entries: Vec<(&&str, &u64)> =
+                                router_drops_by_reason.iter().collect();
+                            entries.sort_by(|a, b| b.1.cmp(a.1));
+                            entries.into_iter().take(8)
+                                .map(|(k, v)| format!("{}={}", k, v))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        },
                         "node status"
                     );
                     // Memory snapshot. Logged separately so the size
@@ -297,14 +332,35 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 .route(&received.bitmask, &received.data);
                             if !route_outcome.should_dispatch() {
                                 router_drops += 1;
+                                if let Some(reason) = route_outcome.reject_reason() {
+                                    *router_drops_by_reason.entry(reason).or_insert(0) += 1;
+                                }
                                 // Categorize for operator visibility.
                                 let topic = match received.bitmask.as_slice() {
-                                    GLOBAL_PEER_INFO => "peer_info",
-                                    GLOBAL_PROVER => "prover",
-                                    GLOBAL_FRAME => "frame",
-                                    GLOBAL_CONSENSUS => "consensus",
-                                    GLOBAL_ALERT => "alert",
-                                    _ => "shard/unknown",
+                                    GLOBAL_PEER_INFO => {
+                                        router_drops_peer_info += 1;
+                                        "peer_info"
+                                    }
+                                    GLOBAL_PROVER => {
+                                        router_drops_prover += 1;
+                                        "prover"
+                                    }
+                                    GLOBAL_FRAME => {
+                                        router_drops_frame += 1;
+                                        "frame"
+                                    }
+                                    GLOBAL_CONSENSUS => {
+                                        router_drops_consensus += 1;
+                                        "consensus"
+                                    }
+                                    GLOBAL_ALERT => {
+                                        router_drops_alert += 1;
+                                        "alert"
+                                    }
+                                    _ => {
+                                        router_drops_other += 1;
+                                        "shard/unknown"
+                                    }
                                 };
                                 let type_prefix = if received.data.len() >= 4 {
                                     format!("0x{:08x}", u32::from_be_bytes(

@@ -153,13 +153,38 @@ pub fn classify_consensus_message(tp: u32) -> Option<ConsensusMessageKind> {
 // Stateful router with per-topic validator closures
 // =====================================================================
 
-/// A per-bitmask validator closure. Returns `true` if the message is
-/// well-formed and should be admitted; `false` if it should be dropped.
+/// Validator outcome. `Accept` admits the message; every `Reject`
+/// variant carries a stable, low-cardinality reason string for
+/// per-cause aggregation in operator metrics. Validators should
+/// reach for short, fixed strings (e.g. `"sig_invalid"`) so the
+/// counter set stays bounded.
+#[derive(Debug, Clone, Copy)]
+pub enum ValidationOutcome {
+    Accept,
+    Reject(&'static str),
+}
+
+impl ValidationOutcome {
+    pub fn is_accept(&self) -> bool {
+        matches!(self, ValidationOutcome::Accept)
+    }
+    pub fn reject_reason(&self) -> Option<&'static str> {
+        match self {
+            ValidationOutcome::Accept => None,
+            ValidationOutcome::Reject(r) => Some(r),
+        }
+    }
+}
+
+/// A per-bitmask validator closure. Returns [`ValidationOutcome`]:
+/// `Accept` admits the message, `Reject(reason)` drops it and the
+/// reason string is aggregated by the dispatcher for diagnostics.
 ///
-/// Validators MUST NOT panic — wrap any decoder calls so that errors
-/// become `false`. A panicking validator would propagate up and crash
-/// the receive loop; that defeats the purpose of validation.
-pub type TopicValidator = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+/// Validators MUST NOT panic — wrap any decoder calls so that
+/// errors become `Reject(...)`. A panicking validator would
+/// propagate up and crash the receive loop; that defeats the
+/// purpose of validation.
+pub type TopicValidator = Arc<dyn Fn(&[u8]) -> ValidationOutcome + Send + Sync>;
 
 /// Outcome of [`MessageRouter::route`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,8 +197,10 @@ pub enum RouteOutcome {
     /// should proceed with the existing dispatch path.
     Accepted,
     /// A validator was registered and rejected the message — caller
-    /// MUST drop the message.
-    Rejected,
+    /// MUST drop the message. Carries the short reason string the
+    /// validator returned so the dispatcher can aggregate per-cause
+    /// drop counters.
+    Rejected(&'static str),
 }
 
 impl RouteOutcome {
@@ -181,6 +208,14 @@ impl RouteOutcome {
     /// Unvalidated topics fall through; rejected ones do not.
     pub fn should_dispatch(&self) -> bool {
         matches!(self, RouteOutcome::Unvalidated | RouteOutcome::Accepted)
+    }
+
+    /// Reason for the rejection if `Rejected`, else `None`.
+    pub fn reject_reason(&self) -> Option<&'static str> {
+        match self {
+            RouteOutcome::Rejected(r) => Some(r),
+            _ => None,
+        }
     }
 }
 
@@ -242,9 +277,9 @@ impl MessageRouter {
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validator(data)));
         match result {
-            Ok(true) => RouteOutcome::Accepted,
-            Ok(false) => RouteOutcome::Rejected,
-            Err(_) => RouteOutcome::Rejected,
+            Ok(ValidationOutcome::Accept) => RouteOutcome::Accepted,
+            Ok(ValidationOutcome::Reject(reason)) => RouteOutcome::Rejected(reason),
+            Err(_) => RouteOutcome::Rejected("validator_panic"),
         }
     }
 }
@@ -265,7 +300,8 @@ impl Default for MessageRouter {
 /// must round-trip and (when populated) carry a 57-byte Ed448 identity
 /// key plus a 585-byte BLS48-581 prover key.
 pub fn validator_global_peer_info() -> TopicValidator {
-    Arc::new(|data: &[u8]| {
+    use ValidationOutcome::{Accept, Reject};
+    Arc::new(|data: &[u8]| -> ValidationOutcome {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -274,25 +310,23 @@ pub fn validator_global_peer_info() -> TopicValidator {
         match quil_p2p::classify_peer_info_message(data) {
             Ok(quil_p2p::PeerInfoMessage::PeerInfo(info)) => {
                 if info.peer_id.is_empty() {
-                    return false;
+                    return Reject("pi_empty_peer_id");
                 }
                 if info.public_key.len() != 57 {
-                    return false;
+                    return Reject("pi_bad_pubkey_len");
                 }
                 if info.signature.len() != 114 {
-                    return false;
+                    return Reject("pi_bad_sig_len");
                 }
                 // Timestamp validation (mirrors Go message_validation.go:522-548).
-                // Hard-reject if older than 1 minute; ignore stale (>1s) or
-                // far-future (>5min).
                 if info.timestamp < now_ms - 60_000 {
-                    return false;
+                    return Reject("pi_ts_too_old");
                 }
                 if info.timestamp < now_ms - 1_000 {
-                    return false;
+                    return Reject("pi_ts_stale");
                 }
                 if info.timestamp > now_ms + 300_000 {
-                    return false;
+                    return Reject("pi_ts_future");
                 }
                 let signing_payload = quil_p2p::encode_canonical_peer_info(
                     &info,
@@ -303,42 +337,40 @@ pub fn validator_global_peer_info() -> TopicValidator {
                     info.public_key.as_slice(),
                 ) {
                     Ok(pk) => pk,
-                    Err(_) => return false,
+                    Err(_) => return Reject("pi_pubkey_decode"),
                 };
-                // Go: ValidateSignature(Ed448, pk, msg, sig, []byte{})
-                // which does ed448.Verify(pk, concat(domain, msg), sig, "")
-                // where domain=[] and context="" → pure Ed448, no context.
-                pubkey
-                    .verify(&signing_payload, &info.signature, None)
-                    .is_ok()
+                if pubkey.verify(&signing_payload, &info.signature, None).is_ok() {
+                    Accept
+                } else {
+                    Reject("pi_sig_invalid")
+                }
             }
             Ok(quil_p2p::PeerInfoMessage::KeyRegistry) => {
                 match quil_p2p::decode_canonical_key_registry(data) {
                     Ok(reg) => {
                         if !reg.ed448_pubkey.is_empty() && reg.ed448_pubkey.len() != 57 {
-                            return false;
+                            return Reject("kr_bad_ed448_len");
                         }
                         if !reg.bls_pubkey.is_empty() && reg.bls_pubkey.len() != 585 {
-                            return false;
+                            return Reject("kr_bad_bls_len");
                         }
-                        // Timestamp validation (mirrors Go message_validation.go:562-577).
                         let ts = reg.last_updated_ms as i64;
                         if ts < now_ms - 60_000 {
-                            return false;
+                            return Reject("kr_ts_too_old");
                         }
                         if ts < now_ms - 1_000 {
-                            return false;
+                            return Reject("kr_ts_stale");
                         }
                         if ts > now_ms + 5_000 {
-                            return false;
+                            return Reject("kr_ts_future");
                         }
-                        true
+                        Accept
                     }
-                    Err(_) => false,
+                    Err(_) => Reject("kr_decode_failed"),
                 }
             }
-            Ok(quil_p2p::PeerInfoMessage::Unknown(_)) => false,
-            Err(_) => false,
+            Ok(quil_p2p::PeerInfoMessage::Unknown(_)) => Reject("pi_unknown_type"),
+            Err(_) => Reject("pi_classify_failed"),
         }
     })
 }
@@ -348,15 +380,16 @@ pub fn validator_global_peer_info() -> TopicValidator {
 /// kinds (join / leave / pause / resume / confirm / reject / kick /
 /// update / seniority-merge) or a message bundle.
 pub fn validator_global_prover() -> TopicValidator {
-    Arc::new(|data: &[u8]| {
+    use ValidationOutcome::{Accept, Reject};
+    Arc::new(|data: &[u8]| -> ValidationOutcome {
         if data.len() < 4 {
-            return false;
+            return Reject("prover_short");
         }
         let tp = u32::from_be_bytes(data[..4].try_into().unwrap());
         if tp == TYPE_MESSAGE_BUNDLE || tp == TYPE_MESSAGE_REQUEST {
-            return true;
+            return Accept;
         }
-        matches!(
+        let is_valid_op = matches!(
             tp,
             TYPE_PROVER_JOIN
                 | TYPE_PROVER_LEAVE
@@ -367,7 +400,12 @@ pub fn validator_global_prover() -> TopicValidator {
                 | TYPE_PROVER_KICK
                 | TYPE_PROVER_UPDATE
                 | TYPE_SENIORITY_MERGE
-        )
+        );
+        if is_valid_op {
+            Accept
+        } else {
+            Reject("prover_bad_type")
+        }
     })
 }
 
@@ -377,15 +415,20 @@ pub fn validator_global_prover() -> TopicValidator {
 /// canonical decoder so partially-truncated frames are dropped before
 /// they reach the queue.
 pub fn validator_global_frame() -> TopicValidator {
-    Arc::new(|data: &[u8]| {
+    use ValidationOutcome::{Accept, Reject};
+    Arc::new(|data: &[u8]| -> ValidationOutcome {
         if data.len() < 4 {
-            return false;
+            return Reject("frame_short");
         }
         let tp = u32::from_be_bytes(data[..4].try_into().unwrap());
         if tp != crate::consensus_wire::GLOBAL_FRAME_TYPE {
-            return false;
+            return Reject("frame_bad_type");
         }
-        crate::consensus_wire::decode_global_frame(data).is_ok()
+        if crate::consensus_wire::decode_global_frame(data).is_ok() {
+            Accept
+        } else {
+            Reject("frame_decode_failed")
+        }
     })
 }
 
@@ -393,13 +436,14 @@ pub fn validator_global_frame() -> TopicValidator {
 /// consensus sub-types (proposal / vote / QC / TC / timeout-state) and
 /// requires the canonical-bytes decoder for that sub-type to succeed.
 pub fn validator_global_consensus() -> TopicValidator {
-    Arc::new(|data: &[u8]| {
+    use ValidationOutcome::{Accept, Reject};
+    Arc::new(|data: &[u8]| -> ValidationOutcome {
         use crate::consensus_wire as cw;
         if data.len() < 4 {
-            return false;
+            return Reject("cons_short");
         }
         let tp = u32::from_be_bytes(data[..4].try_into().unwrap());
-        match tp {
+        let decoded = match tp {
             cw::GLOBAL_PROPOSAL_TYPE => cw::GlobalProposal::from_canonical_bytes(data).is_ok(),
             cw::PROPOSAL_VOTE_TYPE => cw::ProposalVote::from_canonical_bytes(data).is_ok(),
             cw::QUORUM_CERTIFICATE_TYPE => {
@@ -409,8 +453,9 @@ pub fn validator_global_consensus() -> TopicValidator {
                 cw::TimeoutCertificate::from_canonical_bytes(data).is_ok()
             }
             cw::TIMEOUT_STATE_TYPE => cw::TimeoutState::from_canonical_bytes(data).is_ok(),
-            _ => false,
-        }
+            _ => return Reject("cons_bad_type"),
+        };
+        if decoded { Accept } else { Reject("cons_decode_failed") }
     })
 }
 
@@ -494,12 +539,12 @@ mod tests {
 
     /// Convenience: a validator that always accepts.
     fn always_ok() -> TopicValidator {
-        Arc::new(|_| true)
+        Arc::new(|_| ValidationOutcome::Accept)
     }
 
     /// Convenience: a validator that always rejects.
     fn always_bad() -> TopicValidator {
-        Arc::new(|_| false)
+        Arc::new(|_| ValidationOutcome::Reject("test_reject"))
     }
 
     #[test]
@@ -523,7 +568,7 @@ mod tests {
             validator_global_peer_info(),
         );
         let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00]);
-        assert_eq!(outcome, RouteOutcome::Rejected);
+        assert!(matches!(outcome, RouteOutcome::Rejected(_)));
         assert!(!outcome.should_dispatch());
     }
 
@@ -551,7 +596,7 @@ mod tests {
         let bytes = quil_p2p::encode_canonical_peer_info(&info, &pubkey, &sig);
 
         let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &bytes);
-        assert_eq!(outcome, RouteOutcome::Rejected);
+        assert!(matches!(outcome, RouteOutcome::Rejected(_)));
     }
 
     #[test]
@@ -602,7 +647,7 @@ mod tests {
             validator_global_peer_info(),
         );
         let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &[0x00, 0x00, 0x01, 0x01]);
-        assert_eq!(outcome, RouteOutcome::Rejected);
+        assert!(matches!(outcome, RouteOutcome::Rejected(_)));
     }
 
     #[test]
@@ -630,10 +675,10 @@ mod tests {
         );
         // 0xFFFFFFFF isn't any known prover op type.
         let outcome = r.route(bitmasks::GLOBAL_PROVER, &[0xFF, 0xFF, 0xFF, 0xFF]);
-        assert_eq!(outcome, RouteOutcome::Rejected);
+        assert!(matches!(outcome, RouteOutcome::Rejected(_)));
         // Short data also rejected.
         let outcome = r.route(bitmasks::GLOBAL_PROVER, &[0x00, 0x00]);
-        assert_eq!(outcome, RouteOutcome::Rejected);
+        assert!(matches!(outcome, RouteOutcome::Rejected(_)));
     }
 
     #[test]
@@ -644,7 +689,7 @@ mod tests {
             validator_global_consensus(),
         );
         let outcome = r.route(bitmasks::GLOBAL_CONSENSUS, &[0xFF, 0xFF, 0xFF, 0xFF]);
-        assert_eq!(outcome, RouteOutcome::Rejected);
+        assert!(matches!(outcome, RouteOutcome::Rejected(_)));
     }
 
     #[test]
@@ -654,14 +699,14 @@ mod tests {
         let panicking: TopicValidator = Arc::new(|_| panic!("boom"));
         r.register_validator(b"\x42".to_vec(), panicking);
         let outcome = r.route(b"\x42", b"hi");
-        assert_eq!(outcome, RouteOutcome::Rejected);
+        assert!(matches!(outcome, RouteOutcome::Rejected(_)));
     }
 
     #[test]
     fn router_register_replaces_validator() {
         let r = MessageRouter::new();
         r.register_validator(b"\x99".to_vec(), always_bad());
-        assert_eq!(r.route(b"\x99", b"x"), RouteOutcome::Rejected);
+        assert!(matches!(r.route(b"\x99", b"x"), RouteOutcome::Rejected(_)));
         r.register_validator(b"\x99".to_vec(), always_ok());
         assert_eq!(r.route(b"\x99", b"x"), RouteOutcome::Accepted);
         assert!(r.unregister_validator(b"\x99"));
