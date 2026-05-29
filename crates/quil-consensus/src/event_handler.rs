@@ -123,6 +123,65 @@ pub trait ConsensusStore<V: Unique>: Send + Sync {
 /// and outbound consumer. Each subcomponent sits behind
 /// `Arc<Mutex<_>>` so the handler stays `Send + Sync` and can be
 /// shared through task handles.
+/// Maximum number of orphan proposals cached for a single missing
+/// parent identity. Honest replicas produce 1-2 proposals per rank
+/// (leader plus rare equivocations); anything beyond this is
+/// almost certainly attacker traffic. Excess proposals for the
+/// same parent are dropped oldest-first.
+const MAX_ORPHANS_PER_PARENT: usize = 4;
+
+/// Maximum number of distinct missing parents the orphan cache
+/// will track. A legitimate partition leaves at most a handful of
+/// recent ranks missing; once we exceed this we drop the
+/// oldest-inserted parent's bucket entirely. Bounds total cache
+/// size at `MAX_ORPHAN_PARENTS * MAX_ORPHANS_PER_PARENT` proposals.
+const MAX_ORPHAN_PARENTS: usize = 64;
+
+struct OrphanCache<S: Unique, V: Unique> {
+    /// Bucketed proposals keyed by the parent identity they're
+    /// waiting for.
+    buckets: std::collections::HashMap<Identity, std::collections::VecDeque<SignedProposal<S, V>>>,
+    /// Insertion-order log of parent identities currently in
+    /// `buckets`. Used to evict the oldest bucket when total parent
+    /// count exceeds `MAX_ORPHAN_PARENTS`.
+    order: std::collections::VecDeque<Identity>,
+}
+
+impl<S: Unique, V: Unique> OrphanCache<S, V> {
+    fn new() -> Self {
+        Self {
+            buckets: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Push a proposal into the bucket for `parent_id`. Enforces
+    /// per-parent and global caps; oldest entries are evicted first.
+    fn push(&mut self, parent_id: Identity, proposal: SignedProposal<S, V>) {
+        let is_new_parent = !self.buckets.contains_key(&parent_id);
+        if is_new_parent {
+            if self.order.len() >= MAX_ORPHAN_PARENTS {
+                if let Some(victim) = self.order.pop_front() {
+                    self.buckets.remove(&victim);
+                }
+            }
+            self.order.push_back(parent_id.clone());
+        }
+        let bucket = self.buckets.entry(parent_id).or_default();
+        if bucket.len() >= MAX_ORPHANS_PER_PARENT {
+            bucket.pop_front();
+        }
+        bucket.push_back(proposal);
+    }
+
+    /// Remove and return the bucket for `parent_id`.
+    fn remove(&mut self, parent_id: &Identity) -> Option<std::collections::VecDeque<SignedProposal<S, V>>> {
+        let bucket = self.buckets.remove(parent_id)?;
+        self.order.retain(|id| id != parent_id);
+        Some(bucket)
+    }
+}
+
 pub struct HotStuffEventHandler<S: Unique, V: Unique> {
     pacemaker: Arc<Mutex<dyn Pacemaker>>,
     state_producer: Arc<StateProducer<S, V>>,
@@ -137,9 +196,10 @@ pub struct HotStuffEventHandler<S: Unique, V: Unique> {
     /// second invocation drains an empty message-collector snapshot.
     last_proposed_rank: std::sync::atomic::AtomicU64,
     /// Proposals whose parent state is not yet in the forks tree.
-    /// Keyed by the parent QC identity they're waiting for. Drained
-    /// after each successful state addition.
-    orphan_proposals: Mutex<std::collections::HashMap<Identity, Vec<SignedProposal<S, V>>>>,
+    /// Bounded — see `MAX_ORPHAN_PARENTS` / `MAX_ORPHANS_PER_PARENT`.
+    /// Without bounds, a peer that floods proposals with fabricated
+    /// `parent_qc_identity` values would OOM the node.
+    orphan_proposals: Mutex<OrphanCache<S, V>>,
 }
 
 impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
@@ -159,7 +219,7 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             committee,
             notifier,
             last_proposed_rank: std::sync::atomic::AtomicU64::new(0),
-            orphan_proposals: Mutex::new(std::collections::HashMap::new()),
+            orphan_proposals: Mutex::new(OrphanCache::new()),
         }
     }
 
@@ -259,9 +319,7 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
                     self.orphan_proposals
                         .lock()
                         .unwrap()
-                        .entry(parent_id)
-                        .or_default()
-                        .push(proposal.clone());
+                        .push(parent_id, proposal.clone());
                     self.notifier.on_event_processed();
                     return Ok(());
                 }
@@ -429,9 +487,7 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
                     self.orphan_proposals
                         .lock()
                         .unwrap()
-                        .entry(parent_id)
-                        .or_default()
-                        .push(orphan);
+                        .push(parent_id, orphan);
                 }
             }
         }
@@ -1490,5 +1546,82 @@ mod tests {
         let _ = &h.handler;
         let _ = &h.pacemaker;
         let _ = &h.consumer;
+    }
+
+    // =================================================================
+    // OrphanCache eviction
+    // =================================================================
+
+    #[test]
+    fn orphan_cache_caps_per_parent_and_evicts_oldest() {
+        let mut cache: OrphanCache<AppState, AppVote> = OrphanCache::new();
+        // Push MAX_ORPHANS_PER_PARENT + 2 proposals all for the same
+        // parent; the cache should retain only MAX_ORPHANS_PER_PARENT,
+        // evicting the two oldest.
+        let parent: Identity = "parent-A".into();
+        for rank in 1..=(MAX_ORPHANS_PER_PARENT as u64 + 2) {
+            let proposal = make_signed_proposal(
+                rank,
+                &format!("state-{}", rank),
+                "parent-A",
+                0,
+            );
+            cache.push(parent.clone(), proposal);
+        }
+        let bucket = cache.remove(&parent).expect("bucket exists");
+        assert_eq!(bucket.len(), MAX_ORPHANS_PER_PARENT);
+        // First entry retained should be rank 3 (1 and 2 evicted).
+        let first_rank = bucket.front().unwrap().proposal.state.rank;
+        assert_eq!(first_rank, 3);
+    }
+
+    #[test]
+    fn orphan_cache_caps_total_parents_and_evicts_oldest_bucket() {
+        let mut cache: OrphanCache<AppState, AppVote> = OrphanCache::new();
+        // Push proposals for MAX_ORPHAN_PARENTS + 5 distinct parents.
+        // The 5 oldest parent buckets should be evicted.
+        for i in 0..(MAX_ORPHAN_PARENTS + 5) {
+            let parent_id: Identity = format!("parent-{:03}", i).into_bytes();
+            let proposal = make_signed_proposal(
+                1,
+                &format!("state-for-parent-{}", i),
+                &format!("parent-{:03}", i),
+                0,
+            );
+            cache.push(parent_id, proposal);
+        }
+        assert_eq!(cache.buckets.len(), MAX_ORPHAN_PARENTS);
+        assert_eq!(cache.order.len(), MAX_ORPHAN_PARENTS);
+        // Buckets 0..4 should be evicted.
+        for i in 0..5 {
+            let parent_id: Identity = format!("parent-{:03}", i).into_bytes();
+            assert!(
+                !cache.buckets.contains_key(&parent_id),
+                "expected parent {} to have been evicted", i,
+            );
+        }
+        // Buckets 5..MAX_ORPHAN_PARENTS+5 should be retained.
+        for i in 5..(MAX_ORPHAN_PARENTS + 5) {
+            let parent_id: Identity = format!("parent-{:03}", i).into_bytes();
+            assert!(
+                cache.buckets.contains_key(&parent_id),
+                "expected parent {} to be retained", i,
+            );
+        }
+    }
+
+    #[test]
+    fn orphan_cache_remove_drops_from_order() {
+        let mut cache: OrphanCache<AppState, AppVote> = OrphanCache::new();
+        let parent_a: Identity = "parent-A".into();
+        let parent_b: Identity = "parent-B".into();
+        cache.push(parent_a.clone(), make_signed_proposal(1, "s1", "parent-A", 0));
+        cache.push(parent_b.clone(), make_signed_proposal(1, "s2", "parent-B", 0));
+        assert_eq!(cache.order.len(), 2);
+        let drained = cache.remove(&parent_a);
+        assert!(drained.is_some());
+        assert_eq!(cache.order.len(), 1);
+        assert!(!cache.order.contains(&parent_a));
+        assert!(cache.order.contains(&parent_b));
     }
 }
