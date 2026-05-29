@@ -92,7 +92,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
 
     sup.run_until_cancelled("peer-info-publisher", move |_token| async move {
         let bitmask = vec![0x00, 0x00, 0x00, 0x00]; // GLOBAL_PEER_INFO
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             // Resolve multiaddrs: prefer observed (NAT-resolved), then announce, then listen
@@ -204,7 +204,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                 );
             }
 
-            // Publish KeyRegistry alongside PeerInfo (every 5 min).
+            // Publish KeyRegistry alongside PeerInfo (every 30 min).
             if let Some(ref seed) = pi_ed448_seed {
                 let pv = ed448_rust::PrivateKey::from(*seed);
                 let now_ms = std::time::SystemTime::now()
@@ -244,5 +244,5 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             interval.tick().await;
         }
     });
-    info!("PeerInfo publisher started (5-minute interval)");
+    info!("PeerInfo publisher started (30-minute interval)");
 }
