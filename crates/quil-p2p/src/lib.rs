@@ -24,6 +24,7 @@ pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{
     build_worker_reachability, classify_peer_info_message, decode_canonical_key_registry,
     decode_canonical_peer_info, encode_canonical_peer_info, encode_key_registry,
+    peek_key_registry_timestamp, peek_peer_info_timestamp,
     CanonicalCapability, CanonicalKeyRegistry, CanonicalPeerInfo, CanonicalReachability,
     InMemoryPeerInfoManager, PeerInfoMessage, ARCHIVE_SERVICE_CAPABILITY_ID, KEY_REGISTRY_TYPE,
     PEER_INFO_TYPE,

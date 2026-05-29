@@ -636,9 +636,35 @@ impl SharedProverRegistry {
 
     /// Rebuild the cache from the given hypergraph store. Takes a
     /// write lock for the duration of the refresh.
+    ///
+    /// Emits a temporary diagnostic `info!("local prover allocations changed", ...)`
+    /// whenever any field of the LOCAL prover (the one whose address
+    /// matches `LOCAL_PROVER_ADDRESS`) or any of its allocations
+    /// changes across a refresh. Useful for diagnosing why a ProverJoin
+    /// never converts to a Confirm — we should see the allocation
+    /// appear as `status=Joining` here after the join materializes.
     pub fn refresh_from_store(&self, hg_store: &Arc<RocksHypergraphStore>) {
-        let mut guard = self.inner.write().expect("prover registry lock poisoned");
-        guard.refresh(hg_store);
+        // Snapshot the local prover BEFORE we take the write lock for
+        // the refresh; we'll snapshot again after and diff.
+        let before = self.snapshot_local_prover();
+        {
+            let mut guard = self.inner.write().expect("prover registry lock poisoned");
+            guard.refresh(hg_store);
+        }
+        let after = self.snapshot_local_prover();
+        log_local_prover_diff(before.as_ref(), after.as_ref());
+    }
+
+    /// Read the LOCAL prover's `ProverInfo` (if any), keyed by the
+    /// `LOCAL_PROVER_ADDRESS` global. Returns `None` if either the
+    /// address isn't published yet or no matching prover lives in the
+    /// registry.
+    fn snapshot_local_prover(&self) -> Option<ProverInfo> {
+        let addr = crate::global_intrinsic::prover_shard_update::LOCAL_PROVER_ADDRESS
+            .get()?
+            .clone();
+        let guard = self.inner.read().ok()?;
+        guard.get_prover_info(&addr).cloned()
     }
 
     /// Find inactive provers AND apply the kick mutations (Status=4,
@@ -776,6 +802,187 @@ impl SharedProverRegistry {
 impl Default for SharedProverRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Emit an `info!` whenever any tracked field of the LOCAL prover or
+/// its allocations changes across two registry snapshots. Per-allocation
+/// diffs are keyed by `confirmation_filter` so a stuck `Joining`
+/// allocation surfaces as a one-line `appeared` event the moment a
+/// refresh first sees it, and a status flip surfaces as a
+/// `status_change` event when archives finally materialize the
+/// confirm.
+///
+/// This is a **temporary diagnostic** for the join-never-confirms
+/// investigation. Remove once the lifecycle's
+/// "registry never sees self" bug is fixed.
+fn log_local_prover_diff(before: Option<&ProverInfo>, after: Option<&ProverInfo>) {
+    match (before, after) {
+        (None, None) => {}
+        (None, Some(a)) => {
+            tracing::info!(
+                address = %hex::encode(&a.address),
+                status = ?a.status,
+                allocations = a.allocations.len(),
+                seniority = a.seniority,
+                "local prover appeared in registry"
+            );
+            for alloc in &a.allocations {
+                log_local_alloc_appear(alloc);
+            }
+        }
+        (Some(b), None) => {
+            tracing::info!(
+                address = %hex::encode(&b.address),
+                prev_status = ?b.status,
+                "local prover disappeared from registry"
+            );
+        }
+        (Some(b), Some(a)) => {
+            if b.status != a.status {
+                tracing::info!(
+                    address = %hex::encode(&a.address),
+                    prev = ?b.status,
+                    new = ?a.status,
+                    "local prover status changed"
+                );
+            }
+            if b.kick_frame_number != a.kick_frame_number {
+                tracing::info!(
+                    address = %hex::encode(&a.address),
+                    prev = b.kick_frame_number,
+                    new = a.kick_frame_number,
+                    "local prover kick_frame_number changed"
+                );
+            }
+            if b.seniority != a.seniority {
+                tracing::info!(
+                    address = %hex::encode(&a.address),
+                    prev = b.seniority,
+                    new = a.seniority,
+                    "local prover seniority changed"
+                );
+            }
+            if b.available_storage != a.available_storage {
+                tracing::info!(
+                    address = %hex::encode(&a.address),
+                    prev = b.available_storage,
+                    new = a.available_storage,
+                    "local prover available_storage changed"
+                );
+            }
+            if b.delegate_address != a.delegate_address {
+                tracing::info!(
+                    address = %hex::encode(&a.address),
+                    prev = %hex::encode(&b.delegate_address),
+                    new = %hex::encode(&a.delegate_address),
+                    "local prover delegate_address changed"
+                );
+            }
+
+            // Diff allocations keyed by confirmation_filter.
+            use std::collections::HashMap as Map;
+            let before_map: Map<&[u8], &ProverAllocationInfo> = b
+                .allocations
+                .iter()
+                .map(|al| (al.confirmation_filter.as_slice(), al))
+                .collect();
+            let after_map: Map<&[u8], &ProverAllocationInfo> = a
+                .allocations
+                .iter()
+                .map(|al| (al.confirmation_filter.as_slice(), al))
+                .collect();
+
+            for (filter, alloc) in &after_map {
+                match before_map.get(filter) {
+                    None => log_local_alloc_appear(alloc),
+                    Some(prev) => log_local_alloc_diff(prev, alloc),
+                }
+            }
+            for (filter, prev) in &before_map {
+                if !after_map.contains_key(filter) {
+                    tracing::info!(
+                        filter = %hex::encode(filter),
+                        prev_status = ?prev.status,
+                        prev_join_frame = prev.join_frame_number,
+                        "local prover allocation disappeared"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn log_local_alloc_appear(alloc: &ProverAllocationInfo) {
+    tracing::info!(
+        filter = %hex::encode(&alloc.confirmation_filter),
+        status = ?alloc.status,
+        join_frame = alloc.join_frame_number,
+        leave_frame = alloc.leave_frame_number,
+        kick_frame = alloc.kick_frame_number,
+        join_confirm_frame = alloc.join_confirm_frame_number,
+        join_reject_frame = alloc.join_reject_frame_number,
+        last_active_frame = alloc.last_active_frame_number,
+        "local prover allocation appeared"
+    );
+}
+
+fn log_local_alloc_diff(prev: &ProverAllocationInfo, new: &ProverAllocationInfo) {
+    if prev.status != new.status {
+        tracing::info!(
+            filter = %hex::encode(&new.confirmation_filter),
+            prev = ?prev.status,
+            new = ?new.status,
+            "local allocation status changed"
+        );
+    }
+    if prev.join_frame_number != new.join_frame_number {
+        tracing::info!(
+            filter = %hex::encode(&new.confirmation_filter),
+            prev = prev.join_frame_number,
+            new = new.join_frame_number,
+            "local allocation join_frame_number changed"
+        );
+    }
+    if prev.join_confirm_frame_number != new.join_confirm_frame_number {
+        tracing::info!(
+            filter = %hex::encode(&new.confirmation_filter),
+            prev = prev.join_confirm_frame_number,
+            new = new.join_confirm_frame_number,
+            "local allocation join_confirm_frame_number changed"
+        );
+    }
+    if prev.join_reject_frame_number != new.join_reject_frame_number {
+        tracing::info!(
+            filter = %hex::encode(&new.confirmation_filter),
+            prev = prev.join_reject_frame_number,
+            new = new.join_reject_frame_number,
+            "local allocation join_reject_frame_number changed"
+        );
+    }
+    if prev.leave_frame_number != new.leave_frame_number {
+        tracing::info!(
+            filter = %hex::encode(&new.confirmation_filter),
+            prev = prev.leave_frame_number,
+            new = new.leave_frame_number,
+            "local allocation leave_frame_number changed"
+        );
+    }
+    if prev.leave_confirm_frame_number != new.leave_confirm_frame_number {
+        tracing::info!(
+            filter = %hex::encode(&new.confirmation_filter),
+            prev = prev.leave_confirm_frame_number,
+            new = new.leave_confirm_frame_number,
+            "local allocation leave_confirm_frame_number changed"
+        );
+    }
+    if prev.kick_frame_number != new.kick_frame_number {
+        tracing::info!(
+            filter = %hex::encode(&new.confirmation_filter),
+            prev = prev.kick_frame_number,
+            new = new.kick_frame_number,
+            "local allocation kick_frame_number changed"
+        );
     }
 }
 

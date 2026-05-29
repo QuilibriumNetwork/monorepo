@@ -307,6 +307,45 @@ pub fn validator_global_peer_info() -> TopicValidator {
             .unwrap_or_default()
             .as_millis() as i64;
 
+        // Cheap pre-validate: peek the timestamp out of the raw bytes
+        // before doing the full canonical decode + Ed448 verify, which
+        // are by far the most expensive steps and dominate CPU when the
+        // mesh is forwarding millions of stale messages per hour.
+        // 99%+ of GLOBAL_PEER_INFO drops in production were
+        // `*_ts_too_old`, all of which the peek can identify without
+        // allocating or running the signature check. Peek failures
+        // (truncation / wrong type prefix) fall through to the
+        // existing full-decode error paths so genuine corruption still
+        // gets categorized correctly.
+        if data.len() >= 4 {
+            let tp = u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4]));
+            if tp == quil_p2p::PEER_INFO_TYPE {
+                if let Some(ts) = quil_p2p::peek_peer_info_timestamp(data) {
+                    if ts < now_ms - 60_000 {
+                        return Reject("pi_ts_too_old");
+                    }
+                    if ts < now_ms - 1_000 {
+                        return Reject("pi_ts_stale");
+                    }
+                    if ts > now_ms + 300_000 {
+                        return Reject("pi_ts_future");
+                    }
+                }
+            } else if tp == quil_p2p::KEY_REGISTRY_TYPE {
+                if let Some(ts) = quil_p2p::peek_key_registry_timestamp(data).map(|v| v as i64) {
+                    if ts < now_ms - 60_000 {
+                        return Reject("kr_ts_too_old");
+                    }
+                    if ts < now_ms - 1_000 {
+                        return Reject("kr_ts_stale");
+                    }
+                    if ts > now_ms + 5_000 {
+                        return Reject("kr_ts_future");
+                    }
+                }
+            }
+        }
+
         match quil_p2p::classify_peer_info_message(data) {
             Ok(quil_p2p::PeerInfoMessage::PeerInfo(info)) => {
                 if info.peer_id.is_empty() {
@@ -318,7 +357,11 @@ pub fn validator_global_peer_info() -> TopicValidator {
                 if info.signature.len() != 114 {
                     return Reject("pi_bad_sig_len");
                 }
-                // Timestamp validation (mirrors Go message_validation.go:522-548).
+                // Re-check timestamps post-decode in case the peek was
+                // skipped (unknown type prefix path) or a malicious
+                // peer crafted a payload where peek and full decode
+                // disagree. Defense in depth — the costs at this point
+                // are already paid.
                 if info.timestamp < now_ms - 60_000 {
                     return Reject("pi_ts_too_old");
                 }

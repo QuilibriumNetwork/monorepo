@@ -166,6 +166,96 @@ pub fn build_worker_reachability(
 
 /// Decode a `PeerInfo` from the canonical big-endian format used by Go's
 /// `protobufs.PeerInfo.ToCanonicalBytes()`.
+/// Peek the timestamp out of a canonical PeerInfo without allocating
+/// or building structs. Walks the encoding skipping each
+/// length-prefixed field by offset arithmetic. Used by the topic
+/// validator to short-circuit the expensive full decode + Ed448
+/// verify when a stale message is going to be rejected anyway.
+///
+/// Returns `None` if the encoding doesn't look like a PeerInfo
+/// (wrong type prefix, truncated, or any length prefix overflows).
+pub fn peek_peer_info_timestamp(data: &[u8]) -> Option<i64> {
+    let mut pos = 0usize;
+    let tp = read_u32_at(data, &mut pos)?;
+    if tp != PEER_INFO_TYPE {
+        return None;
+    }
+    // peer_id
+    skip_lp_bytes(data, &mut pos)?;
+    // reachability[]
+    let reach_count = read_u32_at(data, &mut pos)? as usize;
+    for _ in 0..reach_count {
+        // filter
+        skip_lp_bytes(data, &mut pos)?;
+        // pubsub_multiaddrs[]
+        let n = read_u32_at(data, &mut pos)? as usize;
+        for _ in 0..n {
+            skip_lp_bytes(data, &mut pos)?;
+        }
+        // stream_multiaddrs[]
+        let n = read_u32_at(data, &mut pos)? as usize;
+        for _ in 0..n {
+            skip_lp_bytes(data, &mut pos)?;
+        }
+    }
+    // timestamp (i64 BE)
+    if pos + 8 > data.len() {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&data[pos..pos + 8]);
+    Some(i64::from_be_bytes(buf))
+}
+
+/// Peek the timestamp out of a canonical KeyRegistry. The KeyRegistry
+/// timestamp lives at the END of the encoding (after the variable
+/// keys_by_purpose list), so we walk forward through the known
+/// length-prefixed fields and pull the final u64. Returns `None` on
+/// any structural error or truncation.
+pub fn peek_key_registry_timestamp(data: &[u8]) -> Option<u64> {
+    let mut pos = 0usize;
+    let tp = read_u32_at(data, &mut pos)?;
+    if tp != KEY_REGISTRY_TYPE {
+        return None;
+    }
+    skip_lp_bytes(data, &mut pos)?; // identity_key (wrapped Ed448 pubkey)
+    skip_lp_bytes(data, &mut pos)?; // prover_key (wrapped BLS pubkey)
+    skip_lp_bytes(data, &mut pos)?; // identity_to_prover (wrapped sig)
+    skip_lp_bytes(data, &mut pos)?; // prover_to_identity (wrapped sig)
+    let kbp_count = read_u32_at(data, &mut pos)? as usize;
+    for _ in 0..kbp_count {
+        skip_lp_bytes(data, &mut pos)?; // purpose
+        skip_lp_bytes(data, &mut pos)?; // value
+    }
+    if pos + 8 > data.len() {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&data[pos..pos + 8]);
+    Some(u64::from_be_bytes(buf))
+}
+
+#[inline]
+fn read_u32_at(data: &[u8], pos: &mut usize) -> Option<u32> {
+    if *pos + 4 > data.len() {
+        return None;
+    }
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&data[*pos..*pos + 4]);
+    *pos += 4;
+    Some(u32::from_be_bytes(buf))
+}
+
+#[inline]
+fn skip_lp_bytes(data: &[u8], pos: &mut usize) -> Option<()> {
+    let len = read_u32_at(data, pos)? as usize;
+    if *pos + len > data.len() {
+        return None;
+    }
+    *pos += len;
+    Some(())
+}
+
 pub fn decode_canonical_peer_info(data: &[u8]) -> Result<CanonicalPeerInfo> {
     let mut r = Reader::new(data);
     let type_prefix = r.read_u32()?;
@@ -1071,5 +1161,92 @@ mod tests {
             r[0].stream_multiaddrs,
             vec!["/ip4/10.0.0.1/tcp/32500".to_string()]
         );
+    }
+
+    // =====================================================================
+    // Cheap-peek timestamp extraction (avoids full canonical decode +
+    // Ed448 verify on messages that will be rejected for staleness anyway)
+    // =====================================================================
+
+    fn fixture_peer_info(timestamp: i64, last_received: u64) -> CanonicalPeerInfo {
+        CanonicalPeerInfo {
+            peer_id: vec![0x11; 38],
+            reachability: vec![
+                CanonicalReachability {
+                    filter: vec![0xAA; 32],
+                    pubsub_multiaddrs: vec![
+                        "/ip4/1.2.3.4/udp/8336/quic-v1".to_string(),
+                        "/ip6/::1/udp/8336/quic-v1".to_string(),
+                    ],
+                    stream_multiaddrs: vec!["/ip4/1.2.3.4/tcp/8340".to_string()],
+                },
+                CanonicalReachability {
+                    filter: vec![0xBB; 32],
+                    pubsub_multiaddrs: vec![],
+                    stream_multiaddrs: vec![],
+                },
+            ],
+            timestamp,
+            version: vec![2, 1, 0],
+            patch_number: vec![20],
+            capabilities: vec![CanonicalCapability {
+                protocol_identifier: ARCHIVE_SERVICE_CAPABILITY_ID,
+                additional_metadata: vec![],
+            }],
+            public_key: vec![],
+            signature: vec![],
+            last_received_frame: last_received,
+            last_global_head_frame: 999_999,
+        }
+    }
+
+    #[test]
+    fn peek_peer_info_timestamp_matches_full_decode() {
+        let info = fixture_peer_info(1_700_000_000_000, 12345);
+        let bytes = encode_canonical_peer_info(&info, &vec![0x33; 57], &vec![0x44; 114]);
+        let peeked = peek_peer_info_timestamp(&bytes).expect("peek");
+        let full = decode_canonical_peer_info(&bytes).expect("decode");
+        assert_eq!(peeked, info.timestamp);
+        assert_eq!(peeked, full.timestamp);
+    }
+
+    #[test]
+    fn peek_peer_info_timestamp_with_no_reachability() {
+        let mut info = fixture_peer_info(1_700_000_001_000, 0);
+        info.reachability.clear();
+        let bytes = encode_canonical_peer_info(&info, &vec![0x33; 57], &vec![0x44; 114]);
+        assert_eq!(peek_peer_info_timestamp(&bytes), Some(1_700_000_001_000));
+    }
+
+    #[test]
+    fn peek_peer_info_timestamp_rejects_wrong_type_prefix() {
+        let mut bytes = vec![0u8; 16];
+        // type prefix = 0xDEADBEEF (not PEER_INFO_TYPE)
+        bytes[0..4].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
+        assert_eq!(peek_peer_info_timestamp(&bytes), None);
+    }
+
+    #[test]
+    fn peek_peer_info_timestamp_rejects_truncated() {
+        let info = fixture_peer_info(1_700_000_000_000, 0);
+        let bytes = encode_canonical_peer_info(&info, &vec![0x33; 57], &vec![0x44; 114]);
+        // Truncate to before the timestamp lands.
+        let truncated = &bytes[..bytes.len() / 4];
+        assert_eq!(peek_peer_info_timestamp(truncated), None);
+    }
+
+    #[test]
+    fn peek_key_registry_timestamp_matches_full_decode() {
+        let encoded = encode_key_registry(
+            &vec![0xAA; 57], // ed448 pubkey
+            &vec![0xBB; 585], // bls pubkey
+            &vec![0xCC; 114], // identity_to_prover_sig (Ed448)
+            &vec![0xDD; 74],  // prover_to_identity_sig (BLS)
+            1_725_000_000_000, // last_updated_ms
+        );
+        let peeked = peek_key_registry_timestamp(&encoded).expect("peek");
+        let full = decode_canonical_key_registry(&encoded).expect("decode");
+        assert_eq!(peeked, 1_725_000_000_000u64);
+        assert_eq!(peeked, full.last_updated_ms);
     }
 }

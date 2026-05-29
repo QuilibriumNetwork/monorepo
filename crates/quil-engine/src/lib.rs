@@ -80,32 +80,46 @@ pub mod bitmasks {
     /// Global alert channel (16 zero bytes).
     pub const GLOBAL_ALERT: &[u8] = &[0u8; 16];
 
-    /// Per-shard frame bitmask = the shard's address/filter itself.
-    pub fn shard_frame_bitmask(filter: &[u8]) -> Vec<u8> {
-        filter.to_vec()
+    /// Compute the 32-byte `appFilter` from a shard address. Mirrors
+    /// Go's `up2p.GetBloomFilter(address, 256, 3)` — a 256-bit
+    /// bitmask with exactly 3 bits set, used as the per-shard
+    /// pubsub topic identifier. The shard `address` is typically a
+    /// 32-byte poseidon hash; only the first 32 bytes participate
+    /// in the SHA3-256 the bloom function consumes.
+    pub fn shard_app_filter(address: &[u8]) -> Vec<u8> {
+        quil_hypergraph::addressing::get_bloom_filter(address, 256, 3)
     }
 
-    /// Per-shard consensus bitmask = `0x00 || filter`.
-    pub fn shard_consensus_bitmask(filter: &[u8]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(1 + filter.len());
+    /// Per-shard frame bitmask = the shard's `appFilter` (32 bytes
+    /// with 3 bits set).
+    pub fn shard_frame_bitmask(address: &[u8]) -> Vec<u8> {
+        shard_app_filter(address)
+    }
+
+    /// Per-shard consensus bitmask = `0x00 || appFilter`.
+    pub fn shard_consensus_bitmask(address: &[u8]) -> Vec<u8> {
+        let af = shard_app_filter(address);
+        let mut v = Vec::with_capacity(1 + af.len());
         v.push(0u8);
-        v.extend_from_slice(filter);
+        v.extend_from_slice(&af);
         v
     }
 
-    /// Per-shard prover bitmask = `0x00 0x00 0x00 || filter`.
-    pub fn shard_prover_bitmask(filter: &[u8]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(3 + filter.len());
+    /// Per-shard prover bitmask = `0x00 0x00 0x00 || appFilter`.
+    pub fn shard_prover_bitmask(address: &[u8]) -> Vec<u8> {
+        let af = shard_app_filter(address);
+        let mut v = Vec::with_capacity(3 + af.len());
         v.extend_from_slice(&[0u8, 0u8, 0u8]);
-        v.extend_from_slice(filter);
+        v.extend_from_slice(&af);
         v
     }
 
-    /// Per-shard dispatch bitmask = `0x00 0x00 || filter`.
-    pub fn shard_dispatch_bitmask(filter: &[u8]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(2 + filter.len());
+    /// Per-shard dispatch bitmask = `0x00 0x00 || appFilter`.
+    pub fn shard_dispatch_bitmask(address: &[u8]) -> Vec<u8> {
+        let af = shard_app_filter(address);
+        let mut v = Vec::with_capacity(2 + af.len());
         v.extend_from_slice(&[0u8, 0u8]);
-        v.extend_from_slice(filter);
+        v.extend_from_slice(&af);
         v
     }
 }
