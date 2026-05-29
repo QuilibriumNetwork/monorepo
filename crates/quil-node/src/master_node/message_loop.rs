@@ -118,6 +118,17 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
     let reward_issuer: Arc<quil_engine::OptRewardIssuance> = Arc::new(quil_engine::OptRewardIssuance);
     let archive_mode_for_recv: bool = archive_mode_recv;
 
+    // Bundle every cache/map we want to size-report in the 30s
+    // status tick. Cheap clone (all Arc inside) so it can move into
+    // the recv-loop closure alongside everything else.
+    let mem_sources = crate::mem_stats::StructuralSources {
+        peer_info_cache: pic_for_recv.clone(),
+        shard_engines: shard_engines_for_recv.clone(),
+        signer_registry: sr_for_recv.clone(),
+        prover_registry: pr_for_recv.clone(),
+        time_reel: time_reel_for_recv.clone(),
+    };
+
     sup.spawn("message-loop", move |recv_token| async move {
         let mut time_reel_rx = time_reel_for_recv
             .as_ref()
@@ -194,6 +205,33 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         prover_msgs = prover_msgs_received,
                         router_drops,
                         "node status"
+                    );
+                    // Memory snapshot. Logged separately so the size
+                    // fields don't crowd `node status`; growth between
+                    // ticks is the diagnosis signal.
+                    let sizes = mem_sources.snapshot(
+                        archive_peers_seen.len(),
+                        peer_info_digest_cache.len(),
+                    );
+                    let proc_mem = crate::mem_stats::process_memory();
+                    info!(
+                        rss_mb = proc_mem
+                            .map(|m| crate::mem_stats::fmt_mb(m.rss_bytes))
+                            .unwrap_or_else(|| "?".to_string()),
+                        vsize_mb = proc_mem
+                            .map(|m| crate::mem_stats::fmt_mb(m.vsize_bytes))
+                            .unwrap_or_else(|| "?".to_string()),
+                        peer_info_cache = sizes.peer_info_cache,
+                        shard_engines = sizes.shard_engines,
+                        signer_registry = sizes.signer_registry,
+                        archive_peers_seen = sizes.archive_peers_seen,
+                        peer_info_digest_cache = sizes.peer_info_digest_cache,
+                        prover_registry_addresses = sizes.prover_registry_addresses,
+                        prover_registry_filters = sizes.prover_registry_filters,
+                        time_reel_nodes = sizes.time_reel_nodes,
+                        time_reel_pending = sizes.time_reel_pending,
+                        time_reel_equivocators = sizes.time_reel_equivocators,
+                        "memory snapshot"
                     );
                 }
                 msg = async {

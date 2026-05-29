@@ -94,6 +94,17 @@ impl GlobalTimeReel {
             .unwrap_or(0)
     }
 
+    /// Structural sizes for memory diagnostics. Returned tuple:
+    /// `(nodes, pending_frames_total, equivocator_frame_buckets)`.
+    /// `pending_frames_total` sums across all parent-selector
+    /// buckets so it reflects total cached orphan frames, not
+    /// distinct selectors.
+    pub fn sizes(&self) -> (usize, usize, usize) {
+        let inner = self.inner.read().unwrap();
+        let pending_total: usize = inner.pending_frames.values().map(|v| v.len()).sum();
+        (inner.nodes.len(), pending_total, inner.equivocators.len())
+    }
+
     pub fn insert(
         &self,
         frame: Arc<quil_types::proto::global::GlobalFrame>,

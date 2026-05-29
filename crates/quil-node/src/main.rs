@@ -26,6 +26,8 @@ mod diagnostic;
 
 mod master_node;
 
+mod mem_stats;
+
 /// Quilibrium Node — Rust implementation
 #[derive(Parser, Debug)]
 #[command(name = "quil-node", version = quil_config::VERSION_STRING, about)]
