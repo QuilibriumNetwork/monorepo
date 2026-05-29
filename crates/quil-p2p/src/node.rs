@@ -385,7 +385,35 @@ impl P2PNode {
                     local_peer_id,
                     libp2p::autonat::Config::default(),
                 );
-                Ok(NodeBehaviour { kademlia, ping, identify, blossomsub, autonat })
+
+                // Hard cap on swarm connections. Without these limits
+                // the swarm accepts unbounded inbound connections and
+                // pays the per-connection memory tax (QUIC/TCP buffers,
+                // multiplexer state, BlossomSub mesh tracking) for
+                // every one. Observed in prod: 4596 peers consuming
+                // ~13 GB RSS with negligible application-level cache
+                // growth. The cap shape mirrors typical libp2p
+                // application defaults — keep dial outbound headroom
+                // for kademlia and bootstrap, hard-cap inbound so a
+                // chatty network can't fill us up.
+                let conn_limits = libp2p::connection_limits::ConnectionLimits::default()
+                    .with_max_established(Some(512))
+                    .with_max_established_incoming(Some(384))
+                    .with_max_established_outgoing(Some(256))
+                    .with_max_established_per_peer(Some(2))
+                    .with_max_pending_incoming(Some(64))
+                    .with_max_pending_outgoing(Some(64));
+                let connection_limits =
+                    libp2p::connection_limits::Behaviour::new(conn_limits);
+
+                Ok(NodeBehaviour {
+                    connection_limits,
+                    kademlia,
+                    ping,
+                    identify,
+                    blossomsub,
+                    autonat,
+                })
             })
             .map_err(|e| QuilError::P2p(format!("behaviour: {}", e)))?
             .with_swarm_config(|cfg| {
@@ -1105,6 +1133,13 @@ type KademliaBehaviour = libp2p::kad::Behaviour<libp2p::kad::store::MemoryStore>
 
 #[derive(NetworkBehaviour)]
 struct NodeBehaviour {
+    /// Connection-count cap. With no cap, observed deployments
+    /// accumulated 4k+ peers on a 4 GB box — each connection brings
+    /// QUIC/TCP buffers (~256-512 KB) plus libp2p multiplexer and
+    /// BlossomSub mesh state. 4596 peers × ~700 KB ≈ 3.2 GB of
+    /// swarm-only overhead, with continued growth as additional
+    /// peers connect. Cap mirrors libp2p sample defaults.
+    connection_limits: libp2p::connection_limits::Behaviour,
     kademlia: KademliaBehaviour,
     ping: libp2p::ping::Behaviour,
     identify: libp2p::identify::Behaviour,

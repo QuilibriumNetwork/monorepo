@@ -41,6 +41,13 @@ pub struct StructuralSizes {
     pub time_reel_nodes: usize,
     pub time_reel_pending: usize,
     pub time_reel_equivocators: usize,
+    /// Sum across all active `AppConsensusEngine` instances of each
+    /// internal cache. Per-shard counts × shard count — diagnostic
+    /// for the "per-shard caches multiplied by shard count" risk.
+    pub app_engine_frame_store: usize,
+    pub app_engine_message_spillover: usize,
+    pub app_engine_proposal_cache: usize,
+    pub app_engine_pending_certified_parents: usize,
 }
 
 /// Read process RSS. Returns `None` on platforms not implemented or
@@ -181,6 +188,24 @@ impl StructuralSources {
             .as_ref()
             .map(|tr| tr.sizes())
             .unwrap_or((0, 0, 0));
+        // Aggregate per-shard engine sizes. Quick read-lock on the
+        // shard_engines map, then snapshot each handle's atomic
+        // sizes slot.
+        let (fs, sp, pc, pcp) = {
+            let engines = self.shard_engines.read();
+            let mut fs = 0usize;
+            let mut sp = 0usize;
+            let mut pc = 0usize;
+            let mut pcp = 0usize;
+            for handle in engines.values() {
+                let s = handle.sizes();
+                fs += s.frame_store;
+                sp += s.message_spillover;
+                pc += s.proposal_cache;
+                pcp += s.pending_certified_parents;
+            }
+            (fs, sp, pc, pcp)
+        };
         StructuralSizes {
             peer_info_cache: self.peer_info_cache.read().len(),
             shard_engines: self.shard_engines.read().len(),
@@ -192,6 +217,10 @@ impl StructuralSources {
             time_reel_nodes: tr_nodes,
             time_reel_pending: tr_pending,
             time_reel_equivocators: tr_eq,
+            app_engine_frame_store: fs,
+            app_engine_message_spillover: sp,
+            app_engine_proposal_cache: pc,
+            app_engine_pending_certified_parents: pcp,
         }
     }
 }

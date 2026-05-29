@@ -58,6 +58,16 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 async-stream = "0.3"
 parking_lot = "0.12"
 
+# Jemalloc as the global allocator. The default system allocator
+# (glibc malloc on Linux) fragments aggressively under our
+# allocation pattern — heavy churn on small-medium-sized Vec/HashMap
+# entries from BlossomSub forwarding plus long-lived caches.
+# jemalloc holds memory roughly 10x better here. Profiling via
+# MALLOC_CONF=prof:true,prof_prefix:/tmp/jeprof + jeprof on the
+# resulting *.heap files surfaces per-call-site allocation totals.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+
 [dev-dependencies]
 tempfile = "3"
 flate2 = "1"

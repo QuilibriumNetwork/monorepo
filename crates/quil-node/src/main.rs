@@ -7,6 +7,16 @@ use tracing::{error, info, warn};
 
 use quil_lifecycle::{ShutdownReason, Supervisor};
 
+// Global allocator: jemalloc. Replaces the system allocator on all
+// non-MSVC targets. Heap profiling is enabled by
+//   MALLOC_CONF=prof:true,prof_prefix:/tmp/jeprof
+// at process start; dumps `/tmp/jeprof.<pid>.<seq>.[fihu].heap`
+// files that `jeprof --text quil-node /tmp/jeprof.<...>.heap`
+// rolls into a per-call-site allocation report.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod logging;
 
 mod prover_message_transport_prod;

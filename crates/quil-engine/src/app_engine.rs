@@ -139,12 +139,45 @@ pub enum AppEngineEvent {
 // Handle for sending messages to the engine
 // =====================================================================
 
+/// Snapshot of per-shard `AppConsensusEngine` internal sizes,
+/// published atomically by the engine each loop iteration. Read
+/// without acquiring any consensus-side locks; size deltas surface
+/// in the `memory snapshot` log so a per-shard cache that's bleeding
+/// memory shows up directly.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AppEngineSizes {
+    pub frame_store: usize,
+    pub message_spillover: usize,
+    pub proposal_cache: usize,
+    pub pending_certified_parents: usize,
+    pub current_rank: u64,
+}
+
+/// Atomic publish slot for [`AppEngineSizes`]. Cheap to clone (one
+/// `Arc`); the engine writes through a mutex on each iteration,
+/// readers take a quick lock to copy out.
+#[derive(Debug, Default, Clone)]
+pub struct SharedAppEngineSizes(Arc<std::sync::Mutex<AppEngineSizes>>);
+
+impl SharedAppEngineSizes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn snapshot(&self) -> AppEngineSizes {
+        *self.0.lock().unwrap()
+    }
+    pub fn store(&self, s: AppEngineSizes) {
+        *self.0.lock().unwrap() = s;
+    }
+}
+
 /// Handle for sending messages to an app engine. Cloneable — the
 /// master holds one, and it can be shared across message routing tasks.
 #[derive(Clone, Debug)]
 pub struct AppEngineHandle {
     pub filter: Vec<u8>,
     msg_tx: mpsc::Sender<AppEngineMessage>,
+    sizes: SharedAppEngineSizes,
 }
 
 impl AppEngineHandle {
@@ -158,6 +191,14 @@ impl AppEngineHandle {
     /// attempts during the halt window are skipped.
     pub fn set_halted(&self, halted: bool) {
         let _ = self.msg_tx.try_send(AppEngineMessage::SetHalted(halted));
+    }
+
+    /// Read the engine's most-recently-published internal sizes.
+    /// Returns the last value the engine wrote — may be a few
+    /// hundred milliseconds stale, which is fine for the 30 s
+    /// memory snapshot tick.
+    pub fn sizes(&self) -> AppEngineSizes {
+        self.sizes.snapshot()
     }
 }
 
@@ -520,6 +561,11 @@ pub struct AppConsensusEngine {
     /// Backing KV store for persistent consensus + liveness state.
     /// `None` falls back to the in-memory stub.
     kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
+
+    /// Atomic publish slot for engine sizes. Updated each event-loop
+    /// iteration so external memory snapshots can read internal
+    /// cache sizes without taking the engine's locks.
+    sizes: SharedAppEngineSizes,
 }
 
 impl AppConsensusEngine {
@@ -537,9 +583,11 @@ impl AppConsensusEngine {
             .map(|h| h.to_vec())
             .unwrap_or_else(|_| filter.clone());
 
+        let sizes = SharedAppEngineSizes::new();
         let handle = AppEngineHandle {
             filter: filter.clone(),
             msg_tx,
+            sizes: sizes.clone(),
         };
 
         let engine = Self {
@@ -577,8 +625,22 @@ impl AppConsensusEngine {
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             coverage_publish: deps.coverage_publish,
             kv_db: deps.kv_db,
+            sizes,
         };
         (engine, handle)
+    }
+
+    /// Publish current internal sizes to the handle's atomic snapshot.
+    /// Called from the event loop after any mutation that could change
+    /// one of the tracked caches. Cheap — single small mutex lock.
+    fn publish_sizes(&self) {
+        self.sizes.store(AppEngineSizes {
+            frame_store: self.frame_store.len(),
+            message_spillover: self.message_spillover.values().map(|v| v.len()).sum(),
+            proposal_cache: self.proposal_cache.len(),
+            pending_certified_parents: self.pending_certified_parents.len(),
+            current_rank: self.current_rank,
+        });
     }
 
     /// Start the app shard consensus loop. Runs on the worker thread's
@@ -738,6 +800,12 @@ impl AppConsensusEngine {
             if let Some(child_rank) = self.pending_seal_rank.take() {
                 self.try_seal_parent_with_child(child_rank).await;
             }
+
+            // Publish cache sizes so external memory snapshots can
+            // see per-shard internal growth. Cheap mutex lock, runs
+            // at message cadence (not per-tick), which is fine for
+            // a 30 s diagnostic log.
+            self.publish_sizes();
         }
 
         // Shutdown consensus event loop

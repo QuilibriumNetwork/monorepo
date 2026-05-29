@@ -10,7 +10,7 @@ quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-hypergraph = { path = "../quil-hypergraph" }
 quil-crypto = { path = "../quil-crypto" }
-rocksdb = { version = "0.22", default-features = false, features = ["snappy"] }
+rocksdb = { version = "0.22", default-features = false, features = ["snappy", "lz4"] }
 prost = "0.13"
 thiserror = "2"
 tracing = "0.1"

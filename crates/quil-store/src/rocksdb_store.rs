@@ -85,11 +85,37 @@ impl RocksDb {
     pub fn open(path: &Path) -> Result<Self> {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB memtable
+
+        opts.set_write_buffer_size(64 * 1024 * 1024);
+
         opts.set_max_open_files(1000);
         opts.set_level_zero_file_num_compaction_trigger(8);
         opts.set_level_zero_slowdown_writes_trigger(16);
         opts.set_level_zero_stop_writes_trigger(32);
+
+        // LZ4 compression: ~50% size reduction at ~5% CPU cost.
+        // RocksDB's default is Snappy (worse ratio); LZ4 is the
+        // standard pick for write-heavy workloads.
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+
+        // Block-cache budget. Without an explicit cache RocksDB
+        // grows an internal cache that can balloon under churn.
+        // 256 MB is enough for the hot working set on a typical
+        // mainnet archive node; tune via env if needed.
+        const DEFAULT_BLOCK_CACHE_MB: usize = 256;
+        let cache_mb: usize = std::env::var("QUIL_ROCKSDB_BLOCK_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_BLOCK_CACHE_MB);
+        let block_cache = rocksdb::Cache::new_lru_cache(cache_mb * 1024 * 1024);
+        let mut block_opts = rocksdb::BlockBasedOptions::default();
+        block_opts.set_block_cache(&block_cache);
+        // Account index + filter blocks against the cache budget,
+        // and pin L0 filter+index blocks so a cold sweep can't
+        // evict the hot consensus working set.
+        block_opts.set_cache_index_and_filter_blocks(true);
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        opts.set_block_based_table_factory(&block_opts);
 
         let db = rocksdb::DB::open(&opts, path)
             .map_err(|e| QuilError::Store(format!("failed to open rocksdb: {}", e)))?;

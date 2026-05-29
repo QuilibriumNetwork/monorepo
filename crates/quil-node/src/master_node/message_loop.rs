@@ -231,6 +231,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         time_reel_nodes = sizes.time_reel_nodes,
                         time_reel_pending = sizes.time_reel_pending,
                         time_reel_equivocators = sizes.time_reel_equivocators,
+                        app_engine_frame_store = sizes.app_engine_frame_store,
+                        app_engine_message_spillover = sizes.app_engine_message_spillover,
+                        app_engine_proposal_cache = sizes.app_engine_proposal_cache,
+                        app_engine_pending_certified_parents = sizes.app_engine_pending_certified_parents,
                         "memory snapshot"
                     );
                 }
