@@ -65,6 +65,15 @@ pub struct ProverPipeline {
     pub transport: Arc<dyn ProverMessageTransport>,
 }
 
+/// Hard ceiling on lifecycle submissions that do NOT perform VDF
+/// compute (confirms, rejects, leaves, seniority merge). Each of
+/// these is sign + canonicalize + publish; the only legitimately
+/// slow piece is the gRPC fan-out, which has its own per-archive
+/// timeout in the transport. 30s is well above the worst case but
+/// bounds the spawned task so a transport bug, runtime starvation,
+/// or stuck publish can't silently wedge a dispatch forever.
+const NON_VDF_SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl ProverPipeline {
     /// Dispatch a lifecycle action. Non-blocking: spawns a tokio task
     /// to handle the (slow) VDF + sign + submit work so the caller's
@@ -77,12 +86,36 @@ impl ProverPipeline {
                 // Guard against overlapping VDF computations — set before
                 // spawn so the next evaluate() sees it immediately.
                 me.lifecycle.set_proof_in_progress(true);
+                // Hard ceiling on the whole submit. VDF compute is
+                // `spawn_blocking` and can run 10-20s on a slow box;
+                // archive RPC has its own per-call timeout; BlossomSub
+                // publish is fast. 90s is well above the legitimate
+                // worst case but bounded — if anything in this path
+                // ever hangs (transport bug, runtime starvation, etc.)
+                // `proof_in_progress` clears so the lifecycle can
+                // try again on the next frame instead of being
+                // permanently stuck.
+                const SUBMIT_JOIN_TIMEOUT: std::time::Duration =
+                    std::time::Duration::from_secs(90);
                 // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
-                    let result = me.submit_join(filters, &worker_ids, frame_number).await;
+                    let outcome = tokio::time::timeout(
+                        SUBMIT_JOIN_TIMEOUT,
+                        me.submit_join(filters, &worker_ids, frame_number),
+                    ).await;
                     me.lifecycle.set_proof_in_progress(false);
-                    if let Err(e) = result {
-                        warn!(frame = frame_number, %e, "ProposeJoin submission failed");
+                    match outcome {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!(frame = frame_number, %e, "ProposeJoin submission failed");
+                        }
+                        Err(_) => {
+                            warn!(
+                                frame = frame_number,
+                                timeout_s = SUBMIT_JOIN_TIMEOUT.as_secs(),
+                                "ProposeJoin submission timed out — clearing proof_in_progress",
+                            );
+                        }
                     }
                 });
             }
@@ -90,8 +123,21 @@ impl ProverPipeline {
                 let me = self.clone();
                 // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
-                    if let Err(e) = me.submit_confirm(filters, frame_number).await {
-                        warn!(frame = frame_number, %e, "ConfirmJoins submission failed");
+                    match tokio::time::timeout(
+                        NON_VDF_SUBMIT_TIMEOUT,
+                        me.submit_confirm(filters, frame_number),
+                    ).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!(frame = frame_number, %e, "ConfirmJoins submission failed");
+                        }
+                        Err(_) => {
+                            warn!(
+                                frame = frame_number,
+                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
+                                "ConfirmJoins submission timed out",
+                            );
+                        }
                     }
                 });
             }
@@ -99,8 +145,21 @@ impl ProverPipeline {
                 let me = self.clone();
                 // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
-                    if let Err(e) = me.submit_reject(filters, frame_number).await {
-                        warn!(frame = frame_number, %e, "RejectJoins submission failed");
+                    match tokio::time::timeout(
+                        NON_VDF_SUBMIT_TIMEOUT,
+                        me.submit_reject(filters, frame_number),
+                    ).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!(frame = frame_number, %e, "RejectJoins submission failed");
+                        }
+                        Err(_) => {
+                            warn!(
+                                frame = frame_number,
+                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
+                                "RejectJoins submission timed out",
+                            );
+                        }
                     }
                 });
             }
@@ -108,8 +167,21 @@ impl ProverPipeline {
                 let me = self.clone();
                 // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
-                    if let Err(e) = me.submit_leave(filters, frame_number).await {
-                        warn!(frame = frame_number, %e, "ProposeLeave submission failed");
+                    match tokio::time::timeout(
+                        NON_VDF_SUBMIT_TIMEOUT,
+                        me.submit_leave(filters, frame_number),
+                    ).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!(frame = frame_number, %e, "ProposeLeave submission failed");
+                        }
+                        Err(_) => {
+                            warn!(
+                                frame = frame_number,
+                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
+                                "ProposeLeave submission timed out",
+                            );
+                        }
                     }
                 });
             }
@@ -117,8 +189,21 @@ impl ProverPipeline {
                 let me = self.clone();
                 // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
-                    if let Err(e) = me.submit_confirm(filters, frame_number).await {
-                        warn!(frame = frame_number, %e, "ConfirmLeaves submission failed");
+                    match tokio::time::timeout(
+                        NON_VDF_SUBMIT_TIMEOUT,
+                        me.submit_confirm(filters, frame_number),
+                    ).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!(frame = frame_number, %e, "ConfirmLeaves submission failed");
+                        }
+                        Err(_) => {
+                            warn!(
+                                frame = frame_number,
+                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
+                                "ConfirmLeaves submission timed out",
+                            );
+                        }
                     }
                 });
             }
@@ -126,8 +211,21 @@ impl ProverPipeline {
                 let me = self.clone();
                 // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
-                    if let Err(e) = me.submit_reject(filters, frame_number).await {
-                        warn!(frame = frame_number, %e, "RejectLeaves submission failed");
+                    match tokio::time::timeout(
+                        NON_VDF_SUBMIT_TIMEOUT,
+                        me.submit_reject(filters, frame_number),
+                    ).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!(frame = frame_number, %e, "RejectLeaves submission failed");
+                        }
+                        Err(_) => {
+                            warn!(
+                                frame = frame_number,
+                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
+                                "RejectLeaves submission timed out",
+                            );
+                        }
                     }
                 });
             }
@@ -135,8 +233,21 @@ impl ProverPipeline {
                 let me = self.clone();
                 // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
                 tokio::spawn(async move {
-                    if let Err(e) = me.submit_seniority_merge(frame_number).await {
-                        warn!(frame = frame_number, %e, "ProposeSeniorityMerge submission failed");
+                    match tokio::time::timeout(
+                        NON_VDF_SUBMIT_TIMEOUT,
+                        me.submit_seniority_merge(frame_number),
+                    ).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!(frame = frame_number, %e, "ProposeSeniorityMerge submission failed");
+                        }
+                        Err(_) => {
+                            warn!(
+                                frame = frame_number,
+                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
+                                "ProposeSeniorityMerge submission timed out",
+                            );
+                        }
                     }
                 });
             }

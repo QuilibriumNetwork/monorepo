@@ -43,16 +43,49 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         // the network head (Go rejects joins where
         // `frame_number < head - 10`). Fall back to local store only
         // if no archive is reachable.
+        //
+        // Hard timeout per archive: a stalled mTLS handshake or
+        // unresponsive gRPC server on the first archive would otherwise
+        // wedge `submit_join` forever, because nothing else in the
+        // lifecycle pipeline imposes a deadline. Symptom observed in
+        // the wild: `prover lifecycle action ProposeJoin {...}` logs,
+        // then complete silence — the next info! ("building ProverJoin")
+        // never fires because the await above never resolves, the
+        // join cooldown never re-arms, and ProposeJoin is silently
+        // dead for the rest of the session.
+        const PER_ARCHIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const MAX_ARCHIVES_TO_TRY: usize = 3;
         if let Some(seed) = self.ed448_seed {
-            if let Some(addr) = self.archive_pool.get_all().await.into_iter().next() {
-                if let Ok(mut c) = ArchiveClient::connect_mtls(&addr, &seed).await {
-                    if let Ok(f) = c.get_global_frame(0).await {
-                        if let Some(h) = f.header.as_ref() {
-                            return Ok(h.clone());
-                        }
+            let addrs: Vec<String> = self
+                .archive_pool
+                .get_all()
+                .await
+                .into_iter()
+                .take(MAX_ARCHIVES_TO_TRY)
+                .collect();
+            for addr in addrs {
+                let attempt = async {
+                    let mut c = ArchiveClient::connect_mtls(&addr, &seed).await.ok()?;
+                    let f = c.get_global_frame(0).await.ok()?;
+                    f.header.clone()
+                };
+                match tokio::time::timeout(PER_ARCHIVE_TIMEOUT, attempt).await {
+                    Ok(Some(h)) => return Ok(h),
+                    Ok(None) => {
+                        tracing::debug!(%addr, "archive returned no header — trying next");
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            %addr,
+                            timeout_ms = PER_ARCHIVE_TIMEOUT.as_millis() as u64,
+                            "archive frame-header fetch timed out — trying next",
+                        );
                     }
                 }
             }
+            tracing::warn!(
+                "all candidate archives timed out — falling back to local clock store",
+            );
         }
         let f = self
             .clock_store
@@ -117,16 +150,26 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         };
 
         let (grpc_ok_count, bs_result) = tokio::join!(grpc_future, bs_future);
-        let p2p_ok = bs_result.is_ok();
-        if let Err(ref e) = bs_result {
-            warn!(error = %e, "BlossomSub publish failed for prover message");
+        // Non-archive nodes never publish on BlossomSub (they don't
+        // subscribe to GLOBAL_PROVER), so for them BlossomSub cannot
+        // count as a delivery path. Treat `p2p_ok` as true only when
+        // we actually attempted a publish AND it succeeded.
+        let p2p_ok = publish_bs && bs_result.is_ok();
+        if publish_bs {
+            if let Err(ref e) = bs_result {
+                warn!(error = %e, "BlossomSub publish failed for prover message");
+            }
         }
 
         if archive_count > 0 && grpc_ok_count == 0 {
             warn!(
                 archive_count,
-                "no archive accepted submission — relying on BlossomSub fallback"
+                publish_bs,
+                "no archive accepted submission — message likely dropped"
             );
+        }
+        if archive_count == 0 && !publish_bs {
+            warn!("no archives discovered AND BlossomSub publish disabled — prover message has no delivery path");
         }
 
         combine_publish_outcome(grpc_ok_count, p2p_ok)
@@ -134,9 +177,12 @@ impl ProverMessageTransport for ProdProverMessageTransport {
 }
 
 /// Combine fan-out outcomes into a final result. Returns `Err` only when
-/// every archive failed AND the BlossomSub publish failed. Empty-mesh /
-/// no-peer scenarios feed in as `p2p_ok = true` because the swarm
-/// successfully accepted the message for buffered redelivery.
+/// every archive failed AND the BlossomSub publish failed. `p2p_ok` is
+/// only `true` when we actually attempted a BlossomSub publish AND the
+/// swarm accepted the message (or had no peers but accepted for
+/// buffered redelivery). Non-archive callers that skip the BlossomSub
+/// path must pass `p2p_ok = false` so a zero-archive-accepted outcome
+/// is correctly classified as a failure rather than a silent drop.
 fn combine_publish_outcome(archive_ok_count: usize, p2p_ok: bool) -> Result<()> {
     if archive_ok_count == 0 && !p2p_ok {
         return Err(QuilError::P2p(
