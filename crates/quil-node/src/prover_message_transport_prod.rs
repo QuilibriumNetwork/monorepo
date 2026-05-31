@@ -53,8 +53,20 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         // never fires because the await above never resolves, the
         // join cooldown never re-arms, and ProposeJoin is silently
         // dead for the rest of the session.
+        // Query archives in parallel and take the FRESHEST response.
+        // Archives drift a few frames apart due to gossip; if we use
+        // the first-to-respond, we may stamp the join with a
+        // frame_number that's already stale at the leading archive,
+        // tripping Go's `frame_number + 10 < current_frame` check at
+        // verify time. The freshness budget gets eaten by VDF compute
+        // (~2s), gRPC delivery, and Go's collector queue depth, so
+        // every frame of staleness at the source matters.
+        //
+        // VDF challenge is `sha3(header.output)` so we can't mix
+        // outputs from different archives — we pick ONE complete
+        // header, just the freshest one available.
         const PER_ARCHIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-        const MAX_ARCHIVES_TO_TRY: usize = 3;
+        const MAX_ARCHIVES_TO_TRY: usize = 5;
         if let Some(seed) = self.ed448_seed {
             let addrs: Vec<String> = self
                 .archive_pool
@@ -63,25 +75,55 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                 .into_iter()
                 .take(MAX_ARCHIVES_TO_TRY)
                 .collect();
+            let mut handles = Vec::with_capacity(addrs.len());
             for addr in addrs {
-                let attempt = async {
-                    let mut c = ArchiveClient::connect_mtls(&addr, &seed).await.ok()?;
-                    let f = c.get_global_frame(0).await.ok()?;
-                    f.header.clone()
-                };
-                match tokio::time::timeout(PER_ARCHIVE_TIMEOUT, attempt).await {
-                    Ok(Some(h)) => return Ok(h),
-                    Ok(None) => {
-                        tracing::debug!(%addr, "archive returned no header — trying next");
+                let seed_copy = seed;
+                let addr_for_log = addr.clone();
+                handles.push(tokio::spawn(async move {
+                    let attempt = async {
+                        let mut c = ArchiveClient::connect_mtls(&addr, &seed_copy).await.ok()?;
+                        let f = c.get_global_frame(0).await.ok()?;
+                        f.header.clone()
+                    };
+                    match tokio::time::timeout(PER_ARCHIVE_TIMEOUT, attempt).await {
+                        Ok(Some(h)) => Some((addr_for_log, h)),
+                        Ok(None) => {
+                            tracing::debug!(
+                                addr = %addr_for_log,
+                                "archive returned no header"
+                            );
+                            None
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                addr = %addr_for_log,
+                                timeout_ms = PER_ARCHIVE_TIMEOUT.as_millis() as u64,
+                                "archive frame-header fetch timed out",
+                            );
+                            None
+                        }
                     }
-                    Err(_) => {
-                        tracing::warn!(
-                            %addr,
-                            timeout_ms = PER_ARCHIVE_TIMEOUT.as_millis() as u64,
-                            "archive frame-header fetch timed out — trying next",
-                        );
+                }));
+            }
+            let mut best: Option<(String, GlobalFrameHeader)> = None;
+            for h in handles {
+                if let Ok(Some((addr, header))) = h.await {
+                    match &best {
+                        None => best = Some((addr, header)),
+                        Some((_, current)) if header.frame_number > current.frame_number => {
+                            best = Some((addr, header));
+                        }
+                        _ => {}
                     }
                 }
+            }
+            if let Some((addr, header)) = best {
+                tracing::debug!(
+                    %addr,
+                    frame_number = header.frame_number,
+                    "selected freshest archive header"
+                );
+                return Ok(header);
             }
             tracing::warn!(
                 "all candidate archives timed out — falling back to local clock store",
