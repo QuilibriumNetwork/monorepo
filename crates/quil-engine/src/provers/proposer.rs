@@ -454,11 +454,18 @@ pub fn decide_joins(
     let basis = pomw_basis(difficulty, world_bytes.try_into().unwrap_or(1), units);
     let scores = score_shards(candidate_shards, &basis, world_bytes, strategy);
 
+    // Two indexes by hex-filter:
+    // - `by_hex`: score, for the threshold comparison
+    // - `desc_by_hex`: descriptor, for the halt-risk bypass below
+    // Indexing once keeps the per-pending loop O(1).
     let mut by_hex: HashMap<String, BigInt> = HashMap::new();
+    let mut desc_by_hex: HashMap<String, &ShardDescriptor> = HashMap::new();
     let mut best_score: Option<BigInt> = None;
     for sc in &scores {
-        let key = hex::encode(&candidate_shards[sc.idx].filter);
-        by_hex.insert(key, sc.score.clone());
+        let d = &candidate_shards[sc.idx];
+        let key = hex::encode(&d.filter);
+        by_hex.insert(key.clone(), sc.score.clone());
+        desc_by_hex.insert(key, d);
         if best_score.as_ref().map_or(true, |b| sc.score > *b) {
             best_score = Some(sc.score.clone());
         }
@@ -490,10 +497,28 @@ pub fn decide_joins(
         match by_hex.get(&key) {
             None => reject.push(p.clone()),
             Some(score) => {
-                if *score < threshold {
-                    reject.push(p.clone());
-                } else {
+                // Halt-risk bypass: confirm regardless of score when the
+                // shard is at or below the halt-risk prover threshold and
+                // has real data (size > 0). Without this, `plan_and_allocate`
+                // proposes joins for halt-risk shards by overriding score
+                // ordering, then `decide_joins` immediately auto-rejects
+                // them ~360 frames later because a larger non-halt-risk
+                // shard's score sits above the 67% threshold. The two paths
+                // disagree on policy, joins are wasted, and halt-risk shards
+                // can still lose their last prover.
+                //
+                // Rust-only divergence from Go's `proposer.go:DecideJoins`,
+                // which applies a flat threshold. Decision pinned 2026-06-01
+                // by operator (caheart).
+                let is_halt_risk = desc_by_hex
+                    .get(&key)
+                    .map(|d| d.size > 0 && d.total_active_joining <= HALT_RISK_PROVER_COUNT)
+                    .unwrap_or(false);
+
+                if is_halt_risk || *score >= threshold {
                     confirm.push(p.clone());
+                } else {
+                    reject.push(p.clone());
                 }
             }
         }
@@ -1152,6 +1177,74 @@ mod tests {
             DEFAULT_UNITS, Strategy::RewardGreedy, usize::MAX,
         );
         assert_eq!(confirm_max.len(), 3);
+    }
+
+    /// Halt-risk pending shard with score below the 67% threshold is
+    /// CONFIRMED, not rejected. Mirrors `plan_and_allocate`'s halt-risk
+    /// priority so the propose→confirm pipeline stays coherent.
+    #[test]
+    fn decide_joins_confirms_halt_risk_below_threshold() {
+        // 0xBB is a big healthy shard (high score), 0xAA is a tiny
+        // halt-risk shard (low score, 2 provers).
+        let shards = vec![
+            ShardDescriptor {
+                filter: vec![0xAA],
+                size: 5_000,
+                ring: 0,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 2, // ← halt-risk (≤ HALT_RISK_PROVER_COUNT)
+            },
+            ShardDescriptor {
+                filter: vec![0xBB],
+                size: 500_000,
+                ring: 0,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 16,
+            },
+        ];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_joins(
+            &shards, &pending, 50000, &BigInt::from(600_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy, usize::MAX,
+        );
+        assert!(reject.is_empty(),
+            "halt-risk pending should bypass the 67% threshold; got reject={reject:?}");
+        assert_eq!(confirm, vec![vec![0xAA]]);
+    }
+
+    /// Halt-risk bypass requires size > 0 — a halt-risk-by-prover-count
+    /// shard with zero data shouldn't be confirmed (no point allocating
+    /// a worker to a shard with nothing to prove).
+    #[test]
+    fn decide_joins_does_not_confirm_zero_size_halt_risk() {
+        let shards = vec![
+            ShardDescriptor {
+                filter: vec![0xAA],
+                size: 0,                // ← no data
+                ring: 0,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 2, // halt-risk by count
+            },
+            ShardDescriptor {
+                filter: vec![0xBB],
+                size: 500_000,
+                ring: 0,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 16,
+            },
+        ];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_joins(
+            &shards, &pending, 50000, &BigInt::from(600_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy, usize::MAX,
+        );
+        assert_eq!(reject, vec![vec![0xAA]],
+            "zero-size halt-risk should still be rejected; got confirm={confirm:?}");
+        assert!(confirm.is_empty());
     }
 
     #[test]

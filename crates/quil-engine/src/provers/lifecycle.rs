@@ -829,8 +829,17 @@ impl ProverLifecycle {
         //   ProposeJoin + as the base for the decide_candidates set.
         // - `decide_all_descriptors`: every shard scored with its current
         //   ring — used only to splice in pending-to-decide entries.
-        // - `allocated_descriptors`: shards *we are on*, scored with the
-        //   current ring — used for plan_leaves.
+        // - `allocated_descriptors`: shards we are *Active* on, scored
+        //   with the current ring — used for plan_leaves. Joining
+        //   shards must NOT be in here: plan_leaves treats them as
+        //   real allocations and may pick the just-joined shard as
+        //   the worst-scoring one to shed, immediately proposing
+        //   Leave for it. Observed in the wild as: ProposeJoin
+        //   accepted by archive → status flips Rejected→Joining in
+        //   local registry → next evaluate() cycle plan_leaves picks
+        //   the same filter to leave → archive eventually rejects
+        //   the unconfirmed Joining → operator-visible symptom is
+        //   "joins never confirm."
         // Merged view: remote sizes (authoritative for shards we're
         // not on) overlaid by local sizes (authoritative for shards
         // we hold data for). See `merged_shard_sizes` for the rule.
@@ -844,7 +853,7 @@ impl ProverLifecycle {
         let decide_all_descriptors =
             build_decide_descriptors(&summaries, &shard_sizes_snapshot);
         let allocated_descriptors: Vec<ShardDescriptor> = decide_all_descriptors.iter()
-            .filter(|d| all_our_filters.contains(&d.filter))
+            .filter(|d| active_filters.contains(&d.filter))
             .cloned()
             .collect();
 
