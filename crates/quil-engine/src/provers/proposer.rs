@@ -573,6 +573,18 @@ pub fn plan_leaves(
 
     let mut candidates: Vec<(Vec<u8>, BigInt)> = alloc_scores
         .iter()
+        // Halt-risk bypass: never propose a leave for a shard with
+        // size > 0 that's at or below the halt-risk prover threshold.
+        // `total_active_joining` for an allocated shard already
+        // includes us, so `<= HALT_RISK_PROVER_COUNT` means we and at
+        // most HALT_RISK_PROVER_COUNT-1 others are holding the shard
+        // up. Leaving makes the halt risk immediately worse. Mirrors
+        // the join-time priority in `plan_and_allocate` and the
+        // confirm-time bypass in `decide_joins`.
+        .filter(|sc| {
+            let d = &allocated_shards[sc.idx];
+            !(d.size > 0 && d.total_active_joining <= HALT_RISK_PROVER_COUNT)
+        })
         .filter(|sc| sc.score < threshold)
         .map(|sc| (allocated_shards[sc.idx].filter.clone(), sc.score.clone()))
         .collect();
@@ -640,11 +652,17 @@ pub fn decide_leaves(
     let basis = pomw_basis(difficulty, world_bytes.try_into().unwrap_or(1), units);
     let scores = score_shards(shards, &basis, world_bytes, strategy);
 
+    // Two indexes by hex-filter, matching `decide_joins`:
+    // - `by_hex`: score, for the threshold comparison
+    // - `desc_by_hex`: descriptor, for the halt-risk bypass below
     let mut by_hex: HashMap<String, BigInt> = HashMap::new();
+    let mut desc_by_hex: HashMap<String, &ShardDescriptor> = HashMap::new();
     let mut best_score: Option<BigInt> = None;
     for sc in &scores {
-        let key = hex::encode(&shards[sc.idx].filter);
-        by_hex.insert(key, sc.score.clone());
+        let d = &shards[sc.idx];
+        let key = hex::encode(&d.filter);
+        by_hex.insert(key.clone(), sc.score.clone());
+        desc_by_hex.insert(key, d);
         if best_score.as_ref().map_or(true, |b| sc.score > *b) {
             best_score = Some(sc.score.clone());
         }
@@ -677,7 +695,19 @@ pub fn decide_leaves(
         match by_hex.get(&key) {
             None => confirm.push(p.clone()),
             Some(score) => {
-                if *score >= threshold {
+                // Halt-risk bypass: reject (stay on shard) when the
+                // pending leave targets a halt-risk shard. Catches
+                // pending leaves left over from before the bypass was
+                // deployed, plus any manual leave the operator queued
+                // for a shard the network has since become dependent
+                // on. Symmetric with the join-side bypasses in
+                // `plan_and_allocate` and `decide_joins`.
+                let is_halt_risk = desc_by_hex
+                    .get(&key)
+                    .map(|d| d.size > 0 && d.total_active_joining <= HALT_RISK_PROVER_COUNT)
+                    .unwrap_or(false);
+
+                if is_halt_risk || *score >= threshold {
                     reject.push(p.clone());
                 } else {
                     confirm.push(p.clone());
@@ -1298,6 +1328,56 @@ mod tests {
         assert_eq!(filters[0], vec![0xA2], "worst shard (ring 4) should be first");
     }
 
+    /// Halt-risk allocated shard MUST NOT be picked as a leave
+    /// candidate even when its score sits below the 67% threshold —
+    /// mirrors `decide_joins`' confirm-side bypass to keep the
+    /// lifecycle coherent across propose/confirm/leave/decide_leave.
+    #[test]
+    fn plan_leaves_skips_halt_risk() {
+        let allocated = vec![
+            ShardDescriptor {
+                filter: vec![0xAA],
+                size: 5_000,
+                ring: 3,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 2, // ← halt-risk
+            },
+        ];
+        let unallocated = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
+        let filters = plan_leaves(
+            &allocated, &unallocated, 50000, &BigInt::from(600_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy,
+        );
+        assert!(filters.is_empty(),
+            "halt-risk allocated shard must not be a leave candidate; got {filters:?}");
+    }
+
+    /// plan_leaves DOES leave a non-halt-risk shard even when a
+    /// halt-risk allocated is present — bypass is per-shard, not
+    /// blanket-disabling.
+    #[test]
+    fn plan_leaves_leaves_non_halt_risk_when_halt_risk_present() {
+        let allocated = vec![
+            ShardDescriptor {
+                filter: vec![0xAA],
+                size: 5_000,
+                ring: 3,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 2, // halt-risk: protected
+            },
+            make_shard(vec![0xBB], 30_000, 4, 1), // non-halt-risk, low score
+        ];
+        let unallocated = vec![make_shard(vec![0xCC], 500_000, 0, 1)];
+        let filters = plan_leaves(
+            &allocated, &unallocated, 50000, &BigInt::from(600_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy,
+        );
+        assert_eq!(filters, vec![vec![0xBB]],
+            "non-halt-risk poor performer should still be a leave candidate");
+    }
+
     #[test]
     fn decide_leaves_confirm_when_still_bad() {
         let shards = vec![
@@ -1367,6 +1447,34 @@ mod tests {
             "aa should be rejected (shard improved), got reject={reject_hex:?} confirm={confirm_hex:?}");
         assert!(confirm_hex.contains(&"bb".to_string()),
             "bb should be confirmed (still bad), got reject={reject_hex:?} confirm={confirm_hex:?}");
+    }
+
+    /// Pending leave on a halt-risk shard gets REJECTED (stay) even
+    /// when the shard's score sits below the 67% threshold. Handles
+    /// the case where a pending leave was queued before the halt-risk
+    /// bypass was deployed, or where the operator manually triggered
+    /// a leave for a shard the network has since become dependent on.
+    #[test]
+    fn decide_leaves_rejects_halt_risk_pending() {
+        let shards = vec![
+            ShardDescriptor {
+                filter: vec![0xAA],
+                size: 5_000,
+                ring: 3,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 2, // ← halt-risk
+            },
+            make_shard(vec![0xBB], 500_000, 0, 1),
+        ];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_leaves(
+            &shards, &pending, 50000, &BigInt::from(600_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy,
+        );
+        assert_eq!(reject, vec![vec![0xAA]],
+            "halt-risk pending leave must be rejected (stay); got confirm={confirm:?}");
+        assert!(confirm.is_empty());
     }
 
     #[test]

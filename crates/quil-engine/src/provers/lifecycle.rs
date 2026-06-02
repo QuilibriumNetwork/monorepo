@@ -656,13 +656,29 @@ impl ProverLifecycle {
             .collect();
 
         if picks.len() < surplus {
+            // Build the exclusion set: manually-managed pins + any
+            // shard at or below the halt-risk prover threshold. The
+            // halt-risk skip is symmetric with the bypasses in
+            // `plan_and_allocate`, `decide_joins`, `decide_leaves`,
+            // and `plan_leaves` — shedding a halt-risk allocation
+            // under capacity pressure would immediately worsen the
+            // network's exposure on that shard. Operators dealing
+            // with chronic capacity pressure should reduce worker
+            // count or add manual pins, not auto-shed halt-risk
+            // shards.
+            let mut excluded = mm_filters.clone();
+            for d in allocated_descriptors {
+                if d.size > 0 && d.total_active_joining <= proposer::HALT_RISK_PROVER_COUNT {
+                    excluded.insert(d.filter.clone());
+                }
+            }
             let ranked = proposer::rank_allocated_by_score_ascending(
                 allocated_descriptors,
                 difficulty,
                 world_bytes,
                 self.units,
                 self.strategy,
-                &mm_filters,
+                &excluded,
             );
             // Lowest-scoring `surplus - orphan_count` auto-bound. A
             // filter that's `Active` but absent from `allocated_descriptors`
