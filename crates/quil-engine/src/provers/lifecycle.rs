@@ -668,7 +668,7 @@ impl ProverLifecycle {
             // shards.
             let mut excluded = mm_filters.clone();
             for d in allocated_descriptors {
-                if d.size > 0 && d.total_active_joining <= proposer::HALT_RISK_PROVER_COUNT {
+                if d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT {
                     excluded.insert(d.filter.clone());
                 }
             }
@@ -1067,7 +1067,7 @@ impl ProverLifecycle {
             let proposal_halt_risk = proposal_descriptors
                 .iter()
                 .filter(|d| d.size > 0
-                    && d.total_active_joining <= proposer::HALT_RISK_PROVER_COUNT)
+                    && d.active_count <= proposer::HALT_RISK_PROVER_COUNT)
                 .count();
             let our_halt_risk = summaries
                 .iter()
@@ -1076,8 +1076,7 @@ impl ProverLifecycle {
                     let raw_size = shard_sizes_snapshot.get(&s.filter).copied().unwrap_or(0);
                     if raw_size == 0 { return false; }
                     let active = s.status_counts.get(&ProverStatus::Active).copied().unwrap_or(0);
-                    let joining = s.status_counts.get(&ProverStatus::Joining).copied().unwrap_or(0);
-                    (active + joining) as u64 <= proposer::HALT_RISK_PROVER_COUNT
+                    active as u64 <= proposer::HALT_RISK_PROVER_COUNT
                 })
                 .count();
             let no_size_count = summaries
@@ -1537,6 +1536,7 @@ fn build_proposal_descriptors(
             shards: 1,
             active_on_ring: ri.active_on_joiner_ring,
             total_active_joining: total as u64,
+            active_count: active as u64,
         });
         seen.insert(s.filter.clone());
     }
@@ -1571,6 +1571,7 @@ fn build_proposal_descriptors(
             // 0 active+joining → halt-risk-eligible. The proposer's
             // bucket-by-halt-risk pass picks these first.
             total_active_joining: 0,
+            active_count: 0,
         });
     }
     out
@@ -1610,6 +1611,7 @@ fn build_decide_descriptors(
             shards: 1,
             active_on_ring: ri.active_on_current_ring,
             total_active_joining: total as u64,
+            active_count: active as u64,
         })
     }).collect()
 }

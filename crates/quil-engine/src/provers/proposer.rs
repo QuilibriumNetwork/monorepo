@@ -43,12 +43,23 @@ pub struct ShardDescriptor {
     /// Number of provers sharing this ring (including joiner if applicable).
     pub active_on_ring: u64,
     /// Total Active+Joining provers on the shard (independent of
-    /// ring assignment). Used for halt-risk prioritization in
-    /// `plan_and_allocate`: shards at or below
-    /// `HALT_RISK_PROVER_COUNT` are picked before any reward-greedy
-    /// candidate, since losing a prover from such a shard halts the
-    /// network and zeroes everyone's reward.
+    /// ring assignment). Used for **ring math** (joiner-ring
+    /// computation in `compute_shard_ring_info`) — NOT for
+    /// halt-risk classification. Use `active_count` for that.
     pub total_active_joining: u64,
+    /// Active-only prover count on the shard. Used for halt-risk
+    /// prioritization in `plan_and_allocate`, the confirm/leave
+    /// bypasses in `decide_joins`/`plan_leaves`/`decide_leaves`,
+    /// and `select_excess_active_filters`'s halt-risk exclusion.
+    ///
+    /// Joining provers MUST NOT count for halt-risk: they haven't
+    /// proven anything yet, and most pending joins on a small shard
+    /// get auto-rejected at the 67% threshold before reaching
+    /// Active. Counting them as coverage masked real halt-risk
+    /// shards in the wild (observed 2026-06-02: 107 shards with
+    /// `active ≤ 3 && size > 0` were invisible to the halt-risk
+    /// bucket because joiners pushed `active+joining` above 3).
+    pub active_count: u64,
 }
 
 /// Provers-per-shard ceiling that classifies a shard as halt-risk.
@@ -329,7 +340,7 @@ pub fn plan_and_allocate(
     let mut other: Vec<Scored> = Vec::new();
     for s in scores {
         let d = &shards[s.idx];
-        if d.size > 0 && d.total_active_joining <= HALT_RISK_PROVER_COUNT {
+        if d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT {
             halt_risk.push(s);
         } else {
             other.push(s);
@@ -343,9 +354,10 @@ pub fn plan_and_allocate(
         .map(|s| {
             let d = &shards[s.idx];
             format!(
-                "{}:provers={},size={}",
+                "{}:active={},joining={},size={}",
                 hex::encode(&d.filter),
-                d.total_active_joining,
+                d.active_count,
+                d.total_active_joining.saturating_sub(d.active_count),
                 d.size,
             )
         })
@@ -388,7 +400,7 @@ pub fn plan_and_allocate(
             let d = shards
                 .iter()
                 .find(|s| s.filter == p.filter);
-            matches!(d, Some(d) if d.size > 0 && d.total_active_joining <= HALT_RISK_PROVER_COUNT)
+            matches!(d, Some(d) if d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
         })
         .count();
     let picks_summary: Vec<String> = proposals
@@ -398,7 +410,7 @@ pub fn plan_and_allocate(
                 .iter()
                 .any(|s| s.filter == p.filter
                     && s.size > 0
-                    && s.total_active_joining <= HALT_RISK_PROVER_COUNT);
+                    && s.active_count <= HALT_RISK_PROVER_COUNT);
             format!(
                 "core={}:filter={}{}",
                 p.worker_id,
@@ -512,7 +524,7 @@ pub fn decide_joins(
                 // by operator (caheart).
                 let is_halt_risk = desc_by_hex
                     .get(&key)
-                    .map(|d| d.size > 0 && d.total_active_joining <= HALT_RISK_PROVER_COUNT)
+                    .map(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
                     .unwrap_or(false);
 
                 if is_halt_risk || *score >= threshold {
@@ -574,16 +586,18 @@ pub fn plan_leaves(
     let mut candidates: Vec<(Vec<u8>, BigInt)> = alloc_scores
         .iter()
         // Halt-risk bypass: never propose a leave for a shard with
-        // size > 0 that's at or below the halt-risk prover threshold.
-        // `total_active_joining` for an allocated shard already
-        // includes us, so `<= HALT_RISK_PROVER_COUNT` means we and at
-        // most HALT_RISK_PROVER_COUNT-1 others are holding the shard
-        // up. Leaving makes the halt risk immediately worse. Mirrors
-        // the join-time priority in `plan_and_allocate` and the
-        // confirm-time bypass in `decide_joins`.
+        // size > 0 whose Active prover count is at or below the
+        // halt-risk threshold. `active_count` already includes us
+        // (we're Active on this shard), so `<= HALT_RISK_PROVER_COUNT`
+        // means we and at most HALT_RISK_PROVER_COUNT-1 others are
+        // holding the shard up. Leaving makes the halt risk
+        // immediately worse. Mirrors the join-time priority in
+        // `plan_and_allocate` and the confirm-time bypass in
+        // `decide_joins`. Joining provers are intentionally NOT
+        // counted — they haven't proven anything yet.
         .filter(|sc| {
             let d = &allocated_shards[sc.idx];
-            !(d.size > 0 && d.total_active_joining <= HALT_RISK_PROVER_COUNT)
+            !(d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
         })
         .filter(|sc| sc.score < threshold)
         .map(|sc| (allocated_shards[sc.idx].filter.clone(), sc.score.clone()))
@@ -704,7 +718,7 @@ pub fn decide_leaves(
                 // `plan_and_allocate` and `decide_joins`.
                 let is_halt_risk = desc_by_hex
                     .get(&key)
-                    .map(|d| d.size > 0 && d.total_active_joining <= HALT_RISK_PROVER_COUNT)
+                    .map(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
                     .unwrap_or(false);
 
                 if is_halt_risk || *score >= threshold {
@@ -791,8 +805,8 @@ mod tests {
     #[test]
     fn score_data_greedy_by_size() {
         let shards = vec![
-            ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16 },
-            ShardDescriptor { filter: vec![2], size: 200, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16 },
+            ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16, active_count: 16 },
+            ShardDescriptor { filter: vec![2], size: 200, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16, active_count: 16 },
         ];
         let scores = score_shards(
             &shards,
@@ -826,7 +840,7 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 16,
-        };
+            active_count: 16,        };
         let small_low_ring = ShardDescriptor {
             filter: vec![0xBB],
             size: 10_000,
@@ -834,7 +848,7 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 16,
-        };
+            active_count: 16,        };
         let shards = vec![big_high_ring, small_low_ring];
         let basis = BigInt::from(1u64) << 50;
         let world_bytes = BigInt::from(1u64) << 30;
@@ -878,7 +892,7 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 16,
-        };
+            active_count: 16,        };
         let small = ShardDescriptor {
             filter: vec![0xBB],
             size: 10_000,
@@ -886,7 +900,7 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 16,
-        };
+            active_count: 16,        };
         let shards = vec![big, small];
         let basis = BigInt::from(1u64) << 50;
         let world_bytes = BigInt::from(1u64) << 30;
@@ -924,14 +938,15 @@ mod tests {
     #[test]
     fn plan_leaves_empty_when_no_unallocated() {
         let allocated = vec![
-            ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16 },
+            ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16, active_count: 16 },
         ];
         let result = plan_leaves(&allocated, &[], 50000, &BigInt::from(1_000_000), DEFAULT_UNITS, Strategy::RewardGreedy);
         assert!(result.is_empty());
     }
 
     fn make_shard(filter: Vec<u8>, size: u64, ring: u8, shards: u64) -> ShardDescriptor {
-        // Default `total_active_joining` = 16 so the shard is NOT
+        // Default `total_active_joining` and `active_count` = 16 so
+        // the shard is NOT
         // halt-risk in tests that don't care about that bucket.
         ShardDescriptor {
             filter,
@@ -940,6 +955,7 @@ mod tests {
             shards,
             active_on_ring: 1,
             total_active_joining: 16,
+            active_count: 16,
         }
     }
 
@@ -955,7 +971,7 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 8,
-        };
+            active_count: 8,        };
         let halt_risk = ShardDescriptor {
             filter: vec![2],
             size: 1_000_000,
@@ -963,7 +979,7 @@ mod tests {
             shards: 1,
             active_on_ring: 4,
             total_active_joining: 3,
-        };
+            active_count: 3,        };
         let result = plan_and_allocate(
             &[healthy, halt_risk],
             50_000,
@@ -989,7 +1005,7 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 8,
-        };
+            active_count: 8,        };
         let halt_a = ShardDescriptor {
             filter: vec![1],
             size: 500_000,
@@ -997,7 +1013,7 @@ mod tests {
             shards: 1,
             active_on_ring: 2,
             total_active_joining: 1,
-        };
+            active_count: 1,        };
         let halt_b = ShardDescriptor {
             filter: vec![2],
             size: 700_000,
@@ -1005,7 +1021,7 @@ mod tests {
             shards: 1,
             active_on_ring: 3,
             total_active_joining: 2,
-        };
+            active_count: 2,        };
         let result = plan_and_allocate(
             &[healthy, halt_a, halt_b],
             50_000,
@@ -1038,7 +1054,7 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 1,
-        };
+            active_count: 1,        };
         let normal = ShardDescriptor {
             filter: vec![2],
             size: 100_000,
@@ -1046,7 +1062,7 @@ mod tests {
             shards: 1,
             active_on_ring: 1,
             total_active_joining: 16,
-        };
+            active_count: 16,        };
         let result = plan_and_allocate(
             &[zero_halt, normal],
             50_000,
@@ -1209,6 +1225,50 @@ mod tests {
         assert_eq!(confirm_max.len(), 3);
     }
 
+    /// Joining provers do NOT count toward halt-risk classification.
+    /// A shard with `active=2, joining=10` (12 total) is still halt-risk
+    /// because joiners haven't confirmed and may not — coverage is
+    /// `active` only. Catches the 2026-06-02 regression where 107
+    /// real halt-risk shards on mainnet were invisible to
+    /// `plan_and_allocate` because pending joins masked the low active
+    /// count.
+    #[test]
+    fn plan_and_allocate_treats_active_only_as_halt_risk_metric() {
+        // `total_active_joining` = 12 (high), `active_count` = 2 (low).
+        // Under the old `total_active_joining`-based check this would
+        // NOT be halt-risk; with `active_count` it IS.
+        let crowded_joiners_few_active = ShardDescriptor {
+            filter: vec![0xAA],
+            size: 1_000_000,
+            ring: 1,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 12,
+            active_count: 2, // ← halt-risk
+        };
+        let healthy = ShardDescriptor {
+            filter: vec![0xBB],
+            size: 10_000_000,
+            ring: 1,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 8,
+            active_count: 8,
+        };
+        let result = plan_and_allocate(
+            &[healthy, crowded_joiners_few_active],
+            50_000,
+            &BigInt::from(20_000_000u64),
+            DEFAULT_UNITS,
+            &[1],
+            1,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].filter, vec![0xAA],
+            "shard with active=2 (despite joining=10) must be picked as halt-risk");
+    }
+
     /// Halt-risk pending shard with score below the 67% threshold is
     /// CONFIRMED, not rejected. Mirrors `plan_and_allocate`'s halt-risk
     /// priority so the propose→confirm pipeline stays coherent.
@@ -1224,6 +1284,7 @@ mod tests {
                 shards: 1,
                 active_on_ring: 1,
                 total_active_joining: 2, // ← halt-risk (≤ HALT_RISK_PROVER_COUNT)
+                active_count: 2,
             },
             ShardDescriptor {
                 filter: vec![0xBB],
@@ -1232,7 +1293,7 @@ mod tests {
                 shards: 1,
                 active_on_ring: 1,
                 total_active_joining: 16,
-            },
+                active_count: 16,            },
         ];
         let pending = vec![vec![0xAA]];
         let (reject, confirm) = decide_joins(
@@ -1257,6 +1318,7 @@ mod tests {
                 shards: 1,
                 active_on_ring: 1,
                 total_active_joining: 2, // halt-risk by count
+                active_count: 2,
             },
             ShardDescriptor {
                 filter: vec![0xBB],
@@ -1265,7 +1327,7 @@ mod tests {
                 shards: 1,
                 active_on_ring: 1,
                 total_active_joining: 16,
-            },
+                active_count: 16,            },
         ];
         let pending = vec![vec![0xAA]];
         let (reject, confirm) = decide_joins(
@@ -1342,6 +1404,7 @@ mod tests {
                 shards: 1,
                 active_on_ring: 1,
                 total_active_joining: 2, // ← halt-risk
+                active_count: 2,
             },
         ];
         let unallocated = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
@@ -1366,6 +1429,7 @@ mod tests {
                 shards: 1,
                 active_on_ring: 1,
                 total_active_joining: 2, // halt-risk: protected
+                active_count: 2,
             },
             make_shard(vec![0xBB], 30_000, 4, 1), // non-halt-risk, low score
         ];
@@ -1464,6 +1528,7 @@ mod tests {
                 shards: 1,
                 active_on_ring: 1,
                 total_active_joining: 2, // ← halt-risk
+                active_count: 2,
             },
             make_shard(vec![0xBB], 500_000, 0, 1),
         ];
