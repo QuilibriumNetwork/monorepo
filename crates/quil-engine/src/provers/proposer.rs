@@ -581,6 +581,18 @@ pub fn plan_leaves(
     // Leave threshold = best_unalloc * 67 / 100
     let threshold = &best_unalloc * BigInt::from(67) / BigInt::from(100);
 
+    // When any unallocated shard is halt-risk, the 67% score threshold
+    // is superseded: even a competitively-scoring active is worth
+    // shedding to free a worker slot so the propose path can grab the
+    // halt-risk shard. Otherwise a node fully bound to healthy shards
+    // (active_count == worker_count) wedges — `allow_proposals` is
+    // false (no free workers), `plan_leaves`' threshold protects every
+    // holding, and halt-risk shards stay uncovered. The protection on
+    // halt-risk holdings (above) still applies — we only shed
+    // non-halt-risk actives.
+    let halt_risk_in_unalloc = unallocated_shards.iter()
+        .any(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT);
+
     let alloc_scores = score_shards(allocated_shards, &basis, world_bytes, strategy);
 
     let mut candidates: Vec<(Vec<u8>, BigInt)> = alloc_scores
@@ -599,7 +611,7 @@ pub fn plan_leaves(
             let d = &allocated_shards[sc.idx];
             !(d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
         })
-        .filter(|sc| sc.score < threshold)
+        .filter(|sc| halt_risk_in_unalloc || sc.score < threshold)
         .map(|sc| (allocated_shards[sc.idx].filter.clone(), sc.score.clone()))
         .collect();
 
@@ -626,11 +638,12 @@ pub fn plan_leaves(
             unallocated = unallocated_shards.len(),
             best_unalloc_score = %best_unalloc.to_str_radix(10),
             threshold = %threshold.to_str_radix(10),
+            halt_risk_in_unalloc,
             below_threshold = candidates.len(),
             picked = picks.len(),
             ?picks_summary,
             strategy = ?strategy,
-            "plan_leaves: proposing score-driven leaves (allocated shards below 67% of best unallocated)"
+            "plan_leaves: proposing leaves (halt-risk override or below 67% of best unallocated)"
         );
     }
 
@@ -1414,6 +1427,72 @@ mod tests {
         );
         assert!(filters.is_empty(),
             "halt-risk allocated shard must not be a leave candidate; got {filters:?}");
+    }
+
+    /// When ANY unallocated shard is halt-risk, the 67% score
+    /// threshold is bypassed and competitive non-halt-risk actives
+    /// become leave candidates. Otherwise a node bound to healthy
+    /// shards wedges — no free worker, threshold protects every
+    /// holding, halt-risk shards stay uncovered. The halt-risk
+    /// protection on allocated shards still applies.
+    #[test]
+    fn plan_leaves_supersedes_threshold_when_unallocated_halt_risk_exists() {
+        let allocated = vec![
+            make_shard(vec![0xA1], 100_000, 0, 1),
+            make_shard(vec![0xA2], 100_000, 0, 1),
+        ];
+        // Halt-risk unallocated: active_count <= HALT_RISK_PROVER_COUNT (3).
+        let unallocated = vec![ShardDescriptor {
+            filter: vec![0xBB],
+            size: 90_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 2,
+            active_count: 2,
+        }];
+        let filters = plan_leaves(
+            &allocated, &unallocated, 50_000, &BigInt::from(300_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy,
+        );
+        assert!(!filters.is_empty(),
+            "halt-risk in unallocated must supersede the 67% threshold");
+    }
+
+    /// Held halt-risk actives stay protected even when the threshold
+    /// bypass triggers — bypass relaxes the score floor on non-halt-risk
+    /// actives, it doesn't unblock leaving halt-risk holdings.
+    #[test]
+    fn plan_leaves_bypass_still_protects_held_halt_risk() {
+        let allocated = vec![
+            // Held halt-risk — must be protected.
+            ShardDescriptor {
+                filter: vec![0xA1],
+                size: 5_000,
+                ring: 3,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 2,
+                active_count: 2,
+            },
+            // Healthy active — leave candidate under bypass.
+            make_shard(vec![0xA2], 100_000, 0, 1),
+        ];
+        let unallocated = vec![ShardDescriptor {
+            filter: vec![0xBB],
+            size: 90_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 2,
+            active_count: 2,
+        }];
+        let filters = plan_leaves(
+            &allocated, &unallocated, 50_000, &BigInt::from(300_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy,
+        );
+        assert_eq!(filters, vec![vec![0xA2]],
+            "bypass must shed healthy A2 but spare held halt-risk A1");
     }
 
     /// plan_leaves DOES leave a non-halt-risk shard even when a
