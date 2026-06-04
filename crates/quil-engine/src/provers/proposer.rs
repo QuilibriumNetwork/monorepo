@@ -597,19 +597,21 @@ pub fn plan_leaves(
 
     let mut candidates: Vec<(Vec<u8>, BigInt)> = alloc_scores
         .iter()
-        // Halt-risk bypass: never propose a leave for a shard with
-        // size > 0 whose Active prover count is at or below the
-        // halt-risk threshold. `active_count` already includes us
-        // (we're Active on this shard), so `<= HALT_RISK_PROVER_COUNT`
-        // means we and at most HALT_RISK_PROVER_COUNT-1 others are
-        // holding the shard up. Leaving makes the halt risk
-        // immediately worse. Mirrors the join-time priority in
-        // `plan_and_allocate` and the confirm-time bypass in
-        // `decide_joins`. Joining provers are intentionally NOT
-        // counted — they haven't proven anything yet.
+        // Halt-risk bypass: never propose a leave when the shard is
+        // already halt-risk OR our departure would push it into halt
+        // risk. `active_count` already includes us (we're Active on
+        // this shard); after we leave it drops by 1, so the post-
+        // leave Active count is `active_count - 1`. To keep
+        // `post_leave > HALT_RISK_PROVER_COUNT` we need
+        // `active_count > HALT_RISK_PROVER_COUNT + 1` — i.e. skip
+        // any shard at or below `HALT_RISK_PROVER_COUNT + 1`.
+        // Mirrors the join-time priority in `plan_and_allocate`
+        // and the confirm-time bypass in `decide_joins`. Joining
+        // provers are intentionally NOT counted — they haven't
+        // proven anything yet.
         .filter(|sc| {
             let d = &allocated_shards[sc.idx];
-            !(d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
+            !(d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT + 1)
         })
         .filter(|sc| halt_risk_in_unalloc || sc.score < threshold)
         .map(|sc| (allocated_shards[sc.idx].filter.clone(), sc.score.clone()))
@@ -723,15 +725,17 @@ pub fn decide_leaves(
             None => confirm.push(p.clone()),
             Some(score) => {
                 // Halt-risk bypass: reject (stay on shard) when the
-                // pending leave targets a halt-risk shard. Catches
-                // pending leaves left over from before the bypass was
-                // deployed, plus any manual leave the operator queued
-                // for a shard the network has since become dependent
-                // on. Symmetric with the join-side bypasses in
-                // `plan_and_allocate` and `decide_joins`.
+                // pending leave targets a halt-risk shard OR would
+                // push it into halt risk on confirm. `<=
+                // HALT_RISK_PROVER_COUNT + 1` matches `plan_leaves`
+                // and `select_excess_active_filters`: a Leaving
+                // prover is still contributing coverage to the shard
+                // until the leave is confirmed, so the effective
+                // safety margin we should preserve is one above the
+                // strict halt-risk floor.
                 let is_halt_risk = desc_by_hex
                     .get(&key)
-                    .map(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
+                    .map(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT + 1)
                     .unwrap_or(false);
 
                 if is_halt_risk || *score >= threshold {
@@ -1427,6 +1431,32 @@ mod tests {
         );
         assert!(filters.is_empty(),
             "halt-risk allocated shard must not be a leave candidate; got {filters:?}");
+    }
+
+    /// Leaving a shard with `active_count == HALT_RISK_PROVER_COUNT
+    /// + 1` would drop its Active count to `HALT_RISK_PROVER_COUNT`
+    /// = halt-risk. The protection extends one prover above the
+    /// threshold to forbid that transition.
+    #[test]
+    fn plan_leaves_skips_shard_one_above_halt_risk_threshold() {
+        let allocated = vec![ShardDescriptor {
+            filter: vec![0xAA],
+            size: 5_000,
+            ring: 3,
+            shards: 1,
+            active_on_ring: 1,
+            // Exactly HALT_RISK_PROVER_COUNT + 1 = 4. Leaving makes
+            // it halt-risk.
+            total_active_joining: HALT_RISK_PROVER_COUNT + 1,
+            active_count: HALT_RISK_PROVER_COUNT + 1,
+        }];
+        let unallocated = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
+        let filters = plan_leaves(
+            &allocated, &unallocated, 50_000, &BigInt::from(600_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy,
+        );
+        assert!(filters.is_empty(),
+            "shard at threshold+1 must be protected — leaving would push it into halt-risk");
     }
 
     /// When ANY unallocated shard is halt-risk, the 67% score
