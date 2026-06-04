@@ -174,6 +174,17 @@ pub(crate) async fn start(
         remote_worker_manager_for_halt,
     } = runtime_state::init(&mut sup, hg_store.clone(), shard_engines.clone());
 
+    // Lazy cell holding the prover-message transport. The transport
+    // itself is constructed later (it depends on the archive pool and
+    // mtls seed which are resolved further down), but worker_manager
+    // needs a stable handle now to wire up its publish paths.
+    // `set()` is called once the real transport is built.
+    let prover_message_transport_cell: Arc<
+        std::sync::OnceLock<
+            Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport>,
+        >,
+    > = Arc::new(std::sync::OnceLock::new());
+
     let worker_manager: Arc<dyn quil_engine::worker::WorkerManager> = worker_manager::init(
         &mut sup,
         worker_manager::WorkerManagerArgs {
@@ -196,6 +207,7 @@ pub(crate) async fn start(
             shard_engines: shard_engines.clone(),
             remote_worker_manager_for_halt: remote_worker_manager_for_halt.clone(),
             pi_worker_manager: pi_worker_manager.clone(),
+            prover_message_transport: prover_message_transport_cell.clone(),
             spawner: detached_spawner.clone(),
         },
     );
@@ -453,6 +465,13 @@ pub(crate) async fn start(
             ed448_seed: mtls_seed,
             publish_to_blossomsub: archive_mode,
         });
+
+    // Hand the freshly-built transport to the worker_manager so its
+    // coverage_publish closure and shard-finalize drain can route
+    // reward proofs through the gRPC archive fan-out instead of a
+    // direct BlossomSub publish on GLOBAL_PROVER (which fails on
+    // non-archive nodes — they don't subscribe to that bitmask).
+    let _ = prover_message_transport_cell.set(prover_message_transport.clone());
 
     let prover_pipeline = Arc::new(quil_engine::prover_pipeline::ProverPipeline {
         lifecycle: prover_lifecycle.clone(),

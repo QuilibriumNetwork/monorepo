@@ -359,7 +359,49 @@ impl WorkerAllocator {
 
         for worker in &workers {
             if worker.filter.is_empty() {
-                continue; // idle worker — nothing to reconcile
+                // Idle worker — but check for an expired pending-join
+                // marker. `submit_join` sets `pending_filter_frame`
+                // BEFORE the alloc lands in the registry (so the
+                // lifecycle's `free_auto()` won't re-pick the same
+                // worker mid-flight). If the join never lands
+                // (archive silently rejected the bundle, network
+                // drop, or the alloc-binding pass below didn't see
+                // a matching alloc within the 10-frame window), the
+                // marker would otherwise persist indefinitely and
+                // the worker stays excluded from `free_auto()` —
+                // wedging the entire lifecycle (no free workers →
+                // `allow_proposals = false` → no new ProposeJoin).
+                // Mirror the 10-frame `PROPOSAL_TIMEOUT_FRAMES`
+                // ceiling used below for filter-pinned-but-
+                // unallocated workers.
+                if worker.pending_filter_frame > 0
+                    && frame_number
+                        > worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES
+                {
+                    // Warn, not info — silent failures are exactly the
+                    // class of bug this telemetry needs to surface. A
+                    // submit_join returned Ok (no transport error
+                    // visible) but the alloc never showed up in the
+                    // registry within 10 frames, which means an
+                    // archive accepted the bundle and then dropped
+                    // it during materialization (typical causes:
+                    // stale frame_number on archive-side materialize,
+                    // BLS / VDF rejection, prover-state gate). The
+                    // operator can spot a string of these in the log
+                    // and dig in before the lifecycle's retry burns
+                    // more attempts.
+                    warn!(
+                        core_id = worker.core_id,
+                        pending_since = worker.pending_filter_frame,
+                        frames_elapsed = frame_number - worker.pending_filter_frame,
+                        "join submitted but no alloc landed in registry within 10 frames \
+                         — archive likely dropped the bundle silently"
+                    );
+                    let _ = self
+                        .worker_manager
+                        .set_pending_filter_frame(worker.core_id, 0);
+                }
+                continue;
             }
 
             match alloc_by_filter.get(&worker.filter) {

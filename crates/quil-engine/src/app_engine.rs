@@ -1939,7 +1939,28 @@ impl AppConsensusEngine {
                 // `GLOBAL_PROVER`. Re-loading from the clock store
                 // would require shard-frame persistence that hasn't
                 // happened yet at this point in the pipeline.
-                if let Some(bytes) = canonical_header_bytes {
+                //
+                // Coverage-halt gate: even though `handle_consensus_message`
+                // drops new incoming messages while halted, the biased
+                // `tokio::select!` polls `consensus_event_rx` BEFORE
+                // `msg_rx`, so any consensus event queued from votes
+                // processed pre-halt will still arrive here for a window
+                // after `SetHalted(true)` lands. We keep the local
+                // clock-store commit (so the forks tree stays consistent
+                // with the network's view) but drop the externally-visible
+                // emissions: no `ShardFrameFinalized` to the drain (which
+                // would publish a reward proof on `GLOBAL_PROVER`), and
+                // the follower's `coverage_publish` closure has a mirror
+                // halt check so its synchronous publish path is also
+                // suppressed.
+                let halted = self.halted.load(std::sync::atomic::Ordering::Relaxed);
+                if halted {
+                    debug!(
+                        core_id = self.core_id,
+                        frame = frame_number,
+                        "suppressing ShardFrameFinalized emit — coverage halt active",
+                    );
+                } else if let Some(bytes) = canonical_header_bytes {
                     let _ = self
                         .event_tx
                         .send(AppEngineEvent::ShardFrameFinalized {

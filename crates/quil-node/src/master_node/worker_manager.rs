@@ -30,6 +30,20 @@ pub(crate) struct WorkerManagerArgs {
     pub remote_worker_manager_for_halt:
         Arc<std::sync::OnceLock<Arc<quil_engine::remote_worker::RemoteWorkerManager>>>,
     pub pi_worker_manager: Arc<std::sync::OnceLock<Arc<dyn quil_engine::worker::WorkerManager>>>,
+    /// Prover-message transport. Populated by master_node init after
+    /// worker_manager comes up (transport depends on archive_pool +
+    /// mtls_seed which are constructed later in the boot sequence).
+    /// Used to publish reward-proof finalizations and coverage updates;
+    /// on non-archive nodes a direct BlossomSub publish to
+    /// `GLOBAL_PROVER` fails ("not subscribed to bitmask") because the
+    /// node deliberately skips that subscription — Rust's BlossomSub
+    /// has no fanout path like Go's. The transport's gRPC archive
+    /// fan-out is the substitute delivery channel.
+    pub prover_message_transport: Arc<
+        std::sync::OnceLock<
+            Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport>,
+        >,
+    >,
     pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
 }
 
@@ -57,6 +71,7 @@ pub(crate) fn init(
         shard_engines,
         remote_worker_manager_for_halt,
         pi_worker_manager,
+        prover_message_transport,
         spawner,
     } = args;
 
@@ -106,13 +121,29 @@ pub(crate) fn init(
             thread_mgr.set_worker_store(worker_store);
             // Closure invoked by AppFollower from inside the consensus
             // event loop: wraps a finalized FrameHeader (canonical
-            // bytes) in a `MessageBundle{Shard: header}` and publishes
-            // on `GLOBAL_PROVER`. Spawning the actual publish keeps the
-            // call non-blocking from the consensus side.
-            let coverage_p2p = p2p_handle.clone();
+            // bytes) in a `MessageBundle{Shard: header}` and ships it
+            // out through the prover-message transport (gRPC archive
+            // fan-out, plus BlossomSub publish on archive nodes that
+            // subscribe to `GLOBAL_PROVER`). Spawning the work keeps
+            // the call non-blocking from the consensus side.
             let coverage_spawner = spawner.clone();
+            let coverage_transport_cell = prover_message_transport.clone();
+            let coverage_halt = halt_state.clone();
             let coverage_publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> =
                 Arc::new(move |header_canonical_bytes: Vec<u8>| {
+                    // Belt-and-suspenders halt gate: the engine's
+                    // `handle_consensus_event::Finalized` arm already
+                    // skips the ShardFrameFinalized emission during
+                    // halt, but `coverage_publish` fires earlier
+                    // (inside the follower's `report_committed`) on a
+                    // separate path, before that gate runs. Drop the
+                    // publish here too so no reward proof escapes
+                    // for shard work that shouldn't have produced
+                    // anything during the halt window.
+                    if coverage_halt.any_halted() {
+                        debug!("suppressing coverage publish — coverage halt active");
+                        return;
+                    }
                     let req = match quil_execution::message_envelope::CanonicalMessageRequest::wrap(
                         header_canonical_bytes,
                     ) {
@@ -132,16 +163,23 @@ pub(crate) fn init(
                     };
                     match bundle.to_canonical_bytes() {
                         Ok(bytes) => {
-                            let p2p = coverage_p2p.clone();
+                            let cell = coverage_transport_cell.clone();
                             coverage_spawner.detach("coverage-publish", async move {
-                                if let Err(e) = p2p
-                                    .publish(
-                                        quil_engine::bitmasks::GLOBAL_PROVER.to_vec(),
-                                        bytes,
-                                    )
-                                    .await
-                                {
-                                    warn!(error = %e, "coverage publish: GLOBAL_PROVER publish failed");
+                                match cell.get() {
+                                    Some(transport) => {
+                                        if let Err(e) = transport
+                                            .publish_prover_bundle(bytes)
+                                            .await
+                                        {
+                                            warn!(error = %e,
+                                                "coverage publish: transport submission failed");
+                                        }
+                                    }
+                                    None => {
+                                        warn!(
+                                            "coverage publish: transport not yet wired — dropping"
+                                        );
+                                    }
                                 }
                                 Ok(())
                             });
@@ -298,6 +336,7 @@ pub(crate) fn init(
                 let drain_shard_engines = shard_engines.clone();
                 let drain_halt = halt_state.clone();
                 let drain_spawner = spawner.clone();
+                let drain_transport_cell = prover_message_transport.clone();
                 sup.run_until_cancelled("worker-master-drain", move |_token| async move {
                     loop {
                         let Some(event) = master_rx.recv().await else { break };
@@ -368,18 +407,26 @@ pub(crate) fn init(
                                         };
                                         match bundle.to_canonical_bytes() {
                                             Ok(bytes) => {
-                                                let p2p = drain_p2p.clone();
+                                                let cell = drain_transport_cell.clone();
                                                 let filter_owned = filter.clone();
                                                 drain_spawner.detach("shard-finalize-publish", async move {
-                                                    if let Err(e) = p2p
-                                                        .publish(
-                                                            quil_engine::bitmasks::GLOBAL_PROVER.to_vec(),
-                                                            bytes,
-                                                        )
-                                                        .await
-                                                    {
-                                                        warn!(core_id, filter = %hex::encode(&filter_owned),
-                                                            error = %e, "GLOBAL_PROVER publish failed");
+                                                    match cell.get() {
+                                                        Some(transport) => {
+                                                            if let Err(e) = transport
+                                                                .publish_prover_bundle(bytes)
+                                                                .await
+                                                            {
+                                                                warn!(core_id,
+                                                                    filter = %hex::encode(&filter_owned),
+                                                                    error = %e,
+                                                                    "shard finalize: transport submission failed");
+                                                            }
+                                                        }
+                                                        None => {
+                                                            warn!(core_id,
+                                                                filter = %hex::encode(&filter_owned),
+                                                                "shard finalize: transport not yet wired — dropping");
+                                                        }
                                                     }
                                                     Ok(())
                                                 });
