@@ -92,6 +92,10 @@ pub struct WorkerOnlyNode {
     local_bls_pubkey: Vec<u8>,
     bls_signer_factory: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync>,
     reward_greedy: bool,
+    /// Minimum Active prover count required before this worker's
+    /// `AppLeaderProvider` will produce frames. Mainnet=3, testnet=1.
+    /// See `AppLeaderProvider::min_active_provers_for_propose`.
+    min_active_provers_for_propose: u64,
     /// Per-worker hypergraph CRDT — required for state_roots.
     hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
     /// Per-worker execution manager — required for requests_root.
@@ -149,6 +153,7 @@ impl WorkerOnlyNode {
         local_bls_pubkey: Vec<u8>,
         bls_signer_factory: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync>,
         reward_greedy: bool,
+        min_active_provers_for_propose: u64,
     ) -> Self {
         let (engine_event_tx, engine_event_rx) = mpsc::unbounded_channel();
         Self {
@@ -163,6 +168,7 @@ impl WorkerOnlyNode {
             local_bls_pubkey,
             bls_signer_factory,
             reward_greedy,
+            min_active_provers_for_propose,
             hypergraph: None,
             execution_engine: None,
             inclusion_prover: None,
@@ -424,6 +430,7 @@ impl WorkerOnlyNode {
             local_bls_pubkey: self.local_bls_pubkey.clone(),
             bls_signer: (self.bls_signer_factory)(),
             reward_greedy: self.reward_greedy,
+            min_active_provers_for_propose: self.min_active_provers_for_propose,
             // Cluster-mode worker: master mediates GLOBAL_PROVER via
             // gRPC. App shard finalize → master path needs separate
             // wiring; leave None until that's ported.

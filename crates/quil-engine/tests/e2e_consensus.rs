@@ -1291,6 +1291,7 @@ impl AppShardHarness {
                 local_bls_pubkey: prover.bls_pubkey.clone(),
                 bls_signer: prover.signer_clone(),
                 reward_greedy: true,
+                min_active_provers_for_propose: 1,
                 coverage_publish,
                 hypergraph: None,
                 // Wire a minimal ExecutionEngineManager + InclusionProver
@@ -4080,6 +4081,7 @@ async fn tier2_composite_end_to_end() {
             local_bls_pubkey: joiner_for_engine.bls_pubkey.clone(),
             bls_signer: joiner_for_engine.signer_clone(),
             reward_greedy: true,
+            min_active_provers_for_propose: 1,
             coverage_publish,
             hypergraph: None,
             execution_engine: Some(Arc::new(build_test_exec_manager(
@@ -4355,6 +4357,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
             local_bls_pubkey: prover_for_spawn.bls_pubkey.clone(),
             bls_signer: prover_for_spawn.signer_clone(),
             reward_greedy: true,
+            min_active_provers_for_propose: 1,
             coverage_publish,
             hypergraph: None,
             execution_engine: Some(Arc::new(build_test_exec_manager(

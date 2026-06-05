@@ -819,6 +819,20 @@ impl GlobalIntrinsic {
                         |alloc_tree, fn_| {
                             // Check timing constraints first
                             verify::validate_confirm_timing(fn_, alloc_tree)?;
+
+                            // Halt-risk gate (leave-confirm only).
+                            // Extracted to a helper so the logic is
+                            // unit-testable. See `check_leave_confirm_halt_risk`.
+                            let current_status =
+                                read_field(alloc_tree, "allocation:ProverAllocation", "Status")
+                                    .and_then(|b| b.first().copied())
+                                    .unwrap_or(0);
+                            check_leave_confirm_halt_risk(
+                                filter,
+                                current_status,
+                                self.prover_registry.as_deref(),
+                            )?;
+
                             materialize::materialize_prover_confirm(alloc_tree, fn_)
                         },
                     )?;
@@ -1756,6 +1770,60 @@ fn ed448_pubkey_to_peer_id_string(pubkey: &[u8]) -> String {
     bs58::encode(&multihash).into_string()
 }
 
+/// Halt-risk gate for `ProverLeaveConfirm`. The lifecycle's
+/// `decide_leaves` is the honest-prover defense; this is the
+/// last-line materializer gate that catches a malicious node
+/// submitting `ProverLeaveConfirm` directly without going through
+/// its own lifecycle.
+///
+/// Only fires on the Leaving→Kicked path (i.e. a leave-confirm).
+/// Join-confirms (Joining→Active) and any other transition are
+/// allowed unconditionally.
+///
+/// At leave-confirm time our own alloc is already in Leaving
+/// status, so `get_active_provers(filter)` returns OTHER active
+/// provers on the shard — confirming our leave moves us
+/// Leaving→Kicked, which doesn't change that count. The check is
+/// therefore "after this confirm, will the shard have enough Active
+/// margin?" If the count is at or below `HALT_RISK_PROVER_COUNT + 1`
+/// the shard is at or one prover above halt-risk; rejecting the
+/// confirm preserves our pending Leaving alloc, which either gets
+/// rejected by `decide_leaves` (returning us to Active) or
+/// auto-expires after the 720-frame grace.
+///
+/// `registry` is optional so test paths and intrinsic configurations
+/// that don't install one still work — without a registry there's no
+/// way to count and the gate degrades open (`Ok(())`). Production
+/// always wires the registry via `with_frame_header_deps`.
+fn check_leave_confirm_halt_risk(
+    filter: &[u8],
+    current_alloc_status: u8,
+    registry: Option<&dyn quil_types::consensus::ProverRegistry>,
+) -> Result<()> {
+    // Only applies when we're confirming a leave. Join-confirms and
+    // any pathological status pass through.
+    if current_alloc_status != materialize::STATUS_LEAVING {
+        return Ok(());
+    }
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    let active_count = registry
+        .get_active_provers(filter)
+        .map(|p| p.len())
+        .unwrap_or(0);
+    if active_count <= materialize::HALT_RISK_PROVER_COUNT + 1 {
+        return Err(QuilError::InvalidArgument(format!(
+            "ProverLeaveConfirm rejected: shard {} would land at {} active provers \
+             (≤ halt-risk floor + 1 = {}); leave can re-attempt after coverage recovers",
+            hex::encode(filter),
+            active_count,
+            materialize::HALT_RISK_PROVER_COUNT + 1,
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1878,6 +1946,179 @@ mod tests {
     fn validate_rejects_short_input() {
         let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
         assert!(gi.validate(1, &[0, 0], None, None).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Leave-confirm halt-risk gate (`check_leave_confirm_halt_risk`).
+    // -----------------------------------------------------------------
+
+    /// Stub registry whose `get_active_provers` returns the configured
+    /// count for any filter. All other methods return empty.
+    struct ActiveCountRegistry {
+        count: usize,
+    }
+    impl quil_types::consensus::ProverRegistry for ActiveCountRegistry {
+        fn get_prover_info(
+            &self,
+            _: &[u8],
+        ) -> Result<Option<quil_types::consensus::ProverInfo>> {
+            Ok(None)
+        }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn get_ordered_provers(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+        ) -> Result<Vec<Vec<u8>>> {
+            Ok(Vec::new())
+        }
+        fn get_active_provers(
+            &self,
+            _: &[u8],
+        ) -> Result<Vec<quil_types::consensus::ProverInfo>> {
+            // Return `count` dummy ProverInfos — only the length is
+            // read by the gate.
+            Ok((0..self.count)
+                .map(|i| quil_types::consensus::ProverInfo {
+                    public_key: vec![i as u8; 585],
+                    address: vec![i as u8; 32],
+                    status: quil_types::consensus::ProverStatus::Active,
+                    kick_frame_number: 0,
+                    allocations: Vec::new(),
+                    available_storage: 0,
+                    seniority: 0,
+                    delegate_address: Vec::new(),
+                })
+                .collect())
+        }
+        fn get_prover_count(&self, _: &[u8]) -> Result<usize> {
+            Ok(self.count)
+        }
+        fn get_provers(
+            &self,
+            _: &[u8],
+        ) -> Result<Vec<quil_types::consensus::ProverInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_provers_by_status(
+            &self,
+            _: &[u8],
+            _: quil_types::consensus::ProverStatus,
+        ) -> Result<Vec<quil_types::consensus::ProverInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_prover_shard_summaries(
+            &self,
+            _: u64,
+        ) -> Result<Vec<quil_types::consensus::ProverShardSummary>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Join-confirm (status != Leaving) — gate is a no-op regardless
+    /// of the shard's active count.
+    #[test]
+    fn halt_risk_gate_ignores_join_confirms() {
+        let registry = ActiveCountRegistry { count: 0 };
+        // STATUS_JOINING: we'd never reject a join-confirm even on a
+        // shard with literally zero existing Actives — that's the
+        // only way a shard ever crosses the halt-risk floor upward.
+        let result = super::check_leave_confirm_halt_risk(
+            b"filterX",
+            materialize::STATUS_JOINING,
+            Some(&registry),
+        );
+        assert!(result.is_ok(), "join-confirm must pass: {:?}", result.err());
+    }
+
+    /// Leave-confirm on a healthy shard (active count well above
+    /// halt-risk + 1) — confirm allowed.
+    #[test]
+    fn halt_risk_gate_allows_leave_confirm_on_healthy_shard() {
+        // 10 Active others. Post-confirm: us Kicked, still 10 Active.
+        // Far above halt-risk floor.
+        let registry = ActiveCountRegistry { count: 10 };
+        let result = super::check_leave_confirm_halt_risk(
+            b"filterX",
+            materialize::STATUS_LEAVING,
+            Some(&registry),
+        );
+        assert!(result.is_ok(), "healthy shard leave-confirm must pass: {:?}", result.err());
+    }
+
+    /// Leave-confirm on a shard already at the halt-risk floor + 1
+    /// (4 Active others) — rejected. This is the boundary case the
+    /// `+ 1` is designed to catch: if a single additional prover ever
+    /// leaves, the shard drops to halt-risk; we don't want to be the
+    /// last confirm to remove the margin.
+    #[test]
+    fn halt_risk_gate_rejects_leave_confirm_at_floor_plus_one() {
+        let registry = ActiveCountRegistry {
+            count: materialize::HALT_RISK_PROVER_COUNT + 1, // = 4 on mainnet
+        };
+        let result = super::check_leave_confirm_halt_risk(
+            b"filterX",
+            materialize::STATUS_LEAVING,
+            Some(&registry),
+        );
+        assert!(result.is_err(),
+            "leave-confirm at floor+1 must be rejected, got {:?}", result);
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("halt-risk"),
+            "rejection message should mention halt-risk: {}", msg);
+    }
+
+    /// Leave-confirm on a shard already below halt-risk floor (0 or 3
+    /// Active others) — rejected. Same gate fires; the shard is
+    /// definitionally halt-risk.
+    #[test]
+    fn halt_risk_gate_rejects_leave_confirm_below_floor() {
+        for active_count in [0, 1, materialize::HALT_RISK_PROVER_COUNT] {
+            let registry = ActiveCountRegistry { count: active_count };
+            let result = super::check_leave_confirm_halt_risk(
+                b"filterX",
+                materialize::STATUS_LEAVING,
+                Some(&registry),
+            );
+            assert!(
+                result.is_err(),
+                "leave-confirm at active={} must be rejected, got {:?}",
+                active_count, result,
+            );
+        }
+    }
+
+    /// Leave-confirm just above floor+1 (5 Active others on mainnet)
+    /// — allowed. Confirms we're not over-rejecting healthy
+    /// boundary cases.
+    #[test]
+    fn halt_risk_gate_allows_leave_confirm_just_above_floor_plus_one() {
+        let registry = ActiveCountRegistry {
+            count: materialize::HALT_RISK_PROVER_COUNT + 2, // = 5 on mainnet
+        };
+        let result = super::check_leave_confirm_halt_risk(
+            b"filterX",
+            materialize::STATUS_LEAVING,
+            Some(&registry),
+        );
+        assert!(result.is_ok(),
+            "leave-confirm at floor+2 must pass: {:?}", result.err());
+    }
+
+    /// No registry installed — gate degrades open (returns Ok) so
+    /// test setups and intrinsic configurations that don't wire a
+    /// registry still work.
+    #[test]
+    fn halt_risk_gate_degrades_open_without_registry() {
+        let result = super::check_leave_confirm_halt_risk(
+            b"filterX",
+            materialize::STATUS_LEAVING,
+            None,
+        );
+        assert!(result.is_ok(),
+            "gate must degrade open when no registry: {:?}", result.err());
     }
 
     #[test]

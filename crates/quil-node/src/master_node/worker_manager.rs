@@ -79,6 +79,15 @@ pub(crate) fn init(
     // If data_worker_stream_multiaddrs has entries, use remote mode
     // (cluster of machines). Otherwise, use local threads.
     let reward_greedy = config.engine.reward_strategy == "reward-greedy";
+    // Minimum Active provers a shard needs before its leader starts
+    // producing frames. Mainnet (`p2p.network == 0`) uses 3 — matches
+    // the protocol's halt-risk floor so a single prover can't drive
+    // consensus alone and burn CPU on rounds that never form a quorum.
+    // Testnets use 1 because a single-prover test cluster is a valid
+    // setup. Plumbed into `WorkerConsensusDeps` →
+    // `AppEngineDeps::min_active_provers_for_propose` →
+    // `AppLeaderProvider::prove_next_state`'s gate.
+    let min_active_provers_for_propose: u64 = if config.p2p.network == 0 { 3 } else { 1 };
     let fkm_for_factory = file_key_manager.clone();
 
     let worker_manager: Arc<dyn quil_engine::worker::WorkerManager> =
@@ -302,6 +311,7 @@ pub(crate) fn init(
                         .expect("BLS signer should be available")
                 }),
                 reward_greedy,
+                min_active_provers_for_propose,
                 coverage_publish: Some(coverage_publish),
                 // Master's global state, used as fallback when the
                 // per-worker builder fails or isn't wired.

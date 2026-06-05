@@ -413,3 +413,134 @@ impl std::fmt::Debug for MessageCache {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod mcache_tests {
+    //! Observable-contract tests for `MessageCache`. The cache backs
+    //! IHAVE/IWANT gossip — a put-then-get cycle must round-trip the
+    //! message, gossip queries must be scoped by bitmask and window,
+    //! and `shift` must bound memory by evicting entries past the
+    //! configured `history_length`.
+    use super::*;
+
+    fn make_peer() -> PeerId {
+        PeerId::random()
+    }
+
+    /// A message put into the cache is retrievable by ID with the
+    /// same bitmask + data round-tripped.
+    #[test]
+    fn put_then_get_round_trips_the_message() {
+        let mut mc = MessageCache::new(5, 3);
+        let id = b"msg-1".to_vec();
+        let bitmask = vec![0xC0];
+        let data = b"hello".to_vec();
+        mc.put(id.clone(), bitmask.clone(), data.clone(), make_peer());
+
+        let got = mc.get(&id);
+        assert!(got.is_some(), "put message must be gettable");
+        let (gb, gd) = got.unwrap();
+        assert_eq!(gb, bitmask.as_slice());
+        assert_eq!(gd, data.as_slice());
+    }
+
+    /// `get` of an unknown ID returns None — no false positives.
+    #[test]
+    fn get_unknown_id_returns_none() {
+        let mc = MessageCache::new(5, 3);
+        assert!(mc.get(b"never-inserted").is_none());
+    }
+
+    /// `get_gossip_ids` returns only IDs whose stored bitmask matches
+    /// the query — cross-bitmask leakage would defeat the per-topic
+    /// gossip flow.
+    #[test]
+    fn gossip_ids_filtered_by_bitmask() {
+        let mut mc = MessageCache::new(5, 3);
+        let bm_a = vec![0xC0];
+        let bm_b = vec![0x0C];
+        mc.put(b"a1".to_vec(), bm_a.clone(), b"x".to_vec(), make_peer());
+        mc.put(b"b1".to_vec(), bm_b.clone(), b"y".to_vec(), make_peer());
+        mc.put(b"a2".to_vec(), bm_a.clone(), b"z".to_vec(), make_peer());
+
+        let mut ids_a = mc.get_gossip_ids(&bm_a);
+        ids_a.sort();
+        let mut ids_b = mc.get_gossip_ids(&bm_b);
+        ids_b.sort();
+        assert_eq!(ids_a, vec![b"a1".to_vec(), b"a2".to_vec()]);
+        assert_eq!(ids_b, vec![b"b1".to_vec()]);
+    }
+
+    /// After enough shifts to push the original window past the
+    /// `history_length` cap, the messages stored in that window
+    /// are evicted from the cache. Construction starts with one
+    /// window already present, so the original window survives
+    /// `history_length - 1` shifts and is evicted on the
+    /// `history_length`th shift (when `windows.len()` exceeds the
+    /// cap and `windows[0]` is dropped).
+    #[test]
+    fn shift_past_history_length_evicts_oldest() {
+        let history_length = 3;
+        let mut mc = MessageCache::new(history_length, 2);
+        let bm = vec![0xC0];
+
+        let id1 = b"id-1".to_vec();
+        mc.put(id1.clone(), bm.clone(), b"d".to_vec(), make_peer());
+        assert!(mc.get(&id1).is_some());
+
+        // history_length - 1 = 2 shifts: original window still
+        // present, no eviction.
+        for _ in 0..(history_length - 1) {
+            mc.shift();
+        }
+        assert!(mc.get(&id1).is_some(),
+            "id should survive history_length - 1 shifts");
+
+        // One more shift puts windows.len() at history_length + 1 →
+        // oldest window evicted.
+        mc.shift();
+        assert!(mc.get(&id1).is_none(),
+            "id should be evicted on the history_length-th shift");
+    }
+
+    /// `get_gossip_ids` returns IDs from at most the last
+    /// `history_gossip` windows — older entries are filtered out
+    /// even if still memory-resident.
+    #[test]
+    fn gossip_ids_scoped_to_history_gossip_window() {
+        let mut mc = MessageCache::new(10, 2);
+        let bm = vec![0xC0];
+
+        // Put one message, then advance windows so it falls outside
+        // the gossip window (history_gossip = 2 means last 2
+        // windows are gossipable; advancing 3 windows pushes it out).
+        let id = b"old".to_vec();
+        mc.put(id.clone(), bm.clone(), b"d".to_vec(), make_peer());
+        mc.shift();
+        mc.shift();
+        mc.shift();
+
+        // Still in `messages` map (history_length = 10) but past
+        // the gossip window.
+        assert!(mc.get(&id).is_some(),
+            "message should still be memory-resident");
+        let gossip = mc.get_gossip_ids(&bm);
+        assert!(!gossip.contains(&id),
+            "message past history_gossip must NOT be advertised");
+    }
+
+    /// `put` deposits IDs into the current (latest) window — a
+    /// subsequent `get_gossip_ids` (history_gossip ≥ 1) sees them.
+    #[test]
+    fn put_lands_in_current_window_and_is_gossipable() {
+        let mut mc = MessageCache::new(5, 3);
+        let bm = vec![0xC0];
+        let id = b"fresh".to_vec();
+        mc.put(id.clone(), bm.clone(), b"d".to_vec(), make_peer());
+
+        let gossip = mc.get_gossip_ids(&bm);
+        assert!(gossip.contains(&id),
+            "fresh put must be reachable through gossip query");
+    }
+}
+

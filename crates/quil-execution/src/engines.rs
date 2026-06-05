@@ -610,6 +610,17 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 crate::token_engine::TYPE_TRANSACTION => {
                     let tx = crate::token_intrinsic::Transaction::from_canonical_bytes(inner_bytes)?;
 
+                    // STRUCTURAL FAIL-FAST. See
+                    // `require_traversal_proof_for_inputs` for the
+                    // attack chain this gate closes. Extracted to a
+                    // standalone function so the regression test can
+                    // pin the invariant directly (the engine's
+                    // `process_message` swallows invoke_token errors
+                    // by design — that's correct production behavior
+                    // but makes the gate untestable via the
+                    // process_message API).
+                    require_traversal_proof_for_inputs(&tx)?;
+
                     // Full crypto verify is unconditional — the providers
                     // are mandatory engine inputs. Production callers
                     // MUST supply real `BulletproofProver` +
@@ -750,26 +761,58 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     }
 
                     // Traversal-proof verification against the source
-                    // shard's commitment root. Mirrors Go
-                    // `token_intrinsic_transaction.go:1563-1580`. The
-                    // root comes from `HypergraphCrdt::get_shard_commits(
-                    // frame, domain)[0]` (vertex-adds phase). Without
-                    // this gate, inputs can reference coins that
-                    // don't exist in the source shard at all —
-                    // hidden-Schnorr verify proves knowledge of a
-                    // matching commitment, but not its on-chain
-                    // existence.
+                    // shard's commitment root. The root comes from
+                    // `HypergraphCrdt::get_shard_commits(frame, domain)[0]`
+                    // (vertex-adds phase). This is the ON-CHAIN
+                    // EXISTENCE GATE for transaction inputs.
                     //
-                    // Skip when:
-                    //   - tx.traversal_proof is empty (legacy/test
-                    //     paths that omit it — engine-level state is
-                    //     consulted via spent-check below for
-                    //     correctness)
-                    //   - tx.outputs is empty (no source frame to
-                    //     cite — verify_transaction_crypto already
-                    //     rejected this for QUIL ops; non-QUIL with
-                    //     no outputs is structurally invalid).
-                    if !tx.traversal_proof.is_empty() && !tx.outputs.is_empty() {
+                    // SECURITY: this check is MANDATORY for any tx
+                    // with inputs. Without it, an attacker can mint
+                    // QUIL from thin air:
+                    //
+                    //   1. Fabricate a 336-byte signature for an
+                    //      input by choosing the secret first and
+                    //      computing the commitment to match — the
+                    //      hidden-Schnorr verify (`verify_input_hidden_signature`)
+                    //      passes by construction.
+                    //   2. The within-tx-duplicate check passes
+                    //      because the fabricated vk is unique.
+                    //   3. The spent-marker check
+                    //      (`check_input_not_double_spent`) returns
+                    //      `not_spent = true` because there is no
+                    //      spent marker at `poseidon(vk)` — but
+                    //      there's no marker because the coin was
+                    //      NEVER MINTED, not because it was
+                    //      "previously unspent." The marker check
+                    //      proves non-double-spend, not existence.
+                    //   4. The bulletproof range/sum check
+                    //      (`verify_transaction_crypto`) verifies
+                    //      internal consistency of the
+                    //      commitment-vs-balance math — but it does
+                    //      not require the input commitments to
+                    //      exist on-chain. An attacker who picks
+                    //      input and output values that sum can pass
+                    //      this trivially.
+                    //
+                    // The traversal_proof is the only place that
+                    // checks the input coin exists in the source
+                    // shard's vertex-adds tree at the cited frame.
+                    // Without it, the entire crypto stack reduces to
+                    // "prove knowledge of values you chose," which
+                    // is no proof at all.
+                    //
+                    // The earlier comment claimed spent-check
+                    // provided fallback correctness when
+                    // traversal_proof was empty. That was wrong — the
+                    // spent-marker is at `poseidon(vk)`, not at the
+                    // coin's address, and its absence is the
+                    // expected case for an unspent coin (whether
+                    // real or fake).
+                    // Structural fail-fast (empty inputs / empty
+                    // traversal_proof / empty outputs) has already
+                    // fired at the top of this arm. Reaching here
+                    // means we have all three; now verify the proof.
+                    if !tx.inputs.is_empty() {
                         let first_output = crate::token_intrinsic::TransactionOutput::from_canonical_bytes(&tx.outputs[0])?;
                         if first_output.frame_number.len() != 8 {
                             return Err(QuilError::InvalidArgument(
@@ -1353,6 +1396,54 @@ impl ShardExecutionEngine for TokenExecutionEngine {
 // =====================================================================
 // Global validation helpers — tree loading for signature verification
 // =====================================================================
+
+/// Structural fail-fast gate for `TYPE_TRANSACTION`. Any token tx
+/// with a non-empty input list MUST carry a non-empty
+/// `traversal_proof` and at least one output (`outputs[0].frame_number`
+/// is the source-shard frame the proof is cited against). Returns
+/// `Ok(())` when the tx is well-shaped or has no inputs.
+///
+/// **Attack chain this closes:** modern 336-byte input signatures
+/// verify hidden-Schnorr against a self-attested commitment — they
+/// prove knowledge of the commitment's discrete log but NOT that the
+/// referenced coin ever existed on-chain. The spent-marker check
+/// (`check_input_not_double_spent`) only proves a marker isn't
+/// present at `poseidon(vk)`; a never-minted coin has no marker
+/// either, so the check returns "not spent." The bulletproof
+/// range/sum check verifies the input/output commitment math is
+/// internally consistent — but doesn't tie the input commitments to
+/// any on-chain state. With all three checks in place but
+/// `traversal_proof` empty, an attacker can fabricate inputs whose
+/// values they choose and mint QUIL from nothing.
+///
+/// The traversal_proof verification below (against
+/// `crdt.get_shard_commits(cited_frame, domain)[0]`) is the only
+/// on-chain existence gate. Making this structural prerequisite
+/// fail-fast lets us reject the malformed shape before paying for
+/// any crypto work, and makes the invariant unit-testable directly.
+pub(crate) fn require_traversal_proof_for_inputs(
+    tx: &crate::token_intrinsic::Transaction,
+) -> Result<()> {
+    if tx.inputs.is_empty() {
+        return Ok(());
+    }
+    if tx.traversal_proof.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "transaction: missing traversal_proof — modern token \
+             transactions with inputs must prove on-chain existence \
+             of each input coin"
+                .into(),
+        ));
+    }
+    if tx.outputs.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "transaction: cannot cite source-shard frame without an \
+             output (outputs[0].frame_number is the citation)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Extract the prover address from a global op's addressed signature,
 /// then load the prover vertex tree (and optionally the allocation tree)
@@ -2992,5 +3083,120 @@ mod tests {
             .unwrap();
         let cost = e.get_cost(&req).unwrap();
         assert_eq!(cost, BigInt::from(64));
+    }
+
+    // =================================================================
+    // Traversal-proof mandatory-gate regression test
+    //
+    // Closes the gap previously documented at `engines.rs:752` (the
+    // skip-when-empty clause): a Transaction with non-empty inputs but
+    // empty `traversal_proof` MUST be rejected. Without the gate, an
+    // attacker can pass hidden-Schnorr + spent-marker + bulletproof
+    // checks with fabricated inputs that never existed on-chain. See
+    // the long docstring above the gate in `process_message`'s
+    // TYPE_TRANSACTION arm for the full attack chain.
+    // =================================================================
+
+    /// Build a `Transaction` with a fabricated input (zeroed commitment
+    /// + signature) for testing the structural gate. Content of the
+    /// input doesn't matter — the helper under test runs BEFORE any
+    /// per-input crypto.
+    fn tx_with_one_input(
+        traversal_proof: Vec<u8>,
+        outputs: Vec<Vec<u8>>,
+    ) -> crate::token_intrinsic::Transaction {
+        use crate::token_intrinsic::{Transaction, TransactionInput};
+        let fake_input = TransactionInput {
+            commitment: vec![0u8; 56],
+            signature: vec![0u8; 336],
+            proofs: Vec::new(),
+        };
+        Transaction {
+            domain: crate::domains::QUIL_TOKEN.to_vec(),
+            inputs: vec![fake_input.to_canonical_bytes().unwrap()],
+            outputs,
+            fees: Vec::new(),
+            range_proof: Vec::new(),
+            traversal_proof,
+        }
+    }
+
+    fn one_zero_output() -> Vec<Vec<u8>> {
+        use crate::token_intrinsic::TransactionOutput;
+        vec![TransactionOutput {
+            frame_number: vec![0u8; 8],
+            commitment: vec![0u8; 64],
+            recipient_output: Vec::new(),
+        }
+        .to_canonical_bytes()
+        .unwrap()]
+    }
+
+    /// Inputs present, traversal_proof empty → rejected with explicit
+    /// "missing traversal_proof" message. This is the load-bearing
+    /// regression: without the gate, the attacker mints QUIL from
+    /// thin air (see the function docstring for the attack chain).
+    #[test]
+    fn transaction_with_empty_traversal_proof_is_rejected() {
+        let tx = tx_with_one_input(Vec::new(), one_zero_output());
+        let result = require_traversal_proof_for_inputs(&tx);
+        let err = result.expect_err(
+            "tx with non-empty inputs and empty traversal_proof must be rejected",
+        );
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("missing traversal_proof"),
+            "expected explicit 'missing traversal_proof' error, got: {}",
+            msg,
+        );
+    }
+
+    /// Inputs present, traversal_proof present, but outputs empty →
+    /// also rejected (the source-shard citation lives in
+    /// outputs[0].frame_number). Even if an attacker provides the
+    /// traversal_proof bytes, they need a citable output frame for
+    /// the proof to verify against.
+    #[test]
+    fn transaction_with_empty_outputs_and_inputs_is_rejected() {
+        let tx = tx_with_one_input(vec![0u8; 32], Vec::new());
+        let result = require_traversal_proof_for_inputs(&tx);
+        let err = result.expect_err(
+            "tx with inputs but no outputs must be rejected",
+        );
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("cannot cite source-shard frame"),
+            "expected explicit 'cannot cite source-shard frame' error, got: {}",
+            msg,
+        );
+    }
+
+    /// Inputs present, traversal_proof present, outputs present →
+    /// helper passes. (The deeper proof verification happens in the
+    /// engine's TYPE_TRANSACTION arm against the actual shard commits;
+    /// this gate is the structural fail-fast.)
+    #[test]
+    fn transaction_with_inputs_and_traversal_proof_and_outputs_passes_structural_gate() {
+        let tx = tx_with_one_input(vec![0u8; 32], one_zero_output());
+        let result = require_traversal_proof_for_inputs(&tx);
+        assert!(result.is_ok(), "well-shaped tx must pass the structural gate: {:?}", result);
+    }
+
+    /// Empty inputs → helper is a no-op (returns Ok). Lets mint
+    /// transactions, dummy bundles, and other zero-input shapes
+    /// through without false-rejecting.
+    #[test]
+    fn transaction_with_no_inputs_passes_structural_gate() {
+        use crate::token_intrinsic::Transaction;
+        let tx = Transaction {
+            domain: crate::domains::QUIL_TOKEN.to_vec(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            fees: Vec::new(),
+            range_proof: Vec::new(),
+            traversal_proof: Vec::new(),
+        };
+        let result = require_traversal_proof_for_inputs(&tx);
+        assert!(result.is_ok(), "zero-input tx must pass: {:?}", result);
     }
 }

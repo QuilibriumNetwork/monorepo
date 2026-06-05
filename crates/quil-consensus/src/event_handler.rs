@@ -638,7 +638,14 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
         {
             Ok(sp) => sp,
             Err(e) if e.is_no_vote() => {
-                tracing::warn!(
+                // Debug, not warn — NoVote is expected during
+                // coverage halts and during the min-active-provers
+                // gate for fresh / draining shards. A halted shard
+                // emits one of these per pacemaker tick (~6/min);
+                // bumping to warn flooded logs and masked real
+                // events. Halt state is visible via the dedicated
+                // CoverageHalt/Resume telemetry.
+                tracing::debug!(
                     cur_rank,
                     error = %e,
                     "leader skipping: safety rules returned NoVote",

@@ -67,28 +67,57 @@ pub struct CoverageThresholds {
     pub halt_grace_frames: u64,
 }
 
+/// Default halt grace window. Sized to cover a full migration cycle
+/// PLUS a complete back-to-back retry if the first attempt fails:
+///
+/// ```text
+///   720   first cycle  : ProposeLeave → ConfirmLeaves → ProposeJoin
+///                        → ConfirmJoins  (2 × CONFIRM_WINDOW)
+///   720   second cycle : full retry if the first never landed an
+///                        alloc (archive silently drops a bundle,
+///                        lifecycle re-proposes after the 10-frame
+///                        PROPOSAL_TIMEOUT_FRAMES expires)
+///   360   slack budget : evaluate cadence + 4-frame join cooldown
+///                        + archive sync skew + a single
+///                        ProposalTimeout detection window
+///   ────
+///   1800
+/// ```
+///
+/// Rationale: a transaction can create a new vertex at an address
+/// that bloom-routes to a zero-coverage shard. Until provers migrate
+/// to it, the shard sits below the halt threshold and the streak
+/// tracker bumps each frame. With a 360-frame grace (one confirm
+/// window), even an instantly-responding network barely has time for
+/// *one* prover to leave a heavily-covered shard before the halt
+/// fires. 1800 frames give the network a complete happy-path
+/// migration AND a full back-to-back retry on top of it before
+/// any halt fires — so a single dropped bundle or a one-off race
+/// doesn't halt the shard.
+pub const DEFAULT_HALT_GRACE_FRAMES: u64 = 1800;
+
 impl CoverageThresholds {
     /// Mainnet defaults: 3-prover halt, 6-prover min, 32-prover max,
-    /// 360-frame grace window.
+    /// `DEFAULT_HALT_GRACE_FRAMES` (1440) frame grace window.
     pub fn mainnet() -> Self {
         Self {
             halt_threshold: 3,
             min_provers: 6,
             max_provers: 32,
-            halt_grace_frames: 360,
+            halt_grace_frames: DEFAULT_HALT_GRACE_FRAMES,
         }
     }
 
     /// Testnet defaults: 0-prover halt (no halt unless `min_provers`
     /// > 1, in which case 1), `min_provers` from config, 32-prover
-    /// max, 360-frame grace window.
+    /// max, `DEFAULT_HALT_GRACE_FRAMES` grace window.
     pub fn testnet(min_provers: u64) -> Self {
         let halt_threshold = if min_provers > 1 { 1 } else { 0 };
         Self {
             halt_threshold,
             min_provers,
             max_provers: 32,
-            halt_grace_frames: 360,
+            halt_grace_frames: DEFAULT_HALT_GRACE_FRAMES,
         }
     }
 }
@@ -326,6 +355,32 @@ pub struct CoverageCheckRequest {
 /// Subscribes to NewHead events and triggers coverage checks
 /// asynchronously, updating the prover-only mode flag on the
 /// message collector when coverage is degraded.
+/// Per-shard data point the coverage monitor needs to make a halt
+/// decision: shard size in bytes (skip if zero — no data to
+/// protect) and current Active prover count. Sourced by the caller
+/// from whichever data layer it has — the prover registry summary
+/// (allocated-only view) on archive nodes, or the lifecycle's
+/// `merged_shard_sizes` cache (archive-sync'd, ≤60 frames stale)
+/// + registry summaries on non-archive nodes.
+#[derive(Debug, Clone)]
+pub struct ShardCoverageEntry {
+    pub filter: Vec<u8>,
+    pub size: u64,
+    pub active_count: u64,
+}
+
+/// Caller-supplied closure that returns the universe of shards to
+/// evaluate. The monitor stays storage-agnostic — non-archive nodes
+/// wire this to `lifecycle.merged_shard_sizes()` keyed by filter,
+/// archive nodes can wire it to a direct local-CRDT walk. When
+/// unset, the monitor falls back to iterating
+/// `prover_registry.get_prover_shard_summaries` — which sees only
+/// shards with at least one allocation in `filter_cache` and
+/// therefore can't observe zero-prover shards (the gap that
+/// motivated this hook).
+pub type ShardInventoryProvider =
+    Arc<dyn Fn() -> Vec<ShardCoverageEntry> + Send + Sync>;
+
 pub struct CoverageMonitor {
     prover_registry: Arc<dyn ProverRegistry>,
     event_distributor: Arc<dyn EventDistributor>,
@@ -340,6 +395,13 @@ pub struct CoverageMonitor {
     /// distributor. Used to detect transitions and emit Halt /
     /// Resume events only on the leading / trailing edge.
     emitted_halted: Mutex<std::collections::HashSet<Vec<u8>>>,
+    /// Optional alternative source of the shard universe — see
+    /// [`ShardInventoryProvider`]. When set, the per-frame `check`
+    /// iterates the provider's output instead of relying on the
+    /// allocated-only registry summary, which lets the monitor see
+    /// zero-prover-but-non-zero-size shards (the address-creation
+    /// failure mode).
+    shard_inventory_provider: Option<ShardInventoryProvider>,
 }
 
 impl CoverageMonitor {
@@ -357,12 +419,31 @@ impl CoverageMonitor {
             prover_only_mode,
             last_checked_frame: AtomicU64::new(0),
             emitted_halted: Mutex::new(std::collections::HashSet::new()),
+            shard_inventory_provider: None,
         }
     }
 
     /// Configured thresholds (halt threshold, min/max provers, grace frames).
     pub fn thresholds(&self) -> CoverageThresholds {
         self.thresholds
+    }
+
+    /// Install a [`ShardInventoryProvider`] so per-frame `check` sees
+    /// the FULL shard universe — including shards with zero active
+    /// provers but non-zero size (data landed via a transaction
+    /// before any prover joined). Without a provider installed,
+    /// `check` falls back to the prover registry's summary, which
+    /// only sees shards already represented in `filter_cache` and
+    /// can't observe the zero-coverage case.
+    ///
+    /// Non-archive nodes should wire this to a closure that reads
+    /// `prover_lifecycle.merged_shard_sizes()` (archive-sourced
+    /// shard sizes cached on a 60-frame cadence) joined with the
+    /// registry's per-filter active counts. Archive nodes can wire
+    /// a closure that pulls sizes directly from the local hypergraph
+    /// CRDT and counts from the registry.
+    pub fn set_shard_inventory_provider(&mut self, provider: ShardInventoryProvider) {
+        self.shard_inventory_provider = Some(provider);
     }
 
     /// Seed the per-shard streak map from each prover's
@@ -396,19 +477,73 @@ impl CoverageMonitor {
             .get_prover_shard_summaries(frame_number)
             .unwrap_or_default();
 
+        // Build the universe of shards to evaluate. Two sources:
+        //
+        // 1. The registry summary (always present). Sees only shards
+        //    represented in `filter_cache` — i.e. shards with at
+        //    least one allocation. Blind to zero-prover-but-data-
+        //    present shards, which is the failure mode where a
+        //    transaction creates a new vertex on a shard nobody has
+        //    joined yet.
+        //
+        // 2. The inventory provider (optional). When set, returns
+        //    the FULL shard universe with sizes — including shards
+        //    nobody is on but where data has landed. Sourced by the
+        //    caller from `lifecycle.merged_shard_sizes` (non-archive)
+        //    or the local CRDT (archive). The provider's
+        //    `active_count` may lag the registry summary by up to
+        //    one archive-refresh interval (~60 frames), which is
+        //    fine against the 1800-frame halt grace.
+        //
+        // When the provider is installed, we use it for the
+        // detection sweep. When absent, we fall back to summaries
+        // only (legacy behavior).
+        let inventory: Vec<ShardCoverageEntry> = match &self.shard_inventory_provider {
+            Some(provider) => provider(),
+            None => summaries
+                .iter()
+                .map(|s| ShardCoverageEntry {
+                    filter: s.filter.clone(),
+                    // Size unknown from registry — pass `u64::MAX`
+                    // so the size==0 skip below doesn't false-skip.
+                    // This is the legacy behavior: every summary
+                    // entry is evaluated for halt regardless of
+                    // actual data size.
+                    size: u64::MAX,
+                    active_count: s.status_counts
+                        .get(&ProverStatus::Active)
+                        .copied()
+                        .unwrap_or(0) as u64,
+                })
+                .collect(),
+        };
+
         let mut any_halted = false;
         let mut currently_halted: std::collections::HashSet<Vec<u8>> =
             std::collections::HashSet::new();
 
-        for summary in &summaries {
-            let active = summary.status_counts
-                .get(&ProverStatus::Active)
-                .copied()
-                .unwrap_or(0) as u64;
+        for entry in &inventory {
+            // Zero-size shards have no data to protect — no halt
+            // needed even if zero provers are on them. Mirrors the
+            // proposer's `if raw_size == 0 { continue }` gate.
+            // Without this, every shard in the network with no
+            // genesis allocation would bump a streak forever.
+            if entry.size == 0 {
+                if self.streaks.get(&entry.filter).is_some() {
+                    // Recovery path: the shard had data before
+                    // (which we were tracking) and now has none.
+                    // Clear the streak so we don't carry it
+                    // indefinitely.
+                    self.streaks.clear(&entry.filter);
+                }
+                continue;
+            }
+
+            let active = entry.active_count;
 
             if active <= self.thresholds.halt_threshold {
                 // Low coverage — bump streak
-                let streak = self.streaks.bump(&summary.filter, frame_number);
+                let streak = self.streaks.bump(&entry.filter, frame_number);
                 // Mainnet extended-enrollment window: before frame
                 // 262_700 (FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 360),
                 // grant an additional 720 grace frames before halting.
@@ -421,23 +556,24 @@ impl CoverageMonitor {
                 };
                 if streak.count >= effective_grace {
                     any_halted = true;
-                    currently_halted.insert(summary.filter.clone());
+                    currently_halted.insert(entry.filter.clone());
                     tracing::debug!(
-                        filter = hex::encode(&summary.filter),
+                        filter = hex::encode(&entry.filter),
                         active,
+                        size = entry.size,
                         streak = streak.count,
                         "COVERAGE HALT — shard below threshold"
                     );
                 }
             } else {
                 // Recovered — clear streak
-                if self.streaks.get(&summary.filter).is_some() {
+                if self.streaks.get(&entry.filter).is_some() {
                     tracing::info!(
-                        filter = hex::encode(&summary.filter),
+                        filter = hex::encode(&entry.filter),
                         active,
                         "shard coverage recovered"
                     );
-                    self.streaks.clear(&summary.filter);
+                    self.streaks.clear(&entry.filter);
                 }
             }
         }
@@ -898,7 +1034,307 @@ mod tests {
         assert_eq!(t.halt_threshold, 3);
         assert_eq!(t.min_provers, 6);
         assert_eq!(t.max_provers, 32);
-        assert_eq!(t.halt_grace_frames, 360);
+        // 1800 = 2 × full migration cycle (720) + slack (360) —
+        // covers a complete leave→confirm→join→confirm migration AND
+        // a full back-to-back retry before a halt fires, so a single
+        // dropped bundle on the first attempt doesn't halt a shard
+        // that's actively being rescued.
+        assert_eq!(t.halt_grace_frames, DEFAULT_HALT_GRACE_FRAMES);
+        assert_eq!(t.halt_grace_frames, 1800);
+    }
+
+    /// Walks through the full lifecycle a prover takes to rescue a
+    /// shard that has just gone uncovered (e.g. a transaction
+    /// created a new vertex at an address that bloom-routes to a
+    /// shard with zero active provers), and verifies the coverage
+    /// monitor's grace window is wide enough for the rescue to
+    /// complete before a CoverageHalt event fires.
+    ///
+    /// Timeline modeled (frame numbers relative to migration start):
+    ///   T=0          shard X goes to active=0 (or stays at 0); coverage
+    ///                monitor begins bumping its streak each frame
+    ///   T=0          prover lifecycle observes halt-risk + no free
+    ///                worker → `plan_leaves` bypass triggers ProposeLeave
+    ///                on a heavily-covered shard Y
+    ///   T=CONFIRM    DecideLeaves matures → ConfirmLeaves submitted →
+    ///                worker freed
+    ///   T=CONFIRM+1  free worker observed → `plan_and_allocate` picks
+    ///                halt-risk shard X → ProposeJoin
+    ///   T=2*CONFIRM  DecideJoins matures → ConfirmJoins → alloc flips
+    ///                to Active → shard X now covered → streak clears
+    ///
+    /// Total cycle = 2 × CONFIRM_WINDOW = 720 frames. The grace must
+    /// be wide enough to absorb BOTH a complete first-attempt
+    /// migration AND a complete back-to-back retry if the first
+    /// attempt's bundle was silently dropped — only then is a single
+    /// transient archive hiccup recoverable without firing a halt
+    /// event on a shard that's actively being rescued. Plus a
+    /// confirm-window of slack for: lifecycle-evaluate cadence, the
+    /// 4-frame join cooldown, archive registry-refresh skew, and the
+    /// 10-frame ProposalTimeout detection window between attempts.
+    #[test]
+    fn halt_grace_covers_full_leave_confirm_join_confirm_cycle() {
+        // Imported via path so this test stays a tripwire if
+        // CONFIRM_WINDOW moves in the lifecycle crate.
+        const CONFIRM_WINDOW: u64 =
+            crate::provers::lifecycle::DEFAULT_CONFIRM_WINDOW_FRAMES;
+        const MIGRATION_CYCLE_FRAMES: u64 = 2 * CONFIRM_WINDOW;
+        // Headroom budget: a full second migration cycle (the retry)
+        // plus one confirm window of slack for cadence/cooldown/sync
+        // skew/ProposalTimeout detection.
+        const RETRY_CYCLE_FRAMES: u64 = MIGRATION_CYCLE_FRAMES;
+        const SLACK_HEADROOM: u64 = CONFIRM_WINDOW;
+
+        // Static relationship: the grace must cover one full cycle
+        // plus a full retry plus the slack budget. If either constant
+        // drifts, this test fires before the coverage monitor starts
+        // halting mid-rescue in production.
+        assert!(
+            DEFAULT_HALT_GRACE_FRAMES
+                >= MIGRATION_CYCLE_FRAMES + RETRY_CYCLE_FRAMES + SLACK_HEADROOM,
+            "halt grace ({}) must be ≥ first cycle ({}) + retry cycle ({}) + slack ({})",
+            DEFAULT_HALT_GRACE_FRAMES,
+            MIGRATION_CYCLE_FRAMES,
+            RETRY_CYCLE_FRAMES,
+            SLACK_HEADROOM,
+        );
+
+        // Simulate the per-frame bumping the coverage monitor would
+        // do while the shard remains uncovered. The streak starts at
+        // 1 on the first bump and increments by 1 per subsequent
+        // frame.
+        let tracker = LowCoverageStreakTracker::new();
+        let shard_x = vec![0xAB; 32];
+        let migration_start: u64 = 100_000;
+
+        // Half-open range: bumping at frames 0..N produces a streak
+        // count of N (1-indexed counter — the first bump establishes
+        // count=1, each subsequent bump adds frame_delta=1). So a
+        // 720-frame migration cycle = 720 bumps → streak count 720.
+        for offset in 0..MIGRATION_CYCLE_FRAMES {
+            let frame = migration_start + offset;
+            let streak = tracker.bump(&shard_x, frame);
+            assert!(
+                streak.count < DEFAULT_HALT_GRACE_FRAMES,
+                "streak {} reached halt grace {} at frame {} (offset {}) — \
+                 coverage halt would fire mid-migration, before the join \
+                 cycle could complete",
+                streak.count, DEFAULT_HALT_GRACE_FRAMES, frame, offset,
+            );
+        }
+
+        // Happy-path recovery check: at the end of the canonical
+        // first cycle the streak still has enough headroom for a
+        // full retry + slack. This is the property the 1800-frame
+        // grace buys us — a dropped bundle on the first attempt
+        // doesn't halt the shard.
+        let final_streak = tracker
+            .get(&shard_x)
+            .expect("streak should still be tracked at migration end");
+        let headroom = DEFAULT_HALT_GRACE_FRAMES - final_streak.count;
+        assert!(
+            headroom >= RETRY_CYCLE_FRAMES + SLACK_HEADROOM,
+            "only {} frames of headroom after one migration cycle — too \
+             tight to absorb a full retry ({} frames) + slack ({} frames) \
+             if the first attempt's bundle gets dropped",
+            headroom, RETRY_CYCLE_FRAMES, SLACK_HEADROOM,
+        );
+
+        // Continue simulating through the retry cycle. The streak
+        // must still stay below the halt grace all the way through
+        // the second attempt.
+        for offset in MIGRATION_CYCLE_FRAMES
+            ..(MIGRATION_CYCLE_FRAMES + RETRY_CYCLE_FRAMES)
+        {
+            let frame = migration_start + offset;
+            let streak = tracker.bump(&shard_x, frame);
+            assert!(
+                streak.count < DEFAULT_HALT_GRACE_FRAMES,
+                "streak {} reached halt grace {} during retry at frame {} \
+                 (offset {}) — coverage halt would fire before the retry \
+                 could complete",
+                streak.count, DEFAULT_HALT_GRACE_FRAMES, frame, offset,
+            );
+        }
+
+        // Recovery: prover join confirmed, active count rises above
+        // halt_threshold, `CoverageMonitor::check` calls `clear` and
+        // the streak goes away — no CoverageHalt event fires.
+        tracker.clear(&shard_x);
+        assert!(
+            tracker.snapshot().is_empty(),
+            "streak must clear once the shard recovers above halt_threshold",
+        );
+    }
+
+    /// Stub registry that returns nothing — exercises the pure-
+    /// inventory-provider code path. Coverage of all required
+    /// `ProverRegistry` methods; behavior is "empty universe."
+    struct EmptyRegistry;
+    impl quil_types::consensus::ProverRegistry for EmptyRegistry {
+        fn get_prover_info(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<
+            Option<quil_types::consensus::ProverInfo>,
+        > {
+            Ok(None)
+        }
+        fn get_next_prover(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+        ) -> quil_types::error::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn get_ordered_provers(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+        ) -> quil_types::error::Result<Vec<Vec<u8>>> {
+            Ok(Vec::new())
+        }
+        fn get_active_provers(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_prover_count(&self, _: &[u8]) -> quil_types::error::Result<usize> {
+            Ok(0)
+        }
+        fn get_provers(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_provers_by_status(
+            &self,
+            _: &[u8],
+            _: quil_types::consensus::ProverStatus,
+        ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_prover_shard_summaries(
+            &self,
+            _: u64,
+        ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverShardSummary>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Capturing distributor for test assertions. `subscribe` returns
+    /// a Receiver from a fresh channel (sender dropped immediately,
+    /// so recv yields None) — coverage monitor only uses `publish`
+    /// in `check`.
+    struct CapturingDistributor(
+        std::sync::Mutex<Vec<quil_types::consensus::ControlEvent>>,
+    );
+    impl quil_types::consensus::EventDistributor for CapturingDistributor {
+        fn subscribe(
+            &self,
+            _: &str,
+        ) -> tokio::sync::mpsc::Receiver<quil_types::consensus::ControlEvent> {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            rx
+        }
+        fn publish(&self, event: quil_types::consensus::ControlEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+        fn unsubscribe(&self, _: &str) {}
+    }
+
+    fn build_monitor_with_inventory(
+        provider: ShardInventoryProvider,
+    ) -> (CoverageMonitor, Arc<CapturingDistributor>) {
+        let registry: Arc<dyn quil_types::consensus::ProverRegistry> =
+            Arc::new(EmptyRegistry);
+        let dist =
+            Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
+        let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> =
+            dist.clone();
+        let mut monitor = CoverageMonitor::new(
+            registry,
+            dist_arc,
+            CoverageThresholds::mainnet(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        monitor.set_shard_inventory_provider(provider);
+        (monitor, dist)
+    }
+
+    /// Verifies the inventory-provider path actually catches the
+    /// "zero provers, non-zero size" case the registry-summary path
+    /// misses. With registry summary empty, the only way the
+    /// monitor sees this shard is via the inventory provider.
+    #[test]
+    fn inventory_provider_surfaces_zero_prover_data_shard() {
+        let target_filter: Vec<u8> = vec![0xAB; 32];
+        let target_for_provider = target_filter.clone();
+        let provider: ShardInventoryProvider = Arc::new(move || {
+            vec![ShardCoverageEntry {
+                filter: target_for_provider.clone(),
+                size: 1024, // 1 KB of data on this shard
+                active_count: 0,
+            }]
+        });
+        let (monitor, dist) = build_monitor_with_inventory(provider);
+
+        // Bump for every frame in the grace window plus one. The
+        // halt fires on the boundary frame.
+        let start: u64 = 1_000_000;
+        for offset in 0..=DEFAULT_HALT_GRACE_FRAMES {
+            monitor.check(start + offset);
+        }
+
+        let events = dist.0.lock().unwrap();
+        let target_halt = events.iter().any(|e| {
+            matches!(
+                (&e.event_type, &e.data),
+                (
+                    quil_types::consensus::ControlEventType::CoverageHalt,
+                    quil_types::consensus::ControlEventData::Coverage { filter, .. }
+                ) if filter == &target_filter
+            )
+        });
+        assert!(target_halt, "no CoverageHalt fired for the zero-prover non-zero-size shard");
+    }
+
+    /// Symmetric to the above: a zero-size shard MUST NOT trigger a
+    /// halt even if the provider reports `active_count = 0`. The
+    /// "no data to protect" rule means we skip it entirely.
+    #[test]
+    fn inventory_provider_skips_zero_size_shards() {
+        let target_filter: Vec<u8> = vec![0xCD; 32];
+        let target_for_provider = target_filter.clone();
+        let provider: ShardInventoryProvider = Arc::new(move || {
+            vec![ShardCoverageEntry {
+                filter: target_for_provider.clone(),
+                size: 0, // no data — must skip
+                active_count: 0,
+            }]
+        });
+        let (monitor, dist) = build_monitor_with_inventory(provider);
+
+        for offset in 0..=DEFAULT_HALT_GRACE_FRAMES {
+            monitor.check(1_000_000 + offset);
+        }
+        let events = dist.0.lock().unwrap();
+        let halts: usize = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.event_type,
+                    quil_types::consensus::ControlEventType::CoverageHalt
+                )
+            })
+            .count();
+        assert_eq!(
+            halts, 0,
+            "expected zero CoverageHalt events for size-0 shard, got {}",
+            halts,
+        );
     }
 
     #[test]

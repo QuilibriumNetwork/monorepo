@@ -1,5 +1,7 @@
 pub mod behaviour;
 pub mod blossomsub;
+#[cfg(test)]
+pub mod test_harness;
 pub mod bitmask;
 pub mod ed448_identity;
 pub mod ed448_noise;
@@ -72,6 +74,14 @@ pub mod params {
     /// the gossip ad lost and (optionally) re-IWANTing from a
     /// different advertiser. Matches Go gossipsub's default.
     pub const IWANT_FOLLOWUP_TIME: Duration = Duration::from_secs(3);
+    /// Per-subnet (IPv4 /24 or IPv6 /48) cap on mesh peers per
+    /// bitmask. Eclipse-resistance: a Sybil attacker who controls a
+    /// single /24 cannot fill more than this many mesh slots,
+    /// limiting how much of the victim's view they can dominate.
+    /// `0` disables the check (legacy / test setups). 2 lets normal
+    /// clustering (a couple of legitimate co-located peers) through
+    /// without bias; 1 is the strictest setting.
+    pub const MESH_PEERS_PER_SUBNET: usize = 2;
 }
 
 /// Runtime-configurable BlossomSub parameters. Behaviour holds an
@@ -103,6 +113,10 @@ pub struct BlossomsubParams {
     /// asked us not to send. A malicious peer could otherwise
     /// enumerate IDs and balloon our memory.
     pub max_idont_want_messages: usize,
+    /// Cap on mesh peers per IPv4 /24 (or IPv6 /48) per bitmask.
+    /// Eclipse-resistance: see [`params::MESH_PEERS_PER_SUBNET`].
+    /// `0` disables the check.
+    pub mesh_peers_per_subnet: usize,
 }
 
 impl Default for BlossomsubParams {
@@ -125,6 +139,7 @@ impl Default for BlossomsubParams {
             iwant_followup_time: params::IWANT_FOLLOWUP_TIME,
             idont_want_message_threshold: params::IDONT_WANT_MESSAGE_THRESHOLD,
             max_idont_want_messages: 5000,
+            mesh_peers_per_subnet: params::MESH_PEERS_PER_SUBNET,
         }
     }
 }
@@ -179,6 +194,10 @@ impl BlossomsubParams {
             } else {
                 d.max_idont_want_messages
             },
+            // No P2PConfig field yet — operators tune via `set_params`
+            // post-build if they need to. Default protects against
+            // single-/24 eclipse on every node.
+            mesh_peers_per_subnet: d.mesh_peers_per_subnet,
         }
     }
 }

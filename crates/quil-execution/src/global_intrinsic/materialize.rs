@@ -17,6 +17,22 @@ pub const STATUS_PAUSED: u8 = 2;
 pub const STATUS_LEAVING: u8 = 3;
 pub const STATUS_KICKED: u8 = 4;
 
+/// Protocol-level halt-risk threshold. A shard with `Active` prover
+/// count at or below this value is classified as halt-risk by the
+/// coverage monitor and the proposer's auto-allocation logic.
+/// Mirrors `quil_engine::provers::proposer::HALT_RISK_PROVER_COUNT`
+/// (the engine-side copy used by `plan_and_allocate` / `plan_leaves`)
+/// — duplicated here to avoid an `engine → execution` dependency.
+/// If the engine constant changes, this one must change with it.
+///
+/// Used by `materialize_prover_confirm`'s leave-confirm gate: at
+/// confirm time, our alloc is `Leaving` so we're NOT counted in
+/// the registry's active-prover query. Rejecting a confirm whose
+/// shard already sits at the threshold preserves what little
+/// margin remains rather than letting attacker-coordinated mass
+/// leaves walk the network through the halt grace.
+pub const HALT_RISK_PROVER_COUNT: usize = 3;
+
 /// Materialize a ProverPause: set allocation Status=2 (paused),
 /// PauseFrameNumber=frame_number.
 ///

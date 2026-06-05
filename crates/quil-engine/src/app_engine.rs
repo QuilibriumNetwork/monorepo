@@ -48,6 +48,7 @@ use crate::committee::ProverRegistryCommittee;
 use crate::consensus_wire;
 use crate::message_collector::MessageCollector;
 use crate::message_router::{classify_consensus_message, ConsensusMessageKind};
+use crate::provers::proposer;
 use crate::voting_provider::{AddressDerivation, BlsVotingProvider};
 
 const CONSENSUS_QUEUE_SIZE: usize = 1000;
@@ -234,6 +235,13 @@ struct AppLeaderProvider {
     /// `prove_next_state` short-circuits when set so the leader stops
     /// producing frames during coverage halts.
     halted: Arc<std::sync::atomic::AtomicBool>,
+    /// Minimum number of Active provers on this shard before the
+    /// leader will produce frames. Network-dependent: mainnet uses
+    /// `HALT_RISK_PROVER_COUNT` (3) so single-prover shards can't
+    /// drive consensus alone; testnet uses 1 so a single-prover
+    /// test cluster still progresses. Plumbed from
+    /// `config.p2p.network` in `worker_manager::init`.
+    min_active_provers_for_propose: u64,
 }
 
 impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeaderProvider {
@@ -263,10 +271,56 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // recover cleanly. The engine flips this flag from
         // `AppEngineMessage::SetHalted` driven by the master's
         // halt-state watcher.
+        //
+        // `NoVote` (not `Consensus`) — `propose_for_new_rank_if_primary`
+        // catches `is_no_vote` errors and logs+returns Ok, letting the
+        // consensus event loop keep running. A `Consensus` error here
+        // bubbles up through `state_producer.make_state_proposal` →
+        // `on_receive_quorum_certificate` → `event_loop.run()`'s
+        // `return Err(...)`, which permanently kills the shard's
+        // event loop. Because `runtime_state.rs`'s halt broadcaster
+        // fans `set_halted(true)` to EVERY engine on the first
+        // network-wide halt (not just halted-shard engines), any
+        // healthy shard mid-QC at that moment loses its consensus
+        // loop and can't recover even after halts clear. Treating
+        // halt as a per-round skip mirrors the NoVote shape used for
+        // safety-rules declines.
         if self.halted.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(QuilError::Consensus(
+            return Err(QuilError::NoVote(
                 "coverage halt active — skipping shard frame production".into(),
             ));
+        }
+        // Minimum-active-provers gate. A shard needs at least
+        // `min_active_provers_for_propose` Active provers before any
+        // of them start producing frames — proposing as a sole
+        // prover (or two-prover pair) on mainnet is wasted work
+        // that the network rejects (sub-quorum) and produces no
+        // rewardable output. Mainnet uses `HALT_RISK_PROVER_COUNT`
+        // (3) so the threshold lines up with the protocol's
+        // coverage-halt classification; testnet uses 1 so a single-
+        // prover test cluster still progresses. Below the
+        // threshold the expected behavior is "wait for more provers
+        // to join," never "drive consensus alone." Without this
+        // gate, a node that lands as the first Active on a fresh
+        // mainnet shard burns CPU on VDF compute every round forever
+        // — exactly the wedge seen on workers 19/20 (sole proposer,
+        // frame 5 staged at ranks 12 → 600+ without ever committing).
+        //
+        // `NoVote` (not `Consensus`) for the same reason as the
+        // halt gate above — bubbling a `Consensus` error here
+        // kills the event loop. Caught by
+        // `propose_for_new_rank_if_primary`'s `is_no_vote` arm.
+        let active_count = self
+            .prover_registry
+            .get_active_provers(&self.filter)
+            .map(|p| p.len())
+            .unwrap_or(0);
+        if (active_count as u64) < self.min_active_provers_for_propose {
+            return Err(QuilError::NoVote(format!(
+                "shard has {} active prover(s); minimum {} required to propose",
+                active_count,
+                self.min_active_provers_for_propose,
+            )));
         }
         // Get latest shard frame number
         let prior_frame_number = self.clock_store
@@ -456,6 +510,10 @@ pub struct AppEngineDeps {
     pub local_bls_pubkey: Vec<u8>,
     pub bls_signer: Box<dyn quil_types::crypto::Signer>,
     pub reward_greedy: bool,
+    /// Minimum Active prover count required before this engine's
+    /// `AppLeaderProvider` will produce frames. Mainnet=3, testnet=1.
+    /// See `AppLeaderProvider::min_active_provers_for_propose`.
+    pub min_active_provers_for_propose: u64,
     /// Callback for publishing finalized canonical FrameHeader bytes
     /// on `GLOBAL_PROVER` for reward attribution. See
     /// `WorkerConsensusDeps::coverage_publish`.
@@ -500,6 +558,10 @@ pub struct AppConsensusEngine {
     message_collector: Arc<MessageCollector>,
     fee_manager: Arc<dyn quil_types::consensus::DynamicFeeManager>,
     reward_greedy: bool,
+    /// Per-network minimum Active prover count required before
+    /// `prove_next_state` will produce a frame. Plumbed through
+    /// `AppEngineDeps` from the master's network config.
+    min_active_provers_for_propose: u64,
     hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
     execution_engine: Option<Arc<quil_execution::ExecutionEngineManager>>,
     inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
@@ -600,6 +662,7 @@ impl AppConsensusEngine {
             message_collector: deps.message_collector,
             fee_manager: deps.fee_manager,
             reward_greedy: deps.reward_greedy,
+            min_active_provers_for_propose: deps.min_active_provers_for_propose,
             hypergraph: deps.hypergraph,
             execution_engine: deps.execution_engine,
             inclusion_prover: deps.inclusion_prover,
@@ -905,6 +968,7 @@ impl AppConsensusEngine {
             inclusion_prover: self.inclusion_prover.clone(),
             app_address: self.app_address.clone(),
             halted: self.halted.clone(),
+            min_active_provers_for_propose: self.min_active_provers_for_propose,
         });
 
         // Committee (from prover registry for this shard)

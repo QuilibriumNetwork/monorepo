@@ -336,6 +336,16 @@ impl PeerScorer {
         result
     }
 
+    /// Read a peer's currently-known IP addresses. Empty if the peer
+    /// has no tracking entry yet. Used by the mesh-graft path to
+    /// compute subnet diversity caps.
+    pub fn peer_ips(&self, peer: &PeerId) -> HashSet<IpAddr> {
+        self.stats
+            .get(peer)
+            .map(|s| s.ips.clone())
+            .unwrap_or_default()
+    }
+
     /// Register IP addresses for a peer. Updates the global IP-to-peer map.
     pub fn set_peer_ips(&mut self, peer: &PeerId, ips: HashSet<IpAddr>) {
         // Remove old IPs
@@ -964,5 +974,89 @@ mod tests {
         scorer.add_peer(&peer);
         scorer.add_delivery(&peer, b"untracked");
         assert_eq!(scorer.score(&peer), 0.0);
+    }
+
+    // ---------------------------------------------------------------
+    // Default-parameter invariants. These guard against accidental
+    // sign flips or out-of-range tweaks in `Default::default()` for
+    // `ScoreThresholds` and `PeerScoreParams`. The asserted
+    // properties are derived from the protocol's semantic
+    // requirements (penalty weights must not be positive, decay
+    // factors must be in (0, 1], thresholds must order so that the
+    // graylist cut sits below the publish cut, etc.).
+
+    /// Penalty weights and the colocation factor must be non-
+    /// positive — they exist to subtract from score, not add.
+    #[test]
+    fn default_penalty_weights_are_non_positive() {
+        let p = PeerScoreParams::default();
+        assert!(p.ip_colocation_factor_weight <= 0.0,
+            "IP colocation factor must penalize, got {}", p.ip_colocation_factor_weight);
+        assert!(p.behaviour_penalty_weight <= 0.0,
+            "behaviour penalty weight must penalize, got {}", p.behaviour_penalty_weight);
+    }
+
+    /// Decay factor must sit in (0, 1] — values ≥ 1 would never
+    /// decay (or amplify) the counter, values ≤ 0 would flip sign.
+    #[test]
+    fn default_behaviour_penalty_decay_in_unit_range() {
+        let p = PeerScoreParams::default();
+        assert!(p.behaviour_penalty_decay > 0.0 && p.behaviour_penalty_decay <= 1.0,
+            "behaviour_penalty_decay must be in (0, 1], got {}", p.behaviour_penalty_decay);
+    }
+
+    /// `decay_to_zero` is the floor below which counters round to
+    /// zero — must be non-negative, since the counter is non-
+    /// negative by construction.
+    #[test]
+    fn default_decay_to_zero_non_negative() {
+        let p = PeerScoreParams::default();
+        assert!(p.decay_to_zero >= 0.0,
+            "decay_to_zero must be non-negative, got {}", p.decay_to_zero);
+    }
+
+    /// Threshold ordering: graylist (most punitive) must sit at or
+    /// below the publish cut, which must sit at or below the gossip
+    /// cut — peers we won't gossip with shouldn't publish to us
+    /// either, and peers we publish to shouldn't be graylisted.
+    /// All three sit below zero (they're "negative-score" cutoffs).
+    #[test]
+    fn default_threshold_ordering() {
+        let t = ScoreThresholds::default();
+        assert!(t.graylist_threshold <= t.publish_threshold,
+            "graylist ({}) must be ≤ publish ({})", t.graylist_threshold, t.publish_threshold);
+        assert!(t.publish_threshold <= t.gossip_threshold,
+            "publish ({}) must be ≤ gossip ({})", t.publish_threshold, t.gossip_threshold);
+        assert!(t.gossip_threshold <= 0.0,
+            "gossip threshold must be ≤ 0, got {}", t.gossip_threshold);
+    }
+
+    /// `accept_px_threshold` (the bar to accept peer-exchange hints
+    /// from a peer) must be ≥ 0 — we only accept PX from peers in
+    /// good standing.
+    #[test]
+    fn default_accept_px_threshold_non_negative() {
+        let t = ScoreThresholds::default();
+        assert!(t.accept_px_threshold >= 0.0,
+            "accept_px_threshold must be ≥ 0, got {}", t.accept_px_threshold);
+    }
+
+    /// `retain_score` must be a non-zero duration — zero would
+    /// reset the score immediately on disconnect, defeating the
+    /// purpose of carrying punitive scores across reconnects.
+    #[test]
+    fn default_retain_score_nonzero() {
+        let p = PeerScoreParams::default();
+        assert!(p.retain_score > std::time::Duration::ZERO,
+            "retain_score must be > 0");
+    }
+
+    /// `decay_interval` must be a non-zero duration — zero would
+    /// produce divide-by-zero or infinite decay on `refresh_scores`.
+    #[test]
+    fn default_decay_interval_nonzero() {
+        let p = PeerScoreParams::default();
+        assert!(p.decay_interval > std::time::Duration::ZERO,
+            "decay_interval must be > 0");
     }
 }

@@ -201,6 +201,11 @@ pub(crate) async fn start(
     };
 
     let reward_greedy = config.engine.reward_strategy == "reward-greedy";
+    // Mainnet (`p2p.network == 0`) uses 3 — matches the protocol's
+    // halt-risk floor so a single prover can't drive consensus alone.
+    // Testnets use 1 so a single-prover test cluster still progresses.
+    let min_active_provers_for_propose: u64 =
+        if config.p2p.network == 0 { 3 } else { 1 };
 
     let mut worker_node = quil_engine::worker_node::WorkerOnlyNode::new(
         worker_config,
@@ -213,6 +218,7 @@ pub(crate) async fn start(
         bls_pubkey,
         signer_factory,
         reward_greedy,
+        min_active_provers_for_propose,
     )
     .with_state_engines(crdt, exec_manager, inclusion_prover);
 

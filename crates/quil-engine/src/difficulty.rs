@@ -240,4 +240,107 @@ mod tests {
         assert_ne!(d, BOOTSTRAP_DIFFICULTY, "mainnet anchor must not hit bootstrap path");
         assert_eq!(d, 80_000, "on-schedule frame should return anchor difficulty");
     }
+
+    /// Adversarial: post-halt resumption can't be used to gain an
+    /// asymmetric VDF advantage.
+    ///
+    /// Hypothetical attack: stall the network for a long period (e.g.
+    /// via a coverage halt of `DEFAULT_HALT_GRACE_FRAMES`), then race
+    /// other provers to produce the first post-halt frame. The fear
+    /// is that the time_delta vs. expected_delta gap causes ASERT to
+    /// collapse difficulty to a level so low that an attacker with
+    /// pre-staged VDF compute can produce many leader proofs cheaply
+    /// before the difficulty re-adjusts.
+    ///
+    /// In practice the half-life clamp (2h) plus the `MIN_DIFFICULTY`
+    /// floor (50_000) make this benign:
+    ///   - A 1800-frame halt at 10s/frame ≈ 5h of stall, 2.5 half-lives.
+    ///     Difficulty drops by ~2^2.5 ≈ 5.66× per cycle.
+    ///   - The drop is symmetric: everyone gets the lower difficulty,
+    ///     not just the attacker.
+    ///   - Even an infinite halt clamps to `MIN_DIFFICULTY = 50_000`,
+    ///     which is the protocol's hard floor — not exploitable as
+    ///     "free" compute.
+    /// This test pins those properties so any future ASERT tweak that
+    /// removes the floor or amplifies the post-halt drop will fail
+    /// loudly.
+    #[test]
+    fn post_halt_resumption_does_not_grant_asymmetric_advantage() {
+        const MAINNET_ANCHOR_DIFF: u32 = 80_000;
+        let anchor_time = 1_762_862_400_000i64;
+        let anchor_frame = 244_200u64;
+        let adj = AsertDifficultyAdjuster::new(
+            anchor_frame,
+            anchor_time,
+            MAINNET_ANCHOR_DIFF,
+        );
+
+        // Realistic worst-case halt: full DEFAULT_HALT_GRACE_FRAMES
+        // (1800) at 10s/frame = 18_000 seconds = 5 hours of stall on
+        // an otherwise-on-schedule chain. The first post-halt frame
+        // sees a time_delta that's 5 hours larger than the expected
+        // 10s × (frame_delta + 1).
+        let frame_delta = 1u64; // one frame after the anchor
+        let halt_seconds: i64 = (1800 * IDEAL_FRAME_TIME) / 1000; // 18000
+        let halt_ms = halt_seconds * 1000;
+        let current_frame = anchor_frame + frame_delta;
+        let on_schedule_time =
+            anchor_time + IDEAL_FRAME_TIME * (frame_delta as i64 + 1);
+        let post_halt_time = on_schedule_time + halt_ms;
+
+        let d_post_halt = adj.get_next_difficulty(current_frame, post_halt_time);
+
+        // (1) Floor: difficulty must never drop below MIN_DIFFICULTY,
+        //     regardless of stall length.
+        assert!(
+            d_post_halt >= MIN_DIFFICULTY,
+            "post-halt difficulty {} fell below floor {}",
+            d_post_halt, MIN_DIFFICULTY,
+        );
+
+        // (2) Symmetry: the lower difficulty applies to every prover
+        //     querying the same (frame, time) — there's no per-prover
+        //     differentiation, so no honest-vs-attacker asymmetry.
+        let d_for_attacker = adj.get_next_difficulty(current_frame, post_halt_time);
+        let d_for_honest = adj.get_next_difficulty(current_frame, post_halt_time);
+        assert_eq!(d_for_attacker, d_for_honest);
+
+        // (3) Recovery: as soon as frames resume on-schedule, the
+        //     adjuster moves back toward anchor. After roughly one
+        //     half-life of on-schedule frames the difficulty should
+        //     have closed most of the gap toward `MAINNET_ANCHOR_DIFF`.
+        let recovery_anchor_diff = d_post_halt as u32;
+        let recovery_anchor_time = post_halt_time;
+        let recovery_adj = AsertDifficultyAdjuster::new(
+            current_frame,
+            recovery_anchor_time,
+            recovery_anchor_diff,
+        );
+        // ~1 half-life later (2h), still on-schedule frame-by-frame.
+        let frames_per_halflife = (HALF_LIFE / IDEAL_FRAME_TIME) as u64; // 720
+        let after_halflife_frame = current_frame + frames_per_halflife;
+        let after_halflife_time =
+            recovery_anchor_time + IDEAL_FRAME_TIME * (frames_per_halflife as i64 + 1);
+        let d_after = recovery_adj.get_next_difficulty(after_halflife_frame, after_halflife_time);
+        // On-schedule recovery → returns the (now-lower) anchor.
+        // The point is it doesn't drift further down once frames
+        // resume; the post-halt floor is the worst case, and it
+        // recovers from there.
+        assert_eq!(
+            d_after, recovery_anchor_diff as u64,
+            "on-schedule frames after halt must stabilize at the post-halt difficulty, \
+             not continue dropping",
+        );
+
+        // (4) Halt magnitude is bounded by the half-life: even a 24h
+        //     halt (12 half-lives) clamps to MIN_DIFFICULTY rather
+        //     than producing exotic values.
+        let mega_halt_time = on_schedule_time + 24 * 3600 * 1000;
+        let d_mega = adj.get_next_difficulty(current_frame, mega_halt_time);
+        assert_eq!(
+            d_mega, MIN_DIFFICULTY,
+            "24h halt should clamp to floor, got {}",
+            d_mega,
+        );
+    }
 }

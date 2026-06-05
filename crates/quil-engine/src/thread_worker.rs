@@ -137,6 +137,11 @@ pub struct WorkerConsensusDeps {
     pub bls_signer_factory: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync>,
     /// Whether the node uses reward-greedy strategy for fee adjustment.
     pub reward_greedy: bool,
+    /// Minimum Active prover count required before a shard's leader
+    /// will produce frames. Mainnet=3 (matches halt-risk floor),
+    /// testnet=1 (single-prover clusters still progress). See
+    /// `AppLeaderProvider::min_active_provers_for_propose`.
+    pub min_active_provers_for_propose: u64,
     /// Callback that publishes finalized canonical FrameHeader bytes
     /// on `GLOBAL_PROVER` so archives credit our shard work toward
     /// rewards. AppFollower invokes this directly from the consensus
@@ -451,6 +456,7 @@ impl ThreadWorkerManager {
                                                         local_bls_pubkey: deps.local_bls_pubkey.clone(),
                                                         bls_signer: (deps.bls_signer_factory)(),
                                                         reward_greedy: deps.reward_greedy,
+                                                        min_active_provers_for_propose: deps.min_active_provers_for_propose,
                                                         coverage_publish: deps.coverage_publish.clone(),
                                                         hypergraph,
                                                         execution_engine,

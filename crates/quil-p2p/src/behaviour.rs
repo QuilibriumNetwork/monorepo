@@ -4,6 +4,7 @@
 //! protobuf RPCs over bidirectional libp2p streams.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -402,7 +403,7 @@ impl BlossomSubBehaviour {
     }
 
     /// Handle an RPC received from a peer's handler.
-    fn handle_rpc(&mut self, peer: PeerId, rpc: pb::Rpc) {
+    pub(crate) fn handle_rpc(&mut self, peer: PeerId, rpc: pb::Rpc) {
         // Subscriptions
         for sub in &rpc.subscriptions {
             let subs = self.peer_subscriptions.entry(peer).or_default();
@@ -698,6 +699,35 @@ impl BlossomSubBehaviour {
                     continue;
                 }
 
+                // Subnet-diversity gate. Cap inbound GRAFTs per
+                // /24 (v4) or /48 (v6). A Sybil attacker with many
+                // PeerIds across one provider subnet can love-bomb
+                // a victim with simultaneous GRAFTs; the Dhi gate
+                // above only catches them once the slice is at the
+                // upper bound. The per-subnet cap fires earlier,
+                // before mesh saturation. Inbound only — outbound
+                // peers were dialed by us, so they're not Sybil
+                // proxies regardless of subnet.
+                if !is_outbound {
+                    let mesh_set: HashSet<PeerId> = self
+                        .mesh
+                        .get(&graft.bitmask)
+                        .cloned()
+                        .unwrap_or_default();
+                    if self.graft_would_violate_subnet_cap(&mesh_set, &peer) {
+                        debug!(
+                            %peer,
+                            bitmask = hex::encode(&graft.bitmask),
+                            "GRAFT: rejected — subnet cap reached"
+                        );
+                        self.backoffs.insert(
+                            (peer, graft.bitmask.clone()),
+                            now + self.params.prune_backoff,
+                        );
+                        continue;
+                    }
+                }
+
                 // All gates passed — add to the simple slice mesh.
                 // The per-slice mesh map is used for forwarding on
                 // the wire.
@@ -733,14 +763,56 @@ impl BlossomSubBehaviour {
                 }
             }
             for prune in &control.prune {
+                // Is this PRUNE for a composite-managed slice? Slice
+                // PRUNEs are legitimate composite-rebalancing
+                // signals (same → broker demotion); they aren't
+                // flap-graft attacks. Skip the backoff install for
+                // those so subsequent slice GRAFTs (which legitimately
+                // promote broker back to same when the peer is fully
+                // subscribed) aren't penalty-blocked.
+                let composite_managed =
+                    self.slice_to_composite.contains_key(&prune.bitmask);
+
+                if !composite_managed {
+                    // Honor the remote peer's `backoff` hint: install
+                    // a backoff entry so we don't try to re-GRAFT
+                    // them until the suggested window expires.
+                    // Without this, an attacker can prune us and
+                    // immediately re-GRAFT to refresh their slot,
+                    // defeating the purpose of the prune. A peer
+                    // that omits the field (`0`) falls back to our
+                    // local `prune_backoff` parameter so a missing
+                    // or malicious-zero value can't disable the
+                    // backoff entirely. Cap the upper bound at one
+                    // hour to prevent a malicious peer from
+                    // advertising a multi-day backoff that locks us
+                    // out of grafting forever.
+                    let suggested = if prune.backoff == 0 {
+                        self.params.prune_backoff
+                    } else {
+                        let secs = std::cmp::min(prune.backoff, 3600);
+                        std::time::Duration::from_secs(secs)
+                    };
+                    let expire = std::time::Instant::now() + suggested;
+                    // Only extend an existing backoff (don't shorten
+                    // it) so repeated PRUNEs from the same peer
+                    // don't reset the clock to a more lenient value.
+                    self.backoffs
+                        .entry((peer, prune.bitmask.clone()))
+                        .and_modify(|e| {
+                            if expire > *e {
+                                *e = expire;
+                            }
+                        })
+                        .or_insert(expire);
+                }
+
                 // If this slice is managed by a composite, demote the peer
                 // from `same` to `broker` rather than removing it from the
                 // mesh — brokers remain in every slice mesh so traffic can
                 // still bridge.  Only actually remove from the slice mesh
                 // when the peer is not managed by any composite (or has
                 // fully dropped out of them).
-                let composite_managed =
-                    self.slice_to_composite.contains_key(&prune.bitmask);
                 if composite_managed {
                     if let Some(comp_keys) =
                         self.slice_to_composite.get(&prune.bitmask).cloned()
@@ -948,6 +1020,114 @@ impl BlossomSubBehaviour {
     /// Get mesh peer count for a bitmask.
     pub fn mesh_peers(&self, bitmask: &[u8]) -> usize {
         self.mesh.get(bitmask).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Read-only access to our own subscription set.
+    pub fn subscriptions(&self) -> &HashSet<Vec<u8>> {
+        &self.subscriptions
+    }
+
+    /// True iff `peer` is in our connected set.
+    pub fn is_connected(&self, peer: &PeerId) -> bool {
+        self.connected_peers.contains_key(peer)
+    }
+
+    /// True iff we know `peer` to be subscribed to `bitmask`.
+    pub fn peer_subscribed_to(&self, peer: &PeerId, bitmask: &[u8]) -> bool {
+        self.peer_subscriptions
+            .get(peer)
+            .map_or(false, |s| s.contains(bitmask))
+    }
+
+    /// Number of distinct peers currently connected.
+    pub fn connected_count(&self) -> usize {
+        self.connected_peers.len()
+    }
+
+    /// Set the local peer ID for outgoing message authoring. The
+    /// production code path sets this through `set_signing_identity`
+    /// (which also installs the signing keypair); the test harness
+    /// uses this lighter setter when signing is irrelevant.
+    pub fn set_local_peer_id(&mut self, peer_id: PeerId) {
+        self.local_peer_id = Some(peer_id);
+    }
+
+    // ---- test-harness helpers (cfg(test) gated to avoid bloating
+    // the production surface area). These let the in-memory
+    // multi-node harness in `crate::test_harness` poke at the
+    // behaviour's private state without exposing every field to the
+    // wider crate. ----
+
+    #[cfg(test)]
+    pub(crate) fn test_record_connection(&mut self, peer: PeerId) {
+        self.connected_peers.entry(peer).or_default();
+        self.peer_subscriptions.entry(peer).or_default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_record_subscription(
+        &mut self,
+        peer: PeerId,
+        bitmask: Vec<u8>,
+    ) {
+        self.peer_subscriptions
+            .entry(peer)
+            .or_default()
+            .insert(bitmask);
+    }
+
+    /// Force a heartbeat tick regardless of `last_heartbeat`. Mirrors
+    /// what the libp2p swarm's poll loop would do, but lets tests
+    /// drive timing deterministically.
+    #[cfg(test)]
+    pub(crate) fn test_force_heartbeat(&mut self) {
+        self.heartbeat();
+    }
+
+    /// Drain pending outbound `NotifyHandler` events, invoking the
+    /// callback with `(target_peer, rpc_bytes)` for each one. Used
+    /// by the test harness to forward RPCs to recipient behaviours
+    /// without going through a real swarm.
+    #[cfg(test)]
+    pub(crate) fn test_drain_events<F>(&mut self, mut on_send: F)
+    where
+        F: FnMut(PeerId, Vec<u8>),
+    {
+        let queued: Vec<_> = self.events.drain(..).collect();
+        for ev in queued {
+            match ev {
+                libp2p::swarm::ToSwarm::NotifyHandler { peer_id, event, .. } => {
+                    on_send(peer_id, event.rpc_data);
+                }
+                libp2p::swarm::ToSwarm::GenerateEvent(other) => {
+                    // Push back; the caller drains GenerateEvent
+                    // separately via `test_drain_generated`.
+                    self.events.push_back(libp2p::swarm::ToSwarm::GenerateEvent(other));
+                }
+                other => {
+                    // Other ToSwarm variants (Dial, etc.) aren't
+                    // relevant to the in-memory harness; push back
+                    // for future drains.
+                    self.events.push_back(other);
+                }
+            }
+        }
+    }
+
+    /// Drain pending `GenerateEvent` (application-facing)
+    /// `BlossomSubEvent`s, invoking the callback with each.
+    #[cfg(test)]
+    pub(crate) fn test_drain_generated<F>(&mut self, mut on_ev: F)
+    where
+        F: FnMut(BlossomSubEvent),
+    {
+        let queued: Vec<_> = self.events.drain(..).collect();
+        for ev in queued {
+            match ev {
+                libp2p::swarm::ToSwarm::GenerateEvent(inner) => on_ev(inner),
+                other => self.events.push_back(other),
+            }
+        }
     }
 
     /// Sum of mesh peer counts across every subscribed bitmask —
@@ -1188,6 +1368,69 @@ impl BlossomSubBehaviour {
         }
     }
 
+    /// Compute the diversity-bucket keys for a peer's IP set.
+    ///
+    /// Each IPv4 address collapses to its /24 (`a.b.c.0`); each IPv6
+    /// to its /48 (the first 48 bits). A peer with multiple known
+    /// IPs contributes one bucket key per address. Eclipse-resistance
+    /// uses these buckets to cap how many mesh slots any single
+    /// subnet can occupy.
+    ///
+    /// Rationale for /24 (v4) and /48 (v6): both are the smallest
+    /// allocations a typical hosting provider hands out as a single
+    /// "block." A Sybil attacker who controls one /24 of cheap VPS
+    /// instances can produce dozens of distinct PeerIds with
+    /// independent IPs but still shares the same routing prefix —
+    /// the colocation-factor penalty (per-IP) misses this case
+    /// because the IPs literally differ. Bucketing at the subnet
+    /// level catches it.
+    fn peer_subnet_buckets(&self, peer: &PeerId) -> HashSet<[u8; 16]> {
+        let mut out = HashSet::new();
+        for ip in self.scorer.peer_ips(peer) {
+            out.insert(subnet_bucket_key(ip));
+        }
+        out
+    }
+
+    /// Count mesh peers in `mesh` whose subnet bucket overlaps with
+    /// `bucket`. Linear scan; mesh is small (~D = 8). Returns 0 if
+    /// the candidate peer has no known IPs (which would prevent
+    /// every legitimate peer from joining the mesh).
+    fn count_mesh_in_subnet(
+        &self,
+        mesh: &HashSet<PeerId>,
+        bucket: &[u8; 16],
+    ) -> usize {
+        mesh.iter()
+            .filter(|p| self.peer_subnet_buckets(p).contains(bucket))
+            .count()
+    }
+
+    /// Returns true if grafting `peer` into `mesh` would violate the
+    /// per-subnet cap. If `params.mesh_peers_per_subnet == 0` the
+    /// check is disabled. If the peer has no known IPs (libp2p
+    /// hasn't observed an address yet), the check is skipped so the
+    /// peer can still join the mesh — the IP gets recorded later
+    /// via `set_peer_ips` and subsequent grafts are bucketed
+    /// normally.
+    fn graft_would_violate_subnet_cap(
+        &self,
+        mesh: &HashSet<PeerId>,
+        peer: &PeerId,
+    ) -> bool {
+        let cap = self.params.mesh_peers_per_subnet;
+        if cap == 0 {
+            return false;
+        }
+        let candidate_buckets = self.peer_subnet_buckets(peer);
+        if candidate_buckets.is_empty() {
+            return false;
+        }
+        candidate_buckets
+            .iter()
+            .any(|b| self.count_mesh_in_subnet(mesh, b) >= cap)
+    }
+
     fn heartbeat(&mut self) {
         self.heartbeat_ticks += 1;
 
@@ -1295,18 +1538,71 @@ impl BlossomSubBehaviour {
             // 4b. If under-subscribed (< D_LO): GRAFT from available peers
             if mesh.len() < self.params.d_lo {
                 let needed = crate::params::D - mesh.len();
-                let candidates: Vec<PeerId> = self
-                    .peer_subscriptions
-                    .iter()
-                    .filter(|(p, subs)| {
-                        subs.contains(bitmask)
-                            && !mesh.contains(p)
-                            && !self.backoffs.contains_key(&(**p, bitmask.clone()))
-                            && self.scorer.score(p) >= 0.0
-                    })
-                    .map(|(p, _)| *p)
-                    .take(needed)
-                    .collect();
+                // Subnet-diversity gate: refuse to graft a candidate
+                // whose /24 (v4) or /48 (v6) already has
+                // `params.mesh_peers_per_subnet` peers in the mesh.
+                // Mutates `mesh` as we go so subsequent candidates
+                // see updated bucket counts (one accepted graft
+                // affects the bucket count for the next).
+                let cap = self.params.mesh_peers_per_subnet;
+                // Helper closure captures only `self.scorer` (an
+                // immutable borrow of a sibling field) so it can
+                // coexist with the mutable borrow of `self.mesh`
+                // (`mesh`). Calling `self.peer_subnet_buckets`
+                // (`&self`) here would re-borrow the parent and
+                // collide.
+                let scorer = &self.scorer;
+                let buckets_for = |peer: &PeerId| -> HashSet<[u8; 16]> {
+                    scorer
+                        .peer_ips(peer)
+                        .into_iter()
+                        .map(subnet_bucket_key)
+                        .collect()
+                };
+
+                let mut accepted_subnet_counts: HashMap<[u8; 16], usize> =
+                    HashMap::new();
+                if cap > 0 {
+                    for peer in mesh.iter() {
+                        for b in buckets_for(peer) {
+                            *accepted_subnet_counts.entry(b).or_insert(0) += 1;
+                        }
+                    }
+                }
+
+                let mut candidates: Vec<PeerId> = Vec::with_capacity(needed);
+                for (peer, subs) in self.peer_subscriptions.iter() {
+                    if candidates.len() >= needed {
+                        break;
+                    }
+                    if !subs.contains(bitmask)
+                        || mesh.contains(peer)
+                        || self.backoffs.contains_key(&(*peer, bitmask.clone()))
+                        || scorer.score(peer) < 0.0
+                    {
+                        continue;
+                    }
+                    if cap > 0 {
+                        let buckets = buckets_for(peer);
+                        if !buckets.is_empty()
+                            && buckets.iter().any(|b| {
+                                accepted_subnet_counts.get(b).copied().unwrap_or(0)
+                                    >= cap
+                            })
+                        {
+                            debug!(
+                                %peer,
+                                bitmask = hex::encode(bitmask),
+                                "heartbeat: skipping graft — subnet cap reached"
+                            );
+                            continue;
+                        }
+                        for b in buckets {
+                            *accepted_subnet_counts.entry(b).or_insert(0) += 1;
+                        }
+                    }
+                    candidates.push(*peer);
+                }
 
                 for peer in &candidates {
                     mesh.insert(*peer);
@@ -1567,6 +1863,32 @@ impl BlossomSubBehaviour {
             }
         }
     }
+}
+
+/// Map an IP to its diversity bucket key. IPv4 → /24 left-padded
+/// into the high 4 bytes (last 12 bytes zero). IPv6 → /48 left into
+/// the first 6 bytes (remaining 10 zero). Different families never
+/// collide because the v4 form has zero bytes [4..16] and the v6
+/// form encodes the unmasked /48 bits in [0..6] — collisions would
+/// require a v6 prefix that starts with `0x00.0x00.0x00.0x00`,
+/// which is the IPv4-mapped reserved range and not used as an
+/// independent v6 prefix on any production network.
+pub(crate) fn subnet_bucket_key(ip: IpAddr) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // /24 — first three octets identify the bucket; fourth
+            // and beyond zeroed.
+            out[..3].copy_from_slice(&octets[..3]);
+        }
+        IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            // /48 — first six bytes identify the bucket.
+            out[..6].copy_from_slice(&octets[..6]);
+        }
+    }
+    out
 }
 
 impl Default for BlossomSubBehaviour {
@@ -1840,3 +2162,1238 @@ mod composite_tests {
     }
 }
 
+#[cfg(test)]
+mod mesh_maintenance_tests {
+    //! Tests that exercise the heartbeat-driven mesh maintenance
+    //! loop's core invariants. These are the regressions that would
+    //! catch eclipse-class bugs (an attacker manipulating mesh slots
+    //! via score / backoff / subscription games) and the gossipsub
+    //! flow-control properties (D_LO / D / D_HI bounds, D_SCORE +
+    //! outbound protection during prune).
+    //!
+    //! Coverage we intentionally skip here: composite mesh
+    //! same/broker classification (`composite_tests` above) and the
+    //! subnet diversity gate (`subnet_diversity_tests` below). Both
+    //! have dedicated suites.
+    use super::*;
+
+    fn make_peer() -> PeerId {
+        PeerId::random()
+    }
+
+    /// Build a behaviour subscribed to a single bitmask, with N peers
+    /// already in the mesh and `extra` additional candidates
+    /// available for graft. Returns (behaviour, bitmask, mesh peers,
+    /// candidate peers).
+    fn setup_subscribed_with_mesh_and_candidates(
+        mesh_size: usize,
+        candidate_count: usize,
+    ) -> (BlossomSubBehaviour, Vec<u8>, Vec<PeerId>, Vec<PeerId>) {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        bh.subscribe(bitmask.clone());
+
+        let mesh_peers: Vec<PeerId> = (0..mesh_size).map(|_| make_peer()).collect();
+        let candidates: Vec<PeerId> = (0..candidate_count).map(|_| make_peer()).collect();
+
+        // Seed subscriptions so the heartbeat sees them as eligible.
+        for p in mesh_peers.iter().chain(candidates.iter()) {
+            bh.peer_subscriptions
+                .entry(*p)
+                .or_default()
+                .insert(bitmask.clone());
+        }
+
+        // Pre-populate mesh.
+        let mesh_entry = bh.mesh.entry(bitmask.clone()).or_default();
+        for p in &mesh_peers {
+            mesh_entry.insert(*p);
+        }
+
+        (bh, bitmask, mesh_peers, candidates)
+    }
+
+    /// Mesh below D_LO + candidates available → heartbeat grafts up
+    /// to D. (Fundamental D-LO maintenance.)
+    #[test]
+    fn heartbeat_grafts_when_below_d_lo() {
+        let d = crate::params::D;
+        let d_lo = crate::params::D_LO;
+        let (mut bh, bitmask, _existing, candidates) =
+            setup_subscribed_with_mesh_and_candidates(d_lo - 1, d * 2);
+        assert!(bh.mesh.get(&bitmask).unwrap().len() < d_lo);
+        let initial = bh.mesh.get(&bitmask).unwrap().len();
+
+        bh.heartbeat();
+
+        let after = bh.mesh.get(&bitmask).unwrap().len();
+        assert_eq!(after, d, "should graft up to D after heartbeat");
+        // The new peers must be drawn from the candidate pool.
+        let new_grafted: Vec<PeerId> = bh
+            .mesh
+            .get(&bitmask)
+            .unwrap()
+            .iter()
+            .filter(|p| candidates.contains(p))
+            .copied()
+            .collect();
+        assert_eq!(new_grafted.len(), d - initial);
+    }
+
+    /// Mesh above D_HI → heartbeat prunes down to D.
+    #[test]
+    fn heartbeat_prunes_when_above_d_hi() {
+        let d = crate::params::D;
+        let d_hi = crate::params::D_HI;
+        // Start with d_hi + 3 — clearly above the cap.
+        let (mut bh, bitmask, _mesh_peers, _) =
+            setup_subscribed_with_mesh_and_candidates(d_hi + 3, 0);
+        assert!(bh.mesh.get(&bitmask).unwrap().len() > d_hi);
+
+        bh.heartbeat();
+
+        let after = bh.mesh.get(&bitmask).unwrap().len();
+        assert_eq!(after, d, "should prune down to D after heartbeat");
+    }
+
+    /// Mesh at D → heartbeat is a no-op.
+    #[test]
+    fn heartbeat_at_d_neither_grafts_nor_prunes() {
+        let d = crate::params::D;
+        let (mut bh, bitmask, mesh_peers, _) =
+            setup_subscribed_with_mesh_and_candidates(d, 0);
+        let before: HashSet<PeerId> =
+            bh.mesh.get(&bitmask).unwrap().iter().copied().collect();
+
+        bh.heartbeat();
+
+        let after: HashSet<PeerId> =
+            bh.mesh.get(&bitmask).unwrap().iter().copied().collect();
+        assert_eq!(before, after, "mesh at D must not be modified");
+        assert_eq!(after.len(), mesh_peers.len());
+    }
+
+    /// Negative-score peers in the mesh are removed by heartbeat
+    /// regardless of D_LO / D_HI state.
+    #[test]
+    fn heartbeat_removes_negative_score_peers_from_mesh() {
+        let d = crate::params::D;
+        let (mut bh, bitmask, mesh_peers, _) =
+            setup_subscribed_with_mesh_and_candidates(d, 0);
+        let bad_peer = mesh_peers[0];
+        // Force a strongly negative score on one mesh peer.
+        bh.scorer.set_application_score(bad_peer, -100.0);
+
+        bh.heartbeat();
+
+        let mesh = bh.mesh.get(&bitmask).unwrap();
+        assert!(
+            !mesh.contains(&bad_peer),
+            "negative-score peer must be evicted from mesh",
+        );
+    }
+
+    /// During a D_HI prune, outbound peers must survive even if
+    /// they're not in the top-D_SCORE band. (Eclipse defense — we
+    /// trust peers we dialed.)
+    ///
+    /// NB: outbound protection only applies when the peer survives
+    /// the prior negative-score sweep (step 4a). A peer whose score
+    /// has dropped negative is considered bad regardless of dial
+    /// direction. This test stays in the small-positive-score band
+    /// so 4a doesn't fire and 4c's outbound check is the load-
+    /// bearing assertion.
+    #[test]
+    fn heartbeat_protects_outbound_during_d_hi_prune() {
+        let d_hi = crate::params::D_HI;
+        let d_score = crate::params::D_SCORE;
+        let (mut bh, bitmask, mesh_peers, _) =
+            setup_subscribed_with_mesh_and_candidates(d_hi + 3, 0);
+
+        // Give the top D_SCORE peers high scores so they fill the
+        // top-score protected band. The outbound peer sits BELOW
+        // that band but has a small positive score (avoids 4a).
+        for (i, p) in mesh_peers.iter().take(d_score).enumerate() {
+            bh.scorer.set_application_score(*p, 100.0 + i as f64);
+        }
+        let outbound_peer = mesh_peers[d_hi]; // outside top-D_SCORE
+        bh.outbound_peers
+            .entry(bitmask.clone())
+            .or_default()
+            .insert(outbound_peer);
+        bh.scorer.set_application_score(outbound_peer, 0.1);
+
+        bh.heartbeat();
+
+        let mesh = bh.mesh.get(&bitmask).unwrap();
+        assert!(
+            mesh.contains(&outbound_peer),
+            "outbound peer must survive D_HI prune even when outside top-D_SCORE band",
+        );
+    }
+
+    /// During a D_HI prune, the top-`D_SCORE` peers by score must
+    /// survive.
+    #[test]
+    fn heartbeat_protects_top_d_score_during_d_hi_prune() {
+        let d_hi = crate::params::D_HI;
+        let d_score = crate::params::D_SCORE;
+        let (mut bh, bitmask, mesh_peers, _) =
+            setup_subscribed_with_mesh_and_candidates(d_hi + 3, 0);
+
+        // Give the first `d_score` peers a high positive score
+        // (must be > 0 so they're not pruned by the negative-score
+        // sweep first).
+        let top_peers: Vec<PeerId> = mesh_peers.iter().take(d_score).copied().collect();
+        for (i, p) in top_peers.iter().enumerate() {
+            bh.scorer.set_application_score(*p, 100.0 + i as f64);
+        }
+
+        bh.heartbeat();
+
+        let mesh = bh.mesh.get(&bitmask).unwrap();
+        for p in &top_peers {
+            assert!(
+                mesh.contains(p),
+                "top-D_SCORE peer {:?} must survive D_HI prune",
+                p,
+            );
+        }
+    }
+
+    /// A peer in the backoff map must not be picked as a graft
+    /// candidate during heartbeat under-D_LO maintenance.
+    /// (Flap-graft defense.)
+    #[test]
+    fn heartbeat_respects_backoff_when_grafting() {
+        use std::time::{Duration, Instant};
+        let d_lo = crate::params::D_LO;
+        // 1 peer in mesh + candidates available, but one candidate is
+        // in backoff.
+        let (mut bh, bitmask, _mesh, candidates) =
+            setup_subscribed_with_mesh_and_candidates(d_lo - 1, 5);
+
+        let backed_off = candidates[0];
+        bh.backoffs.insert(
+            (backed_off, bitmask.clone()),
+            Instant::now() + Duration::from_secs(60),
+        );
+
+        bh.heartbeat();
+
+        let mesh = bh.mesh.get(&bitmask).unwrap();
+        assert!(
+            !mesh.contains(&backed_off),
+            "backed-off peer must not be grafted during heartbeat",
+        );
+    }
+
+    /// Peers that aren't subscribed to the bitmask must not be
+    /// candidates for under-D_LO graft. (Basic correctness.)
+    #[test]
+    fn heartbeat_does_not_graft_unsubscribed_peers() {
+        let d_lo = crate::params::D_LO;
+        let (mut bh, bitmask, _mesh, candidates) =
+            setup_subscribed_with_mesh_and_candidates(d_lo - 1, 5);
+
+        // Drop subscription from one candidate.
+        let unsubbed = candidates[0];
+        if let Some(subs) = bh.peer_subscriptions.get_mut(&unsubbed) {
+            subs.remove(&bitmask);
+        }
+
+        bh.heartbeat();
+
+        let mesh = bh.mesh.get(&bitmask).unwrap();
+        assert!(
+            !mesh.contains(&unsubbed),
+            "unsubscribed peer must not be grafted",
+        );
+    }
+
+    /// When we receive an inbound PRUNE for a bitmask, the remote
+    /// peer's `backoff` hint must be honored — we shouldn't try to
+    /// re-GRAFT them before the suggested window expires. This is
+    /// the flap-graft defense: without it, an attacker can prune us
+    /// then immediately re-graft to refresh slot ownership, which
+    /// defeats the purpose of the prune.
+    #[test]
+    fn incoming_prune_sets_backoff() {
+        use std::time::Instant;
+
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        bh.subscribe(bitmask.clone());
+
+        let peer = make_peer();
+        bh.peer_subscriptions
+            .entry(peer)
+            .or_default()
+            .insert(bitmask.clone());
+        bh.mesh.entry(bitmask.clone()).or_default().insert(peer);
+
+        // Receive a PRUNE with a 60s backoff hint.
+        let rpc = crate::protocol::prune_rpc(&[bitmask.clone()], 60);
+        let before = Instant::now();
+        bh.handle_rpc(peer, rpc);
+
+        // The peer should now be in our backoff map for at least
+        // ~60s ahead.
+        let backoff_until = bh.backoffs.get(&(peer, bitmask.clone()));
+        assert!(
+            backoff_until.is_some(),
+            "incoming PRUNE must populate the backoffs map so we don't \
+             immediately re-GRAFT — flap-graft defense",
+        );
+        let until = *backoff_until.unwrap();
+        let elapsed = until.duration_since(before);
+        assert!(
+            elapsed.as_secs() >= 55 && elapsed.as_secs() <= 65,
+            "expected ~60s backoff (got {}s)",
+            elapsed.as_secs(),
+        );
+    }
+
+    /// PRUNE with `backoff = 0` should fall back to the local
+    /// `prune_backoff` parameter (not "zero, no backoff").
+    /// Otherwise a peer who omits the field could trick us into
+    /// allowing instant re-grafts on their own future GRAFTs.
+    #[test]
+    fn incoming_prune_with_zero_backoff_uses_default() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        bh.subscribe(bitmask.clone());
+
+        let peer = make_peer();
+        bh.peer_subscriptions
+            .entry(peer)
+            .or_default()
+            .insert(bitmask.clone());
+        bh.mesh.entry(bitmask.clone()).or_default().insert(peer);
+
+        let rpc = crate::protocol::prune_rpc(&[bitmask.clone()], 0);
+        bh.handle_rpc(peer, rpc);
+
+        let backoff_until = bh.backoffs.get(&(peer, bitmask.clone()));
+        assert!(
+            backoff_until.is_some(),
+            "PRUNE with backoff=0 must still install some backoff (default), \
+             not be treated as no backoff",
+        );
+    }
+
+    /// Score-pruned peers go into the backoff map so they can't be
+    /// re-grafted on the next heartbeat tick. (Prevents an attacker
+    /// from cycling in and out of the mesh.)
+    #[test]
+    fn negative_score_prune_starts_backoff_implicitly() {
+        let d = crate::params::D;
+        let (mut bh, bitmask, mesh_peers, _) =
+            setup_subscribed_with_mesh_and_candidates(d, 5);
+        let bad_peer = mesh_peers[0];
+        bh.scorer.set_application_score(bad_peer, -100.0);
+
+        bh.heartbeat();
+        // First heartbeat removed bad_peer. The mesh may now be
+        // below D_LO; a second heartbeat should NOT graft the same
+        // bad_peer back (negative score filter on graft candidates).
+        bh.heartbeat();
+
+        let mesh = bh.mesh.get(&bitmask).unwrap();
+        assert!(
+            !mesh.contains(&bad_peer),
+            "negative-score peer must not be re-grafted after eviction",
+        );
+    }
+}
+
+#[cfg(test)]
+mod direct_peer_tests {
+    //! Contracts for direct peers: explicit operator-pinned peers
+    //! that are always-grafted into every subscribed mesh and
+    //! immune to D / D_HI / score pruning.
+    //!
+    //! Derived from `behaviour.rs:1337-1374` (heartbeat direct-peer
+    //! maintenance) and `behaviour.rs:643` (incoming GRAFT bypass).
+    use super::*;
+
+    fn make_peer() -> PeerId {
+        PeerId::random()
+    }
+
+    /// `add_direct_peer` registers the peer in the direct set.
+    #[test]
+    fn add_direct_peer_records_membership() {
+        let mut bh = BlossomSubBehaviour::default();
+        let peer = make_peer();
+        bh.add_direct_peer(peer);
+        assert!(bh.direct_peers.contains(&peer));
+    }
+
+    /// A connected direct peer is grafted into every subscribed
+    /// mesh on the next heartbeat.
+    #[test]
+    fn heartbeat_grafts_direct_peer_into_every_mesh() {
+        let mut bh = BlossomSubBehaviour::default();
+        let direct = make_peer();
+        let a = vec![0xC0];
+        let b = vec![0x0C];
+        bh.subscribe(a.clone());
+        bh.subscribe(b.clone());
+        bh.connected_peers.insert(direct, Vec::new());
+        bh.add_direct_peer(direct);
+
+        bh.heartbeat();
+
+        assert!(bh.mesh.get(&a).map_or(false, |m| m.contains(&direct)),
+            "direct peer must be grafted into mesh A");
+        assert!(bh.mesh.get(&b).map_or(false, |m| m.contains(&direct)),
+            "direct peer must be grafted into mesh B");
+    }
+
+    /// A direct peer that disconnects causes heartbeat to emit a
+    /// `NeedPeers` event so the swarm layer can reconnect.
+    #[test]
+    fn heartbeat_emits_need_peers_for_disconnected_direct() {
+        let mut bh = BlossomSubBehaviour::default();
+        let direct = make_peer();
+        bh.subscribe(vec![0xC0]);
+        bh.add_direct_peer(direct);
+        // Direct peer is NOT in connected_peers — represents
+        // disconnected state.
+
+        bh.heartbeat();
+
+        let need_peers_emitted = bh.events.iter().any(|ev| {
+            matches!(ev,
+                libp2p::swarm::ToSwarm::GenerateEvent(
+                    BlossomSubEvent::NeedPeers { .. }
+                ))
+        });
+        assert!(need_peers_emitted,
+            "disconnected direct peer must trigger NeedPeers event");
+    }
+
+    /// Heartbeat does not graft a direct peer that's not currently
+    /// connected. (Disconnected direct peers can't be in the mesh.)
+    #[test]
+    fn heartbeat_does_not_graft_disconnected_direct() {
+        let mut bh = BlossomSubBehaviour::default();
+        let direct = make_peer();
+        let bitmask = vec![0xC0];
+        bh.subscribe(bitmask.clone());
+        bh.add_direct_peer(direct);
+        // Not in connected_peers.
+
+        bh.heartbeat();
+
+        assert!(!bh.mesh.get(&bitmask).map_or(false, |m| m.contains(&direct)),
+            "disconnected direct peer must not be in mesh");
+    }
+
+    /// An incoming GRAFT from a direct peer is a misconfiguration
+    /// (they're already pinned). Handler ignores and does not change
+    /// mesh membership for that bitmask.
+    #[test]
+    fn incoming_graft_from_direct_peer_is_ignored() {
+        let mut bh = BlossomSubBehaviour::default();
+        let direct = make_peer();
+        let bitmask = vec![0xC0];
+        bh.subscribe(bitmask.clone());
+        bh.add_direct_peer(direct);
+        bh.peer_subscriptions
+            .entry(direct)
+            .or_default()
+            .insert(bitmask.clone());
+
+        // Mesh starts empty for this bitmask.
+        let before: HashSet<PeerId> = bh
+            .mesh
+            .get(&bitmask)
+            .cloned()
+            .unwrap_or_default();
+
+        // Direct GRAFT — should be ignored (no mesh change from
+        // this RPC alone). Heartbeat would later graft via the
+        // direct-peer path, but not this RPC handler.
+        let rpc = crate::protocol::graft_rpc(&[bitmask.clone()]);
+        bh.handle_rpc(direct, rpc);
+
+        let after: HashSet<PeerId> = bh
+            .mesh
+            .get(&bitmask)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(before, after,
+            "GRAFT from direct peer must not mutate mesh state via the RPC");
+    }
+}
+
+#[cfg(test)]
+mod publish_subscribe_tests {
+    //! Contracts around `publish` + `subscribe`/`unsubscribe`.
+    //! Behaviors covered:
+    //!   - Publish-to-unsubscribed-bitmask is rejected (no implicit
+    //!     fanout — see note below).
+    //!   - Subscribe + unsubscribe round-trip cleans up state.
+    //!   - Duplicate publish is deduped by seen-message cache.
+    //!
+    //! Gap flagged: Go gossipsub's fanout behavior (publish to a
+    //! bitmask we don't subscribe to → fan out to D known peers)
+    //! is NOT implemented. The `fanout` + `fanout_last_pub` fields
+    //! exist and the heartbeat expiry runs, but no code path
+    //! populates them. Tests in this module document the current
+    //! "publish requires subscription" semantics; a future port of
+    //! fanout would add more tests here.
+    use super::*;
+
+    /// Publish to a bitmask we haven't subscribed to returns Err.
+    /// (Current semantics — no implicit fanout.)
+    #[test]
+    fn publish_unsubscribed_bitmask_errors() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        let result = bh.publish(bitmask, b"hello".to_vec());
+        assert!(result.is_err(), "publish to unsubscribed bitmask must error");
+    }
+
+    /// Subscribe creates an entry; publish to a subscribed bitmask
+    /// returns Ok.
+    #[test]
+    fn publish_subscribed_bitmask_succeeds() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        bh.subscribe(bitmask.clone());
+        let result = bh.publish(bitmask, b"hello".to_vec());
+        assert!(result.is_ok(), "publish to subscribed bitmask must succeed");
+    }
+
+    /// Duplicate publish (same data) is silently deduped by the
+    /// seen-messages cache — second publish returns Ok but no new
+    /// state change occurs.
+    #[test]
+    fn duplicate_publish_is_deduped() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        bh.subscribe(bitmask.clone());
+        let payload = b"dup".to_vec();
+        let r1 = bh.publish(bitmask.clone(), payload.clone());
+        assert!(r1.is_ok());
+        let r2 = bh.publish(bitmask, payload);
+        assert!(r2.is_ok(), "dedup must be silent, not error");
+    }
+
+    /// Subscribe then unsubscribe leaves no residual subscription
+    /// state for the bitmask.
+    #[test]
+    fn unsubscribe_clears_subscription() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        bh.subscribe(bitmask.clone());
+        assert!(bh.subscriptions.contains(&bitmask));
+        bh.unsubscribe(&bitmask);
+        assert!(!bh.subscriptions.contains(&bitmask),
+            "unsubscribe must remove the entry");
+    }
+
+    /// After unsubscribing, publish to that bitmask errors again —
+    /// confirms unsubscribe also closes the publish path.
+    #[test]
+    fn publish_after_unsubscribe_errors() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        bh.subscribe(bitmask.clone());
+        bh.unsubscribe(&bitmask);
+        let r = bh.publish(bitmask, b"x".to_vec());
+        assert!(r.is_err());
+    }
+
+    /// Re-subscribing after unsubscribe restores the publish path.
+    #[test]
+    fn resubscribe_restores_publish_path() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        bh.subscribe(bitmask.clone());
+        bh.unsubscribe(&bitmask);
+        bh.subscribe(bitmask.clone());
+        let r = bh.publish(bitmask, b"x".to_vec());
+        assert!(r.is_ok());
+    }
+
+    /// Subscribing twice to the same bitmask is idempotent (no
+    /// duplicate entries, no error).
+    #[test]
+    fn duplicate_subscribe_is_idempotent() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        bh.subscribe(bitmask.clone());
+        bh.subscribe(bitmask.clone());
+        assert_eq!(
+            bh.subscriptions.iter().filter(|s| *s == &bitmask).count(),
+            1,
+            "double-subscribe must not duplicate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fanout_expiry_tests {
+    //! Coverage of the fanout-expiry plumbing in `heartbeat`. The
+    //! population side isn't implemented (see
+    //! `publish_subscribe_tests` for the gap note); these tests pin
+    //! the cleanup-side contract so it doesn't silently break when
+    //! fanout publish is later added.
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A fanout entry whose last-publish is past the TTL gets
+    /// removed by heartbeat. Both `fanout` and `fanout_last_pub`
+    /// drop the bitmask.
+    #[test]
+    fn heartbeat_expires_stale_fanout() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+
+        // Seed a fanout entry whose last publish is older than the
+        // configured fanout_ttl.
+        let ttl = bh.params.fanout_ttl;
+        let stale = Instant::now() - ttl - Duration::from_secs(1);
+        bh.fanout
+            .entry(bitmask.clone())
+            .or_default()
+            .insert(PeerId::random());
+        bh.fanout_last_pub.insert(bitmask.clone(), stale);
+
+        bh.heartbeat();
+
+        assert!(!bh.fanout.contains_key(&bitmask),
+            "stale fanout must be cleaned");
+        assert!(!bh.fanout_last_pub.contains_key(&bitmask),
+            "stale fanout_last_pub must be cleaned");
+    }
+
+    /// A recently-published fanout entry survives heartbeat. The
+    /// peer must be in `connected_peers` or section 6 of heartbeat
+    /// (disconnected-peer cleanup) sweeps it independently of TTL.
+    #[test]
+    fn heartbeat_keeps_fresh_fanout() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        let fresh_peer = PeerId::random();
+
+        // Pretend the peer is connected so heartbeat's
+        // disconnected-cleanup pass doesn't drop it.
+        bh.connected_peers.insert(fresh_peer, Vec::new());
+
+        bh.fanout
+            .entry(bitmask.clone())
+            .or_default()
+            .insert(fresh_peer);
+        bh.fanout_last_pub.insert(bitmask.clone(), Instant::now());
+
+        bh.heartbeat();
+
+        assert!(bh.fanout.get(&bitmask).map_or(false, |s| s.contains(&fresh_peer)),
+            "fresh fanout entry with connected peer must survive");
+        assert!(bh.fanout_last_pub.contains_key(&bitmask));
+    }
+
+    /// Section 6 of heartbeat removes disconnected peers from fanout
+    /// even when the TTL hasn't expired. This is the implicit
+    /// pruning the fresh-fanout test had to avoid.
+    #[test]
+    fn heartbeat_prunes_disconnected_fanout_peers() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        let dropped_peer = PeerId::random();
+
+        // Deliberately do NOT add the peer to connected_peers.
+        bh.fanout
+            .entry(bitmask.clone())
+            .or_default()
+            .insert(dropped_peer);
+        bh.fanout_last_pub.insert(bitmask.clone(), Instant::now());
+
+        bh.heartbeat();
+
+        assert!(
+            !bh.fanout.get(&bitmask).map_or(false, |s| s.contains(&dropped_peer)),
+            "disconnected fanout peer must be swept by heartbeat",
+        );
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    //! Backoff-map maintenance properties. The heartbeat sweep at
+    //! `behaviour.rs:1384` calls `self.backoffs.retain(|_, e| *e > now)`
+    //! — these tests pin the observable behavior of that sweep plus
+    //! the (peer, bitmask) uniqueness of backoff keys.
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn make_peer() -> PeerId {
+        PeerId::random()
+    }
+
+    fn fresh_behaviour() -> BlossomSubBehaviour {
+        let mut bh = BlossomSubBehaviour::default();
+        // Subscribe to a bitmask so the heartbeat loop enters its
+        // main work — the backoff sweep at the top of `heartbeat`
+        // runs regardless of subscriptions, but a subscription makes
+        // the function representative of production runs.
+        bh.subscribe(vec![0xC0]);
+        bh
+    }
+
+    /// A backoff whose expiry is in the past gets pruned on the
+    /// next heartbeat. (Required for flap-graft to release the peer
+    /// after the punitive window passes.)
+    #[test]
+    fn heartbeat_removes_expired_backoff_entry() {
+        let mut bh = fresh_behaviour();
+        let bitmask = vec![0xC0];
+        let peer = make_peer();
+        // Expiry already in the past.
+        let past = Instant::now() - Duration::from_secs(5);
+        bh.backoffs.insert((peer, bitmask.clone()), past);
+
+        bh.heartbeat();
+
+        assert!(
+            !bh.backoffs.contains_key(&(peer, bitmask)),
+            "expired backoff entry should have been swept",
+        );
+    }
+
+    /// A backoff whose expiry is well in the future survives the
+    /// heartbeat sweep.
+    #[test]
+    fn heartbeat_preserves_unexpired_backoff_entry() {
+        let mut bh = fresh_behaviour();
+        let bitmask = vec![0xC0];
+        let peer = make_peer();
+        let future = Instant::now() + Duration::from_secs(120);
+        bh.backoffs.insert((peer, bitmask.clone()), future);
+
+        bh.heartbeat();
+
+        let stored = bh.backoffs.get(&(peer, bitmask)).copied();
+        assert_eq!(stored, Some(future), "unexpired backoff must persist");
+    }
+
+    /// Mixed expired + unexpired entries are partitioned correctly:
+    /// only the expired ones are dropped.
+    #[test]
+    fn heartbeat_partitions_mixed_expiries() {
+        let mut bh = fresh_behaviour();
+        let bitmask = vec![0xC0];
+        let past_peer = make_peer();
+        let future_peer = make_peer();
+        bh.backoffs
+            .insert((past_peer, bitmask.clone()), Instant::now() - Duration::from_secs(1));
+        bh.backoffs
+            .insert((future_peer, bitmask.clone()), Instant::now() + Duration::from_secs(60));
+
+        bh.heartbeat();
+
+        assert!(!bh.backoffs.contains_key(&(past_peer, bitmask.clone())));
+        assert!(bh.backoffs.contains_key(&(future_peer, bitmask)));
+    }
+
+    /// Backoff is keyed by (peer, bitmask) — same peer pruned from
+    /// one bitmask doesn't affect their backoff state on a different
+    /// bitmask.
+    #[test]
+    fn backoff_keys_are_per_peer_per_bitmask() {
+        let mut bh = fresh_behaviour();
+        let peer = make_peer();
+        let a = vec![0xC0];
+        let b = vec![0x0C];
+        let past = Instant::now() - Duration::from_secs(1);
+        let future = Instant::now() + Duration::from_secs(60);
+        bh.backoffs.insert((peer, a.clone()), past);
+        bh.backoffs.insert((peer, b.clone()), future);
+
+        bh.heartbeat();
+
+        assert!(!bh.backoffs.contains_key(&(peer, a)));
+        assert!(bh.backoffs.contains_key(&(peer, b)));
+    }
+}
+
+#[cfg(test)]
+mod subnet_diversity_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::net::Ipv6Addr;
+
+    fn make_peer() -> PeerId {
+        PeerId::random()
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    fn v6(parts: [u16; 8]) -> IpAddr {
+        IpAddr::V6(Ipv6Addr::new(
+            parts[0], parts[1], parts[2], parts[3],
+            parts[4], parts[5], parts[6], parts[7],
+        ))
+    }
+
+    /// Same /24, different host → same bucket key.
+    #[test]
+    fn ipv4_slash_24_buckets_match() {
+        let a = subnet_bucket_key(v4(192, 0, 2, 17));
+        let b = subnet_bucket_key(v4(192, 0, 2, 42));
+        assert_eq!(a, b, "/24 mates must share a bucket");
+    }
+
+    /// Different /24 → different bucket keys.
+    #[test]
+    fn ipv4_different_slash_24_buckets_differ() {
+        let a = subnet_bucket_key(v4(192, 0, 2, 17));
+        let b = subnet_bucket_key(v4(192, 0, 3, 17));
+        assert_ne!(a, b);
+    }
+
+    /// Same /48, different higher bits → same bucket key.
+    #[test]
+    fn ipv6_slash_48_buckets_match() {
+        let a = subnet_bucket_key(v6([0x2001, 0xdb8, 0xabcd, 0, 0, 0, 0, 1]));
+        let b = subnet_bucket_key(v6([0x2001, 0xdb8, 0xabcd, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff]));
+        assert_eq!(a, b, "/48 mates must share a bucket");
+    }
+
+    /// IPv4 and IPv6 buckets never collide for normal prefixes.
+    #[test]
+    fn v4_and_v6_buckets_do_not_collide() {
+        let a = subnet_bucket_key(v4(192, 0, 2, 1));
+        let b = subnet_bucket_key(v6([0x2001, 0xdb8, 0xabcd, 0, 0, 0, 0, 1]));
+        assert_ne!(a, b);
+    }
+
+    /// The subnet-cap helper rejects a candidate whose /24 already
+    /// has `mesh_peers_per_subnet` peers in the mesh.
+    #[test]
+    fn graft_would_violate_subnet_cap_blocks_overpopulated_subnet() {
+        let mut bh = BlossomSubBehaviour::default();
+        bh.params.mesh_peers_per_subnet = 2;
+
+        let mut existing_a = HashSet::new();
+        existing_a.insert(v4(10, 0, 0, 1));
+        let mut existing_b = HashSet::new();
+        existing_b.insert(v4(10, 0, 0, 2));
+        let mut candidate_ips = HashSet::new();
+        candidate_ips.insert(v4(10, 0, 0, 3));
+
+        let p1 = make_peer();
+        let p2 = make_peer();
+        let candidate = make_peer();
+
+        bh.scorer.set_peer_ips(&p1, existing_a);
+        bh.scorer.set_peer_ips(&p2, existing_b);
+        bh.scorer.set_peer_ips(&candidate, candidate_ips);
+
+        let mut mesh: HashSet<PeerId> = HashSet::new();
+        mesh.insert(p1);
+        mesh.insert(p2);
+
+        assert!(
+            bh.graft_would_violate_subnet_cap(&mesh, &candidate),
+            "candidate sharing /24 with 2 existing mesh peers should be rejected",
+        );
+    }
+
+    /// A candidate from a fresh subnet (not represented in the mesh
+    /// yet) must pass the cap.
+    #[test]
+    fn graft_would_violate_subnet_cap_admits_fresh_subnet() {
+        let mut bh = BlossomSubBehaviour::default();
+        bh.params.mesh_peers_per_subnet = 2;
+
+        let mut existing_ips = HashSet::new();
+        existing_ips.insert(v4(10, 0, 0, 1));
+        let mut other_ips = HashSet::new();
+        other_ips.insert(v4(10, 0, 0, 2));
+        let mut fresh_ips = HashSet::new();
+        fresh_ips.insert(v4(192, 168, 1, 1)); // distinct /24
+
+        let p1 = make_peer();
+        let p2 = make_peer();
+        let candidate = make_peer();
+
+        bh.scorer.set_peer_ips(&p1, existing_ips);
+        bh.scorer.set_peer_ips(&p2, other_ips);
+        bh.scorer.set_peer_ips(&candidate, fresh_ips);
+
+        let mut mesh: HashSet<PeerId> = HashSet::new();
+        mesh.insert(p1);
+        mesh.insert(p2);
+
+        assert!(
+            !bh.graft_would_violate_subnet_cap(&mesh, &candidate),
+            "candidate from a fresh /24 must pass",
+        );
+    }
+
+    /// When the cap is `0` (disabled), even a maxed-out subnet
+    /// accepts new candidates.
+    #[test]
+    fn graft_would_violate_subnet_cap_zero_disables_check() {
+        let mut bh = BlossomSubBehaviour::default();
+        bh.params.mesh_peers_per_subnet = 0;
+
+        let mut ips_each = HashSet::new();
+        ips_each.insert(v4(10, 0, 0, 1));
+        let p1 = make_peer();
+        let p2 = make_peer();
+        let candidate = make_peer();
+        bh.scorer.set_peer_ips(&p1, ips_each.clone());
+        bh.scorer.set_peer_ips(&p2, ips_each.clone());
+        bh.scorer.set_peer_ips(&candidate, ips_each);
+
+        let mut mesh: HashSet<PeerId> = HashSet::new();
+        mesh.insert(p1);
+        mesh.insert(p2);
+
+        assert!(
+            !bh.graft_would_violate_subnet_cap(&mesh, &candidate),
+            "cap=0 must disable the check",
+        );
+    }
+
+    /// A peer with no known IPs (libp2p hasn't seen its address yet)
+    /// passes the cap — otherwise no peer could ever join until its
+    /// IP was observed elsewhere, which is a chicken-and-egg.
+    #[test]
+    fn graft_would_violate_subnet_cap_admits_unknown_ip_peer() {
+        let mut bh = BlossomSubBehaviour::default();
+        bh.params.mesh_peers_per_subnet = 1;
+
+        let mut ips_e = HashSet::new();
+        ips_e.insert(v4(10, 0, 0, 1));
+        let p1 = make_peer();
+        let candidate = make_peer();
+        bh.scorer.set_peer_ips(&p1, ips_e);
+        // Deliberately do not call set_peer_ips for `candidate`.
+
+        let mut mesh: HashSet<PeerId> = HashSet::new();
+        mesh.insert(p1);
+
+        assert!(
+            !bh.graft_would_violate_subnet_cap(&mesh, &candidate),
+            "candidate with no known IP must not be falsely blocked",
+        );
+    }
+}
+
+#[cfg(test)]
+mod behavior_parity_tests {
+    //! Cross-cutting behavior tests that pin Go-gossipsub semantics
+    //! we promised to honor even where the Rust layout diverges from
+    //! the Go file layout. Each test names the load-bearing
+    //! invariant; if these regress, mesh stability or DoS resistance
+    //! regresses with them.
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn make_peer() -> PeerId {
+        PeerId::random()
+    }
+
+    /// Backoff entry that has expired must release the peer for
+    /// graft on the next under-D_LO heartbeat. The sweep at the top
+    /// of `heartbeat` does the structural removal; this test ties
+    /// it to the graft-candidate selection downstream — the peer
+    /// that was backed off should now show up in the mesh.
+    #[test]
+    fn expired_backoff_clears_and_peer_becomes_graft_eligible() {
+        let d_lo = crate::params::D_LO;
+        let bitmask = vec![0xC0];
+
+        // Start with mesh below D_LO and 5 candidates. One of the
+        // candidates is in backoff with an already-past expiry.
+        let mut bh = BlossomSubBehaviour::default();
+        bh.subscribe(bitmask.clone());
+
+        // Seed mesh with d_lo - 1 peers and 5 candidates so the
+        // under-D_LO graft pass kicks in.
+        let mesh_peers: Vec<PeerId> = (0..d_lo - 1).map(|_| make_peer()).collect();
+        let candidates: Vec<PeerId> = (0..5).map(|_| make_peer()).collect();
+        for p in mesh_peers.iter().chain(candidates.iter()) {
+            bh.peer_subscriptions
+                .entry(*p)
+                .or_default()
+                .insert(bitmask.clone());
+        }
+        let mesh = bh.mesh.entry(bitmask.clone()).or_default();
+        for p in &mesh_peers {
+            mesh.insert(*p);
+        }
+
+        let target = candidates[0];
+        // Already-expired backoff. The heartbeat sweep is the only
+        // thing that should clear this; we don't pre-remove it.
+        bh.backoffs
+            .insert((target, bitmask.clone()), Instant::now() - Duration::from_secs(60));
+
+        bh.heartbeat();
+
+        assert!(
+            !bh.backoffs.contains_key(&(target, bitmask.clone())),
+            "expired backoff entry must be removed by heartbeat sweep",
+        );
+        // Under-D_LO graft drew from the now-clean candidate pool;
+        // the target peer is no longer filtered out. We can't
+        // assert the target was specifically grafted (selection is
+        // randomized across the 5 candidates), but we can assert
+        // the mesh grew to at least D_LO — proving the graft pass
+        // ran on a pool that included our previously-blocked peer.
+        let mesh = bh.mesh.get(&bitmask).unwrap();
+        assert!(
+            mesh.len() >= d_lo,
+            "mesh should have grown to at least D_LO after backoff cleared",
+        );
+    }
+
+    /// IHAVE flood from a single peer caps `pending_iwants` at
+    /// 5000. This is the DoS bound: without it, an attacker
+    /// enumerates message-id space and balloons our memory.
+    #[test]
+    fn ihave_flood_caps_pending_iwants_at_5000() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+        bh.subscribe(bitmask.clone());
+
+        let peer = make_peer();
+        bh.connected_peers.insert(peer, Vec::new());
+        bh.peer_subscriptions
+            .entry(peer)
+            .or_default()
+            .insert(bitmask.clone());
+
+        // Build an IHAVE RPC advertising 5500 unique message IDs.
+        // Each one is a fresh 32-byte vector keyed off the index.
+        let advertised: Vec<Vec<u8>> = (0..5500u32)
+            .map(|i| {
+                let mut id = vec![0u8; 32];
+                id[..4].copy_from_slice(&i.to_be_bytes());
+                id
+            })
+            .collect();
+        let rpc = pb::Rpc {
+            subscriptions: Vec::new(),
+            publish: Vec::new(),
+            control: Some(pb::ControlMessage {
+                ihave: vec![pb::ControlIHave {
+                    bitmask: bitmask.clone(),
+                    message_i_ds: advertised,
+                }],
+                iwant: Vec::new(),
+                graft: Vec::new(),
+                prune: Vec::new(),
+                idontwant: Vec::new(),
+            }),
+        };
+
+        bh.handle_rpc(peer, rpc);
+
+        assert!(
+            bh.pending_iwants.len() <= 5000,
+            "pending_iwants must be capped at 5000 (got {})",
+            bh.pending_iwants.len(),
+        );
+        // The cap must have actually fired — if it allowed all
+        // 5500, the assertion above is meaningless. Check we hit
+        // the ceiling.
+        assert_eq!(
+            bh.pending_iwants.len(),
+            5000,
+            "expected the cap to be hit exactly under a 5500-entry flood",
+        );
+    }
+
+    /// `refresh_scores` decays `behaviour_penalty` exponentially by
+    /// `behaviour_penalty_decay` (default 0.9) on each call. After
+    /// enough ticks the penalty falls below `decay_to_zero` (0.01)
+    /// and is zeroed. This is what gives a peer back its score
+    /// after a transient violation.
+    #[test]
+    fn refresh_scores_decays_behaviour_penalty_to_zero() {
+        let mut bh = BlossomSubBehaviour::default();
+        let peer = make_peer();
+
+        // Mark peer connected so `refresh_scores` decays its stats
+        // (disconnected peers are intentionally not decayed).
+        bh.scorer.add_peer(&peer);
+
+        // Add a penalty and confirm it's recorded.
+        bh.scorer.add_penalty(&peer, 5.0);
+
+        // Apply enough decay ticks that 5.0 * 0.9^n < 0.01.
+        // 5.0 * 0.9^60 ≈ 0.009 → zeroed.
+        for _ in 0..60 {
+            bh.scorer.refresh_scores();
+        }
+
+        // After zeroing, the peer's overall score must no longer
+        // reflect the original penalty. We can't introspect the
+        // penalty field directly here, but score() exposes the
+        // weighted result — with the penalty zeroed it should be
+        // 0.0 (no other stats set).
+        let score = bh.scorer.score(&peer);
+        assert!(
+            score.abs() < 1e-6,
+            "score should be ~0 after behaviour_penalty fully decays (got {})",
+            score,
+        );
+    }
+
+    /// `refresh_scores` applies the per-tick decay multiplicatively.
+    /// One tick reduces a fresh penalty by exactly the configured
+    /// decay factor (modulo the `decay_to_zero` floor, which won't
+    /// fire for the magnitude we use here).
+    #[test]
+    fn refresh_scores_single_tick_applies_decay_factor() {
+        let mut bh = BlossomSubBehaviour::default();
+        let peer = make_peer();
+        bh.scorer.add_peer(&peer);
+
+        // Use a penalty large enough that one decay won't cross
+        // the decay_to_zero floor (0.01 default).
+        bh.scorer.add_penalty(&peer, 10.0);
+        let before = bh.scorer.score(&peer);
+
+        bh.scorer.refresh_scores();
+
+        let after = bh.scorer.score(&peer);
+        // P7 (behaviour_penalty) contributes a squared excess
+        // weighted by behaviour_penalty_weight (negative). After
+        // one decay, the penalty shrinks → squared term shrinks
+        // → score becomes less negative (i.e., increases).
+        assert!(
+            after > before,
+            "score must increase after one decay tick (before={}, after={})",
+            before,
+            after,
+        );
+    }
+
+    /// Leave/rejoin churn: subscribe → mesh populated → unsubscribe
+    /// (drops mesh) → resubscribe → next heartbeat repopulates from
+    /// candidates without carrying any stale peers from the prior
+    /// mesh that have since become ineligible. The contract here is
+    /// **no residual state leak** across the subscription
+    /// boundary.
+    #[test]
+    fn leave_then_rejoin_repopulates_clean_mesh_without_stale_entries() {
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+
+        // Subscribe and seed mesh with 4 peers.
+        bh.subscribe(bitmask.clone());
+        let original: Vec<PeerId> = (0..4).map(|_| make_peer()).collect();
+        for p in &original {
+            bh.peer_subscriptions
+                .entry(*p)
+                .or_default()
+                .insert(bitmask.clone());
+            bh.mesh.entry(bitmask.clone()).or_default().insert(*p);
+        }
+        assert_eq!(bh.mesh.get(&bitmask).unwrap().len(), 4);
+
+        // Unsubscribe drops the mesh entry entirely.
+        bh.unsubscribe(&bitmask);
+        assert!(
+            !bh.mesh.contains_key(&bitmask),
+            "unsubscribe must remove mesh entry",
+        );
+
+        // Two of the original peers are now poisoned with a strong
+        // negative score — they must NOT come back into the new
+        // mesh after resubscribe even though they're still in
+        // peer_subscriptions.
+        let poisoned: Vec<PeerId> = original[..2].to_vec();
+        for p in &poisoned {
+            bh.scorer.set_application_score(*p, -1000.0);
+        }
+
+        // Resubscribe and run heartbeat to repopulate.
+        bh.subscribe(bitmask.clone());
+        // Add fresh candidates so heartbeat has graft material that
+        // isn't poisoned.
+        let fresh: Vec<PeerId> = (0..8).map(|_| make_peer()).collect();
+        for p in &fresh {
+            bh.peer_subscriptions
+                .entry(*p)
+                .or_default()
+                .insert(bitmask.clone());
+        }
+        bh.heartbeat();
+
+        let new_mesh = bh.mesh.get(&bitmask).cloned().unwrap_or_default();
+        for poisoned_peer in &poisoned {
+            assert!(
+                !new_mesh.contains(poisoned_peer),
+                "poisoned peer {:?} must not return to mesh after rejoin",
+                poisoned_peer,
+            );
+        }
+        assert!(
+            !new_mesh.is_empty(),
+            "rejoined mesh must be populated from clean candidates",
+        );
+    }
+
+    /// Subscribe-then-graft contract: when we subscribe to a
+    /// bitmask, peers that are already subscribed to it and
+    /// connected become mesh candidates on the next heartbeat. This
+    /// is the Rust shape of Go's "fanout-promotion-on-subscribe" —
+    /// the Go behaviour copies fanout peers into the new mesh; the
+    /// Rust path achieves the same outcome via the candidate-pool
+    /// selection during the under-D_LO graft pass.
+    #[test]
+    fn subscribe_then_heartbeat_grafts_known_subscribers_into_mesh() {
+        let d = crate::params::D;
+        let mut bh = BlossomSubBehaviour::default();
+        let bitmask = vec![0xC0];
+
+        // Pre-existing connected peers, already subscribed to the
+        // bitmask (mirroring fanout-having-tracked-them state).
+        let known_subscribers: Vec<PeerId> = (0..d + 2).map(|_| make_peer()).collect();
+        for p in &known_subscribers {
+            bh.connected_peers.insert(*p, Vec::new());
+            bh.peer_subscriptions
+                .entry(*p)
+                .or_default()
+                .insert(bitmask.clone());
+        }
+
+        // Now subscribe ourselves. Mesh is empty at this point.
+        bh.subscribe(bitmask.clone());
+        assert!(
+            bh.mesh.get(&bitmask).map_or(true, |m| m.is_empty()),
+            "fresh subscribe must start with empty mesh",
+        );
+
+        // Heartbeat should graft from the known-subscriber pool.
+        bh.heartbeat();
+
+        let mesh = bh.mesh.get(&bitmask).expect("mesh must exist post-heartbeat");
+        assert_eq!(
+            mesh.len(),
+            d,
+            "heartbeat must graft up to D from the known-subscriber pool",
+        );
+        // Every peer in the new mesh must come from our known set.
+        for p in mesh.iter() {
+            assert!(
+                known_subscribers.contains(p),
+                "grafted peer must be drawn from known subscribers",
+            );
+        }
+    }
+}
