@@ -311,10 +311,22 @@ pub(crate) fn spawn_all(
             "Send authentication pubkey wired"
         );
         let send_p2p = p2p_handle.clone();
+        // Reuse the prover pipeline's transport for GLOBAL_PROVER-domain
+        // sends. The transport already implements the correct fan-out:
+        // gRPC to every known archive (so non-archive nodes have a
+        // delivery path) plus optional BlossomSub publish on archive
+        // nodes. A direct `p2p.publish(GLOBAL_PROVER, ...)` on a
+        // non-archive node fails — the node is not subscribed to that
+        // bitmask, so BlossomSub returns "not subscribed". This was the
+        // observed failure in the client prover-manage TUI: the Send
+        // RPC reached a non-archive node, which tried a raw BlossomSub
+        // publish and bounced.
+        let send_transport = prover_pipeline.transport.clone();
         let send_handler: quil_rpc::SendHandler = Arc::new(
             move |domain: Vec<u8>, payload: Vec<u8>, authentication: Vec<u8>|
             -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
                 let p2p = send_p2p.clone();
+                let transport = send_transport.clone();
                 let ed448_pub = peer_ed448_pub.clone();
                 Box::pin(async move {
                     if domain.len() != 32 {
@@ -345,12 +357,29 @@ pub(crate) fn spawn_all(
                         );
                         return Err(format!("authentication failed: {:?}", e));
                     }
-                    let bitmask: Vec<u8> = if domain.iter().all(|&b| b == 0xff) {
-                        quil_engine::bitmasks::GLOBAL_PROVER.to_vec()
+                    if domain.iter().all(|&b| b == 0xff) {
+                        // Global-prover-domain bundle (Join / Leave /
+                        // Confirm / Resume / Reject / AltShard /
+                        // Delegate). Route through the transport so a
+                        // non-archive node still reaches the network
+                        // via the archive gRPC fan-out.
+                        transport
+                            .publish_prover_bundle(payload)
+                            .await
+                            .map_err(|e| format!("prover transport publish failed: {}", e))?;
                     } else {
-                        quil_hypergraph::addressing::get_bloom_filter_indices(&domain, 256, 3).to_vec()
-                    };
-                    p2p.publish(bitmask, payload).await.map_err(|e| format!("p2p publish failed: {}", e))?;
+                        // Shard-domain message (token / app intrinsic).
+                        // Route via the shard's bloom-filter bitmask;
+                        // the local node is expected to be subscribed
+                        // there if it's participating in that shard.
+                        let bitmask = quil_hypergraph::addressing::get_bloom_filter_indices(
+                            &domain, 256, 3,
+                        )
+                        .to_vec();
+                        p2p.publish(bitmask, payload)
+                            .await
+                            .map_err(|e| format!("p2p publish failed: {}", e))?;
+                    }
                     Ok(())
                 })
             },
