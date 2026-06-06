@@ -596,8 +596,16 @@ impl InMemoryProverRegistry {
 /// - `Paused` → `Some(Paused)`
 /// - `Leaving` (within grace) → `Some(Leaving)`
 /// - `ExpiredLeaving` (leave attempt never confirmed/rejected) →
-///   `Some(Active)` — the leave failed silently; allocation reverts
-///   to its pre-leave Active state and remains in the cache.
+///   `None` (excluded). The prover socially left the shard even
+///   though the LeaveConfirm never landed — they stopped proving
+///   when they submitted the Leave. Counting them as Active would
+///   inflate every shard's live coverage by the number of stuck
+///   leaves, which hides real halt-risk shards from the proposer
+///   and coverage monitor. Observed in the wild 2026-06-05: 147
+///   halt-risk shards (active ≤ 3) on the network were invisible
+///   to a node that classified every one of them as ≥4 active
+///   because each had 1+ ExpiredLeaving allocations bumping the
+///   count.
 /// - `ExpiredJoining`, `Rejected`, `Kicked` → `None` (excluded)
 /// - `Unknown` → `None`
 ///
@@ -613,8 +621,8 @@ fn live_allocation_status(
         EffectiveStatus::Active => Some(ProverStatus::Active),
         EffectiveStatus::Paused => Some(ProverStatus::Paused),
         EffectiveStatus::Leaving => Some(ProverStatus::Leaving),
-        EffectiveStatus::ExpiredLeaving => Some(ProverStatus::Active),
         EffectiveStatus::ExpiredJoining
+        | EffectiveStatus::ExpiredLeaving
         | EffectiveStatus::Rejected
         | EffectiveStatus::Kicked
         | EffectiveStatus::Unknown => None,
@@ -2063,7 +2071,9 @@ mod tests {
                     // Status still Leaving (no on-chain confirm/reject),
                     // but leave_frame is old → effective_status returns
                     // ExpiredLeaving → live_allocation_status maps to
-                    // Active per the user's rule.
+                    // None (excluded). The prover socially left when
+                    // they submitted the Leave; the absence of a
+                    // confirm doesn't put them back into active duty.
                     status_byte = 3; // Leaving
                     join_frame = recent_frame - 800;
                     leave_frame = stale_frame;
@@ -2209,8 +2219,10 @@ mod tests {
         let kicked = summary.status_counts.get(&ProverStatus::Kicked).copied().unwrap_or(0);
         let rejected = summary.status_counts.get(&ProverStatus::Rejected).copied().unwrap_or(0);
 
-        // Active = scenarios 2, 7, 8, 10 = 40
-        assert_eq!(active, 40, "Active count");
+        // Active = scenarios 2, 7, 10 = 30. Scenario 8
+        // (LeaveExpiredReturnsActive) no longer counts as Active —
+        // a stuck Leave is treated as "not on the shard."
+        assert_eq!(active, 30, "Active count");
         // Joining = scenario 1 = 10
         assert_eq!(joining, 10, "Joining count");
         // Leaving = scenario 5 = 10
@@ -2223,8 +2235,9 @@ mod tests {
 
         let total_live: u32 = active + joining + leaving + paused;
         assert_eq!(
-            total_live, 70,
-            "70 live allocations (30 must be excluded: Rejected, ExpiredJoining, Kicked)"
+            total_live, 60,
+            "60 live allocations (40 excluded: Rejected, ExpiredJoining, \
+             ExpiredLeaving, Kicked × 10 each)"
         );
     }
 }

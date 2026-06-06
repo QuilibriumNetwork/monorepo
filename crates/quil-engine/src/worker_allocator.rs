@@ -463,8 +463,29 @@ impl WorkerAllocator {
                             self.worker_manager.deallocate_worker(worker.core_id)?;
                         }
                         ProverStatus::Leaving => {
-                            // Leave in flight — keep the worker bound
-                            // until Confirm/Reject resolves.
+                            // Live Leave (within 720-frame grace) →
+                            // keep the worker bound until
+                            // Confirm/Reject resolves. Expired Leave
+                            // (no Confirm/Reject within grace) →
+                            // protocol treats it as terminal; clear
+                            // the worker so it becomes a free auto
+                            // candidate again. Without this, an
+                            // operator-submitted Leave that the
+                            // network never confirmed would pin the
+                            // worker to a shard the operator
+                            // explicitly asked to leave, forever.
+                            if alloc.effective_status(frame_number)
+                                == quil_types::consensus::EffectiveStatus::ExpiredLeaving
+                            {
+                                desired_allocated = false;
+                                info!(
+                                    core_id = worker.core_id,
+                                    filter = hex::encode(&worker.filter),
+                                    leave_frame = alloc.leave_frame_number,
+                                    "leave expired after 720 frames, clearing worker"
+                                );
+                                self.worker_manager.deallocate_worker(worker.core_id)?;
+                            }
                         }
                         _ => {}
                     }
