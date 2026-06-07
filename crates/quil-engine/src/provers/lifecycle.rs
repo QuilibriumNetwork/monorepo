@@ -41,6 +41,15 @@ pub const DEFAULT_CONFIRM_WINDOW_FRAMES: u64 = 360;
 pub const MAX_PROPOSALS_PER_CYCLE: usize = 100;
 /// Max proposals per single PlanAndAllocate call in Go (worker_allocator.go:215).
 pub const GO_PLAN_ALLOCATE_CAP: usize = 100;
+/// Per-filter cooldown between successive Leave proposals on the same
+/// filter. Suppresses duplicate Leave publishes during the
+/// publish→archive-materialize→registry-sync round-trip. Wider than
+/// `JOIN_COOLDOWN_FRAMES` because Leave round-trips include both
+/// archive-side materialization and the (~5-minute-cadence) prover
+/// tree sync that updates our local view of allocation status. 20
+/// frames ≈ 10 minutes on mainnet, comfortably spanning one full
+/// sync cycle so the next plan_leaves cycle sees the Leaving status.
+pub const LEAVE_COOLDOWN_FRAMES: u64 = 20;
 
 /// Result of evaluating the current frame for prover lifecycle actions.
 pub enum LifecycleAction {
@@ -382,6 +391,15 @@ pub struct ProverLifecycle {
     /// global filter, which is explicitly skipped, so no joins
     /// are ever proposed.
     shards_store: RwLock<Option<Arc<dyn quil_types::store::ShardsStore>>>,
+    /// Per-filter "last frame we proposed Leave on this filter."
+    /// Used to suppress duplicate Leave publishes during the
+    /// publish→archive→materialize→sync round-trip — without this,
+    /// every cycle within that window re-proposes Leave on the same
+    /// filter (the local registry still shows it Active until the
+    /// round-trip completes), and the pipeline republishes
+    /// identical bundles. Entries older than `LEAVE_COOLDOWN_FRAMES`
+    /// are pruned lazily on read so the map can't grow unbounded.
+    last_leave_attempt: RwLock<HashMap<Vec<u8>, u64>>,
     /// Set to true after the first successful `GetAppShards` refresh
     /// (`set_remote_shard_sizes`). Gates `ProposeJoin` and `ProposeLeave`:
     /// the lifecycle must not auto-pick shards while it lacks any
@@ -423,6 +441,7 @@ impl ProverLifecycle {
             remote_shard_sizes: RwLock::new(HashMap::new()),
             confirm_window_frames: AtomicU64::new(DEFAULT_CONFIRM_WINDOW_FRAMES),
             shards_store: RwLock::new(None),
+            last_leave_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
         }
     }
@@ -543,6 +562,47 @@ impl ProverLifecycle {
     /// post-success cooldown semantics at `worker_allocator.go:224`.
     pub fn record_join_attempt(&self, frame_number: u64) {
         self.allocator.set_last_join_attempt(frame_number);
+    }
+
+    /// Drop filters whose last Leave proposal is within
+    /// `LEAVE_COOLDOWN_FRAMES` of `frame_number`. Also opportunistically
+    /// prunes expired entries from the cooldown map so it can't grow
+    /// unbounded.
+    fn filter_recent_leave_attempts(
+        &self,
+        candidates: Vec<Vec<u8>>,
+        frame_number: u64,
+    ) -> Vec<Vec<u8>> {
+        let Ok(mut guard) = self.last_leave_attempt.write() else {
+            return candidates;
+        };
+        // Lazy prune: drop entries that are past the cooldown window.
+        guard.retain(|_, last| {
+            frame_number.saturating_sub(*last) < LEAVE_COOLDOWN_FRAMES
+        });
+        candidates
+            .into_iter()
+            .filter(|f| {
+                guard
+                    .get(f)
+                    .map(|&last| {
+                        frame_number.saturating_sub(last) >= LEAVE_COOLDOWN_FRAMES
+                    })
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    /// Stamp the per-filter Leave cooldown map. Called immediately
+    /// before pushing a ProposeLeave action so the next cycle's
+    /// `filter_recent_leave_attempts` excludes these filters.
+    fn record_leave_attempts(&self, filters: &[Vec<u8>], frame_number: u64) {
+        let Ok(mut guard) = self.last_leave_attempt.write() else {
+            return;
+        };
+        for f in filters {
+            guard.insert(f.clone(), frame_number);
+        }
     }
 
     /// Port of Go's `selectExcessPendingFilters` at
@@ -1346,6 +1406,7 @@ impl ProverLifecycle {
                     &world_bytes,
                     self.units,
                     self.strategy,
+                    free_worker_ids.len(),
                 )
             } else {
                 Vec::new()
@@ -1366,12 +1427,32 @@ impl ProverLifecycle {
             }
             let orphan_count =
                 leave_candidates.len() - score_driven_count - empty_shard_count;
+
+            // Per-filter Leave cooldown: drop any filter we already
+            // proposed Leave on within the last `LEAVE_COOLDOWN_FRAMES`
+            // frames. Until that window elapses we don't know whether
+            // the prior bundle landed at the archive, materialized, or
+            // round-tripped back into our local registry. Re-publishing
+            // the same Leave bundle every 4-frame `JOIN_COOLDOWN_FRAMES`
+            // tick is the wire-side symptom of this — observed on
+            // mainnet 2026-06-06: identical 3-filter Leave action
+            // re-emitted ~every 4 frames for 30+ minutes on a single
+            // node.
+            let pre_cooldown_count = leave_candidates.len();
+            leave_candidates = self.filter_recent_leave_attempts(
+                leave_candidates,
+                frame_number,
+            );
+            let cooldown_suppressed =
+                pre_cooldown_count.saturating_sub(leave_candidates.len());
+
             if leave_candidates.len() > MAX_PROPOSALS_PER_CYCLE {
                 leave_candidates.truncate(MAX_PROPOSALS_PER_CYCLE);
             }
 
             if !leave_candidates.is_empty() {
                 self.allocator.set_last_join_attempt(frame_number);
+                self.record_leave_attempts(&leave_candidates, frame_number);
                 let leave_summary: Vec<String> = leave_candidates
                     .iter()
                     .map(hex::encode)
@@ -1384,6 +1465,7 @@ impl ProverLifecycle {
                     score_driven = score_driven_count,
                     empty_allocated = empty_shard_count,
                     orphan = orphan_count,
+                    cooldown_suppressed,
                     ?leave_summary,
                     "proposing leaves (overcrowded + empty + orphan)"
                 );
@@ -1391,6 +1473,12 @@ impl ProverLifecycle {
                     filters: leave_candidates,
                     frame_number,
                 });
+            } else if cooldown_suppressed > 0 {
+                tracing::debug!(
+                    frame = frame_number,
+                    cooldown_suppressed,
+                    "all leave candidates suppressed by per-filter cooldown",
+                );
             }
         }
 
@@ -2109,6 +2197,157 @@ mod proposal_loop_tests {
             proposed > 0,
             "expected ProposeLeave when allocated shards score below the 67% threshold of unallocated alternatives; got {:?}",
             actions
+        );
+    }
+
+    /// Per-filter Leave cooldown: a filter we just proposed Leave on
+    /// must not be re-proposed until LEAVE_COOLDOWN_FRAMES have
+    /// elapsed. Without the cooldown, every cycle within the
+    /// publish→archive-materialize→registry-sync round-trip
+    /// re-emits an identical Leave bundle for the same filters —
+    /// observed on mainnet 2026-06-06 as a 30+-minute loop of the
+    /// same 3-filter ProposeLeave being emitted every 4 frames.
+    #[test]
+    fn leave_cooldown_suppresses_repeat_proposal_within_window() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
+        wm.add(allocated_worker(3, filter_bytes(0xA3)));
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        // Same shape as `overcrowded_actives_get_leave_proposed`:
+        // allocated 0xA1..0xA3 are deep-ring (low score), unallocated
+        // 0xC0/0xC1 are ring 0 (high score). plan_leaves picks the
+        // allocated below the 67% threshold.
+        let crowded = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            crowded(filter_bytes(0xA1), 64, 1_000_000),
+            crowded(filter_bytes(0xA2), 64, 1_000_000),
+            crowded(filter_bytes(0xA3), 64, 1_000_000),
+            crowded(filter_bytes(0xC0), 1, 10_000_000),
+            crowded(filter_bytes(0xC1), 1, 10_000_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        // First cycle proposes leaves.
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let first_leaves: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !first_leaves.is_empty(),
+            "expected first cycle to produce ProposeLeave; got {:?}",
+            actions,
+        );
+
+        // Second cycle, 4 frames later (well within LEAVE_COOLDOWN_FRAMES=20)
+        // — must NOT re-propose Leave on the same filters.
+        // Bump prover_root_verified_frame so the readiness gate passes.
+        lifecycle.set_prover_root_verified_frame(104);
+        let actions = lifecycle.evaluate(104, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let repeat_leaves: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for f in &first_leaves {
+            assert!(
+                !repeat_leaves.contains(f),
+                "filter {} re-proposed Leave within cooldown window; \
+                 first_leaves={:?} repeat_leaves={:?}",
+                hex::encode(f),
+                first_leaves,
+                repeat_leaves,
+            );
+        }
+    }
+
+    /// Per-filter Leave cooldown expires after LEAVE_COOLDOWN_FRAMES:
+    /// once enough frames have passed, the same filter is eligible
+    /// for Leave again. (Without this, a stuck Leave that never
+    /// materializes would lock the filter forever.)
+    #[test]
+    fn leave_cooldown_expires_after_window() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
+        wm.add(allocated_worker(3, filter_bytes(0xA3)));
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        let crowded = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            crowded(filter_bytes(0xA1), 64, 1_000_000),
+            crowded(filter_bytes(0xA2), 64, 1_000_000),
+            crowded(filter_bytes(0xA3), 64, 1_000_000),
+            crowded(filter_bytes(0xC0), 1, 10_000_000),
+            crowded(filter_bytes(0xC1), 1, 10_000_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+        let _ = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+
+        // After the cooldown window, the same filters should be
+        // eligible again. (Use frame 100 + LEAVE_COOLDOWN_FRAMES = 120.)
+        let later_frame = 100 + LEAVE_COOLDOWN_FRAMES;
+        lifecycle.set_prover_root_verified_frame(later_frame);
+        let actions = lifecycle.evaluate(later_frame, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let leaves: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !leaves.is_empty(),
+            "expected Leave to be proposed again after LEAVE_COOLDOWN_FRAMES elapsed; got {:?}",
+            actions,
         );
     }
 

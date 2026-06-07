@@ -552,9 +552,18 @@ pub fn decide_joins(
     (reject, confirm)
 }
 
-/// Identify shards to leave (overcrowded / poor reward).
+/// Identify shards to leave (overcrowded / poor reward / halt-risk swap).
 ///
 /// Returns up to 3 filter candidates for ProverLeave.
+///
+/// `free_workers` is the count of currently-free auto-managed workers.
+/// It bounds the halt-risk swap: if `halt_risk_count > free_workers`,
+/// the deficit is the number of healthy non-halt-risk allocations we
+/// are willing to shed *this cycle* to free slots for the waiting
+/// halt-risk shards. When `free_workers` already covers the deficit,
+/// the swap doesn't fire — the next `plan_and_allocate` will fill the
+/// free slots with halt-risk shards (because of the join-side
+/// priority bucket) without us martyring healthy allocations.
 ///
 /// Port of Go's `PlanLeaves` at `proposer.go:558-646`.
 pub fn plan_leaves(
@@ -564,6 +573,7 @@ pub fn plan_leaves(
     world_bytes: &BigInt,
     units: u64,
     strategy: Strategy,
+    free_workers: usize,
 ) -> Vec<Vec<u8>> {
     if allocated_shards.is_empty() || unallocated_shards.is_empty() {
         return Vec::new();
@@ -581,50 +591,79 @@ pub fn plan_leaves(
     // Leave threshold = best_unalloc * 67 / 100
     let threshold = &best_unalloc * BigInt::from(67) / BigInt::from(100);
 
-    // When any unallocated shard is halt-risk, the 67% score threshold
-    // is superseded: even a competitively-scoring active is worth
-    // shedding to free a worker slot so the propose path can grab the
-    // halt-risk shard. Otherwise a node fully bound to healthy shards
-    // (active_count == worker_count) wedges — `allow_proposals` is
-    // false (no free workers), `plan_leaves`' threshold protects every
-    // holding, and halt-risk shards stay uncovered. The protection on
-    // halt-risk holdings (above) still applies — we only shed
-    // non-halt-risk actives.
-    let halt_risk_in_unalloc = unallocated_shards.iter()
-        .any(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT);
+    // Halt-risk swap demand: count unallocated halt-risk shards we
+    // are NOT currently joining. (Our pending Joining shards are
+    // already excluded from `unallocated_shards` by the caller —
+    // `proposal_descriptors` filters out `all_ours_filters`.) The
+    // deficit between that count and our free worker slots is how
+    // many healthy allocations we will shed this cycle to make
+    // room. Once `free_workers >= halt_risk_count`, the deficit is
+    // 0 and we don't shed anything for the swap — the next
+    // `plan_and_allocate` covers them via the join-side priority
+    // bucket. Bounding by demand prevents the prior failure mode
+    // where the override fired unconditionally every cycle and the
+    // node churned through every healthy holding it had.
+    let halt_risk_count = unallocated_shards.iter()
+        .filter(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
+        .count();
+    let halt_risk_deficit = halt_risk_count.saturating_sub(free_workers);
 
     let alloc_scores = score_shards(allocated_shards, &basis, world_bytes, strategy);
 
-    let mut candidates: Vec<(Vec<u8>, BigInt)> = alloc_scores
+    // Halt-risk shield: never propose a leave on a shard that's
+    // already halt-risk, nor on one where our departure would push
+    // it into halt-risk. `active_count` already includes us
+    // (we're Active on this shard); after we leave it drops by 1,
+    // so the post-leave Active count is `active_count - 1`. To
+    // keep `post_leave > HALT_RISK_PROVER_COUNT` we need
+    // `active_count > HALT_RISK_PROVER_COUNT + 1` — i.e. skip any
+    // shard at or below `HALT_RISK_PROVER_COUNT + 1`. Mirrors the
+    // join-time priority in `plan_and_allocate` and the confirm-
+    // time bypass in `decide_joins`. Joining provers are
+    // intentionally NOT counted — they haven't proven anything
+    // yet. The shield is unconditional and applies on top of every
+    // pick path below.
+    let shielded_scores: Vec<&Scored> = alloc_scores
         .iter()
-        // Halt-risk bypass: never propose a leave when the shard is
-        // already halt-risk OR our departure would push it into halt
-        // risk. `active_count` already includes us (we're Active on
-        // this shard); after we leave it drops by 1, so the post-
-        // leave Active count is `active_count - 1`. To keep
-        // `post_leave > HALT_RISK_PROVER_COUNT` we need
-        // `active_count > HALT_RISK_PROVER_COUNT + 1` — i.e. skip
-        // any shard at or below `HALT_RISK_PROVER_COUNT + 1`.
-        // Mirrors the join-time priority in `plan_and_allocate`
-        // and the confirm-time bypass in `decide_joins`. Joining
-        // provers are intentionally NOT counted — they haven't
-        // proven anything yet.
         .filter(|sc| {
             let d = &allocated_shards[sc.idx];
             !(d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT + 1)
         })
-        .filter(|sc| halt_risk_in_unalloc || sc.score < threshold)
+        .collect();
+
+    // Score-driven picks: shards below the 67% threshold of best
+    // unallocated. These always go.
+    let below_threshold: Vec<(Vec<u8>, BigInt)> = shielded_scores
+        .iter()
+        .filter(|sc| sc.score < threshold)
         .map(|sc| (allocated_shards[sc.idx].filter.clone(), sc.score.clone()))
         .collect();
 
-    // Sort worst first
-    candidates.sort_by(|a, b| a.1.cmp(&b.1));
+    // Halt-risk swap picks: when there's a deficit of free workers
+    // relative to waiting halt-risk shards, pick additional healthy
+    // (non-halt-risk-shielded) allocations to shed. Sorted worst-
+    // first so the swap doesn't sacrifice our strongest holdings.
+    let mut swap_candidates: Vec<(Vec<u8>, BigInt)> = shielded_scores
+        .iter()
+        .filter(|sc| sc.score >= threshold)
+        .map(|sc| (allocated_shards[sc.idx].filter.clone(), sc.score.clone()))
+        .collect();
+    swap_candidates.sort_by(|a, b| a.1.cmp(&b.1));
 
-    // Cap at 3 (matches Go's `limit := 3`)
-    let picks: Vec<Vec<u8>> = candidates.iter().take(3).map(|(f, _)| f.clone()).collect();
+    // Union, deduplicate, sort worst-first, cap at 3.
+    let mut combined: Vec<(Vec<u8>, BigInt)> = below_threshold.clone();
+    let swap_picks = halt_risk_deficit.min(swap_candidates.len());
+    for c in swap_candidates.into_iter().take(swap_picks) {
+        if !combined.iter().any(|(f, _)| f == &c.0) {
+            combined.push(c);
+        }
+    }
+    combined.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let picks: Vec<Vec<u8>> = combined.iter().take(3).map(|(f, _)| f.clone()).collect();
 
     if !picks.is_empty() {
-        let picks_summary: Vec<String> = candidates
+        let picks_summary: Vec<String> = combined
             .iter()
             .take(3)
             .map(|(f, score)| {
@@ -640,12 +679,14 @@ pub fn plan_leaves(
             unallocated = unallocated_shards.len(),
             best_unalloc_score = %best_unalloc.to_str_radix(10),
             threshold = %threshold.to_str_radix(10),
-            halt_risk_in_unalloc,
-            below_threshold = candidates.len(),
+            halt_risk_count,
+            free_workers,
+            halt_risk_deficit,
+            below_threshold = below_threshold.len(),
             picked = picks.len(),
             ?picks_summary,
             strategy = ?strategy,
-            "plan_leaves: proposing leaves (halt-risk override or below 67% of best unallocated)"
+            "plan_leaves: proposing leaves (below 67% threshold + halt-risk swap, shield applied)"
         );
     }
 
@@ -957,7 +998,7 @@ mod tests {
         let allocated = vec![
             ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16, active_count: 16 },
         ];
-        let result = plan_leaves(&allocated, &[], 50000, &BigInt::from(1_000_000), DEFAULT_UNITS, Strategy::RewardGreedy);
+        let result = plan_leaves(&allocated, &[], 50000, &BigInt::from(1_000_000), DEFAULT_UNITS, Strategy::RewardGreedy, 0);
         assert!(result.is_empty());
     }
 
@@ -1362,6 +1403,7 @@ mod tests {
         let unallocated = vec![make_shard(vec![0xBB], 200_000, 0, 1)];
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(250_000), DEFAULT_UNITS, Strategy::RewardGreedy,
+            0,
         );
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0], vec![0xAA]);
@@ -1373,6 +1415,7 @@ mod tests {
         let unallocated = vec![make_shard(vec![0xBB], 100_000, 0, 1)];
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(200_000), DEFAULT_UNITS, Strategy::RewardGreedy,
+            0,
         );
         assert!(filters.is_empty(), "should not leave a competitive shard");
     }
@@ -1389,6 +1432,7 @@ mod tests {
         let unallocated = vec![make_shard(vec![0xBB], 200_000, 0, 1)];
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(450_000), DEFAULT_UNITS, Strategy::RewardGreedy,
+            0,
         );
         assert_eq!(filters.len(), 3, "should cap at 3 leave proposals");
     }
@@ -1402,6 +1446,7 @@ mod tests {
         let unallocated = vec![make_shard(vec![0xBB], 200_000, 0, 1)];
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(300_000), DEFAULT_UNITS, Strategy::RewardGreedy,
+            0,
         );
         assert!(filters.len() >= 2, "should leave at least 2 bad shards");
         assert_eq!(filters[0], vec![0xA2], "worst shard (ring 4) should be first");
@@ -1427,7 +1472,7 @@ mod tests {
         let unallocated = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(600_000),
-            DEFAULT_UNITS, Strategy::RewardGreedy,
+            DEFAULT_UNITS, Strategy::RewardGreedy, 0,
         );
         assert!(filters.is_empty(),
             "halt-risk allocated shard must not be a leave candidate; got {filters:?}");
@@ -1453,25 +1498,25 @@ mod tests {
         let unallocated = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
         let filters = plan_leaves(
             &allocated, &unallocated, 50_000, &BigInt::from(600_000),
-            DEFAULT_UNITS, Strategy::RewardGreedy,
+            DEFAULT_UNITS, Strategy::RewardGreedy, 0,
         );
         assert!(filters.is_empty(),
             "shard at threshold+1 must be protected — leaving would push it into halt-risk");
     }
 
-    /// When ANY unallocated shard is halt-risk, the 67% score
-    /// threshold is bypassed and competitive non-halt-risk actives
-    /// become leave candidates. Otherwise a node bound to healthy
-    /// shards wedges — no free worker, threshold protects every
-    /// holding, halt-risk shards stay uncovered. The halt-risk
-    /// protection on allocated shards still applies.
+    /// Halt-risk swap: with halt-risk shards waiting in the
+    /// unallocated pool AND no free workers to cover them, the node
+    /// sheds one healthy allocation per halt-risk-deficit shard.
+    /// `free_workers=0`, `halt_risk_count=1` → deficit 1 → exactly
+    /// one leave proposed, picked from the worst-scoring healthy
+    /// alloc (ties broken by score). The shield still protects
+    /// halt-risk holdings (none here).
     #[test]
-    fn plan_leaves_supersedes_threshold_when_unallocated_halt_risk_exists() {
+    fn plan_leaves_swap_fires_when_halt_risk_demand_exceeds_free_workers() {
         let allocated = vec![
             make_shard(vec![0xA1], 100_000, 0, 1),
             make_shard(vec![0xA2], 100_000, 0, 1),
         ];
-        // Halt-risk unallocated: active_count <= HALT_RISK_PROVER_COUNT (3).
         let unallocated = vec![ShardDescriptor {
             filter: vec![0xBB],
             size: 90_000,
@@ -1484,18 +1529,53 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50_000, &BigInt::from(300_000),
             DEFAULT_UNITS, Strategy::RewardGreedy,
+            0,
         );
-        assert!(!filters.is_empty(),
-            "halt-risk in unallocated must supersede the 67% threshold");
+        assert_eq!(filters.len(), 1,
+            "deficit = halt_risk(1) - free_workers(0) = 1 → exactly one swap pick; \
+             got {filters:?}");
     }
 
-    /// Held halt-risk actives stay protected even when the threshold
-    /// bypass triggers — bypass relaxes the score floor on non-halt-risk
-    /// actives, it doesn't unblock leaving halt-risk holdings.
+    /// Halt-risk swap stays quiet when free workers already cover
+    /// the demand: the next plan_and_allocate will fill those
+    /// free slots with halt-risk shards via the join-side priority
+    /// bucket, so there's no reason to shed healthy allocations.
     #[test]
-    fn plan_leaves_bypass_still_protects_held_halt_risk() {
+    fn plan_leaves_swap_does_not_fire_when_free_workers_cover_demand() {
         let allocated = vec![
-            // Held halt-risk — must be protected.
+            make_shard(vec![0xA1], 100_000, 0, 1),
+            make_shard(vec![0xA2], 100_000, 0, 1),
+        ];
+        let unallocated = vec![ShardDescriptor {
+            filter: vec![0xBB],
+            size: 90_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 2,
+            active_count: 2,
+        }];
+        // 1 free worker covers the 1 waiting halt-risk shard.
+        let filters = plan_leaves(
+            &allocated, &unallocated, 50_000, &BigInt::from(300_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy,
+            1,
+        );
+        assert!(filters.is_empty(),
+            "free_workers(1) >= halt_risk(1) → no swap should fire, threshold \
+             alone gates; allocs at 100_000 are above the 67% threshold and stay");
+    }
+
+    /// Held halt-risk allocations are protected even when the swap
+    /// would otherwise pick them. The shield applies on top of the
+    /// swap path; halt-risk holdings are never shed regardless of
+    /// score or deficit.
+    #[test]
+    fn plan_leaves_shield_protects_held_halt_risk_below_threshold() {
+        let allocated = vec![
+            // Held halt-risk with tiny size → low score (would
+            // normally be leave-eligible by score), but the shield
+            // protects it.
             ShardDescriptor {
                 filter: vec![0xA1],
                 size: 5_000,
@@ -1505,24 +1585,19 @@ mod tests {
                 total_active_joining: 2,
                 active_count: 2,
             },
-            // Healthy active — leave candidate under bypass.
-            make_shard(vec![0xA2], 100_000, 0, 1),
+            // Non-halt-risk, low-scoring active — leave candidate.
+            make_shard(vec![0xA2], 30_000, 4, 1),
         ];
-        let unallocated = vec![ShardDescriptor {
-            filter: vec![0xBB],
-            size: 90_000,
-            ring: 0,
-            shards: 1,
-            active_on_ring: 1,
-            total_active_joining: 2,
-            active_count: 2,
-        }];
+        // High-scoring unallocated → threshold is ~0.67 * its score,
+        // well above A2's score → A2 gets picked, A1 spared by shield.
+        let unallocated = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
         let filters = plan_leaves(
-            &allocated, &unallocated, 50_000, &BigInt::from(300_000),
-            DEFAULT_UNITS, Strategy::RewardGreedy,
+            &allocated, &unallocated, 50_000, &BigInt::from(600_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy, 0,
         );
         assert_eq!(filters, vec![vec![0xA2]],
-            "bypass must shed healthy A2 but spare held halt-risk A1");
+            "shield must spare held halt-risk A1 even though its low score \
+             would otherwise make it leave-eligible");
     }
 
     /// plan_leaves DOES leave a non-halt-risk shard even when a
@@ -1545,7 +1620,7 @@ mod tests {
         let unallocated = vec![make_shard(vec![0xCC], 500_000, 0, 1)];
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(600_000),
-            DEFAULT_UNITS, Strategy::RewardGreedy,
+            DEFAULT_UNITS, Strategy::RewardGreedy, 0,
         );
         assert_eq!(filters, vec![vec![0xBB]],
             "non-halt-risk poor performer should still be a leave candidate");
