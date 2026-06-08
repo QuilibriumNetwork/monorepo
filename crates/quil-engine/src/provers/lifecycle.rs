@@ -50,6 +50,23 @@ pub const GO_PLAN_ALLOCATE_CAP: usize = 100;
 /// frames ≈ 10 minutes on mainnet, comfortably spanning one full
 /// sync cycle so the next plan_leaves cycle sees the Leaving status.
 pub const LEAVE_COOLDOWN_FRAMES: u64 = 20;
+/// Per-filter cooldown between successive Join proposals on the same
+/// filter. Closes the orphan-Joining gap created by
+/// `PROPOSAL_TIMEOUT_FRAMES` (10) being shorter than typical
+/// bundle-to-local-registry round-trip latency. When the worker-level
+/// pending marker times out, the worker goes back into `free_auto`
+/// and the next cycle can re-pick the same filter via a fresh bundle
+/// — but the prior bundle is still on the wire. Both eventually land,
+/// the registry holds two Joining allocs for the same filter (or
+/// overlapping cycles dilute the worker budget), and the assignment
+/// loop runs out of idle workers, leaving the excess as orphans
+/// (Joining alloc with no worker bound, observed in the wild
+/// 2026-06-07 — 5 overlapping ProposeJoin cycles for the same ~13
+/// halt-risk filters within 45 frames produced 22 unique Joining
+/// allocs against 13 available worker slots, leaving ~9 orphans).
+/// 30 frames ≈ 15 minutes on mainnet, well past the worst-case
+/// archive materialize + prover-tree sync round-trip we've seen.
+pub const JOIN_FILTER_COOLDOWN_FRAMES: u64 = 30;
 
 /// Result of evaluating the current frame for prover lifecycle actions.
 pub enum LifecycleAction {
@@ -400,6 +417,20 @@ pub struct ProverLifecycle {
     /// identical bundles. Entries older than `LEAVE_COOLDOWN_FRAMES`
     /// are pruned lazily on read so the map can't grow unbounded.
     last_leave_attempt: RwLock<HashMap<Vec<u8>, u64>>,
+    /// Per-filter "last frame we proposed Join on this filter."
+    /// Worker-level `pending_filter_frame` already prevents re-using
+    /// the same worker slot mid-flight, but it times out after 10
+    /// frames (`PROPOSAL_TIMEOUT_FRAMES`) — after which the worker
+    /// is freed for reuse, and the next cycle can propose a Join
+    /// for a DIFFERENT filter via that worker even though the first
+    /// bundle is still in flight on the wire. When both bundles
+    /// eventually materialize, the registry ends up with more
+    /// Joining allocs than we have workers for, and the excess
+    /// becomes orphans (alloc Joining, no worker bound). This map
+    /// gates `plan_and_allocate` candidate selection so a filter
+    /// with a recent in-flight bundle isn't re-picked until the
+    /// cooldown elapses. Pruned lazily on read.
+    last_join_attempt: RwLock<HashMap<Vec<u8>, u64>>,
     /// Set to true after the first successful `GetAppShards` refresh
     /// (`set_remote_shard_sizes`). Gates `ProposeJoin` and `ProposeLeave`:
     /// the lifecycle must not auto-pick shards while it lacks any
@@ -442,6 +473,7 @@ impl ProverLifecycle {
             confirm_window_frames: AtomicU64::new(DEFAULT_CONFIRM_WINDOW_FRAMES),
             shards_store: RwLock::new(None),
             last_leave_attempt: RwLock::new(HashMap::new()),
+            last_join_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
         }
     }
@@ -598,6 +630,39 @@ impl ProverLifecycle {
     /// `filter_recent_leave_attempts` excludes these filters.
     fn record_leave_attempts(&self, filters: &[Vec<u8>], frame_number: u64) {
         let Ok(mut guard) = self.last_leave_attempt.write() else {
+            return;
+        };
+        for f in filters {
+            guard.insert(f.clone(), frame_number);
+        }
+    }
+
+    /// Build a set of filters with an in-flight Join proposal — i.e.,
+    /// any filter we stamped in `last_join_attempt` within the last
+    /// `JOIN_FILTER_COOLDOWN_FRAMES`. Used by the propose path to
+    /// exclude these filters from the candidate set passed to
+    /// `plan_and_allocate`, preventing the orphan-Joining failure
+    /// mode where overlapping cycles propose the same filter via
+    /// different workers and both bundles eventually materialize.
+    /// Also opportunistically prunes expired entries so the map
+    /// can't grow unbounded.
+    fn filters_with_inflight_join(&self, frame_number: u64) -> std::collections::HashSet<Vec<u8>> {
+        let Ok(mut guard) = self.last_join_attempt.write() else {
+            return std::collections::HashSet::new();
+        };
+        // Lazy prune.
+        guard.retain(|_, last| {
+            frame_number.saturating_sub(*last) < JOIN_FILTER_COOLDOWN_FRAMES
+        });
+        guard.keys().cloned().collect()
+    }
+
+    /// Stamp the per-filter Join cooldown map. Called immediately
+    /// before pushing a ProposeJoin action so the next cycle excludes
+    /// these filters from `plan_and_allocate`'s candidate pool until
+    /// `JOIN_FILTER_COOLDOWN_FRAMES` elapses.
+    fn record_join_filter_attempts(&self, filters: &[Vec<u8>], frame_number: u64) {
+        let Ok(mut guard) = self.last_join_attempt.write() else {
             return;
         };
         for f in filters {
@@ -1176,8 +1241,29 @@ impl ProverLifecycle {
             );
 
             if can_propose {
+                // Per-filter Join cooldown: exclude any filter we've
+                // already proposed Join for within the last
+                // `JOIN_FILTER_COOLDOWN_FRAMES`. Closes the orphan-
+                // Joining gap where the worker-level
+                // `PROPOSAL_TIMEOUT_FRAMES` (10) frees a worker for
+                // re-use after 10 frames but the prior bundle is still
+                // in flight on the wire — both eventually land, and
+                // the registry ends up with more Joining allocs than
+                // worker slots. See `JOIN_FILTER_COOLDOWN_FRAMES`
+                // docstring for the production trace.
+                let inflight_filters = self.filters_with_inflight_join(frame_number);
+                let pre_cooldown_candidates = proposal_descriptors.len();
+                let proposal_descriptors_filtered: Vec<proposer::ShardDescriptor> =
+                    proposal_descriptors
+                        .iter()
+                        .filter(|d| !inflight_filters.contains(&d.filter))
+                        .cloned()
+                        .collect();
+                let join_cooldown_suppressed =
+                    pre_cooldown_candidates.saturating_sub(proposal_descriptors_filtered.len());
+
                 let proposals = proposer::plan_and_allocate(
-                    &proposal_descriptors,
+                    &proposal_descriptors_filtered,
                     difficulty,
                     &world_bytes,
                     self.units,
@@ -1200,11 +1286,17 @@ impl ProverLifecycle {
                     let worker_ids: Vec<u32> = proposals.iter().map(|p| p.worker_id).collect();
                     let filters: Vec<Vec<u8>> = proposals.into_iter().map(|p| p.filter).collect();
 
+                    // Stamp the per-filter Join cooldown before
+                    // emitting the action so the next cycle sees
+                    // these filters as in-flight and excludes them.
+                    self.record_join_filter_attempts(&filters, frame_number);
+
                     info!(
                         filters = filters.len(),
                         frame = frame_number,
                         prev_join_attempt = prev_attempt,
                         cooldown_frames = crate::worker_allocator::JOIN_COOLDOWN_FRAMES,
+                        join_cooldown_suppressed,
                         strategy = ?self.strategy,
                         "proposing join for shards"
                     );
@@ -1214,6 +1306,12 @@ impl ProverLifecycle {
                         worker_ids,
                         frame_number,
                     });
+                } else if join_cooldown_suppressed > 0 {
+                    tracing::debug!(
+                        frame = frame_number,
+                        join_cooldown_suppressed,
+                        "no join candidates after applying per-filter cooldown",
+                    );
                 }
             } else {
                 tracing::debug!(
@@ -2347,6 +2445,137 @@ mod proposal_loop_tests {
         assert!(
             !leaves.is_empty(),
             "expected Leave to be proposed again after LEAVE_COOLDOWN_FRAMES elapsed; got {:?}",
+            actions,
+        );
+    }
+
+    /// Per-filter Join cooldown: a filter we just proposed Join on
+    /// must NOT be re-picked by `plan_and_allocate` within
+    /// `JOIN_FILTER_COOLDOWN_FRAMES`. Without this, the 10-frame
+    /// `PROPOSAL_TIMEOUT_FRAMES` (which clears the worker-level
+    /// pending marker) lets the same filter get re-proposed via a
+    /// different worker while the prior bundle is still on the wire
+    /// — both eventually materialize and the registry ends up with
+    /// excess Joining allocs (one per cycle) but only one worker
+    /// slot, producing orphan Joining allocs. Observed on mainnet
+    /// 2026-06-07.
+    #[test]
+    fn join_cooldown_suppresses_repeat_proposal_within_window() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        // Two idle workers to make joins possible.
+        wm.add(idle_worker(1));
+        wm.add(idle_worker(2));
+
+        // Empty prover info — no allocations yet.
+        reg.set_prover(prover(address.clone(), vec![]));
+
+        // Two attractive unallocated shards (high score). Both halt-
+        // risk so they're prioritized by the join-side bucket pass.
+        let crowded = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            crowded(filter_bytes(0xC0), 1, 10_000_000),
+            crowded(filter_bytes(0xC1), 1, 10_000_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        // First cycle proposes Joins.
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let first_joins: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeJoin { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !first_joins.is_empty(),
+            "expected first cycle to produce ProposeJoin; got {:?}",
+            actions,
+        );
+
+        // Second cycle 5 frames later (within JOIN_FILTER_COOLDOWN_FRAMES=30):
+        // none of the just-proposed filters may be re-picked.
+        // Bump prover_root_verified_frame so the readiness gate passes.
+        lifecycle.set_prover_root_verified_frame(105);
+        let actions = lifecycle.evaluate(105, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let repeat_joins: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeJoin { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for f in &first_joins {
+            assert!(
+                !repeat_joins.contains(f),
+                "filter {} re-proposed Join within cooldown window; \
+                 first_joins={:?} repeat_joins={:?}",
+                hex::encode(f),
+                first_joins,
+                repeat_joins,
+            );
+        }
+    }
+
+    /// Per-filter Join cooldown expires after JOIN_FILTER_COOLDOWN_FRAMES.
+    /// If a published bundle never materializes (archive silently
+    /// dropped it, network drop, etc.) we must eventually be able
+    /// to re-attempt — otherwise the filter is locked out forever.
+    #[test]
+    fn join_cooldown_expires_after_window() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(idle_worker(1));
+        reg.set_prover(prover(address.clone(), vec![]));
+
+        let crowded = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![crowded(filter_bytes(0xC0), 1, 10_000_000)]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+        let _ = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+
+        // After the cooldown window, the same filter is eligible
+        // again. Frame 100 + JOIN_FILTER_COOLDOWN_FRAMES = 130.
+        let later_frame = 100 + JOIN_FILTER_COOLDOWN_FRAMES;
+        lifecycle.set_prover_root_verified_frame(later_frame);
+        let actions = lifecycle.evaluate(later_frame, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let joins: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeJoin { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !joins.is_empty(),
+            "expected Join to be proposed again after JOIN_FILTER_COOLDOWN_FRAMES elapsed; got {:?}",
             actions,
         );
     }

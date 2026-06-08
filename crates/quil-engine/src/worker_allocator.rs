@@ -584,6 +584,13 @@ impl WorkerAllocator {
             .collect();
         manual_pending.sort();
 
+        // Track allocations that need a worker but couldn't get one
+        // (idle pool empty + no manual-pending available). Without
+        // surfacing this we have no signal that an alloc landed
+        // without a worker binding — the symptom of the orphan-
+        // Joining failure mode that requires the lifecycle-side
+        // per-filter Join cooldown to prevent at the source.
+        let mut orphan_filters: Vec<(Vec<u8>, ProverStatus)> = Vec::new();
         for alloc in &prover.allocations {
             // Bind the filter for any non-expired allocation —
             // including Joining — so the TUI and the user can see
@@ -636,7 +643,40 @@ impl WorkerAllocator {
                     &alloc.confirmation_filter,
                     start_consensus,
                 )?;
+            } else {
+                // No idle worker available — the alloc is on-chain
+                // but has no local worker bound. This is a
+                // worker-budget overflow, almost always caused by
+                // overlapping ProposeJoin cycles materializing more
+                // distinct filters than we have worker slots for.
+                // The lifecycle's per-filter Join cooldown prevents
+                // the upstream cause; this branch logs the symptom
+                // so the operator (or a future regression) can spot
+                // it. Collected and logged in aggregate below so a
+                // batch of 9 orphans produces one log line, not 9.
+                orphan_filters.push((alloc.confirmation_filter.clone(), alloc.status));
             }
+        }
+
+        if !orphan_filters.is_empty() {
+            let count = orphan_filters.len();
+            let sample: Vec<String> = orphan_filters
+                .iter()
+                .take(8)
+                .map(|(f, s)| format!("{}:{:?}", hex::encode(f), s))
+                .collect();
+            warn!(
+                orphan_count = count,
+                frame_number,
+                ?sample,
+                "allocations with no worker bound — idle pool exhausted; \
+                 likely overlapping ProposeJoin cycles produced more \
+                 distinct Joining filters than worker slots. The orphan \
+                 alloc stays in the registry until its 720-frame grace \
+                 expires (Joining) or until the network confirms/rejects \
+                 it. Lifecycle's `JOIN_FILTER_COOLDOWN_FRAMES` is the \
+                 upstream guard against this."
+            );
         }
 
         Ok(())
