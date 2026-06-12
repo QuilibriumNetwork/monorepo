@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # and limitations under the License.
 [workspace]
+resolver = "2"
 members = [
     "crates/vdf",
     "crates/channel",
@@ -26,8 +27,50 @@ members = [
     "crates/bulletproofs",
     "crates/verenc",
     "crates/ferret",
-    "crates/dkls23_ffi"
+    "crates/dkls23_ffi",
+    "crates/dkls23-wasm",
+    "crates/dkls23",
+    "crates/quil-types",
+    "crates/quil-config",
+    "crates/quil-lifecycle",
+    "crates/quil-crypto",
+    "crates/quil-tries",
+    "crates/quil-tries-ffi",
+    "crates/quil-store",
+    "crates/quil-hypergraph",
+    "crates/quil-keys",
+    "crates/quil-keys-ffi",
+    "crates/quil-hypergraph-ffi",
+    "crates/quil-consensus",
+    "crates/quil-p2p",
+    "crates/quil-execution",
+    "crates/quil-engine",
+    "crates/quil-rpc",
+    "crates/quil-node",
+    "crates/quil-compiler",
+    "crates/quil-wallet",
+    "crates/libp2p-identity",
 ]
+
+[patch.crates-io]
+# Fork libp2p-identity to add Ed448 (KeyType=4) support for Quilibrium peer IDs
+libp2p-identity = { path = "crates/libp2p-identity" }
+# Local patch for libp2p-autonat 0.13.0 — one-line fix for a server-side
+# panic at `v1/behaviour/as_server.rs:304` ("Peer is connected.") that
+# fires when an inbound dial-back request races with the sender's
+# disconnect, killing the entire swarm event loop. Upstream master
+# still has the bug. See the crate's
+# `src/v1/behaviour/as_server.rs` for the patched lines.
+libp2p-autonat = { path = "crates/libp2p-autonat" }
+# Local patch for libp2p-kad 0.46.2 (the version libp2p 0.54.1
+# pulls in transitively) — bumps the per-handler
+# `MAX_NUM_STREAMS` cap from 32 to 256 so a single peer can hold
+# more simultaneous inbound kad substreams. The upstream constant
+# is private and unconfigurable; on a busy DHT the 32-cap caused
+# warnings at handler.rs:534 ("New inbound substream … exceeds
+# inbound substream limit. … Dropping new substream.") and lost
+# DHT queries. See `crates/libp2p-kad/src/handler.rs:43`.
+libp2p-kad = { path = "crates/libp2p-kad" }
 
 [profile.release]
 # rpath = false is important to make Go bindings work
@@ -35,3 +78,42 @@ rpath = false
 lto   = true
 debug = false
 # panic = 'abort'
+
+# Test profile overrides.
+#
+# Cryptography tests are 10-100x slower in unoptimized builds because the
+# hand-rolled big-int, pairing, FFT, OT, and bulletproof code (and the
+# heavy third-party curve/hash crates) need inlining and const
+# propagation to be fast. The overrides below compile those packages
+# with optimizations when building tests; Swatinem/rust-cache caches
+# the resulting artifacts so the cost is paid once. Debug assertions
+# and overflow checks remain on. `cargo build`/`cargo check` are
+# unaffected — they use profile.dev.
+
+# All third-party dependencies. `*` matches every package except the
+# one currently being built, so workspace members still need explicit
+# overrides below.
+[profile.test.package."*"]
+opt-level = 3
+
+# Workspace crates whose own code is the hot path in tests.
+[profile.test.package.bls48581]
+opt-level = 3
+[profile.test.package.dkls23]
+opt-level = 3
+[profile.test.package.dkls23_ffi]
+opt-level = 3
+[profile.test.package.ed448-bulletproofs]
+opt-level = 3
+[profile.test.package.classgroup]
+opt-level = 3
+[profile.test.package.vdf]
+opt-level = 3
+[profile.test.package.ferret]
+opt-level = 3
+[profile.test.package.channel]
+opt-level = 3
+[profile.test.package.verenc]
+opt-level = 3
+[profile.test.package.rpm]
+opt-level = 3

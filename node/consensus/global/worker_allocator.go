@@ -194,7 +194,6 @@ func (w *WorkerAllocator) evaluateForProposals(
 	}
 
 	w.logAllocationStatus(snapshot)
-
 	decideDescriptors := snapshot.decideDescriptors
 	worldBytes := snapshot.worldBytes
 

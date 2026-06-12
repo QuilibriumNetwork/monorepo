@@ -1,0 +1,19 @@
+[package]
+name = "quil-tries"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "64-branch vector commitment trees with KZG polynomial commitments"
+
+[dependencies]
+quil-types = { path = "../quil-types" }
+sha2 = "0.10"
+sha3 = "0.10"
+num-bigint = "0.4"
+num-traits = "0.2"
+rayon = "1"
+thiserror = "2"
+tracing = "0.1"
+hex = "0.4"
+
+[dev-dependencies]

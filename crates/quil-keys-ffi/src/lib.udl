@@ -1,0 +1,14 @@
+namespace quil_keys_ffi {
+    // Key manager lifecycle
+    u64 create_key_manager(string path, string encryption_key, string proving_key_id);
+    void destroy_key_manager(u64 handle);
+
+    // Key operations
+    void ensure_standard_keys(u64 handle);
+    sequence<u8> get_public_key(u64 handle, u8 key_type);
+    sequence<u8> sign(u64 handle, u8 key_type, sequence<u8> message);
+    sequence<u8> sign_with_domain(u64 handle, u8 key_type, sequence<u8> message, sequence<u8> domain);
+
+    // Standalone operations
+    sequence<u8> create_temp_key_manager_and_get_pubkey(string encryption_key);
+};

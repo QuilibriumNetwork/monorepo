@@ -431,3 +431,28 @@ impl Default for Point {
         }
     }
 }
+
+#[cfg(test)]
+mod point_encode_round_trip {
+    use super::*;
+    use crate::private_key::PrivateKey;
+    use crate::public_key::PublicKey;
+    use core::convert::TryFrom;
+
+    /// Pubkey bytes round-trip: encode → decode → encode must be
+    /// idempotent. Otherwise verify fails for any pubkey loaded
+    /// from bytes — the verify path internally re-encodes
+    /// (`self.as_byte()`) and decodes again, and any drift breaks
+    /// the shake256 hash input.
+    #[test]
+    fn pubkey_encode_decode_round_trip() {
+        let mut seed = [0u8; 57];
+        seed[0] = 0xAA;
+        let sk = PrivateKey::from(seed);
+        let pk: PublicKey = (&sk).into();
+        let bytes_a = pk.as_byte();
+        let pk2 = PublicKey::try_from(&bytes_a[..]).unwrap();
+        let bytes_b = pk2.as_byte();
+        assert_eq!(bytes_a, bytes_b, "encode → decode → encode must be idempotent");
+    }
+}

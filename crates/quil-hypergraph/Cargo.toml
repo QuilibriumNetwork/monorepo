@@ -1,0 +1,33 @@
+[package]
+name = "quil-hypergraph"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Hypergraph CRDT with add/remove sets and sync protocol"
+
+[features]
+test-utils = []
+
+[dependencies]
+quil-types = { path = "../quil-types" }
+quil-tries = { path = "../quil-tries" }
+tonic = "0.12"
+tokio = { version = "1", features = ["sync", "rt"] }
+tracing = "0.1"
+thiserror = "2"
+num-bigint = "0.4"
+num-traits = "0.2"
+sha3 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+proptest = "1"
+
+# Integration tests live in `tests/` and import the gated `testing`
+# module via `quil_hypergraph::testing`. Enable the feature on the
+# host crate so dev-dep builds resolve it. (The cfg(test) gate on
+# `pub mod testing;` in lib.rs only fires for in-crate unit tests, not
+# for the integration-test compilation unit.)
+[[test]]
+name = "crdt_props"
+required-features = ["test-utils"]

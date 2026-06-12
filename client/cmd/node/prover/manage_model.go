@@ -1,7 +1,7 @@
 package prover
 
 import (
-	"context"
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"math/big"
@@ -137,7 +137,14 @@ type dataRefreshMsg struct {
 type actionResultMsg struct {
 	action string
 	filter string
-	err    error
+	// filtersRaw is the raw filter byte-slices the action was
+	// submitted with. Populated by Join (which uses RequestJoin RPC
+	// rather than the canonical-message build path) so the Update
+	// handler can hook the post-broadcast await loop and verify
+	// on-chain landing — RPC ack only means "node accepted," not
+	// "alloc is now Joining in the registry."
+	filtersRaw [][]byte
+	err        error
 }
 
 type actionPreparedMsg struct {
@@ -167,24 +174,49 @@ type toggleManualMsg struct {
 
 type markManualMsg struct {
 	workerIDs []uint32
+	failedIDs []uint32 // subset of workerIDs whose RPC failed (parallel batch)
 	err       error
 }
 
 type awaitCheckMsg time.Time
 
 type awaitResultMsg struct {
-	action    string
-	unchanged bool
-	frame     uint64
-	err       error
+	action     string
+	frame      uint64
+	err        error
+	// perFilter carries the latest observed status for each
+	// awaited filter. Empty when err != nil.
+	perFilter []filterOutcome
+}
+
+// awaitFilterEntry tracks one filter's confirmation state during a
+// post-broadcast await loop. Replaces the prior single-filter
+// `awaitFilters` slice so batched and multi-filter actions surface
+// per-filter outcomes instead of declaring success on the first
+// observed change.
+type awaitFilterEntry struct {
+	filter         []byte
+	originalStatus uint32
+	settled        bool   // true once this filter has resolved one way or another
+	outcome        string // "Active" / "Removed" / "Paused" / etc., or "" while unsettled
+}
+
+// filterOutcome is one row of `actionConfirmedMsg.outcomes`.
+type filterOutcome struct {
+	filter  []byte
+	outcome string // "Active", "Removed", "unchanged", etc.
+	settled bool
 }
 
 type actionConfirmedMsg struct {
-	action    string
-	filter    string
-	newStatus string
-	frame     uint64
-	timedOut  bool
+	action   string
+	frame    uint64
+	outcomes []filterOutcome
+	// confirmed = number of filters that resolved with a non-original
+	// status; unchanged = number still at original status when the
+	// deadline elapsed (gives the operator a precise summary).
+	confirmed int
+	unchanged int
 }
 
 // Key map for help display.
@@ -396,13 +428,16 @@ type manageModel struct {
 	joinPickerSelected map[uint32]bool
 	joinPickerFilters  [][]byte
 
-	// Await state for multi-phase action tracking.
-	awaitAction         string
-	awaitFilters        [][]byte
-	awaitOriginalStatus uint32
-	awaitSendFrame      uint64
-	awaitDeadline       time.Time
-	awaitStartTime      time.Time
+	// Await state for multi-phase action tracking. Per-filter so
+	// batched (Pause/Resume) and multi-filter (Leave/Confirm/Reject)
+	// actions surface partial successes/failures rather than
+	// declaring success on the first observed change.
+	awaitAction    string
+	awaitFilters   []awaitFilterEntry
+	awaitSendFrame uint64
+	awaitDeadline  time.Time
+	awaitStartTime time.Time
+	awaitRetries   int // transient `awaitResultMsg.err` retry counter
 
 	// Sort state per panel (-1 = no explicit sort).
 	allocSortCol int
@@ -438,12 +473,42 @@ type manageModel struct {
 	height         int
 	statusMsg      string
 	statusIsError  bool
+	statusSticky   bool // true → statusMsg survives the next dataRefreshMsg success
 	spinner        spinner.Model
 	actionInFlight bool
 	help           help.Model
 	keyMap         manageKeyMap
 	showHelp       bool
 	colorCoding    bool
+
+	// Initial-load tracking. `dataLoaded` flips to true after the
+	// first successful `dataRefreshMsg`; until then panels render as
+	// "Loading…" and the header suppresses connectivity / frame
+	// fields rather than showing zero-value defaults that read like
+	// a connected-but-empty node.
+	dataLoaded         bool
+	lastFetchSuccessAt time.Time
+	lastFetchFailedAt  time.Time
+	consecutiveFailures int
+
+	// Cached auxiliary RPC responses. `fetchRPCData` returns a
+	// dataRefreshMsg with err=nil whenever GetNodeInfo succeeds,
+	// even if GetShardInfo or GetWorkerInfo failed (those are
+	// silently nil-on-error). Without caching, a single transient
+	// GetShardInfo or GetWorkerInfo failure between successful
+	// fetches blanks `m.available` / `m.freeWorkers` and flashes
+	// the Available and worker-status panels. Holding the prior
+	// raw response lets `processRefreshData` substitute it in for
+	// the nil one so the panels stay stable across blips.
+	cachedShardInfo  *protobufs.GetShardInfoResponse
+	cachedWorkerInfo *protobufs.WorkerInfoResponse
+
+	// Pending broadcast accumulator. Batched (Pause/Resume) and
+	// multi-filter actions append here on each successful broadcast,
+	// then the await loop tracks every accumulated filter — not just
+	// the final broadcast's filters.
+	broadcastedFilters  [][]byte
+	broadcastedStatuses []uint32
 }
 
 func newManageModel(client protobufs.NodeServiceClient) manageModel {
@@ -519,27 +584,62 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 
 	case dataRefreshMsg:
+		now := time.Now()
 		if msg.err != nil {
-			m.statusMsg = msg.err.Error()
+			m.lastFetchFailedAt = now
+			m.consecutiveFailures++
+			// Sticky errors don't survive forever — but a single
+			// failure shouldn't wipe a transient status the user
+			// just acted on, so we set a sticky error rather than
+			// overwriting the action's own status.
+			m.statusMsg = fmt.Sprintf("Refresh failed: %v", msg.err)
 			m.statusIsError = true
+			m.statusSticky = true
 			return m, nil
 		}
+		// Successful refresh — mark loaded, reset failure counters,
+		// process data, and clear only TRANSIENT status messages so
+		// sticky ones (action errors, "no valid selection", etc.)
+		// stay visible long enough for the user to read.
+		m.lastFetchSuccessAt = now
+		m.consecutiveFailures = 0
+		m.dataLoaded = true
 		m.processRefreshData(msg.nodeInfo, msg.shardInfo, msg.workerInfo)
-		if !m.actionInFlight {
+		if !m.actionInFlight && !m.statusSticky {
 			m.statusMsg = ""
 			m.statusIsError = false
 		}
 		return m, nil
 
 	case actionResultMsg:
-		// Join uses this path. Check queue for batch joins.
+		// Join lands here (RequestJoin RPC ack). RPC success only
+		// means the node accepted the request — the alloc may not
+		// yet be in the registry. Hook the await loop on the raw
+		// filters so the operator sees on-chain confirmation, not
+		// just RPC ack.
 		if msg.err != nil {
-			m.statusMsg = fmt.Sprintf("%s failed: %v", msg.action, msg.err)
-			m.statusIsError = true
-		} else {
-			m.statusMsg = fmt.Sprintf("%s sent for %s", msg.action, msg.filter)
-			m.statusIsError = false
+			return m.handleActionFailure(
+				fmt.Sprintf("%s failed", msg.action),
+				msg.err,
+				fetchData(m.client),
+			)
 		}
+		// For Join we await on-chain landing — originalStatus = 0
+		// (sentinel) because Join targets filters that don't yet
+		// have an allocation; the await reports any non-zero status
+		// (Joining/Active/etc.) as "settled" via the "filter became
+		// present" check.
+		if len(msg.filtersRaw) > 0 {
+			m.beginAwait(msg.action, msg.filtersRaw, 0)
+			m.statusMsg = fmt.Sprintf("%s sent for %s. Awaiting registry...", msg.action, msg.filter)
+			m.statusIsError = false
+			return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+				return awaitCheckMsg(t)
+			})
+		}
+		m.statusMsg = fmt.Sprintf("%s sent for %s", msg.action, msg.filter)
+		m.statusIsError = false
+		m.statusSticky = true
 		if cmd := m.advanceQueue(); cmd != nil {
 			return m, cmd
 		}
@@ -548,13 +648,11 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case actionPreparedMsg:
 		if msg.err != nil {
-			m.statusMsg = fmt.Sprintf("%s failed: %v", msg.action, msg.err)
-			m.statusIsError = true
-			if cmd := m.advanceQueue(); cmd != nil {
-				return m, cmd
-			}
-			m.actionInFlight = false
-			return m, nil
+			return m.handleActionFailure(
+				fmt.Sprintf("%s failed", msg.action),
+				msg.err,
+				nil,
+			)
 		}
 		if m.actionTotal > 1 {
 			m.statusMsg = fmt.Sprintf("Broadcasting %s (%d/%d)...", msg.action, m.actionIndex, m.actionTotal)
@@ -565,36 +663,50 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case actionBroadcastMsg:
 		if msg.err != nil {
-			m.statusMsg = fmt.Sprintf("%s broadcast failed: %v", msg.action, msg.err)
-			m.statusIsError = true
-			if cmd := m.advanceQueue(); cmd != nil {
-				return m, cmd
-			}
-			m.actionInFlight = false
-			return m, nil
+			return m.handleActionFailure(
+				fmt.Sprintf("%s broadcast failed", msg.action),
+				msg.err,
+				fetchData(m.client),
+			)
 		}
-		// If there are more actions in the queue, skip await and advance.
+		// Accumulate per-broadcast filters so the await loop sees
+		// every filter in a batch (Pause/Resume queue), not just
+		// the LAST broadcast's filters.
+		for _, f := range msg.filtersRaw {
+			m.broadcastedFilters = append(m.broadcastedFilters, f)
+			m.broadcastedStatuses = append(m.broadcastedStatuses, msg.originalStatus)
+		}
+		// Track the latest sendFrame for the deadline anchor.
+		if msg.sendFrame > m.awaitSendFrame {
+			m.awaitSendFrame = msg.sendFrame
+		}
+		// If there are more actions in the queue, advance — start
+		// await only after the entire batch has broadcast.
 		if len(m.actionQueue) > 0 {
 			m.statusMsg = fmt.Sprintf("%s broadcast (%d/%d)", msg.action, m.actionIndex, m.actionTotal)
 			cmd := m.advanceQueue()
 			return m, cmd
 		}
-		now := time.Now()
-		m.awaitAction = msg.action
-		m.awaitFilters = msg.filtersRaw
-		m.awaitOriginalStatus = msg.originalStatus
-		m.awaitSendFrame = msg.sendFrame
-		m.awaitStartTime = now
-		m.awaitDeadline = now.Add(90 * time.Second)
+		// Final broadcast of the batch — convert accumulated
+		// filters/statuses into await entries.
+		entries := make([]awaitFilterEntry, len(m.broadcastedFilters))
+		for i, f := range m.broadcastedFilters {
+			entries[i] = awaitFilterEntry{
+				filter:         f,
+				originalStatus: m.broadcastedStatuses[i],
+			}
+		}
+		m.beginAwait(msg.action, nil, 0)
+		m.awaitFilters = entries
 		if m.actionTotal > 1 {
 			m.statusMsg = fmt.Sprintf(
-				"%d %s(s) broadcast. Awaiting last inclusion (frame %d)...",
-				m.actionTotal, msg.action, msg.sendFrame,
+				"%d %s(s) broadcast (frame %d). Awaiting inclusion for %d filter(s)...",
+				m.actionTotal, msg.action, m.awaitSendFrame, len(entries),
 			)
 		} else {
 			m.statusMsg = fmt.Sprintf(
-				"%s broadcast (frame %d). Awaiting inclusion...",
-				msg.action, msg.sendFrame,
+				"%s broadcast (frame %d). Awaiting inclusion for %d filter(s)...",
+				msg.action, m.awaitSendFrame, len(entries),
 			)
 		}
 		return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
@@ -609,70 +721,131 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.client,
 			m.awaitAction,
 			m.awaitFilters,
-			m.awaitOriginalStatus,
 		)
 
 	case awaitResultMsg:
 		if !m.actionInFlight || m.awaitAction == "" {
 			return m, nil
 		}
+		// Transient RPC error: retry with backoff up to a bound,
+		// don't abort the entire confirm-tracking flow on the first
+		// blip. Previously a single network hiccup discarded all
+		// per-filter state and pretended the action failed.
 		if msg.err != nil {
-			m.actionInFlight = false
-			m.awaitAction = ""
-			m.actionQueue = nil
-			m.actionTotal = 0
-			m.actionIndex = 0
-			m.statusMsg = fmt.Sprintf("%s check failed: %v", msg.action, msg.err)
-			m.statusIsError = true
-			return m, fetchData(m.client)
-		}
-		if time.Now().After(m.awaitDeadline) {
-			m.actionInFlight = false
-			m.awaitAction = ""
-			m.actionQueue = nil
-			m.actionTotal = 0
-			m.actionIndex = 0
+			const maxAwaitRetries = 3
+			m.awaitRetries++
+			if m.awaitRetries < maxAwaitRetries && !time.Now().After(m.awaitDeadline) {
+				m.statusMsg = fmt.Sprintf(
+					"%s check transient error (%d/%d): %v",
+					msg.action, m.awaitRetries, maxAwaitRetries, msg.err,
+				)
+				m.statusIsError = false
+				// Backoff: 3s, 6s, 9s.
+				return m, tea.Tick(
+					time.Duration(3*m.awaitRetries)*time.Second,
+					func(t time.Time) tea.Msg { return awaitCheckMsg(t) },
+				)
+			}
+			// Exhausted retries — surface and clear.
+			m.finishAwait()
 			m.statusMsg = fmt.Sprintf(
-				"%s broadcast at frame %d but not yet confirmed after 90s",
-				msg.action, m.awaitSendFrame,
+				"%s check failed after %d retries: %v",
+				msg.action, m.awaitRetries, msg.err,
 			)
-			m.statusIsError = false
+			m.statusIsError = true
+			m.statusSticky = true
 			return m, fetchData(m.client)
 		}
+		// Successful check — reset the retry counter and merge
+		// per-filter outcomes into await state. Any newly-settled
+		// filter is locked in; unsettled ones continue.
+		m.awaitRetries = 0
+		settledNow := 0
+		for _, o := range msg.perFilter {
+			for i := range m.awaitFilters {
+				if bytes.Equal(m.awaitFilters[i].filter, o.filter) && !m.awaitFilters[i].settled {
+					m.awaitFilters[i].settled = o.settled
+					m.awaitFilters[i].outcome = o.outcome
+					if o.settled {
+						settledNow++
+					}
+				}
+			}
+		}
+		// All settled → success summary.
+		allSettled := true
+		for _, e := range m.awaitFilters {
+			if !e.settled {
+				allSettled = false
+				break
+			}
+		}
+		if allSettled {
+			return m, func() tea.Msg {
+				return m.buildConfirmed(msg.frame)
+			}
+		}
+		// Deadline elapsed → surface partial result.
+		if time.Now().After(m.awaitDeadline) {
+			return m, func() tea.Msg {
+				return m.buildConfirmed(msg.frame)
+			}
+		}
+		// Continue polling.
 		elapsed := int(time.Since(m.awaitStartTime).Seconds())
+		settledTotal := 0
+		for _, e := range m.awaitFilters {
+			if e.settled {
+				settledTotal++
+			}
+		}
 		m.statusMsg = fmt.Sprintf(
-			"%s broadcast (frame %d). Awaiting inclusion... (%ds)",
-			m.awaitAction, m.awaitSendFrame, elapsed,
+			"%s awaiting %d/%d filter(s)... (%ds elapsed, frame %d)",
+			m.awaitAction,
+			len(m.awaitFilters)-settledTotal,
+			len(m.awaitFilters),
+			elapsed,
+			m.awaitSendFrame,
 		)
+		m.statusIsError = false
 		return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
 			return awaitCheckMsg(t)
 		})
 
 	case actionConfirmedMsg:
-		m.actionInFlight = false
-		m.awaitAction = ""
-		m.actionQueue = nil
-		m.actionTotal = 0
-		m.actionIndex = 0
-		if msg.timedOut {
+		m.finishAwait()
+		// Build a precise summary: confirmed N of M filters, with
+		// the first unchanged one named for diagnostic clarity.
+		if msg.unchanged == 0 {
 			m.statusMsg = fmt.Sprintf(
-				"%s broadcast but not confirmed after 90s",
-				msg.action,
+				"%s confirmed at frame %d (%d filter(s))",
+				msg.action, msg.frame, msg.confirmed,
 			)
 			m.statusIsError = false
+		} else if msg.confirmed == 0 {
+			// All unchanged — deadline expired without any change.
+			firstHex := firstUnchangedFilterHex(msg.outcomes)
+			m.statusMsg = fmt.Sprintf(
+				"%s broadcast at frame %d but %d/%d filter(s) did not change (e.g. %s)",
+				msg.action, m.awaitSendFrame, msg.unchanged, len(msg.outcomes), firstHex,
+			)
+			m.statusIsError = true
 		} else {
+			firstHex := firstUnchangedFilterHex(msg.outcomes)
 			m.statusMsg = fmt.Sprintf(
-				"%s confirmed at frame %d – status: %s",
-				msg.action, msg.frame, msg.newStatus,
+				"%s partial: %d/%d confirmed, %d unchanged (e.g. %s)",
+				msg.action, msg.confirmed, len(msg.outcomes), msg.unchanged, firstHex,
 			)
-			m.statusIsError = false
+			m.statusIsError = msg.confirmed == 0
 		}
+		m.statusSticky = true
 		return m, fetchData(m.client)
 
 	case toggleManualMsg:
 		if msg.err != nil {
-			m.statusMsg = fmt.Sprintf("toggle manual mode failed: %v", msg.err)
+			m.statusMsg = fmt.Sprintf("Worker %d toggle failed: %v", msg.coreId, msg.err)
 			m.statusIsError = true
+			m.statusSticky = true
 		} else {
 			state := "Manual"
 			if !msg.newState {
@@ -684,7 +857,20 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, fetchData(m.client)
 
 	case markManualMsg:
-		// Fire-and-forget: errors here don't block the main action.
+		// Surface partial failures so the operator knows their
+		// auto→manual flip didn't apply uniformly. Previously this
+		// was deliberately silent ("fire-and-forget") which meant
+		// the action proceeded while some workers stayed in Auto
+		// mode against the operator's intent.
+		if len(msg.failedIDs) > 0 {
+			m.statusMsg = fmt.Sprintf(
+				"manual-tag: %d/%d worker(s) failed to mark manual (e.g. %v): %v",
+				len(msg.failedIDs), len(msg.workerIDs), msg.failedIDs[0], msg.err,
+			)
+			m.statusIsError = true
+			m.statusSticky = true
+			return m, fetchData(m.client)
+		}
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -1046,6 +1232,128 @@ func (m manageModel) renderHelpLine() string {
 		}
 	}
 	return strings.Join(parts, "  ")
+}
+
+// beginAwait initializes per-filter await tracking for an action.
+// `entries` may be passed via `filtersRaw` (single-message path,
+// e.g. Join) or built externally and assigned to `m.awaitFilters`
+// after the call (batch path, where filters arrive incrementally
+// via `broadcastedFilters`).
+//
+// `originalStatus` is the status the filters had before the action.
+// For Join this is 0 — the alloc doesn't exist yet, so the await
+// considers a filter settled the moment it APPEARS in the registry.
+//
+// The deadline is anchored on the latest broadcast frame so the
+// await covers the natural 360-frame protocol confirmation window
+// (roughly 1 hour at 10s/frame on mainnet) rather than a flat 90s
+// timeout that fires well before the chain has any chance to commit.
+func (m *manageModel) beginAwait(action string, filtersRaw [][]byte, originalStatus uint32) {
+	now := time.Now()
+	m.awaitAction = action
+	m.awaitStartTime = now
+	// Deadline = wall-time equivalent of 2*ACTION_FRAME_DELAY frames
+	// at the mainnet 10s/frame cadence, plus a slack constant for
+	// network propagation. ACTION_FRAME_DELAY=360 → 7200s + 30s
+	// slack. We use wall time (not chain frames) since the TUI
+	// doesn't reliably observe every frame increment.
+	const frameWallSeconds = 10
+	const slackSeconds = 30
+	deadlineSeconds := 2*int(ACTION_FRAME_DELAY)*frameWallSeconds + slackSeconds
+	m.awaitDeadline = now.Add(time.Duration(deadlineSeconds) * time.Second)
+	m.awaitRetries = 0
+	if filtersRaw != nil {
+		entries := make([]awaitFilterEntry, len(filtersRaw))
+		for i, f := range filtersRaw {
+			entries[i] = awaitFilterEntry{
+				filter:         f,
+				originalStatus: originalStatus,
+			}
+		}
+		m.awaitFilters = entries
+	}
+}
+
+// finishAwait clears every field associated with an in-flight action
+// so the next action starts from a clean slate. Previously
+// `awaitFilters` (and other fields) leaked across actions because
+// `actionConfirmedMsg` cleared only a subset.
+func (m *manageModel) finishAwait() {
+	m.actionInFlight = false
+	m.awaitAction = ""
+	m.awaitFilters = nil
+	m.awaitSendFrame = 0
+	m.awaitDeadline = time.Time{}
+	m.awaitStartTime = time.Time{}
+	m.awaitRetries = 0
+	m.actionQueue = nil
+	m.actionTotal = 0
+	m.actionIndex = 0
+	m.broadcastedFilters = nil
+	m.broadcastedStatuses = nil
+}
+
+// buildConfirmed assembles an `actionConfirmedMsg` summarizing the
+// final per-filter outcomes. Confirmed = settled with a non-empty
+// outcome string; unchanged = still at original status when deadline
+// elapsed.
+func (m *manageModel) buildConfirmed(frame uint64) actionConfirmedMsg {
+	outcomes := make([]filterOutcome, len(m.awaitFilters))
+	confirmed, unchanged := 0, 0
+	for i, e := range m.awaitFilters {
+		outcomes[i] = filterOutcome{
+			filter:  e.filter,
+			outcome: e.outcome,
+			settled: e.settled,
+		}
+		if e.settled {
+			confirmed++
+		} else {
+			unchanged++
+		}
+	}
+	return actionConfirmedMsg{
+		action:    m.awaitAction,
+		frame:     frame,
+		outcomes:  outcomes,
+		confirmed: confirmed,
+		unchanged: unchanged,
+	}
+}
+
+// firstUnchangedFilterHex returns a short hex prefix of the first
+// filter that didn't settle, for diagnostic clarity in status
+// summaries. Falls back to "n/a" if every filter settled.
+func firstUnchangedFilterHex(outcomes []filterOutcome) string {
+	for _, o := range outcomes {
+		if !o.settled {
+			return truncHex(hex.EncodeToString(o.filter))
+		}
+	}
+	return "n/a"
+}
+
+// handleActionFailure consolidates the failure-cleanup pattern
+// shared by every actionResultMsg / actionPreparedMsg /
+// actionBroadcastMsg case in Update. Sets a sticky error status,
+// advances the action queue if more work is pending, otherwise
+// clears the in-flight flag and returns `fallback` (usually a
+// fresh data fetch, sometimes nil).
+//
+// Before this helper, each phase open-coded the same 7-line
+// sequence; the only variation was the failure-prefix string and
+// the fallback cmd. Diff drift between phases (some set
+// statusSticky, others didn't) was a recurring source of
+// inconsistent UI behavior after partial-batch failures.
+func (m *manageModel) handleActionFailure(failurePrefix string, err error, fallback tea.Cmd) (tea.Model, tea.Cmd) {
+	m.statusMsg = fmt.Sprintf("%s: %v", failurePrefix, err)
+	m.statusIsError = true
+	m.statusSticky = true
+	if cmd := m.advanceQueue(); cmd != nil {
+		return m, cmd
+	}
+	m.actionInFlight = false
+	return m, fallback
 }
 
 // advanceQueue starts the next queued action if any remain.
@@ -1602,11 +1910,43 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 // processRefreshData merges NodeInfo + ShardInfo into model state.
+//
+// Defensive against a nil `nodeInfo`: although `fetchRPCData` short-
+// circuits on the first GetNodeInfo failure today, this method
+// shouldn't rely on that. If the contract ever loosens (e.g.
+// streaming refresh, partial response), the prior version would
+// nil-pointer-deref on `nodeInfo.GetPeerId()`.
+//
+// Auxiliary RPC caching: `shardInfo` and `workerInfo` are both
+// silently nil-on-error in `fetchRPCData`. When that happens we
+// substitute the prior cached response so the dependent panels
+// (Available shards, free workers, worker mode) don't blank between
+// refreshes. Fresh data updates the cache; missing data falls back
+// to it.
 func (m *manageModel) processRefreshData(
 	nodeInfo *protobufs.NodeInfoResponse,
 	shardInfo *protobufs.GetShardInfoResponse,
 	workerInfo *protobufs.WorkerInfoResponse,
 ) {
+	if nodeInfo == nil {
+		// Nothing to merge — leave model state untouched so the
+		// prior good values continue to render.
+		return
+	}
+
+	// Aux-response cache: prefer fresh data, fall back to cached.
+	// We update the cache only when fresh data arrives so a string
+	// of failures doesn't gradually clear it.
+	if shardInfo != nil {
+		m.cachedShardInfo = shardInfo
+	} else {
+		shardInfo = m.cachedShardInfo
+	}
+	if workerInfo != nil {
+		m.cachedWorkerInfo = workerInfo
+	} else {
+		workerInfo = m.cachedWorkerInfo
+	}
 	// Header.
 	m.peerId = nodeInfo.GetPeerId()
 	if s := nodeInfo.GetPeerSeniority(); len(s) > 0 {
@@ -2297,26 +2637,45 @@ func (m manageModel) renderView() string {
 
 	var doc strings.Builder
 
-	// Header bar.
-	peerDisplay := m.peerId
-	reachStr := "OK"
-	if !m.reachable {
-		reachStr = "UNREACHABLE"
+	// Header bar. Before the first successful data fetch, suppress
+	// connectivity / frame fields rather than rendering zero-value
+	// defaults that read like a connected-but-empty node ("Frame: 0"
+	// "[UNREACHABLE]"). After data loads, optionally annotate with
+	// a staleness suffix when the most recent refresh failed.
+	var header string
+	if !m.dataLoaded {
+		// First-paint placeholder so the user knows the TUI is
+		// alive and fetching, not stuck in a broken state.
+		header = fmt.Sprintf(" %s Connecting to node…", m.spinner.View())
+	} else {
+		peerDisplay := m.peerId
+		reachStr := "OK"
+		if !m.reachable {
+			reachStr = "UNREACHABLE"
+		}
+		workerMode := "Manual"
+		if m.autoManaged {
+			workerMode = "Auto"
+		}
+		header = fmt.Sprintf(
+			" Peer ID: %s  Seniority: %s  Workers: %d/%d (%s)  Frame: %d  [%s]",
+			peerDisplay,
+			m.seniority,
+			m.allocatedWorkers,
+			m.runningWorkers,
+			workerMode,
+			m.frameNumber,
+			reachStr,
+		)
+		// Staleness suffix: render when the most recent refresh
+		// failed but we still have prior good data. The suffix
+		// includes age so the operator can judge how stale the
+		// numbers are.
+		if m.consecutiveFailures > 0 && !m.lastFetchSuccessAt.IsZero() {
+			age := time.Since(m.lastFetchSuccessAt).Round(time.Second)
+			header += fmt.Sprintf("  (stale: last update %s ago, %d retries failed)", age, m.consecutiveFailures)
+		}
 	}
-	workerMode := "Manual"
-	if m.autoManaged {
-		workerMode = "Auto"
-	}
-	header := fmt.Sprintf(
-		" Peer ID: %s  Seniority: %s  Workers: %d/%d (%s)  Frame: %d  [%s]",
-		peerDisplay,
-		m.seniority,
-		m.allocatedWorkers,
-		m.runningWorkers,
-		workerMode,
-		m.frameNumber,
-		reachStr,
-	)
 	headerBar := mHeaderStyle.Width(m.width).Render(header)
 	doc.WriteString(headerBar)
 	doc.WriteString("\n")
@@ -2494,6 +2853,9 @@ func (m manageModel) renderFilterEditLines() (string, string) {
 func (m manageModel) renderAllocationsPanel(width, height int) string {
 	sorted := m.sortedAllocations()
 	if len(sorted) == 0 {
+		if !m.dataLoaded {
+			return "  " + m.spinner.View() + " Loading allocations…"
+		}
 		return "  No allocations"
 	}
 
@@ -2635,6 +2997,9 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 func (m manageModel) renderAvailablePanel(width, height int) string {
 	sorted := m.sortedAvailable()
 	if len(sorted) == 0 {
+		if !m.dataLoaded {
+			return "  " + m.spinner.View() + " Loading available shards…"
+		}
 		return "  No available shards"
 	}
 
@@ -2712,6 +3077,15 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 		if m.availSelected[s.filterKey] {
 			marker = "[x]"
 		}
+		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(availColWidths[1])+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s",
+			marker,
+			centerTrunc(s.filterHex, fw),
+			s.activeProvers,
+			s.ring,
+			formatStorage(s.shardSize.Uint64()),
+			s.dataShards,
+			"~"+formatQUIL(s.estimatedReward)+" Q/f",
+		)
 		if i == m.availCursor && m.focus == availablePanel {
 			line = fmt.Sprintf("%"+strconv.Itoa(availColWidths[0])+"s %"+strconv.Itoa(availColWidths[1])+"s %"+strconv.Itoa(availColWidths[2])+"d %"+strconv.Itoa(availColWidths[3])+"d %"+strconv.Itoa(availColWidths[4])+"s %"+strconv.Itoa(availColWidths[5])+"d %"+strconv.Itoa(availColWidths[6])+"s",
 				marker,
@@ -2881,17 +3255,23 @@ func truncHex(h string) string {
 }
 
 // fetchRPCData calls GetNodeInfo, GetShardInfo, and GetWorkerInfo.
+// Each call is wrapped in a bounded context so a hung node fails
+// fast instead of freezing the tea command indefinitely.
 func fetchRPCData(client protobufs.NodeServiceClient) (*protobufs.NodeInfoResponse, *protobufs.GetShardInfoResponse, *protobufs.WorkerInfoResponse, error) {
+	nodeCtx, nodeCancel := withTimeout()
+	defer nodeCancel()
 	nodeInfo, err := client.GetNodeInfo(
-		context.Background(),
+		nodeCtx,
 		&protobufs.GetNodeInfoRequest{},
 	)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("GetNodeInfo: %w", err)
 	}
 
+	shardCtx, shardCancel := withTimeout()
+	defer shardCancel()
 	shardInfo, err := client.GetShardInfo(
-		context.Background(),
+		shardCtx,
 		&protobufs.GetShardInfoRequest{IncludeAll: true},
 	)
 	if err != nil {
@@ -2899,8 +3279,10 @@ func fetchRPCData(client protobufs.NodeServiceClient) (*protobufs.NodeInfoRespon
 		shardInfo = nil
 	}
 
+	workerCtx, workerCancel := withTimeout()
+	defer workerCancel()
 	workerInfo, err := client.GetWorkerInfo(
-		context.Background(),
+		workerCtx,
 		&protobufs.GetWorkerInfoRequest{},
 	)
 	if err != nil {

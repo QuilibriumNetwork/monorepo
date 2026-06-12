@@ -1,0 +1,73 @@
+[package]
+name = "quil-node"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Quilibrium node binary"
+
+[[bin]]
+name = "quil-node"
+path = "src/main.rs"
+
+[[bin]]
+name = "prover-join-test"
+path = "src/bin/prover_join_test.rs"
+
+[[bin]]
+name = "blossom-chat"
+path = "src/bin/blossom_chat.rs"
+
+[dependencies]
+async-trait = "0.1"
+quil-types = { path = "../quil-types" }
+quil-config = { path = "../quil-config" }
+quil-lifecycle = { path = "../quil-lifecycle" }
+quil-crypto = { path = "../quil-crypto", features = ["vdf-prover"] }
+quil-store = { path = "../quil-store" }
+quil-hypergraph = { path = "../quil-hypergraph" }
+quil-keys = { path = "../quil-keys" }
+quil-p2p = { path = "../quil-p2p" }
+quil-consensus = { path = "../quil-consensus" }
+quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
+quil-engine = { path = "../quil-engine" }
+quil-rpc = { path = "../quil-rpc" }
+quil-tries = { path = "../quil-tries" }
+prost = "0.13"
+tonic = "0.12"
+hex = "0.4"
+bs58 = "0.5"
+base64 = "0.22"
+ed448-rust = { path = "../ed448-rust" }
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+chrono = "0.4"
+serde_json = "1"
+file-rotate = "0.7"
+anyhow = "1"
+thiserror = "2"
+sha2 = "0.10"
+sha3 = "0.10"
+num-bigint = "0.4"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+async-stream = "0.3"
+parking_lot = "0.12"
+
+# Jemalloc as the global allocator. The default system allocator
+# (glibc malloc on Linux) fragments aggressively under our
+# allocation pattern — heavy churn on small-medium-sized Vec/HashMap
+# entries from BlossomSub forwarding plus long-lived caches.
+# jemalloc holds memory roughly 10x better here. Profiling via
+# MALLOC_CONF=prof:true,prof_prefix:/tmp/jeprof + jeprof on the
+# resulting *.heap files surfaces per-call-site allocation totals.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+
+[dev-dependencies]
+tempfile = "3"
+flate2 = "1"

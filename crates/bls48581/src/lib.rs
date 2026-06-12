@@ -908,6 +908,185 @@ pub fn init() {
   bls::singleton();
 }
 
+// ============================================================
+// Scalar / G1 helpers used by threshold BLS protocols.
+//
+// These expose the modular arithmetic + scalar-to-G1 mapping over the
+// BLS48-581 scalar field that the existing high-level BLS API doesn't
+// surface. Used by `bls48581-wasm` so the qkms-sdk JavaScript sidecar can
+// drive t-of-n DKG and signing without re-implementing curve math in JS.
+//
+// All scalars are 73 big-endian bytes (== `MODBYTES`). G1 points are
+// 74-byte compressed (matches the existing `bls_sign` output and `ecp::ECP`
+// `tobytes(.., true)` convention).
+// ============================================================
+
+const SCALAR_BYTES: usize = big::MODBYTES; // 73
+const G1_COMPRESSED_BYTES: usize = 74;
+// BLS48-581 uses ECP8 for the public-key group (== "G2" / "G8" in different
+// naming conventions). Compressed serialized size matches the buffer
+// `bls_keygen` allocates for the public key.
+const G8_COMPRESSED_BYTES: usize = 585;
+
+fn parse_scalar(bytes: &[u8]) -> Option<big::BIG> {
+  if bytes.len() != SCALAR_BYTES {
+    return None;
+  }
+  let mut s = big::BIG::frombytes(bytes);
+  // Defensive: callers may hand us bytes that aren't reduced; the modular
+  // ops below all do their own reduction, but normalising here gives us a
+  // canonical 73-byte serialisation on the way out.
+  s.rmod(&big::BIG::new_ints(&rom::CURVE_ORDER));
+  Some(s)
+}
+
+fn scalar_to_bytes(s: &big::BIG) -> Vec<u8> {
+  let mut s_copy = s.clone();
+  s_copy.rmod(&big::BIG::new_ints(&rom::CURVE_ORDER));
+  let mut out = vec![0u8; SCALAR_BYTES];
+  s_copy.tobytes(&mut out);
+  out
+}
+
+/// Generate a uniformly random scalar in [0, q), serialized as 73 BE bytes.
+pub fn bls_scalar_random() -> Vec<u8> {
+  init();
+  let mut raw_seed = [0u8; 128];
+  ::rand::thread_rng().fill_bytes(&mut raw_seed);
+  let mut rng = rand::RAND::new();
+  rng.clean();
+  rng.seed(raw_seed.len(), &raw_seed);
+  let q = big::BIG::new_ints(&rom::CURVE_ORDER);
+  let s = big::BIG::randomnum(&q, &mut rng);
+  scalar_to_bytes(&s)
+}
+
+/// Modular multiplication on the BLS48-581 scalar field: returns `(a * b) mod q`.
+pub fn bls_scalar_mul(a: &[u8], b: &[u8]) -> Vec<u8> {
+  let aa = match parse_scalar(a) { Some(v) => v, None => return Vec::new() };
+  let bb = match parse_scalar(b) { Some(v) => v, None => return Vec::new() };
+  let q = big::BIG::new_ints(&rom::CURVE_ORDER);
+  let r = big::BIG::modmul(&aa, &bb, &q);
+  scalar_to_bytes(&r)
+}
+
+/// Modular addition on the BLS48-581 scalar field: returns `(a + b) mod q`.
+pub fn bls_scalar_add(a: &[u8], b: &[u8]) -> Vec<u8> {
+  let aa = match parse_scalar(a) { Some(v) => v, None => return Vec::new() };
+  let bb = match parse_scalar(b) { Some(v) => v, None => return Vec::new() };
+  let q = big::BIG::new_ints(&rom::CURVE_ORDER);
+  let r = big::BIG::modadd(&aa, &bb, &q);
+  scalar_to_bytes(&r)
+}
+
+/// Modular subtraction on the BLS48-581 scalar field: returns `(a - b) mod q`.
+pub fn bls_scalar_sub(a: &[u8], b: &[u8]) -> Vec<u8> {
+  let aa = match parse_scalar(a) { Some(v) => v, None => return Vec::new() };
+  let bb = match parse_scalar(b) { Some(v) => v, None => return Vec::new() };
+  let q = big::BIG::new_ints(&rom::CURVE_ORDER);
+  let neg_b = big::BIG::modneg(&bb, &q);
+  let r = big::BIG::modadd(&aa, &neg_b, &q);
+  scalar_to_bytes(&r)
+}
+
+/// Modular negation: `-a mod q`.
+pub fn bls_scalar_neg(a: &[u8]) -> Vec<u8> {
+  let aa = match parse_scalar(a) { Some(v) => v, None => return Vec::new() };
+  let q = big::BIG::new_ints(&rom::CURVE_ORDER);
+  let r = big::BIG::modneg(&aa, &q);
+  scalar_to_bytes(&r)
+}
+
+/// Modular inverse: `a^{-1} mod q`. Returns empty vec on non-invertible input
+/// (a == 0).
+pub fn bls_scalar_inv(a: &[u8]) -> Vec<u8> {
+  let mut aa = match parse_scalar(a) { Some(v) => v, None => return Vec::new() };
+  if aa.iszilch() {
+    return Vec::new();
+  }
+  let q = big::BIG::new_ints(&rom::CURVE_ORDER);
+  aa.invmodp(&q);
+  scalar_to_bytes(&aa)
+}
+
+/// Convert a uint64 to a 73-byte BE scalar — used by clients to lift small
+/// integers (party ids) into the scalar field for Lagrange-coefficient
+/// arithmetic without having to hard-code MODBYTES on the JS side.
+pub fn bls_scalar_from_u64(v: u64) -> Vec<u8> {
+  // BIG::new_int takes isize. Constrain to a sane range; party ids are well
+  // below 2^31 in practice.
+  let s = if v <= isize::MAX as u64 {
+    big::BIG::new_int(v as isize)
+  } else {
+    // Build the BIG by hand from a 73-byte BE buffer.
+    let mut buf = vec![0u8; SCALAR_BYTES];
+    buf[SCALAR_BYTES - 8] = (v >> 56) as u8;
+    buf[SCALAR_BYTES - 7] = (v >> 48) as u8;
+    buf[SCALAR_BYTES - 6] = (v >> 40) as u8;
+    buf[SCALAR_BYTES - 5] = (v >> 32) as u8;
+    buf[SCALAR_BYTES - 4] = (v >> 24) as u8;
+    buf[SCALAR_BYTES - 3] = (v >> 16) as u8;
+    buf[SCALAR_BYTES - 2] = (v >> 8) as u8;
+    buf[SCALAR_BYTES - 1] = v as u8;
+    big::BIG::frombytes(&buf)
+  };
+  scalar_to_bytes(&s)
+}
+
+/// Compute the G1 point `g^scalar` (i.e. `scalar * G1.generator()`),
+/// returned as 74-byte compressed bytes. Used for Feldman commitments
+/// in BLS-N DKG.
+pub fn bls_scalar_to_g1(scalar: &[u8]) -> Vec<u8> {
+  let s = match parse_scalar(scalar) { Some(v) => v, None => return Vec::new() };
+  let g = ECP::generator();
+  let p = g.mul(&s);
+  let mut out = vec![0u8; G1_COMPRESSED_BYTES];
+  p.tobytes(&mut out, true);
+  out
+}
+
+/// Add two G1 points (compressed input/output, 74 bytes each). Used by
+/// BLS-N to aggregate G1 partial signatures.
+pub fn bls_g1_add(a: &[u8], b: &[u8]) -> Vec<u8> {
+  if a.len() != G1_COMPRESSED_BYTES || b.len() != G1_COMPRESSED_BYTES {
+    return Vec::new();
+  }
+  let mut pa = ECP::frombytes(a);
+  let pb = ECP::frombytes(b);
+  pa.add(&pb);
+  let mut out = vec![0u8; G1_COMPRESSED_BYTES];
+  pa.tobytes(&mut out, true);
+  out
+}
+
+/// Compute the G8 / ECP8 point `g^scalar` (the BLS48-581 public-key group).
+/// Returns 585-byte compressed bytes — same wire format the existing
+/// `bls_keygen` produces for `public_key` and `bls_verify` accepts.
+/// Used for BLS-N DKG Feldman commitments and master verification key.
+pub fn bls_scalar_to_g8(scalar: &[u8]) -> Vec<u8> {
+  let s = match parse_scalar(scalar) { Some(v) => v, None => return Vec::new() };
+  let g = ecp8::ECP8::generator();
+  let p = g.mul(&s);
+  let mut out = vec![0u8; G8_COMPRESSED_BYTES];
+  p.tobytes(&mut out, true);
+  out
+}
+
+/// Add two G8 / ECP8 points (compressed input/output, 585 bytes each).
+/// Used by BLS-N DKG to sum commitment[0] across all parties into the
+/// master public key.
+pub fn bls_g8_add(a: &[u8], b: &[u8]) -> Vec<u8> {
+  if a.len() != G8_COMPRESSED_BYTES || b.len() != G8_COMPRESSED_BYTES {
+    return Vec::new();
+  }
+  let mut pa = ecp8::ECP8::frombytes(a);
+  let pb = ecp8::ECP8::frombytes(b);
+  pa.add(&pb);
+  let mut out = vec![0u8; G8_COMPRESSED_BYTES];
+  pa.tobytes(&mut out, true);
+  out
+}
+
 const BYTES_PER_SCALAR: usize = 64;
 
 /// Very small helper – SHA3‑512 → field element mod r.

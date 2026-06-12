@@ -1,0 +1,19 @@
+[package]
+name = "quil-tries-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib", "staticlib"]
+name = "quil_tries_ffi"
+
+[dependencies]
+quil-tries = { path = "../quil-tries" }
+quil-types = { path = "../quil-types" }
+uniffi = { version = "0.28.3", features = ["cli"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+sha2 = "0.10"
+
+[build-dependencies]
+uniffi = { version = "0.28.3", features = ["build"] }

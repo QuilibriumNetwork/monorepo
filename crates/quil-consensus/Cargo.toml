@@ -1,0 +1,15 @@
+[package]
+name = "quil-consensus"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Generic HotStuff/BFT consensus protocol library"
+
+[dependencies]
+quil-types = { path = "../quil-types" }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+tracing = "0.1"
+thiserror = "2"
+hex = "0.4"

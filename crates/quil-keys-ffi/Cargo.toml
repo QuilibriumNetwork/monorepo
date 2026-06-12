@@ -1,0 +1,20 @@
+[package]
+name = "quil-keys-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "UniFFI bindings for quil-keys, exposing key management to Go via C FFI"
+
+[lib]
+crate-type = ["lib", "staticlib"]
+name = "quil_keys_ffi"
+
+[dependencies]
+quil-keys = { path = "../quil-keys" }
+quil-types = { path = "../quil-types" }
+quil-crypto = { path = "../quil-crypto" }
+uniffi = { version = "0.28.3", features = ["cli"] }
+tempfile = "3"
+
+[build-dependencies]
+uniffi = { version = "0.28.3", features = ["build"] }

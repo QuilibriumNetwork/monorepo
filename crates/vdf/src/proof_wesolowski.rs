@@ -90,20 +90,16 @@ pub fn approximate_parameters(t: f64) -> (usize, u8, u64) {
 }
 
 fn u64_to_bytes(q: u64) -> [u8; 8] {
-    if false {
-        u64::to_ne_bytes(q.to_be())
-    } else {
-        [
-            (q >> 56) as u8,
-            (q >> 48) as u8,
-            (q >> 40) as u8,
-            (q >> 32) as u8,
-            (q >> 24) as u8,
-            (q >> 16) as u8,
-            (q >> 8) as u8,
-            q as u8,
-        ]
-    }
+    [
+        (q >> 56) as u8,
+        (q >> 48) as u8,
+        (q >> 40) as u8,
+        (q >> 32) as u8,
+        (q >> 24) as u8,
+        (q >> 16) as u8,
+        (q >> 8) as u8,
+        q as u8,
+    ]
 }
 
 /// Quote:

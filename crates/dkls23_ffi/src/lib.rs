@@ -69,7 +69,9 @@ impl Default for EllipticCurve {
     }
 }
 
-// Include the uniffi scaffolding
+// Include the uniffi scaffolding (only for non-wasm32 targets — wasm consumers
+// use the dkls23-wasm crate's wasm-bindgen wrappers instead).
+#[cfg(not(target_arch = "wasm32"))]
 uniffi::include_scaffolding!("lib");
 
 static INIT: Once = Once::new();

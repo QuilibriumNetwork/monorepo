@@ -77,16 +77,57 @@ pub struct MessageCiphertext {
     pub associated_data: Option<String>,
 }
 
+/// Deserialize a byte array from either a base64-encoded string OR
+/// the legacy JSON-integer-array shape. Same on-disk type
+/// (`Vec<u8>`) — only the input wire format changes. Mobile clients
+/// (iOS Swift / Android Kotlin) now base64-encode their byte inputs
+/// to avoid the per-byte `JSONArray.put(int)` boxing that previously
+/// pushed Android heap into OOM territory.
+fn deserialize_bytes_b64_or_array<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Visitor};
+    use std::fmt;
+
+    struct BytesVisitor;
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = Vec<u8>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("base64 string or array of byte values")
+        }
+        fn visit_str<E: Error>(self, v: &str) -> Result<Vec<u8>, E> {
+            BASE64_STANDARD.decode(v).map_err(Error::custom)
+        }
+        fn visit_string<E: Error>(self, v: String) -> Result<Vec<u8>, E> {
+            self.visit_str(&v)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(n) = seq.next_element::<i32>()? {
+                out.push(n as u8);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_any(BytesVisitor)
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct SealedInboxMessageEncryptRequest {
+    #[serde(deserialize_with = "deserialize_bytes_b64_or_array")]
     pub inbox_public_key: Vec<u8>,
+    #[serde(deserialize_with = "deserialize_bytes_b64_or_array")]
     pub ephemeral_private_key: Vec<u8>,
+    #[serde(deserialize_with = "deserialize_bytes_b64_or_array")]
     pub plaintext: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct SealedInboxMessageDecryptRequest {
+    #[serde(deserialize_with = "deserialize_bytes_b64_or_array")]
     pub inbox_private_key: Vec<u8>,
+    #[serde(deserialize_with = "deserialize_bytes_b64_or_array")]
     pub ephemeral_public_key: Vec<u8>,
     pub ciphertext: MessageCiphertext,
 }
@@ -351,7 +392,19 @@ pub fn decrypt_inbox_message(input: String) -> String {
             }
 
             match decrypt_aead(&params.ciphertext, &derived) {
-                Ok(result) => serde_json::to_string(&result).unwrap_or_else(|e| e.to_string()),
+                // Return the decrypted bytes as a base64-encoded string
+                // instead of a JSON array of integers. Same `String`
+                // wire type (so UniFFI bindings stay byte-identical),
+                // but the payload is ~3x smaller AND the receiver does
+                // an O(n) base64 decode instead of allocating a boxed
+                // Integer per byte through `org.json.JSONArray`. That
+                // was the source of OOM crashes on Android for large
+                // messages — see project_rust_binding_bytes_format
+                // memory for context. Errors continue to flow back as
+                // plain-text strings; receivers distinguish success
+                // from error by attempting a base64 decode (errors
+                // aren't valid base64).
+                Ok(result) => BASE64_STANDARD.encode(&result),
                 Err(e) => e,
             }
         }

@@ -1,0 +1,46 @@
+[package]
+name = "quil-p2p"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "P2P networking with BlossomSub pubsub for the Quilibrium node"
+
+[dependencies]
+quil-types = { path = "../quil-types" }
+quil-config = { path = "../quil-config" }
+quil-lifecycle = { path = "../quil-lifecycle" }
+quil-crypto = { path = "../quil-crypto" }
+libp2p = { version = "0.54", features = [
+    "tokio",
+    "noise",
+    "yamux",
+    "tcp",
+    "quic",
+    "dns",
+    "identify",
+    "ping",
+    "kad",
+    "autonat",
+    "macros",
+] }
+prost = "0.13"
+tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
+tracing = "0.1"
+thiserror = "2"
+sha2 = "0.10"
+sha3 = "0.10"
+aes-gcm = "0.10"
+lru = "0.12"
+rand = "0.8"
+async-trait = "0.1"
+anyhow = "1"
+hex = "0.4"
+futures = "0.3"
+ed448-rust = { path = "../ed448-rust" }
+libp2p-identity = { version = "0.2", features = ["ed448"] }
+void = "1"
+snow = "0.9"
+bs58 = "0.5"
+
+[build-dependencies]
+prost-build = "0.13"

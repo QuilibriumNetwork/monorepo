@@ -1,0 +1,17 @@
+[package]
+name = "quil-wallet"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Wallet-side transaction construction: Pedersen commitments + bulletproof range proofs + BLS48581 signing, producing Transaction canonical bytes ready for submission via NodeService::Send."
+
+[dependencies]
+quil-types = { path = "../quil-types" }
+quil-crypto = { path = "../quil-crypto" }
+quil-execution = { path = "../quil-execution" }
+ed448-bulletproofs = { path = "../bulletproofs" }
+thiserror = "2"
+rand = "0.8"
+sha3 = "0.10"
+hex = "0.4"
+num-bigint = "0.4"
