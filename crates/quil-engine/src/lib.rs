@@ -1,5 +1,6 @@
 pub mod app_engine;
 pub mod app_glue;
+pub mod archive_ingest;
 pub mod app_shard_cache;
 pub mod app_shard_metadata;
 pub mod app_timeout_aggregation;

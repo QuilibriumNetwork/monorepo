@@ -2,7 +2,7 @@
 pub const VERSION: [u8; 3] = [0x02, 0x01, 0x00];
 
 /// Patch number (mirror of Go `config.GetPatchNumber`).
-pub const PATCH_NUMBER: u8 = 0x17;
+pub const PATCH_NUMBER: u8 = 0x18;
 
 /// Minimum compatible version.
 pub const MINIMUM_VERSION: [u8; 3] = [0x02, 0x01, 0x00];
@@ -12,7 +12,7 @@ pub const MINIMUM_PATCH_NUMBER: u8 = 0x04;
 
 /// Full protocol version string including patch — must stay in sync
 /// with `VERSION` and `PATCH_NUMBER`.
-pub const VERSION_STRING: &str = "2.1.0.23";
+pub const VERSION_STRING: &str = "2.1.0.24";
 
 /// Format a 3-byte version array as `"major.minor.patch"`. A 4th byte
 /// is treated as a release-candidate suffix: `"major.minor.patch-pN"`.

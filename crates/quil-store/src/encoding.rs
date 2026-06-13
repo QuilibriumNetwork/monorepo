@@ -28,6 +28,13 @@ pub const CONSENSUS: u8 = 0x0C;
 /// migration without overwriting key-bundle data.
 pub const CONSENSUS_STATE: u8 = 0x00;
 pub const CONSENSUS_LIVENESS: u8 = 0x01;
+/// Rust-node-only: highest app-shard frame whose `requests` have been
+/// materialized into the hypergraph CRDT, persisted per shard filter so
+/// the in-memory cursor survives restart (it would otherwise reset to 0
+/// and re-materialize, or — worse — silently skip frames the CRDT
+/// already advanced past). Go has no equivalent record, so 0x02 under
+/// CONSENSUS is unused by a migrated Go store.
+pub const CONSENSUS_MATERIALIZED_CURSOR: u8 = 0x02;
 pub const MIGRATION: u8 = 0xF0;
 pub const WORKER: u8 = 0xFF;
 
@@ -698,6 +705,16 @@ pub fn consensus_liveness_key(filter: &[u8]) -> Vec<u8> {
     k
 }
 
+/// Key for the per-shard "highest materialized frame" cursor. Value is
+/// an 8-byte big-endian `u64`. See [`CONSENSUS_MATERIALIZED_CURSOR`].
+pub fn consensus_materialized_cursor_key(filter: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + filter.len());
+    k.push(CONSENSUS);
+    k.push(CONSENSUS_MATERIALIZED_CURSOR);
+    k.extend_from_slice(filter);
+    k
+}
+
 // -----------------------------------------------------------------------
 // Token store key builders
 // -----------------------------------------------------------------------
@@ -801,6 +818,20 @@ mod tests {
         assert_eq!(key[0], CLOCK_FRAME);    // 0x00
         assert_eq!(key[1], CLOCK_GLOBAL_FRAME); // 0x00
         assert_eq!(&key[2..], &42u64.to_be_bytes());
+    }
+
+    #[test]
+    fn materialized_cursor_key_layout() {
+        // [CONSENSUS(0x0C), CONSENSUS_MATERIALIZED_CURSOR(0x02), filter...]
+        let key = consensus_materialized_cursor_key(&[0xAB, 0xCD]);
+        assert_eq!(key.len(), 4);
+        assert_eq!(key[0], CONSENSUS); // 0x0C
+        assert_eq!(key[1], CONSENSUS_MATERIALIZED_CURSOR); // 0x02
+        assert_eq!(&key[2..], &[0xAB, 0xCD]);
+        // Distinct from the state/liveness keys for the same filter so
+        // the cursor can't clobber persisted consensus/liveness state.
+        assert_ne!(key, consensus_state_key(&[0xAB, 0xCD]));
+        assert_ne!(key, consensus_liveness_key(&[0xAB, 0xCD]));
     }
 
     #[test]

@@ -193,13 +193,24 @@ impl StaticTokenConfigResolver {
             Some(strategy.verkle_root.clone())
         };
 
+        // Resolve the payment fee baseline, leaving it `None` for a free
+        // mint. Go's `isFreeMint` triggers on
+        // `FeeBasis == nil || Type == NoFeeBasis || Baseline == nil ||
+        // Baseline == 0` — the `Type == NoFeeBasis` clause is
+        // first-class. Previously this only checked for an empty
+        // baseline and ignored `fee_type`, so a token configured with
+        // `FeeBasis{Type: NoFeeBasis, Baseline: k>0}` was treated as a
+        // PAID mint at rate k here while Go treats it as FREE — a hard
+        // consensus divergence (each node rejects the other's blocks).
         let mut payment_fee_baseline = None;
         if !strategy.fee_basis.is_empty() {
             let fb = super::config::FeeBasisStruct::from_canonical_bytes(&strategy.fee_basis)?;
-            if !fb.baseline.is_empty() {
-                payment_fee_baseline = Some(BigInt::from_bytes_be(
-                    Sign::Plus, &fb.baseline,
-                ));
+            let baseline = BigInt::from_bytes_be(Sign::Plus, &fb.baseline);
+            let is_free = fb.fee_type == super::constants::NO_FEE_BASIS as u32
+                || fb.baseline.is_empty()
+                || baseline == BigInt::from(0);
+            if !is_free {
+                payment_fee_baseline = Some(baseline);
             }
         }
 

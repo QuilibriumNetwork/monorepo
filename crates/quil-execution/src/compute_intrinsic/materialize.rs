@@ -79,6 +79,133 @@ pub fn materialize_code_deploy(
 }
 
 // =====================================================================
+// Compute intrinsic deploy (metadata vertex / Init)
+// =====================================================================
+
+/// Build the compute configuration metadata tree — Go
+/// `newComputeConfigurationMetadata` (compute_intrinsic.go:273-303):
+/// read key at `[0<<2]`, write key at `[1<<2]`, each sized `57`.
+pub fn build_compute_configuration_metadata_tree(
+    config: &super::config::ComputeConfiguration,
+) -> Result<quil_tries::VectorCommitmentTree> {
+    use num_bigint::BigInt;
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    tree.insert(&[0u8 << 2], &config.read_public_key, &[], &BigInt::from(57))?;
+    tree.insert(&[1u8 << 2], &config.write_public_key, &[], &BigInt::from(57))?;
+    Ok(tree)
+}
+
+/// Materialize a **new** ComputeDeploy — Go `ComputeIntrinsic.Deploy`
+/// deploy branch (compute_intrinsic.go:523-565, `domain ==
+/// COMPUTE_INTRINSIC_DOMAIN`). Derives the new compute app's domain from
+/// `poseidon(COMPUTE_INTRINSIC_DOMAIN ‖ config_commit)` and writes the
+/// full metadata vertex via `init_metadata_vertex` (empty consensus +
+/// sumcheck, the supplied RDF schema, config at `additionalData[13]`,
+/// type-domain `COMPUTE_INTRINSIC_DOMAIN`). `rdf_schema` is supplied by
+/// the deploy message (not generated). Returns the derived domain.
+pub fn materialize_compute_deploy_init(
+    state: &HypergraphState,
+    config: &super::config::ComputeConfiguration,
+    rdf_schema: &[u8],
+    frame_number: u64,
+    inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
+) -> Result<[u8; 32]> {
+    let mut config_tree = build_compute_configuration_metadata_tree(config)?;
+    let config_commit = config_tree.commit(inclusion_prover);
+
+    let base = crate::domains::COMPUTE;
+    let mut preimage = Vec::with_capacity(base.len() + config_commit.len());
+    preimage.extend_from_slice(&base);
+    preimage.extend_from_slice(&config_commit);
+    let domain = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
+
+    // Validate the supplied RDF schema (reject empty/malformed), mirroring
+    // Go's newComputeRDFHypergraphSchema gate. Same structural validator
+    // the hypergraph deploy uses.
+    crate::hypergraph_intrinsic::dispatch::validate_rdf_schema_bytes(rdf_schema)?;
+    let rdf = std::str::from_utf8(rdf_schema)
+        .map_err(|_| QuilError::InvalidArgument("compute deploy: rdf schema not valid UTF-8".into()))?;
+
+    let mut consensus = quil_tries::VectorCommitmentTree::new();
+    let mut sumcheck = quil_tries::VectorCommitmentTree::new();
+    let mut additional: Vec<Option<quil_tries::VectorCommitmentTree>> =
+        (0..14).map(|_| None).collect();
+    additional[13] = Some(config_tree);
+
+    state.init_metadata_vertex(
+        &domain,
+        &mut consensus,
+        &mut sumcheck,
+        rdf,
+        &mut additional,
+        &base, // intrinsic type-domain = COMPUTE_INTRINSIC_DOMAIN
+        frame_number,
+        inclusion_prover,
+    )?;
+    Ok(domain)
+}
+
+/// Materialize a ComputeUpdate — Go `ComputeIntrinsic.Deploy` update
+/// branch (compute_intrinsic.go:414-516). Loads the existing metadata
+/// vertex at `address`, re-seals the config sub-tree at `[16<<2]` (if a
+/// config is supplied), and writes a new RDF schema at `[3<<2]` (if
+/// supplied) — note Go writes the updated RDF at `[3<<2]` even though the
+/// reader reads `[2<<2]` (the deploy key); replicated for byte-parity.
+/// The RDF evolution check (only-adds) runs against the existing `[2<<2]`
+/// schema. Caller has already verified the owner-key signature.
+pub fn materialize_compute_update(
+    state: &HypergraphState,
+    address: &[u8],
+    config: Option<&super::config::ComputeConfiguration>,
+    rdf_schema: &[u8],
+    frame_number: u64,
+    inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
+) -> Result<()> {
+    use num_bigint::BigInt;
+    let metadata_addr = crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS;
+    let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+    let blob = state
+        .get(address, &metadata_addr, &va_disc)?
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| {
+            QuilError::InvalidArgument("compute update: no existing metadata vertex".into())
+        })?;
+    let mut outer = quil_tries::VectorCommitmentTree {
+        root: quil_tries::deserialize_go_tree(&blob)
+            .map_err(|e| QuilError::Internal(format!("compute update: deserialize: {e}")))?,
+    };
+
+    // Existing RDF (deploy key [2<<2]) for the evolution check.
+    let existing_rdf = outer.get(&[2u8 << 2]).map(|b| b.to_vec());
+
+    if let Some(cfg) = config {
+        let mut config_tree = build_compute_configuration_metadata_tree(cfg)?;
+        crate::hypergraph_state::seal_metadata_state_at_index(
+            &mut outer,
+            &mut config_tree,
+            16,
+            inclusion_prover,
+        )?;
+    }
+
+    if !rdf_schema.is_empty() {
+        crate::hypergraph_intrinsic::dispatch::validate_rdf_schema_bytes(rdf_schema)?;
+        if let Some(old) = existing_rdf.as_ref().filter(|o| !o.is_empty()) {
+            crate::hypergraph_intrinsic::dispatch::validate_rdf_schema_evolution(old, rdf_schema)?;
+        }
+        outer
+            .insert(&[3u8 << 2], rdf_schema, &[], &BigInt::from(rdf_schema.len()))
+            .map_err(|e| QuilError::Internal(format!("compute update: rdf insert: {e}")))?;
+    }
+
+    let _ = outer.commit(inclusion_prover);
+    let out_blob = quil_tries::serialize_go_tree(outer.root.as_ref())
+        .map_err(|e| QuilError::Internal(format!("compute update: serialize: {e}")))?;
+    state.set(address, &metadata_addr, &va_disc, frame_number, out_blob)?;
+    Ok(())
+}
+
+// =====================================================================
 // CodeExecute materialization
 // =====================================================================
 

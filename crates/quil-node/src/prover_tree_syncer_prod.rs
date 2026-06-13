@@ -48,4 +48,71 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
         }
         Ok(stats.commitments_match)
     }
+
+    async fn sync_shard_tree(&self, filter: &[u8], expected_root: &[u8]) -> Result<bool> {
+        use quil_types::proto::application::HypergraphPhaseSet;
+        // Derive the shard key from the filter (same as the prove path:
+        // l1 = bloom indices, l2 = filter[..32]).
+        let n = filter.len().min(32);
+        let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&filter[..n], 256, 3);
+        let mut l2 = [0u8; 32];
+        l2[..n].copy_from_slice(&filter[..n]);
+        let shard = quil_types::store::ShardKey { l1, l2 };
+        info!(
+            addr = %self.master_stream_addr,
+            filter = %hex::encode(&filter[..n]),
+            "syncing app-shard tree from archive (all phase sets)"
+        );
+        // Sync ALL FOUR phase sets, mirroring Go's HyperSync
+        // (sync_provider.go:411-414 `phaseSyncs`): app-shard state lives
+        // across vertex adds/removes AND hyperedge adds/removes (token
+        // spends move coins into the remove set; spent-markers + outputs
+        // into adds). Syncing only VertexAdds would leave the other phase
+        // trees stale. Every phase is pinned to the SAME `expected_root`
+        // — the frame's `state_roots[0]` (vertex-adds root), which the
+        // server uses as the snapshot-generation anchor; each phase pulls
+        // its own tree from that one consistent generation.
+        let phases = [
+            HypergraphPhaseSet::VertexAdds,
+            HypergraphPhaseSet::VertexRemoves,
+            HypergraphPhaseSet::HyperedgeAdds,
+            HypergraphPhaseSet::HyperedgeRemoves,
+        ];
+        let mut adds_converged = false;
+        for phase in phases {
+            match quil_rpc::ensure_shard_tree_fresh(
+                &shard,
+                &self.master_stream_addr,
+                &self.ed448_seed,
+                phase,
+                self.hg_store.clone(),
+                expected_root,
+            )
+            .await
+            {
+                Ok(stats) => {
+                    // The vertex-adds phase root IS the generation anchor,
+                    // so its convergence confirms we caught the tree up to
+                    // the pinned frame; the engine keys its cursor
+                    // fast-forward on this.
+                    if matches!(phase, HypergraphPhaseSet::VertexAdds) {
+                        adds_converged = stats.commitments_match;
+                    }
+                }
+                Err(e) => {
+                    warn!(?phase, error = %e, "app-shard phase sync failed");
+                    // A vertex-adds failure means we didn't reach the
+                    // generation at all — surface it; the others are
+                    // best-effort (an empty phase is a no-op).
+                    if matches!(phase, HypergraphPhaseSet::VertexAdds) {
+                        return Err(QuilError::Internal(format!(
+                            "shard vertex-adds sync failed: {}",
+                            e
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(adds_converged)
+    }
 }

@@ -624,6 +624,12 @@ pub(crate) fn spawn_all(
         sup.spawn("node-grpc-server", move |node_grpc_token| async move {
             info!(addr = %addr, "starting NodeService gRPC (plaintext, qclient-facing)");
             tonic::transport::Server::builder()
+                // h2 PING-based reaping of dead clients. Without it a
+                // peer that vanishes without FIN holds its fd forever
+                // and the fd count grows monotonically.
+                .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+                .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+                .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
                 .add_service(node_rpc_service)
                 .serve_with_shutdown(addr, async move { node_grpc_token.cancelled().await; })
                 .await
@@ -793,20 +799,68 @@ pub(crate) fn spawn_all(
                 .await
                 .map_err(anyhow::Error::from)?;
             let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-            let incoming = async_stream::stream! {
+            // TLS handshakes run in per-connection tasks with a deadline,
+            // never inline in the accept loop — one peer stalling
+            // mid-handshake must not block new accepts, and a handshake
+            // that never completes must not hold its fd forever. The
+            // semaphore bounds half-open sockets under a connect flood.
+            let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<
+                tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+            >(64);
+            let accept_token = peer_grpc_token.clone();
+            tokio::spawn(async move {
+                let handshake_permits =
+                    Arc::new(tokio::sync::Semaphore::new(256));
                 loop {
-                    let (tcp, _peer) = match listener.accept().await {
-                        Ok(v) => v,
-                        Err(e) => { warn!(error = %e, "peer gRPC accept failed"); continue; }
+                    let (tcp, _peer) = tokio::select! {
+                        r = listener.accept() => match r {
+                            Ok(v) => v,
+                            Err(e) => {
+                                // EMFILE lands here — sleep so fd
+                                // exhaustion doesn't become a hot loop.
+                                warn!(error = %e, "peer gRPC accept failed");
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                continue;
+                            }
+                        },
+                        _ = accept_token.cancelled() => return,
+                    };
+                    let Ok(permit) = handshake_permits.clone().try_acquire_owned() else {
+                        debug!("too many pending TLS handshakes, dropping connection");
+                        continue;
                     };
                     let acceptor = tls_acceptor.clone();
-                    match acceptor.accept(tcp).await {
-                        Ok(tls) => yield Ok::<_, std::io::Error>(tls),
-                        Err(e) => { debug!(error = %e, "TLS handshake failed"); continue; }
-                    }
+                    let tx = conn_tx.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            acceptor.accept(tcp),
+                        )
+                        .await
+                        {
+                            Ok(Ok(tls)) => {
+                                let _ = tx.send(tls).await;
+                            }
+                            Ok(Err(e)) => debug!(error = %e, "TLS handshake failed"),
+                            Err(_) => debug!("TLS handshake timed out"),
+                        }
+                    });
+                }
+            });
+            let incoming = async_stream::stream! {
+                while let Some(tls) = conn_rx.recv().await {
+                    yield Ok::<_, std::io::Error>(tls);
                 }
             };
             let mut builder = tonic::transport::Server::builder()
+                // h2 PING-based reaping of dead peers. This server faces
+                // the whole network; without keepalive every peer that
+                // disappears without FIN (crash, NAT timeout) leaks one
+                // fd permanently — the node eventually dies of EMFILE
+                // regardless of how high the ulimit is.
+                .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+                .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
                 .add_service(global_service)
                 .add_service(hypersync_service)
                 .add_service(app_shard_service)

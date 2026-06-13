@@ -284,7 +284,18 @@ impl ExecutionEngineManager {
         Ok(BigInt::from(0))
     }
 
-    /// Select the engine for a given domain address.
+    /// Select the engine for a given domain address. Port of Go
+    /// `ExecutionEngineManager.ProcessMessage`'s routing
+    /// (execution_manager.go:357-549):
+    ///   - `0xff*32` (GLOBAL) → global engine.
+    ///   - a base domain (COMPUTE / HYPERGRAPH_BASE / TOKEN_BASE /
+    ///     QUIL_TOKEN) → that engine directly.
+    ///   - any other address is a DEPLOYED app: read its base type-domain
+    ///     from the metadata vertex at `(addr, 0xff*32)`, key `0xff*32`
+    ///     (written at deploy by `init_metadata_vertex`), and route by it.
+    ///   - no metadata / unknown type-domain → error (Go errors "no
+    ///     execution engine found"; we do NOT silently default to
+    ///     hypergraph — that was the prior bug that mis-routed everything).
     fn select_engine(&self, address: &[u8]) -> Result<String> {
         if address.len() < 32 {
             return Err(QuilError::InvalidArgument("address too short".into()));
@@ -294,14 +305,62 @@ impl ExecutionEngineManager {
         addr.copy_from_slice(&address[..32]);
 
         if addr == domains::GLOBAL {
-            Ok("global".into())
-        } else if addr == domains::COMPUTE {
+            return Ok("global".into());
+        }
+
+        let token_base = crate::token_intrinsic::constants::token_base_domain();
+        let hg_base = crate::hypergraph_intrinsic::hypergraph_base_domain();
+
+        // Base domains route directly; anything else resolves via the
+        // deployed app's recorded type-domain.
+        let route: [u8; 32] = if addr == domains::COMPUTE
+            || addr == hg_base
+            || addr == token_base
+            || addr == domains::QUIL_TOKEN
+        {
+            addr
+        } else {
+            let loc = quil_hypergraph::addressing::Location {
+                app_address: addr,
+                data_address: [0xFFu8; 32],
+            };
+            let blob = self.crdt.get_vertex_data(&loc).ok_or_else(|| {
+                QuilError::NotFound(format!(
+                    "no execution engine found for address: {} (no metadata vertex)",
+                    hex::encode(addr)
+                ))
+            })?;
+            let root = quil_tries::deserialize_go_tree(&blob).map_err(|e| {
+                QuilError::Internal(format!("select_engine: metadata tree deserialize: {e}"))
+            })?;
+            let tree = quil_tries::VectorCommitmentTree { root };
+            let type_domain = tree.get(&[0xFFu8; 32]).ok_or_else(|| {
+                QuilError::NotFound(format!(
+                    "no type-domain in metadata for address: {}",
+                    hex::encode(addr)
+                ))
+            })?;
+            if type_domain.len() < 32 {
+                return Err(QuilError::Internal(
+                    "select_engine: type-domain shorter than 32 bytes".into(),
+                ));
+            }
+            let mut td = [0u8; 32];
+            td.copy_from_slice(&type_domain[..32]);
+            td
+        };
+
+        if route == domains::COMPUTE {
             Ok("compute".into())
-        } else if addr == domains::QUIL_TOKEN {
+        } else if route == hg_base {
+            Ok("hypergraph".into())
+        } else if route == token_base || route == domains::QUIL_TOKEN {
             Ok("token".into())
         } else {
-            // Default to hypergraph for unknown domains
-            Ok("hypergraph".into())
+            Err(QuilError::NotFound(format!(
+                "no execution engine found for address: {}",
+                hex::encode(addr)
+            )))
         }
     }
 }
@@ -421,10 +480,156 @@ mod tests {
     }
 
     #[test]
-    fn select_engine_routes_unknown_domain_to_hypergraph() {
+    fn select_engine_rejects_unknown_domain_without_metadata() {
+        // Go parity (execution_manager.go): an address that is neither a
+        // base domain nor a deployed app with a recorded type-domain has
+        // no engine — it errors, rather than silently defaulting to the
+        // hypergraph engine (the prior bug that mis-routed everything).
         let m = build_manager(true);
         let random = [0x42u8; 32];
-        assert_eq!(m.select_engine(&random).unwrap(), "hypergraph");
+        let err = m.select_engine(&random).unwrap_err();
+        assert!(matches!(err, QuilError::NotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn select_engine_routes_base_domains() {
+        let m = build_manager(true);
+        assert_eq!(m.select_engine(&domains::GLOBAL).unwrap(), "global");
+        assert_eq!(m.select_engine(&domains::COMPUTE).unwrap(), "compute");
+        assert_eq!(m.select_engine(&domains::QUIL_TOKEN).unwrap(), "token");
+        assert_eq!(
+            m.select_engine(&crate::token_intrinsic::constants::token_base_domain())
+                .unwrap(),
+            "token"
+        );
+        assert_eq!(
+            m.select_engine(&crate::hypergraph_intrinsic::hypergraph_base_domain())
+                .unwrap(),
+            "hypergraph"
+        );
+    }
+
+    #[test]
+    fn select_engine_resolves_deployed_app_via_metadata() {
+        // Write a metadata vertex for a deployed app whose type-domain is
+        // TOKEN_BASE_DOMAIN, then confirm select_engine reads it back and
+        // routes to the token engine. Exercises init_metadata_vertex →
+        // select_engine round-trip (the deploy → routing contract).
+        use crate::hypergraph_state::HypergraphState;
+        let inclusion_prover: Arc<dyn InclusionProver> = Arc::new(NoopInclusionProver);
+        let mem_store: Arc<dyn quil_types::store::HypergraphStore> = Arc::new(MemStore::new());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            mem_store,
+            inclusion_prover.clone(),
+        ));
+
+        // Deploy: write the type-domain metadata into the shared crdt.
+        let deployed = [0x42u8; 32];
+        let state = HypergraphState::new(crdt.clone());
+        let mut consensus = quil_tries::VectorCommitmentTree::new();
+        let mut sumcheck = quil_tries::VectorCommitmentTree::new();
+        let mut config = quil_tries::VectorCommitmentTree::new();
+        config
+            .insert(&[0x40u8], b"cfg", &[], &num_bigint::BigInt::from(3))
+            .unwrap();
+        let mut additional: Vec<Option<quil_tries::VectorCommitmentTree>> =
+            (0..14).map(|_| None).collect();
+        additional[13] = Some(config);
+        state
+            .init_metadata_vertex(
+                &deployed,
+                &mut consensus,
+                &mut sumcheck,
+                "schema",
+                &mut additional,
+                &crate::token_intrinsic::constants::token_base_domain(),
+                1,
+                inclusion_prover.as_ref(),
+            )
+            .unwrap();
+        state.commit().unwrap();
+
+        let stubs = crate::testing::NoopExecutionCrypto::new();
+        let hg_resolver: Arc<dyn crate::hypergraph_intrinsic::HypergraphConfigResolver> =
+            Arc::new(crate::testing::NoopHypergraphConfigResolver);
+        let m = ExecutionEngineManager::new(
+            inclusion_prover,
+            stubs.key_manager.clone(),
+            crdt,
+            stubs.bulletproof_prover,
+            stubs.decaf_constructor,
+            stubs.circuit_compiler,
+            stubs.clock_store,
+            hg_resolver,
+            true,
+        );
+
+        assert_eq!(m.select_engine(&deployed).unwrap(), "token");
+    }
+
+    #[test]
+    fn select_engine_resolves_each_intrinsic_type_domain() {
+        // A deployed app's metadata vertex records its base type-domain
+        // at 0xff*32; select_engine must route each to the right engine.
+        // Covers token/compute/hypergraph deployed-app routing (#32-34).
+        use crate::hypergraph_state::HypergraphState;
+        let cases: [( [u8; 32], &str); 3] = [
+            (crate::token_intrinsic::constants::token_base_domain(), "token"),
+            (crate::domains::COMPUTE, "compute"),
+            (crate::hypergraph_intrinsic::hypergraph_base_domain(), "hypergraph"),
+        ];
+        for (i, (type_domain, expected_engine)) in cases.iter().enumerate() {
+            let inclusion_prover: Arc<dyn InclusionProver> = Arc::new(NoopInclusionProver);
+            let mem_store: Arc<dyn quil_types::store::HypergraphStore> = Arc::new(MemStore::new());
+            let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                mem_store,
+                inclusion_prover.clone(),
+            ));
+            let deployed = [0x50u8 + i as u8; 32];
+            let state = HypergraphState::new(crdt.clone());
+            let mut consensus = quil_tries::VectorCommitmentTree::new();
+            let mut sumcheck = quil_tries::VectorCommitmentTree::new();
+            let mut config = quil_tries::VectorCommitmentTree::new();
+            config
+                .insert(&[0x40u8], b"cfg", &[], &num_bigint::BigInt::from(3))
+                .unwrap();
+            let mut additional: Vec<Option<quil_tries::VectorCommitmentTree>> =
+                (0..14).map(|_| None).collect();
+            additional[13] = Some(config);
+            state
+                .init_metadata_vertex(
+                    &deployed,
+                    &mut consensus,
+                    &mut sumcheck,
+                    "schema",
+                    &mut additional,
+                    type_domain,
+                    1,
+                    inclusion_prover.as_ref(),
+                )
+                .unwrap();
+            state.commit().unwrap();
+
+            let stubs = crate::testing::NoopExecutionCrypto::new();
+            let hg_resolver: Arc<dyn crate::hypergraph_intrinsic::HypergraphConfigResolver> =
+                Arc::new(crate::testing::NoopHypergraphConfigResolver);
+            let m = ExecutionEngineManager::new(
+                inclusion_prover,
+                stubs.key_manager.clone(),
+                crdt,
+                stubs.bulletproof_prover,
+                stubs.decaf_constructor,
+                stubs.circuit_compiler,
+                stubs.clock_store,
+                hg_resolver,
+                true,
+            );
+            assert_eq!(
+                m.select_engine(&deployed).unwrap(),
+                *expected_engine,
+                "type-domain case {i}"
+            );
+        }
     }
 
     #[test]
@@ -507,6 +712,102 @@ mod tests {
             .process_message(0, &BigInt::from(1), &domains::QUIL_TOKEN, b"")
             .unwrap();
         assert!(r.messages.is_empty());
+    }
+
+    #[test]
+    fn token_deploy_through_manager_creates_routable_shard() {
+        // End-to-end: a TokenDeploy fed to the manager at the token BASE
+        // domain — the exact address the global frame materializer routes
+        // deploy bundles to (#38) — dispatches through the token engine's
+        // deploy arm (#32), derives the new shard's domain from the config,
+        // writes its metadata vertex into the shared CRDT, and makes the
+        // shard routable. This proves a brand-new shard comes into existence
+        // purely via the execution manager (the chain Go relies on: manager
+        // → intrinsic engine → deploy), with no pre-existing target shard.
+        use crate::hypergraph_state::HypergraphState;
+
+        // Use the REAL KZG prover: the new shard's domain is derived from the
+        // config COMMITMENT, so a trivial (constant) commitment would collide
+        // with the token base domain. This also exercises the real KZG path.
+        quil_crypto::init(); // load the SRS (idempotent)
+        let prover: Arc<dyn InclusionProver> = Arc::new(quil_crypto::KzgInclusionProver);
+        let cfg = crate::token_intrinsic::config::TokenConfiguration {
+            behavior: (crate::token_intrinsic::constants::DIVISIBLE
+                | crate::token_intrinsic::constants::ACCEPTABLE
+                | crate::token_intrinsic::constants::EXPIRABLE)
+                as u32,
+            owner_public_key: vec![0x01u8; 32],
+            ..Default::default()
+        };
+
+        // The derived domain depends only on (config, prover), not the CRDT,
+        // so compute it on a throwaway state to know which shard to query.
+        let throwaway_store: Arc<dyn quil_types::store::HypergraphStore> =
+            Arc::new(MemStore::new());
+        let throwaway = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            throwaway_store,
+            prover.clone(),
+        ));
+        let derived = crate::token_intrinsic::materialize::materialize_token_deploy_init(
+            &HypergraphState::new(throwaway),
+            &cfg,
+            0,
+            prover.as_ref(),
+        )
+        .unwrap();
+        // The derived shard is distinct from the token base domain.
+        assert_ne!(
+            derived,
+            crate::token_intrinsic::constants::token_base_domain()
+        );
+
+        // Build a Global-mode manager (all four engines share one CRDT) over
+        // the real KZG prover.
+        let mem_store: Arc<dyn quil_types::store::HypergraphStore> = Arc::new(MemStore::new());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            mem_store,
+            prover.clone(),
+        ));
+        let stubs = crate::testing::NoopExecutionCrypto::new();
+        let hg_resolver: Arc<dyn crate::hypergraph_intrinsic::HypergraphConfigResolver> =
+            Arc::new(crate::testing::NoopHypergraphConfigResolver);
+        let m = ExecutionEngineManager::new(
+            prover.clone(),
+            stubs.key_manager.clone(),
+            crdt,
+            stubs.bulletproof_prover,
+            stubs.decaf_constructor,
+            stubs.circuit_compiler,
+            stubs.clock_store,
+            hg_resolver,
+            true,
+        );
+
+        // Before the deploy, the derived shard has no metadata → not routable.
+        assert!(m.select_engine(&derived).is_err());
+
+        // Encode the TokenDeploy as a canonical MessageBundle.
+        let deploy = crate::token_intrinsic::TokenDeploy {
+            config: cfg.to_canonical_bytes().unwrap(),
+            rdf_schema: Vec::new(),
+        };
+        let inner = deploy.to_canonical_bytes().unwrap();
+        let bundle = crate::message_envelope::CanonicalMessageBundle {
+            requests: vec![Some(
+                crate::message_envelope::CanonicalMessageRequest::wrap(inner).unwrap(),
+            )],
+            timestamp: 0,
+        };
+        let bundle_bytes = bundle.to_canonical_bytes().unwrap();
+
+        // Route it at the token base domain (what #38 does for a deploy).
+        let token_base = crate::token_intrinsic::constants::token_base_domain();
+        m.process_message(0, &BigInt::from(1), &token_base, &bundle_bytes)
+            .unwrap();
+        m.commit_frame(0).unwrap();
+
+        // The brand-new shard now routes to the token engine.
+        assert_eq!(m.select_engine(&derived).unwrap(), "token");
     }
 
     #[test]

@@ -220,11 +220,54 @@ impl FrameMaterializer {
         // `frame_materializer.go:202-213` short-circuit.
         let world_size: u64 = self.hypergraph.total_size().to_u64().unwrap_or(0);
         let difficulty: u64 = header.difficulty as u64;
-        let address = vec![0xFFu8; 32];
+        let global_addr = vec![0xFFu8; 32];
+        // Uncovered-shard global execution gate (new consensus rule,
+        // activates at FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX). Below the
+        // fork, every bundle routes to the global engine (0xff), which
+        // executes prover/shard-admin ops and skips everything else —
+        // app-shard data txs are owned by their shard's own consensus.
+        let uncovered_shard_tx_active = frame_number
+            >= quil_execution::token_intrinsic::constants::FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX;
         let mut processed = 0usize;
         let mut skipped = 0usize;
 
         for bundle in &frame.requests {
+            // Per-bundle routing address. Default: the global engine
+            // (0xff). At/after the fork, a DATA op (token transfer /
+            // hypergraph / compute op) that targets an UNCOVERED shard
+            // (active provers <= HALT_RISK_PROVER_COUNT) is executed here
+            // at the global level — routed to its intrinsic engine by its
+            // own domain, with fees charged — so a new/coverage-lost
+            // shard isn't a dead zone where only prover ops can be
+            // processed. Covered shards + prover/deploy/Shard ops keep
+            // the global path (the covered shard's own consensus, or the
+            // global engine, owns them). Coverage is read from the
+            // (consensus-deterministic) prover registry, so all nodes
+            // agree on the venue for every bundle.
+            let route_addr: Vec<u8> = if uncovered_shard_tx_active {
+                // A DEPLOY mints a brand-new shard whose target domain
+                // never pre-exists — there is no covered shard that could
+                // ever execute it. So it ALWAYS routes to its base
+                // intrinsic domain (TOKEN_BASE / COMPUTE / HYPERGRAPH_BASE),
+                // where the manager dispatches to the token/compute/hg
+                // engine; the engine derives the new domain from the deploy
+                // config and writes its metadata vertex into the global
+                // CRDT, making the shard routable. This is the only path by
+                // which new shards come into existence.
+                if let Some(base) = bundle_deploy_base_domain(bundle) {
+                    base
+                } else {
+                    // Non-deploy DATA ops only execute here when their
+                    // target shard is uncovered (otherwise the covered
+                    // shard's own consensus owns them).
+                    match bundle_target_domain(bundle) {
+                        Some(domain) if self.shard_is_uncovered(&domain) => domain,
+                        _ => global_addr.clone(),
+                    }
+                }
+            } else {
+                global_addr.clone()
+            };
             // Re-encode the proto bundle as canonical bytes.
             let bundle_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
                 Ok(b) => b,
@@ -286,7 +329,7 @@ impl FrameMaterializer {
             // `execution/engine_manager.go:processFrameMessages`.
             if let Err(e) = self.execution_manager.validate_message(
                 frame_number,
-                &address,
+                &route_addr,
                 &bundle_bytes,
             ) {
                 info!(
@@ -301,7 +344,7 @@ impl FrameMaterializer {
             match self.execution_manager.process_message(
                 frame_number,
                 &fee_multiplier,
-                &address,
+                &route_addr,
                 &bundle_bytes,
             ) {
                 Ok(_) => processed += 1,
@@ -555,6 +598,21 @@ impl FrameMaterializer {
         durations.values().any(|&d| d == u64::MAX)
     }
 
+    /// A shard is "uncovered" when its active prover count is at or below
+    /// the halt-risk floor — i.e. it cannot run its own app-shard
+    /// consensus, so its transactions would otherwise be unprocessable.
+    /// Read from the prover registry (consensus-deterministic), so all
+    /// nodes agree on the venue for a given bundle at a given frame. This
+    /// gates the uncovered-shard global execution path.
+    fn shard_is_uncovered(&self, domain: &[u8]) -> bool {
+        let active = self
+            .prover_registry
+            .get_active_provers(domain)
+            .map(|p| p.len())
+            .unwrap_or(0);
+        (active as u64) <= crate::provers::proposer::HALT_RISK_PROVER_COUNT
+    }
+
     /// Update coverage halt durations. Called by the coverage
     /// monitor; keys are raw filter bytes (matching the monitor's
     /// `check()` return type).
@@ -658,9 +716,171 @@ impl FrameMaterializer {
     }
 }
 
+/// Extract the target shard domain (the 32-byte app address = the
+/// shard's identity, post the `app_address == domain` fix) from a request
+/// bundle, for the uncovered-shard global execution path. Returns the
+/// domain of the first DATA operation that targets an existing shard
+/// (token transfer / pending / mint, hypergraph vertex+hyperedge ops,
+/// compute code deploy/execute). Returns `None` for prover-lifecycle ops,
+/// intrinsic deploys/updates (which create or own their own domains), and
+/// the `Shard` op — all of which take the global (`0xff`) path.
+/// For a bundle that DEPLOYS a new intrinsic shard (TokenDeploy /
+/// ComputeDeploy / HypergraphDeploy), return the BASE intrinsic domain the
+/// execution manager routes to the owning engine (token / compute /
+/// hypergraph). That engine's deploy step DERIVES the new shard's domain
+/// from the deploy config (the config commit) and writes its metadata
+/// vertex into the global CRDT — the only way a brand-new shard comes into
+/// existence. A deploy's target domain never pre-exists, so it can never be
+/// a "covered" shard and the uncovered-check is meaningless for it: deploys
+/// must ALWAYS execute under their intrinsic engine here.
+///
+/// Updates (TokenUpdate / ComputeUpdate / HypergraphUpdate) are deliberately
+/// NOT routed here. They carry no domain field, and every engine's update
+/// path (engines.rs) uses the routing `address` as the target domain to load
+/// the prior config from — so an update is inherently scoped to its deployed
+/// shard's own frame (where the frame's app_address IS the target). There is
+/// no per-op target for the global frame to route an update by; this is a
+/// message-format constraint, identical in Go.
+fn bundle_deploy_base_domain(
+    bundle: &quil_types::proto::global::MessageBundle,
+) -> Option<Vec<u8>> {
+    use quil_types::proto::global::message_request::Request;
+    for req in &bundle.requests {
+        let Some(r) = &req.request else { continue };
+        match r {
+            Request::TokenDeploy(_) => {
+                return Some(
+                    quil_execution::token_intrinsic::constants::token_base_domain().to_vec(),
+                );
+            }
+            Request::ComputeDeploy(_) => {
+                return Some(quil_execution::domains::COMPUTE.to_vec());
+            }
+            Request::HypergraphDeploy(_) => {
+                return Some(
+                    quil_execution::hypergraph_intrinsic::hypergraph_base_domain().to_vec(),
+                );
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
+fn bundle_target_domain(bundle: &quil_types::proto::global::MessageBundle) -> Option<Vec<u8>> {
+    use quil_types::proto::global::message_request::Request;
+    for req in &bundle.requests {
+        let Some(r) = &req.request else { continue };
+        let domain: &[u8] = match r {
+            Request::Transaction(t) => &t.domain,
+            Request::PendingTransaction(t) => &t.domain,
+            Request::MintTransaction(t) => &t.domain,
+            Request::VertexAdd(v) => &v.domain,
+            Request::VertexRemove(v) => &v.domain,
+            Request::HyperedgeAdd(h) => &h.domain,
+            Request::HyperedgeRemove(h) => &h.domain,
+            Request::CodeDeploy(c) => &c.domain,
+            Request::CodeExecute(c) => &c.domain,
+            _ => continue,
+        };
+        if domain.len() == 32 {
+            return Some(domain.to_vec());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle_target_domain_extracts_data_op_domains() {
+        use quil_types::proto::global as pb;
+        let mk = |req: pb::message_request::Request| pb::MessageBundle {
+            requests: vec![pb::MessageRequest { timestamp: 0, request: Some(req) }],
+            timestamp: 0,
+        };
+        let dom = vec![0x42u8; 32];
+
+        // Token transfer → its domain.
+        let tx = pb::message_request::Request::Transaction(
+            quil_types::proto::token::Transaction { domain: dom.clone(), ..Default::default() },
+        );
+        assert_eq!(bundle_target_domain(&mk(tx)), Some(dom.clone()));
+
+        // Hypergraph vertex add → its domain.
+        let va = pb::message_request::Request::VertexAdd(
+            quil_types::proto::hypergraph::VertexAdd { domain: dom.clone(), ..Default::default() },
+        );
+        assert_eq!(bundle_target_domain(&mk(va)), Some(dom.clone()));
+
+        // Prover op (Pause) → None (global path).
+        let pause = pb::message_request::Request::Pause(pb::ProverPause {
+            filter: vec![0xAAu8; 32],
+            frame_number: 1,
+            public_key_signature_bls48581: None,
+        });
+        assert_eq!(bundle_target_domain(&mk(pause)), None);
+
+        // Non-32-byte domain → None (defensive).
+        let bad = pb::message_request::Request::Transaction(
+            quil_types::proto::token::Transaction { domain: vec![0x01u8; 16], ..Default::default() },
+        );
+        assert_eq!(bundle_target_domain(&mk(bad)), None);
+    }
+
+    #[test]
+    fn bundle_deploy_base_domain_routes_each_deploy_to_its_intrinsic() {
+        use quil_types::proto::global as pb;
+        let mk = |req: pb::message_request::Request| pb::MessageBundle {
+            requests: vec![pb::MessageRequest { timestamp: 0, request: Some(req) }],
+            timestamp: 0,
+        };
+
+        // TokenDeploy → token base domain (→ manager → token engine, which
+        // derives the new shard's domain from the deploy config).
+        let td = pb::message_request::Request::TokenDeploy(
+            quil_types::proto::token::TokenDeploy::default(),
+        );
+        assert_eq!(
+            bundle_deploy_base_domain(&mk(td)),
+            Some(quil_execution::token_intrinsic::constants::token_base_domain().to_vec()),
+        );
+
+        // ComputeDeploy → compute domain (0xcc*32).
+        let cd = pb::message_request::Request::ComputeDeploy(
+            quil_types::proto::compute::ComputeDeploy::default(),
+        );
+        assert_eq!(
+            bundle_deploy_base_domain(&mk(cd)),
+            Some(quil_execution::domains::COMPUTE.to_vec()),
+        );
+
+        // HypergraphDeploy → hypergraph base domain.
+        let hd = pb::message_request::Request::HypergraphDeploy(
+            quil_types::proto::hypergraph::HypergraphDeploy::default(),
+        );
+        assert_eq!(
+            bundle_deploy_base_domain(&mk(hd)),
+            Some(quil_execution::hypergraph_intrinsic::hypergraph_base_domain().to_vec()),
+        );
+
+        // An UPDATE is NOT a deploy → None: it carries no domain field and
+        // the engine uses the routing address as its target, so it stays
+        // scoped to its deployed shard's own frame.
+        let tu = pb::message_request::Request::TokenUpdate(
+            quil_types::proto::token::TokenUpdate::default(),
+        );
+        assert_eq!(bundle_deploy_base_domain(&mk(tu)), None);
+
+        // A plain data op (transfer) → None: handled by the uncovered-shard
+        // data-op path (bundle_target_domain), not the deploy path.
+        let tx = pb::message_request::Request::Transaction(
+            quil_types::proto::token::Transaction { domain: vec![0x42u8; 32], ..Default::default() },
+        );
+        assert_eq!(bundle_deploy_base_domain(&mk(tx)), None);
+    }
 
     #[test]
     fn materialize_result_defaults() {

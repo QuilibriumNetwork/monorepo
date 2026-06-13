@@ -64,14 +64,29 @@ pub const FRAME_2_1_EXTENDED_ENROLL_END: u64 = 255840;
 /// Frame at which extended enrollment confirmations ended.
 pub const FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END: u64 = FRAME_2_1_EXTENDED_ENROLL_END + 6500;
 
+/// Activation frame for global-level execution of UNCOVERED shards'
+/// general transactions. At/after this frame, a shard whose active
+/// prover count is `<= HALT_RISK_PROVER_COUNT` has its token/compute/
+/// hypergraph transactions executed (and fees charged) at the global
+/// level instead of being dropped, so a newly-created or coverage-lost
+/// shard isn't a dead zone where only prover-lifecycle ops can be
+/// processed. NEW protocol rule (no Go equivalent) — gated so all nodes
+/// switch behavior at the same height. See the global frame materializer.
+pub const FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX: u64 = 670000;
+
 // =====================================================================
 // Domain addresses (Poseidon-derived)
 // =====================================================================
 
+/// `TOKEN_PREFIX` — `b"q_token"` (Go `token_configuration.go:37`). Used
+/// both to derive `TOKEN_BASE_DOMAIN` and as the prefix in a deployed
+/// token's domain derivation (`poseidon(TOKEN_PREFIX ‖ config_commit)`).
+pub const TOKEN_PREFIX: &[u8] = b"q_token";
+
 /// `poseidon("q_token")` → TOKEN_BASE_DOMAIN. Computed at init time
 /// in Go; we compute lazily and cache.
 pub fn token_base_domain() -> [u8; 32] {
-    hash_bytes_to_32(b"q_token").expect("poseidon hash of q_token")
+    hash_bytes_to_32(TOKEN_PREFIX).expect("poseidon hash of q_token")
 }
 
 /// `poseidon("q_token_current_supply")` with byte 0 set to 0xFF

@@ -47,6 +47,11 @@ pub(crate) struct MessageLoopArgs {
     pub p2p_handle: quil_p2p::node::P2PHandle,
     pub time_reel: Option<Arc<quil_engine::time_reel::GlobalTimeReel>>,
     pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
+    /// Archive-only: ingests full app-shard frames received on the bulk
+    /// shard subscription and materializes them into the archive's CRDT.
+    /// `None` on non-archive nodes.
+    pub archive_app_shard_ingest:
+        Option<quil_engine::archive_ingest::ArchiveAppShardIngest>,
 }
 
 pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) {
@@ -84,7 +89,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         p2p_handle: p2p_for_recv,
         time_reel: time_reel_for_recv,
         spawner,
+        archive_app_shard_ingest,
     } = args;
+    let mut archive_ingest_for_recv = archive_app_shard_ingest;
 
     // Global bitmasks for BlossomSub topic subscriptions.
     const GLOBAL_CONSENSUS: &[u8] = &[0x00];
@@ -1017,7 +1024,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                     }
                                 }
                                 if !routed {
-                                    // Non-shard traffic (e.g. mesh relay) — no local handler.
+                                    // Non-shard traffic (e.g. mesh relay) — no local
+                                    // handler. On an archive (no local shard engines),
+                                    // un-routed shard-frame traffic lands here: feed it to
+                                    // the app-shard ingest, which decodes/verifies it as a
+                                    // full AppShardFrame (non-frame messages fail decode and
+                                    // are ignored) and materializes the shard's state.
+                                    if let Some(ingest) = archive_ingest_for_recv.as_mut() {
+                                        ingest.ingest(&received.data);
+                                    }
                                 }
                             }
                             }

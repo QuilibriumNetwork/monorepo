@@ -25,7 +25,7 @@ enum FeldmanRound {
     Reconstructed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Feldman {
     threshold: usize,
     total: usize,
@@ -78,6 +78,19 @@ pub fn vec_to_array<const N: usize>(v: Vec<u8>) -> Result<[u8; N], Box<dyn std::
   let mut arr: [u8; N] = [0u8; N];
   arr.copy_from_slice(&v);
   Ok(arr)
+}
+
+/// Wipe the secret share and intermediate scalars on drop. The public
+/// points / commitments are not secret and are left alone.
+impl Drop for Feldman {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.secret.zeroize();
+        if let Some(s) = self.scalar.as_mut() { s.zeroize(); }
+        if let Some(z) = self.zkpok.as_mut() { z.zeroize(); }
+        for v in self.frags_for_counterparties.values_mut() { v.zeroize(); }
+        for s in self.frags_from_counterparties.values_mut() { s.zeroize(); }
+    }
 }
 
 impl Feldman {

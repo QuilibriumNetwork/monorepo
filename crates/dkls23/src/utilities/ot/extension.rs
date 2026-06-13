@@ -43,6 +43,7 @@ use elliptic_curve::PrimeField;
 use rand::Rng;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use subtle::{Choice, ConstantTimeEq};
 
 use crate::DklsCurve;
 use crate::{RAW_SECURITY, STAT_SECURITY};
@@ -334,8 +335,16 @@ impl OTESender {
             verify_sender.push(verify_sender_i);
         }
 
-        // The two values must agree.
-        if verify_q != verify_sender {
+        // The two values must agree. Constant-time: this is the KOS
+        // selective-failure check and both vectors are derived from
+        // secret OT correlations; a variable-time compare would leak
+        // which element/byte first differs. Lengths are structural
+        // (both KAPPA), so comparing them in the clear is fine.
+        let mut agree = Choice::from(u8::from(verify_q.len() == verify_sender.len()));
+        for (a, b) in verify_q.iter().zip(verify_sender.iter()) {
+            agree &= a[..].ct_eq(&b[..]);
+        }
+        if !bool::from(agree) {
             return Err(ErrorOT::new(
                 "Receiver cheated in OTE: Consistency check failed!",
             ));

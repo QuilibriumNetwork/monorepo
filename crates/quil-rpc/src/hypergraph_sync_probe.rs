@@ -54,6 +54,19 @@ pub fn global_prover_shard_key() -> Vec<u8> {
     encode_shard_key(&[0u8; 3], &[0xffu8; 32])
 }
 
+/// Mirror of Go `isGlobalProverShardBytes` (sync_client_driven.go:44): a
+/// 35-byte key with `L1 = [0;3]`, `L2 = [0xff;32]`. The global prover
+/// sync pins its rebuilt root to a single `expected_root` and rejects a
+/// mismatch; app-shard sync uses `expected_root` only as the snapshot
+/// GENERATION anchor (`state_roots[0]`) shared across all four phase
+/// sets, whose per-phase roots legitimately differ — so the strict
+/// rebuilt-root check is gated on this.
+pub fn is_global_prover_shard_bytes(shard_key_bytes: &[u8]) -> bool {
+    shard_key_bytes.len() == 35
+        && shard_key_bytes[..3].iter().all(|&b| b == 0)
+        && shard_key_bytes[3..].iter().all(|&b| b == 0xff)
+}
+
 /// Stats from a single `pull_root_leaves` call against an archive.
 #[derive(Debug, Default)]
 pub struct ProberStats {
@@ -571,6 +584,7 @@ pub async fn build_local_tree_with_handle(
     phase: HypergraphPhaseSet,
     max_pages: u32,
     expected_root: &[u8],
+    shard_key_bytes: &[u8],
 ) -> Result<
     (BuildTreeStats, VectorCommitmentTree, Vec<VertexDataEntry>),
     HyperSyncProbeError,
@@ -597,7 +611,9 @@ pub async fn build_local_tree_with_handle(
     let (tx, rx) = tokio::sync::mpsc::channel::<HypergraphSyncQuery>(8);
     let req_stream = ReceiverStream::new(rx);
 
-    let shard_key = global_prover_shard_key();
+    // Sync the requested shard's subtree. Global-prover callers pass
+    // `global_prover_shard_key()`; app-shard sync passes the shard's key.
+    let shard_key = shard_key_bytes.to_vec();
     let phase_i32 = phase as i32;
 
     tx.send(HypergraphSyncQuery {
@@ -740,15 +756,24 @@ pub async fn build_local_tree_with_handle(
     stats.local_root_commitment = local_root.clone();
     stats.commitments_match = local_root == stats.server_root_commitment;
 
-    // See probe_build_local_tree for rationale. The expected_root pin
-    // must match the locally-reconstructed root or the sync result is
-    // rejected.
-    if !expected_root.is_empty() && local_root != expected_root {
+    // The `expected_root` pin must match the locally-reconstructed root
+    // ONLY for the global prover shard, mirroring Go's `isGlobalProver`
+    // gate (sync_client_driven.go:557). For app shards, `expected_root`
+    // is the snapshot GENERATION anchor (the frame's `state_roots[0]`,
+    // i.e. the vertex-adds root) sent to the server to select the right
+    // generation; it is shared across all four phase sets, so the
+    // removes/hyperedge phases' rebuilt roots legitimately differ from it
+    // and must NOT be rejected. `commitments_match` above (local ==
+    // server-offered root) still guards pull integrity for every phase.
+    if !expected_root.is_empty()
+        && local_root != expected_root
+        && is_global_prover_shard_bytes(shard_key_bytes)
+    {
         warn!(
             %addr,
             local = hex::encode(&local_root),
             expected = hex::encode(expected_root),
-            "synced tree root does NOT match expected_root — rejecting"
+            "synced prover tree root does NOT match expected_root — rejecting"
         );
         stats.commitments_match = false;
         return Err(HyperSyncProbeError::Rpc(tonic::Status::data_loss(format!(
@@ -961,10 +986,29 @@ pub async fn ensure_prover_tree_fresh(
     hg_store: Arc<RocksHypergraphStore>,
     expected_root: &[u8],
 ) -> Result<BuildTreeStats, HyperSyncProbeError> {
-    let shard = ShardKey {
+    // The global prover tree is shard {[0;3], [0xff;32]}. Thin wrapper
+    // over the shard-generic sync so the global-prover path is unchanged.
+    let global = ShardKey {
         l1: [0u8; 3],
         l2: [0xffu8; 32],
     };
+    ensure_shard_tree_fresh(&global, addr, ed448_seed, phase, hg_store, expected_root).await
+}
+
+/// Fresh (full) sync of an arbitrary shard's subtree from an archive,
+/// persisting the rebuilt tree + per-vertex data under `shard`. Same as
+/// [`ensure_prover_tree_fresh`] but for any shard — used to catch an
+/// app-shard's CRDT up after a gap/restart/late-join. The HyperSync
+/// server already serves any shard key, so this is purely a client-side
+/// addition.
+pub async fn ensure_shard_tree_fresh(
+    shard: &ShardKey,
+    addr: &str,
+    ed448_seed: &[u8; 57],
+    phase: HypergraphPhaseSet,
+    hg_store: Arc<RocksHypergraphStore>,
+    expected_root: &[u8],
+) -> Result<BuildTreeStats, HyperSyncProbeError> {
     let phase_str = match phase {
         HypergraphPhaseSet::VertexAdds => "adds",
         HypergraphPhaseSet::VertexRemoves => "removes",
@@ -975,10 +1019,12 @@ pub async fn ensure_prover_tree_fresh(
         HypergraphPhaseSet::VertexAdds | HypergraphPhaseSet::VertexRemoves => "vertex",
         HypergraphPhaseSet::HyperedgeAdds | HypergraphPhaseSet::HyperedgeRemoves => "hyperedge",
     };
+    let shard_bytes = encode_shard_key(&shard.l1, &shard.l2);
 
-    info!(?phase, "fresh sync from archive (bypassing cache)");
+    info!(?phase, "fresh shard sync from archive (bypassing cache)");
     let (stats, tree, vertex_data) =
-        build_local_tree_with_handle(addr, ed448_seed, phase, 0, expected_root).await?;
+        build_local_tree_with_handle(addr, ed448_seed, phase, 0, expected_root, &shard_bytes)
+            .await?;
 
     if !stats.commitments_match {
         warn!(?phase, "fresh sync commitment mismatch, NOT persisting");
@@ -993,15 +1039,15 @@ pub async fn ensure_prover_tree_fresh(
         }
     };
     let blob_size = serialized.len();
-    match hg_store.save_tree_blob(set_str, phase_str, &shard, &serialized) {
-        Ok(()) => info!(?phase, blob_size, "prover tree refreshed"),
+    match hg_store.save_tree_blob(set_str, phase_str, shard, &serialized) {
+        Ok(()) => info!(?phase, blob_size, "shard tree refreshed"),
         Err(e) => warn!(?phase, error = %e, "save_tree_blob failed"),
     }
 
     let mut persisted_vertices = 0usize;
     for entry in &vertex_data {
         if hg_store
-            .save_vertex_underlying(set_str, phase_str, &shard, &entry.key, &entry.underlying_data)
+            .save_vertex_underlying(set_str, phase_str, shard, &entry.key, &entry.underlying_data)
             .is_ok()
         {
             persisted_vertices += 1;

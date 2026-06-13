@@ -23,7 +23,7 @@ pub use shard_info_refresh::{fetch_shard_sizes_from_archive, ShardInfoRefreshErr
 pub use global_service::{FrameLookup, GlobalRpcServer, SubmitHandler};
 pub use hypergraph_sync_probe::{
     build_local_tree_with_handle, encode_shard_key, ensure_prover_tree, ensure_prover_tree_fresh,
-    ensure_prover_tree_incremental, global_prover_shard_key,
+    ensure_prover_tree_incremental, ensure_shard_tree_fresh, global_prover_shard_key,
     probe_build_local_tree, probe_inspect_vertex_data, probe_perform_sync, probe_pull_root_leaves,
     BuildTreeStats, HyperSyncProbeError, ProberStats, VertexDataEntry,
 };

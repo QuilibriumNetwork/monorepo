@@ -48,12 +48,34 @@ struct PerCoreFiles {
     max_backups: i32,
     max_age: i32,
     compress: bool,
-    /// Held to keep the master appender alive for the process
-    /// lifetime.
-    _master_guard: tracing_appender::non_blocking::WorkerGuard,
 }
 
 static PER_CORE_FILES: OnceLock<Arc<PerCoreFiles>> = OnceLock::new();
+
+/// Appender guards for every non-blocking file writer (master +
+/// workers). Dropping a guard blocks until its writer thread drains,
+/// so they must live for the process lifetime and be dropped exactly
+/// once, at exit, via [`shutdown_logging`].
+static LOG_GUARDS: OnceLock<std::sync::Mutex<Vec<tracing_appender::non_blocking::WorkerGuard>>> =
+    OnceLock::new();
+
+fn hold_guard(guard: tracing_appender::non_blocking::WorkerGuard) {
+    LOG_GUARDS
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(guard);
+}
+
+/// Drop all appender guards, flushing buffered log lines to disk.
+/// Call as the last thing before process exit — the final error/info
+/// lines explaining WHY the node stopped are exactly the ones still
+/// sitting in the non-blocking writer's channel.
+pub fn shutdown_logging() {
+    if let Some(guards) = LOG_GUARDS.get() {
+        guards.lock().unwrap().clear();
+    }
+}
 
 /// First call wins per `core_id`; subsequent calls are a no-op.
 pub fn register_worker_log_file(core_id: u32) {
@@ -78,8 +100,7 @@ pub fn register_worker_log_file(core_id: u32) {
         files.compress,
     );
     let (nb, guard) = tracing_appender::non_blocking(rotate);
-    // `WorkerGuard` must outlive emission for the worker's lifetime.
-    Box::leak(Box::new(guard));
+    hold_guard(guard);
     let mut map = files.workers.write().unwrap();
     map.entry(core_id).or_insert(nb);
 
@@ -379,6 +400,7 @@ pub fn init_logging(
     );
 
     let (non_blocking, guard) = tracing_appender::non_blocking(rotate);
+    hold_guard(guard);
 
     let _ = PER_CORE_FILES.set(Arc::new(PerCoreFiles {
         master: non_blocking.clone(),
@@ -388,7 +410,6 @@ pub fn init_logging(
         max_backups: cfg.max_backups,
         max_age: cfg.max_age,
         compress: cfg.compress,
-        _master_guard: guard,
     }));
     let files = PER_CORE_FILES.get().expect("PerCoreFiles just set").clone();
 
@@ -404,7 +425,8 @@ pub fn init_logging(
         .with(stderr_layer)
         .with(file_layer)
         .init();
-    // Master appender is held by `PER_CORE_FILES`.
+    // Master appender is held by `PER_CORE_FILES`; its guard lives in
+    // `LOG_GUARDS` until `shutdown_logging`.
     None
 }
 

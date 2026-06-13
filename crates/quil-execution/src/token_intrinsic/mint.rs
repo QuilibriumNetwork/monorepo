@@ -978,7 +978,7 @@ fn bigint_bytes_equal(a: &[u8], b: &[u8]) -> bool {
 /// `tx.domain || poseidon(o.RecipientOutput.VerificationKey)` must
 /// NOT exist in the hypergraph. Mirrors Go
 /// `MintTransaction.Verify` lines 2754-2767.
-fn verify_outputs_not_spent(
+pub(crate) fn verify_outputs_not_spent(
     tx: &MintTransaction,
     decoded_outputs: &[MintTransactionOutput],
     hypergraph: &Arc<HypergraphCrdt>,
@@ -1021,7 +1021,7 @@ fn verify_outputs_not_spent(
 /// exist, and key images (signature[56*4..56*5]) must be unique within
 /// the batch. Mirrors the loop at Go `MintTransaction.Verify`
 /// lines 2727-2745.
-fn verify_inputs_not_spent_and_unique(
+pub(crate) fn verify_inputs_not_spent_and_unique(
     tx: &MintTransaction,
     decoded_inputs: &[MintTransactionInput],
     hypergraph: &Arc<HypergraphCrdt>,

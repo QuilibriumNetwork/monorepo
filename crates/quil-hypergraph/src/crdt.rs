@@ -447,6 +447,14 @@ impl HypergraphCrdt {
     /// mutations — identical to Go's behavior and required for
     /// consensus parity. Do NOT call `commit(N)` after mutating the
     /// tree and expect an updated root.
+    /// Borrow the inclusion prover this CRDT commits with. Lets callers
+    /// that hold only a `HypergraphState`/CRDT (e.g. the compute engine,
+    /// which has no prover field of its own) commit metadata sub-trees
+    /// with the same prover the CRDT uses.
+    pub fn prover(&self) -> &Arc<dyn InclusionProver> {
+        &self.prover
+    }
+
     pub fn commit(
         &self,
         frame_number: u64,
