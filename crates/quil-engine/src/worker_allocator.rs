@@ -342,17 +342,27 @@ impl WorkerAllocator {
             .prover_registry
             .get_prover_info(&self.local_prover_address)?;
 
-        let Some(prover) = prover_info else {
-            // Not registered — nothing to reconcile
-            return Ok(());
-        };
-
-        // Build lookup from filter → allocation status
-        let alloc_by_filter: HashMap<Vec<u8>, &quil_types::consensus::ProverAllocationInfo> = prover
-            .allocations
-            .iter()
-            .map(|a| (a.confirmation_filter.clone(), a))
-            .collect();
+        // Do NOT early-return when unregistered. A worker carrying a
+        // `pending_filter_frame` from a ProposeJoin that never landed must
+        // still be swept below — otherwise `free_auto()` stays empty,
+        // `allow_proposals` is false, and the lifecycle never retries the
+        // join, leaving the node permanently unregistered with idle
+        // workers (observed production wedge: a single failed join pins
+        // every worker forever). Matches Go `OnNewFrame`, which proceeds
+        // with `self == nil` and clears stale/pending filters regardless.
+        // When unregistered, `alloc_by_filter` is empty → every
+        // filter-pinned worker hits the `None` arm → the 10-frame
+        // pending-timeout sweep frees it so the lifecycle can re-propose.
+        let alloc_by_filter: HashMap<Vec<u8>, &quil_types::consensus::ProverAllocationInfo> =
+            prover_info
+                .as_ref()
+                .map(|p| {
+                    p.allocations
+                        .iter()
+                        .map(|a| (a.confirmation_filter.clone(), a))
+                        .collect()
+                })
+                .unwrap_or_default();
 
         // Get current worker assignments
         let workers = self.worker_manager.range_workers()?;
@@ -591,7 +601,11 @@ impl WorkerAllocator {
         // Joining failure mode that requires the lifecycle-side
         // per-filter Join cooldown to prevent at the source.
         let mut orphan_filters: Vec<(Vec<u8>, ProverStatus)> = Vec::new();
-        for alloc in &prover.allocations {
+        for alloc in prover_info
+            .as_ref()
+            .map(|p| p.allocations.as_slice())
+            .unwrap_or(&[])
+        {
             // Bind the filter for any non-expired allocation —
             // including Joining — so the TUI and the user can see
             // which worker owns which filter from the moment the
@@ -790,6 +804,45 @@ mod tests {
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         alloc.on_new_frame(100).unwrap();
         assert!(wm.range_workers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clears_stuck_pending_join_when_unregistered() {
+        // Regression (production wedge): a ProposeJoin whose submit never
+        // landed leaves workers carrying a `pending_filter_frame` while the
+        // prover is NOT in the registry (the join never confirmed). If
+        // `on_new_frame` early-returns when unregistered, the marker never
+        // clears → `free_auto()` stays empty → `allow_proposals = false` →
+        // the lifecycle never re-proposes → the node sits permanently idle
+        // with 0 allocations. The sweep must run regardless of registration.
+        let wm = Arc::new(MockWorkerManager::new());
+        // Idle worker (empty filter) carrying a stale pending-join marker.
+        wm.add(crate::worker::WorkerInfo {
+            core_id: 1,
+            filter: Vec::new(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 100,
+            allocated: false,
+        });
+
+        // Empty registry: our prover never registered (join never landed).
+        let reg = Arc::new(TestProverRegistry::new());
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+
+        // Well past the 10-frame proposal timeout.
+        alloc
+            .on_new_frame(100 + PROPOSAL_TIMEOUT_FRAMES + 1)
+            .unwrap();
+
+        let workers = wm.range_workers().unwrap();
+        assert_eq!(workers.len(), 1, "worker must still exist");
+        assert_eq!(
+            workers[0].pending_filter_frame, 0,
+            "stuck pending-join marker must be cleared so the worker is free \
+             again and the lifecycle can re-propose"
+        );
     }
 
     #[test]

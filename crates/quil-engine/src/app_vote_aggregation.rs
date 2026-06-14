@@ -304,3 +304,46 @@ pub fn wire_vote_to_app_shard_vote(
         filter,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_consensus::models::Unique;
+
+    fn sample_wire_vote() -> crate::consensus_wire::ProposalVote {
+        crate::consensus_wire::ProposalVote {
+            filter: Vec::new(),
+            rank: 11,
+            frame_number: 3,
+            selector: vec![0x1Au8; 32], // proposal id
+            timestamp: 1_700_000_000,
+            signature: vec![0x2Bu8; 74],
+            address: vec![0x3Cu8; 32], // voter
+        }
+    }
+
+    #[test]
+    fn wire_vote_binds_shard_filter() {
+        let filter = vec![0xEEu8; 32];
+        let v = wire_vote_to_app_shard_vote(sample_wire_vote(), filter.clone());
+        // The shard filter must ride on the vote so the BLS verify path
+        // uses the shard's vote domain.
+        assert_eq!(v.filter, filter);
+    }
+
+    #[test]
+    fn wire_vote_maps_selector_to_source_and_address_to_identity() {
+        let wire = sample_wire_vote();
+        let v = wire_vote_to_app_shard_vote(wire.clone(), vec![0x00u8; 32]);
+        assert_eq!(v.rank(), 11);
+        assert_eq!(v.identity(), &wire.address); // voter
+        assert_eq!(v.source(), &wire.selector); // proposal id
+        assert_eq!(v.signature(), wire.signature.as_slice());
+    }
+
+    #[test]
+    fn wire_vote_distinct_source_and_identity() {
+        let v = wire_vote_to_app_shard_vote(sample_wire_vote(), vec![0x00u8; 32]);
+        assert_ne!(v.identity(), v.source());
+    }
+}

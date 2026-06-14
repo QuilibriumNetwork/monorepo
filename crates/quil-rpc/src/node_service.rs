@@ -140,7 +140,7 @@ impl NodeRpcServer {
         Self {
             peer_id: String::new(),
             version: vec![2, 1, 0],
-            patch_number: vec![23],
+            patch_number: vec![quil_config::PATCH_NUMBER],
             current_frame: CurrentFrame::new(),
             last_global_head_frame: Arc::new(AtomicU64::new(0)),
             prover_address: Vec::new(),

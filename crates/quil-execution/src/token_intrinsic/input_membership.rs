@@ -361,4 +361,204 @@ mod tests {
         assert_eq!(mc, vec![0xaa, 0xbb, 0xcc]);
         assert_eq!(pr, vec![0xdd, 0xee]);
     }
+
+    #[test]
+    fn inner_multiproof_rejects_truncated_multicommitment() {
+        // d_len=10 but only 2 bytes follow.
+        let bytes = [0, 0, 0, 10, 0xaa, 0xbb];
+        assert!(parse_inner_multiproof(&bytes).is_err());
+    }
+
+    #[test]
+    fn inner_multiproof_rejects_eof_before_length() {
+        let bytes = [0, 0, 0]; // < 4 bytes for first u32
+        assert!(parse_inner_multiproof(&bytes).is_err());
+    }
+
+    #[test]
+    fn evaluation_last_uses_meta_key_not_index() {
+        // For the same data, the last-field eval (0xFF*32 key) must
+        // differ from the non-last eval (index-byte key).
+        let data = vec![0x09u8; 32];
+        let last = evaluation(63, &data, true);
+        let not_last = evaluation(63, &data, false);
+        assert_ne!(last, not_last);
+        assert_eq!(last.len(), 64);
+    }
+
+    // ---- build_layout / verify_input_membership ----
+
+    use crate::traversal_proof::TraversalSubProof;
+    use quil_types::crypto::{Multiproof, NoopInclusionProver};
+
+    const DOMAIN: [u8; 32] = [0x77u8; 32];
+
+    /// Build a minimal inner multiproof blob (`u32 d_len, mc, u32
+    /// proof_len, proof`) for `proofs[0]`.
+    fn inner_multiproof_bytes() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&3u32.to_be_bytes());
+        v.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        v.extend_from_slice(&2u32.to_be_bytes());
+        v.extend_from_slice(&[0xdd, 0xee]);
+        v
+    }
+
+    /// Inclusion prover that returns a fixed `verify_multiple` result so
+    /// we can drive the bound/not-bound branches of
+    /// `verify_input_membership`.
+    struct FixedVerify(bool);
+    impl InclusionProver for FixedVerify {
+        fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
+        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
+        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
+        fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+            Err(QuilError::Internal("n/a".into()))
+        }
+        fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool {
+            self.0
+        }
+    }
+
+    fn sub_proof_with_leaf() -> TraversalSubProof {
+        TraversalSubProof {
+            commits: vec![],
+            ys: vec![vec![0x11u8; 64], vec![0x22u8; 64]],
+            paths: vec![],
+        }
+    }
+
+    /// A divisible-coin input: proofs.len()==1, non-Acceptable token.
+    fn coin_input() -> TransactionInput {
+        TransactionInput {
+            commitment: vec![0x01u8; 56],
+            signature: vec![0x02u8; 336],
+            proofs: vec![inner_multiproof_bytes()],
+        }
+    }
+
+    #[test]
+    fn build_layout_coin_branch_divisible() {
+        // Divisible, non-Acceptable token → coin branch with indices [1,3,63].
+        let behavior = DIVISIBLE; // not Acceptable
+        let layout = build_layout(&coin_input(), &DOMAIN, behavior, 0).unwrap();
+        assert_eq!(layout.indices, vec![1, 3, 63]);
+        assert_eq!(layout.data.len(), 3);
+        assert!(layout.alt_spent_key.is_none());
+        // data[0] = commitment = signature[56*5..56*6]
+        assert_eq!(layout.data[0], vec![0x02u8; 56]);
+        // data[2] = coin_type_hash(domain)
+        assert_eq!(layout.data[2], coin_type_hash(&DOMAIN).unwrap().to_vec());
+    }
+
+    #[test]
+    fn build_layout_rejects_short_signature() {
+        let mut input = coin_input();
+        input.signature = vec![0u8; 100]; // != 336
+        assert!(build_layout(&input, &DOMAIN, DIVISIBLE, 0).is_err());
+    }
+
+    #[test]
+    fn build_layout_coin_on_acceptable_token_is_rejected() {
+        // Coin-length proof (len 1) but token is Acceptable → error.
+        let behavior = DIVISIBLE | ACCEPTABLE;
+        let err = build_layout(&coin_input(), &DOMAIN, behavior, 0);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn build_layout_pending_to_branch() {
+        // Acceptable + divisible, non-expirable → 3 proofs.
+        // offset=0. proofs[1]==[0x02] → isTo branch.
+        let behavior = DIVISIBLE | ACCEPTABLE;
+        let input = TransactionInput {
+            commitment: vec![0x01u8; 56],
+            signature: vec![0x02u8; 336],
+            proofs: vec![
+                inner_multiproof_bytes(),
+                vec![0x02u8],              // proofs[offset+1] == [0x02] → isTo
+                vec![0x33u8; 16],          // proofs[offset+2] = alt_ref
+            ],
+        };
+        let layout = build_layout(&input, &DOMAIN, behavior, 0).unwrap();
+        assert!(layout.alt_spent_key.is_some());
+        // indices: [1,4,5,63]
+        assert_eq!(layout.indices, vec![1, 4, 5, 63]);
+        // alt_spent_key == poseidon(alt_ref)
+        let expected = quil_crypto::poseidon::hash_bytes_to_32(&vec![0x33u8; 16]).unwrap();
+        assert_eq!(layout.alt_spent_key.unwrap(), expected);
+    }
+
+    #[test]
+    fn build_layout_pending_refund_before_expiration_is_rejected() {
+        // Expirable + divisible, refund branch (proofs[offset+1] != [0x02]),
+        // frame_number < expiration → reject.
+        let behavior = DIVISIBLE | ACCEPTABLE | EXPIRABLE;
+        let expiration = 100u64;
+        let input = TransactionInput {
+            commitment: vec![0x01u8; 56],
+            signature: vec![0x02u8; 336],
+            proofs: vec![
+                inner_multiproof_bytes(),
+                expiration.to_be_bytes().to_vec(), // proofs[1] = expiration (8 bytes)
+                vec![0x01u8],                       // proofs[offset+1] != [0x02] → refund
+                vec![0x33u8; 16],                   // proofs[offset+2] = alt_ref
+            ],
+        };
+        // frame_number 50 < expiration 100 → reject.
+        assert!(build_layout(&input, &DOMAIN, behavior, 50).is_err());
+        // frame_number 100 >= expiration 100 → ok.
+        assert!(build_layout(&input, &DOMAIN, behavior, 100).is_ok());
+    }
+
+    #[test]
+    fn build_layout_pending_on_non_acceptable_token_is_rejected() {
+        // Pending-length proof (3 elems) but token not Acceptable → error.
+        let behavior = DIVISIBLE; // not Acceptable
+        let input = TransactionInput {
+            commitment: vec![0x01u8; 56],
+            signature: vec![0x02u8; 336],
+            proofs: vec![
+                inner_multiproof_bytes(),
+                vec![0x02u8],
+                vec![0x33u8; 16],
+            ],
+        };
+        assert!(build_layout(&input, &DOMAIN, behavior, 0).is_err());
+    }
+
+    #[test]
+    fn verify_input_membership_ok_when_prover_accepts() {
+        let behavior = DIVISIBLE; // coin branch
+        let input = coin_input();
+        let sub = sub_proof_with_leaf();
+        let alt = verify_input_membership(
+            &input, &DOMAIN, behavior, 0, &sub, &FixedVerify(true),
+        )
+        .unwrap();
+        // Coin branch → no alt spent key.
+        assert!(alt.is_none());
+    }
+
+    #[test]
+    fn verify_input_membership_err_when_prover_rejects() {
+        let behavior = DIVISIBLE;
+        let input = coin_input();
+        let sub = sub_proof_with_leaf();
+        let err = verify_input_membership(
+            &input, &DOMAIN, behavior, 0, &sub, &FixedVerify(false),
+        );
+        assert!(err.is_err(), "rejecting prover → input not bound");
+    }
+
+    #[test]
+    fn verify_input_membership_err_when_subproof_has_no_leaf() {
+        let behavior = DIVISIBLE;
+        let input = coin_input();
+        let empty_sub = TraversalSubProof { commits: vec![], ys: vec![], paths: vec![] };
+        let err = verify_input_membership(
+            &input, &DOMAIN, behavior, 0, &empty_sub, &NoopInclusionProver,
+        );
+        assert!(err.is_err());
+    }
 }

@@ -385,4 +385,112 @@ mod tests {
         let back = super::super::config::decode_mint_strategy_packed(&packed).unwrap();
         assert_eq!(back, m);
     }
+
+    #[test]
+    fn encode_decode_mint_strategy_packed_round_trip_full() {
+        use super::super::config::{Authority, FeeBasisStruct, TokenMintStrategy};
+        let authority = Authority {
+            key_type: 2,
+            public_key: vec![0xABu8; 97],
+            can_burn: true,
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let fee_basis = FeeBasisStruct {
+            fee_type: 1,
+            baseline: vec![0x10u8, 0x20],
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let m = TokenMintStrategy {
+            mint_behavior: 3,
+            proof_basis: 2,
+            verkle_root: vec![0xCDu8; 64],
+            authority,
+            payment_address: vec![0xEFu8; 32],
+            fee_basis,
+        };
+        let packed = encode_mint_strategy_packed(&m).unwrap();
+        let back = super::super::config::decode_mint_strategy_packed(&packed).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn build_then_decode_token_config_round_trips() {
+        use super::super::config::{Authority, TokenConfiguration, TokenMintStrategy};
+        let authority = Authority {
+            key_type: 2,
+            public_key: vec![0x11u8; 97],
+            can_burn: false,
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let mint_strategy = TokenMintStrategy {
+            mint_behavior: 1,
+            proof_basis: 0,
+            verkle_root: vec![],
+            authority,
+            payment_address: vec![],
+            fee_basis: vec![],
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let cfg = TokenConfiguration {
+            behavior: 0x3F,
+            mint_strategy,
+            units: vec![0x01u8; 32],
+            supply: vec![0x02u8; 32],
+            name: b"MyToken".to_vec(),
+            symbol: b"MTK".to_vec(),
+            additional_reference: vec![],
+            owner_public_key: vec![0x33u8; 585],
+        };
+        let tree = build_token_configuration_metadata_tree(&cfg).unwrap();
+        let decoded = decode_token_config_from_tree(&tree).unwrap();
+
+        assert_eq!(decoded.behavior, cfg.behavior);
+        assert_eq!(decoded.units, cfg.units);
+        assert_eq!(decoded.supply, cfg.supply);
+        assert_eq!(decoded.name, cfg.name);
+        assert_eq!(decoded.symbol, cfg.symbol);
+        assert_eq!(decoded.owner_public_key, cfg.owner_public_key);
+        // MintStrategy round-trips through packed encode/decode.
+        assert_eq!(decoded.mint_strategy, cfg.mint_strategy);
+    }
+
+    #[test]
+    fn decode_token_config_rejects_missing_behavior() {
+        // Empty tree has no Behavior field → error.
+        let tree = quil_tries::VectorCommitmentTree::new();
+        assert!(decode_token_config_from_tree(&tree).is_err());
+    }
+
+    #[test]
+    fn encode_mint_strategy_rejects_oversized() {
+        use super::super::config::TokenMintStrategy;
+        let m = TokenMintStrategy {
+            mint_behavior: 0,
+            proof_basis: 0,
+            verkle_root: vec![0xAAu8; 800], // pushes packed > 701 bytes
+            authority: vec![],
+            payment_address: vec![],
+            fee_basis: vec![],
+        };
+        assert!(encode_mint_strategy_packed(&m).is_err());
+    }
+
+    #[test]
+    fn load_token_config_tree_returns_none_for_missing_vertex() {
+        use std::sync::Arc;
+        use quil_hypergraph::HypergraphCrdt;
+        use quil_hypergraph::testing::MemStore;
+        use quil_types::crypto::NoopInclusionProver;
+        let crdt = HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(NoopInclusionProver),
+        );
+        let domain = [0x42u8; 32];
+        let r = load_token_config_tree(&crdt, &domain).unwrap();
+        assert!(r.is_none());
+    }
 }

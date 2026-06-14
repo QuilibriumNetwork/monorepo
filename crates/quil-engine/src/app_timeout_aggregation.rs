@@ -228,3 +228,68 @@ pub fn wire_timeout_to_app_typed(
         timeout_tick: wire.timeout_tick,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_consensus::models::Unique;
+
+    fn sample_wire_timeout(rank: u64, with_prior_tc: bool) -> crate::consensus_wire::TimeoutState {
+        let qc = crate::consensus_wire::QuorumCertificate::genesis(
+            rank.saturating_sub(1),
+            vec![0xDDu8; 32],
+        );
+        let prior_tc = if with_prior_tc {
+            Some(crate::consensus_wire::TimeoutCertificate {
+                filter: Vec::new(),
+                rank: rank.saturating_sub(1),
+                latest_ranks: Vec::new(),
+                latest_quorum_certificate: Some(qc.clone()),
+                timestamp: 0,
+                aggregate_signature: crate::consensus_wire::AggregateSignature::empty(),
+            })
+        } else {
+            None
+        };
+        crate::consensus_wire::TimeoutState {
+            latest_quorum_certificate: qc,
+            prior_rank_timeout_certificate: prior_tc,
+            vote: crate::consensus_wire::ProposalVote {
+                filter: Vec::new(),
+                rank,
+                frame_number: rank.saturating_sub(1),
+                selector: vec![0xAAu8; 32],
+                timestamp: 1_700_000_000,
+                signature: vec![0xBBu8; 74],
+                address: vec![0xCCu8; 32],
+            },
+            timeout_tick: 55,
+            timestamp: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn wire_timeout_derives_rank_and_binds_filter() {
+        let filter = vec![0xABu8; 32];
+        let typed = wire_timeout_to_app_typed(sample_wire_timeout(33, false), filter.clone());
+        assert_eq!(typed.rank, 33);
+        assert_eq!(typed.vote.rank(), 33);
+        assert_eq!(typed.vote.filter, filter);
+        assert_eq!(typed.timeout_tick, 55);
+    }
+
+    #[test]
+    fn wire_timeout_without_prior_tc_yields_none() {
+        let typed = wire_timeout_to_app_typed(sample_wire_timeout(5, false), vec![0u8; 32]);
+        assert!(typed.prior_rank_timeout_certificate.is_none());
+    }
+
+    #[test]
+    fn wire_timeout_with_prior_tc_carried_through() {
+        let typed = wire_timeout_to_app_typed(sample_wire_timeout(40, true), vec![0u8; 32]);
+        let tc = typed
+            .prior_rank_timeout_certificate
+            .expect("prior TC present");
+        assert_eq!(tc.rank(), 39);
+    }
+}

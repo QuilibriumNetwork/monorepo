@@ -252,3 +252,55 @@ pub fn wire_vote_to_global_vote(
         Vec::new(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_consensus::models::Unique;
+
+    fn sample_wire_vote() -> crate::consensus_wire::ProposalVote {
+        crate::consensus_wire::ProposalVote {
+            filter: Vec::new(),
+            rank: 42,
+            frame_number: 7,
+            selector: vec![0xAAu8; 32], // proposal identity
+            timestamp: 1_700_000_000,
+            signature: vec![0xBBu8; 74],
+            address: vec![0xCCu8; 32], // voter address
+        }
+    }
+
+    // The source/identity inversion is a real correctness concern:
+    // Go's `ProposalVote.Source()` is the proposal id (selector) and
+    // `Identity()` is the voter address. A swap here silently breaks
+    // double-vote detection. Pin the mapping explicitly.
+    #[test]
+    fn wire_vote_maps_selector_to_source_and_address_to_identity() {
+        let wire = sample_wire_vote();
+        let v = wire_vote_to_global_vote(wire.clone());
+        assert_eq!(v.rank(), 42);
+        // identity = voter address
+        assert_eq!(v.identity(), &wire.address);
+        // source = proposal selector
+        assert_eq!(v.source(), &wire.selector);
+        assert_eq!(v.timestamp(), wire.timestamp);
+    }
+
+    #[test]
+    fn wire_vote_carries_signature_and_empty_bitmask() {
+        let wire = sample_wire_vote();
+        let v = wire_vote_to_global_vote(wire.clone());
+        // The vote's signature bytes survive the conversion.
+        assert_eq!(v.signature(), wire.signature.as_slice());
+        // Bitmask is empty (the packer owns the bitmask, not the vote).
+        assert!(v.bitmask.is_empty());
+    }
+
+    #[test]
+    fn wire_vote_preserves_distinct_source_and_identity() {
+        // When selector and address differ, they must not collapse.
+        let wire = sample_wire_vote();
+        let v = wire_vote_to_global_vote(wire);
+        assert_ne!(v.identity(), v.source());
+    }
+}

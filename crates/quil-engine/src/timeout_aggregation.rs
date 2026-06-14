@@ -232,3 +232,83 @@ pub fn wire_timeout_to_typed(
         timeout_tick: wire.timeout_tick,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_consensus::models::Unique;
+
+    fn sample_wire_vote(rank: u64) -> crate::consensus_wire::ProposalVote {
+        crate::consensus_wire::ProposalVote {
+            filter: Vec::new(),
+            rank,
+            frame_number: rank.saturating_sub(1),
+            selector: vec![0xAAu8; 32],
+            timestamp: 1_700_000_000,
+            signature: vec![0xBBu8; 74],
+            address: vec![0xCCu8; 32],
+        }
+    }
+
+    fn sample_wire_timeout(rank: u64, with_prior_tc: bool) -> crate::consensus_wire::TimeoutState {
+        let qc = crate::consensus_wire::QuorumCertificate::genesis(
+            rank.saturating_sub(1),
+            vec![0xDDu8; 32],
+        );
+        let prior_tc = if with_prior_tc {
+            Some(crate::consensus_wire::TimeoutCertificate {
+                filter: Vec::new(),
+                rank: rank.saturating_sub(1),
+                latest_ranks: Vec::new(),
+                latest_quorum_certificate: Some(qc.clone()),
+                timestamp: 0,
+                aggregate_signature: crate::consensus_wire::AggregateSignature::empty(),
+            })
+        } else {
+            None
+        };
+        crate::consensus_wire::TimeoutState {
+            latest_quorum_certificate: qc,
+            prior_rank_timeout_certificate: prior_tc,
+            vote: sample_wire_vote(rank),
+            timeout_tick: 99,
+            timestamp: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn wire_timeout_derives_rank_from_vote() {
+        let typed = wire_timeout_to_typed(sample_wire_timeout(50, false));
+        // The typed timeout's rank must come from the embedded vote.
+        assert_eq!(typed.rank, 50);
+        assert_eq!(typed.vote.rank(), 50);
+        assert_eq!(typed.timeout_tick, 99);
+    }
+
+    #[test]
+    fn wire_timeout_without_prior_tc_yields_none() {
+        let typed = wire_timeout_to_typed(sample_wire_timeout(10, false));
+        assert!(typed.prior_rank_timeout_certificate.is_none());
+        // The latest QC trait object is always present (genesis QC has rank 0).
+        assert_eq!(typed.latest_quorum_certificate.rank(), 0);
+    }
+
+    #[test]
+    fn wire_timeout_with_prior_tc_is_carried_through() {
+        let typed = wire_timeout_to_typed(sample_wire_timeout(20, true));
+        let tc = typed
+            .prior_rank_timeout_certificate
+            .expect("prior TC should be present");
+        assert_eq!(tc.rank(), 19);
+    }
+
+    #[test]
+    fn wire_timeout_preserves_vote_identity_and_source() {
+        let wire = sample_wire_timeout(7, false);
+        let voter = wire.vote.address.clone();
+        let proposal = wire.vote.selector.clone();
+        let typed = wire_timeout_to_typed(wire);
+        assert_eq!(typed.vote.identity(), &voter);
+        assert_eq!(typed.vote.source(), &proposal);
+    }
+}

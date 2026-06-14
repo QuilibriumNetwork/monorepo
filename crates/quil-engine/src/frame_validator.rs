@@ -634,6 +634,223 @@ mod tests {
         assert!(err.to_string().contains("invalid state roots count"));
     }
 
+    #[test]
+    fn global_frame_post_genesis_without_signature_rejected() {
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        let v = BlsGlobalFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let header = GlobalFrameHeader {
+            output: vec![0u8; GLOBAL_FRAME_OUTPUT_LEN],
+            frame_number: 5,
+            public_key_signature_bls48581: None,
+            ..Default::default()
+        };
+        let frame = GlobalFrame {
+            header: Some(header),
+            requests: Vec::new(),
+        };
+        let err = v.validate(&frame).unwrap_err();
+        assert!(err.to_string().contains("no bls signature"));
+    }
+
+    #[test]
+    fn global_frame_empty_signature_bytes_rejected() {
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        use quil_types::proto::keys::{Bls48581AggregateSignature, Bls48581g2PublicKey};
+        let v = BlsGlobalFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let header = GlobalFrameHeader {
+            output: vec![0u8; GLOBAL_FRAME_OUTPUT_LEN],
+            frame_number: 5,
+            public_key_signature_bls48581: Some(Bls48581AggregateSignature {
+                signature: Vec::new(), // empty signature
+                public_key: Some(Bls48581g2PublicKey { key_value: vec![0x01u8; 96] }),
+                bitmask: vec![0x01],
+            }),
+            ..Default::default()
+        };
+        let frame = GlobalFrame {
+            header: Some(header),
+            requests: Vec::new(),
+        };
+        let err = v.validate(&frame).unwrap_err();
+        assert!(err.to_string().contains("signature or public key is nil"));
+    }
+
+    #[test]
+    fn global_frame_empty_bitmask_rejected() {
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        use quil_types::proto::keys::{Bls48581AggregateSignature, Bls48581g2PublicKey};
+        let v = BlsGlobalFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let header = GlobalFrameHeader {
+            output: vec![0u8; GLOBAL_FRAME_OUTPUT_LEN],
+            frame_number: 5,
+            public_key_signature_bls48581: Some(Bls48581AggregateSignature {
+                signature: vec![0xAAu8; 74],
+                public_key: Some(Bls48581g2PublicKey { key_value: vec![0x01u8; 96] }),
+                bitmask: Vec::new(), // empty bitmask
+            }),
+            ..Default::default()
+        };
+        let frame = GlobalFrame {
+            header: Some(header),
+            requests: Vec::new(),
+        };
+        let err = v.validate(&frame).unwrap_err();
+        assert!(err.to_string().contains("bitmask is nil"));
+    }
+
+    #[test]
+    fn app_frame_empty_address_rejected() {
+        use quil_types::proto::global::{AppShardFrame, FrameHeader};
+        let v = BlsAppFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let header = FrameHeader {
+            address: Vec::new(), // empty
+            state_roots: vec![vec![0u8; 64]; 4],
+            ..Default::default()
+        };
+        let frame = AppShardFrame {
+            header: Some(header),
+            requests: Vec::new(),
+        };
+        let err = v.validate(&frame).unwrap_err();
+        assert!(err.to_string().contains("address is empty"));
+    }
+
+    #[test]
+    fn app_frame_bad_state_root_length_rejected() {
+        use quil_types::proto::global::{AppShardFrame, FrameHeader};
+        let v = BlsAppFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let header = FrameHeader {
+            address: vec![0x01u8; 32],
+            // correct count (4) but one root is the wrong length.
+            state_roots: vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 10], vec![0u8; 64]],
+            ..Default::default()
+        };
+        let frame = AppShardFrame {
+            header: Some(header),
+            requests: Vec::new(),
+        };
+        let err = v.validate(&frame).unwrap_err();
+        assert!(err.to_string().contains("invalid state root length"));
+    }
+
+    #[test]
+    fn app_frame_nil_header_rejected() {
+        use quil_types::proto::global::AppShardFrame;
+        let v = BlsAppFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let frame = AppShardFrame {
+            header: None,
+            requests: Vec::new(),
+        };
+        assert!(v.validate(&frame).is_err());
+    }
+
+    #[test]
+    fn app_frame_post_genesis_without_signature_rejected() {
+        use quil_types::proto::global::{AppShardFrame, FrameHeader};
+        let v = BlsAppFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let header = FrameHeader {
+            address: vec![0x01u8; 32],
+            state_roots: vec![vec![0u8; 64]; 4],
+            frame_number: 3,
+            public_key_signature_bls48581: None,
+            ..Default::default()
+        };
+        let frame = AppShardFrame {
+            header: Some(header),
+            requests: Vec::new(),
+        };
+        let err = v.validate(&frame).unwrap_err();
+        assert!(err.to_string().contains("missing BLS signature"));
+    }
+
+    #[test]
+    fn validate_header_fields_rejects_empty_output() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        let header = GlobalFrameHeader {
+            output: Vec::new(),
+            prover: vec![0x01u8; 32],
+            ..Default::default()
+        };
+        let err = GlobalFrameVerifier::validate_header_fields(&header).unwrap_err();
+        assert!(err.to_string().contains("empty output"));
+    }
+
+    #[test]
+    fn validate_header_fields_rejects_empty_prover() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        let header = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: Vec::new(),
+            ..Default::default()
+        };
+        let err = GlobalFrameVerifier::validate_header_fields(&header).unwrap_err();
+        assert!(err.to_string().contains("empty prover"));
+    }
+
+    #[test]
+    fn validate_header_fields_rejects_nongenesis_empty_parent_selector() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        let header = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            parent_selector: Vec::new(),
+            frame_number: 7,
+            ..Default::default()
+        };
+        let err = GlobalFrameVerifier::validate_header_fields(&header).unwrap_err();
+        assert!(err.to_string().contains("empty parent selector"));
+    }
+
+    #[test]
+    fn validate_header_fields_accepts_genesis_empty_parent_selector() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        let header = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            parent_selector: Vec::new(),
+            frame_number: 0,
+            ..Default::default()
+        };
+        assert!(GlobalFrameVerifier::validate_header_fields(&header).is_ok());
+    }
+
+    #[test]
+    fn decode_frame_rejects_garbage() {
+        // Random bytes are not a valid protobuf GlobalFrame in general;
+        // ensure the decode path surfaces a serialization error rather
+        // than panicking.
+        let res = GlobalFrameVerifier::decode_frame(&[0xFFu8; 8]);
+        assert!(res.is_err());
+    }
+
     // ---- test stubs ----
 
     // Shared stub from `crate::test_support`. Replaces a 60-line

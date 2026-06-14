@@ -268,6 +268,16 @@ impl WorkerManager for TestWorkerManager {
         entry.manually_managed = manually_managed;
         Ok(())
     }
+
+    // Persist the pending-join marker (the trait default is a no-op).
+    // Needed so reconcile tests can observe the 10-frame pending-timeout
+    // sweep clearing a stuck marker.
+    fn set_pending_filter_frame(&self, core_id: u32, frame: u64) -> Result<()> {
+        if let Some(w) = self.workers.lock().unwrap().get_mut(&core_id) {
+            w.pending_filter_frame = frame;
+        }
+        Ok(())
+    }
 }
 
 // =====================================================================
