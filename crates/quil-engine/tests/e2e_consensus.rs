@@ -1388,6 +1388,9 @@ impl AppShardHarness {
                                 ));
                             }
                         }
+                        E::FullFrameProduced { .. } => {
+                            events_log.lock().push("FullFrameProduced".into());
+                        }
                         E::ShardFrameFinalized { .. } => {
                             events_log.lock().push("ShardFrameFinalized".into());
                         }
@@ -4109,6 +4112,7 @@ async fn tier2_composite_end_to_end() {
                 use quil_engine::app_engine::AppEngineEvent::*;
                 let name = match ev {
                     FrameProduced { .. } => "FrameProduced",
+                    FullFrameProduced { .. } => "FullFrameProduced",
                     VoteProduced { .. } => "VoteProduced",
                     TimeoutProduced { .. } => "TimeoutProduced",
                     ShardFrameFinalized { .. } => "ShardFrameFinalized",
@@ -4398,6 +4402,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
                 use quil_engine::app_engine::AppEngineEvent::*;
                 let name = match ev {
                     FrameProduced { .. } => "FrameProduced",
+                    FullFrameProduced { .. } => "FullFrameProduced",
                     VoteProduced { .. } => "VoteProduced",
                     TimeoutProduced { .. } => "TimeoutProduced",
                     ShardFrameFinalized { .. } => "ShardFrameFinalized",
