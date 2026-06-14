@@ -430,12 +430,15 @@ impl HypergraphStore for BTreeStore {
     }
     fn save_vertex_underlying(
         &self,
+        _txn: &dyn Transaction,
         _set: &str,
         _phase: &str,
         _shard: &ShardKey,
         vertex_key: &[u8],
         data: &[u8],
     ) -> Result<()> {
+        // This in-memory store writes through immediately; the txn is a
+        // no-op here (matching `NoopTxn`'s write-through semantics).
         self.inner
             .lock()
             .unwrap()

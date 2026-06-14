@@ -292,3 +292,93 @@ async fn get_vertex_data_round_trips_through_real_commit_path() {
         .into_inner();
     assert_eq!(resp_full.raw_data, serialized_tree);
 }
+
+#[tokio::test]
+async fn get_vertex_data_not_visible_when_commit_txn_aborted() {
+    // Transaction-fidelity regression test.
+    //
+    // `get_vertex_data_round_trips_through_real_commit_path` proves the
+    // *success* case: when the commit transaction is committed, the vertex
+    // underlying blob is visible to the handler. This test covers the
+    // *abort* case, which the success test cannot: when the surrounding
+    // transaction is aborted (or the process dies before commit), the
+    // vertex blob must NOT be durable.
+    //
+    // `LazyVectorCommitmentTree::commit` stages tree nodes into the txn via
+    // `insert_node`, but persists each leaf's underlying value through
+    // `walk_leaves_persist` → `save_vertex_underlying`. If that write
+    // bypasses the txn and goes straight to RocksDB, the blob survives an
+    // abort and `GetVertexData` serves data for a vertex whose tree/shard
+    // commit never landed. After the fix, the leaf write joins the same
+    // batch as the nodes, so aborting the txn discards everything.
+    let tmp = TempDir::new().unwrap();
+    let db = RocksDb::open(tmp.path()).unwrap();
+    let store = Arc::new(RocksHypergraphStore::new(Arc::new(db).inner()));
+
+    let mut address = vec![0u8; 64];
+    for (i, b) in address.iter_mut().enumerate().take(32) {
+        *b = 0x50 + i as u8;
+    }
+    let app_address = &address[..32];
+    let shard = ShardKey {
+        l1: quil_hypergraph::addressing::get_bloom_filter_indices(app_address, 256, 3),
+        l2: {
+            let mut l2 = [0u8; 32];
+            l2.copy_from_slice(app_address);
+            l2
+        },
+    };
+
+    let (serialized_tree, _leaves) = build_and_serialize();
+
+    // Drive the real commit path, but abort the transaction instead of
+    // committing it.
+    let lazy = LazyVectorCommitmentTree::new(
+        store.clone() as Arc<dyn HypergraphStore>,
+        "vertex",
+        "adds",
+        shard.clone(),
+        Vec::new(), // empty covered_prefix → no shard-range gate
+    );
+    lazy.insert(
+        &address,
+        &serialized_tree,
+        &[],
+        &BigInt::from(serialized_tree.len() as u64),
+    )
+    .unwrap();
+    let txn = store.new_transaction(false).unwrap();
+    let prover = KzgInclusionProver;
+    lazy.commit(txn.as_ref(), &prover).unwrap();
+    txn.abort().unwrap(); // drop without committing
+
+    let svc = NodeRpcServer::new()
+        .with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
+
+    // Nothing was committed, so the handler must see no vertex data.
+    let resp = svc
+        .get_vertex_data(Request::new(GetVertexDataRequest {
+            address: address.clone(),
+            full_data: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        resp.entries.is_empty(),
+        "aborted commit must not leave enumerable vertex entries"
+    );
+
+    let resp_full = svc
+        .get_vertex_data(Request::new(GetVertexDataRequest {
+            address: address.clone(),
+            full_data: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        resp_full.raw_data.is_empty(),
+        "aborted commit must not leave a durable vertex underlying blob"
+    );
+}

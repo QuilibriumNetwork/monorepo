@@ -23,7 +23,7 @@ use quil_types::proto::application::{
     hypergraph_sync_query, hypergraph_sync_response, HypergraphPhaseSet,
     HypergraphSyncGetBranchRequest, HypergraphSyncGetLeavesRequest, HypergraphSyncQuery,
 };
-use quil_types::store::ShardKey;
+use quil_types::store::{HypergraphStore, ShardKey, Transaction};
 
 use crate::archive_client::{build_quil_client_config, QuilTlsConnector};
 
@@ -1039,22 +1039,52 @@ pub async fn ensure_shard_tree_fresh(
         }
     };
     let blob_size = serialized.len();
-    match hg_store.save_tree_blob(set_str, phase_str, shard, &serialized) {
-        Ok(()) => info!(?phase, blob_size, "shard tree refreshed"),
-        Err(e) => warn!(?phase, error = %e, "save_tree_blob failed"),
+    // Stage the tree blob and every per-vertex blob into a single
+    // transaction so the refresh is atomic: a crash or error partway
+    // through must not leave the tree blob and vertex data out of sync.
+    match persist_shard_refresh(
+        hg_store.as_ref(),
+        set_str,
+        phase_str,
+        shard,
+        &serialized,
+        &vertex_data,
+    ) {
+        Ok(persisted_vertices) => info!(
+            ?phase,
+            blob_size, persisted_vertices, "shard tree + per-vertex data refreshed"
+        ),
+        Err(e) => warn!(?phase, error = %e, "shard refresh persist failed, NOT persisted"),
     }
-
-    let mut persisted_vertices = 0usize;
-    for entry in &vertex_data {
-        if hg_store
-            .save_vertex_underlying(set_str, phase_str, shard, &entry.key, &entry.underlying_data)
-            .is_ok()
-        {
-            persisted_vertices += 1;
-        }
-    }
-    info!(?phase, persisted_vertices, "per-vertex data refreshed");
     Ok(stats)
+}
+
+/// Persist a shard tree blob and its per-vertex underlying blobs in one
+/// transaction. Either everything commits or (on error) nothing does —
+/// the txn is dropped, which aborts the batch. Returns the number of
+/// per-vertex blobs staged.
+fn persist_shard_refresh(
+    hg_store: &RocksHypergraphStore,
+    set_str: &str,
+    phase_str: &str,
+    shard: &ShardKey,
+    serialized: &[u8],
+    vertex_data: &[VertexDataEntry],
+) -> Result<usize, quil_types::error::QuilError> {
+    let txn = hg_store.new_transaction(false)?;
+    hg_store.save_tree_blob_txn(txn.as_ref(), set_str, phase_str, shard, serialized)?;
+    for entry in vertex_data {
+        hg_store.save_vertex_underlying_txn(
+            txn.as_ref(),
+            set_str,
+            phase_str,
+            shard,
+            &entry.key,
+            &entry.underlying_data,
+        )?;
+    }
+    txn.commit()?;
+    Ok(vertex_data.len())
 }
 
 /// Incremental prover tree sync. Loads the cached tree, compares its root
@@ -1377,20 +1407,20 @@ pub async fn ensure_prover_tree_incremental(
         }
     };
     let blob_size = serialized.len();
-    match hg_store.save_tree_blob(set_str, phase_str, &shard, &serialized) {
-        Ok(()) => info!(?phase, blob_size, "prover tree updated incrementally"),
-        Err(e) => warn!(?phase, error = %e, "save_tree_blob failed"),
+    // Atomic persist: tree blob + per-vertex blobs in one transaction.
+    match persist_shard_refresh(
+        hg_store.as_ref(),
+        set_str,
+        phase_str,
+        &shard,
+        &serialized,
+        &vertex_data,
+    ) {
+        Ok(persisted_vertices) => info!(
+            ?phase,
+            blob_size, persisted_vertices, "prover tree + per-vertex data updated incrementally"
+        ),
+        Err(e) => warn!(?phase, error = %e, "incremental persist failed, NOT persisted"),
     }
-
-    let mut persisted_vertices = 0usize;
-    for entry in &vertex_data {
-        if hg_store
-            .save_vertex_underlying(set_str, phase_str, &shard, &entry.key, &entry.underlying_data)
-            .is_ok()
-        {
-            persisted_vertices += 1;
-        }
-    }
-    info!(?phase, persisted_vertices, "per-vertex data updated incrementally");
     Ok(stats)
 }

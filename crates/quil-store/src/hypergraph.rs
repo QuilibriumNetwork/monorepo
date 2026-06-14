@@ -33,6 +33,11 @@ impl RocksHypergraphStore {
     /// Save a fully-serialized vector commitment tree as a single blob,
     /// keyed by `(set_type, phase_type, shard_key)`. The bytes should be
     /// the output of `quil_tries::serialize_tree`.
+    ///
+    /// Test-only: production persists tree blobs transactionally via
+    /// [`save_tree_blob_txn`]. Kept for unit tests that don't need a
+    /// transaction around the write.
+    #[cfg(test)]
     pub fn save_tree_blob(
         &self,
         set_type: &str,
@@ -44,6 +49,38 @@ impl RocksHypergraphStore {
         self.db
             .put(&key, bytes)
             .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
+    /// Transaction-aware tree-blob write: stages the put into `txn`'s
+    /// batch so the blob becomes durable atomically with the rest of the
+    /// transaction.
+    ///
+    /// Unlike the generic [`HypergraphStore`] writers, this deliberately
+    /// does NOT fall back to a direct write when `txn` isn't a `RocksTxn`.
+    /// A silent fallback would persist the blob outside the caller's
+    /// transaction, defeating the atomicity this method exists to provide.
+    /// The only caller obtains `txn` from [`new_transaction`], which always
+    /// yields a `RocksTxn`, so the batch path always applies; an
+    /// unrecognized txn is a programming error and is surfaced loudly
+    /// rather than masked by a non-transactional write.
+    ///
+    /// [`new_transaction`]: quil_types::store::HypergraphStore::new_transaction
+    pub fn save_tree_blob_txn(
+        &self,
+        txn: &dyn Transaction,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
+        if with_rocks_batch(txn, |b| b.put(&key, bytes)) {
+            return Ok(());
+        }
+        Err(QuilError::Internal(
+            "save_tree_blob_txn requires a RocksTxn; refusing to write outside the transaction"
+                .into(),
+        ))
     }
 
     /// Load a previously stored tree blob, or `Ok(None)` if no blob exists
@@ -60,8 +97,17 @@ impl RocksHypergraphStore {
             .map_err(|e| QuilError::Store(e.to_string()))
     }
 
-    /// Persist one vertex's `underlying_data` sub-tree blob. See
-    /// `quil_tries::deserialize_go_tree` for parsing the wire format.
+    /// Persist one vertex's `underlying_data` sub-tree blob directly,
+    /// outside any transaction. See `quil_tries::deserialize_go_tree` for
+    /// parsing the wire format.
+    ///
+    /// Test-only: production persists vertex content transactionally via
+    /// [`save_vertex_underlying_txn`] (or the `HypergraphStore` trait
+    /// method, which delegates to it). Kept as a direct-write fixture for
+    /// tests that seed the per-vertex keyspace without a transaction. Gated
+    /// behind the `test-utils` feature so it can't be reached from
+    /// production code; consuming crates enable it via `[dev-dependencies]`.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn save_vertex_underlying(
         &self,
         set_type: &str,
@@ -71,6 +117,29 @@ impl RocksHypergraphStore {
         bytes: &[u8],
     ) -> Result<()> {
         let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
+        self.db
+            .put(&key, bytes)
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
+    /// Transaction-aware variant of [`save_vertex_underlying`]: stages the
+    /// write into `txn`'s batch so vertex content becomes durable
+    /// atomically with the tree nodes and shard commit of the surrounding
+    /// transaction, falling back to a direct write for an unrecognized txn
+    /// type.
+    pub fn save_vertex_underlying_txn(
+        &self,
+        txn: &dyn Transaction,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        vertex_key: &[u8],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
+        if with_rocks_batch(txn, |b| b.put(&key, bytes)) {
+            return Ok(());
+        }
         self.db
             .put(&key, bytes)
             .map_err(|e| QuilError::Store(e.to_string()))
@@ -509,14 +578,15 @@ impl HypergraphStore for RocksHypergraphStore {
 
     fn save_vertex_underlying(
         &self,
+        txn: &dyn Transaction,
         set_type: &str,
         phase_type: &str,
         shard_key: &ShardKey,
         vertex_key: &[u8],
         data: &[u8],
     ) -> Result<()> {
-        RocksHypergraphStore::save_vertex_underlying(
-            self, set_type, phase_type, shard_key, vertex_key, data,
+        RocksHypergraphStore::save_vertex_underlying_txn(
+            self, txn, set_type, phase_type, shard_key, vertex_key, data,
         )
     }
 

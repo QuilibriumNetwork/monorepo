@@ -102,7 +102,7 @@ impl HypergraphStore for MemStore {
         let k = Self::node_key(set, phase, shard, key);
         Ok(self.nodes.lock().unwrap().get(&k).cloned())
     }
-    fn save_vertex_underlying(&self, set: &str, phase: &str, shard: &ShardKey, key: &[u8], data: &[u8]) -> Result<()> {
+    fn save_vertex_underlying(&self, _txn: &dyn quil_types::store::Transaction, set: &str, phase: &str, shard: &ShardKey, key: &[u8], data: &[u8]) -> Result<()> {
         let k = Self::node_key(set, phase, shard, key);
         self.nodes.lock().unwrap().insert(k, data.to_vec());
         let scope = Self::vertex_scope(set, phase, shard);

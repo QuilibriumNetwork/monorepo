@@ -867,6 +867,7 @@ impl LazyVectorCommitmentTree {
             if let Some(Some(node)) = root_guard.as_ref() {
                 walk_leaves_persist(
                     node,
+                    txn,
                     self.store.as_ref(),
                     &self.set_type,
                     &self.phase_type,
@@ -1168,6 +1169,7 @@ fn index_by_key(
 /// keyspace. Mirrors `lazy_tree::commit`'s vertex-data loop.
 fn walk_leaves_persist(
     node: &VectorCommitmentNode,
+    txn: &dyn Transaction,
     store: &dyn HypergraphStore,
     set_type: &str,
     phase_type: &str,
@@ -1175,12 +1177,12 @@ fn walk_leaves_persist(
 ) -> Result<()> {
     match node {
         VectorCommitmentNode::Leaf(l) if !l.value.is_empty() => {
-            store.save_vertex_underlying(set_type, phase_type, shard_key, &l.key, &l.value)
+            store.save_vertex_underlying(txn, set_type, phase_type, shard_key, &l.key, &l.value)
         }
         VectorCommitmentNode::Leaf(_) => Ok(()),
         VectorCommitmentNode::Branch(b) => {
             for child in b.children.iter().flatten() {
-                walk_leaves_persist(child, store, set_type, phase_type, shard_key)?;
+                walk_leaves_persist(child, txn, store, set_type, phase_type, shard_key)?;
             }
             Ok(())
         }
