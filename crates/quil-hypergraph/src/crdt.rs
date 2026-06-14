@@ -609,11 +609,6 @@ impl HypergraphCrdt {
     /// to `commit()` — reads from the in-memory tree without writing
     /// anything to the store. Returns an empty vec if the shard/phase
     /// has no tree loaded.
-    /// Compute the current root commitment for a single phase set
-    /// (e.g. vertex-adds) of a single shard. Lightweight alternative
-    /// to `commit()` — reads from the in-memory tree without writing
-    /// to RocksDB. Returns an empty vec if the shard/phase has no
-    /// tree loaded.
     pub fn compute_shard_root(
         &self,
         set_type: &str,
@@ -631,23 +626,10 @@ impl HypergraphCrdt {
         let Some(t) = tree else {
             return Vec::new();
         };
-        // Use a no-op transaction — we only want the in-memory
-        // commitment, not a store write. `commit` loads the root
-        // if needed, walks dirty nodes, and returns the root hash.
-        struct NoopTxn;
-        impl quil_types::store::Transaction for NoopTxn {
-            fn get(&self, _: &[u8]) -> quil_types::error::Result<Option<Vec<u8>>> { Ok(None) }
-            fn set(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-            fn commit(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
-            fn delete(&self, _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-            fn abort(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
-            fn new_iter(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<Box<dyn quil_types::store::Iterator>> {
-                Err(quil_types::error::QuilError::Internal("noop".into()))
-            }
-            fn delete_range(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-            fn as_any(&self) -> &dyn std::any::Any { self }
-        }
-        t.commit(&NoopTxn, self.prover.as_ref()).unwrap_or_default()
+        // Read-only root computation: recomputes commitments in memory
+        // and returns the root hash without writing to the store or
+        // touching the tree's dirty bookkeeping.
+        t.compute_root(self.prover.as_ref()).unwrap_or_default()
     }
 
     /// Look up whether a vertex exists (in adds and not in removes).
@@ -794,6 +776,11 @@ impl HypergraphCrdt {
     #[cfg(test)]
     pub(crate) fn insert_shard_metadata_for_test(&self, key: ShardKey, meta: ShardMetadata) {
         self.shard_metadata.write().unwrap().insert(key, meta);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vertex_adds_dirty_for_test(&self, key: &ShardKey) -> bool {
+        self.phase_sets.read().unwrap().vertex_adds.get(key).map(|t| t.is_dirty()).unwrap_or(false)
     }
 
     #[cfg(test)]
@@ -975,6 +962,32 @@ mod tests {
         crdt.add_vertex(&loc(0xAA, 0x01), b"shard-1").unwrap();
         crdt.add_vertex(&loc(0xBB, 0x01), b"shard-2").unwrap();
         assert_eq!(crdt.commit(1).unwrap().len(), 2);
+    }
+
+    #[test] fn compute_shard_root_is_read_only() {
+        let store = Arc::new(MemStore::new());
+        let crdt = HypergraphCrdt::new(store.clone(), Arc::new(HashingProver));
+        // app[0] = 0x01 (<= 0x3f, not all-zero) so bloom indices are computed.
+        let l = loc(0x01, 0x02);
+        crdt.add_vertex(&l, b"data").unwrap();
+        let sk = crate::addressing::shard_key_for_location(&l);
+
+        // Read-only root computation returns a real, non-empty root...
+        let root = crdt.compute_shard_root("vertex", "adds", &sk);
+        assert!(!root.is_empty(), "compute_shard_root should return a root");
+        assert_ne!(root, vec![0u8; 64]);
+
+        // ...but persists nothing and leaves the tree dirty (uncommitted).
+        assert_eq!(store.node_count(), 0, "compute_shard_root must not write tree nodes");
+        assert_eq!(store.per_vertex_count(), 0, "compute_shard_root must not write vertex underlying data");
+        assert!(crdt.vertex_adds_dirty_for_test(&sk), "tree should still be dirty after a read-only root computation");
+
+        // The read-only path agrees byte-for-byte with what a real commit produces,
+        // and the real commit *does* persist.
+        let committed = crdt.commit(1).unwrap();
+        assert_eq!(committed.get(&sk).unwrap()[0], root,
+            "compute_shard_root must equal the committed vertex-adds root");
+        assert!(store.node_count() > 0, "commit should persist tree nodes");
     }
 
     #[test] fn vertex_and_hyperedge_in_same_shard_both_committed() {

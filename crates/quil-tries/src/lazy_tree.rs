@@ -749,6 +749,27 @@ impl LazyVectorCommitmentTree {
             .insert(by_key, (by_path, node));
     }
 
+    /// Compute the current root commitment **in memory only** — the
+    /// read-only half of `commit`. Walks the in-memory tree under the
+    /// root write guard, recomputing any branch whose `commitment` field
+    /// was cleared by Insert (bottom-up; cached commitments are left
+    /// intact, matching Go's `recalculate=false` short-circuit in
+    /// `commitNode`), and returns the root. Writes nothing to the store
+    /// and does not touch dirty / pending-deletion / dirty-flag
+    /// bookkeeping, so it is safe to call for an uncommitted frame on a
+    /// hot path. Use `commit` (with a real txn) to persist.
+    pub fn compute_root(
+        &self,
+        prover: &(dyn InclusionProver + Sync),
+    ) -> Result<Vec<u8>> {
+        self.ensure_root_loaded()?;
+        let mut root_guard = self.root.write().unwrap();
+        match root_guard.as_mut() {
+            Some(Some(node)) => self.commit_recursive(node, prover),
+            _ => Ok(vec![0u8; 64]),
+        }
+    }
+
     /// Commit: walk the in-memory tree top-down, recomputing every
     /// commitment whose `commitment` field was cleared by Insert,
     /// then persist all touched nodes via `Store.insert_node(txn, ...)`
@@ -767,21 +788,8 @@ impl LazyVectorCommitmentTree {
         txn: &dyn Transaction,
         prover: &(dyn InclusionProver + Sync),
     ) -> Result<Vec<u8>> {
-        self.ensure_root_loaded()?;
-
-        // Recompute commitments. The walker mutates the in-memory
-        // tree under the root write guard: any branch whose
-        // `commitment` field was cleared by Insert is recomputed
-        // bottom-up; cached commitments are left intact (matches
-        // Go's `recalculate=false` short-circuit semantic in
-        // `commitNode`).
-        let root_commitment = {
-            let mut root_guard = self.root.write().unwrap();
-            match root_guard.as_mut() {
-                Some(Some(node)) => self.commit_recursive(node, prover)?,
-                _ => vec![0u8; 64],
-            }
-        };
+        // Recompute commitments in memory (the read-only half of commit).
+        let root_commitment = self.compute_root(prover)?;
 
         // Stage every dirty node + the latest root into the txn. We take a
         // non-draining *snapshot* of the dirty set (just the `(by_key,

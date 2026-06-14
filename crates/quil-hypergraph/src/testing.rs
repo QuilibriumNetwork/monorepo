@@ -64,6 +64,16 @@ impl MemStore {
     fn vertex_scope(set: &str, phase: &str, shard: &ShardKey) -> String {
         format!("{}/{}/{:?}{:?}", set, phase, shard.l1, shard.l2)
     }
+
+    /// Number of tree nodes written to the store (test introspection).
+    pub fn node_count(&self) -> usize {
+        self.nodes.lock().unwrap().len()
+    }
+
+    /// Number of per-vertex underlying blobs written (test introspection).
+    pub fn per_vertex_count(&self) -> usize {
+        self.per_vertex.lock().unwrap().len()
+    }
 }
 
 impl HypergraphStore for MemStore {
