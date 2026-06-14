@@ -481,6 +481,13 @@ impl HypergraphCrdt {
 
         let empty_root = vec![0u8; 64];
         let mut result: HashMap<ShardKey, Vec<Vec<u8>>> = HashMap::new();
+        // Trees whose writes we staged into `txn` this call. Their dirty
+        // bookkeeping is cleared only after `txn.commit()` succeeds, so a
+        // failed/aborted commit leaves them dirty for a safe retry. The
+        // borrows are valid for the whole function: `sets` (the
+        // write-guard) is held until return, and nothing mutates a tree in
+        // between.
+        let mut committed_trees: Vec<&LazyVectorCommitmentTree> = Vec::new();
 
         // Phase tuple: (index into commits[shardKey], phase_type, set_type).
         // Indices match `hypergraph_shard_commit_key` layout in
@@ -523,6 +530,7 @@ impl HypergraphCrdt {
                 }
                 if let Some(tree) = phase_trees[i] {
                     let root = tree.commit(txn.as_ref(), prover)?;
+                    committed_trees.push(tree);
                     // Persist so a subsequent commit(frame_number)
                     // short-circuits on the idempotency check above.
                     self.store.set_shard_commit(
@@ -561,6 +569,14 @@ impl HypergraphCrdt {
         // impl that honors the txn argument (our `RocksTxn`) would
         // lose its buffered writes.
         txn.commit()?;
+
+        // The batch is now durable. Only now is it safe to clear each
+        // committed tree's dirty bookkeeping. If `txn.commit()` above had
+        // failed, the `?` would have returned early and left every tree
+        // dirty, so the next commit re-stages the writes that never landed.
+        for tree in committed_trees {
+            tree.mark_persisted();
+        }
 
         Ok(result)
     }

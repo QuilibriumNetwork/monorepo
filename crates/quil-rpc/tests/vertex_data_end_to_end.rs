@@ -254,6 +254,23 @@ async fn get_vertex_data_round_trips_through_real_commit_path() {
     lazy.commit(txn.as_ref(), &prover).unwrap();
     txn.commit().unwrap();
 
+    // Retry-safety lifecycle: `commit` only *stages* into the txn, so the
+    // tree still considers itself dirty even after `txn.commit()` — the
+    // dirty bookkeeping is cleared only by the explicit `mark_persisted`
+    // "the txn committed" signal (which is exactly what
+    // `HypergraphCRDT::commit` calls after its own `txn.commit()`). This
+    // assertion is red before the deferred-clear fix (commit cleared the
+    // flag itself) and green after.
+    assert!(
+        lazy.is_dirty(),
+        "tree must stay dirty until the caller signals durability via mark_persisted"
+    );
+    lazy.mark_persisted();
+    assert!(
+        !lazy.is_dirty(),
+        "mark_persisted after a confirmed commit must clear the dirty flag"
+    );
+
     let svc = NodeRpcServer::new()
         .with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
 
@@ -352,6 +369,15 @@ async fn get_vertex_data_not_visible_when_commit_txn_aborted() {
     lazy.commit(txn.as_ref(), &prover).unwrap();
     txn.abort().unwrap(); // drop without committing
 
+    // Retry-safety: an aborted commit must leave the tree dirty (no
+    // `mark_persisted` was called), so a later commit re-stages the writes
+    // that never landed. Before the deferred-clear fix, `commit` cleared
+    // the flag eagerly and the tree wrongly believed it had persisted.
+    assert!(
+        lazy.is_dirty(),
+        "an aborted commit must leave the tree dirty for a safe retry"
+    );
+
     let svc = NodeRpcServer::new()
         .with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
 
@@ -382,3 +408,4 @@ async fn get_vertex_data_not_visible_when_commit_txn_aborted() {
         "aborted commit must not leave a durable vertex underlying blob"
     );
 }
+

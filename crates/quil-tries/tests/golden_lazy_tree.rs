@@ -150,6 +150,19 @@ impl BTreeStore {
         Arc::new(Self::default())
     }
 
+    /// Number of tree-node entries currently persisted (by-key +
+    /// by-path). Used to observe whether a commit re-stages node writes.
+    fn kv_len(&self) -> usize {
+        self.inner.lock().unwrap().kv.len()
+    }
+
+    /// Discard all persisted tree nodes, simulating a surrounding
+    /// transaction that was aborted / never committed after `commit`
+    /// staged into it.
+    fn clear_kv(&self) {
+        self.inner.lock().unwrap().kv.clear();
+    }
+
     // Key builders. These MUST match `quil_store::encoding`:
     //   HG_TREE_NODE_BY_KEY  = 0x33
     //   HG_TREE_NODE_BY_PATH = 0x34
@@ -1008,5 +1021,78 @@ fn golden_small_scatter() {
 #[test]
 fn golden_medium_scatter() {
     assert_matches_golden(&GOLDENS[3]);
+}
+
+// ---------------------------------------------------------------------------
+// Retry-safety: `commit` must NOT consume its dirty bookkeeping before the
+// surrounding transaction is durably committed. The tree stays dirty (and a
+// retry re-stages every node write) until the caller confirms durability via
+// `mark_persisted`. See the "consumes dirty state before the outer
+// transaction commits" follow-up in the refactored-galaxy plan.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn commit_defers_dirty_clear_until_mark_persisted() {
+    let store = BTreeStore::new();
+    let tree = LazyVectorCommitmentTree::new(
+        store.clone() as Arc<dyn HypergraphStore>,
+        "vertex",
+        "adds",
+        shard_key_zero(),
+        vec![],
+    );
+
+    let mut ks = KeyStream::new(b"retry-safety");
+    for i in 0..5u64 {
+        let key = ks.next_key().to_vec();
+        let mut value = key.clone();
+        value.reverse();
+        let hash_target = deterministic_hash_target(&key, &value);
+        tree.insert(&key, &value, &hash_target, &BigInt::from(i + 1))
+            .unwrap();
+    }
+    assert!(tree.is_dirty(), "inserts must mark the tree dirty");
+
+    // Commit stages every node write. With the write-through BTreeStore the
+    // writes land immediately, but the tree must remain dirty until the
+    // caller confirms the surrounding txn actually committed. (Before the
+    // fix, `commit` cleared `dirty_flag` here and this assertion failed.)
+    let txn = arc_txn(store.clone());
+    tree.commit(txn.as_ref(), &StubProver).unwrap();
+    assert!(store.kv_len() > 0, "commit must stage node writes");
+    assert!(
+        tree.is_dirty(),
+        "commit must NOT clear dirty state before the caller confirms the txn",
+    );
+
+    // Simulate the surrounding transaction being discarded (abort / crash
+    // before `txn.commit()`): wipe everything the commit just staged.
+    store.clear_kv();
+    assert_eq!(store.kv_len(), 0);
+
+    // A retry must re-stage every node, because the dirty bookkeeping was
+    // never cleared. Before the fix the dirty map was already drained, so
+    // this second commit re-staged nothing and the store stayed empty.
+    let txn2 = arc_txn(store.clone());
+    tree.commit(txn2.as_ref(), &StubProver).unwrap();
+    assert!(
+        store.kv_len() > 0,
+        "retry after a discarded txn must re-stage the node writes",
+    );
+
+    // Once the caller confirms durability, `mark_persisted` clears the
+    // bookkeeping and the tree goes clean.
+    tree.mark_persisted();
+    assert!(!tree.is_dirty(), "mark_persisted must clear the dirty flag");
+
+    // A now-clean tree re-stages no node writes on a subsequent commit.
+    store.clear_kv();
+    let txn3 = arc_txn(store.clone());
+    tree.commit(txn3.as_ref(), &StubProver).unwrap();
+    assert_eq!(
+        store.kv_len(),
+        0,
+        "after mark_persisted a clean tree must not re-stage node writes",
+    );
 }
 
