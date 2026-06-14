@@ -19,7 +19,7 @@ use tonic::Request;
 use quil_crypto::KzgInclusionProver;
 use quil_rpc::node_service::NodeRpcServer;
 use quil_store::{RocksDb, RocksHypergraphStore};
-use quil_tries::{serialize_go_tree, VectorCommitmentTree};
+use quil_tries::{serialize_go_tree, LazyVectorCommitmentTree, VectorCommitmentTree};
 use quil_types::proto::node::{
     node_service_server::NodeService, GetHyperedgeDataRequest, GetVertexDataRequest,
 };
@@ -69,24 +69,14 @@ async fn get_vertex_data_round_trips_inserted_leaves() {
 
     let (serialized_tree, leaves) = build_and_serialize();
     // Persist the serialized sub-tree exactly the way Go's
-    // `hypergraph.SetVertexData` → `store.SaveVertexTree` does.
+    // `hypergraph.SetVertexData` → `store.SaveVertexTree` does, which the
+    // Rust side mirrors with `save_vertex_underlying`. The handler reads
+    // it back via `load_vertex_underlying_raw`, so the writer must use the
+    // matching per-vertex key scheme (not `insert_node`, which keys the
+    // global prover tree's individual nodes under a different prefix).
     store
-        .load_vertex_underlying_raw("vertex", "adds", &shard, &address)
-        .unwrap(); // absent lookup is fine
-    let txn = store.new_transaction(false).unwrap();
-    store
-        .insert_node(
-            txn.as_ref(),
-            "vertex",
-            "adds",
-            &shard,
-            &address,
-            &[],
-            &serialized_tree,
-        )
+        .save_vertex_underlying("vertex", "adds", &shard, &address, &serialized_tree)
         .unwrap();
-    // Commit the batch: RocksTxn buffers writes until `commit()`.
-    txn.commit().unwrap();
 
     let svc = NodeRpcServer::new()
         .with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
@@ -171,19 +161,9 @@ async fn get_hyperedge_data_returns_known_indices() {
     };
 
     let (serialized_tree, leaves) = build_and_serialize();
-    let txn = store.new_transaction(false).unwrap();
     store
-        .insert_node(
-            txn.as_ref(),
-            "hyperedge",
-            "adds",
-            &shard,
-            &address,
-            &[],
-            &serialized_tree,
-        )
+        .save_vertex_underlying("hyperedge", "adds", &shard, &address, &serialized_tree)
         .unwrap();
-    txn.commit().unwrap();
 
     let svc = NodeRpcServer::new()
         .with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
@@ -206,4 +186,109 @@ async fn get_hyperedge_data_returns_known_indices() {
             .unwrap_or_else(|| panic!("missing entry for key {:?}", k));
         assert_eq!(&found.value, v);
     }
+}
+
+#[tokio::test]
+async fn get_vertex_data_round_trips_through_real_commit_path() {
+    // Stronger variant of `get_vertex_data_round_trips_inserted_leaves`.
+    //
+    // The tests above hand-write the per-vertex blob with a direct
+    // `save_vertex_underlying` call. That proves the handler's
+    // load → `deserialize_go_tree` → canonical-index enumeration is
+    // internally correct, but it does NOT prove byte-compatibility with
+    // what production actually persists: the writer is mocked.
+    //
+    // In production nothing calls `save_vertex_underlying` by hand for a
+    // vertex. The blob lands in the per-vertex keyspace as a side effect
+    // of committing the *global* hypergraph tree: `LazyVectorCommitmentTree
+    // ::commit` walks every leaf and persists its `value` via
+    // `walk_leaves_persist` → `save_vertex_underlying`
+    // (see `crates/quil-tries/src/lazy_tree.rs`). The global-tree leaf's
+    // `value` IS the serialized underlying sub-tree, which is exactly what
+    // `GetVertexData` later deserializes.
+    //
+    // So this test drives the real write path end-to-end: build a lazy
+    // tree over the same (set, phase, shard), insert a leaf keyed by the
+    // 64-byte vertex address whose value is the serialized sub-tree, then
+    // `commit`. If the lazy commit's per-vertex persistence ever drifts
+    // from the keyspace/format the handler reads, this fails where the
+    // hand-written variant would stay green.
+    let tmp = TempDir::new().unwrap();
+    let db = RocksDb::open(tmp.path()).unwrap();
+    let store = Arc::new(RocksHypergraphStore::new(Arc::new(db).inner()));
+
+    let mut address = vec![0u8; 64];
+    for (i, b) in address.iter_mut().enumerate().take(32) {
+        *b = 0x30 + i as u8;
+    }
+    let app_address = &address[..32];
+    let shard = ShardKey {
+        l1: quil_hypergraph::addressing::get_bloom_filter_indices(app_address, 256, 3),
+        l2: {
+            let mut l2 = [0u8; 32];
+            l2.copy_from_slice(app_address);
+            l2
+        },
+    };
+
+    let (serialized_tree, leaves) = build_and_serialize();
+
+    // Persist via the production path: commit a lazy global tree whose one
+    // leaf carries the serialized sub-tree as its value.
+    let lazy = LazyVectorCommitmentTree::new(
+        store.clone() as Arc<dyn HypergraphStore>,
+        "vertex",
+        "adds",
+        shard.clone(),
+        Vec::new(), // empty covered_prefix → no shard-range gate
+    );
+    lazy.insert(
+        &address,
+        &serialized_tree,
+        &[],
+        &BigInt::from(serialized_tree.len() as u64),
+    )
+    .unwrap();
+    let txn = store.new_transaction(false).unwrap();
+    let prover = KzgInclusionProver;
+    lazy.commit(txn.as_ref(), &prover).unwrap();
+    txn.commit().unwrap();
+
+    let svc = NodeRpcServer::new()
+        .with_hypergraph_store(store.clone() as Arc<dyn HypergraphStore>);
+
+    let resp = svc
+        .get_vertex_data(Request::new(GetVertexDataRequest {
+            address: address.clone(),
+            full_data: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.set_type, "vertex");
+    assert_eq!(resp.phase_type, "adds");
+    assert_eq!(
+        resp.entries.len(),
+        leaves.len(),
+        "lazy-commit-persisted blob must enumerate the same leaves"
+    );
+    for (k, v) in &leaves {
+        let found = resp
+            .entries
+            .iter()
+            .find(|e| &e.key == k)
+            .unwrap_or_else(|| panic!("missing entry for key {:?}", k));
+        assert_eq!(&found.value, v, "value mismatch for key {:?}", k);
+    }
+
+    // full_data=true must hand back the exact bytes the lazy commit wrote.
+    let resp_full = svc
+        .get_vertex_data(Request::new(GetVertexDataRequest {
+            address: address.clone(),
+            full_data: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp_full.raw_data, serialized_tree);
 }
