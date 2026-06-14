@@ -543,8 +543,7 @@ pub trait HypergraphStore: Send + Sync {
     /// content becomes durable atomically with the tree nodes and shard
     /// commit of the surrounding transaction — matching Go's
     /// `SaveVertexTree`, which threads the transaction through to
-    /// `txn.Set`. Store impls whose transaction type is not recognized
-    /// fall back to a direct write.
+    /// `txn.Set`. 
     fn save_vertex_underlying(
         &self,
         txn: &dyn Transaction,
