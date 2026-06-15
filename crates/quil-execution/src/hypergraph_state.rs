@@ -476,7 +476,7 @@ impl quil_types::store::HypergraphStore for InMemoryHypergraphStore {
     fn load_vertex_underlying_raw(&self, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.nodes.lock().unwrap().get(&Self::key(s, p, sk, k)).cloned())
     }
-    fn save_vertex_underlying(&self, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8], d: &[u8]) -> Result<()> {
+    fn save_vertex_underlying(&self, _txn: &dyn quil_types::store::Transaction, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8], d: &[u8]) -> Result<()> {
         self.nodes.lock().unwrap().insert(Self::key(s, p, sk, k), d.to_vec());
         self.per_vertex.lock().unwrap().insert((Self::scope(s, p, sk), k.to_vec()), d.to_vec());
         Ok(())

@@ -749,6 +749,27 @@ impl LazyVectorCommitmentTree {
             .insert(by_key, (by_path, node));
     }
 
+    /// Compute the current root commitment **in memory only** — the
+    /// read-only half of `commit`. Walks the in-memory tree under the
+    /// root write guard, recomputing any branch whose `commitment` field
+    /// was cleared by Insert (bottom-up; cached commitments are left
+    /// intact, matching Go's `recalculate=false` short-circuit in
+    /// `commitNode`), and returns the root. Writes nothing to the store
+    /// and does not touch dirty / pending-deletion / dirty-flag
+    /// bookkeeping, so it is safe to call for an uncommitted frame on a
+    /// hot path. Use `commit` (with a real txn) to persist.
+    pub fn compute_root(
+        &self,
+        prover: &(dyn InclusionProver + Sync),
+    ) -> Result<Vec<u8>> {
+        self.ensure_root_loaded()?;
+        let mut root_guard = self.root.write().unwrap();
+        match root_guard.as_mut() {
+            Some(Some(node)) => self.commit_recursive(node, prover),
+            _ => Ok(vec![0u8; 64]),
+        }
+    }
+
     /// Commit: walk the in-memory tree top-down, recomputing every
     /// commitment whose `commitment` field was cleared by Insert,
     /// then persist all touched nodes via `Store.insert_node(txn, ...)`
@@ -767,36 +788,25 @@ impl LazyVectorCommitmentTree {
         txn: &dyn Transaction,
         prover: &(dyn InclusionProver + Sync),
     ) -> Result<Vec<u8>> {
-        self.ensure_root_loaded()?;
+        // Recompute commitments in memory (the read-only half of commit).
+        let root_commitment = self.compute_root(prover)?;
 
-        // Recompute commitments. The walker mutates the in-memory
-        // tree under the root write guard: any branch whose
-        // `commitment` field was cleared by Insert is recomputed
-        // bottom-up; cached commitments are left intact (matches
-        // Go's `recalculate=false` short-circuit semantic in
-        // `commitNode`).
-        let root_commitment = {
-            let mut root_guard = self.root.write().unwrap();
-            match root_guard.as_mut() {
-                Some(Some(node)) => self.commit_recursive(node, prover)?,
-                _ => vec![0u8; 64],
-            }
-        };
-
-        // Persist every dirty node + the latest root via the txn.
-        // After persistence the dirty map is cleared — fresh Inserts
-        // will repopulate it.
-        let dirty = std::mem::take(&mut *self.dirty.write().unwrap());
-        let mut latest: HashMap<Vec<u8>, (Vec<i32>, VectorCommitmentNode)> = HashMap::new();
-        for (k, (p, _)) in dirty.iter() {
-            latest.insert(k.clone(), (p.clone(), VectorCommitmentNode::Leaf(LeafNode {
-                key: vec![],
-                value: vec![],
-                hash_target: vec![],
-                commitment: vec![],
-                size: BigInt::zero(),
-            })));
-        }
+        // Stage every dirty node + the latest root into the txn. We take a
+        // non-draining *snapshot* of the dirty set (just the `(by_key,
+        // by_path)` locators — the node body is pulled fresh from the
+        // in-memory tree below) and leave the dirty bookkeeping intact. It
+        // is cleared only once the caller confirms the surrounding
+        // transaction committed, via `mark_persisted`. This keeps commit
+        // retry-safe: if the txn is aborted or never commits, the dirty set
+        // survives and a retry re-stages these writes rather than silently
+        // skipping them.
+        let dirty: Vec<(Vec<u8>, Vec<i32>)> = self
+            .dirty
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(by_key, (by_path, _))| (by_key.clone(), by_path.clone()))
+            .collect();
         // Re-walk the in-memory tree to pull the freshly-committed
         // nodes for every entry in `dirty`. The cheap way: index in-
         // memory nodes by their by_key bytes and look them up.
@@ -808,7 +818,7 @@ impl LazyVectorCommitmentTree {
             }
             idx
         };
-        for (by_key, (by_path, _)) in dirty.into_iter() {
+        for (by_key, by_path) in dirty.into_iter() {
             // Prefer the freshly-committed in-memory copy. If a dirty
             // entry can't be located in the in-memory tree (e.g. a
             // branch displaced by a split, or a leaf that got
@@ -833,8 +843,10 @@ impl LazyVectorCommitmentTree {
             )?;
         }
 
-        // Drop orphaned by-path entries from branch splits.
-        let deletions = std::mem::take(&mut *self.pending_deletions.write().unwrap());
+        // Drop orphaned by-path entries from branch splits. Snapshot (don't
+        // drain) so the deletions also survive an aborted txn for retry;
+        // `mark_persisted` clears them after the caller confirms commit.
+        let deletions = self.pending_deletions.read().unwrap().clone();
         for (by_key, by_path) in deletions {
             // `delete_node` clears both the by-key entry and the
             // by-path pointer (per `RocksHypergraphStore::delete_node`).
@@ -867,6 +879,7 @@ impl LazyVectorCommitmentTree {
             if let Some(Some(node)) = root_guard.as_ref() {
                 walk_leaves_persist(
                     node,
+                    txn,
                     self.store.as_ref(),
                     &self.set_type,
                     &self.phase_type,
@@ -875,7 +888,14 @@ impl LazyVectorCommitmentTree {
             }
         }
 
-        *self.dirty_flag.write().unwrap() = false;
+        // NOTE: dirty bookkeeping (the dirty map, pending deletions, and
+        // dirty flag) is deliberately NOT cleared here. These writes are
+        // only *staged* into `txn`; they become durable when the caller
+        // commits it. The caller signals that with `mark_persisted`, which
+        // is the sole place the dirty state is cleared. Clearing here would
+        // make an aborted/failed/never-committed txn leave the store empty
+        // while the tree believes it persisted — and a retry would skip
+        // re-staging.
         Ok(root_commitment)
     }
 
@@ -1109,6 +1129,18 @@ impl LazyVectorCommitmentTree {
     pub fn is_dirty(&self) -> bool {
         *self.dirty_flag.read().unwrap()
     }
+
+    /// Clear dirty bookkeeping after the transaction that `commit` staged
+    /// into has been durably committed by the caller. Must be called ONLY
+    /// after `txn.commit()` succeeds — calling it earlier reintroduces the
+    /// retry-unsafety the deferred-clear split is designed to fix (a
+    /// failed/aborted batch would leave the store empty while the tree
+    /// believes it persisted). Idempotent.
+    pub fn mark_persisted(&self) {
+        self.dirty.write().unwrap().clear();
+        self.pending_deletions.write().unwrap().clear();
+        *self.dirty_flag.write().unwrap() = false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,6 +1200,7 @@ fn index_by_key(
 /// keyspace. Mirrors `lazy_tree::commit`'s vertex-data loop.
 fn walk_leaves_persist(
     node: &VectorCommitmentNode,
+    txn: &dyn Transaction,
     store: &dyn HypergraphStore,
     set_type: &str,
     phase_type: &str,
@@ -1175,12 +1208,12 @@ fn walk_leaves_persist(
 ) -> Result<()> {
     match node {
         VectorCommitmentNode::Leaf(l) if !l.value.is_empty() => {
-            store.save_vertex_underlying(set_type, phase_type, shard_key, &l.key, &l.value)
+            store.save_vertex_underlying(txn, set_type, phase_type, shard_key, &l.key, &l.value)
         }
         VectorCommitmentNode::Leaf(_) => Ok(()),
         VectorCommitmentNode::Branch(b) => {
             for child in b.children.iter().flatten() {
-                walk_leaves_persist(child, store, set_type, phase_type, shard_key)?;
+                walk_leaves_persist(child, txn, store, set_type, phase_type, shard_key)?;
             }
             Ok(())
         }
