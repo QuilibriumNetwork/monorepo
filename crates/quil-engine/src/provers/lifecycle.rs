@@ -50,6 +50,15 @@ pub const GO_PLAN_ALLOCATE_CAP: usize = 100;
 /// frames ≈ 10 minutes on mainnet, comfortably spanning one full
 /// sync cycle so the next plan_leaves cycle sees the Leaving status.
 pub const LEAVE_COOLDOWN_FRAMES: u64 = 20;
+/// Minimum frames an allocation must have been Active (since its join
+/// confirmed) before it is eligible for a *pure-score* leave. A freshly
+/// established, producing allocation is "fine" — shedding it to chase a
+/// marginally-higher unallocated shard is the churn this dwell prevents
+/// (workers leaving good allocations, rejoining elsewhere, then leaving
+/// again). Health-driven leaves (empty / orphan / halt-risk-deficit swap)
+/// ignore the dwell. Matches one confirm window so a holding is kept at
+/// least as long as it took to establish it.
+pub const SCORE_LEAVE_MIN_HOLD_FRAMES: u64 = DEFAULT_CONFIRM_WINDOW_FRAMES;
 /// Per-filter cooldown between successive Join proposals on the same
 /// filter. Closes the orphan-Joining gap created by
 /// `PROPOSAL_TIMEOUT_FRAMES` (10) being shorter than typical
@@ -1494,6 +1503,27 @@ impl ProverLifecycle {
                 .cloned()
                 .collect();
 
+            // Min-hold dwell: allocations confirmed within the last
+            // `SCORE_LEAVE_MIN_HOLD_FRAMES` are exempt from pure-score
+            // leaves so a freshly-established, producing holding isn't
+            // churned to chase a marginally-better unallocated shard.
+            // (Halt-risk swap, empty, and orphan leaves ignore this.)
+            let min_hold_filters: std::collections::HashSet<Vec<u8>> = prover_info
+                .as_ref()
+                .map(|p| {
+                    p.allocations
+                        .iter()
+                        .filter(|a| {
+                            a.join_confirm_frame_number > 0
+                                && frame_number
+                                    < a.join_confirm_frame_number
+                                        .saturating_add(SCORE_LEAVE_MIN_HOLD_FRAMES)
+                        })
+                        .map(|a| a.confirmation_filter.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
             // Score-driven candidates — only meaningful when there are
             // unallocated alternatives to compare against.
             let score_candidates: Vec<Vec<u8>> = if !proposal_descriptors.is_empty() {
@@ -1505,6 +1535,7 @@ impl ProverLifecycle {
                     self.units,
                     self.strategy,
                     free_worker_ids.len(),
+                    &min_hold_filters,
                 )
             } else {
                 Vec::new()
@@ -2287,13 +2318,16 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
+        // Evaluate well past SCORE_LEAVE_MIN_HOLD_FRAMES (360) so the
+        // anti-churn dwell doesn't exempt these allocations (join_confirm
+        // = 11) from score-driven leaves.
+        lifecycle.set_prover_root_verified_frame(500);
 
-        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let actions = lifecycle.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap();
         let proposed = count_proposed_leaves(&actions);
         assert!(
             proposed > 0,
-            "expected ProposeLeave when allocated shards score below the 67% threshold of unallocated alternatives; got {:?}",
+            "expected ProposeLeave when allocated shards score below the threshold of unallocated alternatives; got {:?}",
             actions
         );
     }
@@ -2344,10 +2378,12 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
+        // Past the score-leave dwell (360) so allocations (join_confirm
+        // = 11) are eligible for score-driven leaves.
+        lifecycle.set_prover_root_verified_frame(500);
 
         // First cycle proposes leaves.
-        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let actions = lifecycle.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap();
         let first_leaves: Vec<Vec<u8>> = actions
             .iter()
             .filter_map(|a| match a {
@@ -2365,8 +2401,8 @@ mod proposal_loop_tests {
         // Second cycle, 4 frames later (well within LEAVE_COOLDOWN_FRAMES=20)
         // — must NOT re-propose Leave on the same filters.
         // Bump prover_root_verified_frame so the readiness gate passes.
-        lifecycle.set_prover_root_verified_frame(104);
-        let actions = lifecycle.evaluate(104, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        lifecycle.set_prover_root_verified_frame(504);
+        let actions = lifecycle.evaluate(504, 1, reg.as_ref(), wm.as_ref()).unwrap();
         let repeat_leaves: Vec<Vec<u8>> = actions
             .iter()
             .filter_map(|a| match a {
@@ -2426,12 +2462,14 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
-        let _ = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        // Past the score-leave dwell (360) so the allocations (join_confirm
+        // = 11) are score-leave eligible.
+        lifecycle.set_prover_root_verified_frame(500);
+        let _ = lifecycle.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap();
 
         // After the cooldown window, the same filters should be
-        // eligible again. (Use frame 100 + LEAVE_COOLDOWN_FRAMES = 120.)
-        let later_frame = 100 + LEAVE_COOLDOWN_FRAMES;
+        // eligible again. (Use frame 500 + LEAVE_COOLDOWN_FRAMES.)
+        let later_frame = 500 + LEAVE_COOLDOWN_FRAMES;
         lifecycle.set_prover_root_verified_frame(later_frame);
         let actions = lifecycle.evaluate(later_frame, 1, reg.as_ref(), wm.as_ref()).unwrap();
         let leaves: Vec<Vec<u8>> = actions

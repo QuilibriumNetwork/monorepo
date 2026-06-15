@@ -69,6 +69,18 @@ pub struct ShardDescriptor {
 /// reward-greedy candidate.
 pub const HALT_RISK_PROVER_COUNT: u64 = 3;
 
+/// Score-driven leave threshold, as a percent of the best unallocated
+/// shard's score: an allocated shard is a pure-score leave candidate only
+/// when it scores below this fraction of the best available alternative.
+/// Lowered from the original 67% to 40% to curb worker churn — at 67%,
+/// on a small/forming network the optimistic joiner-ring score of the
+/// best unallocated shard is almost always ~2x a healthy holding, so every
+/// fine allocation perpetually trips the threshold and the node thrashes
+/// (leave → rejoin elsewhere → that shard dilutes → leave again). 40%
+/// means only a large, durable score gap justifies abandoning a holding.
+/// Paired with the `SCORE_LEAVE_MIN_HOLD_FRAMES` dwell in the lifecycle.
+pub const SCORE_LEAVE_THRESHOLD_PERCENT: u64 = 40;
+
 /// A proposed shard allocation.
 #[derive(Debug, Clone)]
 pub struct Proposal {
@@ -574,6 +586,12 @@ pub fn plan_leaves(
     units: u64,
     strategy: Strategy,
     free_workers: usize,
+    // Filters exempt from *pure-score* leaves because their allocation
+    // was confirmed too recently (within `SCORE_LEAVE_MIN_HOLD_FRAMES`).
+    // A freshly-established, producing allocation is "fine" — don't shed
+    // it to chase a marginally-higher unallocated shard. Halt-risk swap
+    // picks below ignore this set (coverage takes priority).
+    min_hold_filters: &std::collections::HashSet<Vec<u8>>,
 ) -> Vec<Vec<u8>> {
     if allocated_shards.is_empty() || unallocated_shards.is_empty() {
         return Vec::new();
@@ -588,8 +606,9 @@ pub fn plan_leaves(
         _ => return Vec::new(),
     };
 
-    // Leave threshold = best_unalloc * 67 / 100
-    let threshold = &best_unalloc * BigInt::from(67) / BigInt::from(100);
+    // Leave threshold = best_unalloc * SCORE_LEAVE_THRESHOLD_PERCENT / 100
+    let threshold =
+        &best_unalloc * BigInt::from(SCORE_LEAVE_THRESHOLD_PERCENT) / BigInt::from(100);
 
     // Halt-risk swap demand: count unallocated halt-risk shards we
     // are NOT currently joining. (Our pending Joining shards are
@@ -636,6 +655,10 @@ pub fn plan_leaves(
     let below_threshold: Vec<(Vec<u8>, BigInt)> = shielded_scores
         .iter()
         .filter(|sc| sc.score < threshold)
+        // Dwell exemption: a recently-confirmed allocation is held even if
+        // it scores below threshold — don't churn a freshly-established
+        // holding. (Halt-risk swap picks below are NOT exempted.)
+        .filter(|sc| !min_hold_filters.contains(&allocated_shards[sc.idx].filter))
         .map(|sc| (allocated_shards[sc.idx].filter.clone(), sc.score.clone()))
         .collect();
 
@@ -686,7 +709,8 @@ pub fn plan_leaves(
             picked = picks.len(),
             ?picks_summary,
             strategy = ?strategy,
-            "plan_leaves: proposing leaves (below 67% threshold + halt-risk swap, shield applied)"
+            threshold_pct = SCORE_LEAVE_THRESHOLD_PERCENT,
+            "plan_leaves: proposing leaves (below threshold_pct of best unallocated + halt-risk swap, shield applied)"
         );
     }
 
@@ -998,7 +1022,7 @@ mod tests {
         let allocated = vec![
             ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16, active_count: 16 },
         ];
-        let result = plan_leaves(&allocated, &[], 50000, &BigInt::from(1_000_000), DEFAULT_UNITS, Strategy::RewardGreedy, 0);
+        let result = plan_leaves(&allocated, &[], 50000, &BigInt::from(1_000_000), DEFAULT_UNITS, Strategy::RewardGreedy, 0, &std::collections::HashSet::<Vec<u8>>::new());
         assert!(result.is_empty());
     }
 
@@ -1404,9 +1428,39 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(250_000), DEFAULT_UNITS, Strategy::RewardGreedy,
             0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0], vec![0xAA]);
+    }
+
+    #[test]
+    fn plan_leaves_dwell_exempts_recently_confirmed() {
+        // Anti-churn dwell: a below-threshold allocation listed in
+        // `min_hold_filters` (confirmed too recently) is NOT a score-leave
+        // candidate, even though the same shard would otherwise be shed.
+        let allocated = vec![make_shard(vec![0xAA], 50_000, 3, 1)]; // ring 3, low
+        let unallocated = vec![make_shard(vec![0xBB], 200_000, 0, 1)]; // ring 0, high
+
+        // No dwell → the weak allocation is shed.
+        let none = std::collections::HashSet::<Vec<u8>>::new();
+        let picked = plan_leaves(
+            &allocated, &unallocated, 50000, &BigInt::from(250_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy, 0, &none,
+        );
+        assert_eq!(picked, vec![vec![0xAA]], "below-threshold alloc leaves without dwell");
+
+        // Dwell exemption on 0xAA → held despite scoring below threshold.
+        let hold: std::collections::HashSet<Vec<u8>> =
+            [vec![0xAAu8]].into_iter().collect();
+        let picked = plan_leaves(
+            &allocated, &unallocated, 50000, &BigInt::from(250_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy, 0, &hold,
+        );
+        assert!(
+            picked.is_empty(),
+            "recently-confirmed allocation must be held (anti-churn dwell)"
+        );
     }
 
     #[test]
@@ -1416,6 +1470,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(200_000), DEFAULT_UNITS, Strategy::RewardGreedy,
             0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert!(filters.is_empty(), "should not leave a competitive shard");
     }
@@ -1433,6 +1488,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(450_000), DEFAULT_UNITS, Strategy::RewardGreedy,
             0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert_eq!(filters.len(), 3, "should cap at 3 leave proposals");
     }
@@ -1447,6 +1503,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(300_000), DEFAULT_UNITS, Strategy::RewardGreedy,
             0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert!(filters.len() >= 2, "should leave at least 2 bad shards");
         assert_eq!(filters[0], vec![0xA2], "worst shard (ring 4) should be first");
@@ -1473,6 +1530,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(600_000),
             DEFAULT_UNITS, Strategy::RewardGreedy, 0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert!(filters.is_empty(),
             "halt-risk allocated shard must not be a leave candidate; got {filters:?}");
@@ -1499,6 +1557,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50_000, &BigInt::from(600_000),
             DEFAULT_UNITS, Strategy::RewardGreedy, 0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert!(filters.is_empty(),
             "shard at threshold+1 must be protected — leaving would push it into halt-risk");
@@ -1530,6 +1589,7 @@ mod tests {
             &allocated, &unallocated, 50_000, &BigInt::from(300_000),
             DEFAULT_UNITS, Strategy::RewardGreedy,
             0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert_eq!(filters.len(), 1,
             "deficit = halt_risk(1) - free_workers(0) = 1 → exactly one swap pick; \
@@ -1560,6 +1620,7 @@ mod tests {
             &allocated, &unallocated, 50_000, &BigInt::from(300_000),
             DEFAULT_UNITS, Strategy::RewardGreedy,
             1,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert!(filters.is_empty(),
             "free_workers(1) >= halt_risk(1) → no swap should fire, threshold \
@@ -1594,6 +1655,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50_000, &BigInt::from(600_000),
             DEFAULT_UNITS, Strategy::RewardGreedy, 0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert_eq!(filters, vec![vec![0xA2]],
             "shield must spare held halt-risk A1 even though its low score \
@@ -1621,6 +1683,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(600_000),
             DEFAULT_UNITS, Strategy::RewardGreedy, 0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert_eq!(filters, vec![vec![0xBB]],
             "non-halt-risk poor performer should still be a leave candidate");
