@@ -81,6 +81,20 @@ pub const HALT_RISK_PROVER_COUNT: u64 = 3;
 /// Paired with the `SCORE_LEAVE_MIN_HOLD_FRAMES` dwell in the lifecycle.
 pub const SCORE_LEAVE_THRESHOLD_PERCENT: u64 = 40;
 
+/// Confirm/reject threshold for `decide_joins` and `decide_leaves`, as a
+/// percent of the best contemporaneous candidate's score. The node keeps
+/// a pending JOIN only when its shard scores >= this fraction of the best
+/// pending join (else it self-withdraws → ProverReject); and it confirms
+/// a pending LEAVE only when the shard scores BELOW this fraction (else it
+/// stays). Lowered from the original 67% to 40% to match
+/// `SCORE_LEAVE_THRESHOLD_PERCENT` and stop the node from self-rejecting
+/// its own joins / over-confirming leaves on a contested fleet where the
+/// optimistic best score sits well above a healthy holding. Purely local
+/// proposer policy — NOT enforced at verification/materialization — so it
+/// only needs to be consistent fleet-wide (it is: single constant), not
+/// matched to any external validator.
+pub const SCORE_DECIDE_THRESHOLD_PERCENT: u64 = 40;
+
 /// A proposed shard allocation.
 #[derive(Debug, Clone)]
 pub struct Proposal {
@@ -529,8 +543,9 @@ pub fn decide_joins(
         }
     };
 
-    // Threshold = best * 67 / 100
-    let threshold = &best * BigInt::from(67) / BigInt::from(100);
+    // Threshold = best * SCORE_DECIDE_THRESHOLD_PERCENT / 100
+    let threshold =
+        &best * BigInt::from(SCORE_DECIDE_THRESHOLD_PERCENT) / BigInt::from(100);
 
     let mut reject = Vec::new();
     let mut confirm = Vec::new();
@@ -796,9 +811,10 @@ pub fn decide_leaves(
         }
     };
 
-    // Threshold = best * 67 / 100
+    // Threshold = best * SCORE_DECIDE_THRESHOLD_PERCENT / 100
     // Reject leave (stay) if score >= threshold; confirm if < threshold.
-    let threshold = &best * BigInt::from(67) / BigInt::from(100);
+    let threshold =
+        &best * BigInt::from(SCORE_DECIDE_THRESHOLD_PERCENT) / BigInt::from(100);
 
     let mut reject = Vec::new();
     let mut confirm = Vec::new();
