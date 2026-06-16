@@ -77,6 +77,18 @@ pub const SCORE_LEAVE_MIN_HOLD_FRAMES: u64 = DEFAULT_CONFIRM_WINDOW_FRAMES;
 /// archive materialize + prover-tree sync round-trip we've seen.
 pub const JOIN_FILTER_COOLDOWN_FRAMES: u64 = 30;
 
+/// Backoff before re-proposing a join to a shard that *rejected* our
+/// last join. `JOIN_FILTER_COOLDOWN_FRAMES` only gates re-proposal off
+/// the last join *attempt*, so a contested shard that keeps rejecting us
+/// is re-hammered every ~cooldown forever (observed: a single filter
+/// oscillating Joining↔Rejected for hours, ~480 rejected allocs on one
+/// node, workers saturated by never-confirming pending joins). When our
+/// allocation lands in Rejected, hold off re-proposing that filter for
+/// this window so the node tries *other* (less contested) unallocated
+/// shards instead of fighting for the same one. Matches one confirm
+/// window. Tunable.
+pub const JOIN_REJECT_BACKOFF_FRAMES: u64 = DEFAULT_CONFIRM_WINDOW_FRAMES;
+
 /// Result of evaluating the current frame for prover lifecycle actions.
 pub enum LifecycleAction {
     /// Nothing to do this frame.
@@ -994,12 +1006,40 @@ impl ProverLifecycle {
         // not on) overlaid by local sizes (authoritative for shards
         // we hold data for). See `merged_shard_sizes` for the rule.
         let shard_sizes_snapshot = self.merged_shard_sizes();
-        let proposal_descriptors = build_proposal_descriptors(
+        let mut proposal_descriptors = build_proposal_descriptors(
             &summaries,
             &all_our_filters,
             &shard_sizes_snapshot,
             &shards_store_filters,
         );
+        // Recently-rejected join backoff: drop any shard that rejected our
+        // join within the last `JOIN_REJECT_BACKOFF_FRAMES`. A Rejected
+        // allocation is terminal so it's excluded from `all_our_filters`
+        // and would otherwise reappear as a join candidate immediately —
+        // producing the Joining↔Rejected oscillation that saturates
+        // workers with never-confirming pending joins. Backing it off
+        // steers the proposer to other (less contested) unallocated
+        // shards. Also keeps these out of the plan_leaves comparison set
+        // (they're not realistically available to us right now).
+        let reject_backoff: std::collections::HashSet<Vec<u8>> = prover_info
+            .as_ref()
+            .map(|p| {
+                p.allocations
+                    .iter()
+                    .filter(|a| {
+                        a.status == ProverStatus::Rejected
+                            && a.join_reject_frame_number > 0
+                            && frame_number
+                                < a.join_reject_frame_number
+                                    .saturating_add(JOIN_REJECT_BACKOFF_FRAMES)
+                    })
+                    .map(|a| a.confirmation_filter.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !reject_backoff.is_empty() {
+            proposal_descriptors.retain(|d| !reject_backoff.contains(&d.filter));
+        }
         let decide_all_descriptors =
             build_decide_descriptors(&summaries, &shard_sizes_snapshot);
         let allocated_descriptors: Vec<ShardDescriptor> = decide_all_descriptors.iter()
@@ -1749,7 +1789,10 @@ fn build_proposal_descriptors(
         out.push(ShardDescriptor {
             filter: s.filter.clone(),
             size: raw_size,
-            ring: ri.joiner_ring,
+            // Contention-dampened joiner ring (see JOIN_CONTENTION_MARGIN):
+            // score as if a few other provers also pile onto this shard,
+            // so near-ring-boundary shards aren't over-proposed.
+            ring: proposer::dampened_joiner_ring(total),
             shards: 1,
             active_on_ring: ri.active_on_joiner_ring,
             total_active_joining: total as u64,
@@ -2234,6 +2277,68 @@ mod proposal_loop_tests {
         assert!(
             count_proposed_joins(&actions) > 0,
             "expected joins to resume past cooldown"
+        );
+    }
+
+    #[test]
+    fn rejected_join_is_backed_off_then_retried() {
+        // A shard that recently rejected our join must NOT be re-proposed
+        // until JOIN_REJECT_BACKOFF_FRAMES elapse — this breaks the
+        // Joining↔Rejected oscillation that saturates workers with
+        // never-confirming pending joins. After the backoff the shard is
+        // eligible again.
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(idle_worker(1));
+        wm.add(idle_worker(2));
+        reg.set_summaries(vec![
+            shard_summary(filter_bytes(0x01), 1),
+            shard_summary(filter_bytes(0x02), 1),
+        ]);
+        // We hold a recently-Rejected allocation for 0x01 (rejected @ 90).
+        let mut rejected = alloc(filter_bytes(0x01), ProverStatus::Rejected, 50);
+        rejected.join_reject_frame_number = 90;
+        reg.set_prover(prover(address.clone(), vec![rejected]));
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+
+        let proposed = |actions: &[LifecycleAction]| -> Vec<Vec<u8>> {
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    LifecycleAction::ProposeJoin { filters, .. } => Some(filters.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+
+        // Within backoff (frame 100 < 90 + JOIN_REJECT_BACKOFF_FRAMES):
+        // 0x01 must NOT be proposed.
+        lifecycle.set_prover_root_verified_frame(100);
+        let a = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let p = proposed(&a);
+        assert!(
+            !p.contains(&filter_bytes(0x01)),
+            "recently-rejected shard 0x01 must be backed off; proposed={:?}",
+            p
+        );
+
+        // Past the backoff: 0x01 is joinable again.
+        let after = 90 + JOIN_REJECT_BACKOFF_FRAMES + 1;
+        lifecycle.set_prover_root_verified_frame(after);
+        let a = lifecycle.evaluate(after, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let p = proposed(&a);
+        assert!(
+            p.contains(&filter_bytes(0x01)),
+            "shard 0x01 must be joinable again after the reject backoff; proposed={:?}",
+            p
         );
     }
 

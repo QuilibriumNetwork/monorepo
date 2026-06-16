@@ -110,6 +110,28 @@ pub struct ShardRingInfo {
 /// Compute ring info from total active+joining prover count.
 ///
 /// Port of Go's `computeShardRingInfo` at `node/consensus/global/worker_allocator.go:540-546`.
+/// Expected number of *other* provers that join a contended shard
+/// alongside us within the same decision window. The naive joiner ring
+/// assumes only we join (`total + 1`); but on a fleet where every prover
+/// greedily targets the same top-scoring (low-ring) shards, they all pile
+/// in at once, the shard's real ring jumps, its reward halves per ring,
+/// it falls below the 67% decide threshold, and the excess joins are
+/// rejected — the `Joining↔Rejected` churn observed in the field. Scoring
+/// the joiner ring as if this many extra provers also join de-prioritizes
+/// near-ring-boundary shards, steering each node toward shards with real
+/// headroom so picks spread instead of colliding. Tunable; `0` reproduces
+/// the original un-dampened joiner ring.
+pub const JOIN_CONTENTION_MARGIN: usize = 4;
+
+/// Joiner ring dampened by [`JOIN_CONTENTION_MARGIN`] — the ring this
+/// shard would land on if we plus `JOIN_CONTENTION_MARGIN` other provers
+/// all joined. Used only for *proposal* scoring (`build_proposal_descriptors`):
+/// the current-ring (decide/leave) path keeps the real ring. With margin
+/// `0` this equals `compute_shard_ring_info(total).joiner_ring`.
+pub fn dampened_joiner_ring(total_active_joining: usize) -> u8 {
+    ((total_active_joining + JOIN_CONTENTION_MARGIN) / 8) as u8
+}
+
 pub fn compute_shard_ring_info(total_active_joining: usize) -> ShardRingInfo {
     let mut ri = ShardRingInfo {
         current_ring: 0,
@@ -821,6 +843,24 @@ pub const DEFAULT_UNITS: u64 = 8_000_000_000;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dampened_joiner_ring_penalizes_near_boundary_shards() {
+        // Margin 4: shards with ample headroom keep their (low) ring;
+        // shards within `margin` of the next ring boundary are bumped up
+        // a ring (lower score) so the proposer avoids piling onto them.
+        assert_eq!(JOIN_CONTENTION_MARGIN, 4, "test assumes default margin");
+        assert_eq!(dampened_joiner_ring(0), 0); // empty → full headroom
+        assert_eq!(dampened_joiner_ring(3), 0); // headroom 5 > margin → unchanged
+        assert_eq!(dampened_joiner_ring(4), 1); // headroom 4 == margin → bumped
+        assert_eq!(dampened_joiner_ring(7), 1); // near boundary → bumped
+        // At/after a real boundary it matches the naive joiner ring.
+        assert_eq!(
+            dampened_joiner_ring(8),
+            compute_shard_ring_info(8).joiner_ring
+        );
+        assert_eq!(dampened_joiner_ring(12), 2); // naive would be 1 → bumped
+    }
 
     #[test]
     fn ring_info_empty() {
