@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/user"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	backupCmd "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/backup"
 	logCmd "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/log"
 	configCmd "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/nodeconfig"
 	proverCmd "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/prover"
@@ -21,10 +21,14 @@ var (
 
 	ConfigDirectory string
 	NodeConfig      *config.Config
+	// NodeConfigDir is the absolute directory holding the active node
+	// config.yml (either the resolved --config value or the default
+	// config's symlink target). Subcommands that write to config.yml
+	// should use this, not the bare "default" symlink.
+	NodeConfigDir string
 
-	NodeUser        *user.User
-	ConfigDirs      string
-	NodeConfigToRun string
+	NodeUser   *user.User
+	ConfigDirs string
 )
 
 // NodeCmd represents the node command
@@ -33,6 +37,12 @@ var NodeCmd = &cobra.Command{
 	Short: "Quilibrium node commands",
 	Long:  `Run Quilibrium node commands.`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Install must be sudo from the first moment: skip root/node init
+		// (config load, default config creation, etc.) until privileges are OK.
+		if cmd == NodeInstallCmd {
+			ExitUnlessSudoForInstall()
+		}
+
 		// Store reference to parent's PersistentPreRun to call it first
 		parent := cmd.Parent()
 		if parent != nil && parent.PersistentPreRun != nil {
@@ -48,27 +58,48 @@ var NodeCmd = &cobra.Command{
 			os.Exit(1)
 		}
 		NodeUser = userLookup
-		ConfigDirs = filepath.Join(userLookup.HomeDir, ".quilibrium", "configs")
+		ConfigDirs = utils.GetNodeConfigsDir()
 		if ConfigDirectory != "" {
+			resolved, rErr := utils.ResolveNodeConfigDir(ConfigDirectory)
+			if rErr != nil {
+				fmt.Printf("error resolving node config: %s\n", rErr)
+				os.Exit(1)
+			}
+			NodeConfigDir = resolved
 			NodeConfig, err = utils.LoadNodeConfig(ConfigDirectory)
-		} else {
-			NodeConfig, err = utils.LoadDefaultNodeConfig()
-		}
-		if err != nil {
-			if err.Error() == utils.ErrConfigNotFoundErrorMessage {
-				fmt.Println("Config not found, creating default configuration...")
-				nodeConfig, err := utils.CreateDefaultNodeConfig(utils.DefaultNodeConfigName)
-				if err != nil {
-					fmt.Printf("error creating default node config: %s\n", err)
-					os.Exit(1)
-				}
-				NodeConfig = nodeConfig
-			} else {
+			if err != nil {
 				fmt.Printf("error loading node config: %s\n", err)
 				os.Exit(1)
 			}
+		} else {
+			NodeConfig, err = utils.LoadDefaultNodeConfig()
+			if err != nil {
+				if err.Error() == utils.ErrConfigNotFoundErrorMessage {
+					fmt.Println("Config not found, creating default configuration...")
+					nodeConfig, err := utils.CreateDefaultNodeConfig(utils.DefaultNodeConfigName)
+					if err != nil {
+						fmt.Printf("error creating default node config: %s\n", err)
+						os.Exit(1)
+					}
+					NodeConfig = nodeConfig
+				} else {
+					fmt.Printf("error loading node config: %s\n", err)
+					os.Exit(1)
+				}
+			}
+			// Resolve the default symlink to an absolute path so writes
+			// target the actual config directory rather than the
+			// symlink path (which breaks if the symlink is later
+			// re-pointed mid-operation).
+			if dir, dErr := utils.GetDefaultNodeConfigDir(); dErr == nil {
+				NodeConfigDir = dir
+			} else {
+				NodeConfigDir = utils.GetDefaultNodeConfigSymlink()
+			}
 		}
 		proverCmd.NodeConfig = NodeConfig
+		configCmd.NodeConfig = NodeConfig
+		configCmd.ActiveNodeConfigDir = NodeConfigDir
 	},
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()
@@ -91,6 +122,13 @@ func init() {
 	NodeCmd.AddCommand(NodeUninstallCmd)
 	NodeCmd.AddCommand(NodeLinkCmd)
 	NodeCmd.AddCommand(logCmd.LogCmd)
+	NodeCmd.AddCommand(NodeGrpcCmd)
+	NodeCmd.AddCommand(NodeRestCmd)
+	NodeCmd.AddCommand(backupCmd.BackupCmd)
+
+	for _, c := range ServiceAliasCommands() {
+		NodeCmd.AddCommand(c)
+	}
 
 	OsType = utils.OsType
 	Arch = utils.Arch

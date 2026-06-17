@@ -11,12 +11,12 @@ import (
 var NodeConfigSwitchCmd = &cobra.Command{
 	Use:   "switch [name]",
 	Short: "Switch the config to be run by the node",
-	Long: fmt.Sprintf(`Switch the configuration to be run by the node by creating a symlink.
+	Long: `Switch the configuration to be run by the node by creating a symlink.
 	
 Example:
   qclient node config switch mynode
 	
-This will symlink %s/mynode to %s`, ConfigDirs, NodeConfigToRun),
+This will symlink the chosen config directory to the default symlink path.`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		var name string

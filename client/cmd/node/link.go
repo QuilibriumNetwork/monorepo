@@ -57,14 +57,14 @@ func NodeCreateSymlink() error {
 		}
 
 		if latestVersion == "" {
-			return fmt.Errorf("no node versions found in %s", utils.NodeDataPath)
+			return fmt.Errorf("no node versions found in %s", utils.GetNodeBinaryDir())
 		}
 		Version = latestVersion
 	}
 
 	// Construct the path to the binary with the highest version
 	normalizedBinaryName := fmt.Sprintf("node-%s-%s-%s", Version, OsType, Arch)
-	nodeBinaryPath := filepath.Join(utils.NodeDataPath, Version, normalizedBinaryName)
+	nodeBinaryPath := filepath.Join(utils.GetNodeBinaryDir(), Version, normalizedBinaryName)
 
 	// Check if the binary exists
 	if _, err := os.Stat(nodeBinaryPath); os.IsNotExist(err) {
@@ -72,7 +72,7 @@ func NodeCreateSymlink() error {
 	}
 
 	// Check if we need sudo privileges for creating symlink in system directory
-	symlinkPath := filepath.Join("/usr/local/bin", utils.NodeServiceName)
+	symlinkPath := utils.GetNodeSymlinkPath()
 	if err := utils.CheckAndRequestSudo(fmt.Sprintf("Creating symlink at %s requires root privileges", symlinkPath)); err != nil {
 		return fmt.Errorf("failed to get sudo privileges: %w", err)
 	}
@@ -88,10 +88,11 @@ func NodeCreateSymlink() error {
 
 // findHighestNodeVersion finds the highest version number in the node binary directory
 func findLatestNodeVersion() (string, error) {
+	binDir := utils.GetNodeBinaryDir()
 	// Read the directory contents
-	entries, err := os.ReadDir(utils.NodeDataPath)
+	entries, err := os.ReadDir(binDir)
 	if err != nil {
-		return "", fmt.Errorf("failed to read node data directory %s: %w", utils.NodeDataPath, err)
+		return "", fmt.Errorf("failed to read node data directory %s: %w", binDir, err)
 	}
 
 	var versions []string

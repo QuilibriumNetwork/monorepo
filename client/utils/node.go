@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 
 	"github.com/pkg/errors"
 
@@ -18,11 +19,8 @@ import (
 var (
 	NetworkConfigOverride  string
 	DefaultNodeConfigName  = "node-quickstart"
-	NodeDataPath           = filepath.Join(BinaryPath, string(ReleaseTypeNode))
-	NodeEnvPath            = filepath.Join(RootQuilibriumPath, "quilibrium.env")
 	NodeServiceName        = "quilibrium-node"
-	DefaultNodeSymlinkPath = filepath.Join(DefaultSymlinkDir, NodeServiceName)
-	LogPath                = "/var/log/quilibrium"
+	DefaultNodeServiceName = "quilibrium-node"
 )
 
 func GetPeerIDFromConfig(cfg *config.Config) peer.ID {
@@ -56,7 +54,37 @@ func GetPrivKeyFromConfig(cfg *config.Config) (crypto.PrivKey, error) {
 }
 
 func IsExistingNodeVersion(version string) bool {
-	return FileExists(filepath.Join(NodeDataPath, version))
+	return FileExists(filepath.Join(GetNodeBinaryDir(), version))
+}
+
+// GetNodeServiceName returns the user-configured systemd/launchd service name,
+// falling back to DefaultNodeServiceName when unset or when the config cannot
+// be read. It is used for Linux systemd unit operations; callers that must
+// reference the fixed binary/package name (e.g. the /usr/local/bin symlink,
+// the macOS launchd label, or cleanup of legacy logrotate configs)
+// should continue to use DefaultNodeServiceName directly.
+// nodeServiceNameRegex restricts service names to characters that are safe
+// for systemd unit filenames and shell invocation.
+var nodeServiceNameRegex = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// ValidateNodeServiceName returns an error when name contains characters
+// that are unsafe for systemd unit filenames / shell invocation.
+func ValidateNodeServiceName(name string) error {
+	if !nodeServiceNameRegex.MatchString(name) {
+		return fmt.Errorf(
+			"invalid service name %q. Allowed characters: letters, digits, '.', '_', '-'",
+			name,
+		)
+	}
+	return nil
+}
+
+func GetNodeServiceName() string {
+	cfg, err := LoadClientConfig()
+	if err != nil || cfg == nil || cfg.NodeServiceName == "" {
+		return DefaultNodeServiceName
+	}
+	return cfg.NodeServiceName
 }
 
 func CheckForSystemd() bool {
@@ -65,20 +93,17 @@ func CheckForSystemd() bool {
 	return err == nil
 }
 
+// GetNodeConfigHomeDir is retained as a thin wrapper over
+// GetNodeConfigsDir so older callers continue to compile. New code should
+// call GetNodeConfigsDir directly.
 func GetNodeConfigHomeDir() string {
-	userLookup, err := GetCurrentSudoUser()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting current user: %v\n", err)
-		os.Exit(1)
-	}
+	return GetNodeConfigsDir()
+}
 
-	path := filepath.Join(userLookup.HomeDir, ".quilibrium", "configs")
-
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		ValidateAndCreateDir(path, userLookup)
-	}
-
-	return path
+// GetDefaultNodeConfigSymlink returns the path of the "default" symlink that
+// the node follows to locate its active configuration directory.
+func GetDefaultNodeConfigSymlink() string {
+	return filepath.Join(GetNodeConfigHomeDir(), "default")
 }
 
 func GetDefaultNodeConfigDir() (string, error) {
@@ -101,9 +126,10 @@ func GetDefaultNodeConfigDir() (string, error) {
 			)
 		}
 
-		fmt.Printf("Default node config directory does not exist, creating it\n")
+		fmt.Printf("Default node config directory does not exist, creating it...")
 		// if neither exists, create it
 		CreateDefaultNodeConfig(DefaultNodeConfigName)
+		fmt.Printf(" done\n")
 		return configPath, nil
 	}
 	// Check if the config path is a symlink
@@ -148,7 +174,58 @@ func LoadNodeConfig(configDirectory string) (*config.Config, error) {
 		return LoadDefaultNodeConfig()
 	}
 
-	return config.LoadConfig(configDirectory, "", false)
+	resolved, err := ResolveNodeConfigDir(configDirectory)
+	if err != nil {
+		return nil, err
+	}
+
+	return config.LoadConfig(resolved, "", false)
+}
+
+// ResolveNodeConfigDir resolves the value passed to --config into an absolute
+// filesystem path, without creating anything on disk. It accepts either a
+// named config (looked up under ~/.quilibrium/configs/<name>) or a direct
+// path (absolute or relative to the current working directory). The resolved
+// directory must exist and contain both config.yml and keys.yml, otherwise an
+// error is returned explaining what was checked.
+func ResolveNodeConfigDir(value string) (string, error) {
+	if value == "" {
+		return "", fmt.Errorf("config directory not specified")
+	}
+
+	namedPath := filepath.Join(GetNodeConfigHomeDir(), value)
+	if info, err := os.Stat(namedPath); err == nil && info.IsDir() {
+		if !HasNodeConfigFiles(namedPath) {
+			return "", fmt.Errorf(
+				"%s: %s", ErrNotValidConfigDirMessage, namedPath,
+			)
+		}
+		return namedPath, nil
+	}
+
+	if info, err := os.Stat(value); err == nil {
+		if !info.IsDir() {
+			return "", fmt.Errorf(
+				"config path is not a directory: %s", value,
+			)
+		}
+		abs, err := filepath.Abs(value)
+		if err != nil {
+			abs = value
+		}
+		if !HasNodeConfigFiles(abs) {
+			return "", fmt.Errorf(
+				"%s: %s", ErrNotValidConfigDirMessage, abs,
+			)
+		}
+		return abs, nil
+	}
+
+	return "", fmt.Errorf(
+		"config directory not found: %q (looked for a named config at %s "+
+			"and as a filesystem path)",
+		value, namedPath,
+	)
 }
 
 // HasNodeConfigFiles checks if a directory contains both config.yml and

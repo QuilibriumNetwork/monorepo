@@ -150,9 +150,9 @@ COPY go-libp2p-blossomsub/go.mod go-libp2p-blossomsub/go.sum go-libp2p-blossomsu
 RUN bash install-emp.sh
 
 ENV CFLAGS="-march=skylake-avx512 -mtune=skylake-avx512"
-RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
+RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && rm -rf build CMakeCache.txt CMakeFiles Makefile cmake_install.cmake CTestTestfile.cmake install_manifest.txt && mkdir -p build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && make -j$(nproc) && make install && cd ..
 
-RUN cd emp-ot && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
+RUN cd emp-ot && rm -rf build CMakeCache.txt CMakeFiles Makefile cmake_install.cmake CTestTestfile.cmake install_manifest.txt && mkdir -p build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && make -j$(nproc) && make install && cd ..
 
 ## Generate Rust bindings and static libs for all seven leaf crates.
 ## One cargo invocation builds all leaf crates plus shared deps exactly once.

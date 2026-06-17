@@ -12,11 +12,22 @@ import (
 
 var BaseReleaseURL = "https://releases.quilibrium.com"
 
+// releaseBaseDir returns the base directory that holds versioned
+// subdirectories for the given release type. Both node and qclient
+// respect the user's configured install directory; defaults are
+// OS-aware (see GetNodeBinaryDir / GetQClientBinaryDir).
+func releaseBaseDir(releaseType ReleaseType) string {
+	if releaseType == ReleaseTypeNode {
+		return GetNodeBinaryDir()
+	}
+	return GetQClientBinaryDir()
+}
+
 // DownloadRelease downloads a specific release file
 func DownloadRelease(releaseType ReleaseType, version string) error {
 	fileName := fmt.Sprintf("%s-%s-%s-%s", releaseType, version, OsType, Arch)
 	fmt.Printf("Getting binary %s...\n", fileName)
-	fmt.Println("Will save to", filepath.Join(BinaryPath, string(releaseType), version))
+	fmt.Println("Will save to", filepath.Join(releaseBaseDir(releaseType), version))
 	url := fmt.Sprintf("%s/%s", BaseReleaseURL, fileName)
 
 	if !DoesRemoteFileExist(url) {
@@ -63,7 +74,7 @@ func GetLatestVersion(releaseType ReleaseType) (string, error) {
 // DownloadReleaseFile downloads a release file from the Quilibrium releases server
 func DownloadReleaseFile(releaseType ReleaseType, fileName string, version string, showError bool) error {
 	url := fmt.Sprintf("%s/%s", BaseReleaseURL, fileName)
-	destDir := filepath.Join(BinaryPath, string(releaseType), version)
+	destDir := filepath.Join(releaseBaseDir(releaseType), version)
 	os.MkdirAll(destDir, 0755)
 	destPath := filepath.Join(destDir, fileName)
 
@@ -102,7 +113,7 @@ func DownloadReleaseSignatures(releaseType ReleaseType, version string) error {
 	var files []string
 	baseName := fmt.Sprintf("%s-%s-%s-%s", releaseType, version, OsType, Arch)
 	fmt.Printf("Searching for signatures for %s from %s\n", baseName, BaseReleaseURL)
-	fmt.Println("Will save to", filepath.Join(BinaryPath, string(releaseType), version))
+	fmt.Println("Will save to", filepath.Join(releaseBaseDir(releaseType), version))
 
 	// Add digest file URL
 	files = append(files, baseName+".dgst")

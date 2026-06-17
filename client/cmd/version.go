@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
@@ -18,9 +19,14 @@ var (
 )
 
 func versionWithPatch(base string) string {
+	// If the base already contains a 4th (patch) component like "2.1.0.22",
+	// return it as-is. Otherwise, append the compiled-in patch number.
+	if strings.Count(base, ".") >= 3 {
+		return base
+	}
 	patch := config.GetPatchNumber()
 	if patch != 0x00 {
-		return fmt.Sprintf("%s-p%d", base, patch)
+		return fmt.Sprintf("%s.%d", base, patch)
 	}
 	return base
 }
@@ -45,7 +51,7 @@ func GetVersionInfo(calcChecksum bool) (VersionInfo, error) {
 
 	// Extract version from executable name (e.g. qclient-2.0.3-linux-amd)
 	baseName := filepath.Base(executable)
-	versionPattern := regexp.MustCompile(`qclient-([0-9]+\.[0-9]+\.[0-9]+)`)
+	versionPattern := regexp.MustCompile(`qclient-([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)`)
 	matches := versionPattern.FindStringSubmatch(baseName)
 
 	version := DefaultVersion

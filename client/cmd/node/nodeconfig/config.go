@@ -2,9 +2,7 @@ package nodeconfig
 
 import (
 	"fmt"
-	"os"
 	"os/user"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
@@ -12,11 +10,22 @@ import (
 )
 
 var (
-	NodeUser        *user.User
-	ConfigDirs      string
+	NodeUser   *user.User
+	ConfigDirs string
+	// NodeConfigToRun is the default-config symlink path
+	// (~/.quilibrium/configs/default). `config create`, `config
+	// import`, and `config switch` use it as the *link destination* so
+	// the node always loads whichever real config is currently aliased
+	// as "default".
 	NodeConfigToRun string
-	SetDefault      bool
-	NodeConfig      *config.Config
+	// ActiveNodeConfigDir is the absolute path to the directory of the
+	// currently-active config.yml — either the resolved --config value
+	// or the default symlink's target. Commands that write to
+	// config.yml (e.g. `config set`) use this so writes land in the
+	// real config dir rather than in the CWD.
+	ActiveNodeConfigDir string
+	SetDefault          bool
+	NodeConfig          *config.Config
 )
 
 // ConfigCmd represents the node config command
@@ -38,13 +47,19 @@ This command provides utilities for configuring your Quilibrium node, such as:
 			parent.PersistentPreRun(parent, args)
 		}
 
-		// Check if the config directory exists
-		user, err := utils.GetCurrentSudoUser()
-		if err != nil {
-			fmt.Println("Error getting current user:", err)
-			os.Exit(1)
-		}
-		ConfigDirs = filepath.Join(user.HomeDir, ".quilibrium", "configs")
+		ConfigDirs = utils.GetNodeConfigsDir()
+		NodeConfigToRun = utils.GetDefaultNodeConfigSymlink()
+		// NodeConfig and ActiveNodeConfigDir are populated by the
+		// parent node command's PersistentPreRun (which has already
+		// run above via parent.PersistentPreRun) so that --config is
+		// honored.
+
+		NodeConfigSwitchCmd.Long = fmt.Sprintf(`Switch the configuration to be run by the node by creating a symlink.
+	
+Example:
+  qclient node config switch mynode
+	
+This will symlink %s/mynode to %s`, ConfigDirs, NodeConfigToRun)
 	},
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()

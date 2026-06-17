@@ -5,6 +5,22 @@ github.env
 Taskfile.yaml
 .git
 
+# CMake in-tree / out-of-tree junk (host paths break Docker builds if copied)
+emp-tool/CMakeCache.txt
+emp-tool/CMakeFiles
+emp-tool/Makefile
+emp-tool/cmake_install.cmake
+emp-tool/CTestTestfile.cmake
+emp-tool/install_manifest.txt
+emp-tool/build
+emp-ot/CMakeCache.txt
+emp-ot/CMakeFiles
+emp-ot/Makefile
+emp-ot/cmake_install.cmake
+emp-ot/CTestTestfile.cmake
+emp-ot/install_manifest.txt
+emp-ot/build
+
 # Rust
 target
 vdf/generated

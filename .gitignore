@@ -18,3 +18,5 @@ target
 
 # Build outputs
 vdf-test*
+
+.cursor

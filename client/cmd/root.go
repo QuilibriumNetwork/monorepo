@@ -81,11 +81,13 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 
 			checksum := sha3.Sum256(b)
 
-			// First check var data path for signatures
-			varDataPath := filepath.Join(utils.ClientDataPath, config.GetVersionString())
-			digestPath := filepath.Join(varDataPath, StandardizedQClientFileName+".dgst")
+			// First check the qclient binary directory for signatures.
+			versionDataPath := filepath.Join(utils.GetQClientBinaryDir(), config.GetVersionString())
+			digestPath := filepath.Join(versionDataPath, StandardizedQClientFileName+".dgst")
 
-			fmt.Printf("Checking signature for %s\n", digestPath)
+			if !clientConfig.Quiet {
+				fmt.Printf("Checking signature for %s\n", digestPath)
+			}
 
 			// Try to read digest from var data path first
 			digest, err := os.ReadFile(digestPath)
@@ -140,8 +142,11 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 				count := 0
 
 				for i := 1; i <= len(config.Signatories); i++ {
-					// Try var data path first for signature files
-					signatureFile := filepath.Join(varDataPath, fmt.Sprintf("%s.dgst.sig.%d", filepath.Base(ex), i))
+					// Try var data path first for signature files. Use the
+					// standardized release filename (qclient-<ver>-<os>-<arch>)
+					// rather than the running executable's basename, since
+					// signatures on disk are named after the release artifact.
+					signatureFile := filepath.Join(versionDataPath, fmt.Sprintf("%s.dgst.sig.%d", StandardizedQClientFileName, i))
 					sig, err := os.ReadFile(signatureFile)
 					if err != nil {
 						// Fall back to checking next to executable
@@ -165,12 +170,16 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 					os.Exit(1)
 				}
 
-				fmt.Println("Signature check passed")
+				if !clientConfig.Quiet {
+					fmt.Println("Signature check passed")
+				}
 			}
 		} else {
-			fmt.Println("Signature check bypassed, be sure you know what you're doing")
-			fmt.Println("----------------------------------------------------------")
-			fmt.Println("")
+			if !clientConfig.Quiet {
+				fmt.Println("Signature check bypassed, be sure you know what you're doing")
+				fmt.Println("----------------------------------------------------------")
+				fmt.Println("")
+			}
 		}
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
@@ -250,5 +259,8 @@ func init() {
 	rootCmd.AddCommand(CrossMintCmd)
 	rootCmd.AddCommand(DownloadSignaturesCmd)
 	rootCmd.AddCommand(LinkCmd)
+	rootCmd.AddCommand(UninstallCmd)
 	rootCmd.AddCommand(VersionCmd)
+	rootCmd.AddCommand(QuietCmd)
+	rootCmd.AddCommand(DevCmd)
 }

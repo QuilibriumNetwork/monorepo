@@ -66,6 +66,39 @@ Examples:
 	},
 }
 
+// serviceAliasCommands returns top-level aliases for service subcommands
+// (everything except install/update/uninstall) so users can run e.g.
+// `qclient node start` instead of `qclient node service start`.
+func ServiceAliasCommands() []*cobra.Command {
+	aliases := []struct {
+		use   string
+		short string
+		run   func()
+	}{
+		{"start", "Start the node service (alias for 'service start')", startService},
+		{"stop", "Stop the node service (alias for 'service stop')", stopService},
+		{"restart", "Restart the node service (alias for 'service restart')", restartService},
+		{"status", "Check the status of the node service (alias for 'service status')", checkServiceStatus},
+		{"enable", "Enable the node service to start on boot (alias for 'service enable')", enableService},
+		{"disable", "Disable the node service from starting on boot (alias for 'service disable')", disableService},
+		{"reload", "Reload the node service (alias for 'service reload')", reloadService},
+	}
+
+	cmds := make([]*cobra.Command, 0, len(aliases))
+	for _, a := range aliases {
+		a := a
+		cmds = append(cmds, &cobra.Command{
+			Use:   a.use,
+			Short: a.short,
+			Args:  cobra.NoArgs,
+			Run: func(cmd *cobra.Command, args []string) {
+				a.run()
+			},
+		})
+	}
+	return cmds
+}
+
 // installService installs the appropriate service configuration for the current OS
 func installService() {
 	if err := utils.CheckAndRequestSudo("Installing service requires root privileges"); err != nil {
@@ -84,7 +117,7 @@ func installService() {
 			// install systemd if not found
 			installSystemd()
 		}
-		if err := createSystemdServiceFile(true); err != nil {
+		if err := CreateSystemdServiceFile(true); err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating systemd service file: %v\n", err)
 			return
 		}
@@ -131,7 +164,7 @@ func startService() {
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "start", utils.NodeServiceName)
+		cmd := exec.Command("sudo", "systemctl", "start", utils.GetNodeServiceName())
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error starting service: %v\n", err)
 			return
@@ -157,7 +190,7 @@ func stopService() {
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "stop", utils.NodeServiceName)
+		cmd := exec.Command("sudo", "systemctl", "stop", utils.GetNodeServiceName())
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error stopping service: %v\n", err)
 			return
@@ -189,7 +222,7 @@ func restartService() {
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "restart", utils.NodeServiceName)
+		cmd := exec.Command("sudo", "systemctl", "restart", utils.GetNodeServiceName())
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error restarting service: %v\n", err)
 			return
@@ -251,7 +284,7 @@ func checkServiceStatus() {
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "status", utils.NodeServiceName)
+		cmd := exec.Command("sudo", "systemctl", "--no-pager", "status", utils.GetNodeServiceName())
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
@@ -277,7 +310,7 @@ func enableService() {
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "enable", utils.NodeServiceName)
+		cmd := exec.Command("sudo", "systemctl", "enable", utils.GetNodeServiceName())
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error enabling service: %v\n", err)
 			return
@@ -304,7 +337,7 @@ func disableService() {
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "disable", utils.NodeServiceName)
+		cmd := exec.Command("sudo", "systemctl", "disable", utils.GetNodeServiceName())
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error disabling service: %v\n", err)
 			return
@@ -317,7 +350,7 @@ func disableService() {
 func createService() {
 	// Create systemd service file
 	if OsType == "linux" {
-		if err := createSystemdServiceFile(true); err != nil {
+		if err := CreateSystemdServiceFile(true); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to create systemd service file: %v\n", err)
 		}
 	} else if OsType == "darwin" {
@@ -335,7 +368,7 @@ func removeService() {
 	}
 
 	if OsType == "linux" {
-		if err := removeSystemdServiceFile(); err != nil {
+		if err := RemoveSystemdServiceFile(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to remove systemd service file: %v\n", err)
 		}
 	} else if OsType == "darwin" {
@@ -347,8 +380,8 @@ func removeService() {
 	}
 }
 
-func removeSystemdServiceFile() error {
-	servicePath := "/etc/systemd/system/" + utils.NodeServiceName + ".service"
+func RemoveSystemdServiceFile() error {
+	servicePath := "/etc/systemd/system/" + utils.GetNodeServiceName() + ".service"
 	if err := os.Remove(servicePath); err != nil {
 		return fmt.Errorf("failed to remove systemd service file: %w", err)
 	}
@@ -367,7 +400,7 @@ func removeMacOSService() error {
 func updateServiceFile() {
 	// Create systemd service file
 	if OsType == "linux" {
-		if err := createSystemdServiceFile(false); err != nil {
+		if err := CreateSystemdServiceFile(false); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to create systemd service file: %v\n", err)
 		}
 	} else if OsType == "darwin" {
@@ -384,13 +417,19 @@ func CreateEnvFile() error {
 	// Create environment file content
 	envContent := `# Quilibrium Node Environment`
 
+	envPath := utils.GetNodeEnvFilePath()
+	// Ensure the install directory exists before writing the env file.
+	if err := utils.ValidateAndCreateDir(filepath.Dir(envPath), NodeUser); err != nil {
+		return fmt.Errorf("failed to create install directory: %w", err)
+	}
+
 	// Write environment file
-	if err := os.WriteFile(utils.NodeEnvPath, []byte(envContent), 0640); err != nil {
+	if err := os.WriteFile(envPath, []byte(envContent), 0640); err != nil {
 		return fmt.Errorf("failed to create environment file: %w", err)
 	}
 
 	// Set ownership of environment file
-	chownCmd := utils.ChownPath(utils.NodeEnvPath, NodeUser, false)
+	chownCmd := utils.ChownPath(envPath, NodeUser, false)
 	if chownCmd != nil {
 		return fmt.Errorf("failed to set environment file ownership: %w", chownCmd)
 	}
@@ -398,8 +437,11 @@ func CreateEnvFile() error {
 	return nil
 }
 
-// createSystemdServiceFile creates the systemd service file with environment file support
-func createSystemdServiceFile(createEnvFile bool) error {
+// CreateSystemdServiceFile creates the systemd service file with environment file support.
+// The unit file is written under the user-configured service name, while the
+// ExecStart/ExecReload commands continue to invoke the fixed binary name so
+// that the /usr/local/bin/quilibrium-node symlink does not need to change.
+func CreateSystemdServiceFile(createEnvFile bool) error {
 	if !utils.CheckForSystemd() {
 		installSystemd()
 	}
@@ -409,12 +451,16 @@ func createSystemdServiceFile(createEnvFile bool) error {
 		return fmt.Errorf("failed to get sudo privileges: %w", err)
 	}
 
-	envPath := filepath.Join(utils.RootQuilibriumPath, "quilibrium.env")
+	envPath := utils.GetNodeEnvFilePath()
 	if createEnvFile {
 		if err := CreateEnvFile(); err != nil {
 			return fmt.Errorf("failed to create environment file: %w", err)
 		}
 	}
+
+	serviceName := utils.GetNodeServiceName()
+	binaryPath := utils.GetNodeSymlinkPath()
+	configPath := filepath.Join(utils.GetNodeConfigsDir(), "default")
 
 	// Create systemd service file content
 	serviceContent := fmt.Sprintf(`[Unit]
@@ -424,26 +470,26 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=quilibrium
-EnvironmentFile=/var/quilibrium/quilibrium.env
-ExecStart=/usr/local/bin/` + utils.NodeServiceName + ` --config ` + ConfigDirs + `/default
+User=%s
+EnvironmentFile=%s
+ExecStart=%s --config %s
 Restart=always
 RestartSec=10
 ExecStop=/bin/kill -s SIGINT $MAINPID
-ExecReload=/bin/kill -s SIGINT $MAINPID && /usr/local/bin/` + utils.NodeServiceName + ` --config ` + ConfigDirs + `/default
+ExecReload=/bin/kill -s SIGINT $MAINPID && %s --config %s
 KillSignal=SIGINT
-RestartSignal=SIGINT
+RestartKillSignal=SIGINT
 FinalKillSignal=SIGKILL
-KillSignal=SIGKILL
+SendSIGKILL=yes
 TimeoutStopSec=240
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-`)
+`, NodeUser.Username, envPath, binaryPath, configPath, binaryPath, configPath)
 
 	// Write service file
-	servicePath := "/etc/systemd/system/quilibrium-node.service"
+	servicePath := "/etc/systemd/system/" + serviceName + ".service"
 	if err := utils.WriteFileAuto(servicePath, serviceContent); err != nil {
 		return fmt.Errorf("failed to create service file: %w", err)
 	}
@@ -474,9 +520,9 @@ func installMacOSService() {
 	<string>{{.Label}}</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/local/bin/quilibrium-node</string>
+		<string>{{.BinaryPath}}</string>
 		<string>--config</string>
-		<string>/opt/quilibrium/config/</string>
+		<string>{{.ConfigPath}}</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
@@ -509,16 +555,41 @@ func installMacOSService() {
 </plist>`
 
 	// Prepare template data
+	// Resolve the active node config's logger.path for launchd's
+	// StandardOutPath/StandardErrorPath. If the active config has no
+	// logger block, fall back to the per-config default directory so
+	// launchd still has a stable place to send stdout/stderr; the node
+	// itself will log to stdout in that case, which launchd will capture.
+	logPath := utils.DefaultNodeLogDirForConfig(filepath.Join(
+		utils.GetNodeConfigsDir(), utils.DefaultNodeConfigName,
+	))
+	if resolved, err := utils.ResolveActiveNodeLog(); err == nil {
+		if resolved.FileBased {
+			logPath = resolved.LogDir
+		} else if resolved.ConfigDir != "" {
+			logPath = utils.DefaultNodeLogDirForConfig(resolved.ConfigDir)
+		}
+	} else if dir, err := utils.GetDefaultNodeConfigDir(); err == nil {
+		logPath = utils.DefaultNodeLogDirForConfig(dir)
+	}
+	if err := os.MkdirAll(logPath, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not create log dir %s: %v\n", logPath, err)
+	}
+
 	data := struct {
 		Label       string
 		DataPath    string
 		ServiceName string
 		LogPath     string
+		BinaryPath  string
+		ConfigPath  string
 	}{
 		Label:       fmt.Sprintf("com.quilibrium.node"),
-		DataPath:    utils.NodeDataPath,
+		DataPath:    utils.GetNodeBinaryDir(),
 		ServiceName: "node",
-		LogPath:     utils.LogPath,
+		LogPath:     logPath,
+		BinaryPath:  utils.GetNodeSymlinkPath(),
+		ConfigPath:  filepath.Join(utils.GetNodeConfigsDir(), "default"),
 	}
 
 	// Parse and execute template

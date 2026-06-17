@@ -88,10 +88,11 @@ func ValidateAndCreateDir(path string, user *user.User) error {
 
 	// Directory doesn't exist, try to create it
 	if os.IsNotExist(err) {
-		fmt.Printf("Creating directory %s\n", path)
+		fmt.Printf("Creating directory %s...", path)
 		if err := os.MkdirAll(path, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %v", path, err)
 		}
+		fmt.Printf(" done\n")
 		if user != nil {
 			ChownPath(path, user, false)
 		}
@@ -150,15 +151,17 @@ func IsSudo() bool {
 func ChownPath(path string, user *user.User, isRecursive bool) error {
 	// Change ownership of the path
 	if isRecursive {
-		fmt.Printf("Changing ownership of %s (recursive) to %s\n", path, user.Username)
+		fmt.Printf("Changing ownership of %s (recursive) to %s...", path, user.Username)
 		if err := exec.Command("chown", "-R", user.Uid+":"+user.Gid, path).Run(); err != nil {
 			return fmt.Errorf("failed to change ownership of %s to %s (requires sudo): %v", path, user.Uid, err)
 		}
+		fmt.Printf(" done\n")
 	} else {
-		fmt.Printf("Changing ownership of %s to %s\n", path, user.Username)
+		fmt.Printf("Changing ownership of %s to %s...", path, user.Username)
 		if err := exec.Command("chown", user.Uid+":"+user.Gid, path).Run(); err != nil {
 			return fmt.Errorf("failed to change ownership of %s to %s (requires sudo): %v", path, user.Uid, err)
 		}
+		fmt.Printf(" done\n")
 	}
 
 	return nil

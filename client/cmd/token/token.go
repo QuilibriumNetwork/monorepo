@@ -35,24 +35,27 @@ var TokenCmd = &cobra.Command{
 		fmt.Println("Loading node config...")
 		if ConfigDirectory != "" {
 			NodeConfig, err = utils.LoadNodeConfig(ConfigDirectory)
-		} else {
-			NodeConfig, err = utils.LoadDefaultNodeConfig()
-		}
-
-		if err != nil {
-			if err.Error() == utils.ErrConfigNotFoundErrorMessage {
-				fmt.Println("Config not found, creating default configuration...")
-				nodeConfig, err := utils.CreateDefaultNodeConfig(
-					utils.DefaultNodeConfigName,
-				)
-				if err != nil {
-					fmt.Printf("error creating default node config: %s\n", err)
-					os.Exit(1)
-				}
-				NodeConfig = nodeConfig
-			} else {
+			if err != nil {
 				fmt.Printf("error loading node config: %s\n", err)
 				os.Exit(1)
+			}
+		} else {
+			NodeConfig, err = utils.LoadDefaultNodeConfig()
+			if err != nil {
+				if err.Error() == utils.ErrConfigNotFoundErrorMessage {
+					fmt.Println("Config not found, creating default configuration...")
+					nodeConfig, err := utils.CreateDefaultNodeConfig(
+						utils.DefaultNodeConfigName,
+					)
+					if err != nil {
+						fmt.Printf("error creating default node config: %s\n", err)
+						os.Exit(1)
+					}
+					NodeConfig = nodeConfig
+				} else {
+					fmt.Printf("error loading node config: %s\n", err)
+					os.Exit(1)
+				}
 			}
 		}
 
