@@ -93,6 +93,48 @@ pub(crate) fn spawn_all(
         fn get_frame(&self, n: u64) -> Result<quil_types::proto::global::GlobalFrame, String> {
             self.0.get_global_frame(n).map_err(|e| e.to_string())
         }
+        /// Assemble the full proposal for frame `n` from the clock store, mirroring
+        /// Go `GlobalConsensusEngine.GetGlobalProposal` (`services.go`): state + the
+        /// parent's QC + the prior-rank TC (optional) + the proposer vote (keyed by
+        /// `(filter, rank, frame-identity)`, where the frame identity is
+        /// `poseidon(header.output)`).
+        fn get_global_proposal(
+            &self,
+            n: u64,
+        ) -> Result<quil_types::proto::global::GlobalProposal, String> {
+            use quil_types::store::ClockStore;
+            let frame = self.0.get_global_frame(n).map_err(|e| e.to_string())?;
+            // Genesis carries no parent cert / vote.
+            if n == 0 {
+                return Ok(quil_types::proto::global::GlobalProposal {
+                    state: Some(frame),
+                    parent_quorum_certificate: None,
+                    prior_rank_timeout_certificate: None,
+                    vote: None,
+                });
+            }
+            let header = frame.header.as_ref().ok_or("frame missing header")?;
+            let rank = header.rank;
+            let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+                .map(|h| h.to_vec())
+                .map_err(|e| format!("frame identity: {e}"))?;
+            // Vote / prior TC are best-effort (Go tolerates their absence).
+            let vote = ClockStore::get_proposal_vote(self.0.as_ref(), &[], rank, &selector).ok();
+            let prior_rank_timeout_certificate =
+                ClockStore::get_timeout_certificate(self.0.as_ref(), &[], rank.saturating_sub(1))
+                    .ok();
+            // Parent QC is keyed by the parent's rank.
+            let parent = self.0.get_global_frame(n - 1).map_err(|e| e.to_string())?;
+            let parent_rank = parent.header.as_ref().map(|h| h.rank).unwrap_or(0);
+            let parent_quorum_certificate =
+                ClockStore::get_quorum_certificate(self.0.as_ref(), &[], parent_rank).ok();
+            Ok(quil_types::proto::global::GlobalProposal {
+                state: Some(frame),
+                parent_quorum_certificate,
+                prior_rank_timeout_certificate,
+                vote,
+            })
+        }
     }
     // Submit handler
     let submit_mc = message_collector.clone();

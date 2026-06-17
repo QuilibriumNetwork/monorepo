@@ -324,6 +324,42 @@ pub fn wire_proposal_to_signed(
     Ok((signed, parent_qc, prior_tc))
 }
 
+/// Convert a proto `GlobalProposal` (as returned by
+/// `GlobalService.GetGlobalProposal`) into a `SignedProposal` + QC (+ optional
+/// TC), reusing [`wire_proposal_to_signed`]. Used by the catch-up sync client to
+/// submit synced proposals to the consensus loop. Errors if the proposal is
+/// missing its state, parent QC, or vote (all required to reconstruct it).
+pub fn proto_proposal_to_signed(
+    proposal: &quil_types::proto::global::GlobalProposal,
+) -> quil_types::error::Result<(
+    quil_consensus::models::SignedProposal<GlobalState, GlobalVote>,
+    std::sync::Arc<dyn quil_consensus::models::QuorumCertificate>,
+    Option<std::sync::Arc<dyn quil_consensus::models::TimeoutCertificate>>,
+)> {
+    use quil_types::error::QuilError;
+    let state = proposal
+        .state
+        .as_ref()
+        .ok_or_else(|| QuilError::InvalidArgument("synced proposal missing state".into()))?;
+    let parent_qc = proposal.parent_quorum_certificate.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("synced proposal missing parent QC".into())
+    })?;
+    let vote = proposal
+        .vote
+        .as_ref()
+        .ok_or_else(|| QuilError::InvalidArgument("synced proposal missing vote".into()))?;
+    let wire = crate::consensus_wire::GlobalProposal {
+        state: crate::consensus_wire::encode_global_frame(state)?,
+        parent_quorum_certificate: crate::consensus_wire::QuorumCertificate::from_proto(parent_qc),
+        prior_rank_timeout_certificate: proposal
+            .prior_rank_timeout_certificate
+            .as_ref()
+            .map(crate::consensus_wire::TimeoutCertificate::from_proto),
+        vote: crate::consensus_wire::ProposalVote::from_proto(vote),
+    };
+    wire_proposal_to_signed(wire)
+}
+
 /// Build a genesis `CertifiedState` for bootstrapping the consensus event loop.
 /// Takes the latest stored frame and produces the trusted root state.
 pub fn build_genesis_certified_state(

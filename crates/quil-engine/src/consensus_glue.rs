@@ -164,7 +164,17 @@ pub struct GlobalConsumer {
     /// frame. Mirrors Go's `OnQuorumCertificateTriggeredRankChange`
     /// at `consensus_protocol.go:622`.
     on_qc_observed: Option<QcObservedHook>,
+    /// Optional hook fired when a proposal can't be applied for lack of its
+    /// parent state (the node has fallen behind). The node binary wires this to
+    /// a catch-up sync that pulls missing proposals from a peer and submits them
+    /// to the consensus loop. Debounced on the node side. Mirrors Go's
+    /// `syncProvider.AddState` trigger.
+    on_missing_parent: Option<SyncTriggerHook>,
 }
+
+/// Hook fired when the consensus engine detects it is behind (an orphaned
+/// proposal with a missing parent). Implemented by the node to drive catch-up.
+pub type SyncTriggerHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// Trait for publishing consensus messages to the network.
 /// Implemented by the node binary to bridge to the P2P layer.
@@ -186,6 +196,7 @@ impl GlobalConsumer {
         Self {
             publisher: None,
             on_qc_observed: None,
+            on_missing_parent: None,
         }
     }
 
@@ -193,6 +204,7 @@ impl GlobalConsumer {
         Self {
             publisher: Some(publisher),
             on_qc_observed: None,
+            on_missing_parent: None,
         }
     }
 
@@ -203,7 +215,16 @@ impl GlobalConsumer {
         Self {
             publisher: Some(publisher),
             on_qc_observed: Some(on_qc_observed),
+            on_missing_parent: None,
         }
+    }
+
+    /// Attach the catch-up trigger fired when the engine orphans a proposal for
+    /// a missing parent (node is behind). Builder-style so it composes with the
+    /// other constructors.
+    pub fn with_sync_trigger(mut self, hook: SyncTriggerHook) -> Self {
+        self.on_missing_parent = Some(hook);
+        self
     }
 }
 
@@ -214,6 +235,12 @@ impl Consumer<GlobalState, GlobalVote> for GlobalConsumer {
 
     fn on_receive_proposal(&self, current_rank: u64, _proposal: &SignedProposal<GlobalState, GlobalVote>) {
         tracing::debug!(rank = current_rank, "received proposal");
+    }
+
+    fn on_missing_parent(&self) {
+        if let Some(hook) = self.on_missing_parent.as_ref() {
+            hook();
+        }
     }
 
     fn on_receive_quorum_certificate(&self, current_rank: u64, qc: &dyn QuorumCertificate) {

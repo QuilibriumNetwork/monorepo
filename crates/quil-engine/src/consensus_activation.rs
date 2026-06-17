@@ -57,6 +57,17 @@ pub struct ConsensusActivationParams {
     /// the clock store so `prove_next_state` for rank+1 can resolve
     /// the latest-QC frame_number/identity.
     pub on_qc_observed: Option<crate::consensus_glue::QcObservedHook>,
+    /// Hook fired when the engine orphans a proposal for a missing parent
+    /// (the node has fallen behind). The node wires this to a catch-up sync
+    /// that pulls missing proposals from a peer and submits them. Debounced
+    /// node-side. Analog of Go's `syncProvider.AddState` trigger.
+    ///
+    /// **Required** (not `Option`): a global-consensus participant that can't
+    /// catch up after falling behind is the exact failure this fixes, so every
+    /// activation must declare its trigger. Callers that genuinely don't want
+    /// catch-up (tests, read-only paths) pass an explicit no-op
+    /// (`Arc::new(|| {})`) so the choice is conscious and greppable.
+    pub on_missing_parent: crate::consensus_glue::SyncTriggerHook,
     /// Override the consensus configuration. Production callers
     /// leave this at `None` to use the default 45s startup delay +
     /// 10s proposal duration. Integration tests set
@@ -175,14 +186,14 @@ pub fn activate_consensus(params: ConsensusActivationParams) -> Result<Consensus
     // Keep a clone of the publisher so the follower can broadcast
     // ProverKick messages on equivocation.
     let publisher_for_follower = params.publisher.clone();
-    let consumer: Arc<dyn quil_consensus::event_handler::Consumer<GlobalState, GlobalVote>> =
-        match (params.publisher, params.on_qc_observed) {
-            (Some(p), Some(qc_hook)) => {
-                Arc::new(GlobalConsumer::with_publisher_and_qc_hook(p, qc_hook))
-            }
-            (Some(p), None) => Arc::new(GlobalConsumer::with_publisher(p)),
-            (None, _) => Arc::new(GlobalConsumer::new()),
+    let consumer: Arc<dyn quil_consensus::event_handler::Consumer<GlobalState, GlobalVote>> = {
+        let base = match (params.publisher, params.on_qc_observed) {
+            (Some(p), Some(qc_hook)) => GlobalConsumer::with_publisher_and_qc_hook(p, qc_hook),
+            (Some(p), None) => GlobalConsumer::with_publisher(p),
+            (None, _) => GlobalConsumer::new(),
         };
+        Arc::new(base.with_sync_trigger(params.on_missing_parent))
+    };
     let participant: Arc<
         dyn quil_consensus::pacemaker::ParticipantConsumer<GlobalState, GlobalVote>,
     > = Arc::new(GlobalParticipantConsumer);

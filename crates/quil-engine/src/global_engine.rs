@@ -172,6 +172,8 @@ impl GlobalConsensusEngine {
             on_finalized_state: None,
             on_incorporated_state: None,
             on_qc_observed: None,
+            // No catch-up trigger on this path (explicit no-op — see field docs).
+            on_missing_parent: std::sync::Arc::new(|| {}),
             config_override: None,
             genesis_qc_override: None,
             kv_db: None,
