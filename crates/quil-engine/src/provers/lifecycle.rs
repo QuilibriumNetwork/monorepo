@@ -529,6 +529,14 @@ impl ProverLifecycle {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Test-only handle to the shared halt state, so tests can simulate
+    /// degraded-coverage / prover-only mode and assert leave proposals
+    /// are suppressed.
+    #[cfg(test)]
+    pub(crate) fn halt_state(&self) -> &Arc<HaltState> {
+        &self.halt_state
+    }
+
     /// Populate the **local** per-shard byte size map (sizes derived
     /// from this node's CRDT vertex-adds). Caller is the archive
     /// poller's `on_frame` closure; it computes sizes per frame via
@@ -1495,7 +1503,18 @@ impl ProverLifecycle {
         //    because `decide_leaves` auto-confirms any pending leave
         //    whose filter isn't in the scored list — and size==0
         //    shards aren't, by the same rule.
-        if shard_info_ready && can_propose && !join_proposed_this_cycle && !active_filters.is_empty()
+        // Do NOT propose leaves while in degraded-coverage / prover-only
+        // mode: coverage data is stale/unreliable there, so the halt-risk
+        // counts that drive `plan_leaves` (and its swap path) are false
+        // positives. A node stuck in prover-only mode was observed
+        // proposing swap leaves against a phantom halt-risk shard for
+        // hours (2026-06-16). Halt-risk swaps are still wanted — but only
+        // off a trustworthy coverage view, i.e. when not halted.
+        if shard_info_ready
+            && can_propose
+            && !join_proposed_this_cycle
+            && !active_filters.is_empty()
+            && !self.halt_state.any_halted()
         {
             let manually_managed_filters: std::collections::HashSet<Vec<u8>> = workers
                 .iter()
@@ -2433,6 +2452,63 @@ mod proposal_loop_tests {
         assert!(
             proposed > 0,
             "expected ProposeLeave when allocated shards score below the threshold of unallocated alternatives; got {:?}",
+            actions
+        );
+    }
+
+    /// Regression: in degraded-coverage / prover-only mode the coverage
+    /// view is stale, so halt-risk counts are false positives. Leave
+    /// proposals (incl. the halt-risk swap) must be suppressed entirely —
+    /// the exact same setup that proposes a leave above must propose NONE
+    /// once `halt_state` reports halted.
+    #[test]
+    fn leaves_suppressed_in_prover_only_mode() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
+        wm.add(allocated_worker(3, filter_bytes(0xA3)));
+
+        reg.set_prover(prover(
+            address.clone(),
+            vec![
+                alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+                alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+                alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+            ],
+        ));
+
+        let crowded = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            crowded(filter_bytes(0xA1), 64, 1_000_000),
+            crowded(filter_bytes(0xA2), 64, 1_000_000),
+            crowded(filter_bytes(0xA3), 64, 1_000_000),
+            crowded(filter_bytes(0xC0), 1, 10_000_000),
+            crowded(filter_bytes(0xC1), 1, 10_000_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(500);
+        // Degraded coverage → prover-only mode.
+        lifecycle.halt_state().mark_halted(filter_bytes(0xC0));
+        assert!(lifecycle.halt_state().any_halted());
+
+        let actions = lifecycle.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(
+            count_proposed_leaves(&actions),
+            0,
+            "no leaves may be proposed while halted (stale coverage → phantom \
+             halt-risk); got {:?}",
             actions
         );
     }

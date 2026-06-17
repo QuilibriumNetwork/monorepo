@@ -647,18 +647,16 @@ pub fn plan_leaves(
     let threshold =
         &best_unalloc * BigInt::from(SCORE_LEAVE_THRESHOLD_PERCENT) / BigInt::from(100);
 
-    // Halt-risk swap demand: count unallocated halt-risk shards we
-    // are NOT currently joining. (Our pending Joining shards are
-    // already excluded from `unallocated_shards` by the caller —
-    // `proposal_descriptors` filters out `all_ours_filters`.) The
-    // deficit between that count and our free worker slots is how
-    // many healthy allocations we will shed this cycle to make
-    // room. Once `free_workers >= halt_risk_count`, the deficit is
-    // 0 and we don't shed anything for the swap — the next
-    // `plan_and_allocate` covers them via the join-side priority
-    // bucket. Bounding by demand prevents the prior failure mode
-    // where the override fired unconditionally every cycle and the
-    // node churned through every healthy holding it had.
+    // Halt-risk swap demand: count unallocated halt-risk shards (size>0,
+    // active_count <= HALT_RISK_PROVER_COUNT) we could cover. The deficit
+    // between that and our free worker slots is how many healthy
+    // allocations we shed this cycle to free room for them. Bounded by
+    // demand so we don't churn through every holding. NOTE: this is only
+    // trustworthy when coverage data is current — the CALLER must not run
+    // leave proposals while in degraded-coverage/prover-only mode, where
+    // `halt_risk_count` is a stale-view false positive (observed
+    // 2026-06-16: a node stuck in prover-only mode proposed swaps against
+    // a phantom halt-risk shard for hours).
     let halt_risk_count = unallocated_shards.iter()
         .filter(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
         .count();
@@ -666,19 +664,11 @@ pub fn plan_leaves(
 
     let alloc_scores = score_shards(allocated_shards, &basis, world_bytes, strategy);
 
-    // Halt-risk shield: never propose a leave on a shard that's
-    // already halt-risk, nor on one where our departure would push
-    // it into halt-risk. `active_count` already includes us
-    // (we're Active on this shard); after we leave it drops by 1,
-    // so the post-leave Active count is `active_count - 1`. To
-    // keep `post_leave > HALT_RISK_PROVER_COUNT` we need
-    // `active_count > HALT_RISK_PROVER_COUNT + 1` — i.e. skip any
-    // shard at or below `HALT_RISK_PROVER_COUNT + 1`. Mirrors the
-    // join-time priority in `plan_and_allocate` and the confirm-
-    // time bypass in `decide_joins`. Joining provers are
-    // intentionally NOT counted — they haven't proven anything
-    // yet. The shield is unconditional and applies on top of every
-    // pick path below.
+    // Halt-risk shield: never propose a leave on a shard that's already
+    // halt-risk, nor on one where our departure would push it into
+    // halt-risk. `active_count` includes us, so after we leave it drops
+    // by 1; to keep `post_leave > HALT_RISK_PROVER_COUNT` we skip any
+    // shard at or below `HALT_RISK_PROVER_COUNT + 1`.
     let shielded_scores: Vec<&Scored> = alloc_scores
         .iter()
         .filter(|sc| {
@@ -687,22 +677,19 @@ pub fn plan_leaves(
         })
         .collect();
 
-    // Score-driven picks: shards below the 67% threshold of best
-    // unallocated. These always go.
+    // Score-driven picks: allocations below `threshold` of the best
+    // unallocated shard. Dwell-exempt recently-confirmed allocations so a
+    // freshly-established holding isn't churned.
     let below_threshold: Vec<(Vec<u8>, BigInt)> = shielded_scores
         .iter()
         .filter(|sc| sc.score < threshold)
-        // Dwell exemption: a recently-confirmed allocation is held even if
-        // it scores below threshold — don't churn a freshly-established
-        // holding. (Halt-risk swap picks below are NOT exempted.)
         .filter(|sc| !min_hold_filters.contains(&allocated_shards[sc.idx].filter))
         .map(|sc| (allocated_shards[sc.idx].filter.clone(), sc.score.clone()))
         .collect();
 
-    // Halt-risk swap picks: when there's a deficit of free workers
-    // relative to waiting halt-risk shards, pick additional healthy
-    // (non-halt-risk-shielded) allocations to shed. Sorted worst-
-    // first so the swap doesn't sacrifice our strongest holdings.
+    // Halt-risk swap picks: when free workers can't cover the waiting
+    // halt-risk shards, shed `halt_risk_deficit` of the worst-scoring
+    // healthy (non-shielded) allocations to make room. Sorted worst-first.
     let mut swap_candidates: Vec<(Vec<u8>, BigInt)> = shielded_scores
         .iter()
         .filter(|sc| sc.score >= threshold)
@@ -710,7 +697,7 @@ pub fn plan_leaves(
         .collect();
     swap_candidates.sort_by(|a, b| a.1.cmp(&b.1));
 
-    // Union, deduplicate, sort worst-first, cap at 3.
+    // Union below-threshold + halt-risk swap picks (deduped), worst-first.
     let mut combined: Vec<(Vec<u8>, BigInt)> = below_threshold.clone();
     let swap_picks = halt_risk_deficit.min(swap_candidates.len());
     for c in swap_candidates.into_iter().take(swap_picks) {
@@ -1619,13 +1606,13 @@ mod tests {
             "shard at threshold+1 must be protected — leaving would push it into halt-risk");
     }
 
-    /// Halt-risk swap: with halt-risk shards waiting in the
-    /// unallocated pool AND no free workers to cover them, the node
-    /// sheds one healthy allocation per halt-risk-deficit shard.
-    /// `free_workers=0`, `halt_risk_count=1` → deficit 1 → exactly
-    /// one leave proposed, picked from the worst-scoring healthy
-    /// alloc (ties broken by score). The shield still protects
-    /// halt-risk holdings (none here).
+    /// Halt-risk swap: with halt-risk shards waiting in the unallocated
+    /// pool AND no free workers to cover them, the node sheds one healthy
+    /// allocation per halt-risk-deficit shard. `free_workers=0`,
+    /// `halt_risk_count=1` → deficit 1 → exactly one swap pick (worst-
+    /// scoring healthy). NOTE: the caller must only run leave proposals
+    /// when coverage data is current (not in prover-only mode); this test
+    /// exercises the pure pick logic.
     #[test]
     fn plan_leaves_swap_fires_when_halt_risk_demand_exceeds_free_workers() {
         let allocated = vec![
