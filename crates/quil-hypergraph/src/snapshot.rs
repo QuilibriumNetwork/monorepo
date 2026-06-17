@@ -32,8 +32,27 @@ use std::sync::{Arc, RwLock};
 use quil_types::store::SnapshotReadable;
 
 /// Maximum number of historical snapshot generations retained.
-/// Mirrors Go's `maxSnapshotGenerations = 10`.
-pub const MAX_GENERATIONS: usize = 10;
+///
+/// Go uses `maxSnapshotGenerations = 10`, but with publishing roughly
+/// once per frame that's only ~10 frames of retention. A follower whose
+/// prover-tree sync runs on a multi-minute cadence (tens of frames apart)
+/// then requests a root the archive has already evicted, gets
+/// `failed to acquire snapshot`, and falls back to a perpetually-lagging
+/// incremental sync — leaving its registry stale and the node stuck in
+/// degraded-coverage prover-only mode (observed 2026-06-16). Widened to
+/// 64 (~64 frames ≈ ~10 min at 10s/frame) so a follower a sync-cycle or
+/// two behind can still acquire the snapshot for a clean full resync.
+///
+/// Each generation now binds a REAL RocksDB point-in-time snapshot (see
+/// `RocksHypergraphSnapshot`), which pins the superseded key versions it
+/// covers until released. Release is driven by `Drop`: a generation
+/// evicted past this cap (FIFO `pop_back`) or cleared on `close()` drops
+/// its handle and releases the snapshot — unless an in-flight sync
+/// session still holds an `Arc` clone, in which case release waits for
+/// that session to finish. So this count bounds disk-version retention;
+/// raising it widens the catch-up window at the cost of pinning more
+/// versions on a busy archive. Tunable.
+pub const MAX_GENERATIONS: usize = 64;
 
 /// One snapshot generation: a (root, frame_number) pair the manager
 /// has seen, plus an optional point-in-time snapshot of the underlying

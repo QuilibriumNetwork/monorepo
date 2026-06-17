@@ -469,10 +469,20 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                             out.push(vec![0u8; 64]);
                         }
                         // Publish the shard's vertex-adds root as a
-                        // snapshot generation so sync clients pinning
-                        // this header can fetch matching CRDT data.
+                        // snapshot generation (binding a real point-in-time
+                        // DB snapshot) so sync clients pinning this header
+                        // get root-consistent CRDT data and acquire succeeds.
                         if !out[0].is_empty() && out[0].iter().any(|b| *b != 0) {
-                            hg.publish_snapshot(out[0].clone(), frame_number);
+                            if let Err(e) =
+                                hg.publish_snapshot_capturing(out[0].clone(), frame_number)
+                            {
+                                warn!(
+                                    filter = hex::encode(&self.filter),
+                                    frame = frame_number,
+                                    error = %e,
+                                    "failed to capture snapshot for published shard root"
+                                );
+                            }
                         }
                         out
                     }

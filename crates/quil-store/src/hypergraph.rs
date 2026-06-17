@@ -27,7 +27,7 @@ impl RocksHypergraphStore {
     /// handle reflects the store's state at the moment of capture and
     /// is immune to subsequent writes through this store.
     pub fn capture_snapshot(&self) -> Result<Arc<RocksHypergraphSnapshot>> {
-        Ok(Arc::new(RocksHypergraphSnapshot::capture(&self.db)?))
+        Ok(Arc::new(RocksHypergraphSnapshot::capture(self.db.clone())?))
     }
 
     /// Save a fully-serialized vector commitment tree as a single blob,
@@ -189,54 +189,46 @@ impl RocksHypergraphStore {
 use std::collections::HashMap;
 use quil_types::store::{ChangeRecord, HypergraphStore, SnapshotReadable, Transaction};
 
-use crate::encoding::HG_TREE_BLOB_PREFIX;
-
-/// Frozen-bytes snapshot of all hypergraph tree blobs at capture time.
+/// A real RocksDB point-in-time snapshot bound to a published root.
 ///
-/// Lifetime / ownership choice: rocksdb 0.22's `Snapshot<'a>` borrows
-/// the `DB`, and binding it to an `Arc<DB>` would require either a
-/// self-referential struct or unsafe lifetime erasure. Rather than
-/// reach for those, we copy every `(set, phase, shard) → tree_blob`
-/// entry from the live store into a `HashMap` at publish time. This
-/// mirrors the semantic Go gets from Pebble's MVCC snapshot — reads
-/// against the snapshot reflect the publish-time state, immune to
-/// later writes — at the cost of holding O(num_shards * num_phases)
-/// blobs in memory per retained generation. With
-/// `MAX_GENERATIONS = 10` and the typical handful of active shards
-/// per node, this stays small. Per-vertex underlying-data blobs are
-/// NOT captured because the sync server doesn't read them; the trait
-/// only exposes `load_tree_blob`.
+/// Reads (`load_tree_blob`) are served at the DB sequence number captured
+/// at `capture` time — immune to later writes through the live store,
+/// matching Go's `tries.TreeBackingStore.NewDBSnapshot`. Capture is cheap
+/// (pins the current sequence; no data copy), but holding the snapshot
+/// pins every key version superseded after it until this struct is
+/// dropped, which releases the snapshot. Release is therefore driven by
+/// the snapshot manager dropping the generation handle (FIFO eviction or
+/// `close()`), gated by any in-flight sync session still holding an `Arc`.
+///
+/// Lifetime: rocksdb 0.22's `SnapshotWithThreadMode<'a, DB>` borrows the
+/// `DB`. To store it past a single scope we keep the `Arc<DB>` in the same
+/// struct and erase the borrow to `'static` (one contained `unsafe` in
+/// `capture`), relying on field drop order — `snapshot` before `_db` — so
+/// the snapshot is always released before its `DB` can go away.
 pub struct RocksHypergraphSnapshot {
-    /// Key: full `hypergraph_tree_blob_key` bytes. Value: tree blob.
-    blobs: HashMap<Vec<u8>, Vec<u8>>,
+    /// Point-in-time snapshot. MUST be declared before `_db`: struct
+    /// fields drop in declaration order, so this drops first (releasing
+    /// the rocksdb snapshot) while the backing `DB` is still alive.
+    snapshot: rocksdb::SnapshotWithThreadMode<'static, rocksdb::DB>,
+    /// Keeps the `DB` alive for as long as `snapshot` borrows it.
+    _db: Arc<rocksdb::DB>,
 }
 
 impl RocksHypergraphSnapshot {
-    /// Walk the live DB and copy every tree-blob entry into memory.
-    /// Iterates only the `HG_TREE_BLOB_PREFIX` range, so cost is
-    /// proportional to the number of (set, phase, shard) tuples — not
-    /// the entire DB.
-    pub fn capture(db: &rocksdb::DB) -> Result<Self> {
-        let prefix = [HG_TREE_BLOB_PREFIX];
-        let iter = db.iterator(rocksdb::IteratorMode::From(
-            &prefix,
-            rocksdb::Direction::Forward,
-        ));
-        let mut blobs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-        for entry in iter {
-            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
-            if !k.starts_with(&prefix) {
-                break;
-            }
-            blobs.insert(k.into_vec(), v.into_vec());
-        }
-        Ok(Self { blobs })
-    }
-
-    /// Number of tree blobs frozen in this snapshot. Test hook.
-    #[doc(hidden)]
-    pub fn blob_count(&self) -> usize {
-        self.blobs.len()
+    /// Capture a RocksDB point-in-time snapshot. Cheap — pins the current
+    /// sequence number; copies no data.
+    pub fn capture(db: Arc<rocksdb::DB>) -> Result<Self> {
+        let snap = db.snapshot();
+        // SAFETY: `snap` borrows `*db`. We move the owning `Arc<DB>` into
+        // `_db` in this same struct, so `*db` outlives the snapshot, and
+        // field declaration order (`snapshot` then `_db`) guarantees the
+        // snapshot is dropped — releasing the rocksdb snapshot — before
+        // `_db` is dropped (which may close the DB). Erasing the borrow to
+        // `'static` only launders the lifetime; layout is unchanged
+        // (a `&DB` plus a raw snapshot pointer), so the transmute is sound.
+        let snapshot: rocksdb::SnapshotWithThreadMode<'static, rocksdb::DB> =
+            unsafe { std::mem::transmute(snap) };
+        Ok(Self { snapshot, _db: db })
     }
 }
 
@@ -248,7 +240,10 @@ impl SnapshotReadable for RocksHypergraphSnapshot {
         shard_key: &quil_types::store::ShardKey,
     ) -> Result<Option<Vec<u8>>> {
         let key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
-        Ok(self.blobs.get(&key).cloned())
+        // Reads at the captured sequence — point-in-time consistent.
+        self.snapshot
+            .get(&key)
+            .map_err(|e| QuilError::Store(e.to_string()))
     }
 }
 
@@ -901,7 +896,7 @@ impl HypergraphStore for RocksHypergraphStore {
     }
 
     fn capture_tree_snapshot(&self) -> Result<Option<Arc<dyn SnapshotReadable>>> {
-        let snap = RocksHypergraphSnapshot::capture(&self.db)?;
+        let snap = RocksHypergraphSnapshot::capture(self.db.clone())?;
         Ok(Some(Arc::new(snap) as Arc<dyn SnapshotReadable>))
     }
 }
@@ -1064,8 +1059,5 @@ mod tests {
             Some(&b"v-adds-POST"[..])
         );
 
-        // Sanity: the snapshot covers exactly the pre-capture blobs
-        // (2 entries: v-adds-pre and v-removes-pre).
-        assert_eq!(snap.blob_count(), 2);
     }
 }

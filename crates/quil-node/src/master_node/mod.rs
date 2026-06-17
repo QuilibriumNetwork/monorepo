@@ -713,6 +713,14 @@ pub(crate) async fn start(
     let reason = sup.run().await;
     info!("master node shutting down");
 
+    // Release retained RocksDB snapshots before teardown so they don't
+    // pin superseded versions past the DB's life. Drop would eventually
+    // do this, but an explicit close also stops new generations from
+    // being published during shutdown. Any in-flight sync session
+    // holding a generation handle keeps its own snapshot alive until it
+    // finishes (the Arc clone), then releases.
+    crdt.close_snapshots();
+
     Ok(reason)
 }
 

@@ -511,11 +511,24 @@ impl FrameMaterializer {
                 if let Some(phase_roots) = commits.get(&global_shard) {
                     if let Some(root) = phase_roots.first() {
                         if root.len() >= 64 {
-                            // Publish to the snapshot generation registry
-                            // so a client that pins to this root can
-                            // succeed in `acquire_snapshot`.
-                            self.hypergraph
-                                .publish_snapshot(root.clone(), frame_number);
+                            // Publish to the snapshot generation registry,
+                            // binding a real point-in-time DB snapshot so a
+                            // follower that pins to this root gets
+                            // root-consistent reads (not the moved-on live
+                            // store) and `acquire_snapshot` succeeds. We are
+                            // inside the commit barrier here, right after
+                            // Commit produced `root`, so the snapshot is
+                            // captured against exactly the state it reflects.
+                            if let Err(e) = self
+                                .hypergraph
+                                .publish_snapshot_capturing(root.clone(), frame_number)
+                            {
+                                warn!(
+                                    frame = frame_number,
+                                    error = %e,
+                                    "failed to capture snapshot for published prover root"
+                                );
+                            }
                             return root.clone();
                         }
                     }
