@@ -20,6 +20,18 @@ pub const GLOBAL_MESSAGE_BROADCAST_CAPACITY: usize = 256;
 pub trait FrameLookup: Send + Sync {
     fn get_latest_frame(&self) -> Result<global::GlobalFrame, String>;
     fn get_frame(&self, frame_number: u64) -> Result<global::GlobalFrame, String>;
+
+    /// Assemble the full `GlobalProposal` for `frame_number` — the state plus
+    /// its certifying parent QC, prior-rank TC, and proposer vote — so a peer
+    /// can sync proposals into its consensus engine (not just mirror frames).
+    /// Mirrors Go `GlobalConsensusEngine.GetGlobalProposal`. The default errors;
+    /// the concrete clock-store-backed impl overrides it.
+    fn get_global_proposal(
+        &self,
+        _frame_number: u64,
+    ) -> Result<global::GlobalProposal, String> {
+        Err("get_global_proposal not supported by this FrameLookup".into())
+    }
 }
 
 /// Handler invoked when a peer submits a message bundle via gRPC
@@ -159,30 +171,20 @@ impl GlobalService for GlobalRpcServer {
         request: Request<global::GetGlobalProposalRequest>,
     ) -> Result<Response<global::GlobalProposalResponse>, Status> {
         let req = request.into_inner();
-        // Genesis (frame 0) path: just return the state frame, no QC/TC/vote.
-        // Matches Go's `services.go:101-117` special case.
-        if req.frame_number == 0 {
-            let frame = self
-                .frames
-                .get_frame(0)
-                .map_err(|e| Status::not_found(format!("no genesis frame: {e}")))?;
-            return Ok(Response::new(global::GlobalProposalResponse {
-                proposal: Some(global::GlobalProposal {
-                    state: Some(frame),
-                    parent_quorum_certificate: None,
-                    prior_rank_timeout_certificate: None,
-                    vote: None,
-                }),
-            }));
+        // Assemble state + parent QC + prior TC + vote from the clock store
+        // (see `FrameLookup::get_global_proposal`). Mirrors Go
+        // `GlobalConsensusEngine.GetGlobalProposal`; on any lookup miss Go
+        // returns an empty response rather than an error (qclient shows
+        // "no proposal at frame N"), so we do the same.
+        match self.frames.get_global_proposal(req.frame_number) {
+            Ok(proposal) => Ok(Response::new(global::GlobalProposalResponse {
+                proposal: Some(proposal),
+            })),
+            Err(e) => {
+                debug!(frame_number = req.frame_number, error = %e, "get_global_proposal: returning empty");
+                Ok(Response::new(global::GlobalProposalResponse { proposal: None }))
+            }
         }
-        // Non-genesis: proposals need QC/TC/vote data that lives in a
-        // different store table Go stitches together. Rust's current
-        // ClockStore doesn't expose `GetProposalVote`/
-        // `GetQuorumCertificate`/`GetTimeoutCertificate` publicly
-        // via FrameLookup. Return an empty response (valid proto,
-        // qclient displays "no proposal at frame N") — matches Go's
-        // fallback at services.go:129,138.
-        Ok(Response::new(global::GlobalProposalResponse { proposal: None }))
     }
 
     async fn get_app_shards(

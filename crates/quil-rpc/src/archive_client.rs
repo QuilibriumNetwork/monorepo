@@ -27,8 +27,8 @@ use tracing::{debug, info};
 
 use quil_types::proto::global::global_service_client::GlobalServiceClient;
 use quil_types::proto::global::{
-    AppShardInfo, GetAppShardsRequest, GetGlobalFrameRequest, GlobalFrame,
-    SubmitGlobalMessageRequest,
+    AppShardInfo, GetAppShardsRequest, GetGlobalFrameRequest, GetGlobalProposalRequest,
+    GlobalFrame, GlobalProposal, SubmitGlobalMessageRequest,
 };
 
 use crate::quil_tls::{build_quil_tls_cert, QuilTlsError};
@@ -169,6 +169,22 @@ impl ArchiveClient {
             .await?
             .into_inner();
         resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
+    }
+
+    /// Fetch the full proposal (state + parent QC + prior TC + vote) for
+    /// `frame_number`, so a lagging node can submit it into its consensus loop
+    /// to catch up. The server returns an empty response (no proposal) on a
+    /// lookup miss, which surfaces here as `MissingField`.
+    pub async fn get_global_proposal(
+        &mut self,
+        frame_number: u64,
+    ) -> Result<GlobalProposal, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_global_proposal(GetGlobalProposalRequest { frame_number })
+            .await?
+            .into_inner();
+        resp.proposal.ok_or(ArchiveClientError::MissingField("proposal"))
     }
 }
 
