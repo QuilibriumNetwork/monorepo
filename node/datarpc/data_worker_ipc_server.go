@@ -3,6 +3,7 @@ package datarpc
 import (
 	"context"
 	"encoding/hex"
+	"sync"
 	"time"
 
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -48,6 +49,8 @@ type DataWorkerIPCServer struct {
 	quit                      chan struct{}
 	peerInfoCtx               lifecycle.SignalerContext
 	peerInfoCancel            context.CancelFunc
+	ready                     chan struct{}
+	readyOnce                 sync.Once
 }
 
 func NewDataWorkerIPCServer(
@@ -102,10 +105,12 @@ func NewDataWorkerIPCServer(
 		frameProver:               frameProver,
 		peerInfoManager:           peerInfoManager,
 		quit:                      make(chan struct{}),
+		ready:                     make(chan struct{}),
 	}, nil
 }
 
 func (r *DataWorkerIPCServer) Start() error {
+	r.logger.Info("starting DataWorkerIPCServer", zap.Uint32("core_id", r.coreId))
 	peerInfoCtx, peerInfoCancel, _ := lifecycle.WithSignallerAndCancel(
 		context.Background(),
 	)
@@ -118,15 +123,19 @@ func (r *DataWorkerIPCServer) Start() error {
 	)
 	select {
 	case <-peerInfoReady:
+		r.logger.Info("peer info manager started successfully", zap.Uint32("core_id", r.coreId))
 	case <-time.After(5 * time.Second):
-		r.logger.Warn("peer info manager did not start before timeout")
+		r.logger.Warn("peer info manager did not start before timeout", zap.Uint32("core_id", r.coreId))
 	}
 	r.peerInfoCtx = peerInfoCtx
 	r.peerInfoCancel = peerInfoCancel
 
+	r.logger.Info("respawning server", zap.Uint32("core_id", r.coreId))
 	r.RespawnServer(nil)
+	r.logger.Info("data worker ipc server started", zap.Uint32("core_id", r.coreId))
 
 	<-r.quit
+	r.logger.Info("data worker ipc server quit signal received, stopping", zap.Uint32("core_id", r.coreId))
 	return nil
 }
 
@@ -257,6 +266,7 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 		return errors.Wrap(err, "respawn server")
 	}
 
+	r.logger.Info("attempting to listen on address", zap.String("address", r.listenAddrGRPC))
 	lis, err := mn.Listen(mg)
 	if err != nil {
 		return errors.Wrap(err, "respawn server")
@@ -267,6 +277,10 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 		zap.String("address", r.listenAddrGRPC),
 		zap.String("resolved", lis.Addr().String()),
 	)
+	// Signal that the server is ready (listening)
+	r.readyOnce.Do(func() {
+		close(r.ready)
+	})
 	if len(filter) != 0 {
 		globalTimeReel, err := r.appConsensusEngineFactory.CreateGlobalTimeReel()
 		if err != nil {
@@ -314,6 +328,11 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 	}()
 
 	return nil
+}
+
+// Ready returns a channel that will be closed when the server has started listening
+func (r *DataWorkerIPCServer) Ready() <-chan struct{} {
+	return r.ready
 }
 
 // CreateJoinProof implements protobufs.DataIPCServiceServer.

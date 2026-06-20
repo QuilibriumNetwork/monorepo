@@ -633,6 +633,20 @@ func main() {
 		rpcMultiaddr = strings.Replace(rpcMultiaddr, "/quic-v1", "", 1)
 		rpcMultiaddr = strings.Replace(rpcMultiaddr, "udp", "tcp", 1)
 
+		if !app.WaitForWorkerPortsAvailable(
+			logger,
+			nodeConfig,
+			uint(*core),
+			rpcMultiaddr,
+			30*time.Second, // Wait up to 30 seconds for ports to become available
+		) {
+			logger.Error(
+				"ports not available, exiting - could not reserve necessary ports",
+				zap.Uint("core_id", uint(*core)),
+			)
+			os.Exit(1)
+		}
+
 		dataWorkerNode, err := app.NewDataWorkerNode(
 			logger,
 			nodeConfig,
