@@ -10,9 +10,12 @@ use std::sync::Arc;
 use sha2::{Sha256, Digest};
 use quil_types::crypto::KeyManager;
 use quil_types::error::{QuilError, Result};
-use quil_types::store::{ClockStore, KvDb, ShardsStore, ShardInfo};
+use quil_types::store::{
+    ClockStore, KvDb, PendingShardChange, ShardChangeKind, ShardsStore, ShardInfo,
+};
 
 use super::materialize;
+use super::reassignment;
 use super::consensus_types::{AltShardUpdate, TYPE_ALT_SHARD_UPDATE};
 use super::prover_filter_ops::{
     ProverLeave, ProverPause, ProverResume,
@@ -31,6 +34,7 @@ use crate::global_engine::{
 use crate::global_schema::{read_field, write_field, GLOBAL_INTRINSIC_ADDRESS};
 use crate::hypergraph_state::{
     HypergraphState, hyperedge_adds_discriminator, vertex_adds_discriminator,
+    vertex_removes_discriminator,
 };
 
 /// The global intrinsic: holds dependencies for signature
@@ -632,6 +636,9 @@ impl GlobalIntrinsic {
                                 bitmask: sig.bitmask.clone(),
                             },
                         ),
+                        storage_attestation_root: op.storage_attestation_root.clone(),
+                        global_frame_number: op.global_frame_number,
+                        storage_attestation: op.storage_attestation.clone(),
                     };
 
                     // Aggregate-pubkey consistency check: the bitmask
@@ -837,6 +844,52 @@ impl GlobalIntrinsic {
                         },
                     )?;
                 }
+                // Fold: write the per-leaf storage-root vertices registered with
+                // this confirm. The roots are bound into the confirm's signing
+                // message (verify_prover_confirm), so they're authenticated as
+                // the signer's. Overwrite-in-place keyed (member, leaf_id).
+                if !op.leaf_roots.is_empty() {
+                    let member: [u8; 32] = op
+                        .public_key_signature_bls48581
+                        .as_ref()
+                        .and_then(|s| <[u8; 32]>::try_from(s.address.as_slice()).ok())
+                        .ok_or_else(|| QuilError::InvalidArgument(
+                            "prover confirm: leaf roots require a 32-byte signer address".into(),
+                        ))?;
+                    let domain = &crate::global_schema::GLOBAL_INTRINSIC_ADDRESS[..];
+                    let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+                    // Epoch-aligned: a confirm in epoch E registers leaf roots for
+                    // the NEXT epoch E+1 (the `next` slot of the two-slot
+                    // registration), matching the allocation's `Epoch` field set
+                    // by `materialize_prover_confirm` and the replica the worker
+                    // encoded ahead. The audit at epoch C reads the slot
+                    // registered for C — written here during epoch C-1's confirm.
+                    let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
+                    for group in &op.leaf_roots {
+                        // Only honor leaf roots for filters actually confirmed here.
+                        if !op.filters.iter().any(|f| f == &group.filter) {
+                            continue;
+                        }
+                        for entry in &group.entries {
+                            let leaf_id = super::leaf_id_bytes(&group.filter, &entry.prefix);
+                            let addr = materialize::leaf_root_address(&member, &leaf_id)?;
+                            // Two-slot upsert: merge into {current,next}, keeping
+                            // the two highest epochs, so the member can hold the
+                            // epoch it's proving + the next it's pre-confirmed.
+                            let existing = state
+                                .get(domain, &addr, &va_disc)?
+                                .filter(|d| !d.is_empty())
+                                .map(|d| crate::prover_registry::rebuild_vertex_tree_from_blob(&d));
+                            let tree = materialize::upsert_leaf_root_registration(
+                                existing.as_ref(),
+                                &member, &group.filter, &entry.prefix, epoch,
+                                &entry.leaf_root, entry.num_blocks, frame_number,
+                            )?;
+                            let blob = crate::prover_registry::vertex_tree_to_blob(&tree);
+                            state.set(domain, &addr, &va_disc, frame_number, blob)?;
+                        }
+                    }
+                }
                 Ok(())
             }
             TYPE_PROVER_REJECT => {
@@ -1016,6 +1069,28 @@ impl GlobalIntrinsic {
             .unwrap_or_default();
         if pubkey.is_empty() {
             return Err(QuilError::InvalidArgument("invoke_step join: no public key".into()));
+        }
+
+        // Phase F join-freeze (decision #2): a shard with a pending split/merge
+        // (recorded between the proposal epoch E and the E+2 flip) cannot accept
+        // new joins — its existence/identity is about to change, and the
+        // coverage-gate reasons over the FROZEN committee. The pending set is
+        // recorded deterministically by the split/merge op, so this reject is
+        // identical on every node. The freeze lifts automatically once
+        // `apply_due_shard_changes` consumes the pending record at E+2.
+        if let Some(store) = self.shards_store.as_ref() {
+            let pending = store.all_pending_shard_changes()?;
+            if !pending.is_empty() {
+                for filter in &op.filters {
+                    if pending.iter().any(|c| c.affects_shard(filter)) {
+                        return Err(QuilError::InvalidArgument(format!(
+                            "invoke_step join: shard {} is frozen by a pending split/merge \
+                             (join blocked until it settles at E+2)",
+                            hex::encode(&filter[..filter.len().min(8)]),
+                        )));
+                    }
+                }
+            }
         }
 
         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
@@ -1226,19 +1301,35 @@ impl GlobalIntrinsic {
         va_disc: &[u8; 32],
     ) -> Result<()> {
         let prover_address = materialize::prover_address_from_pubkey(&op.kicked_prover_public_key)?;
+        self.kick_prover_by_address(frame_number, &prover_address, state, va_disc)
+    }
 
+    /// Evict a prover by its 32-byte address: set the prover vertex to kicked
+    /// (Status=4, KickFrameNumber, Seniority→0) and kick every allocation
+    /// linked from its hyperedge. Shared by [`Self::invoke_kick`] (signed
+    /// `ProverKick`) and the PoRep storage audit (no signature — the eviction
+    /// is a deterministic consequence of a failed sampled possession proof in a
+    /// committee-signed reward frame). Idempotent: re-kicking a kicked prover
+    /// just re-stamps the same fields. A missing prover vertex is a no-op Ok
+    /// (the audit may name a member the archive hasn't synced).
+    fn kick_prover_by_address(
+        &self,
+        frame_number: u64,
+        prover_address: &[u8],
+        state: &HypergraphState,
+        va_disc: &[u8; 32],
+    ) -> Result<()> {
         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
 
         // Load and kick prover vertex
-        let prover_data = state.get(domain, &prover_address, va_disc)?
-            .ok_or_else(|| QuilError::InvalidArgument("invoke_step kick: prover not found".into()))?;
-        if prover_data.is_empty() {
-            return Err(QuilError::InvalidArgument("invoke_step kick: prover has no data".into()));
-        }
+        let prover_data = match state.get(domain, prover_address, va_disc)? {
+            Some(d) if !d.is_empty() => d,
+            _ => return Ok(()),
+        };
         let mut prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
         materialize::materialize_prover_kick(&mut prover_tree, frame_number)?;
         let prover_blob = crate::prover_registry::vertex_tree_to_blob(&prover_tree);
-        state.set(domain, &prover_address, va_disc, frame_number, prover_blob)?;
+        state.set(domain, prover_address, va_disc, frame_number, prover_blob)?;
 
         // Kick every allocation linked from the prover's hyperedge.
         // Hyperedges are addressed by
@@ -1474,12 +1565,106 @@ impl GlobalIntrinsic {
     /// materialization. The full port lives in
     /// `super::prover_shard_update` and is invoked from the consensus
     /// engine's frame materializer, which has those dependencies.
+    /// PoRep storage audit (5w): decode the committee `StorageAttestation`
+    /// carried on the reward proof, recompute the beacon ρ_N from the anchored
+    /// global frame's COMMITTED VDF output, run the bounded ρ_N-sampled
+    /// possession + registry audit, and evict members with a failing sampled
+    /// opening. No-op before the storage fork or when the frame carries no
+    /// attestation. Deterministic over committed state — the eviction is
+    /// identical on every archive (non-archive nodes inherit it via sync).
+    fn audit_storage_attestation(
+        &self,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+        bitmask: &[u8],
+        state: &HypergraphState,
+        va_disc: &[u8; 32],
+    ) -> Result<()> {
+        // Always-on: audit any reward proof that anchors to a real global frame
+        // and carries an attestation. (Genesis / legacy-VDF frames anchor to 0
+        // and carry no attestation, so they no-op here either way.)
+        if op.global_frame_number == 0 || op.storage_attestation.is_empty() {
+            return Ok(());
+        }
+        let att = <quil_types::proto::global::StorageAttestation as prost::Message>::decode(
+            op.storage_attestation.as_slice(),
+        )
+        .map_err(|e| {
+            QuilError::InvalidArgument(format!(
+                "invoke_frame_header: storage attestation decode failed: {e}"
+            ))
+        })?;
+        let openings: Vec<quil_crypto::porep::StorageOpening> = att
+            .openings
+            .iter()
+            .map(quil_crypto::porep::StorageOpening::from_proto)
+            .collect();
+        if openings.is_empty() {
+            return Ok(());
+        }
+        // Possession verify is γ-independent at k=1, so the bitmask is a
+        // don't-care for the per-opening audit (it bound the aggregate root,
+        // already committee-signed). Accept it to document the contract.
+        let _ = bitmask;
+
+        let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+            QuilError::Internal(
+                "invoke_frame_header: clock_store not installed — cannot recompute ρ_N for audit"
+                    .into(),
+            )
+        })?;
+        let global_output = clock_store
+            .get_global_clock_frame(op.global_frame_number)
+            .ok()
+            .and_then(|f| f.header.map(|h| h.output))
+            .unwrap_or_default();
+        let rho_n =
+            quil_crypto::porep::derive_storage_beacon(op.global_frame_number, &global_output);
+        let active_epoch = quil_types::consensus::epoch_for_frame(op.global_frame_number);
+
+        // Registry cross-check: read the on-chain leaf-root registration vertex
+        // `(member, leaf_id)` from committed state.
+        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+        let lookup = |member: &[u8], shard_id: &[u8]| -> Option<(Vec<u8>, u64, u64)> {
+            if member.len() < 32 {
+                return None;
+            }
+            let mut m = [0u8; 32];
+            m.copy_from_slice(&member[..32]);
+            let addr = materialize::leaf_root_address(&m, shard_id).ok()?;
+            let data = state.get(domain, &addr, va_disc).ok()??;
+            if data.is_empty() {
+                return None;
+            }
+            let tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&data);
+            // Two-slot {current,next}: match whichever slot is registered for the
+            // epoch being audited (the member may hold the current epoch in one
+            // slot and a pre-confirmed next epoch in the other).
+            let (leaf_root, num_blocks) =
+                materialize::leaf_root_registration_for_epoch(&tree, active_epoch)?;
+            Some((leaf_root, num_blocks, active_epoch))
+        };
+
+        let failed = quil_crypto::porep::audit_frame_storage_attestations(
+            &openings,
+            &rho_n,
+            quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+            active_epoch,
+            quil_types::consensus::STORAGE_AUDIT_SAMPLE,
+            lookup,
+        );
+        for member in failed {
+            self.kick_prover_by_address(frame_number, &member, state, va_disc)?;
+        }
+        Ok(())
+    }
+
     fn invoke_frame_header(
         &self,
         frame_number: u64,
         op: &super::frame_header::FrameHeader,
         state: &HypergraphState,
-        _va_disc: &[u8; 32],
+        va_disc: &[u8; 32],
     ) -> Result<()> {
         // Verify FIRST, materialize SECOND. The attestation check
         // requires frame_prover + bls_constructor + prover_registry —
@@ -1513,6 +1698,13 @@ impl GlobalIntrinsic {
         ).map_err(|e| QuilError::InvalidArgument(format!(
             "invoke_frame_header: frame header attestation invalid: {e}"
         )))?;
+
+        // Phase F: apply any epoch-aligned shard topology changes that have now
+        // reached their effective (E+2) epoch — flips the local grid topology
+        // AND deterministically reassigns each affected prover's allocation onto
+        // the new shard(s) in committed hypergraph state. Runs regardless of the
+        // archive-mode reward/hypergraph deps below.
+        self.apply_due_shard_changes(frame_number, state)?;
 
         // Now that verification has passed, gate further state writes
         // on the archive-mode deps.
@@ -1568,6 +1760,8 @@ impl GlobalIntrinsic {
                     _: u32,
                     _: u64,
                     _: u64,
+                    _: &[u8],
+                    _: u64,
                 ) -> Result<quil_types::proto::global::FrameHeader>
                 { Err(QuilError::Internal("stub".into())) }
                 fn verify_frame_header(&self, _: &quil_types::proto::global::FrameHeader)
@@ -1609,7 +1803,40 @@ impl GlobalIntrinsic {
             active_provers,
             &participant_indices,
             shard_md,
-        )
+        )?;
+
+        // PoRep (5w): the ρ_N-sampled possession audit runs LAST — AFTER the
+        // coverage credit above — so a cheating member's eviction (Status=4,
+        // Seniority→0) is the final write and isn't clobbered by the
+        // LastActiveFrameNumber update that `materialize_prover_shard_update`
+        // applies from the pre-audit active-prover snapshot. Archive-only (past
+        // the ri/hg gate); deterministic over committed state (ρ_N from the
+        // anchored global frame's committed VDF output + the on-chain leaf-root
+        // registry), so every archive evicts identically and non-archive nodes
+        // inherit it via sync.
+        self.audit_storage_attestation(frame_number, op, &bitmask_bytes, state, va_disc)?;
+        Ok(())
+    }
+
+    /// Go parity (`global_shard_split.go` / `global_shard_merge.go`
+    /// `Verify`): a shard split/merge may only be proposed by a registered
+    /// prover holding an ACTIVE GLOBAL allocation — one whose
+    /// `confirmation_filter` is empty (global/committee membership). The
+    /// registry reflects this frame's committed prover state (refreshed
+    /// before message processing), so the check is deterministic across
+    /// nodes. Fails closed: returns false when the registry is unavailable
+    /// or the proposer is unknown.
+    fn proposer_is_active_global(&self, address: &[u8]) -> bool {
+        let Some(registry) = self.prover_registry.as_ref() else {
+            return false;
+        };
+        match registry.get_prover_info(address) {
+            Ok(Some(info)) => info.allocations.iter().any(|a| {
+                a.confirmation_filter.is_empty()
+                    && a.status == quil_types::consensus::ProverStatus::Active
+            }),
+            _ => false,
+        }
     }
 
     /// ShardSplit invoke_step: register new sub-shard addresses.
@@ -1622,7 +1849,7 @@ impl GlobalIntrinsic {
     /// the split is validated but not persisted.
     fn invoke_shard_split(
         &self,
-        _frame_number: u64,
+        frame_number: u64,
         op: &super::prover_ops::ShardSplit,
         state: &HypergraphState,
         va_disc: &[u8; 32],
@@ -1653,27 +1880,33 @@ impl GlobalIntrinsic {
                 "invoke_shard_split: signature verification failed".into(),
             ));
         }
+        // Authorization (Go parity, global_shard_split.go:82-100): only an
+        // ACTIVE GLOBAL prover (one with an allocation whose
+        // confirmation_filter is empty + status Active) may propose a
+        // shard split.
+        if !self.proposer_is_active_global(&prover_address) {
+            return Err(QuilError::InvalidArgument(
+                "invoke_shard_split: proposer is not an active global prover".into(),
+            ));
+        }
 
-        let output = materialize::materialize_shard_split(
-            &op.shard_address,
-            &op.proposed_shards,
-        )?;
+        // Validate the child filters now (fail fast on a malformed proposal),
+        // but DEFER the topology flip. Epoch-aligned: a split proposed in epoch E
+        // takes effect at the E+2 boundary so committee membership stays frozen
+        // within an epoch. Record a pending change; `apply_due_shard_changes`
+        // (run from invoke_frame_header) applies it when the chain reaches E+2.
+        let _ = materialize::materialize_shard_split(&op.shard_address, &op.proposed_shards)?;
 
-        // Write new sub-shard entries to the shards store.
-        // Go equivalent: shardsStore.PutAppShard(nil, ShardInfo{L2, Path})
-        // at global_shard_split.go:167.
         if let (Some(ref store), Some(ref db)) = (&self.shards_store, &self.shards_db) {
+            let change = PendingShardChange {
+                kind: ShardChangeKind::Split,
+                parent: op.shard_address.clone(),
+                children: op.proposed_shards.clone(),
+                effective_epoch: quil_types::consensus::epoch_for_frame(frame_number) + 2,
+                proposed_frame: frame_number,
+            };
             let txn = db.new_batch(false)?;
-            for (l2, path) in &output.new_shards {
-                let shard = ShardInfo {
-                    shard_key: l2.clone(),
-                    prefix: path.clone(),
-                    size: Vec::new(),
-                    data_shards: 0,
-                    commitment: Vec::new(),
-                };
-                store.put_app_shard(txn.as_ref(), &shard)?;
-            }
+            store.put_pending_shard_change(txn.as_ref(), &change)?;
             txn.commit()?;
         }
 
@@ -1690,7 +1923,7 @@ impl GlobalIntrinsic {
     /// the merge is validated but not persisted.
     fn invoke_shard_merge(
         &self,
-        _frame_number: u64,
+        frame_number: u64,
         op: &super::prover_ops::ShardMerge,
         state: &HypergraphState,
         va_disc: &[u8; 32],
@@ -1719,23 +1952,228 @@ impl GlobalIntrinsic {
                 "invoke_shard_merge: signature verification failed".into(),
             ));
         }
+        // Authorization (Go parity, global_shard_merge.go:84-100): only an
+        // ACTIVE GLOBAL prover may propose a shard merge.
+        if !self.proposer_is_active_global(&prover_address) {
+            return Err(QuilError::InvalidArgument(
+                "invoke_shard_merge: proposer is not an active global prover".into(),
+            ));
+        }
 
-        let output = materialize::materialize_shard_merge(
-            &op.shard_addresses,
-            &op.parent_address,
-        )?;
+        // Validate now, defer the flip to the E+2 boundary (see invoke_shard_split).
+        let _ = materialize::materialize_shard_merge(&op.shard_addresses, &op.parent_address)?;
 
-        // Remove child shard entries from the shards store.
-        // Go equivalent: shardsStore.DeleteAppShard(nil, shardKey, path)
-        // at global_shard_merge.go:175.
         if let (Some(ref store), Some(ref db)) = (&self.shards_store, &self.shards_db) {
+            let change = PendingShardChange {
+                kind: ShardChangeKind::Merge,
+                parent: op.parent_address.clone(),
+                children: op.shard_addresses.clone(),
+                effective_epoch: quil_types::consensus::epoch_for_frame(frame_number) + 2,
+                proposed_frame: frame_number,
+            };
             let txn = db.new_batch(false)?;
-            for (l2, path) in &output.removed_shards {
-                store.delete_app_shard(txn.as_ref(), l2, path)?;
-            }
+            store.put_pending_shard_change(txn.as_ref(), &change)?;
             txn.commit()?;
         }
 
+        Ok(())
+    }
+
+    /// Apply any staged shard topology changes (Phase F) whose `effective_epoch`
+    /// the chain has now reached. Run from `invoke_frame_header`, so it fires on
+    /// the same frame across all nodes (identical frame sequence → deterministic
+    /// shards-store view). Robust to gaps: applies every pending change with
+    /// `effective_epoch <= epoch_for_frame(frame_number)`, then removes it. The
+    /// topology flip (put children / delete children) lands here at E+2, NOT at
+    /// proposal time.
+    pub fn apply_due_shard_changes(
+        &self,
+        frame_number: u64,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        let (Some(store), Some(db)) = (self.shards_store.as_ref(), self.shards_db.as_ref())
+        else {
+            return Ok(());
+        };
+        let cur_epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        let due: Vec<PendingShardChange> = store
+            .all_pending_shard_changes()?
+            .into_iter()
+            .filter(|c| c.effective_epoch <= cur_epoch)
+            .collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Reassign every affected prover's allocation onto the new
+        //    topology (committed hypergraph state, via `state`). Done FIRST:
+        //    a failure here returns Err → `invoke_frame_header` returns Err →
+        //    the frame's state changeset is aborted before we mutate the
+        //    local grid below, keeping the two views consistent.
+        let va_disc = vertex_adds_discriminator()?;
+        for change in &due {
+            self.reassign_shard_allocations(state, &va_disc, change, frame_number)?;
+        }
+
+        // 2. Flip the LOCAL grid topology + consume the pending records.
+        // L1(3) || L2(32) grid key, matching genesis + the original immediate path.
+        let grid_key = |l2: &[u8]| -> Vec<u8> {
+            let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(l2, 256, 3);
+            let mut k = Vec::with_capacity(3 + l2.len());
+            k.extend_from_slice(&l1);
+            k.extend_from_slice(l2);
+            k
+        };
+
+        let txn = db.new_batch(false)?;
+        for change in &due {
+            match change.kind {
+                ShardChangeKind::Split => {
+                    let output =
+                        materialize::materialize_shard_split(&change.parent, &change.children)?;
+                    for (l2, path) in &output.new_shards {
+                        let shard = ShardInfo {
+                            shard_key: grid_key(l2),
+                            prefix: path.clone(),
+                            size: Vec::new(),
+                            data_shards: 0,
+                            commitment: Vec::new(),
+                        };
+                        store.put_app_shard(txn.as_ref(), &shard)?;
+                    }
+                }
+                ShardChangeKind::Merge => {
+                    let output =
+                        materialize::materialize_shard_merge(&change.children, &change.parent)?;
+                    for (l2, path) in &output.removed_shards {
+                        store.delete_app_shard(txn.as_ref(), &grid_key(l2), path)?;
+                    }
+                }
+            }
+            store.delete_pending_shard_change(txn.as_ref(), &change.parent, change.effective_epoch)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Phase F deterministic reassignment: at the E+2 boundary, move every
+    /// affected prover's allocation onto the new shard topology by rewriting
+    /// its `ConfirmationFilter` in committed hypergraph state.
+    ///
+    /// - Split: each ACTIVE prover on the parent → exactly one child, chosen
+    ///   deterministically by [`reassignment::assign_child_index`] over the
+    ///   prover's address (frozen-committee, consensus-identical).
+    /// - Merge: every ACTIVE prover on any child → the parent.
+    ///
+    /// The active set is read from the SAME `prover_registry` the frame-header
+    /// attestation check already trusts at this point (so it's consistent with
+    /// committed state across nodes — otherwise attestation would already
+    /// fork). Leaving/joining allocations are NOT reassigned: a pending Leave
+    /// departs at E+2 by design, and joins to a frozen shard were rejected by
+    /// the join-freeze. When no `prover_registry` is installed (non-archive
+    /// fixtures), this is a no-op — the local grid still flips.
+    fn reassign_shard_allocations(
+        &self,
+        state: &HypergraphState,
+        va_disc: &[u8; 32],
+        change: &PendingShardChange,
+        frame_number: u64,
+    ) -> Result<()> {
+        let Some(pr) = self.prover_registry.as_ref() else {
+            return Ok(());
+        };
+        let vr_disc = vertex_removes_discriminator()?;
+        let ha_disc = hyperedge_adds_discriminator()?;
+
+        match change.kind {
+            ShardChangeKind::Split => {
+                if change.children.is_empty() {
+                    return Ok(());
+                }
+                let provers = pr.get_active_provers(&change.parent).map_err(|e| {
+                    QuilError::InvalidArgument(format!(
+                        "reassign split: get_active_provers failed: {e}"
+                    ))
+                })?;
+                for info in &provers {
+                    let idx =
+                        reassignment::assign_child_index(&info.address, change.children.len());
+                    let new_filter = &change.children[idx];
+                    self.rekey_allocation(
+                        state, va_disc, &vr_disc, &ha_disc, &info.public_key, &info.address,
+                        &change.parent, new_filter, frame_number,
+                    )?;
+                }
+            }
+            ShardChangeKind::Merge => {
+                for child in &change.children {
+                    let provers = pr.get_active_provers(child).map_err(|e| {
+                        QuilError::InvalidArgument(format!(
+                            "reassign merge: get_active_provers failed: {e}"
+                        ))
+                    })?;
+                    for info in &provers {
+                        self.rekey_allocation(
+                            state, va_disc, &vr_disc, &ha_disc, &info.public_key, &info.address,
+                            child, &change.parent, frame_number,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-key one allocation from `old_filter` to `new_filter`: write the new
+    /// allocation vertex (Status/Epoch/frame fields carried verbatim), rebuild
+    /// the prover's hyperedge atom for the new address, and remove the old
+    /// vertex — UNLESS the re-key collided to the same address (poseidon
+    /// absorbs trailing-zero filter suffixes, so a parent and its `…‖0x00`
+    /// child share an allocation address), in which case the `set` already
+    /// updated the filter in place and a `delete` would erase it.
+    #[allow(clippy::too_many_arguments)]
+    fn rekey_allocation(
+        &self,
+        state: &HypergraphState,
+        va_disc: &[u8; 32],
+        vr_disc: &[u8; 32],
+        ha_disc: &[u8; 32],
+        pubkey: &[u8],
+        prover_address: &[u8],
+        old_filter: &[u8],
+        new_filter: &[u8],
+        frame_number: u64,
+    ) -> Result<()> {
+        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+        let old_addr = materialize::allocation_address(pubkey, old_filter)?;
+        let new_addr = materialize::allocation_address(pubkey, new_filter)?;
+
+        // Read the existing (committed) allocation; nothing to move if absent.
+        let old_blob = match state.get(domain, &old_addr, va_disc)? {
+            Some(b) if !b.is_empty() => b,
+            _ => return Ok(()),
+        };
+
+        let new_blob = reassignment::rewrite_allocation_filter(&old_blob, new_filter)?;
+        let new_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&new_blob);
+
+        // Write the new (or, on collision, in-place) allocation vertex.
+        state.set(domain, &new_addr, va_disc, frame_number, new_blob)?;
+
+        // Rebuild the prover's allocation hyperedge atom for the new address so
+        // ProverKick can still enumerate the moved allocation.
+        let existing_he = state
+            .get(domain, prover_address, ha_disc)?
+            .unwrap_or_default();
+        let new_he = reassignment::rebuild_hyperedge_with_reassigned_atom(
+            &existing_he, &old_addr, &new_addr, &new_tree,
+        )?;
+        state.set(domain, prover_address, ha_disc, frame_number, new_he)?;
+
+        // Remove the stale vertex only when the address actually changed.
+        if new_addr != old_addr {
+            state.delete(domain, &old_addr, vr_disc, frame_number)?;
+        }
         Ok(())
     }
 }
@@ -2132,6 +2570,7 @@ mod tests {
                 address: vec![0xCCu8; 32],
             }),
             filters: vec![vec![0xDDu8; 32]],
+            leaf_roots: Vec::new(),
         }
         .to_canonical_bytes()
         .unwrap();
@@ -2554,6 +2993,138 @@ mod tests {
             assert_eq!(
                 read_kick_frame(&state, &alloc_b_addr, "allocation:ProverAllocation"),
                 Some(42),
+            );
+        }
+
+        // -------------------------------------------------------------
+        // PoRep (5w): the storage audit at FrameHeader ingest must evict
+        // a member whose sampled opening fails the registry cross-check
+        // (here: unregistered — no leaf-root vertex), and leave provers
+        // not named in the attestation untouched. Gated on the storage
+        // fork + a non-empty carried attestation.
+        // -------------------------------------------------------------
+        fn storage_opening_proto(
+            member: &[u8],
+            shard_id: &[u8],
+            epoch: u64,
+        ) -> quil_types::proto::global::StorageOpening {
+            quil_types::proto::global::StorageOpening {
+                shard_id: shard_id.to_vec(),
+                epoch,
+                member_id: member.to_vec(),
+                query: 0,
+                leaf_root: vec![0u8; 74],
+                num_blocks: 1,
+                path_commits: vec![],
+                path_proofs: vec![],
+                commitment: vec![0u8; 74],
+                value: vec![0u8; 32],
+                proof: vec![0u8; 74],
+            }
+        }
+
+        fn frame_header_with_attestation(
+            filter: &[u8],
+            global_frame_number: u64,
+            att: &quil_types::proto::global::StorageAttestation,
+        ) -> crate::global_intrinsic::frame_header::FrameHeader {
+            crate::global_intrinsic::frame_header::FrameHeader {
+                address: filter.to_vec(),
+                frame_number: 5,
+                global_frame_number,
+                storage_attestation: prost::Message::encode_to_vec(att),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn storage_audit_evicts_unregistered_member_and_spares_others() {
+            quil_crypto::init();
+            let state = make_state();
+            let va_disc = vertex_adds_discriminator().unwrap();
+
+            // Cheating member: prover vertex present + active, but no
+            // leaf-root registration → registry cross-check fails → evicted.
+            let bad_pubkey = vec![0xA1u8; 585];
+            let bad_addr = prover_address_from_pubkey(&bad_pubkey).unwrap();
+            state.set(
+                &GLOBAL_INTRINSIC_ADDRESS[..],
+                &bad_addr, &va_disc, 1,
+                vertex_tree_to_blob(&create_prover_vertex_tree(&bad_pubkey, 100).unwrap()),
+            ).unwrap();
+
+            // Bystander prover: never named in the attestation → untouched.
+            let other_pubkey = vec![0xB2u8; 585];
+            let other_addr = prover_address_from_pubkey(&other_pubkey).unwrap();
+            state.set(
+                &GLOBAL_INTRINSIC_ADDRESS[..],
+                &other_addr, &va_disc, 1,
+                vertex_tree_to_blob(&create_prover_vertex_tree(&other_pubkey, 100).unwrap()),
+            ).unwrap();
+
+            let filter = vec![0x55u8; 32];
+            let att = quil_types::proto::global::StorageAttestation {
+                openings: vec![storage_opening_proto(&bad_addr, &vec![0x07u8; 32], 1)],
+            };
+            let op = frame_header_with_attestation(&filter, 1_000, &att);
+
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
+            gi.audit_storage_attestation(7, &op, &[], &state, &va_disc).unwrap();
+
+            assert_eq!(
+                read_status(&state, &bad_addr, "prover:Prover"),
+                Some(STATUS_KICKED),
+                "unregistered member must be evicted by the storage audit",
+            );
+            assert_ne!(
+                read_status(&state, &other_addr, "prover:Prover"),
+                Some(STATUS_KICKED),
+                "a prover not named in the attestation must be untouched",
+            );
+        }
+
+        #[test]
+        fn storage_audit_is_noop_without_anchor_or_attestation() {
+            quil_crypto::init();
+            let state = make_state();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let bad_pubkey = vec![0xC3u8; 585];
+            let bad_addr = prover_address_from_pubkey(&bad_pubkey).unwrap();
+            state.set(
+                &GLOBAL_INTRINSIC_ADDRESS[..],
+                &bad_addr, &va_disc, 1,
+                vertex_tree_to_blob(&create_prover_vertex_tree(&bad_pubkey, 100).unwrap()),
+            ).unwrap();
+            let filter = vec![0x55u8; 32];
+            let att = quil_types::proto::global::StorageAttestation {
+                openings: vec![storage_opening_proto(&bad_addr, &vec![0x07u8; 32], 0)],
+            };
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
+
+            // No global anchor (genesis / legacy-VDF frame, gfn == 0): no audit.
+            let pre = frame_header_with_attestation(&filter, 0, &att);
+            gi.audit_storage_attestation(7, &pre, &[], &state, &va_disc).unwrap();
+            assert_ne!(
+                read_status(&state, &bad_addr, "prover:Prover"),
+                Some(STATUS_KICKED),
+                "no eviction for a frame with no global anchor",
+            );
+
+            // Anchored but empty attestation: no audit.
+            let empty = crate::global_intrinsic::frame_header::FrameHeader {
+                address: filter.clone(),
+                frame_number: 5,
+                global_frame_number: 1_000,
+                storage_attestation: Vec::new(),
+                ..Default::default()
+            };
+            gi.audit_storage_attestation(7, &empty, &[], &state, &va_disc).unwrap();
+            assert_ne!(
+                read_status(&state, &bad_addr, "prover:Prover"),
+                Some(STATUS_KICKED),
+                "no eviction when the frame carries no attestation",
             );
         }
 

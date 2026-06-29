@@ -40,6 +40,16 @@ pub(crate) async fn start(
     let shards_store = storage.shards_store.clone();
     let hg_store = storage.hg_store.clone();
 
+    // Normalize the QUIL-token shard grid to the single-nibble (64-shard)
+    // topology. Genesis seeds 64 directly, but a DB restored via the
+    // pebble->rocksdb migration carries the legacy 64x64 = 4096 grid; with a
+    // fresh prover tree those 4096 shards each start with zero coverage and
+    // the network can never escape the coverage halt. Idempotent: a no-op
+    // once the grid is already exactly 64 single-byte-prefix QUIL shards.
+    if let Err(e) = normalize_quil_token_grid(shards_store.as_ref(), clock_store.as_ref()) {
+        tracing::warn!(error = %e, "failed to normalize QUIL token shard grid");
+    }
+
     // Fresh-config peer key: on first run `config.p2p.peer_priv_key` is
     // empty. Generate + persist the Ed448 identity HERE, before anything
     // reads it — `keys::init` derives `prover_address` from this key, and
@@ -510,6 +520,13 @@ pub(crate) async fn start(
         multisig_ed448_seeds,
         delegate_address,
         transport: prover_message_transport,
+        // Storage-attestation confirm hook deps (PoRep). Gated by
+        // STORAGE_EPOCH_ACTIVATION_FRAME inside `submit_confirm`, so these are
+        // inert until the storage fork.
+        hypergraph: Some(crdt.clone()),
+        replica_store: Some(quil_store::replica_store::ReplicaStore::new(
+            db_arc.clone() as Arc<dyn quil_types::store::KvDb>,
+        )),
     });
 
     // Shard orchestration subscriber: watches for ShardSplitEligible /
@@ -572,6 +589,19 @@ pub(crate) async fn start(
         info!("shard orchestration subscriber spawned");
     }
 
+    // Inbound consensus-message verifier for the global chain.
+    // Published by `archive_sync` once the consensus loop activates
+    // (it needs the activation's committee + vote/timeout domains), and
+    // read by the message loop to gate inbound proposals / certs before
+    // they reach fork-choice, the pacemaker, or a vote. Mirrors the
+    // `vote_aggregator` OnceLock plumbing.
+    let global_validator: Arc<std::sync::OnceLock<Arc<
+        quil_engine::validator::ConsensusValidator<
+            quil_engine::consensus_types::GlobalState,
+            quil_engine::consensus_types::GlobalVote,
+        >,
+    >>> = Arc::new(std::sync::OnceLock::new());
+
     archive_sync::spawn_all(&mut sup, archive_sync::ArchiveSyncArgs {
         mtls_seed,
         network,
@@ -599,6 +629,7 @@ pub(crate) async fn start(
         consensus_handle: consensus_handle.clone(),
         vote_aggregator: vote_aggregator.clone(),
         timeout_aggregator: timeout_aggregator.clone(),
+        global_validator: global_validator.clone(),
         db_arc: db_arc.clone(),
         frame_materializer: frame_materializer.clone(),
         consensus_loopback_tx: consensus_loopback_tx.clone(),
@@ -633,6 +664,19 @@ pub(crate) async fn start(
         None
     };
 
+    // Explorer service is archive-only (only archives hold the full frame
+    // + hypergraph history it serves) and gated by config. The recent-
+    // message ring is created here so the message loop can feed it; `None`
+    // means no tap and no overhead.
+    let explorer_enabled = archive_mode && config.explorer.enabled;
+    let recent_messages: Option<Arc<quil_explorer::RecentMessageRing>> = if explorer_enabled {
+        Some(Arc::new(quil_explorer::RecentMessageRing::new(
+            quil_explorer::message_ring::DEFAULT_CAPACITY,
+        )))
+    } else {
+        None
+    };
+
     message_loop::spawn(&mut sup, message_loop::MessageLoopArgs {
         clock_store: clock_store.clone(),
         exec_manager: exec_manager.clone(),
@@ -650,6 +694,7 @@ pub(crate) async fn start(
         consensus_handle: consensus_handle.clone(),
         vote_aggregator: vote_aggregator.clone(),
         timeout_aggregator: timeout_aggregator.clone(),
+        global_validator: global_validator.clone(),
         peer_info_cache: peer_info_cache.clone(),
         shard_engines: shard_engines.clone(),
         signer_registry: signer_registry.clone(),
@@ -672,6 +717,7 @@ pub(crate) async fn start(
         },
         spawner: detached_spawner.clone(),
         archive_app_shard_ingest,
+        recent_messages: recent_messages.clone(),
     });
 
     // ---------------------------------------------------------------
@@ -704,8 +750,75 @@ pub(crate) async fn start(
         global_msg_tx: global_msg_tx.clone(),
         archive_pool: archive_pool.clone(),
         spawner: detached_spawner.clone(),
+        consensus_loopback_tx: consensus_loopback_tx.clone(),
     })?;
 
+    // ---------------------------------------------------------------
+    // 7b. Explorer REST API (archive-only, config-gated)
+    // ---------------------------------------------------------------
+    // Serves a read-only JSON API over the live stores — no second DB,
+    // no second sync (unlike the standalone Go `node/explorer`). Reuses
+    // the same per-shard metadata provider the gRPC global service uses,
+    // so `/provers/shards` sizes match `GetAppShards`.
+    if explorer_enabled {
+        let listen_addr = config.explorer.listen_addr.clone();
+        let app_shards_provider: quil_explorer::AppShardsProvider = {
+            let crdt = crdt.clone();
+            Arc::new(move |shard_key: &[u8], prefix: &[u32]| {
+                let info = quil_types::store::ShardInfo {
+                    shard_key: shard_key.to_vec(),
+                    prefix: prefix.to_vec(),
+                    size: Vec::new(),
+                    data_shards: 0,
+                    commitment: Vec::new(),
+                };
+                let meta = quil_engine::app_shard_metadata::get_app_shard_metadata(
+                    crdt.as_ref(),
+                    &info,
+                )?;
+                Some((meta.size, meta.data_shards, meta.commitments))
+            })
+        };
+        // Coverage-halt durations provider — the same source the archive
+        // evictor consults, so the explorer's eviction-risk numbers match
+        // real eviction decisions.
+        let halt_durations_provider: quil_explorer::HaltDurationsProvider = {
+            let cm = coverage_monitor.clone();
+            Arc::new(move |frame: u64| cm.current_halt_durations(frame))
+        };
+        let state = quil_explorer::ExplorerState::new(
+            clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
+            crdt.clone(),
+            prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+            key_store.clone() as Arc<dyn quil_types::store::KeyStore>,
+            shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>,
+            Some(app_shards_provider),
+            Some(halt_durations_provider),
+            peer_info_cache.clone(),
+            recent_messages
+                .clone()
+                .expect("recent_messages ring present when explorer enabled"),
+            last_global_head_frame.clone(),
+        );
+        let router = quil_explorer::router(state);
+        match tokio::net::TcpListener::bind(&listen_addr).await {
+            Ok(listener) => {
+                info!(addr = %listen_addr, "explorer REST API listening");
+                sup.spawn("explorer-http", move |token| async move {
+                    quil_explorer::serve(listener, router, async move {
+                        token.cancelled().await;
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)
+                });
+            }
+            Err(e) => warn!(
+                addr = %listen_addr,
+                error = %e,
+                "failed to bind explorer REST API; explorer disabled",
+            ),
+        }
+    }
 
     // ---------------------------------------------------------------
     // 8. Wait for shutdown
@@ -724,3 +837,136 @@ pub(crate) async fn start(
     Ok(reason)
 }
 
+
+/// Ensure the QUIL-token app-shard grid is the single-nibble (64-shard)
+/// topology rather than the legacy 64x64 = 4096 grid. Genesis seeds 64
+/// directly; this handles a DB restored via the pebble->rocksdb migration
+/// (which carries the old 4096 grid) so a fresh prover tree re-forms
+/// coverage over 64 shards instead of stalling on 4096 under-covered ones.
+///
+/// Idempotent: returns early when the grid is already exactly 64 QUIL
+/// shards each with a single-byte prefix. Token DATA (the `l2 = QUIL_TOKEN`
+/// tree) is never touched — only the coverage/assignment grid.
+fn normalize_quil_token_grid(
+    shards_store: &dyn quil_types::store::ShardsStore,
+    clock_store: &quil_store::RocksClockStore,
+) -> anyhow::Result<()> {
+    use quil_types::store::ClockStore as _;
+    use quil_types::store::ShardInfo;
+    let quil = quil_execution::domains::QUIL_TOKEN;
+    let all = shards_store.range_app_shards()?;
+    // QUIL entries: shard_key = L1(3) || L2(32); L2 == QUIL_TOKEN.
+    let quil_entries: Vec<&ShardInfo> = all
+        .iter()
+        .filter(|s| s.shard_key.len() >= 35 && s.shard_key[3..35] == quil[..])
+        .collect();
+    let already_normalized =
+        quil_entries.len() == 64 && quil_entries.iter().all(|s| s.prefix.len() == 1);
+    if already_normalized {
+        return Ok(());
+    }
+    // shard_key is identical across all QUIL entries (they differ only in
+    // prefix); reuse an existing one, or reconstruct it as L1 || QUIL_TOKEN.
+    let shard_key = match quil_entries.first() {
+        Some(s) => s.shard_key.clone(),
+        None => {
+            let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
+            let mut sk = Vec::with_capacity(3 + quil.len());
+            sk.extend_from_slice(&l1);
+            sk.extend_from_slice(&quil);
+            sk
+        }
+    };
+    let old_count = quil_entries.len();
+    let txn = clock_store.new_transaction(false)?;
+    for s in &quil_entries {
+        shards_store.delete_app_shard(txn.as_ref(), &s.shard_key, &s.prefix)?;
+    }
+    for i in 0..64u32 {
+        shards_store.put_app_shard(
+            txn.as_ref(),
+            &ShardInfo {
+                shard_key: shard_key.clone(),
+                prefix: vec![i],
+                size: Vec::new(),
+                data_shards: 0,
+                commitment: Vec::new(),
+            },
+        )?;
+    }
+    txn.commit()?;
+    tracing::info!(
+        old_count,
+        new_count = 64,
+        "normalized QUIL token shard grid to single-nibble (64-shard) topology"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod reshard_tests {
+    use super::*;
+    use quil_types::store::{ClockStore, ShardInfo, ShardsStore};
+
+    /// Integration test over a real RocksShardsStore: a legacy 64x64
+    /// (`[i,j]`) QUIL grid is collapsed to exactly 64 single-nibble (`[i]`)
+    /// shards by the actual `normalize_quil_token_grid` used at node
+    /// startup; non-QUIL tokens are untouched; and it's idempotent. Guards
+    /// the reshard wiring that a DB restored via the pebble->rocksdb tool
+    /// relies on.
+    #[test]
+    fn normalize_collapses_quil_grid_to_64_idempotent() {
+        let rocks = quil_store::RocksDb::open_in_memory().expect("open in-memory db");
+        let db = rocks.inner();
+        let shards = quil_store::RocksShardsStore::new(db.clone());
+        let clock = quil_store::RocksClockStore::new(db.clone());
+
+        let quil = quil_execution::domains::QUIL_TOKEN;
+        let mut quil_key = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3).to_vec();
+        quil_key.extend_from_slice(&quil);
+
+        // A non-QUIL token shard that must survive normalization.
+        let other_l2 = [0xABu8; 32];
+        let mut other_key = quil_hypergraph::addressing::get_bloom_filter_indices(&other_l2, 256, 3).to_vec();
+        other_key.extend_from_slice(&other_l2);
+
+        // Seed a legacy [i,j] QUIL grid (100 entries: i,j in 0..10) plus the
+        // non-QUIL shard.
+        let txn = clock.new_transaction(false).unwrap();
+        for i in 0u32..10 {
+            for j in 0u32..10 {
+                shards.put_app_shard(txn.as_ref(), &ShardInfo {
+                    shard_key: quil_key.clone(),
+                    prefix: vec![i, j],
+                    size: Vec::new(), data_shards: 0, commitment: Vec::new(),
+                }).unwrap();
+            }
+        }
+        shards.put_app_shard(txn.as_ref(), &ShardInfo {
+            shard_key: other_key.clone(),
+            prefix: vec![1, 2],
+            size: Vec::new(), data_shards: 0, commitment: Vec::new(),
+        }).unwrap();
+        txn.commit().unwrap();
+
+        normalize_quil_token_grid(&shards, &clock).unwrap();
+
+        let after = shards.range_app_shards().unwrap();
+        let quil_entries: Vec<_> = after.iter()
+            .filter(|s| s.shard_key.len() >= 35 && s.shard_key[3..35] == quil[..])
+            .collect();
+        assert_eq!(quil_entries.len(), 64, "QUIL collapses to exactly 64 (from 100 [i,j])");
+        assert!(quil_entries.iter().all(|s| s.prefix.len() == 1), "all QUIL shards single-nibble");
+        assert!(
+            after.iter().any(|s| s.shard_key.len() >= 35 && s.shard_key[3..35] == other_l2[..] && s.prefix == vec![1, 2]),
+            "non-QUIL token shard must be left untouched"
+        );
+
+        // Idempotent: a second pass is a no-op (still 64).
+        normalize_quil_token_grid(&shards, &clock).unwrap();
+        let quil2 = shards.range_app_shards().unwrap().iter()
+            .filter(|s| s.shard_key.len() >= 35 && s.shard_key[3..35] == quil[..])
+            .count();
+        assert_eq!(quil2, 64, "normalize is idempotent");
+    }
+}

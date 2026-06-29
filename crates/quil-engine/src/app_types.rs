@@ -40,11 +40,18 @@ pub struct AppShardState {
     pub state_roots: Vec<Vec<u8>>,
     pub signature: Vec<u8>,
     pub fee_multiplier: u64,
+    /// Committee digest over the per-member proof-of-storage openings (header
+    /// field 13). Carried so the proto header round-trips losslessly and the
+    /// re-derived VDF challenge matches the signed one.
+    pub storage_attestation_root: Vec<u8>,
+    /// The global frame whose VDF output anchors the storage beacon (field 14).
+    pub global_frame_number: u64,
     /// Cached identity (sha3-256 of output, raw bytes).
     identity_cache: Identity,
 }
 
 impl AppShardState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         filter: Vec<u8>,
         frame_number: u64,
@@ -58,6 +65,8 @@ impl AppShardState {
         state_roots: Vec<Vec<u8>>,
         signature: Vec<u8>,
         fee_multiplier: u64,
+        storage_attestation_root: Vec<u8>,
+        global_frame_number: u64,
     ) -> Self {
         let identity_cache = compute_output_identity(&output);
         Self {
@@ -73,6 +82,8 @@ impl AppShardState {
             state_roots,
             signature,
             fee_multiplier,
+            storage_attestation_root,
+            global_frame_number,
             identity_cache,
         }
     }
@@ -100,6 +111,8 @@ impl AppShardState {
                 .map(|s| s.signature.clone())
                 .unwrap_or_default(),
             fee_multiplier: header.fee_multiplier_vote,
+            storage_attestation_root: header.storage_attestation_root.clone(),
+            global_frame_number: header.global_frame_number,
             identity_cache,
         }
     }
@@ -172,6 +185,12 @@ pub struct AppShardVote {
     /// re-derive the challenge as `sha3(parent_selector)` and check
     /// each multi-proof via `verify_multi_proof`.
     pub multi_proof: Vec<u8>,
+    /// PoRep storage openings this voter attached (a serialized
+    /// `StorageAttestation`). The aggregator collects these across the rank's
+    /// votes at QC formation and assembles the frame's `StorageAttestation` +
+    /// 74-byte aggregate root. Replaces `multi_proof` at the storage fork;
+    /// empty pre-activation.
+    pub openings: Vec<u8>,
 }
 
 impl AppShardVote {
@@ -197,7 +216,14 @@ impl AppShardVote {
             bitmask,
             filter,
             multi_proof: Vec::new(),
+            openings: Vec::new(),
         }
+    }
+
+    /// Attach this voter's PoRep storage openings (serialized `StorageAttestation`).
+    pub fn with_openings(mut self, openings: Vec<u8>) -> Self {
+        self.openings = openings;
+        self
     }
 
     /// Attach a 516-byte VDF multi-proof contribution. Used by the
@@ -406,6 +432,8 @@ pub fn build_app_genesis_certified_state(
         Vec::new(),
         Vec::new(),
         0,
+        Vec::new(),
+        0,
     );
     let identity = state.identity_cache.clone();
 
@@ -495,10 +523,12 @@ mod tests {
         let s1 = AppShardState::new(
             vec![1], 10, 0, 1000, 50000,
             vec![0xAAu8; 64], vec![], vec![], vec![], vec![], vec![], 0,
+            vec![], 0,
         );
         let s2 = AppShardState::new(
             vec![1], 10, 0, 1000, 50000,
             vec![0xAAu8; 64], vec![], vec![], vec![], vec![], vec![], 0,
+            vec![], 0,
         );
         assert_eq!(s1.identity(), s2.identity());
         assert!(!s1.identity().is_empty());
@@ -510,6 +540,7 @@ mod tests {
             vec![1, 2], 42, 5, 1000, 100000,
             vec![0xBBu8; 64], vec![], vec![0xCCu8; 585], vec![], vec![],
             vec![0xDDu8; 74], 100,
+            vec![], 0,
         );
         assert_eq!(s.rank(), 5);
         assert_eq!(s.timestamp(), 1000);

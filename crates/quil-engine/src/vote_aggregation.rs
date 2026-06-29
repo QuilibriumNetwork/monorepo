@@ -267,6 +267,7 @@ mod tests {
             timestamp: 1_700_000_000,
             signature: vec![0xBBu8; 74],
             address: vec![0xCCu8; 32], // voter address
+            openings: Vec::new(),
         }
     }
 

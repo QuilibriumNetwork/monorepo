@@ -7,6 +7,8 @@ mod frame_prover;
 mod inclusion;
 mod key_manager;
 pub mod poseidon;
+pub mod porep;
+pub mod sdr;
 mod secp256k1;
 
 pub use bls::{Bls48581KeyConstructor, Bls48581Signer};

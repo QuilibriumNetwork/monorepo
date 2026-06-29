@@ -40,6 +40,12 @@ impl AccumulatedWeightTracker {
         self.done.load(Ordering::Acquire)
     }
 
+    /// The weight at which this tracker fires. Exposed for diagnostics
+    /// (e.g. logging "accumulated X of threshold Y" on a stuck rank).
+    pub fn min_required(&self) -> u64 {
+        self.min_required
+    }
+
     /// Returns `true` iff `weight >= min_required` AND this is the first
     /// call to observe the threshold crossing. All subsequent calls
     /// return `false`.
@@ -110,6 +116,14 @@ impl<S: Unique, V: Unique> TimeoutProcessor<S, V> {
     /// `true` once the full TC has been built.
     pub fn is_done(&self) -> bool {
         self.tc_tracker.done()
+    }
+
+    /// Diagnostic snapshot: `(accumulated_weight, full_tc_threshold)`.
+    /// A stuck rank where `accumulated_weight` plateaus below the
+    /// threshold means fewer than 2/3-by-seniority of the committee are
+    /// participating — i.e. a liveness shortfall, not a logic bug.
+    pub fn weight_and_threshold(&self) -> (u64, u64) {
+        (self.sig_aggregator.total_weight(), self.tc_tracker.min_required())
     }
 
     /// Process a single timeout state. Expected error returns:

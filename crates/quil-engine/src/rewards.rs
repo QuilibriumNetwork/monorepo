@@ -363,4 +363,63 @@ mod tests {
             .clone();
         assert_eq!(&big, &(&small * 2), "big={} small={}", big, small);
     }
+
+    // ---- Gap coverage (audit 2026-06-28): issuance-path ring + shard scaling.
+    // The 2^(ring+1) divisor and the sqrt-shards branch were untested in the
+    // ACTUAL issuance path (every prior opt_reward test used ring=0, shards=1 —
+    // only the `shard_info` estimate copy covered them). Relationships are exact
+    // by the floor-division identity floor(floor(N/a)/b) == floor(N/(ab)).
+
+    fn one_alloc(
+        ring: u8,
+        shards: u64,
+        state_size: u64,
+    ) -> Vec<HashMap<String, quil_types::consensus::ProverAllocation>> {
+        use quil_types::consensus::ProverAllocation;
+        let mut m = HashMap::new();
+        m.insert("s".to_string(), ProverAllocation { ring, shards, state_size });
+        vec![m]
+    }
+
+    #[test]
+    fn opt_reward_halves_each_ring() {
+        let r = OptRewardIssuance;
+        // Large state so rewards stay non-zero through ring 2.
+        let calc =
+            |ring| r.calculate(5_000, 1 << 30, 1_000_000, &one_alloc(ring, 1, 1 << 28)).unwrap()[0].clone();
+        let r0 = calc(0);
+        let r1 = calc(1);
+        let r2 = calc(2);
+        assert!(!r0.is_zero(), "ring-0 reward must be positive");
+        assert_eq!(r1, &r0 / 2, "ring 1 = ring 0 / 2 (divisor 2^(ring+1))");
+        assert_eq!(r2, &r1 / 2, "ring 2 = ring 1 / 2");
+    }
+
+    /// Generation 2 (difficulty >= 1e8) exercises the 2^k-th-root branch
+    /// (`nth_root(4)`), previously untested (only gen 0/1 covered). More roots
+    /// → strictly smaller basis, so gen0 > gen1 > gen2 for the same world.
+    #[test]
+    fn pomw_basis_generation_two_fourth_root() {
+        let world = 1u64 << 30;
+        let units = 1_000_000u64;
+        let g0 = pomw_basis(5_000, world, units); // gen 0 (no root)
+        let g1 = pomw_basis(50_000, world, units); // gen 1 (sqrt)
+        let g2 = pomw_basis(100_000_000, world, units); // gen 2 (4th root)
+        assert!(g2 > BigInt::zero(), "gen-2 basis must be positive, got {g2}");
+        assert!(g0 > g1 && g1 > g2, "more roots → smaller basis: g0={g0} g1={g1} g2={g2}");
+    }
+
+    #[test]
+    fn opt_reward_scales_inversely_with_sqrt_shards() {
+        let r = OptRewardIssuance;
+        // Perfect-square shard counts → exact integer sqrt, so reward ∝ 1/sqrt(shards).
+        let calc =
+            |shards| r.calculate(5_000, 1 << 30, 1_000_000, &one_alloc(0, shards, 1 << 28)).unwrap()[0].clone();
+        let s1 = calc(1);
+        let s4 = calc(4); // sqrt = 2
+        let s16 = calc(16); // sqrt = 4
+        assert!(!s1.is_zero());
+        assert_eq!(s4, &s1 / 2, "shards=4 (sqrt 2) → half");
+        assert_eq!(s16, &s1 / 4, "shards=16 (sqrt 4) → quarter");
+    }
 }

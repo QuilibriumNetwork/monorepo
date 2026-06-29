@@ -189,14 +189,26 @@ pub fn update_prover_status_from_allocations(
 // ProverConfirm materialize
 // =====================================================================
 
-/// Materialize a ProverConfirm for a single allocation. Two paths:
+/// Materialize a ProverConfirm for a single allocation (epoch-aligned
+/// lifecycle). A confirm in epoch E+1 registers the allocation for its NEXT
+/// epoch E+2 (`Epoch = epoch_for_frame(frame)+1`) — the prover encodes/registers
+/// leaf roots ahead so the committee can stay frozen within an epoch. Three
+/// paths:
 ///
-/// - **Confirm join** (status 0→1): set Status=Active,
-///   JoinConfirmFrameNumber, LastActiveFrameNumber.
-/// - **Confirm leave** (status 3→4): set Status=Kicked,
-///   LeaveConfirmFrameNumber.
+/// - **Confirm join** (status 0→1): set Status=Active, JoinConfirmFrameNumber,
+///   LastActiveFrameNumber, Epoch=epoch_for_frame(frame)+1. The flipped Active
+///   byte does NOT make the prover a committee member until the activation
+///   boundary E+2 — `effective_status` reads it as `Joining` until then
+///   (deferred activation, keyed on JoinConfirmFrameNumber).
+/// - **Re-confirm** (status 1, stays Active): renew Epoch one ahead +
+///   LastActiveFrameNumber. Does NOT touch JoinConfirmFrameNumber (so the
+///   established member's activation epoch stays in the past).
+/// - **Confirm leave** (status 3, stays Leaving): set LeaveConfirmFrameNumber.
+///   The byte stays Leaving; the prover serves notice through the rest of the
+///   epoch and departs at E+2 via `effective_status` (ExpiredLeaving). Keeping
+///   the byte avoids changing committee membership mid-epoch.
 ///
-/// Returns `Err` if the allocation is not in status 0 or 3.
+/// Returns `Err` if the allocation is not in status 0, 1, or 3.
 pub fn materialize_prover_confirm(
     allocation_tree: &mut quil_tries::VectorCommitmentTree,
     frame_number: u64,
@@ -207,23 +219,39 @@ pub fn materialize_prover_confirm(
         .unwrap_or(255);
 
     let frame_bytes = frame_number.to_be_bytes();
+    // Register one epoch ahead: a confirm in epoch E+1 makes the allocation
+    // valid for E+2 (its first/next active epoch). This is the `next` slot of
+    // the two-slot {current,next} leaf-root registration.
+    let next_epoch = (quil_types::consensus::epoch_for_frame(frame_number) + 1).to_be_bytes();
 
     match status {
         STATUS_JOINING => {
-            // Confirm join → active
+            // Confirm join → Active byte, but deferred-active until E+2.
             write_field(allocation_tree, cls, "Status", &[STATUS_ACTIVE])?;
             write_field(allocation_tree, cls, "JoinConfirmFrameNumber", &frame_bytes)?;
             write_field(allocation_tree, cls, "LastActiveFrameNumber", &frame_bytes)?;
+            write_field(allocation_tree, cls, "Epoch", &next_epoch)?;
+            Ok(())
+        }
+        STATUS_ACTIVE => {
+            // Epoch re-confirm: an established Active allocation renews its
+            // registration one epoch ahead (+ activity) and stays Active. This
+            // is the close-the-loop for `EffectiveStatus::ExpiredEpoch`. The
+            // validate gate (`validate_confirm_timing`) already ensured the
+            // recorded epoch is not already ahead. JoinConfirmFrameNumber is
+            // deliberately left untouched.
+            write_field(allocation_tree, cls, "LastActiveFrameNumber", &frame_bytes)?;
+            write_field(allocation_tree, cls, "Epoch", &next_epoch)?;
             Ok(())
         }
         STATUS_LEAVING => {
-            // Confirm leave → left
-            write_field(allocation_tree, cls, "Status", &[STATUS_KICKED])?; // 4 = left/kicked
+            // Confirm leave: keep the Leaving byte; record the confirm frame.
+            // Departure is derived at the E+2 boundary by `effective_status`.
             write_field(allocation_tree, cls, "LeaveConfirmFrameNumber", &frame_bytes)?;
             Ok(())
         }
         _ => Err(QuilError::InvalidArgument(format!(
-            "materialize confirm: allocation status is {} (expected 0=joining or 3=leaving)",
+            "materialize confirm: allocation status is {} (expected 0=joining, 1=active re-confirm, or 3=leaving)",
             status
         ))),
     }
@@ -254,7 +282,12 @@ pub fn materialize_prover_reject(
             Ok(())
         }
         STATUS_LEAVING => {
-            // Reject leave → back to active
+            // Reject leave → back to Active. Do NOT bump Epoch: the prover did
+            // not submit fresh leaf roots, so re-registering it for a new epoch
+            // would make `Epoch` claim a two-slot registration that doesn't
+            // exist (the leave-reject inconsistency class). It keeps whatever
+            // epoch registration it already held and re-confirms on its normal
+            // schedule.
             write_field(allocation_tree, cls, "Status", &[STATUS_ACTIVE])?;
             write_field(allocation_tree, cls, "LeaveRejectFrameNumber", &frame_bytes)?;
             write_field(allocation_tree, cls, "LastActiveFrameNumber", &frame_bytes)?;
@@ -486,6 +519,202 @@ pub fn materialize_prover_join(
     })
 }
 
+/// Compute a leaf-root registration's 32-byte address.
+/// `poseidon("LEAF_ROOT_REGISTRATION" || member || leaf_id) → 32 bytes`.
+/// `member` is the 32-byte prover address; `leaf_id` is
+/// [`super::leaf_id_bytes`]`(shard_filter, prefix)`.
+///
+/// The epoch is deliberately **NOT** in the address: re-registration each epoch
+/// overwrites the same `(member, leaf)` vertex in place (bounded storage, no
+/// stale-epoch pruning). The current epoch is carried in the `Epoch` field, and
+/// the verifier checks it equals the active epoch.
+pub fn leaf_root_address(member: &[u8], leaf_id: &[u8]) -> Result<[u8; 32]> {
+    let mut preimage = Vec::with_capacity(22 + member.len() + leaf_id.len());
+    preimage.extend_from_slice(b"LEAF_ROOT_REGISTRATION");
+    preimage.extend_from_slice(member);
+    preimage.extend_from_slice(leaf_id);
+    quil_crypto::poseidon::hash_bytes_to_32(&preimage)
+}
+
+/// Pack a sub-shard prefix (`Vec<u32>` nibbles) into bytes (u32 BE each) for
+/// storage in the `Prefix` field.
+pub fn pack_prefix(prefix: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() * 4);
+    for p in prefix {
+        out.extend_from_slice(&p.to_be_bytes());
+    }
+    out
+}
+
+/// Inverse of [`pack_prefix`].
+pub fn unpack_prefix(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Create a leaf-root registration vertex tree.
+/// Sets: Member, ShardFilter, Prefix, Epoch, LeafRoot, NumBlocks,
+/// RegistrationFrameNumber.
+#[allow(clippy::too_many_arguments)]
+pub fn create_leaf_root_vertex_tree(
+    member: &[u8; 32],
+    shard_filter: &[u8],
+    prefix: &[u32],
+    epoch: u64,
+    leaf_root: &[u8],
+    num_blocks: u64,
+    frame_number: u64,
+) -> Result<quil_tries::VectorCommitmentTree> {
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    let cls = "leafroot:LeafRootRegistration";
+
+    write_type(&mut tree, cls)?;
+    write_field(&mut tree, cls, "Member", member)?;
+    write_field(&mut tree, cls, "ShardFilter", shard_filter)?;
+    write_field(&mut tree, cls, "Prefix", &pack_prefix(prefix))?;
+    write_field(&mut tree, cls, "Epoch", &epoch.to_be_bytes())?;
+    write_field(&mut tree, cls, "LeafRoot", leaf_root)?;
+    write_field(&mut tree, cls, "NumBlocks", &num_blocks.to_be_bytes())?;
+    write_field(&mut tree, cls, "RegistrationFrameNumber", &frame_number.to_be_bytes())?;
+
+    Ok(tree)
+}
+
+/// Read a `u64` field from a vertex tree (big-endian, first 8 bytes), `None` if
+/// absent.
+fn read_u64_field(
+    tree: &quil_tries::VectorCommitmentTree,
+    cls: &str,
+    name: &str,
+) -> Option<u64> {
+    let b = read_field(tree, cls, name)?;
+    let arr: [u8; 8] = b.get(..8)?.try_into().ok()?;
+    Some(u64::from_be_bytes(arr))
+}
+
+/// Upsert a member's leaf-root registration into the **two-slot** {current,next}
+/// vertex. The audit needs the registration for the epoch a member is currently
+/// proving AND the next epoch it has pre-confirmed to coexist (a member confirms
+/// one epoch ahead while still answering audits for the current epoch). Merge
+/// rule: of {existing current, existing next, new}, keep the **two highest
+/// epochs**, stored epoch-sorted (orders 3..5 = lower "current", 7..9 = higher
+/// "next"). A same-epoch re-register overwrites that slot's value. Two fixed
+/// slots ⇒ no per-epoch address growth. See [[epoch-aligned-lifecycle-design]].
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_leaf_root_registration(
+    existing: Option<&quil_tries::VectorCommitmentTree>,
+    member: &[u8; 32],
+    shard_filter: &[u8],
+    prefix: &[u32],
+    new_epoch: u64,
+    new_leaf_root: &[u8],
+    new_num_blocks: u64,
+    frame_number: u64,
+) -> Result<quil_tries::VectorCommitmentTree> {
+    let cls = "leafroot:LeafRootRegistration";
+
+    // Gather the existing slots (current + next, whichever are present).
+    let mut slots: Vec<(u64, Vec<u8>, u64)> = Vec::new();
+    if let Some(t) = existing {
+        if let Some(e) = read_u64_field(t, cls, "Epoch") {
+            slots.push((
+                e,
+                read_field(t, cls, "LeafRoot").unwrap_or_default(),
+                read_u64_field(t, cls, "NumBlocks").unwrap_or(0),
+            ));
+        }
+        if let Some(e) = read_u64_field(t, cls, "NextEpoch") {
+            slots.push((
+                e,
+                read_field(t, cls, "NextLeafRoot").unwrap_or_default(),
+                read_u64_field(t, cls, "NextNumBlocks").unwrap_or(0),
+            ));
+        }
+    }
+    // Merge the new registration: same-epoch overwrites, else add.
+    slots.retain(|(e, _, _)| *e != new_epoch);
+    slots.push((new_epoch, new_leaf_root.to_vec(), new_num_blocks));
+    // Keep the two highest epochs (drop the lowest if 3+), epoch-sorted ascending
+    // so the vertex bytes are deterministic across nodes.
+    slots.sort_by_key(|(e, _, _)| *e);
+    while slots.len() > 2 {
+        slots.remove(0);
+    }
+
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    write_type(&mut tree, cls)?;
+    write_field(&mut tree, cls, "Member", member)?;
+    write_field(&mut tree, cls, "ShardFilter", shard_filter)?;
+    write_field(&mut tree, cls, "Prefix", &pack_prefix(prefix))?;
+    write_field(&mut tree, cls, "RegistrationFrameNumber", &frame_number.to_be_bytes())?;
+    // Lower epoch → current slot.
+    if let Some((e, lr, nb)) = slots.first() {
+        write_field(&mut tree, cls, "Epoch", &e.to_be_bytes())?;
+        write_field(&mut tree, cls, "LeafRoot", lr)?;
+        write_field(&mut tree, cls, "NumBlocks", &nb.to_be_bytes())?;
+    }
+    // Higher epoch → next slot (only when two slots are present).
+    if let Some((e, lr, nb)) = slots.get(1) {
+        write_field(&mut tree, cls, "NextEpoch", &e.to_be_bytes())?;
+        write_field(&mut tree, cls, "NextLeafRoot", lr)?;
+        write_field(&mut tree, cls, "NextNumBlocks", &nb.to_be_bytes())?;
+    }
+    Ok(tree)
+}
+
+/// Look up the registered `(leaf_root, num_blocks)` for `member`+`leaf_id` at the
+/// given `active_epoch`, checking BOTH slots of the two-slot registration. The
+/// audit cross-checks an opening against whichever slot matches the epoch being
+/// proved. `None` if neither slot is for `active_epoch`.
+pub fn leaf_root_registration_for_epoch(
+    tree: &quil_tries::VectorCommitmentTree,
+    active_epoch: u64,
+) -> Option<(Vec<u8>, u64)> {
+    let cls = "leafroot:LeafRootRegistration";
+    if read_u64_field(tree, cls, "Epoch") == Some(active_epoch) {
+        return Some((
+            read_field(tree, cls, "LeafRoot")?,
+            read_u64_field(tree, cls, "NumBlocks").unwrap_or(0),
+        ));
+    }
+    if read_u64_field(tree, cls, "NextEpoch") == Some(active_epoch) {
+        return Some((
+            read_field(tree, cls, "NextLeafRoot")?,
+            read_u64_field(tree, cls, "NextNumBlocks").unwrap_or(0),
+        ));
+    }
+    None
+}
+
+/// Full leaf-root registration materialize output — the single vertex tree to
+/// write to the CRDT at `address`.
+pub struct LeafRootRegistrationOutput {
+    pub address: [u8; 32],
+    pub tree: quil_tries::VectorCommitmentTree,
+}
+
+/// Materialize a [`super::LeafRootRegistration`] into its vertex tree + address.
+/// `member` is the 32-byte registering prover address.
+pub fn materialize_leaf_root_registration(
+    member: &[u8; 32],
+    reg: &super::LeafRootRegistration,
+) -> Result<LeafRootRegistrationOutput> {
+    let leaf_id = super::leaf_id_bytes(&reg.shard_filter, &reg.prefix);
+    let address = leaf_root_address(member, &leaf_id)?;
+    let tree = create_leaf_root_vertex_tree(
+        member,
+        &reg.shard_filter,
+        &reg.prefix,
+        reg.epoch,
+        &reg.leaf_root,
+        reg.num_blocks,
+        reg.frame_number,
+    )?;
+    Ok(LeafRootRegistrationOutput { address, tree })
+}
+
 /// Address for a spent ProverJoin merge marker.
 /// `poseidon("PROVER_JOIN_MERGE" || merge_target_pubkey) → 32 bytes`.
 ///
@@ -522,17 +751,43 @@ pub fn build_prover_allocation_hyperedge_blob(
     allocations: &[([u8; 32], &quil_tries::VectorCommitmentTree)],
 ) -> Result<Vec<u8>> {
     use num_bigint::BigInt;
+
+    let mut ext_tree = quil_tries::VectorCommitmentTree::new();
+    for (alloc_addr, alloc_tree) in allocations {
+        let (atom_id, atom_bytes) = allocation_hyperedge_atom(alloc_addr, alloc_tree)?;
+        ext_tree.insert(
+            &atom_id,
+            &atom_bytes,
+            &[],
+            &BigInt::from(atom_bytes.len() as u64),
+        )?;
+    }
+
+    let _ = prover_address; // hyperedge address is the prover address (passed by caller)
+    Ok(crate::prover_registry::vertex_tree_to_blob(&ext_tree))
+}
+
+/// Build a single prover→allocation hyperedge atom: the 64-byte atom id
+/// `GLOBAL_INTRINSIC_ADDRESS || allocation_address` and its value bytes
+/// `0x00 || appAddr(32) || dataAddr(32) || commitment(64) || size(32)`.
+///
+/// Factored out so the ProverJoin path and the Phase-F shard-reassignment
+/// path (which re-keys an allocation from parent→child filter and must
+/// rebuild the prover's hyperedge atom for the new address) produce
+/// byte-identical atoms. Consumers (`get_hyperedge_extrinsic_ids`,
+/// ProverKick) read only the 64-byte key, so the value commitment is
+/// informational — but it must still be deterministic across nodes.
+pub fn allocation_hyperedge_atom(
+    alloc_addr: &[u8; 32],
+    alloc_tree: &quil_tries::VectorCommitmentTree,
+) -> Result<([u8; 64], Vec<u8>)> {
+    use num_bigint::BigInt;
     use quil_types::crypto::InclusionProver;
 
-    // The hyperedge atom IDs are `(GLOBAL_INTRINSIC_ADDRESS, allocation_address)`.
-    // We reuse the same convention as `genesis.rs` for byte-for-byte
-    // parity with the existing on-chain hyperedge format.
     let app_addr = crate::global_schema::GLOBAL_INTRINSIC_ADDRESS;
 
     // Tiny stand-in inclusion prover: emits a deterministic 64-byte
-    // commitment from the input bytes (no real KZG). The hyperedge
-    // consumer (`get_hyperedge_extrinsic_ids`) reads only the leaf
-    // **keys**, so the value commitment is informational.
+    // commitment from the input bytes (no real KZG).
     struct LocalProver;
     impl InclusionProver for LocalProver {
         fn commit_raw(&self, data: &[u8], _: u64) -> quil_types::error::Result<Vec<u8>> {
@@ -549,47 +804,34 @@ pub fn build_prover_allocation_hyperedge_blob(
         fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
     }
 
-    let mut ext_tree = quil_tries::VectorCommitmentTree::new();
-    for (alloc_addr, alloc_tree) in allocations {
-        let mut atom_id = [0u8; 64];
-        atom_id[..32].copy_from_slice(&app_addr);
-        atom_id[32..].copy_from_slice(alloc_addr);
+    let mut atom_id = [0u8; 64];
+    atom_id[..32].copy_from_slice(&app_addr);
+    atom_id[32..].copy_from_slice(alloc_addr);
 
-        // value = vertex.ToBytes() shape (0x00 + appAddr + dataAddr + commitment + size32).
-        // Compute the allocation tree's commitment by walking a clone-equivalent.
-        // Since VectorCommitmentTree doesn't implement Clone, serialize +
-        // deserialize a fresh copy to avoid mutating the input.
-        let blob = crate::prover_registry::vertex_tree_to_blob(alloc_tree);
-        let mut tmp = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
-        let alloc_commitment = tmp.commit(&LocalProver);
+    // Compute the allocation tree's commitment on a clone-equivalent
+    // (VectorCommitmentTree isn't Clone) so we don't mutate the input.
+    let blob = crate::prover_registry::vertex_tree_to_blob(alloc_tree);
+    let mut tmp = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+    let alloc_commitment = tmp.commit(&LocalProver);
 
-        let alloc_size = alloc_tree
-            .root
-            .as_ref()
-            .map(|n| n.size().clone())
-            .unwrap_or_else(|| BigInt::from(0));
-        let mut size_bytes = [0u8; 32];
-        let (_, sb) = alloc_size.to_bytes_be();
-        let off = 32usize.saturating_sub(sb.len());
-        size_bytes[off..].copy_from_slice(&sb[..std::cmp::min(sb.len(), 32)]);
+    let alloc_size = alloc_tree
+        .root
+        .as_ref()
+        .map(|n| n.size().clone())
+        .unwrap_or_else(|| BigInt::from(0));
+    let mut size_bytes = [0u8; 32];
+    let (_, sb) = alloc_size.to_bytes_be();
+    let off = 32usize.saturating_sub(sb.len());
+    size_bytes[off..].copy_from_slice(&sb[..std::cmp::min(sb.len(), 32)]);
 
-        let mut atom_bytes = Vec::with_capacity(161);
-        atom_bytes.push(0x00);
-        atom_bytes.extend_from_slice(&app_addr);
-        atom_bytes.extend_from_slice(alloc_addr);
-        atom_bytes.extend_from_slice(&alloc_commitment);
-        atom_bytes.extend_from_slice(&size_bytes);
+    let mut atom_bytes = Vec::with_capacity(161);
+    atom_bytes.push(0x00);
+    atom_bytes.extend_from_slice(&app_addr);
+    atom_bytes.extend_from_slice(alloc_addr);
+    atom_bytes.extend_from_slice(&alloc_commitment);
+    atom_bytes.extend_from_slice(&size_bytes);
 
-        ext_tree.insert(
-            &atom_id,
-            &atom_bytes,
-            &[],
-            &BigInt::from(atom_bytes.len() as u64),
-        )?;
-    }
-
-    let _ = prover_address; // hyperedge address is the prover address (passed by caller)
-    Ok(crate::prover_registry::vertex_tree_to_blob(&ext_tree))
+    Ok((atom_id, atom_bytes))
 }
 
 // =====================================================================
@@ -742,9 +984,16 @@ pub fn materialize_shard_merge(
     shard_addresses: &[Vec<u8>],
     parent_address: &[u8],
 ) -> Result<ShardMergeOutput> {
-    if parent_address.len() != 32 {
+    // Parent length must match `verify_shard_merge` (32-63 bytes). The base
+    // app address is 32 bytes; deeper shards append one split byte per level,
+    // so a merge can collapse children at ANY depth back to their immediate
+    // parent — e.g. the genesis QUIL shards live at 33-byte filters
+    // (`quil + 1 byte`), so their split children are 34-byte and merge to a
+    // 33-byte parent. (Previously this was pinned to exactly 32, which made
+    // merges impossible for the real QUIL topology.)
+    if parent_address.len() < 32 || parent_address.len() > 63 {
         return Err(QuilError::InvalidArgument(
-            "materialize shard merge: parent_address must be 32 bytes".into(),
+            "materialize shard merge: parent_address must be 32-63 bytes".into(),
         ));
     }
     if shard_addresses.len() < 2 {
@@ -755,9 +1004,12 @@ pub fn materialize_shard_merge(
 
     let mut removed_shards = Vec::with_capacity(shard_addresses.len());
     for addr in shard_addresses {
-        if addr.len() <= 32 {
+        // Each child is the parent plus one (factor 2/4) or two (factor 8)
+        // split bytes — same rule `verify_shard_merge` enforces.
+        if addr.len() != parent_address.len() + 1 && addr.len() != parent_address.len() + 2 {
             return Err(QuilError::InvalidArgument(
-                "materialize shard merge: cannot merge base shards (must be > 32 bytes)".into(),
+                "materialize shard merge: child shard must be parent length + 1 or + 2 bytes"
+                    .into(),
             ));
         }
         // Validate that all shards share the parent prefix
@@ -831,7 +1083,99 @@ pub const REWARD_UNITS: u64 = 8_000_000_000;
 mod tests {
     use super::*;
     use num_bigint::BigInt;
-    use crate::global_schema::{write_type, TYPE_HASH_ALLOCATION};
+    use crate::global_schema::{write_type, read_type, TYPE_HASH_ALLOCATION};
+
+    #[test]
+    fn two_slot_registration_keeps_highest_two_and_lookup_matches_by_epoch() {
+        let member = [0x5Au8; 32];
+        let filter = vec![0x44u8; 32];
+        let prefix: Vec<u32> = vec![3, 9];
+        let mk = |existing: Option<&quil_tries::VectorCommitmentTree>, epoch: u64, lr: u8| {
+            upsert_leaf_root_registration(
+                existing, &member, &filter, &prefix, epoch, &vec![lr; 74], (epoch * 10) + 1, 1000,
+            )
+            .unwrap()
+        };
+
+        // First confirm (epoch 5) → single slot.
+        let t1 = mk(None, 5, 0x05);
+        assert_eq!(read_u64_field(&t1, "leafroot:LeafRootRegistration", "Epoch"), Some(5));
+        assert_eq!(read_u64_field(&t1, "leafroot:LeafRootRegistration", "NextEpoch"), None);
+        assert_eq!(
+            leaf_root_registration_for_epoch(&t1, 5),
+            Some((vec![0x05u8; 74], 51)),
+        );
+
+        // Pre-register the next epoch (6) → {current=5, next=6}, epoch-sorted.
+        let t2 = mk(Some(&t1), 6, 0x06);
+        assert_eq!(read_u64_field(&t2, "leafroot:LeafRootRegistration", "Epoch"), Some(5));
+        assert_eq!(read_u64_field(&t2, "leafroot:LeafRootRegistration", "NextEpoch"), Some(6));
+        // Audit can match EITHER slot by epoch.
+        assert_eq!(leaf_root_registration_for_epoch(&t2, 5), Some((vec![0x05u8; 74], 51)));
+        assert_eq!(leaf_root_registration_for_epoch(&t2, 6), Some((vec![0x06u8; 74], 61)));
+        assert_eq!(leaf_root_registration_for_epoch(&t2, 4), None);
+
+        // Roll forward to epoch 7 → drops the lowest (5), keeps {6,7}.
+        let t3 = mk(Some(&t2), 7, 0x07);
+        assert_eq!(read_u64_field(&t3, "leafroot:LeafRootRegistration", "Epoch"), Some(6));
+        assert_eq!(read_u64_field(&t3, "leafroot:LeafRootRegistration", "NextEpoch"), Some(7));
+        assert_eq!(leaf_root_registration_for_epoch(&t3, 5), None, "stale slot dropped");
+        assert_eq!(leaf_root_registration_for_epoch(&t3, 7), Some((vec![0x07u8; 74], 71)));
+
+        // Same-epoch re-register overwrites that slot's value (no third slot).
+        let t4 = mk(Some(&t3), 7, 0xF7);
+        assert_eq!(leaf_root_registration_for_epoch(&t4, 7), Some((vec![0xF7u8; 74], 71)));
+        assert_eq!(read_u64_field(&t4, "leafroot:LeafRootRegistration", "Epoch"), Some(6));
+    }
+
+    #[test]
+    fn leaf_root_registration_vertex_round_trips_and_rekeys() {
+        let member = [0x7Au8; 32];
+        let reg = super::super::LeafRootRegistration {
+            shard_filter: vec![0xAB; 32],
+            prefix: vec![42, 7, 255],
+            epoch: 19,
+            leaf_root: vec![0x11; 74],
+            num_blocks: 1234,
+            frame_number: 900_000,
+            public_key_signature_bls48581: None,
+        };
+        let out = materialize_leaf_root_registration(&member, &reg).unwrap();
+
+        // The vertex's type hash resolves to the new class.
+        assert_eq!(read_type(&out.tree), Some("leafroot:LeafRootRegistration"));
+
+        // Every stored field reads back, and the (member, leaf_id, epoch) key is
+        // reconstructable from the vertex alone — exactly what the registry does.
+        let cls = "leafroot:LeafRootRegistration";
+        let r_member = read_field(&out.tree, cls, "Member").unwrap();
+        let r_filter = read_field(&out.tree, cls, "ShardFilter").unwrap();
+        let r_prefix = unpack_prefix(&read_field(&out.tree, cls, "Prefix").unwrap());
+        let r_epoch = u64::from_be_bytes(
+            read_field(&out.tree, cls, "Epoch").unwrap().try_into().unwrap(),
+        );
+        let r_leaf_root = read_field(&out.tree, cls, "LeafRoot").unwrap();
+        let r_num_blocks = u64::from_be_bytes(
+            read_field(&out.tree, cls, "NumBlocks").unwrap().try_into().unwrap(),
+        );
+        assert_eq!(r_member, member.to_vec());
+        assert_eq!(r_filter, reg.shard_filter);
+        assert_eq!(r_prefix, reg.prefix);
+        assert_eq!(r_epoch, reg.epoch);
+        assert_eq!(r_leaf_root, reg.leaf_root);
+        assert_eq!(r_num_blocks, reg.num_blocks);
+
+        // Reconstructed address matches the materialized one (epoch-independent:
+        // re-registration overwrites in place).
+        let leaf_id = super::super::leaf_id_bytes(&r_filter, &r_prefix);
+        assert_eq!(leaf_root_address(&r_member, &leaf_id).unwrap(), out.address);
+        // A later-epoch registration of the same leaf hits the SAME address.
+        let mut reg2 = reg.clone();
+        reg2.epoch = r_epoch + 1;
+        reg2.leaf_root = vec![0x22; 74];
+        let out2 = materialize_leaf_root_registration(&member, &reg2).unwrap();
+        assert_eq!(out2.address, out.address, "re-registration must overwrite in place");
+    }
 
     fn make_allocation_tree(status: u8) -> quil_tries::VectorCommitmentTree {
         let mut tree = quil_tries::VectorCommitmentTree::new();
@@ -1143,17 +1487,38 @@ mod tests {
     }
 
     #[test]
-    fn confirm_leave_sets_left_and_frame_number() {
+    fn confirm_leave_keeps_leaving_byte_and_records_confirm_frame() {
+        // Epoch-aligned: leave-confirm keeps the Leaving byte (serving notice);
+        // departure is derived at the E+2 boundary by `effective_status`.
         let mut tree = make_allocation_tree(STATUS_LEAVING);
         materialize_prover_confirm(&mut tree, 500).unwrap();
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_KICKED]); // 4 = left
+        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_LEAVING]);
         assert_eq!(read_field(&tree, "allocation:ProverAllocation", "LeaveConfirmFrameNumber").unwrap(), 500u64.to_be_bytes().to_vec());
     }
 
     #[test]
-    fn confirm_rejects_active_status() {
+    fn confirm_active_renews_storage_epoch_and_stays_active() {
+        // PoRep epoch re-confirm: an Active allocation re-confirming renews its
+        // storage Epoch (registers the NEXT epoch = epoch_for_frame(frame)+1) +
+        // LastActiveFrameNumber and stays Active. This is the close-the-loop for
+        // ExpiredEpoch — without it a stale-epoch allocation could never return.
         let mut tree = make_allocation_tree(STATUS_ACTIVE);
-        assert!(materialize_prover_confirm(&mut tree, 400).is_err());
+        let frame = 5 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10; // epoch 5
+        materialize_prover_confirm(&mut tree, frame).unwrap();
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_ACTIVE],
+            "re-confirm must keep the allocation Active",
+        );
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Epoch").unwrap(),
+            (quil_types::consensus::epoch_for_frame(frame) + 1).to_be_bytes().to_vec(),
+            "re-confirm must register the next storage epoch (one ahead)",
+        );
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "LastActiveFrameNumber").unwrap(),
+            frame.to_be_bytes().to_vec(),
+        );
     }
 
     #[test]
@@ -1189,6 +1554,100 @@ mod tests {
         assert!(materialize_prover_reject(&mut tree, 450).is_err());
     }
 
+    // ---- Gap coverage (audit 2026-06-28): epoch invariants -------------
+
+    /// Reject-leave restores Active but MUST NOT bump `Epoch` — the prover
+    /// submitted no fresh leaf roots, so re-registering it for a new epoch
+    /// would claim a two-slot registration that doesn't exist ("leave-reject
+    /// inconsistency class", materialize.rs comment). Load-bearing invariant.
+    #[test]
+    fn reject_leave_does_not_bump_epoch() {
+        let mut tree = make_allocation_tree(STATUS_LEAVING);
+        // Pre-existing epoch registration the prover already held.
+        write_field(&mut tree, "allocation:ProverAllocation", "Epoch", &7u64.to_be_bytes()).unwrap();
+        // Reject at a frame several epochs later.
+        let frame = 9 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 3;
+        materialize_prover_reject(&mut tree, frame).unwrap();
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_ACTIVE]
+        );
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Epoch").unwrap(),
+            7u64.to_be_bytes().to_vec(),
+            "reject-leave must leave Epoch untouched (no fresh leaf-root registration)"
+        );
+    }
+
+    /// Confirm-JOIN registers the next storage epoch (`epoch_for_frame(frame)+1`)
+    /// — the deferred-activation read-side reads ActivationEpoch off this field,
+    /// so the write that sets it must be pinned (previously only the Active
+    /// re-confirm path asserted it).
+    #[test]
+    fn confirm_join_registers_next_epoch() {
+        let mut tree = make_allocation_tree(STATUS_JOINING);
+        let frame = 3 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 5; // epoch 3
+        materialize_prover_confirm(&mut tree, frame).unwrap();
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Epoch").unwrap(),
+            4u64.to_be_bytes().to_vec(),
+            "confirm-join registers epoch_for_frame(frame)+1 = 4"
+        );
+    }
+
+    /// A second confirm on a freshly-confirmed join takes the Active re-confirm
+    /// branch: it renews Epoch + LastActive but must NOT move JoinConfirmFrameNumber
+    /// (the activation epoch is anchored to the FIRST confirm).
+    #[test]
+    fn double_confirm_join_keeps_activation_anchor() {
+        let mut tree = make_allocation_tree(STATUS_JOINING);
+        let f1 = 3 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 5;
+        let f2 = 4 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 5;
+        materialize_prover_confirm(&mut tree, f1).unwrap();
+        materialize_prover_confirm(&mut tree, f2).unwrap();
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "JoinConfirmFrameNumber").unwrap(),
+            f1.to_be_bytes().to_vec(),
+            "second confirm must not move the activation anchor"
+        );
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Epoch").unwrap(),
+            (quil_types::consensus::epoch_for_frame(f2) + 1).to_be_bytes().to_vec(),
+            "second confirm renews the storage epoch"
+        );
+    }
+
+    /// Confirm/reject on a terminal (byte-4) allocation hit the error arm —
+    /// previously only PAUSED was tested for confirm and ACTIVE for reject.
+    #[test]
+    fn confirm_and_reject_reject_terminal_status() {
+        let mut t1 = make_allocation_tree(STATUS_KICKED);
+        assert!(materialize_prover_confirm(&mut t1, 400).is_err(), "confirm on byte-4 rejected");
+        let mut t2 = make_allocation_tree(STATUS_KICKED);
+        assert!(materialize_prover_reject(&mut t2, 400).is_err(), "reject on byte-4 rejected");
+    }
+
+    /// Kick and reject-join BOTH write status byte 4 (intended overload); they
+    /// are disambiguated only by which frame field is stamped — kick sets
+    /// `KickFrameNumber`, reject-join sets `JoinRejectFrameNumber`. Pins the
+    /// contract `effective_status` + the eviction path rely on.
+    #[test]
+    fn kick_and_reject_join_share_byte4_disambiguated_by_frame_field() {
+        let cls = "allocation:ProverAllocation";
+        // Kick: byte 4 + KickFrameNumber, no JoinRejectFrameNumber.
+        let mut k = make_allocation_tree(STATUS_ACTIVE);
+        materialize_prover_kick_allocation(&mut k, 999).unwrap();
+        assert_eq!(read_field(&k, cls, "Status").unwrap(), vec![STATUS_KICKED]);
+        assert_eq!(read_field(&k, cls, "KickFrameNumber").unwrap(), 999u64.to_be_bytes().to_vec());
+        assert!(read_field(&k, cls, "JoinRejectFrameNumber").is_none(), "kick stamps no JoinRejectFrameNumber");
+        // Reject-join: byte 4 + JoinRejectFrameNumber, no KickFrameNumber.
+        let mut r = make_allocation_tree(STATUS_JOINING);
+        materialize_prover_reject(&mut r, 999).unwrap();
+        assert_eq!(read_field(&r, cls, "Status").unwrap(), vec![STATUS_KICKED]);
+        assert_eq!(read_field(&r, cls, "JoinRejectFrameNumber").unwrap(), 999u64.to_be_bytes().to_vec());
+        assert!(read_field(&r, cls, "KickFrameNumber").is_none(), "reject-join stamps no KickFrameNumber");
+    }
+
     // -----------------------------------------------------------------
     // Full lifecycle: join → confirm → pause → leave → confirm leave
     // -----------------------------------------------------------------
@@ -1218,9 +1677,10 @@ mod tests {
         materialize_prover_leave(&mut alloc, 700).unwrap();
         assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_LEAVING]);
 
-        // Confirm leave → left
+        // Confirm leave → keeps Leaving byte (departs at E+2 via read-side)
         materialize_prover_confirm(&mut alloc, 1060).unwrap();
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_KICKED]);
+        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_LEAVING]);
+        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "LeaveConfirmFrameNumber").unwrap(), 1060u64.to_be_bytes().to_vec());
     }
 
     #[test]
@@ -1560,6 +2020,23 @@ mod tests {
         assert_eq!(output.removed_shards[0].0, parent);
         assert_eq!(output.removed_shards[0].1, vec![0x01u32]);
         assert_eq!(output.removed_shards[1].1, vec![0x02u32]);
+    }
+
+    #[test]
+    fn shard_merge_accepts_deeper_parent() {
+        // QUIL topology: genesis shards are 33-byte filters, so their split
+        // children are 34 bytes and merge back to a 33-byte parent.
+        let mut parent = vec![0xAAu8; 32];
+        parent.push(0x05);
+        let mut c0 = parent.clone();
+        c0.push(0x00);
+        let mut c1 = parent.clone();
+        c1.push(0x80);
+        let output = materialize_shard_merge(&[c0, c1], &parent).unwrap();
+        assert_eq!(output.removed_shards.len(), 2);
+        assert_eq!(output.removed_shards[0].0, vec![0xAAu8; 32]); // L2
+        assert_eq!(output.removed_shards[0].1, vec![0x05u32, 0x00u32]); // path
+        assert_eq!(output.removed_shards[1].1, vec![0x05u32, 0x80u32]);
     }
 
     #[test]

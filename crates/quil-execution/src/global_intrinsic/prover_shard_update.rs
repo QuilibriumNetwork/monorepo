@@ -126,6 +126,9 @@ pub fn verify_frame_header_attestation(
                 bitmask: agg.bitmask.clone(),
             },
         ),
+        storage_attestation_root: frame_header.storage_attestation_root.clone(),
+        global_frame_number: frame_header.global_frame_number,
+        storage_attestation: frame_header.storage_attestation.clone(),
     };
 
     frame_prover.verify_frame_header(&proto)?;
@@ -147,17 +150,26 @@ pub fn verify_frame_header_attestation(
         }
         out
     };
-    let id_refs: Vec<&[u8]> = participant_ids.iter().map(|v| v.as_slice()).collect();
+    // Pass the FULL active committee — the deterministic universe the
+    // multiproof's challenge prime `b` is bound to. `verify_frame_header_signature`
+    // re-derives the PRESENT signer subset from the header bitmask and verifies
+    // only their proofs against the committee-bound `b`. Requiring full
+    // attendance was the bug: a BFT committee can't know who is absent until
+    // the vote threshold is in. (`participant_ids` above already bounds-checked
+    // every bitmask index against the committee.) See
+    // `vdf::wesolowski_verify_multi_sparse`.
+    let committee_refs: Vec<&[u8]> =
+        active_provers.iter().map(|p| p.address.as_slice()).collect();
     // 74-byte aggregate = single signer, no multi-proofs to verify.
     let ids_arg: Option<&[&[u8]]> = if agg.signature.len() == 74 {
-        if id_refs.len() != 1 {
+        if participant_ids.len() != 1 {
             return Err(QuilError::InvalidSignature(
                 "frame header attestation: 74-byte signature requires exactly 1 participant".into(),
             ));
         }
         None
     } else {
-        Some(&id_refs)
+        Some(&committee_refs)
     };
     let valid = frame_prover.verify_frame_header_signature(
         &proto,
@@ -569,6 +581,7 @@ mod tests {
                 leave_confirm_frame_number: 0,
                 leave_reject_frame_number: 0,
                 last_active_frame_number: 0,
+                epoch: 0,
                 vertex_address: vec![seed; 32],
             }],
             available_storage: 0,
@@ -619,6 +632,9 @@ mod tests {
             prover: Vec::new(),
             fee_multiplier_vote: 0,
             public_key_signature_bls48581: Vec::new(),
+            storage_attestation_root: Vec::new(),
+            global_frame_number: 0,
+            storage_attestation: Vec::new(),
         }
     }
 
@@ -826,6 +842,8 @@ mod tests {
                 _: u32,
                 _: u64,
                 _: u64,
+                _: &[u8],
+                _: u64,
             ) -> Result<quil_types::proto::global::FrameHeader> {
                 Err(QuilError::InvalidArgument("noop".into()))
             }
@@ -887,5 +905,225 @@ mod tests {
         let lafn = read_field(&atree, "allocation:ProverAllocation", "LastActiveFrameNumber").unwrap();
         assert_eq!(lafn, 11u64.to_be_bytes().to_vec());
 
+    }
+
+    // ---- Gap coverage (audit 2026-06-28): partial-ring reward distribution.
+
+    fn noop_registry() -> Arc<dyn ProverRegistry> {
+        struct R;
+        impl ProverRegistry for R {
+            fn get_prover_info(&self, _: &[u8]) -> Result<Option<ProverInfo>> { Ok(None) }
+            fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<u8>> { Ok(Vec::new()) }
+            fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
+            fn get_active_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
+            fn get_prover_count(&self, _: &[u8]) -> Result<usize> { Ok(0) }
+            fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
+            fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
+            fn get_prover_shard_summaries(&self, _: u64) -> Result<Vec<quil_types::consensus::ProverShardSummary>> { Ok(Vec::new()) }
+        }
+        Arc::new(R)
+    }
+    fn noop_frame_prover() -> Arc<dyn FrameProver> {
+        struct F;
+        impl FrameProver for F {
+            fn prove_frame_header(&self, _: &[u8], _: &[u8], _: &[u8], _: &[Vec<u8>], _: &[u8], _: i64, _: u32, _: u64, _: u64, _: &[u8], _: u64) -> Result<quil_types::proto::global::FrameHeader> { Err(QuilError::InvalidArgument("noop".into())) }
+            fn verify_frame_header(&self, _: &quil_types::proto::global::FrameHeader) -> Result<Vec<u8>> { Ok(Vec::new()) }
+            fn prove_global_frame_header(&self, _: &quil_types::proto::global::GlobalFrameHeader, _: &[Vec<u8>], _: &[u8], _: &[u8], _: &dyn quil_types::crypto::Signer, _: i64, _: u32, _: u8) -> Result<quil_types::proto::global::GlobalFrameHeader> { Err(QuilError::InvalidArgument("noop".into())) }
+            fn verify_global_frame_header(&self, _: &quil_types::proto::global::GlobalFrameHeader) -> Result<Vec<u8>> { Ok(Vec::new()) }
+            fn calculate_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: u32) -> Result<Vec<u8>> { Ok(Vec::new()) }
+            fn verify_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: &[&[u8]]) -> Result<bool> { Ok(true) }
+        }
+        Arc::new(F)
+    }
+    fn reward_balance(state: &HypergraphState, prover: &ProverInfo) -> BigInt {
+        let reward_addr = reward_address(&prover.address).unwrap();
+        let va_disc = vertex_adds_discriminator().unwrap();
+        match state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &reward_addr, &va_disc).unwrap() {
+            Some(blob) => {
+                let tree = rebuild_vertex_tree_from_blob(&blob);
+                let b = read_field(&tree, "reward:ProverReward", "Balance").unwrap_or_default();
+                BigInt::from_bytes_be(num_bigint::Sign::Plus, &b)
+            }
+            None => BigInt::from(0),
+        }
+    }
+
+    /// A ring with N < RING_GROUP_SIZE participants pays each member
+    /// `outputs[0] / RING_GROUP_SIZE`, so the ring mints only N/8 of the full
+    /// ring reward — the empty slots are NOT minted. Intended per-slot economic
+    /// model (reward tracks participation). Pinned here; VERIFY vs Go before altering.
+    #[test]
+    fn partial_ring_pays_each_an_eighth_and_undermints() {
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        // 6 active provers, distinct join frames → ranks 0..5 → all in ring 0
+        // (6 < RING_GROUP_SIZE=8). Full participation (bitmask 0b00111111).
+        let provers: Vec<ProverInfo> =
+            (1u8..=6).map(|s| fake_prover(s, s as u64, 0, &filter)).collect();
+        for p in &provers {
+            seed_alloc_blob(&state, p, &filter);
+        }
+        let header = fake_header(filter.clone(), 10);
+        let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8_000)));
+        let md = ShardMetadata { state_size: 1024, shard_count: 1 };
+
+        materialize_prover_shard_update(
+            &header, 11, &state, &noop_registry(), &noop_frame_prover(),
+            &reward_issuance, 4096, provers.clone(),
+            &[0, 1, 2, 3, 4, 5], // participant INDICES (full attendance: all 6)
+            md,
+        )
+        .unwrap();
+
+        // Each of the 6 members gets exactly 8_000 / 8 = 1_000; total minted is
+        // 6_000 (= 6/8 of the full 8_000 ring reward) — the 2 vacant slots'
+        // 2_000 is NOT minted.
+        let mut total = BigInt::from(0);
+        for p in &provers {
+            let bal = reward_balance(&state, p);
+            assert_eq!(bal, BigInt::from(1_000), "each ring member gets outputs[0]/8");
+            total += bal;
+        }
+        assert_eq!(total, BigInt::from(6_000), "partial ring under-mints to N/8");
+    }
+
+    /// A zero reward share (integer division rounds to 0 / StubReward 0) writes
+    /// NO reward vertex, but `LastActiveFrameNumber` is still bumped — activity
+    /// and reward are decoupled.
+    #[test]
+    fn zero_reward_share_skips_vertex_but_bumps_activity() {
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        let p = fake_prover(1, 1, 0, &filter);
+        seed_alloc_blob(&state, &p, &filter);
+        let header = fake_header(filter.clone(), 10);
+        let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(0)));
+        let md = ShardMetadata { state_size: 1024, shard_count: 1 };
+
+        materialize_prover_shard_update(
+            &header, 11, &state, &noop_registry(), &noop_frame_prover(),
+            &reward_issuance, 4096, vec![p.clone()], &[0u8], md,
+        )
+        .unwrap();
+
+        // No reward vertex written (share == 0).
+        let reward_addr = reward_address(&p.address).unwrap();
+        let va_disc = vertex_adds_discriminator().unwrap();
+        assert!(
+            state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &reward_addr, &va_disc).unwrap().is_none(),
+            "zero share must not write a reward vertex"
+        );
+        // But activity still bumped.
+        let alloc_addr = allocation_address(&p.public_key, &filter).unwrap();
+        let atree = rebuild_vertex_tree_from_blob(
+            &state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_addr, &va_disc).unwrap().unwrap(),
+        );
+        assert_eq!(
+            read_field(&atree, "allocation:ProverAllocation", "LastActiveFrameNumber").unwrap(),
+            11u64.to_be_bytes().to_vec()
+        );
+    }
+
+    /// Reward is credited to the prover's OWN reward vertex, never redirected to
+    /// its `delegate_address` (the delegate is distribution metadata only).
+    /// Guards against a "pay the delegate" regression (consensus fork).
+    #[test]
+    fn reward_credits_prover_vertex_not_delegate() {
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        let mut p = fake_prover(1, 1, 0, &filter);
+        let delegate = vec![0xDDu8; 32];
+        p.delegate_address = delegate.clone();
+        seed_alloc_blob(&state, &p, &filter);
+        let header = fake_header(filter.clone(), 10);
+        let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8_000)));
+        let md = ShardMetadata { state_size: 1024, shard_count: 1 };
+
+        materialize_prover_shard_update(
+            &header, 11, &state, &noop_registry(), &noop_frame_prover(),
+            &reward_issuance, 4096, vec![p.clone()], &[0u8], md,
+        )
+        .unwrap();
+
+        // Prover's own reward vertex got the credit.
+        assert_eq!(reward_balance(&state, &p), BigInt::from(1_000));
+        // The delegate address has NO reward vertex.
+        let va_disc = vertex_adds_discriminator().unwrap();
+        let delegate_reward = reward_address(&delegate).unwrap();
+        assert!(
+            state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &delegate_reward, &va_disc).unwrap().is_none(),
+            "delegate must not receive a direct reward credit"
+        );
+    }
+
+    /// Two rings credit DISTINCT per-ring shares. A ring-aware stub returns
+    /// `8000 >> ring` (ring 0 → 8000, ring 1 → 4000); each member is paid
+    /// `that / 8`, so ring-0 members get 1000 and the ring-1 member gets 500.
+    #[test]
+    fn two_rings_credit_distinct_shares() {
+        // Ring-aware reward stub: value depends on the allocation's ring.
+        struct RingStub;
+        impl RewardIssuance for RingStub {
+            fn calculate(
+                &self, _: u64, _: u64, _: u64,
+                provers: &[HashMap<String, ProverAllocation>],
+            ) -> Result<Vec<BigInt>> {
+                let ring = provers.first().and_then(|m| m.values().next()).map(|a| a.ring).unwrap_or(0);
+                Ok(provers.iter().map(|_| BigInt::from(8_000u64 >> ring)).collect())
+            }
+        }
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        // 9 provers, ranks 0..8 → ring 0 (ranks 0-7) + ring 1 (rank 8). The
+        // rank order follows join_frame, so seed 9 (join_frame 9) is rank 8.
+        let provers: Vec<ProverInfo> =
+            (1u8..=9).map(|s| fake_prover(s, s as u64, 0, &filter)).collect();
+        for p in &provers {
+            seed_alloc_blob(&state, p, &filter);
+        }
+        let header = fake_header(filter.clone(), 10);
+        let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(RingStub);
+        let md = ShardMetadata { state_size: 1024, shard_count: 1 };
+        let indices: Vec<u8> = (0u8..9).collect();
+
+        materialize_prover_shard_update(
+            &header, 11, &state, &noop_registry(), &noop_frame_prover(),
+            &reward_issuance, 4096, provers.clone(), &indices, md,
+        )
+        .unwrap();
+
+        // First 8 (ring 0) get 1000; the 9th (ring 1) gets 500.
+        for p in &provers[..8] {
+            assert_eq!(reward_balance(&state, p), BigInt::from(1_000), "ring-0 member share");
+        }
+        assert_eq!(reward_balance(&state, &provers[8]), BigInt::from(500), "ring-1 member share");
+    }
+
+    /// The participant index list binds to POSITION in `active_provers`: index 0
+    /// and 2 are credited, index 1 (skipped) is not — a reorder would
+    /// misattribute rewards, so this guards the consensus determinism.
+    #[test]
+    fn participant_indices_bind_to_active_prover_position() {
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        let provers: Vec<ProverInfo> =
+            (1u8..=3).map(|s| fake_prover(s, s as u64, 0, &filter)).collect();
+        for p in &provers {
+            seed_alloc_blob(&state, p, &filter);
+        }
+        let header = fake_header(filter.clone(), 10);
+        let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8_000)));
+        let md = ShardMetadata { state_size: 1024, shard_count: 1 };
+
+        // Participants = positions 0 and 2 (skip position 1). 2 of 3 ≥ 2/3.
+        materialize_prover_shard_update(
+            &header, 11, &state, &noop_registry(), &noop_frame_prover(),
+            &reward_issuance, 4096, provers.clone(), &[0, 2], md,
+        )
+        .unwrap();
+
+        assert_eq!(reward_balance(&state, &provers[0]), BigInt::from(1_000), "index 0 credited");
+        assert_eq!(reward_balance(&state, &provers[1]), BigInt::from(0), "index 1 (skipped) not credited");
+        assert_eq!(reward_balance(&state, &provers[2]), BigInt::from(1_000), "index 2 credited");
     }
 }

@@ -110,25 +110,82 @@ pub enum AppConsensusEvent {
 /// available after the consumer has been constructed.
 pub struct AppConsumer {
     filter: Vec<u8>,
-    /// Poseidon(filter) — peers compare an inbound proposal's
-    /// FrameHeader.address against this; encoding our own proposal
-    /// with `address = filter` would have peers reject every proposal.
+    /// The wire `FrameHeader.address` field — **equal to `filter`**. Peers
+    /// (`handle_app_shard_proposal`) compare an inbound proposal's
+    /// `header.address` against the engine's `app_address`, which is also
+    /// `filter` (app_engine.rs:92,786) and `AppFollower`'s (app_glue.rs:655).
+    /// Encoding proposals with `poseidon(filter)` here had peers drop every
+    /// consensus-driven proposal, stalling the shard past frame 1 — the #30
+    /// `app_address = filter` fix had not reached this consumer.
     app_address: Vec<u8>,
     event_tx: mpsc::UnboundedSender<AppConsensusEvent>,
     aggregator: std::sync::OnceLock<std::sync::Arc<crate::app_vote_aggregation::AppVoteAggregation>>,
+    /// Storage-attestation deps for vote-attached openings (PoRep). Installed
+    /// post-construction via [`Self::set_storage_deps`]; absent → votes carry no
+    /// openings (pre-activation / non-archive).
+    storage: std::sync::OnceLock<StorageVoteDeps>,
+}
+
+/// Deps the consumer needs to attach PoRep openings to its app-shard votes.
+struct StorageVoteDeps {
+    crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    replica_store: quil_store::replica_store::ReplicaStore,
+    clock_store: std::sync::Arc<dyn quil_types::store::ClockStore>,
+    member: Vec<u8>,
 }
 
 impl AppConsumer {
     pub fn new(filter: Vec<u8>, event_tx: mpsc::UnboundedSender<AppConsensusEvent>) -> Self {
-        let app_address = quil_crypto::poseidon::hash_bytes_to_32(&filter)
-            .map(|h| h.to_vec())
-            .unwrap_or_default();
+        let app_address = filter.clone();
         Self {
             filter,
             app_address,
             event_tx,
             aggregator: std::sync::OnceLock::new(),
+            storage: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the storage-attestation deps so votes carry PoRep openings.
+    /// Idempotent (first set wins), like [`Self::set_aggregator`].
+    pub fn set_storage_deps(
+        &self,
+        crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+        replica_store: quil_store::replica_store::ReplicaStore,
+        clock_store: std::sync::Arc<dyn quil_types::store::ClockStore>,
+        member: Vec<u8>,
+    ) {
+        let _ = self.storage.set(StorageVoteDeps { crdt, replica_store, clock_store, member });
+    }
+
+    /// The openings blob to attach to a vote: this member's `StorageAttestation`
+    /// for the shard, at the current epoch + beacon ρ_N derived from the latest
+    /// global frame. Empty unless storage is active and the deps are installed.
+    fn storage_vote_openings(&self) -> Vec<u8> {
+        let Some(sd) = self.storage.get() else {
+            return Vec::new();
+        };
+        let Ok(gf) = sd.clock_store.get_latest_global_clock_frame() else {
+            return Vec::new();
+        };
+        let Some(gh) = gf.header else {
+            return Vec::new();
+        };
+        // Always-on: attach openings whenever there is a real global anchor.
+        if gh.frame_number == 0 {
+            return Vec::new();
+        }
+        let epoch = quil_types::consensus::epoch_for_frame(gh.frame_number);
+        let rho_n = quil_crypto::porep::derive_storage_beacon(gh.frame_number, &gh.output);
+        crate::app_shard_metadata::build_vote_openings(
+            &sd.crdt,
+            &sd.replica_store,
+            &self.filter,
+            &sd.member,
+            epoch,
+            &rho_n,
+        )
+        .unwrap_or_default()
     }
 
     /// Install the per-shard vote aggregator. Idempotent — only the
@@ -153,13 +210,28 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
     fn on_receive_proposal(
         &self,
         current_rank: u64,
-        _proposal: &SignedProposal<AppShardState, AppShardVote>,
+        proposal: &SignedProposal<AppShardState, AppShardVote>,
     ) {
         debug!(
             filter = hex::encode(&self.filter),
             rank = current_rank,
             "received shard proposal"
         );
+
+        // Hand the received proposal to the rank's vote collector so it
+        // transitions Caching → Verifying and tallies votes (cached and
+        // subsequent) against this proposal's identifier. Without this,
+        // only the proposer (which feeds its aggregator in
+        // `on_own_proposal`) ever leaves `Caching`; followers cache
+        // votes but never process them, so only the proposer forms a
+        // local QC and the next-rank leader never advances. The
+        // app-shard design aggregates on every node (votes arrive via
+        // `handle_vote` + self-tally), so every node must also see the
+        // proposal. `process_state` is idempotent for the proposer's
+        // re-injected self-proposal (same state id → no-op).
+        if let Some(agg) = self.aggregator.get() {
+            agg.handle_proposal(proposal);
+        }
     }
 
     fn on_receive_quorum_certificate(
@@ -220,6 +292,10 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
             timestamp: vote.timestamp(),
             signature: vote.signature_bytes.clone(),
             address: vote.identity().clone(),
+            // PoRep: attach this member's storage openings (empty unless storage
+            // is active and the deps are installed). The aggregator collects
+            // these from the rank's votes to assemble the frame attestation.
+            openings: self.storage_vote_openings(),
         };
         if let Ok(bytes) = wire_vote.to_canonical_bytes() {
             let _ = self.event_tx.send(AppConsensusEvent::OwnVote {
@@ -247,6 +323,7 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
             timestamp: 0,
             signature: timeout.vote.signature_bytes.clone(),
             address: timeout.vote.identity().clone(),
+            openings: Vec::new(), // timeout votes never carry openings
         };
         let wire_ts = crate::consensus_wire::TimeoutState {
             latest_quorum_certificate: wire_qc,
@@ -290,8 +367,8 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
         // here is unparseable on the wire and peers never vote.
         let st = &proposal.proposal.state.state;
         let canonical_header = quil_execution::global_intrinsic::frame_header::FrameHeader {
-            // Peers compare against `app_address = Poseidon(filter)`,
-            // not the raw filter (see `handle_app_shard_proposal`).
+            // `app_address == filter` — peers' `handle_app_shard_proposal`
+            // drops any proposal whose `header.address != filter`.
             address: self.app_address.clone(),
             frame_number: st.frame_number,
             rank: proposal.proposal.state.rank,
@@ -304,6 +381,11 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
             prover: st.prover.clone(),
             fee_multiplier_vote: st.fee_multiplier as i64,
             public_key_signature_bls48581: st.signature.clone(),
+            storage_attestation_root: st.storage_attestation_root.clone(),
+            global_frame_number: st.global_frame_number,
+            // Proposal-time: openings aren't known until votes land; the
+            // attestation is assembled at QC on the finalize/coverage path.
+            storage_attestation: Vec::new(),
         };
         let header_bytes = match canonical_header.to_canonical_bytes() {
             Ok(b) => b,
@@ -364,6 +446,7 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
             timestamp: v.timestamp(),
             signature: v.signature_bytes.clone(),
             address: v.identity().clone(),
+            openings: Vec::new(),
         };
         let vote_bytes = match wire_vote.to_canonical_bytes() {
             Ok(b) => b,
@@ -662,6 +745,17 @@ pub struct AppFollower {
     on_incorporated: Option<AppIncorporatedStateHook>,
     /// Lookup for certifying QCs — see `QcStore`.
     qc_store: Arc<QcStore>,
+    /// PoRep (5w): deps to assemble the committee `StorageAttestation` from the
+    /// rank's voted openings at finalization and bind it onto the reward proof.
+    /// Installed post-construction (the aggregator is built after the follower).
+    storage: std::sync::OnceLock<AppFollowerStorageDeps>,
+}
+
+/// Deps `AppFollower` needs to assemble + attach the frame `StorageAttestation`
+/// on the coverage/finalize path.
+struct AppFollowerStorageDeps {
+    aggregator: Arc<crate::app_vote_aggregation::AppVoteAggregation>,
+    clock_store: Arc<dyn quil_types::store::ClockStore>,
 }
 
 impl AppFollower {
@@ -679,6 +773,7 @@ impl AppFollower {
             coverage_publish,
             on_incorporated: None,
             qc_store,
+            storage: std::sync::OnceLock::new(),
         }
     }
 
@@ -697,7 +792,65 @@ impl AppFollower {
             coverage_publish,
             on_incorporated,
             qc_store,
+            storage: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the PoRep finalize-path deps (idempotent — first set wins).
+    /// Called once the per-shard vote aggregator exists.
+    pub fn set_storage_deps(
+        &self,
+        aggregator: Arc<crate::app_vote_aggregation::AppVoteAggregation>,
+        clock_store: Arc<dyn quil_types::store::ClockStore>,
+    ) {
+        let _ = self.storage.set(AppFollowerStorageDeps { aggregator, clock_store });
+    }
+
+    /// Assemble the committee `StorageAttestation` from rank `rank`'s voted
+    /// openings and bind both the 74-byte aggregate root and the openings blob
+    /// onto `header`. No-op (returns `header` unchanged) pre-activation, when
+    /// the deps aren't installed, or when no vote at this rank carried openings
+    /// — keeping the canonical bytes byte-identical to the legacy layout.
+    fn enrich_with_storage_attestation(
+        &self,
+        mut header: quil_execution::global_intrinsic::frame_header::FrameHeader,
+        rank: u64,
+    ) -> quil_execution::global_intrinsic::frame_header::FrameHeader {
+        // Always-on: enrich whenever the header anchors to a real global frame.
+        if header.global_frame_number == 0 {
+            return header;
+        }
+        let Some(sd) = self.storage.get() else {
+            return header;
+        };
+        let openings = sd.aggregator.take_frame_openings(rank);
+        if openings.is_empty() {
+            return header;
+        }
+        let global_output = sd
+            .clock_store
+            .get_global_clock_frame(header.global_frame_number)
+            .ok()
+            .and_then(|f| f.header.map(|h| h.output))
+            .unwrap_or_default();
+        let rho_n = quil_crypto::porep::derive_storage_beacon(
+            header.global_frame_number,
+            &global_output,
+        );
+        let bitmask = quil_execution::hypergraph_intrinsic::canonical::AggregateSignature
+            ::from_canonical_bytes(&header.public_key_signature_bls48581)
+            .map(|s| s.bitmask)
+            .unwrap_or_default();
+        let (att, root) = quil_crypto::porep::build_frame_storage_attestation(
+            &openings,
+            header.frame_number,
+            &rho_n,
+            &bitmask,
+            quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+        );
+        header.storage_attestation_root = root;
+        header.storage_attestation = prost::Message::encode_to_vec(&att);
+        header
     }
 }
 
@@ -781,7 +934,16 @@ impl FollowerConsumer<AppShardState> for AppFollower {
             prover: state.state.prover.clone(),
             fee_multiplier_vote: state.state.fee_multiplier as i64,
             public_key_signature_bls48581: sig_bytes,
+            storage_attestation_root: state.state.storage_attestation_root.clone(),
+            global_frame_number: state.state.global_frame_number,
+            storage_attestation: Vec::new(),
         };
+        // PoRep (5w): past the storage fork, assemble the committee attestation
+        // from the rank's voted openings and bind it (root + openings) onto the
+        // canonical header BEFORE publishing — so every finalizing node's reward
+        // proof carries what the global frame audits. Empty (no deps / no
+        // openings / pre-activation) leaves the header byte-identical to legacy.
+        let canonical_header = self.enrich_with_storage_attestation(canonical_header, state.rank);
         let header_bytes: Option<Vec<u8>> = match canonical_header.to_canonical_bytes() {
             Ok(bytes) => {
                 if let Some(publisher) = self.coverage_publish.as_ref() {

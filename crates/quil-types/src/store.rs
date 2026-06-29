@@ -65,6 +65,44 @@ pub struct ShardInfo {
     pub commitment: Vec<Vec<u8>>,
 }
 
+/// The kind of a staged shard topology change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardChangeKind {
+    /// Parent shard splits into the listed child sub-shards.
+    Split,
+    /// The listed child sub-shards merge back into the parent.
+    Merge,
+}
+
+/// A staged (epoch-aligned) shard topology change. A split/merge proposed in
+/// epoch E is recorded as pending and only flips the live topology at the E+2
+/// boundary (`effective_epoch`), keeping committee membership frozen within an
+/// epoch. Recorded deterministically by every node that materializes the op, so
+/// the shards store stays consistent across the network. See
+/// `[[epoch-aligned-lifecycle-design]]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingShardChange {
+    pub kind: ShardChangeKind,
+    /// The parent shard address (split source / merge target).
+    pub parent: Vec<u8>,
+    /// The child sub-shard addresses (split targets / merge sources).
+    pub children: Vec<Vec<u8>>,
+    /// The epoch at which the change takes effect (= epoch_for_frame(proposed)+2).
+    pub effective_epoch: u64,
+    /// The frame the op was materialized at (for diagnostics / ordering).
+    pub proposed_frame: u64,
+}
+
+impl PendingShardChange {
+    /// True when this pending change touches the given shard address — either as
+    /// the parent or one of the children. Used by the join-freeze gate: a join
+    /// targeting a shard with a pending change (between E and E+2) is rejected
+    /// because the shard's existence/identity is about to change.
+    pub fn affects_shard(&self, shard: &[u8]) -> bool {
+        self.parent == shard || self.children.iter().any(|c| c == shard)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Domain-specific stores
 // ---------------------------------------------------------------------------
@@ -443,6 +481,43 @@ pub trait ShardsStore: Send + Sync {
         shard_key: &[u8],
         prefix: &[u32],
     ) -> Result<()>;
+
+    // ---- Epoch-aligned pending topology changes (Phase F) -------------------
+    // Default no-ops so light/test stores don't need to implement staging; the
+    // persistent RocksDB store overrides them.
+
+    /// Stage a pending split/merge. Recorded by `invoke_shard_split/merge` at
+    /// proposal time; applied at the `effective_epoch` boundary.
+    fn put_pending_shard_change(
+        &self,
+        _txn: &dyn Transaction,
+        _change: &PendingShardChange,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// All pending changes that take effect at exactly `effective_epoch` — the
+    /// set the epoch-boundary materializer applies when the chain crosses into
+    /// that epoch.
+    fn get_pending_shard_changes(&self, _effective_epoch: u64) -> Result<Vec<PendingShardChange>> {
+        Ok(Vec::new())
+    }
+
+    /// Every staged change not yet applied — used by the join-freeze gate to ask
+    /// "does any pending change touch this shard?".
+    fn all_pending_shard_changes(&self) -> Result<Vec<PendingShardChange>> {
+        Ok(Vec::new())
+    }
+
+    /// Remove a staged change after it has been applied (or superseded).
+    fn delete_pending_shard_change(
+        &self,
+        _txn: &dyn Transaction,
+        _parent: &[u8],
+        _effective_epoch: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Hypergraph tree backing store (vector commitment trees).
@@ -519,6 +594,21 @@ pub trait HypergraphStore: Send + Sync {
         &self,
         frame_number: u64,
     ) -> Result<std::collections::HashMap<ShardKey, Vec<Vec<u8>>>>;
+
+    /// Delete the cached per-frame shard-commit roots (all four phases)
+    /// for a single shard, identified by its 32-byte shard address (the
+    /// `ShardKey.l2`). Used to force `commit(frame_number)` to recompute
+    /// and reflush a shard whose tree was mutated AFTER that frame's first
+    /// commit — the same-frame idempotency cache would otherwise reuse the
+    /// stale cached root and skip the now-dirty tree. Default no-op for
+    /// stores without a per-frame commit cache (test/in-memory impls).
+    fn delete_shard_commits(
+        &self,
+        _frame_number: u64,
+        _shard_address: &[u8],
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Load one vertex's underlying data blob (Go-serialized tree format
     /// per `SerializeNonLazyTree`), or `Ok(None)` if absent. Used by
@@ -674,4 +764,34 @@ pub trait SnapshotReadable: Send + Sync {
         phase_type: &str,
         shard_key: &ShardKey,
     ) -> Result<Option<Vec<u8>>>;
+
+    /// Read one tree node by its by-path index, point-in-time consistent
+    /// at the captured sequence. Mirrors
+    /// [`HypergraphStore::get_node_by_path`] (SeekGE + prefix
+    /// compression). Lets a consumer walk a whole tree over a single
+    /// consistent snapshot (e.g. the prover shard) instead of issuing
+    /// non-isolated live reads. Default `Ok(None)` for blob-only snapshot
+    /// impls that don't support per-node reads.
+    fn get_node_by_path(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_key: &ShardKey,
+        _path: &[i32],
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Read one vertex's underlying data blob at the captured sequence.
+    /// Mirrors [`HypergraphStore::load_vertex_underlying_raw`]. Default
+    /// `Ok(None)`.
+    fn load_vertex_underlying_raw(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_key: &ShardKey,
+        _vertex_key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }

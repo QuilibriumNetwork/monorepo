@@ -125,6 +125,15 @@ pub struct ProposalVote {
     pub timestamp: u64,
     pub signature: Vec<u8>,   // BLS48581AddressedSignature bytes
     pub address: Vec<u8>,     // 32 bytes — prover address
+    /// PoRep storage openings this voter attaches to its app-shard vote
+    /// (a serialized `global::StorageAttestation`). The vote-aggregator
+    /// collects these and assembles the frame's `StorageAttestation` +
+    /// 74-byte aggregate `storage_attestation_root` when the QC forms.
+    /// Empty for global / timeout votes and pre-activation app votes — and
+    /// when empty it is NOT written, so the encoding is byte-identical to
+    /// the legacy `ProposalVote`. Trailing + tolerant-decoded; safe because
+    /// the only embedded use (`TimeoutState.vote`) is length-prefixed.
+    pub openings: Vec<u8>,
 }
 
 impl ProposalVote {
@@ -149,6 +158,11 @@ impl ProposalVote {
             put_bytes(&mut sig, &self.signature);
             put_bytes(&mut sig, &self.address);
             put_bytes(&mut out, &sig);
+        }
+        // PoRep openings — appended ONLY when present, so an empty-openings
+        // vote serializes byte-identically to the legacy wire form.
+        if !self.openings.is_empty() {
+            put_bytes(&mut out, &self.openings);
         }
         Ok(out)
     }
@@ -176,7 +190,15 @@ impl ProposalVote {
             let address = read_bytes(&sig_bytes, &mut sc)?;
             (signature, address)
         };
-        Ok(Self { filter, rank, frame_number, selector, timestamp, signature, address })
+        // Tolerant trailing field: PoRep openings, present only on post-
+        // activation app-shard votes. Absent on legacy / global / timeout
+        // votes — the cursor is already at the end, so this reads nothing.
+        let openings = if c < data.len() {
+            read_bytes(data, &mut c)?
+        } else {
+            Vec::new()
+        };
+        Ok(Self { filter, rank, frame_number, selector, timestamp, signature, address, openings })
     }
 
     /// Build a wire `ProposalVote` from the proto representation (as returned by
@@ -195,6 +217,9 @@ impl ProposalVote {
             timestamp: v.timestamp,
             signature,
             address,
+            // The proto ProposalVote has no openings field; reconstructed
+            // votes (catch-up sync) carry none.
+            openings: Vec::new(),
         }
     }
 
@@ -766,9 +791,17 @@ pub fn decode_global_frame(
     // Requests: each entry is a length-prefixed MessageBundle in canonical
     // bytes form (see Go: protobufs/global.go GlobalFrame.FromCanonicalBytes).
     let req_count = read_u32(data, &mut c)? as usize;
-    if req_count > 100 {
+    // No fixed per-frame request cap: a global frame carries every pending
+    // request (a coverage proof from every shard), delivered over the
+    // direct :8340 transport which has no gossip size ceiling. Guard only
+    // against an allocation bomb — each request is length-prefixed (>= 4
+    // bytes), so a valid count can't exceed the remaining bytes / 4. The
+    // read loop below still validates each entry against the actual data.
+    let remaining = data.len().saturating_sub(c);
+    if req_count > remaining / 4 {
         return Err(QuilError::InvalidArgument(format!(
-            "GlobalFrame: invalid requests count {}", req_count
+            "GlobalFrame: requests count {} exceeds what {} remaining bytes can hold",
+            req_count, remaining
         )));
     }
     let mut requests = Vec::with_capacity(req_count);
@@ -1057,6 +1090,7 @@ mod tests {
             timestamp: 1700000000,
             signature: vec![0xBB; 74],
             address: vec![0xCC; 32],
+            openings: Vec::new(),
         };
         let bytes = vote.to_canonical_bytes().unwrap();
         assert_eq!(&bytes[..4], &PROPOSAL_VOTE_TYPE.to_be_bytes());
@@ -1064,6 +1098,37 @@ mod tests {
         assert_eq!(decoded.rank, 42);
         assert_eq!(decoded.frame_number, 1000);
         assert_eq!(decoded.filter, vec![0xFF; 32]);
+    }
+
+    #[test]
+    fn proposal_vote_openings_roundtrip_and_backcompat() {
+        let base = ProposalVote {
+            filter: vec![0xFF; 32],
+            rank: 7,
+            frame_number: 9,
+            selector: vec![0xAA; 32],
+            timestamp: 5,
+            signature: vec![0xBB; 74],
+            address: vec![0xCC; 32],
+            openings: Vec::new(),
+        };
+        // Empty openings → nothing appended → decodes back to empty.
+        let empty_bytes = base.to_canonical_bytes().unwrap();
+        assert!(ProposalVote::from_canonical_bytes(&empty_bytes).unwrap().openings.is_empty());
+
+        // Non-empty openings → appended (longer) and round-trips, with the
+        // legacy fields intact.
+        let with = ProposalVote { openings: vec![0x11, 0x22, 0x33, 0x44], ..base.clone() };
+        let with_bytes = with.to_canonical_bytes().unwrap();
+        assert!(
+            with_bytes.len() > empty_bytes.len(),
+            "openings must be appended after the legacy fields"
+        );
+        let d = ProposalVote::from_canonical_bytes(&with_bytes).unwrap();
+        assert_eq!(d.openings, vec![0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(d.rank, 7);
+        assert_eq!(d.signature, vec![0xBB; 74]);
+        assert_eq!(d.address, vec![0xCC; 32]);
     }
 
     #[test]
@@ -1102,6 +1167,7 @@ mod tests {
                 filter: vec![], rank: 1, frame_number: 1,
                 selector: vec![0; 32], timestamp: 0,
                 signature: vec![0; 74], address: vec![0; 32],
+                openings: Vec::new(),
             },
             timeout_tick: 10,
             timestamp: 5000,

@@ -887,4 +887,95 @@ mod tests {
         assert!(workers[0].filter.is_empty());
         assert!(!workers[0].allocated);
     }
+
+    // ---- master↔worker boundary coverage (2026-06-29) -----------------
+    use quil_types::store::WorkerStore as _;
+
+    /// In-memory `WorkerStore` for the persist-across-restart path.
+    #[derive(Default)]
+    struct MemWorkerStore(
+        std::sync::Mutex<HashMap<u32, quil_types::store::PersistedWorkerInfo>>,
+    );
+    impl quil_types::store::WorkerStore for MemWorkerStore {
+        fn get_worker(
+            &self,
+            core_id: u32,
+        ) -> quil_types::error::Result<Option<quil_types::store::PersistedWorkerInfo>> {
+            Ok(self.0.lock().unwrap().get(&core_id).cloned())
+        }
+        fn put_worker(
+            &self,
+            w: &quil_types::store::PersistedWorkerInfo,
+        ) -> quil_types::error::Result<()> {
+            self.0.lock().unwrap().insert(w.core_id, w.clone());
+            Ok(())
+        }
+        fn delete_worker(&self, core_id: u32) -> quil_types::error::Result<()> {
+            self.0.lock().unwrap().remove(&core_id);
+            Ok(())
+        }
+        fn range_workers(
+            &self,
+        ) -> quil_types::error::Result<Vec<quil_types::store::PersistedWorkerInfo>> {
+            Ok(self.0.lock().unwrap().values().cloned().collect())
+        }
+    }
+
+    /// `set_worker_filter` flushes the filter binding through to the wired
+    /// `WorkerStore` (the operator-intent-survives-restart path), and
+    /// `load_persisted` reads it back. Master→worker boundary, persistence leg.
+    #[tokio::test]
+    async fn set_worker_filter_persists_to_worker_store() {
+        let mgr = ThreadWorkerManager::new();
+        let store = Arc::new(MemWorkerStore::default());
+        mgr.set_worker_store(store.clone());
+        let _rx = mgr.take_master_rx();
+
+        mgr.set_worker_filter(1, b"shard-filter", false).unwrap();
+
+        let persisted = store.get_worker(1).unwrap().expect("worker persisted");
+        assert_eq!(persisted.filter, b"shard-filter");
+        assert!(!persisted.manually_managed);
+        // load_persisted reads through the same store.
+        let lp = mgr.load_persisted(1).expect("load_persisted hit");
+        assert_eq!(lp.filter, b"shard-filter");
+    }
+
+    /// Toggling manual-management mode flushes through to the store while
+    /// preserving the filter — operator pins survive a restart.
+    #[tokio::test]
+    async fn set_manually_managed_persists_and_keeps_filter() {
+        let mgr = ThreadWorkerManager::new();
+        let store = Arc::new(MemWorkerStore::default());
+        mgr.set_worker_store(store.clone());
+        let _rx = mgr.take_master_rx();
+
+        mgr.set_worker_filter(1, b"f", false).unwrap();
+        mgr.set_manually_managed(1, true).unwrap();
+
+        let p = store.get_worker(1).unwrap().expect("persisted");
+        assert!(p.manually_managed, "manual mode flushed");
+        assert_eq!(p.filter, b"f", "filter preserved across the mode flip");
+    }
+
+    /// `set_worker_filter(start_consensus=true)` spawns the worker thread,
+    /// which signals `Ready` back to the master and is listed with its filter.
+    /// Exercises the real master→worker `Respawn` send over the channel.
+    #[tokio::test]
+    async fn set_worker_filter_spawns_worker_and_signals_ready() {
+        let mgr = ThreadWorkerManager::new();
+        let mut rx = mgr.take_master_rx().unwrap();
+
+        mgr.set_worker_filter(1, b"active-filter", true).unwrap();
+
+        // The spawned worker thread sends Ready back over the boundary.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+        assert!(
+            matches!(msg, Ok(Some(WorkerToMaster::Ready { core_id: 1 }))),
+            "expected Ready from core 1, got {msg:?}"
+        );
+        let workers = mgr.range_workers().unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].filter, b"active-filter");
+    }
 }

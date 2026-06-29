@@ -66,16 +66,37 @@ pub fn build_join_bundle(
     wrap_in_bundle(signed.to_canonical_bytes()?)
 }
 
-/// Build a signed ProverConfirm wrapped in a MessageBundle.
+/// Build a signed ProverConfirm wrapped in a MessageBundle (no storage
+/// leaf roots — the legacy / pre-storage-attestation path).
 pub fn build_confirm_bundle(
     filters: &[Vec<u8>],
     frame_number: u64,
     bls_signer: &dyn Signer,
     prover_address: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut msg = Vec::new();
-    for f in filters { msg.extend_from_slice(f); }
-    msg.extend_from_slice(&frame_number.to_be_bytes());
+    build_confirm_bundle_with_leaf_roots(filters, frame_number, bls_signer, prover_address, &[])
+}
+
+/// Build a signed ProverConfirm carrying the prover's per-epoch storage
+/// `leaf_roots`. The signature covers `confirm_signing_message` (the
+/// multi-filter message with the leaf-root set appended), so the
+/// registered roots are authenticated. An empty `leaf_roots` slice signs
+/// + serializes byte-identically to the pre-storage-attestation confirm,
+/// so [`build_confirm_bundle`] delegates here with `&[]`. The roots are
+/// produced by `app_shard_metadata::compute_storage_confirm` (which also
+/// persists the SDR replicas). PoRep wiring E.
+pub fn build_confirm_bundle_with_leaf_roots(
+    filters: &[Vec<u8>],
+    frame_number: u64,
+    bls_signer: &dyn Signer,
+    prover_address: &[u8],
+    leaf_roots: &[quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots],
+) -> Result<Vec<u8>> {
+    let msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
+        filters,
+        frame_number,
+        leaf_roots,
+    );
 
     let mut dp = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS.to_vec();
     dp.extend_from_slice(b"PROVER_CONFIRM");
@@ -91,6 +112,7 @@ pub fn build_confirm_bundle(
             address: prover_address.to_vec(),
         }),
         filters: filters.to_vec(),
+        leaf_roots: leaf_roots.to_vec(),
     };
 
     wrap_in_bundle(confirm.to_canonical_bytes()?)
@@ -387,6 +409,61 @@ mod tests {
         assert_eq!(confirm.filter.len(), 32);
         let sig = confirm.public_key_signature_bls48581.expect("sig present");
         assert_eq!(sig.address, address);
+        assert!(!sig.signature.is_empty());
+    }
+
+    #[test]
+    fn confirm_bundle_with_leaf_roots_round_trips() {
+        use quil_execution::global_intrinsic::leaf_root_registration::{
+            ConfirmLeafRoots, LeafRootEntry,
+        };
+        let (signer, _pk) = bls_keypair();
+        let filters = vec![vec![0x05u8; 32]];
+        let frame_number = 778u64;
+        let address = vec![0x42u8; 32];
+        let roots = vec![ConfirmLeafRoots {
+            filter: filters[0].clone(),
+            entries: vec![LeafRootEntry {
+                prefix: vec![0u32, 1u32],
+                leaf_root: vec![0xABu8; 64],
+                num_blocks: 3,
+            }],
+        }];
+
+        let bytes = build_confirm_bundle_with_leaf_roots(
+            &filters,
+            frame_number,
+            signer.as_ref(),
+            &address,
+            &roots,
+        )
+        .unwrap();
+        let inner = decode_single_inner(&bytes);
+        let confirm = ProverConfirm::from_canonical_bytes(&inner).expect("confirm decodes");
+        assert_eq!(confirm.filters, filters);
+        assert_eq!(confirm.leaf_roots.len(), 1);
+        assert_eq!(confirm.leaf_roots[0].filter, filters[0]);
+        assert_eq!(confirm.leaf_roots[0].entries.len(), 1);
+        assert_eq!(confirm.leaf_roots[0].entries[0].prefix, vec![0u32, 1u32]);
+        assert_eq!(confirm.leaf_roots[0].entries[0].num_blocks, 3);
+
+        // The signature must cover the leaf-root-bearing signing message, so a
+        // confirm whose declared roots were tampered no longer matches.
+        let sig = confirm.public_key_signature_bls48581.clone().expect("sig");
+        let signed_msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
+            &confirm.filters,
+            confirm.frame_number,
+            &confirm.leaf_roots,
+        );
+        let tampered_msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
+            &confirm.filters,
+            confirm.frame_number,
+            &[],
+        );
+        assert_ne!(
+            signed_msg, tampered_msg,
+            "non-empty leaf roots must change the signed message vs the legacy form"
+        );
         assert!(!sig.signature.is_empty());
     }
 

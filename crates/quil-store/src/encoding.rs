@@ -20,6 +20,10 @@ pub const HYPERGRAPH_SHARD: u8 = 0x09;
 pub const SHARD: u8 = 0x0A;
 pub const INBOX: u8 = 0x0B;
 pub const CONSENSUS: u8 = 0x0C;
+/// Per-member SDR storage replicas for proof-of-storage attestation, keyed
+/// `[STORAGE_REPLICA][epoch:u64 BE][leaf_id]` (epoch-first so dropping a stale
+/// epoch is a single `delete_range`). Rust-only (no Go counterpart).
+pub const STORAGE_REPLICA: u8 = 0x0D;
 /// Sub-discriminators under CONSENSUS — match Go's
 /// `node/store/constants.go:178-179`. The Rust consensus store
 /// historically wrote these at top-level prefixes 0x01/0x02 which

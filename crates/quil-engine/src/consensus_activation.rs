@@ -41,6 +41,11 @@ pub struct ConsensusActivationParams {
     pub local_bls_pubkey: Vec<u8>,
     pub bls_signer: Box<dyn quil_types::crypto::Signer>,
     pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver + Send + Sync>,
+    /// Execution manager used to validate collected messages before they
+    /// ride into a proposal, dropping protocol-invalid ones from the
+    /// mempool (Go's liveness-provider `ValidateMessage` + `collector.Remove`
+    /// gate). `None` disables the gate.
+    pub message_validator: Option<Arc<quil_execution::ExecutionEngineManager>>,
     pub genesis_frame: quil_types::proto::global::GlobalFrame,
     pub publisher: Option<Arc<dyn crate::consensus_glue::ConsensusPublisher>>,
     /// Optional callback invoked by the forks tree when a state is
@@ -131,6 +136,7 @@ pub fn activate_consensus(params: ConsensusActivationParams) -> Result<Consensus
         params.local_bls_pubkey.clone(),
         signer.clone(),
         params.inclusion_prover,
+        params.message_validator,
     ));
 
     // Global consensus uses the empty filter — `SharedProverRegistry`

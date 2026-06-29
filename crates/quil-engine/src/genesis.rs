@@ -175,7 +175,7 @@ pub fn genesis_archive_static_multiaddrs() -> Vec<&'static str> {
     vec![
         "/ip4/192.69.222.130/udp/8336/quic-v1/p2p/QmcKQjpQmLpbDsiif2MuakhHFyxWvqYauPsJDaXnLav7PJ",
         "/ip4/191.96.166.157/udp/8336/quic-v1/p2p/QmestbFp8PddwRk6ysBRrmWZEiHun5aRidHkqFxgeFaWVK",
-        "/ip4/146.0.74.72/udp/8336/quic-v1/p2p/QmZKERVN8UkwLp9mPCZw4aaRx9N8Ewnkv7VQh1zyZwBSir",
+        "/ip4/109.94.96.183/udp/8336/quic-v1/p2p/QmZKERVN8UkwLp9mPCZw4aaRx9N8Ewnkv7VQh1zyZwBSir",
         "/ip4/147.124.199.194/udp/8336/quic-v1/p2p/QmS3xJKbAmQxDiry9HpXV6bJyRvyd47pbufpZwEmgY1cy6",
         "/ip4/192.154.103.90/udp/8336/quic-v1/p2p/QmcuXdV3mdgwmhUv9kzRnZmjJyBwE7erNWVo8Q2ikrcjzX",
     ]
@@ -313,20 +313,42 @@ pub fn initialize_genesis_state(
         shard_key.extend_from_slice(&l1);
         shard_key.extend_from_slice(&key_bytes);
 
-        // Store app shard entries (64x64 grid for each bloom index)
+        // Store app shard entries. QUIL_TOKEN is partitioned ONE level
+        // shallower than every other app — a single-nibble prefix (64
+        // shards) instead of the 64x64 = 4096 grid. 4096 QUIL shards each
+        // need their own quorum of workers; at current participation that
+        // spreads coverage too thin and the network halts permanently.
+        // 64 shards keep each shard's worker count above the halt
+        // threshold. All other tokens keep the full 4096 grid.
+        let is_quil = key_bytes == quil_execution::domains::QUIL_TOKEN;
         let txn = clock_store.new_transaction(false)?;
-        for i in 0..64u32 {
-            for j in 0..64u32 {
+        if is_quil {
+            for i in 0..64u32 {
                 shards_store.put_app_shard(
                     txn.as_ref(),
                     &quil_types::store::ShardInfo {
                         shard_key: shard_key.clone(),
-                        prefix: vec![i, j],
+                        prefix: vec![i],
                         size: Vec::new(),
                         data_shards: 0,
                         commitment: Vec::new(),
                     },
                 )?;
+            }
+        } else {
+            for i in 0..64u32 {
+                for j in 0..64u32 {
+                    shards_store.put_app_shard(
+                        txn.as_ref(),
+                        &quil_types::store::ShardInfo {
+                            shard_key: shard_key.clone(),
+                            prefix: vec![i, j],
+                            size: Vec::new(),
+                            data_shards: 0,
+                            commitment: Vec::new(),
+                        },
+                    )?;
+                }
             }
         }
         txn.commit()?;
@@ -492,6 +514,22 @@ fn add_genesis_prover(
     seniority: u64,
     frame_number: u64,
 ) -> Result<()> {
+    // Genesis provers are global-committee members: empty
+    // ConfirmationFilter (global shard allocation).
+    add_prover_on_filter(state, pubkey, seniority, frame_number, &[])
+}
+
+/// Seed an Active prover with an Active allocation on a SPECIFIC shard
+/// `filter`. Generalization of [`add_genesis_prover`] (which uses the
+/// empty/global filter) — see that function's doc for the vertex layout.
+/// When `filter` is empty this is byte-identical to `add_genesis_prover`.
+fn add_prover_on_filter(
+    state: &HypergraphState,
+    pubkey: &[u8],
+    seniority: u64,
+    frame_number: u64,
+    filter: &[u8],
+) -> Result<()> {
     let va_disc = hypergraph_state::vertex_adds_discriminator()?;
     let ha_disc = hypergraph_state::hyperedge_adds_discriminator()?;
     let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
@@ -542,7 +580,7 @@ fn add_genesis_prover(
     //   poseidon("PROVER_ALLOCATION" || pubkey || filter)
     // For genesis the filter is empty, so the concat is just
     // "PROVER_ALLOCATION" || pubkey.
-    let alloc_address = materialize::allocation_address(pubkey, &[])?;
+    let alloc_address = materialize::allocation_address(pubkey, filter)?;
 
     let mut alloc_tree = quil_tries::VectorCommitmentTree::new();
 
@@ -555,8 +593,8 @@ fn add_genesis_prover(
     // Status = 1 (Active)
     write_field(&mut alloc_tree, alloc_cls, "Status", &[materialize::STATUS_ACTIVE])?;
 
-    // ConfirmationFilter = nil (empty, global shard allocation).
-    write_field(&mut alloc_tree, alloc_cls, "ConfirmationFilter", &[])?;
+    // ConfirmationFilter = the shard filter (empty ⇒ global shard).
+    write_field(&mut alloc_tree, alloc_cls, "ConfirmationFilter", filter)?;
 
     // JoinFrameNumber = 0
     write_field(&mut alloc_tree, alloc_cls, "JoinFrameNumber", &0u64.to_be_bytes())?;
@@ -629,6 +667,33 @@ fn add_genesis_prover(
         "added genesis prover"
     );
 
+    Ok(())
+}
+
+/// Test-only seeding helper: register `pubkey` as an Active prover with
+/// an Active allocation on shard `filter` directly into an existing,
+/// already-genesis'd hypergraph, then commit so a subsequent
+/// `SharedProverRegistry::refresh_from_store` observes it.
+///
+/// Used by the tier-2 coverage e2e harness so the archive's prover
+/// registry contains the worker cohort as active provers on their shard.
+/// The FrameHeader aggregate-pubkey verifier reconstructs the committee
+/// from `get_active_provers(filter)`; without these vertices the active
+/// set for the worker shard is empty and verification fails with
+/// "aggregate pubkey ... active_count=0". Producer (worker committee) and
+/// verifier (archive) must derive the committee from the SAME registry so
+/// their member ordering — and thus the signed bitmask — agree.
+pub fn seed_active_prover_on_filter(
+    hypergraph: &Arc<HypergraphCrdt>,
+    pubkey: &[u8],
+    seniority: u64,
+    frame_number: u64,
+    filter: &[u8],
+) -> Result<()> {
+    let state = HypergraphState::new(hypergraph.clone());
+    add_prover_on_filter(&state, pubkey, seniority, frame_number, filter)?;
+    state.commit()?;
+    hypergraph.commit(frame_number)?;
     Ok(())
 }
 

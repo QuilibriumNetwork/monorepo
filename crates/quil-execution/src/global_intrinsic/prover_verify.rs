@@ -110,6 +110,20 @@ pub fn multi_filter_signing_message(filters: &[Vec<u8>], frame_number: u64) -> V
     msg
 }
 
+/// The ProverConfirm signing message: the multi-filter message with the
+/// confirm's leaf-root set appended, so the registered roots are authenticated
+/// by the prover's signature. An empty leaf-root set appends nothing, so this is
+/// byte-identical to [`multi_filter_signing_message`] for legacy confirms.
+pub fn confirm_signing_message(
+    filters: &[Vec<u8>],
+    frame_number: u64,
+    leaf_roots: &[super::leaf_root_registration::ConfirmLeafRoots],
+) -> Vec<u8> {
+    let mut msg = multi_filter_signing_message(filters, frame_number);
+    super::leaf_root_registration::append_confirm_leaf_roots(&mut msg, leaf_roots);
+    msg
+}
+
 /// Build the signing message for ProverJoin.
 /// `message = concat(filters) || frame_number_be_u64`
 ///

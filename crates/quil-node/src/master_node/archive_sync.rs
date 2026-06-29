@@ -95,6 +95,124 @@ async fn run_proposal_catchup(
     }
 }
 
+/// Record-only frame backfill for the restart "hole" `[lo, hi]`.
+///
+/// On restart the forks tree re-seeds at the latest-QC frame N and
+/// finalizes *forward* from there — it never re-finalizes ranks below N.
+/// If finalization had lagged the persisted canonical head H before the
+/// restart, frame RECORDS `[H+1, N-1]` are absent from the clock store,
+/// and the archive poller can't recover them: it forward-fills from the
+/// MAX stored frame (which consensus pushes up to ~N), so the sub-max gap
+/// is never scanned. This task fills exactly that gap.
+///
+/// "Record-only" is load-bearing: we fetch each missing frame from a peer
+/// archive and write ONLY the clock-store record (`put_global_frame`). We
+/// deliberately do NOT run the frame through `on_frame` /
+/// `process_global_frame` — that path re-applies the frame's message
+/// bundles to the execution engines, double-spending/-crediting state that
+/// was already materialized before the restart. This restores the archive's
+/// ability to SERVE those heights; CRDT state convergence is a separate
+/// concern (handled by materialization on the consensus path / hypersync),
+/// not this task.
+///
+/// Best-effort and bounded: a frame that no peer can serve is genuinely
+/// absent (uncommitted / TC-orphaned and correctly not part of the
+/// canonical chain), so after trying the known endpoints we give up on the
+/// remainder and log it rather than wedging.
+async fn run_record_only_backfill(
+    pool: Arc<quil_rpc::ArchiveEndpointPool>,
+    clock_store: Arc<quil_store::RocksClockStore>,
+    seed: [u8; 57],
+    lo: u64,
+    hi: u64,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    if lo > hi {
+        return;
+    }
+    info!(lo, hi, "record-only frame-record backfill started");
+    // Which heights are actually missing? (Consensus may have already
+    // persisted some of the range forward.) Uses the inherent
+    // `get_global_frame` point lookup on the concrete clock store.
+    let mut remaining: Vec<u64> = (lo..=hi)
+        .filter(|&n| clock_store.get_global_frame(n).is_err())
+        .collect();
+    if remaining.is_empty() {
+        info!(lo, hi, "record-only backfill: no holes, nothing to do");
+        return;
+    }
+    let initial = remaining.len();
+    info!(holes = initial, lo, hi, "record-only backfill: filling missing frame records");
+
+    let endpoints = pool.get_all().await;
+    if endpoints.is_empty() {
+        warn!(holes = initial, "record-only backfill: no archive endpoints known yet — skipping");
+        return;
+    }
+    // One pass per known endpoint, plus a little slack; we rotate through
+    // `endpoints` so each round prefers a different archive.
+    let max_rounds = endpoints.len() + 2;
+    let mut filled = 0u64;
+    for round in 0..max_rounds {
+        if remaining.is_empty() || cancel.is_cancelled() {
+            break;
+        }
+        let addr = endpoints[round % endpoints.len()].clone();
+        let mut client = match quil_rpc::ArchiveClient::connect_mtls(&addr, &seed).await {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(%addr, error = %e, "record-only backfill: connect failed, rotating");
+                continue;
+            }
+        };
+        let mut still: Vec<u64> = Vec::new();
+        for n in std::mem::take(&mut remaining) {
+            if cancel.is_cancelled() {
+                still.push(n);
+                continue;
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                client.get_global_frame(n),
+            )
+            .await
+            {
+                Ok(Ok(frame)) => {
+                    // RECORD-ONLY: store the clock-store record, never the
+                    // execution side effects.
+                    if let Err(e) = clock_store.put_global_frame(&frame, None) {
+                        warn!(error = %e, frame = n, "record-only backfill: store failed");
+                        still.push(n);
+                    } else {
+                        filled += 1;
+                    }
+                }
+                Ok(Err(e)) => {
+                    // This endpoint lacks it; retry on another next round.
+                    debug!(%addr, frame = n, error = %e, "record-only backfill: frame unavailable");
+                    still.push(n);
+                }
+                Err(_) => {
+                    debug!(%addr, frame = n, "record-only backfill: fetch timeout");
+                    still.push(n);
+                }
+            }
+        }
+        remaining = still;
+    }
+    if remaining.is_empty() {
+        info!(filled, attempted = initial, "record-only frame-record backfill complete");
+    } else {
+        warn!(
+            filled,
+            attempted = initial,
+            unrecoverable = remaining.len(),
+            "record-only backfill finished with frames no peer could serve — \
+             these heights are likely uncommitted/orphaned (correctly not canonical)"
+        );
+    }
+}
+
 pub(crate) struct ArchiveSyncArgs {
     pub mtls_seed: Option<[u8; 57]>,
     pub network: u8,
@@ -125,6 +243,12 @@ pub(crate) struct ArchiveSyncArgs {
         Arc<std::sync::OnceLock<Arc<quil_engine::vote_aggregation::VoteAggregation>>>,
     pub timeout_aggregator:
         Arc<std::sync::OnceLock<Arc<quil_engine::timeout_aggregation::TimeoutAggregation>>>,
+    pub global_validator: Arc<std::sync::OnceLock<Arc<
+        quil_engine::validator::ConsensusValidator<
+            quil_engine::consensus_types::GlobalState,
+            quil_engine::consensus_types::GlobalVote,
+        >,
+    >>>,
     pub db_arc: Arc<quil_store::RocksDb>,
     pub frame_materializer: Option<Arc<quil_engine::frame_materializer::FrameMaterializer>>,
     pub consensus_loopback_tx: tokio::sync::mpsc::Sender<quil_p2p::node::ReceivedMessage>,
@@ -160,6 +284,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         consensus_handle,
         vote_aggregator,
         timeout_aggregator,
+        global_validator,
         db_arc,
         frame_materializer,
         consensus_loopback_tx,
@@ -409,13 +534,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 anchor_frame, anchor_time, anchor_diff,
             ));
             let sync_mc = message_collector.clone();
+            let sync_em = exec_manager.clone();
             let sync_bls_pub = bls_pubkey.clone();
             let sync_pa = prover_address;
             let sync_crdt = crdt.clone();
+            let sync_shards_store = shards_store.clone();
             let sync_p2p = p2p_handle.clone();
             let sync_ch = consensus_handle.clone();
             let sync_va = vote_aggregator.clone();
             let sync_ta = timeout_aggregator.clone();
+            let sync_gv = global_validator.clone();
             let sync_cov = coverage_monitor.clone();
             let sync_cf = current_frame.clone();
             let sync_lhf = last_global_head_frame.clone();
@@ -423,6 +551,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sync_catchup_notify = catchup_notify.clone();
             let sync_archive_mode = archive_mode;
             let sync_db_for_consensus: Arc<dyn quil_types::store::KvDb> = db_arc.clone();
+            // Committee endpoints for the direct global-consensus publisher.
+            let sync_archive_pool = archive_pool.clone();
             sup.spawn("archive-prover-tree-sync", move |sync_token| async move {
                 // Archive nodes ARE the source of truth — they don't wait
                 // for some other archive to be discovered before activating
@@ -583,6 +713,74 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         }
                     };
 
+                    // #2 visibility: detect a canonical frame-record hole.
+                    // On restart the forks tree re-seeds from the latest QC
+                    // candidate (frame N), and finalization resumes from
+                    // there — it does NOT re-finalize ranks below N. If
+                    // finalization was lagging before the restart (heavy
+                    // timeouts → chain advancing on TCs), the canonical
+                    // clock store's head H can sit well below N, leaving
+                    // frame RECORDS [H+1, N-1] absent even though their CRDT
+                    // state was materialized (durably) before the restart.
+                    // Those frames can't be served to catching-up peers
+                    // until backfilled. We surface the gap here; the
+                    // partial-progress-safe archive poller backfills forward
+                    // from the canonical head via peers.
+                    //
+                    // We deliberately do NOT reprocess these frames through
+                    // the execution pipeline on restart: that path
+                    // re-applies already-materialized messages (double
+                    // spend/credit). The safe recovery is a record-only
+                    // backfill (fetch frame, store record, skip on_frame),
+                    // tracked separately.
+                    {
+                        let canonical_head = sync_cs
+                            .get_latest_global_frame()
+                            .ok()
+                            .and_then(|f| f.header.map(|h| h.frame_number))
+                            .unwrap_or(0);
+                        if let Ok(gf) = genesis_frame_result.as_ref() {
+                            let reseed_frame =
+                                gf.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+                            if reseed_frame > canonical_head.saturating_add(1) {
+                                warn!(
+                                    canonical_head,
+                                    reseed_frame,
+                                    gap = reseed_frame
+                                        .saturating_sub(canonical_head)
+                                        .saturating_sub(1),
+                                    "restart: canonical frame records lag the consensus \
+                                     re-seed point — backfilling the gap (record-only) from peers",
+                                );
+                                // Archives serve frame ranges to the network;
+                                // fill the sub-max hole the poller can't reach.
+                                // Record-only — no re-materialization (see
+                                // run_record_only_backfill). Non-archive nodes
+                                // don't serve ranges, so skip.
+                                if sync_archive_mode {
+                                    let bf_pool = sync_archive_pool.clone();
+                                    let bf_cs = sync_cs.clone();
+                                    let bf_cancel = sync_token.clone();
+                                    let lo = canonical_head.saturating_add(1);
+                                    let hi = reseed_frame.saturating_sub(1);
+                                    spawner.detach("record-only-backfill", async move {
+                                        run_record_only_backfill(
+                                            bf_pool, bf_cs, seed, lo, hi, bf_cancel,
+                                        )
+                                        .await;
+                                        Ok(())
+                                    });
+                                }
+                            } else {
+                                info!(
+                                    canonical_head,
+                                    reseed_frame,
+                                    "restart: canonical frame records contiguous to re-seed point",
+                                );
+                            }
+                        }
+                    }
+
                     // Only nodes registered as global provers (i.e. with
                     // an allocation on the empty filter) should run the
                     // global consensus event loop. A non-global prover
@@ -630,19 +828,152 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     } else if genesis_frame_result.is_ok() {
                         if let Ok(genesis_frame) = genesis_frame_result {
                             if let Ok(bls_signer) = sync_km.get_signer(quil_types::crypto::KeyType::Bls48581G1) {
+                                // Global consensus is delivered point-to-point over
+                                // the :8340 mTLS channel to the committee archives
+                                // (a full-coverage proposal exceeds the gossip
+                                // message-size cap); app consensus stays on gossip.
+                                // Falls back to the BlossomSub publisher only if we
+                                // lack an mTLS identity (not a global prover archive).
                                 let publisher: Arc<dyn quil_engine::consensus_glue::ConsensusPublisher> =
-                                    Arc::new(crate::blossomsub_consensus_publisher::BlossomsubConsensusPublisher {
-                                        p2p_handle: sync_p2p.clone(),
-                                        loopback_tx: consensus_loopback_tx.clone(),
-                                        self_peer_id: peer_id.to_bytes(),
-                                        spawner: spawner.clone(),
-                                    });
+                                    match mtls_seed {
+                                        Some(seed) => Arc::new(
+                                            crate::direct_global_consensus_publisher::DirectGlobalConsensusPublisher::new(
+                                                sync_archive_pool.clone(),
+                                                seed,
+                                                consensus_loopback_tx.clone(),
+                                                peer_id.to_bytes(),
+                                                sync_p2p.clone(),
+                                                spawner.clone(),
+                                            ),
+                                        ),
+                                        None => Arc::new(
+                                            crate::blossomsub_consensus_publisher::BlossomsubConsensusPublisher {
+                                                p2p_handle: sync_p2p.clone(),
+                                                loopback_tx: consensus_loopback_tx.clone(),
+                                                self_peer_id: peer_id.to_bytes(),
+                                                spawner: spawner.clone(),
+                                            },
+                                        ),
+                                    };
                                 // Build an on-finalized hook that prunes per-rank
                                 // aggregator state below the finalized watermark.
                                 // Captures the OnceLocks so the callback stays valid
                                 // even though the aggregators are populated later
                                 // in this same activation (finalization can't fire
                                 // before the event loop runs).
+                                // Dedicated materialization worker (archive nodes only).
+                                // Frame materialization — up to ~100 BLS aggregate
+                                // signature verifications plus the CRDT/KZG commit per
+                                // frame — MUST NOT run on the consensus event loop:
+                                // `on_finalized_state` is called synchronously from the
+                                // forks finalizer on that loop, so an inline materialize
+                                // blocks proposals/votes/timeouts for its whole duration
+                                // (the network-wide stall once frames filled with
+                                // shard-frame proofs). Offload to an ordered single-
+                                // consumer channel; each materialize runs on the blocking
+                                // pool and is awaited in turn, preserving finalize order
+                                // and the materializer's `last_materialized_frame`
+                                // idempotency guard. The consensus loop only does a
+                                // non-blocking `send`.
+                                let mat_job_tx: Option<
+                                    tokio::sync::mpsc::UnboundedSender<(quil_types::proto::global::GlobalFrame, u64)>,
+                                > = if let Some(m) = frame_materializer.clone() {
+                                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
+                                        quil_types::proto::global::GlobalFrame,
+                                        u64,
+                                    )>();
+                                    let cov_for_worker = sync_cov.clone();
+                                    let mc_for_worker = sync_mc.clone();
+                                    let pa_for_worker = sync_pa.to_vec();
+                                    // Handles for the leader-gated merge trigger's shard-inventory
+                                    // assembly (filters + committed sizes + active counts). Use the
+                                    // closure-local `sync_*` clones so the outer originals stay
+                                    // available to later spawns.
+                                    let crdt_for_merge = sync_crdt.clone();
+                                    let shards_store_for_merge = sync_shards_store.clone();
+                                    let registry_for_merge = sync_pr.clone();
+                                    spawner.detach("global-materializer", async move {
+                                        while let Some((frame, frame_number)) = rx.recv().await {
+                                            let m = m.clone();
+                                            let cov = cov_for_worker.clone();
+                                            let mc = mc_for_worker.clone();
+                                            let pa = pa_for_worker.clone();
+                                            let crdt_for_merge = crdt_for_merge.clone();
+                                            let shards_store_for_merge = shards_store_for_merge.clone();
+                                            let registry_for_merge = registry_for_merge.clone();
+                                            let outcome = tokio::task::spawn_blocking(move || {
+                                                // Refresh halt durations right before
+                                                // materialize so the eviction step inside
+                                                // skips halted shards correctly.
+                                                let halts = cov.check(frame_number);
+                                                m.set_coverage_halt_durations(halts);
+                                                let res = match m.materialize(&frame) {
+                                                    Ok(result) => {
+                                                        // Consume the finalized frame's
+                                                        // bundles from the mempool so they
+                                                        // aren't re-proposed.
+                                                        if !result.finalized_bundles.is_empty() {
+                                                            mc.mark_finalized(&result.finalized_bundles);
+                                                        }
+                                                        Ok(())
+                                                    }
+                                                    Err(e) => Err(e),
+                                                };
+                                                // Leader-gated shard-split rebalance trigger:
+                                                // only the producer of THIS frame proposes,
+                                                // matching Go's `frameProver` gate (exactly one
+                                                // proposer per frame, no duplicates). Publishes
+                                                // ShardSplitEligible events; the shard-
+                                                // orchestrator loop submits the op to the
+                                                // mempool. Runs after materialize so the
+                                                // registry reflects this frame's prover changes.
+                                                let producer = frame
+                                                    .header
+                                                    .as_ref()
+                                                    .map(|h| h.prover.clone())
+                                                    .unwrap_or_default();
+                                                if !producer.is_empty() && producer == pa {
+                                                    cov.propose_split_rebalance(frame_number);
+                                                    // Leader-gated MERGE trigger (16GiB-gated).
+                                                    // Assemble the current shard inventory
+                                                    // (filters + committed sizes + active counts)
+                                                    // and propose merges for under-covered
+                                                    // factor-2 sibling pairs that fit the gate.
+                                                    let inventory =
+                                                        quil_engine::coverage::build_shard_inventory(
+                                                            crdt_for_merge.clone(),
+                                                            shards_store_for_merge.clone(),
+                                                            registry_for_merge.as_ref(),
+                                                        );
+                                                    cov.propose_merge_rebalance(
+                                                        frame_number,
+                                                        &inventory,
+                                                    );
+                                                }
+                                                res
+                                            })
+                                            .await;
+                                            match outcome {
+                                                Ok(Ok(())) => {}
+                                                Ok(Err(e)) => tracing::warn!(
+                                                    error = %e,
+                                                    frame = frame_number,
+                                                    "frame materialize failed",
+                                                ),
+                                                Err(e) => tracing::warn!(
+                                                    error = %e,
+                                                    frame = frame_number,
+                                                    "materializer task panicked",
+                                                ),
+                                            }
+                                        }
+                                        tracing::info!("global materializer worker exited");
+                                        Ok(())
+                                    });
+                                    Some(tx)
+                                } else {
+                                    None
+                                };
                                 let finalized_hook: quil_engine::consensus_glue::FinalizedStateHook = {
                                     let va_cell = sync_va.clone();
                                     let ta_cell = sync_ta.clone();
@@ -650,8 +981,6 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     let cf_for_fin = sync_cf.clone();
                                     let lhf_for_fin = sync_lhf.clone();
                                     let consensus_finalized_for_fin = sync_consensus_finalized.clone();
-                                    let materializer_for_fin = frame_materializer.clone();
-                                    let cov_for_fin = sync_cov.clone();
                                     Arc::new(move |state| {
                                         if let Some(va) = va_cell.get() {
                                             va.advance_min_active_rank(state.rank);
@@ -727,6 +1056,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         // monotonic even if finalization
                                         // callbacks arrive out of order.
                                         cf_for_fin.observe(app.frame_number);
+                                        // Track the consensus RANK (distinct from
+                                        // the frame number) so the gRPC submit path
+                                        // and the GLOBAL_PROVER relay tag mempool
+                                        // messages in the rank space the leader's
+                                        // `collect_for_rank` actually reads.
+                                        cf_for_fin.observe_rank(app.rank);
                                         lhf_for_fin.fetch_max(
                                             app.frame_number,
                                             std::sync::atomic::Ordering::Relaxed,
@@ -740,31 +1075,26 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
 
-                                        // Archive nodes materialize the
-                                        // finalized global frame: commit the
-                                        // hypergraph, verify the prover root,
-                                        // process bundles through execution,
-                                        // prune orphan joins, evict inactive
-                                        // provers, persist alt-shard updates,
-                                        // and publish the post-materialize
-                                        // snapshot for workers + non-archive
-                                        // peers to sync against. Non-archive
-                                        // master threads skip this (their
-                                        // `materializer_for_fin` is None);
-                                        // they pull materialized state from
-                                        // archives via the archive poller.
-                                        if let Some(m) = &materializer_for_fin {
-                                            // Refresh halt durations right
-                                            // before materialize so the
-                                            // eviction step inside skips
-                                            // halted shards correctly.
-                                            let halts = cov_for_fin.check(app.frame_number);
-                                            m.set_coverage_halt_durations(halts);
-                                            if let Err(e) = m.materialize(&frame) {
+                                        // Hand the finalized frame to the dedicated
+                                        // materializer worker (archive nodes only) —
+                                        // a non-blocking send so the consensus event
+                                        // loop is never stalled by materialization
+                                        // (hypergraph commit + per-proof BLS verifies).
+                                        // The worker materializes in finalize order:
+                                        // commits the hypergraph, verifies the prover
+                                        // root, processes bundles, prunes orphan joins,
+                                        // evicts inactive provers, persists alt-shard
+                                        // updates, publishes the post-materialize
+                                        // snapshot, and marks the frame's bundles
+                                        // consumed in the mempool. Non-archive masters
+                                        // have no worker (`mat_job_tx` is None) and pull
+                                        // materialized state from archives via the poller.
+                                        if let Some(tx) = &mat_job_tx {
+                                            if let Err(e) = tx.send((frame, app.frame_number)) {
                                                 tracing::warn!(
                                                     error = %e,
                                                     frame = app.frame_number,
-                                                    "frame materialize failed"
+                                                    "materializer worker channel closed",
                                                 );
                                             }
                                         }
@@ -778,8 +1108,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 // `prove_next_state` -> `get_global_clock_frame_candidate`.
                                 let incorporated_hook: quil_engine::consensus_glue::IncorporatedStateHook = {
                                     let cs = sync_cs.clone();
+                                    let cf_for_inc = sync_cf.clone();
                                     Arc::new(move |state| {
                                         let app = &state.state;
+                                        // Freshest consensus-rank signal — incorporation
+                                        // fires per proposal, ahead of finalization.
+                                        cf_for_inc.observe_rank(app.rank);
                                         let header = quil_types::proto::global::GlobalFrameHeader {
                                             frame_number: app.frame_number,
                                             rank: app.rank,
@@ -909,6 +1243,25 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     .as_ref()
                                     .map(|h| h.rank)
                                     .unwrap_or(0);
+                                // Genesis-QC identity for the global
+                                // validator's rank-0 trust. Computed here,
+                                // before `genesis_frame` is moved into the
+                                // activation params below. `Some` only on a
+                                // true cold start (bootstrap rank 0); `None`
+                                // for a checkpoint-seeded chain so any
+                                // rank-0 QC is rejected.
+                                let genesis_qc_identity_for_validator: Option<Vec<u8>> =
+                                    if trusted_rank_for_qc == 0 {
+                                        genesis_frame
+                                            .header
+                                            .as_ref()
+                                            .and_then(|h| {
+                                                quil_crypto::poseidon::hash_bytes_to_32(&h.output).ok()
+                                            })
+                                            .map(|h| h.to_vec())
+                                    } else {
+                                        None
+                                    };
                                 let genesis_qc_override = {
                                     use quil_types::store::ClockStore;
                                     let cs_trait: &dyn ClockStore = sync_cs.as_ref();
@@ -943,8 +1296,24 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         local_prover_address: sync_pa.to_vec(),
                                         local_bls_pubkey: sync_bls_pub.clone(),
                                         bls_signer,
-                                        inclusion_prover: Arc::new(quil_types::crypto::NoopInclusionProver)
+                                        // Must be the REAL KZG prover (not Noop):
+                                        // the leader provider commits the global
+                                        // requests tree through this to produce
+                                        // `requests_root`. With Noop, any frame
+                                        // whose request tree forms a branch
+                                        // (≥2 messages) committed to 64 zero bytes,
+                                        // so every non-trivial frame shipped a
+                                        // zero requests_root. Verification uses the
+                                        // CARRIED header value, so this is
+                                        // self-consistent / not a fork.
+                                        inclusion_prover: Arc::new(quil_crypto::KzgInclusionProver)
                                             as Arc<dyn quil_types::crypto::InclusionProver + Send + Sync>,
+                                        // Drop protocol-invalid global messages
+                                        // from the mempool at collect time
+                                        // instead of re-proposing them until
+                                        // they age out (Go liveness-provider
+                                        // ValidateMessage + collector.Remove).
+                                        message_validator: Some(sync_em.clone()),
                                         genesis_frame,
                                         publisher: Some(publisher),
                                         on_finalized_state: Some(finalized_hook),
@@ -998,6 +1367,36 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             // identical signature verification.
                                             let bls_ctor: Arc<dyn quil_types::crypto::BlsConstructor> =
                                                 Arc::new(quil_crypto::Bls48581KeyConstructor);
+
+                                            // Inbound-cert verifier.
+                                            // Committee-aware so it can also verify the
+                                            // proposer's own vote; the global chain signs
+                                            // vote messages with an empty filter. Built
+                                            // from the same committee + domains the
+                                            // aggregators use, so peer-formed certs verify.
+                                            let global_validator_instance = {
+                                                let raw_agg: Arc<dyn quil_consensus::signature_aggregator::SignatureAggregator> =
+                                                    Arc::new(quil_engine::bls_signature_aggregator::BlsSignatureAggregator::new(
+                                                        bls_ctor.clone(),
+                                                    ));
+                                                let verifier = quil_engine::bls_verifier::BlsConsensusVerifier::new_with_committee(
+                                                    raw_agg,
+                                                    activation.vote_domain.clone(),
+                                                    activation.timeout_domain.clone(),
+                                                    activation.committee.clone()
+                                                        as Arc<dyn quil_consensus::committee::Replicas>,
+                                                    Vec::new(),
+                                                );
+                                                Arc::new(quil_engine::validator::ConsensusValidator::new(
+                                                    activation.committee.clone()
+                                                        as Arc<dyn quil_consensus::committee::Replicas>,
+                                                    Arc::new(verifier),
+                                                )
+                                                .with_genesis_qc_identity(
+                                                    genesis_qc_identity_for_validator.clone(),
+                                                ))
+                                            };
+
                                             let va = Arc::new(
                                                 quil_engine::vote_aggregation::VoteAggregation::new(
                                                     activation.committee.clone(),
@@ -1034,10 +1433,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             );
                                             let va_ok = sync_va.set(va).is_ok();
                                             let ta_ok = sync_ta.set(ta).is_ok();
-                                            if va_ok && ta_ok {
-                                                info!("consensus event loop started, handle + vote/timeout aggregators published");
+                                            let gv_ok = sync_gv.set(global_validator_instance).is_ok();
+                                            if va_ok && ta_ok && gv_ok {
+                                                info!("consensus event loop started, handle + vote/timeout aggregators + validator published");
                                             } else {
-                                                warn!(va_ok, ta_ok, "aggregators already set");
+                                                warn!(va_ok, ta_ok, gv_ok, "aggregators/validator already set");
                                             }
                                         }
                                     }

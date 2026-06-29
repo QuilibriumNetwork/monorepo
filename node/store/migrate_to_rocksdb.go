@@ -17,6 +17,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 	p2putil "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
@@ -767,4 +768,324 @@ func goUnsignedToRustSignedBigInt(unsigned []byte) []byte {
 		return out
 	}
 	return trimmed
+}
+
+// =====================================================================
+// Post-migration verification.
+//
+// Opens an already-migrated RocksDB read-only and round-trips one read
+// from each major store category in the EXACT format the Rust node
+// expects (proto where Rust proto-decodes, JSON for seniority, canonical
+// for the embedded liveness QC, the 24-byte certified-state record with
+// its referenced frame/QC, the Rust solo tree-node framing, etc.).
+//
+// Each category reports PASS (decoded), SKIP (no data of that kind — e.g.
+// app shards that never produced frames), or FAIL. Any FAIL makes the run
+// return an error. This is cheap insurance against a translator regression
+// on a future schema change — it does NOT prove byte-for-byte parity, only
+// that every present category decodes the way the Rust reader will.
+// =====================================================================
+func VerifyRocksDBMigration(rocksdbPath string) error {
+	fmt.Printf("=== Verifying migrated RocksDB ===\n")
+	fmt.Printf("target (rocksdb): %s\n", rocksdbPath)
+	if _, err := os.Stat(rocksdbPath); os.IsNotExist(err) {
+		return fmt.Errorf("rocksdb database does not exist: %s", rocksdbPath)
+	}
+
+	opts := grocksdb.NewDefaultOptions()
+	defer opts.Destroy()
+	db, err := grocksdb.OpenDbForReadOnly(opts, rocksdbPath, false)
+	if err != nil {
+		return errors.Wrap(err, "open rocksdb (read-only)")
+	}
+	defer db.Close()
+
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+
+	// get fetches the value at an exact key.
+	get := func(key []byte) ([]byte, bool) {
+		s, err := db.Get(ro, key)
+		if err != nil || s == nil {
+			return nil, false
+		}
+		defer s.Free()
+		if !s.Exists() {
+			return nil, false
+		}
+		out := make([]byte, s.Size())
+		copy(out, s.Data())
+		return out, true
+	}
+
+	// firstWithPrefix returns the value of the first key matching prefix
+	// for which pred (if non-nil) returns true.
+	firstWithPrefix := func(prefix []byte, pred func([]byte) bool) ([]byte, bool) {
+		it := db.NewIterator(ro)
+		defer it.Close()
+		for it.Seek(prefix); it.Valid(); it.Next() {
+			ks := it.Key()
+			k := ks.Data()
+			if !bytes.HasPrefix(k, prefix) {
+				ks.Free()
+				return nil, false
+			}
+			match := pred == nil || pred(k)
+			ks.Free()
+			if match {
+				vs := it.Value()
+				v := make([]byte, vs.Size())
+				copy(v, vs.Data())
+				vs.Free()
+				return v, true
+			}
+		}
+		return nil, false
+	}
+
+	u64be := func(n uint64) []byte {
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, n)
+		return b
+	}
+	exactLen := func(n int) func([]byte) bool {
+		return func(k []byte) bool { return len(k) == n }
+	}
+
+	var failures int
+	run := func(name string, fn func() (detail string, skipped bool, err error)) {
+		detail, skipped, err := fn()
+		switch {
+		case err != nil:
+			failures++
+			fmt.Printf("  [FAIL] %-34s %v\n", name, err)
+		case skipped:
+			fmt.Printf("  [SKIP] %-34s (no data)\n", name)
+		default:
+			fmt.Printf("  [PASS] %-34s %s\n", name, detail)
+		}
+	}
+
+	// 1. Global frame header (proto, read directly at [0x00,0x00,fn]).
+	run("global frame (proto header)", func() (string, bool, error) {
+		v, ok := firstWithPrefix([]byte{CLOCK_FRAME, CLOCK_GLOBAL_FRAME}, exactLen(2+8))
+		if !ok {
+			return "", true, nil
+		}
+		h := &protobufs.GlobalFrameHeader{}
+		if err := proto.Unmarshal(v, h); err != nil {
+			return "", false, errors.Wrap(err, "decode GlobalFrameHeader")
+		}
+		return fmt.Sprintf("frame %d", h.FrameNumber), false, nil
+	})
+
+	// 2-5. QC / TC / proposal-vote / timeout-vote — these were translated
+	// canonical→proto, so proto-decoding them validates the translation.
+	run("quorum certificate (→proto)", func() (string, bool, error) {
+		v, ok := firstWithPrefix([]byte{CLOCK_FRAME, CLOCK_QUORUM_CERTIFICATE}, nil)
+		if !ok {
+			return "", true, nil
+		}
+		qc := &protobufs.QuorumCertificate{}
+		if err := proto.Unmarshal(v, qc); err != nil {
+			return "", false, errors.Wrap(err, "decode QuorumCertificate proto")
+		}
+		return fmt.Sprintf("rank %d", qc.Rank), false, nil
+	})
+	run("timeout certificate (→proto)", func() (string, bool, error) {
+		v, ok := firstWithPrefix([]byte{CLOCK_FRAME, CLOCK_TIMEOUT_CERTIFICATE}, nil)
+		if !ok {
+			return "", true, nil
+		}
+		tc := &protobufs.TimeoutCertificate{}
+		if err := proto.Unmarshal(v, tc); err != nil {
+			return "", false, errors.Wrap(err, "decode TimeoutCertificate proto")
+		}
+		return fmt.Sprintf("rank %d", tc.Rank), false, nil
+	})
+	run("proposal vote (→proto)", func() (string, bool, error) {
+		v, ok := firstWithPrefix([]byte{CLOCK_FRAME, CLOCK_PROPOSAL_VOTE}, nil)
+		if !ok {
+			return "", true, nil
+		}
+		if err := proto.Unmarshal(v, &protobufs.ProposalVote{}); err != nil {
+			return "", false, errors.Wrap(err, "decode ProposalVote proto")
+		}
+		return "ok", false, nil
+	})
+	run("timeout vote/state (→proto)", func() (string, bool, error) {
+		v, ok := firstWithPrefix([]byte{CLOCK_FRAME, CLOCK_TIMEOUT_VOTE}, nil)
+		if !ok {
+			return "", true, nil
+		}
+		if err := proto.Unmarshal(v, &protobufs.TimeoutState{}); err != nil {
+			return "", false, errors.Wrap(err, "decode TimeoutState proto")
+		}
+		return "ok", false, nil
+	})
+
+	// 6. Certified global state: 24-byte record + its referenced frame/QC
+	// (Rust reconstructs the GlobalProposal from these).
+	run("certified global state", func() (string, bool, error) {
+		v, ok := firstWithPrefix([]byte{CLOCK_FRAME, CLOCK_GLOBAL_CERTIFIED_STATE}, exactLen(2+8))
+		if !ok {
+			return "", true, nil
+		}
+		if len(v) != 24 {
+			return "", false, fmt.Errorf("record is %d bytes, want 24", len(v))
+		}
+		frameNum := binary.BigEndian.Uint64(v[0:8])
+		qcRank := binary.BigEndian.Uint64(v[8:16])
+		fv, ok := get(append([]byte{CLOCK_FRAME, CLOCK_GLOBAL_FRAME}, u64be(frameNum)...))
+		if !ok {
+			return "", false, fmt.Errorf("referenced frame %d missing", frameNum)
+		}
+		if err := proto.Unmarshal(fv, &protobufs.GlobalFrameHeader{}); err != nil {
+			return "", false, errors.Wrapf(err, "referenced frame %d decode", frameNum)
+		}
+		if qcRank != ^uint64(0) { // sentinel = absent
+			qv, ok := get(append([]byte{CLOCK_FRAME, CLOCK_QUORUM_CERTIFICATE}, u64be(qcRank)...))
+			if !ok {
+				return "", false, fmt.Errorf("referenced QC rank %d missing", qcRank)
+			}
+			if err := proto.Unmarshal(qv, &protobufs.QuorumCertificate{}); err != nil {
+				return "", false, errors.Wrapf(err, "referenced QC rank %d decode", qcRank)
+			}
+		}
+		return fmt.Sprintf("frame %d, qc rank %d", frameNum, qcRank), false, nil
+	})
+
+	// 7. Peer seniority — translated gob→JSON.
+	run("peer seniority (gob→JSON)", func() (string, bool, error) {
+		v, ok := firstWithPrefix([]byte{CLOCK_FRAME, CLOCK_SHARD_FRAME_SENIORITY_SHARD}, nil)
+		if !ok {
+			return "", true, nil
+		}
+		var m map[string]uint64
+		if err := json.Unmarshal(v, &m); err != nil {
+			return "", false, errors.Wrap(err, "decode seniority JSON")
+		}
+		return fmt.Sprintf("%d entries", len(m)), false, nil
+	})
+
+	// 8. Hypergraph tree node — Rust solo layout at [0x33,...].
+	run("hypergraph tree node (Rust solo)", func() (string, bool, error) {
+		v, ok := firstWithPrefix([]byte{rustHGTreeNodeByKey}, nil)
+		if !ok {
+			return "", true, nil
+		}
+		if err := validateRustSoloNode(v); err != nil {
+			return "", false, err
+		}
+		return fmt.Sprintf("type %d", v[0]), false, nil
+	})
+
+	// 9. Hypergraph vertex sub-tree data at [0x30,...]. Most entries are
+	// Go `SerializeNonLazyTree` blobs (deserialize them as a strong check);
+	// raw-leaf entries also legitimately exist, so a non-tree value is
+	// reported as present rather than failed.
+	run("hypergraph vertex data", func() (string, bool, error) {
+		v, ok := firstWithPrefix([]byte{rustHGVertexDataPrefix}, nil)
+		if !ok {
+			return "", true, nil
+		}
+		if _, err := tries.DeserializeNonLazyTree(v); err != nil {
+			return "present (raw leaf, not a sub-tree)", false, nil
+		}
+		return "sub-tree decoded", false, nil
+	})
+
+	// 10. Key registry identity key (proto).
+	run("key registry (identity key proto)", func() (string, bool, error) {
+		v, ok := firstWithPrefix([]byte{KEY_BUNDLE, KEY_IDENTITY}, nil)
+		if !ok {
+			return "", true, nil
+		}
+		if err := proto.Unmarshal(v, &protobufs.Ed448PublicKey{}); err != nil {
+			return "", false, errors.Wrap(err, "decode Ed448PublicKey")
+		}
+		return "ok", false, nil
+	})
+
+	// 11. Consensus liveness state — framing + embedded canonical QC
+	// (copied verbatim; this confirms the layout matches the Rust codec).
+	run("consensus liveness state", func() (string, bool, error) {
+		v, ok := firstWithPrefix([]byte{CONSENSUS, CONSENSUS_LIVENESS}, nil)
+		if !ok {
+			return "", true, nil
+		}
+		buf := bytes.NewBuffer(v)
+		var filterLen uint32
+		if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
+			return "", false, errors.Wrap(err, "liveness filter len")
+		}
+		if buf.Len() < int(filterLen) {
+			return "", false, fmt.Errorf("liveness filter truncated")
+		}
+		buf.Next(int(filterLen))
+		var rank uint64
+		if err := binary.Read(buf, binary.BigEndian, &rank); err != nil {
+			return "", false, errors.Wrap(err, "liveness current_rank")
+		}
+		var qcLen uint32
+		if err := binary.Read(buf, binary.BigEndian, &qcLen); err != nil {
+			return "", false, errors.Wrap(err, "liveness qc len")
+		}
+		if uint64(buf.Len()) < uint64(qcLen) {
+			return "", false, fmt.Errorf("liveness QC truncated")
+		}
+		qc := &protobufs.QuorumCertificate{}
+		if err := qc.FromCanonicalBytes(buf.Next(int(qcLen))); err != nil {
+			return "", false, errors.Wrap(err, "liveness embedded QC canonical decode")
+		}
+		return fmt.Sprintf("current_rank %d", rank), false, nil
+	})
+
+	fmt.Println()
+	if failures > 0 {
+		return fmt.Errorf("verification failed: %d categor(y/ies) did not decode", failures)
+	}
+	fmt.Printf("=== Verification Passed ===\n")
+	fmt.Printf("Every present store category decodes in the format the Rust node reads.\n")
+	return nil
+}
+
+// validateRustSoloNode parses the Rust `serialize_node_solo` framing
+// (the output of `translateGoNodeToRustSolo`) far enough to confirm a
+// migrated tree node is well-formed and not truncated.
+func validateRustSoloNode(v []byte) error {
+	if len(v) < 1 {
+		return fmt.Errorf("empty tree node")
+	}
+	switch v[0] {
+	case 1: // leaf: key, value(empty), hash_target, commitment, size
+		buf := bytes.NewBuffer(v[1:])
+		for _, f := range []string{"key", "value", "hash_target", "commitment", "size"} {
+			if _, err := readLenPrefixedU64(buf); err != nil {
+				return errors.Wrapf(err, "leaf field %s", f)
+			}
+		}
+		return nil
+	case 2: // branch: prefix_len(u32)+prefix, commitment, size, leaf_count(8)+longest_branch(4)
+		buf := bytes.NewBuffer(v[1:])
+		var prefixLen uint32
+		if err := binary.Read(buf, binary.BigEndian, &prefixLen); err != nil {
+			return errors.Wrap(err, "branch prefixLen")
+		}
+		if buf.Len() < int(prefixLen)*4 {
+			return fmt.Errorf("branch prefix truncated")
+		}
+		buf.Next(int(prefixLen) * 4)
+		if _, err := readLenPrefixedU64(buf); err != nil {
+			return errors.Wrap(err, "branch commitment")
+		}
+		if _, err := readLenPrefixedU64(buf); err != nil {
+			return errors.Wrap(err, "branch size")
+		}
+		if buf.Len() < 12 {
+			return fmt.Errorf("branch trailer truncated")
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown node type byte %d", v[0])
 }

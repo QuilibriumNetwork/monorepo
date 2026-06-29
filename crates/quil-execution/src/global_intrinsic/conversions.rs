@@ -210,6 +210,7 @@ pub fn prover_confirm_from_proto(pb: &pb::ProverConfirm) -> ProverConfirm {
             .as_ref()
             .map(addressed_sig_from_proto),
         filters: pb.filters.clone(),
+        leaf_roots: pb.leaf_roots.iter().map(confirm_leaf_roots_from_proto).collect(),
     }
 }
 
@@ -222,6 +223,41 @@ pub fn prover_confirm_to_proto(c: &ProverConfirm) -> pb::ProverConfirm {
             .as_ref()
             .map(addressed_sig_to_proto),
         filters: c.filters.clone(),
+        leaf_roots: c.leaf_roots.iter().map(confirm_leaf_roots_to_proto).collect(),
+    }
+}
+
+fn confirm_leaf_roots_from_proto(
+    pb: &pb::ConfirmLeafRoots,
+) -> super::leaf_root_registration::ConfirmLeafRoots {
+    super::leaf_root_registration::ConfirmLeafRoots {
+        filter: pb.filter.clone(),
+        entries: pb
+            .entries
+            .iter()
+            .map(|e| super::leaf_root_registration::LeafRootEntry {
+                prefix: e.prefix.clone(),
+                leaf_root: e.leaf_root.clone(),
+                num_blocks: e.num_blocks,
+            })
+            .collect(),
+    }
+}
+
+fn confirm_leaf_roots_to_proto(
+    c: &super::leaf_root_registration::ConfirmLeafRoots,
+) -> pb::ConfirmLeafRoots {
+    pb::ConfirmLeafRoots {
+        filter: c.filter.clone(),
+        entries: c
+            .entries
+            .iter()
+            .map(|e| pb::LeafRootEntry {
+                prefix: e.prefix.clone(),
+                leaf_root: e.leaf_root.clone(),
+                num_blocks: e.num_blocks,
+            })
+            .collect(),
     }
 }
 
@@ -373,6 +409,7 @@ mod tests {
             frame_number: 50,
             public_key_signature_bls48581: Some(sample_pb_addr_sig()),
             filters: vec![vec![0x55u8; 16], vec![0x66u8; 24]],
+            leaf_roots: vec![],
         };
         let c = prover_confirm_from_proto(&pb);
         let back = prover_confirm_to_proto(&c);
@@ -471,6 +508,9 @@ pub fn frame_header_from_proto(pb: &pb::FrameHeader) -> FrameHeader {
         prover: pb.prover.clone(),
         fee_multiplier_vote: pb.fee_multiplier_vote as i64,
         public_key_signature_bls48581: agg_bytes,
+        storage_attestation_root: pb.storage_attestation_root.clone(),
+        global_frame_number: pb.global_frame_number,
+        storage_attestation: pb.storage_attestation.clone(),
     }
 }
 
@@ -511,5 +551,8 @@ pub fn frame_header_to_proto(h: &FrameHeader) -> pb::FrameHeader {
         prover: h.prover.clone(),
         fee_multiplier_vote: h.fee_multiplier_vote as u64,
         public_key_signature_bls48581: sig_pb,
+        storage_attestation_root: h.storage_attestation_root.clone(),
+        global_frame_number: h.global_frame_number,
+        storage_attestation: h.storage_attestation.clone(),
     }
 }

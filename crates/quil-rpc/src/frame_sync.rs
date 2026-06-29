@@ -61,13 +61,18 @@ pub struct ArchiveEndpointPool {
 const BLACKLIST_TTL: Duration = Duration::from_secs(60);
 
 struct ArchiveEndpointPoolInner {
-    /// All known archive endpoints we haven't blacklisted yet, in arrival
-    /// order. The poller's "next" pointer rotates through this list.
+    /// ALL known archive endpoints, in arrival order — once added, an
+    /// endpoint is NEVER removed. This is the set the consensus publisher
+    /// fans out to (`get_all`), so dropping an endpoint here would silently
+    /// stop delivering consensus to a committee member on a transient
+    /// connect failure (which, with a flaky :8340 mesh, collapses the
+    /// quorum). The poller's "next" pointer rotates through this list,
+    /// skipping currently-blacklisted entries for frame-polling only.
     endpoints: Vec<String>,
-    /// Endpoints that have failed recently. Each entry records the
-    /// instant of the most recent failure; entries older than
-    /// `BLACKLIST_TTL` are eligible to be restored on the next pool
-    /// operation.
+    /// Endpoints that have failed recently — a SKIP HINT for the poller's
+    /// round-robin only; it does NOT remove them from `endpoints`. Each
+    /// entry records the instant of the most recent failure; entries older
+    /// than `BLACKLIST_TTL` are eligible to be retried.
     blacklist: HashMap<String, Instant>,
     /// Index into `endpoints` for the next pick.
     cursor: usize,
@@ -155,8 +160,12 @@ impl ArchiveEndpointPool {
 
     async fn blacklist(&self, endpoint: &str) {
         let mut inner = self.inner.lock().await;
+        // Record the failure so the poller's `next()` round-robin skips this
+        // endpoint for frame-polling until the TTL expires. Do NOT remove it
+        // from `endpoints`: it stays in the consensus fan-out set (`get_all`)
+        // and is never pruned — a transient poll failure must not drop a
+        // committee member from consensus delivery.
         inner.blacklist.insert(endpoint.to_string(), Instant::now());
-        inner.endpoints.retain(|e| e != endpoint);
         debug!(%endpoint, "blacklisted archive endpoint");
     }
 
@@ -317,7 +326,15 @@ pub async fn run_archive_poller(
         //    Archive nodes need the full history; everyone else
         //    just wants to start from the current head.
         if config.forward_fill && last_frame > 0 && new_number > last_frame + 1 {
-            let mut catchup_failed = false;
+            // Track partial progress: every frame we successfully store
+            // advances `last_frame`, so a failure midway does NOT throw
+            // away the frames we already pulled. The previous design left
+            // `last_frame` untouched on any failure and retried the WHOLE
+            // gap against the SAME endpoint forever — a single unfetchable
+            // frame (e.g. one the source archive never persisted) wedged
+            // catch-up permanently, which is exactly the "far-behind node
+            // never catches up" symptom.
+            let mut failed_frame: Option<u64> = None;
             for fn_ in (last_frame + 1)..new_number {
                 match tokio::time::timeout(
                     config.call_timeout,
@@ -332,24 +349,42 @@ pub async fn run_archive_poller(
                         if let Some(ref cb) = config.on_frame {
                             cb(&frame);
                         }
+                        // Advance over each stored frame so progress is durable.
+                        last_frame = fn_;
                     }
                     Ok(Err(e)) => {
-                        debug!(%addr, frame = fn_, error = %e, "catchup fetch error");
-                        catchup_failed = true;
+                        warn!(%addr, frame = fn_, error = %e, "catchup fetch error");
+                        failed_frame = Some(fn_);
                         break;
                     }
                     Err(_) => {
-                        debug!(%addr, frame = fn_, "catchup timeout");
-                        catchup_failed = true;
+                        warn!(%addr, frame = fn_, "catchup timeout");
+                        failed_frame = Some(fn_);
                         break;
                     }
                 }
             }
-            if catchup_failed {
-                // Drop the connection so we re-try with another endpoint
-                // next tick. last_frame stays where it was so we'll try
-                // the same gap again.
+            if let Some(bad) = failed_frame {
+                // `last_frame` already sits at the last good frame, so we
+                // resume from `bad` next tick — never redoing work. Rotate
+                // to a DIFFERENT endpoint (a mere missing/slow frame is not
+                // grounds to blacklist a committee member: another archive
+                // may well have it). Back off briefly so that if EVERY
+                // endpoint is missing `bad` (a genuine data hole) we cycle
+                // them at a sane cadence instead of a once-a-second mTLS
+                // reconnect storm onto the :8340 path consensus shares.
+                warn!(
+                    %addr,
+                    failed_frame = bad,
+                    resume_from = bad,
+                    head = new_number,
+                    "catchup stalled at frame; rotating endpoint and retrying from last good frame"
+                );
                 current_client = None;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
                 continue;
             }
         }
@@ -419,20 +454,24 @@ mod pool_tests {
     }
 
     #[tokio::test]
-    async fn blacklist_removes_endpoint_from_rotation() {
+    async fn blacklist_skips_rotation_but_never_prunes() {
         let pool = ArchiveEndpointPool::new();
         pool.add("a:1".into()).await;
         pool.add("b:1".into()).await;
         pool.blacklist("a:1").await;
-        // After blacklist, only "b:1" comes out and `add()` rejects the
-        // re-add while the blacklist entry is still fresh.
+        // Blacklist skips "a:1" in the poller's round-robin...
         assert_eq!(pool.next().await.as_deref(), Some("b:1"));
         assert_eq!(pool.next().await.as_deref(), Some("b:1"));
-        pool.add("a:1".into()).await;
+        // ...but it is NEVER removed from the pool. `get_all()` (the
+        // consensus fan-out set) must always include every known archive,
+        // so a transient poll failure can't drop a committee member from
+        // consensus delivery.
+        let mut all = pool.get_all().await;
+        all.sort();
         assert_eq!(
-            pool.get_all().await,
-            vec!["b:1"],
-            "freshly-blacklisted endpoint must not be re-addable"
+            all,
+            vec!["a:1", "b:1"],
+            "blacklist must not prune endpoints from get_all"
         );
     }
 
@@ -469,18 +508,25 @@ mod pool_tests {
         assert_eq!(pool.get_all().await, vec!["a:1"]);
     }
 
-    /// Mirror of the above for the `add()` recovery path: PeerInfo
-    /// gossip re-advertising an endpoint after its blacklist entry
-    /// expired must re-enter the pool.
+    /// A blacklisted endpoint is never pruned from the pool — it stays in
+    /// `get_all()` (consensus fan-out) the whole time, is merely skipped by
+    /// the poller's `next()` round-robin while fresh, and becomes eligible
+    /// for `next()` again once the TTL expires.
     #[tokio::test]
-    async fn add_accepts_after_blacklist_expires() {
+    async fn blacklisted_endpoint_never_pruned_retried_after_ttl() {
         let pool = ArchiveEndpointPool::new();
         pool.add("a:1".into()).await;
         pool.blacklist("a:1").await;
-        pool.add("a:1".into()).await;
+        // Never pruned: still in the consensus fan-out set while blacklisted.
+        assert_eq!(
+            pool.get_all().await,
+            vec!["a:1"],
+            "blacklisted endpoint must remain in get_all"
+        );
+        // Skipped by the poller's rotation while the blacklist is fresh.
         assert!(
-            pool.get_all().await.is_empty(),
-            "add() rejected while blacklist is fresh"
+            pool.next().await.is_none(),
+            "blacklisted-within-TTL endpoint is skipped by next()"
         );
 
         // Backdate the blacklist entry past the TTL.
@@ -490,12 +536,9 @@ mod pool_tests {
             inner.blacklist.insert("a:1".to_string(), past);
         }
 
-        pool.add("a:1".into()).await;
-        assert_eq!(
-            pool.get_all().await,
-            vec!["a:1"],
-            "expired-blacklist endpoint must accept re-add"
-        );
+        // After the TTL, the poller retries it; it was in get_all all along.
+        assert_eq!(pool.next().await.as_deref(), Some("a:1"), "retried after TTL");
+        assert_eq!(pool.get_all().await, vec!["a:1"]);
     }
 
     #[tokio::test]

@@ -706,6 +706,7 @@ fn build_confirm(
         frame_number: frame,
         public_key_signature_bls48581: Some(AddressedSignature { signature: sig, address: addr.to_vec() }),
         filters: filters.to_vec(),
+        leaf_roots: Vec::new(),
     }.to_canonical_bytes()
 }
 

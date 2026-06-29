@@ -402,7 +402,82 @@ pub struct CoverageMonitor {
     /// zero-prover-but-non-zero-size shards (the address-creation
     /// failure mode).
     shard_inventory_provider: Option<ShardInventoryProvider>,
+    /// Per-shard frame of the last split/merge proposal we emitted, so a
+    /// hot/cold shard isn't re-proposed every frame while the previous
+    /// proposal is still working through consensus + materialize. Mirrors
+    /// Go's `shard_rebalancer` cooldown.
+    last_rebalance_frame: Mutex<std::collections::HashMap<Vec<u8>, u64>>,
 }
+
+/// Frames to wait before re-proposing a split/merge for the same shard.
+const REBALANCE_COOLDOWN_FRAMES: u64 = 30;
+
+/// Assemble the per-shard inventory `propose_merge_rebalance` needs:
+/// every current grid sub-shard with its reconstructed filter, committed
+/// byte size, and Active prover count. Mirrors the proven filter +
+/// size-byte reconstruction the archive poller uses to feed
+/// `set_local_shard_sizes` (`bp = L2[32] ++ prefix-bytes`), so the filters
+/// match what the rest of the system keys on.
+///
+/// Includes size-0 sub-shards (unlike the size-feeding path) so the
+/// merge trigger can correctly count a parent's children and reject
+/// partial-group (factor-4/8) merges.
+pub fn build_shard_inventory(
+    crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    shards_store: std::sync::Arc<dyn quil_types::store::ShardsStore>,
+    prover_registry: &dyn ProverRegistry,
+) -> Vec<ShardCoverageEntry> {
+    let get_sizes = crate::shard_info::local_app_shard_get_sizes(crdt, shards_store.clone());
+    let mut out: Vec<ShardCoverageEntry> = Vec::new();
+    let Ok(shards) = shards_store.range_app_shards() else {
+        return out;
+    };
+    // `range_app_shards` returns one row per sub-shard; `get_sizes` returns
+    // every sub-shard under a shard_key, so dedupe to one call per key.
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for s in &shards {
+        if !seen.insert(s.shard_key.clone()) {
+            continue;
+        }
+        let Ok(sub_sizes) = get_sizes(&s.shard_key, s) else {
+            continue;
+        };
+        for entry in sub_sizes {
+            let mut bytes: u64 = 0;
+            for &b in entry.size.iter() {
+                bytes = bytes.saturating_mul(256).saturating_add(b as u64);
+            }
+            let l2 = if s.shard_key.len() >= 35 {
+                &s.shard_key[3..35]
+            } else if s.shard_key.len() > 3 {
+                &s.shard_key[3..]
+            } else {
+                &s.shard_key[..]
+            };
+            let mut filter = l2.to_vec();
+            for &p in &entry.prefix {
+                filter.push(p as u8);
+            }
+            let active = prover_registry
+                .get_active_provers(&filter)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+            out.push(ShardCoverageEntry { filter, size: bytes, active_count: active });
+        }
+    }
+    out
+}
+
+/// Maximum total size of the shard that results from a merge: 16 GiB. A
+/// merge whose combined child size would exceed this is NOT proposed — the
+/// resulting shard would be too large to replicate/attest efficiently.
+///
+/// This is a LEADER-side decision gate: the frame producer evaluates it
+/// against its own (full-coverage) per-shard size view before proposing.
+/// The `ShardMerge` op carries no size field, so peers validate it
+/// structurally only — consistent with how split/merge proposals work
+/// (no per-node size verify, which would fork under partial coverage).
+pub const MERGE_MAX_SIZE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 impl CoverageMonitor {
     pub fn new(
@@ -420,6 +495,7 @@ impl CoverageMonitor {
             last_checked_frame: AtomicU64::new(0),
             emitted_halted: Mutex::new(std::collections::HashSet::new()),
             shard_inventory_provider: None,
+            last_rebalance_frame: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -697,6 +773,212 @@ impl CoverageMonitor {
         }
 
         actions
+    }
+
+    /// Leader-gated per-frame rebalance trigger. The CALLER must gate on
+    /// `local_prover == frame_producer` before calling (mirrors Go's
+    /// `checkShardCoverage(frameNumber, frameProver)` — only the producer
+    /// of the triggering frame emits, so we get exactly one proposer per
+    /// frame instead of N duplicates).
+    ///
+    /// For every shard whose ACTIVE prover count exceeds `max_provers`,
+    /// publishes a `ShardSplitEligible` event carrying the computed
+    /// sub-shards. The already-wired shard-orchestrator loop
+    /// (`master_node/mod.rs`) consumes the event and submits the
+    /// `ShardSplit` op to the global mempool; it rides into a later frame,
+    /// is finalized, and the materializer registers the sub-shards in the
+    /// grid. Worker redistribution onto the new sub-shards is then
+    /// emergent via the normal lifecycle (`decide_leaves` sheds the
+    /// crowded parent, `decide_joins` fills the children) — matching Go,
+    /// whose `ShardSplitOp.Materialize` is also grid-only.
+    ///
+    /// Auto-MERGE is intentionally NOT emitted here: the QUIL reshard
+    /// deliberately widened coverage (4096→64) to escape an under-coverage
+    /// halt, so auto-merging low shards would fight that and risk
+    /// re-spiraling; merge is also the riskier inverse and rarely fires at
+    /// the current thresholds. Split is wired now; merge can be enabled
+    /// once split is validated in the field.
+    pub fn propose_split_rebalance(&self, frame_number: u64) {
+        let summaries = self
+            .prover_registry
+            .get_prover_shard_summaries(frame_number)
+            .unwrap_or_default();
+        let mut last = self.last_rebalance_frame.lock().unwrap();
+        for summary in &summaries {
+            let filter = &summary.filter;
+            if filter.is_empty() {
+                continue;
+            }
+            let active = summary
+                .status_counts
+                .get(&ProverStatus::Active)
+                .copied()
+                .unwrap_or(0) as u64;
+            if active <= self.thresholds.max_provers {
+                continue;
+            }
+            // Per-shard cooldown so we don't re-propose every frame while
+            // the previous split works through consensus + materialize.
+            if last
+                .get(filter)
+                .map_or(false, |&lf| frame_number < lf + REBALANCE_COOLDOWN_FRAMES)
+            {
+                continue;
+            }
+            let factor = crate::shard_rebalancer::split_factor(active);
+            let proposed = crate::shard_rebalancer::compute_proposed_shards(filter, factor);
+            if proposed.len() < 2 {
+                continue;
+            }
+            self.event_distributor.publish(ControlEvent {
+                event_type: ControlEventType::ShardSplitEligible,
+                data: ControlEventData::ShardSplit {
+                    filter: filter.clone(),
+                    proposed,
+                },
+            });
+            last.insert(filter.clone(), frame_number);
+            tracing::info!(
+                filter = hex::encode(filter),
+                active,
+                factor,
+                frame = frame_number,
+                "shard eligible for split — proposing"
+            );
+        }
+    }
+
+    /// Leader-gated per-frame MERGE rebalance trigger — the merge counterpart
+    /// of [`Self::propose_split_rebalance`]. The CALLER must gate on
+    /// `local_prover == frame_producer` before calling (exactly one proposer
+    /// per frame, no duplicates).
+    ///
+    /// `inventory` is the universe of current sub-shards with per-filter
+    /// `size` + `active_count` (assembled by the caller from the grid + the
+    /// local per-shard sizes + registry counts). For each depth-1 factor-2
+    /// sibling pair `{P‖0x00, P‖0x80}` (`P` = 32-byte parent) where BOTH
+    /// halves are under-covered and the merge is safe, publishes a
+    /// `ShardMergeEligible` event; the shard-orchestrator submits the
+    /// `ShardMerge` op, which rides into a later frame and (epoch-aligned)
+    /// flips at E+2.
+    ///
+    /// Three gates, all leader-side:
+    /// - TRIGGER: each child's active count `< min_provers` (both starved →
+    ///   consolidation is warranted).
+    /// - COVERAGE (decision #3): combined active `<= max_provers` — never
+    ///   merge into an over-crowded shard.
+    /// - SIZE (decision #4, REQUIRED): combined size `<= MERGE_MAX_SIZE_BYTES`
+    ///   (16 GiB) — never merge into an over-large shard.
+    ///
+    /// v1 scope: only depth-1 factor-2 shards (33-byte filters, suffix
+    /// `0x00`/`0x80`) collapsing to a 32-byte root — exactly what
+    /// `materialize_shard_merge` supports (merge-to-root). Factor-4/8 and
+    /// deeper groups are skipped: a partial-group merge would leave coverage
+    /// holes, so a clean two-child `{0x00,0x80}` group is required.
+    pub fn propose_merge_rebalance(
+        &self,
+        frame_number: u64,
+        inventory: &[ShardCoverageEntry],
+    ) {
+        use std::collections::{HashMap, HashSet};
+        let by_filter: HashMap<&[u8], &ShardCoverageEntry> =
+            inventory.iter().map(|e| (e.filter.as_slice(), e)).collect();
+        let mut last = self.last_rebalance_frame.lock().unwrap();
+        let mut emitted: HashSet<Vec<u8>> = HashSet::new();
+
+        for entry in inventory {
+            let f = &entry.filter;
+            // A factor-2 split child at ANY depth: parent (32-63 bytes) plus one
+            // 0x00/0x80 split byte. Parent = drop the last byte. (The genesis
+            // QUIL shards are 33-byte filters, so their children are 34-byte and
+            // merge to a 33-byte parent — not just the 32-byte root.)
+            if f.len() < 33 || f.len() > 64 {
+                continue;
+            }
+            let suffix = *f.last().unwrap();
+            if suffix != 0x00 && suffix != 0x80 {
+                continue;
+            }
+            let parent = f[..f.len() - 1].to_vec();
+            if emitted.contains(&parent) {
+                continue;
+            }
+
+            // Require a clean factor-2 split: exactly the two {0x00,0x80}
+            // children exist under P (any 0x40/0xC0/… ⇒ a factor-4/8 group,
+            // which we don't partial-merge).
+            let child_len = parent.len() + 1;
+            let child_count = inventory
+                .iter()
+                .filter(|e| e.filter.len() == child_len && e.filter.starts_with(&parent))
+                .count();
+            if child_count != 2 {
+                continue;
+            }
+            let c0 = {
+                let mut c = parent.clone();
+                c.push(0x00);
+                c
+            };
+            let c1 = {
+                let mut c = parent.clone();
+                c.push(0x80);
+                c
+            };
+            let (Some(e0), Some(e1)) =
+                (by_filter.get(c0.as_slice()), by_filter.get(c1.as_slice()))
+            else {
+                continue;
+            };
+
+            // TRIGGER: both halves starved.
+            if e0.active_count >= self.thresholds.min_provers
+                || e1.active_count >= self.thresholds.min_provers
+            {
+                continue;
+            }
+            let combined_active = e0.active_count.saturating_add(e1.active_count);
+            // COVERAGE gate (#3): never merge into an over-crowded shard.
+            if combined_active > self.thresholds.max_provers {
+                continue;
+            }
+            // SIZE gate (#4): never merge into an over-large shard.
+            let combined_size = e0.size.saturating_add(e1.size);
+            if combined_size > MERGE_MAX_SIZE_BYTES {
+                tracing::info!(
+                    parent = hex::encode(&parent),
+                    combined_size,
+                    "merge skipped — resulting shard would exceed the 16GiB gate"
+                );
+                continue;
+            }
+            // Per-shard cooldown.
+            if last
+                .get(&parent)
+                .map_or(false, |&lf| frame_number < lf + REBALANCE_COOLDOWN_FRAMES)
+            {
+                continue;
+            }
+
+            self.event_distributor.publish(ControlEvent {
+                event_type: ControlEventType::ShardMergeEligible,
+                data: ControlEventData::ShardMerge {
+                    filters: vec![c0.clone(), c1.clone()],
+                    parent: parent.clone(),
+                },
+            });
+            last.insert(c0, frame_number);
+            last.insert(c1, frame_number);
+            last.insert(parent.clone(), frame_number);
+            emitted.insert(parent.clone());
+            tracing::info!(
+                parent = hex::encode(&parent),
+                combined_active,
+                combined_size,
+                frame = frame_number,
+                "shards eligible for merge — proposing"
+            );
+        }
     }
 
     /// Check coverage for a single shard and return the appropriate action.
@@ -995,6 +1277,7 @@ mod tests {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: last_active,
+            epoch: 0,
             vertex_address: vec![],
         }
     }
@@ -1264,6 +1547,78 @@ mod tests {
         (monitor, dist)
     }
 
+    /// Stub registry exposing exactly one shard whose Active count we set,
+    /// to drive `propose_split_rebalance`.
+    struct HotShardRegistry {
+        filter: Vec<u8>,
+        active: u32,
+    }
+    impl quil_types::consensus::ProverRegistry for HotShardRegistry {
+        fn get_prover_info(&self, _: &[u8]) -> quil_types::error::Result<Option<quil_types::consensus::ProverInfo>> { Ok(None) }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> quil_types::error::Result<Vec<u8>> { Ok(Vec::new()) }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> quil_types::error::Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
+        fn get_active_provers(&self, _: &[u8]) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
+        fn get_prover_count(&self, _: &[u8]) -> quil_types::error::Result<usize> { Ok(0) }
+        fn get_provers(&self, _: &[u8]) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
+        fn get_provers_by_status(&self, _: &[u8], _: quil_types::consensus::ProverStatus) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
+        fn get_prover_shard_summaries(&self, _: u64) -> quil_types::error::Result<Vec<quil_types::consensus::ProverShardSummary>> {
+            let mut status_counts = std::collections::HashMap::new();
+            status_counts.insert(quil_types::consensus::ProverStatus::Active, self.active);
+            Ok(vec![quil_types::consensus::ProverShardSummary {
+                filter: self.filter.clone(),
+                status_counts,
+                total_size: 0,
+            }])
+        }
+    }
+
+    #[test]
+    fn propose_split_emits_above_threshold_then_cools_down() {
+        // 33-byte depth-1 QUIL-style filter, 40 active provers (> mainnet max 32).
+        let mut filter = vec![0x11u8; 32];
+        filter.push(0x05);
+        let registry: Arc<dyn quil_types::consensus::ProverRegistry> =
+            Arc::new(HotShardRegistry { filter: filter.clone(), active: 40 });
+        let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
+        let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
+        let monitor = CoverageMonitor::new(
+            registry,
+            dist_arc,
+            CoverageThresholds::mainnet(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        // First call: one ShardSplitEligible with valid child shards.
+        monitor.propose_split_rebalance(1000);
+        {
+            let events = dist.0.lock().unwrap();
+            assert_eq!(events.len(), 1, "expected one split event");
+            assert!(matches!(
+                events[0].event_type,
+                quil_types::consensus::ControlEventType::ShardSplitEligible
+            ));
+            match &events[0].data {
+                quil_types::consensus::ControlEventData::ShardSplit { filter: f, proposed } => {
+                    assert_eq!(f, &filter);
+                    assert!(proposed.len() >= 2, "must propose >= 2 children");
+                    for child in proposed {
+                        assert!(child.starts_with(&filter), "child must extend parent");
+                        assert!(child.len() == filter.len() + 1 || child.len() == filter.len() + 2);
+                    }
+                }
+                _ => panic!("wrong event data"),
+            }
+        }
+
+        // Within cooldown: suppressed.
+        monitor.propose_split_rebalance(1005);
+        assert_eq!(dist.0.lock().unwrap().len(), 1, "cooldown must suppress re-emit");
+
+        // After cooldown: emits again.
+        monitor.propose_split_rebalance(1000 + REBALANCE_COOLDOWN_FRAMES + 1);
+        assert_eq!(dist.0.lock().unwrap().len(), 2, "should re-emit after cooldown");
+    }
+
     /// Verifies the inventory-provider path actually catches the
     /// "zero provers, non-zero size" case the registry-summary path
     /// misses. With registry summary empty, the only way the
@@ -1335,6 +1690,150 @@ mod tests {
             "expected zero CoverageHalt events for size-0 shard, got {}",
             halts,
         );
+    }
+
+    // =================================================================
+    // Merge rebalance trigger + 16GiB gate (decision #4) + coverage gate (#3)
+    // =================================================================
+
+    /// Build a monitor with an empty registry + capturing distributor.
+    /// `propose_merge_rebalance` takes its inventory as a parameter, so no
+    /// inventory provider is needed.
+    fn build_merge_monitor() -> (CoverageMonitor, Arc<CapturingDistributor>) {
+        build_monitor_with_inventory(Arc::new(Vec::new))
+    }
+
+    fn entry(filter: Vec<u8>, size: u64, active: u64) -> ShardCoverageEntry {
+        ShardCoverageEntry { filter, size, active_count: active }
+    }
+
+    fn child(parent: &[u8], suffix: u8) -> Vec<u8> {
+        let mut c = parent.to_vec();
+        c.push(suffix);
+        c
+    }
+
+    fn merge_events(dist: &Arc<CapturingDistributor>) -> Vec<(Vec<Vec<u8>>, Vec<u8>)> {
+        dist.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match (&e.event_type, &e.data) {
+                (
+                    quil_types::consensus::ControlEventType::ShardMergeEligible,
+                    quil_types::consensus::ControlEventData::ShardMerge { filters, parent },
+                ) => Some((filters.clone(), parent.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_emitted_for_starved_factor2_pair_under_gates() {
+        let parent = vec![0xAAu8; 32];
+        let inv = vec![
+            entry(child(&parent, 0x00), 1 << 30, 2), // 1 GiB, 2 active
+            entry(child(&parent, 0x80), 1 << 30, 3), // 1 GiB, 3 active
+        ];
+        let (monitor, dist) = build_merge_monitor();
+        monitor.propose_merge_rebalance(100, &inv);
+
+        let events = merge_events(&dist);
+        assert_eq!(events.len(), 1, "exactly one merge proposed");
+        let (filters, p) = &events[0];
+        assert_eq!(p, &parent);
+        assert_eq!(filters, &vec![child(&parent, 0x00), child(&parent, 0x80)]);
+    }
+
+    #[test]
+    fn merge_emitted_for_deeper_quil_topology_pair() {
+        // Genesis QUIL shards are 33-byte filters; their split children are
+        // 34-byte and must merge back to the 33-byte parent (not just a
+        // 32-byte root). This is the case that actually fires on mainnet.
+        let mut parent = vec![0xAAu8; 32];
+        parent.push(0x05); // 33-byte parent
+        let inv = vec![
+            entry(child(&parent, 0x00), 1 << 30, 2),
+            entry(child(&parent, 0x80), 1 << 30, 3),
+        ];
+        let (monitor, dist) = build_merge_monitor();
+        monitor.propose_merge_rebalance(100, &inv);
+
+        let events = merge_events(&dist);
+        assert_eq!(events.len(), 1, "deeper QUIL-topology merge must fire");
+        let (filters, p) = &events[0];
+        assert_eq!(p, &parent, "33-byte parent");
+        assert_eq!(filters, &vec![child(&parent, 0x00), child(&parent, 0x80)]);
+    }
+
+    #[test]
+    fn merge_skipped_when_combined_size_exceeds_16gib() {
+        let parent = vec![0xBBu8; 32];
+        // 9 GiB + 9 GiB = 18 GiB > 16 GiB gate.
+        let nine_gib = 9u64 * (1 << 30);
+        let inv = vec![
+            entry(child(&parent, 0x00), nine_gib, 1),
+            entry(child(&parent, 0x80), nine_gib, 1),
+        ];
+        let (monitor, dist) = build_merge_monitor();
+        monitor.propose_merge_rebalance(100, &inv);
+        assert!(merge_events(&dist).is_empty(), "16GiB gate must block the merge");
+    }
+
+    #[test]
+    fn merge_emitted_right_at_16gib_boundary() {
+        let parent = vec![0xB1u8; 32];
+        let half = MERGE_MAX_SIZE_BYTES / 2; // exactly 16 GiB combined
+        let inv = vec![
+            entry(child(&parent, 0x00), half, 1),
+            entry(child(&parent, 0x80), half, 1),
+        ];
+        let (monitor, dist) = build_merge_monitor();
+        monitor.propose_merge_rebalance(100, &inv);
+        assert_eq!(merge_events(&dist).len(), 1, "exactly-16GiB merge is allowed");
+    }
+
+    #[test]
+    fn merge_skipped_when_either_child_is_healthy() {
+        let parent = vec![0xCCu8; 32];
+        // c1 has 6 active == min_provers ⇒ not starved.
+        let inv = vec![
+            entry(child(&parent, 0x00), 1 << 20, 2),
+            entry(child(&parent, 0x80), 1 << 20, 6),
+        ];
+        let (monitor, dist) = build_merge_monitor();
+        monitor.propose_merge_rebalance(100, &inv);
+        assert!(merge_events(&dist).is_empty(), "a healthy half must block the merge");
+    }
+
+    #[test]
+    fn merge_skipped_for_factor4_group() {
+        // Four children under P ⇒ factor-4 split, not a clean {0x00,0x80} pair.
+        let parent = vec![0xDDu8; 32];
+        let inv = vec![
+            entry(child(&parent, 0x00), 1 << 20, 1),
+            entry(child(&parent, 0x40), 1 << 20, 1),
+            entry(child(&parent, 0x80), 1 << 20, 1),
+            entry(child(&parent, 0xC0), 1 << 20, 1),
+        ];
+        let (monitor, dist) = build_merge_monitor();
+        monitor.propose_merge_rebalance(100, &inv);
+        assert!(merge_events(&dist).is_empty(), "factor-4 group must not partial-merge");
+    }
+
+    #[test]
+    fn merge_cooldown_prevents_immediate_reproposal() {
+        let parent = vec![0xEEu8; 32];
+        let inv = vec![
+            entry(child(&parent, 0x00), 1 << 20, 1),
+            entry(child(&parent, 0x80), 1 << 20, 1),
+        ];
+        let (monitor, dist) = build_merge_monitor();
+        monitor.propose_merge_rebalance(100, &inv);
+        monitor.propose_merge_rebalance(100 + 5, &inv); // within cooldown window
+        assert_eq!(merge_events(&dist).len(), 1, "cooldown blocks the second proposal");
+        monitor.propose_merge_rebalance(100 + REBALANCE_COOLDOWN_FRAMES, &inv);
+        assert_eq!(merge_events(&dist).len(), 2, "proposal allowed after cooldown");
     }
 
     #[test]

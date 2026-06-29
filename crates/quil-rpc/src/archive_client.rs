@@ -28,7 +28,7 @@ use tracing::{debug, info};
 use quil_types::proto::global::global_service_client::GlobalServiceClient;
 use quil_types::proto::global::{
     AppShardInfo, GetAppShardsRequest, GetGlobalFrameRequest, GetGlobalProposalRequest,
-    GlobalFrame, GlobalProposal, SubmitGlobalMessageRequest,
+    GlobalFrame, GlobalProposal, SubmitGlobalConsensusRequest, SubmitGlobalMessageRequest,
 };
 
 use crate::quil_tls::{build_quil_tls_cert, QuilTlsError};
@@ -50,6 +50,11 @@ pub enum ArchiveClientError {
 }
 
 /// A connected gRPC client for an archive node's `GlobalService`.
+///
+/// `Clone` is cheap: the inner tonic client shares one multiplexed h2
+/// `Channel`, so cached connections can be cloned per request (e.g. the
+/// direct global-consensus publisher fanning to several archives).
+#[derive(Clone)]
 pub struct ArchiveClient {
     inner: GlobalServiceClient<Channel>,
     endpoint: String,
@@ -69,7 +74,13 @@ impl ArchiveClient {
         let channel = endpoint.connect().await?;
         info!(%addr, "archive client connected");
         Ok(Self {
-            inner: GlobalServiceClient::new(channel),
+            // 64 MiB decode/encode limit (tonic defaults to 4 MiB). Full
+            // global frames and app-shard size sets routinely exceed 4 MiB;
+            // the default silently failed those RPCs. Matches the hypersync
+            // client limits in `hypergraph_sync_probe`.
+            inner: GlobalServiceClient::new(channel)
+                .max_decoding_message_size(64 * 1024 * 1024)
+                .max_encoding_message_size(64 * 1024 * 1024),
             endpoint: addr.to_string(),
         })
     }
@@ -98,6 +109,15 @@ impl ArchiveClient {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(15))
             .tcp_nodelay(true)
+            // Actively PING the peer every 10s. `keep_alive_while_idle(true)`
+            // alone is a NO-OP in tonic unless an interval is set — without
+            // this, an idle cached connection sends nothing, the peer's h2
+            // keepalive (20s interval / 10s timeout on the :8340 server)
+            // reaps it, and the next use forces a full reconnect + the
+            // expensive Ed448 mTLS handshake. Pinging under the peer's reap
+            // window keeps consensus/sync connections alive so they're
+            // reused instead of re-handshaken.
+            .http2_keep_alive_interval(Duration::from_secs(10))
             .keep_alive_while_idle(true);
 
         debug!(%addr, "dialing archive node (mTLS)");
@@ -122,7 +142,13 @@ impl ArchiveClient {
         };
         debug!(%addr, "archive client connected (mTLS)");
         Ok(Self {
-            inner: GlobalServiceClient::new(channel),
+            // 64 MiB decode/encode limit (tonic defaults to 4 MiB). Full
+            // global frames and app-shard size sets routinely exceed 4 MiB;
+            // the default silently failed those RPCs. Matches the hypersync
+            // client limits in `hypergraph_sync_probe`.
+            inner: GlobalServiceClient::new(channel)
+                .max_decoding_message_size(64 * 1024 * 1024)
+                .max_encoding_message_size(64 * 1024 * 1024),
             endpoint: addr.to_string(),
         })
     }
@@ -140,6 +166,23 @@ impl ArchiveClient {
     ) -> Result<(), ArchiveClientError> {
         self.inner
             .submit_global_message(SubmitGlobalMessageRequest { data })
+            .await?;
+        Ok(())
+    }
+
+    /// Deliver a global-consensus message (proposal / vote / timeout)
+    /// point-to-point to a peer archive. `bitmask` is the original gossip
+    /// topic (GLOBAL_FRAME or GLOBAL_CONSENSUS) so the receiver routes it
+    /// through the matching handler. Global consensus uses this instead of
+    /// gossip because a full-coverage proposal exceeds the gossip
+    /// message-size ceiling.
+    pub async fn submit_global_consensus(
+        &mut self,
+        bitmask: Vec<u8>,
+        data: Vec<u8>,
+    ) -> Result<(), ArchiveClientError> {
+        self.inner
+            .submit_global_consensus(SubmitGlobalConsensusRequest { bitmask, data })
             .await?;
         Ok(())
     }
@@ -214,7 +257,24 @@ impl ArchiveClient {
 /// peer_id without holding its Ed448 signing key, so the
 /// impersonation chain is already broken at the gossip layer.
 #[derive(Debug)]
-pub struct AcceptAnyServerCert;
+pub struct AcceptAnyServerCert {
+    /// Signature-verification algorithms from the installed crypto provider,
+    /// used to perform the real TLS `CertificateVerify` proof-of-possession
+    /// check in `verify_tls1x_signature`.
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl Default for AcceptAnyServerCert {
+    /// Build a verifier wired to the ring crypto provider's signature
+    /// algorithms (matching the provider installed by
+    /// `build_quil_client_config`).
+    fn default() -> Self {
+        Self {
+            supported: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms,
+        }
+    }
+}
 
 impl ServerCertVerifier for AcceptAnyServerCert {
     fn verify_server_cert(
@@ -235,41 +295,61 @@ impl ServerCertVerifier for AcceptAnyServerCert {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        // This callback IS the TLS proof-of-possession check: verify the
+        // server's CertificateVerify signature against the cert's Ed25519 key,
+        // proving the live server holds the cert's private half. Without it a
+        // replayed (public) peer cert would be accepted from any party.
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ED25519,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-        ]
+        // The Quilibrium cert always uses Ed25519 — narrow the list so
+        // rustls negotiates that scheme. (The Go side leaves it open;
+        // restricting here is harmless and surfaces mismatches early.)
+        // Mirrors the server-side `XsignClientCertVerifier`.
+        vec![SignatureScheme::ED25519]
     }
 }
 
 /// Build a rustls `ClientConfig` that presents a Quilibrium peer cert and
 /// accepts any server cert. Suitable for `tonic`'s tls layer when paired with
 /// a custom transport.
+/// Process-wide cache of built client TLS configs, keyed by Ed448 seed.
+/// The config is a pure, deterministic function of the seed — same seed
+/// always yields the identical cert + cross-signature — but building it
+/// runs a (slow, vendored-pure-Rust) Ed448 public-key derivation + Ed448
+/// SIGN plus x509 cert generation. Recomputing that on every `connect_mtls`
+/// put an Ed448 signature on the critical path of every outbound dial
+/// (thousands per node under reconnect churn), starving the `:8340`
+/// handshake path that consensus delivery depends on. Build once, reuse.
+static CLIENT_CONFIG_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<[u8; 57], Arc<ClientConfig>>>,
+> = std::sync::OnceLock::new();
+
 pub fn build_quil_client_config(ed448_seed: &[u8; 57]) -> Result<Arc<ClientConfig>, ArchiveClientError> {
+    let cache = CLIENT_CONFIG_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(cfg) = cache.lock().unwrap().get(ed448_seed) {
+        return Ok(cfg.clone());
+    }
+    let cfg = build_quil_client_config_uncached(ed448_seed)?;
+    cache.lock().unwrap().insert(*ed448_seed, cfg.clone());
+    Ok(cfg)
+}
+
+fn build_quil_client_config_uncached(ed448_seed: &[u8; 57]) -> Result<Arc<ClientConfig>, ArchiveClientError> {
     let tls_cert = build_quil_tls_cert(ed448_seed)?;
     let cert_chain = rustls_pemfile::certs(&mut tls_cert.cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
@@ -284,7 +364,7 @@ pub fn build_quil_client_config(ed448_seed: &[u8; 57]) -> Result<Arc<ClientConfi
 
     let mut config = ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert::default()))
         .with_client_auth_cert(
             cert_chain.into_iter().map(CertificateDer::from).collect(),
             key_der_to_owned(key_der),
@@ -350,5 +430,143 @@ fn key_der_to_owned(key: PrivateKeyDer<'_>) -> PrivateKeyDer<'static> {
         PrivateKeyDer::Sec1(d) => PrivateKeyDer::Sec1(d.secret_sec1_der().to_vec().into()),
         PrivateKeyDer::Pkcs8(d) => PrivateKeyDer::Pkcs8(d.secret_pkcs8_der().to_vec().into()),
         _ => panic!("unsupported key type"),
+    }
+}
+
+// =====================================================================
+// Proof-of-possession regression test — CLIENT direction, END-TO-END HANDSHAKE.
+//
+// Mirror of `quil_tls::tests::acceptor_completes_handshake_with_forged_client_signature`
+// for the outbound side. `AcceptAnyServerCert::verify_xsign` proves the
+// server's cert is genuine (the Ed448 identity authorized its Ed25519 cert
+// key) but NOT that the live server holds the cert's private key. That second
+// guarantee is the TLS `CertificateVerify` check, which rustls routes through
+// `verify_tls1x_signature`. `AcceptAnyServerCert` now performs that check (it
+// previously stubbed those callbacks to `Ok(assertion())`, which let a server
+// present a public cert it did not own — signing CertificateVerify with a
+// different key — and still be accepted).
+//
+// The repro drives a real TLS 1.3 handshake through the actual production
+// client construction (`build_quil_client_config`) and asserts the client
+// REJECTS the forged server. It failed before possession was enforced (the
+// handshake succeeded, demonstrating the bypass); it now guards against that
+// regression.
+// =====================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::sign::CertifiedKey;
+    use rustls::ServerConfig;
+    use tokio_rustls::TlsAcceptor;
+
+    fn cert_chain_from_seed(seed: &[u8; 57]) -> Vec<CertificateDer<'static>> {
+        let tls = build_quil_tls_cert(seed).unwrap();
+        rustls_pemfile::certs(&mut tls.cert_pem.as_bytes())
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// Load the Ed25519 signing key derived from `seed`. Pairing this with a
+    /// *different* seed's cert chain via `CertifiedKey::new` (which — unlike
+    /// `from_der` — does not check the key matches the cert) is the forgery:
+    /// present someone else's cert, sign with your own key.
+    fn signing_key_from_seed(seed: &[u8; 57]) -> Arc<dyn rustls::sign::SigningKey> {
+        let tls = build_quil_tls_cert(seed).unwrap();
+        let key: PrivateKeyDer<'static> =
+            rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
+                .unwrap()
+                .unwrap();
+        rustls::crypto::ring::sign::any_supported_type(&key).unwrap()
+    }
+
+    /// Server resolver presenting a fixed `CertifiedKey` — used to pair a
+    /// victim's cert chain with an attacker's (mismatched) key for the forged
+    /// repro, and a matched pair for the positive control.
+    #[derive(Debug)]
+    struct StaticServerCert(Arc<CertifiedKey>);
+    impl rustls::server::ResolvesServerCert for StaticServerCert {
+        fn resolve(
+            &self,
+            _client_hello: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<CertifiedKey>> {
+            Some(self.0.clone())
+        }
+    }
+
+    fn acceptor_for(cert: Arc<CertifiedKey>) -> TlsAcceptor {
+        // SAFETY: install the default provider once; an error just means
+        // another provider is already installed.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut cfg = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(StaticServerCert(cert)));
+        // Match the client's ALPN so the handshake fails (or succeeds) on the
+        // cert check, not on protocol negotiation.
+        cfg.alpn_protocols = vec![b"h2".to_vec()];
+        TlsAcceptor::from(Arc::new(cfg))
+    }
+
+    #[tokio::test]
+    async fn client_rejects_forged_server_signature() {
+        // Attacker server: victim's public cert (0x61) + attacker's own,
+        // different key (0x62) — a server that does NOT possess the cert key.
+        let forged = Arc::new(CertifiedKey::new(
+            cert_chain_from_seed(&[0x61u8; 57]),
+            signing_key_from_seed(&[0x62u8; 57]),
+        ));
+        let acceptor = acceptor_for(forged);
+
+        // Production client, built exactly as the node does.
+        let connector = TlsConnector::from(build_quil_client_config(&[0x71u8; 57]).unwrap());
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let (_server_res, client_res) = tokio::join!(
+            acceptor.accept(server_io),
+            connector.connect(server_name, client_io),
+        );
+
+        assert!(
+            client_res.is_err(),
+            "VULNERABILITY: build_quil_client_config (AcceptAnyServerCert) completed the \
+             handshake with a server that presented the victim's cert but signed \
+             CertificateVerify with a different key — proof-of-possession is not \
+             enforced, so the server identity is spoofable by cert replay",
+        );
+    }
+
+    /// Positive control: the SAME client must SUCCEED against a legitimate
+    /// server that actually possesses its cert's key. Proves the forged test
+    /// fails specifically because possession is missing — not because of ALPN,
+    /// the duplex transport, or some other setup detail. Passes before and
+    /// after the fix (all possession is legitimate).
+    #[tokio::test]
+    async fn client_accepts_legitimate_server() {
+        let seed = [0x61u8; 57];
+        let legit = Arc::new(CertifiedKey::new(
+            cert_chain_from_seed(&seed),
+            signing_key_from_seed(&seed),
+        ));
+        let acceptor = acceptor_for(legit);
+
+        let connector = TlsConnector::from(build_quil_client_config(&[0x71u8; 57]).unwrap());
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let (server_res, client_res) = tokio::join!(
+            acceptor.accept(server_io),
+            connector.connect(server_name, client_io),
+        );
+
+        assert!(
+            client_res.is_ok(),
+            "legitimate handshake must succeed (client side): {:?}",
+            client_res.err(),
+        );
+        assert!(
+            server_res.is_ok(),
+            "legitimate handshake must succeed (server side): {:?}",
+            server_res.err(),
+        );
     }
 }

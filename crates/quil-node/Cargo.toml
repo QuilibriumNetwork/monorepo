@@ -31,6 +31,7 @@ quil-consensus = { path = "../quil-consensus" }
 quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-engine = { path = "../quil-engine" }
 quil-rpc = { path = "../quil-rpc" }
+quil-explorer = { path = "../quil-explorer" }
 quil-tries = { path = "../quil-tries" }
 prost = "0.13"
 tonic = "0.12"

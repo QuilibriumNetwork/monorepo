@@ -303,6 +303,10 @@ pub fn wesolowski_solve_multi(
 /// Verify all workers in one shot from their individual blobs.
 /// `alleged_solutions` must be parallel to `ids`, each entry a `[y_i | π_i]` blob
 /// produced by `wesolowski_solve_multi` for that same `id`.
+///
+/// Full-attendance (dense) case: the committee that fixes the challenge prime
+/// `b` IS the set of present provers. This delegates to the sparse verifier
+/// with `commitment_ids == present_ids == ids`.
 pub fn wesolowski_verify_multi(
   int_size_bits: u16,
   challenge: &[u8],
@@ -310,11 +314,53 @@ pub fn wesolowski_verify_multi(
   ids: &Vec<Vec<u8>>,
   alleged_solutions: &Vec<Vec<u8>>,
 ) -> bool {
+  wesolowski_verify_multi_sparse(
+      int_size_bits,
+      challenge,
+      difficulty,
+      ids,                // commitment set (fixes b)
+      ids,                // present set (aggregation)
+      alleged_solutions,
+  )
+}
+
+/// Verify a SUBSET of workers against a multiproof whose challenge prime `b`
+/// is bound to a fixed `commitment_ids` set (the full committee), while the
+/// aggregation runs over only the `present_ids` that actually contributed a
+/// proof.
+///
+/// Why this exists: each worker precomputes its multiproof at vote time —
+/// BEFORE the set of who-will-vote is known — so the prime
+/// `b = H_prime(challenge, t, commit_ids(commitment_ids))` MUST be derived
+/// from a fixed, deterministic universe (the active committee), not from the
+/// dynamic signer subset. Requiring `present_ids == commitment_ids` (full
+/// attendance) is the bug that rejected any partial multi-signer frame; a BFT
+/// system cannot know who is absent until the threshold of votes is in.
+///
+/// Soundness is unchanged vs. the dense check: each present worker's proof
+/// satisfies `π_iᵇ · x^{h_i·r} = y_i` for the committee-derived `b`, so the
+/// product over ANY present subset satisfies the same aggregate equation
+///   `(∏π_i)ᵇ · x^{r·Σh_i} == ∏y_i`.
+/// The present membership itself is authenticated elsewhere (the BLS bitmask +
+/// aggregate signature); this only proves the present provers did the VDF work.
+///
+/// `present_ids` and `alleged_solutions` must be parallel and in the same
+/// order the prover/aggregator emitted them (ascending committee index).
+pub fn wesolowski_verify_multi_sparse(
+  int_size_bits: u16,
+  challenge: &[u8],
+  difficulty: u32,
+  commitment_ids: &Vec<Vec<u8>>,
+  present_ids: &Vec<Vec<u8>>,
+  alleged_solutions: &Vec<Vec<u8>>,
+) -> bool {
   use classgroup::{gmp_classgroup::GmpClassGroup, BigNum, BigNumExt, ClassGroup};
   use crate::proof_wesolowski::{commit_ids, hash_prime_fixed, hash_to_exponent};
 
-  // Basic shape checks
-  if ids.is_empty() || ids.len() != alleged_solutions.len() { return false; }
+  // Basic shape checks. `present_ids` is parallel to the solutions; the
+  // committee that fixes `b` is independent and must be non-empty.
+  if present_ids.is_empty() || present_ids.len() != alleged_solutions.len() { return false; }
+  if commitment_ids.is_empty() { return false; }
   if (usize::MAX - 16) < int_size_bits as usize { return false; }
   let elem_units = ((int_size_bits as usize) + 16) >> 4; // element is 2 * elem_units bytes
   if elem_units == 0 { return false; }
@@ -325,16 +371,18 @@ pub fn wesolowski_verify_multi(
   let disc: <GmpClassGroup as ClassGroup>::BigNum = create_discriminant(challenge, int_size_bits);
   let x = GmpClassGroup::from_ab_discriminant(2.into(), 1.into(), disc.clone());
 
-  // Fixed prime b from (challenge, bits, t, ids_commitment)
-  let ids_slices: Vec<&[u8]> = ids.iter().map(|v| v.as_slice()).collect();
-  let ids_commitment = commit_ids(&ids_slices);
+  // Fixed prime b from (challenge, bits, t, commit_ids(COMMITTEE)). This is
+  // the same `b` every worker used when precomputing — derived from the full
+  // committee, NOT the present subset.
+  let commitment_slices: Vec<&[u8]> = commitment_ids.iter().map(|v| v.as_slice()).collect();
+  let ids_commitment = commit_ids(&commitment_slices);
   let b = hash_prime_fixed::<<GmpClassGroup as ClassGroup>::BigNum>(
       challenge,
       int_size_bits,
       difficulty as u64,
       &ids_commitment,
   );
-  
+
   let two = <<GmpClassGroup as ClassGroup>::BigNum>::from(2u64);
   if !(b > two) { return false; }
 
@@ -346,33 +394,99 @@ pub fn wesolowski_verify_multi(
       &b,
   );
 
-  // Aggregate Y = ∏ y_i and Π = ∏ π_i; compute S = Σ h_i
-  let (first_id, first_blob) = (&ids[0], &alleged_solutions[0]);
-  if first_blob.len() != blob_len { return false; }
-  let (y0_bytes, pi0_bytes) = first_blob.split_at(element_len);
-  let mut y_agg  = GmpClassGroup::from_bytes(y0_bytes, disc.clone());
-  let mut pi_agg = GmpClassGroup::from_bytes(pi0_bytes, disc.clone());
-  let mut S = hash_to_exponent::<<GmpClassGroup as ClassGroup>::BigNum>(challenge, first_id.as_slice());
-
-
-  for (id_bytes, blob) in ids.iter().zip(alleged_solutions.iter()).skip(1) {
+  // Per-member verification (collusion-sound). Each present prover's proof
+  // must INDIVIDUALLY satisfy  π_iᵇ · x^{h_i·r} == y_i  (with x_i = x^{h_i},
+  // y_i = x_i^{2^t}, π_i = x_i^{⌊2^t/b⌋}).
+  //
+  // We deliberately do NOT use the cheaper batched product check
+  //   (∏π_i)ᵇ · x^{r·Σh_i} == ∏y_i
+  // because it is FORGEABLE BY ≥2 COLLUDING MEMBERS: with two members under
+  // their control they can pick compensating (y_i, π_i) whose residuals
+  // cancel in the product (derive one member's y from the others — NO b-th
+  // root required), passing the aggregate without doing the VDF work. Since
+  // rewards are distributed per participating prover, that is a real
+  // fake-attestation / reward-farming vector for a Byzantine minority. The
+  // per-member check forces a b-th root in a class group of unknown order to
+  // forge EACH proof, so collusion gains nothing. Cost is N exponentiations
+  // (N ≤ committee size, bounded per shard) instead of ~constant — an
+  // acceptable price for soundness.
+  for (id_bytes, blob) in present_ids.iter().zip(alleged_solutions.iter()) {
       if blob.len() != blob_len { return false; }
       let (y_bytes, pi_bytes) = blob.split_at(element_len);
       let y_i  = GmpClassGroup::from_bytes(y_bytes, disc.clone());
-      let pi_i = GmpClassGroup::from_bytes(pi_bytes,  disc.clone());
-      y_agg  = &y_agg  * &y_i;
-      pi_agg = &pi_agg * &pi_i;
-      S = S + hash_to_exponent::<<GmpClassGroup as ClassGroup>::BigNum>(challenge, id_bytes.as_slice());
+      let pi_i = GmpClassGroup::from_bytes(pi_bytes, disc.clone());
+      let h_i = hash_to_exponent::<<GmpClassGroup as ClassGroup>::BigNum>(
+          challenge,
+          id_bytes.as_slice(),
+      );
+      // lhs = π_iᵇ · x^{h_i·r}
+      let mut lhs = pi_i.clone();
+      lhs.pow(b.clone());
+      let mut x_exp = x.clone();
+      x_exp.pow(&h_i * &r);
+      lhs *= &x_exp;
+      if lhs != y_i {
+          return false;
+      }
   }
+  true
+}
 
-  // Single aggregated check:  Π^b * x^{ r * S } ?= Y
-  let mut lhs = pi_agg.clone();
-  lhs.pow(b.clone()); // Π^b
+#[cfg(test)]
+mod multiproof_bench {
+    use super::*;
+    use std::time::Instant;
 
-  let mut x_exp = x.clone();
-  x_exp.pow(r * S);   // x^{r*S}
+    fn ids(n: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|i| {
+                let mut v = vec![0u8; 32];
+                v[0] = i as u8;
+                v[31] = 0xab;
+                v
+            })
+            .collect()
+    }
 
-  lhs *= &x_exp;
-
-  lhs == y_agg
+    /// Times the per-member (collusion-sound) `wesolowski_verify_multi` at the
+    /// mainnet integer size for a range of committee sizes. Verify cost is
+    /// ~independent of `difficulty` (it verifies in O(log work)), so a small
+    /// difficulty keeps proof generation cheap while the verify timing stays
+    /// representative. Run:
+    ///   FLINT_DIR=... cargo test -p vdf --release multiproof_bench -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing benchmark; run with --release --ignored --nocapture"]
+    fn bench_multiproof_verify_scaling() {
+        let int_size_bits: u16 = 2048; // mainnet
+        let difficulty: u32 = 1000; // verify cost ~difficulty-independent
+        let challenge: &[u8] = b"bench-challenge-parent-selector-32bytesxx";
+        for &n in &[1usize, 2, 4, 8, 16, 32] {
+            let id_set = ids(n);
+            let blobs: Vec<Vec<u8>> = (0..n)
+                .map(|i| {
+                    wesolowski_solve_multi(int_size_bits, challenge, difficulty, &id_set, i as u32)
+                })
+                .collect();
+            assert!(
+                wesolowski_verify_multi(int_size_bits, challenge, difficulty, &id_set, &blobs),
+                "N={n} honest proofs must verify"
+            );
+            let iters = 20u32;
+            let start = Instant::now();
+            for _ in 0..iters {
+                assert!(wesolowski_verify_multi(
+                    int_size_bits,
+                    challenge,
+                    difficulty,
+                    &id_set,
+                    &blobs
+                ));
+            }
+            let total = start.elapsed() / iters;
+            let per_member = total / n as u32;
+            println!(
+                "N={n:>2}  verify_total={total:?}  per_member={per_member:?}"
+            );
+        }
+    }
 }

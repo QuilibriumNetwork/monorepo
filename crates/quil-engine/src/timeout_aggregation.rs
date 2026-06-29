@@ -102,6 +102,11 @@ impl TimeoutAggregation {
             return;
         }
         info!(rank, qc_rank, voter = %voter, "ingesting timeout");
+
+        // Capture the embedded prior-rank TC before `ts` is consumed by
+        // the processor — used below to converge a split pacemaker.
+        let prior_tc = ts.prior_rank_timeout_certificate.clone();
+
         let proc = match self.get_or_create(rank) {
             Ok(p) => p,
             Err(e) => {
@@ -116,6 +121,49 @@ impl TimeoutAggregation {
             // etc.), and the only way to spot that without recompiling
             // for debug logs is to print it here.
             info!(rank, voter = %voter, error = %e, "timeout processor rejected timeout");
+        }
+        // Always log the running weight vs the full-TC threshold. When a
+        // rank is stuck, this plateaus below the threshold — direct
+        // evidence of a quorum/liveness shortfall (fewer than 2/3-by-
+        // seniority of the committee online) rather than a logic bug.
+        let (weight, threshold) = proc.weight_and_threshold();
+        info!(
+            rank,
+            weight,
+            threshold,
+            quorum_met = weight >= threshold,
+            "timeout quorum status"
+        );
+
+        // Pacemaker convergence: advance on the TC embedded in a peer's
+        // timeout. Each node persists its own pacemaker rank, so on a
+        // coordinated restart the committee can resume split across
+        // adjacent ranks. Once split, NO new TC for the lower rank can
+        // form (each rank holds < 2/3 of the voters), so a lagging node
+        // can ONLY catch up by observing the TC that already carried the
+        // leaders forward — which is embedded as `prior_rank_timeout_
+        // certificate` in their timeouts (a non-consecutive timeout is
+        // invalid without it). We validate it with the same timeout-
+        // domain validator the processor uses, then submit it to the
+        // event loop. Validation makes this safe (the reason an earlier
+        // revision dropped embedded TCs was malformed-TC poisoning);
+        // mirrors Go's pacemaker, which advances on any valid observed TC.
+        if let Some(prior_tc) = prior_tc {
+            if let Some(handle) = self.consensus_handle.get() {
+                let tc_rank = prior_tc.rank();
+                match self
+                    .validator
+                    .validate_timeout_certificate(prior_tc.as_ref())
+                {
+                    Ok(()) => {
+                        debug!(tc_rank, "advancing pacemaker on embedded prior-rank TC");
+                        handle.submit_timeout_certificate(prior_tc);
+                    }
+                    Err(e) => {
+                        debug!(tc_rank, error = %e, "embedded prior-rank TC failed validation");
+                    }
+                }
+            }
         }
     }
 
@@ -247,6 +295,7 @@ mod tests {
             timestamp: 1_700_000_000,
             signature: vec![0xBBu8; 74],
             address: vec![0xCCu8; 32],
+            openings: Vec::new(),
         }
     }
 

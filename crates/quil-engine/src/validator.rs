@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use quil_consensus::committee::Replicas;
 use quil_consensus::models::{
-    QuorumCertificate, SignedProposal, TimeoutCertificate, Unique, WeightedIdentity,
+    Identity, QuorumCertificate, SignedProposal, TimeoutCertificate, Unique, WeightedIdentity,
 };
 use quil_consensus::packer::decode_signer_indices;
 use quil_consensus::validator::Validator;
@@ -37,6 +37,12 @@ use quil_types::error::{QuilError, Result};
 pub struct ConsensusValidator<S: Unique, V: Unique> {
     committee: Arc<dyn Replicas>,
     verifier: Arc<dyn Verifier<V>>,
+    /// Identity (selector) of the one rank-0 genesis QC this validator
+    /// trusts implicitly. `Some` only on a true cold-start (genesis at
+    /// rank 0); `None` on a checkpoint/resume start, where no rank-0 QC
+    /// is ever legitimate and every rank-0 QC is rejected. See
+    /// [`Validator::validate_quorum_certificate`].
+    genesis_qc_identity: Option<Identity>,
     _marker: std::marker::PhantomData<S>,
 }
 
@@ -45,8 +51,19 @@ impl<S: Unique, V: Unique> ConsensusValidator<S, V> {
         Self {
             committee,
             verifier,
+            genesis_qc_identity: None,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Configure the trusted genesis-QC identity. Pass `Some(selector)`
+    /// (where `selector = poseidon(genesis_output)`) only when this chain
+    /// bootstraps at rank 0; pass `None` for a checkpoint/resume start so
+    /// that any rank-0 QC is rejected by
+    /// [`Validator::validate_quorum_certificate`].
+    pub fn with_genesis_qc_identity(mut self, identity: Option<Identity>) -> Self {
+        self.genesis_qc_identity = identity;
+        self
     }
 
     /// Helper: decode signer subset from bitmask + compute weight.
@@ -94,16 +111,37 @@ impl<S: Unique, V: Unique> ConsensusValidator<S, V> {
 
 impl<S: Unique, V: Unique> Validator<S, V> for ConsensusValidator<S, V> {
     fn validate_quorum_certificate(&self, qc: &dyn QuorumCertificate) -> Result<()> {
-        // Genesis QCs (rank 0) are trusted — they carry
-        // `AggregateSignature::empty()` (all-zero pk/sig, 0xFF bitmask)
-        // which can't pass BLS verification. Every node seeds the same
-        // genesis QC at startup; re-verifying it would stall the
-        // chain at rank 1 because the first proposal embeds the
-        // genesis QC as its parent. Matches Go's implicit trust: the
-        // genesis QC enters the liveness store at startup and is
-        // never re-verified by the consensus loop.
+        // Genesis QCs (rank 0) carry `AggregateSignature::empty()`
+        // (all-zero pk/sig, 0xFF bitmask) which can't pass BLS
+        // verification, so they get a verification bypass — but ONLY for
+        // the exact genesis QC this validator was seeded with, matched by
+        // identity (selector). A peer-forged rank-0 QC with any other
+        // identity, or *any* rank-0 QC on a checkpoint-resumed chain
+        // (`genesis_qc_identity == None`, since no rank-0 QC is ever
+        // legitimate there), is rejected. This is the inbound-path mirror
+        // of Go loading the stored genesis QC and accepting only on
+        // equality (`app_consensus_engine.go` / `consensus_protocol.go`);
+        // a blanket `rank == 0 => Ok` would let a forged standalone QC
+        // skip signature verification entirely.
+        //
+        // NOTE: the genesis selector is public, so this check alone does
+        // not authorize acting on a rank-0 QC's *payload* (e.g. its
+        // attacker-chosen `frame_number`). Side-effecting callers that
+        // commit on a standalone QC reject rank-0 outright; see
+        // `AppShardConsensusEngine::handle_quorum_certificate`.
         if qc.rank() == 0 {
-            return Ok(());
+            return match &self.genesis_qc_identity {
+                Some(genesis_id) if qc.identity() == genesis_id => Ok(()),
+                Some(_) => Err(QuilError::InvalidQuorumCertificate(format!(
+                    "rank-0 QC identity {} does not match the trusted genesis QC",
+                    hex::encode(qc.identity()),
+                ))),
+                None => Err(QuilError::InvalidQuorumCertificate(
+                    "rank-0 (genesis) QC is only valid as a cold-start bootstrap parent; \
+                     this validator was seeded from a checkpoint, so a rank-0 QC is rejected"
+                        .into(),
+                )),
+            };
         }
         let bitmask = qc.aggregated_signature().bitmask();
         let (_subset, total_weight) = self.decode_signers(qc.rank(), bitmask)?;
@@ -280,6 +318,43 @@ impl<S: Unique, V: Unique> Validator<S, V> for ConsensusValidator<S, V> {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Port of Go's `processProposalInternal` gate
+/// (`node/consensus/{global,app}/message_processors.go`): run the
+/// crypto checks on an inbound proposal **in order** and return `Err`
+/// on the first failure, *before* the proposal is added to fork-choice,
+/// fed to the pacemaker, or voted on. Callers drop + log on `Err` and
+/// never submit.
+///
+/// The five Go-equivalent checks:
+/// 1. **Parent QC** aggregate signature (`VerifyQuorumCertificate`).
+///    `validate_proposal` deliberately punts this (see its doc), so the
+///    gate runs it explicitly — this is the only place the parent QC's
+///    signature is checked on the inbound path.
+/// 2. **Proposal structure**: proposer-is-leader, Jolteon rank rules,
+///    and — on the recovery path — the embedded prior-rank TC's
+///    aggregate signature (`validate_proposal` validates that TC
+///    internally, so it is not re-checked here).
+/// 3. **Proposer's own vote** (`VerifyVote`). Requires a committee-aware
+///    verifier (see [`crate::bls_verifier::BlsConsensusVerifier::new_with_committee`]).
+/// 4/5. **State + frame**: the VDF + BLS frame check, supplied by the
+///    caller as `frame_check` since the frame-validator type differs
+///    between the global and app paths.
+pub fn gate_proposal<S: Unique, V: Unique>(
+    validator: &ConsensusValidator<S, V>,
+    signed: &SignedProposal<S, V>,
+    frame_check: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    // 1. Parent QC.
+    validator.validate_quorum_certificate(signed.proposal.parent_quorum_certificate.as_ref())?;
+    // 2. Leader / rank rules + embedded prior-rank TC.
+    validator.validate_proposal(signed)?;
+    // 3. Proposer's self-vote.
+    validator.validate_vote(&signed.vote)?;
+    // 4/5. State + frame (VDF/BLS).
+    frame_check()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -552,6 +627,51 @@ mod tests {
     }
 
     #[test]
+    fn validate_qc_rank0_rejected_without_genesis_identity() {
+        // Default validator (no genesis identity configured, e.g. a
+        // checkpoint-resumed chain): every rank-0 QC is rejected, closing
+        // the old blanket `rank == 0 => Ok` bypass.
+        let v = build_validator(committee_of_3(), StubVerifier::ok());
+        let qc = StubQc {
+            rank: 0,
+            id: "forged-genesis".into(),
+            agg: StubAgg { bitmask: bitmask_of(&[true, true, true]) },
+        };
+        let err = v.validate_quorum_certificate(&qc).unwrap_err();
+        assert!(err.is_invalid_quorum_certificate());
+    }
+
+    #[test]
+    fn validate_qc_rank0_accepted_when_identity_matches_genesis() {
+        // Cold-start validator seeded with the genesis selector: the real
+        // genesis QC (matching identity) is trusted without a signature
+        // check, preserving bootstrap.
+        let v = build_validator(committee_of_3(), StubVerifier::ok())
+            .with_genesis_qc_identity(Some(b"the-genesis".to_vec()));
+        let qc = StubQc {
+            rank: 0,
+            id: "the-genesis".into(),
+            agg: StubAgg { bitmask: vec![] }, // empty agg sig, like genesis
+        };
+        v.validate_quorum_certificate(&qc).unwrap();
+    }
+
+    #[test]
+    fn validate_qc_rank0_rejected_when_identity_mismatch() {
+        // Cold-start validator, but a forged rank-0 QC with a different
+        // selector is rejected even though it is rank 0.
+        let v = build_validator(committee_of_3(), StubVerifier::ok())
+            .with_genesis_qc_identity(Some(b"the-genesis".to_vec()));
+        let qc = StubQc {
+            rank: 0,
+            id: "forged-genesis".into(),
+            agg: StubAgg { bitmask: vec![] },
+        };
+        let err = v.validate_quorum_certificate(&qc).unwrap_err();
+        assert!(err.is_invalid_quorum_certificate());
+    }
+
+    #[test]
     fn validate_tc_rank_lower_than_embedded_qc_errors() {
         let v = build_validator(committee_of_3(), StubVerifier::ok());
         let tc = StubTc {
@@ -715,6 +835,74 @@ mod tests {
         p.proposal.previous_rank_timeout_certificate = Some(tc);
         let err = v.validate_proposal(&p).unwrap_err();
         assert!(err.is_invalid_proposal());
+    }
+
+    // ---------- gate_proposal (processProposalInternal port) ----------
+
+    #[test]
+    fn gate_proposal_happy_path_passes_all_checks() {
+        let v = build_validator(committee_of_3(), StubVerifier::ok());
+        let p = make_proposal(5, "alice", 4);
+        // Frame check passes → whole gate passes.
+        gate_proposal(&v, &p, || Ok(())).unwrap();
+    }
+
+    #[test]
+    fn gate_proposal_rejects_bad_frame() {
+        let v = build_validator(committee_of_3(), StubVerifier::ok());
+        let p = make_proposal(5, "alice", 4);
+        // QC/proposal/vote all pass, but the frame check fails → gate fails
+        // and the closure's error is surfaced.
+        let err = gate_proposal(&v, &p, || {
+            Err(QuilError::Crypto("frame VDF invalid".into()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, QuilError::Crypto(_)));
+    }
+
+    #[test]
+    fn gate_proposal_rejects_non_leader_proposer() {
+        let v = build_validator(committee_of_3(), StubVerifier::ok());
+        // bob is not the leader → validate_proposal fails before the frame
+        // check ever runs.
+        let p = make_proposal(5, "bob", 4);
+        let mut frame_checked = false;
+        let err = gate_proposal(&v, &p, || {
+            frame_checked = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(err.is_invalid_proposal());
+        assert!(!frame_checked, "frame check must not run after an earlier failure");
+    }
+
+    #[test]
+    fn gate_proposal_rejects_bad_parent_qc() {
+        // Parent-QC signature verification fails → gate fails at step 1.
+        let verifier = StubVerifier {
+            qc_error: Mutex::new(Some(QuilError::InvalidSignature("bad parent QC".into()))),
+            tc_error: Mutex::new(None),
+            vote_error: Mutex::new(None),
+        };
+        let v = build_validator(committee_of_3(), verifier);
+        let p = make_proposal(5, "alice", 4);
+        let err = gate_proposal(&v, &p, || Ok(())).unwrap_err();
+        assert!(err.is_invalid_signature());
+    }
+
+    #[test]
+    fn gate_proposal_rejects_bad_proposer_vote() {
+        // Parent QC ok, proposal structure ok, but the proposer's own vote
+        // fails signature verification → gate fails at step 3.
+        let verifier = StubVerifier {
+            qc_error: Mutex::new(None),
+            tc_error: Mutex::new(None),
+            vote_error: Mutex::new(Some(QuilError::InvalidSignature("bad vote".into()))),
+        };
+        let v = build_validator(committee_of_3(), verifier);
+        let p = make_proposal(5, "alice", 4);
+        let err = gate_proposal(&v, &p, || Ok(())).unwrap_err();
+        assert!(err.is_invalid_vote());
     }
 
     #[test]

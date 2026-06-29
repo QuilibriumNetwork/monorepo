@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use quil_consensus::committee::Replicas;
 use quil_consensus::models::{QuorumCertificate, TimeoutCertificate, Unique};
 use quil_consensus::signature_aggregator::SignatureAggregator;
 use quil_consensus::verification::{make_timeout_message, make_vote_message};
@@ -34,6 +35,16 @@ pub struct BlsConsensusVerifier {
     /// Domain separator used for TC verification. Mirrors the
     /// `timeout_domain` the timeout votes were signed under.
     timeout_ds_tag: Vec<u8>,
+    /// Committee used to resolve a single vote's signer → public key
+    /// in [`Verifier::verify_vote`]. `None` for the QC/TC-only callers
+    /// (and tests) that never verify standalone votes; `Some` for the
+    /// inbound-proposal gate, which must check the proposer's own vote.
+    committee: Option<Arc<dyn Replicas>>,
+    /// Filter the voters signed under, baked into the reconstructed
+    /// vote message (`make_vote_message(filter, rank, source)`). The
+    /// global chain uses an empty filter; app shards use the shard's
+    /// address.
+    vote_filter: Vec<u8>,
 }
 
 impl BlsConsensusVerifier {
@@ -45,6 +56,8 @@ impl BlsConsensusVerifier {
             aggregator,
             vote_ds_tag: ds_tag.clone(),
             timeout_ds_tag: ds_tag,
+            committee: None,
+            vote_filter: Vec::new(),
         }
     }
 
@@ -63,7 +76,111 @@ impl BlsConsensusVerifier {
             aggregator,
             vote_ds_tag: vote_domain,
             timeout_ds_tag: timeout_domain,
+            committee: None,
+            vote_filter: Vec::new(),
         }
+    }
+
+    /// Construct a verifier that can also verify a *standalone* vote by
+    /// resolving the signer's public key through `committee`. Required
+    /// by the inbound-proposal gate, which checks the proposer's own
+    /// vote (`VerifyVote` in Go's `processProposalInternal`). `vote_filter`
+    /// is the filter the voters signed under — empty for the global
+    /// chain, the shard address for app shards — and must match what
+    /// the per-rank vote collector uses in `make_vote_message`.
+    pub fn new_with_committee(
+        aggregator: Arc<dyn SignatureAggregator>,
+        vote_domain: Vec<u8>,
+        timeout_domain: Vec<u8>,
+        committee: Arc<dyn Replicas>,
+        vote_filter: Vec<u8>,
+    ) -> Self {
+        Self {
+            aggregator,
+            vote_ds_tag: vote_domain,
+            timeout_ds_tag: timeout_domain,
+            committee: Some(committee),
+            vote_filter,
+        }
+    }
+
+    /// Bind a cert's transmitted aggregate public key to the committee:
+    /// reconstruct the aggregate of the public keys of the members the
+    /// `bitmask` selects at `rank`, and require it to equal `transmitted_pk`.
+    ///
+    /// Without this, the QC/TC signature is verified against a public key
+    /// that travels *inside the cert*, so a peer can sign the canonical
+    /// message with a self-generated key, set the bitmask to name real
+    /// members (passing the weight check), and present a matching
+    /// `(pk, sig)` pair that verifies in isolation — a complete forgery of
+    /// consensus authority. This is the inbound-path mirror of the
+    /// `bytes.Equal(qc.PubKey, Aggregate(committeePubkeys).PubKey)` check in
+    /// Go's `VerifyQuorumCertificate` / `VerifyTimeoutCertificate`
+    /// (`consensus_protocol.go`).
+    ///
+    /// Enforced only when this verifier is committee-aware. Every inbound
+    /// verification path constructs the verifier via
+    /// [`Self::new_with_committee`], so the binding is always in force
+    /// there; the cert-*forming* verifiers used by the vote/timeout
+    /// aggregators have no committee and never call the QC/TC verify
+    /// methods, so they correctly skip it.
+    fn bind_aggregate_pubkey_to_committee(
+        &self,
+        rank: u64,
+        bitmask: &[u8],
+        transmitted_pk: &[u8],
+        sig: &[u8],
+    ) -> Result<()> {
+        let committee = match &self.committee {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let members = committee.identities_by_rank(rank)?;
+        let expected_len = (members.len() + 7) / 8;
+        if bitmask.len() < expected_len {
+            return Err(QuilError::InsufficientSignatures(format!(
+                "bitmask length {} too short for committee size {} at rank {}",
+                bitmask.len(),
+                members.len(),
+                rank
+            )));
+        }
+        // Same index→bit convention as `ConsensusValidator::decode_signers`,
+        // so the selected set matches the one the weight check used.
+        let mut signer_pks: Vec<&[u8]> = Vec::new();
+        for (i, m) in members.iter().enumerate() {
+            if bitmask[i / 8] & (1 << (i % 8)) != 0 {
+                let pk = m.public_key();
+                if pk.is_empty() {
+                    return Err(QuilError::InsufficientSignatures(format!(
+                        "committee member {} at rank {} has no public key to bind",
+                        hex::encode(m.identity()),
+                        rank
+                    )));
+                }
+                signer_pks.push(pk);
+            }
+        }
+        if signer_pks.is_empty() {
+            return Err(QuilError::InsufficientSignatures(
+                "bitmask selects no committee members".into(),
+            ));
+        }
+        // The aggregate *public key* depends only on the member public
+        // keys (G2 point sum, order-independent); the signature argument
+        // is irrelevant to it. We pass the transmitted signature once per
+        // signer to satisfy the aggregate API's equal-length contract, as
+        // Go does.
+        let sigs: Vec<&[u8]> = vec![sig; signer_pks.len()];
+        let reconstructed = self.aggregator.aggregate(&signer_pks, &sigs)?;
+        if reconstructed.public_key() != transmitted_pk {
+            return Err(QuilError::InvalidQuorumCertificate(format!(
+                "aggregate public key does not match the committee members \
+                 selected by the bitmask at rank {} — forged or stale cert",
+                rank
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -84,10 +201,47 @@ impl<V: Unique> Verifier<V> for BlsConsensusVerifier {
     /// [`Self::verify_vote_with_key`] or use a
     /// [`WeightedSignatureAggregator`](quil_consensus::signature_aggregator::WeightedSignatureAggregator)
     /// which owns the committee membership.
-    fn verify_vote(&self, _vote: &V) -> Result<()> {
-        Err(QuilError::Consensus(
-            "verify_vote requires per-signer public key — use verify_vote_with_key".into(),
-        ))
+    fn verify_vote(&self, vote: &V) -> Result<()> {
+        // Without a committee we can't map signer → public key, so we
+        // can't verify a standalone vote at this layer (the QC/TC paths
+        // carry their own aggregate public key and don't need one).
+        let committee = self.committee.as_ref().ok_or_else(|| {
+            QuilError::Consensus(
+                "verify_vote requires per-signer public key — construct with new_with_committee"
+                    .into(),
+            )
+        })?;
+
+        // Resolve the voter's public key from the committee at the
+        // vote's rank. An unknown signer surfaces as `InvalidSigner`,
+        // which the caller (`ConsensusValidator::validate_vote`) treats
+        // as a rejection.
+        let voter = committee.identity_by_rank(vote.rank(), vote.identity())?;
+        let pk = voter.public_key();
+        if pk.is_empty() {
+            return Err(QuilError::InvalidVote(format!(
+                "voter {} has no public key at rank {}",
+                hex::encode(vote.identity()),
+                vote.rank()
+            )));
+        }
+
+        // Reconstruct the canonical vote message the signer produced:
+        // `make_vote_message(filter, rank, state_id)` where `state_id`
+        // is the proposal identity the vote carries in `source()`.
+        let msg = make_vote_message(&self.vote_filter, vote.rank(), vote.source());
+        if self
+            .aggregator
+            .verify_signature_raw(pk, vote.signature(), &msg, &self.vote_ds_tag)
+        {
+            Ok(())
+        } else {
+            Err(QuilError::InvalidSignature(format!(
+                "vote {} for rank {} failed signature verification",
+                hex::encode(vote.identity()),
+                vote.rank()
+            )))
+        }
     }
 
     /// Verify a QC against its own embedded aggregate signature. The
@@ -106,6 +260,10 @@ impl<V: Unique> Verifier<V> for BlsConsensusVerifier {
                 "QC has no aggregated public key".into(),
             ));
         }
+        // Bind the transmitted aggregate pk to the committee BEFORE
+        // trusting it for signature verification — otherwise the check
+        // below is verifying a self-consistent forgery.
+        self.bind_aggregate_pubkey_to_committee(qc.rank(), bitmask, pk, sig)?;
         let ok = self.aggregator.verify_signature_raw(pk, sig, &msg, &self.vote_ds_tag);
         if !ok {
             // Dump details so an operator can compare what voters signed
@@ -148,11 +306,15 @@ impl<V: Unique> Verifier<V> for BlsConsensusVerifier {
         let agg = tc.aggregated_signature();
         let pk = agg.public_key();
         let sig = agg.signature();
+        let bitmask = agg.bitmask();
         if pk.is_empty() {
             return Err(QuilError::InsufficientSignatures(
                 "TC has no aggregated public key".into(),
             ));
         }
+        // Bind the transmitted aggregate pk to the committee before
+        // trusting it (same rationale as the QC path above).
+        self.bind_aggregate_pubkey_to_committee(tc.rank(), bitmask, pk, sig)?;
 
         // Reconstruct one message per signer. The TC aggregate was
         // built over these messages in some stable order — the raw
@@ -409,6 +571,193 @@ mod tests {
         let err = <BlsConsensusVerifier as Verifier<TestVote>>::verify_vote(&verifier, &vote)
             .unwrap_err();
         assert!(matches!(err, QuilError::Consensus(_)));
+    }
+
+    #[test]
+    fn verify_vote_with_committee_verifies_and_rejects() {
+        use quil_consensus::committee::Replicas;
+        use quil_consensus::models::WeightedIdentity;
+
+        let (raw, bls, ds_tag) = bls_bundle();
+        let filter = b"global".to_vec();
+        let rank = 7u64;
+        // `TestVote::source()` returns its `id`, so we sign the canonical
+        // vote message over that same identity (the test exercises the
+        // committee pk lookup + message reconstruction + domain check, not
+        // the voter/state distinction).
+        let voter_id: Identity = b"voter-1".to_vec();
+        let msg = make_vote_message(&filter, rank, &voter_id);
+        let (signer, pk) = bls.new_key().unwrap();
+        let sig = signer.sign_with_domain(&msg, &ds_tag).unwrap();
+
+        // Minimal committee returning the voter's real public key.
+        struct C {
+            voter: Identity,
+            pk: Vec<u8>,
+        }
+        #[derive(Debug)]
+        struct M {
+            id: Identity,
+            pk: Vec<u8>,
+        }
+        impl WeightedIdentity for M {
+            fn public_key(&self) -> &[u8] { &self.pk }
+            fn identity(&self) -> &Identity { &self.id }
+            fn weight(&self) -> u64 { 1 }
+        }
+        impl Replicas for C {
+            fn leader_for_rank(&self, _r: u64) -> Result<Identity> { Ok(self.voter.clone()) }
+            fn quorum_threshold_for_rank(&self, _r: u64) -> Result<u64> { Ok(1) }
+            fn timeout_threshold_for_rank(&self, _r: u64) -> Result<u64> { Ok(1) }
+            fn self_identity(&self) -> &Identity { &self.voter }
+            fn identities_by_rank(&self, _r: u64) -> Result<Vec<Box<dyn WeightedIdentity>>> {
+                Ok(vec![])
+            }
+            fn identity_by_rank(
+                &self,
+                _r: u64,
+                pid: &Identity,
+            ) -> Result<Box<dyn WeightedIdentity>> {
+                if pid == &self.voter {
+                    Ok(Box::new(M { id: self.voter.clone(), pk: self.pk.clone() }))
+                } else {
+                    Err(QuilError::InvalidSigner(hex::encode(pid)))
+                }
+            }
+        }
+
+        let committee: Arc<dyn Replicas> = Arc::new(C { voter: voter_id.clone(), pk });
+        let verifier = BlsConsensusVerifier::new_with_committee(
+            raw as Arc<dyn SignatureAggregator>,
+            ds_tag.clone(),
+            ds_tag,
+            committee,
+            filter,
+        );
+
+        // Valid vote verifies.
+        let good = TestVote { id: voter_id.clone(), rank, payload: sig.clone() };
+        <BlsConsensusVerifier as Verifier<TestVote>>::verify_vote(&verifier, &good).unwrap();
+
+        // Wrong rank → reconstructed message differs → invalid signature.
+        let wrong_rank = TestVote { id: voter_id.clone(), rank: rank + 1, payload: sig.clone() };
+        let err = <BlsConsensusVerifier as Verifier<TestVote>>::verify_vote(&verifier, &wrong_rank)
+            .unwrap_err();
+        assert!(err.is_invalid_signature());
+
+        // Unknown signer → InvalidSigner.
+        let unknown = TestVote { id: b"stranger".to_vec(), rank, payload: sig };
+        let err = <BlsConsensusVerifier as Verifier<TestVote>>::verify_vote(&verifier, &unknown)
+            .unwrap_err();
+        assert!(err.is_invalid_signer());
+    }
+
+    #[test]
+    fn verify_qc_binds_aggregate_pubkey_to_committee() {
+        use quil_consensus::committee::Replicas;
+        use quil_consensus::models::WeightedIdentity;
+
+        let (raw, bls, ds_tag) = bls_bundle();
+        let filter = b"shard".to_vec();
+        let state_id: Identity = "state-9".into();
+        let rank = 9u64;
+        let msg = make_vote_message(&filter, rank, &state_id);
+
+        // The committee's one real member signs the canonical message.
+        let (member_signer, member_pk) = bls.new_key().unwrap();
+        let sig = member_signer.sign_with_domain(&msg, &ds_tag).unwrap();
+        // What the binding will reconstruct from the bitmask-selected
+        // member pubkeys.
+        let reconstructed_pk = raw
+            .aggregate(&[member_pk.as_slice()], &[sig.as_slice()])
+            .unwrap()
+            .public_key()
+            .to_vec();
+
+        // QC carrying an explicit bitmask (the test `BlsAggregatedSignature`
+        // has none, so use a local agg).
+        #[derive(Debug)]
+        struct AggBm { sig: Vec<u8>, pk: Vec<u8>, bm: Vec<u8> }
+        impl AggregatedSignature for AggBm {
+            fn signature(&self) -> &[u8] { &self.sig }
+            fn public_key(&self) -> &[u8] { &self.pk }
+            fn bitmask(&self) -> &[u8] { &self.bm }
+        }
+        #[derive(Debug)]
+        struct QcBm { rank: u64, id: Identity, filter: Vec<u8>, agg: AggBm }
+        impl QuorumCertificate for QcBm {
+            fn filter(&self) -> &[u8] { &self.filter }
+            fn rank(&self) -> u64 { self.rank }
+            fn frame_number(&self) -> u64 { 0 }
+            fn identity(&self) -> &Identity { &self.id }
+            fn timestamp(&self) -> u64 { 0 }
+            fn aggregated_signature(&self) -> &dyn AggregatedSignature { &self.agg }
+            fn equals(&self, o: &dyn QuorumCertificate) -> bool {
+                self.rank == o.rank() && self.id == *o.identity()
+            }
+        }
+
+        // 1-member committee returning the member's real pubkey.
+        #[derive(Debug)]
+        struct M { id: Identity, pk: Vec<u8> }
+        impl WeightedIdentity for M {
+            fn public_key(&self) -> &[u8] { &self.pk }
+            fn identity(&self) -> &Identity { &self.id }
+            fn weight(&self) -> u64 { 1 }
+        }
+        struct C { id: Identity, pk: Vec<u8> }
+        impl Replicas for C {
+            fn leader_for_rank(&self, _r: u64) -> Result<Identity> { Ok(self.id.clone()) }
+            fn quorum_threshold_for_rank(&self, _r: u64) -> Result<u64> { Ok(1) }
+            fn timeout_threshold_for_rank(&self, _r: u64) -> Result<u64> { Ok(1) }
+            fn self_identity(&self) -> &Identity { &self.id }
+            fn identities_by_rank(&self, _r: u64) -> Result<Vec<Box<dyn WeightedIdentity>>> {
+                Ok(vec![Box::new(M { id: self.id.clone(), pk: self.pk.clone() })])
+            }
+            fn identity_by_rank(&self, _r: u64, pid: &Identity) -> Result<Box<dyn WeightedIdentity>> {
+                if pid == &self.id {
+                    Ok(Box::new(M { id: self.id.clone(), pk: self.pk.clone() }))
+                } else {
+                    Err(QuilError::InvalidSigner(hex::encode(pid)))
+                }
+            }
+        }
+        let committee: Arc<dyn Replicas> =
+            Arc::new(C { id: b"m1".to_vec(), pk: member_pk.clone() });
+        let verifier = BlsConsensusVerifier::new_with_committee(
+            raw as Arc<dyn SignatureAggregator>,
+            ds_tag.clone(),
+            ds_tag.clone(),
+            committee,
+            filter.clone(),
+        );
+        type V = crate::bls_verifier::tests::TestVote;
+
+        // Honest QC: pk = committee-reconstructed aggregate, bit 0 set.
+        let good = QcBm {
+            rank,
+            id: state_id.clone(),
+            filter: filter.clone(),
+            agg: AggBm { sig: sig.clone(), pk: reconstructed_pk.clone(), bm: vec![0b1] },
+        };
+        <BlsConsensusVerifier as Verifier<V>>::verify_quorum_certificate(&verifier, &good).unwrap();
+
+        // FORGED QC: attacker signs the same message with their OWN key and
+        // presents (attacker_pk, attacker_sig) under the same bitmask. The
+        // signature is self-consistent, but the pk is not bound to the
+        // committee → rejected before the (passable) signature check.
+        let (attacker_signer, attacker_pk) = bls.new_key().unwrap();
+        let attacker_sig = attacker_signer.sign_with_domain(&msg, &ds_tag).unwrap();
+        let forged = QcBm {
+            rank,
+            id: state_id,
+            filter,
+            agg: AggBm { sig: attacker_sig, pk: attacker_pk, bm: vec![0b1] },
+        };
+        let err =
+            <BlsConsensusVerifier as Verifier<V>>::verify_quorum_certificate(&verifier, &forged)
+                .unwrap_err();
+        assert!(err.is_invalid_quorum_certificate());
     }
 
     // Placeholder vote type for the generic `Verifier<V>` bounds.

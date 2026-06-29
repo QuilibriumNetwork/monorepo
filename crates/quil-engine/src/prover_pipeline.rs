@@ -63,6 +63,14 @@ pub struct ProverPipeline {
     /// `GLOBAL_PROVER` and to fetch the latest frame header for VDF
     /// challenge derivation in [`Self::submit_join`].
     pub transport: Arc<dyn ProverMessageTransport>,
+    /// Live hypergraph CRDT — read by the storage-attestation confirm hook
+    /// (`submit_confirm`) to partition each confirmed shard's committed
+    /// subtree into PoRep leaves. `None` disables the hook (tests / pre-wiring).
+    pub hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// Replica store the confirm hook persists per-leaf SDR replicas into
+    /// (keyed by `(epoch, leaf_id)`), so the per-frame producer can later
+    /// answer openings. `None` disables the hook.
+    pub replica_store: Option<quil_store::replica_store::ReplicaStore>,
 }
 
 /// Hard ceiling on lifecycle submissions that do NOT perform VDF
@@ -202,6 +210,44 @@ impl ProverPipeline {
                                 frame = frame_number,
                                 timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
                                 "ConfirmLeaves submission timed out",
+                            );
+                        }
+                    }
+                });
+            }
+            LifecycleAction::ReconfirmEpoch { filters, frame_number } => {
+                let me = self.clone();
+                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
+                tokio::spawn(async move {
+                    // Re-confirm = a ProverConfirm at the current frame, which
+                    // re-encodes fresh-epoch replicas (compute_storage_confirm
+                    // puts under epoch_for_frame(frame_number)) + re-registers
+                    // leaf roots for the new epoch.
+                    match tokio::time::timeout(
+                        NON_VDF_SUBMIT_TIMEOUT,
+                        me.submit_confirm(filters, frame_number),
+                    ).await {
+                        Ok(Ok(())) => {
+                            // Only after the new-epoch replicas are persisted do
+                            // we prune the stale ones — keep_from = the epoch we
+                            // just (re)confirmed, dropping everything below it.
+                            if let Some(rs) = me.replica_store.as_ref() {
+                                let epoch =
+                                    quil_types::consensus::epoch_for_frame(frame_number);
+                                if let Err(e) = rs.evict_below_epoch(epoch) {
+                                    warn!(frame = frame_number, %e,
+                                        "replica evict_below_epoch failed after re-confirm");
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            warn!(frame = frame_number, %e, "ReconfirmEpoch submission failed");
+                        }
+                        Err(_) => {
+                            warn!(
+                                frame = frame_number,
+                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
+                                "ReconfirmEpoch submission timed out",
                             );
                         }
                     }
@@ -430,11 +476,19 @@ impl ProverPipeline {
     }
 
     async fn submit_confirm(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {
-        // Go: sign(concat(filters) || u64(frame_number), PROVER_CONFIRM_domain).
-        // See global_prover_confirm.go:302-325.
-        let mut msg = Vec::new();
-        for f in &filters { msg.extend_from_slice(f); }
-        msg.extend_from_slice(&frame_number.to_be_bytes());
+        // Storage-attestation confirm hook (PoRep): at/after activation,
+        // partition each confirmed shard, SDR-encode + persist this prover's
+        // per-leaf replicas, and fold the registered leaf roots into the
+        // confirm. The signature covers `confirm_signing_message`, which
+        // appends the leaf-root set — byte-identical to the legacy
+        // concat(filters)||frame message when the set is empty (pre-activation
+        // / deps absent), so default Go-parity is preserved.
+        let leaf_roots = self.storage_confirm_leaf_roots(&filters, frame_number);
+        let msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
+            &filters,
+            frame_number,
+            &leaf_roots,
+        );
 
         let signer = self.bls_signer()?;
         let domain = Self::domain(b"PROVER_CONFIRM")?;
@@ -448,12 +502,59 @@ impl ProverPipeline {
                 address: self.prover_address.to_vec(),
             }),
             filters: filters.clone(),
+            leaf_roots,
         };
         let bytes = confirm.to_canonical_bytes()?;
 
         info!(frame = frame_number, filter_count = filters.len(), "submitting ProverConfirm");
         crate::metrics::inc_prover_confirms_submitted();
         self.publish_prover_message(bytes).await
+    }
+
+    /// Storage-attestation confirm hook. At/after `STORAGE_EPOCH_ACTIVATION_FRAME`,
+    /// and only when the hypergraph + replica store are wired, partition each
+    /// confirmed shard's committed subtree into PoRep leaves, SDR-encode each into
+    /// this prover's unique replica, persist them, and return the per-shard
+    /// `ConfirmLeafRoots` to fold into the confirm. Empty otherwise (legacy
+    /// byte-identical path). A hook error degrades to an empty set rather than
+    /// blocking the confirm.
+    fn storage_confirm_leaf_roots(
+        &self,
+        filters: &[Vec<u8>],
+        frame_number: u64,
+    ) -> Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots> {
+        // Always-on: the only gate is whether the storage deps are wired
+        // (archive/worker with a hypergraph + replica store). Absent on
+        // light/test nodes → empty, byte-identical legacy confirm.
+        let (Some(crdt), Some(replica_store)) =
+            (self.hypergraph.as_ref(), self.replica_store.as_ref())
+        else {
+            return Vec::new();
+        };
+        // Epoch-aligned: a confirm in epoch E encodes + registers leaf roots for
+        // the NEXT epoch E+1 (the `next` slot). The prover encodes ahead so that
+        // when it becomes active next epoch it is already proving against an
+        // on-chain registration. The per-frame proving path
+        // (`storage_vote_openings`) reads replica@CURRENT-epoch, which this same
+        // store wrote one epoch earlier — so encode-ahead lines up exactly.
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
+        crate::app_shard_metadata::compute_storage_confirm(
+            crdt,
+            replica_store,
+            filters,
+            &self.prover_address,
+            epoch,
+            quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+            &quil_crypto::sdr::SdrParams::default(),
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                frame = frame_number,
+                "storage confirm hook failed; confirming without leaf roots"
+            );
+            Vec::new()
+        })
     }
 
     async fn submit_reject(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {

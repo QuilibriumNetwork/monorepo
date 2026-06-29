@@ -22,6 +22,9 @@ pub mod token_intrinsic;
 pub mod traversal_proof;
 pub mod turtle;
 
+#[cfg(test)]
+mod shard_frame_conflict_tests;
+
 pub use engines::{EngineType, ExecutionMode};
 pub use global_schema::{
     class_def, class_for_type_hash, compute_type_hash, field_key, field_tag, order_to_key,

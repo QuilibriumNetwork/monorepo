@@ -245,6 +245,56 @@ impl SnapshotReadable for RocksHypergraphSnapshot {
             .get(&key)
             .map_err(|e| QuilError::Store(e.to_string()))
     }
+
+    /// Per-node read at the captured sequence. MUST mirror
+    /// `RocksHypergraphStore::get_node_by_path` (SeekGE + prefix
+    /// compression) exactly, but bound to the snapshot so a whole-tree
+    /// walk is isolated from concurrent commits.
+    fn get_node_by_path(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &quil_types::store::ShardKey,
+        path: &[i32],
+    ) -> Result<Option<Vec<u8>>> {
+        let prefix = hypergraph_tree_node_by_path_prefix(set_type, phase_type, shard_key);
+        let requested = hypergraph_tree_node_by_path(set_type, phase_type, shard_key, path);
+        let mut iter = self.snapshot.raw_iterator();
+        iter.seek(&requested);
+        if !iter.valid() {
+            return Ok(None);
+        }
+        let found_key = match iter.key() {
+            Some(k) => k.to_vec(),
+            None => return Ok(None),
+        };
+        if !found_key.starts_with(&prefix) {
+            return Ok(None);
+        }
+        if !found_key.starts_with(&requested) {
+            return Ok(None);
+        }
+        let by_key = match iter.value() {
+            Some(v) => v.to_vec(),
+            None => return Ok(None),
+        };
+        self.snapshot
+            .get(&by_key)
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
+    fn load_vertex_underlying_raw(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &quil_types::store::ShardKey,
+        vertex_key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
+        self.snapshot
+            .get(&key)
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
 }
 
 /// Live-store adapter — lets the sync server call the same
@@ -260,6 +310,27 @@ impl SnapshotReadable for RocksHypergraphStore {
         shard_key: &quil_types::store::ShardKey,
     ) -> Result<Option<Vec<u8>>> {
         RocksHypergraphStore::load_tree_blob(self, set_type, phase_type, shard_key)
+    }
+
+    fn get_node_by_path(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &quil_types::store::ShardKey,
+        path: &[i32],
+    ) -> Result<Option<Vec<u8>>> {
+        // Live fallback (not isolated) — delegates to the HypergraphStore impl.
+        <Self as HypergraphStore>::get_node_by_path(self, set_type, phase_type, shard_key, path)
+    }
+
+    fn load_vertex_underlying_raw(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &quil_types::store::ShardKey,
+        vertex_key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        self.load_vertex_underlying(set_type, phase_type, shard_key, vertex_key)
     }
 }
 
@@ -482,6 +553,21 @@ impl HypergraphStore for RocksHypergraphStore {
         let key = hypergraph_shard_commit_key(frame_number, phase_type, set_type, shard_address);
         self.db.get(&key).map_err(|e| QuilError::Store(e.to_string()))?
             .ok_or_else(|| QuilError::NotFound("shard commit not found".into()))
+    }
+
+    fn delete_shard_commits(&self, frame_number: u64, shard_address: &[u8]) -> Result<()> {
+        // All four (phase_type, set_type) pairs that `commit` caches per
+        // shard — matches the PHASES table in `HypergraphCrdt::commit`.
+        for (phase_type, set_type) in [
+            ("adds", "vertex"),
+            ("removes", "vertex"),
+            ("adds", "hyperedge"),
+            ("removes", "hyperedge"),
+        ] {
+            let key = hypergraph_shard_commit_key(frame_number, phase_type, set_type, shard_address);
+            self.db.delete(&key).map_err(|e| QuilError::Store(e.to_string()))?;
+        }
+        Ok(())
     }
 
     fn get_root_commits(&self, frame_number: u64) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {

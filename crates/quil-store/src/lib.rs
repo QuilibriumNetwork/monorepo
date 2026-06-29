@@ -7,6 +7,7 @@ mod hypergraph;
 mod dispatch;
 pub mod encoding;
 mod worker;
+pub mod replica_store;
 pub mod import;
 pub mod migration;
 pub mod disk_monitor;

@@ -840,6 +840,7 @@ mod tests {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: 100,
+            epoch: 0,
             vertex_address: vec![],
         }
     }
@@ -940,7 +941,10 @@ mod tests {
         let window = crate::provers::lifecycle::DEFAULT_CONFIRM_WINDOW_FRAMES; // 360
         let frame = 10_000u64;
 
-        let active = make_alloc(vec![0x01; 32]); // status Active, leave_frame 0
+        let mut active = make_alloc(vec![0x01; 32]); // status Active, leave_frame 0
+        // Confirmed for the current epoch so always-on epoch expiry keeps it
+        // Active (eval frame 10_000 is well past the first epoch boundary).
+        active.epoch = quil_types::consensus::epoch_for_frame(frame);
 
         let mut leaving_in = make_alloc(vec![0x02; 32]);
         leaving_in.status = ProverStatus::Leaving;

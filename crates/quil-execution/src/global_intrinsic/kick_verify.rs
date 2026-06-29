@@ -461,6 +461,9 @@ fn local_app_header_to_proto(
         public_key_signature_bls48581: decode_aggregate_signature_to_proto(
             &h.public_key_signature_bls48581,
         )?,
+        storage_attestation_root: h.storage_attestation_root.clone(),
+        global_frame_number: h.global_frame_number,
+        storage_attestation: h.storage_attestation.clone(),
     })
 }
 
@@ -800,6 +803,9 @@ mod tests {
             prover: vec![],
             fee_multiplier_vote: 0,
             public_key_signature_bls48581: agg_sig_bytes(bitmask),
+            storage_attestation_root: Vec::new(),
+            global_frame_number: 0,
+            storage_attestation: Vec::new(),
         };
         header.to_canonical_bytes().unwrap()
     }

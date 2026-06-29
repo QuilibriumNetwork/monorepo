@@ -105,6 +105,7 @@ fn build_committee(
                 leave_confirm_frame_number: 0,
                 leave_reject_frame_number: 0,
                 last_active_frame_number: 0,
+                epoch: 0,
                 vertex_address: Vec::new(),
             }],
             available_storage: 0,
@@ -144,10 +145,19 @@ fn build_and_verify_partial(
     signer_count: usize,
 ) -> Result<(quil_execution::global_intrinsic::frame_header::FrameHeader, Vec<ProverInfo>), Box<dyn std::error::Error>>
 {
+    build_and_verify_partial_with_filter(committee_size, signer_count, &test_filter())
+}
+
+fn build_and_verify_partial_with_filter(
+    committee_size: usize,
+    signer_count: usize,
+    filter: &[u8],
+) -> Result<(quil_execution::global_intrinsic::frame_header::FrameHeader, Vec<ProverInfo>), Box<dyn std::error::Error>>
+{
     assert!(signer_count >= 1 && signer_count <= committee_size);
     let bls = Bls48581KeyConstructor;
     let frame_prover = WesolowskiFrameProver::new(2048);
-    let filter = test_filter();
+    let filter = filter.to_vec();
     let app_address = filter.clone(); // live invariant — Go alias
 
     let signers = build_committee(&bls, committee_size, &filter);
@@ -165,6 +175,7 @@ fn build_and_verify_partial(
     let proto = frame_prover.prove_frame_header(
         &[], &app_address, &requests_root, &state_roots,
         &prover_address, timestamp, difficulty, fee_multiplier_vote, frame_number,
+        &[], 0,
     )?;
 
     let identity = quil_crypto::poseidon::hash_bytes_to_32(&proto.output)?.to_vec();
@@ -248,6 +259,8 @@ fn build_and_verify_partial(
         prover: prover_address,
         fee_multiplier_vote: fee_multiplier_vote as i64,
         public_key_signature_bls48581: agg_canonical.to_canonical_bytes()?,
+        storage_attestation_root: Vec::new(),
+        global_frame_number: 0,
     };
 
     let returned = verify_frame_header_attestation(
@@ -311,6 +324,8 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
         difficulty,
         fee_multiplier_vote,
         frame_number,
+        &[],
+        0,
     )?;
 
     // 3. Each signer produces a vote. The payload + domain must
@@ -395,6 +410,8 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
         prover: prover_address,
         fee_multiplier_vote: fee_multiplier_vote as i64,
         public_key_signature_bls48581: agg_canonical_bytes,
+        storage_attestation_root: Vec::new(),
+        global_frame_number: 0,
     };
 
     // 6. Verify — must succeed. The function's return value is the
@@ -473,6 +490,8 @@ fn signing_with_raw_filter_instead_of_app_address_must_fail_verify() {
             difficulty,
             0,
             frame_number,
+            &[],
+            0,
         )
         .unwrap();
 
@@ -512,6 +531,8 @@ fn signing_with_raw_filter_instead_of_app_address_must_fail_verify() {
         prover: prover_address,
         fee_multiplier_vote: 0,
         public_key_signature_bls48581: agg_canonical.to_canonical_bytes().unwrap(),
+        storage_attestation_root: Vec::new(),
+        global_frame_number: 0,
     };
 
     let result = verify_frame_header_attestation(
@@ -565,6 +586,8 @@ fn build_state(
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
+        0,
         Vec::new(),
         0,
     );
@@ -623,6 +646,7 @@ fn bls_voting_provider_sign_vote_round_trips_through_verifier() {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: 0,
+            epoch: 0,
             vertex_address: Vec::new(),
         }],
         available_storage: 0,
@@ -643,6 +667,8 @@ fn bls_voting_provider_sign_vote_round_trips_through_verifier() {
             200,
             0,
             1,
+            &[],
+            0,
         )
         .expect("prove_frame_header");
 
@@ -716,6 +742,8 @@ fn bls_voting_provider_sign_vote_round_trips_through_verifier() {
         public_key_signature_bls48581: agg_canonical
             .to_canonical_bytes()
             .expect("canonical encode"),
+        storage_attestation_root: Vec::new(),
+        global_frame_number: 0,
     };
 
     let bitmask = verify_frame_header_attestation(
@@ -726,4 +754,146 @@ fn bls_voting_provider_sign_vote_round_trips_through_verifier() {
     )
     .expect("verify_frame_header_attestation must succeed end-to-end");
     assert_eq!(bitmask, vec![0x01u8]);
+}
+
+// =====================================================================
+// Condition 1 — shard-frame BLS + VDF-multiproof + 2/3 quorum gate
+// =====================================================================
+//
+// Scenario: a shard with THREE active workers emits a shard-frame proof.
+// We drive the EXACT validity path the global materializer's
+// `invoke_frame_header` runs:
+//   1. `verify_frame_header_attestation` — real BLS aggregate + Wesolowski
+//      VDF leader proof + per-worker VDF multi-proof tail (74-byte
+//      single-signer short-circuit, or `74 + 4 + N×516` multi-proof tail).
+//   2. bit-packed bitmask → participant-index expansion (`set_bit_indices`,
+//      mirrors invoke_frame_header.rs:1529).
+//   3. `build_shard_update_context` — the 2/3 participation quorum gate
+//      (`participants*3 >= active*2`, prover_shard_update.rs:219).
+//
+// A shard frame is ACCEPTED for state mutation at the global level iff
+// BOTH the crypto attestation AND the quorum gate pass. For a 3-worker
+// shard: 3/3 and 2/3 satisfy 2/3; 1/3 does not.
+
+/// Run the full attestation + 2/3-quorum validity path for a shard frame
+/// signed by `signer_count` of a `committee_size`-worker shard on `filter`.
+/// Returns `Ok(())` iff the shard frame would be accepted for state
+/// mutation at the global level.
+fn shard_frame_quorum_outcome_with_filter(
+    committee_size: usize,
+    signer_count: usize,
+    filter: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use quil_execution::global_intrinsic::prover_shard_update::{
+        build_shard_update_context, ShardMetadata,
+    };
+    // Builds the shard FrameHeader with real BLS+VDF and asserts the
+    // CRYPTO attestation passes (verify_frame_header_attestation runs
+    // inside). Returns the header + the shard's active worker set.
+    let (frame_header, active_provers) =
+        build_and_verify_partial_with_filter(committee_size, signer_count, filter)?;
+
+    // Re-run the attestation exactly as invoke_frame_header does to obtain
+    // the verified, bit-packed worker bitmask.
+    let bls = Bls48581KeyConstructor;
+    let frame_prover = WesolowskiFrameProver::new(2048);
+    let bitmask_bytes = verify_frame_header_attestation(
+        &frame_header,
+        &frame_prover,
+        &bls,
+        &active_provers,
+    )?;
+
+    // Expand bitmask → participant indices (invoke_frame_header.rs:1529).
+    let participant_indices: Vec<u8> =
+        quil_consensus::bitmask::set_bit_indices(&bitmask_bytes)
+            .filter_map(|idx| u8::try_from(idx).ok())
+            .collect();
+
+    // The 2/3 participation quorum gate.
+    let shard_md = ShardMetadata {
+        state_size: 0,
+        shard_count: 64,
+    };
+    build_shard_update_context(
+        &frame_header,
+        active_provers,
+        &participant_indices,
+        shard_md,
+    )?;
+    Ok(())
+}
+
+fn shard_frame_quorum_outcome(
+    committee_size: usize,
+    signer_count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    shard_frame_quorum_outcome_with_filter(committee_size, signer_count, &test_filter())
+}
+
+/// 1(a): all three workers contribute → BLS+VDF multiproof valid AND 2/3
+/// quorum satisfied (3*3 >= 3*2) → accepted.
+#[test]
+fn shard_frame_all_three_workers_sign_is_valid() {
+    shard_frame_quorum_outcome(3, 3)
+        .expect("3-of-3 shard frame must pass crypto attestation + 2/3 quorum");
+}
+
+/// 1(b): one worker doesn't contribute (2 of 3) → valid for consensus
+/// rules (2*3 >= 3*2). The aggregate omits the absent worker's signature
+/// + multiproof; the bitmask names only the two participants.
+///
+/// This is the partial-attendance case a BFT committee must tolerate (you
+/// can't know who's absent until the vote threshold is in). It works via
+/// sparse multiproof verification: the challenge prime `b` is bound to the
+/// FIXED full committee (what every worker precomputed against), while the
+/// aggregate is verified over only the PRESENT signers
+/// (`vdf::wesolowski_verify_multi_sparse`). Previously this failed because
+/// the verifier derived `b` from the present subset instead of the
+/// committee, so `b` mismatched the workers' proofs for any 1 < k < n.
+#[test]
+fn shard_frame_two_of_three_workers_sign_is_valid() {
+    shard_frame_quorum_outcome(3, 2)
+        .expect("2-of-3 shard frame must pass crypto attestation + 2/3 quorum");
+}
+
+/// 1(c): only one worker contributes (1 of 3) → the crypto attestation
+/// still verifies (74-byte single-signer short-circuit), but the shard
+/// frame is INVALID for consensus rules: 1*3 < 3*2 fails the 2/3 quorum
+/// gate, so it is rejected before any state mutation.
+#[test]
+fn shard_frame_one_of_three_workers_signs_is_invalid() {
+    let err = shard_frame_quorum_outcome(3, 1)
+        .expect_err("1-of-3 shard frame must FAIL the 2/3 quorum gate");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("insufficient prover participation"),
+        "expected a 2/3-quorum rejection, got: {msg}"
+    );
+}
+
+/// Two-shard scenario: each shard runs its own 3-worker committee and the
+/// quorum gate is enforced PER SHARD — a valid quorum on one shard is
+/// independent of the other, and a degenerate 1-of-3 on the second shard
+/// is rejected on its own terms.
+#[test]
+fn two_shards_each_enforce_quorum_independently() {
+    let shard_a = {
+        let mut f = test_filter();
+        f[1] = 0xa1;
+        f
+    };
+    let shard_b = {
+        let mut f = test_filter();
+        f[1] = 0xb2;
+        f
+    };
+    // Both shards independently reach a valid 3-of-3 quorum.
+    shard_frame_quorum_outcome_with_filter(3, 3, &shard_a)
+        .expect("shard A: 3-of-3 must be valid");
+    shard_frame_quorum_outcome_with_filter(3, 3, &shard_b)
+        .expect("shard B: 3-of-3 must be valid");
+    // A degenerate 1-of-3 on shard B is rejected without affecting shard A.
+    shard_frame_quorum_outcome_with_filter(3, 1, &shard_b)
+        .expect_err("shard B: 1-of-3 must fail quorum independently");
 }

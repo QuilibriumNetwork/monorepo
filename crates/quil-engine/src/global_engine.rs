@@ -167,6 +167,9 @@ impl GlobalConsensusEngine {
             local_bls_pubkey,
             bls_signer,
             inclusion_prover: Arc::clone(&self.inclusion_prover),
+            // Convenience path (production bypasses this method per the note
+            // below); the invalid-message drop gate is wired in archive_sync.
+            message_validator: None,
             genesis_frame,
             publisher,
             on_finalized_state: None,

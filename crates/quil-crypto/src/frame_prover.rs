@@ -1,4 +1,7 @@
-use quil_types::crypto::FrameProver;
+use std::collections::HashSet;
+use std::sync::RwLock;
+
+use quil_types::crypto::{BlsConstructor, FrameProver};
 use quil_types::error::{QuilError, Result};
 use quil_types::proto::global;
 
@@ -6,12 +9,78 @@ use quil_types::proto::global;
 pub struct WesolowskiFrameProver {
     /// VDF integer size in bits (typically 2048).
     pub int_size_bits: u16,
+    /// Keys of shard-`FrameHeader` BLS signatures already verified in a
+    /// batch this frame. `verify_frame_header_signature` skips the BLS
+    /// pairing (keeps the VDF) when the header's key is present. A key is
+    /// a hash of the FULL verification tuple (pubkey‖sig‖payload‖domain),
+    /// so a present key can only ever short-circuit a signature that was
+    /// actually verified valid over those exact inputs — safe for every
+    /// caller, not just the materializer. Cleared per frame.
+    bls_preverified: RwLock<HashSet<[u8; 32]>>,
 }
 
 impl WesolowskiFrameProver {
     pub fn new(int_size_bits: u16) -> Self {
-        Self { int_size_bits }
+        Self {
+            int_size_bits,
+            bls_preverified: RwLock::new(HashSet::new()),
+        }
     }
+}
+
+/// Build the exact BLS verification inputs for a shard `FrameHeader`:
+/// `(public_key, signature[..74], payload, domain)`. Mirrors
+/// `verify_frame_header_signature` byte-for-byte so the batch path and
+/// the per-header path agree. Returns `None` if the header lacks a
+/// well-formed signature (the per-header path will reject it).
+fn frame_header_bls_inputs(
+    header: &global::FrameHeader,
+) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let sig = header.public_key_signature_bls48581.as_ref()?;
+    let pubkey = sig.public_key.as_ref().map(|k| k.key_value.clone()).unwrap_or_default();
+    if pubkey.is_empty() || sig.signature.len() < 74 {
+        return None;
+    }
+    let identity = crate::poseidon::hash_bytes_to_32(&header.output).ok()?;
+    // payload = address || identity || rank_be (MakeVoteMessage)
+    let mut payload = Vec::with_capacity(header.address.len() + 32 + 8);
+    payload.extend_from_slice(&header.address);
+    payload.extend_from_slice(&identity);
+    payload.extend_from_slice(&header.rank.to_be_bytes());
+    // domain = "appshard" || address
+    let mut domain = Vec::with_capacity(8 + header.address.len());
+    domain.extend_from_slice(b"appshard");
+    domain.extend_from_slice(&header.address);
+    Some((pubkey, sig.signature[..74].to_vec(), payload, domain))
+}
+
+/// Hash the full BLS verification tuple → the preverified-set key.
+fn bls_tuple_key(pk: &[u8], sig74: &[u8], payload: &[u8], domain: &[u8]) -> [u8; 32] {
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update((pk.len() as u32).to_be_bytes());
+    h.update(pk);
+    h.update(sig74);
+    h.update((payload.len() as u32).to_be_bytes());
+    h.update(payload);
+    h.update(domain);
+    h.finalize().into()
+}
+
+/// Indices of set bits in a bitmask, ascending. Bit `i` lives at byte `i/8`,
+/// position `i%8` — matching `quil_consensus::signature_aggregator::build_bitmask`
+/// and `quil_consensus::bitmask::set_bit_indices`. Inlined here so the crypto
+/// crate need not depend on quil-consensus.
+fn set_bit_indices(bitmask: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (byte_idx, &byte) in bitmask.iter().enumerate() {
+        for bit in 0..8u32 {
+            if byte & (1u8 << bit) != 0 {
+                out.push(byte_idx * 8 + bit as usize);
+            }
+        }
+    }
+    out
 }
 
 impl FrameProver for WesolowskiFrameProver {
@@ -26,6 +95,8 @@ impl FrameProver for WesolowskiFrameProver {
         difficulty: u32,
         fee_multiplier_vote: u64,
         frame_number: u64,
+        storage_attestation_root: &[u8],
+        global_frame_number: u64,
     ) -> Result<global::FrameHeader> {
         use sha3::{Digest, Sha3_256};
 
@@ -50,6 +121,10 @@ impl FrameProver for WesolowskiFrameProver {
             input.extend_from_slice(sr);
         }
         input.extend_from_slice(prover);
+        // Storage-attestation binding: commit the attestation root and the
+        // global beacon anchor so neither can be altered after the VDF is solved.
+        input.extend_from_slice(storage_attestation_root);
+        input.extend_from_slice(&global_frame_number.to_be_bytes());
 
         let challenge: [u8; 32] = Sha3_256::digest(&input).into();
         let output = vdf::wesolowski_solve(self.int_size_bits, &challenge, difficulty);
@@ -67,6 +142,9 @@ impl FrameProver for WesolowskiFrameProver {
             prover: prover.to_vec(),
             fee_multiplier_vote,
             public_key_signature_bls48581: None,
+            storage_attestation_root: storage_attestation_root.to_vec(),
+            global_frame_number,
+            storage_attestation: Vec::new(),
         })
     }
 
@@ -85,6 +163,8 @@ impl FrameProver for WesolowskiFrameProver {
             input.extend_from_slice(sr);
         }
         input.extend_from_slice(&header.prover);
+        input.extend_from_slice(&header.storage_attestation_root);
+        input.extend_from_slice(&header.global_frame_number.to_be_bytes());
 
         let challenge: [u8; 32] = Sha3_256::digest(&input).into();
 
@@ -303,12 +383,14 @@ impl FrameProver for WesolowskiFrameProver {
         domain.extend_from_slice(b"appshard");
         domain.extend_from_slice(&header.address);
 
-        if !bls.verify_signature_raw(
-            pubkey_bytes,
-            &sig.signature[..74],
-            &payload,
-            &domain,
-        ) {
+        // Skip the (expensive) BLS pairing if this exact signature tuple
+        // was already verified valid in a batch this frame; the VDF
+        // multiproof below still runs. Falls back to the full pairing
+        // verify when not preverified.
+        let bls_key = bls_tuple_key(pubkey_bytes, &sig.signature[..74], &payload, &domain);
+        let bls_ok = self.bls_preverified.read().unwrap().contains(&bls_key)
+            || bls.verify_signature_raw(pubkey_bytes, &sig.signature[..74], &payload, &domain);
+        if !bls_ok {
             tracing::warn!(
                 header_address_prefix = %hex::encode(&header.address[..header.address.len().min(16)]),
                 rank = header.rank,
@@ -371,25 +453,98 @@ impl FrameProver for WesolowskiFrameProver {
         use sha3::{Digest, Sha3_256};
         let challenge_bytes: [u8; 32] = Sha3_256::digest(&header.parent_selector).into();
 
-        let result = self.verify_multi_proof(
+        // `ids` is the full active committee — the deterministic universe the
+        // workers committed the challenge prime `b` to when they precomputed.
+        // The PRESENT signer set is whoever the bitmask names; we verify only
+        // their proofs against the committee-bound `b`. A BFT committee never
+        // requires full attendance, and a prover cannot know who will be
+        // present when it precomputes — so `b` must bind to the committee, not
+        // the dynamic signer subset. See `vdf::wesolowski_verify_multi_sparse`.
+        let committee = ids;
+        let present_indices: Vec<usize> = set_bit_indices(&sig.bitmask);
+        for &idx in &present_indices {
+            if idx >= committee.len() {
+                tracing::warn!(
+                    idx,
+                    committee = committee.len(),
+                    "verify_frame_header_signature: bitmask index out of committee range"
+                );
+                return Ok(false);
+            }
+        }
+        // The aggregator emits one proof per present signer, in ascending
+        // committee-index order — so the packed proofs must be 1:1 with the
+        // bitmask's set bits.
+        if present_indices.len() != multiproofs.len() {
+            tracing::warn!(
+                present = present_indices.len(),
+                proofs = multiproofs.len(),
+                "verify_frame_header_signature: present-signer count != packed multiproof count"
+            );
+            return Ok(false);
+        }
+        let committee_vec: Vec<Vec<u8>> = committee.iter().map(|s| s.to_vec()).collect();
+        let present_vec: Vec<Vec<u8>> =
+            present_indices.iter().map(|&i| committee[i].to_vec()).collect();
+        let solutions_vec: Vec<Vec<u8>> = multiproofs.iter().map(|s| s.to_vec()).collect();
+        let ok = vdf::wesolowski_verify_multi_sparse(
+            self.int_size_bits,
             &challenge_bytes,
             header.difficulty,
-            ids,
-            &multiproofs,
+            &committee_vec,
+            &present_vec,
+            &solutions_vec,
         );
-        if let Ok(false) = result {
+        if !ok {
             tracing::warn!(
                 mp_count,
-                ids_count = ids.len(),
+                committee = committee.len(),
+                present = present_indices.len(),
                 difficulty = header.difficulty,
                 challenge_prefix = %hex::encode(&challenge_bytes[..16]),
                 parent_selector_prefix = %hex::encode(
                     &header.parent_selector[..header.parent_selector.len().min(16)]
                 ),
-                "verify_frame_header_signature: multi-proof verify returned false"
+                "verify_frame_header_signature: sparse multi-proof verify returned false"
             );
         }
-        result
+        Ok(ok)
+    }
+
+    fn verify_frame_header_signatures_batch(
+        &self,
+        headers: &[&global::FrameHeader],
+        bls: &dyn BlsConstructor,
+    ) -> bool {
+        // Build the per-header BLS verification tuples. A header without a
+        // well-formed signature makes the whole batch fail → fall back to
+        // per-header verification (which rejects it precisely).
+        let mut items: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> =
+            Vec::with_capacity(headers.len());
+        for h in headers {
+            match frame_header_bls_inputs(h) {
+                Some(t) => items.push(t),
+                None => return false,
+            }
+        }
+        if items.is_empty() {
+            return true;
+        }
+        // One multi-pairing + one final exponentiation for all N.
+        if !bls.verify_signatures_batch(&items) {
+            return false;
+        }
+        // Record each verified tuple so the per-header
+        // `verify_frame_header_signature` skips the redundant pairing.
+        let mut set = self.bls_preverified.write().unwrap();
+        for (pk, sig74, payload, domain) in &items {
+            set.insert(bls_tuple_key(pk, sig74, payload, domain));
+        }
+        true
+    }
+
+    fn clear_bls_preverified(&self) {
+        self.bls_preverified.write().unwrap().clear();
     }
 
     fn verify_global_header_signature(
@@ -425,5 +580,91 @@ impl FrameProver for WesolowskiFrameProver {
             &payload,
             b"global",
         ))
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use quil_types::crypto::{BlsConstructor, FrameProver, Signer};
+
+    /// Build a shard `FrameHeader` with a real single-signer BLS aggregate
+    /// signature over the exact `(payload, domain)` that
+    /// `verify_frame_header_signature` reconstructs.
+    fn make_signed_header(
+        signer: &dyn Signer,
+        pk: &[u8],
+        address: Vec<u8>,
+        output: Vec<u8>,
+        rank: u64,
+    ) -> global::FrameHeader {
+        let identity = crate::poseidon::hash_bytes_to_32(&output).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&address);
+        payload.extend_from_slice(&identity);
+        payload.extend_from_slice(&rank.to_be_bytes());
+        let mut domain = b"appshard".to_vec();
+        domain.extend_from_slice(&address);
+        let sig = signer.sign_with_domain(&payload, &domain).unwrap();
+        assert_eq!(sig.len(), 74, "single-signer aggregate must be 74 bytes");
+        global::FrameHeader {
+            address,
+            output,
+            rank,
+            public_key_signature_bls48581: Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
+                    key_value: pk.to_vec(),
+                }),
+                signature: sig,
+                bitmask: vec![0x01],
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn batch_preverify_skips_and_matches_individual() {
+        crate::init();
+        let bls = crate::Bls48581KeyConstructor;
+        let fp = WesolowskiFrameProver::new(2048);
+
+        let mut headers = Vec::new();
+        let mut _signers = Vec::new(); // keep alive
+        for i in 0..6u64 {
+            let (signer, pk) = BlsConstructor::new_key(&bls).unwrap();
+            let addr = vec![i as u8; 32];
+            let output = vec![(i + 1) as u8; 516];
+            let h = make_signed_header(signer.as_ref(), &pk, addr, output, 100 + i);
+            // Ground truth: individual verify passes (74-byte sig, ids None).
+            assert!(fp.verify_frame_header_signature(&h, &bls, None).unwrap(), "individual {i}");
+            headers.push(h);
+            _signers.push(signer);
+        }
+
+        // Batch verify all → true, populates the preverified set.
+        let refs: Vec<&global::FrameHeader> = headers.iter().collect();
+        assert!(fp.verify_frame_header_signatures_batch(&refs, &bls), "batch all-valid");
+
+        // Per-header verify now succeeds via the skip path.
+        for h in &headers {
+            assert!(fp.verify_frame_header_signature(h, &bls, None).unwrap(), "post-batch skip");
+        }
+
+        // Clear → still verifies (real pairing again, no stale skip).
+        fp.clear_bls_preverified();
+        for h in &headers {
+            assert!(fp.verify_frame_header_signature(h, &bls, None).unwrap(), "post-clear re-verify");
+        }
+
+        // Tamper one header's address (payload changes) → batch rejects all,
+        // and the individual verify of the tampered one also rejects.
+        let mut tampered = headers.clone();
+        tampered[2].address = vec![0xABu8; 32];
+        let trefs: Vec<&global::FrameHeader> = tampered.iter().collect();
+        assert!(!fp.verify_frame_header_signatures_batch(&trefs, &bls), "batch rejects tampered set");
+        assert!(
+            !fp.verify_frame_header_signature(&tampered[2], &bls, None).unwrap(),
+            "individual rejects tampered"
+        );
     }
 }

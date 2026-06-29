@@ -4,6 +4,8 @@ use tracing::{debug, info, warn};
 
 use quil_lifecycle::Supervisor;
 
+use quil_consensus::validator::Validator;
+
 /// No-op transaction for direct clock-store writes outside a batch. The clock
 /// store's `put_*` methods fall through to a direct DB write when the txn isn't
 /// a real clock batch (see `with_clock_batch`), so this just satisfies the
@@ -48,6 +50,12 @@ pub(crate) struct MessageLoopArgs {
         Arc<std::sync::OnceLock<Arc<quil_engine::vote_aggregation::VoteAggregation>>>,
     pub timeout_aggregator:
         Arc<std::sync::OnceLock<Arc<quil_engine::timeout_aggregation::TimeoutAggregation>>>,
+    pub global_validator: Arc<std::sync::OnceLock<Arc<
+        quil_engine::validator::ConsensusValidator<
+            quil_engine::consensus_types::GlobalState,
+            quil_engine::consensus_types::GlobalVote,
+        >,
+    >>>,
     pub peer_info_cache: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
     >>,
@@ -74,6 +82,10 @@ pub(crate) struct MessageLoopArgs {
     /// `None` on non-archive nodes.
     pub archive_app_shard_ingest:
         Option<quil_engine::archive_ingest::ArchiveAppShardIngest>,
+    /// Explorer recent-message ring. `Some` only when the explorer service
+    /// is enabled; every inbound gossip message is recorded for the
+    /// `GET /messages` endpoint. `None` (the default) means no overhead.
+    pub recent_messages: Option<Arc<quil_explorer::RecentMessageRing>>,
 }
 
 pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) {
@@ -94,6 +106,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         consensus_handle: ch_for_recv,
         vote_aggregator: va_for_recv,
         timeout_aggregator: ta_for_recv,
+        global_validator: gv_for_recv,
         peer_info_cache: pic_for_recv,
         shard_engines: shard_engines_for_recv,
         signer_registry: sr_for_recv,
@@ -112,6 +125,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         time_reel: time_reel_for_recv,
         spawner,
         archive_app_shard_ingest,
+        recent_messages: recent_messages_for_recv,
     } = args;
     let mut archive_ingest_for_recv = archive_app_shard_ingest;
 
@@ -318,6 +332,18 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                 } => {
                     match msg {
                         Some(received) => {
+                            // Explorer tap: record every inbound gossip
+                            // message for the `GET /messages` endpoint.
+                            // Only present when the explorer is enabled,
+                            // so this is a no-op otherwise.
+                            if let Some(ring) = &recent_messages_for_recv {
+                                ring.push_received(
+                                    &received.from,
+                                    &received.bitmask,
+                                    &received.data,
+                                );
+                            }
+
                             // Forward to connected StreamGlobalMessages
                             // subscribers (workers) — ONLY peer-info.
                             //
@@ -862,8 +888,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             }
                             GLOBAL_CONSENSUS => {
                                 consensus_msgs_received += 1;
-                                let current_rank = frames_received;
-                                mc_for_recv.add_message(current_rank, received.data.clone());
+                                // NOTE: do NOT add consensus control messages
+                                // (proposals/votes/timeouts) to the mempool
+                                // message collector — they are not requests.
+                                // They previously polluted the collector (tagged
+                                // with the wrong `frames_received` counter) and
+                                // were the bogus `message_count` the leader saw;
+                                // they fail `MessageBundle` decode and produced
+                                // empty frames. They are routed to the consensus
+                                // event loop below, which is their only consumer.
                                 // Route inbound consensus messages to the event
                                 // loop handle (populated once activation completes).
                                 if let Some(handle) = ch_for_recv.get() {
@@ -883,37 +916,89 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                         ) {
                                                             debug!(error = %e, "persist proposal vote failed");
                                                         }
+                                                        // Decode the embedded frame for the gate's
+                                                        // frame check before `wire` is consumed by
+                                                        // the bridge conversion.
+                                                        let frame_for_gate = quil_engine::consensus_wire::decode_global_frame(&wire.state);
                                                         match quil_engine::consensus_types::wire_proposal_to_signed(wire) {
                                                             Ok((sp, qc, _tc)) => {
-                                                                handle.submit_quorum_certificate(qc);
-                                                                // Skip pre-submitting the
-                                                                // proposal's
-                                                                // `previous_rank_timeout_certificate`.
-                                                                // Same hazard as the TimeoutState
-                                                                // path below: an unvalidated TC
-                                                                // would land in the pacemaker's
-                                                                // newest-TC tracker and be
-                                                                // embedded into our own next
-                                                                // outgoing timeout. Validation
-                                                                // happens later in
-                                                                // `validate_proposal` →
-                                                                // `validate_timeout_certificate`,
-                                                                // and a real TC will surface via
-                                                                // the local timeout aggregator's
-                                                                // `on_tc_created` callback once
-                                                                // enough peer timeouts arrive.
-                                                                // Feed into the rank's vote collector
-                                                                // so the proposer's self-vote counts
-                                                                // toward quorum and subsequent
-                                                                // standalone votes get verified.
-                                                                if let Some(agg) = va_for_recv.get() {
-                                                                    agg.handle_proposal(&sp);
+                                                                // Verify the proposal BEFORE any side effect —
+                                                                // parent QC aggregate signature,
+                                                                // leader/rank rules + embedded prior-rank
+                                                                // TC, the proposer's own vote, and the
+                                                                // frame VDF/BLS. On failure we drop: no
+                                                                // QC fast-forward, no vote-aggregator
+                                                                // feed, no consensus submission. Mirrors
+                                                                // Go's `processProposalInternal`.
+                                                                let gate_ok = match gv_for_recv.get() {
+                                                                    Some(validator) => {
+                                                                        let res = quil_engine::validator::gate_proposal(
+                                                                            validator,
+                                                                            &sp,
+                                                                            || match &frame_for_gate {
+                                                                                Ok(frame) => {
+                                                                                    // Panic-contain like the GLOBAL_FRAME
+                                                                                    // path above — malformed VDF output
+                                                                                    // can panic inside the classgroup code,
+                                                                                    // and a peer message must be dropped,
+                                                                                    // not unwind the receive task.
+                                                                                    let validated = std::panic::catch_unwind(
+                                                                                        std::panic::AssertUnwindSafe(|| frame_validator_for_recv.validate(frame)),
+                                                                                    );
+                                                                                    match validated {
+                                                                                        Ok(Ok(true)) => Ok(()),
+                                                                                        Ok(Ok(false)) => Err(quil_types::error::QuilError::Crypto(
+                                                                                            "global proposal frame failed validation".into(),
+                                                                                        )),
+                                                                                        Ok(Err(e)) => Err(e),
+                                                                                        Err(_) => Err(quil_types::error::QuilError::Crypto(
+                                                                                            "global proposal frame validation panicked (malformed input)".into(),
+                                                                                        )),
+                                                                                    }
+                                                                                }
+                                                                                Err(e) => Err(quil_types::error::QuilError::Serialization(
+                                                                                    format!("global proposal frame decode failed: {}", e),
+                                                                                )),
+                                                                            },
+                                                                        );
+                                                                        match res {
+                                                                            Ok(()) => true,
+                                                                            Err(e) => {
+                                                                                warn!(
+                                                                                    rank = sp.proposal.state.rank,
+                                                                                    error = %e,
+                                                                                    "rejecting unverified global proposal",
+                                                                                );
+                                                                                false
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    None => {
+                                                                        debug!("global proposal received but validator not ready — dropping");
+                                                                        false
+                                                                    }
+                                                                };
+                                                                if gate_ok {
+                                                                    // Verified: now safe to fast-forward
+                                                                    // the pacemaker on the parent QC. The
+                                                                    // embedded prior-rank TC is still NOT
+                                                                    // pre-submitted (a real TC surfaces via
+                                                                    // the local timeout aggregator); it was
+                                                                    // verified as part of the gate above.
+                                                                    handle.submit_quorum_certificate(qc);
+                                                                    // Feed the rank's vote collector so the
+                                                                    // proposer's self-vote counts toward
+                                                                    // quorum and later standalone votes get
+                                                                    // verified.
+                                                                    if let Some(agg) = va_for_recv.get() {
+                                                                        agg.handle_proposal(&sp);
+                                                                    }
+                                                                    let h = handle.clone();
+                                                                    spawner.detach("global-proposal-submit", async move {
+                                                                        h.submit_proposal(sp).await;
+                                                                        Ok(())
+                                                                    });
                                                                 }
-                                                                let h = handle.clone();
-                                                                spawner.detach("global-proposal-submit", async move {
-                                                                    h.submit_proposal(sp).await;
-                                                                    Ok(())
-                                                                });
                                                             }
                                                             Err(e) => warn!(error = %e, "GlobalProposal bridge failed"),
                                                         }
@@ -939,10 +1024,28 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             quil_engine::consensus_wire::TIMEOUT_STATE_TYPE => {
                                                 match quil_engine::consensus_wire::TimeoutState::from_canonical_bytes(&received.data) {
                                                     Ok(ts) => {
-                                                        // Fast-forward the newest-QC tracker.
-                                                        // Safe: bad QCs fail later validation.
+                                                        // Verify the embedded QC
+                                                        // before it can fast-forward the pacemaker. A
+                                                        // forged high-rank QC must not strand the node
+                                                        // off the real rank. The timeout body itself
+                                                        // still flows to the *verifying* timeout
+                                                        // aggregator below regardless.
                                                         let qc_for_handle = ts.latest_quorum_certificate.clone().into_trait_object();
-                                                        handle.submit_quorum_certificate(qc_for_handle);
+                                                        match gv_for_recv.get() {
+                                                            Some(validator) => {
+                                                                match validator.validate_quorum_certificate(qc_for_handle.as_ref()) {
+                                                                    Ok(()) => handle.submit_quorum_certificate(qc_for_handle),
+                                                                    Err(e) => warn!(
+                                                                        rank = qc_for_handle.rank(),
+                                                                        error = %e,
+                                                                        "dropping unverified QC embedded in timeout state",
+                                                                    ),
+                                                                }
+                                                            }
+                                                            None => {
+                                                                debug!("timeout-state QC received but validator not ready — dropping QC fast-forward");
+                                                            }
+                                                        }
                                                         // DO NOT auto-submit the embedded
                                                         // `prior_rank_timeout_certificate` —
                                                         // a malformed TC would land in our
@@ -968,7 +1071,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             }
                             GLOBAL_PROVER => {
                                 prover_msgs_received += 1;
-                                let current_rank = frames_received;
+                                // Tag with the CONSENSUS RANK (matches the
+                                // gRPC submit path and the leader's
+                                // `collect_for_rank`). `frames_received` is a
+                                // session-local counter in the wrong space, so
+                                // relayed prover messages were never collected.
+                                let current_rank = cf_for_recv.effective_rank();
                                 mc_for_recv.add_message(current_rank, received.data.clone());
                             }
                             GLOBAL_ALERT => {

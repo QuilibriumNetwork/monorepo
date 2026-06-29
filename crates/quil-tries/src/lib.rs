@@ -8,7 +8,7 @@ mod tree;
 
 pub use compare::compare_trees_at_height;
 pub use go_format::{deserialize_go_tree, serialize_go_tree};
-pub use lazy_tree::{LazyVectorCommitmentTree, NodeMetadata};
+pub use lazy_tree::{load_full_tree_from_snapshot, LazyVectorCommitmentTree, NodeMetadata};
 pub use nibble::{get_full_path, get_next_nibble};
 pub use node::{BranchNode, LeafNode, VectorCommitmentNode};
 pub use serialize::{

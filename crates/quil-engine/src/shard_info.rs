@@ -868,12 +868,16 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
+                    // Confirmed for the current epoch (eval frame 2000 → epoch 2)
+                    // so always-on epoch expiry doesn't read it as ExpiredEpoch.
+                    epoch: 2,
                     vertex_address: vec![],
                 },
                 ProverAllocationInfo {
                     status: ProverStatus::Joining,
                     confirmation_filter: vec![0xCC, 0xDD],
                     rejection_filter: vec![],
+                    // Proposed in epoch 1; still within its epoch-2 confirm window.
                     join_frame_number: 900,
                     leave_frame_number: 0,
                     pause_frame_number: 0,
@@ -884,9 +888,11 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
+                    epoch: 0,
                     vertex_address: vec![],
                 },
-                // Joining but expired (join_frame=100, current=1000 > 100+720)
+                // Joining but expired: proposed in epoch 0, never confirmed in
+                // epoch 1 → implicitly rejected by epoch 2.
                 ProverAllocationInfo {
                     status: ProverStatus::Joining,
                     confirmation_filter: vec![0xEE],
@@ -901,6 +907,7 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
+                    epoch: 0,
                     vertex_address: vec![],
                 },
             ],
@@ -909,7 +916,7 @@ mod tests {
             delegate_address: vec![],
         };
 
-        let filters = build_allocated_filters(&prover, 1000);
+        let filters = build_allocated_filters(&prover, 2000); // epoch 2
         assert!(filters.contains(&vec![0xAA, 0xBB]));
         assert!(filters.contains(&vec![0xCC, 0xDD]));
         // Expired joining allocation should be excluded.
@@ -1104,6 +1111,7 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 100,
+                    epoch: 0,
                     vertex_address: vec![],
                 }],
                 available_storage: 1 << 30,
@@ -1303,5 +1311,39 @@ mod tests {
             details.len(),
             unique_shard_keys.len()
         );
+    }
+
+    /// PARITY: the TUI per-prover estimate (`compute_shard_reward`) must equal
+    /// the actually-minted per-prover share (`OptRewardIssuance::calculate / 8`)
+    /// for the same inputs. These are two independent implementations of the
+    /// PoMW formula in two modules; this guards them against drift. (Gap
+    /// coverage 2026-06-28.)
+    #[test]
+    fn estimate_matches_minted_per_prover_share() {
+        use crate::rewards::{pomw_basis, OptRewardIssuance};
+        use quil_types::consensus::{ProverAllocation, RewardIssuance};
+        use std::collections::HashMap;
+        let difficulty = 5_000u64;
+        let world = 1u64 << 30;
+        let units = 1_000_000u64;
+        let size = 1u64 << 28;
+        let basis = pomw_basis(difficulty, world, units);
+        for ring in [0u8, 1, 2] {
+            for shards in [1u64, 4, 16] {
+                let est = compute_shard_reward(
+                    &basis,
+                    &BigInt::from(size),
+                    &BigInt::from(world),
+                    ring,
+                    shards,
+                );
+                let mut m = HashMap::new();
+                m.insert("s".to_string(), ProverAllocation { ring, shards, state_size: size });
+                let mint =
+                    &OptRewardIssuance.calculate(difficulty, world, units, &[m]).unwrap()[0]
+                        / 8;
+                assert_eq!(est, mint, "ring={ring} shards={shards}: estimate != minted/8");
+            }
+        }
     }
 }

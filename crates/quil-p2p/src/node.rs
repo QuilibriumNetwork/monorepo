@@ -28,6 +28,12 @@ pub struct P2PNode {
     pub peer_id: PeerId,
     keypair: Keypair,
     bootstrap_peers: Vec<(PeerId, Multiaddr)>,
+    /// Operator-configured direct peers (e.g. genesis global archives).
+    /// Pinned into every gossip mesh via `add_direct_peer` in `start()`
+    /// so sparse committee topics — `GLOBAL_CONSENSUS` is subscribed by
+    /// only the handful of global archives and relayed by no one else —
+    /// keep propagating even when the broader swarm churns.
+    direct_peers: Vec<(PeerId, Multiaddr)>,
     network: u8,
     /// If a new Ed448 key was generated, the hex-encoded config key (228 chars).
     /// The caller should persist this in the config file.
@@ -53,6 +59,56 @@ pub struct P2PNode {
     /// signing keypair's public key. `None` falls back to the host's
     /// own peer ID.
     pubsub_from_peer_id: Option<PeerId>,
+}
+
+/// Parse operator-configured multiaddr strings into `(PeerId, Multiaddr)`
+/// pairs, applying the same `/dnsaddr/` → `/dns/` rewrite (and QUIC marker
+/// synthesis) the Quilibrium bootstrap entries require. Entries that don't
+/// parse or lack a `/p2p/<peer-id>` segment are skipped. Shared by both
+/// bootstrap-peer and direct-peer parsing so the two stay in lockstep.
+fn parse_peer_multiaddrs(entries: &[String]) -> Vec<(PeerId, Multiaddr)> {
+    entries
+        .iter()
+        .filter_map(|addr_str| {
+            let raw: Multiaddr = addr_str.parse().ok()?;
+            let was_dnsaddr = raw.iter().any(|p| matches!(p, Protocol::Dnsaddr(_)));
+            let mut rewritten = Multiaddr::empty();
+            let mut last_was_udp = false;
+            let mut quic_inserted = false;
+            for proto in raw.iter() {
+                match proto {
+                    Protocol::Dnsaddr(host) => {
+                        rewritten.push(Protocol::Dns(host));
+                        last_was_udp = false;
+                    }
+                    Protocol::Udp(_) => {
+                        rewritten.push(proto);
+                        last_was_udp = true;
+                    }
+                    other => {
+                        // Quilibrium `/dnsaddr/` entries omit the QUIC
+                        // marker that TXT records would have supplied —
+                        // synthesize it.
+                        if was_dnsaddr
+                            && last_was_udp
+                            && !quic_inserted
+                            && !matches!(other, Protocol::QuicV1 | Protocol::Quic)
+                        {
+                            rewritten.push(Protocol::QuicV1);
+                            quic_inserted = true;
+                        }
+                        rewritten.push(other);
+                        last_was_udp = false;
+                    }
+                }
+            }
+            let peer_id = rewritten.iter().find_map(|p| match p {
+                Protocol::P2p(id) => Some(id),
+                _ => None,
+            })?;
+            Some((peer_id, rewritten))
+        })
+        .collect()
 }
 
 impl P2PNode {
@@ -106,56 +162,19 @@ impl P2PNode {
         // which it can't dial ("Unsupported resolved address"). Inject
         // `/quic-v1/` between `/udp/<port>` and `/p2p/<id>` for any
         // address that came in as `/dnsaddr/`.
-        let bootstrap_peers = config
-            .bootstrap_peers
-            .iter()
-            .filter_map(|addr_str| {
-                let raw: Multiaddr = addr_str.parse().ok()?;
-                let was_dnsaddr = raw
-                    .iter()
-                    .any(|p| matches!(p, Protocol::Dnsaddr(_)));
-                let mut rewritten = Multiaddr::empty();
-                let mut last_was_udp = false;
-                let mut quic_inserted = false;
-                for proto in raw.iter() {
-                    match proto {
-                        Protocol::Dnsaddr(host) => {
-                            rewritten.push(Protocol::Dns(host));
-                            last_was_udp = false;
-                        }
-                        Protocol::Udp(_) => {
-                            rewritten.push(proto);
-                            last_was_udp = true;
-                        }
-                        other => {
-                            // Quilibrium `/dnsaddr/` entries omit the
-                            // QUIC marker that TXT records would have
-                            // supplied — synthesize it.
-                            if was_dnsaddr
-                                && last_was_udp
-                                && !quic_inserted
-                                && !matches!(other, Protocol::QuicV1 | Protocol::Quic)
-                            {
-                                rewritten.push(Protocol::QuicV1);
-                                quic_inserted = true;
-                            }
-                            rewritten.push(other);
-                            last_was_udp = false;
-                        }
-                    }
-                }
-                let peer_id = rewritten.iter().find_map(|p| match p {
-                    Protocol::P2p(id) => Some(id),
-                    _ => None,
-                })?;
-                Some((peer_id, rewritten))
-            })
-            .collect();
+        let bootstrap_peers = parse_peer_multiaddrs(&config.bootstrap_peers);
+        // Operator-configured direct peers (e.g. the genesis global
+        // archives). Parsed identically to bootstrap peers; entries must
+        // carry a `/p2p/<peer-id>` segment so we can pin them by PeerId.
+        // These are registered via `add_direct_peer` + persistently dialed
+        // in `start()`.
+        let direct_peers = parse_peer_multiaddrs(&config.direct_peers);
 
         Ok(Self {
             peer_id,
             keypair,
             bootstrap_peers,
+            direct_peers,
             network: config.network,
             generated_key_hex,
             blossomsub_params: crate::BlossomsubParams::from_p2p_config(config),
@@ -480,6 +499,7 @@ impl P2PNode {
 
         let peer_id = self.peer_id;
         let bootstrap_peers = self.bootstrap_peers.clone();
+        let direct_peers = self.direct_peers.clone();
         let (msg_tx, msg_rx) = mpsc::channel::<ReceivedMessage>(4096);
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<P2PCommand>(256);
         let peer_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -516,6 +536,26 @@ impl P2PNode {
                         break;
                     }
                     _ = discovery_timer.tick() => {
+                        // Keep operator-configured direct peers (e.g. the
+                        // genesis global archives) connected at all times.
+                        // Unlike bootstrap re-dial, this is gated only on
+                        // `bootstrapped` — NOT on low overall connectivity or
+                        // the discovery_count cap — because sparse committee
+                        // topics (GLOBAL_CONSENSUS) ride exclusively on these
+                        // links: no other peers relay that traffic, so a
+                        // dropped direct peer must always be re-dialed.
+                        if bootstrapped {
+                            for (dp_peer, dp_addr) in &direct_peers {
+                                if !swarm.is_connected(dp_peer) {
+                                    swarm.behaviour_mut().kademlia.add_address(dp_peer, dp_addr.clone());
+                                    let opts = DialOpts::unknown_peer_id()
+                                        .address(dp_addr.clone())
+                                        .allocate_new_port()
+                                        .build();
+                                    let _ = swarm.dial(opts);
+                                }
+                            }
+                        }
                         if bootstrapped && discovery_count < 30 {
                             discovery_count += 1;
                             let connected = swarm.connected_peers().count();
@@ -586,6 +626,26 @@ impl P2PNode {
                                             .build();
                                         if let Err(e) = swarm.dial(opts) {
                                             debug!(%e, %bp_peer, "dial failed");
+                                        }
+                                    }
+                                    // Register + dial operator-configured
+                                    // direct peers (e.g. genesis archives).
+                                    // `add_direct_peer` pins each into every
+                                    // gossip mesh (see `behaviour.rs`), so the
+                                    // sparse GLOBAL_CONSENSUS committee mesh
+                                    // forms and holds regardless of swarm
+                                    // churn; the dial establishes the
+                                    // connection that graft needs.
+                                    for (dp_peer, dp_addr) in &direct_peers {
+                                        debug!(%dp_peer, %dp_addr, "registering + dialing direct peer");
+                                        swarm.behaviour_mut().blossomsub.add_direct_peer(*dp_peer);
+                                        swarm.behaviour_mut().kademlia.add_address(dp_peer, dp_addr.clone());
+                                        let opts = DialOpts::unknown_peer_id()
+                                            .address(dp_addr.clone())
+                                            .allocate_new_port()
+                                            .build();
+                                        if let Err(e) = swarm.dial(opts) {
+                                            debug!(%e, %dp_peer, "direct peer dial failed");
                                         }
                                     }
                                     // Start Kademlia bootstrap

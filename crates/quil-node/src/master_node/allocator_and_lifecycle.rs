@@ -284,7 +284,49 @@ pub(crate) fn init(
             )
             .with_eviction_registry(prover_registry.clone())
             .with_rocks_hg_store(hg_store.clone())
-            .with_current_frame(current_frame.clone());
+            // Deterministic per-shard data-size source for the eviction
+            // halt gate: enumerate committed shards from the shards store
+            // and key by `confirmation_filter` = L2(32) ++ prefix-byte
+            // (strip the leading L1(3) from shard_key) — exactly how the
+            // registry/worker-allocator key filters. Every archive derives
+            // the same map from the same committed frames, so eviction is
+            // consensus-deterministic. Empty (size==0) shards are thereby
+            // excluded from suppressing eviction.
+            .with_shard_size_source({
+                let ss = shards_store.clone();
+                std::sync::Arc::new(move || {
+                    let mut out: std::collections::HashMap<Vec<u8>, u64> =
+                        std::collections::HashMap::new();
+                    if let Ok(shards) = ss.range_app_shards() {
+                        for s in shards {
+                            let l2_start = if s.shard_key.len() >= 3 { 3 } else { 0 };
+                            let mut filter = s.shard_key[l2_start..].to_vec();
+                            for p in &s.prefix {
+                                filter.push(*p as u8);
+                            }
+                            if filter.is_empty() {
+                                continue;
+                            }
+                            // `size` is a big-endian byte count; we only need
+                            // "has any data" → record 1 when non-zero.
+                            let has_data = s.size.iter().any(|&b| b != 0);
+                            out.insert(filter, if has_data { 1 } else { 0 });
+                        }
+                    }
+                    out
+                })
+            })
+            .with_current_frame(current_frame.clone())
+            // Same `frame_prover` Arc installed into the intrinsic above, so
+            // the batch-preverified set the materializer records is the one
+            // `verify_frame_header_signature` reads. BLS constructor is
+            // stateless (the set lives on the frame prover), so a fresh one
+            // is equivalent.
+            .with_bls_batch_verify(
+                frame_prover.clone(),
+                Arc::new(quil_crypto::Bls48581KeyConstructor)
+                    as Arc<dyn quil_types::crypto::BlsConstructor>,
+            );
             Some(Arc::new(m))
         } else {
             None

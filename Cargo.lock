@@ -349,6 +349,8 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
+ "hyper 1.9.0",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -357,10 +359,15 @@ dependencies = [
  "pin-project-lite",
  "rustversion",
  "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
  "sync_wrapper",
+ "tokio",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -381,6 +388,7 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -606,6 +614,7 @@ dependencies = [
  "criterion 0.4.0",
  "hex 0.4.3",
  "rand 0.8.5",
+ "rayon",
  "serde_json",
  "sha2 0.10.8",
  "uniffi",
@@ -3619,6 +3628,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "ordered-float"
+version = "2.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "os_str_bytes"
 version = "6.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3979,6 +3997,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-reflect"
+version = "0.14.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5edd582b62f5cde844716e66d92565d7faf7ab1445c8cebce6e00fba83ddb2"
+dependencies = [
+ "base64 0.22.1",
+ "once_cell",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde-value",
+]
+
+[[package]]
 name = "prost-types"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4174,6 +4206,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "quil-explorer"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "bs58",
+ "chrono",
+ "hex 0.4.3",
+ "num-bigint 0.4.6",
+ "parking_lot",
+ "prost",
+ "quil-hypergraph",
+ "quil-p2p",
+ "quil-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
+]
+
+[[package]]
 name = "quil-hypergraph"
 version = "0.1.0"
 dependencies = [
@@ -4265,6 +4319,7 @@ dependencies = [
  "quil-crypto",
  "quil-engine",
  "quil-execution",
+ "quil-explorer",
  "quil-hypergraph",
  "quil-keys",
  "quil-lifecycle",
@@ -4419,10 +4474,13 @@ dependencies = [
  "async-trait",
  "bytes",
  "num-bigint 0.4.6",
+ "once_cell",
  "prost",
  "prost-build",
+ "prost-reflect",
  "prost-types",
  "serde",
+ "serde_json",
  "thiserror 2.0.12",
  "tokio",
  "tokio-util",
@@ -5058,6 +5116,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-value"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
+dependencies = [
+ "ordered-float",
+ "serde",
+]
+
+[[package]]
 name = "serde_bytes"
 version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5103,6 +5171,29 @@ version = "1.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "455182ea6142b14f93f4bc5320a2b31c1f266b66a4a5c858b013302a5d8cbfc3"
 dependencies = [
+ "itoa",
+ "ryu",
+ "serde",
+]
+
+[[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
+name = "serde_urlencoded"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
+dependencies = [
+ "form_urlencoded",
  "itoa",
  "ryu",
  "serde",
@@ -5746,8 +5837,10 @@ dependencies = [
  "futures-util",
  "pin-project-lite",
  "sync_wrapper",
+ "tokio",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -5768,6 +5861,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",

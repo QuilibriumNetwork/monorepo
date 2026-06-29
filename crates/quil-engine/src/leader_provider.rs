@@ -47,6 +47,15 @@ pub struct GlobalLeaderProvider {
     /// bound is required because `VectorCommitmentTree::commit` walks
     /// branches in parallel via rayon.
     inclusion_prover: Arc<dyn InclusionProver + Send + Sync>,
+    /// Execution manager used to validate collected messages before they
+    /// ride into a proposal. Mirrors Go's
+    /// `executionManager.ValidateMessage` gate in the liveness provider's
+    /// collect loop (`consensus_liveness_provider.go:86-97`): a message
+    /// that fails validation is dropped from the mempool
+    /// (`MessageCollector::remove`) instead of being re-collected and
+    /// re-proposed every rank until it ages out. `None` disables the gate
+    /// (tests / nodes without an execution manager wired).
+    message_validator: Option<Arc<quil_execution::ExecutionEngineManager>>,
 }
 
 impl GlobalLeaderProvider {
@@ -60,6 +69,7 @@ impl GlobalLeaderProvider {
         local_public_key: Vec<u8>,
         signer: Arc<dyn Signer>,
         inclusion_prover: Arc<dyn InclusionProver + Send + Sync>,
+        message_validator: Option<Arc<quil_execution::ExecutionEngineManager>>,
     ) -> Self {
         Self {
             prover_registry,
@@ -71,6 +81,7 @@ impl GlobalLeaderProvider {
             local_public_key,
             signer,
             inclusion_prover,
+            message_validator,
         }
     }
 
@@ -290,9 +301,63 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         let frame_number = prior_header.frame_number + 1;
 
         // ------------------------------------------------------------------
-        // 3. Collect pending messages
+        // 3. Collect pending messages, then drop protocol-invalid ones.
+        //
+        // Collection is non-destructive (so a timed-out proposal doesn't
+        // vaporize the mempool). That means a message which fails protocol
+        // validation would otherwise be re-collected and re-proposed every
+        // rank until it ages out of the retention window. Mirror Go's
+        // liveness-provider collect loop
+        // (`consensus_liveness_provider.go:86-97`): validate each collected
+        // message and `MessageCollector::remove` the failures so they leave
+        // the mempool the moment we know they're invalid. Only the
+        // surviving (valid) messages ride into this proposal.
+        //
+        // Shard-`FrameHeader` bundles are NOT re-validated here: they are
+        // deduplicated at ingest and fully validated by the materializer,
+        // and re-verifying their per-proof VDF multiproofs (unbatchable,
+        // and now uncapped — a frame can carry thousands) would load the
+        // latency-sensitive prove path. Structurally-invalid bundles were
+        // already rejected at ingest.
         // ------------------------------------------------------------------
-        let messages = self.message_collector.collect_for_rank(rank);
+        let collected = self.message_collector.collect_for_rank(rank);
+        let messages = match self.message_validator.as_ref() {
+            Some(validator) => {
+                // The collector holds GLOBAL messages, validated against the
+                // global intrinsic engine address (0xff..), matching Go's
+                // `globalMessageAddress`.
+                let global_addr = [0xFFu8; 32];
+                let mut valid: Vec<Vec<u8>> = Vec::with_capacity(collected.len());
+                let mut invalid: Vec<Vec<u8>> = Vec::new();
+                for raw in collected {
+                    if crate::message_collector::bundle_has_shard_frame(&raw) {
+                        valid.push(raw);
+                        continue;
+                    }
+                    match validator.validate_message(frame_number, &global_addr, &raw) {
+                        Ok(()) => valid.push(raw),
+                        Err(e) => {
+                            tracing::debug!(
+                                frame = frame_number,
+                                error = %e,
+                                "dropping protocol-invalid message from global mempool",
+                            );
+                            invalid.push(raw);
+                        }
+                    }
+                }
+                if !invalid.is_empty() {
+                    tracing::info!(
+                        frame = frame_number,
+                        removed = invalid.len(),
+                        "dropped protocol-invalid messages from global mempool",
+                    );
+                    self.message_collector.remove(&invalid);
+                }
+                valid
+            }
+            None => collected,
+        };
 
         tracing::info!(
             frame = frame_number,
@@ -450,7 +515,7 @@ mod tests {
     struct StubFrameProver;
     impl FrameProver for StubFrameProver {
         fn prove_frame_header(
-            &self, _: &[u8], _: &[u8], _: &[u8], _: &[Vec<u8>], _: &[u8], _: i64, _: u32, _: u64, _: u64,
+            &self, _: &[u8], _: &[u8], _: &[u8], _: &[Vec<u8>], _: &[u8], _: i64, _: u32, _: u64, _: u64, _: &[u8], _: u64,
         ) -> Result<quil_types::proto::global::FrameHeader> {
             Err(QuilError::Internal("stub".into()))
         }
@@ -523,7 +588,56 @@ mod tests {
             // Real KZG prover so `compute_requests_root` reflects tree
             // contents (the noop prover returns all-zero roots).
             Arc::new(quil_crypto::KzgInclusionProver),
+            // No execution manager in these unit tests — the validate-and-
+            // drop gate is exercised via integration tests on real stores.
+            None,
         )
+    }
+
+    fn provider_with_prover(
+        prover: Arc<dyn quil_types::crypto::InclusionProver + Send + Sync>,
+    ) -> GlobalLeaderProvider {
+        let signer: Arc<dyn Signer> = Arc::new(DummySigner);
+        GlobalLeaderProvider::new(
+            Arc::new(TestProverRegistry::new()),
+            Arc::new(StubFrameProver),
+            Arc::new(AsertDifficultyAdjuster::new(0, 0, 100)),
+            Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            Arc::new(MessageCollector::new()),
+            vec![0xABu8; 32],
+            vec![0xABu8; 96],
+            signer,
+            prover,
+            None,
+        )
+    }
+
+    /// Regression for the archive-consensus `requests_root = 0x00..00` bug.
+    /// `compute_requests_root` builds a VectorCommitmentTree and commits it
+    /// via the WIRED inclusion prover. A `NoopInclusionProver` commits any
+    /// BRANCH (>= 2 messages) to 64 zero bytes — so every non-trivial frame
+    /// shipped a zero root. A single message is a LEAF (SHA-512), non-zero
+    /// even under Noop, which is exactly why the bug was invisible on
+    /// near-empty frames. The real KZG prover yields a non-zero root. The
+    /// archive path had been wired with Noop (fixed to Kzg); this pins the
+    /// contract so it can't silently regress.
+    #[test]
+    fn requests_root_zero_under_noop_nonzero_under_kzg_for_branch() {
+        let msgs: Vec<Vec<u8>> = vec![vec![1u8; 40], vec![2u8; 40], vec![3u8; 40]];
+
+        let noop = provider_with_prover(Arc::new(quil_types::crypto::NoopInclusionProver));
+        assert_eq!(
+            noop.compute_requests_root(&msgs),
+            vec![0u8; 64],
+            "Noop prover commits the multi-message branch to zeros — the bug"
+        );
+
+        let kzg = provider_with_prover(Arc::new(quil_crypto::KzgInclusionProver));
+        assert_ne!(
+            kzg.compute_requests_root(&msgs),
+            vec![0u8; 64],
+            "real KZG prover must produce a non-zero requests_root for a multi-message frame"
+        );
     }
 
     fn prior_state(output_len: usize) -> State<GlobalState> {

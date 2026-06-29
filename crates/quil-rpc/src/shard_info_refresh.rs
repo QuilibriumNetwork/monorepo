@@ -170,9 +170,14 @@ async fn try_one_endpoint(
 ) -> Result<HashMap<Vec<u8>, u64>, ArchiveClientError> {
     let mut client = ArchiveClient::connect_mtls(endpoint, ed448_seed).await?;
     let mut out: HashMap<Vec<u8>, u64> = HashMap::new();
+    let mut any_success = false;
+    let mut last_err: Option<ArchiveClientError> = None;
     for shard_key in shard_keys {
         let infos = match client.get_app_shards(shard_key.clone(), Vec::new()).await {
-            Ok(v) => v,
+            Ok(v) => {
+                any_success = true;
+                v
+            }
             Err(e) => {
                 debug!(
                     %endpoint,
@@ -180,6 +185,7 @@ async fn try_one_endpoint(
                     error = %e,
                     "shard_info refresh: per-shard call failed, skipping"
                 );
+                last_err = Some(e);
                 continue;
             }
         };
@@ -196,6 +202,16 @@ async fn try_one_endpoint(
             }
             let size = bigint_to_u64_saturating(&info.size);
             out.insert(filter, size);
+        }
+    }
+    // Distinguish "every per-shard call errored" (a real transport/handler
+    // failure that was being masked as the generic 'no shard sizes' rotate
+    // message) from "calls succeeded but returned no data" (legitimately
+    // empty). Only the former is surfaced as an error so the caller logs
+    // the actual cause at WARN; the latter stays Ok(empty).
+    if out.is_empty() && !any_success {
+        if let Some(e) = last_err {
+            return Err(e);
         }
     }
     Ok(out)

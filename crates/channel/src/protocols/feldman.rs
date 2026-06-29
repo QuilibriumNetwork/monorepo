@@ -42,6 +42,13 @@ pub struct Feldman {
     round: FeldmanRound,
     zkcommits_from_counterparties: HashMap<usize, Vec<u8>>,
     points_from_counterparties: HashMap<usize, EdwardsPoint>,
+    /// Our polynomial's Feldman coefficient commitments `C_j = generator * a_j`
+    /// (j = 0..threshold), published alongside each fragment so a receiver can
+    /// verify the fragment lies on our committed polynomial. Public (not secret).
+    commitments: Vec<EdwardsPoint>,
+    /// Each counterparty's published coefficient commitments, used to verify the
+    /// fragment they send us against their committed polynomial.
+    commitments_from_counterparties: HashMap<usize, Vec<EdwardsPoint>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -61,6 +68,10 @@ pub struct FeldmanJson {
     round: usize,
     zkcommits_from_counterparties: HashMap<usize, String>,
     points_from_counterparties: HashMap<usize, String>,
+    #[serde(default)]
+    commitments: Vec<String>,
+    #[serde(default)]
+    commitments_from_counterparties: HashMap<usize, Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -68,6 +79,15 @@ pub struct FeldmanReveal {
     point: Vec<u8>,
     random_commitment_point: Vec<u8>,
     zk_pok: Vec<u8>,
+}
+
+/// Wire payload for one peer's polynomial fragment: the scalar share plus the
+/// dealer's Feldman coefficient commitments, so the receiver can verify the
+/// share lies on the dealer's committed polynomial (Feldman VSS check).
+#[derive(Serialize, Deserialize)]
+pub struct FeldmanFrag {
+    pub frag: Vec<u8>,
+    pub commitments: Vec<Vec<u8>>,
 }
 
 pub fn vec_to_array<const N: usize>(v: Vec<u8>) -> Result<[u8; N], Box<dyn std::error::Error>> {
@@ -117,6 +137,8 @@ impl Feldman {
             round: FeldmanRound::Uninitialized,
             zkcommits_from_counterparties: HashMap::new(),
             points_from_counterparties: HashMap::new(),
+            commitments: Vec::new(),
+            commitments_from_counterparties: HashMap::new(),
         }
     }
 
@@ -145,6 +167,12 @@ impl Feldman {
                 .collect(),
             points_from_counterparties: self.points_from_counterparties.iter()
                 .map(|(&k, v)| (k, BASE64_STANDARD.encode(v.compress().to_bytes())))
+                .collect(),
+            commitments: self.commitments.iter()
+                .map(|c| BASE64_STANDARD.encode(c.compress().to_bytes()))
+                .collect(),
+            commitments_from_counterparties: self.commitments_from_counterparties.iter()
+                .map(|(&k, v)| (k, v.iter().map(|c| BASE64_STANDARD.encode(c.compress().to_bytes())).collect()))
                 .collect(),
         };
 
@@ -228,6 +256,25 @@ impl Feldman {
             },
             zkcommits_from_counterparties,
             points_from_counterparties,
+            commitments: feldman_json.commitments.into_iter()
+                .map(|c| {
+                    EdwardsPoint::from_bytes(&vec_to_array::<57>(BASE64_STANDARD.decode(c)?)?.into())
+                        .into_option()
+                        .ok_or_else(|| FeldmanError::InvalidData("invalid commitment".into()).into())
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?,
+            commitments_from_counterparties: feldman_json.commitments_from_counterparties.into_iter()
+                .map(|(k, v)| {
+                    let pts = v.into_iter()
+                        .map(|c| {
+                            EdwardsPoint::from_bytes(&vec_to_array::<57>(BASE64_STANDARD.decode(c)?)?.into())
+                                .into_option()
+                                .ok_or_else(|| FeldmanError::InvalidData("invalid commitment".into()).into())
+                        })
+                        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+                    Ok((k, pts))
+                })
+                .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?,
         })
     }
 
@@ -240,7 +287,13 @@ impl Feldman {
             return Err(FeldmanError::WrongRound);
         }
 
-        let samples = Feldman::construct_polynomial_samples(rng, self.secret, self.threshold, self.total);
+        let (samples, coeffs) =
+            Feldman::construct_polynomial_samples(rng, self.secret, self.threshold, self.total);
+
+        // Feldman commitments to each coefficient: C_j = generator * a_j.
+        // Published with our fragments so receivers can verify their share lies
+        // on this committed polynomial.
+        self.commitments = coeffs.iter().map(|a| self.generator * a).collect();
 
         for i in 1..=self.total {
             if i == self.id {
@@ -254,18 +307,18 @@ impl Feldman {
         Ok(())
     }
 
-    fn construct_polynomial_samples<R: RngCore + CryptoRng>(rng: &mut R, secret: Scalar, threshold: usize, total: usize) -> Vec<Scalar> {
+    fn construct_polynomial_samples<R: RngCore + CryptoRng>(rng: &mut R, secret: Scalar, threshold: usize, total: usize) -> (Vec<Scalar>, Vec<Scalar>) {
         let mut coeffs = vec![secret];
-    
+
         for _ in 1..threshold {
             coeffs.push(Scalar::random(rng));
         }
-    
+
         let mut samples = Vec::<Scalar>::new();
         for i in 1..=total {
             let mut result = coeffs[0];
-            let x = Scalar::from(i as u32);
-    
+            let _x = Scalar::from(i as u32);
+
             for j in 1..threshold {
                 let term = coeffs[j] * Scalar::from(i.pow(j as u32) as u32);
                 result += term;
@@ -274,7 +327,41 @@ impl Feldman {
             samples.push(result);
         }
 
-        return samples;
+        (samples, coeffs)
+    }
+
+    /// Our published Feldman coefficient commitments (compressed Edwards point
+    /// bytes), to be broadcast with each fragment. Available once the polynomial
+    /// has been sampled.
+    pub fn get_commitments(&self) -> Result<Vec<Vec<u8>>, FeldmanError> {
+        if self.round == FeldmanRound::Uninitialized {
+            return Err(FeldmanError::WrongRound);
+        }
+        Ok(self.commitments.iter().map(|c| c.compress().to_bytes().to_vec()).collect())
+    }
+
+    /// Verify a counterparty fragment `f(self.id)` lies on the polynomial the
+    /// counterparty committed to: `generator * frag == Σ_j (self.id^j * C_j)`.
+    /// This is the Feldman VSS share check — without it a malicious dealer can
+    /// hand out a share inconsistent with its commitments and silently bias the
+    /// shared secret. `commitments` are the dealer's `get_commitments()` bytes.
+    fn verify_frag_against_commitments(
+        &self,
+        frag: &Scalar,
+        commitments: &[EdwardsPoint],
+    ) -> bool {
+        if commitments.len() != self.threshold {
+            return false;
+        }
+        // Σ_j C_j * (self.id)^j, with the exponent computed exactly as the
+        // dealer did in `construct_polynomial_samples` (i.pow(j) as u32).
+        let mut expected = commitments[0];
+        for j in 1..commitments.len() {
+            let exp = Scalar::from(self.id.pow(j as u32) as u32);
+            expected += commitments[j] * exp;
+        }
+        let lhs = self.generator * frag;
+        lhs.ct_eq(&expected).into()
     }
     
     pub fn scalar(&self) -> Option<&Scalar> {
@@ -288,12 +375,40 @@ impl Feldman {
         Ok(&self.frags_for_counterparties)
     }
 
-    pub fn set_poly_frag_for_party(&mut self, id: usize, frag: &[u8]) -> Result<Option<Vec<u8>>, FeldmanError> {
+    pub fn set_poly_frag_for_party(
+        &mut self,
+        id: usize,
+        frag: &[u8],
+        commitments: &[Vec<u8>],
+    ) -> Result<Option<Vec<u8>>, FeldmanError> {
         if self.round != FeldmanRound::Initialized {
             return Err(FeldmanError::WrongRound);
         }
 
-        let scalar = Scalar::from_bytes(frag.try_into().unwrap());
+        let frag_arr: [u8; 56] = frag.try_into()
+            .map_err(|_| FeldmanError::InvalidData("fragment must be 56 bytes".into()))?;
+        let scalar = Scalar::from_bytes(&frag_arr);
+
+        // Feldman VSS share check: the fragment must lie on the dealer's
+        // committed polynomial. Reject an inconsistent share rather than fold it
+        // into our combined secret (a malicious dealer would otherwise bias the
+        // group key). Decode + retain the dealer's commitments for the record.
+        let decoded: Vec<EdwardsPoint> = commitments.iter()
+            .map(|c| {
+                let arr = vec_to_array::<57>(c.clone())
+                    .map_err(|_| FeldmanError::InvalidData("commitment must be 57 bytes".into()))?;
+                EdwardsPoint::from_bytes(&arr.into())
+                    .into_option()
+                    .ok_or_else(|| FeldmanError::InvalidData("invalid commitment point".into()))
+            })
+            .collect::<Result<Vec<_>, FeldmanError>>()?;
+        if !self.verify_frag_against_commitments(&scalar, &decoded) {
+            return Err(FeldmanError::InvalidData(
+                "fragment inconsistent with dealer commitments (Feldman VSS check failed)".into(),
+            ));
+        }
+        self.commitments_from_counterparties.insert(id, decoded);
+
         self.frags_from_counterparties.insert(id, scalar);
 
         if self.frags_from_counterparties.len() == self.total - 1 {
@@ -543,7 +658,7 @@ impl Feldman {
             reconstructed_sum += reconstructed_fragment;
         }
 
-        return Ok(Feldman::construct_polynomial_samples(rng, reconstructed_sum, threshold, total).iter().map(|s| s.to_bytes().to_vec()).collect())
+        return Ok(Feldman::construct_polynomial_samples(rng, reconstructed_sum, threshold, total).0.iter().map(|s| s.to_bytes().to_vec()).collect())
     }
 
     pub fn get_scalar(&self) -> Scalar {
@@ -552,5 +667,58 @@ impl Feldman {
 
     pub fn get_id(&self) -> usize {
       return self.id;
+    }
+}
+
+#[cfg(test)]
+mod feldman_vss_tests {
+    use super::*;
+    use ed448_goldilocks_plus::{EdwardsPoint, Scalar};
+    use rand::rngs::OsRng;
+
+    // A receiver must accept a fragment that lies on the dealer's committed
+    // polynomial and REJECT one that does not (the Feldman VSS share check),
+    // closing the door on a malicious dealer biasing the shared secret.
+    #[test]
+    fn feldman_share_check_accepts_honest_and_rejects_inconsistent() {
+        let gen = EdwardsPoint::generator();
+        let (threshold, total) = (2usize, 3usize);
+
+        // Dealer = party 1. Sample its polynomial + publish commitments.
+        let mut dealer = Feldman::new(threshold, total, 1, Scalar::random(&mut OsRng), gen);
+        dealer.sample_polynomial(&mut OsRng).unwrap();
+        let commitments = dealer.get_commitments().unwrap();
+        assert_eq!(commitments.len(), threshold, "one commitment per coefficient");
+        let honest = dealer.get_poly_frags().unwrap().get(&2).unwrap().clone();
+
+        // Honest fragment for party 2 verifies.
+        let mut recv = Feldman::new(threshold, total, 2, Scalar::random(&mut OsRng), gen);
+        recv.sample_polynomial(&mut OsRng).unwrap();
+        assert!(
+            recv.set_poly_frag_for_party(1, &honest, &commitments).is_ok(),
+            "honest fragment on the committed polynomial must verify",
+        );
+
+        // A tampered fragment is rejected.
+        let mut recv2 = Feldman::new(threshold, total, 2, Scalar::random(&mut OsRng), gen);
+        recv2.sample_polynomial(&mut OsRng).unwrap();
+        let mut tampered = honest.clone();
+        tampered[0] ^= 0x01;
+        assert!(
+            recv2.set_poly_frag_for_party(1, &tampered, &commitments).is_err(),
+            "a share off the committed polynomial must be rejected",
+        );
+
+        // The honest fragment checked against a DIFFERENT dealer's commitments
+        // is also rejected (a swapped/forged commitment set can't pass).
+        let mut other = Feldman::new(threshold, total, 1, Scalar::random(&mut OsRng), gen);
+        other.sample_polynomial(&mut OsRng).unwrap();
+        let wrong = other.get_commitments().unwrap();
+        let mut recv3 = Feldman::new(threshold, total, 2, Scalar::random(&mut OsRng), gen);
+        recv3.sample_polynomial(&mut OsRng).unwrap();
+        assert!(
+            recv3.set_poly_frag_for_party(1, &honest, &wrong).is_err(),
+            "fragment must not verify against another dealer's commitments",
+        );
     }
 }

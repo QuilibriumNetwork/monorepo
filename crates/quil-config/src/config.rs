@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{DbConfig, EngineConfig, KeyConfig, LogConfig, P2PConfig};
+use crate::{DbConfig, EngineConfig, ExplorerConfig, KeyConfig, LogConfig, P2PConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -19,6 +19,8 @@ pub struct Config {
     pub listen_grpc_multiaddr: String,
     #[serde(default, rename = "listenRESTMultiaddr")]
     pub listen_rest_multiaddr: String,
+    #[serde(default)]
+    pub explorer: ExplorerConfig,
 }
 
 impl Default for Config {
@@ -31,6 +33,7 @@ impl Default for Config {
             logger: LogConfig::default(),
             listen_grpc_multiaddr: String::new(),
             listen_rest_multiaddr: String::new(),
+            explorer: ExplorerConfig::default(),
         }
     }
 }
@@ -41,5 +44,6 @@ impl Config {
         self.p2p.apply_defaults();
         self.engine.apply_defaults();
         self.db.apply_defaults();
+        self.explorer.apply_defaults();
     }
 }

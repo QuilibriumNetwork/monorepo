@@ -27,12 +27,16 @@ mod release_check;
 mod util;
 
 mod blossomsub_consensus_publisher;
+mod direct_global_consensus_publisher;
 
 mod dht_node;
 
 mod worker_node;
 
 mod diagnostic;
+mod check_bootstrap;
+mod check_submit;
+mod verify_migration;
 
 mod master_node;
 
@@ -73,6 +77,26 @@ struct Args {
     /// Import a Pebble database export file into RocksDB
     #[arg(long)]
     import_db: Option<PathBuf>,
+
+    /// Verify a migrated RocksDB is valid/accepted by the node's loaders
+    /// and validators (trie root, frame, QC/TC, certified state), then
+    /// exit. Empty path uses config.db.path.
+    #[arg(long)]
+    verify_db: Option<PathBuf>,
+
+    /// Diagnose the consensus bootstrap root: replay the latest-QC
+    /// candidate-frame lookup and report whether the forks-root identity
+    /// (Poseidon of the frame output) matches the QC selector the leader
+    /// resolves its parent by. Empty path uses config.db.path. Read-only.
+    #[arg(long)]
+    check_bootstrap: Option<PathBuf>,
+
+    /// Diagnose prover-message submission to an archive. Connects to the
+    /// given `host:8340` over Ed448 mTLS and submits a no-op ProverJoin
+    /// bundle, reporting where the path breaks (handshake vs RPC). Use a
+    /// known archive, e.g. `--check-submit 192.69.222.130:8340`.
+    #[arg(long)]
+    check_submit: Option<String>,
 
     /// Print the peer ID to stdout and exit
     #[arg(long)]
@@ -286,6 +310,36 @@ async fn main() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    if let Some(ref verify_path) = args.verify_db {
+        return match verify_migration::run_verify_db(verify_path, &config) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref check_path) = args.check_bootstrap {
+        return match check_bootstrap::run_check_bootstrap(check_path, &config) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref addr) = args.check_submit {
+        return match check_submit::run_check_submit(addr, &config).await {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
     // Hand off to the chosen node mode. It owns `sup` for its lifetime,
     // registers its subsystems, runs the supervisor, and returns the
     // `ShutdownReason` for `main` to translate into an exit code.
@@ -313,6 +367,43 @@ async fn main() -> anyhow::Result<ExitCode> {
             worker_node::start(sup, &config, core_id, args.parent_process).await?
         }
     };
+
+    // The supervisor has returned, so shutdown is underway — but not
+    // everything it kicked off is the supervisor's to stop. The consensus
+    // event loop and materializer run as DETACHED tasks, and the
+    // peer-facing :8340 gRPC server runs on its own dedicated runtime;
+    // none are cancelled when `sup.run()` returns. Worse, tonic drives a
+    // GRACEFUL shutdown of :8340 that waits for in-flight requests to
+    // finish, and hypersync sessions are long-lived streams — a single
+    // one still in flight wedges teardown indefinitely (observed in the
+    // field: a node logged ctrl-c, then kept materializing frames and
+    // serving sync for an hour). Arm a hard-deadline watchdog on a plain
+    // OS thread (independent of any runtime): if the process can't exit
+    // under its own power within the grace window, force it. This is
+    // safe — RocksDB is crash-consistent via its WAL and the master node
+    // already released its snapshots before returning, so a forced exit
+    // costs only a WAL replay on restart.
+    {
+        let code: i32 = match &reason {
+            // POSIX: signal-driven exit is 128 + signal number.
+            ShutdownReason::CtrlC => 130,
+            ShutdownReason::Terminated => 143,
+            _ => 1,
+        };
+        const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+        let _ = std::thread::Builder::new()
+            .name("shutdown-watchdog".into())
+            .spawn(move || {
+                std::thread::sleep(SHUTDOWN_GRACE);
+                // Logging may already be torn down; go straight to stderr.
+                eprintln!(
+                    "shutdown watchdog: graceful teardown exceeded {}s — forcing exit({})",
+                    SHUTDOWN_GRACE.as_secs(),
+                    code,
+                );
+                std::process::exit(code);
+            });
+    }
 
     let result = match reason {
         // POSIX convention: signal-driven exit is 128 + signal number.

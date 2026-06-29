@@ -48,6 +48,15 @@ pub struct CurrentFrame {
     /// against an archive snapshot. The gate the lifecycle's
     /// `tree_synced` reads. Updated by `verify()`.
     verified: AtomicU64,
+    /// Latest HotStuff CONSENSUS RANK observed (NOT the frame number —
+    /// rank and frame differ by the genesis offset). The message
+    /// collector is keyed by consensus rank: the leader collects via
+    /// `collect_for_rank(rank)`, so messages must be tagged with the
+    /// rank, not the frame number. Updated by `observe_rank()` from the
+    /// consensus incorporate/finalize hooks. Without this, the submit
+    /// handler tagged messages with the (larger) frame number and the
+    /// leader's `collect_for_rank` never saw them → empty frames.
+    rank: AtomicU64,
 }
 
 impl CurrentFrame {
@@ -86,6 +95,22 @@ impl CurrentFrame {
         }
         self.observed.fetch_max(frame_number, Ordering::Relaxed);
         self.verified.fetch_max(frame_number, Ordering::Relaxed);
+    }
+
+    /// Record the latest HotStuff consensus rank (monotonic). Called
+    /// from the consensus incorporate/finalize hooks. This is the rank
+    /// space the message collector is keyed by.
+    pub fn observe_rank(&self, rank: u64) {
+        if rank == 0 {
+            return;
+        }
+        self.rank.fetch_max(rank, Ordering::Relaxed);
+    }
+
+    /// The latest consensus rank seen. Use this — NOT `effective()` —
+    /// to tag messages for the rank-keyed message collector.
+    pub fn effective_rank(&self) -> u64 {
+        self.rank.load(Ordering::Relaxed)
     }
 
     /// The freshest frame this node has any evidence of.

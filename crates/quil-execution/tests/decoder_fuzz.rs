@@ -348,6 +348,7 @@ roundtrip_test!(
             frame_number,
             public_key_signature_bls48581: sig,
             filters,
+            leaf_roots: Vec::new(),
         })
 );
 decode_fuzz_test!(prover_confirm_decode_fuzz, ProverConfirm);

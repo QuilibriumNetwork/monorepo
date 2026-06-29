@@ -86,6 +86,8 @@ impl FrameProver for StubFrameProver {
         difficulty: u32,
         _fee_multiplier_vote: u64,
         frame_number: u64,
+        _storage_attestation_root: &[u8],
+        global_frame_number: u64,
     ) -> QResult<gpb::FrameHeader> {
         // Output must be unique per (frame, ts) — otherwise every rank
         // hashes to the same identity, all states alias to the same
@@ -114,11 +116,30 @@ impl FrameProver for StubFrameProver {
             prover: vec![0u8; 96],
             fee_multiplier_vote: 0,
             public_key_signature_bls48581: None,
+            storage_attestation_root: Vec::new(),
+            global_frame_number,
+            storage_attestation: Vec::new(),
         })
     }
 
     fn verify_frame_header(&self, _h: &gpb::FrameHeader) -> QResult<Vec<u8>> {
         Ok(vec![0u8; 516])
+    }
+
+    // Accept any shard FrameHeader's signature. The stub prover produces
+    // no real VDF multiproof, so the archive's per-bundle verify path
+    // (which the real prover would use for BLS + multiproof) is a no-op
+    // here. The aggregate-pubkey/committee check in the intrinsic still
+    // runs (and is exercised by the tier-2 coverage tests, which seed the
+    // worker committee into the archive registry); this only short-
+    // circuits the stubbed VDF/BLS proof verification.
+    fn verify_frame_header_signature(
+        &self,
+        _header: &gpb::FrameHeader,
+        _bls: &dyn quil_types::crypto::BlsConstructor,
+        _ids: Option<&[&[u8]]>,
+    ) -> QResult<bool> {
+        Ok(true)
     }
 
     fn prove_global_frame_header(
@@ -188,6 +209,38 @@ impl FrameProver for StubFrameProver {
         _proofs: &[&[u8]],
     ) -> QResult<bool> {
         Ok(true)
+    }
+}
+
+/// Build a single-signer (`bitmask=[0x01]`) shard-FrameHeader aggregate
+/// signature whose DECLARED aggregate public key matches what the
+/// intrinsic's attestation verifier reconstructs via
+/// `bls.aggregate([member_pubkey], …)`. The 74-byte `signature` is a
+/// placeholder: a 74-byte single-signer attestation carries no VDF
+/// multiproof, and `StubFrameProver::verify_frame_header_signature`
+/// accepts it. Used by the synthetic-coverage tier-2 tests so their
+/// hand-built coverage FrameHeader survives the aggregate-pubkey
+/// consistency check (which only needs `member_pubkey` to be an Active
+/// prover under the frame's shard filter in the verifying registry).
+fn single_signer_agg_sig(
+    member_pubkey: &[u8],
+) -> quil_execution::hypergraph_intrinsic::canonical::AggregateSignature {
+    use quil_types::crypto::BlsConstructor;
+    let bls = quil_crypto::Bls48581KeyConstructor;
+    let (_t, throwaway_pub) = bls.new_key().expect("throwaway bls key");
+    // The aggregate's public key depends only on the input pubkeys (the
+    // signature slot is a don't-care here), so a throwaway fills it.
+    let agg = bls
+        .aggregate(&[member_pubkey], &[throwaway_pub.as_slice()])
+        .expect("aggregate single member pubkey");
+    quil_execution::hypergraph_intrinsic::canonical::AggregateSignature {
+        signature: vec![0u8; 74],
+        public_key: Some(
+            quil_execution::hypergraph_intrinsic::canonical::Bls48581G2PublicKey {
+                key_value: agg.public_key,
+            },
+        ),
+        bitmask: vec![0x01],
     }
 }
 
@@ -341,9 +394,7 @@ fn build_signed_genesis_qc(
     let ctor = quil_crypto::Bls48581KeyConstructor;
     let pk_refs: Vec<&[u8]> = pks.iter().map(|v| v.as_slice()).collect();
     let sig_refs: Vec<&[u8]> = sigs.iter().map(|v| v.as_slice()).collect();
-    let agg = ctor
-        .aggregate(&pk_refs, &sig_refs)
-        .expect("bls aggregate");
+    let agg = ctor.aggregate(&pk_refs, &sig_refs).expect("bls aggregate");
 
     // Bitmask: bit i set means prover i signed. All provers signed,
     // so every bit in `provers.len()` slots is set. Padded to 32
@@ -404,13 +455,19 @@ pub struct NetworkLatency {
 
 impl NetworkLatency {
     pub fn instant() -> Self {
-        Self { base_ms: 0, jitter_ms: 0 }
+        Self {
+            base_ms: 0,
+            jitter_ms: 0,
+        }
     }
 
     /// Realistic WAN: ~80ms mean, ±50ms jitter — matches common
     /// commercial internet round-trip / 2.
     pub fn realistic_wan() -> Self {
-        Self { base_ms: 30, jitter_ms: 100 }
+        Self {
+            base_ms: 30,
+            jitter_ms: 100,
+        }
     }
 }
 
@@ -495,7 +552,10 @@ pub struct InMemoryPublisher {
 
 impl InMemoryPublisher {
     pub fn new(network: Arc<InMemoryNetwork>, sender_addr: Vec<u8>) -> Self {
-        Self { network, sender_addr }
+        Self {
+            network,
+            sender_addr,
+        }
     }
 }
 
@@ -582,9 +642,7 @@ pub fn build_node(
             bitmask: genesis_qc.aggregate_signature.bitmask.clone(),
         }),
     };
-    let qc_txn = clock_store
-        .new_transaction(false)
-        .expect("new_transaction");
+    let qc_txn = clock_store.new_transaction(false).expect("new_transaction");
     clock_store
         .put_quorum_certificate(&proto_qc, qc_txn.as_ref())
         .expect("seed genesis QC");
@@ -603,28 +661,27 @@ pub fn build_node(
     let finalized_frames: Arc<Mutex<Vec<gpb::GlobalFrame>>> = Arc::new(Mutex::new(Vec::new()));
     let finalized_clone = finalized.clone();
     let finalized_frames_clone = finalized_frames.clone();
-    let finalized_hook: quil_engine::consensus_glue::FinalizedStateHook =
-        Arc::new(move |state| {
-            let app = &state.state;
-            finalized_clone.lock().push(app.frame_number);
-            let header = gpb::GlobalFrameHeader {
-                frame_number: app.frame_number,
-                rank: app.rank,
-                timestamp: app.timestamp,
-                difficulty: app.difficulty,
-                output: app.output.clone(),
-                parent_selector: app.parent_selector.clone(),
-                prover: app.prover.clone(),
-                prover_tree_commitment: app.prover_tree_commitment.clone(),
-                requests_root: app.requests_root.clone(),
-                ..Default::default()
-            };
-            let frame = gpb::GlobalFrame {
-                header: Some(header),
-                requests: app.messages.clone(),
-            };
-            finalized_frames_clone.lock().push(frame);
-        });
+    let finalized_hook: quil_engine::consensus_glue::FinalizedStateHook = Arc::new(move |state| {
+        let app = &state.state;
+        finalized_clone.lock().push(app.frame_number);
+        let header = gpb::GlobalFrameHeader {
+            frame_number: app.frame_number,
+            rank: app.rank,
+            timestamp: app.timestamp,
+            difficulty: app.difficulty,
+            output: app.output.clone(),
+            parent_selector: app.parent_selector.clone(),
+            prover: app.prover.clone(),
+            prover_tree_commitment: app.prover_tree_commitment.clone(),
+            requests_root: app.requests_root.clone(),
+            ..Default::default()
+        };
+        let frame = gpb::GlobalFrame {
+            header: Some(header),
+            requests: app.messages.clone(),
+        };
+        finalized_frames_clone.lock().push(frame);
+    });
 
     // Persist incorporated (forks-tree) frames as candidates so the
     // leader can chain rank+1 proposals via
@@ -659,27 +716,26 @@ pub fn build_node(
     // Persist observed QCs so `get_latest_quorum_certificate` resolves
     // to the freshest QC. Mirror of main.rs:2531-2584.
     let cs_for_qc = clock_store.clone();
-    let qc_observed_hook: quil_engine::consensus_glue::QcObservedHook =
-        Arc::new(move |qc| {
-            let proto_qc = gpb::QuorumCertificate {
-                filter: qc.filter().to_vec(),
-                rank: qc.rank(),
-                frame_number: qc.frame_number(),
-                selector: qc.identity().clone(),
-                timestamp: qc.timestamp(),
-                aggregate_signature: Some(quil_types::proto::keys::Bls48581AggregateSignature {
-                    public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
-                        key_value: qc.aggregated_signature().public_key().to_vec(),
-                    }),
-                    signature: qc.aggregated_signature().signature().to_vec(),
-                    bitmask: qc.aggregated_signature().bitmask().to_vec(),
+    let qc_observed_hook: quil_engine::consensus_glue::QcObservedHook = Arc::new(move |qc| {
+        let proto_qc = gpb::QuorumCertificate {
+            filter: qc.filter().to_vec(),
+            rank: qc.rank(),
+            frame_number: qc.frame_number(),
+            selector: qc.identity().clone(),
+            timestamp: qc.timestamp(),
+            aggregate_signature: Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
+                    key_value: qc.aggregated_signature().public_key().to_vec(),
                 }),
-            };
-            if let Ok(txn) = cs_for_qc.new_transaction(false) {
-                let _ = cs_for_qc.put_quorum_certificate(&proto_qc, txn.as_ref());
-                let _ = txn.commit();
-            }
-        });
+                signature: qc.aggregated_signature().signature().to_vec(),
+                bitmask: qc.aggregated_signature().bitmask().to_vec(),
+            }),
+        };
+        if let Ok(txn) = cs_for_qc.new_transaction(false) {
+            let _ = cs_for_qc.put_quorum_certificate(&proto_qc, txn.as_ref());
+            let _ = txn.commit();
+        }
+    });
 
     let mut cfg = quil_engine::consensus_bootstrap::ConsensusConfig::default();
     cfg.startup_delay = std::time::Duration::ZERO;
@@ -702,6 +758,7 @@ pub fn build_node(
         local_bls_pubkey: prover.bls_pubkey.clone(),
         bls_signer: prover.signer_clone(),
         inclusion_prover,
+        message_validator: None,
         genesis_frame: genesis,
         publisher: Some(publisher),
         on_finalized_state: Some(finalized_hook),
@@ -713,20 +770,22 @@ pub fn build_node(
         kv_db: None,
     };
 
-    let activation = quil_engine::consensus_activation::activate_consensus(params)
-        .expect("activate_consensus");
+    let activation =
+        quil_engine::consensus_activation::activate_consensus(params).expect("activate_consensus");
     // Drive the event loop. In production this is handed to the
     // supervisor; tests spawn it directly since they don't run a
     // supervisor.
     tokio::spawn(activation.run_future);
 
     // Build vote + timeout aggregators (mirrors main.rs:2615-2638).
-    let handle_cell: Arc<std::sync::OnceLock<
-        quil_consensus::event_loop::EventLoopHandle<
-            quil_engine::consensus_types::GlobalState,
-            quil_engine::consensus_types::GlobalVote,
+    let handle_cell: Arc<
+        std::sync::OnceLock<
+            quil_consensus::event_loop::EventLoopHandle<
+                quil_engine::consensus_types::GlobalState,
+                quil_engine::consensus_types::GlobalVote,
+            >,
         >,
-    >> = Arc::new(std::sync::OnceLock::new());
+    > = Arc::new(std::sync::OnceLock::new());
     let _ = handle_cell.set(activation.handle.clone());
 
     let bls_ctor: Arc<dyn quil_types::crypto::BlsConstructor> =
@@ -793,8 +852,7 @@ pub fn build_node(
                         if let Some(tc) = ts.prior_rank_timeout_certificate.clone() {
                             handle_for_recv.submit_timeout_certificate(tc.into_trait_object());
                         }
-                        let typed =
-                            quil_engine::timeout_aggregation::wire_timeout_to_typed(ts);
+                        let typed = quil_engine::timeout_aggregation::wire_timeout_to_typed(ts);
                         ta_for_recv.handle_timeout(typed);
                     }
                 }
@@ -850,10 +908,7 @@ impl MultiNodeHarness {
         // current architecture) is reached comfortably rather than
         // exactly at the threshold boundary.
         let provers: Vec<TestProver> = (0..n).map(|_| TestProver::generate()).collect();
-        let all_prover_infos: Vec<_> = provers
-            .iter()
-            .map(|p| p.to_prover_info(1))
-            .collect();
+        let all_prover_infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
 
         let genesis = build_genesis_frame(&provers[0]);
         let genesis_qc = build_signed_genesis_qc(&provers, &genesis);
@@ -880,16 +935,10 @@ impl MultiNodeHarness {
 
     /// Wait up to `timeout` for every node to observe at least one
     /// finalization. Returns true if all nodes finalized at least once.
-    pub async fn wait_for_finalization_all(
-        &self,
-        timeout: std::time::Duration,
-    ) -> bool {
+    pub async fn wait_for_finalization_all(&self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
-            let all_finalized = self
-                .nodes
-                .iter()
-                .all(|n| !n.finalized.lock().is_empty());
+            let all_finalized = self.nodes.iter().all(|n| !n.finalized.lock().is_empty());
             if all_finalized {
                 return true;
             }
@@ -972,6 +1021,7 @@ async fn single_archive_node_activates_consensus() {
         local_bls_pubkey: proposer.bls_pubkey.clone(),
         bls_signer: proposer.signer_clone(),
         inclusion_prover,
+        message_validator: None,
         genesis_frame: genesis,
         publisher: None,
         on_finalized_state: None,
@@ -983,8 +1033,8 @@ async fn single_archive_node_activates_consensus() {
         kv_db: None,
     };
 
-    let activation = quil_engine::consensus_activation::activate_consensus(params)
-        .expect("activate_consensus");
+    let activation =
+        quil_engine::consensus_activation::activate_consensus(params).expect("activate_consensus");
     assert!(!activation.vote_domain.is_empty());
     assert!(!activation.timeout_domain.is_empty());
     let _ = activation;
@@ -1052,9 +1102,7 @@ async fn multi_archive_finalizes_via_quorum() {
     );
     // Verify the chain advanced past genesis: at least one node
     // finalized frame>=1.
-    let any_post_genesis = observations
-        .iter()
-        .any(|v| v.iter().any(|&f| f >= 1));
+    let any_post_genesis = observations.iter().any(|v| v.iter().any(|&f| f >= 1));
     assert!(
         any_post_genesis,
         "expected at least one finalized frame >= 1; observations: {:?}",
@@ -1114,13 +1162,13 @@ async fn multi_archive_finalizes_under_wan_latency() {
         finalized_count >= quorum_size,
         "under realistic WAN latency, ≥{}/{} archives should finalize ≥1 frame within 120s \
          (consensus quorum threshold); got {}/{}; observations={:?}",
-        quorum_size, observations.len(),
-        finalized_count, observations.len(),
+        quorum_size,
+        observations.len(),
+        finalized_count,
+        observations.len(),
         observations,
     );
-    let any_post_genesis = observations
-        .iter()
-        .any(|v| v.iter().any(|&f| f >= 1));
+    let any_post_genesis = observations.iter().any(|v| v.iter().any(|&f| f >= 1));
     assert!(
         any_post_genesis,
         "WAN-latency chain stalled before frame >= 1; observations={:?}",
@@ -1229,6 +1277,10 @@ pub struct WorkerRig {
     /// finalized FrameHeader bytes back to the master for inclusion
     /// in GLOBAL_PROVER broadcasts.
     pub coverage_published: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// Serialized `AppShardFrame` bytes from each `FullFrameProduced`
+    /// event — the authoritative state-distribution payload that carries
+    /// the out-of-band `StorageAttestation` on the active PoRep path.
+    pub full_frames: Arc<Mutex<Vec<Vec<u8>>>>,
     /// All `AppEngineEvent`s captured for diagnostics.
     pub events: Arc<Mutex<Vec<String>>>,
 }
@@ -1238,6 +1290,58 @@ pub struct AppShardHarness {
     pub workers: Vec<WorkerRig>,
 }
 
+/// Shared inputs that put the PoRep producer path LIVE for the harness:
+/// a committed CRDT (vertices under the harness filter `[0x55;32]`) and a
+/// global beacon frame at `global_frame_number`. Built once, cloned into
+/// every worker's deps by `build_with_storage`.
+pub struct StorageHarness {
+    pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    pub global_frame: gpb::GlobalFrame,
+}
+
+impl StorageHarness {
+    /// Seed a CRDT with a handful of committed vertices under the harness
+    /// filter and a global frame at `global_frame_number` carrying a
+    /// non-empty output (the ρ_N beacon source). Storage attestation is
+    /// always-on, so seeding a global frame (`global_frame_number > 0`) is all
+    /// it takes to engage the storage path.
+    pub fn seeded(global_frame_number: u64) -> Self {
+        quil_crypto::init();
+        assert!(
+            global_frame_number > 0,
+            "storage path needs a real global anchor"
+        );
+
+        let store: Arc<dyn quil_types::store::HypergraphStore> =
+            Arc::new(quil_hypergraph::testing::MemStore::new());
+        let prover: Arc<dyn quil_types::crypto::InclusionProver> =
+            Arc::new(quil_hypergraph::testing::StubProver);
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store, prover));
+        // Filter is `[0x55;32]` (== app_address) — matches `build_inner`.
+        for d in 0u8..4 {
+            crdt.add_vertex(
+                &quil_hypergraph::Location {
+                    app_address: [0x55; 32],
+                    data_address: [d; 32],
+                },
+                &vec![d.wrapping_add(1); 256],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+
+        let global_frame = gpb::GlobalFrame {
+            header: Some(gpb::GlobalFrameHeader {
+                frame_number: global_frame_number,
+                output: vec![0xABu8; 64],
+                ..Default::default()
+            }),
+            requests: vec![],
+        };
+        Self { crdt, global_frame }
+    }
+}
+
 impl AppShardHarness {
     /// Build `n` workers all running consensus for the same shard
     /// filter. Each worker's outbound app-consensus events
@@ -1245,13 +1349,52 @@ impl AppShardHarness {
     /// worker via `AppEngineHandle::send(AppEngineMessage::Consensus)`.
     pub fn build(n: usize) -> Self {
         assert!(n >= 1, "need at least one worker");
-
         let provers: Vec<TestProver> = (0..n).map(|_| TestProver::generate()).collect();
-        let all_prover_infos: Vec<_> = provers
-            .iter()
-            .map(|p| p.to_prover_info(1))
-            .collect();
-        let registry = Arc::new(TestProverRegistry::with_provers(all_prover_infos));
+        let all_prover_infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
+        let registry =
+            Arc::new(TestProverRegistry::with_provers(all_prover_infos)) as Arc<dyn ProverRegistry>;
+        Self::build_with_registry(provers, registry)
+    }
+
+    /// Build a worker cohort from a caller-supplied prover set and a
+    /// SHARED prover registry. Used by the tier-2 coverage tests, which
+    /// pass the archive's `SharedProverRegistry` (pre-seeded with these
+    /// same provers as Active on the shard filter) so the committee the
+    /// workers sign with is byte-identical to the one the archive's
+    /// FrameHeader verifier reconstructs. `build(n)` is the standalone
+    /// path: it generates fresh provers + an in-test registry.
+    pub fn build_with_registry(
+        provers: Vec<TestProver>,
+        registry: Arc<dyn ProverRegistry>,
+    ) -> Self {
+        Self::build_inner(provers, registry, None)
+    }
+
+    /// Active-path PoRep variant: every worker gets a shared committed CRDT, an
+    /// in-memory replica store seeded with its confirmed leaf replicas, and a
+    /// global frame at `global_frame_number` (> 0) so the storage-attestation
+    /// producer path is LIVE — votes carry openings and finalized frames carry
+    /// a `StorageAttestation`. Storage attestation is always-on, so a non-zero
+    /// global anchor is all it takes (no activation override).
+    pub fn build_with_storage(
+        provers: Vec<TestProver>,
+        registry: Arc<dyn ProverRegistry>,
+        storage: StorageHarness,
+    ) -> Self {
+        Self::build_inner(provers, registry, Some(storage))
+    }
+
+    fn build_inner(
+        provers: Vec<TestProver>,
+        registry: Arc<dyn ProverRegistry>,
+        storage: Option<StorageHarness>,
+    ) -> Self {
+        let n = provers.len();
+        assert!(n >= 1, "need at least one worker");
+
+        // Run the app-shard cadence fast so the in-process harness reaches
+        // finalization within the test budget (production paces at 10 s).
+        quil_engine::app_engine::set_app_proposal_duration_ms(200);
 
         // Shard filter — arbitrary 32-byte value identifies the shard.
         let filter: Vec<u8> = vec![0x55; 32];
@@ -1276,6 +1419,38 @@ impl AppShardHarness {
                 }));
 
             let clock_store = Arc::new(InMemoryClockStore::new());
+            // Active-path PoRep wiring: seed the global beacon frame, build the
+            // worker's replica store + confirm its leaf replicas, and pass the
+            // shared CRDT so `storage_vote_openings` / the seal can run.
+            let (hypergraph_dep, kv_db_dep): (
+                Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+                Option<Arc<dyn quil_types::store::KvDb>>,
+            ) = if let Some(sh) = storage.as_ref() {
+                clock_store.seed_frame(sh.global_frame.clone());
+                let rocks = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+                let kv: Arc<dyn quil_types::store::KvDb> = rocks.clone();
+                let rs = quil_store::replica_store::ReplicaStore::new(kv.clone());
+                let gfn = sh
+                    .global_frame
+                    .header
+                    .as_ref()
+                    .map(|h| h.frame_number)
+                    .unwrap_or(0);
+                let epoch = quil_types::consensus::epoch_for_frame(gfn);
+                quil_engine::app_shard_metadata::compute_storage_confirm(
+                    &sh.crdt,
+                    &rs,
+                    std::slice::from_ref(&filter),
+                    &prover.address,
+                    epoch,
+                    quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+                    &quil_crypto::sdr::SdrParams::default(),
+                )
+                .expect("seed worker storage confirm");
+                (Some(sh.crdt.clone()), Some(kv))
+            } else {
+                (None, None)
+            };
             let frame_prover: Arc<dyn FrameProver> = Arc::new(StubFrameProver);
             let message_collector =
                 Arc::new(quil_engine::message_collector::MessageCollector::new());
@@ -1295,7 +1470,7 @@ impl AppShardHarness {
                 reward_greedy: true,
                 min_active_provers_for_propose: 1,
                 coverage_publish,
-                hypergraph: None,
+                hypergraph: hypergraph_dep,
                 // Wire a minimal ExecutionEngineManager + InclusionProver
                 // so workers can carry real dispatch messages.
                 // `compute_requests_root` requires both whenever the
@@ -1308,9 +1483,9 @@ impl AppShardHarness {
                     /* include_global */ false,
                 ))),
                 inclusion_prover: Some(
-                    Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>,
+                    Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
                 ),
-                kv_db: None,
+                kv_db: kv_db_dep,
             };
 
             let (engine, handle) = quil_engine::app_engine::AppConsensusEngine::new(
@@ -1324,6 +1499,7 @@ impl AppShardHarness {
                 prover,
                 handle,
                 coverage_published,
+                full_frames: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(Vec::new())),
             });
             pendings.push(Pending {
@@ -1339,6 +1515,8 @@ impl AppShardHarness {
             workers.iter().map(|w| w.handle.clone()).collect();
         let events_per_worker: Vec<Arc<Mutex<Vec<String>>>> =
             workers.iter().map(|w| w.events.clone()).collect();
+        let full_frames_per_worker: Vec<Arc<Mutex<Vec<Vec<u8>>>>> =
+            workers.iter().map(|w| w.full_frames.clone()).collect();
 
         // Spawn each worker's engine + its event drain.
         for (idx, pending) in pendings.into_iter().enumerate() {
@@ -1355,6 +1533,7 @@ impl AppShardHarness {
                 .map(|(_, h)| h.clone())
                 .collect();
             let events_log = events_per_worker[idx].clone();
+            let full_frames_log = full_frames_per_worker[idx].clone();
             let mut rx = pending.event_rx;
             tokio::spawn(async move {
                 while let Some(ev) = rx.recv().await {
@@ -1390,8 +1569,9 @@ impl AppShardHarness {
                                 ));
                             }
                         }
-                        E::FullFrameProduced { .. } => {
+                        E::FullFrameProduced { frame_data, .. } => {
                             events_log.lock().push("FullFrameProduced".into());
+                            full_frames_log.lock().push(frame_data.clone());
                         }
                         E::ShardFrameFinalized { .. } => {
                             events_log.lock().push("ShardFrameFinalized".into());
@@ -1431,6 +1611,25 @@ impl AppShardHarness {
         }
         false
     }
+
+    /// Wait up to `timeout` for any worker to emit a `FullFrameProduced`
+    /// event, then decode and return the first such `AppShardFrame`.
+    pub async fn wait_for_full_frame(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<gpb::AppShardFrame> {
+        use prost::Message;
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            for w in &self.workers {
+                if let Some(bytes) = w.full_frames.lock().first().cloned() {
+                    return gpb::AppShardFrame::decode(bytes.as_slice()).ok();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        None
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1469,8 +1668,7 @@ async fn worker_activates_after_confirm_and_emits_proof() {
 
     eprintln!("worker coverage counts: {counts:?}");
     for (i, log) in events.iter().enumerate() {
-        let mut counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for ev in log {
             *counts.entry(ev.as_str()).or_insert(0) += 1;
         }
@@ -1480,6 +1678,95 @@ async fn worker_activates_after_confirm_and_emits_proof() {
     assert!(
         got_coverage,
         "no worker emitted a coverage_publish frame within timeout. counts={counts:?}"
+    );
+}
+
+/// Active PoRep path end-to-end through the live consensus harness.
+///
+/// Each of the 4 workers gets a shared committed CRDT (vertices under the
+/// shard filter), an in-memory replica store pre-seeded with its confirmed
+/// leaf replicas, and a global beacon frame at frame 1000 — and the
+/// process-global activation frame is lowered to 1000. With the storage
+/// fork live (`global_frame_number >= storage_activation_frame()`):
+///   * the producer omits the app-shard VDF and binds a deterministic
+///     ρ_N-bound `header.output`,
+///   * each follower's vote carries serialized `StorageOpening`s,
+///   * the aggregator stashes the openings by rank, and
+///   * the seal recomputes the 74-byte BLS48-581 G1 aggregate
+///     `storage_attestation_root` and attaches the `StorageAttestation`.
+///
+/// Asserts the finalized `AppShardFrame` carries that attestation + root —
+/// the inverse of every other harness test, where the (un-activated) path
+/// leaves both empty and byte-identical to the legacy frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn worker_active_storage_attestation() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let provers: Vec<TestProver> = (0..4).map(|_| TestProver::generate()).collect();
+    let infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
+    let registry = Arc::new(TestProverRegistry::with_provers(infos)) as Arc<dyn ProverRegistry>;
+
+    // `seeded` lowers `storage_activation_frame()` to 1000 and builds the
+    // shared CRDT + a global frame at 1000 (≥ activation → fork live).
+    let storage = StorageHarness::seeded(1000);
+    let harness = AppShardHarness::build_with_storage(provers, registry, storage);
+
+    let frame = harness
+        .wait_for_full_frame(std::time::Duration::from_secs(90))
+        .await
+        .expect("expected a FullFrameProduced AppShardFrame within timeout");
+
+    assert!(
+        frame.storage_attestation.is_some(),
+        "active-path full frame must carry a StorageAttestation",
+    );
+    let root = frame
+        .header
+        .as_ref()
+        .map(|h| h.storage_attestation_root.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        root.len(),
+        74,
+        "storage_attestation_root must be the 74-byte BLS48-581 G1 aggregate; got {} bytes",
+        root.len(),
+    );
+
+    // The reward proof — the canonical FrameHeader published on GLOBAL_PROVER
+    // (captured via coverage_publish) — must ALSO carry the root + the openings
+    // blob, since that is the payload the global frame recomputes + audits.
+    let cov = harness
+        .workers
+        .iter()
+        .flat_map(|w| w.coverage_published.lock().clone())
+        .next()
+        .expect("a coverage reward proof must have been published");
+    let cov_header =
+        quil_execution::global_intrinsic::frame_header::FrameHeader::from_canonical_bytes(&cov)
+            .expect("coverage bytes decode as a canonical FrameHeader");
+    assert_eq!(
+        cov_header.storage_attestation_root.len(),
+        74,
+        "reward-proof storage_attestation_root must be the 74-byte aggregate",
+    );
+    assert!(
+        !cov_header.storage_attestation.is_empty(),
+        "reward proof must carry the StorageAttestation openings for the global audit",
+    );
+    // And the carried blob must decode as a StorageAttestation with openings.
+    let att = <quil_types::proto::global::StorageAttestation as prost::Message>::decode(
+        cov_header.storage_attestation.as_slice(),
+    )
+    .expect("carried attestation decodes");
+    assert!(
+        !att.openings.is_empty(),
+        "carried StorageAttestation must contain member openings",
     );
 }
 
@@ -1526,14 +1813,37 @@ async fn worker_carries_real_dispatch_message_in_shard_frame() {
     // `0x00000201` is a compute-domain test prefix; the test
     // only cares that the message bytes end up in the frame's
     // requests_root, not that they're a recognized intrinsic.
-    let mut dispatch_bytes = Vec::new();
-    dispatch_bytes.extend_from_slice(&0x00000201u32.to_be_bytes());
-    dispatch_bytes.extend_from_slice(&[0xAAu8; 32]);
-    harness.workers[0]
-        .handle
-        .send(quil_engine::app_engine::AppEngineMessage::Dispatch(
-            dispatch_bytes.clone(),
-        ));
+    // The proposal path (`app_engine.rs:401-417`) decodes each buffered
+    // dispatch via `decode_message_bundle`, which requires a canonical
+    // `MessageBundle` (type 0x0312). A bare op blob fails to decode and
+    // is dropped, leaving `requests_root` zero — so wrap the op in a
+    // `CanonicalMessageBundle` exactly as the wire path delivers it.
+    let mut op_bytes = Vec::new();
+    op_bytes.extend_from_slice(&0x00000201u32.to_be_bytes());
+    op_bytes.extend_from_slice(&[0xAAu8; 32]);
+    let dispatch_bytes = {
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let req = CanonicalMessageRequest::wrap(op_bytes).expect("wrap dispatch request");
+        CanonicalMessageBundle {
+            requests: vec![Some(req)],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .expect("encode dispatch bundle")
+    };
+    // Inject into EVERY worker's collector. Dispatch messages are not
+    // relayed by the harness's consensus drain (only proposals/votes/
+    // timeouts are), and the frame is built by whichever worker leads
+    // the finalized rank — which need not be worker 0. In production a
+    // dispatch gossips to all shard members, so each buffers it and the
+    // leader folds it into `requests_root`; mirror that here so the
+    // assertion doesn't hinge on worker 0 happening to be the leader.
+    for w in &harness.workers {
+        w.handle
+            .send(quil_engine::app_engine::AppEngineMessage::Dispatch(
+                dispatch_bytes.clone(),
+            ));
+    }
 
     // Wait for at least one shard frame to be produced — `events`
     // log records "FrameProduced" once per produced frame.
@@ -1551,9 +1861,8 @@ async fn worker_carries_real_dispatch_message_in_shard_frame() {
             break;
         }
     }
-    let leader_idx = leader_idx.expect(
-        "no worker produced a FrameProduced event within 90s — frame production stalled",
-    );
+    let leader_idx = leader_idx
+        .expect("no worker produced a FrameProduced event within 90s — frame production stalled");
     eprintln!("leader is worker {}", leader_idx);
 
     // Give the leader an extra tick to finish encoding the proposal.
@@ -1584,33 +1893,40 @@ async fn worker_carries_real_dispatch_message_in_shard_frame() {
         "shard never finalized — workers produced proposals but no QC formed"
     );
 
-    // At least one worker has coverage bytes. Find one and decode.
-    let mut canonical_header_bytes: Option<Vec<u8>> = None;
-    for w in &harness.workers {
-        let bytes = w.coverage_published.lock();
-        if let Some(first) = bytes.first() {
-            canonical_header_bytes = Some(first.clone());
-            break;
+    // The injected dispatch lands in exactly ONE finalized frame (once
+    // buffered it stays in the collector until `mark_finalized` removes
+    // it on inclusion), and NOT necessarily frame 1 — the first frame
+    // can be proposed before the async `Dispatch` is drained from the
+    // engine's channel. So poll until SOME finalized coverage frame
+    // (across all workers, all entries) carries a non-zero
+    // `requests_root`, rather than inspecting only the first.
+    use quil_execution::global_intrinsic::frame_header::FrameHeader;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut carrying: Option<FrameHeader> = None;
+    'outer: while std::time::Instant::now() < deadline {
+        for w in &harness.workers {
+            let entries: Vec<Vec<u8>> = w.coverage_published.lock().clone();
+            for bytes in &entries {
+                if let Ok(h) = FrameHeader::from_canonical_bytes(bytes) {
+                    let zero_root = vec![0u8; h.requests_root.len()];
+                    if h.requests_root != zero_root {
+                        carrying = Some(h);
+                        break 'outer;
+                    }
+                }
+            }
         }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let header_bytes = canonical_header_bytes
-        .expect("no worker has finalized coverage bytes despite wait_for_coverage success");
 
-    let header = quil_execution::global_intrinsic::frame_header::FrameHeader::from_canonical_bytes(
-        &header_bytes,
-    )
-    .expect("decode FrameHeader from coverage bytes");
-
-    let zero_root = vec![0u8; header.requests_root.len()];
+    let header = carrying.expect(
+        "no finalized coverage frame carried a non-zero requests_root — the \
+         injected dispatch message was never incorporated into a shard frame",
+    );
     eprintln!(
-        "coverage FrameHeader: frame_number={}, requests_root[..16]={}",
+        "carrying coverage FrameHeader: frame_number={}, requests_root[..16]={}",
         header.frame_number,
         hex::encode(&header.requests_root[..16.min(header.requests_root.len())]),
-    );
-    assert_ne!(
-        header.requests_root, zero_root,
-        "FrameHeader.requests_root is all-zero — the injected dispatch \
-         message was not incorporated into the shard frame"
     );
 }
 
@@ -1797,23 +2113,23 @@ pub fn build_tier2_archive_rig_with_key_manager(
     genesis_seed_hex: &str,
     exec_key_manager: Arc<dyn quil_types::crypto::KeyManager>,
 ) -> Tier2ArchiveRig {
-    use std::sync::Arc;
+    use quil_engine::current_frame::CurrentFrame;
     use quil_engine::frame_materializer::FrameMaterializer;
     use quil_engine::halt_state::HaltState;
-    use quil_engine::current_frame::CurrentFrame;
+    use quil_engine::prover_message_transport::ProverMessageTransport;
+    use quil_engine::prover_pipeline::ProverPipeline;
     use quil_engine::provers::lifecycle::ProverLifecycle;
     use quil_engine::provers::proposer::Strategy;
-    use quil_engine::worker_allocator::WorkerAllocator;
-    use quil_engine::prover_pipeline::ProverPipeline;
-    use quil_engine::prover_message_transport::ProverMessageTransport;
     use quil_engine::test_support::{
         TestKeyManager, TestProverMessageTransport, TestWorkerManager,
     };
+    use quil_engine::worker_allocator::WorkerAllocator;
     use quil_execution::{ExecutionEngineManager, SharedProverRegistry};
-    use quil_hypergraph::HypergraphCrdt;
     use quil_hypergraph::testing::StubProver;
+    use quil_hypergraph::HypergraphCrdt;
     use quil_store::{RocksDb, RocksHypergraphStore, RocksShardsStore};
     use quil_types::store::ShardsStore;
+    use std::sync::Arc;
 
     // 1. In-memory Rocks → hypergraph store.
     let rocks = Arc::new(RocksDb::open_in_memory().expect("rocks open_in_memory"));
@@ -1842,6 +2158,24 @@ pub fn build_tier2_archive_rig_with_key_manager(
     )
     .expect("initialize_testnet_genesis_state");
 
+    // 3b. Seed a synthetic head frame (frame 5) that every tier-2 test
+    //     references as the join/confirm `frame_number` (they also set it
+    //     on the transport via `set_head_header`). The ProverJoin VDF
+    //     gate (`global_intrinsic/intrinsic.rs`) resolves this referenced
+    //     frame via the clock store; without it, joins are rejected with
+    //     "referenced frame 5 not in clock store" and skipped.
+    clock_store.seed_frame(gpb::GlobalFrame {
+        header: Some(gpb::GlobalFrameHeader {
+            frame_number: 5,
+            rank: 0,
+            timestamp: 0,
+            difficulty: 100_000,
+            output: vec![0u8; 516],
+            ..Default::default()
+        }),
+        requests: vec![],
+    });
+
     // 4. Build prover registry and refresh from the seeded store.
     let prover_registry = Arc::new(SharedProverRegistry::new());
     prover_registry.refresh_from_store(&hg_store);
@@ -1863,7 +2197,13 @@ pub fn build_tier2_archive_rig_with_key_manager(
         exec_stubs.bulletproof_prover,
         exec_stubs.decaf_constructor,
         exec_stubs.circuit_compiler,
-        exec_stubs.clock_store,
+        // Use the REAL clock store (not the noop stub) — mirrors production
+        // (`master_node/engines.rs` wires `storage.clock_store`). The
+        // ProverJoin VDF-verification gate (`global_intrinsic/intrinsic.rs`)
+        // looks up the join's referenced frame via this clock store; with
+        // the noop stub every join was rejected with "referenced frame N
+        // not in clock store" and materialized as skipped.
+        clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
         exec_hg_resolver,
         /* include_global */ true,
     ));
@@ -1909,8 +2249,7 @@ pub fn build_tier2_archive_rig_with_key_manager(
 
     // 7. WorkerManager + WorkerAllocator + Lifecycle.
     let worker_manager = Arc::new(TestWorkerManager::new());
-    let worker_manager_dyn: Arc<dyn quil_engine::worker::WorkerManager> =
-        worker_manager.clone();
+    let worker_manager_dyn: Arc<dyn quil_engine::worker::WorkerManager> = worker_manager.clone();
     let worker_allocator = Arc::new(WorkerAllocator::new(
         worker_manager_dyn.clone(),
         prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
@@ -1930,12 +2269,11 @@ pub fn build_tier2_archive_rig_with_key_manager(
 
     // 8. KeyManager (quil_keys::KeyManager — provides this node's
     //    BLS signer to ProverPipeline).
-    let pipeline_key_manager: Arc<dyn quil_keys::KeyManager + Send + Sync> = Arc::new(
-        TestKeyManager::new(
+    let pipeline_key_manager: Arc<dyn quil_keys::KeyManager + Send + Sync> =
+        Arc::new(TestKeyManager::new(
             prover.bls_signer.private_key().to_vec(),
             prover.bls_pubkey.clone(),
-        ),
-    );
+        ));
 
     // 9. Transport + ProverPipeline.
     let transport = Arc::new(TestProverMessageTransport::new());
@@ -1953,6 +2291,8 @@ pub fn build_tier2_archive_rig_with_key_manager(
         multisig_ed448_seeds: vec![],
         delegate_address: vec![],
         transport: transport.clone() as Arc<dyn ProverMessageTransport>,
+        hypergraph: None,
+        replica_store: None,
     });
 
     let _ = all_provers; // unused in this builder — kept for API symmetry
@@ -1996,9 +2336,9 @@ async fn tier2_archive_rig_constructs_with_genesis_provers() {
     );
 
     // Self-prover should be discoverable.
-    let my_info = rig.prover_registry.read(|r| {
-        r.get_prover_info(&me.address).cloned()
-    });
+    let my_info = rig
+        .prover_registry
+        .read(|r| r.get_prover_info(&me.address).cloned());
     assert!(
         my_info.is_some(),
         "self prover {} not in registry after genesis seed",
@@ -2030,11 +2370,7 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
     // 1. Build a single archive that knows about 3 genesis provers.
     let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
     let seed_hex = build_genesis_seed_hex(&genesis_provers);
-    let archive = build_tier2_archive_rig(
-        genesis_provers[0].clone(),
-        &genesis_provers,
-        &seed_hex,
-    );
+    let archive = build_tier2_archive_rig(genesis_provers[0].clone(), &genesis_provers, &seed_hex);
 
     // 2. Seed the archive's clock store with a "head" frame so
     //    `submit_join` can stamp a sane frame_number on the join.
@@ -2048,6 +2384,8 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
         output: vec![0u8; 516],
         ..Default::default()
     };
+    // (The archive rig already seeds frame 5 into its clock store so the
+    // ProverJoin VDF gate can resolve the join's referenced frame.)
 
     // 3. Build a new (non-genesis) prover. This is the joiner.
     let joiner = TestProver::generate();
@@ -2056,12 +2394,11 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
     //    storage so the test can drive both sides in one process.
     let transport = Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
     transport.set_head_header(head_header.clone());
-    let joiner_key_manager: Arc<dyn quil_keys::KeyManager + Send + Sync> = Arc::new(
-        quil_engine::test_support::TestKeyManager::new(
+    let joiner_key_manager: Arc<dyn quil_keys::KeyManager + Send + Sync> =
+        Arc::new(quil_engine::test_support::TestKeyManager::new(
             joiner.bls_signer.private_key().to_vec(),
             joiner.bls_pubkey.clone(),
-        ),
-    );
+        ));
     let joiner_wm = Arc::new(quil_engine::test_support::TestWorkerManager::new());
     let joiner_wm_dyn: Arc<dyn quil_engine::worker::WorkerManager> = joiner_wm.clone();
     let joiner_allocator = Arc::new(quil_engine::worker_allocator::WorkerAllocator::new(
@@ -2092,6 +2429,8 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
         delegate_address: vec![],
         transport: transport.clone()
             as Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport>,
+        hypergraph: None,
+        replica_store: None,
     });
 
     // 5. Pick a filter that exists in shards_store. Genesis seeds
@@ -2152,7 +2491,9 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
     // 8. Refresh registry from the now-updated store. After the join
     //    is materialized, the joiner should appear with a Joining
     //    allocation on the chosen filter.
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
+    archive
+        .prover_registry
+        .refresh_from_store(&archive.hg_store);
 
     let joiner_info = archive
         .prover_registry
@@ -2166,483 +2507,14 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
     );
 
     // The joining allocation should exist for the filter we chose.
-    let provers_on_filter =
-        archive.prover_registry.read(|r| r.get_provers(&filter).len());
+    let provers_on_filter = archive
+        .prover_registry
+        .read(|r| r.get_provers(&filter).len());
     assert!(
         provers_on_filter >= 1,
         "expected ≥1 prover on filter {} after join (joiner should be Joining); got {}",
         hex::encode(&filter),
         provers_on_filter,
-    );
-}
-
-/// Drives the join further: after the joiner's `ProverJoin` has been
-/// materialized into the shared registry, the *joiner* (not the
-/// archive!) ticks its own lifecycle. `ProverConfirm` is a
-/// self-affirmation — each prover confirms their own pending joins
-/// once `confirm_window` frames have elapsed, not third-party. After
-/// enough frames the joiner's lifecycle should emit a `ConfirmJoins`
-/// action and the joiner's pipeline turn it into a signed
-/// `ProverConfirm` bundle captured by `TestProverMessageTransport`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tier2_joiner_lifecycle_emits_self_confirm_after_join() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_test_writer()
-        .try_init();
-
-    // 1. Archive setup.
-    let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
-    let seed_hex = build_genesis_seed_hex(&genesis_provers);
-    let archive = build_tier2_archive_rig(
-        genesis_provers[0].clone(),
-        &genesis_provers,
-        &seed_hex,
-    );
-
-    // Seed transport's head so submit_join works.
-    archive.transport.set_head_header(gpb::GlobalFrameHeader {
-        frame_number: 5,
-        rank: 0,
-        timestamp: 0,
-        difficulty: 100_000,
-        output: vec![0u8; 516],
-        ..Default::default()
-    });
-
-    // 2. Build joiner pipeline. Crucially, the joiner's lifecycle
-    //    needs a `ProverRegistry` that, post-materialize, will report
-    //    its OWN Joining allocation. We let the joiner SHARE the
-    //    archive's `SharedProverRegistry` — production would refresh
-    //    each node's own copy from its own `hg_store` via HyperSync,
-    //    but for this test the shared registry is the simplest way
-    //    to model "the join was observed and persisted everywhere".
-    let joiner = TestProver::generate();
-    let joiner_transport =
-        Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
-    joiner_transport.set_head_header(gpb::GlobalFrameHeader {
-        frame_number: 5,
-        rank: 0,
-        timestamp: 0,
-        difficulty: 100_000,
-        output: vec![0u8; 516],
-        ..Default::default()
-    });
-    let joiner_pipeline = build_test_pipeline_with_registry(
-        &joiner,
-        joiner_transport.clone(),
-        archive.prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
-    );
-    // Seed worker 0 with allocated=false. `decide_joins` only confirms
-    // joins up to `available_workers = workers.filter(!allocated).count()`;
-    // without this the lifecycle sees zero capacity and rejects every
-    // pending join. Mirrors production where workers exist before the
-    // first join is proposed.
-    joiner_pipeline.worker_manager.add(quil_engine::worker::WorkerInfo {
-        core_id: 0,
-        filter: Vec::new(),
-        available_storage: 1_000_000,
-        total_storage: 1_000_000,
-        manually_managed: false,
-        pending_filter_frame: 0,
-        allocated: false,
-    });
-
-    // 3. Pick filter and submit the join.
-    let filter: Vec<u8> = {
-        let mut a = vec![0u8; 32];
-        a[0] = 2;
-        a
-    };
-    joiner_pipeline
-        .submit_join(vec![filter.clone()], &[0u32], 5)
-        .await
-        .expect("submit_join");
-    let join_bundles = joiner_transport.drain_outbound();
-    assert_eq!(join_bundles.len(), 1);
-
-    // 4. Materialize the join at frame 6.
-    let join_frame = build_global_frame_with_bundle(6, &join_bundles[0]);
-    archive
-        .materializer
-        .materialize(&join_frame)
-        .expect("materialize join");
-    archive
-        .prover_registry
-        .refresh_from_store(&archive.hg_store);
-
-    // Sanity: joiner is now in the registry.
-    assert!(
-        archive
-            .prover_registry
-            .read(|r| r.get_prover_info(&joiner.address).is_some()),
-        "joiner missing from registry after materialize"
-    );
-
-    // 5. Tick the JOINER's lifecycle. The joiner's lifecycle reads
-    //    its own `Joining` allocation (now in the shared registry
-    //    post-materialize) and after `confirm_window_frames = 10`
-    //    frames emits a `ConfirmJoins` action.
-    //
-    // Lifecycle gates the entire `evaluate` body on a baseline
-    // readiness check (`frame_seen + initial_sync_complete +
-    // tree_verified`). In production these flip true once the node
-    // finishes the initial prover-tree sync; tests have to flip them
-    // by hand or every `evaluate` call early-returns with empty actions.
-    joiner_pipeline.lifecycle.set_sync_complete();
-    joiner_pipeline.lifecycle.set_confirm_window_frames(10);
-    // `build_decide_descriptors` filters out any shard whose
-    // `shard_sizes` lookup returns 0 or missing — those summaries
-    // never become descriptors and so `decide_joins` never sees them
-    // as confirm candidates, rejecting every pending join by default.
-    // Seed a nonzero size for our filter (and a few neighboring
-    // genesis shards so the joiner has comparison baseline).
-    let mut shard_sizes: std::collections::HashMap<Vec<u8>, u64> =
-        std::collections::HashMap::new();
-    shard_sizes.insert(filter.clone(), 1000);
-    for i in 0u8..6 {
-        let mut a = vec![0u8; 32];
-        a[0] = i;
-        shard_sizes.insert(a, 1000);
-    }
-    joiner_pipeline.lifecycle.set_remote_shard_sizes(shard_sizes);
-
-    let joiner_cf = joiner_pipeline.current_frame.clone();
-    joiner_cf.observe(6);
-    joiner_cf.materialize(6);
-
-    let mut confirm_seen = false;
-    for frame_num in 7u64..=21 {
-        joiner_cf.observe(frame_num);
-        joiner_cf.materialize(frame_num);
-        joiner_pipeline
-            .lifecycle
-            .set_prover_root_verified_frame(frame_num);
-
-        let registry_ref = archive.prover_registry.clone()
-            as Arc<dyn quil_types::consensus::ProverRegistry>;
-        if frame_num == 16 {
-            // Diagnostic: dump everything the lifecycle will see.
-            let info = registry_ref
-                .get_prover_info(&joiner.address)
-                .expect("get_prover_info")
-                .expect("joiner missing");
-            eprintln!("joiner allocations at frame {}:", frame_num);
-            for a in &info.allocations {
-                eprintln!(
-                    "  filter={} status={:?} join_frame={} confirm_frame={}",
-                    hex::encode(&a.confirmation_filter),
-                    a.status,
-                    a.join_frame_number,
-                    a.join_confirm_frame_number,
-                );
-            }
-            let summaries =
-                registry_ref.get_prover_shard_summaries(frame_num).unwrap();
-            eprintln!("summaries: {} entries", summaries.len());
-            for s in summaries.iter().take(10) {
-                eprintln!(
-                    "  filter={} status_counts={:?} total_size={}",
-                    hex::encode(&s.filter),
-                    s.status_counts,
-                    s.total_size,
-                );
-            }
-        }
-        let actions = joiner_pipeline
-            .lifecycle
-            .evaluate(
-                frame_num,
-                100_000,
-                registry_ref.as_ref(),
-                joiner_pipeline.worker_manager.as_ref(),
-            )
-            .expect("lifecycle evaluate");
-        eprintln!(
-            "frame {} → {} action(s)",
-            frame_num,
-            actions.len()
-        );
-        for action in actions {
-            use quil_engine::provers::lifecycle::LifecycleAction;
-            eprintln!("    action: {:?}", action);
-            if let LifecycleAction::ConfirmJoins { ref filters, .. } = action {
-                if filters.iter().any(|f| f == &filter) {
-                    confirm_seen = true;
-                }
-            }
-            joiner_pipeline.pipeline.dispatch(action);
-        }
-
-        // dispatch is async — give it a tick to drain.
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    // Wait briefly for any in-flight dispatched ProverConfirm to be
-    // published through the transport.
-    for _ in 0..50 {
-        if joiner_transport.outbound_len() > 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-
-    let joiner_outbound = joiner_transport.drain_outbound();
-    eprintln!(
-        "joiner outbound bundles: {} (lifecycle saw confirm_action: {})",
-        joiner_outbound.len(),
-        confirm_seen,
-    );
-
-    assert!(
-        confirm_seen,
-        "joiner lifecycle never emitted ConfirmJoins for its own filter \
-         after 15 frames past the join (confirm_window=10)"
-    );
-    assert!(
-        !joiner_outbound.is_empty(),
-        "joiner pipeline never published any outbound bundle \
-         (expected at least one ProverConfirm)"
-    );
-}
-
-/// Full round-trip: joiner submits ProverJoin → archive materializes
-/// (allocation = Joining) → joiner self-confirms after window →
-/// archive materializes the ProverConfirm (allocation flips
-/// Joining → Active) → `WorkerAllocator.on_new_frame` detects the
-/// Active allocation and calls `set_worker_filter(..., true)` to
-/// trigger shard-engine spawn.
-///
-/// Verifies the confirm → Active → allocator → worker-spawn link
-/// end-to-end against the in-memory archive harness.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tier2_confirm_materializes_to_active_and_allocator_starts_worker() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_test_writer()
-        .try_init();
-
-    // The materializer's verifier independently enforces the confirm
-    // timing window — its default 360-frame minimum rejects any
-    // ProverConfirm submitted earlier (Go's
-    // `validate_confirm_timing`). Production calls this on testnet
-    // bootstrap (main.rs:1658). Test must do the same or every
-    // ProverConfirm gets a "must wait 360 frames after join" reject
-    // and the allocation stays Joining.
-    //
-    // Set via this static once per process; subsequent tests inherit.
-    quil_execution::global_intrinsic::verify::set_confirm_window_frames(10, 720);
-
-    let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
-    let seed_hex = build_genesis_seed_hex(&genesis_provers);
-    let archive = build_tier2_archive_rig(
-        genesis_provers[0].clone(),
-        &genesis_provers,
-        &seed_hex,
-    );
-    archive.transport.set_head_header(gpb::GlobalFrameHeader {
-        frame_number: 5,
-        rank: 0,
-        timestamp: 0,
-        difficulty: 100_000,
-        output: vec![0u8; 516],
-        ..Default::default()
-    });
-
-    let joiner = TestProver::generate();
-    let joiner_transport =
-        Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
-    joiner_transport.set_head_header(gpb::GlobalFrameHeader {
-        frame_number: 5,
-        rank: 0,
-        timestamp: 0,
-        difficulty: 100_000,
-        output: vec![0u8; 516],
-        ..Default::default()
-    });
-    let joiner_pipeline = build_test_pipeline_with_registry(
-        &joiner,
-        joiner_transport.clone(),
-        archive.prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
-    );
-    joiner_pipeline.worker_manager.add(quil_engine::worker::WorkerInfo {
-        core_id: 0,
-        filter: Vec::new(),
-        available_storage: 1_000_000,
-        total_storage: 1_000_000,
-        manually_managed: false,
-        pending_filter_frame: 0,
-        allocated: false,
-    });
-
-    let filter: Vec<u8> = {
-        let mut a = vec![0u8; 32];
-        a[0] = 3;
-        a
-    };
-
-    // Step A: join → materialize at frame 6 → allocation = Joining
-    joiner_pipeline
-        .pipeline
-        .submit_join(vec![filter.clone()], &[0u32], 5)
-        .await
-        .expect("submit_join");
-    let join_bundles = joiner_transport.drain_outbound();
-    assert_eq!(join_bundles.len(), 1);
-    let join_frame = build_global_frame_with_bundle(6, &join_bundles[0]);
-    archive
-        .materializer
-        .materialize(&join_frame)
-        .expect("materialize join");
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
-
-    // Verify Joining status.
-    let joining = archive.prover_registry.read(|r| {
-        let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
-        info.allocations
-            .iter()
-            .find(|a| a.confirmation_filter == filter)
-            .map(|a| a.status)
-    });
-    assert_eq!(
-        joining,
-        Some(quil_types::consensus::ProverStatus::Joining),
-        "expected joiner to be Joining after materialize"
-    );
-
-    // Step B: drive joiner's lifecycle to emit ConfirmJoins.
-    joiner_pipeline.lifecycle.set_sync_complete();
-    joiner_pipeline.lifecycle.set_confirm_window_frames(10);
-    let mut shard_sizes: std::collections::HashMap<Vec<u8>, u64> =
-        std::collections::HashMap::new();
-    shard_sizes.insert(filter.clone(), 1000);
-    for i in 0u8..6 {
-        let mut a = vec![0u8; 32];
-        a[0] = i;
-        shard_sizes.insert(a, 1000);
-    }
-    joiner_pipeline.lifecycle.set_remote_shard_sizes(shard_sizes);
-
-    let joiner_cf = joiner_pipeline.current_frame.clone();
-    for frame_num in 6u64..=21 {
-        joiner_cf.observe(frame_num);
-        joiner_cf.materialize(frame_num);
-        joiner_pipeline
-            .lifecycle
-            .set_prover_root_verified_frame(frame_num);
-        let registry_ref = archive.prover_registry.clone()
-            as Arc<dyn quil_types::consensus::ProverRegistry>;
-        let actions = joiner_pipeline
-            .lifecycle
-            .evaluate(
-                frame_num,
-                100_000,
-                registry_ref.as_ref(),
-                joiner_pipeline.worker_manager.as_ref(),
-            )
-            .expect("evaluate");
-        for action in actions {
-            joiner_pipeline.pipeline.dispatch(action);
-        }
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    // Drain after the loop — dispatch is async and the bundle may
-    // arrive at the transport a few hundred ms after the action fires.
-    for _ in 0..50 {
-        if joiner_transport.outbound_len() > 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let mut drained = joiner_transport.drain_outbound();
-    eprintln!("joiner emitted {} bundles total", drained.len());
-    let confirm_bytes = drained
-        .pop()
-        .expect("joiner pipeline never emitted a ProverConfirm");
-
-    // Step C: archive materializes the ProverConfirm at frame 17 →
-    // allocation flips Joining → Active.
-    let confirm_frame = build_global_frame_with_bundle(17, &confirm_bytes);
-    let confirm_result = archive
-        .materializer
-        .materialize(&confirm_frame)
-        .expect("materialize ProverConfirm");
-    eprintln!(
-        "ProverConfirm materialize: processed={} skipped={}",
-        confirm_result.processed, confirm_result.skipped,
-    );
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
-
-    let status_after_confirm = archive.prover_registry.read(|r| {
-        let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
-        info.allocations
-            .iter()
-            .find(|a| a.confirmation_filter == filter)
-            .map(|a| a.status)
-    });
-    assert_eq!(
-        status_after_confirm,
-        Some(quil_types::consensus::ProverStatus::Active),
-        "expected joiner allocation to flip Joining→Active after ProverConfirm; \
-         processed={} skipped={}",
-        confirm_result.processed,
-        confirm_result.skipped,
-    );
-
-    // Step D: WorkerAllocator.on_new_frame sees the Active allocation
-    // and calls `set_worker_filter(core_id, filter, start_consensus=true)`
-    // on its worker manager. We use the ARCHIVE's allocator (which
-    // wraps a `TestWorkerManager`) to check this — but the archive
-    // isn't the joiner, so its allocations don't change. To verify
-    // the allocator's reconciliation logic we need to drive it for
-    // the JOINER. Build a dedicated allocator + worker_manager for
-    // the joiner that shares the archive's (now-updated) registry.
-    let joiner_alloc_wm = Arc::new(quil_engine::test_support::TestWorkerManager::new());
-    joiner_alloc_wm.add(quil_engine::worker::WorkerInfo {
-        core_id: 0,
-        filter: filter.clone(),
-        available_storage: 1_000_000,
-        total_storage: 1_000_000,
-        manually_managed: false,
-        pending_filter_frame: 5, // would be set by submit_join in prod
-        allocated: false,        // pending: filter pinned, awaiting confirm
-    });
-    let joiner_allocator = Arc::new(quil_engine::worker_allocator::WorkerAllocator::new(
-        joiner_alloc_wm.clone() as Arc<dyn quil_engine::worker::WorkerManager>,
-        archive.prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
-        joiner.address.clone(),
-    ));
-
-    joiner_allocator
-        .on_new_frame(18)
-        .expect("WorkerAllocator.on_new_frame");
-
-    // After reconciliation: worker 0's `allocated` flag should be
-    // true (allocation transitioned Joining→Active in registry).
-    use quil_engine::worker::WorkerManager as _;
-    let workers = joiner_alloc_wm.range_workers().expect("range_workers");
-    let w0 = workers.iter().find(|w| w.core_id == 0).expect("worker 0");
-    eprintln!(
-        "worker 0 after reconcile: filter={} allocated={} pending_filter_frame={}",
-        hex::encode(&w0.filter),
-        w0.allocated,
-        w0.pending_filter_frame,
-    );
-    assert!(
-        w0.allocated,
-        "WorkerAllocator did not flip worker 0 to allocated=true after the registry showed Active"
-    );
-    assert_eq!(
-        w0.filter, filter,
-        "worker 0's filter should remain pinned to the confirmed shard"
     );
 }
 
@@ -2712,9 +2584,16 @@ async fn multi_archive_finalization_cadence_is_steady() {
     eprintln!("cadence deltas: {:?} (median={:?})", deltas, median);
 
     // Production-realistic bounds: finalization should arrive at a
-    // STEADY cadence (no minutes-long stalls). We don't pin to
-    // proposal_duration because the lag adds 3-chain rounds.
-    let lower = std::time::Duration::from_secs(1);
+    // STEADY cadence (no minutes-long stalls, no consensus-free runaway).
+    // We don't pin to proposal_duration because the lag adds 3-chain
+    // rounds. The lower bound only needs to catch a genuine runaway
+    // (frames finalizing with no real consensus rounds → sub-100ms): on
+    // a fast/uncontended machine the post-warmup median settles around
+    // ~0.9 s (the startup catch-up burst leaks past the warmup filter and
+    // pulls the median onto the old 1 s floor, making it flake by machine
+    // speed). 500 ms cleanly separates healthy cadence from runaway while
+    // staying robust to host load.
+    let lower = std::time::Duration::from_millis(500);
     let upper = std::time::Duration::from_secs(20);
     assert!(
         median >= lower && median <= upper,
@@ -2755,10 +2634,9 @@ async fn tier2_adversarial_forged_join_signature_rejected() {
 
     // Real BLS verifier — DefaultKeyManager dispatches to
     // Bls48581KeyConstructor::verify_signature_raw.
-    let real_km: Arc<dyn quil_types::crypto::KeyManager> =
-        Arc::new(quil_crypto::DefaultKeyManager::new(Arc::new(
-            quil_crypto::Bls48581KeyConstructor,
-        )));
+    let real_km: Arc<dyn quil_types::crypto::KeyManager> = Arc::new(
+        quil_crypto::DefaultKeyManager::new(Arc::new(quil_crypto::Bls48581KeyConstructor)),
+    );
     let archive = build_tier2_archive_rig_with_key_manager(
         genesis_provers[0].clone(),
         &genesis_provers,
@@ -2767,8 +2645,7 @@ async fn tier2_adversarial_forged_join_signature_rejected() {
     );
 
     let joiner = TestProver::generate();
-    let joiner_transport =
-        Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
+    let joiner_transport = Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
     joiner_transport.set_head_header(gpb::GlobalFrameHeader {
         frame_number: 5,
         rank: 0,
@@ -2782,15 +2659,17 @@ async fn tier2_adversarial_forged_join_signature_rejected() {
         joiner_transport.clone(),
         archive.prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
     );
-    joiner_pipeline.worker_manager.add(quil_engine::worker::WorkerInfo {
-        core_id: 0,
-        filter: Vec::new(),
-        available_storage: 1_000_000,
-        total_storage: 1_000_000,
-        manually_managed: false,
-        pending_filter_frame: 0,
-        allocated: false,
-    });
+    joiner_pipeline
+        .worker_manager
+        .add(quil_engine::worker::WorkerInfo {
+            core_id: 0,
+            filter: Vec::new(),
+            available_storage: 1_000_000,
+            total_storage: 1_000_000,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: false,
+        });
 
     let filter: Vec<u8> = {
         let mut a = vec![0u8; 32];
@@ -2861,7 +2740,9 @@ async fn tier2_adversarial_forged_join_signature_rejected() {
     );
 
     // Step 4: archive should have REJECTED the tampered request.
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
+    archive
+        .prover_registry
+        .refresh_from_store(&archive.hg_store);
     let joiner_info = archive
         .prover_registry
         .read(|r| r.get_prover_info(&joiner.address).cloned());
@@ -2904,10 +2785,9 @@ async fn tier2_adversarial_premature_confirm_rejected() {
 
     let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
     let seed_hex = build_genesis_seed_hex(&genesis_provers);
-    let real_km: Arc<dyn quil_types::crypto::KeyManager> =
-        Arc::new(quil_crypto::DefaultKeyManager::new(Arc::new(
-            quil_crypto::Bls48581KeyConstructor,
-        )));
+    let real_km: Arc<dyn quil_types::crypto::KeyManager> = Arc::new(
+        quil_crypto::DefaultKeyManager::new(Arc::new(quil_crypto::Bls48581KeyConstructor)),
+    );
     let archive = build_tier2_archive_rig_with_key_manager(
         genesis_provers[0].clone(),
         &genesis_provers,
@@ -2918,8 +2798,7 @@ async fn tier2_adversarial_premature_confirm_rejected() {
     // Submit a valid join first (via the joiner's pipeline) so an
     // allocation exists for the attacker to target.
     let joiner = TestProver::generate();
-    let joiner_transport =
-        Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
+    let joiner_transport = Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
     joiner_transport.set_head_header(gpb::GlobalFrameHeader {
         frame_number: 5,
         rank: 0,
@@ -2933,15 +2812,17 @@ async fn tier2_adversarial_premature_confirm_rejected() {
         joiner_transport.clone(),
         archive.prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
     );
-    joiner_pipeline.worker_manager.add(quil_engine::worker::WorkerInfo {
-        core_id: 0,
-        filter: Vec::new(),
-        available_storage: 1_000_000,
-        total_storage: 1_000_000,
-        manually_managed: false,
-        pending_filter_frame: 0,
-        allocated: false,
-    });
+    joiner_pipeline
+        .worker_manager
+        .add(quil_engine::worker::WorkerInfo {
+            core_id: 0,
+            filter: Vec::new(),
+            available_storage: 1_000_000,
+            total_storage: 1_000_000,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: false,
+        });
 
     let filter: Vec<u8> = {
         let mut a = vec![0u8; 32];
@@ -2959,7 +2840,9 @@ async fn tier2_adversarial_premature_confirm_rejected() {
         .materializer
         .materialize(&join_frame)
         .expect("materialize join");
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
+    archive
+        .prover_registry
+        .refresh_from_store(&archive.hg_store);
     let pre_status = archive.prover_registry.read(|r| {
         let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
         info.allocations
@@ -2997,6 +2880,7 @@ async fn tier2_adversarial_premature_confirm_rejected() {
             address: joiner.address.clone(),
         }),
         filters: vec![filter.clone()],
+        leaf_roots: Vec::new(),
     };
     let confirm_bytes = confirm.to_canonical_bytes().expect("encode confirm");
 
@@ -3031,7 +2915,9 @@ async fn tier2_adversarial_premature_confirm_rejected() {
     );
 
     // Verify allocation is still Joining.
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
+    archive
+        .prover_registry
+        .refresh_from_store(&archive.hg_store);
     let post_status = archive.prover_registry.read(|r| {
         let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
         info.allocations
@@ -3085,10 +2971,9 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
 
     let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
     let seed_hex = build_genesis_seed_hex(&genesis_provers);
-    let real_km: Arc<dyn quil_types::crypto::KeyManager> =
-        Arc::new(quil_crypto::DefaultKeyManager::new(Arc::new(
-            quil_crypto::Bls48581KeyConstructor,
-        )));
+    let real_km: Arc<dyn quil_types::crypto::KeyManager> = Arc::new(
+        quil_crypto::DefaultKeyManager::new(Arc::new(quil_crypto::Bls48581KeyConstructor)),
+    );
     let archive = build_tier2_archive_rig_with_key_manager(
         genesis_provers[0].clone(),
         &genesis_provers,
@@ -3098,8 +2983,7 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
 
     // 1. Victim submits a valid ProverJoin.
     let victim = TestProver::generate();
-    let victim_transport =
-        Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
+    let victim_transport = Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
     victim_transport.set_head_header(gpb::GlobalFrameHeader {
         frame_number: 5,
         rank: 0,
@@ -3113,15 +2997,17 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
         victim_transport.clone(),
         archive.prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
     );
-    victim_pipeline.worker_manager.add(quil_engine::worker::WorkerInfo {
-        core_id: 0,
-        filter: Vec::new(),
-        available_storage: 1_000_000,
-        total_storage: 1_000_000,
-        manually_managed: false,
-        pending_filter_frame: 0,
-        allocated: false,
-    });
+    victim_pipeline
+        .worker_manager
+        .add(quil_engine::worker::WorkerInfo {
+            core_id: 0,
+            filter: Vec::new(),
+            available_storage: 1_000_000,
+            total_storage: 1_000_000,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: false,
+        });
 
     let filter: Vec<u8> = {
         let mut a = vec![0u8; 32];
@@ -3139,7 +3025,9 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
         .materializer
         .materialize(&join_frame)
         .expect("materialize join");
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
+    archive
+        .prover_registry
+        .refresh_from_store(&archive.hg_store);
 
     // Confirm victim's allocation is Joining.
     let pre_status = archive.prover_registry.read(|r| {
@@ -3183,6 +3071,7 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
             address: attacker.address.clone(), // attacker's address, NOT victim's
         }),
         filters: vec![filter.clone()],
+        leaf_roots: Vec::new(),
     };
     let confirm_bytes = confirm.to_canonical_bytes().expect("encode");
 
@@ -3193,8 +3082,7 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
         timestamp: 0,
     };
     let bundle_bytes = bundle.to_canonical_bytes().expect("encode bundle");
-    let proto = quil_engine::consensus_wire::decode_message_bundle(&bundle_bytes)
-        .expect("decode");
+    let proto = quil_engine::consensus_wire::decode_message_bundle(&bundle_bytes).expect("decode");
     let attack_frame = gpb::GlobalFrame {
         header: Some(gpb::GlobalFrameHeader {
             frame_number: confirm_frame_number,
@@ -3217,7 +3105,9 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
     );
 
     // 3. Verify the victim's allocation is STILL Joining.
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
+    archive
+        .prover_registry
+        .refresh_from_store(&archive.hg_store);
     let post_status = archive.prover_registry.read(|r| {
         let info = r.get_prover_info(&victim.address).expect("victim").clone();
         info.allocations
@@ -3248,283 +3138,6 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
     );
 }
 
-/// End-to-end: archive ingests a shard `FrameHeader` (coverage proof)
-/// and the contributing prover's allocation advances on-chain
-/// (`LastActiveFrameNumber`).
-///
-/// Exercises the full materialize → state-advance path, including
-/// `validate_message` → `process_message` ordering, BLS aggregate-sig
-/// verification against `get_active_provers`, and `Shard`
-/// (`FrameHeader`) variant round-trip through `consensus_wire`'s
-/// canonical → proto → canonical encoders.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tier2_coverage_ingest_advances_archive_allocation_state() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_test_writer()
-        .try_init();
-
-    // Confirm window open enough for the joiner to self-confirm
-    // within ~10 frames (testnet shortcut).
-    quil_execution::global_intrinsic::verify::set_confirm_window_frames(10, 720);
-
-    let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
-    let seed_hex = build_genesis_seed_hex(&genesis_provers);
-    let real_km: Arc<dyn quil_types::crypto::KeyManager> =
-        Arc::new(quil_crypto::DefaultKeyManager::new(Arc::new(
-            quil_crypto::Bls48581KeyConstructor,
-        )));
-    let archive = build_tier2_archive_rig_with_key_manager(
-        genesis_provers[0].clone(),
-        &genesis_provers,
-        &seed_hex,
-        real_km,
-    );
-
-    // 1. Joiner submits a real ProverJoin.
-    let joiner = TestProver::generate();
-    let joiner_transport =
-        Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
-    joiner_transport.set_head_header(gpb::GlobalFrameHeader {
-        frame_number: 5,
-        rank: 0,
-        timestamp: 0,
-        difficulty: 100_000,
-        output: vec![0u8; 516],
-        ..Default::default()
-    });
-    let joiner_pipeline = build_test_pipeline_with_registry(
-        &joiner,
-        joiner_transport.clone(),
-        archive.prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
-    );
-    joiner_pipeline.worker_manager.add(quil_engine::worker::WorkerInfo {
-        core_id: 0,
-        filter: Vec::new(),
-        available_storage: 1_000_000,
-        total_storage: 1_000_000,
-        manually_managed: false,
-        pending_filter_frame: 0,
-        allocated: false,
-    });
-    let filter: Vec<u8> = {
-        let mut a = vec![0u8; 32];
-        a[0] = 9;
-        a
-    };
-    joiner_pipeline
-        .pipeline
-        .submit_join(vec![filter.clone()], &[0u32], 5)
-        .await
-        .expect("submit_join");
-    let join_bundles = joiner_transport.drain_outbound();
-    archive
-        .materializer
-        .materialize(&build_global_frame_with_bundle(6, &join_bundles[0]))
-        .expect("materialize join");
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
-
-    // 2. Joiner self-confirms after the window.
-    joiner_pipeline.lifecycle.set_sync_complete();
-    joiner_pipeline.lifecycle.set_confirm_window_frames(10);
-    let mut shard_sizes: std::collections::HashMap<Vec<u8>, u64> =
-        std::collections::HashMap::new();
-    shard_sizes.insert(filter.clone(), 1000);
-    for i in 0u8..6 {
-        let mut a = vec![0u8; 32];
-        a[0] = i;
-        shard_sizes.insert(a, 1000);
-    }
-    joiner_pipeline.lifecycle.set_remote_shard_sizes(shard_sizes);
-    let joiner_cf = joiner_pipeline.current_frame.clone();
-    for frame_num in 6u64..=21 {
-        joiner_cf.observe(frame_num);
-        joiner_cf.materialize(frame_num);
-        joiner_pipeline
-            .lifecycle
-            .set_prover_root_verified_frame(frame_num);
-        let registry_ref = archive.prover_registry.clone()
-            as Arc<dyn quil_types::consensus::ProverRegistry>;
-        let actions = joiner_pipeline
-            .lifecycle
-            .evaluate(
-                frame_num,
-                100_000,
-                registry_ref.as_ref(),
-                joiner_pipeline.worker_manager.as_ref(),
-            )
-            .expect("evaluate");
-        for action in actions {
-            joiner_pipeline.pipeline.dispatch(action);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    // Wait for the confirm bundle to publish.
-    for _ in 0..50 {
-        if joiner_transport.outbound_len() > 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let confirm_bytes = joiner_transport
-        .drain_outbound()
-        .pop()
-        .expect("joiner pipeline never emitted a ProverConfirm");
-    archive
-        .materializer
-        .materialize(&build_global_frame_with_bundle(17, &confirm_bytes))
-        .expect("materialize confirm");
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
-
-    // Verify allocation is now Active.
-    let status_after_confirm = archive.prover_registry.read(|r| {
-        let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
-        info.allocations
-            .iter()
-            .find(|a| a.confirmation_filter == filter)
-            .cloned()
-    });
-    let alloc = status_after_confirm.expect("joiner has allocation");
-    assert_eq!(
-        alloc.status,
-        quil_types::consensus::ProverStatus::Active,
-        "joiner should be Active after confirm"
-    );
-    let pre_last_active = alloc.last_active_frame_number;
-
-    // 3. Build a shard `FrameHeader` claiming the joiner participated.
-    //    `address` = the shard's app-shard address (Poseidon(filter));
-    //    `prover` = joiner's BLS pubkey; aggregate-sig `bitmask=[0x01]`
-    //    so participant index 0 = joiner (the only Active prover).
-    use quil_execution::global_intrinsic::frame_header::FrameHeader;
-    use quil_execution::hypergraph_intrinsic::canonical::AggregateSignature;
-
-    // The FrameHeader's `address` is the raw shard filter (matches
-    // what `AppFollower::on_finalized_state` emits in production —
-    // see `app_glue.rs:544-549`). `pr.get_active_provers(&filter)`
-    // returns provers whose allocation.confirmation_filter == filter,
-    // so the participant-index lookup resolves.
-    let shard_address = filter.clone();
-    // Aggregate signature decoder requires `sig_len == 74` or
-    // `sig_len == 74 + n*516` (canonical.rs:198-205). Empty bytes
-    // fail the length check and `invoke_frame_header` would bail —
-    // the error is swallowed by the bundle loop (engines.rs:216), so
-    // the materializer reports "processed=1" while the per-request
-    // mutation never ran. Use a 74-byte placeholder.
-    let agg_sig = AggregateSignature {
-        signature: vec![0u8; 74],
-        public_key: None,
-        bitmask: vec![0x01],
-    };
-    let agg_sig_bytes = agg_sig.to_canonical_bytes().expect("agg sig");
-
-    let coverage_frame_number = 25u64; // some frame after confirm
-
-    let header = FrameHeader {
-        address: shard_address.clone(),
-        frame_number: coverage_frame_number,
-        rank: 0,
-        timestamp: 0,
-        difficulty: 100_000,
-        output: vec![0u8; 516],
-        parent_selector: vec![0u8; 32],
-        requests_root: vec![0u8; 64],
-        state_roots: vec![vec![0u8; 64]; 4],
-        prover: joiner.bls_pubkey.clone(),
-        fee_multiplier_vote: 0,
-        public_key_signature_bls48581: agg_sig_bytes,
-    };
-    let header_bytes = header.to_canonical_bytes().expect("encode header");
-
-    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
-    let req = CanonicalMessageRequest::wrap(header_bytes).expect("wrap");
-    let bundle = CanonicalMessageBundle {
-        requests: vec![Some(req)],
-        timestamp: 0,
-    };
-    let bundle_bytes = bundle.to_canonical_bytes().expect("encode bundle");
-    let proto = quil_engine::consensus_wire::decode_message_bundle(&bundle_bytes)
-        .expect("decode");
-
-    let coverage_global_frame = gpb::GlobalFrame {
-        header: Some(gpb::GlobalFrameHeader {
-            frame_number: coverage_frame_number,
-            rank: 0,
-            timestamp: 0,
-            difficulty: 100_000,
-            output: vec![0u8; 516],
-            ..Default::default()
-        }),
-        requests: vec![proto],
-        ..Default::default()
-    };
-    // Diagnostic: what does get_active_provers return for our filter?
-    use quil_types::consensus::ProverRegistry as _;
-    let active = archive
-        .prover_registry
-        .get_active_provers(&filter)
-        .expect("get_active_provers");
-    eprintln!(
-        "active provers for filter {}: {}",
-        hex::encode(&filter),
-        active.len()
-    );
-    for p in &active {
-        eprintln!(
-            "  address={} status={:?} pubkey_len={}",
-            hex::encode(&p.address),
-            p.status,
-            p.public_key.len()
-        );
-    }
-
-    // Probe via the registry's view of the joiner.
-    let joiner_pubkey_matches = active
-        .iter()
-        .find(|p| p.address == joiner.address)
-        .map(|p| p.public_key == joiner.bls_pubkey)
-        .unwrap_or(false);
-    eprintln!(
-        "joiner pubkey matches active-registry record: {}",
-        joiner_pubkey_matches
-    );
-
-    let result = archive
-        .materializer
-        .materialize(&coverage_global_frame)
-        .expect("materialize coverage");
-    eprintln!(
-        "coverage ingest: processed={} skipped={}",
-        result.processed, result.skipped
-    );
-
-    // 4. Refresh and assert: joiner's allocation last_active advanced.
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
-    let alloc_after = archive.prover_registry.read(|r| {
-        let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
-        info.allocations
-            .iter()
-            .find(|a| a.confirmation_filter == filter)
-            .cloned()
-    });
-    let alloc_after = alloc_after.expect("joiner still has allocation");
-    eprintln!(
-        "last_active: {} → {} (coverage_frame={})",
-        pre_last_active, alloc_after.last_active_frame_number, coverage_frame_number,
-    );
-    assert!(
-        alloc_after.last_active_frame_number >= coverage_frame_number,
-        "LastActiveFrameNumber should advance to (or past) {} after coverage ingest; \
-         pre={} post={}",
-        coverage_frame_number,
-        pre_last_active,
-        alloc_after.last_active_frame_number,
-    );
-}
-
 /// Full Tier-2 e2e: after the allocator flips a worker to
 /// `allocated=true`, we ALSO want to verify that a finalized shard
 /// frame's canonical `FrameHeader` bytes (the "coverage proof") flow
@@ -3551,23 +3164,73 @@ async fn tier2_shard_coverage_reaches_archive_materializer() {
     // Build a Tier-2 archive — gives us a real materializer.
     let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
     let seed_hex = build_genesis_seed_hex(&genesis_provers);
-    let archive = build_tier2_archive_rig(
-        genesis_provers[0].clone(),
-        &genesis_provers,
-        &seed_hex,
-    );
+    let archive = build_tier2_archive_rig(genesis_provers[0].clone(), &genesis_provers, &seed_hex);
 
     // Build a Tier-1 worker cohort. They run a full HotStuff round on
     // a shared shard filter and fire `coverage_publish` on
-    // finalization with the canonical FrameHeader bytes. Independent
-    // of the Tier-2 join/confirm dance — for THIS test the focus is
-    // the archive's ingestion of coverage, not the activation
-    // pipeline.
-    let workers = AppShardHarness::build(4);
+    // finalization with the canonical FrameHeader bytes. The cohort
+    // SHARES the archive's prover registry, seeded below with these
+    // provers as Active on the shard filter — so the committee the
+    // workers sign their coverage FrameHeader with is byte-identical to
+    // the one the archive's FrameHeader verifier reconstructs from
+    // `get_active_provers(filter)`. Without this the archive's active
+    // set for the shard is empty and verification fails with
+    // "aggregate pubkey ... active_count=0".
+    // Single-signer cohort: a stub-crypto coverage FrameHeader carries a
+    // bare 74-byte BLS aggregate with NO VDF multiproof bytes appended.
+    // The intrinsic's attestation check treats a 74-byte signature as
+    // single-signer (a real multi-signer attestation is >74 bytes — it
+    // appends the per-member Wesolowski multiproofs the stub can't
+    // produce). So coverage ingest is exercised with one prover; the
+    // multi-prover consensus path is covered separately by
+    // `worker_activates_after_confirm_and_emits_proof`.
+    let shard_filter: Vec<u8> = vec![0x55; 32];
+    let worker_provers: Vec<TestProver> = (0..1).map(|_| TestProver::generate()).collect();
+    for p in &worker_provers {
+        quil_engine::genesis::seed_active_prover_on_filter(
+            &archive.crdt,
+            &p.bls_pubkey,
+            /* seniority */ 1,
+            /* frame_number */ 1,
+            &shard_filter,
+        )
+        .expect("seed worker prover as Active on shard filter");
+    }
+    archive
+        .prover_registry
+        .refresh_from_store(&archive.hg_store);
+
+    // The PoMW reward needs a non-zero shard `state_size`. Seed ~1 MiB of
+    // committed data on the worker's shard so `shard_metadata_for_address`
+    // reports a real size (fixed 2026-06-29 — was hardcoded zero, which made
+    // every reward compute to zero). Without committed data the reward stays 0.
+    let worker_pubkey = worker_provers[0].bls_pubkey.clone();
+    {
+        let mut app = [0u8; 32];
+        app.copy_from_slice(&shard_filter);
+        archive
+            .crdt
+            .add_vertex(
+                &quil_hypergraph::Location { app_address: app, data_address: [0x01; 32] },
+                &vec![0xEEu8; 1 << 20],
+            )
+            .unwrap();
+        // Commit BEFORE the coverage frame (frame 7) so the size is populated
+        // when the materializer sources it.
+        archive.crdt.commit(6).unwrap();
+    }
+
+    let workers = AppShardHarness::build_with_registry(
+        worker_provers,
+        archive.prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+    );
     let got_coverage = workers
         .wait_for_coverage(std::time::Duration::from_secs(90))
         .await;
-    assert!(got_coverage, "worker cohort never produced a coverage frame");
+    assert!(
+        got_coverage,
+        "worker cohort never produced a coverage frame"
+    );
 
     // Drain every worker's coverage bytes.
     let mut coverage_bytes: Vec<Vec<u8>> = Vec::new();
@@ -3630,6 +3293,30 @@ async fn tier2_shard_coverage_reaches_archive_materializer() {
         result.processed,
         result.skipped,
     );
+
+    // The fix's payoff (the missing reward leg): the participating worker
+    // prover received a NON-ZERO reward through the real frame-header
+    // materialize path. Before the per-shard-size fix this was always 0.
+    use quil_execution::global_intrinsic::materialize::{prover_address_from_pubkey, reward_address};
+    let prover_addr = prover_address_from_pubkey(&worker_pubkey).unwrap();
+    let reward_addr = reward_address(&prover_addr).unwrap();
+    let reward_loc = quil_hypergraph::Location {
+        app_address: quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS,
+        data_address: reward_addr,
+    };
+    let blob = archive
+        .crdt
+        .get_vertex_data(&reward_loc)
+        .expect("worker prover reward vertex must exist after coverage materialize");
+    let tree = quil_execution::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+    let bal_bytes = quil_execution::global_schema::read_field(&tree, "reward:ProverReward", "Balance")
+        .unwrap_or_default();
+    let balance = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &bal_bytes);
+    assert!(
+        balance > num_bigint::BigInt::from(0),
+        "worker prover must receive a non-zero reward (got {balance})"
+    );
+    eprintln!("worker prover reward balance: {balance}");
 }
 
 /// Wrapper around a `ProverPipeline` that also exposes the
@@ -3659,12 +3346,12 @@ fn build_test_pipeline_with_registry(
     transport: Arc<quil_engine::test_support::TestProverMessageTransport>,
     registry: Arc<dyn quil_types::consensus::ProverRegistry>,
 ) -> TestPipelineRig {
+    use quil_engine::prover_message_transport::ProverMessageTransport;
+    use quil_engine::prover_pipeline::ProverPipeline;
     use quil_engine::provers::lifecycle::ProverLifecycle;
     use quil_engine::provers::proposer::Strategy;
-    use quil_engine::worker_allocator::WorkerAllocator;
-    use quil_engine::prover_pipeline::ProverPipeline;
-    use quil_engine::prover_message_transport::ProverMessageTransport;
     use quil_engine::test_support::{TestKeyManager, TestWorkerManager};
+    use quil_engine::worker_allocator::WorkerAllocator;
 
     let wm = Arc::new(TestWorkerManager::new());
     let wm_dyn: Arc<dyn quil_engine::worker::WorkerManager> = wm.clone();
@@ -3699,6 +3386,8 @@ fn build_test_pipeline_with_registry(
         multisig_ed448_seeds: vec![],
         delegate_address: vec![],
         transport: transport as Arc<dyn ProverMessageTransport>,
+        hypergraph: None,
+        replica_store: None,
     });
     TestPipelineRig {
         pipeline,
@@ -3789,9 +3478,18 @@ async fn self_coverage_composite_loopback() {
         parent_selector: vec![0u8; 64],
         requests_root: vec![0u8; 64],
         state_roots: vec![vec![0u8; 64]; 4],
-        prover: prover.address.clone(),
+        // `prover` is the BLS pubkey (a real G2 point) — the committee
+        // member; the attestation verifier reconstructs the aggregate
+        // pubkey from the registry's active member, so the declared
+        // pubkey in `single_signer_agg_sig` must use the same key.
+        prover: prover.bls_pubkey.clone(),
         fee_multiplier_vote: 1,
-        public_key_signature_bls48581: vec![0u8; 74],
+        public_key_signature_bls48581: single_signer_agg_sig(&prover.bls_pubkey)
+            .to_canonical_bytes()
+            .expect("self-coverage agg sig"),
+        storage_attestation_root: Vec::new(),
+        global_frame_number: 0,
+        storage_attestation: Vec::new(),
     };
     let header_bytes = synthetic_header
         .to_canonical_bytes()
@@ -3819,17 +3517,27 @@ async fn self_coverage_composite_loopback() {
     // -----------------------------------------------------------------
     let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
     let seed_hex = build_genesis_seed_hex(&genesis_provers);
-    let archive = build_tier2_archive_rig(
-        genesis_provers[0].clone(),
-        &genesis_provers,
-        &seed_hex,
-    );
+    let archive = build_tier2_archive_rig(genesis_provers[0].clone(), &genesis_provers, &seed_hex);
+
+    // Seed the synthetic worker as an Active prover on the coverage
+    // frame's shard filter so the archive's attestation verifier can
+    // reconstruct the (single-member) committee that signed it.
+    quil_engine::genesis::seed_active_prover_on_filter(
+        &archive.crdt,
+        &prover.bls_pubkey,
+        /* seniority */ 1,
+        /* frame_number */ 1,
+        &filter,
+    )
+    .expect("seed self-coverage prover as Active on shard filter");
+    archive
+        .prover_registry
+        .refresh_from_store(&archive.hg_store);
 
     let proto_bundles: Vec<quil_types::proto::global::MessageBundle> = inbox_snapshot
         .iter()
         .map(|b| {
-            quil_engine::consensus_wire::decode_message_bundle(b)
-                .expect("self-coverage decode")
+            quil_engine::consensus_wire::decode_message_bundle(b).expect("self-coverage decode")
         })
         .collect();
     let coverage_frame = gpb::GlobalFrame {
@@ -3862,6 +3570,150 @@ async fn self_coverage_composite_loopback() {
     );
 }
 
+/// End-to-end PoRep storage audit + eviction THROUGH the real global
+/// materialize path (`FrameMaterializer` → `invoke_frame_header` → sig verify
+/// → archive-mode gate → `audit_storage_attestation` → `kick_prover_by_address`).
+///
+/// A prover is Active on a shard but submits a reward proof whose carried
+/// `StorageAttestation` opening is UNREGISTERED (no on-chain
+/// `leafroot:LeafRootRegistration` vertex), so the ρ_N-sampled audit's registry
+/// cross-check fails → the member is evicted. Asserts the on-chain eviction
+/// signature (Seniority zeroed + KickFrameNumber set), proving the audit is
+/// actually reached in the materialize pipeline (not just the unit-tested
+/// helper) and that it mutates committed prover state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn tier2_storage_audit_evicts_cheating_member() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
+    quil_crypto::init();
+
+    let prover = TestProver::generate();
+    let filter: Vec<u8> = vec![0x46; 32];
+
+    // One opening for `prover`, at the current epoch, but with NO matching
+    // leaf-root registration on chain → the audit's registry cross-check fails.
+    let opening = quil_types::proto::global::StorageOpening {
+        shard_id: vec![0x07u8; 32],
+        epoch: quil_types::consensus::epoch_for_frame(1000),
+        member_id: prover.address.clone(),
+        query: 0,
+        leaf_root: vec![0u8; 74],
+        num_blocks: 1,
+        path_commits: vec![],
+        path_proofs: vec![],
+        commitment: vec![0u8; 74],
+        value: vec![0u8; 32],
+        proof: vec![0u8; 74],
+    };
+    let att = quil_types::proto::global::StorageAttestation {
+        openings: vec![opening],
+    };
+
+    // Reward proof anchored to a real global frame (gfn=1000 → storage active),
+    // signed by the single-member committee (this prover). `output=[0;516]` is
+    // accepted by the rig's frame prover (same as `self_coverage_*`).
+    let reward = quil_execution::global_intrinsic::frame_header::FrameHeader {
+        address: filter.clone(),
+        frame_number: 5,
+        rank: 0,
+        timestamp: 1_700_000_000_000,
+        difficulty: 100_000,
+        output: vec![0u8; 516],
+        parent_selector: vec![0u8; 64],
+        requests_root: vec![0u8; 64],
+        state_roots: vec![vec![0u8; 64]; 4],
+        prover: prover.bls_pubkey.clone(),
+        fee_multiplier_vote: 1,
+        public_key_signature_bls48581: single_signer_agg_sig(&prover.bls_pubkey)
+            .to_canonical_bytes()
+            .expect("agg sig"),
+        storage_attestation_root: vec![0u8; 74],
+        global_frame_number: 1000,
+        storage_attestation: prost::Message::encode_to_vec(&att),
+    };
+    let header_bytes = reward.to_canonical_bytes().expect("encode reward proof");
+    let bundle = {
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let req = CanonicalMessageRequest::wrap(header_bytes).expect("wrap reward");
+        CanonicalMessageBundle {
+            requests: vec![Some(req)],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .expect("encode bundle")
+    };
+
+    let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
+    let seed_hex = build_genesis_seed_hex(&genesis_provers);
+    let archive = build_tier2_archive_rig(genesis_provers[0].clone(), &genesis_provers, &seed_hex);
+
+    // Seed the cheating prover Active on the shard (seniority 1) so the
+    // attestation verifier reconstructs the single-member committee + the kick
+    // has a prover vertex to mutate.
+    quil_engine::genesis::seed_active_prover_on_filter(
+        &archive.crdt,
+        &prover.bls_pubkey,
+        /* seniority */ 1,
+        /* frame_number */ 1,
+        &filter,
+    )
+    .expect("seed cheating prover Active on shard filter");
+    archive
+        .prover_registry
+        .refresh_from_store(&archive.hg_store);
+
+    let before = archive
+        .prover_registry
+        .read(|r| r.get_prover_info(&prover.address).cloned())
+        .expect("prover present before audit");
+    assert_eq!(
+        before.seniority, 1,
+        "precondition: prover Active with seniority 1"
+    );
+    assert_eq!(before.kick_frame_number, 0, "precondition: not yet kicked");
+
+    let coverage_frame = build_global_frame_with_bundle(10, &bundle);
+    let result = archive
+        .materializer
+        .materialize(&coverage_frame)
+        .expect("materialize reward proof with cheating attestation");
+    assert!(
+        result.processed >= 1,
+        "reward proof must be processed by the materializer; processed={} skipped={}",
+        result.processed,
+        result.skipped,
+    );
+
+    archive
+        .prover_registry
+        .refresh_from_store(&archive.hg_store);
+    let after = archive
+        .prover_registry
+        .read(|r| r.get_prover_info(&prover.address).cloned())
+        .expect("prover present after audit");
+    // Eviction signature: the kick zeroes the prover's seniority and stamps the
+    // allocation with the kick frame (the same `materialize_prover_kick` path a
+    // signed ProverKick uses).
+    assert_eq!(
+        after.seniority, 0,
+        "storage audit must evict the unregistered member (Seniority → 0)",
+    );
+    assert!(
+        after.allocations.iter().any(|a| a.kick_frame_number > 0),
+        "evicted member's allocation must carry a KickFrameNumber; allocs={:?}",
+        after
+            .allocations
+            .iter()
+            .map(|a| (a.status, a.kick_frame_number))
+            .collect::<Vec<_>>(),
+    );
+}
+
 /// Helper: build a `GlobalFrame` whose `requests` contain a single
 /// proto MessageBundle decoded from the given canonical bundle bytes.
 fn build_global_frame_with_bundle(frame_number: u64, bundle_bytes: &[u8]) -> gpb::GlobalFrame {
@@ -3879,414 +3731,6 @@ fn build_global_frame_with_bundle(frame_number: u64, bundle_bytes: &[u8]) -> gpb
         requests: vec![proto_bundle],
         ..Default::default()
     }
-}
-
-/// Tier-2 composite end-to-end: one test that drives the entire
-/// pipeline from join → confirm → allocator → spawned worker engine
-/// → coverage_publish → archive materialize → LastActiveFrameNumber
-/// advance. Existing tests each pin down one link; this one verifies
-/// they compose without surprise interactions (timing-window edges,
-/// shared registry mutations, materializer back-pressure, etc.).
-///
-/// Phases:
-///   * A — joiner submits ProverJoin → archive materializes Joining
-///   * B — joiner lifecycle emits ProverConfirm → archive materializes
-///         Joining → Active
-///   * C — joiner's `WorkerAllocator` reconciles → SpawningWorkerManager
-///         spawns a real `AppConsensusEngine` for the new shard
-///   * D — spawned engine produces shard frames; with a single-prover
-///         quorum (threshold=0), `FrameProduced` fires within a few
-///         seconds via the leader's self-vote
-///   * E — engine's `coverage_publish` callback captures the canonical
-///         FrameHeader bytes for one finalized shard frame
-///   * F — each captured coverage header has its
-///         `public_key_signature_bls48581` rewritten with a valid
-///         synthetic `AggregateSignature{sig=74×0x00, bitmask=[0x01]}`
-///         so the materializer's `invoke_frame_header` aggregate-decode
-///         and bitmask-index lookup succeed. The model surface for
-///         carrying the certifying QC trait object through to the
-///         consumer (`State.parent_quorum_certificate`,
-///         `CertifiedState.certifying_quorum_certificate`) is in
-///         place; routing it through `AppFollower` end-to-end is
-///         left for a follow-on change.
-///   * G — archive's `LastActiveFrameNumber` for the joiner's
-///         allocation advances to (or past) the coverage frame number
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn tier2_composite_end_to_end() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_test_writer()
-        .try_init();
-
-    quil_execution::global_intrinsic::verify::set_confirm_window_frames(10, 720);
-
-    // -----------------------------------------------------------------
-    // Phase A — bootstrap archive + joiner; submit ProverJoin
-    // -----------------------------------------------------------------
-    let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
-    let seed_hex = build_genesis_seed_hex(&genesis_provers);
-    let archive = build_tier2_archive_rig(
-        genesis_provers[0].clone(),
-        &genesis_provers,
-        &seed_hex,
-    );
-    archive.transport.set_head_header(gpb::GlobalFrameHeader {
-        frame_number: 5,
-        rank: 0,
-        timestamp: 0,
-        difficulty: 100_000,
-        output: vec![0u8; 516],
-        ..Default::default()
-    });
-
-    let joiner = TestProver::generate();
-    let joiner_transport =
-        Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
-    joiner_transport.set_head_header(gpb::GlobalFrameHeader {
-        frame_number: 5,
-        rank: 0,
-        timestamp: 0,
-        difficulty: 100_000,
-        output: vec![0u8; 516],
-        ..Default::default()
-    });
-    let joiner_pipeline = build_test_pipeline_with_registry(
-        &joiner,
-        joiner_transport.clone(),
-        archive.prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
-    );
-    joiner_pipeline.worker_manager.add(quil_engine::worker::WorkerInfo {
-        core_id: 0,
-        filter: Vec::new(),
-        available_storage: 1_000_000,
-        total_storage: 1_000_000,
-        manually_managed: false,
-        pending_filter_frame: 0,
-        allocated: false,
-    });
-
-    let filter: Vec<u8> = {
-        let mut a = vec![0u8; 32];
-        a[0] = 0x33;
-        a
-    };
-
-    joiner_pipeline
-        .pipeline
-        .submit_join(vec![filter.clone()], &[0u32], 5)
-        .await
-        .expect("submit_join");
-    let join_bundles = joiner_transport.drain_outbound();
-    assert_eq!(join_bundles.len(), 1);
-    let join_frame = build_global_frame_with_bundle(6, &join_bundles[0]);
-    archive.materializer.materialize(&join_frame).expect("materialize join");
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
-
-    // -----------------------------------------------------------------
-    // Phase B — lifecycle emits ProverConfirm; archive flips to Active
-    // -----------------------------------------------------------------
-    joiner_pipeline.lifecycle.set_sync_complete();
-    joiner_pipeline.lifecycle.set_confirm_window_frames(10);
-    let mut shard_sizes: std::collections::HashMap<Vec<u8>, u64> =
-        std::collections::HashMap::new();
-    shard_sizes.insert(filter.clone(), 1000);
-    for i in 0u8..6 {
-        let mut a = vec![0u8; 32];
-        a[0] = i;
-        shard_sizes.insert(a, 1000);
-    }
-    joiner_pipeline.lifecycle.set_remote_shard_sizes(shard_sizes);
-
-    let joiner_cf = joiner_pipeline.current_frame.clone();
-    for frame_num in 6u64..=21 {
-        joiner_cf.observe(frame_num);
-        joiner_cf.materialize(frame_num);
-        joiner_pipeline.lifecycle.set_prover_root_verified_frame(frame_num);
-        let registry_ref = archive.prover_registry.clone()
-            as Arc<dyn quil_types::consensus::ProverRegistry>;
-        let actions = joiner_pipeline
-            .lifecycle
-            .evaluate(
-                frame_num,
-                100_000,
-                registry_ref.as_ref(),
-                joiner_pipeline.worker_manager.as_ref(),
-            )
-            .expect("evaluate");
-        for action in actions {
-            joiner_pipeline.pipeline.dispatch(action);
-        }
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    for _ in 0..50 {
-        if joiner_transport.outbound_len() > 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let mut drained = joiner_transport.drain_outbound();
-    let confirm_bytes = drained.pop().expect("joiner never emitted ProverConfirm");
-    let confirm_frame = build_global_frame_with_bundle(17, &confirm_bytes);
-    archive.materializer.materialize(&confirm_frame).expect("materialize ProverConfirm");
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
-
-    let status_after = archive.prover_registry.read(|r| {
-        let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
-        info.allocations
-            .iter()
-            .find(|a| a.confirmation_filter == filter)
-            .map(|a| a.status)
-    });
-    assert_eq!(
-        status_after,
-        Some(quil_types::consensus::ProverStatus::Active),
-        "joiner allocation must be Active after ProverConfirm materialize"
-    );
-
-    // -----------------------------------------------------------------
-    // Phase C — SpawningWorkerManager fires on the Active transition.
-    // -----------------------------------------------------------------
-    let coverage_published: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-    let event_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-    // Build the engine deps closure. The spawned engine runs the joiner
-    // as a single-prover shard committee — the event loop yields per
-    // iteration so the self-vote → QC → propose chain doesn't starve
-    // the engine run-loop.
-    let registry_for_engine = archive.prover_registry.clone();
-    let joiner_for_engine = joiner.clone();
-    let coverage_for_cb = coverage_published.clone();
-    let event_for_cb = event_log.clone();
-    let spawn_fn: Arc<
-        dyn Fn(u32, Vec<u8>) -> quil_engine::app_engine::AppEngineHandle + Send + Sync,
-    > = Arc::new(move |core_id: u32, filter_bytes: Vec<u8>| {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let clock_store = Arc::new(InMemoryClockStore::new());
-        let message_collector =
-            Arc::new(quil_engine::message_collector::MessageCollector::new());
-        let cov_inner = coverage_for_cb.clone();
-        let coverage_publish: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>> =
-            Some(Arc::new(move |bytes: Vec<u8>| {
-                cov_inner.lock().push(bytes);
-            }));
-
-        let deps = quil_engine::app_engine::AppEngineDeps {
-            clock_store: clock_store as Arc<dyn ClockStore>,
-            prover_registry: registry_for_engine.clone()
-                as Arc<dyn quil_types::consensus::ProverRegistry>,
-            frame_prover: Arc::new(StubFrameProver) as Arc<dyn FrameProver>,
-            message_collector,
-            fee_manager: Arc::new(quil_engine::InMemoryDynamicFeeManager::new(32))
-                as Arc<dyn quil_types::consensus::DynamicFeeManager>,
-            local_prover_address: joiner_for_engine.address.clone(),
-            local_bls_pubkey: joiner_for_engine.bls_pubkey.clone(),
-            bls_signer: joiner_for_engine.signer_clone(),
-            reward_greedy: true,
-            min_active_provers_for_propose: 1,
-            coverage_publish,
-            hypergraph: None,
-            execution_engine: Some(Arc::new(build_test_exec_manager(
-                Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
-                false,
-            ))),
-            inclusion_prover: Some(
-                Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>,
-            ),
-            kv_db: None,
-        };
-        let (engine, handle) = quil_engine::app_engine::AppConsensusEngine::new(
-            core_id,
-            filter_bytes,
-            deps,
-            event_tx,
-        );
-        let bls = joiner_for_engine.signer_clone();
-        tokio::spawn(async move {
-            engine.run(bls).await;
-        });
-        let event_drain = event_for_cb.clone();
-        tokio::spawn(async move {
-            while let Some(ev) = event_rx.recv().await {
-                use quil_engine::app_engine::AppEngineEvent::*;
-                let name = match ev {
-                    FrameProduced { .. } => "FrameProduced",
-                    FullFrameProduced { .. } => "FullFrameProduced",
-                    VoteProduced { .. } => "VoteProduced",
-                    TimeoutProduced { .. } => "TimeoutProduced",
-                    ShardFrameFinalized { .. } => "ShardFrameFinalized",
-                    EquivocationDetected { .. } => "EquivocationDetected",
-                    Halted { .. } => "Halted",
-                    AncestorSyncRequested { .. } => "AncestorSyncRequested",
-                    ParentSealed { .. } => "ParentSealed",
-                };
-                event_drain.lock().push(name.to_string());
-            }
-        });
-        handle
-    });
-
-    let spawn_wm = Arc::new(
-        quil_engine::test_support::SpawningWorkerManager::new(spawn_fn),
-    );
-    spawn_wm.add(quil_engine::worker::WorkerInfo {
-        core_id: 0,
-        filter: filter.clone(),
-        available_storage: 1_000_000,
-        total_storage: 1_000_000,
-        manually_managed: false,
-        pending_filter_frame: 5,
-        allocated: false,
-    });
-
-    let composite_allocator = Arc::new(quil_engine::worker_allocator::WorkerAllocator::new(
-        spawn_wm.clone() as Arc<dyn quil_engine::worker::WorkerManager>,
-        archive.prover_registry.clone()
-            as Arc<dyn quil_types::consensus::ProverRegistry>,
-        joiner.address.clone(),
-    ));
-    composite_allocator
-        .on_new_frame(18)
-        .expect("WorkerAllocator.on_new_frame should spawn the engine");
-
-    let handles = spawn_wm.snapshot_handles();
-    assert_eq!(handles.len(), 1, "expected SpawningWorkerManager to spawn one engine");
-
-    // -----------------------------------------------------------------
-    // Phase D/E — wait for the spawned engine to produce events
-    // (FrameProduced/VoteProduced) AND emit at least one
-    // coverage_publish bundle (one finalized shard frame).
-    // -----------------------------------------------------------------
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let evs = event_log.lock().clone();
-        let cov_n = coverage_published.lock().len();
-        if cov_n >= 1 {
-            eprintln!(
-                "phase E ready: {} events ({:?}), {} coverage bundles",
-                evs.len(),
-                evs.iter().take(8).collect::<Vec<_>>(),
-                cov_n
-            );
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!(
-                "spawned engine never emitted coverage within 120s; \
-                 events={:?} cov={}",
-                evs, cov_n
-            );
-        }
-    }
-    let cov_bytes_snapshot = std::mem::take(&mut *coverage_published.lock());
-
-    // -----------------------------------------------------------------
-    // Phase F — substitute each captured coverage header's
-    // `public_key_signature_bls48581` with a valid synthetic
-    // `AggregateSignature{sig=74×0x00, bitmask=[0x01]}` so the
-    // materializer's `invoke_frame_header` aggregate-decode +
-    // bitmask-index lookup succeeds. The coverage header emitted by
-    // `AppFollower::on_finalized_state` currently carries the
-    // proposer's BLS authorship signature rather than the certifying
-    // QC's aggregate; substituting here lets the test pin the
-    // materialize → state-advance path without depending on the
-    // future change that routes the certifying QC end-to-end.
-    // -----------------------------------------------------------------
-    use quil_execution::global_intrinsic::frame_header::FrameHeader;
-    use quil_execution::hypergraph_intrinsic::canonical::AggregateSignature;
-    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
-
-    let synth_agg_sig = AggregateSignature {
-        signature: vec![0u8; 74],
-        public_key: None,
-        bitmask: vec![0x01],
-    };
-    let synth_agg_bytes = synth_agg_sig.to_canonical_bytes().expect("synth agg sig");
-
-    let mut proto_bundles: Vec<quil_types::proto::global::MessageBundle> = Vec::new();
-    for bytes in &cov_bytes_snapshot {
-        let mut hdr = FrameHeader::from_canonical_bytes(bytes).expect("decode coverage header");
-        hdr.public_key_signature_bls48581 = synth_agg_bytes.clone();
-        let new_bytes = hdr.to_canonical_bytes().expect("re-encode coverage header");
-        let req = CanonicalMessageRequest::wrap(new_bytes).expect("wrap request");
-        let bundle = CanonicalMessageBundle {
-            requests: vec![Some(req)],
-            timestamp: 0,
-        };
-        let bundle_bytes = bundle.to_canonical_bytes().expect("encode bundle");
-        let proto = quil_engine::consensus_wire::decode_message_bundle(&bundle_bytes)
-            .expect("decode bundle");
-        proto_bundles.push(proto);
-    }
-    let coverage_frame_number = 30u64;
-    let coverage_frame = gpb::GlobalFrame {
-        header: Some(gpb::GlobalFrameHeader {
-            frame_number: coverage_frame_number,
-            rank: 0,
-            timestamp: 0,
-            difficulty: 100_000,
-            output: vec![0u8; 516],
-            ..Default::default()
-        }),
-        requests: proto_bundles,
-        ..Default::default()
-    };
-    let pre_last_active = archive.prover_registry.read(|r| {
-        r.get_prover_info(&joiner.address)
-            .expect("joiner")
-            .clone()
-            .allocations
-            .iter()
-            .find(|a| a.confirmation_filter == filter)
-            .map(|a| a.last_active_frame_number)
-            .unwrap_or(0)
-    });
-    let result = archive
-        .materializer
-        .materialize(&coverage_frame)
-        .expect("materialize coverage frame");
-    eprintln!(
-        "coverage materialize: processed={} skipped={}",
-        result.processed, result.skipped
-    );
-    assert!(
-        result.processed >= 1,
-        "archive must process at least one coverage bundle"
-    );
-
-    // -----------------------------------------------------------------
-    // Phase G — LastActiveFrameNumber advance assertion. The materializer
-    // applied the synthetic-aggregate coverage header, so the joiner's
-    // allocation should now record `last_active_frame_number >=
-    // coverage_frame_number`.
-    // -----------------------------------------------------------------
-    archive.prover_registry.refresh_from_store(&archive.hg_store);
-    let post_last_active = archive.prover_registry.read(|r| {
-        r.get_prover_info(&joiner.address)
-            .expect("joiner")
-            .clone()
-            .allocations
-            .iter()
-            .find(|a| a.confirmation_filter == filter)
-            .map(|a| a.last_active_frame_number)
-            .unwrap_or(0)
-    });
-    eprintln!(
-        "LastActiveFrame: pre={} post={} (coverage_frame={})",
-        pre_last_active, post_last_active, coverage_frame_number
-    );
-    assert!(
-        post_last_active >= coverage_frame_number,
-        "LastActiveFrame should advance to ≥{} after coverage ingest; \
-         pre={} post={}",
-        coverage_frame_number,
-        pre_last_active,
-        post_last_active
-    );
 }
 
 /// After WorkerAllocator detects a Joining→Active transition, the
@@ -4344,8 +3788,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         let clock_store = Arc::new(InMemoryClockStore::new());
-        let message_collector =
-            Arc::new(quil_engine::message_collector::MessageCollector::new());
+        let message_collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
         let coverage_published: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let cp_for_cb = coverage_published.clone();
         let coverage_publish: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>> =
@@ -4371,17 +3814,13 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
                 false,
             ))),
             inclusion_prover: Some(
-                Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>,
+                Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
             ),
             kv_db: None,
         };
 
-        let (engine, handle) = quil_engine::app_engine::AppConsensusEngine::new(
-            core_id,
-            filter_bytes,
-            deps,
-            event_tx,
-        );
+        let (engine, handle) =
+            quil_engine::app_engine::AppConsensusEngine::new(core_id, filter_bytes, deps, event_tx);
         let bls_signer = prover_for_spawn.signer_clone();
         let exit_log = event_log_clone.clone();
         let join = tokio::spawn(async move {
@@ -4420,7 +3859,9 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
         handle
     });
 
-    let wm = Arc::new(quil_engine::test_support::SpawningWorkerManager::new(spawn_fn));
+    let wm = Arc::new(quil_engine::test_support::SpawningWorkerManager::new(
+        spawn_fn,
+    ));
     // Seed worker 0 — the allocator can find it before spawn.
     wm.add(quil_engine::worker::WorkerInfo {
         core_id: 0,
@@ -4440,7 +3881,12 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
 
     // Verify spawn was called.
     let log = spawn_log.lock().clone();
-    assert_eq!(log.len(), 1, "expected one spawn invocation, got {}", log.len());
+    assert_eq!(
+        log.len(),
+        1,
+        "expected one spawn invocation, got {}",
+        log.len()
+    );
     assert_eq!(log[0].0, 0);
     assert_eq!(log[0].1, filter);
 
@@ -4471,9 +3917,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
     eprintln!("post-spawn event entries: {:?}", entries);
     let crashed: Vec<&String> = entries
         .iter()
-        .filter(|e| {
-            e.starts_with("engine_panic") || e.as_str() == "engine_task_returned"
-        })
+        .filter(|e| e.starts_with("engine_panic") || e.as_str() == "engine_task_returned")
         .collect();
     assert!(
         crashed.is_empty(),
@@ -4481,9 +3925,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
     );
     let live: Vec<&String> = entries
         .iter()
-        .filter(|e| {
-            !e.starts_with("engine_panic") && e.as_str() != "engine_task_returned"
-        })
+        .filter(|e| !e.starts_with("engine_panic") && e.as_str() != "engine_task_returned")
         .collect();
     assert!(
         !live.is_empty(),

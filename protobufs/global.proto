@@ -49,11 +49,31 @@ message ProverResume {
   quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 3;
 }
 
+// One leaf's storage root within a shard being confirmed.
+message LeafRootEntry {
+  // The leaf's sub-shard prefix path (6-bit nibbles) within the shard tree.
+  repeated uint32 prefix = 1;
+  // The registered KZG leaf root.
+  bytes leaf_root = 2;
+  // The leaf's block count.
+  uint64 num_blocks = 3;
+}
+
+// All the leaf roots a prover registers for one shard at confirm time.
+message ConfirmLeafRoots {
+  bytes filter = 1;
+  repeated LeafRootEntry entries = 2;
+}
+
 message ProverConfirm {
   bytes filter = 1 [deprecated = true];
   uint64 frame_number = 2;
   quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 3;
   repeated bytes filters = 4;
+  // Per-shard storage leaf roots registered as part of this confirm (folded in:
+  // a confirm is the prover's per-epoch storage re-registration). Bound into the
+  // confirm's signing message.
+  repeated ConfirmLeafRoots leaf_roots = 5;
 }
 
 message ProverUpdate {
@@ -262,6 +282,64 @@ message FrameHeader {
   uint64 fee_multiplier_vote = 11;
   // The confirmation signatures of the frame
   quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 12;
+  // The committee-signed storage-attestation root: a deterministic digest over
+  // the canonical set of per-member proof-of-storage openings carried with this
+  // frame (see StorageAttestation). Binds *which* openings the committee
+  // attested into the signed header; a global validator recomputes this root
+  // from the openings and re-verifies possession. Replaces the per-member VDF
+  // multiproof as the proof each committee member is storing its shard data.
+  bytes storage_attestation_root = 13;
+  // The global frame this shard frame anchors its storage beacon to. The
+  // verifier loads global_frame[global_frame_number].output (the global VDF
+  // output) and derives rho_N from it — the unpredictable, lockstep-shared
+  // value that selects every committee member's challenged leaf/block/point.
+  // Committed into the VDF challenge so it cannot be altered post-hoc.
+  uint64 global_frame_number = 14;
+  // The committee's serialized StorageAttestation (the per-member PoRep
+  // openings the global frame samples + audits). Carried as opaque bytes so it
+  // survives the canonical→proto→canonical round-trip when a reward proof is
+  // folded into a global frame's requests; decoded only at the global audit.
+  // Empty pre-storage / for legacy-VDF frames.
+  bytes storage_attestation = 15;
+}
+
+// One committee member's proof-of-storage opening for one challenge query in a
+// frame: a KZG opening of a randomly-challenged block of a randomly-challenged
+// leaf, plus the vector-commitment authentication path binding that block to
+// the member's registered leaf root. The evaluation point and block/leaf
+// indices are NOT carried — they are derived by the verifier from the frame's
+// storage beacon (rho_n), so the prover has no freedom over what it opens.
+message StorageOpening {
+  // The shard this opening attests to (bound into the challenge + transcript).
+  bytes shard_id = 1;
+  // The replication epoch (the SDR re-encode generation).
+  uint64 epoch = 2;
+  // The attesting member's identity.
+  bytes member_id = 3;
+  // Query index for this member (which of its challenged leaves).
+  uint32 query = 4;
+  // The registered leaf commitment — the KZG root of the leaf's
+  // vector-commitment tree.
+  bytes leaf_root = 5;
+  // Number of blocks in the leaf (sets the challenge block index + path depth).
+  uint64 num_blocks = 6;
+  // Authentication-path parent node commitments C_1..C_L (C_L == leaf_root),
+  // bottom-to-top. Empty for a single-block leaf.
+  repeated bytes path_commits = 7;
+  // KZG opening proofs for the authentication path, aligned to path_commits.
+  repeated bytes path_proofs = 8;
+  // The challenged block's KZG commitment (the bottom of the path).
+  bytes commitment = 9;
+  // The claimed evaluation at the derived point (scalar bytes).
+  bytes value = 10;
+  // The KZG opening proof for the possession opening.
+  bytes proof = 11;
+}
+
+// The set of per-member storage openings carried with an app-shard frame. The
+// frame header's storage_attestation_root commits to this set.
+message StorageAttestation {
+  repeated StorageOpening openings = 1;
 }
 
 message ProverLivenessCheck {
@@ -375,6 +453,11 @@ message GlobalFrame {
 message AppShardFrame {
   FrameHeader header = 1;
   repeated MessageBundle requests = 2;
+  // The per-member proof-of-storage openings the committee attested this frame.
+  // The header's storage_attestation_root commits to this set; a full-frame
+  // holder (gossip validator / committee member) recomputes the root and
+  // re-verifies possession against each member's registered leaf roots.
+  StorageAttestation storage_attestation = 3;
 }
 
 message GlobalAlert {
@@ -497,6 +580,22 @@ message SubmitGlobalMessageRequest {
 
 message SubmitGlobalMessageResponse {}
 
+// Direct point-to-point delivery of a global-consensus message
+// (proposal / vote / timeout) between genesis archives. Global
+// consensus is moved off BlossomSub gossip because a full-coverage
+// proposal exceeds the gossip message-size ceiling; the ~6-member
+// genesis committee is direct-peered, so proposals/votes/timeouts are
+// sent point-to-point over this mTLS RPC instead. `bitmask` carries the
+// original topic (GLOBAL_FRAME or GLOBAL_CONSENSUS) so the receiver
+// routes it through the same handler the gossip arm used. App-shard
+// consensus is unaffected (it stays on per-shard gossip topics).
+message SubmitGlobalConsensusRequest {
+  bytes bitmask = 1;
+  bytes data = 2;
+}
+
+message SubmitGlobalConsensusResponse {}
+
 service GlobalService {
   rpc GetGlobalFrame (GetGlobalFrameRequest) returns (GlobalFrameResponse);
   rpc GetGlobalProposal (GetGlobalProposalRequest) returns (GlobalProposalResponse);
@@ -506,6 +605,7 @@ service GlobalService {
   rpc GetWorkerInfo(GlobalGetWorkerInfoRequest) returns (GlobalGetWorkerInfoResponse);
   rpc StreamGlobalMessages(StreamGlobalMessagesRequest) returns (stream StreamGlobalMessagesResponse);
   rpc SubmitGlobalMessage(SubmitGlobalMessageRequest) returns (SubmitGlobalMessageResponse);
+  rpc SubmitGlobalConsensus(SubmitGlobalConsensusRequest) returns (SubmitGlobalConsensusResponse);
 }
 
 service AppShardService {

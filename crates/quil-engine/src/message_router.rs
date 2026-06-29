@@ -324,9 +324,6 @@ pub fn validator_global_peer_info() -> TopicValidator {
                     if ts < now_ms - 60_000 {
                         return Reject("pi_ts_too_old");
                     }
-                    if ts < now_ms - 1_000 {
-                        return Reject("pi_ts_stale");
-                    }
                     if ts > now_ms + 300_000 {
                         return Reject("pi_ts_future");
                     }
@@ -335,9 +332,6 @@ pub fn validator_global_peer_info() -> TopicValidator {
                 if let Some(ts) = quil_p2p::peek_key_registry_timestamp(data).map(|v| v as i64) {
                     if ts < now_ms - 60_000 {
                         return Reject("kr_ts_too_old");
-                    }
-                    if ts < now_ms - 1_000 {
-                        return Reject("kr_ts_stale");
                     }
                     if ts > now_ms + 5_000 {
                         return Reject("kr_ts_future");
@@ -364,9 +358,6 @@ pub fn validator_global_peer_info() -> TopicValidator {
                 // are already paid.
                 if info.timestamp < now_ms - 60_000 {
                     return Reject("pi_ts_too_old");
-                }
-                if info.timestamp < now_ms - 1_000 {
-                    return Reject("pi_ts_stale");
                 }
                 if info.timestamp > now_ms + 300_000 {
                     return Reject("pi_ts_future");
@@ -400,9 +391,6 @@ pub fn validator_global_peer_info() -> TopicValidator {
                         let ts = reg.last_updated_ms as i64;
                         if ts < now_ms - 60_000 {
                             return Reject("kr_ts_too_old");
-                        }
-                        if ts < now_ms - 1_000 {
-                            return Reject("kr_ts_stale");
                         }
                         if ts > now_ms + 5_000 {
                             return Reject("kr_ts_future");

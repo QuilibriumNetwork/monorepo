@@ -262,6 +262,7 @@ mod tests {
                 timestamp: 1_700_000_000,
                 signature: vec![0xBBu8; 74],
                 address: vec![0xCCu8; 32],
+                openings: Vec::new(),
             },
             timeout_tick: 55,
             timestamp: 1_700_000_000,

@@ -587,6 +587,165 @@ pub fn verify_raw(
   );
 }
 
+/// Aggregate-verify a batch of KZG openings with ONE pairing check.
+///
+/// Every opening shares the global SRS, so the `K` individual checks
+/// `e(π_k, [s−z_k]₂) == e(C_k − y_k·[1]₁, [1]₂)` fold under a single
+/// Fiat-Shamir scalar `γ` into:
+///   A = Σ γ^k·π_k
+///   B = Σ γ^k·C_k − (Σ γ^k·y_k)·[1]₁ + Σ (γ^k·z_k)·π_k
+///   accept ⇔ e(A, [s]₂) == e(B, [1]₂)         (which is `verify(B, 0, 0, A)`)
+///
+/// Inputs are parallel slices of length `K`: `commits[k]`/`proofs[k]` are
+/// compressed G1 points, `indices[k]` selects `z_k = RootsOfUnity[poly_size]
+/// [index]`, `values[k]` is `y_k` (scalar bytes). `gamma` is the caller's
+/// transcript-bound FS scalar (any length; reduced mod the curve order).
+///
+/// Soundness: if any single opening is invalid the LHS−RHS is a non-zero
+/// degree-`K` polynomial in `γ`, so it passes with probability ≤ K/order
+/// (Schwartz–Zippel) over a uniformly-derived `γ`. `gamma` MUST be bound to
+/// every `(C_k, z_k, y_k, π_k)` by the caller, or the batch is forgeable.
+pub fn aggregate_verify_openings(
+  commits: &[Vec<u8>],
+  indices: &[u64],
+  values: &[Vec<u8>],
+  proofs: &[Vec<u8>],
+  poly_size: u64,
+  gamma: &[u8],
+) -> bool {
+  let k = commits.len();
+  if k == 0 {
+    return true; // vacuous: no openings to satisfy. Caller enforces quorum.
+  }
+  if indices.len() != k || values.len() != k || proofs.len() != k {
+    return false;
+  }
+
+  let order = big::BIG::new_ints(&rom::CURVE_ORDER);
+  let roots = match bls::singleton().RootsOfUnityBLS48581.get(&poly_size) {
+    Some(r) => r,
+    None => return false,
+  };
+
+  // Parse points + scalars; reject degenerate group elements (matches
+  // verify_raw's infinity/generator guard).
+  let mut commit_pts: Vec<ecp::ECP> = Vec::with_capacity(k);
+  let mut proof_pts: Vec<ecp::ECP> = Vec::with_capacity(k);
+  let mut zs: Vec<big::BIG> = Vec::with_capacity(k);
+  let mut ys: Vec<big::BIG> = Vec::with_capacity(k);
+  for i in 0..k {
+    let c = ecp::ECP::frombytes(&commits[i]);
+    if c.is_infinity() || c.equals(&ecp::ECP::generator()) {
+      return false;
+    }
+    let p = ecp::ECP::frombytes(&proofs[i]);
+    if p.is_infinity() || p.equals(&ecp::ECP::generator()) {
+      return false;
+    }
+    let idx = indices[i] as usize;
+    if idx >= roots.len() {
+      return false;
+    }
+    commit_pts.push(c);
+    proof_pts.push(p);
+    zs.push(roots[idx]);
+    ys.push(big::BIG::frombytes(&values[i]));
+  }
+
+  // γ reduced mod the curve order (accept any-length input, big-endian).
+  let mut gbuf = [0u8; big::MODBYTES];
+  let n = gamma.len().min(big::MODBYTES);
+  gbuf[big::MODBYTES - n..].copy_from_slice(&gamma[gamma.len() - n..]);
+  let mut g = big::BIG::frombytes(&gbuf);
+  g.rmod(&order);
+
+  // γ powers [1, γ, γ², …, γ^{K−1}].
+  let mut gpows: Vec<big::BIG> = Vec::with_capacity(k);
+  let mut cur = big::BIG::new_int(1);
+  for _ in 0..k {
+    gpows.push(cur);
+    cur = big::BIG::modmul(&cur, &g, &order);
+  }
+
+  // A = Σ γ^k π_k
+  let a = match point_linear_combination_parallel(&proof_pts, &gpows) {
+    Ok(v) => v,
+    Err(_) => return false,
+  };
+  // term1 = Σ γ^k C_k
+  let term1 = match point_linear_combination_parallel(&commit_pts, &gpows) {
+    Ok(v) => v,
+    Err(_) => return false,
+  };
+  // term2 = (Σ γ^k y_k)·G1
+  let mut sum_gy = big::BIG::new_int(0);
+  for i in 0..k {
+    let t = big::BIG::modmul(&gpows[i], &ys[i], &order);
+    sum_gy = big::BIG::modadd(&sum_gy, &t, &order);
+  }
+  let term2 = ecp::ECP::generator().mul(&sum_gy);
+  // term3 = Σ (γ^k z_k) π_k
+  let gz: Vec<big::BIG> = (0..k)
+    .map(|i| big::BIG::modmul(&gpows[i], &zs[i], &order))
+    .collect();
+  let term3 = match point_linear_combination_parallel(&proof_pts, &gz) {
+    Ok(v) => v,
+    Err(_) => return false,
+  };
+
+  // B = term1 − term2 + term3
+  let mut b = term1.clone();
+  b.sub(&term2);
+  b.add(&term3);
+
+  // e(A, [s]₂) == e(B, [1]₂)  ⇔  verify(C = B, z = 0, y = 0, proof = A)
+  let zero = big::BIG::new_int(0);
+  verify(&b, &zero, &zero, &a)
+}
+
+/// Aggregate proof point `A = Σ_k γ^k · π_k` from compressed-G1 proof bytes
+/// (`proofs`, in the caller's canonical order) and a Fiat-Shamir challenge
+/// `gamma` (big-endian, any length, reduced mod the curve order). This is the
+/// 74-byte compressed G1 element used as a storage-attestation root: it IS the
+/// frame's aggregate possession proof and binds the opening set, because `gamma`
+/// is FS over the full opening transcript (changing any opening changes `A`).
+/// `proofs` must be the SAME proof bytes, in the SAME order, that
+/// [`aggregate_verify_openings`] receives, so producer and verifier agree.
+/// Returns `None` on an empty set or a malformed / degenerate proof point.
+pub fn aggregate_proof_point(proofs: &[Vec<u8>], gamma: &[u8]) -> Option<Vec<u8>> {
+  let k = proofs.len();
+  if k == 0 {
+    return None;
+  }
+  let order = big::BIG::new_ints(&rom::CURVE_ORDER);
+  let mut pts: Vec<ecp::ECP> = Vec::with_capacity(k);
+  for pb in proofs {
+    let p = ecp::ECP::frombytes(pb);
+    if p.is_infinity() || p.equals(&ecp::ECP::generator()) {
+      return None;
+    }
+    pts.push(p);
+  }
+  // γ reduced mod the curve order (any-length big-endian input), matching
+  // `aggregate_verify_openings`.
+  let mut gbuf = [0u8; big::MODBYTES];
+  let n = gamma.len().min(big::MODBYTES);
+  gbuf[big::MODBYTES - n..].copy_from_slice(&gamma[gamma.len() - n..]);
+  let mut g = big::BIG::frombytes(&gbuf);
+  g.rmod(&order);
+  // γ powers [1, γ, γ², …, γ^{K−1}].
+  let mut gpows: Vec<big::BIG> = Vec::with_capacity(k);
+  let mut cur = big::BIG::new_int(1);
+  for _ in 0..k {
+    gpows.push(cur);
+    cur = big::BIG::modmul(&cur, &g, &order);
+  }
+  let a = point_linear_combination(&pts, &gpows).ok()?;
+  let mut b = [0u8; 74];
+  a.tobytes(&mut b, true);
+  Some(b.to_vec())
+}
+
 // ── Full-width scalar API ───────────────────────────────────────────────────
 //
 // The original commit/prove functions use 64-byte-per-scalar serialization
@@ -747,6 +906,46 @@ pub fn point_linear_combination_fast(
   Ok(result)
 }
 
+/// Parallel multi-scalar multiplication: split into per-core chunks, run the
+/// adaptive-window Pippenger (`muln_fast`) on each chunk concurrently, then sum
+/// the partials. Near-linear speedup in cores for large `n`.
+///
+/// The per-frame storage-attestation batch (`aggregate_verify_openings` over
+/// K = Σ_shards Σ_members openings) is exactly this shape, so a validator with
+/// C cores verifies the whole batch in ~K/C time — which is what lets the
+/// 32–768-core global validators verify EVERY prover's possession proof every
+/// frame, rather than sampling.
+pub fn point_linear_combination_parallel(
+  points: &[ecp::ECP],
+  scalars: &[big::BIG],
+) -> Result<ecp::ECP, Box<dyn Error>> {
+  use rayon::prelude::*;
+  if points.len() != scalars.len() {
+    return Err(format!(
+      "length mismatch between arguments, points: {}, scalars: {}",
+      points.len(),
+      scalars.len(),
+    ).into());
+  }
+  let n = points.len();
+  if n == 0 {
+    return Ok(ecp::ECP::new());
+  }
+  // One window-amortized Pippenger pass per core.
+  let threads = rayon::current_num_threads().max(1);
+  let chunk = ((n + threads - 1) / threads).max(1);
+  let partials: Vec<ecp::ECP> = points
+    .par_chunks(chunk)
+    .zip(scalars.par_chunks(chunk))
+    .map(|(p, s)| ecp::ECP::muln_fast(p.len(), p, s))
+    .collect();
+  let mut acc = ecp::ECP::new();
+  for p in &partials {
+    acc.add(p);
+  }
+  Ok(acc)
+}
+
 /// Like [`commit_scalars_monomial`] but uses the optimized `muln_fast`.
 pub fn commit_scalars_monomial_fast(
   coeffs: &[big::BIG],
@@ -861,6 +1060,89 @@ pub fn bls_verify(pk: &[u8], sig: &[u8], msg: &[u8], domain: &[u8]) -> bool {
 
   let is_sig_ok = bls48581::bls256::core_verify(&sig, &fullmsg, &pk);
   is_sig_ok == bls48581::bls256::BLS_OK
+}
+
+/// Derive a 128-bit batch coefficient `rᵢ = SHA-256(seed ‖ i)[..16]` as a
+/// `BIG`. 128 bits gives ~2⁻¹²⁸ batch soundness; keeping the scalar small
+/// keeps the per-signature G1 multiplications cheap.
+fn bls_batch_coeff(seed: &[u8], i: usize) -> bls48581::big::BIG {
+  let mut h = hash256::HASH256::new();
+  h.process_array(seed);
+  h.process_array(&(i as u64).to_be_bytes());
+  let digest = h.hash();
+  // Zero-pad into a fixed buffer so `frombytes` reads a clean 128-bit value.
+  let mut buf = [0u8; 16];
+  buf.copy_from_slice(&digest[..16]);
+  bls48581::big::BIG::frombytes(&buf)
+}
+
+/// Batch-verify N BLS48-581 signatures, each over its own `domain‖msg`
+/// with its own (aggregate) public key. Returns `true` iff EVERY
+/// signature verifies.
+///
+/// Uses the random-linear-combination batch check: with secret random
+/// coefficients `rᵢ` derived from `seed`,
+///
+/// ```text
+///   e(G2, -Σ rᵢ·sigᵢ) · Πᵢ e(pkᵢ, rᵢ·H(domainᵢ‖msgᵢ)) == 1
+/// ```
+///
+/// This collapses N individual verifications (each a Miller loop + a
+/// final exponentiation) into ONE multi-Miller loop over N+1 pairs + ONE
+/// final exponentiation. The Fp48 final exponentiation is the dominant
+/// cost, so collapsing N→1 is the main win; the pairing count also drops
+/// from 2N to N+1.
+///
+/// **All-or-nothing.** A `false` result only means "at least one
+/// signature is invalid" — the caller must fall back to per-signature
+/// `bls_verify` to identify which. **`seed` MUST be fresh, unpredictable
+/// entropy per call** (OS randomness): the coefficients must be unknowable
+/// to whoever produced the signatures, or a cancellation forgery is
+/// possible.
+///
+/// `items`: `(public_key_g2, signature_g1, message, domain)` per
+/// signature — identical inputs and hashing to `bls_verify`.
+pub fn bls_verify_batch(items: &[(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)], seed: &[u8]) -> bool {
+  use bls48581::ecp::ECP;
+  use bls48581::ecp8::ECP8;
+  use bls48581::pair8;
+
+  if items.is_empty() {
+    return true;
+  }
+
+  let mut acc = pair8::initmp();
+  // Σ rᵢ·sigᵢ accumulated in G1.
+  let mut agg_sig = ECP::new(); // point at infinity
+
+  for (i, (pk, sig, msg, domain)) in items.iter().enumerate() {
+    let r = bls_batch_coeff(seed, i);
+
+    // Signature point (G1), subgroup-checked, scaled by rᵢ.
+    let s = ECP::frombytes(sig);
+    if s.is_infinity() || !pair8::g1member(&s) {
+      return false;
+    }
+    agg_sig.add(&s.mul(&r));
+
+    // Public key (G2), subgroup-checked.
+    let pk_pt = ECP8::frombytes(pk);
+    if !pair8::g2member(&pk_pt) {
+      return false;
+    }
+    // rᵢ·H(domain‖msg) in G1 → e(pkᵢ, rᵢ·Hᵢ).
+    let mut fullmsg = domain.clone();
+    fullmsg.extend_from_slice(msg);
+    let hm = bls48581::bls256::bls_hash_to_point(&fullmsg);
+    pair8::another(&mut acc, &pk_pt, &hm.mul(&r));
+  }
+
+  // LHS: e(G2_generator, -Σ rᵢ·sigᵢ).
+  agg_sig.neg();
+  pair8::another(&mut acc, &ECP8::generator(), &agg_sig);
+
+  let v = pair8::fexp(&pair8::miller(&mut acc));
+  v.isunity()
 }
 
 pub fn bls_verify_msig_mmsg(pks: &Vec<Vec<u8>>, sig: &[u8], msgs: &Vec<Vec<u8>>, domain: &[u8]) -> bool {
@@ -1416,6 +1698,36 @@ mod tests {
     }
 
     #[test]
+    fn bls_verify_batch_matches_individual() {
+        init();
+        let n = 12usize;
+        let outs: Vec<BlsKeygenOutput> = (0..n).map(|_| bls_keygen()).collect();
+        let domain = b"appshard-test-domain".to_vec();
+        let mut items: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+        for (i, out) in outs.iter().enumerate() {
+            let msg = format!("frame-header-{i}").into_bytes();
+            let sig = bls_sign(&out.secret_key, &msg, &domain);
+            // Each must verify individually (ground truth).
+            assert!(bls_verify(&out.public_key, &sig, &msg, &domain), "item {i} individual verify");
+            items.push((out.public_key.clone(), sig, msg, domain.clone()));
+        }
+        let seed = b"fresh-unpredictable-per-call-entropy";
+
+        // All valid → batch passes; empty + single-item edge cases.
+        assert!(bls_verify_batch(&items, seed), "all-valid batch");
+        assert!(bls_verify_batch(&[], seed), "empty batch is vacuously true");
+        assert!(bls_verify_batch(&items[..1], seed), "single-item batch");
+
+        // Substitute a VALID signature point from another item (so it passes
+        // the subgroup check) but for the wrong message → the batch equation
+        // must reject. This exercises the pairing check, not just decoding.
+        let mut bad = items.clone();
+        bad[3].1 = bad[4].1.clone();
+        assert!(!bls_verify(&bad[3].0, &bad[3].1, &bad[3].2, &bad[3].3), "tampered item now individually invalid");
+        assert!(!bls_verify_batch(&bad, seed), "batch must reject when one sig is invalid");
+    }
+
+    #[test]
     fn bls_multi_message_sign() {
         init();
         let outs: Vec<BlsKeygenOutput> = (0..20).into_iter().map(|_| bls_keygen()).collect();
@@ -1742,5 +2054,209 @@ mod tests {
         let cm_orig = commit_scalars_monomial(&coeffs);
         let cm_fast = commit_scalars_monomial_fast(&coeffs);
         assert_eq!(cm_orig, cm_fast, "commit_scalars_monomial_fast must match");
+    }
+
+    /// Aggregate batch verification: a batch of honest KZG openings (3 distinct
+    /// commitments, 2 points each = 6 openings) verifies under ONE pairing
+    /// check, and any tampered value / proof / point is rejected.
+    #[test]
+    fn aggregate_verify_batch_golden_and_forgery() {
+        init();
+        let poly_size: u64 = 16;
+        let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
+        let mut rng = rand::RAND::new();
+        rng.clean();
+        rng.seed(32, &[0x5C; 32]);
+
+        let indices_per: [[u64; 2]; 3] = [[1, 7], [3, 11], [5, 13]];
+        let mut commits: Vec<Vec<u8>> = Vec::new();
+        let mut idxs: Vec<u64> = Vec::new();
+        let mut values: Vec<Vec<u8>> = Vec::new();
+        let mut proofs: Vec<Vec<u8>> = Vec::new();
+
+        for m in 0..3usize {
+            // One "member" = one distinct evaluation-form polynomial.
+            let mut scalars = Vec::with_capacity(poly_size as usize);
+            for _ in 0..poly_size {
+                let mut s = big::BIG::random(&mut rng);
+                s.rmod(&modulus);
+                scalars.push(s);
+            }
+            let mut full = Vec::with_capacity(poly_size as usize * big::MODBYTES);
+            for s in &scalars {
+                let mut buf = [0u8; big::MODBYTES];
+                s.tobytes(&mut buf);
+                full.extend_from_slice(&buf);
+            }
+            let commit = commit_scalars(&scalars, poly_size);
+            for &ix in &indices_per[m] {
+                let proof = prove_raw_full(&full, ix, poly_size);
+                let mut y = [0u8; big::MODBYTES];
+                scalars[ix as usize].tobytes(&mut y);
+                // Sanity: each opening verifies individually.
+                assert!(
+                    verify_raw(&y, &commit, ix, &proof, poly_size),
+                    "single verify failed (m={m}, ix={ix})"
+                );
+                commits.push(commit.clone());
+                idxs.push(ix);
+                values.push(y.to_vec());
+                proofs.push(proof);
+            }
+        }
+
+        let gamma = [0xABu8; 48];
+        // Golden: the whole batch passes one aggregate pairing check.
+        assert!(
+            aggregate_verify_openings(&commits, &idxs, &values, &proofs, poly_size, &gamma),
+            "honest batch must aggregate-verify"
+        );
+
+        // Forgery: tamper one value.
+        let mut bad_v = values.clone();
+        bad_v[2][0] ^= 0x01;
+        assert!(
+            !aggregate_verify_openings(&commits, &idxs, &bad_v, &proofs, poly_size, &gamma),
+            "tampered value must be rejected"
+        );
+
+        // Forgery: tamper one proof.
+        let mut bad_p = proofs.clone();
+        bad_p[4][2] ^= 0x01;
+        assert!(
+            !aggregate_verify_openings(&commits, &idxs, &values, &bad_p, poly_size, &gamma),
+            "tampered proof must be rejected"
+        );
+
+        // Forgery: open at the wrong point (proof no longer matches z).
+        let mut bad_i = idxs.clone();
+        bad_i[0] = idxs[1];
+        assert!(
+            !aggregate_verify_openings(&commits, &bad_i, &values, &proofs, poly_size, &gamma),
+            "wrong opening point must be rejected"
+        );
+
+        // γ is a verification randomizer, not part of the statement: any γ
+        // accepts the honest batch.
+        let gamma2 = [0x11u8; 32];
+        assert!(
+            aggregate_verify_openings(&commits, &idxs, &values, &proofs, poly_size, &gamma2),
+            "honest batch verifies under any γ"
+        );
+    }
+
+    /// Benchmark `aggregate_verify_openings` (the whole shard-storage
+    /// attestation of a global frame folds into ONE of these) at the mainnet
+    /// curve for a range of total opening counts K = Σ_shards Σ_members q.
+    /// Real openings are generated once and replicated to size K, so the timing
+    /// reflects the K-point multiexp + 2 pairings the verifier actually runs.
+    ///   cargo test -p bls48581 --release bench_aggregate_verify -- --ignored --nocapture
+    #[test]
+    #[ignore = "BLS48-581 aggregate-verify benchmark; run with --release --ignored --nocapture"]
+    fn bench_aggregate_verify_scaling() {
+        init();
+        let poly_size: u64 = 256;
+        let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
+        let mut rng = rand::RAND::new();
+        rng.clean();
+        rng.seed(32, &[0x7E; 32]);
+
+        // One real polynomial, opened at all 256 domain points → a pool of
+        // genuine (commitment, index, value, proof) tuples to replicate.
+        let mut scalars = Vec::with_capacity(poly_size as usize);
+        for _ in 0..poly_size {
+            let mut s = big::BIG::random(&mut rng);
+            s.rmod(&modulus);
+            scalars.push(s);
+        }
+        let mut full = Vec::with_capacity(poly_size as usize * big::MODBYTES);
+        for s in &scalars {
+            let mut buf = [0u8; big::MODBYTES];
+            s.tobytes(&mut buf);
+            full.extend_from_slice(&buf);
+        }
+        let commit = commit_scalars(&scalars, poly_size);
+        let mut base_idx: Vec<u64> = Vec::new();
+        let mut base_val: Vec<Vec<u8>> = Vec::new();
+        let mut base_proof: Vec<Vec<u8>> = Vec::new();
+        for ix in 0..poly_size {
+            let proof = prove_raw_full(&full, ix, poly_size);
+            let mut y = [0u8; big::MODBYTES];
+            scalars[ix as usize].tobytes(&mut y);
+            base_idx.push(ix);
+            base_val.push(y.to_vec());
+            base_proof.push(proof);
+        }
+        let pool = base_idx.len();
+        let gamma = [0xCDu8; 48];
+
+        for &kk in &[256usize, 1024, 4096, 16384, 65536] {
+            let commits: Vec<Vec<u8>> = (0..kk).map(|_| commit.clone()).collect();
+            let idxs: Vec<u64> = (0..kk).map(|i| base_idx[i % pool]).collect();
+            let values: Vec<Vec<u8>> = (0..kk).map(|i| base_val[i % pool].clone()).collect();
+            let proofs: Vec<Vec<u8>> = (0..kk).map(|i| base_proof[i % pool].clone()).collect();
+            assert!(
+                aggregate_verify_openings(&commits, &idxs, &values, &proofs, poly_size, &gamma),
+                "replicated honest batch must verify (K={kk})"
+            );
+            let iters = 3u32;
+            let start = Instant::now();
+            for _ in 0..iters {
+                assert!(aggregate_verify_openings(
+                    &commits, &idxs, &values, &proofs, poly_size, &gamma
+                ));
+            }
+            let per = start.elapsed() / iters;
+            println!("K={kk:>6}  aggregate_verify={per:?}");
+        }
+    }
+
+    /// Parallel vs serial multiexp: asserts equality (correctness) and reports
+    /// the core speedup. The aggregate-verify batch is dominated by these
+    /// multiexps, so this is the lever that lets a many-core validator verify
+    /// every prover's possession proof per frame.
+    ///   cargo test -p bls48581 --release bench_parallel_multiexp -- --ignored --nocapture
+    #[test]
+    #[ignore = "parallel multiexp benchmark; run with --release --ignored --nocapture"]
+    fn bench_parallel_multiexp() {
+        init();
+        let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
+        let mut rng = rand::RAND::new();
+        rng.clean();
+        rng.seed(32, &[0x9A; 32]);
+        let g = ecp::ECP::generator();
+        println!("cores={}", rayon::current_num_threads());
+
+        for &k in &[4096usize, 16384, 65536] {
+            let mut pts: Vec<ecp::ECP> = Vec::with_capacity(k);
+            let mut sca: Vec<big::BIG> = Vec::with_capacity(k);
+            for _ in 0..k {
+                let mut s = big::BIG::random(&mut rng);
+                s.rmod(&modulus);
+                pts.push(g.mul(&s));
+                let mut t = big::BIG::random(&mut rng);
+                t.rmod(&modulus);
+                sca.push(t);
+            }
+
+            // Correctness: parallel result must equal serial.
+            let ser_val = point_linear_combination_fast(&pts, &sca).unwrap();
+            let par_val = point_linear_combination_parallel(&pts, &sca).unwrap();
+            assert!(
+                ser_val.equals(&par_val),
+                "parallel multiexp must equal serial (K={k})"
+            );
+
+            let t0 = Instant::now();
+            let _ = point_linear_combination_fast(&pts, &sca).unwrap();
+            let serial = t0.elapsed();
+            let t1 = Instant::now();
+            let _ = point_linear_combination_parallel(&pts, &sca).unwrap();
+            let parallel = t1.elapsed();
+            println!(
+                "K={k:>6}  serial={serial:?}  parallel={parallel:?}  speedup={:.1}x",
+                serial.as_secs_f64() / parallel.as_secs_f64()
+            );
+        }
     }
 }

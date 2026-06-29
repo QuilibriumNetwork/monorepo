@@ -190,12 +190,51 @@ use rustls::{ServerConfig, SignatureScheme};
 /// Requires a client cert (mandatory auth) so downstream code can
 /// always rely on `TlsConnectInfo::peer_certs()` being populated.
 #[derive(Debug)]
-pub struct XsignClientCertVerifier;
+pub struct XsignClientCertVerifier {
+    /// Signature-verification algorithms from the installed crypto provider,
+    /// used to perform the real TLS `CertificateVerify` proof-of-possession
+    /// check in `verify_tls1x_signature`.
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl Default for XsignClientCertVerifier {
+    /// Build a verifier wired to the ring crypto provider's signature
+    /// algorithms (matching the provider installed by
+    /// `build_quil_server_tls_config`).
+    fn default() -> Self {
+        Self {
+            supported: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms,
+        }
+    }
+}
+
+/// Memoized results of [`XsignClientCertVerifier::verify_xsign`], keyed by
+/// SHA-256 of the presented cert DER → the SAN-derived Ed448 pubkey. A peer
+/// presents the IDENTICAL cert on every handshake, and the xsign scheme has
+/// no expiry, so the (slow, vendored-pure-Rust) Ed448 *verify* — plus the
+/// x509 parse — should run once per distinct peer cert, not once per
+/// connection. A tampered cert hashes differently → cache miss → full
+/// verify → reject, so caching is sound. Bounded; cleared wholesale on
+/// overflow (crude but keeps it from growing unbounded as prover identities
+/// churn). The verify is deterministic, so a re-fill is cheap correctness-wise.
+static XSIGN_VERIFY_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<[u8; 32], Vec<u8>>>,
+> = std::sync::OnceLock::new();
+const XSIGN_VERIFY_CACHE_CAP: usize = 8192;
 
 impl XsignClientCertVerifier {
     /// Stand-alone validation routine, exposed for tests. Returns the
     /// SAN-derived Ed448 public key on success.
     pub fn verify_xsign(cert_der: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+        use sha2::{Digest, Sha256};
+        let cert_hash: [u8; 32] = Sha256::digest(cert_der).into();
+        let cache = XSIGN_VERIFY_CACHE
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Some(pk) = cache.lock().unwrap().get(&cert_hash) {
+            return Ok(pk.clone());
+        }
+
         let (_, cert) = x509_parser::parse_x509_certificate(cert_der)
             .map_err(|e| rustls::Error::General(format!("parse client cert: {e}")))?;
 
@@ -255,7 +294,15 @@ impl XsignClientCertVerifier {
             .verify(&signed, xsign, None)
             .map_err(|e| rustls::Error::General(format!("xsign verify failed: {e:?}")))?;
 
-        Ok(blob[..57].to_vec())
+        let pubkey = blob[..57].to_vec();
+        {
+            let mut c = cache.lock().unwrap();
+            if c.len() >= XSIGN_VERIFY_CACHE_CAP {
+                c.clear();
+            }
+            c.insert(cert_hash, pubkey.clone());
+        }
+        Ok(pubkey)
     }
 }
 
@@ -284,24 +331,25 @@ impl ClientCertVerifier for XsignClientCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        // The cert's Ed25519 key is verified by rustls itself when
-        // checking the handshake signature against the presented cert.
-        // We only assert; the cryptographic check is the standard TLS
-        // one performed by the rustls crypto provider.
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        // This callback IS the TLS proof-of-possession check: when a custom
+        // verifier is installed there is no separate built-in step. Verify the
+        // client's CertificateVerify signature against the cert's Ed25519 key,
+        // proving the live peer holds the cert's private half (Go's
+        // crypto/tls enforces this unconditionally; xsign alone does not).
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -342,7 +390,7 @@ pub fn build_quil_server_tls_config(
     .map_err(|e| QuilTlsError::Rcgen(format!("parse key pem: {}", e)))?
     .ok_or_else(|| QuilTlsError::Rcgen("no private key in pem".into()))?;
 
-    let verifier: Arc<dyn ClientCertVerifier> = Arc::new(XsignClientCertVerifier);
+    let verifier: Arc<dyn ClientCertVerifier> = Arc::new(XsignClientCertVerifier::default());
 
     let mut config = ServerConfig::builder()
         .with_client_cert_verifier(verifier)
@@ -700,5 +748,201 @@ mod tests {
         let msg2 = format!("{}", err2);
         assert!(msg2.contains("rcgen"));
         assert!(msg2.contains("build failed"));
+    }
+
+    // =================================================================
+    // Proof-of-possession regression test — END-TO-END HANDSHAKE
+    //
+    // `verify_xsign` proves the presented cert is genuine (the Ed448
+    // identity authorized its Ed25519 cert key) but NOT that the live peer
+    // holds the cert's private key. That second guarantee is the TLS
+    // `CertificateVerify` check, which rustls routes through
+    // `verify_tls1x_signature`. `XsignClientCertVerifier` now performs that
+    // check (it previously stubbed those callbacks to `Ok(assertion())`,
+    // which let a client present a public cert it did not own — signing
+    // CertificateVerify with a different key — and still authenticate).
+    //
+    // This repro covers the acceptor direction (`build_quil_server_tls_config`
+    // / `XsignClientCertVerifier`); the client direction is covered in
+    // `archive_client.rs`. The test drives a real TLS 1.3 handshake through
+    // the actual production construction and asserts the handshake FAILS for a
+    // forged (non-possessing) client. It failed before possession was enforced
+    // (the handshake succeeded, demonstrating the bypass); it now guards
+    // against that regression.
+    // =================================================================
+
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    fn cert_chain_from_seed(seed: &[u8; 57]) -> Vec<CertificateDer<'static>> {
+        vec![CertificateDer::from(cert_der_from_seed(seed))]
+    }
+
+    /// Load the Ed25519 signing key derived from `seed`. Pairing this with a
+    /// *different* seed's cert chain (via `CertifiedKey::new`, which — unlike
+    /// `from_der` — does not check the key matches the cert) is the forgery:
+    /// present someone else's cert, sign with your own key.
+    fn signing_key_from_seed(seed: &[u8; 57]) -> Arc<dyn rustls::sign::SigningKey> {
+        let tls = build_quil_tls_cert(seed).unwrap();
+        let key: PrivateKeyDer<'static> =
+            rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
+                .unwrap()
+                .unwrap();
+        rustls::crypto::ring::sign::any_supported_type(&key).unwrap()
+    }
+
+    /// Client resolver presenting `victim`'s cert chain but signing with the
+    /// attacker's key — a client that does NOT possess the cert's key.
+    #[derive(Debug)]
+    struct ForgedClientIdentity(Arc<rustls::sign::CertifiedKey>);
+    impl rustls::client::ResolvesClientCert for ForgedClientIdentity {
+        fn resolve(
+            &self,
+            _root_hint_subjects: &[&[u8]],
+            _sigschemes: &[SignatureScheme],
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            Some(self.0.clone())
+        }
+        fn has_certs(&self) -> bool {
+            true
+        }
+    }
+
+    /// Proper client-side server-cert verifier for the test client. This
+    /// branch has no client-side xsign verifier, so we implement one inline,
+    /// mirroring Go's client `VerifyPeerCertificate`: verify the server's
+    /// xsign cross-signature on its cert AND verify the handshake signature
+    /// (real proof-of-possession) via rustls' standard webpki path. With a
+    /// fully-correct verifier on the client, the handshake completing in the
+    /// forged test is unambiguously the *server* accepting a non-possessing
+    /// client — not a pushover client rubber-stamping the server.
+    #[derive(Debug)]
+    struct XsignServerVerifier {
+        supported: rustls::crypto::WebPkiSupportedAlgorithms,
+    }
+    impl XsignServerVerifier {
+        fn new() -> Self {
+            Self {
+                supported: rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms,
+            }
+        }
+    }
+    impl rustls::client::danger::ServerCertVerifier for XsignServerVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            // Genuine cert check: the server must present a valid xsign cert.
+            XsignClientCertVerifier::verify_xsign(end_entity.as_ref())?;
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            // Real proof-of-possession: the server must hold its cert's key.
+            rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.supported.supported_schemes()
+        }
+    }
+
+    #[tokio::test]
+    async fn acceptor_completes_handshake_with_forged_client_signature() {
+        // Production server, built exactly as the node does.
+        let acceptor = TlsAcceptor::from(build_quil_server_tls_config(&[0x71u8; 57]).unwrap());
+
+        // Attacker: victim's public cert + attacker's own (different) key.
+        let forged = Arc::new(rustls::sign::CertifiedKey::new(
+            cert_chain_from_seed(&[0x61u8; 57]),
+            signing_key_from_seed(&[0x62u8; 57]),
+        ));
+        let client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(XsignServerVerifier::new()))
+            .with_client_cert_resolver(Arc::new(ForgedClientIdentity(forged)));
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let (server_res, client_res) = tokio::join!(
+            acceptor.accept(server_io),
+            connector.connect(server_name, client_io),
+        );
+
+        // Setup guard: the attacker's client side must complete. In TLS 1.3
+        // the client finishes its flight before the server validates the
+        // client cert, so this is Ok before and after the fix — ensuring the
+        // handshake actually reached the client-auth stage.
+        assert!(
+            client_res.is_ok(),
+            "handshake did not reach the client-auth stage: {:?}",
+            client_res.err(),
+        );
+        assert!(
+            server_res.is_err(),
+            "VULNERABILITY: TlsAcceptor (build_quil_server_tls_config) completed the \
+             handshake with a client that presented the victim's cert but signed \
+             CertificateVerify with a different key — proof-of-possession is not \
+             enforced, so the peer identity is spoofable by cert replay",
+        );
+    }
+
+    /// Positive control: the SAME server must SUCCEED for a legitimate client
+    /// that actually possesses its cert's key. Proves the forged test fails
+    /// specifically because possession is missing — not because of ALPN, the
+    /// duplex transport, or some other setup detail. Passes before and after
+    /// the fix (all possession is legitimate).
+    #[tokio::test]
+    async fn acceptor_completes_handshake_with_legitimate_client() {
+        let acceptor = TlsAcceptor::from(build_quil_server_tls_config(&[0x71u8; 57]).unwrap());
+
+        // Legit client: presents its own cert signed with its own key.
+        let seed = [0x61u8; 57];
+        let tls = build_quil_tls_cert(&seed).unwrap();
+        let key: PrivateKeyDer<'static> =
+            rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
+                .unwrap()
+                .unwrap();
+        let client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(XsignServerVerifier::new()))
+            .with_client_auth_cert(cert_chain_from_seed(&seed), key)
+            .unwrap();
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let (server_res, client_res) = tokio::join!(
+            acceptor.accept(server_io),
+            connector.connect(server_name, client_io),
+        );
+
+        // Nobody rejects here, so both sides must complete.
+        assert!(
+            client_res.is_ok(),
+            "legitimate handshake must succeed (client side): {:?}",
+            client_res.err(),
+        );
+        assert!(
+            server_res.is_ok(),
+            "legitimate handshake must succeed (server side): {:?}",
+            server_res.err(),
+        );
     }
 }

@@ -91,6 +91,17 @@ pub struct FrameHeader {
     pub prover: Vec<u8>,
     pub fee_multiplier_vote: i64,
     pub public_key_signature_bls48581: Vec<u8>,
+    /// Committee digest over the per-member proof-of-storage openings carried
+    /// with the frame (committed into the VDF challenge).
+    pub storage_attestation_root: Vec<u8>,
+    /// The global frame whose VDF output anchors the storage beacon rho_N.
+    pub global_frame_number: u64,
+    /// Serialized `proto::global::StorageAttestation` — the per-member PoRep
+    /// openings the committee voted with, assembled at QC. Carried on the
+    /// reward proof so the global frame can recompute the attestation root and
+    /// run the ρ_N-sampled possession audit. Empty pre-activation (and then
+    /// byte-identical to the legacy layout, since it's a tolerant trailing field).
+    pub storage_attestation: Vec<u8>,
 }
 
 impl FrameHeader {
@@ -109,6 +120,18 @@ impl FrameHeader {
         put_lp(&mut out, &self.prover);
         put_i64(&mut out, self.fee_multiplier_vote);
         put_lp(&mut out, &self.public_key_signature_bls48581);
+        // Appended storage-attestation binding (new fields after the legacy
+        // layout, so older positional readers stop cleanly before them).
+        put_lp(&mut out, &self.storage_attestation_root);
+        put_u64(&mut out, self.global_frame_number);
+        // Tolerant trailing field (after the storage-root + global-frame fields):
+        // the full openings blob for the global audit. Length-prefixed, so an
+        // empty attestation appends a 4-byte zero length — and to keep the
+        // pre-activation bytes byte-identical to the legacy layout we omit it
+        // entirely when empty (decoders stop cleanly at the prior field).
+        if !self.storage_attestation.is_empty() {
+            put_lp(&mut out, &self.storage_attestation);
+        }
         Ok(out)
     }
 
@@ -120,7 +143,7 @@ impl FrameHeader {
                 format!("FrameHeader: bad type 0x{:08x}", tp),
             ));
         }
-        Ok(Self {
+        let mut h = Self {
             address: read_lp(data, &mut c)?,
             frame_number: read_u64(data, &mut c)?,
             rank: read_u64(data, &mut c)?,
@@ -133,7 +156,22 @@ impl FrameHeader {
             prover: read_lp(data, &mut c)?,
             fee_multiplier_vote: read_i64(data, &mut c)?,
             public_key_signature_bls48581: read_opt_sig(data, &mut c)?,
-        })
+            storage_attestation_root: Vec::new(),
+            global_frame_number: 0,
+            storage_attestation: Vec::new(),
+        };
+        // The storage-attestation fields are appended; tolerate their absence so
+        // pre-attestation canonical bytes still decode (the bytes are then empty).
+        if c < data.len() {
+            h.storage_attestation_root = read_lp(data, &mut c)?;
+            h.global_frame_number = read_u64(data, &mut c)?;
+            // The full openings blob is itself a tolerant trailing field —
+            // present only when the committee attested (post-activation).
+            if c < data.len() {
+                h.storage_attestation = read_lp(data, &mut c)?;
+            }
+        }
+        Ok(h)
     }
 }
 
@@ -175,6 +213,9 @@ mod tests {
             prover: vec![0xFFu8; 585],
             fee_multiplier_vote: 42,
             public_key_signature_bls48581: vec![0x11u8; 74],
+            storage_attestation_root: vec![0x33u8; 32],
+            global_frame_number: 777,
+            storage_attestation: vec![0x44u8; 96],
         };
         let b = f.to_canonical_bytes().unwrap();
         assert_eq!(&b[..4], &TYPE_FRAME_HEADER.to_be_bytes());
@@ -186,6 +227,32 @@ mod tests {
         let f = FrameHeader::default();
         let b = f.to_canonical_bytes().unwrap();
         assert_eq!(FrameHeader::from_canonical_bytes(&b).unwrap(), f);
+    }
+
+    #[test]
+    fn frame_header_storage_attestation_is_tolerant_trailing() {
+        // A header with root + global frame but NO openings blob must encode
+        // byte-identically to the legacy layout (the field is omitted when
+        // empty), and a legacy-shaped buffer must decode with empty openings.
+        let mut legacy = FrameHeader {
+            address: vec![0x01u8; 32],
+            frame_number: 9,
+            global_frame_number: 1_000,
+            storage_attestation_root: vec![0x33u8; 74],
+            ..Default::default()
+        };
+        let with_empty = legacy.to_canonical_bytes().unwrap();
+        // Now attach openings; the bytes must grow (trailing field present).
+        legacy.storage_attestation = vec![0xABu8; 120];
+        let with_att = legacy.to_canonical_bytes().unwrap();
+        assert!(with_att.len() > with_empty.len());
+        // Both round-trip.
+        let back_empty = FrameHeader::from_canonical_bytes(&with_empty).unwrap();
+        assert!(back_empty.storage_attestation.is_empty());
+        assert_eq!(back_empty.storage_attestation_root, vec![0x33u8; 74]);
+        let back_att = FrameHeader::from_canonical_bytes(&with_att).unwrap();
+        assert_eq!(back_att.storage_attestation, vec![0xABu8; 120]);
+        assert_eq!(back_att, legacy);
     }
 
     #[test]

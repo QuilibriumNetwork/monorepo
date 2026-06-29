@@ -29,21 +29,62 @@ use quil_types::store::{ShardKey, SnapshotReadable};
 
 const DEFAULT_LEAF_PAGE_SIZE: usize = 1000;
 
+/// Max distinct trees held in the cross-request cache. Keyed by
+/// `(phase, shard, root)`, so the live working set is ~4 phases ×
+/// (global + active app shards) per generation; a new frame changes the
+/// root and supersedes old keys. The cap bounds memory if roots churn;
+/// on overflow we clear (entries simply reload on the next request).
+const MAX_CACHED_TREES: usize = 64;
+
+/// Shared, generation-keyed tree cache. The hot global prover tree
+/// (~10^5 leaves) is served identically to every syncing peer until the
+/// next commit changes its root, so without this each of the hundreds of
+/// concurrent peer streams re-read+rebuilt it from RocksDB — the dominant
+/// disk-pressure source. Keyed by `(phase_set, shard, root)` so a stale
+/// generation is never mis-served (root mismatch ⇒ cache miss ⇒ reload).
+type TreeCache =
+    Arc<std::sync::RwLock<HashMap<(i32, ShardKey, Vec<u8>), Arc<VectorCommitmentTree>>>>;
+
 /// HyperSync server implementation.
 pub struct HyperSyncServer {
     hg_store: Arc<RocksHypergraphStore>,
     /// When set, sync requests with a non-empty `expected_root` are
     /// validated against the snapshot generation registry.
     crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// Cross-request tree cache shared by all `perform_sync` streams.
+    tree_cache: TreeCache,
+    /// Optional dedicated runtime for the long-lived `perform_sync`
+    /// producer tasks. The peer-gRPC listener serves consensus delivery,
+    /// frame reads, and hypersync on ONE port/runtime; hypersync streams
+    /// are the heavy, long-lived load. Spawning their producers onto a
+    /// separate runtime keeps the listener's own worker threads free to
+    /// run the accept loop and dispatch latency-critical archive↔archive
+    /// consensus RPCs — so a flood of sync requests (a DDoS vector) can
+    /// saturate the sync runtime without ever starving consensus. `None`
+    /// falls back to the ambient runtime (`tokio::spawn`).
+    executor: Option<tokio::runtime::Handle>,
 }
 
 impl HyperSyncServer {
     pub fn new(hg_store: Arc<RocksHypergraphStore>) -> Self {
-        Self { hg_store, crdt: None }
+        Self {
+            hg_store,
+            crdt: None,
+            tree_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            executor: None,
+        }
     }
 
     pub fn with_crdt(mut self, crdt: Arc<quil_hypergraph::HypergraphCrdt>) -> Self {
         self.crdt = Some(crdt);
+        self
+    }
+
+    /// Run `perform_sync` producer tasks on a dedicated runtime instead of
+    /// the ambient (peer-gRPC) runtime, isolating heavy sync work from the
+    /// consensus-delivery path. See the `executor` field docs.
+    pub fn with_executor(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.executor = Some(handle);
         self
     }
 }
@@ -125,12 +166,37 @@ fn load_tree_for_phase(
     let mut t = VectorCommitmentTree::new();
     t.root = Some(root);
 
-    // Diagnostic: detect lazy-load truncation or stale-cache divergence
-    // by comparing loaded-leaf count + recomputed commit to stored values.
+    // Diagnostic: detect stale-cache divergence by recomputing the root
+    // and comparing to the stored commitment.
+    //
+    // CRITICAL: this is only valid when the ENTIRE tree is resident in
+    // memory. `load_root_and_two_levels` deliberately loads only levels
+    // 0-2, so a deep tree (e.g. the global vertex tree with ~10^5 leaves
+    // at level 3) has its real leaves unloaded. Recomputing over that
+    // truncated tree is meaningless: `VectorCommitmentTree::commit`
+    // always recalculates (`tree.rs` hardcodes recalculate=true), so every
+    // level-2 branch whose children weren't loaded rebuilds its commitment
+    // from an all-zero child vector — producing a bogus root and a
+    // guaranteed (false) "divergence". We therefore only run the recompute
+    // when we actually hold every leaf: `collected == leaf_count_meta`.
     let collected = if let Some(root_ref) = t.root.as_ref() {
         collect_leaves(root_ref).len() as u64
     } else { 0 };
-    let leaves_match = collected == leaf_count_loaded;
+    let fully_resident = collected == leaf_count_loaded;
+
+    if !fully_resident {
+        // Shallow (2-level) load of a deeper tree — expected for large
+        // trees. Log the stored root only; recompute is not meaningful.
+        tracing::info!(
+            set = %set_str, phase = %phase_str,
+            root_commit = %root_commit_hex,
+            children_loaded = child_count_loaded,
+            leaf_count_meta = leaf_count_loaded,
+            leaves_collected = collected,
+            "sync server: load_tree_for_phase loaded root (shallow; recompute skipped)",
+        );
+        return Some(t);
+    }
 
     let mut t_for_recompute = VectorCommitmentTree::new();
     t_for_recompute.root = t.root.clone();
@@ -156,20 +222,146 @@ fn load_tree_for_phase(
         children_loaded = child_count_loaded,
         leaf_count_meta = leaf_count_loaded,
         leaves_collected = collected,
-        leaves_match,
-        "sync server: load_tree_for_phase loaded root (diagnostic)",
+        "sync server: load_tree_for_phase loaded root (diagnostic, fully resident)",
     );
-    if !commits_match || !leaves_match {
+    if !commits_match {
         tracing::warn!(
             set = %set_str, phase = %phase_str,
             commits_match,
-            leaves_match,
             stored_commit_prefix = %hex::encode(&stored_commit[..stored_commit.len().min(16)]),
             recomputed_prefix = %hex::encode(&recomputed[..recomputed.len().min(16)]),
             "sync server: tree state divergence — clients will see commitment mismatch",
         );
     }
     Some(t)
+}
+
+/// True for the global prover shard (`l2 == [0xff; 32]`) — the only tree
+/// we hold fully resident. Token/app shards can be ~10^2 GB and must
+/// stay on the bounded lazy path.
+fn is_prover_shard(shard: &ShardKey) -> bool {
+    shard.l2 == [0xffu8; 32]
+}
+
+/// Fully load a RAM-safe shard's tree (every node, every depth) so the
+/// server serves all peers' leaf walks from one in-memory copy pinned to
+/// a commit root, instead of a per-request lazy descent into RocksDB.
+/// ONLY safe for the prover shard — see [`is_prover_shard`] and
+/// `LazyVectorCommitmentTree::load_full`.
+fn load_full_tree_for_phase(
+    hg_store: &std::sync::Arc<quil_store::RocksHypergraphStore>,
+    phase: HypergraphPhaseSet,
+    shard: ShardKey,
+) -> Option<VectorCommitmentTree> {
+    let (set_str, phase_str) = phase_strings(phase);
+    let lazy = quil_tries::LazyVectorCommitmentTree::new(
+        std::sync::Arc::clone(hg_store)
+            as std::sync::Arc<dyn quil_types::store::HypergraphStore>,
+        set_str.to_string(),
+        phase_str.to_string(),
+        shard.clone(),
+        Vec::new(),
+    );
+    match lazy.load_full() {
+        Ok(Some(root)) => {
+            let mut t = VectorCommitmentTree::new();
+            t.root = Some(root);
+            Some(t)
+        }
+        Ok(None) => {
+            tracing::info!(set = %set_str, phase = %phase_str,
+                "sync server: load_full_tree_for_phase: no root in store");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(set = %set_str, phase = %phase_str, error = %e,
+                "sync server: load_full_tree_for_phase errored");
+            None
+        }
+    }
+}
+
+/// Load the tree for one sync request. Prover shard → full tree from the
+/// point-in-time snapshot (structure + leaf values one generation), with
+/// live full-load as last resort; token shards → snapshot blob if pinned,
+/// else bounded 2-level live load. This is BLOCKING (RocksDB + KZG/CPU) —
+/// callers MUST run it via `spawn_blocking`, never inline on the async
+/// runtime.
+fn load_tree_owned(
+    hg_store: &std::sync::Arc<quil_store::RocksHypergraphStore>,
+    crdt: &Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    handle: Option<quil_hypergraph::GenerationHandle>,
+    phase: HypergraphPhaseSet,
+    shard: &ShardKey,
+) -> Option<VectorCommitmentTree> {
+    if let Some(h) = handle.as_ref() {
+        if let Some(snap) = h.db_snapshot.as_ref() {
+            match load_tree_from_snapshot(snap, phase, shard) {
+                Ok(Some(t)) => return Some(t),
+                Ok(None) => {}
+                Err(e) => warn!(
+                    error = %e,
+                    "snapshot tree decode failed, falling back to live store",
+                ),
+            }
+        }
+    }
+    // Prover shard (`0xff..ff`): whole tree resident, pinned to a commit
+    // root, from the snapshot (RAM-safe ~10^5 leaves). Token shards stay
+    // bounded to avoid ~10^2 GB resident.
+    if is_prover_shard(shard) {
+        let eff = handle.or_else(|| crdt.as_ref().and_then(|c| c.acquire_snapshot(&[])));
+        if let Some(snap) = eff.as_ref().and_then(|h| h.db_snapshot.as_ref()) {
+            let (set_str, phase_str) = phase_strings(phase);
+            match quil_tries::load_full_tree_from_snapshot(snap.as_ref(), set_str, phase_str, shard)
+            {
+                Ok(Some(mut root)) => {
+                    hydrate_leaf_values(&mut root, snap.as_ref(), set_str, phase_str, shard);
+                    let mut t = VectorCommitmentTree::new();
+                    t.root = Some(root);
+                    return Some(t);
+                }
+                Ok(None) => {}
+                Err(e) => warn!(error = %e, "prover snapshot full-load failed; live fallback"),
+            }
+        }
+        return load_full_tree_for_phase(hg_store, phase, shard.clone());
+    }
+    load_tree_for_phase(hg_store, phase, shard.clone())
+}
+
+/// Cache-or-load a tree, dispatching the BLOCKING load onto the blocking
+/// pool so the async runtime stays free. Shared across all peer streams;
+/// keyed `(phase, shard, root)` so a stale generation is never served.
+async fn get_or_load_tree(
+    tree_cache: &TreeCache,
+    hg_store: &std::sync::Arc<quil_store::RocksHypergraphStore>,
+    crdt: &Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    cache_key: &(i32, ShardKey, Vec<u8>),
+    handle: &Option<quil_hypergraph::GenerationHandle>,
+    phase: HypergraphPhaseSet,
+    shard: &ShardKey,
+) -> Option<Arc<VectorCommitmentTree>> {
+    // Fast path: cache hit (the guard is dropped before any await).
+    if let Some(t) = tree_cache.read().unwrap().get(cache_key).cloned() {
+        return Some(t);
+    }
+    // Slow path: heavy load OFF the async runtime.
+    let hg = hg_store.clone();
+    let cr = crdt.clone();
+    let h = handle.clone();
+    let sh = shard.clone();
+    let loaded = tokio::task::spawn_blocking(move || load_tree_owned(&hg, &cr, h, phase, &sh))
+        .await
+        .ok()
+        .flatten()?;
+    let arc = Arc::new(loaded);
+    let mut w = tree_cache.write().unwrap();
+    if w.len() >= MAX_CACHED_TREES {
+        w.clear();
+    }
+    // Re-check: another stream may have inserted concurrently.
+    Some(w.entry(cache_key.clone()).or_insert_with(|| arc.clone()).clone())
 }
 
 /// Pagination continuation token — ASCII hex of a 4-byte big-endian
@@ -374,7 +566,7 @@ fn root_response(tree: &VectorCommitmentTree) -> HypergraphSyncBranchResponse {
 /// encoding strips it to avoid double-storing the vertex blob.
 fn hydrate_leaf_values(
     node: &mut VectorCommitmentNode,
-    hg_store: &quil_store::RocksHypergraphStore,
+    reader: &dyn quil_types::store::SnapshotReadable,
     set_str: &str,
     phase_str: &str,
     shard: &ShardKey,
@@ -385,7 +577,7 @@ fn hydrate_leaf_values(
                 return;
             }
             if let Ok(Some(v)) =
-                hg_store.load_vertex_underlying(set_str, phase_str, shard, &leaf.key)
+                reader.load_vertex_underlying_raw(set_str, phase_str, shard, &leaf.key)
             {
                 leaf.value = v;
             }
@@ -393,7 +585,7 @@ fn hydrate_leaf_values(
         VectorCommitmentNode::Branch(branch) => {
             for child in branch.children.iter_mut() {
                 if let Some(c) = child.as_mut() {
-                    hydrate_leaf_values(c, hg_store, set_str, phase_str, shard);
+                    hydrate_leaf_values(c, reader, set_str, phase_str, shard);
                 }
             }
         }
@@ -449,16 +641,16 @@ impl HypergraphComparisonService for HyperSyncServer {
     ) -> Result<Response<Self::PerformSyncStream>, Status> {
         let hg_store = self.hg_store.clone();
         let crdt = self.crdt.clone();
+        let tree_cache = self.tree_cache.clone();
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<HypergraphSyncResponse, Status>>(16);
+        // Spawn the (heavy, long-lived) producer onto the dedicated sync
+        // runtime when configured, so it never occupies the peer-gRPC
+        // runtime threads that drive the accept loop + consensus delivery.
+        let executor = self.executor.clone();
 
         // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-        tokio::spawn(async move {
-            // Cache tree per (phase, shard, snapshot_root) so multi-phase
-            // streams don't reload, shards never cross-serve, and a
-            // pinned `expected_root` gets a distinct tree from the
-            // live-store fallback.
-            let mut trees: HashMap<(i32, ShardKey, Vec<u8>), VectorCommitmentTree> = HashMap::new();
+        let producer = async move {
 
             // When the client pinned `expected_root`, require a matching
             // snapshot generation. The returned handle's `db_snapshot`
@@ -486,30 +678,40 @@ impl HypergraphComparisonService for HyperSyncServer {
                 }
             };
 
-            // Load the tree for this request, preferring the
-            // generation-bound snapshot when one is available so reads
-            // are point-in-time consistent under concurrent writes.
-            // Falls back to the live store on snapshot miss or decode
-            // failure.
-            let load_tree_for_request = |
-                handle: &Option<quil_hypergraph::GenerationHandle>,
-                phase: HypergraphPhaseSet,
-                shard: &ShardKey,
-            | -> Option<VectorCommitmentTree> {
-                if let Some(h) = handle {
-                    if let Some(snap) = h.db_snapshot.as_ref() {
-                        match load_tree_from_snapshot(snap, phase, shard) {
-                            Ok(Some(t)) => return Some(t),
-                            Ok(None) => {}
-                            Err(e) => warn!(
-                                error = %e,
-                                "snapshot tree decode failed, falling back to live store",
-                            ),
-                        }
-                    }
-                }
-                load_tree_for_phase(&hg_store, phase, shard.clone())
-            };
+            // Tree loading + cross-request caching now lives in the
+            // module-level `load_tree_owned` / `get_or_load_tree`. The
+            // heavy load (prover full-tree walk + KZG + hydration, or a
+            // shard 2-level load) is dispatched onto the BLOCKING pool by
+            // `get_or_load_tree` so it never blocks the async runtime —
+            // critical because the same runtime drives the blossomsub
+            // consensus mesh, h2 keepalives, and gRPC accept. Running
+            // 10^5-node loads inline on tokio workers (once per generation,
+            // ×hundreds of peers) starved all of those and collapsed
+            // consensus network-wide.
+
+            // Per-stream tree pin, keyed by (phase, shard). A single
+            // `perform_sync` exchange is one client's full sync of one
+            // subtree: GetBranch (root + children) followed by paged
+            // GetLeaves. The client's pagination is POSITIONAL — a
+            // continuation token is an integer index into the server's
+            // `collect_leaves(node)` vector — so every page MUST be served
+            // from the SAME tree. Without a pin, two things shift the leaf
+            // set under the cursor mid-exchange: (a) the cross-stream
+            // `tree_cache` is cleared whenever it overflows (hundreds of
+            // peers at different generations churn it), forcing a reload;
+            // and (b) on the bootstrap path the client sends an EMPTY
+            // expected_root, so each reload re-acquires the *latest*
+            // snapshot — which advances as the archive commits new frames.
+            // Either one skips/duplicates leaves at a page boundary, the
+            // client's recomputed root never matches, and the sync retries
+            // forever without persisting — the "archives never converge on
+            // the tries" symptom. Pinning the loaded `Arc` for the lifetime
+            // of the stream makes pagination stable regardless of global
+            // cache pressure or a moving live store.
+            let mut pinned_trees: std::collections::HashMap<
+                (i32, ShardKey),
+                Arc<VectorCommitmentTree>,
+            > = std::collections::HashMap::new();
 
             while let Some(query) = inbound.next().await {
                 let query = match query {
@@ -538,18 +740,23 @@ impl HypergraphComparisonService for HyperSyncServer {
                             .unwrap_or_default();
                         let cache_key: (i32, ShardKey, Vec<u8>) =
                             (req.phase_set, shard.clone(), snapshot_id);
-                        if !trees.contains_key(&cache_key) {
-                            if let Some(t) = load_tree_for_request(&handle, phase, &shard) {
-                                trees.insert(cache_key.clone(), t);
+                        let pin_key = (req.phase_set, shard.clone());
+                        let tree_opt = if let Some(t) = pinned_trees.get(&pin_key) {
+                            Some(t.clone())
+                        } else {
+                            let loaded = get_or_load_tree(&tree_cache, &hg_store, &crdt, &cache_key, &handle, phase, &shard).await;
+                            if let Some(ref t) = loaded {
+                                pinned_trees.insert(pin_key, t.clone());
                             }
-                        }
-                        match trees.get(&cache_key) {
+                            loaded
+                        };
+                        match tree_opt {
                             Some(tree) => {
                                 if req.path.is_empty() {
                                     HypergraphSyncResponse {
                                         response: Some(
                                             hypergraph_sync_response::Response::Branch(
-                                                root_response(tree),
+                                                root_response(&tree),
                                             ),
                                         ),
                                     }
@@ -601,12 +808,17 @@ impl HypergraphComparisonService for HyperSyncServer {
                             .unwrap_or_default();
                         let cache_key: (i32, ShardKey, Vec<u8>) =
                             (req.phase_set, shard.clone(), snapshot_id);
-                        if !trees.contains_key(&cache_key) {
-                            if let Some(t) = load_tree_for_request(&handle, phase, &shard) {
-                                trees.insert(cache_key.clone(), t);
+                        let pin_key = (req.phase_set, shard.clone());
+                        let tree_opt = if let Some(t) = pinned_trees.get(&pin_key) {
+                            Some(t.clone())
+                        } else {
+                            let loaded = get_or_load_tree(&tree_cache, &hg_store, &crdt, &cache_key, &handle, phase, &shard).await;
+                            if let Some(ref t) = loaded {
+                                pinned_trees.insert(pin_key, t.clone());
                             }
-                        }
-                        match trees.get(&cache_key) {
+                            loaded
+                        };
+                        match tree_opt {
                             Some(tree) => match tree.root.as_ref() {
                                 Some(root) => {
                                     let subtree_node = if req.path.is_empty() {
@@ -692,7 +904,15 @@ impl HypergraphComparisonService for HyperSyncServer {
             }
 
             debug!("perform_sync stream closed");
-        });
+        };
+        match executor {
+            Some(handle) => {
+                handle.spawn(producer);
+            }
+            None => {
+                tokio::spawn(producer);
+            }
+        }
 
         let stream = ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(stream) as Self::PerformSyncStream))

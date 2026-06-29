@@ -738,7 +738,8 @@ pub fn verify_prover_confirm(
         QuilError::InvalidArgument("verify prover confirm: missing signature".into())
     })?;
 
-    let message = prover_verify::multi_filter_signing_message(&op.filters, op.frame_number);
+    let message =
+        prover_verify::confirm_signing_message(&op.filters, op.frame_number, &op.leaf_roots);
     let domain = prover_verify::prover_confirm_domain()?;
 
     key_manager.validate_signature(
@@ -750,24 +751,32 @@ pub fn verify_prover_confirm(
     )
 }
 
-/// Validate ProverConfirm timing constraints. Called during invoke_step
-/// with the allocation tree loaded. Mirrors Go's frame window checks in
-/// `global_prover_confirm.go:492-574`.
+/// Validate ProverConfirm timing constraints (epoch-aligned lifecycle). Called
+/// during invoke_step with the allocation tree loaded. A proposal made in epoch
+/// E must be confirmed in EXACTLY epoch E+1 — this is what keeps committee
+/// membership frozen within an epoch (a confirm can only ever take effect at the
+/// next boundary E+2).
 ///
-/// - Join confirm (status=0): must wait 360-720 frames after JoinFrameNumber
-/// - Leave confirm (status=3): must wait 360-720 frames after LeaveFrameNumber
+/// - Join confirm (status=0): `epoch_for_frame(frame) == epoch_for_frame(JoinFrameNumber)+1`.
+/// - Leave confirm (status=3): `epoch_for_frame(frame) == epoch_for_frame(LeaveFrameNumber)+1`.
+/// - Re-confirm (status=1): a data shard registering its NEXT epoch — allowed
+///   iff `!filter.is_empty() && Epoch <= epoch_for_frame(frame)` (renews for
+///   frame_epoch+1; rejects the empty/global filter and a double re-confirm that
+///   already registered ahead).
 pub fn validate_confirm_timing(
     frame_number: u64,
     allocation_tree: &quil_tries::VectorCommitmentTree,
 ) -> Result<()> {
+    use quil_types::consensus::epoch_for_frame;
     let cls = "allocation:ProverAllocation";
     let status = crate::global_schema::read_field(allocation_tree, cls, "Status")
         .and_then(|b| b.first().copied())
         .unwrap_or(255);
+    let confirm_epoch = epoch_for_frame(frame_number);
 
     match status {
         0 => {
-            // Joining — check JoinFrameNumber timing
+            // Joining — must confirm in exactly the epoch after the join.
             let join_frame_bytes = crate::global_schema::read_field(
                 allocation_tree, cls, "JoinFrameNumber",
             ).unwrap_or_default();
@@ -776,58 +785,19 @@ pub fn validate_confirm_timing(
                     "confirm: missing JoinFrameNumber".into(),
                 ));
             }
-            let mut join_frame = u64::from_be_bytes(join_frame_bytes.try_into().unwrap());
-
-            // Tier-5 #11: 2.1 transition window. Joins between
-            // 244100..255840 must wait until frame 255840 to confirm.
-            // Once frame 255840 hits, those joins immediately become
-            // eligible (they all "catch up" at once). Joins ≥ 255840
-            // fall through to the normal 360..720 window. Mirrors Go's
-            // `global_prover_confirm.go:507-546`.
-            const TRANSITION_END: u64 =
-                crate::token_intrinsic::constants::FRAME_2_1_EXTENDED_ENROLL_END;
-            const TRANSITION_BEGIN: u64 = 244_100;
-            if join_frame >= TRANSITION_BEGIN && join_frame < TRANSITION_END {
-                if frame_number < TRANSITION_END {
-                    return Err(QuilError::InvalidArgument(
-                        "confirm: cannot confirm before frame 255840 (2.1 enrollment window)"
-                            .into(),
-                    ));
-                }
-                // Clamp join_frame so the resulting window starts at
-                // (TRANSITION_END - 360). For joins newer than the
-                // floor, leave them alone so they get the full 360.
-                if join_frame < TRANSITION_END - 360 {
-                    join_frame = TRANSITION_END - 360;
-                }
-            }
-
-            // Joins ≥ (TRANSITION_END - 360) OR ≤ 244100 follow the
-            // normal MIN..MAX window (360..720 on mainnet; configurable
-            // for testnet via `set_confirm_window_frames`). Joins inside
-            // the transition band were either rejected above or
-            // clamped.
-            if join_frame >= TRANSITION_END - 360 || join_frame <= TRANSITION_BEGIN {
-                let min = MIN_CONFIRM_FRAMES.load(Ordering::Relaxed);
-                let max = MAX_CONFIRM_FRAMES.load(Ordering::Relaxed);
-                let frames_since = frame_number.saturating_sub(join_frame);
-                if frames_since < min {
-                    return Err(QuilError::InvalidArgument(format!(
-                        "confirm: must wait {} frames after join (only {} elapsed)",
-                        min, frames_since
-                    )));
-                }
-                if frames_since > max {
-                    return Err(QuilError::InvalidArgument(format!(
-                        "confirm: join confirmation window expired ({} frames, {} elapsed)",
-                        max, frames_since
-                    )));
-                }
+            let join_frame = u64::from_be_bytes(join_frame_bytes.try_into().unwrap());
+            let expect = epoch_for_frame(join_frame) + 1;
+            if confirm_epoch != expect {
+                return Err(QuilError::InvalidArgument(format!(
+                    "confirm: join must be confirmed in epoch {} (join epoch {}), \
+                     not epoch {}",
+                    expect, epoch_for_frame(join_frame), confirm_epoch,
+                )));
             }
             Ok(())
         }
         3 => {
-            // Leaving — check LeaveFrameNumber timing
+            // Leaving — must confirm in exactly the epoch after the leave.
             let leave_frame_bytes = crate::global_schema::read_field(
                 allocation_tree, cls, "LeaveFrameNumber",
             ).unwrap_or_default();
@@ -837,25 +807,43 @@ pub fn validate_confirm_timing(
                 ));
             }
             let leave_frame = u64::from_be_bytes(leave_frame_bytes.try_into().unwrap());
-            let frames_since = frame_number.saturating_sub(leave_frame);
-            let min = MIN_CONFIRM_FRAMES.load(Ordering::Relaxed);
-            let max = MAX_CONFIRM_FRAMES.load(Ordering::Relaxed);
-            if frames_since < min {
+            let expect = epoch_for_frame(leave_frame) + 1;
+            if confirm_epoch != expect {
                 return Err(QuilError::InvalidArgument(format!(
-                    "confirm: must wait {} frames after leave (only {} elapsed)",
-                    min, frames_since
+                    "confirm: leave must be confirmed in epoch {} (leave epoch {}), \
+                     not epoch {}",
+                    expect, epoch_for_frame(leave_frame), confirm_epoch,
                 )));
             }
-            if frames_since > max {
+            Ok(())
+        }
+        1 => {
+            // Active — epoch re-confirm (registers the NEXT epoch). A data-shard
+            // allocation renews by registering one epoch ahead; allowed only
+            // when it hasn't already (`Epoch <= confirm_epoch`). The empty/global
+            // filter never epoch-expires and is rejected.
+            let filter = crate::global_schema::read_field(
+                allocation_tree, cls, "ConfirmationFilter",
+            ).unwrap_or_default();
+            let epoch_bytes = crate::global_schema::read_field(
+                allocation_tree, cls, "Epoch",
+            ).unwrap_or_default();
+            let epoch = if epoch_bytes.len() == 8 {
+                u64::from_be_bytes(epoch_bytes.try_into().unwrap())
+            } else {
+                0
+            };
+            if filter.is_empty() || epoch > confirm_epoch {
                 return Err(QuilError::InvalidArgument(format!(
-                    "confirm: leave confirmation window expired ({} frames, {} elapsed)",
-                    max, frames_since
+                    "confirm: active re-confirm only for a data shard not already \
+                     registered ahead (epoch {} > confirm epoch {}, empty_filter={})",
+                    epoch, confirm_epoch, filter.is_empty(),
                 )));
             }
             Ok(())
         }
         _ => Err(QuilError::InvalidArgument(format!(
-            "confirm: invalid allocation status {} (expected 0=joining or 3=leaving)",
+            "confirm: invalid allocation status {} (expected 0=joining, 1=active re-confirm, or 3=leaving)",
             status
         ))),
     }
@@ -1389,6 +1377,7 @@ mod tests {
                 address: vec![0xCCu8; 32],
             }),
             filters: vec![vec![0xDDu8; 32]],
+            leaf_roots: Vec::new(),
         }
     }
 
@@ -1597,14 +1586,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Tier-5 #11: 2.1 transition window in validate_confirm_timing
+    // Epoch-aligned confirm timing: a proposal in epoch E confirms in
+    // EXACTLY epoch E+1. EPOCH_LENGTH_FRAMES = 720.
     // -----------------------------------------------------------------
+    const E: u64 = quil_types::consensus::EPOCH_LENGTH_FRAMES;
 
     fn make_alloc_tree_with_join_frame(status: u8, join_frame: u64)
         -> quil_tries::VectorCommitmentTree
     {
-        // ConfirmationFilter at order 2 → key 0x08; JoinFrameNumber at order 4 → key 0x10.
-        // Use schema-driven keys to be safe.
         let mut tree = make_allocation_tree(status);
         let cls = "allocation:ProverAllocation";
         let join_key = crate::global_schema::field_key(cls, "JoinFrameNumber").unwrap();
@@ -1612,53 +1601,110 @@ mod tests {
         tree
     }
 
-    /// Joins inside the 2.1 transition window (244100..255840) cannot
-    /// confirm before frame 255840.
-    #[test]
-    fn confirm_timing_blocks_transition_window_before_255840() {
-        let alloc = make_alloc_tree_with_join_frame(0, 244_500);
-        // frame_number < 255840 → must error.
-        let res = validate_confirm_timing(255_000, &alloc);
-        assert!(res.is_err(), "must reject confirm before 255840");
+    fn make_alloc_tree_with_leave_frame(leave_frame: u64)
+        -> quil_tries::VectorCommitmentTree
+    {
+        let mut tree = make_allocation_tree(3); // Leaving
+        let cls = "allocation:ProverAllocation";
+        let leave_key = crate::global_schema::field_key(cls, "LeaveFrameNumber").unwrap();
+        tree.insert(&leave_key, &leave_frame.to_be_bytes(), &[], &BigInt::from(8)).unwrap();
+        tree
     }
 
-    /// Joins inside the transition window get clamped at frame 255840
-    /// so they all confirm immediately once the cutover frame hits.
+    /// A join proposed in epoch E must be confirmed in exactly epoch E+1.
     #[test]
-    fn confirm_timing_admits_transition_window_at_255840() {
-        // Join in the middle of the band; once frame_number hits
-        // 255840, the clamped join_frame becomes 255840-360, so
-        // frames_since == 360 → allowed.
-        let alloc = make_alloc_tree_with_join_frame(0, 244_200);
-        let res = validate_confirm_timing(255_840, &alloc);
-        assert!(res.is_ok(), "must admit transition-window join at 255840: {res:?}");
+    fn confirm_timing_join_requires_next_epoch() {
+        // Join in epoch 2.
+        let alloc = make_alloc_tree_with_join_frame(0, 2 * E + 100);
+        // Same epoch (2) → too early.
+        assert!(validate_confirm_timing(2 * E + 500, &alloc).is_err());
+        // Epoch 3 (= E+1) → ok, anywhere in the epoch.
+        assert!(validate_confirm_timing(3 * E, &alloc).is_ok());
+        assert!(validate_confirm_timing(3 * E + 719, &alloc).is_ok());
+        // Epoch 4 → too late (missed the slot).
+        assert!(validate_confirm_timing(4 * E, &alloc).is_err());
     }
 
-    /// Pre-transition joins (< 244100) follow the normal 360..720 window.
+    /// A leave proposed in epoch E must be confirmed in exactly epoch E+1.
     #[test]
-    fn confirm_timing_normal_window_pre_transition() {
-        let alloc = make_alloc_tree_with_join_frame(0, 200_000);
-
-        // Too early.
-        assert!(validate_confirm_timing(200_300, &alloc).is_err());
-        // In the window.
-        assert!(validate_confirm_timing(200_400, &alloc).is_ok());
-        // Past the window.
-        assert!(validate_confirm_timing(200_800, &alloc).is_err());
+    fn confirm_timing_leave_requires_next_epoch() {
+        let alloc = make_alloc_tree_with_leave_frame(5 * E + 10); // epoch 5
+        assert!(validate_confirm_timing(5 * E + 700, &alloc).is_err()); // same epoch
+        assert!(validate_confirm_timing(6 * E + 1, &alloc).is_ok());    // E+1
+        assert!(validate_confirm_timing(7 * E, &alloc).is_err());       // too late
     }
 
-    /// Joins after the cutover (≥ 255840) follow the normal 360..720
-    /// window — the transition logic does not affect them.
+    /// Active re-confirm registers the NEXT epoch: allowed iff the recorded
+    /// Epoch is not already ahead of the confirm epoch, and the filter is a
+    /// non-empty data shard.
     #[test]
-    fn confirm_timing_normal_window_post_transition() {
-        let alloc = make_alloc_tree_with_join_frame(0, 256_000);
+    fn confirm_timing_active_reconfirm_not_already_ahead() {
+        let cls = "allocation:ProverAllocation";
+        let mk = |epoch: u64, filter: &[u8]| {
+            let mut tree = make_allocation_tree(1); // Active
+            tree.insert(
+                &crate::global_schema::field_key(cls, "Epoch").unwrap(),
+                &epoch.to_be_bytes(), &[], &BigInt::from(8),
+            ).unwrap();
+            tree.insert(
+                &crate::global_schema::field_key(cls, "ConfirmationFilter").unwrap(),
+                filter, &[], &BigInt::from(filter.len() as i64),
+            ).unwrap();
+            tree
+        };
+        // Registered for epoch 3, re-confirming in epoch 3 (to register 4) → ok.
+        assert!(validate_confirm_timing(3 * E + 5, &mk(3, &[0xAB; 32])).is_ok());
+        // Already registered ahead (epoch 4) but confirming in epoch 3 → reject.
+        assert!(validate_confirm_timing(3 * E + 5, &mk(4, &[0xAB; 32])).is_err());
+        // Empty/global filter never epoch-expires → reject.
+        assert!(validate_confirm_timing(3 * E + 5, &mk(3, &[])).is_err());
+    }
 
-        // Too early.
-        assert!(validate_confirm_timing(256_200, &alloc).is_err());
-        // In the window (frames_since = 360).
-        assert!(validate_confirm_timing(256_360, &alloc).is_ok());
-        // Past 720 frames.
-        assert!(validate_confirm_timing(256_721, &alloc).is_err());
+    // ---- Gap coverage (audit 2026-06-28): defensive arms + stale recovery ----
+
+    /// Missing JoinFrameNumber / LeaveFrameNumber (field length != 8) is rejected
+    /// rather than silently defaulting.
+    #[test]
+    fn confirm_timing_missing_frame_fields_error() {
+        // Status 0 (Joining) with no JoinFrameNumber field at all.
+        let joining = make_allocation_tree(0);
+        assert!(validate_confirm_timing(3 * E, &joining).is_err());
+        // Status 3 (Leaving) with no LeaveFrameNumber field.
+        let leaving = make_allocation_tree(3);
+        assert!(validate_confirm_timing(3 * E, &leaving).is_err());
+    }
+
+    /// Confirm on a non-confirmable status byte (paused / terminal / garbage)
+    /// hits the `_ =>` arm → Err.
+    #[test]
+    fn confirm_timing_invalid_status_byte_error() {
+        for byte in [2u8, 4u8, 5u8, 255u8] {
+            let t = make_allocation_tree(byte);
+            assert!(
+                validate_confirm_timing(3 * E, &t).is_err(),
+                "status byte {byte} must not be confirmable"
+            );
+        }
+    }
+
+    /// Active re-confirm RECOVERS from a stale (ExpiredEpoch) registration: an
+    /// allocation registered for epoch 2, confirming in epoch 5, is allowed
+    /// (`epoch <= confirm_epoch`) — it re-registers for epoch 6. Previously only
+    /// the `epoch == confirm_epoch` case was tested.
+    #[test]
+    fn confirm_timing_active_reconfirm_recovers_from_stale_epoch() {
+        let cls = "allocation:ProverAllocation";
+        let mut t = make_allocation_tree(1); // Active
+        t.insert(
+            &crate::global_schema::field_key(cls, "Epoch").unwrap(),
+            &2u64.to_be_bytes(), &[], &BigInt::from(8),
+        ).unwrap();
+        t.insert(
+            &crate::global_schema::field_key(cls, "ConfirmationFilter").unwrap(),
+            &[0xCD; 32], &[], &BigInt::from(32),
+        ).unwrap();
+        // Confirming in epoch 5 with a stale epoch-2 registration → recovery ok.
+        assert!(validate_confirm_timing(5 * E + 10, &t).is_ok());
     }
 
     // -----------------------------------------------------------------

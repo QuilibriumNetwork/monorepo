@@ -86,7 +86,37 @@ pub struct FrameMaterializer {
     /// completes so every consumer of "what frame are we on" sees
     /// the new value as soon as state has been applied.
     current_frame: Option<Arc<CurrentFrame>>,
+
+    /// Frame prover + BLS constructor used to BATCH-verify a frame's
+    /// shard-`FrameHeader` aggregate signatures before the per-bundle
+    /// loop. Must be the SAME `frame_prover` Arc installed into the
+    /// execution manager's global intrinsic, so the preverified set the
+    /// batch records is the one the per-bundle `verify_frame_header_signature`
+    /// reads. When unset (or the Arc isn't shared) every header just falls
+    /// back to individual BLS verification — slower, never wrong.
+    frame_prover: Option<Arc<dyn quil_types::crypto::FrameProver>>,
+    bls: Option<Arc<dyn quil_types::crypto::BlsConstructor>>,
+
+    /// Deterministic per-shard data-size source, keyed by
+    /// `confirmation_filter` (= L2(32) ++ prefix-byte) → size in bytes.
+    /// Used to exclude EMPTY shards (no data) from the eviction halt gate:
+    /// a shard with ≤ halt_threshold active provers but zero data has
+    /// nothing to protect, so it must not suppress eviction. MUST be a
+    /// consensus-deterministic source (the committed shards store, NOT a
+    /// per-node size cache) so every archive computes the same eviction
+    /// set — otherwise nodes diverge once eviction activates. `None`
+    /// falls back to the legacy size-blind behavior.
+    shard_size_source:
+        Option<Arc<dyn Fn() -> std::collections::HashMap<Vec<u8>, u64> + Send + Sync>>,
 }
+
+/// Frame at and after which inactive-prover eviction actually mutates
+/// state. Before this frame the materializer computes the would-be
+/// eviction set (visible via the explorer `/provers/eviction-risk`
+/// endpoint and logged) but does NOT evict — a deliberate ramp so the
+/// targets can be reviewed before any prover is kicked. Eviction is
+/// consensus-state-mutating, so every archive shares this constant.
+pub const GLOBAL_EVICTION_ACTIVATION_FRAME: u64 = 674_570;
 
 /// Results from materializing a frame.
 #[derive(Debug)]
@@ -99,6 +129,10 @@ pub struct MaterializeResult {
     pub prover_root_matched: bool,
     /// The local prover root after materialization.
     pub local_prover_root: Vec<u8>,
+    /// Canonical bytes of every bundle in the finalized frame. The caller
+    /// feeds these to `MessageCollector::mark_finalized` so the consumed
+    /// messages leave the mempool and aren't re-proposed.
+    pub finalized_bundles: Vec<Vec<u8>>,
 }
 
 impl FrameMaterializer {
@@ -132,7 +166,37 @@ impl FrameMaterializer {
             rocks_hg_store: None,
             eviction_registry: None,
             current_frame: None,
+            frame_prover: None,
+            bls: None,
+            shard_size_source: None,
         }
+    }
+
+    /// Wire a deterministic per-shard data-size source (filter → bytes)
+    /// so empty shards are excluded from the eviction halt gate. Must be
+    /// backed by consensus-deterministic committed state (the shards
+    /// store), NOT a per-node cache. See `shard_size_source`.
+    pub fn with_shard_size_source(
+        mut self,
+        source: Arc<dyn Fn() -> std::collections::HashMap<Vec<u8>, u64> + Send + Sync>,
+    ) -> Self {
+        self.shard_size_source = Some(source);
+        self
+    }
+
+    /// Wire the shared frame prover + BLS constructor so the materializer
+    /// batch-verifies each frame's shard-`FrameHeader` BLS signatures up
+    /// front (one multi-pairing + one final exponentiation instead of N).
+    /// Pass the SAME `frame_prover` Arc installed into the execution
+    /// manager's global intrinsic.
+    pub fn with_bls_batch_verify(
+        mut self,
+        frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
+        bls: Arc<dyn quil_types::crypto::BlsConstructor>,
+    ) -> Self {
+        self.frame_prover = Some(frame_prover);
+        self.bls = Some(bls);
+        self
     }
 
     /// Wire the shared `CurrentFrame` so the materializer can
@@ -187,6 +251,7 @@ impl FrameMaterializer {
                 skipped: 0,
                 prover_root_matched: true,
                 local_prover_root: Vec::new(),
+                finalized_bundles: Vec::new(),
             });
         }
 
@@ -230,6 +295,109 @@ impl FrameMaterializer {
             >= quil_execution::token_intrinsic::constants::FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX;
         let mut processed = 0usize;
         let mut skipped = 0usize;
+        // Canonical bytes of every well-formed bundle in this frame, fed
+        // to `MessageCollector::mark_finalized` by the caller so consumed
+        // messages leave the mempool.
+        let mut finalized_bundles: Vec<Vec<u8>> = Vec::with_capacity(frame.requests.len());
+
+        // Batch-verify this frame's shard-`FrameHeader` BLS aggregate
+        // signatures up front — one multi-pairing + one final
+        // exponentiation for all N, instead of one pairing-verify per
+        // proof. On success the frame prover records them so each
+        // per-bundle `validate_message` → `verify_frame_header_signature`
+        // below skips the redundant BLS pairing (the VDF multiproof still
+        // runs); on any failure nothing is recorded and per-bundle
+        // verification runs unchanged. Requires the materializer's
+        // `frame_prover` to be the SAME Arc installed into the execution
+        // manager's global intrinsic (otherwise it's a no-op, never wrong).
+        if let (Some(fp), Some(bls)) = (self.frame_prover.as_ref(), self.bls.as_ref()) {
+            let headers: Vec<&quil_types::proto::global::FrameHeader> = frame
+                .requests
+                .iter()
+                .flat_map(|b| b.requests.iter())
+                .filter_map(|r| match r.request.as_ref() {
+                    Some(quil_types::proto::global::message_request::Request::Shard(fh)) => Some(fh),
+                    _ => None,
+                })
+                .collect();
+            if !headers.is_empty() {
+                let batched = fp.verify_frame_header_signatures_batch(&headers, bls.as_ref());
+                debug!(
+                    frame = frame_number,
+                    headers = headers.len(),
+                    batched,
+                    "shard-frame BLS batch pre-verify"
+                );
+            }
+        }
+
+        // Parallel crypto pre-pass for shard-`FrameHeader` bundles. Their
+        // per-proof Wesolowski VDF multiproof is the dominant remaining
+        // verification cost and CANNOT be batched (each lives in its own
+        // challenge-derived class group), but the verifications are
+        // independent and parallelize cleanly. Validate the FrameHeader
+        // bundles across cores up front and cache the verdict; the
+        // sequential loop below reuses it instead of re-verifying (BLS is
+        // already short-circuited by the batch pre-pass).
+        //
+        // Safe because FrameHeader validation reads only the prover
+        // registry CACHE — which is frozen at the start of the frame and
+        // refreshed via `refresh_from_store` only AFTER this loop — plus
+        // the header itself; it does NOT read the CRDT trees that
+        // `process_message` mutates mid-loop. So the result is identical
+        // whether computed up front in parallel or in sequence, and no
+        // `process_message` has run yet, so the concurrent
+        // `validate_message` calls take only shared RwLock reads.
+        let fh_validation: std::collections::HashMap<Vec<u8>, bool> = {
+            let fh_bytes: Vec<Vec<u8>> = frame
+                .requests
+                .iter()
+                .filter(|b| {
+                    b.requests.iter().any(|r| {
+                        matches!(
+                            r.request,
+                            Some(quil_types::proto::global::message_request::Request::Shard(_))
+                        )
+                    })
+                })
+                .filter_map(|b| {
+                    crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok()
+                })
+                .collect();
+            if fh_bytes.len() >= 2 {
+                let threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .min(fh_bytes.len());
+                let chunk = fh_bytes.len().div_ceil(threads);
+                let out: std::sync::Mutex<std::collections::HashMap<Vec<u8>, bool>> =
+                    std::sync::Mutex::new(std::collections::HashMap::with_capacity(fh_bytes.len()));
+                std::thread::scope(|s| {
+                    for c in fh_bytes.chunks(chunk) {
+                        let out = &out;
+                        let em = &self.execution_manager;
+                        // FrameHeaders route to the global engine (0xff).
+                        let addr = global_addr.clone();
+                        s.spawn(move || {
+                            let mut local: Vec<(Vec<u8>, bool)> = Vec::with_capacity(c.len());
+                            for bytes in c {
+                                let ok = em
+                                    .validate_message(frame_number, &addr, bytes)
+                                    .is_ok();
+                                local.push((bytes.clone(), ok));
+                            }
+                            let mut g = out.lock().unwrap();
+                            for (k, v) in local {
+                                g.insert(k, v);
+                            }
+                        });
+                    }
+                });
+                out.into_inner().unwrap()
+            } else {
+                std::collections::HashMap::new()
+            }
+        };
 
         for bundle in &frame.requests {
             // Per-bundle routing address. Default: the global engine
@@ -289,6 +457,11 @@ impl FrameMaterializer {
                 skipped += 1;
                 continue;
             }
+            // This bundle is part of the finalized frame → it is consumed
+            // from the mempool regardless of whether execution processes
+            // or skips it below.
+            finalized_bundles.push(bundle_bytes.clone());
+
             let request_type = u32::from_be_bytes([
                 bundle_bytes[0],
                 bundle_bytes[1],
@@ -327,17 +500,38 @@ impl FrameMaterializer {
             // Mirrors Go's `ExecutionEngineManager.ValidateMessage`
             // gate before `ProcessMessage` at
             // `execution/engine_manager.go:processFrameMessages`.
-            if let Err(e) = self.execution_manager.validate_message(
-                frame_number,
-                &route_addr,
-                &bundle_bytes,
-            ) {
-                info!(
-                    frame = frame_number,
-                    request_type = format!("0x{:08x}", request_type),
-                    error = %e,
-                    "skipping message that failed signature validation"
-                );
+            // Use the parallel pre-pass verdict for FrameHeader bundles;
+            // validate everything else here (sequentially, against the
+            // mid-loop CRDT state those ops legitimately depend on).
+            let valid = match fh_validation.get(&bundle_bytes) {
+                Some(&ok) => {
+                    if !ok {
+                        info!(
+                            frame = frame_number,
+                            request_type = format!("0x{:08x}", request_type),
+                            "skipping message that failed signature validation (parallel pre-pass)"
+                        );
+                    }
+                    ok
+                }
+                None => match self.execution_manager.validate_message(
+                    frame_number,
+                    &route_addr,
+                    &bundle_bytes,
+                ) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        info!(
+                            frame = frame_number,
+                            request_type = format!("0x{:08x}", request_type),
+                            error = %e,
+                            "skipping message that failed signature validation"
+                        );
+                        false
+                    }
+                },
+            };
+            if !valid {
                 skipped += 1;
                 continue;
             }
@@ -358,6 +552,12 @@ impl FrameMaterializer {
                     skipped += 1;
                 }
             }
+        }
+
+        // Drop the per-frame batch-preverified set so it never leaks into
+        // the next frame's verification.
+        if let Some(fp) = self.frame_prover.as_ref() {
+            fp.clear_bls_preverified();
         }
 
         // 4. Advance the shared current-frame tracker so RPC handlers,
@@ -408,48 +608,185 @@ impl FrameMaterializer {
         // `EvictInactiveProvers(..., evictionState)` at
         // `frame_materializer.go:285`.
         if self.archive_mode {
-            let has_active_halt = self.has_active_coverage_halt();
-            if !has_active_halt {
-                if let Some(eviction_reg) = self.eviction_registry.as_ref() {
-                    let halt_bytes = self.coverage_halt_durations.lock().unwrap().clone();
-                    let state = quil_execution::hypergraph_state::HypergraphState::new(
-                        self.hypergraph.clone(),
+            if let Some(eviction_reg) = self.eviction_registry.as_ref() {
+                // Build the size-aware effective halt map. The coverage
+                // monitor stamps `u64::MAX` on every shard with
+                // `active_count <= halt_threshold` REGARDLESS of data size,
+                // which means a handful of empty (no-data) under-subscribed
+                // shards perpetually suppress eviction across the whole
+                // network. Drop those: a shard with zero committed data has
+                // nothing to protect, so its low coverage must not gate
+                // eviction. Sizes come from a consensus-deterministic source
+                // (the shards store) so every archive computes the same set.
+                let mut effective_halt =
+                    self.coverage_halt_durations.lock().unwrap().clone();
+                let raw_max_count =
+                    effective_halt.values().filter(|&&d| d == u64::MAX).count();
+                let mut sizes_loaded = 0usize;
+                let mut sizes_was_empty = true;
+                if let Some(sizes_fn) = self.shard_size_source.as_ref() {
+                    let sizes = sizes_fn();
+                    sizes_loaded = sizes.len();
+                    sizes_was_empty = sizes.is_empty();
+                    // Only apply the size filter once sizes are actually
+                    // loaded — an empty map means "unknown", in which case
+                    // we keep the conservative size-blind behavior rather
+                    // than treating every shard as empty.
+                    if !sizes.is_empty() {
+                        effective_halt.retain(|filter, dur| {
+                            // Keep non-halt streak entries untouched; only
+                            // re-evaluate full-halt (u64::MAX) entries.
+                            if *dur != u64::MAX {
+                                return true;
+                            }
+                            sizes.get(filter).copied().unwrap_or(0) > 0
+                        });
+                    }
+                }
+
+                // Diagnostic: which shards (if any) still hold a full halt
+                // after the size filter — these are what suppress eviction.
+                let surviving: Vec<String> = effective_halt
+                    .iter()
+                    .filter(|(_, &d)| d == u64::MAX)
+                    .map(|(f, _)| hex::encode(f))
+                    .collect();
+                let has_active_halt = !surviving.is_empty();
+                if has_active_halt {
+                    // A data-bearing shard is still halted — Go parity:
+                    // nobody is evicted while any real shard is
+                    // under-covered. Log the offenders so we can confirm
+                    // whether the size filter is actually clearing the
+                    // empty shards or the size source came back empty.
+                    let sample: Vec<&String> = surviving.iter().take(10).collect();
+                    info!(
+                        frame = frame_number,
+                        raw_max = raw_max_count,
+                        surviving_max = surviving.len(),
+                        sizes_loaded,
+                        sizes_was_empty,
+                        suppressors = ?sample,
+                        "eviction suppressed by coverage halt (surviving_max>0 ⇒ these shards block; sizes_was_empty=true ⇒ size source returned nothing → size-blind)"
                     );
-                    match eviction_reg.evict_inactive_provers(
+                } else {
+                    // Compute the would-be eviction set every frame (read
+                    // only) so it's observable (logs + explorer
+                    // `/provers/eviction-risk`) even before eviction
+                    // actually activates.
+                    let candidates = eviction_reg.find_eviction_candidates(
                         frame_number,
                         self.eviction_grace_frames,
-                        &halt_bytes,
-                        &state,
-                    ) {
-                        Ok(evicted) => {
-                            if !evicted.is_empty() {
-                                if let Err(e) = state.commit() {
-                                    warn!(frame = frame_number, error = %e, "eviction commit failed");
-                                } else {
-                                    info!(
-                                        frame = frame_number,
-                                        count = evicted.len(),
-                                        "evicted inactive provers"
-                                    );
+                        &effective_halt,
+                    );
+                    // Unconditional: log the candidate count every frame, even
+                    // zero. The gate is open here (no surviving u64::MAX), so a
+                    // zero count means find_eviction_candidates itself rejected
+                    // every prover — e.g. the per-shard streak subtraction in
+                    // effective_halt pulled effective_inactive below the grace
+                    // threshold — which is invisible without this line and is
+                    // the explorer/materializer divergence we're chasing.
+                    info!(
+                        frame = frame_number,
+                        candidates = candidates.len(),
+                        halt_entries = effective_halt.len(),
+                        "eviction candidate scan"
+                    );
+                    if frame_number >= GLOBAL_EVICTION_ACTIVATION_FRAME {
+                        // Activated: actually mark Status=4 + KickFrameNumber.
+                        let state = quil_execution::hypergraph_state::HypergraphState::new(
+                            self.hypergraph.clone(),
+                        );
+                        match eviction_reg.evict_inactive_provers(
+                            frame_number,
+                            self.eviction_grace_frames,
+                            &effective_halt,
+                            &state,
+                            // Flat-keyspace fallback for vertices the CRDT
+                            // tree lacks (e.g. populated via hypergraph sync).
+                            self.rocks_hg_store.as_ref(),
+                        ) {
+                            Ok(evicted) => {
+                                if !evicted.is_empty() {
+                                    if let Err(e) = state.commit() {
+                                        warn!(frame = frame_number, error = %e, "eviction commit failed");
+                                    } else {
+                                        // Persist the eviction durably. `commit_frame`
+                                        // already ran earlier this frame (before
+                                        // eviction), so the kick currently lives only in
+                                        // the CRDT's in-memory global-shard tree. A plain
+                                        // re-commit would hit the same-frame idempotency
+                                        // cache and SKIP the now-dirty shard, so the kick
+                                        // would never reach RocksDB — the background
+                                        // refresh_from_store would then revert the cache
+                                        // and the same provers would be re-evicted every
+                                        // frame (no visible effect). Invalidate the global
+                                        // intrinsic shard's cached frame commit, re-commit
+                                        // (only that dirty shard recomputes; others stay
+                                        // cached), then refresh so the registry cache +
+                                        // shard summaries reflect the kicks.
+                                        let global_addr =
+                                            quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+                                        if let Err(e) = self
+                                            .hypergraph
+                                            .invalidate_domain_shard_commit(frame_number, &global_addr)
+                                        {
+                                            warn!(frame = frame_number, error = %e, "eviction: invalidate shard commit failed");
+                                        }
+                                        if let Err(e) =
+                                            self.execution_manager.commit_frame(frame_number)
+                                        {
+                                            warn!(frame = frame_number, error = %e, "eviction re-commit (flush) failed");
+                                        }
+                                        if let Some(rocks_store) = self.rocks_hg_store.as_ref() {
+                                            eviction_reg.refresh_from_store(rocks_store);
+                                        }
+                                        // Persistence probe: after the flush+refresh the
+                                        // just-kicked provers must no longer be eviction
+                                        // candidates — their vertex is now Status=4 and is
+                                        // dropped from the registry cache. If any still
+                                        // appear, the kick did not reach the backing store
+                                        // (or was reverted by a later sync) — surface it.
+                                        let recheck = eviction_reg.find_eviction_candidates(
+                                            frame_number,
+                                            self.eviction_grace_frames,
+                                            &effective_halt,
+                                        );
+                                        let still_present = recheck
+                                            .iter()
+                                            .filter(|a| evicted.contains(a))
+                                            .count();
+                                        info!(
+                                            frame = frame_number,
+                                            count = evicted.len(),
+                                            still_candidates = still_present,
+                                            "evicted inactive provers (still_candidates>0 ⇒ kick did not persist)"
+                                        );
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                warn!(frame = frame_number, error = %e, "eviction (mutating) failed");
+                            }
                         }
-                        Err(e) => {
-                            warn!(frame = frame_number, error = %e, "eviction (mutating) failed");
-                        }
+                    } else if !candidates.is_empty() {
+                        // Pre-activation ramp: identify but do NOT evict.
+                        info!(
+                            frame = frame_number,
+                            count = candidates.len(),
+                            activation_frame = GLOBAL_EVICTION_ACTIVATION_FRAME,
+                            "eviction targets identified — gated until activation frame, not evicting yet"
+                        );
                     }
-                } else {
-                    // Without a concrete-typed `eviction_registry`,
-                    // the materializer can't construct a
-                    // `HypergraphState` to mutate prover/allocation
-                    // vertices. Skip eviction entirely — there's no
-                    // useful read-only path here. Production wires
-                    // the registry via `with_eviction_registry`.
-                    debug!(
-                        frame = frame_number,
-                        "skipping eviction — no concrete registry wired"
-                    );
                 }
+            } else {
+                // Without a concrete-typed `eviction_registry`, the
+                // materializer can't construct a `HypergraphState` to
+                // mutate prover/allocation vertices. Production wires the
+                // registry via `with_eviction_registry`.
+                debug!(
+                    frame = frame_number,
+                    "skipping eviction — no concrete registry wired"
+                );
             }
         }
 
@@ -477,6 +814,7 @@ impl FrameMaterializer {
             skipped,
             prover_root_matched,
             local_prover_root: post_root,
+            finalized_bundles,
         })
     }
 
@@ -902,6 +1240,7 @@ mod tests {
             skipped: 1,
             prover_root_matched: true,
             local_prover_root: vec![0xAA; 64],
+            finalized_bundles: Vec::new(),
         };
         assert_eq!(r.processed, 5);
         assert_eq!(r.skipped, 1);

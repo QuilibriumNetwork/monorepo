@@ -53,6 +53,13 @@ pub struct AppVoteAggregation {
     /// QC cache shared with `AppFollower::on_finalized_state` for
     /// certifying-QC rehydration.
     qc_store: Arc<QcStore>,
+    /// PoRep: per-rank, per-member storage openings collected from votes
+    /// (`rank → member → openings`). Populated in `handle_vote` when a vote
+    /// carries openings, drained by the seal path via `take_frame_openings` to
+    /// assemble the finalized frame's `StorageAttestation`. Empty pre-activation.
+    #[allow(clippy::type_complexity)]
+    vote_openings:
+        Arc<Mutex<HashMap<u64, HashMap<Vec<u8>, Vec<quil_crypto::porep::StorageOpening>>>>>,
 }
 
 impl AppVoteAggregation {
@@ -80,6 +87,18 @@ impl AppVoteAggregation {
             proposal_duration,
             rank_entry_times: Arc::new(Mutex::new(HashMap::new())),
             qc_store,
+            vote_openings: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Drain the storage openings collected for `rank` (all members, deduped),
+    /// for the seal path to assemble the finalized frame's `StorageAttestation`.
+    /// Empty when no vote at this rank carried openings (pre-activation).
+    pub fn take_frame_openings(&self, rank: u64) -> Vec<quil_crypto::porep::StorageOpening> {
+        let mut map = self.vote_openings.lock().unwrap();
+        match map.remove(&rank) {
+            Some(by_member) => by_member.into_values().flatten().collect(),
+            None => Vec::new(),
         }
     }
 
@@ -90,6 +109,21 @@ impl AppVoteAggregation {
         if rank < self.min_active_rank.load(Ordering::Relaxed) {
             debug!(rank, "dropping shard vote below finalized rank");
             return;
+        }
+        // PoRep: stash this voter's storage openings (if any) for the seal path
+        // to assemble the frame attestation when the rank's QC finalizes. Keyed
+        // by member so a re-vote overwrites rather than duplicates.
+        if !vote.openings.is_empty() {
+            let member = vote.identity().clone();
+            let openings = crate::app_shard_metadata::decode_vote_openings(&vote.openings);
+            if !openings.is_empty() {
+                self.vote_openings
+                    .lock()
+                    .unwrap()
+                    .entry(rank)
+                    .or_default()
+                    .insert(member, openings);
+            }
         }
         let collector = self.get_or_create(rank);
         if let Err(e) = collector.add_vote(vote) {
@@ -130,6 +164,7 @@ impl AppVoteAggregation {
         map.retain(|r, _| *r >= rank);
         let mut times = self.rank_entry_times.lock().unwrap();
         times.retain(|r, _| *r >= rank);
+        self.vote_openings.lock().unwrap().retain(|r, _| *r >= rank);
         self.qc_store.advance_min_active_rank(rank);
     }
 
@@ -303,6 +338,7 @@ pub fn wire_vote_to_app_shard_vote(
         Vec::new(),
         filter,
     )
+    .with_openings(wire.openings)
 }
 
 #[cfg(test)]
@@ -319,6 +355,7 @@ mod tests {
             timestamp: 1_700_000_000,
             signature: vec![0x2Bu8; 74],
             address: vec![0x3Cu8; 32], // voter
+            openings: Vec::new(),
         }
     }
 
@@ -345,5 +382,19 @@ mod tests {
     fn wire_vote_distinct_source_and_identity() {
         let v = wire_vote_to_app_shard_vote(sample_wire_vote(), vec![0x00u8; 32]);
         assert_ne!(v.identity(), v.source());
+    }
+
+    #[test]
+    fn wire_vote_carries_porep_openings() {
+        // PoRep openings must survive the wire→internal conversion so the
+        // aggregator can collect them at QC (they were silently dropped before
+        // Step 4 part 1).
+        let mut wire = sample_wire_vote();
+        wire.openings = vec![0xABu8, 0xCD, 0xEF, 0x01];
+        let v = wire_vote_to_app_shard_vote(wire.clone(), vec![0x00u8; 32]);
+        assert_eq!(v.openings, wire.openings);
+        // Empty stays empty (legacy / pre-activation).
+        let v2 = wire_vote_to_app_shard_vote(sample_wire_vote(), vec![0x00u8; 32]);
+        assert!(v2.openings.is_empty());
     }
 }

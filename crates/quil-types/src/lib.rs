@@ -1,4 +1,5 @@
 pub mod proto;
+pub mod protojson;
 pub mod crypto;
 pub mod store;
 pub mod consensus;

@@ -35,6 +35,12 @@ pub(crate) struct GrpcArgs {
     >,
     pub archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
     pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
+    /// Receive side of the direct global-consensus transport: peers'
+    /// `SubmitGlobalConsensus` RPCs inject `(bitmask, data)` here, the
+    /// same channel BlossomSub self-loopback uses, so the existing
+    /// GLOBAL_FRAME / GLOBAL_CONSENSUS message-loop arms process them.
+    pub consensus_loopback_tx:
+        tokio::sync::mpsc::Sender<quil_p2p::node::ReceivedMessage>,
 }
 
 pub(crate) fn spawn_all(
@@ -68,6 +74,7 @@ pub(crate) fn spawn_all(
         global_msg_tx,
         archive_pool,
         spawner,
+        consensus_loopback_tx,
     } = args;
 
     let grpc_addr = if config.listen_grpc_multiaddr.is_empty() {
@@ -154,7 +161,12 @@ pub(crate) fn spawn_all(
                 quil_engine::metrics::inc_grpc_submits_rejected();
                 return Err("empty payload".into());
             }
-            let rank = submit_cf.effective();
+            // Tag with the CONSENSUS RANK (not the frame number) — the
+            // collector is keyed by rank and the leader collects via
+            // `collect_for_rank(rank)`. Tagging with `effective()` (the
+            // frame number, larger by the genesis offset) put messages
+            // out of the collect range, so they never landed.
+            let rank = submit_cf.effective_rank();
             let accepted = submit_mc.add_message(rank, data);
             if accepted {
                 tracing::debug!(peer = %auth.peer_id, rank, "accepted gRPC submit");
@@ -166,6 +178,51 @@ pub(crate) fn spawn_all(
             }
         },
     );
+    // Direct global-consensus delivery handler. Peer archives call
+    // `SubmitGlobalConsensus(bitmask, data)`; we inject it into the same
+    // loopback channel the message loop reads, tagged with the original
+    // topic, so the existing GLOBAL_FRAME / GLOBAL_CONSENSUS arms process
+    // it exactly as they did for gossip. This is the receive half of
+    // moving global consensus off gossip (app consensus is unaffected).
+    let consensus_delivery: quil_rpc::global_service::ConsensusDeliveryHandler = {
+        let tx = consensus_loopback_tx.clone();
+        Arc::new(
+            move |request: tonic::Request<quil_types::proto::global::SubmitGlobalConsensusRequest>| {
+                let auth = request
+                    .extensions()
+                    .get::<quil_rpc::peer_auth_middleware::AuthenticatedPeer>()
+                    .cloned();
+                let Some(auth) = auth else {
+                    return Err("unauthenticated peer — global consensus delivery requires a valid Ed448 client cert".into());
+                };
+                let req = request.into_inner();
+                // Only accept the two global-consensus topics.
+                if req.bitmask.as_slice() != quil_engine::bitmasks::GLOBAL_FRAME
+                    && req.bitmask.as_slice() != quil_engine::bitmasks::GLOBAL_CONSENSUS
+                {
+                    return Err(format!(
+                        "unexpected consensus bitmask 0x{}",
+                        hex::encode(&req.bitmask)
+                    ));
+                }
+                let received = quil_p2p::node::ReceivedMessage {
+                    bitmask: req.bitmask,
+                    data: req.data,
+                    from: auth.peer_id.to_bytes(),
+                };
+                match tx.try_send(received) {
+                    Ok(()) => Ok(()),
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        Err("consensus receive queue full".into())
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        Err("consensus receive queue closed".into())
+                    }
+                }
+            },
+        )
+    };
+
     let shards_store: Arc<dyn quil_types::store::ShardsStore> =
         Arc::new(quil_store::RocksShardsStore::new(db_arc.inner()));
 
@@ -244,16 +301,48 @@ pub(crate) fn spawn_all(
         })
     };
 
+    // Wrap the clock-store lookup in a bounded read-through cache. The
+    // peer-facing GlobalService serves frame/proposal reads to the whole
+    // network; hundreds of nodes polling the same recent frames every
+    // second would otherwise hit RocksDB (and re-assemble proposals) per
+    // request. Frames are immutable by number so by-number caching is
+    // always correct; the head is cached under a 1s TTL. 256 entries per
+    // map keeps the hot tip + recent catch-up range resident.
+    let cached_lookup = quil_rpc::global_service::CachingFrameLookup::new(
+        ClockStoreFrameLookup(clock_store.clone()),
+        256,
+        std::time::Duration::from_secs(1),
+    );
     let grpc_server = quil_rpc::GlobalRpcServer::new(
-        Arc::new(ClockStoreFrameLookup(clock_store.clone())),
+        Arc::new(cached_lookup),
     )
     .with_submit_handler(submit_handler.clone())
+    .with_consensus_delivery(consensus_delivery)
     .with_shards_store(shards_store.clone())
     .with_worker_snapshot(global_worker_snap)
     .with_global_shards_provider(global_shards_provider)
     .with_app_shards_provider(app_shards_provider)
     .with_message_broadcast(global_msg_tx.clone());
-    let hypersync = quil_rpc::hypersync_server::HyperSyncServer::new(hg_store.clone());
+    // Dedicated runtime for hypersync's heavy, long-lived `perform_sync`
+    // producer tasks. The peer-gRPC listener serves consensus delivery,
+    // frame reads, AND hypersync on ONE port/runtime; without this, a flood
+    // of sync streams occupies the listener's worker threads and starves the
+    // accept loop + latency-critical archive↔archive consensus delivery (a
+    // DDoS vector that halts the chain). Spawning sync producers here keeps
+    // consensus on the listener's own threads. Socket I/O stays in the h2
+    // connection task on the serving runtime — only the request/response
+    // bodies (channel-backed) cross over, which is safe. Leaked: a runtime
+    // must never be dropped from an async context, and it lives for the
+    // whole process anyway.
+    let hypersync_rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .thread_name("hypersync")
+            .enable_all()
+            .build()?,
+    ));
+    let hypersync = quil_rpc::hypersync_server::HyperSyncServer::new(hg_store.clone())
+        .with_executor(hypersync_rt.handle().clone());
 
     let node_submit_mc = message_collector.clone();
     let node_submit_cf = current_frame.clone();
@@ -262,7 +351,8 @@ pub(crate) fn spawn_all(
             if data.is_empty() {
                 return Err("empty message".into());
             }
-            let rank = node_submit_cf.effective();
+            // Consensus rank, not frame number (see peer submit handler).
+            let rank = node_submit_cf.effective_rank();
             if node_submit_mc.add_message(rank, data) {
                 Ok(())
             } else {
@@ -683,11 +773,23 @@ pub(crate) fn spawn_all(
 
     if let Ok(addr) = stream_addr.parse::<std::net::SocketAddr>() {
         let global_service = tonic::service::interceptor::InterceptedService::new(
-            quil_types::proto::global::global_service_server::GlobalServiceServer::new(grpc_server),
+            // 64 MiB decode/encode (tonic defaults to 4 MiB). Inbound
+            // submits are small, but full global-frame / app-shard
+            // responses this server encodes can exceed 4 MiB; the default
+            // truncated them, surfacing as `h2 protocol error: error
+            // reading a body` on the client. Mirrors the client limits.
+            quil_types::proto::global::global_service_server::GlobalServiceServer::new(grpc_server)
+                .max_decoding_message_size(64 * 1024 * 1024)
+                .max_encoding_message_size(64 * 1024 * 1024),
             quil_rpc::peer_auth_middleware::peer_auth_interceptor,
         );
         let hypersync_service = tonic::service::interceptor::InterceptedService::new(
-            quil_types::proto::application::hypergraph_comparison_service_server::HypergraphComparisonServiceServer::new(hypersync),
+            // Prover-tree / hypergraph sync streams large per-node and
+            // per-leaf payloads; raise both limits to 64 MiB to match the
+            // client (`build_local_tree_with_handle`).
+            quil_types::proto::application::hypergraph_comparison_service_server::HypergraphComparisonServiceServer::new(hypersync)
+                .max_decoding_message_size(64 * 1024 * 1024)
+                .max_encoding_message_size(64 * 1024 * 1024),
             quil_rpc::peer_auth_middleware::peer_auth_interceptor,
         );
         let app_shard_service = tonic::service::interceptor::InterceptedService::new(
@@ -836,7 +938,41 @@ pub(crate) fn spawn_all(
         let tls_config = quil_rpc::build_quil_server_tls_config(&seed)
             .map_err(|e| anyhow::anyhow!("peer gRPC mTLS config init failed: {} — check `p2p.peerPrivKey`", e))?;
         sup.spawn("peer-grpc-server", move |peer_grpc_token| async move {
-            info!(addr = %addr, "starting peer gRPC (mTLS)");
+            // The peer-facing gRPC server (:8340) runs on its OWN dedicated
+            // multi-threaded runtime. The main runtime carries consensus,
+            // commit (which holds the CRDT write lock across KZG+I/O),
+            // materialization and frame production — bursts of that heavy,
+            // .await-free work saturate every main-runtime worker and starve
+            // this network-facing path: field captures showed get_global_frame
+            // (a single frame read) AND even the Ed448 TLS handshake timing
+            // out at 10-15s while the node was busy, which blocked prover
+            // submission and archive↔archive sync network-wide. Isolating the
+            // accept loop / handshakes / RPC handlers onto separate worker
+            // threads keeps :8340 responsive regardless of main-runtime load.
+            //
+            // Driven via spawn_blocking so (a) we don't pin a main-runtime
+            // async worker for the server's whole lifetime and (b) dropping
+            // the dedicated runtime happens in a blocking context (dropping a
+            // runtime inside an async context panics).
+            let serve = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                // 8 threads (was 4): this runtime drives the TLS accept loop,
+                // Ed448 handshakes, and latency-critical archive↔archive
+                // consensus delivery. Heavy hypersync `perform_sync` producers
+                // are spawned onto their OWN dedicated runtime (see
+                // `hypersync_rt` above), so a flood of sync streams can't
+                // occupy these workers and stall the accept/consensus path —
+                // that starvation was timing out consensus dials network-wide.
+                // The extra headroom keeps the accept loop draining even while
+                // this runtime still streams sync RESPONSES (light channel
+                // piping; the heavy work happens on the sync runtime).
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(8)
+                    .thread_name("peer-grpc")
+                    .enable_all()
+                    .build()
+                    .map_err(anyhow::Error::from)?;
+                let res = rt.block_on(async move {
+            info!(addr = %addr, "starting peer gRPC (mTLS) on dedicated runtime");
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .map_err(anyhow::Error::from)?;
@@ -844,15 +980,25 @@ pub(crate) fn spawn_all(
             // TLS handshakes run in per-connection tasks with a deadline,
             // never inline in the accept loop — one peer stalling
             // mid-handshake must not block new accepts, and a handshake
-            // that never completes must not hold its fd forever. The
-            // semaphore bounds half-open sockets under a connect flood.
-            let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<
+            // that never completes must not hold its fd forever.
+            //
+            // The archive RPC connection limit is intentionally UNBOUNDED:
+            // neither the accept backlog nor the concurrent-handshake count
+            // is capped, so a legitimate connection (a peer hypersync, an
+            // archive↔archive consensus dial) is never dropped because a
+            // count was hit. Protection against a connect / TLS-handshake
+            // flood is instead time- and fd-bounded: each handshake has a
+            // 10 s deadline (half-open sockets self-clean), `raise_fd_limit`
+            // lifts RLIMIT_NOFILE, and the h2/tcp keepalives below reap dead
+            // peers so fds don't leak. The previous count-based semaphore was
+            // belt-and-suspenders once permits were released the instant the
+            // crypto finished (no permit is ever held across the enqueue, so
+            // the old starvation cascade can't recur regardless).
+            let (conn_tx, mut conn_rx) = tokio::sync::mpsc::unbounded_channel::<
                 tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-            >(64);
+            >();
             let accept_token = peer_grpc_token.clone();
             tokio::spawn(async move {
-                let handshake_permits =
-                    Arc::new(tokio::sync::Semaphore::new(256));
                 loop {
                     let (tcp, _peer) = tokio::select! {
                         r = listener.accept() => match r {
@@ -867,25 +1013,31 @@ pub(crate) fn spawn_all(
                         },
                         _ = accept_token.cancelled() => return,
                     };
-                    let Ok(permit) = handshake_permits.clone().try_acquire_owned() else {
-                        debug!("too many pending TLS handshakes, dropping connection");
-                        continue;
-                    };
                     let acceptor = tls_acceptor.clone();
                     let tx = conn_tx.clone();
                     tokio::spawn(async move {
-                        let _permit = permit;
-                        match tokio::time::timeout(
+                        let tls = match tokio::time::timeout(
                             std::time::Duration::from_secs(10),
                             acceptor.accept(tcp),
                         )
                         .await
                         {
-                            Ok(Ok(tls)) => {
-                                let _ = tx.send(tls).await;
+                            Ok(Ok(tls)) => tls,
+                            Ok(Err(e)) => {
+                                debug!(error = %e, "TLS handshake failed");
+                                return;
                             }
-                            Ok(Err(e)) => debug!(error = %e, "TLS handshake failed"),
-                            Err(_) => debug!("TLS handshake timed out"),
+                            Err(_) => {
+                                debug!("TLS handshake timed out");
+                                return;
+                            }
+                        };
+                        // Hand off to tonic. The backlog is unbounded, so this
+                        // never blocks and never sheds a completed handshake;
+                        // `send` only errors if the receiver (tonic serve loop)
+                        // is gone, i.e. the listener is shutting down.
+                        if let Err(e) = tx.send(tls) {
+                            debug!(error = %e, "peer gRPC accept receiver closed — dropping connection (shutdown)");
                         }
                     });
                 }
@@ -918,6 +1070,18 @@ pub(crate) fn spawn_all(
                 .serve_with_incoming_shutdown(incoming, async move { peer_grpc_token.cancelled().await; })
                 .await
                 .map_err(anyhow::Error::from)
+                });
+                // `rt` is dropped here, inside the blocking thread — legal
+                // (dropping a runtime in an async context would panic).
+                res
+            })
+            .await;
+            match serve {
+                Ok(r) => r,
+                Err(join_err) => Err(anyhow::anyhow!(
+                    "peer-grpc dedicated runtime thread panicked: {join_err}"
+                )),
+            }
         });
     } else {
         warn!(addr = %stream_addr, "invalid peer gRPC listen address, server disabled");

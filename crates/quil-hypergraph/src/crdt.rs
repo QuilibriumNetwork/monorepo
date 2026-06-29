@@ -64,6 +64,16 @@ pub struct HypergraphCrdt {
     /// Empty by default (covers everything). Mirrors Go
     /// `HypergraphCRDT.coveredPrefix`.
     covered_prefix: RwLock<Vec<i32>>,
+    /// Serializes `commit` calls against each other so two commits never
+    /// recompute the same per-shard tree's interior commitment cache
+    /// concurrently. `commit` holds only a `phase_sets` READ lock (it never
+    /// structurally mutates the maps), so reads — explorer `get_vertex_data`,
+    /// the `app_shards`/`global_shards` providers — proceed during a commit;
+    /// this mutex restores the one invariant the old write-lock gave us
+    /// (commits don't overlap) without re-blocking those readers. Mutations
+    /// (`add_vertex` etc.) still take the `phase_sets` write lock and so are
+    /// still excluded for a commit's duration, exactly as before.
+    commit_lock: std::sync::Mutex<()>,
 }
 
 impl HypergraphCrdt {
@@ -79,6 +89,7 @@ impl HypergraphCrdt {
             size: RwLock::new(BigInt::zero()),
             snapshot_mgr: crate::snapshot::SnapshotManager::new(),
             covered_prefix: RwLock::new(Vec::new()),
+            commit_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -156,6 +167,49 @@ impl HypergraphCrdt {
         let ha = read_one(sets.hyperedge_adds.get(shard_key))?;
         let hr = read_one(sets.hyperedge_removes.get(shard_key))?;
         Ok([va, vr, ha, hr])
+    }
+
+    /// Canonical PoRep leaf-data BODY: serialize the subtree under
+    /// `full_path` across all four phase sets, in fixed order
+    /// `[vertex_adds, vertex_removes, hyperedge_adds, hyperedge_removes]`.
+    /// Per set: `set_tag(1B) || entry_count(u32 BE) || (key_len(u32 BE)
+    /// || key || val_len(u32 BE) || val)*` with entries ascending by key.
+    ///
+    /// Reads COMMITTED on-disk state (via `collect_leaves_under_path`), so
+    /// the bytes are member-independent and identical across nodes at the
+    /// same committed state — the property the storage attestation relies
+    /// on. The caller (`app_shard_metadata::leaf_data_for`) prepends a
+    /// header binding `filter` + the relative leaf prefix. See memory
+    /// `porep-leaf-data-canonical-spec`. Consensus-critical: do not change
+    /// the encoding after storage-epoch activation without a fork.
+    pub fn serialize_phase_subtrees(
+        &self,
+        shard_key: &ShardKey,
+        full_path: &[i32],
+    ) -> Result<Vec<u8>> {
+        let sets = self.phase_sets.read().unwrap();
+        let trees: [Option<&LazyVectorCommitmentTree>; 4] = [
+            sets.vertex_adds.get(shard_key),
+            sets.vertex_removes.get(shard_key),
+            sets.hyperedge_adds.get(shard_key),
+            sets.hyperedge_removes.get(shard_key),
+        ];
+        let mut out: Vec<u8> = Vec::new();
+        for (set_idx, tree) in trees.iter().enumerate() {
+            out.push(set_idx as u8);
+            let entries = match tree {
+                Some(t) => t.collect_leaves_under_path(full_path)?,
+                None => Vec::new(),
+            };
+            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for (key, val) in &entries {
+                out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+                out.extend_from_slice(key);
+                out.extend_from_slice(&(val.len() as u32).to_be_bytes());
+                out.extend_from_slice(val);
+            }
+        }
+        Ok(out)
     }
 
     /// Record a published root in the snapshot registry. Mirrors Go
@@ -459,7 +513,15 @@ impl HypergraphCrdt {
         &self,
         frame_number: u64,
     ) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
-        let sets = self.phase_sets.write().unwrap();
+        // Serialize against other commits (see `commit_lock`), then take only
+        // a READ lock on the phase sets. Commit never structurally mutates the
+        // maps — it reads keys/trees and calls `tree.commit(&self)` (the tree
+        // carries its own interior synchronization) — so a read lock is
+        // sufficient and lets concurrent readers (explorer, the shard
+        // providers) run instead of stalling for the whole KZG + RocksDB
+        // flush. Inserts still need the write lock and remain excluded.
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let sets = self.phase_sets.read().unwrap();
         let prover: &(dyn InclusionProver + Sync) = self.prover.as_ref();
         let txn = self.store.new_transaction(false)?;
 
@@ -545,17 +607,24 @@ impl HypergraphCrdt {
                 }
             }
 
-            let leaf_count = sets.vertex_adds
-                .get(shard_key)
-                .map(|t| t.get_metadata().0 as u64)
-                .unwrap_or(0);
+            let va_tree = sets.vertex_adds.get(shard_key);
+            let leaf_count = va_tree.map(|t| t.get_metadata().0 as u64).unwrap_or(0);
+            // Per-shard committed byte size = the vertex_adds tree's aggregate
+            // root size. This is the `state_size` the PoMW reward formula reads
+            // via `shard_metadata_for_address` (sourced in `invoke_frame_header`).
+            // It was previously hardcoded to zero, which made EVERY prover's
+            // reward compute to zero. Deterministic from committed state — the
+            // reward quorum (global provers + archives) holds byte-identical
+            // shard data, and `invoke_frame_header(N)` reads the size populated
+            // by `commit(N-1)`, an identical committed snapshot on every node.
+            let size = va_tree.map(|t| t.get_size()).unwrap_or_else(BigInt::zero);
 
             self.shard_metadata.write().unwrap().insert(
                 shard_key.clone(),
                 ShardMetadata {
                     commitment: roots.to_vec(),
                     leaf_count,
-                    size: BigInt::zero(),
+                    size,
                 },
             );
 
@@ -654,6 +723,23 @@ impl HypergraphCrdt {
 
     /// Fetch the four sub-scoped vector commitments for a given shard
     /// at a given frame number: `[vertex_adds, vertex_removes,
+    /// Invalidate the cached per-frame shard-commit roots for the shard
+    /// owning `app_address` (its `ShardKey.l2` equals the app_address —
+    /// see `shard_key_for_location`). A subsequent `commit(frame_number)`
+    /// will then recompute and reflush that shard's trees instead of
+    /// reusing the stale cached root. Required when a tree is mutated
+    /// AFTER the frame's first `commit` (e.g. post-commit prover eviction
+    /// on the global intrinsic shard): the same-frame idempotency cache
+    /// would otherwise skip the now-dirty tree, so the mutation never
+    /// reaches the backing store.
+    pub fn invalidate_domain_shard_commit(
+        &self,
+        frame_number: u64,
+        app_address: &[u8],
+    ) -> Result<()> {
+        self.store.delete_shard_commits(frame_number, app_address)
+    }
+
     /// hyperedge_adds, hyperedge_removes]`.
     ///
     /// Mirrors Go `HypergraphCRDT.GetShardCommits` at
@@ -853,6 +939,76 @@ mod tests {
         crdt.add_vertex(&loc(0xAA, 0x01), b"aaaa").unwrap();
         crdt.add_vertex(&loc(0xAA, 0x02), b"bbbbb").unwrap();
         assert_eq!(crdt.total_size(), BigInt::from(9));
+    }
+
+    /// REGRESSION (2026-06-29): `ShardMetadata.size` — the source of the PoMW
+    /// reward `state_size` via `shard_metadata_for_address` → `invoke_frame_header`
+    /// — was hardcoded to zero, so EVERY prover reward computed to zero. After
+    /// commit it must reflect the shard's committed byte size.
+    #[test]
+    fn commit_populates_real_per_shard_size_for_reward() {
+        let crdt = stub_crdt();
+        crdt.add_vertex(&loc(0xAA, 0xBB), b"hello-world").unwrap(); // 11 bytes
+        crdt.add_vertex(&loc(0xAA, 0xCC), b"more").unwrap(); // 4 bytes
+        crdt.commit(1).unwrap();
+        let md = crdt
+            .shard_metadata_for_address(&[0xAAu8; 32])
+            .expect("shard committed");
+        assert_eq!(
+            md.size,
+            BigInt::from(15),
+            "per-shard size must equal committed bytes (was hardcoded 0 → zero rewards)"
+        );
+    }
+
+    // PoRep canonical leaf-data determinism: the SDR-encoded byte string
+    // must be byte-identical across nodes that reached the same committed
+    // state regardless of the order ops were applied. Insert the same
+    // vertices in opposite orders into two CRDTs, commit both, and compare
+    // the serialized subtree body. (Foundation of #62 — see memory
+    // `porep-leaf-data-canonical-spec`.)
+    #[test]
+    fn serialize_phase_subtrees_is_order_independent() {
+        let app = 0x55u8;
+        let entries: [(u8, &[u8]); 3] = [
+            (0x01, b"alpha"),
+            (0x02, b"beta-value"),
+            (0x03, b"gamma"),
+        ];
+        let sk = shard_key_for_location(&loc(app, 0x01));
+
+        let crdt_a = stub_crdt();
+        for (d, v) in entries.iter() {
+            crdt_a.add_vertex(&loc(app, *d), v).unwrap();
+        }
+        crdt_a.commit(1).unwrap();
+
+        let crdt_b = stub_crdt();
+        for (d, v) in entries.iter().rev() {
+            crdt_b.add_vertex(&loc(app, *d), v).unwrap();
+        }
+        crdt_b.commit(1).unwrap();
+
+        // Empty path → collect every leaf in the shard subtree.
+        let body_a = crdt_a.serialize_phase_subtrees(&sk, &[]).unwrap();
+        let body_b = crdt_b.serialize_phase_subtrees(&sk, &[]).unwrap();
+
+        assert_eq!(
+            body_a, body_b,
+            "canonical leaf-data must be insertion-order independent"
+        );
+        // vertex_adds is set 0: tag byte 0x00 then a u32 entry count of 3.
+        assert_eq!(body_a[0], 0u8, "first byte is the vertex_adds set tag");
+        assert_eq!(
+            &body_a[1..5],
+            &3u32.to_be_bytes(),
+            "vertex_adds entry count must be 3"
+        );
+        // The leaf VALUES (not just keys) are serialized.
+        assert!(
+            body_a.windows(5).any(|w| w == b"alpha"),
+            "leaf value bytes must appear in the canonical serialization"
+        );
     }
 
     #[test] fn add_vertex_creates_shard_entry() {

@@ -1,0 +1,28 @@
+[package]
+name = "quil-explorer"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "In-process read-only explorer REST API over the node's live stores (Rust port of node/explorer)"
+
+[dependencies]
+quil-types = { path = "../quil-types" }
+quil-hypergraph = { path = "../quil-hypergraph" }
+quil-p2p = { path = "../quil-p2p" }
+
+prost = "0.13"
+axum = "0.7"
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+base64 = "0.22"
+bs58 = "0.5"
+num-bigint = "0.4"
+parking_lot = "0.12"
+tracing = "0.1"
+chrono = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tower = { version = "0.5", features = ["util"] }

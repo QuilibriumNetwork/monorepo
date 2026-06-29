@@ -177,14 +177,17 @@ impl ConsensusComponents {
     ) -> quil_types::error::Result<ConsensusStart> {
         let forks = Forks::<GlobalState>::new(trusted_root, finalizer, follower)?;
 
-        let handler = Arc::new(HotStuffEventHandler::new(
-            self.pacemaker,
-            self.state_producer,
-            Arc::new(Mutex::new(forks)),
-            self.safety_rules,
-            self.committee,
-            self.notifier,
-        ));
+        let handler = Arc::new(
+            HotStuffEventHandler::new(
+                self.pacemaker,
+                self.state_producer,
+                Arc::new(Mutex::new(forks)),
+                self.safety_rules,
+                self.committee,
+                self.notifier,
+            )
+            .with_label("global"),
+        );
 
         // Delay consensus loop start by `startup_delay` so the
         // BlossomSub mesh has time to form before the leader

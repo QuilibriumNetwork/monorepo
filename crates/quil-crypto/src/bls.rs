@@ -76,6 +76,19 @@ impl BlsConstructor for Bls48581KeyConstructor {
         )
     }
 
+    fn verify_signatures_batch(
+        &self,
+        items: &[(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)],
+    ) -> bool {
+        // Fresh OS entropy per call: the random batch coefficients must be
+        // unpredictable to whoever produced the signatures, else a
+        // cancellation forgery is possible.
+        use rand::RngCore;
+        let mut seed = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut seed);
+        bls48581::bls_verify_batch(items, &seed)
+    }
+
     fn aggregate(
         &self,
         public_keys: &[&[u8]],

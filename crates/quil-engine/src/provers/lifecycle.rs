@@ -77,6 +77,16 @@ pub const SCORE_LEAVE_MIN_HOLD_FRAMES: u64 = DEFAULT_CONFIRM_WINDOW_FRAMES;
 /// archive materialize + prover-tree sync round-trip we've seen.
 pub const JOIN_FILTER_COOLDOWN_FRAMES: u64 = 30;
 
+/// Backoff between successive per-epoch re-confirm submissions on the same
+/// filter. An `ExpiredEpoch` allocation stays expired through the
+/// submit→archive→materialize round-trip (the local registry shows the stale
+/// epoch until the ProverConfirm lands), so without this every cycle in that
+/// window would re-publish an identical confirm. Sized like the join cooldown:
+/// well past the round-trip, but short enough that a failed submit (cooldown
+/// never recorded on success) retries promptly — critical, since a missed
+/// re-confirm means eviction at the next audit.
+pub const RECONFIRM_COOLDOWN_FRAMES: u64 = 30;
+
 /// Backoff before re-proposing a join to a shard that *rejected* our
 /// last join. `JOIN_FILTER_COOLDOWN_FRAMES` only gates re-proposal off
 /// the last join *attempt*, so a contested shard that keeps rejecting us
@@ -118,6 +128,14 @@ pub enum LifecycleAction {
     },
     /// Submit a ProverConfirm for these leave filters.
     ConfirmLeaves {
+        filters: Vec<Vec<u8>>,
+        frame_number: u64,
+    },
+    /// Re-confirm Active allocations whose storage epoch went stale: re-encode
+    /// fresh-epoch SDR replicas + re-register leaf roots (a ProverConfirm at the
+    /// current frame), then prune replicas below the new epoch. PoRep epoch
+    /// rotation — without it the storage audit evicts the prover next epoch.
+    ReconfirmEpoch {
         filters: Vec<Vec<u8>>,
         frame_number: u64,
     },
@@ -171,6 +189,11 @@ impl std::fmt::Debug for LifecycleAction {
                 .field("filters", &hex_list(filters))
                 .field("frame_number", frame_number)
                 .finish(),
+            Self::ReconfirmEpoch { filters, frame_number } => f
+                .debug_struct("ReconfirmEpoch")
+                .field("filters", &hex_list(filters))
+                .field("frame_number", frame_number)
+                .finish(),
             Self::RejectLeaves { filters, frame_number } => f
                 .debug_struct("RejectLeaves")
                 .field("filters", &hex_list(filters))
@@ -204,6 +227,10 @@ pub struct AllocationBuckets {
     /// Every filter we own (Joining, Active, Paused, Leaving) but
     /// NOT terminal/expired. The "are we already on this shard" set.
     pub all_ours: Vec<Vec<u8>>,
+    /// On-chain Active allocations whose recorded storage epoch is stale
+    /// (`EffectiveStatus::ExpiredEpoch`) — must re-confirm fresh leaf roots
+    /// for the current epoch to keep counting + avoid the storage audit.
+    pub expired_epoch: Vec<Vec<u8>>,
 }
 
 impl AllocationBuckets {
@@ -218,15 +245,23 @@ impl AllocationBuckets {
         allocations: &[quil_types::consensus::ProverAllocationInfo],
         frame_number: u64,
     ) -> Self {
-        use quil_types::consensus::EffectiveStatus;
+        use quil_types::consensus::{EffectiveStatus, ProverStatus};
         let mut buckets = AllocationBuckets::default();
         for alloc in allocations {
             match alloc.effective_status(frame_number) {
                 EffectiveStatus::Joining => {
                     buckets.all_ours.push(alloc.confirmation_filter.clone());
-                    buckets
-                        .joining
-                        .push((alloc.confirmation_filter.clone(), alloc.join_frame_number));
+                    // Only a NOT-YET-CONFIRMED join (raw byte still Joining) is
+                    // eligible for confirm. A join that already confirmed reads
+                    // as Joining too — deferred activation keeps it out of the
+                    // committee until the next epoch boundary — but its raw byte
+                    // is Active and it must NOT be re-confirmed. It owns the slot
+                    // (all_ours) and its worker prepares during the wait.
+                    if alloc.status == ProverStatus::Joining {
+                        buckets
+                            .joining
+                            .push((alloc.confirmation_filter.clone(), alloc.join_frame_number));
+                    }
                 }
                 EffectiveStatus::Active => {
                     buckets.all_ours.push(alloc.confirmation_filter.clone());
@@ -246,6 +281,16 @@ impl AllocationBuckets {
                     // surplus/leave pressure) nor joining/leaving
                     // (no decide-pending action).
                     buckets.all_ours.push(alloc.confirmation_filter.clone());
+                }
+                // ExpiredEpoch: the prover holds an on-chain Active allocation
+                // but hasn't re-confirmed its leaf roots for the current epoch.
+                // Recoverable, not terminal — keep it in `all_ours` (we still
+                // own the shard, so don't re-propose a join) but NOT in `active`
+                // (it doesn't count toward coverage until re-confirmed), and
+                // queue it for the per-epoch re-confirm (PoRep increment E).
+                EffectiveStatus::ExpiredEpoch => {
+                    buckets.all_ours.push(alloc.confirmation_filter.clone());
+                    buckets.expired_epoch.push(alloc.confirmation_filter.clone());
                 }
                 // Terminal / past-grace. Treat as "doesn't exist":
                 // don't push anywhere, otherwise these would leak
@@ -452,6 +497,12 @@ pub struct ProverLifecycle {
     /// with a recent in-flight bundle isn't re-picked until the
     /// cooldown elapses. Pruned lazily on read.
     last_join_attempt: RwLock<HashMap<Vec<u8>, u64>>,
+    /// Per-filter "last frame we submitted a per-epoch re-confirm." Suppresses
+    /// duplicate ProverConfirm publishes while an `ExpiredEpoch` allocation's
+    /// re-confirm is in flight (the local registry shows the stale epoch until
+    /// the round-trip completes). Pruned lazily on read. See
+    /// [`RECONFIRM_COOLDOWN_FRAMES`].
+    last_reconfirm_attempt: RwLock<HashMap<Vec<u8>, u64>>,
     /// Set to true after the first successful `GetAppShards` refresh
     /// (`set_remote_shard_sizes`). Gates `ProposeJoin` and `ProposeLeave`:
     /// the lifecycle must not auto-pick shards while it lacks any
@@ -495,6 +546,7 @@ impl ProverLifecycle {
             shards_store: RwLock::new(None),
             last_leave_attempt: RwLock::new(HashMap::new()),
             last_join_attempt: RwLock::new(HashMap::new()),
+            last_reconfirm_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
         }
     }
@@ -659,6 +711,41 @@ impl ProverLifecycle {
     /// `filter_recent_leave_attempts` excludes these filters.
     fn record_leave_attempts(&self, filters: &[Vec<u8>], frame_number: u64) {
         let Ok(mut guard) = self.last_leave_attempt.write() else {
+            return;
+        };
+        for f in filters {
+            guard.insert(f.clone(), frame_number);
+        }
+    }
+
+    /// Drop `candidates` whose per-epoch re-confirm was submitted within the
+    /// last `RECONFIRM_COOLDOWN_FRAMES` — mirrors `filter_recent_leave_attempts`.
+    fn filter_recent_reconfirm_attempts(
+        &self,
+        candidates: Vec<Vec<u8>>,
+        frame_number: u64,
+    ) -> Vec<Vec<u8>> {
+        let Ok(mut guard) = self.last_reconfirm_attempt.write() else {
+            return candidates;
+        };
+        guard.retain(|_, last| {
+            frame_number.saturating_sub(*last) < RECONFIRM_COOLDOWN_FRAMES
+        });
+        candidates
+            .into_iter()
+            .filter(|f| {
+                guard
+                    .get(f)
+                    .map(|&last| frame_number.saturating_sub(last) >= RECONFIRM_COOLDOWN_FRAMES)
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    /// Stamp the per-filter re-confirm cooldown map, just before pushing a
+    /// `ReconfirmEpoch` action.
+    fn record_reconfirm_attempts(&self, filters: &[Vec<u8>], frame_number: u64) {
+        let Ok(mut guard) = self.last_reconfirm_attempt.write() else {
             return;
         };
         for f in filters {
@@ -991,6 +1078,7 @@ impl ProverLifecycle {
         let active_filters = buckets.active;
         let leaving_filters = buckets.leaving;
         let all_our_filters = buckets.all_ours;
+        let expired_epoch_filters = buckets.expired_epoch;
 
         // Build separate descriptor views.
         //
@@ -1096,6 +1184,25 @@ impl ProverLifecycle {
 
         let mut actions: Vec<LifecycleAction> = Vec::new();
         let mut join_proposed_this_cycle = false;
+
+        // PoRep epoch rotation: any Active allocation whose recorded storage
+        // epoch went stale must re-confirm fresh leaf roots for the current
+        // epoch — otherwise the global storage audit evicts it. Gate behind the
+        // per-filter cooldown so the confirm isn't re-published every frame
+        // while the round-trip is in flight. This runs regardless of coverage
+        // halts: a prover maintaining its own storage commitment is never the
+        // cause of a halt and must not be evicted for one.
+        if !expired_epoch_filters.is_empty() {
+            let to_reconfirm =
+                self.filter_recent_reconfirm_attempts(expired_epoch_filters, frame_number);
+            if !to_reconfirm.is_empty() {
+                self.record_reconfirm_attempts(&to_reconfirm, frame_number);
+                actions.push(LifecycleAction::ReconfirmEpoch {
+                    filters: to_reconfirm,
+                    frame_number,
+                });
+            }
+        }
 
         // Seniority-merge check — matches Go's `checkAndSubmitSeniorityMerge`
         // at worker_allocator.go:963-1011. When our on-chain seniority
@@ -1389,9 +1496,12 @@ impl ProverLifecycle {
         // (no score-based reject). Filters bound to auto workers or
         // currently unbound flow through the existing score-driven
         // `decide_joins` against the remaining capacity.
-        let confirm_window = self.confirm_window_frames();
+        // Epoch-aligned: a join proposed in epoch E is confirmed in EXACTLY
+        // epoch E+1 (the chain rejects confirms outside that slot). We emit the
+        // confirm anywhere within E+1; dedup/cooldown handles repeats.
+        let cur_epoch = quil_types::consensus::epoch_for_frame(frame_number);
         let ready_join_filters: Vec<Vec<u8>> = joining_filters.iter()
-            .filter(|(_, jf)| frame_number >= *jf + confirm_window)
+            .filter(|(_, jf)| cur_epoch == quil_types::consensus::epoch_for_frame(*jf) + 1)
             .map(|(f, _)| f.clone())
             .collect();
 
@@ -1678,8 +1788,10 @@ impl ProverLifecycle {
         // the leave via gRPC, so the registry-side score should not
         // veto). Auto-bound and unbound leaves flow through the
         // existing score-driven `decide_leaves`.
+        // Epoch-aligned: a leave proposed in epoch E is confirmed in EXACTLY
+        // epoch E+1 (departs at the E+2 boundary).
         let ready_leave_filters: Vec<Vec<u8>> = leaving_filters.iter()
-            .filter(|(_, lf)| frame_number >= *lf + confirm_window)
+            .filter(|(_, lf)| cur_epoch == quil_types::consensus::epoch_for_frame(*lf) + 1)
             .map(|(f, _)| f.clone())
             .collect();
 
@@ -1927,6 +2039,7 @@ mod buckets_tests {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: 0,
+            epoch: 0,
             vertex_address: Vec::new(),
         }
     }
@@ -1947,17 +2060,38 @@ mod buckets_tests {
         assert_eq!(b.all_ours.len(), 4);
     }
 
+    /// Deferred activation: an allocation whose RAW byte is Active but whose
+    /// effective_status is `Joining` (confirmed, awaiting the E+2 activation
+    /// boundary) is OWNED (`all_ours`) but must NOT be re-confirmed (`joining`
+    /// bucket, gated on the raw Joining byte) nor counted `active` yet — the
+    /// committee stays frozen until activation. Guards against re-confirm storms.
+    #[test]
+    fn deferred_active_is_owned_but_not_reconfirmed_or_counted() {
+        let e = 720u64;
+        let deferred = ProverAllocationInfo {
+            status: ProverStatus::Active,
+            join_confirm_frame_number: 2 * e + 100, // confirmed epoch 2 → activation epoch 3
+            epoch: 100,                             // high → not epoch-expired
+            ..alloc(0x07, ProverStatus::Active, 0, 0)
+        };
+        // Evaluate in epoch 2 (before activation epoch 3) → effective = Joining.
+        let b = AllocationBuckets::from_allocations(&[deferred], 2 * e + 500);
+        assert_eq!(b.all_ours.len(), 1, "deferred-active allocation is owned");
+        assert!(b.joining.is_empty(), "no re-confirm for an already-confirmed (deferred) join");
+        assert!(b.active.is_empty(), "not counted active until the E+2 boundary");
+    }
+
     #[test]
     fn expired_joining_and_leaving_are_excluded_from_all_ours() {
-        // Joining at frame 1 — by frame 1 + GRACE + 1, it's expired.
+        // Epoch-aligned: a join/leave proposed in epoch 0 must settle in epoch 1;
+        // by epoch 2 (current_epoch > proposed_epoch + 1) it's implicitly expired.
         let allocations = vec![
             alloc(0x01, ProverStatus::Joining, 1, 0),
-            // Leaving at frame 2 — by frame 2 + GRACE + 1, it's expired.
             alloc(0x02, ProverStatus::Leaving, 1, 2),
         ];
         let b = AllocationBuckets::from_allocations(
             &allocations,
-            ALLOCATION_GRACE_FRAMES + 100,
+            2 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 1, // epoch 2
         );
         assert!(b.joining.is_empty(), "expired joining excluded");
         assert!(b.leaving.is_empty(), "expired leaving excluded");
@@ -1975,6 +2109,40 @@ mod buckets_tests {
         assert!(b.joining.is_empty());
         assert!(b.active.is_empty());
         assert!(b.leaving.is_empty());
+    }
+
+    #[test]
+    fn stale_epoch_active_alloc_buckets_into_reconfirm() {
+        // Storage attestation is always-on: an Active alloc recorded at epoch 0,
+        // evaluated at frame 1000 (epoch 1 > 0), is ExpiredEpoch.
+        let b = AllocationBuckets::from_allocations(
+            &[alloc(0x02, ProverStatus::Active, 50, 0)],
+            1000,
+        );
+        assert_eq!(
+            b.expired_epoch,
+            vec![vec![0x02]],
+            "stale-epoch active alloc must queue for re-confirm",
+        );
+        assert!(
+            b.active.is_empty(),
+            "an expired-epoch alloc must NOT count as active coverage",
+        );
+        assert_eq!(
+            b.all_ours,
+            vec![vec![0x02]],
+            "still owned — don't re-propose a join for it",
+        );
+    }
+
+    #[test]
+    fn current_epoch_active_alloc_is_not_expired() {
+        // Same alloc but already confirmed for the current epoch (1) → Active.
+        let mut a = alloc(0x02, ProverStatus::Active, 50, 0);
+        a.epoch = 1;
+        let b = AllocationBuckets::from_allocations(&[a], 1000);
+        assert!(b.expired_epoch.is_empty(), "current-epoch alloc is not expired");
+        assert_eq!(b.active, vec![vec![0x02]]);
     }
 }
 
@@ -2181,10 +2349,17 @@ mod proposal_loop_tests {
             pause_frame_number: 0,
             resume_frame_number: 0,
             kick_frame_number: 0,
-            join_confirm_frame_number: if status == ProverStatus::Active { join_frame + 1 } else { 0 },
+            // join_confirm 0 = genesis/no deferred-activation: an Active alloc
+            // reads Active immediately (these tests run in epoch 0 and exercise
+            // active/leave/surplus decisions, not the deferred-activation gate).
+            join_confirm_frame_number: 0,
             join_reject_frame_number: 0,
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
+            // Far-future epoch = never epoch-expires. These tests isolate
+            // join/leave/surplus/cooldown decisions from the orthogonal storage
+            // re-confirm cycle, so an Active alloc reads Active at any eval frame.
+            epoch: u64::MAX,
             last_active_frame_number: 0,
             vertex_address: vec![],
         }
@@ -2984,6 +3159,7 @@ mod proposal_loop_tests {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: 0,
+            epoch: 0,
             vertex_address: vec![],
         };
         let allocs = vec![
@@ -3007,10 +3183,10 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
-        // confirm_window is 2 in make_lifecycle. leave_frame=90, so
-        // frame 100 is well past 90 + 2.
-        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        lifecycle.set_prover_root_verified_frame(800);
+        // Epoch-aligned: leave_frame=90 is epoch 0, so the leave confirms in
+        // epoch 1 — evaluate at frame 800 (epoch 1).
+        let actions = lifecycle.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
 
         let confirm_filters: Vec<Vec<u8>> = actions
             .iter()
@@ -3457,8 +3633,8 @@ mod proposal_loop_tests {
 
         wm.add(idle_worker(1));
 
-        // Joined at frame 10, current frame 800 → 790 frames past join,
-        // well over the 720-frame grace.
+        // Joined in epoch 0 (frame 10), never confirmed in epoch 1 → by epoch 2
+        // (eval frame 1440) the join is implicitly expired/rejected.
         let allocs = vec![alloc(filter_bytes(0xA1), ProverStatus::Joining, 10)];
         reg.set_prover(prover(address.clone(), allocs));
         // Only the expired-shard summary; no alternatives. Without the
@@ -3471,9 +3647,9 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(800);
+        lifecycle.set_prover_root_verified_frame(1440);
 
-        let actions = lifecycle.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let actions = lifecycle.evaluate(1440, 1, reg.as_ref(), wm.as_ref()).unwrap();
 
         // Expired joins must not be force-rejected.
         assert_eq!(
@@ -3672,9 +3848,7 @@ mod proposal_loop_tests {
         // Worker 1 is manually pinned to the alloc we'll confirm.
         wm.add(manual_worker(1, manual_filter.clone()));
 
-        // Alloc is Joining, ready to confirm. Set join_frame to 50 so
-        // at frame 100 the confirm-window (default 2 frames in tests)
-        // has long passed.
+        // Alloc is Joining (proposed epoch 0, join_frame 50); confirms in epoch 1.
         let allocs = vec![alloc(manual_filter.clone(), ProverStatus::Joining, 50)];
         reg.set_prover(prover(address.clone(), allocs));
 
@@ -3698,10 +3872,11 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
+        lifecycle.set_prover_root_verified_frame(800);
 
+        // Epoch 1 → the epoch-0 join is in its confirm slot.
         let actions = lifecycle
-            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .evaluate(800, 1, reg.as_ref(), wm.as_ref())
             .unwrap();
 
         let confirms = count_confirms(&actions);
@@ -3763,10 +3938,11 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
+        lifecycle.set_prover_root_verified_frame(800);
 
+        // Epoch 1 → all 150 epoch-0 joins are in their confirm slot.
         let actions = lifecycle
-            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .evaluate(800, 1, reg.as_ref(), wm.as_ref())
             .unwrap();
 
         let confirms = count_confirms(&actions);
@@ -3833,10 +4009,11 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
+        lifecycle.set_prover_root_verified_frame(800);
 
+        // Epoch 1 → the three epoch-0 joins are in their confirm slot.
         let actions = lifecycle
-            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .evaluate(800, 1, reg.as_ref(), wm.as_ref())
             .unwrap();
 
         let confirms = count_confirms(&actions);

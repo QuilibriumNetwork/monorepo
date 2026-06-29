@@ -20,3 +20,11 @@ func MigrateToRocksDB(pebblePath string, rocksdbPath string) error {
 func MigrateToRocksDBFromConfig(cfg *config.Config, rocksdbPath string) error {
 	return MigrateToRocksDB("", rocksdbPath)
 }
+
+// VerifyRocksDBMigration is a stub when built without the "rocksdb" tag.
+// Build with: go build -tags rocksdb
+func VerifyRocksDBMigration(rocksdbPath string) error {
+	return fmt.Errorf(
+		"migration verification requires RocksDB support; rebuild with: go build -tags rocksdb",
+	)
+}

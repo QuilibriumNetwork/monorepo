@@ -40,6 +40,12 @@ pub struct ProverConfirm {
     pub frame_number: u64,
     pub public_key_signature_bls48581: Option<AddressedSignature>,
     pub filters: Vec<Vec<u8>>,
+    /// Per-shard storage leaf roots registered as part of this confirm (folded
+    /// in: a confirm is the prover's per-epoch re-registration). Appended after
+    /// the legacy fields and bound into the signing message; an empty set
+    /// serializes + signs byte-identically to the pre-storage-attestation
+    /// format. See [`super::leaf_root_registration::ConfirmLeafRoots`].
+    pub leaf_roots: Vec<super::leaf_root_registration::ConfirmLeafRoots>,
 }
 
 impl ProverConfirm {
@@ -53,6 +59,7 @@ impl ProverConfirm {
         put_u64(&mut out, self.frame_number);
         write_opt_addr_sig(&mut out, self.public_key_signature_bls48581.as_ref())?;
         write_filters(&mut out, &self.filters);
+        super::leaf_root_registration::append_confirm_leaf_roots(&mut out, &self.leaf_roots);
         Ok(out)
     }
     pub fn from_canonical_bytes(data: &[u8]) -> Result<Self> {
@@ -65,7 +72,8 @@ impl ProverConfirm {
         let frame_number = read_u64(data, &mut c)?;
         let sig = read_opt_addr_sig(data, &mut c)?;
         let filters = read_filters(data, &mut c)?;
-        Ok(Self { filter, frame_number, public_key_signature_bls48581: sig, filters })
+        let leaf_roots = super::leaf_root_registration::read_confirm_leaf_roots(data, &mut c)?;
+        Ok(Self { filter, frame_number, public_key_signature_bls48581: sig, filters, leaf_roots })
     }
 }
 
@@ -326,7 +334,7 @@ mod tests {
     // -- ProverConfirm --
     #[test]
     fn confirm_round_trip() {
-        let c = ProverConfirm { filter: vec![], frame_number: 42, public_key_signature_bls48581: Some(addr_sig()), filters: vec![vec![1u8; 8], vec![2u8; 16]] };
+        let c = ProverConfirm { filter: vec![], frame_number: 42, public_key_signature_bls48581: Some(addr_sig()), filters: vec![vec![1u8; 8], vec![2u8; 16]], leaf_roots: Vec::new() };
         let b = c.to_canonical_bytes().unwrap();
         assert_eq!(&b[..4], &TYPE_PROVER_CONFIRM.to_be_bytes());
         let decoded = ProverConfirm::from_canonical_bytes(&b).unwrap();
@@ -343,6 +351,48 @@ mod tests {
         assert_eq!(decoded.filter, b"reservedreservedreservedreserved".to_vec());
         assert_eq!(decoded.frame_number, 0);
         assert!(decoded.filters.is_empty());
+        assert!(decoded.leaf_roots.is_empty());
+    }
+
+    #[test]
+    fn confirm_empty_leaf_roots_is_byte_identical_to_legacy() {
+        use super::super::leaf_root_registration::ConfirmLeafRoots;
+        // A confirm with no leaf roots must serialize EXACTLY as before the
+        // storage-attestation fold (append nothing) — so existing signatures
+        // and on-wire bytes are unchanged.
+        let mut c = ProverConfirm {
+            filter: vec![], frame_number: 42,
+            public_key_signature_bls48581: Some(addr_sig()),
+            filters: vec![vec![1u8; 8], vec![2u8; 16]],
+            leaf_roots: Vec::new(),
+        };
+        let legacy = c.to_canonical_bytes().unwrap();
+        c.leaf_roots = Vec::<ConfirmLeafRoots>::new();
+        assert_eq!(c.to_canonical_bytes().unwrap(), legacy);
+    }
+
+    #[test]
+    fn confirm_with_leaf_roots_round_trips() {
+        use super::super::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+        let groups = vec![ConfirmLeafRoots {
+            filter: vec![0xAB; 32],
+            entries: vec![
+                LeafRootEntry { prefix: vec![42, 7], leaf_root: vec![0x11; 74], num_blocks: 1234 },
+                LeafRootEntry { prefix: vec![], leaf_root: vec![0x22; 74], num_blocks: 1 },
+            ],
+        }];
+        let c = ProverConfirm {
+            filter: vec![], frame_number: 9,
+            public_key_signature_bls48581: Some(addr_sig()),
+            filters: vec![vec![0xAB; 32]],
+            leaf_roots: groups.clone(),
+        };
+        let b = c.to_canonical_bytes().unwrap();
+        let decoded = ProverConfirm::from_canonical_bytes(&b).unwrap();
+        assert_eq!(decoded.leaf_roots, groups);
+        // The leaf roots extend the bytes beyond the legacy tail.
+        let legacy = ProverConfirm { leaf_roots: Vec::new(), ..c.clone() };
+        assert!(b.len() > legacy.to_canonical_bytes().unwrap().len());
     }
 
     // -- ProverReject --

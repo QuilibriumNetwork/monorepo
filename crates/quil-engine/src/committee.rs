@@ -135,19 +135,50 @@ impl ProverRegistryCommittee {
 
 impl Replicas for ProverRegistryCommittee {
     fn leader_for_rank(&self, rank: u64) -> Result<Identity> {
-        // Leader selection walks the registry in seniority order
-        // seeded by a 32-byte hash input; map `rank` via big-endian
-        // embedding + zero pad.
-        let mut seed = [0u8; 32];
-        seed[24..].copy_from_slice(&rank.to_be_bytes());
-        let leader_address = self.registry.get_next_prover(&seed, &self.filter)?;
-        if leader_address.is_empty() {
+        // Byte-exact mirror of Go's `ConsensusProtocol.LeaderForRank`
+        // (`node/consensus/global/consensus_protocol.go:193`):
+        //
+        //   input  = poseidon.HashBytes(be8(rank))
+        //   set    = GetActiveProvers(filter)   // sorted by address asc
+        //   index  = input mod len(set)
+        //   leader = set[index].Address
+        //
+        // Two properties this preserves that the previous
+        // `get_next_prover(be8(rank))` walk did NOT:
+        //  1. The rank is *hashed* (Poseidon), so consecutive ranks land
+        //     on unrelated indices — leadership rotates every rank.
+        //  2. Selection is `mod N` into the address-sorted active set,
+        //     not "closest address to the seed". The old code seeded with
+        //     the bare rank integer and took the nearest address, which is
+        //     stable across ±1 — pinning leadership to one prover. A
+        //     pinned leader that cannot propose (e.g. on a head it can't
+        //     resolve) wedges the chain forever because no timeout ever
+        //     rotates past it. Hashing + mod restores Go's per-rank
+        //     rotation so a stuck leader is bypassed on the next rank.
+        let input = quil_crypto::poseidon::hash_bytes_to_32(&rank.to_be_bytes())
+            .map_err(|e| QuilError::Crypto(format!("leader_for_rank poseidon: {e}")))?;
+
+        // Go's `getProversByStatusInternal` returns the active set sorted
+        // by address ascending; replicate that ordering so `index` maps
+        // to the same prover on every node.
+        let mut active = self.registry.get_active_provers(&self.filter)?;
+        if active.is_empty() {
             return Err(QuilError::NotFound(format!(
-                "no leader available for rank {}",
+                "no active provers for leader at rank {}",
                 rank
             )));
         }
-        Ok(address_to_identity(&leader_address))
+        active.sort_by(|a, b| a.address.cmp(&b.address));
+
+        // index = big-endian(input) mod N, computed via Horner so we need
+        // no bignum dependency. N is the prover count (small), so each
+        // step stays well within u64.
+        let n = active.len() as u64;
+        let mut acc: u64 = 0;
+        for &b in input.iter() {
+            acc = (acc * 256 + b as u64) % n;
+        }
+        Ok(address_to_identity(&active[acc as usize].address))
     }
 
     fn quorum_threshold_for_rank(&self, _rank: u64) -> Result<u64> {
@@ -225,11 +256,23 @@ mod tests {
         fn with(provers: Vec<ProverInfo>) -> Arc<dyn ProverRegistry> {
             Arc::new(TestProverRegistry::with_provers(provers))
         }
-        fn with_leader(provers: Vec<ProverInfo>, leader: Vec<u8>) -> Arc<dyn ProverRegistry> {
-            let r = TestProverRegistry::with_provers(provers);
-            r.set_next_prover(leader);
-            Arc::new(r)
+    }
+
+    /// Reference computation of Go's leader formula:
+    /// `active_sorted_by_addr[ poseidon(be8(rank)) mod N ]`.
+    fn expected_leader(provers: &[ProverInfo], rank: u64) -> Identity {
+        let mut active: Vec<Vec<u8>> = provers
+            .iter()
+            .filter(|p| p.status == ProverStatus::Active)
+            .map(|p| p.address.clone())
+            .collect();
+        active.sort();
+        let hash = quil_crypto::poseidon::hash_bytes_to_32(&rank.to_be_bytes()).unwrap();
+        let mut acc = 0u64;
+        for &b in hash.iter() {
+            acc = (acc * 256 + b as u64) % active.len() as u64;
         }
+        address_to_identity(&active[acc as usize])
     }
 
     fn make_prover(addr_byte: u8, pk_byte: u8, seniority: u64) -> ProverInfo {
@@ -295,20 +338,48 @@ mod tests {
     }
 
     #[test]
-    fn committee_leader_for_rank_delegates_to_registry() {
-        let provers = vec![make_prover(1, 10, 5), make_prover(2, 20, 3)];
-        let registry = StubRegistry::with_leader(
-            provers,
-            vec![2; 32], // leader is prover 2
+    fn committee_leader_for_rank_matches_go_formula() {
+        // Mirror of Go's `LeaderForRank`: hash the rank, index the
+        // address-sorted active set by `mod N`.
+        let provers = vec![
+            make_prover(3, 30, 5),
+            make_prover(1, 10, 3),
+            make_prover(2, 20, 1),
+        ];
+        let registry = StubRegistry::with(provers.clone());
+        let committee =
+            ProverRegistryCommittee::new(registry, b"f".to_vec(), &[1; 32], Vec::new());
+        for rank in [0u64, 1, 5, 42, 579_214, u64::MAX] {
+            assert_eq!(
+                committee.leader_for_rank(rank).unwrap(),
+                expected_leader(&provers, rank),
+                "leader mismatch at rank {rank}"
+            );
+        }
+    }
+
+    #[test]
+    fn committee_leader_rotates_across_ranks() {
+        // The previous bare-rank/nearest-address walk pinned leadership to
+        // a single prover (the halt). The Go formula must rotate: over a
+        // window of consecutive ranks we should see multiple distinct
+        // leaders.
+        let provers = vec![
+            make_prover(1, 10, 1),
+            make_prover(2, 20, 1),
+            make_prover(3, 30, 1),
+            make_prover(4, 40, 1),
+        ];
+        let committee = make_committee(provers, vec![1; 32]);
+        let mut seen = std::collections::HashSet::new();
+        for rank in 0..64u64 {
+            seen.insert(committee.leader_for_rank(rank).unwrap());
+        }
+        assert!(
+            seen.len() > 1,
+            "leadership must rotate across ranks; got {} distinct leader(s)",
+            seen.len()
         );
-        let committee = ProverRegistryCommittee::new(
-            registry,
-            b"f".to_vec(),
-            &[1; 32],
-            Vec::new(),
-        );
-        let leader = committee.leader_for_rank(5).unwrap();
-        assert_eq!(leader, address_to_identity(&[2; 32]));
     }
 
     #[test]

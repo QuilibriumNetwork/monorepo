@@ -273,6 +273,7 @@ impl Consumer<GlobalState, GlobalVote> for GlobalConsumer {
                 timestamp: vote.timestamp(),
                 signature: vote.signature_bytes.clone(),
                 address: vote.identity().clone(),
+                openings: Vec::new(), // global votes never carry openings
             };
             if let Ok(bytes) = wire_vote.to_canonical_bytes() {
                 pub_.publish_consensus(bytes);
@@ -332,6 +333,7 @@ impl Consumer<GlobalState, GlobalVote> for GlobalConsumer {
                 timestamp: timeout.vote.timestamp(),
                 signature: timeout.vote.signature_bytes.clone(),
                 address: timeout.vote.identity().clone(),
+                openings: Vec::new(),
             };
             let wire_ts = crate::consensus_wire::TimeoutState {
                 latest_quorum_certificate: wire_qc,
@@ -443,6 +445,7 @@ impl Consumer<GlobalState, GlobalVote> for GlobalConsumer {
             timestamp: v.timestamp(),
             address: v.identity().clone(),
             signature: v.signature_bytes.clone(),
+            openings: Vec::new(),
         };
 
         let global_proposal = crate::consensus_wire::GlobalProposal {

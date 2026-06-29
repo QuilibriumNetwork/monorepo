@@ -208,6 +208,11 @@ pub struct HotStuffEventHandler<S: Unique, V: Unique> {
     /// Without bounds, a peer that floods proposals with fabricated
     /// `parent_qc_identity` values would OOM the node.
     orphan_proposals: Mutex<OrphanCache<S, V>>,
+    /// Engine label for diagnostics ("global" / "app-shard" /
+    /// "consensus"). Used to escalate proposal-skip logs to info for
+    /// the global engine (which must never stall) while keeping the
+    /// app-shard engine's routine halt-skips at debug.
+    label: &'static str,
 }
 
 impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
@@ -228,7 +233,18 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             notifier,
             last_proposed_rank: std::sync::atomic::AtomicU64::new(0),
             orphan_proposals: Mutex::new(OrphanCache::new()),
+            label: "consensus",
         }
+    }
+
+    /// Tag this handler with an engine label for diagnostics. The
+    /// global engine sets "global" so its proposal-skip reasons surface
+    /// at info (the global chain must never stall, so any skip is
+    /// noteworthy), while app-shard handlers keep routine halt-skips at
+    /// debug.
+    pub fn with_label(mut self, label: &'static str) -> Self {
+        self.label = label;
+        self
     }
 
     /// Handle a freshly-validated quorum certificate from the
@@ -567,12 +583,27 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
 
         let self_id = self.committee.self_identity().clone();
         if self_id != current_leader {
-            tracing::debug!(
-                cur_rank,
-                self_id = %hex::encode(&self_id),
-                leader = %hex::encode(&current_leader),
-                "not the leader for this rank — skipping proposal",
-            );
+            // For the global engine, surface this at info: if we ever
+            // decide we're "not the leader" for a rank whose leader the
+            // rank-details line just printed as our own address, that's
+            // a self-identity vs leader-address mismatch wedging the
+            // chain (the elected leader silently never proposes).
+            if self.label == "global" {
+                tracing::info!(
+                    engine = self.label,
+                    cur_rank,
+                    self_id = %hex::encode(&self_id),
+                    leader = %hex::encode(&current_leader),
+                    "not the leader for this rank — skipping proposal",
+                );
+            } else {
+                tracing::debug!(
+                    cur_rank,
+                    self_id = %hex::encode(&self_id),
+                    leader = %hex::encode(&current_leader),
+                    "not the leader for this rank — skipping proposal",
+                );
+            }
             return Ok(());
         }
 
@@ -650,18 +681,28 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
         {
             Ok(sp) => sp,
             Err(e) if e.is_no_vote() => {
-                // Debug, not warn — NoVote is expected during
-                // coverage halts and during the min-active-provers
-                // gate for fresh / draining shards. A halted shard
-                // emits one of these per pacemaker tick (~6/min);
-                // bumping to warn flooded logs and masked real
-                // events. Halt state is visible via the dedicated
-                // CoverageHalt/Resume telemetry.
-                tracing::debug!(
-                    cur_rank,
-                    error = %e,
-                    "leader skipping: safety rules returned NoVote",
-                );
+                // NoVote is expected during coverage halts / the
+                // min-active-provers gate for app-shard engines (a
+                // halted shard emits ~6/min), so those stay at debug.
+                // But the GLOBAL chain must never NoVote — it isn't
+                // coverage-gated — so surface it at info there: a
+                // global NoVote means the leader is silently not
+                // proposing and the chain will stall on timeouts.
+                if self.label == "global" {
+                    tracing::info!(
+                        engine = self.label,
+                        cur_rank,
+                        error = %e,
+                        "leader skipping: safety rules returned NoVote (global must not stall)",
+                    );
+                } else {
+                    tracing::debug!(
+                        engine = self.label,
+                        cur_rank,
+                        error = %e,
+                        "leader skipping: safety rules returned NoVote",
+                    );
+                }
                 return Ok(());
             }
             Err(e) => {

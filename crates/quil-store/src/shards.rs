@@ -1,11 +1,16 @@
 use std::sync::Arc;
 
 use quil_types::error::{QuilError, Result};
-use quil_types::store::{ShardInfo, ShardsStore, Transaction};
+use quil_types::store::{
+    PendingShardChange, ShardChangeKind, ShardInfo, ShardsStore, Transaction,
+};
 
 /// Store prefix bytes matching the Go constants.
 const SHARD: u8 = 0x0A;
 const APP_SHARD_DATA: u8 = 0x00;
+/// Keyspace for epoch-aligned pending topology changes (Phase F). Distinct from
+/// `APP_SHARD_DATA` so the Go-byte-compatible shard enumeration is untouched.
+const PENDING_SHARD_CHANGE: u8 = 0x01;
 
 /// Shard key length: L1 (3 bytes) + L2 (32 bytes) = 35 bytes.
 const SHARD_KEY_LEN: usize = 35;
@@ -52,6 +57,69 @@ fn decode_path(value: &[u8]) -> Result<Vec<u32>> {
         out.push(u32::from_be_bytes(bytes));
     }
     Ok(out)
+}
+
+/// Key for a pending change: `[SHARD, PENDING, effective_epoch BE(8), parent...]`.
+/// `effective_epoch` leads the parent so a range scan over a single epoch (the
+/// boundary-apply path) is a clean prefix scan, while a full scan (the
+/// join-freeze path) covers everything under `[SHARD, PENDING]`.
+fn pending_change_key(effective_epoch: u64, parent: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + 8 + parent.len());
+    key.push(SHARD);
+    key.push(PENDING_SHARD_CHANGE);
+    key.extend_from_slice(&effective_epoch.to_be_bytes());
+    key.extend_from_slice(parent);
+    key
+}
+
+/// Self-contained deterministic encoding (consensus-consistent across nodes):
+/// `[kind:1][effective_epoch:8][proposed_frame:8][parent_len:2][parent][n:2]([len:2][child])*`.
+fn encode_pending_change(c: &PendingShardChange) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.push(match c.kind {
+        ShardChangeKind::Split => 0u8,
+        ShardChangeKind::Merge => 1u8,
+    });
+    v.extend_from_slice(&c.effective_epoch.to_be_bytes());
+    v.extend_from_slice(&c.proposed_frame.to_be_bytes());
+    v.extend_from_slice(&(c.parent.len() as u16).to_be_bytes());
+    v.extend_from_slice(&c.parent);
+    v.extend_from_slice(&(c.children.len() as u16).to_be_bytes());
+    for child in &c.children {
+        v.extend_from_slice(&(child.len() as u16).to_be_bytes());
+        v.extend_from_slice(child);
+    }
+    v
+}
+
+fn decode_pending_change(v: &[u8]) -> Result<PendingShardChange> {
+    let err = || QuilError::Store("invalid pending shard change encoding".into());
+    let mut i = 0usize;
+    let take = |v: &[u8], i: &mut usize, n: usize| -> Result<Vec<u8>> {
+        if *i + n > v.len() {
+            return Err(QuilError::Store("invalid pending shard change encoding".into()));
+        }
+        let s = v[*i..*i + n].to_vec();
+        *i += n;
+        Ok(s)
+    };
+    let kind = match v.first().ok_or_else(err)? {
+        0 => ShardChangeKind::Split,
+        1 => ShardChangeKind::Merge,
+        _ => return Err(err()),
+    };
+    i += 1;
+    let effective_epoch = u64::from_be_bytes(take(v, &mut i, 8)?.try_into().map_err(|_| err())?);
+    let proposed_frame = u64::from_be_bytes(take(v, &mut i, 8)?.try_into().map_err(|_| err())?);
+    let plen = u16::from_be_bytes(take(v, &mut i, 2)?.try_into().map_err(|_| err())?) as usize;
+    let parent = take(v, &mut i, plen)?;
+    let n = u16::from_be_bytes(take(v, &mut i, 2)?.try_into().map_err(|_| err())?) as usize;
+    let mut children = Vec::with_capacity(n);
+    for _ in 0..n {
+        let clen = u16::from_be_bytes(take(v, &mut i, 2)?.try_into().map_err(|_| err())?) as usize;
+        children.push(take(v, &mut i, clen)?);
+    }
+    Ok(PendingShardChange { kind, parent, children, effective_epoch, proposed_frame })
 }
 
 impl ShardsStore for RocksShardsStore {
@@ -136,6 +204,66 @@ impl ShardsStore for RocksShardsStore {
         txn.delete(&key)
             .map_err(|e| QuilError::Store(format!("delete app shard: {}", e)))
     }
+
+    fn put_pending_shard_change(
+        &self,
+        txn: &dyn Transaction,
+        change: &PendingShardChange,
+    ) -> Result<()> {
+        let key = pending_change_key(change.effective_epoch, &change.parent);
+        txn.set(&key, &encode_pending_change(change))
+            .map_err(|e| QuilError::Store(format!("put pending shard change: {}", e)))
+    }
+
+    fn get_pending_shard_changes(&self, effective_epoch: u64) -> Result<Vec<PendingShardChange>> {
+        // Prefix scan over a single epoch: [SHARD, PENDING, epoch BE].
+        let mut lower = vec![SHARD, PENDING_SHARD_CHANGE];
+        lower.extend_from_slice(&effective_epoch.to_be_bytes());
+        let mut upper = vec![SHARD, PENDING_SHARD_CHANGE];
+        upper.extend_from_slice(&(effective_epoch.saturating_add(1)).to_be_bytes());
+
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_iterate_lower_bound(lower);
+        read_opts.set_iterate_upper_bound(upper);
+        let iter = self.db.iterator_opt(rocksdb::IteratorMode::Start, read_opts);
+
+        let mut out = Vec::new();
+        for item in iter {
+            let (_k, v) =
+                item.map_err(|e| QuilError::Store(format!("get pending changes: {}", e)))?;
+            out.push(decode_pending_change(&v)?);
+        }
+        Ok(out)
+    }
+
+    fn all_pending_shard_changes(&self) -> Result<Vec<PendingShardChange>> {
+        let lower = vec![SHARD, PENDING_SHARD_CHANGE];
+        let upper = vec![SHARD, PENDING_SHARD_CHANGE + 1];
+
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_iterate_lower_bound(lower);
+        read_opts.set_iterate_upper_bound(upper);
+        let iter = self.db.iterator_opt(rocksdb::IteratorMode::Start, read_opts);
+
+        let mut out = Vec::new();
+        for item in iter {
+            let (_k, v) =
+                item.map_err(|e| QuilError::Store(format!("all pending changes: {}", e)))?;
+            out.push(decode_pending_change(&v)?);
+        }
+        Ok(out)
+    }
+
+    fn delete_pending_shard_change(
+        &self,
+        txn: &dyn Transaction,
+        parent: &[u8],
+        effective_epoch: u64,
+    ) -> Result<()> {
+        let key = pending_change_key(effective_epoch, parent);
+        txn.delete(&key)
+            .map_err(|e| QuilError::Store(format!("delete pending shard change: {}", e)))
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +309,73 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].shard_key, shard_key);
         assert_eq!(results[0].prefix, prefix);
+    }
+
+    #[test]
+    fn pending_shard_changes_roundtrip_and_filter_by_epoch() {
+        let (db, store) = test_db();
+        let parent_a = vec![0xAAu8; 32];
+        let parent_b = vec![0xBBu8; 33];
+
+        let split = PendingShardChange {
+            kind: ShardChangeKind::Split,
+            parent: parent_a.clone(),
+            children: vec![vec![0xAA, 0x00], vec![0xAA, 0x80]],
+            effective_epoch: 7,
+            proposed_frame: 5 * 720 + 3,
+        };
+        let merge = PendingShardChange {
+            kind: ShardChangeKind::Merge,
+            parent: parent_b.clone(),
+            children: vec![vec![0xBB; 34], vec![0xBB; 34]],
+            effective_epoch: 9,
+            proposed_frame: 7 * 720,
+        };
+
+        let txn = db.new_batch(false).expect("new batch");
+        store.put_pending_shard_change(txn.as_ref(), &split).expect("put split");
+        store.put_pending_shard_change(txn.as_ref(), &merge).expect("put merge");
+        txn.commit().expect("commit");
+
+        // Filter by effective epoch.
+        let e7 = store.get_pending_shard_changes(7).expect("get e7");
+        assert_eq!(e7, vec![split.clone()], "epoch 7 holds only the split");
+        let e9 = store.get_pending_shard_changes(9).expect("get e9");
+        assert_eq!(e9, vec![merge.clone()], "epoch 9 holds only the merge");
+        assert!(store.get_pending_shard_changes(8).expect("get e8").is_empty());
+
+        // All pending (join-freeze lookup) + affects_shard.
+        let all = store.all_pending_shard_changes().expect("all");
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|c| c.affects_shard(&parent_a)));
+        assert!(all.iter().any(|c| c.affects_shard(&[0xAA, 0x80]))); // a child of the split
+        assert!(!all.iter().any(|c| c.affects_shard(&[0x01, 0x02]))); // unrelated
+
+        // Delete the applied split.
+        let txn = db.new_batch(false).expect("new batch");
+        store.delete_pending_shard_change(txn.as_ref(), &parent_a, 7).expect("delete");
+        txn.commit().expect("commit");
+        assert!(store.get_pending_shard_changes(7).expect("get e7 post-delete").is_empty());
+        assert_eq!(store.all_pending_shard_changes().expect("all post-delete").len(), 1);
+    }
+
+    #[test]
+    fn pending_changes_do_not_leak_into_app_shard_enumeration() {
+        // The pending keyspace (0x0A 0x01) must not appear in range_app_shards
+        // (0x0A 0x00) — otherwise a staged change would masquerade as a live shard.
+        let (db, store) = test_db();
+        let change = PendingShardChange {
+            kind: ShardChangeKind::Split,
+            parent: vec![0xCCu8; 35],
+            children: vec![vec![0xCC; 36]],
+            effective_epoch: 3,
+            proposed_frame: 720,
+        };
+        let txn = db.new_batch(false).expect("new batch");
+        store.put_pending_shard_change(txn.as_ref(), &change).expect("put");
+        txn.commit().expect("commit");
+        assert!(store.range_app_shards().expect("range").is_empty(),
+            "pending changes must not leak into the live shard enumeration");
     }
 
     #[test]

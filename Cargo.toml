@@ -49,6 +49,7 @@ members = [
     "crates/quil-node",
     "crates/quil-compiler",
     "crates/quil-wallet",
+    "crates/quil-explorer",
     "crates/libp2p-identity",
 ]
 
