@@ -56,6 +56,14 @@ pub enum WorkerToMaster {
         frame_number: u64,
         frame_data: Vec<u8>,
     },
+    /// Worker finalized a full app shard frame (header+requests) for the
+    /// master to publish on `shard_frame_bitmask` (state distribution).
+    FullFrameProduced {
+        core_id: u32,
+        filter: Vec<u8>,
+        frame_number: u64,
+        frame_data: Vec<u8>,
+    },
     /// Shard frame finalized — canonical FrameHeader bytes for the
     /// master to wrap in a `MessageBundle{Shard: header}` and publish
     /// on `GLOBAL_PROVER`.
@@ -509,6 +517,19 @@ impl ThreadWorkerManager {
                                                                     );
                                                                     let _ = master_tx_events.send(
                                                                         WorkerToMaster::FrameProduced {
+                                                                            core_id,
+                                                                            filter,
+                                                                            frame_number,
+                                                                            frame_data,
+                                                                        }
+                                                                    ).await;
+                                                                }
+                                                                crate::app_engine::AppEngineEvent::FullFrameProduced { filter, frame_number, frame_data } => {
+                                                                    // Forward to the master to publish on
+                                                                    // shard_frame_bitmask (no loopback — the
+                                                                    // producing engine already self-materialized).
+                                                                    let _ = master_tx_events.send(
+                                                                        WorkerToMaster::FullFrameProduced {
                                                                             core_id,
                                                                             filter,
                                                                             frame_number,

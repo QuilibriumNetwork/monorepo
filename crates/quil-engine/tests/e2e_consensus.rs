@@ -707,6 +707,7 @@ pub fn build_node(
         on_finalized_state: Some(finalized_hook),
         on_incorporated_state: Some(incorporated_hook),
         on_qc_observed: Some(qc_observed_hook),
+        on_missing_parent: std::sync::Arc::new(|| {}),
         config_override: Some(cfg),
         genesis_qc_override: Some(genesis_qc),
         kv_db: None,
@@ -976,6 +977,7 @@ async fn single_archive_node_activates_consensus() {
         on_finalized_state: None,
         on_incorporated_state: None,
         on_qc_observed: None,
+        on_missing_parent: std::sync::Arc::new(|| {}),
         config_override: Some(cfg),
         genesis_qc_override: None,
         kv_db: None,
@@ -1387,6 +1389,9 @@ impl AppShardHarness {
                                     timeout_data.clone(),
                                 ));
                             }
+                        }
+                        E::FullFrameProduced { .. } => {
+                            events_log.lock().push("FullFrameProduced".into());
                         }
                         E::ShardFrameFinalized { .. } => {
                             events_log.lock().push("ShardFrameFinalized".into());
@@ -4109,6 +4114,7 @@ async fn tier2_composite_end_to_end() {
                 use quil_engine::app_engine::AppEngineEvent::*;
                 let name = match ev {
                     FrameProduced { .. } => "FrameProduced",
+                    FullFrameProduced { .. } => "FullFrameProduced",
                     VoteProduced { .. } => "VoteProduced",
                     TimeoutProduced { .. } => "TimeoutProduced",
                     ShardFrameFinalized { .. } => "ShardFrameFinalized",
@@ -4398,6 +4404,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
                 use quil_engine::app_engine::AppEngineEvent::*;
                 let name = match ev {
                     FrameProduced { .. } => "FrameProduced",
+                    FullFrameProduced { .. } => "FullFrameProduced",
                     VoteProduced { .. } => "VoteProduced",
                     TimeoutProduced { .. } => "TimeoutProduced",
                     ShardFrameFinalized { .. } => "ShardFrameFinalized",

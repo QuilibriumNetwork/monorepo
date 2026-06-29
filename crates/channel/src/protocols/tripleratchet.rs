@@ -12,6 +12,7 @@ use ed448_goldilocks_plus::{subtle, EdwardsPoint, Scalar};
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
 use subtle::ConstantTimeEq;
+use super::doubleratchet::{MAX_SKIP, MAX_SKIPPED_KEYS};
 
 use super::doubleratchet::{DoubleRatchetParticipant, DoubleRatchetParticipantJson, MessageCiphertext, P2PChannelEnvelope};
 use super::feldman::{Feldman, vec_to_array, FeldmanReveal};
@@ -48,7 +49,31 @@ pub struct PeerInfo {
     pub(crate) signed_pre_public_key: Vec<u8>,
 }
 
-#[derive(Debug)]
+/// Wipe long-lived secret key material on drop. Nested `peer_channels`
+/// (DoubleRatchetParticipant) and `dkg_ratchet`/`next_dkg_ratchet`
+/// (Feldman) wipe their own secrets via their own Drop impls. Public
+/// points and counters are left alone.
+impl Drop for TripleRatchetParticipant {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.peer_key.zeroize();
+        self.sending_ephemeral_private_key.zeroize();
+        for v in self.receiving_ephemeral_keys.values_mut() { v.zeroize(); }
+        if let Some(k) = self.receiving_group_key.as_mut() { k.zeroize(); }
+        self.root_key.zeroize();
+        self.sending_chain_key.zeroize();
+        self.current_header_key.zeroize();
+        self.next_header_key.zeroize();
+        for v in self.receiving_chain_key.values_mut() { v.zeroize(); }
+        for by_peer in self.skipped_keys_map.values_mut() {
+            for by_idx in by_peer.values_mut() {
+                for v in by_idx.values_mut() { v.zeroize(); }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct TripleRatchetParticipant {
     peer_key: Scalar,
     sending_ephemeral_private_key: Scalar,
@@ -609,6 +634,20 @@ impl TripleRatchetParticipant {
           return Ok((plaintext, false));
       }
 
+      // SECURITY: advance on a throwaway clone, commit only once the
+      // message body authenticates. The skip / receiver-ephemeral
+      // ratchet / DKG-advance below all mutate persistent state before
+      // the AEAD body is verified — running them on a clone means a
+      // forged header (which decrypts under the group header key, since
+      // header keys are shared across the group) cannot advance the
+      // chain, stuff the skipped-keys map, or perturb the DKG ratchet.
+      let mut work = self.clone();
+      let result = work.advance_and_decrypt(envelope)?;
+      *self = work;
+      Ok(result)
+    }
+
+    fn advance_and_decrypt(&mut self, envelope: &P2PChannelEnvelope) -> Result<(Vec<u8>, bool), Box<dyn std::error::Error>> {
       let header_key = self.current_header_key.clone();
       let (header, mut should_dkg_ratchet, should_advance_dkg_ratchet) = self.decrypt_header(&envelope.message_header, &header_key)?;
 
@@ -801,43 +840,80 @@ impl TripleRatchetParticipant {
   }
 
   fn try_skipped_message_keys(&mut self, envelope: &P2PChannelEnvelope) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+      // Find a matching stored key, then decrypt and delete it on
+      // success (one-time use). Collect the match first to avoid
+      // borrowing `self` mutably while iterating.
+      let mut matched: Option<(Vec<u8>, Vec<u8>, u32, Vec<u8>)> = None; // (header_key, peer_key, idx, key_pair)
       for (receiving_header_key, skipped_keys) in &self.skipped_keys_map.clone() {
           if let Ok((header, _, _)) = self.decrypt_header(&envelope.message_header, receiving_header_key) {
               let (peer_key, _, _, current, _) = self.decode_header(&header)?;
-              if let Some(peer_skipped_keys) = skipped_keys.get(&peer_key.compress().to_bytes().to_vec()) {
+              let pk = peer_key.compress().to_bytes().to_vec();
+              if let Some(peer_skipped_keys) = skipped_keys.get(&pk) {
                   if let Some(key_pair) = peer_skipped_keys.get(&current) {
-                      let message_key = &key_pair[..32];
-                      let aead_key = &key_pair[32..];
-                      let plaintext = self.decrypt(
-                          &envelope.message_body,
-                          message_key,
-                          Some(&[aead_key, &envelope.message_header.ciphertext].concat()),
-                      )?;
-                      return Ok(Some(plaintext));
+                      matched = Some((receiving_header_key.clone(), pk, current, key_pair.clone()));
+                      break;
                   }
               }
           }
       }
-      Ok(None)
+
+      let Some((header_key, peer_key, index, key_pair)) = matched else {
+          return Ok(None);
+      };
+
+      let message_key = &key_pair[..32];
+      let aead_key = &key_pair[32..];
+      let plaintext = self.decrypt(
+          &envelope.message_body,
+          message_key,
+          Some(&[aead_key, &envelope.message_header.ciphertext].concat()),
+      )?;
+
+      // One-time use: delete after a successful decrypt (spec) — bounds
+      // retention and prevents replaying the same ciphertext.
+      if let Some(by_peer) = self.skipped_keys_map.get_mut(&header_key) {
+          if let Some(by_idx) = by_peer.get_mut(&peer_key) {
+              by_idx.remove(&index);
+              if by_idx.is_empty() { by_peer.remove(&peer_key); }
+          }
+          if by_peer.is_empty() { self.skipped_keys_map.remove(&header_key); }
+      }
+
+      Ok(Some(plaintext))
+  }
+
+  fn skipped_keys_total(&self) -> usize {
+      self.skipped_keys_map
+          .values()
+          .flat_map(|by_peer| by_peer.values())
+          .map(|by_idx| by_idx.len())
+          .sum()
   }
 
   fn skip_message_keys(&mut self, sender_key: &EdwardsPoint, until: u32) -> Result<(), Box<dyn std::error::Error>> {
       let mut current = *self.current_receiving_chain_length.entry(sender_key.compress().to_bytes().to_vec()).or_insert(0);
-      if current + 100 < until {
+      if current + MAX_SKIP < until {
           return Err(Box::new(TripleRatchetError::SkipLimitExceeded));
       }
 
+      let mut total = self.skipped_keys_total();
+      let current_header_key = self.current_header_key.clone();
       if let Some(chain_key) = self.receiving_chain_key.get_mut(&sender_key.compress().to_bytes().to_vec()) {
           while current < until {
+              // Global retention cap (DoS bound).
+              if total >= MAX_SKIPPED_KEYS {
+                  return Err(Box::new(TripleRatchetError::SkipLimitExceeded));
+              }
               let (new_chain_key, message_key, aead_key) = ratchet_keys(chain_key);
               self.skipped_keys_map
-                  .entry(self.current_header_key.clone())
+                  .entry(current_header_key.clone())
                   .or_insert_with(HashMap::new)
                   .entry(sender_key.compress().to_bytes().to_vec())
                   .or_insert_with(HashMap::new)
                   .insert(current, [message_key, aead_key].concat());
               *chain_key = new_chain_key;
               current += 1;
+              total += 1;
               *self.current_receiving_chain_length.entry(sender_key.compress().to_bytes().to_vec()).or_insert(0) += 1;
           }
       }

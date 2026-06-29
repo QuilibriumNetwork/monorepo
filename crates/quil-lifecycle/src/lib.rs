@@ -67,6 +67,25 @@ impl<E: Send + 'static> DetachedSpawner<E> {
     }
 }
 
+/// Completes when SIGTERM is delivered; pends forever on non-unix.
+/// Like the `ctrl_c()` arm above it is re-registered on each select
+/// iteration — iterations only recycle on rare supervisor events, so
+/// the unwatched window is negligible.
+async fn terminate_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    }
+    #[cfg(not(unix))]
+    std::future::pending::<()>().await
+}
+
 pub struct Supervisor<E> {
     set: JoinSet<Result<(), E>>,
     names: HashMap<Id, String>,
@@ -85,6 +104,10 @@ pub struct Supervisor<E> {
 
 pub enum ShutdownReason<E> {
     CtrlC,
+    /// SIGTERM — what `systemd stop`, `docker stop`, and most process
+    /// managers send. Without handling it the process dies mid-write
+    /// with no shutdown log line.
+    Terminated,
     TaskExited(String),
     TaskError(String, E),
     JoinError(String, JoinError),
@@ -216,6 +239,7 @@ impl<E: Send + 'static> Supervisor<E> {
                     }
                 },
                 _ = tokio::signal::ctrl_c() => break ShutdownReason::CtrlC,
+                _ = terminate_signal() => break ShutdownReason::Terminated,
             }
         };
 

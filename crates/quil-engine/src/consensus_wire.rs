@@ -178,6 +178,48 @@ impl ProposalVote {
         };
         Ok(Self { filter, rank, frame_number, selector, timestamp, signature, address })
     }
+
+    /// Build a wire `ProposalVote` from the proto representation (as returned by
+    /// `GlobalService.GetGlobalProposal`). Inverse of the proto produced by the
+    /// engine; lets the catch-up sync client reconstruct a `SignedProposal`.
+    pub fn from_proto(v: &quil_types::proto::global::ProposalVote) -> Self {
+        let (signature, address) = match v.public_key_signature_bls48581.as_ref() {
+            Some(s) => (s.signature.clone(), s.address.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
+        Self {
+            filter: v.filter.clone(),
+            rank: v.rank,
+            frame_number: v.frame_number,
+            selector: v.selector.clone(),
+            timestamp: v.timestamp,
+            signature,
+            address,
+        }
+    }
+
+    /// Convert to the proto representation for persistence
+    /// (`ClockStore::put_proposal_vote`), so it can later be served by
+    /// `GetGlobalProposal`. Inverse of [`Self::from_proto`].
+    pub fn to_proto(&self) -> quil_types::proto::global::ProposalVote {
+        let public_key_signature_bls48581 =
+            if self.signature.is_empty() && self.address.is_empty() {
+                None
+            } else {
+                Some(quil_types::proto::keys::Bls48581AddressedSignature {
+                    signature: self.signature.clone(),
+                    address: self.address.clone(),
+                })
+            };
+        quil_types::proto::global::ProposalVote {
+            filter: self.filter.clone(),
+            rank: self.rank,
+            frame_number: self.frame_number,
+            selector: self.selector.clone(),
+            timestamp: self.timestamp,
+            public_key_signature_bls48581,
+        }
+    }
 }
 
 // =====================================================================
@@ -304,6 +346,36 @@ pub struct TimeoutCertificate {
 }
 
 impl TimeoutCertificate {
+    /// Build a wire `TimeoutCertificate` from the proto representation (as
+    /// returned by `GlobalService.GetGlobalProposal` in a proposal's
+    /// `prior_rank_timeout_certificate`). Lets the catch-up sync client
+    /// reconstruct a `SignedProposal`.
+    pub fn from_proto(tc: &quil_types::proto::global::TimeoutCertificate) -> Self {
+        let (public_key, signature, bitmask) = match tc.aggregate_signature.as_ref() {
+            Some(agg) => (
+                agg.public_key.as_ref().map(|pk| pk.key_value.clone()).unwrap_or_default(),
+                agg.signature.clone(),
+                agg.bitmask.clone(),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        Self {
+            filter: tc.filter.clone(),
+            rank: tc.rank,
+            latest_ranks: tc.latest_ranks.clone(),
+            latest_quorum_certificate: tc
+                .latest_quorum_certificate
+                .as_ref()
+                .map(QuorumCertificate::from_proto),
+            timestamp: tc.timestamp,
+            aggregate_signature: AggregateSignature {
+                public_key,
+                signature,
+                bitmask,
+            },
+        }
+    }
+
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         put_u32(&mut out, TIMEOUT_CERTIFICATE_TYPE);

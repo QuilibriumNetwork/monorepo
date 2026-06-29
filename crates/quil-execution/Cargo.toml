@@ -38,6 +38,7 @@ serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+quil-store = { path = "../quil-store", features = ["test-utils"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 quil-crypto = { path = "../quil-crypto", features = ["vdf-prover"] }
 quil-engine = { path = "../quil-engine" }

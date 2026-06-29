@@ -13,6 +13,7 @@ use elliptic_curve::ops::Reduce;
 use elliptic_curve::CurveArithmetic;
 use elliptic_curve::{Field, PrimeField};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::utilities::hashes::{hash, hash_as_scalar, scalar_to_bytes, HashOutput};
 use crate::utilities::proofs::{DLogProof, EncProof};
@@ -579,8 +580,11 @@ where
         // We transform r into a hash.
         let expected_verify_r: HashOutput = hash(&r_as_bytes, session_id);
 
-        // We compare the values.
-        if data_received.verify_r != expected_verify_r {
+        // We compare the values. Constant-time: this MAC gates whether
+        // the sender cheated, and `expected_verify_r` is derived from
+        // secret OT outputs — a short-circuiting `!=` would leak which
+        // byte first differs to a co-located attacker.
+        if !bool::from(data_received.verify_r[..].ct_eq(&expected_verify_r[..])) {
             return Err(ErrorMul::new(
                 "Sender cheated in multiplication protocol: Consistency check failed!",
             ));

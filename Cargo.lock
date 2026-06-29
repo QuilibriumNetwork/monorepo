@@ -803,6 +803,7 @@ dependencies = [
  "sha2 0.10.8",
  "thiserror 1.0.63",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]
@@ -1390,6 +1391,8 @@ dependencies = [
  "serde",
  "serde_bytes",
  "sha3 0.10.8",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -4251,6 +4254,7 @@ dependencies = [
  "file-rotate",
  "flate2",
  "hex 0.4.3",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "num-bigint 0.4.6",
@@ -6119,6 +6123,7 @@ dependencies = [
  "serde",
  "sha2 0.9.9",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]

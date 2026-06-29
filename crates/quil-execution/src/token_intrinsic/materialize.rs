@@ -267,6 +267,61 @@ pub fn materialize_token_deploy(
     Ok(metadata_addr)
 }
 
+/// Materialize a **new** TokenDeploy — Go `TokenIntrinsic.Deploy` deploy
+/// branch (`token_intrinsic.go:255-307`, the `domain == TOKEN_BASE_DOMAIN`
+/// path). Unlike `materialize_token_deploy` (the update path, which writes
+/// the config into an existing metadata vertex at a known address), a
+/// deploy DERIVES the new token's domain from its config and builds the
+/// full metadata vertex via `init_metadata_vertex`:
+///   1. build the config (`additionalData[13]`) tree,
+///   2. derive `domain = poseidon(TOKEN_PREFIX ‖ config_tree.commit)`,
+///   3. build the RDF schema templated by `(domain, behavior)`,
+///   4. `init_metadata_vertex(domain, empty, empty, rdf, [13]=config,
+///      TOKEN_BASE_DOMAIN, ...)` — which records the `0xff*32`
+///      type-domain so the manager can route this domain to the token
+///      engine.
+/// Returns the derived domain.
+pub fn materialize_token_deploy_init(
+    state: &crate::hypergraph_state::HypergraphState,
+    config: &super::config::TokenConfiguration,
+    frame_number: u64,
+    inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
+) -> Result<[u8; 32]> {
+    // 1. Config tree (additionalData[13]).
+    let mut config_tree = super::metadata_schema::build_token_configuration_metadata_tree(config)?;
+
+    // 2. Derive the domain from the config commitment.
+    let config_commit = config_tree.commit(inclusion_prover);
+    let mut preimage =
+        Vec::with_capacity(super::constants::TOKEN_PREFIX.len() + config_commit.len());
+    preimage.extend_from_slice(super::constants::TOKEN_PREFIX);
+    preimage.extend_from_slice(&config_commit);
+    let domain = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
+
+    // 3. RDF schema (templated by domain + behavior).
+    let rdf = super::rdf_schema::prepare_rdf_schema_from_config(&domain, config.behavior);
+
+    // 4. Full metadata vertex with the TOKEN_BASE_DOMAIN type-domain.
+    let mut consensus = quil_tries::VectorCommitmentTree::new();
+    let mut sumcheck = quil_tries::VectorCommitmentTree::new();
+    let mut additional: Vec<Option<quil_tries::VectorCommitmentTree>> =
+        (0..14).map(|_| None).collect();
+    additional[13] = Some(config_tree);
+
+    let token_base = super::constants::token_base_domain();
+    state.init_metadata_vertex(
+        &domain,
+        &mut consensus,
+        &mut sumcheck,
+        &rdf,
+        &mut additional,
+        &token_base,
+        frame_number,
+        inclusion_prover,
+    )?;
+    Ok(domain)
+}
+
 /// Extract the verification key from a standard transaction input
 /// signature. The signature is 336 bytes (6 × 56), and the
 /// verification key is at bytes [224..280] (56*4 to 56*5).
@@ -336,6 +391,112 @@ mod tests {
                 additional_reference_key: vec![],
             },
         }
+    }
+
+    /// Byte-parity (structure) verification of the deploy metadata vertex
+    /// against Go `hgstate.Init`'s layout: a deployed token's metadata
+    /// vertex must carry, at the prover-independent keys, exactly:
+    ///   [0<<2]  empty consensus sub-tree  → serialize_go_tree(None) = [0x00]
+    ///   [1<<2]  empty sumcheck sub-tree   → [0x00]
+    ///   [2<<2]  the templated RDF schema (raw)
+    ///   [16<<2] the config sub-tree (sealed, non-empty)
+    ///   0xff*32 the type-domain = TOKEN_BASE_DOMAIN
+    /// The type-domain assertion is the critical consensus link: it is
+    /// exactly what the manager's select_engine reads back to route this
+    /// domain to the token engine. (Commitment bytes depend on the
+    /// inclusion prover and are exercised separately.)
+    #[test]
+    fn token_deploy_metadata_vertex_matches_go_init_layout() {
+        use crate::hypergraph_state::{
+            vertex_adds_discriminator, HypergraphState, HYPERGRAPH_METADATA_ADDRESS,
+        };
+        use std::sync::Arc;
+
+        let prover = Arc::new(NoopInclusionProver);
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            prover.clone(),
+        ));
+        let state = HypergraphState::new(crdt);
+
+        let cfg = super::super::config::TokenConfiguration {
+            behavior: (super::super::constants::DIVISIBLE
+                | super::super::constants::ACCEPTABLE
+                | super::super::constants::EXPIRABLE) as u32,
+            owner_public_key: vec![0x01u8; 32],
+            ..Default::default()
+        };
+        let domain =
+            materialize_token_deploy_init(&state, &cfg, 1, prover.as_ref()).unwrap();
+
+        let va = vertex_adds_discriminator().unwrap();
+        let blob = state
+            .get(&domain, &HYPERGRAPH_METADATA_ADDRESS, &va)
+            .unwrap()
+            .unwrap();
+        let outer = quil_tries::VectorCommitmentTree {
+            root: quil_tries::deserialize_go_tree(&blob).unwrap(),
+        };
+
+        // Type-domain (the routing link).
+        assert_eq!(
+            outer.get(&[0xFFu8; 32]).unwrap(),
+            &super::super::constants::token_base_domain()[..]
+        );
+        // RDF schema, raw at [2<<2].
+        let expected_rdf =
+            super::super::rdf_schema::prepare_rdf_schema_from_config(&domain, cfg.behavior);
+        assert_eq!(outer.get(&[2u8 << 2]).unwrap(), expected_rdf.as_bytes());
+        // Empty consensus + sumcheck sub-trees sealed at [0<<2]/[1<<2].
+        assert_eq!(outer.get(&[0u8 << 2]).unwrap(), &[0x00u8][..]);
+        assert_eq!(outer.get(&[1u8 << 2]).unwrap(), &[0x00u8][..]);
+        // Config sub-tree sealed at [16<<2] (non-empty).
+        assert!(outer.get(&[16u8 << 2]).is_some());
+        // Derived domain is deterministic (poseidon of prefix‖config_commit).
+        let domain2 =
+            materialize_token_deploy_init(&state, &cfg, 2, prover.as_ref()).unwrap();
+        assert_eq!(domain, domain2);
+    }
+
+    /// TRUE byte-parity of the KZG prover + quil-tries commit/serialize
+    /// against Go. The (key,value) tree below is committed in Go with the
+    /// real KZG inclusion prover (bls48581) and serialized via
+    /// SerializeNonLazyTree (node test TestPrintKZGCommitVector); the
+    /// expected hex is that Go output. This is the missing prover-DEPENDENT
+    /// half of deploy-metadata-vertex parity: it proves Rust's
+    /// KzgInclusionProver (same libbls48581) + VectorCommitmentTree::commit
+    /// + serialize_go_tree produce byte-identical commitments and serialized
+    /// trees to Go's tries.Commit + SerializeNonLazyTree. Combined with the
+    /// RDF Go-vectors and the Init-layout test, the full metadata vertex is
+    /// byte-parity-verified.
+    #[test]
+    fn kzg_tree_commit_matches_go_vector() {
+        use num_bigint::BigInt;
+
+        quil_crypto::init(); // load the KZG SRS (idempotent across calls)
+        let prover = quil_crypto::KzgInclusionProver;
+
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[0u8 << 2], b"hello world", &[], &BigInt::from(11))
+            .unwrap();
+        tree.insert(&[1u8 << 2], &[0xABu8; 56], &[], &BigInt::from(56))
+            .unwrap();
+        tree.insert(&[16u8 << 2], &[0xCDu8; 32], &[], &BigInt::from(32))
+            .unwrap();
+
+        let commit = tree.commit(&prover);
+        assert_eq!(
+            hex::encode(&commit),
+            "020f8e94f575785f6ca4260ee36dee3370f226af96a0f5ad2727c6e2335fb01defa026b7d6696d802dd035f276f8c7cbd04987313415fb206882a06e337561dca0ee675a9d370cb2b20a",
+            "KZG root commitment must match Go bls48581"
+        );
+
+        let ser = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        assert_eq!(
+            hex::encode(&ser),
+            "020000000001000000000000000100000000000000000b68656c6c6f20776f726c6400000000000000000000000000000040b30d43f7820dea2998631be4af2e0a5665de80dca55b547a4ce637db8add468d3353f46b2f91f31c3d25e1fc664249c7f92c3b6cd03f300c9becd75f44544b2900000000000000010b010000000000000001040000000000000038abababababababababababababababababababababababababababababababababababababababababababababababababababababababab000000000000000000000000000000407941c8dc10a26dad206aabee1f7c73886bf3161c25360cf5eb11adc3b90c5128fe4cd54483412eb2bbd6c3b6d4efa1ca43ece88d200d8d676f2c7c9692c555180000000000000001380000000000000000000000000000010000000000000001400000000000000020cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd00000000000000000000000000000040c8234b7610cb08164ece21a18803b3fb7a5ca6c7dd3659c5de974ae279f87fc1e5d567153f60304e22d6cf84959bdb4172190dc48ea4a3e3b3f92cc32ad458c90000000000000001200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004a020f8e94f575785f6ca4260ee36dee3370f226af96a0f5ad2727c6e2335fb01defa026b7d6696d802dd035f276f8c7cbd04987313415fb206882a06e337561dca0ee675a9d370cb2b20a000000000000000163000000000000000300000001",
+            "serialized committed tree must match Go SerializeNonLazyTree"
+        );
     }
 
     #[test]

@@ -54,6 +54,28 @@ pub struct Party<C: DklsCurve> {
     pub eth_address: String,
 }
 
+/// Wipe the secret key share when a `Party` is dropped so it doesn't
+/// linger in freed heap (swap, core dump, allocator reuse).
+///
+/// We overwrite `poly_point` with `Scalar::ZERO` and force the write to
+/// be observed via `black_box`, rather than `zeroize::Zeroize`:
+/// `DklsCurve` does not propagate a `C::Scalar: Zeroize` bound to its
+/// users (see the lib.rs docs), so requiring it here would force that
+/// bound onto every `Party<C>` user; and the crate denies `unsafe`, so
+/// a volatile write isn't available. `Field::ZERO` is reachable via
+/// `CurveArithmetic` with no extra bound. `black_box` keeps the
+/// optimizer from eliding the store as dead on a value about to be
+/// freed; the fence orders it. The `zero_share` seeds wipe themselves
+/// via `SeedPair`'s own `Drop`.
+impl<C: DklsCurve> Drop for Party<C> {
+    fn drop(&mut self) {
+        use elliptic_curve::Field;
+        self.poly_point = C::Scalar::ZERO;
+        core::hint::black_box(&self.poly_point);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Abort {
     /// Index of the party generating the abort message.

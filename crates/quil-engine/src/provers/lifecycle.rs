@@ -50,6 +50,15 @@ pub const GO_PLAN_ALLOCATE_CAP: usize = 100;
 /// frames ≈ 10 minutes on mainnet, comfortably spanning one full
 /// sync cycle so the next plan_leaves cycle sees the Leaving status.
 pub const LEAVE_COOLDOWN_FRAMES: u64 = 20;
+/// Minimum frames an allocation must have been Active (since its join
+/// confirmed) before it is eligible for a *pure-score* leave. A freshly
+/// established, producing allocation is "fine" — shedding it to chase a
+/// marginally-higher unallocated shard is the churn this dwell prevents
+/// (workers leaving good allocations, rejoining elsewhere, then leaving
+/// again). Health-driven leaves (empty / orphan / halt-risk-deficit swap)
+/// ignore the dwell. Matches one confirm window so a holding is kept at
+/// least as long as it took to establish it.
+pub const SCORE_LEAVE_MIN_HOLD_FRAMES: u64 = DEFAULT_CONFIRM_WINDOW_FRAMES;
 /// Per-filter cooldown between successive Join proposals on the same
 /// filter. Closes the orphan-Joining gap created by
 /// `PROPOSAL_TIMEOUT_FRAMES` (10) being shorter than typical
@@ -67,6 +76,18 @@ pub const LEAVE_COOLDOWN_FRAMES: u64 = 20;
 /// 30 frames ≈ 15 minutes on mainnet, well past the worst-case
 /// archive materialize + prover-tree sync round-trip we've seen.
 pub const JOIN_FILTER_COOLDOWN_FRAMES: u64 = 30;
+
+/// Backoff before re-proposing a join to a shard that *rejected* our
+/// last join. `JOIN_FILTER_COOLDOWN_FRAMES` only gates re-proposal off
+/// the last join *attempt*, so a contested shard that keeps rejecting us
+/// is re-hammered every ~cooldown forever (observed: a single filter
+/// oscillating Joining↔Rejected for hours, ~480 rejected allocs on one
+/// node, workers saturated by never-confirming pending joins). When our
+/// allocation lands in Rejected, hold off re-proposing that filter for
+/// this window so the node tries *other* (less contested) unallocated
+/// shards instead of fighting for the same one. Matches one confirm
+/// window. Tunable.
+pub const JOIN_REJECT_BACKOFF_FRAMES: u64 = DEFAULT_CONFIRM_WINDOW_FRAMES;
 
 /// Result of evaluating the current frame for prover lifecycle actions.
 pub enum LifecycleAction {
@@ -506,6 +527,14 @@ impl ProverLifecycle {
     pub fn confirm_window_frames(&self) -> u64 {
         self.confirm_window_frames
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only handle to the shared halt state, so tests can simulate
+    /// degraded-coverage / prover-only mode and assert leave proposals
+    /// are suppressed.
+    #[cfg(test)]
+    pub(crate) fn halt_state(&self) -> &Arc<HaltState> {
+        &self.halt_state
     }
 
     /// Populate the **local** per-shard byte size map (sizes derived
@@ -985,12 +1014,40 @@ impl ProverLifecycle {
         // not on) overlaid by local sizes (authoritative for shards
         // we hold data for). See `merged_shard_sizes` for the rule.
         let shard_sizes_snapshot = self.merged_shard_sizes();
-        let proposal_descriptors = build_proposal_descriptors(
+        let mut proposal_descriptors = build_proposal_descriptors(
             &summaries,
             &all_our_filters,
             &shard_sizes_snapshot,
             &shards_store_filters,
         );
+        // Recently-rejected join backoff: drop any shard that rejected our
+        // join within the last `JOIN_REJECT_BACKOFF_FRAMES`. A Rejected
+        // allocation is terminal so it's excluded from `all_our_filters`
+        // and would otherwise reappear as a join candidate immediately —
+        // producing the Joining↔Rejected oscillation that saturates
+        // workers with never-confirming pending joins. Backing it off
+        // steers the proposer to other (less contested) unallocated
+        // shards. Also keeps these out of the plan_leaves comparison set
+        // (they're not realistically available to us right now).
+        let reject_backoff: std::collections::HashSet<Vec<u8>> = prover_info
+            .as_ref()
+            .map(|p| {
+                p.allocations
+                    .iter()
+                    .filter(|a| {
+                        a.status == ProverStatus::Rejected
+                            && a.join_reject_frame_number > 0
+                            && frame_number
+                                < a.join_reject_frame_number
+                                    .saturating_add(JOIN_REJECT_BACKOFF_FRAMES)
+                    })
+                    .map(|a| a.confirmation_filter.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !reject_backoff.is_empty() {
+            proposal_descriptors.retain(|d| !reject_backoff.contains(&d.filter));
+        }
         let decide_all_descriptors =
             build_decide_descriptors(&summaries, &shard_sizes_snapshot);
         let allocated_descriptors: Vec<ShardDescriptor> = decide_all_descriptors.iter()
@@ -1446,7 +1503,18 @@ impl ProverLifecycle {
         //    because `decide_leaves` auto-confirms any pending leave
         //    whose filter isn't in the scored list — and size==0
         //    shards aren't, by the same rule.
-        if shard_info_ready && can_propose && !join_proposed_this_cycle && !active_filters.is_empty()
+        // Do NOT propose leaves while in degraded-coverage / prover-only
+        // mode: coverage data is stale/unreliable there, so the halt-risk
+        // counts that drive `plan_leaves` (and its swap path) are false
+        // positives. A node stuck in prover-only mode was observed
+        // proposing swap leaves against a phantom halt-risk shard for
+        // hours (2026-06-16). Halt-risk swaps are still wanted — but only
+        // off a trustworthy coverage view, i.e. when not halted.
+        if shard_info_ready
+            && can_propose
+            && !join_proposed_this_cycle
+            && !active_filters.is_empty()
+            && !self.halt_state.any_halted()
         {
             let manually_managed_filters: std::collections::HashSet<Vec<u8>> = workers
                 .iter()
@@ -1494,6 +1562,27 @@ impl ProverLifecycle {
                 .cloned()
                 .collect();
 
+            // Min-hold dwell: allocations confirmed within the last
+            // `SCORE_LEAVE_MIN_HOLD_FRAMES` are exempt from pure-score
+            // leaves so a freshly-established, producing holding isn't
+            // churned to chase a marginally-better unallocated shard.
+            // (Halt-risk swap, empty, and orphan leaves ignore this.)
+            let min_hold_filters: std::collections::HashSet<Vec<u8>> = prover_info
+                .as_ref()
+                .map(|p| {
+                    p.allocations
+                        .iter()
+                        .filter(|a| {
+                            a.join_confirm_frame_number > 0
+                                && frame_number
+                                    < a.join_confirm_frame_number
+                                        .saturating_add(SCORE_LEAVE_MIN_HOLD_FRAMES)
+                        })
+                        .map(|a| a.confirmation_filter.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
             // Score-driven candidates — only meaningful when there are
             // unallocated alternatives to compare against.
             let score_candidates: Vec<Vec<u8>> = if !proposal_descriptors.is_empty() {
@@ -1505,6 +1594,7 @@ impl ProverLifecycle {
                     self.units,
                     self.strategy,
                     free_worker_ids.len(),
+                    &min_hold_filters,
                 )
             } else {
                 Vec::new()
@@ -1718,7 +1808,10 @@ fn build_proposal_descriptors(
         out.push(ShardDescriptor {
             filter: s.filter.clone(),
             size: raw_size,
-            ring: ri.joiner_ring,
+            // Contention-dampened joiner ring (see JOIN_CONTENTION_MARGIN):
+            // score as if a few other provers also pile onto this shard,
+            // so near-ring-boundary shards aren't over-proposed.
+            ring: proposer::dampened_joiner_ring(total),
             shards: 1,
             active_on_ring: ri.active_on_joiner_ring,
             total_active_joining: total as u64,
@@ -2207,6 +2300,68 @@ mod proposal_loop_tests {
     }
 
     #[test]
+    fn rejected_join_is_backed_off_then_retried() {
+        // A shard that recently rejected our join must NOT be re-proposed
+        // until JOIN_REJECT_BACKOFF_FRAMES elapse — this breaks the
+        // Joining↔Rejected oscillation that saturates workers with
+        // never-confirming pending joins. After the backoff the shard is
+        // eligible again.
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(idle_worker(1));
+        wm.add(idle_worker(2));
+        reg.set_summaries(vec![
+            shard_summary(filter_bytes(0x01), 1),
+            shard_summary(filter_bytes(0x02), 1),
+        ]);
+        // We hold a recently-Rejected allocation for 0x01 (rejected @ 90).
+        let mut rejected = alloc(filter_bytes(0x01), ProverStatus::Rejected, 50);
+        rejected.join_reject_frame_number = 90;
+        reg.set_prover(prover(address.clone(), vec![rejected]));
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+
+        let proposed = |actions: &[LifecycleAction]| -> Vec<Vec<u8>> {
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    LifecycleAction::ProposeJoin { filters, .. } => Some(filters.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+
+        // Within backoff (frame 100 < 90 + JOIN_REJECT_BACKOFF_FRAMES):
+        // 0x01 must NOT be proposed.
+        lifecycle.set_prover_root_verified_frame(100);
+        let a = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let p = proposed(&a);
+        assert!(
+            !p.contains(&filter_bytes(0x01)),
+            "recently-rejected shard 0x01 must be backed off; proposed={:?}",
+            p
+        );
+
+        // Past the backoff: 0x01 is joinable again.
+        let after = 90 + JOIN_REJECT_BACKOFF_FRAMES + 1;
+        lifecycle.set_prover_root_verified_frame(after);
+        let a = lifecycle.evaluate(after, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let p = proposed(&a);
+        assert!(
+            p.contains(&filter_bytes(0x01)),
+            "shard 0x01 must be joinable again after the reject backoff; proposed={:?}",
+            p
+        );
+    }
+
+    #[test]
     fn excess_pending_joins_get_rejected() {
         let address = vec![0xCDu8; 32];
         let wm = Arc::new(ConfigurableWorkerManager::new());
@@ -2287,13 +2442,73 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
+        // Evaluate well past SCORE_LEAVE_MIN_HOLD_FRAMES (360) so the
+        // anti-churn dwell doesn't exempt these allocations (join_confirm
+        // = 11) from score-driven leaves.
+        lifecycle.set_prover_root_verified_frame(500);
 
-        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let actions = lifecycle.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap();
         let proposed = count_proposed_leaves(&actions);
         assert!(
             proposed > 0,
-            "expected ProposeLeave when allocated shards score below the 67% threshold of unallocated alternatives; got {:?}",
+            "expected ProposeLeave when allocated shards score below the threshold of unallocated alternatives; got {:?}",
+            actions
+        );
+    }
+
+    /// Regression: in degraded-coverage / prover-only mode the coverage
+    /// view is stale, so halt-risk counts are false positives. Leave
+    /// proposals (incl. the halt-risk swap) must be suppressed entirely —
+    /// the exact same setup that proposes a leave above must propose NONE
+    /// once `halt_state` reports halted.
+    #[test]
+    fn leaves_suppressed_in_prover_only_mode() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
+        wm.add(allocated_worker(3, filter_bytes(0xA3)));
+
+        reg.set_prover(prover(
+            address.clone(),
+            vec![
+                alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+                alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+                alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+            ],
+        ));
+
+        let crowded = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            crowded(filter_bytes(0xA1), 64, 1_000_000),
+            crowded(filter_bytes(0xA2), 64, 1_000_000),
+            crowded(filter_bytes(0xA3), 64, 1_000_000),
+            crowded(filter_bytes(0xC0), 1, 10_000_000),
+            crowded(filter_bytes(0xC1), 1, 10_000_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(500);
+        // Degraded coverage → prover-only mode.
+        lifecycle.halt_state().mark_halted(filter_bytes(0xC0));
+        assert!(lifecycle.halt_state().any_halted());
+
+        let actions = lifecycle.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(
+            count_proposed_leaves(&actions),
+            0,
+            "no leaves may be proposed while halted (stale coverage → phantom \
+             halt-risk); got {:?}",
             actions
         );
     }
@@ -2344,10 +2559,12 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
+        // Past the score-leave dwell (360) so allocations (join_confirm
+        // = 11) are eligible for score-driven leaves.
+        lifecycle.set_prover_root_verified_frame(500);
 
         // First cycle proposes leaves.
-        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let actions = lifecycle.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap();
         let first_leaves: Vec<Vec<u8>> = actions
             .iter()
             .filter_map(|a| match a {
@@ -2365,8 +2582,8 @@ mod proposal_loop_tests {
         // Second cycle, 4 frames later (well within LEAVE_COOLDOWN_FRAMES=20)
         // — must NOT re-propose Leave on the same filters.
         // Bump prover_root_verified_frame so the readiness gate passes.
-        lifecycle.set_prover_root_verified_frame(104);
-        let actions = lifecycle.evaluate(104, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        lifecycle.set_prover_root_verified_frame(504);
+        let actions = lifecycle.evaluate(504, 1, reg.as_ref(), wm.as_ref()).unwrap();
         let repeat_leaves: Vec<Vec<u8>> = actions
             .iter()
             .filter_map(|a| match a {
@@ -2426,12 +2643,14 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
-        let _ = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        // Past the score-leave dwell (360) so the allocations (join_confirm
+        // = 11) are score-leave eligible.
+        lifecycle.set_prover_root_verified_frame(500);
+        let _ = lifecycle.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap();
 
         // After the cooldown window, the same filters should be
-        // eligible again. (Use frame 100 + LEAVE_COOLDOWN_FRAMES = 120.)
-        let later_frame = 100 + LEAVE_COOLDOWN_FRAMES;
+        // eligible again. (Use frame 500 + LEAVE_COOLDOWN_FRAMES.)
+        let later_frame = 500 + LEAVE_COOLDOWN_FRAMES;
         lifecycle.set_prover_root_verified_frame(later_frame);
         let actions = lifecycle.evaluate(later_frame, 1, reg.as_ref(), wm.as_ref()).unwrap();
         let leaves: Vec<Vec<u8>> = actions

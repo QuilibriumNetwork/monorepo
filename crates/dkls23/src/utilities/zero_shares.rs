@@ -29,6 +29,16 @@ pub struct SeedPair {
     pub seed: Seed,
 }
 
+/// Wipe the shared seed on drop. This seed deterministically generates
+/// a party's zero-shares for every signing session, so leaking it from
+/// freed memory is as damaging as leaking a key share.
+impl Drop for SeedPair {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.seed.zeroize();
+    }
+}
+
 /// Used to run the protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZeroShare {

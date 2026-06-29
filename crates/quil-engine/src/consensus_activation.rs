@@ -57,6 +57,17 @@ pub struct ConsensusActivationParams {
     /// the clock store so `prove_next_state` for rank+1 can resolve
     /// the latest-QC frame_number/identity.
     pub on_qc_observed: Option<crate::consensus_glue::QcObservedHook>,
+    /// Hook fired when the engine orphans a proposal for a missing parent
+    /// (the node has fallen behind). The node wires this to a catch-up sync
+    /// that pulls missing proposals from a peer and submits them. Debounced
+    /// node-side. Analog of Go's `syncProvider.AddState` trigger.
+    ///
+    /// **Required** (not `Option`): a global-consensus participant that can't
+    /// catch up after falling behind is the exact failure this fixes, so every
+    /// activation must declare its trigger. Callers that genuinely don't want
+    /// catch-up (tests, read-only paths) pass an explicit no-op
+    /// (`Arc::new(|| {})`) so the choice is conscious and greppable.
+    pub on_missing_parent: crate::consensus_glue::SyncTriggerHook,
     /// Override the consensus configuration. Production callers
     /// leave this at `None` to use the default 45s startup delay +
     /// 10s proposal duration. Integration tests set
@@ -175,14 +186,14 @@ pub fn activate_consensus(params: ConsensusActivationParams) -> Result<Consensus
     // Keep a clone of the publisher so the follower can broadcast
     // ProverKick messages on equivocation.
     let publisher_for_follower = params.publisher.clone();
-    let consumer: Arc<dyn quil_consensus::event_handler::Consumer<GlobalState, GlobalVote>> =
-        match (params.publisher, params.on_qc_observed) {
-            (Some(p), Some(qc_hook)) => {
-                Arc::new(GlobalConsumer::with_publisher_and_qc_hook(p, qc_hook))
-            }
-            (Some(p), None) => Arc::new(GlobalConsumer::with_publisher(p)),
-            (None, _) => Arc::new(GlobalConsumer::new()),
+    let consumer: Arc<dyn quil_consensus::event_handler::Consumer<GlobalState, GlobalVote>> = {
+        let base = match (params.publisher, params.on_qc_observed) {
+            (Some(p), Some(qc_hook)) => GlobalConsumer::with_publisher_and_qc_hook(p, qc_hook),
+            (Some(p), None) => GlobalConsumer::with_publisher(p),
+            (None, _) => GlobalConsumer::new(),
         };
+        Arc::new(base.with_sync_trigger(params.on_missing_parent))
+    };
     let participant: Arc<
         dyn quil_consensus::pacemaker::ParticipantConsumer<GlobalState, GlobalVote>,
     > = Arc::new(GlobalParticipantConsumer);
@@ -496,6 +507,121 @@ impl MemConsensusStore {
             consensus: Mutex::new(None),
             liveness: Mutex::new(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_consensus::models::Unique;
+    use quil_consensus::signature_aggregator::TimeoutSignerInfo;
+
+    use crate::bls_signature_aggregator::BlsAggregatedSignature;
+
+    fn agg_sig() -> Arc<dyn AggregatedSignature> {
+        Arc::new(BlsAggregatedSignature::new(quil_types::crypto::BlsAggregateOutput {
+            signature: vec![0xAAu8; 74],
+            public_key: vec![0xBBu8; 96],
+        }))
+    }
+
+    fn sample_state() -> State<GlobalState> {
+        let gs = GlobalState::new(
+            10,                       // frame_number
+            7,                        // rank
+            0,                        // timestamp
+            100,                      // difficulty
+            vec![0x11u8; 516],        // output
+            vec![0x03u8; 32],         // parent_selector
+            vec![0x02u8; 32],         // prover
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        State {
+            rank: 7,
+            identifier: vec![0xCDu8; 32],
+            proposer_id: vec![0x02u8; 32],
+            parent_qc_identity: vec![0x03u8; 32],
+            parent_qc_rank: 6,
+            parent_quorum_certificate: None,
+            timestamp: 1_700_000_000,
+            state: gs,
+        }
+    }
+
+    #[test]
+    fn factory_make_vote_sets_voter_identity_and_proposal_source() {
+        let f = GlobalVoteFactory;
+        let state_id = vec![0xCDu8; 32];
+        let voter = vec![0x42u8; 32];
+        let vote = f
+            .make_vote(7, &state_id, vec![0x01u8; 74], &voter)
+            .unwrap();
+        assert_eq!(vote.rank(), 7);
+        assert_eq!(vote.identity(), &voter); // voter address
+        assert_eq!(vote.source(), &state_id); // proposal id
+        assert_eq!(vote.signature(), &[0x01u8; 74]);
+    }
+
+    #[test]
+    fn factory_make_timeout_vote_has_empty_source() {
+        let f = GlobalVoteFactory;
+        let voter = vec![0x55u8; 32];
+        let vote = f.make_timeout_vote(9, 8, vec![0x02u8; 74], &voter).unwrap();
+        assert_eq!(vote.rank(), 9);
+        assert_eq!(vote.identity(), &voter);
+        // Timeout votes don't point at a proposal — source is empty.
+        assert!(vote.source().is_empty());
+    }
+
+    #[test]
+    fn factory_make_quorum_certificate_carries_state_fields() {
+        let f = GlobalVoteFactory;
+        let state = sample_state();
+        let qc = f.make_quorum_certificate(&state, agg_sig()).unwrap();
+        assert_eq!(qc.rank(), 7);
+        assert_eq!(qc.frame_number(), 10);
+        assert_eq!(qc.identity(), &state.identifier);
+        assert_eq!(qc.timestamp(), 1_700_000_000);
+        assert_eq!(qc.aggregated_signature().signature(), &[0xAAu8; 74]);
+    }
+
+    #[test]
+    fn factory_make_timeout_certificate_collects_latest_ranks() {
+        let f = GlobalVoteFactory;
+        let newest_qc = f.make_quorum_certificate(&sample_state(), agg_sig()).unwrap();
+        let signers = vec![
+            TimeoutSignerInfo { newest_qc_rank: 5, signer: vec![0x01u8; 32] },
+            TimeoutSignerInfo { newest_qc_rank: 6, signer: vec![0x02u8; 32] },
+        ];
+        let tc = f
+            .make_timeout_certificate(8, newest_qc, signers, agg_sig())
+            .unwrap();
+        assert_eq!(tc.rank(), 8);
+        assert_eq!(tc.latest_ranks(), &[5u64, 6u64]);
+        assert_eq!(tc.latest_quorum_cert().rank(), 7);
+    }
+
+    #[test]
+    fn qc_equals_compares_rank_and_identity() {
+        let f = GlobalVoteFactory;
+        let qc1 = f.make_quorum_certificate(&sample_state(), agg_sig()).unwrap();
+        let qc2 = f.make_quorum_certificate(&sample_state(), agg_sig()).unwrap();
+        assert!(qc1.equals(qc2.as_ref()));
+    }
+
+    #[test]
+    fn tc_equals_compares_rank() {
+        let f = GlobalVoteFactory;
+        let newest = f.make_quorum_certificate(&sample_state(), agg_sig()).unwrap();
+        let tc1 = f
+            .make_timeout_certificate(8, newest.clone(), Vec::new(), agg_sig())
+            .unwrap();
+        let tc2 = f
+            .make_timeout_certificate(8, newest, Vec::new(), agg_sig())
+            .unwrap();
+        assert!(tc1.equals(tc2.as_ref()));
     }
 }
 

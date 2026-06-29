@@ -508,20 +508,17 @@ pub fn decode_and_validate_deploy(input: &[u8]) -> Result<DispatchedDeploy> {
 /// hash fields against the schema; this validator just rejects
 /// blatantly-broken documents so deploy fails fast instead of
 /// poisoning every subsequent vertex op.
-fn validate_rdf_schema_bytes(schema: &[u8]) -> Result<()> {
+pub(crate) fn validate_rdf_schema_bytes(schema: &[u8]) -> Result<()> {
     if schema.is_empty() {
         return Err(QuilError::InvalidArgument(
             "hypergraph deploy: empty RDF schema".into(),
         ));
     }
-    const MAX_SCHEMA_BYTES: usize = 10_000;
-    if schema.len() > MAX_SCHEMA_BYTES {
-        return Err(QuilError::InvalidArgument(format!(
-            "hypergraph deploy: RDF schema too large ({} > {} bytes)",
-            schema.len(),
-            MAX_SCHEMA_BYTES
-        )));
-    }
+    // NOTE: no byte-size cap here. Go's deploy gate
+    // (rdfMultiprover.GetSchemaMap → TurtleRDFParser.GetTagsByClass via
+    // rdf2go) imposes none, so a Rust-only cap would reject large schemas
+    // Go accepts and fork. Schema size is bounded upstream by the
+    // consensus message-size limits.
     let text = std::str::from_utf8(schema).map_err(|_| {
         QuilError::InvalidArgument("hypergraph deploy: RDF schema is not valid UTF-8".into())
     })?;
@@ -1273,10 +1270,47 @@ mod tests {
         assert!(validate_rdf_schema_bytes(schema).is_err());
     }
 
+    /// Parity with Go's deploy gate (TurtleRDFParser.GetTagsByClass via
+    /// rdf2go), captured by running node test TestPrintRDFParseVector
+    /// against the FFI-linked Go build. Go results:
+    ///   quil (Divisible|Acceptable|Expirable) → accept, 2 classes, 17 fields
+    ///   no_prefix / classless / bad_int       → reject (parse error)
+    /// The Rust validator (full parse_turtle_schema + structural heuristics)
+    /// must match these accept/reject outcomes AND extract the same
+    /// class/field structure for the real schema.
     #[test]
-    fn rdf_validator_rejects_too_large() {
-        let schema = vec![b'.'; 10_001];
-        assert!(validate_rdf_schema_bytes(&schema).is_err());
+    fn rdf_validator_matches_go_gettagsbyclass_vectors() {
+        let quil = crate::token_intrinsic::rdf_schema::prepare_rdf_schema_from_config(
+            &[0x42u8; 32],
+            (crate::token_intrinsic::constants::DIVISIBLE
+                | crate::token_intrinsic::constants::ACCEPTABLE
+                | crate::token_intrinsic::constants::EXPIRABLE) as u32,
+        );
+        assert!(validate_rdf_schema_bytes(quil.as_bytes()).is_ok(), "quil accept");
+        let parsed = crate::turtle::parse_turtle_schema(&quil).unwrap();
+        let nclasses = parsed.classes.len();
+        let nfields: usize = parsed.classes.values().map(|c| c.fields.len()).sum();
+        assert_eq!(nclasses, 2, "Go: 2 classes (coin + pending)");
+        assert_eq!(nfields, 17, "Go: 17 fields total");
+
+        assert!(
+            validate_rdf_schema_bytes(b":Foo a rdfs:Class .").is_err(),
+            "no_prefix → Go rejects (undeclared prefixes)"
+        );
+        assert!(
+            validate_rdf_schema_bytes(
+                b"@prefix qcl: <https://types.quilibrium.com/qcl/> .\n:X qcl:order 0 ."
+            )
+            .is_err(),
+            "classless → Go rejects"
+        );
+        assert!(
+            validate_rdf_schema_bytes(
+                b"@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n@prefix qcl: <https://types.quilibrium.com/qcl/> .\n:Foo a rdfs:Class ; qcl:order abc ."
+            )
+            .is_err(),
+            "bad_int → Go rejects"
+        );
     }
 
     #[test]

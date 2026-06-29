@@ -5,6 +5,12 @@ edition = "2021"
 license = "Apache-2.0"
 description = "RocksDB-backed storage implementations for the Quilibrium node"
 
+[features]
+# Exposes non-transactional store helpers (e.g. the direct
+# `save_vertex_underlying`) for use as test fixtures. Off in production
+# builds; enable from a consuming crate's `[dev-dependencies]`.
+test-utils = []
+
 [dependencies]
 quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }

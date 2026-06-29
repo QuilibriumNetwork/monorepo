@@ -21,6 +21,18 @@ pub struct SeedTree {
     num_leaves: usize   // N
 }
 
+/// Wipe every GGM seed on drop. These seeds are the DKG-in-the-head
+/// party randomness behind the verifiable-encryption proof; leaking
+/// them from freed memory would expose the witness-sharing secrets.
+impl Drop for SeedTree {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for s in self.seeds.iter_mut() {
+            s.zeroize();
+        }
+    }
+}
+
 impl SeedTree {
 
     fn expand(salt : &[u8], rep_index : u16, seed_index : u16, seed : &Seed) -> (Seed, Seed) {

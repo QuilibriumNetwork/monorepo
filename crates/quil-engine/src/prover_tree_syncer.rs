@@ -25,4 +25,13 @@ pub trait ProverTreeSyncer: Send + Sync {
     /// Returns `Ok(true)` if post-sync root matches, `Ok(false)` if
     /// the sync completed but roots still diverge, `Err` on failure.
     async fn sync_prover_tree(&self, expected_root: &[u8]) -> Result<bool>;
+
+    /// Sync a specific app-shard's vertex-adds subtree from an archive,
+    /// pinning to `expected_root`. Used to catch a shard's CRDT up after
+    /// a frame gap / restart / late-join (step 4). `filter` is the
+    /// shard filter; the impl derives the `ShardKey`. Default is a no-op
+    /// (returns `Ok(false)`) for syncers that don't support shard sync.
+    async fn sync_shard_tree(&self, _filter: &[u8], _expected_root: &[u8]) -> Result<bool> {
+        Ok(false)
+    }
 }

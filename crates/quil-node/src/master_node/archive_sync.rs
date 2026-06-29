@@ -7,6 +7,94 @@ use quil_keys::KeyManager as _;
 
 use quil_lifecycle::Supervisor;
 
+/// Consensus catch-up sync. Woken by `notify` (the engine fires
+/// `on_missing_parent` when it orphans a proposal because the node is behind),
+/// it pulls the missing proposals from a peer's `GlobalService` and submits them
+/// into the consensus loop so the node rejoins consensus rather than just
+/// mirroring frames into the store. Mirrors Go's `SyncProvider` /
+/// `GlobalSyncClient` (`GetGlobalProposal` → `AddProposal`, ascending from the
+/// finalized head). The partition is applied to this path for free: the proxy
+/// gates `GetGlobalProposal` exactly like `GetGlobalFrame`.
+async fn run_proposal_catchup(
+    pool: Arc<quil_rpc::ArchiveEndpointPool>,
+    consensus_handle: Arc<
+        std::sync::OnceLock<quil_engine::consensus_types::GlobalEventLoopHandle>,
+    >,
+    notify: Arc<tokio::sync::Notify>,
+    finalized: Arc<std::sync::atomic::AtomicU64>,
+    seed: [u8; 57],
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    info!("consensus proposal-catchup task started");
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = notify.notified() => {}
+        }
+        // Coalesce bursts of orphan signals into one catch-up round.
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+        }
+        // Need the live consensus handle (set once activation completes).
+        let Some(handle) = consensus_handle.get() else { continue };
+
+        // Try known archive endpoints until one serves the gap. During a
+        // partition every peer returns UNAVAILABLE here; the next orphan signal
+        // retries, so recovery happens on the first poll after the heal.
+        for addr in pool.get_all().await {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let mut client = match quil_rpc::ArchiveClient::connect_mtls(&addr, &seed).await {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!(%addr, error = %e, "catchup: connect failed");
+                    continue;
+                }
+            };
+            let mut next = finalized.load(Relaxed) + 1;
+            let mut synced = 0u64;
+            loop {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let proposal = match client.get_global_proposal(next).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // No proposal at `next` (caught up to source head) or the
+                        // peer is partitioned/erroring — stop this endpoint.
+                        debug!(%addr, frame = next, error = %e, "catchup: stop (no proposal)");
+                        break;
+                    }
+                };
+                match quil_engine::consensus_types::proto_proposal_to_signed(&proposal) {
+                    Ok((sp, qc, tc)) => {
+                        handle.submit_quorum_certificate(qc);
+                        if let Some(tc) = tc {
+                            handle.submit_timeout_certificate(tc);
+                        }
+                        if !handle.submit_proposal(sp).await {
+                            break; // loop shutting down
+                        }
+                        synced += 1;
+                        next += 1;
+                    }
+                    Err(e) => {
+                        debug!(%addr, frame = next, error = %e, "catchup: decode failed");
+                        break;
+                    }
+                }
+            }
+            if synced > 0 {
+                info!(%addr, synced, "catchup: submitted synced proposals to consensus");
+                break; // made progress; done for this round
+            }
+        }
+    }
+}
+
 pub(crate) struct ArchiveSyncArgs {
     pub mtls_seed: Option<[u8; 57]>,
     pub network: u8,
@@ -80,6 +168,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
     } = args;
 
     if let Some(seed) = mtls_seed {
+        // Catch-up sync (Part C): the engine fires `on_missing_parent` when it
+        // orphans a proposal (node fell behind, e.g. after a partition); that
+        // notifies `catchup_notify`, and the task below pulls the missing
+        // proposals from a peer's GlobalService and submits them into the
+        // consensus loop so the node rejoins consensus. `consensus_finalized`
+        // tracks the engine's finalized frame (updated only by the finalized
+        // hook — distinct from the poller-written store head) so the sync starts
+        // from the right point.
+        let catchup_notify = Arc::new(tokio::sync::Notify::new());
+        let consensus_finalized = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let exec_mgr_for_poller = exec_manager.clone();
         let wa_for_poller = worker_allocator.clone();
         let pl_for_poller = prover_lifecycle.clone();
@@ -277,6 +375,20 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         }
         info!("archive frame poller spawned (with execution pipeline)");
 
+        // Consensus catch-up sync task — replays missing proposals into the
+        // consensus loop when the engine signals it's behind (Part C).
+        {
+            let pool = archive_pool.clone();
+            let ch = consensus_handle.clone();
+            let notify = catchup_notify.clone();
+            let finalized = consensus_finalized.clone();
+            sup.run_until_cancelled("global-consensus-catchup", move |cancel| async move {
+                run_proposal_catchup(pool, ch, notify, finalized, seed, cancel).await;
+                Ok(())
+            });
+        }
+        info!("consensus proposal-catchup task spawned");
+
         // Periodic incremental HyperSync — refreshes prover registry every ~5 minutes.
         // After initial full sync, subsequent syncs use commitment comparison
         // and only fetch changed branches (seconds instead of 9 minutes).
@@ -307,6 +419,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sync_cov = coverage_monitor.clone();
             let sync_cf = current_frame.clone();
             let sync_lhf = last_global_head_frame.clone();
+            let sync_consensus_finalized = consensus_finalized.clone();
+            let sync_catchup_notify = catchup_notify.clone();
             let sync_archive_mode = archive_mode;
             let sync_db_for_consensus: Arc<dyn quil_types::store::KvDb> = db_arc.clone();
             sup.spawn("archive-prover-tree-sync", move |sync_token| async move {
@@ -535,6 +649,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     let cs_for_fin = sync_cs.clone();
                                     let cf_for_fin = sync_cf.clone();
                                     let lhf_for_fin = sync_lhf.clone();
+                                    let consensus_finalized_for_fin = sync_consensus_finalized.clone();
                                     let materializer_for_fin = frame_materializer.clone();
                                     let cov_for_fin = sync_cov.clone();
                                     Arc::new(move |state| {
@@ -613,6 +728,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         // callbacks arrive out of order.
                                         cf_for_fin.observe(app.frame_number);
                                         lhf_for_fin.fetch_max(
+                                            app.frame_number,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        // Track the engine's finalized frame for
+                                        // the catch-up sync's start point (only
+                                        // the consensus path bumps this, unlike
+                                        // the poller-shared head atomic above).
+                                        consensus_finalized_for_fin.fetch_max(
                                             app.frame_number,
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
@@ -827,6 +950,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         on_finalized_state: Some(finalized_hook),
                                         on_incorporated_state: Some(incorporated_hook),
                                         on_qc_observed: Some(qc_observed_hook),
+                                        // Real catch-up trigger: wake the
+                                        // proposal-catchup task when the engine
+                                        // orphans a proposal (node is behind).
+                                        // Cheap + sync-safe (just stores a permit).
+                                        on_missing_parent: {
+                                            let n = sync_catchup_notify.clone();
+                                            std::sync::Arc::new(move || n.notify_one())
+                                        },
                                         config_override: None,
                                         genesis_qc_override,
                                         // Persist consensus + liveness

@@ -20,7 +20,16 @@ const CHAIN_KEY: u8 = 0x01;
 const MESSAGE_KEY: u8 = 0x02;
 const AEAD_KEY: u8 = 0x03;
 
-#[derive(Debug)]
+/// Per-call forward-skip ceiling (a single message may not jump more
+/// than this many chain steps ahead). Shared with the triple ratchet.
+pub(crate) const MAX_SKIP: u32 = 100;
+/// Global ceiling on retained skipped message keys. Bounds memory even
+/// across many legitimately-out-of-order messages; an attacker can't
+/// grow this past the cap (and, post-fix, can't grow it at all without
+/// an authenticated body — see `ratchet_decrypt`).
+pub(crate) const MAX_SKIPPED_KEYS: usize = 2000;
+
+#[derive(Debug, Clone)]
 pub struct DoubleRatchetParticipant {
     sending_ephemeral_private_key: Scalar,
     receiving_ephemeral_key: EdwardsPoint,
@@ -307,8 +316,29 @@ impl DoubleRatchetParticipant {
             return Ok(plaintext);
         }
 
+        // SECURITY: advance the ratchet on a throwaway clone and only
+        // commit (`*self = work`) once the message BODY authenticates.
+        // Previously `skip_message_keys` / `ratchet_ephemeral_keys` ran
+        // directly on `self` *before* the AEAD body was verified, so a
+        // forged header (decryptable under a header key but with a junk
+        // body) would advance the receiving chain and stuff up to ~99
+        // derived keys into `skipped_keys_map` — an unauthenticated DoS
+        // and skipped-key over-retention. Mutating a clone makes any
+        // such failure a no-op on real state, since `work` is dropped
+        // when `advance_and_decrypt` returns `Err`.
+        let mut work = self.clone();
+        let plaintext = work.advance_and_decrypt(envelope)?;
+        *self = work;
+        Ok(plaintext)
+    }
+
+    /// Advance the receiving chain (skipping/ratcheting as the header
+    /// dictates), decrypt+authenticate the body, and on success commit
+    /// the chain advance. Intended to run on a clone so a failed body
+    /// auth leaves no persistent state change (see `ratchet_decrypt`).
+    fn advance_and_decrypt(&mut self, envelope: &P2PChannelEnvelope) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let (header, should_ratchet) = self.decrypt_header(&envelope.message_header, &self.current_receiving_header_key)?;
-        let (receiving_ephemeral_key, previous_receiving_chain_length, current_receiving_chain_length) = 
+        let (receiving_ephemeral_key, previous_receiving_chain_length, current_receiving_chain_length) =
             self.decode_header(&header)?;
 
         if should_ratchet {
@@ -320,6 +350,9 @@ impl DoubleRatchetParticipant {
 
         let (new_chain_key, message_key, aead_key) = ratchet_keys(&self.receiving_chain_key);
 
+        // This is the authentication gate. Until it returns Ok, none of
+        // the mutations above are visible to the caller (clone is
+        // discarded on Err).
         let plaintext = self.decrypt(
             &envelope.message_body,
             &message_key,
@@ -366,31 +399,64 @@ impl DoubleRatchetParticipant {
         Ok(())
     }
 
-    fn try_skipped_message_keys(&self, envelope: &P2PChannelEnvelope) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    fn try_skipped_message_keys(&mut self, envelope: &P2PChannelEnvelope) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        // Locate a stored key whose header key decrypts this header and
+        // whose index matches. Collect the match (clones) before
+        // mutating, to keep the borrow checker happy.
+        let mut matched: Option<(Vec<u8>, u32, Vec<u8>)> = None;
         for (receiving_header_key, skipped_keys) in &self.skipped_keys_map {
             if let Ok((header, _)) = self.decrypt_header(&envelope.message_header, receiving_header_key) {
                 let (_, _, current) = self.decode_header(&header)?;
                 if let Some(key_pair) = skipped_keys.get(&current) {
-                    let message_key = &key_pair[..32];
-                    let aead_key = &key_pair[32..];
-                    return self.decrypt(
-                        &envelope.message_body,
-                        message_key,
-                        Some(&[aead_key, &envelope.message_header.ciphertext[..]].concat()),
-                    ).map(Some);
+                    matched = Some((receiving_header_key.clone(), current, key_pair.clone()));
+                    break;
                 }
             }
         }
-        Ok(None)
+
+        let Some((header_key, index, key_pair)) = matched else {
+            return Ok(None);
+        };
+
+        let message_key = &key_pair[..32];
+        let aead_key = &key_pair[32..];
+        let plaintext = self.decrypt(
+            &envelope.message_body,
+            message_key,
+            Some(&[aead_key, &envelope.message_header.ciphertext[..]].concat()),
+        )?;
+
+        // Delete the key after successful use (Double Ratchet spec): a
+        // one-time skipped key must not be retained — keeping it both
+        // widens the compromise window and would allow trivial replay of
+        // the same ciphertext. Only reached on successful auth.
+        if let Some(sub) = self.skipped_keys_map.get_mut(&header_key) {
+            sub.remove(&index);
+            if sub.is_empty() {
+                self.skipped_keys_map.remove(&header_key);
+            }
+        }
+
+        Ok(Some(plaintext))
+    }
+
+    fn skipped_keys_total(&self) -> usize {
+        self.skipped_keys_map.values().map(|m| m.len()).sum()
     }
 
     fn skip_message_keys(&mut self, until: u32) -> Result<(), Box<dyn std::error::Error>> {
-        if self.current_receiving_chain_length + 100 < until {
+        if self.current_receiving_chain_length + MAX_SKIP < until {
             return Err("Skip limit exceeded".into());
         }
 
         if !self.receiving_chain_key.is_empty() {
+            let mut total = self.skipped_keys_total();
             while self.current_receiving_chain_length < until {
+                // Global retention cap — defends memory even against a
+                // sender who legitimately skips a great deal over time.
+                if total >= MAX_SKIPPED_KEYS {
+                    return Err("Skipped-key store full".into());
+                }
                 let (new_chain_key, message_key, aead_key) = ratchet_keys(&self.receiving_chain_key);
                 self.skipped_keys_map
                     .entry(self.current_receiving_header_key.clone())
@@ -398,6 +464,7 @@ impl DoubleRatchetParticipant {
                     .insert(self.current_receiving_chain_length, [&message_key[..], &aead_key[..]].concat());
                 self.receiving_chain_key = new_chain_key;
                 self.current_receiving_chain_length += 1;
+                total += 1;
             }
         }
 
@@ -491,6 +558,29 @@ impl DoubleRatchetParticipant {
 
     pub fn get_public_key(&self) -> EdwardsPoint {
         EdwardsPoint::mul_by_generator(&self.sending_ephemeral_private_key)
+    }
+}
+
+/// Wipe long-lived secret key material on drop so root/chain/message
+/// keys and the sending ephemeral scalar don't linger in freed heap
+/// (swap, core dump, allocator reuse). Public points and chain-length
+/// counters are not secret and are left alone.
+impl Drop for DoubleRatchetParticipant {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.sending_ephemeral_private_key.zeroize();
+        self.root_key.zeroize();
+        self.sending_chain_key.zeroize();
+        self.current_sending_header_key.zeroize();
+        self.current_receiving_header_key.zeroize();
+        self.next_sending_header_key.zeroize();
+        self.next_receiving_header_key.zeroize();
+        self.receiving_chain_key.zeroize();
+        for sub in self.skipped_keys_map.values_mut() {
+            for v in sub.values_mut() {
+                v.zeroize();
+            }
+        }
     }
 }
 

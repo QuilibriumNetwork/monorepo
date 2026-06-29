@@ -432,7 +432,206 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
     }
 }
 
-// Tests for GlobalLeaderProvider require full ClockStore/ProverRegistry
-// stubs. These are integration-tested via the consensus bootstrap tests
-// which use the real RocksDB stores. The struct construction is verified
-// implicitly by the consensus bootstrap wiring.
+// `prove_next_state` (the VDF/clock-store path) is integration-tested
+// via the consensus bootstrap tests on real stores. The unit tests
+// below cover `get_next_leaders` (leader selection) and the pure
+// helper functions, which need only a `ProverRegistry`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_types::consensus::{ProverInfo, ProverStatus};
+    use quil_types::proto::global::GlobalFrameHeader;
+
+    use crate::difficulty::AsertDifficultyAdjuster;
+    use crate::test_support::TestProverRegistry;
+
+    /// Minimal `FrameProver` stub — `get_next_leaders` never invokes it.
+    #[derive(Default)]
+    struct StubFrameProver;
+    impl FrameProver for StubFrameProver {
+        fn prove_frame_header(
+            &self, _: &[u8], _: &[u8], _: &[u8], _: &[Vec<u8>], _: &[u8], _: i64, _: u32, _: u64, _: u64,
+        ) -> Result<quil_types::proto::global::FrameHeader> {
+            Err(QuilError::Internal("stub".into()))
+        }
+        fn verify_frame_header(
+            &self, _: &quil_types::proto::global::FrameHeader,
+        ) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn prove_global_frame_header(
+            &self, _: &GlobalFrameHeader, _: &[Vec<u8>], _: &[u8], _: &[u8],
+            _: &dyn Signer, _: i64, _: u32, _: u8,
+        ) -> Result<GlobalFrameHeader> {
+            Err(QuilError::Internal("stub".into()))
+        }
+        fn verify_global_frame_header(&self, _: &GlobalFrameHeader) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn calculate_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: u32) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn verify_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: &[&[u8]]) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn make_prover(addr_byte: u8) -> ProverInfo {
+        ProverInfo {
+            public_key: vec![addr_byte; 96],
+            address: vec![addr_byte; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![],
+            available_storage: 0,
+            seniority: 1,
+            delegate_address: vec![],
+        }
+    }
+
+    /// Structure-only signer (never actually invoked by these tests).
+    struct DummySigner;
+    impl Signer for DummySigner {
+        fn key_type(&self) -> quil_types::crypto::KeyType {
+            quil_types::crypto::KeyType::Bls48581G1
+        }
+        fn public_key(&self) -> &[u8] {
+            &[]
+        }
+        fn private_key(&self) -> &[u8] {
+            &[0u8]
+        }
+        fn sign(&self, _: &[u8]) -> Result<Vec<u8>> {
+            Ok(vec![0xAA; 74])
+        }
+        fn sign_with_domain(&self, _: &[u8], _: &[u8]) -> Result<Vec<u8>> {
+            Ok(vec![0xAA; 74])
+        }
+    }
+
+    fn provider_with(registry: Arc<dyn ProverRegistry>) -> GlobalLeaderProvider {
+        let signer: Arc<dyn Signer> = Arc::new(DummySigner);
+        GlobalLeaderProvider::new(
+            registry,
+            Arc::new(StubFrameProver),
+            Arc::new(AsertDifficultyAdjuster::new(0, 0, 100)),
+            Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            Arc::new(MessageCollector::new()),
+            vec![0xABu8; 32],
+            vec![0xABu8; 96],
+            signer,
+            // Real KZG prover so `compute_requests_root` reflects tree
+            // contents (the noop prover returns all-zero roots).
+            Arc::new(quil_crypto::KzgInclusionProver),
+        )
+    }
+
+    fn prior_state(output_len: usize) -> State<GlobalState> {
+        let gs = GlobalState::new(
+            5,                          // frame_number
+            5,                          // rank
+            0,                          // timestamp
+            100,                        // difficulty
+            vec![0x11u8; output_len],   // output
+            vec![0x03u8; 32],           // parent_selector
+            vec![0x02u8; 32],           // prover
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        State {
+            rank: 5,
+            identifier: vec![0x01u8; 32],
+            proposer_id: vec![0x02u8; 32],
+            parent_qc_identity: vec![0x03u8; 32],
+            parent_qc_rank: 4,
+            parent_quorum_certificate: None,
+            timestamp: 0,
+            state: gs,
+        }
+    }
+
+    #[test]
+    fn get_next_leaders_errors_without_prior() {
+        let p = provider_with(Arc::new(TestProverRegistry::new()));
+        let err = p.get_next_leaders(None).unwrap_err();
+        assert!(err.to_string().contains("no prior frame"));
+    }
+
+    #[test]
+    fn get_next_leaders_errors_on_wrong_output_length() {
+        let p = provider_with(Arc::new(TestProverRegistry::with_provers(vec![make_prover(1)])));
+        let prior = prior_state(100); // != VDF_OUTPUT_LEN
+        let err = p.get_next_leaders(Some(&prior)).unwrap_err();
+        assert!(err.to_string().contains("output length"));
+    }
+
+    #[test]
+    fn get_next_leaders_errors_when_registry_empty() {
+        let p = provider_with(Arc::new(TestProverRegistry::new()));
+        let prior = prior_state(VDF_OUTPUT_LEN);
+        let err = p.get_next_leaders(Some(&prior)).unwrap_err();
+        assert!(err.to_string().contains("no active provers"));
+    }
+
+    #[test]
+    fn get_next_leaders_returns_ordered_identities() {
+        let registry = TestProverRegistry::with_provers(vec![
+            make_prover(0xAA),
+            make_prover(0xBB),
+            make_prover(0xCC),
+        ]);
+        let p = provider_with(Arc::new(registry));
+        let prior = prior_state(VDF_OUTPUT_LEN);
+        let leaders = p.get_next_leaders(Some(&prior)).unwrap();
+        assert_eq!(leaders.len(), 3);
+        // Identities are the raw 32-byte addresses (address_to_identity).
+        assert_eq!(leaders[0], vec![0xAAu8; 32]);
+        assert_eq!(leaders[1], vec![0xBBu8; 32]);
+        assert_eq!(leaders[2], vec![0xCCu8; 32]);
+    }
+
+    #[test]
+    fn compute_parent_selector_is_deterministic_and_32_bytes() {
+        let out = vec![0x42u8; VDF_OUTPUT_LEN];
+        let a = GlobalLeaderProvider::compute_parent_selector(&out);
+        let b = GlobalLeaderProvider::compute_parent_selector(&out);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32);
+        // Different input → different selector.
+        let c = GlobalLeaderProvider::compute_parent_selector(&vec![0x43u8; VDF_OUTPUT_LEN]);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn frame_identity_hashes_output() {
+        let header = GlobalFrameHeader {
+            output: vec![0x55u8; VDF_OUTPUT_LEN],
+            ..Default::default()
+        };
+        let id = GlobalLeaderProvider::frame_identity(&header);
+        assert_eq!(id.len(), 32);
+        // Matches the direct poseidon hash of the output.
+        let expected = quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap();
+        assert_eq!(id, expected.to_vec());
+    }
+
+    #[test]
+    fn qc_identity_returns_selector_bytes() {
+        let qc = quil_types::proto::global::QuorumCertificate {
+            selector: vec![0x77u8; 32],
+            ..Default::default()
+        };
+        assert_eq!(GlobalLeaderProvider::qc_identity(&qc), vec![0x77u8; 32]);
+    }
+
+    #[test]
+    fn compute_requests_root_empty_vs_nonempty_differ() {
+        let p = provider_with(Arc::new(TestProverRegistry::new()));
+        let empty = p.compute_requests_root(&[]);
+        let nonempty = p.compute_requests_root(&[vec![0x01u8; 16], vec![0x02u8; 16]]);
+        assert_ne!(empty, nonempty);
+        // Deterministic for the same input.
+        assert_eq!(empty, p.compute_requests_root(&[]));
+    }
+}

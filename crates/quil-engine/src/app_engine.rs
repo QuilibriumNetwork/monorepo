@@ -53,6 +53,9 @@ use crate::voting_provider::{AddressDerivation, BlsVotingProvider};
 
 const CONSENSUS_QUEUE_SIZE: usize = 1000;
 const MAX_APP_MESSAGES_PER_RANK: usize = 100;
+/// Consecutive `commit_frame` failures on a received frame before it's
+/// dropped and repaired via a shard sync instead of retried-from-zero.
+const MAX_MATERIALIZE_RETRIES: u32 = 3;
 
 // =====================================================================
 // Inbound messages to the app engine
@@ -80,6 +83,16 @@ pub enum AppEngineMessage {
     /// shard work. Mirrors Go's behavior where the app workers stop
     /// frame production while any shard is halted.
     SetHalted(bool),
+    /// A background shard-tree sync converged the CRDT to the state a
+    /// finalized header advertised (`state_roots[0]`), catching this node
+    /// up to `synced_to_frame`. The engine fast-forwards its
+    /// `last_materialized_frame` to this height (the sync supplied the
+    /// state for every frame at/below it), persists the durable cursor,
+    /// and drops now-stale buffered frames. Without this, a tree sync
+    /// would fix CRDT state but leave the materialization cursor behind,
+    /// so the gap would re-fire forever and later-arriving full frames
+    /// could be re-applied on top of the already-synced tree.
+    ShardSyncCompleted { synced_to_frame: u64 },
 }
 
 // =====================================================================
@@ -91,6 +104,18 @@ pub enum AppEngineMessage {
 pub enum AppEngineEvent {
     /// Engine produced a new shard frame.
     FrameProduced {
+        filter: Vec<u8>,
+        frame_number: u64,
+        frame_data: Vec<u8>,
+    },
+    /// A finalized shard frame, fully assembled as a prost
+    /// `AppShardFrame { header, requests }` — published on
+    /// `shard_frame_bitmask` so followers and archives can decode,
+    /// verify (`requests` vs the reward-proof `requests_root`), and
+    /// materialize the shard's state. This is the authoritative
+    /// state-distribution channel; `FrameProduced` (proposal-time,
+    /// header-only) is unrelated.
+    FullFrameProduced {
         filter: Vec<u8>,
         frame_number: u64,
         frame_data: Vec<u8>,
@@ -242,6 +267,17 @@ struct AppLeaderProvider {
     /// test cluster still progresses. Plumbed from
     /// `config.p2p.network` in `worker_manager::init`.
     min_active_provers_for_propose: u64,
+    /// Requests this node collected per frame it proposed, decoded to
+    /// proto `MessageBundle`s. The leader (writer) records the bundles
+    /// it included when proving a frame; the engine (reader) retrieves
+    /// them at finalization to (a) self-materialize and (b) assemble the
+    /// FULL `AppShardFrame{header, requests}` published on
+    /// `shard_frame_bitmask` so archives/followers can materialize.
+    /// `requests_root` is computed over these bundles' canonical
+    /// encodings, so it is recomputable/verifiable from the frame.
+    frame_requests: Arc<std::sync::Mutex<
+        std::collections::HashMap<u64, Vec<quil_types::proto::global::MessageBundle>>,
+    >>,
 }
 
 impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeaderProvider {
@@ -330,13 +366,44 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             .unwrap_or(0);
         let frame_number = prior_frame_number + 1;
 
-        // Collect pending messages
-        let messages = self.message_collector.collect_for_rank(rank);
+        // Collect pending messages (raw canonical bytes from the
+        // dispatch bitmask), then decode each into a proto MessageBundle.
+        // These bundles ARE the frame's `requests`: they get published in
+        // the full AppShardFrame at finalization and materialized into
+        // shard state. `requests_root` is computed below over their
+        // canonical RE-encodings (not the raw collected bytes) so that an
+        // archive can recompute it byte-for-byte from `frame.requests`.
+        let raw_messages = self.message_collector.collect_for_rank(rank);
+        let mut request_bundles: Vec<quil_types::proto::global::MessageBundle> =
+            Vec::with_capacity(raw_messages.len());
+        let mut canonical_requests: Vec<Vec<u8>> = Vec::with_capacity(raw_messages.len());
+        for raw in &raw_messages {
+            match crate::consensus_wire::decode_message_bundle(raw) {
+                Ok(bundle) => {
+                    match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&bundle) {
+                        Ok(canon) => {
+                            canonical_requests.push(canon);
+                            request_bundles.push(bundle);
+                        }
+                        Err(e) => debug!(error = %e, "dropping un-re-encodable request bundle"),
+                    }
+                }
+                Err(e) => debug!(error = %e, "dropping undecodable dispatch message"),
+            }
+        }
+        // Stash the bundles so the engine can retrieve them at
+        // finalization (to self-materialize + publish the full frame).
+        if let Ok(mut map) = self.frame_requests.lock() {
+            map.insert(frame_number, request_bundles);
+            // Bound memory: keep only recent frames.
+            let cutoff = frame_number.saturating_sub(64);
+            map.retain(|&fnum, _| fnum >= cutoff);
+        }
         debug!(
             filter = hex::encode(&self.filter),
             frame = frame_number,
             rank,
-            messages = messages.len(),
+            messages = canonical_requests.len(),
             "producing shard frame"
         );
 
@@ -402,10 +469,20 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                             out.push(vec![0u8; 64]);
                         }
                         // Publish the shard's vertex-adds root as a
-                        // snapshot generation so sync clients pinning
-                        // this header can fetch matching CRDT data.
+                        // snapshot generation (binding a real point-in-time
+                        // DB snapshot) so sync clients pinning this header
+                        // get root-consistent CRDT data and acquire succeeds.
                         if !out[0].is_empty() && out[0].iter().any(|b| *b != 0) {
-                            hg.publish_snapshot(out[0].clone(), frame_number);
+                            if let Err(e) =
+                                hg.publish_snapshot_capturing(out[0].clone(), frame_number)
+                            {
+                                warn!(
+                                    filter = hex::encode(&self.filter),
+                                    frame = frame_number,
+                                    error = %e,
+                                    "failed to capture snapshot for published shard root"
+                                );
+                            }
                         }
                         out
                     }
@@ -436,7 +513,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // `sha3_256(tree.commit())[..32] || serialize_non_lazy(tree)`.
         // Empty messages → 64-byte zero buffer, matching Go.
         let requests_root: Vec<u8> = compute_requests_root(
-            &messages,
+            &canonical_requests,
             &self.app_address,
             frame_number,
             self.execution_engine.as_deref(),
@@ -584,6 +661,30 @@ pub struct AppConsensusEngine {
     pending_certified_parents: HashMap<u64, Vec<u8>>,
     /// Ranks queued for parent sealing (set by sync handler, drained in loop).
     pending_seal_rank: Option<u64>,
+    /// Highest shard frame number whose requests have been materialized
+    /// into the hypergraph. Idempotency gate so a frame is never
+    /// materialized twice (mirrors Go `lastMaterializedFrame`,
+    /// app_consensus_engine.go:1444-1449).
+    last_materialized_frame: u64,
+    /// Shared with the leader provider: requests this node collected for
+    /// frames it proposed (proto `MessageBundle`s), keyed by frame
+    /// number. Read at finalization to self-materialize + assemble the
+    /// full `AppShardFrame` for publication.
+    frame_requests: Arc<std::sync::Mutex<
+        std::collections::HashMap<u64, Vec<quil_types::proto::global::MessageBundle>>,
+    >>,
+    /// `requests_root` of frames this node FINALIZED through (BLS-verified)
+    /// consensus, keyed by frame number. The trust anchor for materializing
+    /// a full frame received on the wire as a follower: the received
+    /// frame's recomputed `requests_root` must equal the one we finalized.
+    finalized_requests_roots: HashMap<u64, Vec<u8>>,
+    /// Full `AppShardFrame`s received on `shard_frame_bitmask`, buffered
+    /// by frame number until they can be materialized in order.
+    received_full_frames: HashMap<u64, quil_types::proto::global::AppShardFrame>,
+    /// Consecutive `commit_frame` failure counts per frame number, so a
+    /// frame that can't be materialized is dropped + repaired via sync
+    /// rather than retried-from-zero forever. Cleared on success.
+    materialize_failures: HashMap<u64, u32>,
 
     // Channels
     cancel: CancellationToken,
@@ -641,9 +742,19 @@ impl AppConsensusEngine {
         let (msg_tx, msg_rx) = mpsc::channel(CONSENSUS_QUEUE_SIZE);
         let (consensus_event_tx, consensus_event_rx) = mpsc::unbounded_channel();
 
-        let app_address = quil_crypto::poseidon::hash_bytes_to_32(&filter)
-            .map(|h| h.to_vec())
-            .unwrap_or_else(|_| filter.clone());
+        // The shard's app address IS the domain — the same 32-byte value
+        // the master assigns as `filter` (Go's `appAddress`). It must NOT
+        // be re-hashed: `filter` is already the intrinsic-computed domain
+        // (e.g. `QUIL_TOKEN_ADDRESS = poseidon("q_mainnet_token")` for the
+        // QUIL shard), and the per-shard pubsub bitmask is `bloom(filter)`
+        // (see `shard_app_filter`), which must equal Go's
+        // `bloom(appAddress)` — pinning `filter == appAddress == domain`.
+        // This address is what routes a message to its intrinsic engine
+        // and is the lock address for `requests_root`; an extra
+        // `poseidon` here (the prior behavior) yielded an address that
+        // matches no domain, so every app-shard tx fell through to the
+        // hypergraph engine and `requests_root` diverged from Go.
+        let app_address = filter.clone();
 
         let sizes = SharedAppEngineSizes::new();
         let handle = AppEngineHandle {
@@ -675,6 +786,11 @@ impl AppConsensusEngine {
             frame_store: HashMap::new(),
             pending_certified_parents: HashMap::new(),
             pending_seal_rank: None,
+            last_materialized_frame: 0,
+            frame_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            finalized_requests_roots: HashMap::new(),
+            received_full_frames: HashMap::new(),
+            materialize_failures: HashMap::new(),
             cancel: CancellationToken::new(),
             msg_rx: Some(msg_rx),
             event_tx,
@@ -706,6 +822,139 @@ impl AppConsensusEngine {
         });
     }
 
+    /// Read the durable per-shard materialized-frame cursor (8-byte BE
+    /// `u64`), or 0 if absent/unreadable. Initialized into
+    /// `last_materialized_frame` at startup so the in-memory idempotency
+    /// gate survives restart instead of resetting to 0.
+    fn load_materialized_cursor(&self) -> u64 {
+        self.kv_db
+            .as_ref()
+            .and_then(|kv| {
+                kv.get(&quil_store::encoding::consensus_materialized_cursor_key(&self.filter))
+                    .ok()
+                    .flatten()
+            })
+            .filter(|v| v.len() == 8)
+            .map(|v| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&v[..8]);
+                u64::from_be_bytes(b)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Persist the durable per-shard materialized-frame cursor. MUST be
+    /// called only AFTER the frame's `commit_frame` succeeded, so the
+    /// stored cursor never claims a height the CRDT hasn't reached. The
+    /// safe failure direction is cursor < CRDT height (a redundant
+    /// re-materialize on restart, which the CRDT's set semantics +
+    /// spent-markers make idempotent), never cursor > CRDT height (which
+    /// would silently skip a frame's mutations).
+    fn persist_materialized_cursor(&self, frame: u64) {
+        if let Some(kv) = self.kv_db.as_ref() {
+            if let Err(e) = kv.set(
+                &quil_store::encoding::consensus_materialized_cursor_key(&self.filter),
+                &frame.to_be_bytes(),
+            ) {
+                warn!(
+                    core_id = self.core_id,
+                    frame,
+                    error = %e,
+                    "failed to persist materialized cursor"
+                );
+            }
+        }
+    }
+
+    /// Run a frame's `requests` through the execution engines on the
+    /// blocking thread pool, off the engine's `tokio::select!` task.
+    /// Materialization is CPU- and DB-bound; running it inline on the
+    /// runtime worker thread head-of-line-blocks this worker's other
+    /// async work (its consensus loop, its gRPC server) for the whole
+    /// frame. `spawn_blocking` frees the runtime thread while the work
+    /// runs. Ordering is unchanged: the caller `.await`s to completion
+    /// before the engine polls its next event (the engine still holds
+    /// `&mut self` exclusively across the await — no new reentrancy).
+    /// Returns `Ok((0, 0))` with a warning if no execution engine is
+    /// wired (matches the prior inline `if let Some(exec)` skip).
+    async fn materialize_offloaded(
+        &self,
+        requests: Vec<quil_types::proto::global::MessageBundle>,
+        frame_number: u64,
+        difficulty: u32,
+        world_size: u64,
+        fee_multiplier_vote: u64,
+    ) -> Result<(usize, usize)> {
+        let exec = match self.execution_engine.clone() {
+            Some(e) => e,
+            None => return Ok((0, 0)),
+        };
+        let app_address = self.app_address.clone();
+        tokio::task::spawn_blocking(move || {
+            materialize_app_shard_requests(
+                exec.as_ref(),
+                &requests,
+                frame_number,
+                difficulty,
+                world_size,
+                fee_multiplier_vote,
+                &app_address,
+            )
+        })
+        .await
+        .map_err(|e| QuilError::Internal(format!("materialize task panicked: {e}")))?
+    }
+
+    /// Recompute a received frame's `requests_root` on the blocking
+    /// thread pool (the inclusion-prover commit is CPU-heavy). Same
+    /// rationale as [`materialize_offloaded`].
+    async fn recompute_requests_root_offloaded(
+        &self,
+        canonical: Vec<Vec<u8>>,
+        frame_number: u64,
+    ) -> Result<Vec<u8>> {
+        let exec = self.execution_engine.clone();
+        let prover = self.inclusion_prover.clone();
+        let app_address = self.app_address.clone();
+        tokio::task::spawn_blocking(move || {
+            compute_requests_root(
+                &canonical,
+                &app_address,
+                frame_number,
+                exec.as_deref(),
+                prover.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| QuilError::Internal(format!("requests_root task panicked: {e}")))?
+    }
+
+    /// Advance `last_materialized_frame` to a synced height reported by a
+    /// background shard-tree sync, persist the cursor, and drop now-stale
+    /// buffered frames + finalized-root entries. Idempotent: a sync that
+    /// reports a height we're already past is a no-op.
+    async fn reconcile_with_sync(&mut self, synced_to_frame: u64) {
+        if synced_to_frame <= self.last_materialized_frame {
+            return;
+        }
+        debug!(
+            core_id = self.core_id,
+            from = self.last_materialized_frame,
+            to = synced_to_frame,
+            "fast-forwarding materialized cursor from shard sync"
+        );
+        self.last_materialized_frame = synced_to_frame;
+        self.persist_materialized_cursor(synced_to_frame);
+        // Anything at/below the synced height is now covered by the
+        // synced tree; drop stale buffers so they can't be re-applied.
+        self.received_full_frames
+            .retain(|&f, _| f > synced_to_frame);
+        self.finalized_requests_roots
+            .retain(|&f, _| f > synced_to_frame);
+        // Continue materializing any contiguous frames we still hold.
+        self.try_materialize_follower_frames().await;
+    }
+
     /// Start the app shard consensus loop. Runs on the worker thread's
     /// tokio runtime and processes messages until cancelled.
     ///
@@ -727,6 +976,23 @@ impl AppConsensusEngine {
             filter = hex::encode(&self.filter),
             "app consensus engine starting"
         );
+
+        // Restore the durable materialized-frame cursor so the
+        // idempotency gate (and gap detection) resume where the prior
+        // session left off rather than re-materializing from 0. This is
+        // the CRDT-application height; it may legitimately lag the clock
+        // frame height below (the frame is finalized in the clock store
+        // before its requests are materialized — a crash in that window
+        // leaves cursor < clock height, healed by gossip replay of the
+        // missing full frame or a shard sync).
+        self.last_materialized_frame = self.load_materialized_cursor();
+        if self.last_materialized_frame > 0 {
+            info!(
+                core_id = self.core_id,
+                materialized = self.last_materialized_frame,
+                "restored materialized-frame cursor"
+            );
+        }
 
         // Initialize from stored state
         match self.clock_store.get_latest_shard_clock_frame(&self.filter) {
@@ -811,7 +1077,7 @@ impl AppConsensusEngine {
                             self.handle_prover_message(&data);
                         }
                         Some(AppEngineMessage::Frame(data)) => {
-                            self.handle_frame_message(&data);
+                            self.handle_frame_message(&data).await;
                         }
                         Some(AppEngineMessage::Dispatch(data)) => {
                             self.handle_dispatch_message(&data);
@@ -835,6 +1101,9 @@ impl AppConsensusEngine {
                                     "shard halt state changed"
                                 );
                             }
+                        }
+                        Some(AppEngineMessage::ShardSyncCompleted { synced_to_frame }) => {
+                            self.reconcile_with_sync(synced_to_frame).await;
                         }
                         None => {
                             info!(core_id = self.core_id, "message channel closed");
@@ -969,6 +1238,7 @@ impl AppConsensusEngine {
             app_address: self.app_address.clone(),
             halted: self.halted.clone(),
             min_active_provers_for_propose: self.min_active_provers_for_propose,
+            frame_requests: self.frame_requests.clone(),
         });
 
         // Committee (from prover registry for this shard)
@@ -1784,34 +2054,33 @@ impl AppConsensusEngine {
     }
 
     /// Handle a frame message (AppShardFrame from another prover).
-    fn handle_frame_message(&mut self, data: &[u8]) {
+    async fn handle_frame_message(&mut self, data: &[u8]) {
         if self.halted.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         if let Ok(frame) = prost::Message::decode(data) {
             let frame: quil_types::proto::global::AppShardFrame = frame;
             if let Some(h) = frame.header.as_ref() {
-                // Validate: filter must match this shard
+                // Validate: address must match this shard
                 if h.address != self.app_address {
                     return;
                 }
+                let frame_number = h.frame_number;
 
-                if h.frame_number > self.shard_frame_number {
-                    debug!(
-                        core_id = self.core_id,
-                        remote_frame = h.frame_number,
-                        local_frame = self.shard_frame_number,
-                        "received newer shard frame"
-                    );
+                // Cache in frame store (keyed by output hash) — kept for
+                // the existing output-hash lookup path.
+                use sha2::{Digest, Sha256};
+                let frame_id = hex::encode(Sha256::digest(&h.output));
+                self.frame_store.insert(frame_id, data.to_vec());
 
-                    // Cache in frame store (keyed by output hash)
-                    use sha2::{Digest, Sha256};
-                    let frame_id = hex::encode(Sha256::digest(&h.output));
-                    self.frame_store.insert(frame_id, data.to_vec());
-
-                    // Shard frame persistence is done via stage + commit
-                    // through the clock store's transaction API during
-                    // finalization. The frame is cached locally for now.
+                // Buffer the full frame (header+requests) for follower
+                // materialization, but only if it's still ahead of what
+                // we've materialized (avoid unbounded re-buffering of old
+                // frames). The buffer is materialized in strict order
+                // against the finalized (trusted) requests_root.
+                if frame_number > self.last_materialized_frame {
+                    self.received_full_frames.insert(frame_number, frame);
+                    self.try_materialize_follower_frames().await;
                 }
             }
         }
@@ -2029,8 +2298,17 @@ impl AppConsensusEngine {
                         .event_tx
                         .send(AppEngineEvent::ShardFrameFinalized {
                             filter: self.filter.clone(),
-                            header_canonical_bytes: bytes,
+                            header_canonical_bytes: bytes.clone(),
                         });
+                    // Steps 1+2: if THIS node proposed this frame it holds
+                    // the requests it collected — assemble the full
+                    // AppShardFrame, materialize it into local shard state,
+                    // and publish it on `shard_frame_bitmask` so followers
+                    // and archives can materialize too. A node that only
+                    // finalized someone else's frame has no requests and
+                    // skips (it will materialize on receiving the full
+                    // frame from the proposer).
+                    self.distribute_and_materialize_own_frame(frame_number, &bytes).await;
                 } else {
                     warn!(
                         core_id = self.core_id,
@@ -2132,6 +2410,307 @@ impl AppConsensusEngine {
         self.proposal_cache.retain(|&rank, _| rank >= cutoff);
     }
 
+    /// On finalizing a frame THIS node proposed: assemble the full
+    /// `AppShardFrame { header, requests }`, materialize its requests
+    /// into local shard state, and publish the full frame on
+    /// `shard_frame_bitmask`. No-op if this node didn't propose the frame
+    /// (no collected requests on hand — it materializes on receipt
+    /// instead). `header_canonical_bytes` is the certified header.
+    async fn distribute_and_materialize_own_frame(
+        &mut self,
+        frame_number: u64,
+        header_canonical_bytes: &[u8],
+    ) {
+        // Decode the certified canonical header into a proto FrameHeader.
+        // This is the header THIS node finalized through BLS-verified
+        // consensus, so its `requests_root` is the trust anchor for
+        // materializing the matching full frame (whether ours or a
+        // follower's received from the proposer).
+        let canon = match quil_execution::global_intrinsic::frame_header::FrameHeader::from_canonical_bytes(
+            header_canonical_bytes,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(core_id = self.core_id, frame = frame_number, error = %e,
+                    "could not decode finalized header");
+                return;
+            }
+        };
+        // Record the trusted requests_root and bound the map.
+        self.finalized_requests_roots
+            .insert(frame_number, canon.requests_root.clone());
+        let root_cutoff = frame_number.saturating_sub(256);
+        self.finalized_requests_roots
+            .retain(|&f, _| f >= root_cutoff);
+
+        // Requests are present only if WE proposed this frame. A follower
+        // has none here and materializes from the received full frame
+        // (try_materialize_follower_frames below).
+        let requests = match self
+            .frame_requests
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(&frame_number))
+        {
+            Some(r) => r,
+            None => {
+                // Follower path: maybe the full frame already arrived.
+                self.try_materialize_follower_frames().await;
+                return;
+            }
+        };
+
+        let proto_header = quil_types::proto::global::FrameHeader {
+            address: canon.address.clone(),
+            frame_number: canon.frame_number,
+            rank: canon.rank,
+            timestamp: canon.timestamp,
+            difficulty: canon.difficulty,
+            output: canon.output.clone(),
+            parent_selector: canon.parent_selector.clone(),
+            requests_root: canon.requests_root.clone(),
+            state_roots: canon.state_roots.clone(),
+            prover: canon.prover.clone(),
+            fee_multiplier_vote: canon.fee_multiplier_vote as u64,
+            // Carry the quorum aggregate BLS cert into the gossiped frame
+            // so any receiver (follower or archive) can verify it against
+            // the shard committee via BlsAppFrameValidator. The canonical
+            // header's sig blob is the same AggregateSignature the global
+            // engine quorum-verifies as the reward proof
+            // (intrinsic.rs:599-634).
+            public_key_signature_bls48581: if canon.public_key_signature_bls48581.is_empty() {
+                None
+            } else {
+                quil_execution::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
+                    &canon.public_key_signature_bls48581,
+                )
+                .ok()
+                .map(|sig| quil_types::proto::keys::Bls48581AggregateSignature {
+                    public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
+                        key_value: sig
+                            .public_key
+                            .as_ref()
+                            .map(|k| k.key_value.clone())
+                            .unwrap_or_default(),
+                    }),
+                    signature: sig.signature.clone(),
+                    bitmask: sig.bitmask.clone(),
+                })
+            },
+        };
+        let fee_multiplier_vote = proto_header.fee_multiplier_vote;
+        let frame = quil_types::proto::global::AppShardFrame {
+            header: Some(proto_header),
+            requests: requests.clone(),
+        };
+
+        // Step 2: self-materialize into local shard state (idempotent).
+        // Offloaded to the blocking pool so it doesn't HOL-block the
+        // engine's runtime thread.
+        if frame_number > self.last_materialized_frame && self.execution_engine.is_some() {
+            let world_size = self
+                .hypergraph
+                .as_ref()
+                .map(|hg| {
+                    use num_traits::ToPrimitive;
+                    hg.total_size().to_u64().unwrap_or(0)
+                })
+                .unwrap_or(0);
+            let difficulty = self
+                .current_difficulty
+                .load(std::sync::atomic::Ordering::Relaxed);
+            match self
+                .materialize_offloaded(
+                    requests.clone(),
+                    frame_number,
+                    difficulty,
+                    world_size,
+                    fee_multiplier_vote,
+                )
+                .await
+            {
+                Ok((processed, skipped)) => {
+                    self.last_materialized_frame = frame_number;
+                    // Persist AFTER commit_frame succeeded (inside
+                    // materialize_app_shard_requests) so the durable
+                    // cursor never outruns the CRDT.
+                    self.persist_materialized_cursor(frame_number);
+                    debug!(core_id = self.core_id, frame = frame_number, processed, skipped,
+                        "self-materialized own shard frame");
+                }
+                Err(e) => warn!(core_id = self.core_id, frame = frame_number, error = %e,
+                    "self-materialize of own shard frame failed"),
+            }
+        }
+
+        // Step 1: publish the full frame for followers/archives.
+        let mut buf = Vec::new();
+        if prost::Message::encode(&frame, &mut buf).is_ok() {
+            let _ = self.event_tx.send(AppEngineEvent::FullFrameProduced {
+                filter: self.filter.clone(),
+                frame_number,
+                frame_data: buf,
+            });
+        }
+    }
+
+    /// Materialize buffered received full frames in strict order, as a
+    /// follower. Each is gated by: it is exactly the next frame to
+    /// materialize, we hold the finalized (trusted) `requests_root` for
+    /// it, and the frame's `requests` recompute to that root. A mismatch
+    /// rejects the frame (it didn't come from the consensus-finalized
+    /// frame). Out-of-order frames stay buffered until the gap fills
+    /// (or a future sync resolves it).
+    async fn try_materialize_follower_frames(&mut self) {
+        loop {
+            let next = self.last_materialized_frame + 1;
+            let trusted_root = match self.finalized_requests_roots.get(&next) {
+                Some(r) => r.clone(),
+                None => break, // not finalized through consensus yet
+            };
+            let frame = match self.received_full_frames.get(&next) {
+                Some(f) => f.clone(),
+                None => break, // full frame not received yet
+            };
+            // Validate address + capture the fee vote (Copy) so we don't
+            // hold a borrow of `frame.header` across the awaits below.
+            let fee_multiplier_vote = match frame.header.as_ref() {
+                Some(h) if h.address == self.app_address => h.fee_multiplier_vote,
+                _ => {
+                    self.received_full_frames.remove(&next);
+                    break;
+                }
+            };
+
+            // Recompute requests_root over the frame's requests (canonical
+            // encodings) and require it to equal what we finalized.
+            let canonical: Vec<Vec<u8>> = frame
+                .requests
+                .iter()
+                .filter_map(|b| {
+                    crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok()
+                })
+                .collect();
+            if canonical.len() != frame.requests.len() {
+                warn!(core_id = self.core_id, frame = next,
+                    "received frame has un-re-encodable requests; rejecting");
+                self.received_full_frames.remove(&next);
+                break;
+            }
+            let recomputed = match self.recompute_requests_root_offloaded(canonical, next).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(core_id = self.core_id, frame = next, error = %e,
+                        "requests_root recompute failed");
+                    break;
+                }
+            };
+            if recomputed != trusted_root {
+                warn!(core_id = self.core_id, frame = next,
+                    "received frame requests_root mismatch with finalized header — rejecting");
+                self.received_full_frames.remove(&next);
+                break;
+            }
+
+            // Verified authentic — materialize. Preserve the old
+            // "no execution engine → stop" behavior (the offload helper
+            // would otherwise report 0 processed and falsely advance).
+            if self.execution_engine.is_none() {
+                break;
+            }
+            let world_size = self
+                .hypergraph
+                .as_ref()
+                .map(|hg| {
+                    use num_traits::ToPrimitive;
+                    hg.total_size().to_u64().unwrap_or(0)
+                })
+                .unwrap_or(0);
+            let difficulty = self
+                .current_difficulty
+                .load(std::sync::atomic::Ordering::Relaxed);
+            match self
+                .materialize_offloaded(
+                    frame.requests.clone(),
+                    next,
+                    difficulty,
+                    world_size,
+                    fee_multiplier_vote,
+                )
+                .await
+            {
+                Ok((processed, skipped)) => {
+                    self.last_materialized_frame = next;
+                    self.persist_materialized_cursor(next);
+                    self.received_full_frames.remove(&next);
+                    self.materialize_failures.remove(&next);
+                    debug!(core_id = self.core_id, frame = next, processed, skipped,
+                        "materialized received shard frame (follower)");
+                }
+                Err(e) => {
+                    // A materialize error here is a hard `commit_frame`
+                    // (store) failure, not a bad bundle (those are
+                    // skipped inside materialize). Re-running re-applies
+                    // already-committed bundles — safe under CRDT
+                    // set-semantics + spent-markers, but wasteful. Bound
+                    // the retries: after `MAX_MATERIALIZE_RETRIES`,
+                    // stop blindly replaying and route the frame to the
+                    // authoritative repair path (a shard sync), which
+                    // rebuilds state from an archive rather than from
+                    // this (apparently un-committable) full frame.
+                    let attempts = self
+                        .materialize_failures
+                        .entry(next)
+                        .and_modify(|n| *n += 1)
+                        .or_insert(1);
+                    if *attempts >= MAX_MATERIALIZE_RETRIES {
+                        warn!(core_id = self.core_id, frame = next, attempts = *attempts, error = %e,
+                            "materialize of received shard frame failed repeatedly — dropping frame, requesting shard sync");
+                        self.received_full_frames.remove(&next);
+                        self.materialize_failures.remove(&next);
+                        let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
+                            filter: self.filter.clone(),
+                            missing_frames: vec![next],
+                        });
+                    } else {
+                        warn!(core_id = self.core_id, frame = next, attempts = *attempts, error = %e,
+                            "materialize of received shard frame failed — will retry");
+                    }
+                    break;
+                }
+            }
+        }
+        // Gap detection: if frames are buffered AHEAD of the next one we
+        // need but the next one is missing, this node is behind and the
+        // gap won't self-heal from gossip — it needs a shard sync (step
+        // 4). Surface it and signal via AncestorSyncRequested (the
+        // existing event; its handler is the sync-client integration
+        // point still to be wired).
+        let next_needed = self.last_materialized_frame + 1;
+        let ahead: Vec<u64> = self
+            .received_full_frames
+            .keys()
+            .copied()
+            .filter(|&f| f > next_needed)
+            .collect();
+        if !self.received_full_frames.contains_key(&next_needed) && !ahead.is_empty() {
+            warn!(
+                core_id = self.core_id,
+                missing_from = next_needed,
+                buffered_ahead = ahead.len(),
+                "app-shard frame gap — node behind; shard sync needed (step 4)"
+            );
+            let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
+                filter: self.filter.clone(),
+                missing_frames: vec![next_needed],
+            });
+        }
+
+        // Bound the received-frame buffer to recent + future frames.
+        let cutoff = self.last_materialized_frame.saturating_sub(8);
+        self.received_full_frames.retain(|&f, _| f > cutoff);
+    }
+
     // ---------------------------------------------------------------
     // Certified parent sealing
     // ---------------------------------------------------------------
@@ -2186,6 +2765,80 @@ impl AppConsensusEngine {
             Some(h) => h,
             None => return,
         };
+
+        // Materialize the certified parent's requests into hypergraph
+        // state BEFORE sealing the clock frame — token/compute/hypergraph
+        // engines run here. Mirrors Go `addCertifiedState → materialize`
+        // (app_consensus_engine.go:2996), which gates the clock commit on
+        // a successful materialize. The idempotency gate
+        // (`last_materialized_frame`) makes a repeat seal a no-op. If
+        // materialize fails we DON'T seal: re-queue the parent so a later
+        // attempt can retry, rather than committing an un-materialized
+        // frame.
+        if header.frame_number > self.last_materialized_frame {
+            // Scalars up front so no borrow of `self`/`frame` survives
+            // into the result arms where we mutate
+            // `self.last_materialized_frame` / `pending_certified_parents`.
+            let frame_number = header.frame_number;
+            let fee_multiplier_vote = header.fee_multiplier_vote;
+            if self.execution_engine.is_some() {
+                let world_size = self
+                    .hypergraph
+                    .as_ref()
+                    .map(|hg| {
+                        use num_traits::ToPrimitive;
+                        hg.total_size().to_u64().unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                let difficulty = self
+                    .current_difficulty
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                // Offloaded to the blocking pool (off the engine task).
+                let result = self
+                    .materialize_offloaded(
+                        frame.requests.clone(),
+                        frame_number,
+                        difficulty,
+                        world_size,
+                        fee_multiplier_vote,
+                    )
+                    .await;
+                // Best-effort: we seal the clock frame regardless of the
+                // materialize outcome (it never blocks consensus
+                // progress). A commit_frame error only means the CRDT
+                // flush failed — log it; the clock chain still advances,
+                // matching prior behavior where app-shard frames weren't
+                // materialized at all. Advance the idempotency gate so we
+                // don't re-attempt this frame.
+                match result {
+                    Ok((processed, skipped)) => {
+                        // Only advance + persist the cursor on a
+                        // successful commit_frame. Advancing on Err would
+                        // push the cursor past the CRDT (the unsafe
+                        // direction) and silently skip this frame's
+                        // mutations on restart.
+                        self.last_materialized_frame = frame_number;
+                        self.persist_materialized_cursor(frame_number);
+                        debug!(
+                            core_id = self.core_id,
+                            frame = frame_number,
+                            processed,
+                            skipped,
+                            "materialized sealed app-shard frame"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            core_id = self.core_id,
+                            parent_rank,
+                            frame = frame_number,
+                            error = %e,
+                            "app-shard materialize commit failed (sealing anyway; cursor not advanced)"
+                        );
+                    }
+                }
+            }
+        }
 
         let txn = match self.clock_store.new_transaction(false) {
             Ok(t) => t,
@@ -2717,7 +3370,7 @@ impl TimeoutCertificate for WireTC {
 /// execution engine or inclusion prover are missing — those are
 /// required for byte-for-byte parity with Go peers during VDF
 /// challenge verification.
-fn compute_requests_root(
+pub(crate) fn compute_requests_root(
     messages: &[Vec<u8>],
     app_address: &[u8],
     frame_number: u64,
@@ -2778,6 +3431,106 @@ fn compute_requests_root(
     Ok(out)
 }
 
+/// Materialize an app-shard frame's `requests` into hypergraph state —
+/// the Rust port of Go `AppConsensusEngine.materialize`
+/// (app_consensus_engine.go:1457-1546). This is what actually runs the
+/// token / compute / hypergraph engines for a shard: each bundle is
+/// dispatched by address to its intrinsic engine, which applies its
+/// state changes (token spends + spent-markers, compute outputs,
+/// hyperedge mutations) into the per-shard CRDT.
+///
+/// Per bundle, in `frame.requests` slice order (Go fans these out over
+/// an errgroup but relies on CRDT commutativity for determinism; a
+/// serial loop in the same order is deterministic and a safe superset):
+///   1. canonical-encode the bundle,
+///   2. cost basis → baseline fee (`GetBaselineFee/cost`, or 0 when the
+///      bundle has zero cost),
+///   3. `fee = baseline * fee_multiplier_vote` — the app-shard path
+///      multiplies by the header's vote; the global path does not
+///      (app_consensus_engine.go:1515 vs frame_materializer.go:217),
+///   4. `process_message(frame, fee, app_address[..32], bytes)` —
+///      address is the shard's own app address (NOT the global
+///      0xFF*32), which routes dispatch to the right engine.
+///
+/// BEST-EFFORT per bundle: a bundle that fails to encode or dispatch is
+/// SKIPPED (logged), not fatal — mirroring the Rust global materializer
+/// (`frame_materializer.rs`), and deliberately NOT Go's app-side
+/// fail-fast. Blocking the frame on a single bad bundle would let one
+/// malformed/unroutable request permanently stall a shard's clock chain
+/// (the caller seals regardless of this result). The only hard error is
+/// a `commit_frame` failure. No `validate_message` is run: app-shard
+/// validity/signature gating happens upstream at message ingest, and the
+/// per-tx crypto/double-spend checks live inside the engines'
+/// `process_message`. Engines self-commit their changeset per message
+/// (the Rust model — see the token engine's `commit_state`);
+/// `commit_frame` then flushes the CRDT phase trees to the backing store.
+///
+/// Returns `(processed, skipped)`.
+pub(crate) fn materialize_app_shard_requests(
+    execution_manager: &quil_execution::ExecutionEngineManager,
+    requests: &[quil_types::proto::global::MessageBundle],
+    frame_number: u64,
+    difficulty: u32,
+    world_size: u64,
+    fee_multiplier_vote: u64,
+    app_address: &[u8],
+) -> Result<(usize, usize)> {
+    use num_bigint::BigInt;
+    use num_traits::{ToPrimitive, Zero};
+
+    let addr: &[u8] = if app_address.len() >= 32 {
+        &app_address[..32]
+    } else {
+        app_address
+    };
+
+    let mut processed = 0usize;
+    let mut skipped = 0usize;
+    for bundle in requests {
+        let bundle_bytes =
+            match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
+                Ok(b) if b.len() >= 4 => b,
+                Ok(_) => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(e) => {
+                    debug!(frame = frame_number, error = %e, "app-shard materialize: skipping un-encodable bundle");
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+        let cost_basis = execution_manager
+            .get_cost(&bundle_bytes)
+            .unwrap_or_else(|_| BigInt::zero());
+        let fee = if cost_basis.is_zero() {
+            BigInt::zero()
+        } else {
+            let cost_u64 = cost_basis.to_u64().unwrap_or(1);
+            let baseline = crate::rewards::get_baseline_fee(
+                difficulty as u64,
+                world_size,
+                cost_u64,
+                crate::rewards::QUIL_TOKEN_UNITS,
+            );
+            &baseline / &cost_basis
+        };
+        let fee = fee * BigInt::from(fee_multiplier_vote);
+
+        match execution_manager.process_message(frame_number, &fee, addr, &bundle_bytes) {
+            Ok(_) => processed += 1,
+            Err(e) => {
+                debug!(frame = frame_number, error = %e, "app-shard materialize: skipping bundle that failed processing");
+                skipped += 1;
+            }
+        }
+    }
+
+    execution_manager.commit_frame(frame_number)?;
+    Ok((processed, skipped))
+}
+
 /// Convert a decoded wire-format `QuorumCertificate` into a trait object
 /// suitable for submission to the HotStuff event loop.
 fn wire_qc_to_trait(
@@ -2823,6 +3576,77 @@ fn wire_tc_to_trait(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build an Application-mode ExecutionEngineManager backed by an
+    /// in-memory CRDT + noop crypto, for exercising the app-shard
+    /// materialize plumbing.
+    fn app_test_manager() -> (
+        std::sync::Arc<quil_execution::ExecutionEngineManager>,
+        std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    ) {
+        use std::sync::Arc;
+        use quil_types::crypto::NoopInclusionProver;
+        let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(NoopInclusionProver),
+        ));
+        let mgr = Arc::new(quil_execution::ExecutionEngineManager::new(
+            Arc::new(NoopInclusionProver),
+            crypto.key_manager.clone(),
+            crdt.clone(),
+            crypto.bulletproof_prover.clone(),
+            crypto.decaf_constructor.clone(),
+            crypto.circuit_compiler.clone(),
+            crypto.clock_store.clone(),
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+            false, // application mode (no global engine)
+        ));
+        (mgr, crdt)
+    }
+
+    #[test]
+    fn app_shard_materialize_empty_frame_commits() {
+        let (mgr, _crdt) = app_test_manager();
+        // No requests → nothing processed, commit_frame still succeeds.
+        let (processed, skipped) = materialize_app_shard_requests(
+            mgr.as_ref(),
+            &[],
+            1,
+            50_000,
+            0,
+            1,
+            &quil_execution::domains::QUIL_TOKEN,
+        )
+        .unwrap();
+        assert_eq!(processed, 0);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn app_shard_materialize_iterates_each_bundle() {
+        let (mgr, _crdt) = app_test_manager();
+        // Two (empty) bundles routed to the token domain: each is
+        // dispatched to the token engine and the frame committed. Proves
+        // the seal-time pass iterates frame.requests, routes by the
+        // shard app address, and calls commit_frame — the wiring that was
+        // missing (app-shard frames previously only hit the clock store).
+        let bundles = vec![
+            quil_types::proto::global::MessageBundle::default(),
+            quil_types::proto::global::MessageBundle::default(),
+        ];
+        let (processed, _skipped) = materialize_app_shard_requests(
+            mgr.as_ref(),
+            &bundles,
+            2,
+            50_000,
+            0,
+            7, // non-trivial fee_multiplier_vote exercises the app-specific multiply
+            &quil_execution::domains::QUIL_TOKEN,
+        )
+        .unwrap();
+        assert_eq!(processed, 2);
+    }
 
     #[test]
     fn validation_rejects_short_consensus_message() {

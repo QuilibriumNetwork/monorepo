@@ -46,6 +46,14 @@ pub trait Consumer<S: Unique, V: Unique>: Send + Sync {
     /// Called when a proposal has been received.
     fn on_receive_proposal(&self, _current_rank: u64, _proposal: &SignedProposal<S, V>) {}
 
+    /// Called when a received proposal can't be applied because its parent
+    /// state is missing — i.e. the node has fallen behind (e.g. after a network
+    /// partition) and gossip alone won't backfill the gap. The consumer should
+    /// drive a catch-up sync from a peer (analog of Go's
+    /// `syncProvider.AddState`). Fires once per orphaned proposal; the consumer
+    /// is responsible for debouncing concurrent syncs. Default: no-op.
+    fn on_missing_parent(&self) {}
+
     /// Called when the local timeout fires.
     fn on_local_timeout(&self, _current_rank: u64) {}
 
@@ -320,6 +328,10 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
                         .lock()
                         .unwrap()
                         .push(parent_id, proposal.clone());
+                    // Signal that we're behind so the consumer can trigger a
+                    // catch-up sync (the parent will never arrive via gossip in
+                    // a hub topology). The consumer debounces.
+                    self.notifier.on_missing_parent();
                     self.notifier.on_event_processed();
                     return Ok(());
                 }

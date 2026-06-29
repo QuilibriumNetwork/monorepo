@@ -469,6 +469,28 @@ pub(crate) fn init(
                                             Ok(())
                                         });
                                     }
+                                    WorkerToMaster::FullFrameProduced { core_id, filter, frame_data, .. } => {
+                                        // Full AppShardFrame (header+requests) — publish on
+                                        // the per-shard frame bitmask for state distribution
+                                        // to followers/archives.
+                                        if drain_halt.any_halted() {
+                                            continue;
+                                        }
+                                        let p2p = drain_p2p.clone();
+                                        drain_spawner.detach("shard-full-frame-publish", async move {
+                                            if let Err(e) = p2p
+                                                .publish(
+                                                    quil_engine::bitmasks::shard_frame_bitmask(&filter),
+                                                    frame_data,
+                                                )
+                                                .await
+                                            {
+                                                warn!(core_id, filter = %hex::encode(&filter),
+                                                    error = %e, "full shard frame publish failed");
+                                            }
+                                            Ok(())
+                                        });
+                                    }
                                     WorkerToMaster::VoteProduced { core_id, filter, vote_data } => {
                                         // Per-shard consensus bitmask = `0x00 || filter`.
                                         if drain_halt.any_halted() {

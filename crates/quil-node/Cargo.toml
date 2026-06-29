@@ -58,6 +58,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 async-stream = "0.3"
 parking_lot = "0.12"
 
+[target.'cfg(unix)'.dependencies]
+# RLIMIT_NOFILE raise at startup (raise_fd_limit in main.rs).
+libc = "0.2"
+
 # Jemalloc as the global allocator. The default system allocator
 # (glibc malloc on Linux) fragments aggressively under our
 # allocation pattern — heavy churn on small-medium-sized Vec/HashMap

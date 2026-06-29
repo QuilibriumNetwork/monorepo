@@ -1660,4 +1660,406 @@ mod tests {
         // Past 720 frames.
         assert!(validate_confirm_timing(256_721, &alloc).is_err());
     }
+
+    // -----------------------------------------------------------------
+    // verify_prover_leave / verify_prover_update / shard split+merge /
+    // seniority merge / closure-based gates
+    // -----------------------------------------------------------------
+
+    use super::super::prover_ops::{
+        ProverSeniorityMerge, ProverUpdate, ShardMerge, ShardSplit,
+    };
+    use super::super::seniority_merge::SeniorityMerge;
+    use super::super::materialize::prover_address_from_pubkey;
+
+    // The make_prover_tree() helper uses pubkey 0xAA*585. The address-
+    // binding checks require sig.address == poseidon(pubkey).
+    fn prover_addr() -> Vec<u8> {
+        prover_address_from_pubkey(&vec![0xAAu8; 585]).unwrap().to_vec()
+    }
+
+    #[test]
+    fn leave_verify_rejects_wrong_vertex_type() {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[0xFFu8; 32], &TYPE_HASH_ALLOCATION, &[], &BigInt::from(32)).unwrap();
+        let op = ProverLeave {
+            filters: vec![vec![0xAAu8; 32]],
+            frame_number: 1,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: vec![0xCCu8; 32],
+            }),
+        };
+        assert!(verify_prover_leave(&op, &tree, &AcceptKeyManager).is_err());
+    }
+
+    #[test]
+    fn leave_has_active_allocation_finds_active() {
+        let pubkey = vec![0xAAu8; 585];
+        let op = ProverLeave {
+            filters: vec![vec![0x01u8; 32], vec![0x02u8; 32]],
+            frame_number: 1,
+            public_key_signature_bls48581: None,
+        };
+        // Second filter has an active allocation.
+        let active_addr =
+            super::super::materialize::allocation_address(&pubkey, &op.filters[1]).unwrap();
+        let r = verify_prover_leave_has_active_allocation(&op, &pubkey, |addr| {
+            if *addr == active_addr {
+                Ok(Some(make_allocation_tree(1)))
+            } else {
+                Ok(None)
+            }
+        });
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn leave_has_active_allocation_errs_when_none_active() {
+        let pubkey = vec![0xAAu8; 585];
+        let op = ProverLeave {
+            filters: vec![vec![0x01u8; 32]],
+            frame_number: 1,
+            public_key_signature_bls48581: None,
+        };
+        // Allocation exists but is paused (status 2), not active.
+        let r = verify_prover_leave_has_active_allocation(&op, &pubkey, |_addr| {
+            Ok(Some(make_allocation_tree(2)))
+        });
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn prover_update_accepts_with_matching_address() {
+        let prover_tree = make_prover_tree();
+        let op = ProverUpdate {
+            delegate_address: vec![0x12u8; 32],
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: prover_addr(),
+            }),
+        };
+        assert!(verify_prover_update(&op, &prover_tree, &AcceptKeyManager).unwrap());
+    }
+
+    #[test]
+    fn prover_update_rejects_address_mismatch() {
+        let prover_tree = make_prover_tree();
+        let op = ProverUpdate {
+            delegate_address: vec![0x12u8; 32],
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: vec![0xEEu8; 32], // != poseidon(pubkey)
+            }),
+        };
+        // Address binding fails → Ok(false), not Err.
+        assert!(!verify_prover_update(&op, &prover_tree, &AcceptKeyManager).unwrap());
+    }
+
+    #[test]
+    fn prover_update_rejects_bad_address_length() {
+        let prover_tree = make_prover_tree();
+        let op = ProverUpdate {
+            delegate_address: vec![0x12u8; 32],
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: vec![0xCCu8; 16], // != 32
+            }),
+        };
+        assert!(verify_prover_update(&op, &prover_tree, &AcceptKeyManager).is_err());
+    }
+
+    fn sample_split() -> ShardSplit {
+        ShardSplit {
+            shard_address: vec![0x01u8; 32],
+            proposed_shards: vec![vec![0x01u8; 33], vec![0x01u8; 33]],
+            frame_number: 10,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: prover_addr(),
+            }),
+        }
+    }
+
+    #[test]
+    fn shard_split_accepts_valid() {
+        let prover_tree = make_prover_tree();
+        assert!(verify_shard_split(&sample_split(), &prover_tree, &AcceptKeyManager).unwrap());
+    }
+
+    #[test]
+    fn shard_split_rejects_bad_shard_address_length() {
+        let prover_tree = make_prover_tree();
+        let mut op = sample_split();
+        op.shard_address = vec![0x01u8; 31]; // < 32
+        assert!(verify_shard_split(&op, &prover_tree, &AcceptKeyManager).is_err());
+    }
+
+    #[test]
+    fn shard_split_rejects_too_few_proposed_shards() {
+        let prover_tree = make_prover_tree();
+        let mut op = sample_split();
+        op.proposed_shards = vec![vec![0x01u8; 33]]; // only 1
+        assert!(verify_shard_split(&op, &prover_tree, &AcceptKeyManager).is_err());
+    }
+
+    #[test]
+    fn shard_split_rejects_proposed_shard_wrong_prefix() {
+        let prover_tree = make_prover_tree();
+        let mut op = sample_split();
+        // Right length (parent+1) but wrong prefix.
+        op.proposed_shards = vec![vec![0x09u8; 33], vec![0x01u8; 33]];
+        assert!(verify_shard_split(&op, &prover_tree, &AcceptKeyManager).is_err());
+    }
+
+    #[test]
+    fn shard_split_rejects_bad_signature() {
+        let prover_tree = make_prover_tree();
+        assert!(!verify_shard_split(&sample_split(), &prover_tree, &RejectKeyManager).unwrap());
+    }
+
+    fn sample_merge() -> ShardMerge {
+        ShardMerge {
+            shard_addresses: vec![vec![0x01u8; 33], vec![0x01u8; 33]],
+            parent_address: vec![0x01u8; 32],
+            frame_number: 10,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: prover_addr(),
+            }),
+        }
+    }
+
+    #[test]
+    fn shard_merge_accepts_valid() {
+        let prover_tree = make_prover_tree();
+        assert!(verify_shard_merge(&sample_merge(), &prover_tree, &AcceptKeyManager).unwrap());
+    }
+
+    #[test]
+    fn shard_merge_rejects_child_wrong_prefix() {
+        let prover_tree = make_prover_tree();
+        let mut op = sample_merge();
+        op.shard_addresses = vec![vec![0x09u8; 33], vec![0x01u8; 33]];
+        assert!(verify_shard_merge(&op, &prover_tree, &AcceptKeyManager).is_err());
+    }
+
+    #[test]
+    fn shard_merge_rejects_address_binding_mismatch() {
+        let prover_tree = make_prover_tree();
+        let mut op = sample_merge();
+        op.public_key_signature_bls48581.as_mut().unwrap().address = vec![0x77u8; 32];
+        // poseidon(pubkey) != sig.address → Ok(false).
+        assert!(!verify_shard_merge(&op, &prover_tree, &AcceptKeyManager).unwrap());
+    }
+
+    fn sample_seniority_merge() -> ProverSeniorityMerge {
+        ProverSeniorityMerge {
+            frame_number: 100,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: prover_addr(),
+            }),
+            merge_targets: vec![SeniorityMerge {
+                signature: vec![0xDDu8; 114],
+                key_type: 0, // Ed448
+                prover_public_key: vec![0xEEu8; 57],
+            }],
+        }
+    }
+
+    #[test]
+    fn seniority_merge_accepts_valid() {
+        let prover_tree = make_prover_tree();
+        let op = sample_seniority_merge();
+        assert!(verify_prover_seniority_merge(&op, &prover_tree, 100, &AcceptKeyManager).unwrap());
+    }
+
+    #[test]
+    fn seniority_merge_rejects_no_targets() {
+        let prover_tree = make_prover_tree();
+        let mut op = sample_seniority_merge();
+        op.merge_targets.clear();
+        assert!(verify_prover_seniority_merge(&op, &prover_tree, 100, &AcceptKeyManager).is_err());
+    }
+
+    #[test]
+    fn seniority_merge_rejects_outdated_request() {
+        let prover_tree = make_prover_tree();
+        let op = sample_seniority_merge(); // frame_number=100
+        // current 200 → 100+10 < 200 → outdated.
+        assert!(verify_prover_seniority_merge(&op, &prover_tree, 200, &AcceptKeyManager).is_err());
+    }
+
+    #[test]
+    fn seniority_merge_rejects_address_binding() {
+        let prover_tree = make_prover_tree();
+        let mut op = sample_seniority_merge();
+        op.public_key_signature_bls48581.as_mut().unwrap().address = vec![0x33u8; 32];
+        assert!(!verify_prover_seniority_merge(&op, &prover_tree, 100, &AcceptKeyManager).unwrap());
+    }
+
+    #[test]
+    fn seniority_merge_rejects_unknown_merge_target_key_type() {
+        let prover_tree = make_prover_tree();
+        let mut op = sample_seniority_merge();
+        op.merge_targets[0].key_type = 99;
+        assert!(verify_prover_seniority_merge(&op, &prover_tree, 100, &AcceptKeyManager).is_err());
+    }
+
+    #[test]
+    fn seniority_merge_rejects_when_target_sig_invalid() {
+        let prover_tree = make_prover_tree();
+        let op = sample_seniority_merge();
+        // RejectKeyManager fails the merge-target signature check.
+        assert!(!verify_prover_seniority_merge(&op, &prover_tree, 100, &RejectKeyManager).unwrap());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_prover_join_signatures
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn join_signatures_accepts_with_accept_key_manager() {
+        let op = sample_join(vec![vec![0x01u8; 32]]);
+        let validation = validate_prover_join_structural(&op, 105).unwrap();
+        let ok = verify_prover_join_signatures(&op, &validation, &AcceptKeyManager, None).unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn join_signatures_rejects_with_reject_key_manager() {
+        let op = sample_join(vec![vec![0x01u8; 32]]);
+        let validation = validate_prover_join_structural(&op, 105).unwrap();
+        let ok = verify_prover_join_signatures(&op, &validation, &RejectKeyManager, None).unwrap();
+        assert!(!ok);
+    }
+
+    // -----------------------------------------------------------------
+    // verify_prover_join_not_kicked
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn join_not_kicked_passes_when_no_kick_field() {
+        let prover_tree = make_prover_tree();
+        assert!(verify_prover_join_not_kicked(&prover_tree).is_ok());
+    }
+
+    #[test]
+    fn join_not_kicked_rejects_kicked_prover() {
+        let mut prover_tree = make_prover_tree();
+        // KickFrameNumber on prover:Prover at its schema key.
+        let kf_key = crate::global_schema::field_key("prover:Prover", "KickFrameNumber").unwrap();
+        prover_tree.insert(&kf_key, &500u64.to_be_bytes(), &[], &BigInt::from(8)).unwrap();
+        assert!(verify_prover_join_not_kicked(&prover_tree).is_err());
+    }
+
+    #[test]
+    fn join_not_kicked_passes_when_kick_frame_zero() {
+        let mut prover_tree = make_prover_tree();
+        let kf_key = crate::global_schema::field_key("prover:Prover", "KickFrameNumber").unwrap();
+        prover_tree.insert(&kf_key, &0u64.to_be_bytes(), &[], &BigInt::from(8)).unwrap();
+        assert!(verify_prover_join_not_kicked(&prover_tree).is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_prover_join_allocations_expired
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn join_allocations_expired_ok_when_no_existing_allocation() {
+        let op = sample_join(vec![vec![0x01u8; 32]]);
+        let pubkey = vec![0xAAu8; 585];
+        let r = verify_prover_join_allocations_expired(&op, &pubkey, 1000, |_| Ok(None));
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn join_allocations_expired_ok_when_status_left() {
+        let op = sample_join(vec![vec![0x01u8; 32]]);
+        let pubkey = vec![0xAAu8; 585];
+        // status 4 = left/kicked → skipped.
+        let r = verify_prover_join_allocations_expired(&op, &pubkey, 1000, |_| {
+            Ok(Some(make_allocation_tree(4)))
+        });
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn join_allocations_expired_rejects_active_recent_allocation() {
+        let op = sample_join(vec![vec![0x01u8; 32]]);
+        let pubkey = vec![0xAAu8; 585];
+        // Active allocation joined at frame 900, current 1000 → not yet
+        // expired (< 900+720) → reject.
+        let r = verify_prover_join_allocations_expired(&op, &pubkey, 1000, |_| {
+            Ok(Some(make_alloc_tree_with_join_frame(1, 900)))
+        });
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn join_allocations_expired_ok_when_window_elapsed() {
+        let op = sample_join(vec![vec![0x01u8; 32]]);
+        let pubkey = vec![0xAAu8; 585];
+        // Active allocation joined at frame 100; current 2000 >= 100+720.
+        let r = verify_prover_join_allocations_expired(&op, &pubkey, 2000, |_| {
+            Ok(Some(make_alloc_tree_with_join_frame(1, 100)))
+        });
+        assert!(r.is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_shard_op_signer_is_active_global
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn shard_op_signer_active_global_ok() {
+        let prover_tree = make_prover_tree();
+        let pubkey = vec![0xAAu8; 585];
+        let global_alloc =
+            super::super::materialize::allocation_address(&pubkey, &[]).unwrap();
+        let r = verify_shard_op_signer_is_active_global(&prover_tree, |addr| {
+            if *addr == global_alloc {
+                Ok(Some(make_allocation_tree(1)))
+            } else {
+                Ok(None)
+            }
+        });
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn shard_op_signer_rejects_no_global_allocation() {
+        let prover_tree = make_prover_tree();
+        let r = verify_shard_op_signer_is_active_global(&prover_tree, |_| Ok(None));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn shard_op_signer_rejects_inactive_global_allocation() {
+        let prover_tree = make_prover_tree();
+        let r = verify_shard_op_signer_is_active_global(&prover_tree, |_| {
+            Ok(Some(make_allocation_tree(2))) // paused
+        });
+        assert!(r.is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_prover_seniority_merge_spent_markers
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn seniority_merge_spent_markers_ok_when_fresh() {
+        let op = sample_seniority_merge();
+        let r = verify_prover_seniority_merge_spent_markers(&op, |_| Ok(None));
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn seniority_merge_spent_markers_rejects_consumed_target() {
+        let op = sample_seniority_merge();
+        // Any tombstone present → reject.
+        let r = verify_prover_seniority_merge_spent_markers(&op, |_| Ok(Some(vec![0x01])));
+        assert!(r.is_err());
+    }
 }

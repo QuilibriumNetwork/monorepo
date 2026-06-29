@@ -9,6 +9,7 @@ use crate::utilities::rng;
 use elliptic_curve::group::GroupEncoding;
 use elliptic_curve::CurveArithmetic;
 use rand::Rng;
+use subtle::ConstantTimeEq;
 
 // Computational security parameter lambda_c from DKLs23 (divided by 8)
 use crate::SECURITY;
@@ -38,7 +39,9 @@ pub fn commit(msg: &[u8]) -> (HashOutput, Vec<u8>) {
 #[must_use]
 pub fn verify_commitment(msg: &[u8], commitment: &HashOutput, salt: &[u8]) -> bool {
     let expected_commitment = hash(msg, salt);
-    *commitment == expected_commitment
+    // Constant-time compare — the commitment primitive gates every
+    // decommit check in the protocol; keep it timing-independent.
+    bool::from(commitment[..].ct_eq(&expected_commitment[..]))
 }
 
 /// Commits to a given point.

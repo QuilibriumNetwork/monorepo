@@ -1027,7 +1027,7 @@ mod tests {
         fn load_vertex_underlying_raw(&self, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8]) -> QResult<Option<Vec<u8>>> {
             Ok(self.nodes.lock().unwrap().get(&Self::key(set, phase, shard, k)).cloned())
         }
-        fn save_vertex_underlying(&self, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8], d: &[u8]) -> QResult<()> {
+        fn save_vertex_underlying(&self, _txn: &dyn quil_types::store::Transaction, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8], d: &[u8]) -> QResult<()> {
             self.nodes.lock().unwrap().insert(Self::key(set, phase, shard, k), d.to_vec());
             self.per_vertex.lock().unwrap().insert((Self::scope(set, phase, shard), k.to_vec()), d.to_vec());
             Ok(())

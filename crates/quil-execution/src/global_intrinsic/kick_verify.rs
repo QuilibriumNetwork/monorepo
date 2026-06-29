@@ -768,4 +768,167 @@ mod tests {
     // are installed. The structural-rejection path is exercised by the
     // existing `no_equivocation_*` tests above, which run before any
     // external dependency is touched inside `verify_prover_kick_full`.
+
+    // -----------------------------------------------------------------
+    // extract_kick_frame_filter_and_bitmask
+    // -----------------------------------------------------------------
+
+    use crate::hypergraph_intrinsic::canonical::AggregateSignature;
+    use crate::global_intrinsic::frame_header::FrameHeader;
+
+    fn agg_sig_bytes(bitmask: &[u8]) -> Vec<u8> {
+        AggregateSignature {
+            signature: vec![0xABu8; 74],
+            public_key: None,
+            bitmask: bitmask.to_vec(),
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    fn app_frame_bytes(address: &[u8], bitmask: &[u8]) -> Vec<u8> {
+        let header = FrameHeader {
+            address: address.to_vec(),
+            frame_number: 42,
+            rank: 0,
+            timestamp: 0,
+            difficulty: 50_000,
+            output: vec![0x01u8; 8],
+            parent_selector: vec![],
+            requests_root: vec![],
+            state_roots: vec![],
+            prover: vec![],
+            fee_multiplier_vote: 0,
+            public_key_signature_bls48581: agg_sig_bytes(bitmask),
+        };
+        header.to_canonical_bytes().unwrap()
+    }
+
+    #[test]
+    fn extract_app_frame_filter_and_bitmask() {
+        let addr = vec![0xCDu8; 32];
+        let bitmask = vec![0b0000_0101u8];
+        let bytes = app_frame_bytes(&addr, &bitmask);
+        let (filter, mask) = extract_kick_frame_filter_and_bitmask(&bytes).unwrap();
+        assert_eq!(filter, addr);
+        assert_eq!(mask, bitmask);
+    }
+
+    #[test]
+    fn extract_rejects_short_frame() {
+        assert!(extract_kick_frame_filter_and_bitmask(&[0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn extract_rejects_unknown_type_prefix() {
+        let mut bytes = app_frame_bytes(&vec![0xCDu8; 32], &[0x01]);
+        bytes[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        assert!(extract_kick_frame_filter_and_bitmask(&bytes).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_kick_bitmask_overlap
+    // -----------------------------------------------------------------
+
+    use quil_types::consensus::{
+        ProverInfo, ProverRegistry, ProverShardSummary, ProverStatus,
+    };
+
+    struct FixedRegistry {
+        active: Vec<ProverInfo>,
+    }
+
+    fn fake_prover_info(addr: [u8; 32]) -> ProverInfo {
+        ProverInfo {
+            public_key: vec![0u8; 585],
+            address: addr.to_vec(),
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![],
+            available_storage: 0,
+            seniority: 0,
+            delegate_address: vec![],
+        }
+    }
+
+    impl ProverRegistry for FixedRegistry {
+        fn get_prover_info(&self, _: &[u8]) -> Result<Option<ProverInfo>> { Ok(None) }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<u8>> { Ok(vec![]) }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<Vec<u8>>> { Ok(vec![]) }
+        fn get_active_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> {
+            Ok(self.active.clone())
+        }
+        fn get_prover_count(&self, _: &[u8]) -> Result<usize> { Ok(self.active.len()) }
+        fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(self.active.clone()) }
+        fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> {
+            Ok(vec![])
+        }
+        fn get_prover_shard_summaries(&self, _: u64) -> Result<Vec<ProverShardSummary>> {
+            Ok(vec![])
+        }
+    }
+
+    fn kick_for_pubkey(pubkey: Vec<u8>) -> ProverKick {
+        ProverKick {
+            frame_number: 100,
+            kicked_prover_public_key: pubkey,
+            conflicting_frame_1: vec![],
+            conflicting_frame_2: vec![],
+            commitment: vec![],
+            proof: vec![],
+            traversal_proof: vec![],
+        }
+    }
+
+    #[test]
+    fn bitmask_overlap_accepts_when_both_frames_include_signer() {
+        let pubkey = vec![0x55u8; 585];
+        let addr = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
+        // Put the kicked prover at index 0.
+        let reg = FixedRegistry { active: vec![fake_prover_info(addr)] };
+        let kick = kick_for_pubkey(pubkey);
+        // bit 0 set in both bitmasks.
+        let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b1], &reg);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn bitmask_overlap_rejects_when_one_frame_misses_signer() {
+        let pubkey = vec![0x55u8; 585];
+        let addr = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
+        let reg = FixedRegistry { active: vec![fake_prover_info(addr)] };
+        let kick = kick_for_pubkey(pubkey);
+        // frame 1 has bit 0; frame 2 does not.
+        let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b0], &reg);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn bitmask_overlap_rejects_when_signer_not_in_active_set() {
+        let pubkey = vec![0x55u8; 585];
+        // Active set contains a DIFFERENT prover.
+        let other_addr = [0x99u8; 32];
+        let reg = FixedRegistry { active: vec![fake_prover_info(other_addr)] };
+        let kick = kick_for_pubkey(pubkey);
+        let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b1], &reg);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn bitmask_overlap_handles_index_beyond_first_byte() {
+        // Place the kicked prover at index 9 → byte 1, bit 1.
+        let pubkey = vec![0x55u8; 585];
+        let addr = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
+        let mut active: Vec<ProverInfo> =
+            (0..9).map(|i| fake_prover_info([i as u8; 32])).collect();
+        active.push(fake_prover_info(addr)); // index 9
+        let reg = FixedRegistry { active };
+        let kick = kick_for_pubkey(pubkey);
+        // index 9 → byte_index=1, bit_index=1 → mask byte [_, 0b10].
+        let bitmask = vec![0x00u8, 0b10u8];
+        assert!(verify_kick_bitmask_overlap(&kick, &[], &bitmask, &bitmask, &reg).is_ok());
+        // Missing bit in second frame → reject.
+        let no_bit = vec![0x00u8, 0x00u8];
+        assert!(verify_kick_bitmask_overlap(&kick, &[], &bitmask, &no_bit, &reg).is_err());
+    }
 }

@@ -150,7 +150,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                     .unwrap_or_default()
                     .as_millis() as i64,
                 version: vec![2, 1, 0],
-                patch_number: vec![23],
+                patch_number: vec![quil_config::PATCH_NUMBER],
                 capabilities: pi_caps.clone(),
                 // pubkey/signature are passed separately to
                 // encode_canonical_peer_info below; the struct

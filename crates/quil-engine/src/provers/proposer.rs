@@ -69,6 +69,32 @@ pub struct ShardDescriptor {
 /// reward-greedy candidate.
 pub const HALT_RISK_PROVER_COUNT: u64 = 3;
 
+/// Score-driven leave threshold, as a percent of the best unallocated
+/// shard's score: an allocated shard is a pure-score leave candidate only
+/// when it scores below this fraction of the best available alternative.
+/// Lowered from the original 67% to 40% to curb worker churn — at 67%,
+/// on a small/forming network the optimistic joiner-ring score of the
+/// best unallocated shard is almost always ~2x a healthy holding, so every
+/// fine allocation perpetually trips the threshold and the node thrashes
+/// (leave → rejoin elsewhere → that shard dilutes → leave again). 40%
+/// means only a large, durable score gap justifies abandoning a holding.
+/// Paired with the `SCORE_LEAVE_MIN_HOLD_FRAMES` dwell in the lifecycle.
+pub const SCORE_LEAVE_THRESHOLD_PERCENT: u64 = 40;
+
+/// Confirm/reject threshold for `decide_joins` and `decide_leaves`, as a
+/// percent of the best contemporaneous candidate's score. The node keeps
+/// a pending JOIN only when its shard scores >= this fraction of the best
+/// pending join (else it self-withdraws → ProverReject); and it confirms
+/// a pending LEAVE only when the shard scores BELOW this fraction (else it
+/// stays). Lowered from the original 67% to 40% to match
+/// `SCORE_LEAVE_THRESHOLD_PERCENT` and stop the node from self-rejecting
+/// its own joins / over-confirming leaves on a contested fleet where the
+/// optimistic best score sits well above a healthy holding. Purely local
+/// proposer policy — NOT enforced at verification/materialization — so it
+/// only needs to be consistent fleet-wide (it is: single constant), not
+/// matched to any external validator.
+pub const SCORE_DECIDE_THRESHOLD_PERCENT: u64 = 40;
+
 /// A proposed shard allocation.
 #[derive(Debug, Clone)]
 pub struct Proposal {
@@ -98,6 +124,28 @@ pub struct ShardRingInfo {
 /// Compute ring info from total active+joining prover count.
 ///
 /// Port of Go's `computeShardRingInfo` at `node/consensus/global/worker_allocator.go:540-546`.
+/// Expected number of *other* provers that join a contended shard
+/// alongside us within the same decision window. The naive joiner ring
+/// assumes only we join (`total + 1`); but on a fleet where every prover
+/// greedily targets the same top-scoring (low-ring) shards, they all pile
+/// in at once, the shard's real ring jumps, its reward halves per ring,
+/// it falls below the 67% decide threshold, and the excess joins are
+/// rejected — the `Joining↔Rejected` churn observed in the field. Scoring
+/// the joiner ring as if this many extra provers also join de-prioritizes
+/// near-ring-boundary shards, steering each node toward shards with real
+/// headroom so picks spread instead of colliding. Tunable; `0` reproduces
+/// the original un-dampened joiner ring.
+pub const JOIN_CONTENTION_MARGIN: usize = 4;
+
+/// Joiner ring dampened by [`JOIN_CONTENTION_MARGIN`] — the ring this
+/// shard would land on if we plus `JOIN_CONTENTION_MARGIN` other provers
+/// all joined. Used only for *proposal* scoring (`build_proposal_descriptors`):
+/// the current-ring (decide/leave) path keeps the real ring. With margin
+/// `0` this equals `compute_shard_ring_info(total).joiner_ring`.
+pub fn dampened_joiner_ring(total_active_joining: usize) -> u8 {
+    ((total_active_joining + JOIN_CONTENTION_MARGIN) / 8) as u8
+}
+
 pub fn compute_shard_ring_info(total_active_joining: usize) -> ShardRingInfo {
     let mut ri = ShardRingInfo {
         current_ring: 0,
@@ -495,8 +543,9 @@ pub fn decide_joins(
         }
     };
 
-    // Threshold = best * 67 / 100
-    let threshold = &best * BigInt::from(67) / BigInt::from(100);
+    // Threshold = best * SCORE_DECIDE_THRESHOLD_PERCENT / 100
+    let threshold =
+        &best * BigInt::from(SCORE_DECIDE_THRESHOLD_PERCENT) / BigInt::from(100);
 
     let mut reject = Vec::new();
     let mut confirm = Vec::new();
@@ -574,6 +623,12 @@ pub fn plan_leaves(
     units: u64,
     strategy: Strategy,
     free_workers: usize,
+    // Filters exempt from *pure-score* leaves because their allocation
+    // was confirmed too recently (within `SCORE_LEAVE_MIN_HOLD_FRAMES`).
+    // A freshly-established, producing allocation is "fine" — don't shed
+    // it to chase a marginally-higher unallocated shard. Halt-risk swap
+    // picks below ignore this set (coverage takes priority).
+    min_hold_filters: &std::collections::HashSet<Vec<u8>>,
 ) -> Vec<Vec<u8>> {
     if allocated_shards.is_empty() || unallocated_shards.is_empty() {
         return Vec::new();
@@ -588,21 +643,20 @@ pub fn plan_leaves(
         _ => return Vec::new(),
     };
 
-    // Leave threshold = best_unalloc * 67 / 100
-    let threshold = &best_unalloc * BigInt::from(67) / BigInt::from(100);
+    // Leave threshold = best_unalloc * SCORE_LEAVE_THRESHOLD_PERCENT / 100
+    let threshold =
+        &best_unalloc * BigInt::from(SCORE_LEAVE_THRESHOLD_PERCENT) / BigInt::from(100);
 
-    // Halt-risk swap demand: count unallocated halt-risk shards we
-    // are NOT currently joining. (Our pending Joining shards are
-    // already excluded from `unallocated_shards` by the caller —
-    // `proposal_descriptors` filters out `all_ours_filters`.) The
-    // deficit between that count and our free worker slots is how
-    // many healthy allocations we will shed this cycle to make
-    // room. Once `free_workers >= halt_risk_count`, the deficit is
-    // 0 and we don't shed anything for the swap — the next
-    // `plan_and_allocate` covers them via the join-side priority
-    // bucket. Bounding by demand prevents the prior failure mode
-    // where the override fired unconditionally every cycle and the
-    // node churned through every healthy holding it had.
+    // Halt-risk swap demand: count unallocated halt-risk shards (size>0,
+    // active_count <= HALT_RISK_PROVER_COUNT) we could cover. The deficit
+    // between that and our free worker slots is how many healthy
+    // allocations we shed this cycle to free room for them. Bounded by
+    // demand so we don't churn through every holding. NOTE: this is only
+    // trustworthy when coverage data is current — the CALLER must not run
+    // leave proposals while in degraded-coverage/prover-only mode, where
+    // `halt_risk_count` is a stale-view false positive (observed
+    // 2026-06-16: a node stuck in prover-only mode proposed swaps against
+    // a phantom halt-risk shard for hours).
     let halt_risk_count = unallocated_shards.iter()
         .filter(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
         .count();
@@ -610,19 +664,11 @@ pub fn plan_leaves(
 
     let alloc_scores = score_shards(allocated_shards, &basis, world_bytes, strategy);
 
-    // Halt-risk shield: never propose a leave on a shard that's
-    // already halt-risk, nor on one where our departure would push
-    // it into halt-risk. `active_count` already includes us
-    // (we're Active on this shard); after we leave it drops by 1,
-    // so the post-leave Active count is `active_count - 1`. To
-    // keep `post_leave > HALT_RISK_PROVER_COUNT` we need
-    // `active_count > HALT_RISK_PROVER_COUNT + 1` — i.e. skip any
-    // shard at or below `HALT_RISK_PROVER_COUNT + 1`. Mirrors the
-    // join-time priority in `plan_and_allocate` and the confirm-
-    // time bypass in `decide_joins`. Joining provers are
-    // intentionally NOT counted — they haven't proven anything
-    // yet. The shield is unconditional and applies on top of every
-    // pick path below.
+    // Halt-risk shield: never propose a leave on a shard that's already
+    // halt-risk, nor on one where our departure would push it into
+    // halt-risk. `active_count` includes us, so after we leave it drops
+    // by 1; to keep `post_leave > HALT_RISK_PROVER_COUNT` we skip any
+    // shard at or below `HALT_RISK_PROVER_COUNT + 1`.
     let shielded_scores: Vec<&Scored> = alloc_scores
         .iter()
         .filter(|sc| {
@@ -631,18 +677,19 @@ pub fn plan_leaves(
         })
         .collect();
 
-    // Score-driven picks: shards below the 67% threshold of best
-    // unallocated. These always go.
+    // Score-driven picks: allocations below `threshold` of the best
+    // unallocated shard. Dwell-exempt recently-confirmed allocations so a
+    // freshly-established holding isn't churned.
     let below_threshold: Vec<(Vec<u8>, BigInt)> = shielded_scores
         .iter()
         .filter(|sc| sc.score < threshold)
+        .filter(|sc| !min_hold_filters.contains(&allocated_shards[sc.idx].filter))
         .map(|sc| (allocated_shards[sc.idx].filter.clone(), sc.score.clone()))
         .collect();
 
-    // Halt-risk swap picks: when there's a deficit of free workers
-    // relative to waiting halt-risk shards, pick additional healthy
-    // (non-halt-risk-shielded) allocations to shed. Sorted worst-
-    // first so the swap doesn't sacrifice our strongest holdings.
+    // Halt-risk swap picks: when free workers can't cover the waiting
+    // halt-risk shards, shed `halt_risk_deficit` of the worst-scoring
+    // healthy (non-shielded) allocations to make room. Sorted worst-first.
     let mut swap_candidates: Vec<(Vec<u8>, BigInt)> = shielded_scores
         .iter()
         .filter(|sc| sc.score >= threshold)
@@ -650,7 +697,7 @@ pub fn plan_leaves(
         .collect();
     swap_candidates.sort_by(|a, b| a.1.cmp(&b.1));
 
-    // Union, deduplicate, sort worst-first, cap at 3.
+    // Union below-threshold + halt-risk swap picks (deduped), worst-first.
     let mut combined: Vec<(Vec<u8>, BigInt)> = below_threshold.clone();
     let swap_picks = halt_risk_deficit.min(swap_candidates.len());
     for c in swap_candidates.into_iter().take(swap_picks) {
@@ -686,7 +733,8 @@ pub fn plan_leaves(
             picked = picks.len(),
             ?picks_summary,
             strategy = ?strategy,
-            "plan_leaves: proposing leaves (below 67% threshold + halt-risk swap, shield applied)"
+            threshold_pct = SCORE_LEAVE_THRESHOLD_PERCENT,
+            "plan_leaves: proposing leaves (below threshold_pct of best unallocated + halt-risk swap, shield applied)"
         );
     }
 
@@ -750,9 +798,10 @@ pub fn decide_leaves(
         }
     };
 
-    // Threshold = best * 67 / 100
+    // Threshold = best * SCORE_DECIDE_THRESHOLD_PERCENT / 100
     // Reject leave (stay) if score >= threshold; confirm if < threshold.
-    let threshold = &best * BigInt::from(67) / BigInt::from(100);
+    let threshold =
+        &best * BigInt::from(SCORE_DECIDE_THRESHOLD_PERCENT) / BigInt::from(100);
 
     let mut reject = Vec::new();
     let mut confirm = Vec::new();
@@ -797,6 +846,24 @@ pub const DEFAULT_UNITS: u64 = 8_000_000_000;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dampened_joiner_ring_penalizes_near_boundary_shards() {
+        // Margin 4: shards with ample headroom keep their (low) ring;
+        // shards within `margin` of the next ring boundary are bumped up
+        // a ring (lower score) so the proposer avoids piling onto them.
+        assert_eq!(JOIN_CONTENTION_MARGIN, 4, "test assumes default margin");
+        assert_eq!(dampened_joiner_ring(0), 0); // empty → full headroom
+        assert_eq!(dampened_joiner_ring(3), 0); // headroom 5 > margin → unchanged
+        assert_eq!(dampened_joiner_ring(4), 1); // headroom 4 == margin → bumped
+        assert_eq!(dampened_joiner_ring(7), 1); // near boundary → bumped
+        // At/after a real boundary it matches the naive joiner ring.
+        assert_eq!(
+            dampened_joiner_ring(8),
+            compute_shard_ring_info(8).joiner_ring
+        );
+        assert_eq!(dampened_joiner_ring(12), 2); // naive would be 1 → bumped
+    }
 
     #[test]
     fn ring_info_empty() {
@@ -998,7 +1065,7 @@ mod tests {
         let allocated = vec![
             ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16, active_count: 16 },
         ];
-        let result = plan_leaves(&allocated, &[], 50000, &BigInt::from(1_000_000), DEFAULT_UNITS, Strategy::RewardGreedy, 0);
+        let result = plan_leaves(&allocated, &[], 50000, &BigInt::from(1_000_000), DEFAULT_UNITS, Strategy::RewardGreedy, 0, &std::collections::HashSet::<Vec<u8>>::new());
         assert!(result.is_empty());
     }
 
@@ -1404,9 +1471,39 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(250_000), DEFAULT_UNITS, Strategy::RewardGreedy,
             0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0], vec![0xAA]);
+    }
+
+    #[test]
+    fn plan_leaves_dwell_exempts_recently_confirmed() {
+        // Anti-churn dwell: a below-threshold allocation listed in
+        // `min_hold_filters` (confirmed too recently) is NOT a score-leave
+        // candidate, even though the same shard would otherwise be shed.
+        let allocated = vec![make_shard(vec![0xAA], 50_000, 3, 1)]; // ring 3, low
+        let unallocated = vec![make_shard(vec![0xBB], 200_000, 0, 1)]; // ring 0, high
+
+        // No dwell → the weak allocation is shed.
+        let none = std::collections::HashSet::<Vec<u8>>::new();
+        let picked = plan_leaves(
+            &allocated, &unallocated, 50000, &BigInt::from(250_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy, 0, &none,
+        );
+        assert_eq!(picked, vec![vec![0xAA]], "below-threshold alloc leaves without dwell");
+
+        // Dwell exemption on 0xAA → held despite scoring below threshold.
+        let hold: std::collections::HashSet<Vec<u8>> =
+            [vec![0xAAu8]].into_iter().collect();
+        let picked = plan_leaves(
+            &allocated, &unallocated, 50000, &BigInt::from(250_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy, 0, &hold,
+        );
+        assert!(
+            picked.is_empty(),
+            "recently-confirmed allocation must be held (anti-churn dwell)"
+        );
     }
 
     #[test]
@@ -1416,6 +1513,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(200_000), DEFAULT_UNITS, Strategy::RewardGreedy,
             0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert!(filters.is_empty(), "should not leave a competitive shard");
     }
@@ -1433,6 +1531,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(450_000), DEFAULT_UNITS, Strategy::RewardGreedy,
             0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert_eq!(filters.len(), 3, "should cap at 3 leave proposals");
     }
@@ -1447,6 +1546,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(300_000), DEFAULT_UNITS, Strategy::RewardGreedy,
             0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert!(filters.len() >= 2, "should leave at least 2 bad shards");
         assert_eq!(filters[0], vec![0xA2], "worst shard (ring 4) should be first");
@@ -1473,6 +1573,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(600_000),
             DEFAULT_UNITS, Strategy::RewardGreedy, 0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert!(filters.is_empty(),
             "halt-risk allocated shard must not be a leave candidate; got {filters:?}");
@@ -1499,18 +1600,19 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50_000, &BigInt::from(600_000),
             DEFAULT_UNITS, Strategy::RewardGreedy, 0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert!(filters.is_empty(),
             "shard at threshold+1 must be protected — leaving would push it into halt-risk");
     }
 
-    /// Halt-risk swap: with halt-risk shards waiting in the
-    /// unallocated pool AND no free workers to cover them, the node
-    /// sheds one healthy allocation per halt-risk-deficit shard.
-    /// `free_workers=0`, `halt_risk_count=1` → deficit 1 → exactly
-    /// one leave proposed, picked from the worst-scoring healthy
-    /// alloc (ties broken by score). The shield still protects
-    /// halt-risk holdings (none here).
+    /// Halt-risk swap: with halt-risk shards waiting in the unallocated
+    /// pool AND no free workers to cover them, the node sheds one healthy
+    /// allocation per halt-risk-deficit shard. `free_workers=0`,
+    /// `halt_risk_count=1` → deficit 1 → exactly one swap pick (worst-
+    /// scoring healthy). NOTE: the caller must only run leave proposals
+    /// when coverage data is current (not in prover-only mode); this test
+    /// exercises the pure pick logic.
     #[test]
     fn plan_leaves_swap_fires_when_halt_risk_demand_exceeds_free_workers() {
         let allocated = vec![
@@ -1530,6 +1632,7 @@ mod tests {
             &allocated, &unallocated, 50_000, &BigInt::from(300_000),
             DEFAULT_UNITS, Strategy::RewardGreedy,
             0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert_eq!(filters.len(), 1,
             "deficit = halt_risk(1) - free_workers(0) = 1 → exactly one swap pick; \
@@ -1560,6 +1663,7 @@ mod tests {
             &allocated, &unallocated, 50_000, &BigInt::from(300_000),
             DEFAULT_UNITS, Strategy::RewardGreedy,
             1,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert!(filters.is_empty(),
             "free_workers(1) >= halt_risk(1) → no swap should fire, threshold \
@@ -1594,6 +1698,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50_000, &BigInt::from(600_000),
             DEFAULT_UNITS, Strategy::RewardGreedy, 0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert_eq!(filters, vec![vec![0xA2]],
             "shield must spare held halt-risk A1 even though its low score \
@@ -1621,6 +1726,7 @@ mod tests {
         let filters = plan_leaves(
             &allocated, &unallocated, 50000, &BigInt::from(600_000),
             DEFAULT_UNITS, Strategy::RewardGreedy, 0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
         );
         assert_eq!(filters, vec![vec![0xBB]],
             "non-halt-risk poor performer should still be a leave candidate");

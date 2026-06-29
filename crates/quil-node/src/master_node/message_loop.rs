@@ -4,6 +4,28 @@ use tracing::{debug, info, warn};
 
 use quil_lifecycle::Supervisor;
 
+/// No-op transaction for direct clock-store writes outside a batch. The clock
+/// store's `put_*` methods fall through to a direct DB write when the txn isn't
+/// a real clock batch (see `with_clock_batch`), so this just satisfies the
+/// `&dyn Transaction` parameter.
+struct NoTxn;
+impl quil_types::store::Transaction for NoTxn {
+    fn get(&self, _: &[u8]) -> quil_types::error::Result<Option<Vec<u8>>> { Ok(None) }
+    fn set(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
+    fn commit(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
+    fn delete(&self, _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
+    fn abort(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
+    fn new_iter(
+        &self,
+        _: &[u8],
+        _: &[u8],
+    ) -> quil_types::error::Result<Box<dyn quil_types::store::Iterator>> {
+        Err(quil_types::error::QuilError::NotFound("noop".into()))
+    }
+    fn delete_range(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
 pub(crate) struct MessageLoopArgs {
     pub clock_store: Arc<quil_store::RocksClockStore>,
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
@@ -47,6 +69,11 @@ pub(crate) struct MessageLoopArgs {
     pub p2p_handle: quil_p2p::node::P2PHandle,
     pub time_reel: Option<Arc<quil_engine::time_reel::GlobalTimeReel>>,
     pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
+    /// Archive-only: ingests full app-shard frames received on the bulk
+    /// shard subscription and materializes them into the archive's CRDT.
+    /// `None` on non-archive nodes.
+    pub archive_app_shard_ingest:
+        Option<quil_engine::archive_ingest::ArchiveAppShardIngest>,
 }
 
 pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) {
@@ -84,7 +111,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         p2p_handle: p2p_for_recv,
         time_reel: time_reel_for_recv,
         spawner,
+        archive_app_shard_ingest,
     } = args;
+    let mut archive_ingest_for_recv = archive_app_shard_ingest;
 
     // Global bitmasks for BlossomSub topic subscriptions.
     const GLOBAL_CONSENSUS: &[u8] = &[0x00];
@@ -843,6 +872,17 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             quil_engine::consensus_wire::GLOBAL_PROPOSAL_TYPE => {
                                                 match quil_engine::consensus_wire::GlobalProposal::from_canonical_bytes(&received.data) {
                                                     Ok(wire) => {
+                                                        // Persist the proposer vote so this node can
+                                                        // serve it via GetGlobalProposal for a peer's
+                                                        // catch-up sync. Keyed (filter, rank, selector).
+                                                        let vote_proto = wire.vote.to_proto();
+                                                        if let Err(e) = quil_types::store::ClockStore::put_proposal_vote(
+                                                            clock_store_recv.as_ref(),
+                                                            &NoTxn,
+                                                            &vote_proto,
+                                                        ) {
+                                                            debug!(error = %e, "persist proposal vote failed");
+                                                        }
                                                         match quil_engine::consensus_types::wire_proposal_to_signed(wire) {
                                                             Ok((sp, qc, _tc)) => {
                                                                 handle.submit_quorum_certificate(qc);
@@ -1017,7 +1057,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                     }
                                 }
                                 if !routed {
-                                    // Non-shard traffic (e.g. mesh relay) — no local handler.
+                                    // Non-shard traffic (e.g. mesh relay) — no local
+                                    // handler. On an archive (no local shard engines),
+                                    // un-routed shard-frame traffic lands here: feed it to
+                                    // the app-shard ingest, which decodes/verifies it as a
+                                    // full AppShardFrame (non-frame messages fail decode and
+                                    // are ignored) and materializes the shard's state.
+                                    if let Some(ingest) = archive_ingest_for_recv.as_mut() {
+                                        ingest.ingest(&received.data);
+                                    }
                                 }
                             }
                             }

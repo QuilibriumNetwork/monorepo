@@ -40,6 +40,33 @@ pub(crate) async fn start(
     let shards_store = storage.shards_store.clone();
     let hg_store = storage.hg_store.clone();
 
+    // Fresh-config peer key: on first run `config.p2p.peer_priv_key` is
+    // empty. Generate + persist the Ed448 identity HERE, before anything
+    // reads it — `keys::init` derives `prover_address` from this key, and
+    // `P2PNode::new` would otherwise generate its own copy that the
+    // already-built `FileKeyManager` never sees. That gap was the
+    // "q-peer-key not found" failure on the first run that vanished on
+    // the second (once the key had been persisted to the config file).
+    // Shadow `config` with the filled-in version so the entire startup —
+    // keys, networking, prover address, downstream peer-key reads — is
+    // consistent on the very first run.
+    let owned_config;
+    let config: &quil_config::Config = if config.p2p.peer_priv_key.is_empty() {
+        let key_hex = quil_p2p::ed448_identity::Ed448Identity::generate()
+            .map_err(|e| anyhow::anyhow!("failed to generate Ed448 peer key: {}", e))?
+            .to_config_hex();
+        let mut c = config.clone();
+        c.p2p.peer_priv_key = key_hex;
+        match quil_config::save_config(config_dir, &c) {
+            Ok(()) => info!("generated and persisted new Ed448 peer key (stable identity)"),
+            Err(e) => warn!(error = %e, "failed to persist generated peer key to config (continuing with in-memory key)"),
+        }
+        owned_config = c;
+        &owned_config
+    } else {
+        config
+    };
+
     let keys = keys::init(config, config_dir)?;
     let file_key_manager = keys.file_key_manager.clone();
     let bls_pubkey = keys.bls_pubkey.clone();
@@ -589,6 +616,23 @@ pub(crate) async fn start(
         quil_rpc::global_service::GLOBAL_MESSAGE_BROADCAST_CAPACITY,
     )
     .0;
+    // Archive-only: ingest full app-shard frames into the archive's CRDT
+    // so it holds (and can serve via HyperSync) every shard's state.
+    let archive_app_shard_ingest = if archive_mode {
+        Some(quil_engine::archive_ingest::ArchiveAppShardIngest::new(
+            prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+            Arc::new(quil_crypto::Bls48581KeyConstructor)
+                as Arc<dyn quil_types::crypto::BlsConstructor>,
+            frame_prover.clone(),
+            exec_manager.clone(),
+            inclusion_prover.clone(),
+            crdt.clone(),
+            Some(db_arc.clone() as Arc<dyn quil_types::store::KvDb>),
+        ))
+    } else {
+        None
+    };
+
     message_loop::spawn(&mut sup, message_loop::MessageLoopArgs {
         clock_store: clock_store.clone(),
         exec_manager: exec_manager.clone(),
@@ -627,6 +671,7 @@ pub(crate) async fn start(
             None
         },
         spawner: detached_spawner.clone(),
+        archive_app_shard_ingest,
     });
 
     // ---------------------------------------------------------------
@@ -667,6 +712,14 @@ pub(crate) async fn start(
     // ---------------------------------------------------------------
     let reason = sup.run().await;
     info!("master node shutting down");
+
+    // Release retained RocksDB snapshots before teardown so they don't
+    // pin superseded versions past the DB's life. Drop would eventually
+    // do this, but an explicit close also stops new generations from
+    // being published during shutdown. Any in-flight sync session
+    // holding a generation handle keeps its own snapshot alive until it
+    // finishes (the Arc clone), then releases.
+    crdt.close_snapshots();
 
     Ok(reason)
 }

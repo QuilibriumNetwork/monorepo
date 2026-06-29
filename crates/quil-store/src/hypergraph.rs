@@ -27,12 +27,17 @@ impl RocksHypergraphStore {
     /// handle reflects the store's state at the moment of capture and
     /// is immune to subsequent writes through this store.
     pub fn capture_snapshot(&self) -> Result<Arc<RocksHypergraphSnapshot>> {
-        Ok(Arc::new(RocksHypergraphSnapshot::capture(&self.db)?))
+        Ok(Arc::new(RocksHypergraphSnapshot::capture(self.db.clone())?))
     }
 
     /// Save a fully-serialized vector commitment tree as a single blob,
     /// keyed by `(set_type, phase_type, shard_key)`. The bytes should be
     /// the output of `quil_tries::serialize_tree`.
+    ///
+    /// Test-only: production persists tree blobs transactionally via
+    /// [`save_tree_blob_txn`]. Kept for unit tests that don't need a
+    /// transaction around the write.
+    #[cfg(test)]
     pub fn save_tree_blob(
         &self,
         set_type: &str,
@@ -44,6 +49,28 @@ impl RocksHypergraphStore {
         self.db
             .put(&key, bytes)
             .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
+    /// Transaction-aware tree-blob write: stages the put into `txn`'s
+    /// batch so the blob becomes durable atomically with the rest of the
+    /// transaction.
+    ///
+    /// Like every other `RocksHypergraphStore` writer, this stages into the
+    /// txn's batch and errors (rather than writing directly) if `txn` isn't a
+    /// `RocksTxn` — see [`RocksTxn::from_dyn`]. A silent fallback would
+    /// persist the blob outside the caller's transaction, defeating the
+    /// atomicity this method exists to provide.
+    pub fn save_tree_blob_txn(
+        &self,
+        txn: &dyn Transaction,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
+        RocksTxn::from_dyn(txn)?.batch.lock().unwrap().put(&key, bytes);
+        Ok(())
     }
 
     /// Load a previously stored tree blob, or `Ok(None)` if no blob exists
@@ -60,8 +87,17 @@ impl RocksHypergraphStore {
             .map_err(|e| QuilError::Store(e.to_string()))
     }
 
-    /// Persist one vertex's `underlying_data` sub-tree blob. See
-    /// `quil_tries::deserialize_go_tree` for parsing the wire format.
+    /// Persist one vertex's `underlying_data` sub-tree blob directly,
+    /// outside any transaction. See `quil_tries::deserialize_go_tree` for
+    /// parsing the wire format.
+    ///
+    /// Test-only: production persists vertex content transactionally via
+    /// [`save_vertex_underlying_txn`] (or the `HypergraphStore` trait
+    /// method, which delegates to it). Kept as a direct-write fixture for
+    /// tests that seed the per-vertex keyspace without a transaction. Gated
+    /// behind the `test-utils` feature so it can't be reached from
+    /// production code; consuming crates enable it via `[dev-dependencies]`.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn save_vertex_underlying(
         &self,
         set_type: &str,
@@ -74,6 +110,25 @@ impl RocksHypergraphStore {
         self.db
             .put(&key, bytes)
             .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
+    /// Transaction-aware variant of [`save_vertex_underlying`]: stages the
+    /// write into `txn`'s batch so vertex content becomes durable
+    /// atomically with the tree nodes and shard commit of the surrounding
+    /// transaction. Errors for an unrecognized txn type rather than writing
+    /// outside the transaction (see [`RocksTxn::from_dyn`]).
+    pub fn save_vertex_underlying_txn(
+        &self,
+        txn: &dyn Transaction,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        vertex_key: &[u8],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
+        RocksTxn::from_dyn(txn)?.batch.lock().unwrap().put(&key, bytes);
+        Ok(())
     }
 
     /// Load one vertex's `underlying_data`, or `Ok(None)` if absent.
@@ -134,54 +189,46 @@ impl RocksHypergraphStore {
 use std::collections::HashMap;
 use quil_types::store::{ChangeRecord, HypergraphStore, SnapshotReadable, Transaction};
 
-use crate::encoding::HG_TREE_BLOB_PREFIX;
-
-/// Frozen-bytes snapshot of all hypergraph tree blobs at capture time.
+/// A real RocksDB point-in-time snapshot bound to a published root.
 ///
-/// Lifetime / ownership choice: rocksdb 0.22's `Snapshot<'a>` borrows
-/// the `DB`, and binding it to an `Arc<DB>` would require either a
-/// self-referential struct or unsafe lifetime erasure. Rather than
-/// reach for those, we copy every `(set, phase, shard) → tree_blob`
-/// entry from the live store into a `HashMap` at publish time. This
-/// mirrors the semantic Go gets from Pebble's MVCC snapshot — reads
-/// against the snapshot reflect the publish-time state, immune to
-/// later writes — at the cost of holding O(num_shards * num_phases)
-/// blobs in memory per retained generation. With
-/// `MAX_GENERATIONS = 10` and the typical handful of active shards
-/// per node, this stays small. Per-vertex underlying-data blobs are
-/// NOT captured because the sync server doesn't read them; the trait
-/// only exposes `load_tree_blob`.
+/// Reads (`load_tree_blob`) are served at the DB sequence number captured
+/// at `capture` time — immune to later writes through the live store,
+/// matching Go's `tries.TreeBackingStore.NewDBSnapshot`. Capture is cheap
+/// (pins the current sequence; no data copy), but holding the snapshot
+/// pins every key version superseded after it until this struct is
+/// dropped, which releases the snapshot. Release is therefore driven by
+/// the snapshot manager dropping the generation handle (FIFO eviction or
+/// `close()`), gated by any in-flight sync session still holding an `Arc`.
+///
+/// Lifetime: rocksdb 0.22's `SnapshotWithThreadMode<'a, DB>` borrows the
+/// `DB`. To store it past a single scope we keep the `Arc<DB>` in the same
+/// struct and erase the borrow to `'static` (one contained `unsafe` in
+/// `capture`), relying on field drop order — `snapshot` before `_db` — so
+/// the snapshot is always released before its `DB` can go away.
 pub struct RocksHypergraphSnapshot {
-    /// Key: full `hypergraph_tree_blob_key` bytes. Value: tree blob.
-    blobs: HashMap<Vec<u8>, Vec<u8>>,
+    /// Point-in-time snapshot. MUST be declared before `_db`: struct
+    /// fields drop in declaration order, so this drops first (releasing
+    /// the rocksdb snapshot) while the backing `DB` is still alive.
+    snapshot: rocksdb::SnapshotWithThreadMode<'static, rocksdb::DB>,
+    /// Keeps the `DB` alive for as long as `snapshot` borrows it.
+    _db: Arc<rocksdb::DB>,
 }
 
 impl RocksHypergraphSnapshot {
-    /// Walk the live DB and copy every tree-blob entry into memory.
-    /// Iterates only the `HG_TREE_BLOB_PREFIX` range, so cost is
-    /// proportional to the number of (set, phase, shard) tuples — not
-    /// the entire DB.
-    pub fn capture(db: &rocksdb::DB) -> Result<Self> {
-        let prefix = [HG_TREE_BLOB_PREFIX];
-        let iter = db.iterator(rocksdb::IteratorMode::From(
-            &prefix,
-            rocksdb::Direction::Forward,
-        ));
-        let mut blobs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-        for entry in iter {
-            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
-            if !k.starts_with(&prefix) {
-                break;
-            }
-            blobs.insert(k.into_vec(), v.into_vec());
-        }
-        Ok(Self { blobs })
-    }
-
-    /// Number of tree blobs frozen in this snapshot. Test hook.
-    #[doc(hidden)]
-    pub fn blob_count(&self) -> usize {
-        self.blobs.len()
+    /// Capture a RocksDB point-in-time snapshot. Cheap — pins the current
+    /// sequence number; copies no data.
+    pub fn capture(db: Arc<rocksdb::DB>) -> Result<Self> {
+        let snap = db.snapshot();
+        // SAFETY: `snap` borrows `*db`. We move the owning `Arc<DB>` into
+        // `_db` in this same struct, so `*db` outlives the snapshot, and
+        // field declaration order (`snapshot` then `_db`) guarantees the
+        // snapshot is dropped — releasing the rocksdb snapshot — before
+        // `_db` is dropped (which may close the DB). Erasing the borrow to
+        // `'static` only launders the lifetime; layout is unchanged
+        // (a `&DB` plus a raw snapshot pointer), so the transmute is sound.
+        let snapshot: rocksdb::SnapshotWithThreadMode<'static, rocksdb::DB> =
+            unsafe { std::mem::transmute(snap) };
+        Ok(Self { snapshot, _db: db })
     }
 }
 
@@ -193,7 +240,10 @@ impl SnapshotReadable for RocksHypergraphSnapshot {
         shard_key: &quil_types::store::ShardKey,
     ) -> Result<Option<Vec<u8>>> {
         let key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
-        Ok(self.blobs.get(&key).cloned())
+        // Reads at the captured sequence — point-in-time consistent.
+        self.snapshot
+            .get(&key)
+            .map_err(|e| QuilError::Store(e.to_string()))
     }
 }
 
@@ -251,20 +301,32 @@ impl Transaction for RocksTxn {
     }
 }
 
-/// If `txn` is a `RocksTxn`, stage `op` into its write batch and
-/// return `true`; else return `false` so the caller can fall back
-/// to direct DB writes.
-#[inline]
-fn with_rocks_batch<F>(txn: &dyn Transaction, op: F) -> bool
-where
-    F: FnOnce(&mut rocksdb::WriteBatch),
-{
-    if let Some(rt) = txn.as_any().downcast_ref::<RocksTxn>() {
-        let mut guard = rt.batch.lock().unwrap();
-        op(&mut *guard);
-        true
-    } else {
-        false
+impl RocksTxn {
+    /// Recover the concrete `RocksTxn` from the `&dyn Transaction` that the
+    /// [`HypergraphStore`] trait hands every writer. The trait must stay
+    /// `dyn`-typed (it has several store implementors and is used as
+    /// `Arc<dyn HypergraphStore>`), but every txn reaching a
+    /// `RocksHypergraphStore` write is obtained from [`new_transaction`],
+    /// which always yields a `RocksTxn` — so this downcast always succeeds
+    /// in practice.
+    ///
+    /// It deliberately errors (rather than letting the caller fall back to a
+    /// direct `db.put`/`db.delete`) for an unrecognized txn: a silent direct
+    /// write would persist outside the caller's transaction, breaking the
+    /// atomicity these writers exist to provide (and masking bugs like a
+    /// no-op txn leaking writes to disk — the defect that made
+    /// `compute_shard_root` non-read-only). An unrecognized txn is a
+    /// programming error and is surfaced loudly.
+    ///
+    /// [`HypergraphStore`]: quil_types::store::HypergraphStore
+    /// [`new_transaction`]: quil_types::store::HypergraphStore::new_transaction
+    fn from_dyn(txn: &dyn Transaction) -> Result<&RocksTxn> {
+        txn.as_any().downcast_ref::<RocksTxn>().ok_or_else(|| {
+            QuilError::Internal(
+                "hypergraph store write requires a RocksTxn; refusing to write outside the transaction"
+                    .into(),
+            )
+        })
     }
 }
 
@@ -355,13 +417,8 @@ impl HypergraphStore for RocksHypergraphStore {
         // Root sentinel keeps its legacy blob route for backward compat.
         if key == [0xFFu8; 32] {
             let db_key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
-            if with_rocks_batch(txn, |b| b.put(&db_key, data)) {
-                return Ok(());
-            }
-            return self
-                .db
-                .put(&db_key, data)
-                .map_err(|e| QuilError::Store(e.to_string()));
+            RocksTxn::from_dyn(txn)?.batch.lock().unwrap().put(&db_key, data);
+            return Ok(());
         }
         // Per-node: write the by-key entry and the by-path pointer
         // atomically. Pointer value is the by-key key — the lazy
@@ -369,29 +426,16 @@ impl HypergraphStore for RocksHypergraphStore {
         // entry. This is exactly Go's dual-index scheme.
         let by_key = hypergraph_tree_node_by_key(set_type, phase_type, shard_key, key);
         let by_path = hypergraph_tree_node_by_path(set_type, phase_type, shard_key, path);
-        let by_key_for_pointer = by_key.clone();
-        if with_rocks_batch(txn, |b| {
-            b.put(&by_key, data);
-            b.put(&by_path, &by_key_for_pointer);
-        }) {
-            return Ok(());
-        }
-        self.db
-            .put(&by_key, data)
-            .map_err(|e| QuilError::Store(e.to_string()))?;
-        self.db
-            .put(&by_path, &by_key_for_pointer)
-            .map_err(|e| QuilError::Store(e.to_string()))
+        let mut batch = RocksTxn::from_dyn(txn)?.batch.lock().unwrap();
+        batch.put(&by_key, data);
+        batch.put(&by_path, &by_key);
+        Ok(())
     }
 
     fn save_root(&self, txn: &dyn Transaction, set_type: &str, phase_type: &str, shard_key: &ShardKey, data: &[u8]) -> Result<()> {
         let db_key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
-        if with_rocks_batch(txn, |b| b.put(&db_key, data)) {
-            return Ok(());
-        }
-        self.db
-            .put(&db_key, data)
-            .map_err(|e| QuilError::Store(e.to_string()))
+        RocksTxn::from_dyn(txn)?.batch.lock().unwrap().put(&db_key, data);
+        Ok(())
     }
 
     fn delete_node(
@@ -405,28 +449,15 @@ impl HypergraphStore for RocksHypergraphStore {
     ) -> Result<()> {
         if key == [0xFFu8; 32] {
             let db_key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
-            if with_rocks_batch(txn, |b| b.delete(&db_key)) {
-                return Ok(());
-            }
-            return self
-                .db
-                .delete(&db_key)
-                .map_err(|e| QuilError::Store(e.to_string()));
+            RocksTxn::from_dyn(txn)?.batch.lock().unwrap().delete(&db_key);
+            return Ok(());
         }
         let by_key = hypergraph_tree_node_by_key(set_type, phase_type, shard_key, key);
         let by_path = hypergraph_tree_node_by_path(set_type, phase_type, shard_key, path);
-        if with_rocks_batch(txn, |b| {
-            b.delete(&by_key);
-            b.delete(&by_path);
-        }) {
-            return Ok(());
-        }
-        self.db
-            .delete(&by_key)
-            .map_err(|e| QuilError::Store(e.to_string()))?;
-        self.db
-            .delete(&by_path)
-            .map_err(|e| QuilError::Store(e.to_string()))
+        let mut batch = RocksTxn::from_dyn(txn)?.batch.lock().unwrap();
+        batch.delete(&by_key);
+        batch.delete(&by_path);
+        Ok(())
     }
 
     fn set_covered_prefix(&self, prefix: &[i32]) -> Result<()> {
@@ -443,10 +474,8 @@ impl HypergraphStore for RocksHypergraphStore {
 
     fn set_shard_commit(&self, txn: &dyn Transaction, frame_number: u64, phase_type: &str, set_type: &str, shard_address: &[u8], commitment: &[u8]) -> Result<()> {
         let key = hypergraph_shard_commit_key(frame_number, phase_type, set_type, shard_address);
-        if with_rocks_batch(txn, |b| b.put(&key, commitment)) {
-            return Ok(());
-        }
-        self.db.put(&key, commitment).map_err(|e| QuilError::Store(e.to_string()))
+        RocksTxn::from_dyn(txn)?.batch.lock().unwrap().put(&key, commitment);
+        Ok(())
     }
 
     fn get_shard_commit(&self, frame_number: u64, phase_type: &str, set_type: &str, shard_address: &[u8]) -> Result<Vec<u8>> {
@@ -509,14 +538,15 @@ impl HypergraphStore for RocksHypergraphStore {
 
     fn save_vertex_underlying(
         &self,
+        txn: &dyn Transaction,
         set_type: &str,
         phase_type: &str,
         shard_key: &ShardKey,
         vertex_key: &[u8],
         data: &[u8],
     ) -> Result<()> {
-        RocksHypergraphStore::save_vertex_underlying(
-            self, set_type, phase_type, shard_key, vertex_key, data,
+        RocksHypergraphStore::save_vertex_underlying_txn(
+            self, txn, set_type, phase_type, shard_key, vertex_key, data,
         )
     }
 
@@ -636,26 +666,13 @@ impl HypergraphStore for RocksHypergraphStore {
             _ => true,
         };
 
-        if with_rocks_batch(txn, |b| {
-            b.put(&commit_key, &value);
-            if should_update_latest {
-                b.put(&latest_key, frame_number.to_be_bytes());
-            }
-            b.put(&index_key, &[] as &[u8]);
-        }) {
-            return Ok(());
-        }
-
-        // Fallback path — no RocksTxn; use a local atomic batch.
-        let mut batch = rocksdb::WriteBatch::default();
+        let mut batch = RocksTxn::from_dyn(txn)?.batch.lock().unwrap();
         batch.put(&commit_key, &value);
         if should_update_latest {
             batch.put(&latest_key, frame_number.to_be_bytes());
         }
         batch.put(&index_key, &[] as &[u8]);
-        self.db
-            .write(batch)
-            .map_err(|e| QuilError::Store(e.to_string()))
+        Ok(())
     }
 
     fn get_latest_alt_shard_commit(
@@ -795,10 +812,8 @@ impl HypergraphStore for RocksHypergraphStore {
             "track_change: unknown set/phase pair ({}, {})", set_type, phase_type,
         )))?;
         let value: &[u8] = old_value.unwrap_or(&[]);
-        if with_rocks_batch(txn, |b| b.put(&change_key, value)) {
-            return Ok(());
-        }
-        self.db.put(&change_key, value).map_err(|e| QuilError::Store(e.to_string()))
+        RocksTxn::from_dyn(txn)?.batch.lock().unwrap().put(&change_key, value);
+        Ok(())
     }
     fn get_changes(
         &self,
@@ -876,14 +891,12 @@ impl HypergraphStore for RocksHypergraphStore {
         .ok_or_else(|| QuilError::InvalidArgument(format!(
             "untrack_change: unknown set/phase pair ({}, {})", set_type, phase_type,
         )))?;
-        if with_rocks_batch(txn, |b| b.delete(&change_key)) {
-            return Ok(());
-        }
-        self.db.delete(&change_key).map_err(|e| QuilError::Store(e.to_string()))
+        RocksTxn::from_dyn(txn)?.batch.lock().unwrap().delete(&change_key);
+        Ok(())
     }
 
     fn capture_tree_snapshot(&self) -> Result<Option<Arc<dyn SnapshotReadable>>> {
-        let snap = RocksHypergraphSnapshot::capture(&self.db)?;
+        let snap = RocksHypergraphSnapshot::capture(self.db.clone())?;
         Ok(Some(Arc::new(snap) as Arc<dyn SnapshotReadable>))
     }
 }
@@ -1046,8 +1059,5 @@ mod tests {
             Some(&b"v-adds-POST"[..])
         );
 
-        // Sanity: the snapshot covers exactly the pre-capture blobs
-        // (2 entries: v-adds-pre and v-removes-pre).
-        assert_eq!(snap.blob_count(), 2);
     }
 }

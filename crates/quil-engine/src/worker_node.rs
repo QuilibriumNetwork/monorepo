@@ -281,6 +281,11 @@ impl WorkerOnlyNode {
         let server_handle = tokio::spawn(async move {
             info!("DataIPC gRPC server starting on {}", listen_addr);
             if let Err(e) = Server::builder()
+                // Reap dead master connections (h2 PING) so a master that
+                // dies without FIN doesn't leave the stream fd behind.
+                .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+                .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+                .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
                 .add_service(
                     quil_types::proto::node::data_ipc_service_server::DataIpcServiceServer::new(
                         ipc_service,
@@ -320,6 +325,23 @@ impl WorkerOnlyNode {
             if let Some(mut rx) = rx_opt {
                 let pump_cancel = self.cancel.clone();
                 let halt_flag = self.local_halted.clone();
+                // Captured so the pump can trigger a shard catch-up sync
+                // on `AncestorSyncRequested` (step 4).
+                let sync_for_pump = self.prover_tree_syncer.clone();
+                let clock_for_pump = self.clock_store.clone();
+                // The worker (for its engine_handle), so a completed sync
+                // can notify the engine to fast-forward its materialized
+                // cursor. Cloned Arc — the engine handle is read at sync
+                // completion (it may rotate across Respawn).
+                let worker_for_pump = self.clone();
+                // In-flight shard syncs keyed by filter. Gap detection
+                // re-fires `AncestorSyncRequested` on every subsequent
+                // frame until the cursor catches up, so without this the
+                // pump would spawn an unbounded pile of concurrent syncs
+                // against the archive. Shared with each spawned sync task
+                // so it clears its own slot on completion.
+                let syncing_filters: Arc<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>> =
+                    Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
                 // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
                 tokio::spawn(async move {
                     loop {
@@ -348,6 +370,14 @@ impl WorkerOnlyNode {
                                         // (massive amplification for no benefit).
                                         publish(crate::bitmasks::shard_frame_bitmask(&filter), frame_data).await;
                                     }
+                                    FullFrameProduced { filter, frame_data, .. } => {
+                                        if halted {
+                                            continue;
+                                        }
+                                        // Full AppShardFrame (header+requests) for
+                                        // state distribution to followers/archives.
+                                        publish(crate::bitmasks::shard_frame_bitmask(&filter), frame_data).await;
+                                    }
                                     VoteProduced { filter, vote_data, .. } => {
                                         if halted {
                                             tracing::debug!(filter = %hex::encode(&filter),
@@ -367,10 +397,66 @@ impl WorkerOnlyNode {
                                         }
                                         publish(crate::bitmasks::shard_consensus_bitmask(&filter), timeout_data).await;
                                     }
+                                    // Shard catch-up: a frame gap was detected
+                                    // (step 4). Pull the shard's vertex-adds
+                                    // subtree from the archive, pinning to the
+                                    // vertex-adds root of the latest finalized
+                                    // header we hold.
+                                    AncestorSyncRequested { filter, .. } => {
+                                        if let Some(syncer) = sync_for_pump.clone() {
+                                            // Dedup: skip if a sync for this
+                                            // filter is already running.
+                                            {
+                                                let mut g = syncing_filters.lock().unwrap();
+                                                if !g.insert(filter.clone()) {
+                                                    continue;
+                                                }
+                                            }
+                                            // Pin to the latest finalized header's
+                                            // vertex-adds root (`state_roots[0]`).
+                                            // That root is the PRE-materialization
+                                            // state of frame L = POST-materialization
+                                            // of L-1, so a converged sync brings the
+                                            // tree to frame L-1. We report
+                                            // `synced_to_frame = L-1` to the engine.
+                                            let latest = clock_for_pump
+                                                .get_latest_shard_clock_frame(&filter)
+                                                .ok()
+                                                .and_then(|f| f.header)
+                                                .map(|h| (h.frame_number, h.state_roots.into_iter().next().unwrap_or_default()));
+                                            let (pinned_frame, expected_root) = match latest {
+                                                Some((n, r)) => (n, r),
+                                                None => {
+                                                    syncing_filters.lock().unwrap().remove(&filter);
+                                                    continue;
+                                                }
+                                            };
+                                            let synced_to_frame = pinned_frame.saturating_sub(1);
+                                            let syncing = syncing_filters.clone();
+                                            let worker = worker_for_pump.clone();
+                                            tokio::spawn(async move {
+                                                match syncer.sync_shard_tree(&filter, &expected_root).await {
+                                                    Ok(true) => {
+                                                        tracing::info!(synced_to_frame, "shard catch-up sync converged");
+                                                        // Tell the engine to fast-forward
+                                                        // its materialized cursor + drop
+                                                        // stale buffers.
+                                                        if let Some(h) = worker.engine_handle.lock().unwrap().clone() {
+                                                            if h.filter == filter {
+                                                                h.send(AppEngineMessage::ShardSyncCompleted { synced_to_frame });
+                                                            }
+                                                        }
+                                                    }
+                                                    Ok(false) => tracing::warn!("shard catch-up sync did not converge"),
+                                                    Err(e) => tracing::warn!(error = %e, "shard catch-up sync failed"),
+                                                }
+                                                syncing.lock().unwrap().remove(&filter);
+                                            });
+                                        }
+                                    }
                                     // Internal signals — no network publish.
                                     EquivocationDetected { .. }
                                     | Halted { .. }
-                                    | AncestorSyncRequested { .. }
                                     | ParentSealed { .. }
                                     | ShardFrameFinalized { .. } => {
                                         // Proxy mode: master handles

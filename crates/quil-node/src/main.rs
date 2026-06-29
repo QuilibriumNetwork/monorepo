@@ -145,6 +145,14 @@ async fn main() -> anyhow::Result<ExitCode> {
         args.log_filter.as_deref(),
     );
 
+    // Raise RLIMIT_NOFILE soft → hard. The Go runtime did this
+    // automatically (Go ≥1.19), so the Go node never saw EMFILE; Rust
+    // does not, leaving the default soft limit (often 1024) in place.
+    // RocksDB alone is configured for up to 1000 open files, before
+    // counting p2p connections and gRPC — exhaustion kills the node
+    // mid-dial with "too many open files".
+    raise_fd_limit();
+
     // Initialize crypto subsystem
     quil_crypto::init();
 
@@ -306,11 +314,15 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
     };
 
-    match reason {
-        // POSIX convention: SIGINT-driven exit is 128 + SIGINT(2) = 130.
+    let result = match reason {
+        // POSIX convention: signal-driven exit is 128 + signal number.
         ShutdownReason::CtrlC => {
             info!("shut down via ctrl-c");
             Ok(ExitCode::from(130))
+        }
+        ShutdownReason::Terminated => {
+            info!("shut down via SIGTERM");
+            Ok(ExitCode::from(143))
         }
         ShutdownReason::TaskExited(name) => {
             error!(task = %name, "supervised task exited unexpectedly");
@@ -326,6 +338,70 @@ async fn main() -> anyhow::Result<ExitCode> {
             error!(task = %name, error = %e, "supervised task join failed");
             Err(anyhow::Error::from(e)
                 .context(format!("supervised task {name:?} join failed")))
+        }
+    };
+
+    // Drop the file appender guards, blocking until their writer threads
+    // drain. Without this the error! lines above — the only record of WHY
+    // the node died — race process exit and routinely lose.
+    logging::shutdown_logging();
+
+    result
+}
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit. No-op on
+/// non-unix. Failure is non-fatal — the node may still run fine under
+/// a low limit on small networks — but a low effective limit gets a
+/// loud warning so EMFILE deaths aren't a mystery.
+fn raise_fd_limit() {
+    #[cfg(unix)]
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let original_soft = lim.rlim_cur;
+        let target = lim.rlim_max;
+        // macOS reports RLIM_INFINITY as the hard limit but rejects
+        // anything above `kern.maxfilesperproc`; OPEN_MAX (10240) is
+        // accepted everywhere. The walk-down below covers hosts where
+        // even that is too high.
+        #[cfg(target_os = "macos")]
+        let target = target.min(10_240);
+        let mut target = target;
+        while target > lim.rlim_cur {
+            let new = libc::rlimit {
+                rlim_cur: target,
+                rlim_max: lim.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &new) == 0 {
+                lim.rlim_cur = target;
+                break;
+            }
+            target /= 2;
+        }
+        if lim.rlim_cur > original_soft {
+            info!(
+                soft = lim.rlim_cur,
+                previous = original_soft,
+                "raised RLIMIT_NOFILE soft limit to hard limit"
+            );
+        }
+        // RocksDB is configured for up to 1000 open files and the p2p
+        // swarm allows 512 connections — anything under ~4096 is asking
+        // for an EMFILE death under load.
+        if lim.rlim_cur < 4096 {
+            warn!(
+                soft = lim.rlim_cur,
+                hard = lim.rlim_max,
+                "open-file limit is low; raise the hard limit \
+                 (systemd: LimitNOFILE=, docker: --ulimit nofile=, \
+                 shell: ulimit -n) or the node may die with \
+                 'too many open files'"
+            );
         }
     }
 }

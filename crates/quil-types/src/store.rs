@@ -538,8 +538,15 @@ pub trait HypergraphStore: Send + Sync {
     /// `data` is the Go-serialized sub-tree blob. The per-vertex
     /// keyspace is the canonical record of vertex content; the lazy
     /// commitment tree blob is metadata-only.
+    ///
+    /// The write joins `txn` (staged into its batch) so that vertex
+    /// content becomes durable atomically with the tree nodes and shard
+    /// commit of the surrounding transaction — matching Go's
+    /// `SaveVertexTree`, which threads the transaction through to
+    /// `txn.Set`. 
     fn save_vertex_underlying(
         &self,
+        txn: &dyn Transaction,
         set_type: &str,
         phase_type: &str,
         shard_key: &ShardKey,

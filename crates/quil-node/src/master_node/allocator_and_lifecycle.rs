@@ -205,6 +205,10 @@ pub(crate) fn init(
     if network != 0 {
         const TESTNET_CONFIRM_WINDOW_FRAMES: u64 = 10;
         lifecycle_inner.set_confirm_window_frames(TESTNET_CONFIRM_WINDOW_FRAMES);
+        // Keep the worker reestablish cutoff in lockstep: a recovered
+        // Leaving allocation is reestablished only while within the
+        // confirm window, then handed to the lifecycle to confirm.
+        worker_allocator.set_confirm_window_frames(TESTNET_CONFIRM_WINDOW_FRAMES);
         // The lifecycle setting controls *when the local node submits*
         // a Confirm. The materializer's `validate_confirm_timing`
         // independently enforces that the recipient ledger has waited
