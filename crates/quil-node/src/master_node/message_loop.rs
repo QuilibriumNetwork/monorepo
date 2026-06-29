@@ -315,6 +315,22 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         app_engine_pending_certified_parents = sizes.app_engine_pending_certified_parents,
                         "memory snapshot"
                     );
+                    // jemalloc allocator stats — PROCESS-GLOBAL, so this single
+                    // line captures the master, every worker thread, AND the
+                    // C++ RocksDB allocations. The decisive OOM signal:
+                    //   allocated rising            → true live-heap leak
+                    //   allocated flat, resident hi → fragmentation, not a leak
+                    // Compare `allocated_mb` across ticks to tell them apart.
+                    if let Some(j) = crate::mem_stats::jemalloc_stats() {
+                        info!(
+                            allocated_mb = %crate::mem_stats::fmt_mb(j.allocated),
+                            active_mb = %crate::mem_stats::fmt_mb(j.active),
+                            resident_mb = %crate::mem_stats::fmt_mb(j.resident),
+                            retained_mb = %crate::mem_stats::fmt_mb(j.retained),
+                            mapped_mb = %crate::mem_stats::fmt_mb(j.mapped),
+                            "jemalloc stats"
+                        );
+                    }
                 }
                 msg = async {
                     // Merge the network receive channel and the

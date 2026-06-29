@@ -13,7 +13,7 @@ pub mod migration;
 pub mod disk_monitor;
 pub mod testing;
 
-pub use rocksdb_store::{RocksDb, RocksTransaction, RocksIterator, StoreFormat, detect_store_format};
+pub use rocksdb_store::{RocksDb, RocksDbMemory, RocksTransaction, RocksIterator, StoreFormat, detect_store_format};
 pub use clock::RocksClockStore;
 pub use token::RocksTokenStore;
 pub use key::RocksKeyStore;

@@ -17,6 +17,14 @@ pub trait KvDb: Send + Sync {
     fn compact_all(&self) -> Result<()>;
     fn close(&self) -> Result<()>;
     fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()>;
+    /// Approximate bytes of process memory this DB instance holds (block
+    /// cache + memtables + table-reader index/filter blocks). Used by memory
+    /// diagnostics to attribute RSS to RocksDB — especially worker DBs, which
+    /// run in separate threads invisible to the master's structural snapshot.
+    /// Default `0` for non-RocksDB (in-memory / test) impls.
+    fn approximate_memory_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// Batch/transaction abstraction over the KV store.

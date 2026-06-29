@@ -79,6 +79,23 @@ pub struct RocksDb {
     db: Arc<rocksdb::DB>,
 }
 
+/// Per-instance RocksDB memory accounting (bytes). See [`RocksDb::memory_usage`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RocksDbMemory {
+    pub block_cache: u64,
+    pub block_cache_pinned: u64,
+    pub memtables: u64,
+    pub table_readers: u64,
+}
+
+impl RocksDbMemory {
+    /// Total bytes this instance accounts for.
+    pub fn total(&self) -> u64 {
+        // block_cache_pinned is a subset of block_cache — don't double count.
+        self.block_cache + self.memtables + self.table_readers
+    }
+}
+
 impl RocksDb {
     /// Open a RocksDB database at the given path.
     /// Runs pending migrations automatically.
@@ -165,6 +182,22 @@ impl RocksDb {
         self.db.clone()
     }
 
+    /// RocksDB's own memory accounting for this instance, in bytes. Each
+    /// open DB holds a block cache (256 MB default) + live memtables +
+    /// table-reader (index/filter) memory. A node runs one of these per
+    /// store (master) plus one per worker, so summing these across all
+    /// instances attributes the RocksDB share of process RSS — the key
+    /// number when diagnosing OOM on a node running many workers.
+    pub fn memory_usage(&self) -> RocksDbMemory {
+        let prop = |name: &str| self.db.property_int_value(name).ok().flatten().unwrap_or(0);
+        RocksDbMemory {
+            block_cache: prop("rocksdb.block-cache-usage"),
+            block_cache_pinned: prop("rocksdb.block-cache-pinned-usage"),
+            memtables: prop("rocksdb.cur-size-all-mem-tables"),
+            table_readers: prop("rocksdb.estimate-table-readers-mem"),
+        }
+    }
+
     /// Create an owned iterator over a key range.
     fn make_iter(&self, lower: &[u8], upper: &[u8]) -> Result<Box<dyn store::Iterator>> {
         Ok(Box::new(RocksIterator::new(self.db.clone(), lower, upper)))
@@ -221,6 +254,10 @@ impl store::KvDb for RocksDb {
         self.db
             .write(batch)
             .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
+    fn approximate_memory_bytes(&self) -> u64 {
+        self.memory_usage().total()
     }
 }
 

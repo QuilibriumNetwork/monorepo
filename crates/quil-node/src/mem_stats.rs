@@ -156,6 +156,51 @@ pub fn fmt_mb(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
 }
 
+/// jemalloc allocator stats (process-global — covers the master, every
+/// worker thread, AND the C++ RocksDB allocations, since jemalloc overrides
+/// `malloc` process-wide). This is the decisive OOM signal:
+///
+/// - `allocated` rising over time  → a TRUE live-heap leak (find it with
+///   `MALLOC_CONF=prof:true` + `jeprof`, or the SIGUSR1 dump).
+/// - `allocated` flat but `resident`/`retained` high → allocator
+///   fragmentation / retained pages, NOT a leak (tune, don't chase).
+/// - `resident − allocated` is the overhead jemalloc holds beyond live data.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JemallocStats {
+    /// Bytes of live application data (the true heap working set).
+    pub allocated: u64,
+    /// Bytes in active pages (≥ allocated; includes per-size-class slack).
+    pub active: u64,
+    /// Bytes physically resident (≈ the allocator's contribution to RSS).
+    pub resident: u64,
+    /// Bytes mapped but not yet returned to the OS (fragmentation pool).
+    pub retained: u64,
+    /// Bytes in the address space mapping.
+    pub mapped: u64,
+}
+
+/// Sample jemalloc's live statistics. Advances the stats epoch first (jemalloc
+/// caches stats and only refreshes them on epoch advance). Returns `None` if
+/// the allocator isn't jemalloc (e.g. an MSVC build) or a read fails.
+#[cfg(not(target_env = "msvc"))]
+pub fn jemalloc_stats() -> Option<JemallocStats> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    // Refresh the cached statistics.
+    epoch::advance().ok()?;
+    Some(JemallocStats {
+        allocated: stats::allocated::read().ok()? as u64,
+        active: stats::active::read().ok()? as u64,
+        resident: stats::resident::read().ok()? as u64,
+        retained: stats::retained::read().ok()? as u64,
+        mapped: stats::mapped::read().ok()? as u64,
+    })
+}
+
+#[cfg(target_env = "msvc")]
+pub fn jemalloc_stats() -> Option<JemallocStats> {
+    None
+}
+
 /// Owning accessor bundle for the live components the master node
 /// tracks. Cheap to clone (everything is `Arc`).
 #[derive(Clone)]

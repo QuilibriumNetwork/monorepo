@@ -372,6 +372,20 @@ impl ThreadWorkerManager {
                     let mut current_filter: Vec<u8> = Vec::new();
                     let mut engine_cancel: Option<tokio_util::sync::CancellationToken> = None;
 
+                    // Per-worker memory tick. Each worker owns its own RocksDB
+                    // (block cache + memtables + table readers) in this thread,
+                    // invisible to the master's structural snapshot. Logging it
+                    // here attributes the RocksDB share of process RSS per worker
+                    // — the key number when a node running N workers OOMs.
+                    let worker_db = worker_owned
+                        .as_ref()
+                        .and_then(|d| d.kv_db.clone());
+                    let mut mem_tick =
+                        tokio::time::interval(std::time::Duration::from_secs(60));
+                    mem_tick.set_missed_tick_behavior(
+                        tokio::time::MissedTickBehavior::Skip,
+                    );
+
                     // Notify master we're ready
                     let _ = master_tx
                         .send(WorkerToMaster::Ready { core_id })
@@ -379,6 +393,17 @@ impl ThreadWorkerManager {
 
                     loop {
                         tokio::select! {
+                            _ = mem_tick.tick() => {
+                                if let Some(db) = worker_db.as_ref() {
+                                    let bytes = db.approximate_memory_bytes();
+                                    info!(
+                                        core_id,
+                                        worker_db_mb = bytes as f64 / (1024.0 * 1024.0),
+                                        filter = hex::encode(&current_filter),
+                                        "worker rocksdb memory",
+                                    );
+                                }
+                            }
                             cmd = rx.recv() => {
                                 match cmd {
                                     Some(MasterToWorker::Respawn { filter, start_consensus }) => {

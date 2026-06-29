@@ -72,6 +72,11 @@ libc = "0.2"
 # resulting *.heap files surfaces per-call-site allocation totals.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+# Read live jemalloc stats (allocated/active/resident/retained) + trigger
+# on-demand heap dumps (prof.dump) from inside the process. Lets the status
+# tick distinguish a true live-heap leak from allocator fragmentation, and
+# SIGUSR1 capture a per-call-site profile without restarting.
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
 [dev-dependencies]
 tempfile = "3"
