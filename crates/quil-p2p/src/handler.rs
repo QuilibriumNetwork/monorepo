@@ -29,6 +29,17 @@ use crate::protocol::pb;
 /// comfortably covers a healthy mesh peer's transient burst.
 const SEND_QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// After this many consecutive shed events with no successful outbound write
+/// in between, the peer is unwritable — its outbound substream never
+/// negotiated (3 failed upgrades, then we give up) or its socket is wedged
+/// (remote not reading). A healthy peer drains at least one RPC between
+/// cap-overflows, which resets this counter, so only a true zero-drain peer
+/// reaches the threshold. When it does, we let the connection close so the
+/// swarm can replace it. Without this, a wedged peer is fed forever and the
+/// master core spins shedding a quarter-million-entry queue instead of doing
+/// useful work. At the observed ~1.5k sheds/s this is ~1.4s of grace.
+const MAX_STUCK_SHEDS: u32 = 2048;
+
 /// Messages from the behaviour to the handler.
 #[derive(Debug, Clone)]
 pub struct HandlerIn {
@@ -72,6 +83,18 @@ pub struct BlossomSubHandler {
     send_queue: VecDeque<QueuedRpc>,
     /// Running total of `send_queue` payload bytes (for the OOM cap).
     send_queue_bytes: usize,
+    /// Of `send_queue_bytes`, how many belong to `bulk` entries. Lets
+    /// `shed_send_queue` skip its O(n) bulk-selective scan entirely when the
+    /// backlog is pure control (the observed flood: 209k × 40-byte RPCs),
+    /// keeping shedding O(dropped) instead of O(queue len) per push.
+    send_queue_bulk_bytes: usize,
+    /// Consecutive shed events since the last successful full outbound write.
+    /// A nonzero value means the peer isn't keeping up; `MAX_STUCK_SHEDS`
+    /// means it isn't draining at all. Reset to 0 on every full write.
+    stuck_sheds: u32,
+    /// Set once the peer is declared unwritable. We stop queuing new sends
+    /// (they could never go out) and let the connection close.
+    closing: bool,
     /// Pending events to emit to the behaviour.
     events: VecDeque<HandlerOut>,
     /// Whether we've requested an outbound substream.
@@ -103,6 +126,9 @@ impl BlossomSubHandler {
             outbound: None,
             send_queue: VecDeque::new(),
             send_queue_bytes: 0,
+            send_queue_bulk_bytes: 0,
+            stuck_sheds: 0,
+            closing: false,
             events: VecDeque::new(),
             outbound_requested: false,
             keep_alive: true,
@@ -136,25 +162,36 @@ impl BlossomSubHandler {
         let mut dropped = 0usize;
         let mut dropped_bytes = 0usize;
 
-        // Pass 1: drop oldest bulk entries until under budget.
-        let mut kept: VecDeque<QueuedRpc> = VecDeque::with_capacity(self.send_queue.len());
-        for q in std::mem::take(&mut self.send_queue) {
-            if self.send_queue_bytes > SEND_QUEUE_MAX_BYTES && q.bulk {
-                self.send_queue_bytes -= q.data.len();
-                dropped += 1;
-                dropped_bytes += q.data.len();
-                continue;
+        // Pass 1: drop oldest bulk entries first (gossip tolerates loss). Skip
+        // the full O(n) scan entirely when the backlog holds no bulk — the
+        // observed pathology is a flood of tiny control RPCs (209k × 40 B),
+        // where rebuilding a quarter-million-entry deque on every push pegs
+        // the master core. With no bulk, fall straight through to the cheap
+        // O(dropped) front-pop below.
+        if self.send_queue_bulk_bytes > 0 {
+            let mut kept: VecDeque<QueuedRpc> = VecDeque::with_capacity(self.send_queue.len());
+            for q in std::mem::take(&mut self.send_queue) {
+                if self.send_queue_bytes > SEND_QUEUE_MAX_BYTES && q.bulk {
+                    self.send_queue_bytes -= q.data.len();
+                    self.send_queue_bulk_bytes -= q.data.len();
+                    dropped += 1;
+                    dropped_bytes += q.data.len();
+                    continue;
+                }
+                kept.push_back(q);
             }
-            kept.push_back(q);
+            self.send_queue = kept;
         }
-        self.send_queue = kept;
 
-        // Pass 2 (rare): queue is all control and still over budget — drop
-        // oldest regardless so memory stays bounded.
+        // Pass 2: still over budget (all control, or bulk exhausted) — drop
+        // oldest regardless so memory stays bounded. O(dropped).
         while self.send_queue_bytes > SEND_QUEUE_MAX_BYTES {
             match self.send_queue.pop_front() {
                 Some(q) => {
                     self.send_queue_bytes -= q.data.len();
+                    if q.bulk {
+                        self.send_queue_bulk_bytes -= q.data.len();
+                    }
                     dropped += 1;
                     dropped_bytes += q.data.len();
                 }
@@ -162,14 +199,41 @@ impl BlossomSubHandler {
             }
         }
 
-        if dropped > 0 {
+        if dropped == 0 {
+            return;
+        }
+
+        self.stuck_sheds = self.stuck_sheds.saturating_add(1);
+
+        // Rate-limited logging: a wedged peer can trigger thousands of sheds
+        // per second. Log once at onset, then once when we give up — not on
+        // every drop.
+        if self.stuck_sheds == 1 {
             warn!(
                 dropped,
                 dropped_bytes,
                 remaining = self.send_queue.len(),
                 remaining_bytes = self.send_queue_bytes,
-                "blossomsub handler: shed outbound backlog — peer not draining \
-                 (OOM backpressure guard)"
+                "blossomsub handler: outbound backlog over cap — peer draining \
+                 slowly (backpressure guard)"
+            );
+        }
+
+        // No outbound progress across many sheds → the peer is unwritable.
+        // Stop feeding it and let the connection close; the swarm/mesh will
+        // graft a replacement. Free the doomed backlog immediately.
+        if self.stuck_sheds >= MAX_STUCK_SHEDS && !self.closing {
+            self.closing = true;
+            self.keep_alive = false;
+            let abandoned = self.send_queue.len();
+            self.send_queue.clear();
+            self.send_queue_bytes = 0;
+            self.send_queue_bulk_bytes = 0;
+            warn!(
+                stuck_sheds = self.stuck_sheds,
+                abandoned,
+                "blossomsub handler: peer unwritable (zero outbound drain) — \
+                 closing connection so the swarm can replace it"
             );
         }
     }
@@ -263,13 +327,22 @@ impl BlossomSubHandler {
                     if n == queued.data.len() {
                         if let Some(done) = self.send_queue.pop_front() {
                             self.send_queue_bytes -= done.data.len();
+                            if done.bulk {
+                                self.send_queue_bulk_bytes -= done.data.len();
+                            }
                         }
+                        // The peer accepted a full RPC — it's draining, so it
+                        // isn't the wedged/zero-drain case. Reset the guard.
+                        self.stuck_sheds = 0;
                         debug!(bytes = n, "wrote to outbound");
                     } else {
                         // Partial write — trim what was sent
                         let front = self.send_queue.front_mut().unwrap();
                         front.data = front.data[n..].to_vec();
                         self.send_queue_bytes -= n;
+                        if front.bulk {
+                            self.send_queue_bulk_bytes -= n;
+                        }
                         break;
                     }
                 }
@@ -306,8 +379,16 @@ impl ConnectionHandler for BlossomSubHandler {
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
+        if self.closing {
+            // Peer declared unwritable; the connection is winding down.
+            // Queuing more would only be shed — drop it now.
+            return;
+        }
         debug!(data_len = event.rpc_data.len(), queue_len = self.send_queue.len(), "handler received data from behaviour");
         self.send_queue_bytes += event.rpc_data.len();
+        if event.bulk {
+            self.send_queue_bulk_bytes += event.rpc_data.len();
+        }
         self.send_queue.push_back(QueuedRpc {
             data: event.rpc_data,
             bulk: event.bulk,
@@ -349,8 +430,16 @@ impl ConnectionHandler for BlossomSubHandler {
                     debug!(retry = self.outbound_retries, "outbound BlossomSub upgrade failed, will retry");
                     self.outbound_requested = false;
                 } else {
-                    debug!("outbound BlossomSub upgrade failed 3 times, giving up");
-                    // Keep outbound_requested=true to prevent more retries
+                    // Outbound never negotiated after 3 tries: we can never
+                    // send to this peer. Don't sit on it as a zombie with a
+                    // growing send_queue — close so the swarm can re-dial /
+                    // graft a replacement.
+                    debug!("outbound BlossomSub upgrade failed 3 times, giving up — closing");
+                    self.closing = true;
+                    self.keep_alive = false;
+                    self.send_queue.clear();
+                    self.send_queue_bytes = 0;
+                    self.send_queue_bulk_bytes = 0;
                 }
             }
             _ => {}
@@ -443,5 +532,46 @@ mod tests {
             "pure-control backlog must still be bounded, got {}",
             h.send_queue_bytes
         );
+    }
+
+    /// REGRESSION (CPU peg + warning storm): a peer that never drains (no
+    /// outbound write ever resets `stuck_sheds`) must eventually be declared
+    /// unwritable so the connection closes — otherwise the master core spins
+    /// shedding a quarter-million-entry queue forever (observed: 6k warns in
+    /// 4s, zero useful work).
+    #[test]
+    fn unwritable_peer_closes_after_repeated_sheds() {
+        let mut h = handler();
+        // No outbound stream is ever negotiated, so nothing drains. Each
+        // over-cap push triggers a shed. Push enough small control RPCs to
+        // exceed the cap, then keep pushing past MAX_STUCK_SHEDS.
+        let entry = 64 * 1024; // 64 KiB; ~128 fill the 8 MiB cap
+        for _ in 0..(128 + MAX_STUCK_SHEDS as usize + 8) {
+            feed(&mut h, entry, false);
+            if h.closing {
+                break;
+            }
+        }
+        assert!(h.closing, "a zero-drain peer must be declared unwritable");
+        assert!(!h.keep_alive, "closing handler must drop keep_alive");
+        // Backlog freed on close; further sends are dropped, not queued.
+        assert_eq!(h.send_queue_bytes, 0);
+        assert!(h.send_queue.is_empty());
+        feed(&mut h, entry, false);
+        assert!(h.send_queue.is_empty(), "closing handler must not re-queue");
+    }
+
+    /// A peer that drains keeps the connection: a successful write resets the
+    /// stuck counter, so transient over-cap bursts never trip the close path.
+    #[test]
+    fn draining_peer_is_not_closed() {
+        let mut h = handler();
+        for _ in 0..200 {
+            feed(&mut h, 64 * 1024, false);
+            // Simulate the peer accepting a full RPC between pushes.
+            h.stuck_sheds = 0;
+        }
+        assert!(!h.closing, "a draining peer must not be closed");
+        assert!(h.send_queue_bytes <= SEND_QUEUE_MAX_BYTES);
     }
 }
