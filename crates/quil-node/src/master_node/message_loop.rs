@@ -330,6 +330,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             mapped_mb = %crate::mem_stats::fmt_mb(j.mapped),
                             "jemalloc stats"
                         );
+                        // Localize the leak BY ALLOCATION SIZE: the dominant
+                        // size class says small-objects-leak vs big-buffers-leak
+                        // and the exact byte size to cross-reference. Sampled
+                        // here (cheap mallctl reads), so the next status tick on
+                        // an affected node pins where the 40 GB lives.
+                        let br = crate::mem_stats::jemalloc_size_classes();
+                        info!(
+                            breakdown = %crate::mem_stats::fmt_breakdown(&br),
+                            "jemalloc size classes"
+                        );
                     }
                 }
                 msg = async {

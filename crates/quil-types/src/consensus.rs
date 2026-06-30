@@ -208,6 +208,28 @@ pub fn epoch_length_frames() -> u64 {
     if o == 0 { EPOCH_LENGTH_FRAMES } else { o }
 }
 
+/// Epoch length for testnet/devnet (`network != 0`): a short epoch so the
+/// epoch-aligned join→confirm(E+1)→activate(E+2) lifecycle plays out in
+/// minutes instead of hours. The whole pipeline (`epoch_for_frame`,
+/// `validate_confirm_timing`, lifecycle confirm/leave emission, materialize,
+/// `effective_status`) reads `epoch_length_frames()`, so setting this once at
+/// startup auto-scales every timing rule consistently.
+pub const TESTNET_EPOCH_LENGTH_FRAMES: u64 = 60;
+
+/// Pin the process-global epoch length from the network id at node startup.
+/// Mainnet (`network == 0`) keeps the 720-frame default; every other network
+/// uses the short testnet epoch. CONSENSUS PARAMETER — all nodes on a network
+/// share the network id, so they all derive the SAME epoch length (fork-proof).
+/// Must be called by BOTH the master and each worker process before any frame
+/// is evaluated.
+pub fn init_epoch_length_for_network(network: u8) {
+    if network == 0 {
+        set_epoch_length_frames(0); // mainnet default 720
+    } else {
+        set_epoch_length_frames(TESTNET_EPOCH_LENGTH_FRAMES);
+    }
+}
+
 /// The storage epoch a frame belongs to.
 #[inline]
 pub fn epoch_for_frame(frame_number: u64) -> u64 {

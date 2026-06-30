@@ -106,6 +106,13 @@ struct Args {
     #[arg(long)]
     node_info: bool,
 
+    /// Ensure the node's identity keys exist (generating + persisting an Ed448
+    /// peer key and a BLS prover key if missing), then print machine-readable
+    /// `PEER_ID=<base58>` and `BLS_PUBKEY=<full-hex>` lines and exit. Used by
+    /// `scripts/localnet.sh` to assemble a genesis seed + peer multiaddrs.
+    #[arg(long)]
+    print_identity: bool,
+
     /// Print peer info and exit
     #[arg(long)]
     peer_info: bool,
@@ -192,6 +199,49 @@ async fn main() -> anyhow::Result<ExitCode> {
         network: args.network,
     };
     if diagnostic::handle_diagnostic_flags(&diag_flags, &config)? {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // `--print-identity`: ensure keys exist, print them machine-readably, exit.
+    if args.print_identity {
+        // Ensure a stable Ed448 peer key (generate + persist if missing).
+        let mut cfg = config.clone();
+        if cfg.p2p.peer_priv_key.is_empty() {
+            cfg.p2p.peer_priv_key = quil_p2p::ed448_identity::Ed448Identity::generate()
+                .map_err(|e| anyhow::anyhow!("generate Ed448 peer key: {e}"))?
+                .to_config_hex();
+            quil_config::save_config(&args.config, &cfg)?;
+        }
+        // Derive the libp2p peer ID from the Ed448 key.
+        let pk_bytes = hex::decode(&cfg.p2p.peer_priv_key).unwrap_or_default();
+        let mut seed = [0u8; 57];
+        seed.copy_from_slice(&pk_bytes[..57]);
+        let ed_pub = quil_p2p::ed448_identity::derive_public_key(&seed);
+        let peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&ed_pub);
+        // Ensure the BLS prover key (auto-created if missing), read full pubkey.
+        let keys_path = if cfg.key.key_store_file.path.is_empty() {
+            args.config.join("keys.yml")
+        } else {
+            PathBuf::from(&cfg.key.key_store_file.path)
+        };
+        let proving_key_id = if cfg.engine.proving_key_id.is_empty() {
+            "default-proving-key".to_string()
+        } else {
+            cfg.engine.proving_key_id.clone()
+        };
+        let fkm = quil_keys::FileKeyManager::new(
+            keys_path,
+            &cfg.key.key_store_file.encryption_key,
+            proving_key_id,
+            Box::new(quil_crypto::Bls48581KeyConstructor),
+        )?;
+        fkm.set_peer_priv_key_hex(&cfg.p2p.peer_priv_key);
+        fkm.ensure_standard_keys()?;
+        use quil_keys::KeyManager as _;
+        let bls_pubkey =
+            fkm.get_public_key(quil_types::crypto::KeyType::Bls48581G1)?;
+        println!("PEER_ID={}", bs58::encode(&peer_id).into_string());
+        println!("BLS_PUBKEY={}", hex::encode(&bls_pubkey));
         return Ok(ExitCode::SUCCESS);
     }
 

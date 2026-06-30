@@ -16,6 +16,12 @@ pub(crate) async fn start(
 ) -> anyhow::Result<ShutdownReason<anyhow::Error>> {
     info!(core_id, parent_process, "worker node starting");
 
+    // Match the master's epoch length (network-derived). Workers are separate
+    // processes with their own copy of the epoch-length atomic; without this a
+    // testnet worker would evaluate frames at the 720-frame default and diverge
+    // from the master's short-epoch lifecycle timing.
+    quil_types::consensus::init_epoch_length_for_network(config.p2p.network);
+
     // Resolve the per-worker store path. Worker processes can NOT
     // share the master's RocksDB directory: RocksDB takes an exclusive
     // file lock per `LOCK` file, so a second `open` against the same
@@ -359,6 +365,56 @@ pub(crate) async fn start(
     }
 
     info!(core_id, "worker node initialized, starting event loop");
+
+    // Memory telemetry for THIS worker process. In cluster mode each worker
+    // is a SEPARATE OS process with its own jemalloc heap + RocksDB, invisible
+    // to the master's status tick — so without this a cluster worker's memory
+    // (the most likely OOM contributor on a node running many workers) is
+    // completely unmonitored. Mirrors the master's `"jemalloc stats"` and the
+    // thread-worker's `"worker rocksdb memory"` lines. Every 60s.
+    {
+        let db_for_mem = db_arc.clone();
+        sup.run_until_cancelled("worker-mem-telemetry", move |token| async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = tick.tick() => {
+                        let rss = crate::mem_stats::process_memory()
+                            .map(|m| crate::mem_stats::fmt_mb(m.rss_bytes))
+                            .unwrap_or_else(|| "?".to_string());
+                        let dbm = db_for_mem.memory_usage();
+                        if let Some(j) = crate::mem_stats::jemalloc_stats() {
+                            info!(
+                                core_id,
+                                rss_mb = %rss,
+                                allocated_mb = %crate::mem_stats::fmt_mb(j.allocated),
+                                resident_mb = %crate::mem_stats::fmt_mb(j.resident),
+                                retained_mb = %crate::mem_stats::fmt_mb(j.retained),
+                                rocksdb_mb = %crate::mem_stats::fmt_mb(dbm.total()),
+                                "worker process memory",
+                            );
+                            let br = crate::mem_stats::jemalloc_size_classes();
+                            info!(
+                                core_id,
+                                breakdown = %crate::mem_stats::fmt_breakdown(&br),
+                                "worker jemalloc size classes",
+                            );
+                        } else {
+                            info!(
+                                core_id,
+                                rss_mb = %rss,
+                                rocksdb_mb = %crate::mem_stats::fmt_mb(dbm.total()),
+                                "worker process memory",
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
 
     // Run the worker — uses plain `sup.spawn` (not `run_until_cancelled`)
     // because the cancel branch must call `worker.stop()`; drop-on-cancel

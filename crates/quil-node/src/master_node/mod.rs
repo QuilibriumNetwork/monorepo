@@ -32,6 +32,19 @@ pub(crate) async fn start(
     // `tokio::spawn`.
     let detached_spawner = sup.detached_spawner();
 
+    // Pin the epoch length from the network id BEFORE genesis (frame 0) or any
+    // frame evaluation. Mainnet keeps 720; testnet/devnet use a short epoch so
+    // the join→confirm→activate lifecycle runs in minutes. Every epoch timing
+    // rule reads `epoch_length_frames()`, so this one call scales them all.
+    quil_types::consensus::init_epoch_length_for_network(network);
+    if network != 0 {
+        info!(
+            network,
+            epoch_length_frames = quil_types::consensus::epoch_length_frames(),
+            "testnet epoch length pinned",
+        );
+    }
+
     let storage = storage::init(config, archive_mode)?;
     let db_arc = storage.db_arc.clone();
     let clock_store = storage.clock_store.clone();
