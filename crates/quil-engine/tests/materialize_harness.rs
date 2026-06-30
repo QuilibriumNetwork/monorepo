@@ -136,7 +136,7 @@ impl MaterializeHarness {
         vk.extend_from_slice(addr);
         let txn = self.hg_store.new_transaction(false).unwrap();
         self.hg_store
-            .save_vertex_underlying(txn.as_ref(), "vertex", "adds", &shard, &vk, blob)
+            .save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vk, blob)
             .unwrap();
         txn.commit().unwrap();
     }
@@ -306,10 +306,10 @@ fn seed_global_prover(
     let txn = hg_store.new_transaction(false).unwrap();
     let mut vkp = vec![0xFFu8; 32];
     vkp.extend_from_slice(&prover_addr);
-    hg_store.save_vertex_underlying(txn.as_ref(), "vertex", "adds", &shard, &vkp, &prover_blob).unwrap();
+    hg_store.save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vkp, &prover_blob).unwrap();
     let mut vka = vec![0xFFu8; 32];
     vka.extend_from_slice(&[alloc_flat_byte; 32]);
-    hg_store.save_vertex_underlying(txn.as_ref(), "vertex", "adds", &shard, &vka, &alloc_blob).unwrap();
+    hg_store.save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vka, &alloc_blob).unwrap();
     txn.commit().unwrap();
     registry.refresh_from_store(hg_store);
 
@@ -534,10 +534,10 @@ fn seed_data_prover(
     let txn = hg_store.new_transaction(false).unwrap();
     let mut vkp = vec![0xFFu8; 32];
     vkp.extend_from_slice(&prover_addr);
-    hg_store.save_vertex_underlying(txn.as_ref(), "vertex", "adds", &shard, &vkp, &prover_blob).unwrap();
+    hg_store.save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vkp, &prover_blob).unwrap();
     let mut vka = vec![0xFFu8; 32];
     vka.extend_from_slice(&alloc_addr);
-    hg_store.save_vertex_underlying(txn.as_ref(), "vertex", "adds", &shard, &vka, &alloc_blob).unwrap();
+    hg_store.save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vka, &alloc_blob).unwrap();
     txn.commit().unwrap();
     registry.refresh_from_store(hg_store);
 
