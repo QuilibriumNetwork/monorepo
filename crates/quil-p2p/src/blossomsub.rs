@@ -82,7 +82,7 @@ impl BlossomSubRouter {
             last_pub: HashMap::new(),
             backoff: HashMap::new(),
             outbound: HashMap::new(),
-            mcache: MessageCache::new(HISTORY_LENGTH, HISTORY_GOSSIP),
+            mcache: MessageCache::new(HISTORY_LENGTH, HISTORY_GOSSIP, MCACHE_MAX_BYTES),
         }
     }
 
@@ -336,6 +336,13 @@ pub struct MessageCache {
     history_length: usize,
     /// Number of windows to include in gossip.
     history_gossip: usize,
+    /// Hard cap on total cached payload bytes. When exceeded, the OLDEST
+    /// windows are evicted early (before `history_length`) so a catch-up
+    /// flood of large subscribed messages can't drive OOM. Window-count
+    /// history alone does not bound bytes.
+    max_bytes: usize,
+    /// Running total of `entry_bytes` over every cached message.
+    cur_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -345,28 +352,72 @@ struct CachedMessage {
     pub _from: PeerId,
 }
 
+/// Approximate retained-heap cost of one cached message (the dominant
+/// allocations: the id key, the bitmask, and the payload).
+fn entry_bytes(id: &[u8], m: &CachedMessage) -> usize {
+    id.len() + m.bitmask.len() + m.data.len()
+}
+
 impl MessageCache {
-    pub fn new(history_length: usize, history_gossip: usize) -> Self {
+    pub fn new(history_length: usize, history_gossip: usize, max_bytes: usize) -> Self {
         Self {
             windows: vec![Vec::new()],
             messages: HashMap::new(),
             history_length,
             history_gossip,
+            max_bytes,
+            cur_bytes: 0,
         }
+    }
+
+    /// Number of messages currently cached (for diagnostics).
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Total cached payload bytes (for diagnostics / OOM gauges).
+    pub fn byte_len(&self) -> usize {
+        self.cur_bytes
     }
 
     /// Add a message to the current window.
     pub fn put(&mut self, msg_id: Vec<u8>, bitmask: Vec<u8>, data: Vec<u8>, from: PeerId) {
-        self.messages.insert(
+        let added = msg_id.len() + bitmask.len() + data.len();
+        match self.messages.insert(
             msg_id.clone(),
             CachedMessage {
                 bitmask,
                 data,
                 _from: from,
             },
-        );
-        if let Some(window) = self.windows.last_mut() {
-            window.push(msg_id);
+        ) {
+            // Replacing an existing id (dedup normally prevents this; the id
+            // already sits in a window). Adjust the byte total in place.
+            Some(old) => {
+                self.cur_bytes = self
+                    .cur_bytes
+                    .saturating_sub(msg_id.len() + old.bitmask.len() + old.data.len());
+            }
+            None => {
+                if let Some(window) = self.windows.last_mut() {
+                    window.push(msg_id);
+                }
+            }
+        }
+        self.cur_bytes += added;
+        self.evict_to_budget();
+    }
+
+    /// Drop whole windows from the front until under the byte budget, never
+    /// evicting the current (last) window we are still writing into.
+    fn evict_to_budget(&mut self) {
+        while self.cur_bytes > self.max_bytes && self.windows.len() > 1 {
+            let old = self.windows.remove(0);
+            for id in old {
+                if let Some(m) = self.messages.remove(&id) {
+                    self.cur_bytes = self.cur_bytes.saturating_sub(entry_bytes(&id, &m));
+                }
+            }
         }
     }
 
@@ -399,7 +450,9 @@ impl MessageCache {
         if self.windows.len() > self.history_length {
             let old = self.windows.remove(0);
             for id in old {
-                self.messages.remove(&id);
+                if let Some(m) = self.messages.remove(&id) {
+                    self.cur_bytes = self.cur_bytes.saturating_sub(entry_bytes(&id, &m));
+                }
             }
         }
     }
@@ -410,6 +463,7 @@ impl std::fmt::Debug for MessageCache {
         f.debug_struct("MessageCache")
             .field("windows", &self.windows.len())
             .field("messages", &self.messages.len())
+            .field("bytes", &self.cur_bytes)
             .finish()
     }
 }
@@ -431,7 +485,7 @@ mod mcache_tests {
     /// same bitmask + data round-tripped.
     #[test]
     fn put_then_get_round_trips_the_message() {
-        let mut mc = MessageCache::new(5, 3);
+        let mut mc = MessageCache::new(5, 3, usize::MAX);
         let id = b"msg-1".to_vec();
         let bitmask = vec![0xC0];
         let data = b"hello".to_vec();
@@ -447,7 +501,7 @@ mod mcache_tests {
     /// `get` of an unknown ID returns None — no false positives.
     #[test]
     fn get_unknown_id_returns_none() {
-        let mc = MessageCache::new(5, 3);
+        let mc = MessageCache::new(5, 3, usize::MAX);
         assert!(mc.get(b"never-inserted").is_none());
     }
 
@@ -456,7 +510,7 @@ mod mcache_tests {
     /// gossip flow.
     #[test]
     fn gossip_ids_filtered_by_bitmask() {
-        let mut mc = MessageCache::new(5, 3);
+        let mut mc = MessageCache::new(5, 3, usize::MAX);
         let bm_a = vec![0xC0];
         let bm_b = vec![0x0C];
         mc.put(b"a1".to_vec(), bm_a.clone(), b"x".to_vec(), make_peer());
@@ -481,7 +535,7 @@ mod mcache_tests {
     #[test]
     fn shift_past_history_length_evicts_oldest() {
         let history_length = 3;
-        let mut mc = MessageCache::new(history_length, 2);
+        let mut mc = MessageCache::new(history_length, 2, usize::MAX);
         let bm = vec![0xC0];
 
         let id1 = b"id-1".to_vec();
@@ -508,7 +562,7 @@ mod mcache_tests {
     /// even if still memory-resident.
     #[test]
     fn gossip_ids_scoped_to_history_gossip_window() {
-        let mut mc = MessageCache::new(10, 2);
+        let mut mc = MessageCache::new(10, 2, usize::MAX);
         let bm = vec![0xC0];
 
         // Put one message, then advance windows so it falls outside
@@ -529,11 +583,38 @@ mod mcache_tests {
             "message past history_gossip must NOT be advertised");
     }
 
+    /// REGRESSION (OOM): window-count history does NOT bound bytes. A
+    /// catch-up flood of large subscribed messages within `history_length`
+    /// windows piled up to 14+ GB in `mcache`. The byte budget must evict the
+    /// oldest windows early so total cached bytes stays under `max_bytes`.
+    #[test]
+    fn byte_budget_bounds_total_cached_bytes() {
+        let bm = vec![0xC0];
+        // 10 windows of history, but a 4 KiB byte ceiling.
+        let mut mc = MessageCache::new(10, 3, 4096);
+        // Each "window" gets a 1 KiB message, then we shift. After many
+        // windows the byte total must stay bounded by the budget (+ at most
+        // the current window), NOT grow with history_length.
+        for i in 0..1000u32 {
+            let id = i.to_le_bytes().to_vec();
+            mc.put(id, bm.clone(), vec![0u8; 1024], make_peer());
+            mc.shift();
+        }
+        assert!(
+            mc.byte_len() <= 4096 + 1024,
+            "cached bytes must stay near the budget, got {}",
+            mc.byte_len()
+        );
+        // And the most-recent message is still retained (recency preserved).
+        let last = 999u32.to_le_bytes().to_vec();
+        assert!(mc.get(&last).is_some(), "freshest message must survive");
+    }
+
     /// `put` deposits IDs into the current (latest) window — a
     /// subsequent `get_gossip_ids` (history_gossip ≥ 1) sees them.
     #[test]
     fn put_lands_in_current_window_and_is_gossipable() {
-        let mut mc = MessageCache::new(5, 3);
+        let mut mc = MessageCache::new(5, 3, usize::MAX);
         let bm = vec![0xC0];
         let id = b"fresh".to_vec();
         mc.put(id.clone(), bm.clone(), b"d".to_vec(), make_peer());

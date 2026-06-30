@@ -166,6 +166,7 @@ impl BlossomSubBehaviour {
     pub fn with_params(network: u8, params: crate::BlossomsubParams) -> Self {
         let mcache_len = params.history_length;
         let mcache_gossip = params.history_gossip;
+        let mcache_max_bytes = params.mcache_max_bytes;
         Self {
             subscriptions: HashSet::new(),
             peer_subscriptions: HashMap::new(),
@@ -185,6 +186,7 @@ impl BlossomSubBehaviour {
             mcache: crate::blossomsub::MessageCache::new(
                 mcache_len,
                 mcache_gossip,
+                mcache_max_bytes,
             ),
             last_heartbeat: Instant::now(),
             pending_subscribe_rpc: None,
@@ -1538,6 +1540,34 @@ impl BlossomSubBehaviour {
 
     fn heartbeat(&mut self) {
         self.heartbeat_ticks += 1;
+
+        // Periodic memory gauge for the unbounded-growth structures behind the
+        // regular-node OOM. Frame-pointer-less release builds collapse jeprof
+        // onto `on_connection_handler_event`, hiding WHICH structure grows;
+        // this log makes it observable. ~32 heartbeats ≈ 22s at 700ms.
+        if self.heartbeat_ticks % 32 == 0 {
+            let events = self.events.len();
+            let mcache_bytes = self.mcache.byte_len();
+            let mcache_msgs = self.mcache.len();
+            debug!(
+                events,
+                mcache_msgs,
+                mcache_bytes,
+                seen = self.seen_messages.len(),
+                pending_iwants = self.pending_iwants.len(),
+                peer_subs = self.peer_subscriptions.len(),
+                "blossomsub memory gauge"
+            );
+            // Surface at WARN if any bulk structure is climbing toward OOM.
+            if events > 100_000 || mcache_bytes > 256 * 1024 * 1024 {
+                warn!(
+                    events,
+                    mcache_msgs,
+                    mcache_bytes,
+                    "blossomsub: bulk buffers elevated (backpressure / catch-up)"
+                );
+            }
+        }
 
         // 0a. IWANT follow-up. For every pending IWANT older than
         // `params.iwant_followup_time`, either retry from another
