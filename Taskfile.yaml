@@ -134,6 +134,38 @@ tasks:
     cmds:
       - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output node/build/amd64_linux --target=node .
 
+  test_rust_amd64_linux:
+    desc: >-
+      Run the Rust workspace tests inside the AMD64 Linux build image — the
+      same environment that builds the node, carrying the GMP/FLINT/EMP native
+      deps that classgroup, bls48581, and vdf need to compile (which a bare
+      `cargo test` on a host lacking them cannot). Mirrors CI's `cargo nextest
+      run`, including the .nextest.toml skip-filter. Narrow scope by appending
+      args after `--`, e.g. `task test_rust_amd64_linux -- -p quil-engine` or
+      `task test_rust_amd64_linux -- -E 'test(materialize)'`; with no args it
+      runs the whole workspace. The cargo registry/git caches persist in named
+      volumes, but the compile target dir does not, so expect a cold compile
+      on the first run after a source change.
+    vars:
+      NEXTEST_ARGS: '{{.CLI_ARGS | default "--workspace --exclude channelwasm"}}'
+    cmds:
+      # test-context = build-context (full source + native deps) plus the node/
+      # tree that several crates embed fixtures from. Layers below build-context
+      # are already cached if the node image was built, so this is cheap.
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --target test-context -t quilibrium-rust-test:latest .
+      # The target volume persists compiled artifacts across runs so a long
+      # cold compile resumes instead of restarting; it starts empty and is
+      # populated from source exactly as CI does (CI has no prebuilt artifacts),
+      # so it safely shadows the image's gen-rust release .a files.
+      - >-
+        docker run --rm --ulimit stack=-1:-1 --platform linux/amd64
+        -v quilibrium-cargo-registry:/root/.cargo/registry
+        -v quilibrium-cargo-git:/root/.cargo/git
+        -v quilibrium-cargo-target:/opt/ceremonyclient/target
+        -w /opt/ceremonyclient quilibrium-rust-test:latest
+        bash -c 'curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/bin &&
+        cargo nextest run --locked --no-fail-fast --config-file .nextest.toml {{.NEXTEST_ARGS}}'
+
   build_conntest_amd64_linux:
     desc: Build the Quilibrium node connection test binary for AMD64 Linux. Outputs to conntest/build.
     cmds:
