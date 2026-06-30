@@ -82,6 +82,16 @@ pub mod params {
     /// clustering (a couple of legitimate co-located peers) through
     /// without bias; 1 is the strictest setting.
     pub const MESH_PEERS_PER_SUBNET: usize = 2;
+    /// Hard cap on the total bytes of message payloads held in the
+    /// IHAVE/IWANT message cache (`MessageCache`). The cache retains
+    /// `HISTORY_LENGTH` (24) windows × `HEARTBEAT_INTERVAL` (700ms) ≈ 17s
+    /// of *subscribed* traffic, cloning each message's full payload. Under
+    /// a catch-up flood of large consensus frames that window alone reached
+    /// 14+ GB (jeprof: dominant stack through `on_connection_handler_event`
+    /// → `handle_rpc` → `mcache.put`). Window-count bounding does not bound
+    /// bytes; this does. 512 MiB is far more than gossip recovery needs
+    /// while keeping the cache from driving OOM.
+    pub const MCACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 }
 
 /// Runtime-configurable BlossomSub parameters. Behaviour holds an
@@ -117,6 +127,10 @@ pub struct BlossomsubParams {
     /// Eclipse-resistance: see [`params::MESH_PEERS_PER_SUBNET`].
     /// `0` disables the check.
     pub mesh_peers_per_subnet: usize,
+    /// Hard byte cap on the IHAVE/IWANT message cache. See
+    /// [`params::MCACHE_MAX_BYTES`]. Bounds memory under catch-up floods
+    /// that window-count history alone cannot.
+    pub mcache_max_bytes: usize,
 }
 
 impl Default for BlossomsubParams {
@@ -140,6 +154,7 @@ impl Default for BlossomsubParams {
             idont_want_message_threshold: params::IDONT_WANT_MESSAGE_THRESHOLD,
             max_idont_want_messages: 5000,
             mesh_peers_per_subnet: params::MESH_PEERS_PER_SUBNET,
+            mcache_max_bytes: params::MCACHE_MAX_BYTES,
         }
     }
 }
@@ -198,6 +213,9 @@ impl BlossomsubParams {
             // post-build if they need to. Default protects against
             // single-/24 eclipse on every node.
             mesh_peers_per_subnet: d.mesh_peers_per_subnet,
+            // No P2PConfig field yet — defaults to a 512 MiB ceiling,
+            // tunable via `set_params` post-build.
+            mcache_max_bytes: d.mcache_max_bytes,
         }
     }
 }
