@@ -283,6 +283,19 @@ COPY --from=gen-rust /opt/ceremonyclient/bulletproofs /opt/ceremonyclient/bullet
 COPY --from=gen-rust /out/ /opt/ceremonyclient/target/release/
 
 # -----------------------------------------------------------------------------
+# Stage: test-context
+# build-context plus the node/ tree (which build-context excludes). Several
+# Rust crates embed fixtures from node/ at compile time — e.g.
+# quil-execution's seniority_compat.rs does `include_str!(
+# "../../../node/execution/intrinsics/global/compat/*_retro.json")` — so the
+# workspace tests can't even compile without it. This stage exists purely for
+# the `test_rust_amd64_linux` task; it does NOT build the node binary (no
+# build.sh), so it's a cheap COPY on top of build-context.
+# -----------------------------------------------------------------------------
+FROM build-context AS test-context
+COPY ./node /opt/ceremonyclient/node
+
+# -----------------------------------------------------------------------------
 # Stage: build-node
 # -----------------------------------------------------------------------------
 FROM build-context AS build-node

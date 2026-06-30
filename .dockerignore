@@ -1,0 +1,23 @@
+# Build output — the image compiles fresh in-container; host target/ is never
+# needed (target/release is repopulated from the gen-rust stage), and it's
+# ~10 GB of pure context bloat.
+target/
+**/target/
+
+# Version control metadata — not needed by any build stage.
+.git/
+
+# Node/qclient build outputs (the Dockerfile produces its own).
+node/build/
+client/build/
+conntest/build/
+
+# Local profiling / log artifacts (jemalloc heaps, per-core logs, copied
+# binaries). Tens of GB; never an input to the build.
+.log/
+jeprof/
+*.heap
+jeprof.*
+
+# Editor / OS noise.
+.DS_Store
