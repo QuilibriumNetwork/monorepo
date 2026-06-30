@@ -13,10 +13,21 @@ use libp2p::swarm::handler::{
 };
 use libp2p::swarm::Stream;
 use libp2p::StreamProtocol;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::protocol;
 use crate::protocol::pb;
+
+/// Per-connection cap on buffered outbound bytes. A peer whose outbound
+/// substream stalls, never negotiates, or whose socket is backpressured
+/// would otherwise accumulate forwarded RPCs without bound in `send_queue`
+/// — the regular-node OOM (jeprof: 25 GB retained through `handle_rpc`,
+/// held downstream in this queue after the behaviour drained its own
+/// bounded `events` queue). Above this, the oldest `bulk` payloads (and,
+/// as a last resort, the oldest control) are dropped; a peer we can't
+/// write to can't use them anyway, and gossip tolerates loss. 8 MiB
+/// comfortably covers a healthy mesh peer's transient burst.
+const SEND_QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Messages from the behaviour to the handler.
 #[derive(Debug, Clone)]
@@ -29,6 +40,14 @@ pub struct HandlerIn {
     /// can drop these bulky events under OOM pressure while preserving small
     /// control RPCs (graft/prune/IWANT-request/IHAVE/IDONTWANT/subscribe).
     pub bulk: bool,
+}
+
+/// An outbound RPC buffered in the handler's `send_queue`, tagged with
+/// whether it carries a full message payload so the backpressure cap can
+/// drop bulk traffic first.
+struct QueuedRpc {
+    data: Vec<u8>,
+    bulk: bool,
 }
 
 /// Messages from the handler to the behaviour.
@@ -50,7 +69,9 @@ pub struct BlossomSubHandler {
     /// Outbound substream (writing RPCs to peer).
     outbound: Option<OutboundState>,
     /// Pending outbound RPCs to send.
-    send_queue: VecDeque<Vec<u8>>,
+    send_queue: VecDeque<QueuedRpc>,
+    /// Running total of `send_queue` payload bytes (for the OOM cap).
+    send_queue_bytes: usize,
     /// Pending events to emit to the behaviour.
     events: VecDeque<HandlerOut>,
     /// Whether we've requested an outbound substream.
@@ -81,6 +102,7 @@ impl BlossomSubHandler {
             inbound: None,
             outbound: None,
             send_queue: VecDeque::new(),
+            send_queue_bytes: 0,
             events: VecDeque::new(),
             outbound_requested: false,
             keep_alive: true,
@@ -92,9 +114,64 @@ impl BlossomSubHandler {
     pub fn with_initial_data(protocol: StreamProtocol, initial_rpc: Vec<u8>) -> Self {
         let mut h = Self::new(protocol);
         if !initial_rpc.is_empty() {
-            h.send_queue.push_back(initial_rpc);
+            h.send_queue_bytes += initial_rpc.len();
+            // Subscription hello — control, never shed.
+            h.send_queue.push_back(QueuedRpc {
+                data: initial_rpc,
+                bulk: false,
+            });
         }
         h
+    }
+
+    /// Bound the outbound backlog. When buffered bytes exceed
+    /// `SEND_QUEUE_MAX_BYTES`, drop the OLDEST `bulk` payloads first
+    /// (forwards/publishes — gossip tolerates loss); if the queue is still
+    /// over budget with only control left, drop oldest control too as a hard
+    /// stop. Prevents a stalled/unwritable peer from ballooning memory.
+    fn shed_send_queue(&mut self) {
+        if self.send_queue_bytes <= SEND_QUEUE_MAX_BYTES {
+            return;
+        }
+        let mut dropped = 0usize;
+        let mut dropped_bytes = 0usize;
+
+        // Pass 1: drop oldest bulk entries until under budget.
+        let mut kept: VecDeque<QueuedRpc> = VecDeque::with_capacity(self.send_queue.len());
+        for q in std::mem::take(&mut self.send_queue) {
+            if self.send_queue_bytes > SEND_QUEUE_MAX_BYTES && q.bulk {
+                self.send_queue_bytes -= q.data.len();
+                dropped += 1;
+                dropped_bytes += q.data.len();
+                continue;
+            }
+            kept.push_back(q);
+        }
+        self.send_queue = kept;
+
+        // Pass 2 (rare): queue is all control and still over budget — drop
+        // oldest regardless so memory stays bounded.
+        while self.send_queue_bytes > SEND_QUEUE_MAX_BYTES {
+            match self.send_queue.pop_front() {
+                Some(q) => {
+                    self.send_queue_bytes -= q.data.len();
+                    dropped += 1;
+                    dropped_bytes += q.data.len();
+                }
+                None => break,
+            }
+        }
+
+        if dropped > 0 {
+            warn!(
+                dropped,
+                dropped_bytes,
+                remaining = self.send_queue.len(),
+                remaining_bytes = self.send_queue_bytes,
+                "blossomsub handler: shed outbound backlog — peer not draining \
+                 (OOM backpressure guard)"
+            );
+        }
     }
 
     /// Try to read an RPC from the inbound stream.
@@ -180,16 +257,19 @@ impl BlossomSubHandler {
 
         let OutboundState::Active { stream } = outbound;
 
-        while let Some(data) = self.send_queue.front() {
-            match Pin::new(&mut *stream).poll_write(cx, data) {
+        while let Some(queued) = self.send_queue.front() {
+            match Pin::new(&mut *stream).poll_write(cx, &queued.data) {
                 Poll::Ready(Ok(n)) => {
-                    if n == data.len() {
-                        self.send_queue.pop_front();
+                    if n == queued.data.len() {
+                        if let Some(done) = self.send_queue.pop_front() {
+                            self.send_queue_bytes -= done.data.len();
+                        }
                         debug!(bytes = n, "wrote to outbound");
                     } else {
                         // Partial write — trim what was sent
-                        let remaining = data[n..].to_vec();
-                        *self.send_queue.front_mut().unwrap() = remaining;
+                        let front = self.send_queue.front_mut().unwrap();
+                        front.data = front.data[n..].to_vec();
+                        self.send_queue_bytes -= n;
                         break;
                     }
                 }
@@ -227,7 +307,12 @@ impl ConnectionHandler for BlossomSubHandler {
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
         debug!(data_len = event.rpc_data.len(), queue_len = self.send_queue.len(), "handler received data from behaviour");
-        self.send_queue.push_back(event.rpc_data);
+        self.send_queue_bytes += event.rpc_data.len();
+        self.send_queue.push_back(QueuedRpc {
+            data: event.rpc_data,
+            bulk: event.bulk,
+        });
+        self.shed_send_queue();
     }
 
     fn on_connection_event(
@@ -299,5 +384,64 @@ impl ConnectionHandler for BlossomSubHandler {
         }
 
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handler() -> BlossomSubHandler {
+        BlossomSubHandler::new(StreamProtocol::new("/blossomsub/test"))
+    }
+
+    fn feed(h: &mut BlossomSubHandler, len: usize, bulk: bool) {
+        h.on_behaviour_event(HandlerIn {
+            rpc_data: vec![0u8; len],
+            bulk,
+        });
+    }
+
+    /// REGRESSION (OOM): the per-connection outbound `send_queue` had no
+    /// bound. A peer whose outbound stream stalls/never negotiates accumulates
+    /// forwarded payloads forever (jeprof: 25 GB retained through handle_rpc,
+    /// held here). The cap must bound buffered bytes while preserving control.
+    #[test]
+    fn send_queue_capped_drops_bulk_keeps_control() {
+        let mut h = handler();
+        // A few small control RPCs first (must survive).
+        for _ in 0..4 {
+            feed(&mut h, 64, false);
+        }
+        // Flood with 1 MiB bulk forwards — far over the 8 MiB cap.
+        for _ in 0..64 {
+            feed(&mut h, 1024 * 1024, true);
+        }
+        assert!(
+            h.send_queue_bytes <= SEND_QUEUE_MAX_BYTES,
+            "outbound backlog must stay under the cap, got {}",
+            h.send_queue_bytes
+        );
+        // All 4 control RPCs preserved.
+        let control = h.send_queue.iter().filter(|q| !q.bulk).count();
+        assert_eq!(control, 4, "control RPCs must survive backlog shedding");
+        // Accounting matches the actual buffered bytes.
+        let actual: usize = h.send_queue.iter().map(|q| q.data.len()).sum();
+        assert_eq!(actual, h.send_queue_bytes, "byte accounting must stay exact");
+    }
+
+    /// Hard stop: a queue of pure control that still exceeds the cap drops
+    /// oldest entries so memory can't grow without bound even with no bulk.
+    #[test]
+    fn send_queue_hard_caps_even_pure_control() {
+        let mut h = handler();
+        for _ in 0..200 {
+            feed(&mut h, 64 * 1024, false); // 200 × 64 KiB = 12.5 MiB of control
+        }
+        assert!(
+            h.send_queue_bytes <= SEND_QUEUE_MAX_BYTES,
+            "pure-control backlog must still be bounded, got {}",
+            h.send_queue_bytes
+        );
     }
 }
