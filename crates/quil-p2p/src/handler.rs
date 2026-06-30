@@ -23,6 +23,12 @@ use crate::protocol::pb;
 pub struct HandlerIn {
     /// Serialized RPC to send to the peer.
     pub rpc_data: Vec<u8>,
+    /// True if `rpc_data` carries a full message payload (a forward, a
+    /// local publish, or an IWANT response). The handler ignores this; it
+    /// exists so the behaviour's backpressure guard (`shed_overflow_events`)
+    /// can drop these bulky events under OOM pressure while preserving small
+    /// control RPCs (graft/prune/IWANT-request/IHAVE/IDONTWANT/subscribe).
+    pub bulk: bool,
 }
 
 /// Messages from the handler to the behaviour.

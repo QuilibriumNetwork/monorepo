@@ -262,6 +262,7 @@ impl BlossomSubBehaviour {
                         handler: NotifyHandler::Any,
                         event: HandlerIn {
                             rpc_data: rpc_data.clone(),
+                            bulk: false,
                         },
                     });
                 }
@@ -402,7 +403,7 @@ impl BlossomSubBehaviour {
             self.events.push_back(ToSwarm::NotifyHandler {
                 peer_id: *peer,
                 handler: NotifyHandler::Any,
-                event: HandlerIn { rpc_data: encoded.clone() },
+                event: HandlerIn { rpc_data: encoded.clone(), bulk: true },
             });
         }
         // TEMP mesh-debug: surface exactly what the leader can reach so we can
@@ -448,17 +449,24 @@ impl BlossomSubBehaviour {
     }
 
     /// Backpressure guard for the outbound `self.events` queue. The swarm
-    /// drains it one entry per `poll`; if the application consuming
-    /// `SwarmEvent::Behaviour` stalls (busy/blocked), inbound `Message`
-    /// deliveries accumulate without bound — the regular-node OOM (jeprof:
-    /// dominant stack through `on_connection_handler_event`, ~18M ~1KiB
-    /// `pb::Message` clones, 30+ GB).
+    /// drains it one entry per `poll`; if the swarm consumer stalls or the
+    /// transport backs up, the bulky payload-carrying events accumulate
+    /// without bound — the regular-node OOM (jeprof: dominant stack through
+    /// `on_connection_handler_event`, ~18M ~1KiB clones, 30+ GB).
     ///
-    /// When the queue exceeds the high-water mark, drop the OLDEST app-bound
-    /// `Message` deliveries (gossip tolerates message loss; a stalled app
-    /// can't use them anyway) down to the low-water mark, while PRESERVING
-    /// every `NotifyHandler` control event (graft/prune/forward/IWANT) so the
-    /// mesh and forwarding stay intact.
+    /// Two kinds of events carry full message payloads:
+    ///   1. app-bound `Message` deliveries (`ToSwarm::GenerateEvent`), and
+    ///   2. `NotifyHandler` events tagged `bulk` — forwards, local publishes,
+    ///      and IWANT responses (each holds a full `encoded` RPC ~1KiB).
+    /// A relay node subscribed to nothing on a bitmask emits ONLY (2), so a
+    /// guard that drops only (1) never bounds the queue — that was the
+    /// still-OOMing bug this replaces.
+    ///
+    /// When the queue exceeds the high-water mark, drop the OLDEST bulk events
+    /// of either kind (gossip tolerates message loss; a stalled consumer can't
+    /// use them anyway) down to the low-water mark, while PRESERVING every
+    /// small control event (graft/prune/IWANT-request/IHAVE/IDONTWANT/
+    /// subscribe) so the mesh and gossip stay intact.
     fn shed_overflow_events(&mut self) {
         const HIGH_WATER: usize = 200_000;
         const LOW_WATER: usize = 150_000;
@@ -470,12 +478,15 @@ impl BlossomSubBehaviour {
         let mut kept: VecDeque<ToSwarm<BlossomSubEvent, HandlerIn>> =
             VecDeque::with_capacity(LOW_WATER + 1);
         for ev in std::mem::take(&mut self.events) {
-            if removed < target_remove
-                && matches!(
-                    &ev,
-                    ToSwarm::GenerateEvent(BlossomSubEvent::Message { .. })
-                )
-            {
+            let is_bulk = matches!(
+                &ev,
+                ToSwarm::GenerateEvent(BlossomSubEvent::Message { .. })
+                    | ToSwarm::NotifyHandler {
+                        event: HandlerIn { bulk: true, .. },
+                        ..
+                    }
+            );
+            if removed < target_remove && is_bulk {
                 removed += 1;
                 continue;
             }
@@ -485,8 +496,8 @@ impl BlossomSubBehaviour {
         warn!(
             dropped = removed,
             remaining = self.events.len(),
-            "blossomsub: shed inbound messages — swarm consumer not draining \
-             (OOM backpressure guard); control events preserved"
+            "blossomsub: shed bulk message/forward events — swarm consumer not \
+             draining (OOM backpressure guard); control events preserved"
         );
     }
 
@@ -652,6 +663,7 @@ impl BlossomSubBehaviour {
                         handler: NotifyHandler::Any,
                         event: HandlerIn {
                             rpc_data: encoded.clone(),
+                            bulk: true,
                         },
                     });
                 }
@@ -695,6 +707,7 @@ impl BlossomSubBehaviour {
                                 handler: NotifyHandler::Any,
                                 event: HandlerIn {
                                     rpc_data: encoded_idontwant.clone(),
+                                    bulk: false,
                                 },
                             });
                         }
@@ -1026,7 +1039,7 @@ impl BlossomSubBehaviour {
                     self.events.push_back(ToSwarm::NotifyHandler {
                         peer_id: peer,
                         handler: NotifyHandler::Any,
-                        event: HandlerIn { rpc_data: encoded },
+                        event: HandlerIn { rpc_data: encoded, bulk: false },
                     });
                 }
             }
@@ -1058,7 +1071,7 @@ impl BlossomSubBehaviour {
                         self.events.push_back(ToSwarm::NotifyHandler {
                             peer_id: peer,
                             handler: NotifyHandler::Any,
-                            event: HandlerIn { rpc_data: encoded },
+                            event: HandlerIn { rpc_data: encoded, bulk: true },
                         });
                     }
                 }
@@ -1102,6 +1115,7 @@ impl BlossomSubBehaviour {
                     handler: NotifyHandler::Any,
                     event: HandlerIn {
                         rpc_data: rpc_data.clone(),
+                        bulk: false,
                     },
                 });
             }
@@ -1453,7 +1467,7 @@ impl BlossomSubBehaviour {
                 self.events.push_back(ToSwarm::NotifyHandler {
                     peer_id: target,
                     handler: NotifyHandler::Any,
-                    event: HandlerIn { rpc_data: encoded },
+                    event: HandlerIn { rpc_data: encoded, bulk: false },
                 });
             }
         }
@@ -1809,7 +1823,7 @@ impl BlossomSubBehaviour {
                             self.events.push_back(ToSwarm::NotifyHandler {
                                 peer_id: peer,
                                 handler: NotifyHandler::One(conn),
-                                event: HandlerIn { rpc_data: encoded.clone() },
+                                event: HandlerIn { rpc_data: encoded.clone(), bulk: false },
                             });
                         }
                     }
@@ -1928,7 +1942,7 @@ impl BlossomSubBehaviour {
                 self.events.push_back(ToSwarm::NotifyHandler {
                     peer_id: *peer,
                     handler: NotifyHandler::One(conn),
-                    event: HandlerIn { rpc_data: encoded },
+                    event: HandlerIn { rpc_data: encoded, bulk: false },
                 });
             }
         }
@@ -1944,7 +1958,7 @@ impl BlossomSubBehaviour {
                 self.events.push_back(ToSwarm::NotifyHandler {
                     peer_id: *peer,
                     handler: NotifyHandler::One(conn),
-                    event: HandlerIn { rpc_data: encoded },
+                    event: HandlerIn { rpc_data: encoded, bulk: false },
                 });
                 // Set backoff
                 self.backoffs.insert(
@@ -2038,6 +2052,7 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                         handler: NotifyHandler::Any,
                         event: HandlerIn {
                             rpc_data: rpc_data.clone(),
+                            bulk: false,
                         },
                     });
                 }
@@ -2233,6 +2248,56 @@ mod composite_tests {
         let len = bh.events.len();
         bh.shed_overflow_events();
         assert_eq!(bh.events.len(), len, "no-op when already under the cap");
+    }
+
+    #[test]
+    fn shed_overflow_bounds_queue_dominated_by_forwards() {
+        // REGRESSION: a relay node not subscribed to a bitmask emits ZERO
+        // `Message` GenerateEvents — it only enqueues `NotifyHandler` FORWARDS
+        // (each carrying a full ~1KiB encoded RPC). The old guard sheds only
+        // `Message` events, so it found nothing to drop and the queue grew
+        // unbounded to OOM (36 GB). The guard must shed `bulk` NotifyHandler
+        // events too, while preserving small control RPCs.
+        let mut bh = BlossomSubBehaviour::new(0);
+        let peer = PeerId::random();
+        let mut control_pushed = 0usize;
+        for i in 0..260_000u32 {
+            // Bulk forward — the floodable, payload-carrying path.
+            bh.events.push_back(ToSwarm::NotifyHandler {
+                peer_id: peer,
+                handler: NotifyHandler::Any,
+                event: HandlerIn { rpc_data: vec![0u8; 1024], bulk: true },
+            });
+            // Interleave small control RPCs that MUST survive shedding.
+            if i % 40_000 == 0 {
+                bh.events.push_back(ToSwarm::NotifyHandler {
+                    peer_id: peer,
+                    handler: NotifyHandler::Any,
+                    event: HandlerIn { rpc_data: vec![0u8; 8], bulk: false },
+                });
+                control_pushed += 1;
+            }
+        }
+        assert!(bh.events.len() > 200_000);
+        bh.shed_overflow_events();
+        assert!(
+            bh.events.len() <= 200_000,
+            "queue must be bounded even when dominated by forwards"
+        );
+        let control_after = bh
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ToSwarm::NotifyHandler { event: HandlerIn { bulk: false, .. }, .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            control_after, control_pushed,
+            "control RPCs must survive shedding"
+        );
     }
 
     #[test]
