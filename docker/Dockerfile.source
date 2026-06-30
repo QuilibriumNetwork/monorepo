@@ -286,6 +286,14 @@ COPY --from=gen-rust /out/ /opt/ceremonyclient/target/release/
 # Stage: build-node
 # -----------------------------------------------------------------------------
 FROM build-context AS build-node
+# Emit frame pointers across the whole Rust node binary (quil-node + its
+# deps, including quil-p2p/libp2p). Release builds otherwise omit them, so
+# jemalloc/jeprof can't unwind allocation stacks and collapse every sample
+# onto `prof_backtrace_impl` / a single `on_connection_handler_event` frame,
+# hiding which structure actually leaks. The ~1-2% perf cost is acceptable
+# for a profilable production binary. No .cargo/config rustflags exist to
+# merge with, and build.sh leaves RUSTFLAGS untouched, so cargo inherits it.
+ENV RUSTFLAGS="-C force-frame-pointers=yes"
 COPY ./node /opt/ceremonyclient/node
 WORKDIR /opt/ceremonyclient/node
 # build.sh compiles the Rust `quil-node` crate in release mode and
