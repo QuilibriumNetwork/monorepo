@@ -212,6 +212,7 @@ pub(crate) async fn start(
         key_manager: file_key_manager.clone(),
         exec_manager: exec_manager.clone(),
         archive_mode,
+        network,
     });
 
     let runtime_state::RuntimeState {

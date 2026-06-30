@@ -374,6 +374,41 @@ pub fn bundle_has_shard_frame(data: &[u8]) -> bool {
     !extract_shard_frame_keys(data).is_empty()
 }
 
+/// True iff every shard `FrameHeader` carried by `data` is in STRICT LOCKSTEP
+/// with a global frame `frame_number`: its `global_frame_number` (storage-beacon
+/// anchor) is either 0 (genesis / legacy-VDF, no anchor) or exactly
+/// `frame_number - 1` (the immediately-preceding global frame). Returns `true`
+/// for bundles that aren't decodable / carry no shard frames (this gate only
+/// governs shard proofs).
+///
+/// The global leader calls this to include ONLY in-lockstep shard proofs.
+/// Because the materializer HARD-REJECTS any frame containing an out-of-lockstep
+/// shard op (`audit_storage_attestation`), a leader that packed a stale proof
+/// would produce a frame its followers refuse — a halt. Dropping stale proofs
+/// here keeps producer and verifier symmetric: the shard must re-attest fresh
+/// (anchored to the new tip) to be included.
+pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
+    use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+    use quil_execution::message_envelope::CanonicalMessageBundle;
+
+    let expected = frame_number.saturating_sub(1);
+    let bundle = match CanonicalMessageBundle::from_canonical_bytes(data) {
+        Ok(b) => b,
+        Err(_) => return true,
+    };
+    for req in bundle.requests.into_iter().flatten() {
+        if req.inner_type_prefix == TYPE_FRAME_HEADER {
+            if let Ok(fh) = FrameHeader::from_canonical_bytes(&req.inner_bytes) {
+                let anchor = fh.global_frame_number;
+                if anchor != 0 && anchor != expected {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 fn extract_shard_frame_keys(data: &[u8]) -> Vec<(Vec<u8>, u64)> {
     use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
     use quil_execution::message_envelope::CanonicalMessageBundle;
@@ -651,5 +686,38 @@ mod tests {
         mc.clear_shard_frame_dedup();
         // Same frame number now accepted because cache is empty.
         assert!(mc.dedup_shard_frames(&vec![(vec![0xAAu8; 32], 100)]));
+    }
+
+    #[test]
+    fn lockstep_gate_accepts_only_preceding_anchor() {
+        use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+        use quil_execution::message_envelope::{
+            CanonicalMessageBundle, CanonicalMessageRequest,
+        };
+
+        // A bundle carrying one shard FrameHeader anchored to `anchor`.
+        let make = |anchor: u64| -> Vec<u8> {
+            let fh = FrameHeader {
+                address: vec![0x11u8; 32],
+                frame_number: 7,
+                global_frame_number: anchor,
+                ..Default::default()
+            };
+            let req = CanonicalMessageRequest {
+                inner_type_prefix: TYPE_FRAME_HEADER,
+                inner_bytes: fh.to_canonical_bytes().unwrap(),
+            };
+            CanonicalMessageBundle { requests: vec![Some(req)], timestamp: 0 }
+                .to_canonical_bytes()
+                .unwrap()
+        };
+
+        // Building global frame 100: in lockstep iff anchor == 99 (frame-1) or 0.
+        assert!(bundle_shard_frames_in_lockstep(&make(99), 100), "anchor==frame-1 in lockstep");
+        assert!(bundle_shard_frames_in_lockstep(&make(0), 100), "genesis anchor exempt");
+        assert!(!bundle_shard_frames_in_lockstep(&make(98), 100), "stale anchor dropped");
+        assert!(!bundle_shard_frames_in_lockstep(&make(100), 100), "future anchor dropped");
+        // Non-bundle / non-shard-frame data passes (this gate only governs shard frames).
+        assert!(bundle_shard_frames_in_lockstep(b"not a bundle", 100));
     }
 }

@@ -280,6 +280,38 @@ impl BlossomSubBehaviour {
     /// Publish data to a bitmask topic. Sends the message to all mesh
     /// peers for this bitmask, adds to message cache, and marks as seen.
     /// Messages are signed with the libp2p identity key for Go compatibility.
+    /// Resolve the mesh peers a message for `bitmask` should be sent/forwarded
+    /// to. COMPOSITE (multi-slice, e.g. bloom-filter app-shard) bitmasks keep
+    /// their mesh in `self.composites` (same + broker peers); only SIMPLE
+    /// (single-slice, e.g. all-zeros global) bitmasks live directly in
+    /// `self.mesh`. `publish`/`forward` previously looked up `self.mesh[full
+    /// bitmask]`, which is ALWAYS EMPTY for a composite — so app-shard
+    /// proposals/votes were published into the void and never reached peers
+    /// (the regular-node "leader proposes but nobody receives" bug). Resolve
+    /// composites through their composite entry.
+    fn mesh_recipients(&self, bitmask: &[u8]) -> Vec<PeerId> {
+        let mut out: HashSet<PeerId> = HashSet::new();
+        // (a) Heartbeat-maintained mesh keyed by the full bitmask (works for
+        // simple bitmasks; also populated for composites when peers advertise
+        // the full bitmask in their SUBSCRIBE).
+        if let Some(s) = self.mesh.get(bitmask) {
+            out.extend(s.iter().copied());
+        }
+        // (b) Composite same/broker peers + the per-slice meshes — covers the
+        // case where the composite classification holds the peers but the
+        // full-bitmask mesh entry was never grafted.
+        if let Some(comp) = self.composites.get(bitmask) {
+            out.extend(comp.same.iter().copied());
+            out.extend(comp.broker.iter().copied());
+            for slice in &comp.slices {
+                if let Some(s) = self.mesh.get(slice) {
+                    out.extend(s.iter().copied());
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
     pub fn publish(&mut self, bitmask: Vec<u8>, data: Vec<u8>) -> std::result::Result<(), String> {
         if !self.subscriptions.contains(&bitmask) {
             return Err(format!(
@@ -365,20 +397,33 @@ impl BlossomSubBehaviour {
         let rpc = crate::protocol::publish_rpc(vec![msg]);
         let encoded = crate::protocol::encode_rpc(&rpc);
 
-        if let Some(peers) = self.mesh.get(&bitmask) {
-            for &peer in peers {
-                self.events.push_back(ToSwarm::NotifyHandler {
-                    peer_id: peer,
-                    handler: NotifyHandler::Any,
-                    event: HandlerIn { rpc_data: encoded.clone() },
-                });
-            }
-            tracing::debug!(
-                bitmask = hex::encode(&bitmask),
-                mesh_peers = peers.len(),
-                "published to mesh"
-            );
+        let recipients = self.mesh_recipients(&bitmask);
+        for peer in &recipients {
+            self.events.push_back(ToSwarm::NotifyHandler {
+                peer_id: *peer,
+                handler: NotifyHandler::Any,
+                event: HandlerIn { rpc_data: encoded.clone() },
+            });
         }
+        // TEMP mesh-debug: surface exactly what the leader can reach so we can
+        // tell mesh-formation failure from a keying bug.
+        let full_mesh = self.mesh.get(&bitmask).map(|s| s.len()).unwrap_or(0);
+        let (same, broker, nslices) = self
+            .composites
+            .get(&bitmask)
+            .map(|c| (c.same.len(), c.broker.len(), c.slices.len()))
+            .unwrap_or((0, 0, 0));
+        tracing::info!(
+            bitmask = hex::encode(&bitmask),
+            recipients = recipients.len(),
+            full_mesh,
+            comp_same = same,
+            comp_broker = broker,
+            nslices,
+            peer_subs = self.peer_subscriptions.len(),
+            connected = self.connected_peers.len(),
+            "MESH-DBG published to mesh"
+        );
 
         Ok(())
     }
@@ -400,6 +445,49 @@ impl BlossomSubBehaviour {
             let rpc = protocol::subscribe_rpc(&bitmasks);
             self.pending_subscribe_rpc = Some(protocol::encode_rpc(&rpc));
         }
+    }
+
+    /// Backpressure guard for the outbound `self.events` queue. The swarm
+    /// drains it one entry per `poll`; if the application consuming
+    /// `SwarmEvent::Behaviour` stalls (busy/blocked), inbound `Message`
+    /// deliveries accumulate without bound — the regular-node OOM (jeprof:
+    /// dominant stack through `on_connection_handler_event`, ~18M ~1KiB
+    /// `pb::Message` clones, 30+ GB).
+    ///
+    /// When the queue exceeds the high-water mark, drop the OLDEST app-bound
+    /// `Message` deliveries (gossip tolerates message loss; a stalled app
+    /// can't use them anyway) down to the low-water mark, while PRESERVING
+    /// every `NotifyHandler` control event (graft/prune/forward/IWANT) so the
+    /// mesh and forwarding stay intact.
+    fn shed_overflow_events(&mut self) {
+        const HIGH_WATER: usize = 200_000;
+        const LOW_WATER: usize = 150_000;
+        if self.events.len() <= HIGH_WATER {
+            return;
+        }
+        let target_remove = self.events.len() - LOW_WATER;
+        let mut removed = 0usize;
+        let mut kept: VecDeque<ToSwarm<BlossomSubEvent, HandlerIn>> =
+            VecDeque::with_capacity(LOW_WATER + 1);
+        for ev in std::mem::take(&mut self.events) {
+            if removed < target_remove
+                && matches!(
+                    &ev,
+                    ToSwarm::GenerateEvent(BlossomSubEvent::Message { .. })
+                )
+            {
+                removed += 1;
+                continue;
+            }
+            kept.push_back(ev);
+        }
+        self.events = kept;
+        warn!(
+            dropped = removed,
+            remaining = self.events.len(),
+            "blossomsub: shed inbound messages — swarm consumer not draining \
+             (OOM backpressure guard); control events preserved"
+        );
     }
 
     /// Handle an RPC received from a peer's handler.
@@ -523,7 +611,10 @@ impl BlossomSubBehaviour {
             // have announced IDONTWANT for this message id).
             let msg_size = msg.data.len();
             let msg_bitmask = msg.bitmask.clone();
-            if let Some(mesh_peers) = self.mesh.get(&msg_bitmask) {
+            // Composite-aware: resolve through `mesh_recipients` so app-shard
+            // (composite) traffic is RELAYED — `self.mesh[composite]` is empty.
+            let mesh_peers = self.mesh_recipients(&msg_bitmask);
+            if !mesh_peers.is_empty() {
                 let forward_rpc = protocol::publish_rpc(vec![msg]);
                 let encoded = protocol::encode_rpc(&forward_rpc);
                 let idontwant_peers: Vec<PeerId> = mesh_peers
@@ -2008,6 +2099,12 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                     debug!(%peer_id, subs, msgs, "behaviour received RPC with data from handler");
                 }
                 self.handle_rpc(peer_id, rpc);
+                // OOM GUARD: bound `self.events`. `poll` drains one event per
+                // call, so if the swarm consumer (the application) stalls — e.g.
+                // catch-up while archives are unreachable — inbound `Message`
+                // deliveries pile up here without limit (observed: ~18M ~1KiB
+                // objects → 30+ GB OOM, jeprof stack `on_connection_handler_event`).
+                self.shed_overflow_events();
             }
             HandlerOut::Error(e) => {
                 debug!(%peer_id, error = %e, "handler error");
@@ -2067,6 +2164,75 @@ mod composite_tests {
     /// Build a PRUNE-only RPC for a single bitmask (no backoff).
     fn prune_rpc(bitmask: &[u8]) -> pb::Rpc {
         crate::protocol::prune_rpc(&[bitmask.to_vec()], 0)
+    }
+
+    #[test]
+    fn composite_publish_resolves_to_composite_mesh() {
+        // REGRESSION: app-shard (bloom-filter) bitmasks are multi-slice
+        // composites. Their mesh lives in `self.composites`, NOT
+        // `self.mesh[full_bitmask]` — so publish/forward looking up
+        // `self.mesh[full]` found nobody and app-shard gossip went into the
+        // void. `mesh_recipients` must resolve composites correctly.
+        let (bitmask, slices) = two_slice_bitmask();
+        let mut bh = BlossomSubBehaviour::new(0);
+        let peer = PeerId::random();
+        // Peer subscribed to BOTH slices → "same" peer for the composite.
+        seed_subscription(&mut bh, peer, &slices);
+        bh.subscribe(bitmask.clone()); // multi-slice → join_composite runs
+
+        // The full composite key is (by design) absent from `self.mesh`.
+        assert!(
+            bh.mesh.get(&bitmask).is_none(),
+            "full composite key is not stored in self.mesh"
+        );
+        // The fix: recipients resolved through the composite entry.
+        let recipients = bh.mesh_recipients(&bitmask);
+        assert!(
+            recipients.contains(&peer),
+            "composite publish/forward must target the composite mesh peer"
+        );
+    }
+
+    #[test]
+    fn shed_overflow_drops_inbound_messages_keeps_control() {
+        // OOM guard: overflow the outbound queue with inbound Message
+        // deliveries (the floodable path) plus some non-Message events, then
+        // confirm shedding bounds the queue while preserving control.
+        let mut bh = BlossomSubBehaviour::new(0);
+        let peer = PeerId::random();
+        let mut control_pushed = 0usize;
+        for i in 0..260_000u32 {
+            bh.events.push_back(ToSwarm::GenerateEvent(BlossomSubEvent::Message {
+                propagation_source: peer,
+                message_id: vec![0u8; 4],
+                message: pb::Message::default(),
+            }));
+            // Interleave non-Message events that MUST survive shedding.
+            if i % 40_000 == 0 {
+                bh.events.push_back(ToSwarm::GenerateEvent(BlossomSubEvent::Subscribed {
+                    peer_id: peer,
+                    bitmask: vec![0xAB],
+                }));
+                control_pushed += 1;
+            }
+        }
+        assert!(bh.events.len() > 200_000);
+        bh.shed_overflow_events();
+        // Queue bounded back under the high-water mark.
+        assert!(bh.events.len() <= 200_000, "queue must be bounded after shed");
+        // Every non-Message (control) event preserved.
+        let control_after = bh
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(e, ToSwarm::GenerateEvent(BlossomSubEvent::Subscribed { .. }))
+            })
+            .count();
+        assert_eq!(control_after, control_pushed, "control events must survive shedding");
+        // Idempotent below the cap.
+        let len = bh.events.len();
+        bh.shed_overflow_events();
+        assert_eq!(bh.events.len(), len, "no-op when already under the cap");
     }
 
     #[test]

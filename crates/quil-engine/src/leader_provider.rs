@@ -331,7 +331,24 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 let mut invalid: Vec<Vec<u8>> = Vec::new();
                 for raw in collected {
                     if crate::message_collector::bundle_has_shard_frame(&raw) {
-                        valid.push(raw);
+                        // Strict lockstep: include a shard-frame proof ONLY if it
+                        // anchors to `frame_number - 1` (or genesis anchor 0). The
+                        // materializer hard-rejects any frame carrying an
+                        // out-of-lockstep shard op, so packing a stale proof would
+                        // halt the chain — drop it here instead. A lagging shard
+                        // must re-attest against the new tip to be included.
+                        if crate::message_collector::bundle_shard_frames_in_lockstep(
+                            &raw,
+                            frame_number,
+                        ) {
+                            valid.push(raw);
+                        } else {
+                            tracing::debug!(
+                                frame = frame_number,
+                                "dropping out-of-lockstep shard frame proof from global mempool",
+                            );
+                            invalid.push(raw);
+                        }
                         continue;
                     }
                     match validator.validate_message(frame_number, &global_addr, &raw) {

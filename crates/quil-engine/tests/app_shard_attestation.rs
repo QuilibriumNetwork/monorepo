@@ -261,6 +261,7 @@ fn build_and_verify_partial_with_filter(
         public_key_signature_bls48581: agg_canonical.to_canonical_bytes()?,
         storage_attestation_root: Vec::new(),
         global_frame_number: 0,
+        storage_attestation: Vec::new(),
     };
 
     let returned = verify_frame_header_attestation(
@@ -412,6 +413,7 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
         public_key_signature_bls48581: agg_canonical_bytes,
         storage_attestation_root: Vec::new(),
         global_frame_number: 0,
+        storage_attestation: Vec::new(),
     };
 
     // 6. Verify — must succeed. The function's return value is the
@@ -533,6 +535,7 @@ fn signing_with_raw_filter_instead_of_app_address_must_fail_verify() {
         public_key_signature_bls48581: agg_canonical.to_canonical_bytes().unwrap(),
         storage_attestation_root: Vec::new(),
         global_frame_number: 0,
+        storage_attestation: Vec::new(),
     };
 
     let result = verify_frame_header_attestation(
@@ -744,6 +747,7 @@ fn bls_voting_provider_sign_vote_round_trips_through_verifier() {
             .expect("canonical encode"),
         storage_attestation_root: Vec::new(),
         global_frame_number: 0,
+        storage_attestation: Vec::new(),
     };
 
     let bitmask = verify_frame_header_attestation(

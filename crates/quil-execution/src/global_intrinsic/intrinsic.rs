@@ -1580,10 +1580,33 @@ impl GlobalIntrinsic {
         state: &HypergraphState,
         va_disc: &[u8; 32],
     ) -> Result<()> {
-        // Always-on: audit any reward proof that anchors to a real global frame
-        // and carries an attestation. (Genesis / legacy-VDF frames anchor to 0
-        // and carry no attestation, so they no-op here either way.)
-        if op.global_frame_number == 0 || op.storage_attestation.is_empty() {
+        // Genesis / legacy-VDF frames anchor to 0 — no storage beacon, no
+        // lockstep requirement.
+        if op.global_frame_number == 0 {
+            return Ok(());
+        }
+
+        // STRICT LOCKSTEP: a storage frame (global_frame_number > 0) MUST anchor
+        // to the IMMEDIATELY PRECEDING global frame. This makes app-shard frames
+        // 1:1 lockstepped with the global chain — exactly one fresh storage
+        // attestation per global frame — and rejects stale, replayed, or
+        // early/future anchors. Hard-reject: an out-of-lockstep op invalidates
+        // the entire global frame (Err propagates out of invoke_frame_header →
+        // materialize), so a correct leader may include ONLY shard proofs whose
+        // beacon anchors to `frame_number - 1`. A prover that can't land a fresh
+        // proof every frame stops proving current storage and earns nothing.
+        let expected_anchor = frame_number.saturating_sub(1);
+        if op.global_frame_number != expected_anchor {
+            return Err(QuilError::InvalidArgument(format!(
+                "storage attestation out of lockstep: anchor global_frame_number={} \
+                 but global frame {} requires anchor {} (frame_number - 1)",
+                op.global_frame_number, frame_number, expected_anchor
+            )));
+        }
+
+        // Anchor is in lockstep. If there's no attestation payload, there are no
+        // openings to audit — nothing more to do.
+        if op.storage_attestation.is_empty() {
             return Ok(());
         }
         let att = <quil_types::proto::global::StorageAttestation as prost::Message>::decode(
@@ -3070,7 +3093,8 @@ mod tests {
 
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
                 .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
-            gi.audit_storage_attestation(7, &op, &[], &state, &va_disc).unwrap();
+            // In lockstep: anchor 1000 == frame_number 1001 - 1.
+            gi.audit_storage_attestation(1_001, &op, &[], &state, &va_disc).unwrap();
 
             assert_eq!(
                 read_status(&state, &bad_addr, "prover:Prover"),
@@ -3112,7 +3136,7 @@ mod tests {
                 "no eviction for a frame with no global anchor",
             );
 
-            // Anchored but empty attestation: no audit.
+            // Anchored (in lockstep) but empty attestation: no audit.
             let empty = crate::global_intrinsic::frame_header::FrameHeader {
                 address: filter.clone(),
                 frame_number: 5,
@@ -3120,12 +3144,41 @@ mod tests {
                 storage_attestation: Vec::new(),
                 ..Default::default()
             };
-            gi.audit_storage_attestation(7, &empty, &[], &state, &va_disc).unwrap();
+            gi.audit_storage_attestation(1_001, &empty, &[], &state, &va_disc).unwrap();
             assert_ne!(
                 read_status(&state, &bad_addr, "prover:Prover"),
                 Some(STATUS_KICKED),
                 "no eviction when the frame carries no attestation",
             );
+        }
+
+        #[test]
+        fn storage_audit_rejects_out_of_lockstep_anchor() {
+            quil_crypto::init();
+            let state = make_state();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let member_pubkey = vec![0xD4u8; 585];
+            let member_addr = prover_address_from_pubkey(&member_pubkey).unwrap();
+            let filter = vec![0x55u8; 32];
+            let att = quil_types::proto::global::StorageAttestation {
+                openings: vec![storage_opening_proto(&member_addr, &vec![0x07u8; 32], 1)],
+            };
+            // Anchor=1000 but materializing frame=7 → anchor must be 6 (frame-1).
+            let op = frame_header_with_attestation(&filter, 1_000, &att);
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
+            let err = gi
+                .audit_storage_attestation(7, &op, &[], &state, &va_disc)
+                .expect_err("out-of-lockstep anchor must hard-reject");
+            assert!(
+                format!("{err}").contains("lockstep"),
+                "error should name the lockstep violation, got: {err}"
+            );
+
+            // The exact preceding frame (anchor == frame-1) is accepted.
+            let ok = frame_header_with_attestation(&filter, 6, &att);
+            gi.audit_storage_attestation(7, &ok, &[], &state, &va_disc)
+                .expect("anchor == frame_number-1 is in lockstep");
         }
 
         // -------------------------------------------------------------

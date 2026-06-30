@@ -26,6 +26,10 @@ pub(crate) struct PeerInfoPublisherArgs {
     pub key_manager: Arc<quil_keys::FileKeyManager>,
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
     pub archive_mode: bool,
+    /// Network id — controls the publish cadence. Mainnet (0) republishes
+    /// every 30 min; testnet/devnet every 30 s so a freshly-joined node
+    /// discovers archives in seconds instead of waiting out the long ticker.
+    pub network: u8,
 }
 
 pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisherArgs) {
@@ -48,6 +52,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
         key_manager: kr_key_manager,
         exec_manager,
         archive_mode,
+        network,
     } = args;
 
     let pi_handle = p2p_handle.clone();
@@ -90,9 +95,14 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
         });
     }
 
+    // Mainnet: 30 min (PeerInfo is stable, gossip is dense). Testnet/devnet:
+    // 30 s so a node that joins after the startup publish discovers archives
+    // within seconds rather than waiting out a 30-min ticker.
+    let publish_secs: u64 = if network == 0 { 30 * 60 } else { 30 };
     sup.run_until_cancelled("peer-info-publisher", move |_token| async move {
         let bitmask = vec![0x00, 0x00, 0x00, 0x00]; // GLOBAL_PEER_INFO
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(publish_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             // Resolve multiaddrs: prefer observed (NAT-resolved), then announce, then listen
@@ -244,5 +254,5 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             interval.tick().await;
         }
     });
-    info!("PeerInfo publisher started (30-minute interval)");
+    info!(publish_secs, "PeerInfo publisher started");
 }
