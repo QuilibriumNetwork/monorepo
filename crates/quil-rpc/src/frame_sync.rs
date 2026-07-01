@@ -47,18 +47,16 @@ pub enum FrameSyncError {
 pub struct ArchiveEndpointPool {
     inner: Mutex<ArchiveEndpointPoolInner>,
     notify: Notify,
+    /// How long a blacklisted endpoint stays banned before becoming
+    /// eligible again. Short enough that transient network blips don't
+    /// permanently drain the pool, long enough that we don't hammer a
+    /// struggling endpoint into the ground. A value of `Duration::ZERO`
+    /// disables blacklisting entirely: a failed endpoint's entry is
+    /// instantly expired, so it is restored on the very next `next()` and
+    /// re-accepted by `add()` — used where instant partition recovery
+    /// matters more than backing off a struggling peer.
+    blacklist_ttl: Duration,
 }
-
-/// How long a blacklisted endpoint stays banned before becoming
-/// eligible again. Short enough that transient network blips don't
-/// permanently drain the pool, long enough that we don't hammer a
-/// struggling endpoint into the ground. The previous design had no
-/// TTL — a single timeout permanently removed the endpoint, and
-/// `add()` rejected re-adds from PeerInfo discovery, so over hours
-/// of uptime the pool gradually drained to zero and every archive
-/// call surfaced as `"connect_mtls failed: transport error: deadline
-/// has expired"` even though the endpoints had long since recovered.
-const BLACKLIST_TTL: Duration = Duration::from_secs(60);
 
 struct ArchiveEndpointPoolInner {
     /// ALL known archive endpoints, in arrival order — once added, an
@@ -72,14 +70,18 @@ struct ArchiveEndpointPoolInner {
     /// Endpoints that have failed recently — a SKIP HINT for the poller's
     /// round-robin only; it does NOT remove them from `endpoints`. Each
     /// entry records the instant of the most recent failure; entries older
-    /// than `BLACKLIST_TTL` are eligible to be retried.
+    /// than `blacklist_ttl` are eligible to be retried.
     blacklist: HashMap<String, Instant>,
     /// Index into `endpoints` for the next pick.
     cursor: usize,
 }
 
 impl ArchiveEndpointPool {
-    pub fn new() -> Self {
+    /// Build a pool with the given blacklist TTL. `Duration::ZERO` disables
+    /// blacklisting (see the `blacklist_ttl` field). The production default
+    /// lives in `quil-config` (`EngineConfig::archive_blacklist_ttl_secs`),
+    /// not here — every caller passes an explicit TTL.
+    pub fn new(blacklist_ttl: Duration) -> Self {
         Self {
             inner: Mutex::new(ArchiveEndpointPoolInner {
                 endpoints: Vec::new(),
@@ -87,6 +89,7 @@ impl ArchiveEndpointPool {
                 cursor: 0,
             }),
             notify: Notify::new(),
+            blacklist_ttl,
         }
     }
 
@@ -98,7 +101,7 @@ impl ArchiveEndpointPool {
     pub async fn add(&self, endpoint: String) {
         let mut inner = self.inner.lock().await;
         if let Some(ts) = inner.blacklist.get(&endpoint) {
-            if ts.elapsed() < BLACKLIST_TTL {
+            if ts.elapsed() < self.blacklist_ttl {
                 return;
             }
             inner.blacklist.remove(&endpoint);
@@ -123,16 +126,17 @@ impl ArchiveEndpointPool {
 
     /// Pick the next non-blacklisted endpoint round-robin. Returns `None` if
     /// the pool is empty. Opportunistically restores endpoints whose
-    /// blacklist entry has aged past `BLACKLIST_TTL`, so a temporarily
+    /// blacklist entry has aged past `blacklist_ttl`, so a temporarily
     /// dead archive can be retried without waiting for PeerInfo
-    /// re-discovery.
+    /// re-discovery. With a zero TTL every entry is immediately eligible,
+    /// so a failed endpoint returns to rotation on the next call.
     pub(crate) async fn next(&self) -> Option<String> {
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
         let expired: Vec<String> = inner
             .blacklist
             .iter()
-            .filter(|(_, ts)| now.duration_since(**ts) >= BLACKLIST_TTL)
+            .filter(|(_, ts)| now.duration_since(**ts) >= self.blacklist_ttl)
             .map(|(e, _)| e.clone())
             .collect();
         for e in expired {
@@ -182,12 +186,6 @@ impl ArchiveEndpointPool {
                 _ = cancel.cancelled() => return,
             }
         }
-    }
-}
-
-impl Default for ArchiveEndpointPool {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -524,9 +522,18 @@ pub async fn run_archive_poller(
 mod pool_tests {
     use super::*;
 
+    /// Default TTL used by the pool tests that aren't specifically about
+    /// the disabled (zero-TTL) path.
+    const TEST_TTL: Duration = Duration::from_secs(60);
+
+    /// A pool with a normal (non-zero) blacklist TTL.
+    fn pool() -> ArchiveEndpointPool {
+        ArchiveEndpointPool::new(TEST_TTL)
+    }
+
     #[tokio::test]
     async fn add_then_get_all_returns_endpoints_in_order() {
-        let pool = ArchiveEndpointPool::new();
+        let pool = pool();
         pool.add("a.example.com:443".into()).await;
         pool.add("b.example.com:443".into()).await;
         let all = pool.get_all().await;
@@ -535,7 +542,7 @@ mod pool_tests {
 
     #[tokio::test]
     async fn add_dedups_existing_endpoint() {
-        let pool = ArchiveEndpointPool::new();
+        let pool = pool();
         pool.add("a.example.com:443".into()).await;
         pool.add("a.example.com:443".into()).await;
         assert_eq!(pool.len().await, 1);
@@ -543,7 +550,7 @@ mod pool_tests {
 
     #[tokio::test]
     async fn next_rotates_round_robin() {
-        let pool = ArchiveEndpointPool::new();
+        let pool = pool();
         for ep in ["a:1", "b:1", "c:1"] {
             pool.add(ep.into()).await;
         }
@@ -567,7 +574,7 @@ mod pool_tests {
 
     #[tokio::test]
     async fn blacklist_skips_rotation_but_never_prunes() {
-        let pool = ArchiveEndpointPool::new();
+        let pool = pool();
         pool.add("a:1".into()).await;
         pool.add("b:1".into()).await;
         pool.blacklist("a:1").await;
@@ -597,7 +604,7 @@ mod pool_tests {
     /// PeerInfo's re-`add()`.
     #[tokio::test]
     async fn blacklist_expires_after_ttl() {
-        let pool = ArchiveEndpointPool::new();
+        let pool = pool();
         pool.add("a:1".into()).await;
         pool.blacklist("a:1").await;
         assert!(pool.next().await.is_none(), "still blacklisted within TTL");
@@ -607,7 +614,7 @@ mod pool_tests {
         // for a unit test.
         {
             let mut inner = pool.inner.lock().await;
-            let past = Instant::now() - (BLACKLIST_TTL + Duration::from_secs(1));
+            let past = Instant::now() - (TEST_TTL + Duration::from_secs(1));
             inner.blacklist.insert("a:1".to_string(), past);
         }
 
@@ -626,7 +633,7 @@ mod pool_tests {
     /// for `next()` again once the TTL expires.
     #[tokio::test]
     async fn blacklisted_endpoint_never_pruned_retried_after_ttl() {
-        let pool = ArchiveEndpointPool::new();
+        let pool = pool();
         pool.add("a:1".into()).await;
         pool.blacklist("a:1").await;
         // Never pruned: still in the consensus fan-out set while blacklisted.
@@ -644,7 +651,7 @@ mod pool_tests {
         // Backdate the blacklist entry past the TTL.
         {
             let mut inner = pool.inner.lock().await;
-            let past = Instant::now() - (BLACKLIST_TTL + Duration::from_secs(1));
+            let past = Instant::now() - (TEST_TTL + Duration::from_secs(1));
             inner.blacklist.insert("a:1".to_string(), past);
         }
 
@@ -655,8 +662,36 @@ mod pool_tests {
 
     #[tokio::test]
     async fn next_returns_none_on_empty_pool() {
-        let pool = ArchiveEndpointPool::new();
+        let pool = pool();
         assert!(pool.next().await.is_none());
+    }
+
+    /// A zero TTL disables blacklisting: a failed endpoint is restored on
+    /// the very next `next()` (its entry is instantly expired), so it never
+    /// leaves rotation for more than a single pick. This is the devnet
+    /// configuration where partition recovery must be instantaneous.
+    #[tokio::test]
+    async fn blacklist_disabled_when_ttl_zero() {
+        let pool = ArchiveEndpointPool::new(Duration::ZERO);
+        pool.add("a:1".into()).await;
+        pool.add("b:1".into()).await;
+        pool.blacklist("a:1").await;
+
+        // `next()` immediately restores "a:1" (entry expired at TTL 0), so
+        // both endpoints come back into rotation without any wait.
+        let mut seen = vec![pool.next().await, pool.next().await]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["a:1", "b:1"],
+            "zero TTL must restore a blacklisted endpoint on the next pick"
+        );
+        let mut all = pool.get_all().await;
+        all.sort();
+        assert_eq!(all, vec!["a:1", "b:1"]);
     }
 
     /// `wait_nonempty` must release as soon as an endpoint arrives,
@@ -664,7 +699,7 @@ mod pool_tests {
     /// poller → PeerInfo discovery feeds endpoint → poller resumes.
     #[tokio::test]
     async fn wait_nonempty_releases_on_add() {
-        let pool = Arc::new(ArchiveEndpointPool::new());
+        let pool = Arc::new(pool());
         let cancel = CancellationToken::new();
         let waiter_pool = pool.clone();
         let waiter_cancel = cancel.clone();
@@ -689,7 +724,7 @@ mod pool_tests {
     /// endpoints — otherwise shutdown hangs.
     #[tokio::test]
     async fn wait_nonempty_respects_cancellation() {
-        let pool = Arc::new(ArchiveEndpointPool::new());
+        let pool = Arc::new(pool());
         let cancel = CancellationToken::new();
         let waiter_pool = pool.clone();
         let waiter_cancel = cancel.clone();

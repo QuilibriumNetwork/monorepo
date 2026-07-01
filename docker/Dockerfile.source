@@ -444,6 +444,60 @@ FROM qclient-unix AS qclient-darwin
 FROM qclient-${TARGETOS} AS qclient
 
 # -----------------------------------------------------------------------------
+# Stage: build-devnet-proxy
+# Purpose: Build the Rust `devnet-proxy` binary — the devnet integration-test
+# harness's in-container gossip/gRPC partition proxy. It reuses build-context's
+# generated static libs (libbls48581.a, libvdf.a, …) and the FLINT/GMP install
+# exactly like build-node; `devnet/` is already present in build-context's full
+# source copy. Built only when explicitly targeted (`--target devnet-proxy`);
+# placed before `final` so `final` stays the default target for the node image.
+# -----------------------------------------------------------------------------
+FROM build-context AS build-devnet-proxy
+# build-context excludes node/, but quil-execution `include_str!`s data files
+# under node/execution/ at compile time (build-node copies ./node for the same
+# reason). Bring it in before compiling.
+COPY ./node /opt/ceremonyclient/node
+WORKDIR /opt/ceremonyclient
+# cargo-target-devnet-proxy is per-stage (like build-node's cargo-target-node):
+# the -p set differs from gen-rust/build-node, so a shared target dir would
+# thrash cargo's fingerprints. The cp runs in the same RUN while the mount is
+# live, so target/release/devnet-proxy is present.
+RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=cargo-target-devnet-proxy,target=/opt/ceremonyclient/target \
+    cargo build -p devnet-proxy --release && \
+    cp target/release/devnet-proxy /usr/bin/devnet-proxy
+
+# -----------------------------------------------------------------------------
+# Stage: build-p2p-ping
+# Purpose: Build the Go `p2p-ping` example used by the compose healthcheck to
+# ping the proxy's QUIC endpoint. It is its own Go module under go-libp2p.
+# -----------------------------------------------------------------------------
+FROM build-context AS build-p2p-ping
+WORKDIR /opt/ceremonyclient/go-libp2p/examples/p2p-ping
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
+    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
+    go build -o /usr/bin/p2p-ping .
+
+# -----------------------------------------------------------------------------
+# Stage: devnet-proxy (runtime)
+# Purpose: Minimal runtime image for the devnet proxy. Mirrors the node final
+# stage's runtime deps (the proxy links the same crypto crates) plus the
+# p2p-ping binary the healthcheck invokes.
+# -----------------------------------------------------------------------------
+FROM ubuntu:24.04 AS devnet-proxy
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libgmp10 \
+    libmpfr6 \
+    libflint-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build-devnet-proxy /usr/bin/devnet-proxy /usr/local/bin/devnet-proxy
+COPY --from=build-p2p-ping /usr/bin/p2p-ping /usr/local/bin/p2p-ping
+WORKDIR /root
+ENTRYPOINT ["devnet-proxy"]
+
+# -----------------------------------------------------------------------------
 # Stage: final (Default combined image)
 # -----------------------------------------------------------------------------
 FROM ubuntu:24.04 AS final
@@ -472,6 +526,9 @@ LABEL org.opencontainers.image.revision=$GIT_COMMIT
 
 COPY --from=build-node /usr/bin/node /usr/local/bin
 COPY --from=build-qclient /opt/ceremonyclient/client/qclient /usr/local/bin
+# p2p-ping: the devnet compose healthchecks ping each node's QUIC endpoint with
+# it, and it's a handy P2P liveness diagnostic in general.
+COPY --from=build-p2p-ping /usr/bin/p2p-ping /usr/local/bin/p2p-ping
 
 WORKDIR /root
 ENTRYPOINT ["node"]

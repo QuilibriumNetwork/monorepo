@@ -392,6 +392,15 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     /// normally. Ported from the Quilibrium reference `BlossomSubBehaviour`.
     #[allow(clippy::type_complexity)]
     validators: HashMap<TopicHash, Box<dyn Fn(&PeerId, &[u8]) -> ValidationResult + Send + Sync>>,
+
+    /// Optional per-(source, target) forward filter. When set, a message
+    /// relayed from propagation source `source` is forwarded to a mesh peer
+    /// `target` only if `forward_filter(source, target)` returns true. Default
+    /// is `None` (all forwards allowed). Used by the devnet test proxy to
+    /// impose bipartite network partitions; equivalent to go-libp2p
+    /// blossomsub's `WithForwardFilter`.
+    #[allow(clippy::type_complexity)]
+    forward_filter: Option<Box<dyn Fn(&PeerId, &PeerId) -> bool + Send + Sync>>,
 }
 
 /// Builds the DEFAULT peer-scoring configuration installed on every
@@ -650,6 +659,7 @@ where
             subscription_filter,
             data_transform,
             validators: HashMap::new(),
+            forward_filter: None,
         })
     }
 }
@@ -1049,6 +1059,35 @@ where
         validator: impl Fn(&PeerId, &[u8]) -> ValidationResult + Send + Sync + 'static,
     ) {
         self.validators.insert(topic, Box::new(validator));
+    }
+
+    /// Installs a per-(source, target) forward filter consulted before relaying
+    /// each message to a mesh peer. When the filter returns `false` for a
+    /// `(source, target)` pair, that target is skipped (the message is still
+    /// delivered to other mesh peers). Replaces any previously installed
+    /// filter. With no filter installed (the default), all forwards are
+    /// allowed — preserving the standard relay behaviour.
+    pub fn set_forward_filter(
+        &mut self,
+        filter: impl Fn(&PeerId, &PeerId) -> bool + Send + Sync + 'static,
+    ) {
+        self.forward_filter = Some(Box::new(filter));
+    }
+
+    /// Same as [`Self::set_forward_filter`] but accepts an already-boxed
+    /// filter. Used to install a filter delivered over a command channel
+    /// (which must erase the closure's concrete type).
+    #[allow(clippy::type_complexity)]
+    pub fn set_forward_filter_boxed(
+        &mut self,
+        filter: Box<dyn Fn(&PeerId, &PeerId) -> bool + Send + Sync>,
+    ) {
+        self.forward_filter = Some(filter);
+    }
+
+    /// Removes any installed forward filter (all forwards allowed again).
+    pub fn clear_forward_filter(&mut self) {
+        self.forward_filter = None;
     }
 
     /// Late-binds the signing identity used for published messages. Upstream
@@ -3809,6 +3848,12 @@ where
         // already has this message.
         recipient_peers.retain(|peer| !self.peer_does_not_want(peer, msg_id));
 
+        // Devnet partition hook: drop the relay to a target when an installed
+        // forward filter disallows propagation_source→target.
+        if let (Some(filter), Some(source)) = (&self.forward_filter, propagation_source) {
+            recipient_peers.retain(|peer| filter(source, peer));
+        }
+
         // forward the message to peers
         if !recipient_peers.is_empty() {
             // Emit-on-new-message (IDONTWANT): tell our mesh recipients we now
@@ -5717,6 +5762,112 @@ mod scoring_and_control_tests {
                 ControlAction::IDontWant { message_ids } if message_ids.contains(&big_id)
             ))),
             "large message must emit IDONTWANT"
+        );
+    }
+}
+
+#[cfg(test)]
+mod forward_filter_tests {
+    //! Tests for the per-(source, target) forward filter used by the devnet
+    //! test proxy to impose bipartite network partitions. The node relays a
+    //! message to its mesh peers (excluding the propagation source); an
+    //! installed filter suppresses the relay for blocked (source, target)
+    //! pairs only.
+    use super::*;
+    use crate::config::Config;
+
+    type Gs = Behaviour<IdentityTransform, AllowAllSubscriptionFilter>;
+
+    /// A node subscribed to `topic` with every peer in `mesh` connected,
+    /// subscribed, and grafted into the (simple, single-bit) mesh.
+    fn make_node(topic: &TopicHash, mesh: &[PeerId]) -> Gs {
+        let keypair = Keypair::generate_ed25519();
+        let mut gs: Gs =
+            Behaviour::new(MessageAuthenticity::Signed(keypair), Config::default()).unwrap();
+        for &p in mesh {
+            gs.connected_peers.insert(
+                p,
+                PeerConnections {
+                    kind: PeerKind::Gossipsubv1_1,
+                    connections: vec![ConnectionId::new_unchecked(0)],
+                },
+            );
+            gs.peer_topics.entry(p).or_default().insert(topic.clone());
+            gs.mesh.entry(topic.clone()).or_default().insert(p);
+        }
+        gs
+    }
+
+    /// Forward a message relayed by propagation source `from` and return the
+    /// set of peers the node forwarded it to (the NotifyHandler targets
+    /// drained from the event queue).
+    fn forwarded_targets(gs: &mut Gs, from: PeerId, topic: &TopicHash, data: &[u8]) -> HashSet<PeerId> {
+        gs.events.clear();
+        let message = RawMessage {
+            source: None,
+            data: data.to_vec(),
+            sequence_number: Some(1),
+            topic: topic.clone(),
+            signature: None,
+            key: None,
+            validated: true,
+        };
+        gs.forward_msg(&MessageId::from(data.to_vec()), message, Some(&from), HashSet::new())
+            .unwrap();
+        gs.events
+            .iter()
+            .filter_map(|ev| match ev {
+                ToSwarm::NotifyHandler {
+                    peer_id,
+                    event: HandlerIn::Message(RpcOut::Forward(m)),
+                    ..
+                } if m.data == data => Some(*peer_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_filter_forwards_to_all_mesh_peers_except_source() {
+        let topic = TopicHash::from_raw(vec![0x80]); // single-bit => simple mesh
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let mut gs = make_node(&topic, &[a, b, c]);
+        let targets = forwarded_targets(&mut gs, a, &topic, b"m1");
+        assert_eq!(targets, HashSet::from([b, c]));
+    }
+
+    #[test]
+    fn forward_filter_blocks_only_the_named_pair() {
+        let topic = TopicHash::from_raw(vec![0x80]);
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let mut gs = make_node(&topic, &[a, b, c]);
+        // Block relay from a -> c only.
+        gs.set_forward_filter(move |src, dst| !(*src == a && *dst == c));
+        assert_eq!(
+            forwarded_targets(&mut gs, a, &topic, b"m1"),
+            HashSet::from([b]),
+            "a->c blocked, a->b allowed",
+        );
+        // The rule is directional + source-specific: messages relayed by b are
+        // unaffected and still reach both a and c.
+        assert_eq!(
+            forwarded_targets(&mut gs, b, &topic, b"m2"),
+            HashSet::from([a, c]),
+        );
+    }
+
+    #[test]
+    fn clear_forward_filter_restores_all_targets() {
+        let topic = TopicHash::from_raw(vec![0x80]);
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let mut gs = make_node(&topic, &[a, b, c]);
+        gs.set_forward_filter(move |src, dst| !(*src == a && *dst == c));
+        assert_eq!(forwarded_targets(&mut gs, a, &topic, b"m1"), HashSet::from([b]));
+        gs.clear_forward_filter();
+        assert_eq!(
+            forwarded_targets(&mut gs, a, &topic, b"m2"),
+            HashSet::from([b, c]),
+            "clearing the filter restores the blocked target",
         );
     }
 }

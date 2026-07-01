@@ -1,0 +1,251 @@
+name: quilibrium-devnet
+
+# Docker Compose configuration for running 4 Quilibrium archive nodes plus a
+# client node in isolated networks, fronted by the devnet proxy.
+#
+# The archive/client services run the Rust node, and the `proxy` service runs
+# the Rust devnet-proxy binary — both built from docker/Dockerfile.source (the
+# proxy as its `devnet-proxy` target stage, reusing the node's native build).
+#
+# Usage:
+#   1. Start the nodes: docker compose up -d --build --remove-orphans
+#   2. View logs: docker compose logs -f
+#   3. Clean up: docker compose down -v
+#
+# Environment variables:
+#   TARGETARCH: Target architecture (default: arm64)
+#   RUN_ID: Required unique identifier for this test run
+#   RUNNER_ADDRESS: Runner's network address for notifications (default: host.docker.internal:8080)
+#   STOP_FRAME: Required maximum frame number before shutdown
+#   RUNNER_AUTH: Optional authentication credential for runner notifications
+
+networks:
+  proxy-network:
+    driver: bridge
+  archive-1-network:
+    driver: bridge
+    internal: true
+  archive-2-network:
+    driver: bridge
+    internal: true
+  archive-3-network:
+    driver: bridge
+    internal: true
+  archive-4-network:
+    driver: bridge
+    internal: true
+  client-1-network:
+    driver: bridge
+    internal: true
+
+services:
+  # Proxy node - starts first and provides initial peer discovery, gossip
+  # interception, network partitioning, and run-result notifications.
+  proxy:
+    build:
+      # The proxy shares the node's heavy native-crypto build, so it's built as
+      # the `devnet-proxy` target stage of docker/Dockerfile.source rather than
+      # duplicating the whole multi-stage pipeline.
+      context: ../..
+      dockerfile: docker/Dockerfile.source
+      target: devnet-proxy
+      args:
+        TARGETOS: linux
+        TARGETARCH: ${TARGETARCH:-arm64}
+    image: quilibrium-proxy:latest
+    hostname: proxy
+    command: ["--network=1", "--config=/root/config"]
+    environment:
+      - RUN_ID=${RUN_ID}
+      - RUNNER_ADDRESS=${RUNNER_ADDRESS}
+      - STOP_FRAME=${STOP_FRAME}
+      - RUNNER_AUTH=${RUNNER_AUTH}
+      - NODE_INFOS=${NODE_INFOS}
+      - MIN_NODES=${MIN_NODES}
+      - RANK_PARTITIONS=${RANK_PARTITIONS}
+      - GLOBAL_TIMEOUT=${GLOBAL_TIMEOUT}
+      - NODE_CATCHUP_TIMEOUT=${NODE_CATCHUP_TIMEOUT}
+      - RUST_LOG=${RUST_LOG:-info}
+    networks:
+      - proxy-network
+      - archive-1-network
+      - archive-2-network
+      - archive-3-network
+      - archive-4-network
+      - client-1-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config/proxy-config/:/root/config
+    healthcheck:
+      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmYWRH2ujTmiD1m4jCQaLgUqx72AD31P51pZdtynbHi8Sc"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 1m
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: 100m
+
+  # Archive nodes
+  # These nodes use the proxy node for peer discovery.
+  # Ideally we would template this to avoid duplication, but getting the index to match the config is tricky
+  # https://stackoverflow.com/a/64799824
+  archive-1:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.source
+      args:
+        TARGETOS: linux
+        TARGETARCH: ${TARGETARCH:-arm64}
+    image: quilibrium-node:latest
+    networks:
+      - archive-1-network
+    command: ["--network=1", "--signature-check=false", "--config=/root/config", "--debug"]
+    depends_on:
+      proxy:
+        condition: service_healthy
+    volumes:
+       - ./config/archive-1-config:/root/config
+    healthcheck:
+      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmUTm2VphyTw3ZxFEP5Bsmf7oEbNm9odWfWVfq2uMWE71G"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: 100m
+
+  archive-2:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.source
+      args:
+        TARGETOS: linux
+        TARGETARCH: ${TARGETARCH:-arm64}
+    image: quilibrium-node:latest
+    networks:
+      - archive-2-network
+    command: ["--network=1", "--signature-check=false", "--config=/root/config", "--debug"]
+    depends_on:
+      proxy:
+        condition: service_healthy
+    volumes:
+       - ./config/archive-2-config:/root/config
+    healthcheck:
+      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmabWWynnmuommyVP1cQDxrGESweGmzrG84p24uERR5sYh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: 100m
+
+  archive-3:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.source
+      args:
+        TARGETOS: linux
+        TARGETARCH: ${TARGETARCH:-arm64}
+    image: quilibrium-node:latest
+    networks:
+      - archive-3-network
+    command: ["--network=1", "--signature-check=false", "--config=/root/config", "--debug"]
+    depends_on:
+      proxy:
+        condition: service_healthy
+    volumes:
+       - ./config/archive-3-config:/root/config
+    healthcheck:
+      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmdgHiGSSHD25cTjfZmYCXzajhdXzPKpPC9sXRFtZgUePX"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: 100m
+
+  archive-4:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.source
+      args:
+        TARGETOS: linux
+        TARGETARCH: ${TARGETARCH:-arm64}
+    image: quilibrium-node:latest
+    networks:
+      - archive-4-network
+    command: ["--network=1", "--signature-check=false", "--config=/root/config", "--debug"]
+    depends_on:
+      proxy:
+        condition: service_healthy
+    volumes:
+       - ./config/archive-4-config:/root/config
+    healthcheck:
+      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmRTd8oGd75wjYhoVxkffpzmmCm9MF6oqYpoXNL7n3rjGk"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: 100m
+
+  # Non-archive (client) nodes
+  # Same binary as the archives, with engine.archiveMode=false. The Rust node's
+  # prover lifecycle automatically drives ProverJoin/ProverConfirm via the
+  # archive gRPC pool (routed through the proxy in devnet).
+  client-1:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.source
+      args:
+        TARGETOS: linux
+        TARGETARCH: ${TARGETARCH:-arm64}
+    image: quilibrium-node:latest
+    # Constrain to CPUs 0-2 (3 logical cores) so the rust node's
+    # `available_parallelism - 1` worker pre-allocation produces
+    # exactly 2 workers. The proxy's enrollment monitor asserts
+    # this expected core count.
+    cpuset: "0-2"
+    networks:
+      - client-1-network
+    command: ["--network=1", "--signature-check=false", "--config=/root/config", "--debug"]
+    depends_on:
+      proxy:
+        condition: service_healthy
+      archive-1:
+        condition: service_healthy
+      archive-2:
+        condition: service_healthy
+      archive-3:
+        condition: service_healthy
+      archive-4:
+        condition: service_healthy
+    volumes:
+       - ./config/client-1-config:/root/config
+    healthcheck:
+      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmeR2GE77KwyavM7RHn2C415wDxytvh3Q119v7JSSjK6KM"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: 100m

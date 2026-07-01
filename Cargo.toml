@@ -52,6 +52,8 @@ members = [
     "crates/quil-explorer",
     "crates/blossomsub",
     "crates/libp2p-identity",
+    "crates/devnet",
+    "crates/devnet/proxy",
 ]
 
 [patch.crates-io]

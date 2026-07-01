@@ -1,0 +1,136 @@
+# Peer id: QmUTm2VphyTw3ZxFEP5Bsmf7oEbNm9odWfWVfq2uMWE71G
+# Prover id: 2c28a92ba6ce97f999ef2089d823b8a643b2fefb673685e6e7536b3d11aacc58
+alias: null
+key:
+  keyManagerType: file
+  keyManagerFile:
+    path: /root/config/keys.yml
+    createIfMissing: false
+    encryptionKey: 9545056d74e42ccf1c822269f0eada6d2b2772b7191c117ee98447421e5177d0
+p2p:
+  d: 0
+  dLo: 0
+  dHi: 0
+  dScore: 0
+  dOut: 0
+  historyLength: 0
+  historyGossip: 0
+  dLazy: 0
+  gossipFactor: 0
+  gossipRetransmission: 0
+  heartbeatInitialDelay: 0s
+  heartbeatInterval: 0s
+  fanoutTTL: 0s
+  prunePeers: 0
+  pruneBackoff: 0s
+  unsubscribeBackoff: 0s
+  connectors: 0
+  maxPendingConnections: 0
+  connectionTimeout: 0s
+  directConnectTicks: 0
+  directConnectInitialDelay: 0s
+  opportunisticGraftTicks: 0
+  opportunisticGraftPeers: 0
+  graftFloodThreshold: 0s
+  maxIHaveLength: 0
+  maxIHaveMessages: 0
+  maxIDontWantMessages: 0
+  iWantFollowupTime: 0s
+  iDontWantMessageThreshold: 0
+  iDontWantMessageTTL: 0
+  bootstrapPeers:
+  - /dns/proxy/udp/8336/quic-v1/p2p/QmYWRH2ujTmiD1m4jCQaLgUqx72AD31P51pZdtynbHi8Sc
+  listenMultiaddr: /ip4/0.0.0.0/udp/8336/quic-v1
+  streamListenMultiaddr: /ip4/0.0.0.0/tcp/8340/
+  announceListenMultiaddr: /dns/archive-1/udp/8336/quic-v1/p2p/QmUTm2VphyTw3ZxFEP5Bsmf7oEbNm9odWfWVfq2uMWE71G
+  announceStreamListenMultiaddr: /dns/proxy/tcp/9001/
+  peerPrivKey: 6d5f7af9e6546ed193f2afea43afa807569770e995eb7fb813d1f6a89ef90f650dffa1161eddaf30b6794407c1253d73cdb317649a329d7cf71ed667a8ff39881cab52391e664c1b5b42e5ab841cafcf360ec0a72c4ec751e1ce88e3a367432ed7de2f9d9e6dd558aaf3c2efddb9cb5de600
+  traceLogFile: ""
+  traceLogStdout: false
+  network: 0
+  lowWatermarkConnections: 0
+  highWatermarkConnections: 0
+  directPeers: []
+  grpcServerRateLimit: 0
+  minBootstrapPeers: 1
+  bootstrapParallelism: 0
+  discoveryParallelism: 0
+  discoveryPeerLookupLimit: 0
+  pingTimeout: 0s
+  pingPeriod: 0s
+  pingAttempts: 0
+  validateQueueSize: 0
+  validateWorkers: 0
+  subscriptionQueueSize: 0
+  peerOutboundQueueSize: 0
+  reportPeerInfoInterval: 5s
+engine:
+  provingKeyId: default-proving-key
+  filter: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+  # Concatanated q-prover-key public keys for each archive node
+  genesisSeed: >-
+    020d8145d824e1ab5b9b106fb69a6f42ec1f64ba0f9366fa377a6603b68439ffc8134f2df8d7c605c26202146aec986f9112fc73019b38bbe651c4e0ee201253e8e6bca7909d9a24ab100a8c70d242f6ee5a7cd2602a6eaa7d414b28bce35362cba2e30374ec98363732fece72c67d3f02d71af866f4e9bc71440623bdfd7a0f6f38374e6422bf7d12600ec12936025eee656001eef5ff33abca5402d15b6d34fae48f43333517d9e3e16cefe657a80df9f9a41bcf6d9ae0f9df305fbb26951ff3395ce31d1c409f9ec5f0d3e8b556fd060aabb045ca8e641a7139be07839edf90601c7f004bbedab287e404b4b73f70f9386a91543dd695b28ef761e2d1bd91480403ec6577f886a9ff55032ded7a8d3a5e1f09649585772cfed7464bc7e849eeb7a459890d276babc1c3c295b383ea6e13b1c94745ef15b130455ad5bbe93d90c82e34d02ba233bf6b97a983b3045cb95c605209d638ff2e51abf4bb93e7bf044eb9b3199606e3e3ec63c714d10cfa3f19c531889a1eac622b9e2f00496550fc2863040c22161dc60997d3e2ba2342be15bb425d980136d846e17ba6acebe0015874a75969ca1c956c391ae90ad7316144511344148a111e65a0334c337e69257dce10309bb85e7223b4c3022af1ea8138339f8b020f9e440acfe5079d6385e8c0aeb131af4492b3b13cd456e0f6096a486bf842cf92b13c8367bb8212132102d2d231f40b9b2e9d0851ea4b80b31ad3106c808d93602ea9a7fe4450726890fc7c3c74a2120d4abef79ba06dc6f7bc015a7b3a20a6250217e9bc5d5fec57a4ee3169958e8ba233f6
+    0209951ded3f9e59332883d214803c53994c6600de37fe72efe71d539ddb64b92b2eb31aa7d4727fc428613907b14e25ba6748d98fb75fe91c920489adbd041246a9e60ac7521ba751280a558b9ffc3d88b772480c5fb6da83c8cfd3ea5beec33b182e1e259fc58125f1b13933eb0eed92bc00138b4b08f62516a0c01417b14a72afcde5766f02f2758229addc8d238d286df807fbab25435ebebb5cffe4c98ed6a0b897ae6eb64226b3b3becf222408e2de23dfe93caf73ee85f4ac2ff25de4dd841a027b23ceba928f7f7e7a7cb74bd74476d54540ae7bd0f4e97311e95a179ea8a04e629b9d279f828dd0bd0a2b47ff761dd25b1b9e188b736a466654e3a7e63f8d67d526749ec97c29c6231c3cf1c91480f03ae4f53cf6e428b544fc55516672bdaef307b9124b29cb5535604b951cbc6ea66cdb4befe748077960106f6026d81b183ffce5a81eb28d7a08e99c54c67e8b239a231be63152a3c0189649264b2999a8746aeaddc7a4f3b00a630b13e7d2033cea36c0c1bc38d772a83d3345f73b7c0aa20e6e65220cee98a62c8f508af1e42fd7e850b72fc9a938ec5ce0306098f504d89c474bdfc90332665f9f21f855b40403e04e0575bc846a7917474daef6f9fccd0d33d717316f321be394419cc9dd248daba6adeae3af93371b68520e27a92f4afa7fe9116b0b9fe2405f8ec5ec40ccd81457fe48a8e0c6b7b7a252073c6436b2aa868a2842c1da97c3d88ceb12d612e1c49f53ef807e86d9f260e26779e4b1052f9c3a044d3bcad09be3e21a2224c09d5718aaee542eaa34f425e4b2f51725cdbc2371f6
+    0309879559798e3a4932a843ab1d573faebe8745e5d7f29e171aff3e0ec4073ade29a39f8b3a73128fc03e8f6ec1cf2a83deae89d00d47cefcf37a6be5c17a32f8886be87fb685694e9c0c88ec13af047959fef2855fbb3678bd2fc4387b405d3d7b401bdad3e6806e7f82f2b7d00ead147d83a63028a0a9b4210255034761e0a5d56e8281c8b68844defe7f311c2a719ce38610354040e53202828f886d5e768042bc363e89d3582cd85a9207fd626d548eaff6acbdc8869fdbccdfb6ea1cd3c9e3d8da219f193a29aab983cde5076955b0e6f80361e8664efaf44c00decef1a3c452a9ecfc708f0a9a8ec988574233dc9cc0fe817624a9c4fddb1a6b43b996d852367c711582c5da2252b6619de0a08cb8357cbfc7b3523dfc4d33ba71a658d17cb48be50301496e8927edecb04cbea306fe1208ee0b38dc0c9db547d19cc73d7be2b3ef574f39a76ab0b7d535e464d0e2f9c2e9ac75e5c262376ef439141c5ee7c06fc632da56f658d98d1748061281a1b22e4ecfb7243fb5adee57228c3b96b252e3f3e1edde3254ef378a82df4c0650c393492b52ce1f994bbc63bb7dd31954378bb510204595c72562b525129df4b3f8ddbf431503cd7242ffdf9a2d37d4935aed2bcf38ec29e4d185738cf39faff08ae19e78160e9d13004a2ff158be5ecf436a8861ead6efe4a247e0085929b7af6c139f2765b31a7ef368592d118d0a5e8acdd371bdf3a25dc0d2bac560aafdc56fb2eac0495bbf1f28ea95d1ba0395bffcecc9bfc0331292788904ccb32f78368aeb247af7c166db5cf632e513373b0cc9227742fef260
+    03096bdfb51be78e704f517d8e084db83148ba730586f434b35ef8e1abf695985a66d1e6a8a3b50526f44e8e317b43795cac767a4314934bc6dac6e6f0c8e88d4aa83ee8a3d63400ad71009d37e2fdc3eebdfc6d491a9101f28bab092b30f56c6705480f7760a385bdda4ba774c2c1d5fedcaf1930f1ef7cb25461a47b72dca5b6037ca1e6791414b68f585c69bf0177493d20067eb8698b50f88d873cf31ba5dd559613612c8d7f283d1cef5d986dc248550427f6427386e008dc0b4546f3fcb4188556ae5211c84d6940e50570226174979cc57c9ea53662e3bd07027151c99df48107d8509e69c3f153c3ad44014f0019e88835261f9dc24db1c13365397da7be77e668cca86fd4f196bfba9de90ae5b61f62cff9d427a342b74d65331f8ec1b625f503055606ba24850b0ab9fe3dcf0a72670c3c72dbba4a0446254579c3572bf5b00ad6519a6bd89bca3b777c0271cb978895e82d59d43c668a18c27472a8568d54ea04cddfa2add878db840745441188015e07dde8fdc578f5b6638d8ab67b5943540e6650c3b14f4a04ea83cb9d19a13f6fb031640477f71d197489c0261113f4c111a3304c750961ead79b7ca131b96ce310e90c3079c88502fc0a1b978e972cd04840f788796f884e50583549eedb7427537316f2b0eb0ccc4de426b0575a5eead334dd9b2f9afec1ca59b220197afb977264bb37ca5665f935938200cf5fd164e368379715ef42e9bb7c51274a81939328cbe4eb6d5c1129bd12d536596f3a97a6216f2fc5fabb628271dfa3d585b20c60466180be14916aca27ff9a433f068d5550f13c
+  pendingCommitWorkers: 4
+  minimumPeersRequired: 0
+  statsMultiaddr: ""
+  dataWorkerBaseListenMultiaddr: ""
+  dataWorkerBaseP2PPort: 0
+  dataWorkerBaseStreamPort: 0
+  dataWorkerMemoryLimit: 0
+  dataWorkerP2PMultiaddrs: []
+  dataWorkerStreamMultiaddrs: []
+  dataWorkerCount: 0
+  dataWorkerFilters: []
+  multisigProverEnrollmentPaths: []
+  syncTimeout: 0s
+  syncCandidates: 0
+  syncMessageLimits:
+    maxRecvMsgSize: 0
+    maxSendMsgSize: 0
+  enableMasterProxy: false
+  rewardStrategy: ""
+  archiveMode: true
+  delegateAddress: ""
+  allowExcessiveGOMAXPROCS: false
+  # Devnet: peer archives are reachable only through the proxy's per-archive
+  # gRPC listeners (port 9000 + ordinal). Seed the OTHER archives so the frame
+  # poller can gRPC-sync any frames missed during a network partition. Self is
+  # omitted so the poller can't glue to its own (possibly stuck) head.
+  archiveEndpoints:
+  - /dns/proxy/tcp/9002/
+  - /dns/proxy/tcp/9003/
+  - /dns/proxy/tcp/9004/
+  # Disable archive-endpoint blacklisting so a peer that dropped during a
+  # partition is retried on the next poll tick — instant partition recovery.
+  archiveBlacklistTtl: -1
+  blacklist: []
+  alertKey: ""
+  difficulty: 0
+  rebuildstart: ""
+  rebuildend: ""
+  periodicSyncInterval: 10s
+  globalFrameInterval: 1s
+  appFrameInterval: 1s
+  framePublish:
+    mode: ""
+    threshold: 0
+    fragmentation:
+      algorithm: ""
+      reedSolomon:
+        dataShards: 0
+        parityShards: 0
+    ballastSize: 0
+db:
+  path: .config/store
+  workerPathPrefix: .config/worker-store/%d
+  workerPaths: []
+  noticePercentage: 0
+  warnPercentage: 0
+  terminatePercentage: 0
+  inmemorydonotuse: false
+logger: null
+listenGrpcMultiaddr: /ip4/0.0.0.0/tcp/8337
+listenRESTMultiaddr: /ip4/0.0.0.0/tcp/8338
