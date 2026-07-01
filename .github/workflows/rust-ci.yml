@@ -80,13 +80,8 @@ jobs:
           tool: nextest
 
       # channelwasm excluded: see comment in build job above.
-      #
-      # The list of temporarily-skipped failing tests lives in
-      # .nextest.toml `default-filter` (e2e_consensus binary +
-      # 8 individually-named tests). Keep that list in one place rather
-      # than splitting between YAML and config.
       - name: cargo nextest run --workspace
-        run: cargo nextest run --workspace --locked --no-fail-fast --exclude channelwasm --config-file .nextest.toml
+        run: cargo nextest run --workspace --locked --no-fail-fast --exclude channelwasm
 
   # ------------------------------------------------------------------
   # release-build — verify `node/build.sh` succeeds on every supported
