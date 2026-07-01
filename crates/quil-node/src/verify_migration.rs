@@ -201,7 +201,7 @@ pub fn run_verify_db(db_path: &Path, config: &quil_config::Config) -> anyhow::Re
         &[0u8; 32],
         Vec::new(),
     ));
-    let verifier = quil_engine::bls_verifier::BlsConsensusVerifier::new_with_committee(
+    let verifier = quil_engine::bls_verifier::BlsConsensusVerifier::new(
         Arc::new(quil_engine::bls_signature_aggregator::BlsSignatureAggregator::new(bls.clone())),
         b"global".to_vec(),
         b"globaltimeout".to_vec(),

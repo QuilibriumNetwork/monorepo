@@ -1379,7 +1379,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     Arc::new(quil_engine::bls_signature_aggregator::BlsSignatureAggregator::new(
                                                         bls_ctor.clone(),
                                                     ));
-                                                let verifier = quil_engine::bls_verifier::BlsConsensusVerifier::new_with_committee(
+                                                let verifier = quil_engine::bls_verifier::BlsConsensusVerifier::new(
                                                     raw_agg,
                                                     activation.vote_domain.clone(),
                                                     activation.timeout_domain.clone(),

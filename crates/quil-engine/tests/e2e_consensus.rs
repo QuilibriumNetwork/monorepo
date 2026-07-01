@@ -3677,7 +3677,11 @@ async fn tier2_storage_audit_evicts_cheating_member() {
     );
     assert_eq!(before.kick_frame_number, 0, "precondition: not yet kicked");
 
-    let coverage_frame = build_global_frame_with_bundle(10, &bundle);
+    // STRICT LOCKSTEP: a storage frame's attestation must anchor to the
+    // IMMEDIATELY PRECEDING global frame, so the enclosing global frame number
+    // must be `global_frame_number + 1` (= 1001) to satisfy the
+    // `anchor == frame_number - 1` gate in `audit_storage_attestation`.
+    let coverage_frame = build_global_frame_with_bundle(1001, &bundle);
     let result = archive
         .materializer
         .materialize(&coverage_frame)

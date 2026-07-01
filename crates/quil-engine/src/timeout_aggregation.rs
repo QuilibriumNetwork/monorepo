@@ -67,12 +67,17 @@ impl TimeoutAggregation {
         // TC validation as soon as a real TC arrived.
         let raw: Arc<dyn SignatureAggregator> =
             Arc::new(BlsSignatureAggregator::new(bls.clone()));
-        let verifier = Arc::new(BlsConsensusVerifier::new_with_timeout_domain(
+        let committee_as_replicas: Arc<dyn Replicas> = committee.clone();
+        // Committee-aware verifier: the QC/TC aggregate-pubkey bind is
+        // mandatory on this inbound timeout path. Global chain signs
+        // votes under an empty filter.
+        let verifier = Arc::new(BlsConsensusVerifier::new(
             raw,
             vote_domain,
             timeout_domain.clone(),
+            committee_as_replicas.clone(),
+            Vec::new(),
         ));
-        let committee_as_replicas: Arc<dyn Replicas> = committee.clone();
         let validator: Arc<dyn Validator<GlobalState, GlobalVote>> = Arc::new(
             ConsensusValidator::<GlobalState, GlobalVote>::new(
                 committee_as_replicas,
