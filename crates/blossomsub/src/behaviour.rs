@@ -4144,6 +4144,19 @@ where
                 }
             }
 
+            // Remove the peer from any composite mesh membership (same/broker).
+            // Composites are our fork's addition and are NOT covered by the
+            // per-topic mesh/topic_peers cleanup above. A disconnected peer left
+            // lingering in `same`/`broker` gets prune-iterated later by
+            // `leave()`/heartbeat and — being absent from `connected_peers` —
+            // trips the "unknown peer" prune warning and previously panicked in
+            // `peer_removed_from_mesh`. Drop it here so composite state stays in
+            // sync with the connection table.
+            for comp in self.composites.values_mut() {
+                comp.same.remove(&peer_id);
+                comp.broker.remove(&peer_id);
+            }
+
             // Forget px and outbound status for this peer
             self.px_peers.remove(&peer_id);
             self.outbound_peers.remove(&peer_id);
@@ -4440,14 +4453,15 @@ fn peer_added_to_mesh(
     events: &mut VecDeque<ToSwarm<Event, HandlerIn>>,
     connections: &HashMap<PeerId, PeerConnections>,
 ) {
-    // Ensure there is an active connection
-    let connection_id = {
-        let conn = connections.get(&peer_id).expect("To be connected to peer.");
-        assert!(
-            !conn.connections.is_empty(),
-            "Must have at least one connection"
-        );
-        conn.connections[0]
+    // Ensure there is an active connection. Mirror of `peer_removed_from_mesh`:
+    // this only exists to notify the handler that a peer joined a mesh, so if
+    // the peer is not connected there is nothing to do — return rather than
+    // panic (a panic here kills the swarm task and exits the node).
+    let Some(connection_id) = connections
+        .get(&peer_id)
+        .and_then(|conn| conn.connections.first().copied())
+    else {
+        return;
     };
 
     if let Some(topics) = known_topics {
@@ -4481,13 +4495,18 @@ fn peer_removed_from_mesh(
     events: &mut VecDeque<ToSwarm<Event, HandlerIn>>,
     connections: &HashMap<PeerId, PeerConnections>,
 ) {
-    // Ensure there is an active connection
-    let connection_id = connections
+    // Ensure there is an active connection. The sole purpose of this function
+    // is to notify the handler to stop maintaining the connection for a peer
+    // that left a mesh — if the peer is no longer connected (e.g. a composite
+    // `same`/`broker` member that disconnected before `leave`/PRUNE ran) there
+    // is nothing to notify, so bail out gracefully instead of panicking. A
+    // panic here kills the whole swarm task and exits the node.
+    let Some(connection_id) = connections
         .get(&peer_id)
-        .expect("To be connected to peer.")
-        .connections
-        .first()
-        .expect("There should be at least one connection to a peer.");
+        .and_then(|c| c.connections.first())
+    else {
+        return;
+    };
 
     if let Some(topics) = known_topics {
         for topic in topics {
