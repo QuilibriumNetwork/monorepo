@@ -115,6 +115,23 @@ impl ExecutionEngineManager {
         Ok(())
     }
 
+    /// Like [`commit_frame`] but ALSO stages the durable GLOBAL
+    /// materialization cursor (`= frame_number`) into the CRDT commit's own
+    /// batch, so the cursor is persisted atomically with this frame's reward /
+    /// prover / shard writes (one `db.write`).
+    ///
+    /// GLOBAL-ONLY: this must be called only by the global frame materializer.
+    /// The per-shard app engines keep calling [`commit_frame`], which never
+    /// writes the global cursor. Reward minting is additive with no per-frame
+    /// idempotency, so the cursor MUST equal the CRDT frontier exactly — the
+    /// atomic co-write here is what guarantees the crash-gap re-materialize
+    /// only re-runs un-committed frames and never double-mints.
+    pub fn commit_frame_with_global_cursor(&self, frame_number: u64) -> Result<()> {
+        let cursor_key = quil_store::encoding::global_materialized_cursor_key();
+        self.crdt.commit_with_global_cursor(frame_number, &cursor_key)?;
+        Ok(())
+    }
+
     /// Get an engine by name.
     pub fn get_engine(&self, name: &str) -> Option<String> {
         let engines = self.engines.read().unwrap();

@@ -197,12 +197,26 @@ impl Default for ArchiveEndpointPool {
 /// they arrive.
 pub type OnFrameCallback = Arc<dyn Fn(&GlobalFrame) + Send + Sync>;
 
+/// Validates a frame BEFORE it is persisted. Returns `true` to accept
+/// (store + fire `on_frame`), `false` to drop. Wired from the node's
+/// genesis-prover allowlist + VDF/BLS `GlobalFrameVerifier` so the
+/// archive-poll path gates identically to the gossip `GLOBAL_FRAME`
+/// handler — a forged frame served by a peer archive is dropped, never
+/// stored and never fired to `on_frame`. `None` disables the gate
+/// (e.g. a trusted/test caller).
+pub type FrameValidator = Arc<dyn Fn(&GlobalFrame) -> bool + Send + Sync>;
+
 /// Poller configuration. Defaults match Go's `pollFramesFromArchive`.
 pub struct ArchivePollerConfig {
     pub poll_interval: Duration,
     pub call_timeout: Duration,
     /// Optional callback fired for each frame after storage.
     pub on_frame: Option<OnFrameCallback>,
+    /// Optional genesis-prover + VDF/BLS gate applied to every frame
+    /// BEFORE it is stored. Frames failing this check are dropped
+    /// (not stored, `on_frame` not fired), mirroring the gossip
+    /// `GLOBAL_FRAME` handler's drop-before-store semantics.
+    pub frame_validator: Option<FrameValidator>,
     /// When true, the poller forward-fills every missed frame
     /// between the previously-seen head and the current head — the
     /// archive case where retaining full history is the point.
@@ -220,6 +234,7 @@ impl Default for ArchivePollerConfig {
             poll_interval: Duration::from_secs(1),
             call_timeout: Duration::from_secs(30),
             on_frame: None,
+            frame_validator: None,
             forward_fill: false,
         }
     }
@@ -343,6 +358,20 @@ pub async fn run_archive_poller(
                 .await
                 {
                     Ok(Ok(frame)) => {
+                        // Gate BEFORE persist — genesis-prover allowlist +
+                        // VDF/BLS, mirroring the gossip GLOBAL_FRAME handler.
+                        // A frame that fails validation is never stored and
+                        // never fired to on_frame. Treat it like an
+                        // unavailable frame: rotate to another endpoint (an
+                        // honest archive may serve the real record at this
+                        // height) rather than persisting forged data.
+                        if let Some(ref validate) = config.frame_validator {
+                            if !validate(&frame) {
+                                warn!(%addr, frame = fn_, "catchup frame failed validation — rotating endpoint");
+                                failed_frame = Some(fn_);
+                                break;
+                            }
+                        }
                         if let Err(e) = clock_store.put_global_frame(&frame, None) {
                             warn!(error = %e, frame = fn_, "store catchup frame failed");
                         }
@@ -390,6 +419,16 @@ pub async fn run_archive_poller(
         }
 
         // 3. Process the new head.
+        // Gate BEFORE persist, same as the forward-fill path above and the
+        // gossip GLOBAL_FRAME handler. A head frame failing validation is
+        // dropped: don't store, don't fire on_frame, and don't advance
+        // last_frame (the next tick re-polls the head).
+        if let Some(ref validate) = config.frame_validator {
+            if !validate(&head) {
+                warn!(%addr, frame = new_number, "head frame failed validation — dropping");
+                continue;
+            }
+        }
         if let Err(e) = clock_store.put_global_frame(&head, None) {
             warn!(error = %e, frame = new_number, "store head frame failed");
             continue;

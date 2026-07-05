@@ -201,7 +201,7 @@ pub fn run_verify_db(db_path: &Path, config: &quil_config::Config) -> anyhow::Re
         &[0u8; 32],
         Vec::new(),
     ));
-    let verifier = quil_engine::bls_verifier::BlsConsensusVerifier::new_with_committee(
+    let verifier = quil_engine::bls_verifier::BlsConsensusVerifier::new(
         Arc::new(quil_engine::bls_signature_aggregator::BlsSignatureAggregator::new(bls.clone())),
         b"global".to_vec(),
         b"globaltimeout".to_vec(),
@@ -260,6 +260,69 @@ pub fn run_verify_db(db_path: &Path, config: &quil_config::Config) -> anyhow::Re
         }
         Ok(Outcome::Pass("reconstructed + QC verified".into()))
     });
+
+    // ---- Informational: QUIL token app-shard listing ----
+    // The QUIL token's 64 shards are stored as path-only REGISTRY ROWS (the
+    // rows carry L1/L2/path only — `size`/`data_shards`/`commitment` on the row
+    // itself are unset). The REAL per-branch size + commitment live inside the
+    // single QUIL token tree (which the trie category verifies as one root). So
+    // we enumerate the registry rows to get the paths + count, then for each
+    // path pull the actual `size` / `data_shards` / vertex-adds commitment from
+    // the token TREE via `get_app_shard_metadata`. Purely informational.
+    {
+        use quil_types::store::ShardsStore;
+        let shards_store = quil_store::RocksShardsStore::new(inner.clone());
+        let crdt = quil_hypergraph::HypergraphCrdt::new(
+            hg_store.clone() as Arc<dyn HypergraphStore>,
+            Arc::new(quil_crypto::KzgInclusionProver),
+        );
+        let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(
+            &quil_execution::domains::QUIL_TOKEN,
+            256,
+            3,
+        );
+        let mut shard_key = l1.to_vec();
+        shard_key.extend_from_slice(&quil_execution::domains::QUIL_TOKEN);
+
+        println!();
+        println!("--- QUIL token app-shards (informational) ---");
+        println!("  shard_key: {}", hex::encode(&shard_key));
+        match shards_store.get_app_shards(&shard_key, &[]) {
+            Ok(mut rows) => {
+                rows.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+                println!("  total shards: {}", rows.len());
+                let mut total_size = num_bigint::BigInt::from(0);
+                for r in &rows {
+                    // Pull the REAL per-branch metadata from the token tree at
+                    // this branch path (registry row fields are unset).
+                    match quil_engine::app_shard_metadata::get_app_shard_metadata(&crdt, r) {
+                        Some(m) => {
+                            let size = num_bigint::BigInt::from_bytes_be(
+                                num_bigint::Sign::Plus,
+                                &m.size,
+                            );
+                            total_size += &size;
+                            let va = &m.commitments[0]; // vertex_adds commitment
+                            let commit = if va.iter().all(|&b| b == 0) {
+                                "zero".to_string()
+                            } else {
+                                format!("{}…", hex::encode(&va[..8.min(va.len())]))
+                            };
+                            println!(
+                                "    path {:?}  size={}  data_shards={}  vertex_adds_commit={}",
+                                r.prefix, size, m.data_shards, commit,
+                            );
+                        }
+                        None => {
+                            println!("    path {:?}  (malformed shard_key)", r.prefix)
+                        }
+                    }
+                }
+                println!("  aggregate size: {}", total_size);
+            }
+            Err(e) => println!("  (failed to read app-shard registry: {e})"),
+        }
+    }
 
     println!();
     if failures > 0 {

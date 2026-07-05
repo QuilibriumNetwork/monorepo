@@ -117,8 +117,8 @@ impl RocksClockStore {
         // Pre-compute all writes.
         let latest_key = encoding::clock_global_latest_index();
         let earliest_key = encoding::clock_global_earliest_index();
-        let current_latest = self.get_latest_frame_number();
-        let current_earliest = self.get_earliest_frame_number();
+        let current_latest = self.read_u64_index_checked(&latest_key)?;
+        let current_earliest = self.read_u64_index_checked(&earliest_key)?;
         // Mirror the earliest check: if no frames are stored yet, this
         // IS the latest; otherwise compare. The previous form
         // `frame_number > unwrap_or(0)` collapsed "no frames" to "latest
@@ -300,12 +300,39 @@ impl RocksClockStore {
         self.read_u64_index(&key)
     }
 
+    /// Durable GLOBAL materialization cursor: the highest global frame whose
+    /// `requests` have been committed into the hypergraph CRDT. `None` when
+    /// absent (fresh store → treat as 0). This key is written atomically
+    /// inside the CRDT commit batch (see
+    /// [`crate::encoding::global_materialized_cursor_key`]); the global store
+    /// (clock + hypergraph) shares one RocksDB, so the write staged by the
+    /// hypergraph txn is visible here. Read at startup to seed the
+    /// materializer and drive the crash-gap re-materialize `[cursor+1..=head]`.
+    pub fn get_global_materialized_cursor(&self) -> Option<u64> {
+        let key = encoding::global_materialized_cursor_key();
+        self.read_u64_index(&key)
+    }
+
     fn read_u64_index(&self, key: &[u8]) -> Option<u64> {
         self.db
             .get(key)
             .ok()?
             .filter(|v| v.len() == 8)
             .map(|v| u64::from_be_bytes(v[..8].try_into().unwrap()))
+    }
+
+    /// Like `read_u64_index` but distinguishes a genuine absence (`Ok(None)`)
+    /// from a DB read error (`Err`). Write paths that decide whether to
+    /// overwrite the latest/earliest cursor MUST use this: swallowing a
+    /// transient read error as `None` makes `update_latest` true and
+    /// overwrites the index with a lower frame number, regressing the cursor.
+    fn read_u64_index_checked(&self, key: &[u8]) -> Result<Option<u64>> {
+        Ok(self
+            .db
+            .get(key)
+            .map_err(|e| QuilError::Store(e.to_string()))?
+            .filter(|v| v.len() == 8)
+            .map(|v| u64::from_be_bytes(v[..8].try_into().unwrap())))
     }
 
     fn read_frame_requests(&self, frame_number: u64) -> Result<Vec<global::MessageBundle>> {
@@ -347,6 +374,34 @@ mod tests {
         // Leak to keep temp dir alive
         std::mem::forget(tmp);
         RocksClockStore::new(Arc::new(db))
+    }
+
+    #[test]
+    fn test_global_materialized_cursor_getter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = Arc::new(rocksdb::DB::open(&opts, tmp.path()).unwrap());
+        let store = RocksClockStore::new(db.clone());
+
+        // Absent → None (fresh store; materializer treats as 0).
+        assert_eq!(store.get_global_materialized_cursor(), None);
+
+        // A raw 8-byte BE value at the single global key round-trips. In
+        // production this value is staged into the hypergraph CRDT commit's
+        // own batch (same shared DB); here we write it directly to isolate
+        // the getter.
+        let key = encoding::global_materialized_cursor_key();
+        db.put(&key, 1234u64.to_be_bytes()).unwrap();
+        assert_eq!(store.get_global_materialized_cursor(), Some(1234));
+
+        // Overwrite reflects the latest value (single global key).
+        db.put(&key, 5678u64.to_be_bytes()).unwrap();
+        assert_eq!(store.get_global_materialized_cursor(), Some(5678));
+
+        // A malformed (wrong-length) value is ignored (treated as absent).
+        db.put(&key, [0u8; 3]).unwrap();
+        assert_eq!(store.get_global_materialized_cursor(), None);
     }
 
     #[test]
@@ -872,6 +927,7 @@ impl store::ClockStore for RocksClockStore {
         // Go's GetShardClockFrame already accepts a non-pointer value
         // at the canonical key (the `else` branch at clock.go:1290).
         let staged_key = encoding::clock_shard_staged_key(selector, frame_number);
+        let mut have_frame = false;
         if let Some(staged_bytes) = self
             .db
             .get(&staged_key)
@@ -883,11 +939,28 @@ impl store::ClockStore for RocksClockStore {
                     .put(&canonical_key, &staged_bytes)
                     .map_err(|e| QuilError::Store(e.to_string()))?;
             }
+            have_frame = true;
+        } else {
+            // Staged frame absent (e.g. a re-commit after restart where the
+            // frame is already canonical). Only treat this frame_number as
+            // real if the canonical frame actually exists on disk.
+            let canonical_key = encoding::clock_shard_frame_key(filter, frame_number);
+            have_frame = self
+                .db
+                .get(&canonical_key)
+                .map_err(|e| QuilError::Store(e.to_string()))?
+                .is_some();
         }
 
         // Update the latest-index pointer (skipped during backfill,
-        // matching Go).
-        if !backfill {
+        // matching Go). SECURITY: `frame_number` comes from the QC's wire
+        // field, which is NOT covered by the aggregate signature (the vote
+        // binds filter‖state_id‖rank only). A malicious peer can take a valid
+        // QC and set frame_number = u64::MAX; without the `have_frame` guard
+        // that would bump the index past every real frame and permanently
+        // wedge the shard (no future commit can exceed MAX). Only advance the
+        // index to a frame_number for which a frame actually exists.
+        if !backfill && have_frame {
             let idx_key = encoding::clock_shard_latest_index(filter);
             let current = self.read_u64_index(&idx_key);
             if current.is_none() || frame_number > current.unwrap() {

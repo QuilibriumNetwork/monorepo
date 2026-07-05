@@ -348,12 +348,23 @@ impl GlobalConsensusEngine {
                     debug!("QC received before loop started, dropping");
                     return Ok(());
                 };
+                // SECURITY: do NOT submit a standalone QC to the pacemaker
+                // here. This path has no `ConsensusValidator` in scope (only a
+                // materialization `ExecutionEngineManager`), so submitting would
+                // fast-forward `newest_qc`/the pacemaker rank with a
+                // committee-unverified cert — a forged QC with `rank=u64::MAX-1`
+                // would wedge the chain. The live master path (message_loop.rs)
+                // has no standalone-QC gossip arm at all: QCs are formed locally
+                // by aggregation and embedded QCs are validated
+                // (`validate_quorum_certificate`) before use. Fail-closed: drop.
+                let _ = handle;
                 match consensus_wire::QuorumCertificate::from_canonical_bytes(data) {
                     Ok(wire_qc) => {
-                        let rank = wire_qc.rank;
-                        let trait_qc = wire_qc.into_trait_object();
-                        handle.submit_quorum_certificate(trait_qc);
-                        debug!(rank, "routed QC to consensus loop");
+                        warn!(
+                            rank = wire_qc.rank,
+                            "dropping standalone QC on the consensus route — \
+                             not committee-validated on this path"
+                        );
                     }
                     Err(e) => {
                         debug!(error = %e, "failed to decode QC, dropping");
@@ -366,11 +377,16 @@ impl GlobalConsensusEngine {
                     debug!("TC received before loop started, dropping");
                     return Ok(());
                 };
+                // SECURITY: same as the QC arm above — no validator here, so
+                // dropping rather than submitting an unverified standalone TC
+                // (which would advance the pacemaker). Fail-closed.
+                let _ = handle;
                 match consensus_wire::TimeoutCertificate::from_canonical_bytes(data) {
-                    Ok(wire_tc) => {
-                        let trait_tc = wire_tc.into_trait_object();
-                        handle.submit_timeout_certificate(trait_tc);
-                        debug!("routed TC to consensus loop");
+                    Ok(_wire_tc) => {
+                        warn!(
+                            "dropping standalone TC on the consensus route — \
+                             not committee-validated on this path"
+                        );
                     }
                     Err(e) => {
                         debug!(error = %e, "failed to decode TC, dropping");

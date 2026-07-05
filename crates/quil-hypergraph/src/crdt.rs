@@ -513,6 +513,37 @@ impl HypergraphCrdt {
         &self,
         frame_number: u64,
     ) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
+        self.commit_inner(frame_number, None)
+    }
+
+    /// Commit all trees for `frame_number` AND stage the durable GLOBAL
+    /// materialization cursor into the SAME RocksTxn batch, so the cursor is
+    /// persisted atomically with every reward-balance / prover / shard write
+    /// this frame produces. `cursor_key` is the raw key bytes (built by the
+    /// caller via `quil_store::encoding::global_materialized_cursor_key`, kept
+    /// out of this crate to avoid a quil-store dependency); the value written
+    /// is `frame_number` big-endian.
+    ///
+    /// SAFETY / DOUBLE-MINT INVARIANT: this must ONLY be used by the GLOBAL
+    /// materializer, never the per-shard app CRDTs. Reward minting is additive
+    /// with no per-frame idempotency, so the durable cursor must equal the CRDT
+    /// frontier EXACTLY. Writing it in this batch (one `db.write`) guarantees
+    /// that — a crash either lands both the CRDT mutations and cursor=N, or
+    /// neither. Startup then re-materializes only `[cursor+1..=head]`, never a
+    /// frame already reflected in the CRDT.
+    pub fn commit_with_global_cursor(
+        &self,
+        frame_number: u64,
+        cursor_key: &[u8],
+    ) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
+        self.commit_inner(frame_number, Some(cursor_key))
+    }
+
+    fn commit_inner(
+        &self,
+        frame_number: u64,
+        global_cursor_key: Option<&[u8]>,
+    ) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
         // Serialize against other commits (see `commit_lock`), then take only
         // a READ lock on the phase sets. Commit never structurally mutates the
         // maps — it reads keys/trees and calls `tree.commit(&self)` (the tree
@@ -588,6 +619,42 @@ impl HypergraphCrdt {
                     .filter(|v| v.len() != 64 && !v.is_empty());
                 if let Some(cached) = cached_this_phase {
                     roots[i] = cached.clone();
+                    // The frame-N root for this (shard, phase) is already
+                    // cached — from an earlier commit(N) this same frame (the
+                    // global materializer runs `compute_local_prover_root(N)`
+                    // BEFORE applying reward vertices). But the idempotency
+                    // guard must NOT conflate "root cached" with "tree clean":
+                    // the underlying tree may have been mutated AFTER that
+                    // cache was written (reward-balance vertices land in the
+                    // global-intrinsic vertex_adds tree post-`compute_root`).
+                    // If we `continue` here, those dirty NODES are never staged
+                    // into THIS batch; they only reach disk in a LATER,
+                    // cursor-free commit (commit(N+1), or the eviction
+                    // re-commit) — desynchronizing the durable cursor from the
+                    // reward state it is meant to certify. A crash between the
+                    // cursor's db.write and that later flush then loses frame
+                    // N's rewards while the cursor claims N is done →
+                    // permanent under-mint / prover-root divergence.
+                    //
+                    // On the GLOBAL cursor path ONLY, force-flush a DIRTY tree's
+                    // nodes into this batch so {reward nodes} and {cursor=N} ride
+                    // the same atomic `db.write`. We KEEP the cached (pre-reward)
+                    // root — frame N's committee-expected `prover_tree_commitment`
+                    // stays pre-reward; the reward mutations are reflected in
+                    // frame N+1's root by design. Deliberately do NOT re-run
+                    // `set_shard_commit`, so the cached frame-N root is preserved,
+                    // and `tree.commit()`'s recomputed (post-reward) root is
+                    // discarded. `mark_persisted` runs after `txn.commit()`
+                    // (via `committed_trees`), so a later commit(N+1) sees a
+                    // clean tree and doesn't re-stage these nodes.
+                    if global_cursor_key.is_some() {
+                        if let Some(tree) = phase_trees[i] {
+                            if tree.is_dirty() {
+                                let _ = tree.commit(txn.as_ref(), prover)?;
+                                committed_trees.push(tree);
+                            }
+                        }
+                    }
                     continue;
                 }
                 if let Some(tree) = phase_trees[i] {
@@ -629,6 +696,16 @@ impl HypergraphCrdt {
             );
 
             result.insert(shard_key.clone(), roots.to_vec());
+        }
+
+        // Stage the durable GLOBAL materialization cursor into THIS batch,
+        // before the flush, so it lands atomically with every reward /
+        // prover / shard write above. This is the double-mint safety
+        // linchpin: cursor == CRDT frontier, always, because both ride one
+        // `db.write`. Only the global materializer passes a key here; the
+        // per-shard app CRDTs commit with `None` and never touch it.
+        if let Some(cursor_key) = global_cursor_key {
+            txn.set(cursor_key, &frame_number.to_be_bytes())?;
         }
 
         // Atomically flush all per-shard per-phase tree writes that

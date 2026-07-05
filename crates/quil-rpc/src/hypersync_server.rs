@@ -834,10 +834,17 @@ impl HypergraphComparisonService for HyperSyncServer {
                                         Some(node) => {
                                             let leaves = collect_leaves(node);
 
+                                            // Clamp the attacker-supplied
+                                            // continuation token to the leaf
+                                            // count: without this, a token >
+                                            // leaves.len() makes `leaves[start..end]`
+                                            // panic (start > end) and tear down
+                                            // the sync stream.
                                             let start = parse_continuation_token(
                                                 &req.continuation_token,
                                             )
-                                            .unwrap_or(0);
+                                            .unwrap_or(0)
+                                            .min(leaves.len());
                                             let max = if req.max_leaves == 0 {
                                                 DEFAULT_LEAF_PAGE_SIZE
                                             } else {

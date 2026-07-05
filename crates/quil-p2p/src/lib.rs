@@ -1,8 +1,4 @@
-pub mod behaviour;
-pub mod blossomsub;
-#[cfg(test)]
-pub mod test_harness;
-pub mod bitmask;
+pub mod blossomsub_behaviour;
 pub mod ed448_identity;
 pub mod ed448_noise;
 pub mod ed448_noise_transport;
@@ -13,14 +9,16 @@ pub mod onion;
 pub mod peer_authenticator;
 pub mod peer_info;
 pub mod protocol;
-mod scoring;
 pub mod signer_registry;
 pub mod tls_debug;
 
-pub use behaviour::ValidationResult;
-pub use bitmask::slice_bitmask;
+// The BlossomSub behaviour + event + validation-result surface come from the
+// hardened `blossomsub` crate via the `blossomsub_behaviour` bridge. (Stage 7
+// deleted the old in-crate `behaviour` / `scoring` / `blossomsub` / bitmask
+// modules; the fork is now the sole implementation.)
+pub use blossomsub_behaviour::{BlossomSubBehaviour, BlossomSubEvent, ValidationResult};
 pub use libp2p::PeerId;
-pub use ed448_identity::Ed448Identity;
+pub use ed448_identity::{peer_id_from_ed448_pubkey, Ed448Identity};
 pub use node::{P2PHandle, P2PNode, ReceivedMessage};
 pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{

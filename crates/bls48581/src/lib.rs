@@ -1186,6 +1186,23 @@ pub fn bls_aggregate(pks: &Vec<Vec<u8>>, sigs: &Vec<Vec<u8>>) -> BlsAggregateOut
   }
 }
 
+/// Aggregate G8 (G2) public keys ONLY — the public-key half of
+/// [`bls_aggregate`], without any signatures. Folds each `frombytes`-decoded
+/// `ECP8` into the running sum and returns the 585-byte compressed aggregate.
+/// An empty input folds to the identity point. Callers MUST pass full-length
+/// (585-byte) compressed keys; `ECP8::frombytes` indexes without a length
+/// guard, so short input OOB-panics.
+pub fn bls_aggregate_pubkeys(pks: &[Vec<u8>]) -> Vec<u8> {
+  let pk_all = pks.iter().fold(ecp8::ECP8::new(), |acc, pk| {
+    let mut a = ecp8::ECP8::frombytes(pk);
+    a.add(&acc);
+    a
+  });
+  let mut pkbytes = [0u8; 585];
+  pk_all.tobytes(&mut pkbytes, true);
+  pkbytes.to_vec()
+}
+
 pub fn init() {
   bls::singleton();
 }

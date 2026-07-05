@@ -265,6 +265,10 @@ pub fn inc_grpc_submits_accepted() {
 pub fn inc_grpc_submits_rejected() {
     counter!("engine_grpc_submits_rejected_total").increment(1);
 }
+#[inline]
+pub fn inc_grpc_submits_duplicate() {
+    counter!("engine_grpc_submits_duplicate_total").increment(1);
+}
 
 #[inline]
 pub fn record_vdf_prove_duration(seconds: f64) {

@@ -422,4 +422,40 @@ mod tests {
         assert_eq!(s4, &s1 / 2, "shards=4 (sqrt 2) → half");
         assert_eq!(s16, &s1 / 4, "shards=16 (sqrt 4) → quarter");
     }
+
+    /// PoMW rewards STORED DATA: a shard with materialized state earns a
+    /// positive reward, while an EMPTY shard (state_size==0) — the localnet's
+    /// case — correctly earns ZERO. This confirms rewards_visited=0 on the
+    /// empty-shard localnet is the RIGHT answer, not a bug: inject shard data
+    /// (state_size>0) and the exact same path pays out. Covers both zero
+    /// sources: empty shard allocation AND empty world.
+    #[test]
+    fn opt_reward_zero_for_empty_nonzero_for_data() {
+        let r = OptRewardIssuance;
+        let world: u64 = 1 << 30;
+        let units = 1_000_000u64;
+        let difficulty = 5_000u64;
+
+        // Data present (state_size > 0, world > 0) → positive reward.
+        let with_data =
+            r.calculate(difficulty, world, units, &one_alloc(0, 1, 1 << 28)).unwrap()[0].clone();
+        assert!(
+            with_data > BigInt::zero(),
+            "a shard with materialized state must earn a reward, got {with_data}"
+        );
+
+        // Empty shard (state_size == 0) → zero. This is exactly the localnet:
+        // no token/compute/hg data → state_size 0 → no PoMW reward.
+        let empty_shard =
+            r.calculate(difficulty, world, units, &one_alloc(0, 1, 0)).unwrap()[0].clone();
+        assert!(
+            empty_shard.is_zero(),
+            "empty shard (state_size=0) must earn 0, got {empty_shard}"
+        );
+
+        // Empty world (world_state_bytes == 0) → zero for everyone (early return).
+        let empty_world =
+            r.calculate(difficulty, 0, units, &one_alloc(0, 1, 1 << 28)).unwrap()[0].clone();
+        assert!(empty_world.is_zero(), "empty world → 0 reward, got {empty_world}");
+    }
 }

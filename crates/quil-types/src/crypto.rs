@@ -48,6 +48,23 @@ pub trait BlsConstructor: Send + Sync {
         context: &[u8],
     ) -> bool;
 
+    /// Verify an aggregate signature where signer `j` signed a DISTINCT
+    /// message `messages[j]` under public key `public_keys_g2[j]`, i.e.
+    /// `e(sig, g) == Π_j e(pk_j, H(context||m_j))`. This is the correct
+    /// multi-signer/multi-message BLS verify — NOT reducible to a single
+    /// aggregate pubkey (that only works when every signer signs the same
+    /// message). `public_keys_g2.len()` MUST equal `messages.len()`. Default
+    /// impl is unsupported; curve-backed constructors override it.
+    fn verify_multi_pubkey_multi_message_raw(
+        &self,
+        _public_keys_g2: &[&[u8]],
+        _signature_g1: &[u8],
+        _messages: &[&[u8]],
+        _context: &[u8],
+    ) -> bool {
+        false
+    }
+
     /// Batch-verify many independent signatures at once. Each item is
     /// `(public_key_g2, signature_g1, message, context)`, with the same
     /// meaning as [`verify_signature_raw`]. Returns `true` iff EVERY
@@ -72,6 +89,18 @@ pub trait BlsConstructor: Send + Sync {
         public_keys: &[&[u8]],
         signatures: &[&[u8]],
     ) -> Result<BlsAggregateOutput>;
+
+    /// Aggregate G2 public keys ONLY into a single aggregate public key —
+    /// the pubkey half of [`aggregate`], with no signatures involved. Used to
+    /// reconstruct a committee's aggregate pubkey from a participation bitmask
+    /// for consistency checks (e.g. FrameHeader verification), without the
+    /// wasteful throwaway-signature dance that abusing [`aggregate`] required.
+    /// Default impl is unsupported; curve-backed constructors override it.
+    fn aggregate_public_keys(&self, _public_keys: &[&[u8]]) -> Result<Vec<u8>> {
+        Err(crate::error::QuilError::Internal(
+            "aggregate_public_keys not supported by this BlsConstructor".into(),
+        ))
+    }
 }
 
 /// Multiproof output from inclusion proving.

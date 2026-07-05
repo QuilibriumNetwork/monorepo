@@ -312,11 +312,20 @@ impl InMemoryProverRegistry {
             .iter()
             .filter_map(|a| self.prover_cache.get(a))
             .filter(|p| {
-                p.status == ProverStatus::Active
-                    && p.allocations.iter().any(|alloc| {
-                        alloc.status == ProverStatus::Active
-                            && alloc.confirmation_filter == filter
-                    })
+                // Eligibility is determined by ALLOCATION status only, matching
+                // `get_ordered_provers` (which documents why) and Go's
+                // authoritative committee filter. The prover's aggregate
+                // `status` is a derived rollup whose freshness depends on
+                // materializer ordering; gating on it here excludes a
+                // newly-confirmed prover (allocation just flipped Active but the
+                // per-filter Confirm hasn't refreshed the prover rollup) from
+                // leader rotation and the quorum weight, stalling the committee
+                // until the rollup catches up. A terminal prover (kicked/
+                // rejected) has no Active allocation, so it's still excluded.
+                p.allocations.iter().any(|alloc| {
+                    alloc.status == ProverStatus::Active
+                        && alloc.confirmation_filter == filter
+                })
             })
             .collect()
     }

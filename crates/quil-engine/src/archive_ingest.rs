@@ -58,9 +58,18 @@ impl ArchiveAppShardIngest {
         inclusion_prover: Arc<dyn InclusionProver>,
         hypergraph: Arc<quil_hypergraph::HypergraphCrdt>,
         kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
+        clock_store: Arc<dyn quil_types::store::ClockStore>,
     ) -> Self {
         Self {
-            validator: BlsAppFrameValidator::new(prover_registry, bls_constructor, frame_prover),
+            // clock_store is REQUIRED: post-genesis app frames
+            // (global_frame_number > 0) use the deterministic ρ_N-bound
+            // output, which the validator recomputes from the anchored global
+            // frame's VDF output. Without a clock store that branch
+            // (frame_validator: deterministic-output) hard-errors and the
+            // archive rejects every post-genesis app frame at ingest, so it
+            // never materializes app-shard state.
+            validator: BlsAppFrameValidator::new(prover_registry, bls_constructor, frame_prover)
+                .with_clock_store(clock_store),
             execution_manager,
             inclusion_prover,
             hypergraph,

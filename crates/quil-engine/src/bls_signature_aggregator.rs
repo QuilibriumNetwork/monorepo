@@ -101,26 +101,23 @@ impl SignatureAggregator for BlsSignatureAggregator {
             );
         }
 
-        // Aggregate the public keys by reusing the BLS aggregator's
-        // `aggregate` method with zero-length signatures — this
-        // wouldn't work directly. Instead, we verify each (pk, msg)
-        // pair against the aggregate signature individually via the
-        // multi-message verifier. Since the underlying Go BLS API
-        // doesn't expose key-only aggregation, we fall back to a
-        // sequence of single-message checks when we have >1 signer
-        // here. For the production path, the vote/timeout aggregators
-        // in quil-consensus only use this method once per verify call
-        // (single-signer), so this fallback is unreachable under
-        // normal load — but we implement it correctly.
+        // Multi-signer / multi-message aggregate: signer j signed a DISTINCT
+        // message m_j under pk_j, so the aggregate verifies as
+        // `e(sig, g) == Π_j e(pk_j, H(ds_tag||m_j))`. This is NOT the sum of
+        // per-pair `verify_signature_raw` checks (that would require the
+        // aggregate sig to equal each individual signature) — it needs the
+        // multi-pairing product, which `verify_multi_pubkey_multi_message_raw`
+        // performs. Used by the TC verify when timeout signers report
+        // differing `newest_qc_rank`.
         if messages.len() != public_keys.len() {
             return false;
         }
-        for (pk, msg) in public_keys.iter().zip(messages.iter()) {
-            if !self.bls.verify_signature_raw(pk, signature, msg, ds_tag) {
-                return false;
-            }
-        }
-        true
+        self.bls.verify_multi_pubkey_multi_message_raw(
+            public_keys,
+            signature,
+            messages,
+            ds_tag,
+        )
     }
 
     fn aggregate(

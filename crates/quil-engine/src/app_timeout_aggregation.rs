@@ -66,12 +66,21 @@ impl AppTimeoutAggregation {
         // succeed inside `TimeoutProcessor::process`.
         let raw: Arc<dyn SignatureAggregator> =
             Arc::new(BlsSignatureAggregator::new(bls.clone()));
-        let verifier = Arc::new(BlsConsensusVerifier::new_with_timeout_domain(
+        let committee_as_replicas: Arc<dyn Replicas> = committee.clone();
+        // SECURITY: the verifier MUST be committee-aware — see the matching
+        // comment in `TimeoutAggregation::new`. A peer's `TimeoutState` embeds
+        // a QC/TC that routes through this validator on the inbound timeout
+        // path; a committee-less verifier would skip
+        // `bind_aggregate_pubkey_to_committee` and accept a self-signed forgery
+        // whose bitmask names real members. App shards sign votes under the
+        // shard filter.
+        let verifier = Arc::new(BlsConsensusVerifier::new(
             raw,
             vote_domain,
             timeout_domain.clone(),
+            committee_as_replicas.clone(),
+            filter.clone(),
         ));
-        let committee_as_replicas: Arc<dyn Replicas> = committee.clone();
         let validator: Arc<dyn Validator<AppShardState, AppShardVote>> = Arc::new(
             ConsensusValidator::<AppShardState, AppShardVote>::new(
                 committee_as_replicas,

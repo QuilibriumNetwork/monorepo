@@ -63,8 +63,13 @@ pub(crate) async fn init(
     // (BlossomSub does not echo self-published messages, so without
     // this the proposer's own state never reaches its own
     // `vote_aggregator` / event_loop).
+    // Capacity sized to absorb bursts of peer proposals/votes without
+    // dropping. The delivery handler drops a peer's consensus message when
+    // this fills (grpc.rs), and dropped peer votes directly threaten the
+    // 2f+1 quorum, so give the drain task ample headroom over the small
+    // global committee's per-rank message volume.
     let (consensus_loopback_tx, consensus_loopback_rx) =
-        tokio::sync::mpsc::channel::<quil_p2p::node::ReceivedMessage>(256);
+        tokio::sync::mpsc::channel::<quil_p2p::node::ReceivedMessage>(4096);
 
     // GLOBAL_FRAME subscription is archive-only — non-archive nodes
     // get the chain head via the archive poller and don't need the
@@ -85,10 +90,18 @@ pub(crate) async fn init(
         p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_FRAME.to_vec()).await;
         p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec()).await;
         p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PROVER.to_vec()).await;
-        // Bulk shard subscription — mirrors Go's `bytes.Repeat([]byte{0xff}, 32)`
-        // inside `subscribeToGlobalConsensus`. Catches all per-shard frame/
-        // consensus/prover traffic via bloom-filter overlap.
-        p2p_handle.subscribe(vec![0xFFu8; 32]).await;
+        // Bulk shard subscription — an all-ones bitmask bit-COVERS every
+        // specific per-shard bloom, so coverage classification meshes the
+        // archive with the provers. The four per-shard channels are different
+        // LENGTHS due to their prefix bytes: frame=`filter` (32),
+        // consensus=`0x00‖filter` (33), dispatch=`0x00 0x00‖filter` (34),
+        // prover=`0x00 0x00 0x00‖filter` (35). `bitmask_covers` requires equal
+        // length, so we subscribe at EACH length — otherwise the archive relays
+        // proposals (frame) but not votes (consensus) and app-shard consensus
+        // stalls with no QC.
+        for len in [32usize, 33, 34, 35] {
+            p2p_handle.subscribe(vec![0xFFu8; len]).await;
+        }
     }
     p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec()).await;
     p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_ALERT.to_vec()).await;

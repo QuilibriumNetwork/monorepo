@@ -35,11 +35,15 @@ pub struct BlsConsensusVerifier {
     /// Domain separator used for TC verification. Mirrors the
     /// `timeout_domain` the timeout votes were signed under.
     timeout_ds_tag: Vec<u8>,
-    /// Committee used to resolve a single vote's signer → public key
-    /// in [`Verifier::verify_vote`]. `None` for the QC/TC-only callers
-    /// (and tests) that never verify standalone votes; `Some` for the
-    /// inbound-proposal gate, which must check the proposer's own vote.
-    committee: Option<Arc<dyn Replicas>>,
+    /// Committee this verifier binds certs to. Used two ways: (1) the QC/TC
+    /// aggregate-public-key bind in [`Self::bind_aggregate_pubkey_to_committee`]
+    /// (reconstruct the aggregate of the bitmask-selected members and require
+    /// it to equal the cert's transmitted pubkey), and (2) resolving a single
+    /// vote's signer → public key in [`Verifier::verify_vote`]. It is
+    /// MANDATORY: a committee-less verifier would silently skip the bind and
+    /// leave every QC/TC verify path fail-open to a self-signed forgery, so the
+    /// type does not allow one.
+    committee: Arc<dyn Replicas>,
     /// Filter the voters signed under, baked into the reconstructed
     /// vote message (`make_vote_message(filter, rank, source)`). The
     /// global chain uses an empty filter; app shards use the shard's
@@ -48,47 +52,25 @@ pub struct BlsConsensusVerifier {
 }
 
 impl BlsConsensusVerifier {
-    /// Construct a verifier whose vote_domain is used for both QC and
-    /// TC checks. Kept for backwards-compat with tests; production
-    /// should call [`Self::new_with_timeout_domain`].
-    pub fn new(aggregator: Arc<dyn SignatureAggregator>, ds_tag: Vec<u8>) -> Self {
-        Self {
-            aggregator,
-            vote_ds_tag: ds_tag.clone(),
-            timeout_ds_tag: ds_tag,
-            committee: None,
-            vote_filter: Vec::new(),
-        }
-    }
-
-    /// Construct a verifier with distinct domains for QC and TC. QCs
-    /// are aggregates of votes (signed with `vote_domain`), TCs are
-    /// aggregates of timeout votes (signed with `timeout_domain`).
-    /// Using the same tag for both was a latent bug — a TC formed under
-    /// the timeout domain would never verify against the vote-domain
-    /// `ds_tag`.
-    pub fn new_with_timeout_domain(
-        aggregator: Arc<dyn SignatureAggregator>,
-        vote_domain: Vec<u8>,
-        timeout_domain: Vec<u8>,
-    ) -> Self {
-        Self {
-            aggregator,
-            vote_ds_tag: vote_domain,
-            timeout_ds_tag: timeout_domain,
-            committee: None,
-            vote_filter: Vec::new(),
-        }
-    }
-
-    /// Construct a verifier that can also verify a *standalone* vote by
-    /// resolving the signer's public key through `committee`. Required
-    /// by the inbound-proposal gate, which checks the proposer's own
-    /// vote (`VerifyVote` in Go's `processProposalInternal`). `vote_filter`
-    /// is the filter the voters signed under — empty for the global
-    /// chain, the shard address for app shards — and must match what
-    /// the per-rank vote collector uses in `make_vote_message`.
-    pub fn new_with_committee(
+    /// Construct a verifier bound to `committee`.
+    ///
+    /// QCs are aggregates of votes signed with `vote_domain`; TCs are
+    /// aggregates of timeout votes signed with `timeout_domain`. These must be
+    /// distinct — using one tag for both is a latent bug, since a TC formed
+    /// under the timeout domain would never verify against the vote domain.
+    ///
+    /// `committee` is MANDATORY: it binds each cert's transmitted aggregate
+    /// public key to the bitmask-selected members
+    /// ([`Self::bind_aggregate_pubkey_to_committee`]) and resolves signers in
+    /// [`Verifier::verify_vote`]. Requiring it at the type level makes the
+    /// committee-less fail-open unrepresentable.
+    ///
+    /// `vote_filter` is the filter the voters signed under — empty for the
+    /// global chain, the shard address for app shards — and must match what the
+    /// per-rank vote collector uses in [`make_vote_message`]. It affects only
+    /// `verify_vote`; the QC/TC paths reconstruct the message from the cert's
+    /// own filter.
+    pub fn new(
         aggregator: Arc<dyn SignatureAggregator>,
         vote_domain: Vec<u8>,
         timeout_domain: Vec<u8>,
@@ -99,7 +81,7 @@ impl BlsConsensusVerifier {
             aggregator,
             vote_ds_tag: vote_domain,
             timeout_ds_tag: timeout_domain,
-            committee: Some(committee),
+            committee,
             vote_filter,
         }
     }
@@ -118,23 +100,25 @@ impl BlsConsensusVerifier {
     /// Go's `VerifyQuorumCertificate` / `VerifyTimeoutCertificate`
     /// (`consensus_protocol.go`).
     ///
-    /// Enforced only when this verifier is committee-aware. Every inbound
-    /// verification path constructs the verifier via
-    /// [`Self::new_with_committee`], so the binding is always in force
-    /// there; the cert-*forming* verifiers used by the vote/timeout
-    /// aggregators have no committee and never call the QC/TC verify
-    /// methods, so they correctly skip it.
+    /// The committee is mandatory, so this bind is unconditional on every
+    /// verification path — there is no committee-less verifier to skip it. It
+    /// runs on the inbound-proposal gate (`app_engine`), the archive proposal
+    /// ingest (`archive_sync`), AND the global/app-shard TIMEOUT aggregators
+    /// (`timeout_aggregation`, `app_timeout_aggregation`), whose validator
+    /// verifies the QC/TC embedded in a peer's `TimeoutState`.
+    /// Bind the transmitted aggregate pubkey to the committee members the
+    /// bitmask selects, and return those members' public keys IN BITMASK
+    /// (committee-index) ORDER. The TC path needs this order to pair each
+    /// signer's pubkey with that signer's per-message (the aggregator sorts
+    /// both the bitmask and `latest_ranks` by member index, so they align).
     fn bind_aggregate_pubkey_to_committee(
         &self,
         rank: u64,
         bitmask: &[u8],
         transmitted_pk: &[u8],
         sig: &[u8],
-    ) -> Result<()> {
-        let committee = match &self.committee {
-            Some(c) => c,
-            None => return Ok(()),
-        };
+    ) -> Result<Vec<Vec<u8>>> {
+        let committee = &self.committee;
         let members = committee.identities_by_rank(rank)?;
         let expected_len = (members.len() + 7) / 8;
         if bitmask.len() < expected_len {
@@ -147,7 +131,7 @@ impl BlsConsensusVerifier {
         }
         // Same index→bit convention as `ConsensusValidator::decode_signers`,
         // so the selected set matches the one the weight check used.
-        let mut signer_pks: Vec<&[u8]> = Vec::new();
+        let mut signer_pks: Vec<Vec<u8>> = Vec::new();
         for (i, m) in members.iter().enumerate() {
             if bitmask[i / 8] & (1 << (i % 8)) != 0 {
                 let pk = m.public_key();
@@ -158,7 +142,7 @@ impl BlsConsensusVerifier {
                         rank
                     )));
                 }
-                signer_pks.push(pk);
+                signer_pks.push(pk.to_vec());
             }
         }
         if signer_pks.is_empty() {
@@ -171,8 +155,9 @@ impl BlsConsensusVerifier {
         // is irrelevant to it. We pass the transmitted signature once per
         // signer to satisfy the aggregate API's equal-length contract, as
         // Go does.
+        let pk_refs: Vec<&[u8]> = signer_pks.iter().map(|p| p.as_slice()).collect();
         let sigs: Vec<&[u8]> = vec![sig; signer_pks.len()];
-        let reconstructed = self.aggregator.aggregate(&signer_pks, &sigs)?;
+        let reconstructed = self.aggregator.aggregate(&pk_refs, &sigs)?;
         if reconstructed.public_key() != transmitted_pk {
             return Err(QuilError::InvalidQuorumCertificate(format!(
                 "aggregate public key does not match the committee members \
@@ -180,7 +165,7 @@ impl BlsConsensusVerifier {
                 rank
             )));
         }
-        Ok(())
+        Ok(signer_pks)
     }
 }
 
@@ -202,15 +187,7 @@ impl<V: Unique> Verifier<V> for BlsConsensusVerifier {
     /// [`WeightedSignatureAggregator`](quil_consensus::signature_aggregator::WeightedSignatureAggregator)
     /// which owns the committee membership.
     fn verify_vote(&self, vote: &V) -> Result<()> {
-        // Without a committee we can't map signer → public key, so we
-        // can't verify a standalone vote at this layer (the QC/TC paths
-        // carry their own aggregate public key and don't need one).
-        let committee = self.committee.as_ref().ok_or_else(|| {
-            QuilError::Consensus(
-                "verify_vote requires per-signer public key — construct with new_with_committee"
-                    .into(),
-            )
-        })?;
+        let committee = &self.committee;
 
         // Resolve the voter's public key from the committee at the
         // vote's rank. An unknown signer surfaces as `InvalidSigner`,
@@ -263,7 +240,7 @@ impl<V: Unique> Verifier<V> for BlsConsensusVerifier {
         // Bind the transmitted aggregate pk to the committee BEFORE
         // trusting it for signature verification — otherwise the check
         // below is verifying a self-consistent forgery.
-        self.bind_aggregate_pubkey_to_committee(qc.rank(), bitmask, pk, sig)?;
+        let _ = self.bind_aggregate_pubkey_to_committee(qc.rank(), bitmask, pk, sig)?;
         let ok = self.aggregator.verify_signature_raw(pk, sig, &msg, &self.vote_ds_tag);
         if !ok {
             // Dump details so an operator can compare what voters signed
@@ -313,19 +290,38 @@ impl<V: Unique> Verifier<V> for BlsConsensusVerifier {
             ));
         }
         // Bind the transmitted aggregate pk to the committee before
-        // trusting it (same rationale as the QC path above).
-        self.bind_aggregate_pubkey_to_committee(tc.rank(), bitmask, pk, sig)?;
+        // trusting it (same rationale as the QC path above), and get the
+        // selected members' pubkeys in bitmask order.
+        let signer_pks = self.bind_aggregate_pubkey_to_committee(tc.rank(), bitmask, pk, sig)?;
 
-        // Reconstruct one message per signer. The TC aggregate was
-        // built over these messages in some stable order — the raw
-        // aggregator's `verify_signature_multi_message` is
-        // responsible for the set-equality semantics.
+        // Reconstruct one message per signer (each signs a DIFFERENT
+        // message: `filter||rank||newest_qc_rank_j`). The TC aggregator
+        // sorts both the bitmask and `latest_ranks` by committee-member
+        // index, so `signer_pks[j]` (bitmask order) pairs with
+        // `latest_ranks[j]`.
         let messages: Vec<Vec<u8>> = latest_ranks
             .iter()
             .map(|r| make_timeout_message(tc.filter(), tc.rank(), *r))
             .collect();
+
+        // SECURITY: pass ONE pubkey per message so `core_msig_verify`
+        // checks `e(sig,g) == Π_j e(pk_j, H(m_j))` over EVERY signer.
+        // Passing the single aggregate pk (as before) made the verifier's
+        // `pks.zip(hms)` truncate to `messages[0]`, silently ignoring
+        // `messages[1..]` — so honest TCs with mixed `newest_qc_rank`
+        // values (the lag condition that produces timeouts) were rejected,
+        // wedging recovery rounds. The signer count (bitmask) MUST match
+        // the per-signer rank count.
+        if signer_pks.len() != messages.len() {
+            return Err(QuilError::InvalidTimeoutCertificate(format!(
+                "TC signer count {} != per-signer rank count {} at rank {}",
+                signer_pks.len(),
+                messages.len(),
+                tc.rank()
+            )));
+        }
         let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
-        let pk_refs: Vec<&[u8]> = vec![pk];
+        let pk_refs: Vec<&[u8]> = signer_pks.iter().map(|p| p.as_slice()).collect();
 
         let ok = self.aggregator.verify_signature_multi_message(
             &pk_refs,
@@ -346,10 +342,10 @@ impl<V: Unique> Verifier<V> for BlsConsensusVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bls_signature_aggregator::{BlsAggregatedSignature, BlsSignatureAggregator};
+    use crate::bls_signature_aggregator::BlsSignatureAggregator;
     use quil_consensus::models::{AggregatedSignature, Identity};
     use quil_crypto::Bls48581KeyConstructor;
-    use quil_types::crypto::{BlsAggregateOutput, BlsConstructor};
+    use quil_types::crypto::BlsConstructor;
     // The `Signer` trait is needed in scope so that dyn-dispatched
     // calls to `sign_with_domain` on `Box<dyn Signer>` resolve
     // correctly below — the compiler reports it as "unused" because
@@ -357,44 +353,6 @@ mod tests {
     // false positive.
     #[allow(unused_imports)]
     use quil_types::crypto::Signer;
-
-    // Minimal concrete QC we can construct on demand.
-    #[derive(Debug)]
-    struct TestQc {
-        rank: u64,
-        id: Identity,
-        filter: Vec<u8>,
-        agg: BlsAggregatedSignature,
-    }
-    impl QuorumCertificate for TestQc {
-        fn filter(&self) -> &[u8] { &self.filter }
-        fn rank(&self) -> u64 { self.rank }
-        fn frame_number(&self) -> u64 { 0 }
-        fn identity(&self) -> &Identity { &self.id }
-        fn timestamp(&self) -> u64 { 0 }
-        fn aggregated_signature(&self) -> &dyn AggregatedSignature { &self.agg }
-        fn equals(&self, o: &dyn QuorumCertificate) -> bool {
-            self.rank == o.rank() && self.id == *o.identity()
-        }
-    }
-
-    // Minimal concrete TC.
-    #[derive(Debug)]
-    struct TestTc {
-        rank: u64,
-        latest_ranks: Vec<u64>,
-        filter: Vec<u8>,
-        latest_qc: TestQc,
-        agg: BlsAggregatedSignature,
-    }
-    impl TimeoutCertificate for TestTc {
-        fn filter(&self) -> &[u8] { &self.filter }
-        fn rank(&self) -> u64 { self.rank }
-        fn latest_ranks(&self) -> &[u64] { &self.latest_ranks }
-        fn latest_quorum_cert(&self) -> &dyn QuorumCertificate { &self.latest_qc }
-        fn aggregated_signature(&self) -> &dyn AggregatedSignature { &self.agg }
-        fn equals(&self, o: &dyn TimeoutCertificate) -> bool { self.rank == o.rank() }
-    }
 
     fn bls_bundle() -> (
         Arc<BlsSignatureAggregator>,
@@ -407,60 +365,122 @@ mod tests {
         (raw, bls, ds_tag)
     }
 
-    #[test]
-    fn verify_valid_single_signer_qc() {
-        let (raw, bls, ds_tag) = bls_bundle();
-        let verifier = BlsConsensusVerifier::new(
-            raw.clone() as Arc<dyn SignatureAggregator>,
-            ds_tag.clone(),
-        );
+    // ---- Shared committee-bind test helpers ----
+    // `BlsAggregatedSignature` deliberately carries an EMPTY bitmask (owned by
+    // the packer, decoded separately), but the mandatory committee bind reads
+    // `agg.bitmask()` to select members — so these tests use a bitmask-carrying
+    // aggregate + a single-member committee whose member holds the test key.
+    use quil_consensus::models::WeightedIdentity;
 
-        // Build the canonical QC message the committee would sign.
-        let filter = b"shard-global".to_vec();
-        let state_id: Identity = "state-5".into();
-        let rank = 5u64;
-        let msg = make_vote_message(&filter, rank, &state_id);
-
-        // One-signer "aggregate": sign with a single key and take
-        // the single (pk, sig) pair as the aggregate.
-        let (signer, pk) = bls.new_key().unwrap();
-        let sig = signer.sign_with_domain(&msg, &ds_tag).unwrap();
-        let agg = BlsAggregatedSignature::new(BlsAggregateOutput {
-            signature: sig,
-            public_key: pk,
-        });
-        let qc = TestQc {
-            rank,
-            id: state_id,
-            filter,
-            agg,
-        };
-        type V = crate::bls_verifier::tests::TestVote;
-        <BlsConsensusVerifier as Verifier<V>>::verify_quorum_certificate(&verifier, &qc).unwrap();
+    #[derive(Debug)]
+    struct BmAgg {
+        sig: Vec<u8>,
+        pk: Vec<u8>,
+        bm: Vec<u8>,
+    }
+    impl AggregatedSignature for BmAgg {
+        fn signature(&self) -> &[u8] { &self.sig }
+        fn public_key(&self) -> &[u8] { &self.pk }
+        fn bitmask(&self) -> &[u8] { &self.bm }
+    }
+    #[derive(Debug)]
+    struct BmQc {
+        rank: u64,
+        id: Identity,
+        filter: Vec<u8>,
+        agg: BmAgg,
+    }
+    impl QuorumCertificate for BmQc {
+        fn filter(&self) -> &[u8] { &self.filter }
+        fn rank(&self) -> u64 { self.rank }
+        fn frame_number(&self) -> u64 { 0 }
+        fn identity(&self) -> &Identity { &self.id }
+        fn timestamp(&self) -> u64 { 0 }
+        fn aggregated_signature(&self) -> &dyn AggregatedSignature { &self.agg }
+        fn equals(&self, o: &dyn QuorumCertificate) -> bool {
+            self.rank == o.rank() && self.id == *o.identity()
+        }
+    }
+    #[derive(Debug)]
+    struct BmTc {
+        rank: u64,
+        latest_ranks: Vec<u64>,
+        filter: Vec<u8>,
+        latest_qc: BmQc,
+        agg: BmAgg,
+    }
+    impl TimeoutCertificate for BmTc {
+        fn filter(&self) -> &[u8] { &self.filter }
+        fn rank(&self) -> u64 { self.rank }
+        fn latest_ranks(&self) -> &[u64] { &self.latest_ranks }
+        fn latest_quorum_cert(&self) -> &dyn QuorumCertificate { &self.latest_qc }
+        fn aggregated_signature(&self) -> &dyn AggregatedSignature { &self.agg }
+        fn equals(&self, o: &dyn TimeoutCertificate) -> bool { self.rank == o.rank() }
+    }
+    #[derive(Debug)]
+    struct OneMemberId {
+        id: Identity,
+        pk: Vec<u8>,
+    }
+    impl WeightedIdentity for OneMemberId {
+        fn public_key(&self) -> &[u8] { &self.pk }
+        fn identity(&self) -> &Identity { &self.id }
+        fn weight(&self) -> u64 { 1 }
+    }
+    struct OneMember {
+        id: Identity,
+        pk: Vec<u8>,
+    }
+    impl Replicas for OneMember {
+        fn leader_for_rank(&self, _r: u64) -> Result<Identity> { Ok(self.id.clone()) }
+        fn quorum_threshold_for_rank(&self, _r: u64) -> Result<u64> { Ok(1) }
+        fn timeout_threshold_for_rank(&self, _r: u64) -> Result<u64> { Ok(1) }
+        fn self_identity(&self) -> &Identity { &self.id }
+        fn identities_by_rank(&self, _r: u64) -> Result<Vec<Box<dyn WeightedIdentity>>> {
+            Ok(vec![Box::new(OneMemberId { id: self.id.clone(), pk: self.pk.clone() })])
+        }
+        fn identity_by_rank(&self, _r: u64, pid: &Identity) -> Result<Box<dyn WeightedIdentity>> {
+            if pid == &self.id {
+                Ok(Box::new(OneMemberId { id: self.id.clone(), pk: self.pk.clone() }))
+            } else {
+                Err(QuilError::InvalidSigner(hex::encode(pid)))
+            }
+        }
+    }
+    fn one_member_committee(id: Identity, pk: Vec<u8>) -> Arc<dyn Replicas> {
+        Arc::new(OneMember { id, pk })
     }
 
     #[test]
-    fn verify_qc_with_tampered_message_fails() {
+    fn verify_qc_with_committee_bind_but_tampered_message_fails() {
+        // The bind PASSES (correct committee-reconstructed pubkey) but the
+        // signature check fails because the QC advertises a rank whose
+        // reconstructed message the signature doesn't cover — distinct from a
+        // forged-pubkey rejection at the bind.
         let (raw, bls, ds_tag) = bls_bundle();
-        let verifier = BlsConsensusVerifier::new(
-            raw.clone() as Arc<dyn SignatureAggregator>,
-            ds_tag.clone(),
-        );
-        // Sign the real message but advertise a different rank on the QC.
         let filter = b"f".to_vec();
         let state_id: Identity = "state-5".into();
         let msg = make_vote_message(&filter, 5, &state_id);
-        let (signer, pk) = bls.new_key().unwrap();
+        let (signer, member_pk) = bls.new_key().unwrap();
         let sig = signer.sign_with_domain(&msg, &ds_tag).unwrap();
-        let agg = BlsAggregatedSignature::new(BlsAggregateOutput {
-            signature: sig,
-            public_key: pk,
-        });
-        let qc = TestQc {
+        let reconstructed_pk = raw
+            .aggregate(&[member_pk.as_slice()], &[sig.as_slice()])
+            .unwrap()
+            .public_key()
+            .to_vec();
+        let committee = one_member_committee(b"m1".to_vec(), member_pk);
+        let verifier = BlsConsensusVerifier::new(
+            raw as Arc<dyn SignatureAggregator>,
+            ds_tag.clone(),
+            ds_tag,
+            committee,
+            filter.clone(),
+        );
+        let qc = BmQc {
             rank: 6, // mismatched — verification reconstructs msg from rank=6
             id: state_id,
             filter,
-            agg,
+            agg: BmAgg { sig, pk: reconstructed_pk, bm: vec![0b1] },
         };
         type V = crate::bls_verifier::tests::TestVote;
         let err = <BlsConsensusVerifier as Verifier<V>>::verify_quorum_certificate(&verifier, &qc)
@@ -470,19 +490,22 @@ mod tests {
 
     #[test]
     fn verify_qc_with_empty_pk_is_insufficient_signatures() {
+        // Empty aggregate pubkey → the `pk.is_empty()` guard fires before the
+        // committee bind → InsufficientSignatures.
         let (raw, _bls, ds_tag) = bls_bundle();
+        let committee = one_member_committee(b"m1".to_vec(), vec![1, 2, 3]);
         let verifier = BlsConsensusVerifier::new(
-            raw.clone() as Arc<dyn SignatureAggregator>,
+            raw as Arc<dyn SignatureAggregator>,
+            ds_tag.clone(),
             ds_tag,
+            committee,
+            vec![],
         );
-        let qc = TestQc {
+        let qc = BmQc {
             rank: 0,
             id: "empty".into(),
             filter: vec![],
-            agg: BlsAggregatedSignature::new(BlsAggregateOutput {
-                signature: vec![0u8; 10],
-                public_key: vec![],
-            }),
+            agg: BmAgg { sig: vec![0u8; 10], pk: vec![], bm: vec![0b1] },
         };
         type V = crate::bls_verifier::tests::TestVote;
         let err = <BlsConsensusVerifier as Verifier<V>>::verify_quorum_certificate(&verifier, &qc)
@@ -493,33 +516,36 @@ mod tests {
     #[test]
     fn verify_tc_with_valid_single_signer() {
         let (raw, bls, ds_tag) = bls_bundle();
-        let verifier = BlsConsensusVerifier::new(
-            raw.clone() as Arc<dyn SignatureAggregator>,
-            ds_tag.clone(),
-        );
         let filter = b"f".to_vec();
         let tc_rank = 10u64;
         let signer_newest_qc_rank = 9u64;
         let msg = make_timeout_message(&filter, tc_rank, signer_newest_qc_rank);
-        let (signer, pk) = bls.new_key().unwrap();
+        let (signer, member_pk) = bls.new_key().unwrap();
         let sig = signer.sign_with_domain(&msg, &ds_tag).unwrap();
-        let tc = TestTc {
+        let reconstructed_pk = raw
+            .aggregate(&[member_pk.as_slice()], &[sig.as_slice()])
+            .unwrap()
+            .public_key()
+            .to_vec();
+        let committee = one_member_committee(b"m1".to_vec(), member_pk);
+        let verifier = BlsConsensusVerifier::new(
+            raw as Arc<dyn SignatureAggregator>,
+            ds_tag.clone(),
+            ds_tag,
+            committee,
+            filter.clone(),
+        );
+        let tc = BmTc {
             rank: tc_rank,
             latest_ranks: vec![signer_newest_qc_rank],
             filter: filter.clone(),
-            latest_qc: TestQc {
+            latest_qc: BmQc {
                 rank: signer_newest_qc_rank,
                 id: "qc-9".into(),
                 filter: filter.clone(),
-                agg: BlsAggregatedSignature::new(BlsAggregateOutput {
-                    signature: vec![],
-                    public_key: vec![],
-                }),
+                agg: BmAgg { sig: vec![], pk: vec![], bm: vec![] },
             },
-            agg: BlsAggregatedSignature::new(BlsAggregateOutput {
-                signature: sig,
-                public_key: pk,
-            }),
+            agg: BmAgg { sig, pk: reconstructed_pk, bm: vec![0b1] },
         };
         type V = crate::bls_verifier::tests::TestVote;
         <BlsConsensusVerifier as Verifier<V>>::verify_timeout_certificate(&verifier, &tc).unwrap();
@@ -527,50 +553,33 @@ mod tests {
 
     #[test]
     fn verify_tc_with_no_signers_is_insufficient() {
+        // Empty latest_ranks → the `latest_ranks.is_empty()` guard fires before
+        // the committee bind → InsufficientSignatures.
         let (raw, _bls, ds_tag) = bls_bundle();
+        let committee = one_member_committee(b"m1".to_vec(), vec![1, 2, 3]);
         let verifier = BlsConsensusVerifier::new(
-            raw.clone() as Arc<dyn SignatureAggregator>,
+            raw as Arc<dyn SignatureAggregator>,
+            ds_tag.clone(),
             ds_tag,
+            committee,
+            vec![],
         );
-        let tc = TestTc {
+        let tc = BmTc {
             rank: 10,
             latest_ranks: vec![],
             filter: vec![],
-            latest_qc: TestQc {
+            latest_qc: BmQc {
                 rank: 0,
                 id: "".into(),
                 filter: vec![],
-                agg: BlsAggregatedSignature::new(BlsAggregateOutput {
-                    signature: vec![],
-                    public_key: vec![],
-                }),
+                agg: BmAgg { sig: vec![], pk: vec![], bm: vec![] },
             },
-            agg: BlsAggregatedSignature::new(BlsAggregateOutput {
-                signature: vec![1, 2, 3],
-                public_key: vec![1, 2, 3],
-            }),
+            agg: BmAgg { sig: vec![1, 2, 3], pk: vec![1, 2, 3], bm: vec![0b1] },
         };
         type V = crate::bls_verifier::tests::TestVote;
         let err = <BlsConsensusVerifier as Verifier<V>>::verify_timeout_certificate(&verifier, &tc)
             .unwrap_err();
         assert!(err.is_insufficient_signatures());
-    }
-
-    #[test]
-    fn verify_vote_requires_key_lookup() {
-        let (raw, _bls, ds_tag) = bls_bundle();
-        let verifier = BlsConsensusVerifier::new(
-            raw.clone() as Arc<dyn SignatureAggregator>,
-            ds_tag,
-        );
-        let vote = TestVote {
-            id: "v1".into(),
-            rank: 5,
-            payload: vec![],
-        };
-        let err = <BlsConsensusVerifier as Verifier<TestVote>>::verify_vote(&verifier, &vote)
-            .unwrap_err();
-        assert!(matches!(err, QuilError::Consensus(_)));
     }
 
     #[test]
@@ -627,7 +636,7 @@ mod tests {
         }
 
         let committee: Arc<dyn Replicas> = Arc::new(C { voter: voter_id.clone(), pk });
-        let verifier = BlsConsensusVerifier::new_with_committee(
+        let verifier = BlsConsensusVerifier::new(
             raw as Arc<dyn SignatureAggregator>,
             ds_tag.clone(),
             ds_tag,
@@ -724,7 +733,7 @@ mod tests {
         }
         let committee: Arc<dyn Replicas> =
             Arc::new(C { id: b"m1".to_vec(), pk: member_pk.clone() });
-        let verifier = BlsConsensusVerifier::new_with_committee(
+        let verifier = BlsConsensusVerifier::new(
             raw as Arc<dyn SignatureAggregator>,
             ds_tag.clone(),
             ds_tag.clone(),
