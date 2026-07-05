@@ -645,7 +645,7 @@ impl ConnectionHandler for Handler {
                     handler.inbound_substream_attempts += 1;
 
                     if handler.inbound_substream_attempts == MAX_SUBSTREAM_ATTEMPTS {
-                        tracing::warn!(
+                        tracing::debug!(
                             "The maximum number of inbound substreams attempts has been exceeded"
                         );
                         *self = Handler::Disabled(DisabledHandler::MaxSubstreamAttempts);
@@ -659,7 +659,7 @@ impl ConnectionHandler for Handler {
                     handler.outbound_substream_attempts += 1;
 
                     if handler.outbound_substream_attempts == MAX_SUBSTREAM_ATTEMPTS {
-                        tracing::warn!(
+                        tracing::debug!(
                             "The maximum number of outbound substream attempts has been exceeded"
                         );
                         *self = Handler::Disabled(DisabledHandler::MaxSubstreamAttempts);

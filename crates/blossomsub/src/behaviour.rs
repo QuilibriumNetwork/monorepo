@@ -810,7 +810,7 @@ where
         if self.duplicate_cache.contains(&msg_id) {
             // This message has already been seen. We don't re-publish messages that have already
             // been published on the network.
-            tracing::warn!(
+            tracing::debug!(
                 message=%msg_id,
                 "Not publishing a message that has already been published"
             );
@@ -985,7 +985,7 @@ where
                         (raw_message.clone(), originating_peers)
                     }
                     None => {
-                        tracing::warn!(
+                        tracing::debug!(
                             message=%msg_id,
                             "Message not in cache. Ignoring forwarding"
                         );
@@ -1032,7 +1032,7 @@ where
             }
             Ok(true)
         } else {
-            tracing::warn!(message=%msg_id, "Rejected message not in cache");
+            tracing::debug!(message=%msg_id, "Rejected message not in cache");
             Ok(false)
         }
     }
@@ -1969,7 +1969,7 @@ where
 
         // we don't GRAFT to/from explicit peers; complain loudly if this happens
         if self.explicit_peers.contains(peer_id) {
-            tracing::warn!(peer=%peer_id, "GRAFT: ignoring request from direct peer");
+            tracing::debug!(peer=%peer_id, "GRAFT: ignoring request from direct peer");
             // this is possibly a bug from non-reciprocal configuration; send a PRUNE for all topics
             to_prune_topics = topics.into_iter().collect();
             // but don't PX
@@ -1994,7 +1994,7 @@ where
                         self.backoffs.get_backoff_time(&topic_hash, peer_id)
                     {
                         if backoff_time > now {
-                            tracing::warn!(
+                            tracing::debug!(
                                 peer=%peer_id,
                                 "[Penalty] Peer attempted composite graft within backoff, penalizing"
                             );
@@ -2113,7 +2113,7 @@ where
                     if let Some(backoff_time) = self.backoffs.get_backoff_time(&topic_hash, peer_id)
                     {
                         if backoff_time > now {
-                            tracing::warn!(
+                            tracing::debug!(
                                 peer=%peer_id,
                                 "[Penalty] Peer attempted graft within backoff time, penalizing"
                             );
@@ -4113,7 +4113,7 @@ where
                     if let Some(peer_list) = self.topic_peers.get_mut(topic) {
                         if !peer_list.remove(&peer_id) {
                             // debugging purposes
-                            tracing::warn!(
+                            tracing::debug!(
                                 peer=%peer_id,
                                 "Disconnected node: peer not in topic_peers"
                             );
@@ -4130,7 +4130,7 @@ where
                             self.topic_peers.remove(topic);
                         }
                     } else {
-                        tracing::warn!(
+                        tracing::debug!(
                             peer=%peer_id,
                             topic=%topic,
                             "Disconnected node: peer with topic not in topic_peers"
@@ -4344,7 +4344,7 @@ where
                 } else {
                     // log the invalid messages
                     for (message, validation_error) in invalid_messages {
-                        tracing::warn!(
+                        tracing::debug!(
                             peer=%propagation_source,
                             source=?message.source,
                             "Invalid message from peer. Reason: {:?}",
@@ -4359,7 +4359,7 @@ where
                     if self.config.max_messages_per_rpc().is_some()
                         && Some(count) >= self.config.max_messages_per_rpc()
                     {
-                        tracing::warn!("Received more messages than permitted. Ignoring further messages. Processed: {}", count);
+                        tracing::debug!("Received more messages than permitted. Ignoring further messages. Processed: {}", count);
                         break;
                     }
                     self.handle_received_message(raw_message, &propagation_source);

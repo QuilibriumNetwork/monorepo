@@ -246,7 +246,7 @@ impl GossipsubCodec {
             match PublicKey::try_decode_protobuf(&message.key) {
                 Ok(key) => key,
                 Err(_) => {
-                    tracing::warn!("Signature verification failed: No valid public key supplied");
+                    tracing::debug!("Signature verification failed: No valid public key supplied");
                     return false;
                 }
             }
@@ -254,7 +254,7 @@ impl GossipsubCodec {
             match PublicKey::try_decode_protobuf(&source.to_bytes()[2..]) {
                 Ok(v) => v,
                 Err(_) => {
-                    tracing::warn!("Signature verification failed: No valid public key supplied");
+                    tracing::debug!("Signature verification failed: No valid public key supplied");
                     return false;
                 }
             }
@@ -262,7 +262,7 @@ impl GossipsubCodec {
 
         // The key must match the peer_id
         if source != public_key.to_peer_id() {
-            tracing::warn!(
+            tracing::debug!(
                 "Signature verification failed: Public key doesn't match source peer id"
             );
             return false;
@@ -371,17 +371,17 @@ impl Decoder for GossipsubCodec {
                 }
                 ValidationMode::Anonymous => {
                     if !message.signature.is_empty() {
-                        tracing::warn!(
+                        tracing::debug!(
                             "Signature field was non-empty and anonymous validation mode is set"
                         );
                         invalid_kind = Some(ValidationError::SignaturePresent);
                     } else if !message.seqno.is_empty() {
-                        tracing::warn!(
+                        tracing::debug!(
                             "Sequence number was non-empty and anonymous validation mode is set"
                         );
                         invalid_kind = Some(ValidationError::SequenceNumberPresent);
                     } else if !message.from.is_empty() {
-                        tracing::warn!("Message dropped. Message source was non-empty and anonymous validation mode is set");
+                        tracing::debug!("Message dropped. Message source was non-empty and anonymous validation mode is set");
                         invalid_kind = Some(ValidationError::MessageSourcePresent);
                     }
                 }

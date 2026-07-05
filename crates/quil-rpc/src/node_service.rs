@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tonic::{Request, Response, Status};
 
 use quil_engine::current_frame::CurrentFrame;
-use quil_types::consensus::{ProverRegistry, ShardInfoProvider};
+use quil_types::consensus::{
+    epoch_for_frame, epoch_length_frames, EffectiveStatus, ProverRegistry, ShardInfoProvider,
+};
 use quil_types::proto::{global, node};
 use quil_types::proto::node::node_service_server::NodeService;
 use quil_types::store::{ClockStore, TokenStore};
@@ -339,11 +341,16 @@ impl NodeService for NodeRpcServer {
                 // regardless of where the latest frame came from.
                 let current_frame = self.current_frame.effective();
                 for alloc in &info.allocations {
-                    // Only return live (non-terminal, non-expired)
-                    // allocations. `is_live` applies the 720-frame
-                    // grace check for Joining/Leaving and excludes
-                    // Rejected/Kicked terminal states.
-                    if !alloc.is_live(current_frame) {
+                    // Return live allocations, PLUS `ExpiredEpoch` ones. An
+                    // Active data-shard allocation that missed its per-epoch
+                    // re-confirm reads as `ExpiredEpoch` (recoverable — the
+                    // prover re-registers leaf roots and becomes Active again),
+                    // so surfacing it lets the client warn the operator instead
+                    // of the allocation silently vanishing. The truly terminal
+                    // states (Rejected/Kicked/ExpiredJoining/ExpiredLeaving) are
+                    // still filtered out.
+                    let eff = alloc.effective_status(current_frame);
+                    if !(eff.is_live() || eff == EffectiveStatus::ExpiredEpoch) {
                         continue;
                     }
                     shard_allocations.push(node::ShardAllocationInfo {
@@ -353,6 +360,8 @@ impl NodeService for NodeRpcServer {
                         join_confirm_frame_number: alloc.join_confirm_frame_number,
                         leave_frame_number: alloc.leave_frame_number,
                         last_active_frame_number: alloc.last_active_frame_number,
+                        epoch: alloc.epoch,
+                        leave_confirm_frame_number: alloc.leave_confirm_frame_number,
                     });
                 }
             }
@@ -382,6 +391,11 @@ impl NodeService for NodeRpcServer {
             last_global_head_frame: self.last_global_head_frame.load(Ordering::Relaxed),
             reachable: self.reachable,
             shard_allocations,
+            // Epoch is derived from the same frame the effective-status grace
+            // checks above used (`current_frame.effective()`), so the client's
+            // epoch matches the one the allocations were evaluated against.
+            current_epoch: epoch_for_frame(self.current_frame.effective()),
+            epoch_length_frames: epoch_length_frames(),
         }))
     }
 

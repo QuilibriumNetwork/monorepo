@@ -58,6 +58,18 @@ message ShardAllocationInfo {
   uint64 join_confirm_frame_number = 4;
   uint64 leave_frame_number = 5;
   uint64 last_active_frame_number = 6;
+  // The storage epoch this allocation was last confirmed for (the highest
+  // epoch it has registered leaf roots for). Data-shard (non-empty filter)
+  // Active allocations are epoch-bound: an `epoch` older than the current
+  // epoch means the prover missed its per-epoch re-confirm and reads as
+  // effectively ExpiredEpoch. `0` is the genesis/grandfather sentinel.
+  uint64 epoch = 7;
+  // The frame at which a leave was confirmed. With epoch-aligned lifecycle a
+  // leave confirmed in epoch E+1 departs at the E+2 boundary
+  // (DeactivationEpoch = epoch_for_frame(leave_confirm_frame_number)+1); the
+  // client needs this to distinguish Leaving (serving notice) from a departed
+  // allocation.
+  uint64 leave_confirm_frame_number = 8;
 }
 
 message NodeInfoResponse {
@@ -72,6 +84,13 @@ message NodeInfoResponse {
   uint64 last_global_head_frame = 9;
   bool reachable = 10;
   repeated ShardAllocationInfo shard_allocations = 11;
+  // The epoch the node is currently in (epoch_for_frame(last_global_head_frame)).
+  // Provided so clients don't have to assume an epoch length.
+  uint64 current_epoch = 12;
+  // Number of frames per epoch (720 mainnet / 60 testnet; a node consensus
+  // parameter). Clients mirror the node's epoch-aligned lifecycle timing with
+  // this rather than hardcoding a value.
+  uint64 epoch_length_frames = 13;
 }
 
 message WorkerInfo {

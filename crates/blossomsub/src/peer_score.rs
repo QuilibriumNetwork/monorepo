@@ -599,7 +599,12 @@ impl PeerScore {
 
         // this should be the first delivery trace
         if record.status != DeliveryStatus::Unknown {
-            tracing::warn!(
+            // Benign: a message re-arrives after it aged out of the dedup
+            // cache but while its delivery record is still retained (the
+            // dedup-cache vs TIME_CACHE_DURATION window). Heavy full-coverage
+            // forwarders (archives) keep messages circulating long enough to
+            // trigger it. Not actionable — debug, not warn.
+            tracing::debug!(
                 peer=%from,
                 status=?record.status,
                 first_seen=?record.first_seen.elapsed().as_secs(),

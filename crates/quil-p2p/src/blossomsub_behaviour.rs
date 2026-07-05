@@ -519,6 +519,16 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> blossomsub::Co
         .idontwant_message_size_threshold(params.idont_want_message_threshold)
         .mesh_peers_per_subnet(params.mesh_peers_per_subnet)
         .mcache_max_bytes(params.mcache_max_bytes)
+        // Keep de-duplicated message IDs at least as long as the peer-score
+        // delivery-record cache (TIME_CACHE_DURATION = 120s). If the dedup
+        // cache forgets a message while it is still circulating (heavy
+        // full-coverage forwarders like archives keep messages alive well past
+        // the 60s default under WAN latency), the node re-accepts and
+        // re-forwards a stale message and the scoring layer logs an
+        // "Unexpected delivery trace" (record still `Valid`). 300s covers the
+        // 120s scoring window with WAN margin; the cost is holding msg IDs
+        // (~32B each) a bit longer.
+        .duplicate_cache_time(std::time::Duration::from_secs(300))
         // Inbound signature verification (Go nodes StrictSign). Signed
         // outbound is late-bound via `set_signing_identity`.
         .validation_mode(blossomsub::ValidationMode::Strict);
