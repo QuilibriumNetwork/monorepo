@@ -420,7 +420,7 @@ impl Decoder for GossipsubCodec {
 
             // verify message signatures if required
             if verify_signature && !GossipsubCodec::verify_signature(&message) {
-                tracing::warn!("Invalid signature for received message");
+                tracing::debug!("Invalid signature for received message");
 
                 // Build the invalid message (ignoring further validation of sequence number
                 // and source)
