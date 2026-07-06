@@ -107,6 +107,21 @@ impl RankBuffer {
     }
 }
 
+/// Outcome of an [`MessageCollector::add_message_outcome`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitOutcome {
+    /// Newly added to the mempool.
+    Accepted,
+    /// The collector already holds this message (already finalized, a byte
+    /// duplicate, or superseded by a newer shard frame for the same shard).
+    /// The submitter's work is NOT lost — a network submit handler should
+    /// report this to the caller as success, not a dropped message.
+    Duplicate,
+    /// Rejected by a real filter (prover-only mode dropped a non-prover
+    /// message during degraded coverage); the message was NOT retained.
+    Filtered,
+}
+
 /// Thread-safe message collector. The message receive loop (writer)
 /// adds messages via `add_message`. The leader provider (reader)
 /// drains messages via `collect_for_rank`.
@@ -171,25 +186,39 @@ impl MessageCollector {
         self.shard_frame_dedup.write().unwrap().clear();
     }
 
-    /// Add a message for the given rank. Returns true if the message
-    /// was accepted (not a duplicate, not filtered). Global consensus has
-    /// no per-frame count cap, so a well-formed, non-duplicate message is
+    /// Add a message for the given rank. Returns true iff it was NEWLY
+    /// added (see [`SubmitOutcome`] via [`add_message_outcome`] for the
+    /// duplicate-vs-filtered distinction). Global consensus has no
+    /// per-frame count cap, so a well-formed, non-duplicate message is
     /// always retained.
     pub fn add_message(&self, rank: u64, data: Vec<u8>) -> bool {
+        matches!(self.add_message_outcome(rank, data), SubmitOutcome::Accepted)
+    }
+
+    /// Add a message, distinguishing "newly accepted" from "we already
+    /// hold it (or a newer shard frame)" from "filtered out". A network
+    /// submit handler should treat both `Accepted` and `Duplicate` as
+    /// SUCCESS — re-delivering something the collector already has (or has
+    /// superseded) is not a dropped message; only `Filtered` is a real
+    /// rejection. This is what stops a prover's idempotent re-submission
+    /// of an already-delivered bundle from being reported to it as a
+    /// transport failure.
+    pub fn add_message_outcome(&self, rank: u64, data: Vec<u8>) -> SubmitOutcome {
         // Prover-only mode filtering: check if the message is a
         // prover-protocol op (type prefix 0x0301-0x031A). If not,
         // reject it during degraded coverage.
         if self.prover_only_mode.load(std::sync::atomic::Ordering::Relaxed) {
             if !is_prover_message(&data) {
-                return false;
+                return SubmitOutcome::Filtered;
             }
         }
 
         // Already included in a finalized frame → never re-accept. This
         // is what stops a message from re-entering the mempool after it
-        // has been consumed by a committed frame.
+        // has been consumed by a committed frame. The archive already has
+        // this work, so this is a duplicate, not a rejection.
         if self.finalized.read().unwrap().contains(&sha256(&data)) {
-            return false;
+            return SubmitOutcome::Duplicate;
         }
 
         // Shard-frame dedup at ingest (Go parity,
@@ -200,17 +229,18 @@ impl MessageCollector {
         // every round, so frames fill with already-seen proofs that the
         // materializer must re-verify (the expensive per-proof BLS work)
         // and then skip — the backlog explosion behind the halt. The
-        // dedup commits the new high-water marks as a side effect.
+        // dedup commits the new high-water marks as a side effect. A stale
+        // shard frame means we hold a newer one — a duplicate, not a drop.
         let shard_frames = extract_shard_frame_keys(&data);
         if !shard_frames.is_empty() && !self.dedup_shard_frames(&shard_frames) {
-            return false;
+            return SubmitOutcome::Duplicate;
         }
 
         let mut buffers = self.buffers.write().unwrap();
         let buffer = buffers.entry(rank).or_insert_with(RankBuffer::new);
         match buffer.add(data) {
-            AddOutcome::Added => true,
-            AddOutcome::Duplicate => false,
+            AddOutcome::Added => SubmitOutcome::Accepted,
+            AddOutcome::Duplicate => SubmitOutcome::Duplicate,
         }
     }
 
@@ -623,6 +653,29 @@ mod tests {
         assert!(mc.add_message(1, join));
 
         assert_eq!(mc.pending_count(1), 2);
+    }
+
+    #[test]
+    fn add_message_outcome_distinguishes_accepted_duplicate_filtered() {
+        let mc = MessageCollector::new();
+        // A prover op (0x0301 = ProverJoin): new → Accepted, re-submit →
+        // Duplicate (the collector already holds it — NOT a drop, so a submit
+        // handler reports success and the prover doesn't see a transport error).
+        let mut bundle = 0x0301u32.to_be_bytes().to_vec();
+        bundle.extend_from_slice(b"prover-op");
+        assert_eq!(mc.add_message_outcome(1, bundle.clone()), SubmitOutcome::Accepted);
+        assert_eq!(mc.add_message_outcome(1, bundle), SubmitOutcome::Duplicate);
+        // In prover-only mode a non-prover message is a REAL reject (Filtered).
+        mc.set_prover_only_mode(true);
+        assert_eq!(
+            mc.add_message_outcome(2, b"not-a-prover-message".to_vec()),
+            SubmitOutcome::Filtered
+        );
+        // The bool `add_message` wrapper is unchanged: true only for Accepted.
+        let mut b2 = 0x0301u32.to_be_bytes().to_vec();
+        b2.extend_from_slice(b"another");
+        assert!(mc.add_message(3, b2.clone()));
+        assert!(!mc.add_message(3, b2));
     }
 
     #[test]

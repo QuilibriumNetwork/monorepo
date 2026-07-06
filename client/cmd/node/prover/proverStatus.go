@@ -69,6 +69,20 @@ and shard allocations.
 		fmt.Printf("Allocated Workers:  %d\n", info.GetAllocatedWorkers())
 		fmt.Printf("Last Received:      %d\n", info.GetLastReceivedFrame())
 		fmt.Printf("Last Global Head:   %d\n", info.GetLastGlobalHeadFrame())
+
+		// Epoch context: the prover lifecycle is epoch-aligned (propose in
+		// epoch E, confirm in E+1, take effect in E+2). Show where we are so
+		// the confirm/reject windows below are interpretable.
+		epochLength := info.GetEpochLengthFrames()
+		curEpoch := info.GetCurrentEpoch()
+		el := epochLen(epochLength)
+		// Use last_received_frame as the "current frame" for effective-status
+		// derivation — it is exactly the frame the node evaluated allocations
+		// against, so the client's view matches the node's byte-for-byte.
+		currentFrame := info.GetLastReceivedFrame()
+		nextBoundary := (curEpoch + 1) * el
+		fmt.Printf("Epoch:              %d  (length %d frames; next boundary @ frame %d)\n",
+			curEpoch, el, nextBoundary)
 		fmt.Printf("Reachable:          %v\n", info.GetReachable())
 
 		allocations := info.GetShardAllocations()
@@ -78,25 +92,20 @@ and shard allocations.
 		}
 
 		workers := workerByFilter(client)
-		headFrame := info.GetLastGlobalHeadFrame()
 
 		fmt.Printf("\nShard Allocations:\n")
 		for i, alloc := range allocations {
-			// Skip expired joins (implicitly rejected after 720 frames)
-			if alloc.GetStatus() == 1 && alloc.GetJoinFrameNumber() > 0 &&
-				headFrame >= alloc.GetJoinFrameNumber()+720 {
-				continue
-			}
-			// Skip expired leaves (implicitly left after 720 frames)
-			if alloc.GetStatus() == 4 && alloc.GetLeaveFrameNumber() > 0 &&
-				headFrame >= alloc.GetLeaveFrameNumber()+720 {
-				continue
-			}
-
-			statusName, ok := allocationStatusNames[alloc.GetStatus()]
-			if !ok {
-				statusName = fmt.Sprintf("Unknown(%d)", alloc.GetStatus())
-			}
+			eff := computeEffectiveStatus(
+				alloc.GetStatus(),
+				alloc.GetFilter(),
+				alloc.GetJoinFrameNumber(),
+				alloc.GetJoinConfirmFrameNumber(),
+				alloc.GetLeaveFrameNumber(),
+				alloc.GetLeaveConfirmFrameNumber(),
+				alloc.GetEpoch(),
+				currentFrame,
+				epochLength,
+			)
 
 			filter := alloc.GetFilter()
 			filterHex := hex.EncodeToString(filter)
@@ -106,17 +115,38 @@ and shard allocations.
 				workerStr = fmt.Sprintf("  Worker: %d", wid)
 			}
 
-			fmt.Printf("  [%d] Filter: %s  Status: %s%s\n", i, filterHex, statusName, workerStr)
+			fmt.Printf("  [%d] Filter: %s  Status: %s%s\n", i, filterHex, eff.String(), workerStr)
+
+			// Confirm/reject window for a pending join or leave.
+			if w, ok := allocConfirmWindow(alloc, epochLength); ok {
+				fmt.Printf("      Action: %s | %s\n",
+					w.label("Confirm", currentFrame, epochLength),
+					w.label("Reject", currentFrame, epochLength))
+			} else if eff == effActive && len(filter) > 0 {
+				// Data-shard Active provers must re-confirm every epoch (X for
+				// X+1). `epoch` is the highest epoch registered so far.
+				fmt.Printf("      Re-confirm through epoch %d (renew before frame %d)\n",
+					alloc.GetEpoch(), nextBoundary)
+			} else if eff == effExpiredEpoch {
+				fmt.Printf("      MISSED re-confirm (registered epoch %d < current %d) — confirm now to restore\n",
+					alloc.GetEpoch(), curEpoch)
+			}
 
 			if alloc.GetJoinFrameNumber() > 0 {
-				fmt.Printf("      Join Frame: %d", alloc.GetJoinFrameNumber())
+				fmt.Printf("      Join Frame: %d (epoch %d)",
+					alloc.GetJoinFrameNumber(), epochForFrame(alloc.GetJoinFrameNumber(), epochLength))
 				if alloc.GetJoinConfirmFrameNumber() > 0 {
 					fmt.Printf("  Confirm Frame: %d", alloc.GetJoinConfirmFrameNumber())
 				}
 				fmt.Println()
 			}
 			if alloc.GetLeaveFrameNumber() > 0 {
-				fmt.Printf("      Leave Frame: %d\n", alloc.GetLeaveFrameNumber())
+				fmt.Printf("      Leave Frame: %d (epoch %d)",
+					alloc.GetLeaveFrameNumber(), epochForFrame(alloc.GetLeaveFrameNumber(), epochLength))
+				if alloc.GetLeaveConfirmFrameNumber() > 0 {
+					fmt.Printf("  Confirm Frame: %d", alloc.GetLeaveConfirmFrameNumber())
+				}
+				fmt.Println()
 			}
 			if alloc.GetLastActiveFrameNumber() > 0 {
 				fmt.Printf("      Last Active: %d\n", alloc.GetLastActiveFrameNumber())

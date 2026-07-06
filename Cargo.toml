@@ -50,6 +50,7 @@ members = [
     "crates/quil-compiler",
     "crates/quil-wallet",
     "crates/quil-explorer",
+    "crates/blossomsub",
     "crates/libp2p-identity",
 ]
 

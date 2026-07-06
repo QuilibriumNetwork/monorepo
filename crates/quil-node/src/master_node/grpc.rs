@@ -167,14 +167,25 @@ pub(crate) fn spawn_all(
             // frame number, larger by the genesis offset) put messages
             // out of the collect range, so they never landed.
             let rank = submit_cf.effective_rank();
-            let accepted = submit_mc.add_message(rank, data);
-            if accepted {
-                tracing::debug!(peer = %auth.peer_id, rank, "accepted gRPC submit");
-                quil_engine::metrics::inc_grpc_submits_accepted();
-                Ok(())
-            } else {
-                quil_engine::metrics::inc_grpc_submits_rejected();
-                Err("message collector rejected".into())
+            match submit_mc.add_message_outcome(rank, data) {
+                quil_engine::message_collector::SubmitOutcome::Accepted => {
+                    tracing::debug!(peer = %auth.peer_id, rank, "accepted gRPC submit");
+                    quil_engine::metrics::inc_grpc_submits_accepted();
+                    Ok(())
+                }
+                // Already delivered (or superseded by a newer shard frame) —
+                // the submitter's work is NOT lost, so report success. This is
+                // what stops a prover's idempotent bundle re-submission from
+                // being reported back to it as "message likely dropped" and
+                // triggering a wasteful gossip-fallback + retry.
+                quil_engine::message_collector::SubmitOutcome::Duplicate => {
+                    quil_engine::metrics::inc_grpc_submits_duplicate();
+                    Ok(())
+                }
+                quil_engine::message_collector::SubmitOutcome::Filtered => {
+                    quil_engine::metrics::inc_grpc_submits_rejected();
+                    Err("message collector rejected".into())
+                }
             }
         },
     );
@@ -353,10 +364,13 @@ pub(crate) fn spawn_all(
             }
             // Consensus rank, not frame number (see peer submit handler).
             let rank = node_submit_cf.effective_rank();
-            if node_submit_mc.add_message(rank, data) {
-                Ok(())
-            } else {
-                Err("message collector rejected".into())
+            match node_submit_mc.add_message_outcome(rank, data) {
+                // Duplicate = already delivered → success (not a drop).
+                quil_engine::message_collector::SubmitOutcome::Accepted
+                | quil_engine::message_collector::SubmitOutcome::Duplicate => Ok(()),
+                quil_engine::message_collector::SubmitOutcome::Filtered => {
+                    Err("message collector rejected".into())
+                }
             }
         },
     );
@@ -812,6 +826,19 @@ pub(crate) fn spawn_all(
         );
 
         let inbox_store = Arc::new(quil_store::RocksInboxStore::new(db_arc.inner()));
+        // Construct permissive (`responsible_filters = None` => responsible
+        // for ALL filters). This keeps external dispatch working while the
+        // responsibility guard is PRESENT and ENFORCED-when-set. Archives
+        // legitimately store all filters, so they stay `None`.
+        //
+        // TODO(non-archive coverage): a non-archive node should only accept
+        // dispatch puts/gets for the shards it actually covers. Once the
+        // lifecycle cleanly exposes its live covered-shard set, call
+        // `dispatch.set_responsible_filters(Some(covered_shard_bloom_filters))`
+        // (3-byte `get_bloom_filter_indices(addr,256,3)` filters) to enforce
+        // it. Archives must remain `None` (store all). Getting this set
+        // wrong (empty/stale) would reject-all and break messaging
+        // network-wide, so we default permissive rather than Go's reject-all.
         let dispatch_service = tonic::service::interceptor::InterceptedService::new(
             quil_types::proto::global::dispatch_service_server::DispatchServiceServer::new(
                 quil_rpc::dispatch_service::DispatchRpcServer::new(inbox_store.clone()),

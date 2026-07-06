@@ -446,25 +446,35 @@ pub(crate) fn init(
                                         }
                                     }
                                     WorkerToMaster::FrameProduced { core_id, filter, frame_data, .. } => {
-                                        // Per-shard frame bitmask = filter itself.
-                                        // Self-loopback is handled in thread_worker
-                                        // before we get here.
+                                        // `FrameProduced` carries the proposal-time
+                                        // `AppShardProposal` (0x0318), NOT a finalized frame.
+                                        // It MUST go on the per-shard CONSENSUS bitmask so peers
+                                        // route it through `handle_consensus_message` →
+                                        // `handle_app_shard_proposal`, which submits the proposal's
+                                        // parent QC + the proposal to their event loop so they
+                                        // VOTE and ADVANCE. Publishing it on the frame bitmask
+                                        // sent it to `handle_frame_message` (finalized-frame
+                                        // materialization only), which can't decode 0x0318 and
+                                        // drops it — so followers never voted, the chain wedged at
+                                        // rank 1, no 2-chain, no finalization, no reward. Mirrors
+                                        // Go publishing proposals on `getConsensusMessageBitmask`.
+                                        // (`FullFrameProduced` below stays on the frame bitmask.)
                                         if drain_halt.any_halted() {
                                             debug!(core_id, filter = %hex::encode(&filter),
-                                                "suppressing shard frame publish — coverage halt active");
+                                                "suppressing shard proposal publish — coverage halt active");
                                             continue;
                                         }
                                         let p2p = drain_p2p.clone();
-                                        drain_spawner.detach("shard-frame-publish", async move {
+                                        drain_spawner.detach("shard-proposal-publish", async move {
                                             if let Err(e) = p2p
                                                 .publish(
-                                                    quil_engine::bitmasks::shard_frame_bitmask(&filter),
+                                                    quil_engine::bitmasks::shard_consensus_bitmask(&filter),
                                                     frame_data,
                                                 )
                                                 .await
                                             {
                                                 warn!(core_id, filter = %hex::encode(&filter),
-                                                    error = %e, "shard frame publish failed");
+                                                    error = %e, "shard proposal publish failed");
                                             }
                                             Ok(())
                                         });

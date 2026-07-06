@@ -233,6 +233,23 @@ pub fn verify_code_execute(
     execute: &CodeExecute,
     bp: &dyn BulletproofProver,
 ) -> Result<bool> {
+    // Reserved-address guard. `materialize_code_execute` writes a vertex at
+    // `(execute.domain, execute.rendezvous)` under the vertex-adds
+    // discriminator — and `rendezvous` is fully attacker-controlled while a
+    // zero/`is_zero_payer` payer skips the signature check below entirely. The
+    // per-domain compute config-metadata vertex (write/owner/read keys) lives
+    // at the reserved `HYPERGRAPH_METADATA_ADDRESS` ([0xFF; 32]) under the SAME
+    // discriminator, so a `rendezvous` colliding with it would OVERWRITE the
+    // deployed app's config with an execute-DAG blob — a permissionless
+    // domain-config-corruption / takeover. Reject the collision.
+    if execute.rendezvous == crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS {
+        return Err(QuilError::InvalidArgument(
+            "verify: code execute rendezvous collides with reserved metadata \
+             address"
+                .into(),
+        ));
+    }
+
     // Payment proof check.
     let payer = execute.proof_of_payment.first().map(Vec::as_slice).unwrap_or(&[]);
     if !payer.is_empty() && !is_zero_payer(payer) {

@@ -266,6 +266,25 @@ impl AllocationBuckets {
                 EffectiveStatus::Active => {
                     buckets.all_ours.push(alloc.confirmation_filter.clone());
                     buckets.active.push(alloc.confirmation_filter.clone());
+                    // Proactive per-epoch re-confirm. An allocation registered
+                    // only for the current epoch (alloc.epoch == current) is
+                    // still Active now but flips ExpiredEpoch at the next
+                    // boundary — and, worse, the global storage audit at the new
+                    // epoch finds no leaf-root registration for it. Re-confirming
+                    // NOW registers current+1 (and encodes its replica ahead), so
+                    // the member stays continuously Active/attesting. The prior
+                    // ExpiredEpoch-ONLY trigger only fired after expiry, yielding
+                    // an every-other-epoch cadence with a coverage/attestation
+                    // gap at each boundary. Global (empty-filter) allocations are
+                    // exempt (no storage epoch). Stays in `active` so it keeps
+                    // counting for coverage; the re-confirm is cooldown-gated
+                    // downstream so it isn't re-published every frame.
+                    if !alloc.confirmation_filter.is_empty()
+                        && alloc.epoch
+                            <= quil_types::consensus::epoch_for_frame(frame_number)
+                    {
+                        buckets.expired_epoch.push(alloc.confirmation_filter.clone());
+                    }
                 }
                 EffectiveStatus::Leaving => {
                     buckets.all_ours.push(alloc.confirmation_filter.clone());
@@ -2136,13 +2155,49 @@ mod buckets_tests {
     }
 
     #[test]
-    fn current_epoch_active_alloc_is_not_expired() {
-        // Same alloc but already confirmed for the current epoch (1) → Active.
+    fn current_epoch_active_alloc_queues_proactive_reconfirm() {
+        // Registered only for the current epoch (1), evaluated during epoch 1.
+        // Still Active (counts for coverage), but must re-confirm NOW to register
+        // epoch 2 — otherwise it flips ExpiredEpoch at the next boundary and the
+        // storage audit finds no registration for epoch 2. Proactive per-epoch
+        // re-confirm (not the old ExpiredEpoch-only, every-other-epoch cadence).
         let mut a = alloc(0x02, ProverStatus::Active, 50, 0);
         a.epoch = 1;
         let b = AllocationBuckets::from_allocations(&[a], 1000);
-        assert!(b.expired_epoch.is_empty(), "current-epoch alloc is not expired");
+        assert_eq!(b.active, vec![vec![0x02]], "still counts for coverage");
+        assert_eq!(
+            b.expired_epoch,
+            vec![vec![0x02]],
+            "current-epoch alloc must proactively re-confirm for next epoch",
+        );
+    }
+
+    #[test]
+    fn alloc_registered_ahead_does_not_reconfirm() {
+        // Already re-confirmed this epoch: registered for epoch 2 (current+1)
+        // while evaluated during epoch 1. No further re-confirm this epoch.
+        let mut a = alloc(0x02, ProverStatus::Active, 50, 0);
+        a.epoch = 2;
+        let b = AllocationBuckets::from_allocations(&[a], 1000);
         assert_eq!(b.active, vec![vec![0x02]]);
+        assert!(
+            b.expired_epoch.is_empty(),
+            "an alloc already registered for next epoch must not re-confirm again",
+        );
+    }
+
+    #[test]
+    fn global_empty_filter_alloc_never_reconfirms() {
+        // Global (empty ConfirmationFilter) allocations do no storage attestation
+        // and are exempt from epoch expiry — they must never queue a re-confirm.
+        let mut a = alloc(0x02, ProverStatus::Active, 50, 0);
+        a.confirmation_filter = Vec::new();
+        a.epoch = 0;
+        let b = AllocationBuckets::from_allocations(&[a], 1000);
+        assert!(
+            b.expired_epoch.is_empty(),
+            "global empty-filter alloc must never re-confirm",
+        );
     }
 }
 

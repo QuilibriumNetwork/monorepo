@@ -102,11 +102,13 @@ type allocationRow struct {
 	shardSize       *big.Int
 	dataShards      uint64
 	estimatedReward *big.Int
-	joinFrame       uint64
-	confirmFrame    uint64
-	leaveFrame      uint64
-	lastActiveFrame uint64
-	workerID        int // core_id, -1 if no worker assigned
+	joinFrame         uint64
+	confirmFrame      uint64
+	leaveFrame        uint64
+	leaveConfirmFrame uint64
+	epoch             uint64 // highest epoch this allocation registered leaf roots for
+	lastActiveFrame   uint64
+	workerID          int // core_id, -1 if no worker assigned
 	nextAction      string
 	defaultAction   string
 	manuallyManaged bool
@@ -266,6 +268,18 @@ const minFilterWidth = 12
 
 const ACTION_FRAME_DELAY = 360
 
+// epochFrame returns the frame the client should use for epoch-aligned
+// lifecycle computations. The node evaluates allocations against its
+// `current_frame.effective()`, surfaced as `last_received_frame`; using it
+// keeps the client's effective-status/confirm-window view identical to the
+// node's. Falls back to the shard head frame if the node hasn't reported one.
+func (m manageModel) epochFrame() uint64 {
+	if m.lastReceivedFrame > 0 {
+		return m.lastReceivedFrame
+	}
+	return m.frameNumber
+}
+
 func newManageKeyMap() manageKeyMap {
 	return manageKeyMap{
 		Up:           key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
@@ -396,8 +410,15 @@ type manageModel struct {
 	lastGlobalHead   uint64
 	reachable        bool
 	frameNumber      uint64
-	difficulty       uint64
-	autoManaged      bool
+	// Epoch context (from NodeInfoResponse) driving epoch-aligned lifecycle
+	// timing. `lastReceivedFrame` is the frame the node evaluated allocations
+	// against (its `current_frame.effective()`), so using it here keeps the
+	// client's effective-status view identical to the node's.
+	epochLength       uint64
+	currentEpoch      uint64
+	lastReceivedFrame uint64
+	difficulty        uint64
+	autoManaged       bool
 
 	// Panel data.
 	allocations []allocationRow
@@ -1021,30 +1042,32 @@ func (m manageModel) applicableAllocActions() map[string]bool {
 	}
 
 	actionsForRow := func(row allocationRow) map[string]bool {
+		// A pending join (status 1) or leave (status 4) may be confirmed OR
+		// rejected in EXACTLY the epoch after it was proposed (E+1). The node
+		// applies `validate_confirm_timing` to both confirm and reject, so both
+		// buttons are enabled only while that one-epoch window is open.
+		ef := m.epochFrame()
+		el := m.epochLength
+		windowGatedActions := func(proposeFrame uint64) map[string]bool {
+			actions := map[string]bool{}
+			if proposeFrame == 0 {
+				// Genesis/legacy sentinel — no epoch window to enforce.
+				actions["Reject"] = true
+				actions["Confirm"] = true
+				return actions
+			}
+			w := joinConfirmWindow(proposeFrame, el) // same slot math for join & leave
+			if w.state(ef, el) == windowOpen {
+				actions["Confirm"] = true
+				actions["Reject"] = true
+			}
+			return actions
+		}
 		switch row.status {
 		case 1:
-			// Confirm is only valid once the action window opens (joinFrame+delay)
-			// and before it expires (joinFrame+2*delay).
-			actions := map[string]bool{"Reject": true}
-			if row.joinFrame > 0 {
-				actionFrame := row.joinFrame + ACTION_FRAME_DELAY
-				expiryFrame := row.joinFrame + ACTION_FRAME_DELAY*2
-				if m.frameNumber >= actionFrame && m.frameNumber < expiryFrame {
-					actions["Confirm"] = true
-				}
-			}
-			return actions
+			return windowGatedActions(row.joinFrame)
 		case 4:
-			// Same window logic using leaveFrame.
-			actions := map[string]bool{"Reject": true}
-			if row.leaveFrame > 0 {
-				actionFrame := row.leaveFrame + ACTION_FRAME_DELAY
-				expiryFrame := row.leaveFrame + ACTION_FRAME_DELAY*2
-				if m.frameNumber >= actionFrame && m.frameNumber < expiryFrame {
-					actions["Confirm"] = true
-				}
-			}
-			return actions
+			return windowGatedActions(row.leaveFrame)
 		case 2:
 			return map[string]bool{"Leave": true, "Pause": true}
 		case 3:
@@ -1252,14 +1275,16 @@ func (m *manageModel) beginAwait(action string, filtersRaw [][]byte, originalSta
 	now := time.Now()
 	m.awaitAction = action
 	m.awaitStartTime = now
-	// Deadline = wall-time equivalent of 2*ACTION_FRAME_DELAY frames
-	// at the mainnet 10s/frame cadence, plus a slack constant for
-	// network propagation. ACTION_FRAME_DELAY=360 → 7200s + 30s
-	// slack. We use wall time (not chain frames) since the TUI
-	// doesn't reliably observe every frame increment.
+	// Deadline = wall-time equivalent of one epoch at the 10s/frame cadence,
+	// plus a slack constant for network propagation. Confirm/reject settle
+	// within the E+1 window, and a fresh join/leave takes full effect at the
+	// E+2 boundary, so one epoch of wall time comfortably covers the on-chain
+	// state change while scaling with the node's epoch length (720 mainnet →
+	// 7200s, matching the prior budget; 60 testnet → 600s). We use wall time
+	// (not chain frames) since the TUI doesn't observe every frame increment.
 	const frameWallSeconds = 10
 	const slackSeconds = 30
-	deadlineSeconds := 2*int(ACTION_FRAME_DELAY)*frameWallSeconds + slackSeconds
+	deadlineSeconds := int(epochLen(m.epochLength))*frameWallSeconds + slackSeconds
 	m.awaitDeadline = now.Add(time.Duration(deadlineSeconds) * time.Second)
 	m.awaitRetries = 0
 	if filtersRaw != nil {
@@ -1956,6 +1981,9 @@ func (m *manageModel) processRefreshData(
 	m.allocatedWorkers = nodeInfo.GetAllocatedWorkers()
 	m.lastGlobalHead = nodeInfo.GetLastGlobalHeadFrame()
 	m.reachable = nodeInfo.GetReachable()
+	m.epochLength = nodeInfo.GetEpochLengthFrames()
+	m.currentEpoch = nodeInfo.GetCurrentEpoch()
+	m.lastReceivedFrame = nodeInfo.GetLastReceivedFrame()
 
 	if shardInfo != nil {
 		m.frameNumber = shardInfo.GetFrameNumber()
@@ -2006,56 +2034,77 @@ func (m *manageModel) processRefreshData(
 
 	// Build allocations from NodeInfo, enriched with ShardInfo.
 	allocs := make([]allocationRow, 0, len(nodeInfo.GetShardAllocations()))
+	ef := m.epochFrame()
+	el := m.epochLength
+	nextBoundary := (m.currentEpoch + 1) * epochLen(el)
 	for _, a := range nodeInfo.GetShardAllocations() {
 		// Only show allocations the prover is actively participating in.
 		s := a.GetStatus()
 		if s != 1 && s != 2 && s != 3 && s != 4 {
 			continue
 		}
-		// Skip expired joins (implicitly rejected after 720 frames).
-		if s == 1 && a.GetJoinFrameNumber() > 0 &&
-			m.frameNumber >= a.GetJoinFrameNumber()+ACTION_FRAME_DELAY*2 {
+
+		// Epoch-aligned effective status (mirrors the node's effective_status).
+		eff := computeEffectiveStatus(
+			s, a.GetFilter(),
+			a.GetJoinFrameNumber(), a.GetJoinConfirmFrameNumber(),
+			a.GetLeaveFrameNumber(), a.GetLeaveConfirmFrameNumber(),
+			a.GetEpoch(), ef, el,
+		)
+		// Skip implicitly-departed allocations. The node already filters these
+		// out of GetNodeInfo; this is belt-and-suspenders for an older node.
+		if eff == effExpiredJoining || eff == effExpiredLeaving {
 			continue
 		}
-		// Skip expired leaves (implicitly left after 720 frames).
-		if s == 4 && a.GetLeaveFrameNumber() > 0 &&
-			m.frameNumber >= a.GetLeaveFrameNumber()+ACTION_FRAME_DELAY*2 {
-			continue
-		}
+
 		filterHex := hex.EncodeToString(a.GetFilter())
 		allocatedFilters[filterHex] = true
 
-		statusName, ok := allocationStatusNames[a.GetStatus()]
-		if !ok {
-			statusName = fmt.Sprintf("Unknown(%d)", a.GetStatus())
-		}
+		statusName := eff.String()
 
 		nextAction := ""
 		defaultAction := ""
-		// For Joining, annotate with confirmable frame.
-		if a.GetStatus() == 1 && a.GetJoinFrameNumber() > 0 {
-			actionFrame := a.GetJoinFrameNumber() + ACTION_FRAME_DELAY
-			expiryFrame := a.GetJoinFrameNumber() + ACTION_FRAME_DELAY*2
-			if m.frameNumber >= actionFrame && m.frameNumber < expiryFrame {
-				nextAction = "Reject@now | Confirm@now"
-			} else {
-				nextAction = fmt.Sprintf("Reject@now | Confirm@%d", actionFrame)
+		if w, ok := allocConfirmWindow(a, el); ok {
+			// Pending join or leave: confirm/reject in EXACTLY confirmEpoch.
+			switch w.state(ef, el) {
+			case windowOpen:
+				nextAction = "Reject | Confirm now"
+				defaultAction = fmt.Sprintf("thru f%d", w.endFrame)
+			case windowPending:
+				nextAction = fmt.Sprintf("Reject | Confirm@f%d", w.startFrame)
+				defaultAction = fmt.Sprintf("epoch %d", w.confirmEpoch)
+			default:
+				nextAction = "window missed"
+				defaultAction = "expired"
 			}
-			defaultAction = fmt.Sprintf("Reject@%d", expiryFrame)
-		} else if a.GetStatus() == 4 && a.GetLeaveFrameNumber() > 0 {
-			// For Leaving, use LeaveFrameNumber for action/expiry calculation.
-			actionFrame := a.GetLeaveFrameNumber() + ACTION_FRAME_DELAY
-			expiryFrame := a.GetLeaveFrameNumber() + ACTION_FRAME_DELAY*2
-			if m.frameNumber >= actionFrame && m.frameNumber < expiryFrame {
-				nextAction = "Reject@now | Confirm@now"
-			} else {
-				nextAction = fmt.Sprintf("Reject@now | Confirm@%d", actionFrame)
+		} else {
+			switch eff {
+			case effActive:
+				nextAction = "Pause | Leave"
+				if len(a.GetFilter()) > 0 {
+					// Data-shard Active: re-confirm each epoch (X for X+1).
+					defaultAction = fmt.Sprintf("renew<f%d", nextBoundary)
+				}
+			case effPaused:
+				nextAction = "Resume | Leave"
+			case effJoining:
+				// Deferred activation: confirmed, awaiting the E+2 boundary.
+				if a.GetJoinConfirmFrameNumber() > 0 {
+					actE := epochForFrame(a.GetJoinConfirmFrameNumber(), el) + 1
+					nextAction = "confirmed"
+					defaultAction = fmt.Sprintf("active@e%d", actE)
+				}
+			case effLeaving:
+				// Confirmed leave: serving notice until the E+2 boundary.
+				if a.GetLeaveConfirmFrameNumber() > 0 {
+					deactE := epochForFrame(a.GetLeaveConfirmFrameNumber(), el) + 1
+					nextAction = "leaving"
+					defaultAction = fmt.Sprintf("departs@e%d", deactE)
+				}
+			case effExpiredEpoch:
+				nextAction = "Confirm now (renew)"
+				defaultAction = "re-confirm!"
 			}
-			defaultAction = fmt.Sprintf("Confirm@%d", expiryFrame)
-		} else if a.GetStatus() == 2 {
-			nextAction = "Pause@now | Leave@now"
-		} else if a.GetStatus() == 3 {
-			nextAction = "Resume@now | Leave@now"
 		}
 
 		wid := -1
@@ -2066,21 +2115,23 @@ func (m *manageModel) processRefreshData(
 		}
 
 		row := allocationRow{
-			filter:          a.GetFilter(),
-			filterKey:       filterHex,
-			filterHex:       filterHex,
-			status:          a.GetStatus(),
-			statusName:      statusName,
-			joinFrame:       a.GetJoinFrameNumber(),
-			confirmFrame:    a.GetJoinConfirmFrameNumber(),
-			leaveFrame:      a.GetLeaveFrameNumber(),
-			lastActiveFrame: a.GetLastActiveFrameNumber(),
-			shardSize:       big.NewInt(0),
-			estimatedReward: big.NewInt(0),
-			workerID:        wid,
-			nextAction:      nextAction,
-			defaultAction:   defaultAction,
-			manuallyManaged: mm,
+			filter:            a.GetFilter(),
+			filterKey:         filterHex,
+			filterHex:         filterHex,
+			status:            a.GetStatus(),
+			statusName:        statusName,
+			joinFrame:         a.GetJoinFrameNumber(),
+			confirmFrame:      a.GetJoinConfirmFrameNumber(),
+			leaveFrame:        a.GetLeaveFrameNumber(),
+			leaveConfirmFrame: a.GetLeaveConfirmFrameNumber(),
+			epoch:             a.GetEpoch(),
+			lastActiveFrame:   a.GetLastActiveFrameNumber(),
+			shardSize:         big.NewInt(0),
+			estimatedReward:   big.NewInt(0),
+			workerID:          wid,
+			nextAction:        nextAction,
+			defaultAction:     defaultAction,
+			manuallyManaged:   mm,
 		}
 
 		if info, ok := rewardByFilter[filterHex]; ok {
@@ -2658,13 +2709,17 @@ func (m manageModel) renderView() string {
 			workerMode = "Auto"
 		}
 		header = fmt.Sprintf(
-			" Peer ID: %s  Seniority: %s  Workers: %d/%d (%s)  Frame: %d  [%s]",
+			" Peer ID: %s  Seniority: %s  Workers: %d/%d (%s)  Frame: %d  Epoch: %d  [%s]",
 			peerDisplay,
 			m.seniority,
 			m.allocatedWorkers,
 			m.runningWorkers,
 			workerMode,
 			m.frameNumber,
+			// Derive from the displayed frame so Frame/Epoch are always
+			// consistent (epoch = frame / epoch_length; length from the node,
+			// 720 fallback).
+			epochForFrame(m.frameNumber, m.epochLength),
 			reachStr,
 		)
 		// Staleness suffix: render when the most recent refresh

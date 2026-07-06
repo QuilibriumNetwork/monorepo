@@ -1756,7 +1756,7 @@ impl AppConsensusEngine {
             // filter and the QC/TC `.filter()` match what voters signed.
             let raw_agg: Arc<dyn SignatureAggregator> =
                 Arc::new(BlsSignatureAggregator::new(bls_ctor.clone()));
-            let verifier = BlsConsensusVerifier::new_with_committee(
+            let verifier = BlsConsensusVerifier::new(
                 raw_agg,
                 vote_domain_for_validator,
                 timeout_domain_for_validator,

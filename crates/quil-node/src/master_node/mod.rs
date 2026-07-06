@@ -639,6 +639,7 @@ pub(crate) async fn start(
         message_collector: message_collector.clone(),
         bls_pubkey: bls_pubkey.clone(),
         prover_address,
+        genesis_prover_addrs: genesis_prover_addrs.clone(),
         p2p_handle: p2p_handle.clone(),
         consensus_handle: consensus_handle.clone(),
         vote_aggregator: vote_aggregator.clone(),
@@ -673,6 +674,7 @@ pub(crate) async fn start(
             inclusion_prover.clone(),
             crdt.clone(),
             Some(db_arc.clone() as Arc<dyn quil_types::store::KvDb>),
+            clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
         ))
     } else {
         None

@@ -1,0 +1,55 @@
+# blossomsub — a hard fork of libp2p-gossipsub 0.47.0, modified so that
+# topics are BITMASKS with composite same/broker overlap routing (the
+# Quilibrium BlossomSub protocol). Version 0.47.0 is pinned because it is the
+# gossipsub release whose libp2p-core (0.42) / libp2p-swarm (0.45) deps match
+# what libp2p 0.54.1 pulls in this workspace. Original upstream manifest is in
+# Cargo.toml.orig.
+[package]
+name = "blossomsub"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+description = "BlossomSub: bitmask-composite gossip protocol (fork of libp2p-gossipsub)"
+license = "MIT"
+publish = false
+
+[dependencies]
+asynchronous-codec = "0.7.0"
+base64 = "0.22.1"
+byteorder = "1.5.0"
+bytes = "1.6"
+either = "1.11"
+fnv = "1.0.7"
+futures = "0.3.30"
+futures-ticker = "0.0.3"
+getrandom = "0.2.15"
+hex_fmt = "0.3.0"
+libp2p-core = "0.42.0"
+libp2p-identity = { version = "0.2.9", features = ["rand"] }
+libp2p-swarm = "0.45.0"
+prometheus-client = "0.22.2"
+prost = "0.13"
+quick-protobuf = "0.8"
+quick-protobuf-codec = "0.3.1"
+rand = "0.8"
+regex = "1.10.5"
+serde = { version = "1", features = ["derive"], optional = true }
+sha2 = "0.10.8"
+smallvec = "1.13.2"
+tracing = "0.1.37"
+void = "1.0.2"
+web-time = "1.1.0"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+hex = "0.4.2"
+
+[features]
+wasm-bindgen = ["getrandom/js"]
+# Gates upstream libp2p-gossipsub's async-std integration + quickcheck codec
+# tests, quarantined during the fork (replaced by the BlossomSub test_harness
+# in Stage 7). Enabling it would require async-std / tracing-subscriber / an
+# old quickcheck; not built by default.
+upstream-tests = []

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use quil_types::consensus::ProverRegistry;
 use quil_types::error::{QuilError, Result};
@@ -584,8 +584,28 @@ impl FrameMaterializer {
         // this frame but the cache never saw it). Mirrors Go's
         // `ProcessStateTransition(st, frameNumber)` at
         // `frame_materializer.go:257`.
-        if let Err(e) = self.execution_manager.commit_frame(frame_number) {
-            warn!(frame = frame_number, error = %e, "CRDT commit_frame failed");
+        // A failed CRDT commit must NOT be swallowed: if we advance
+        // `last_materialized_frame` (below) past a frame whose CRDT mutations
+        // never persisted, the durable clock cursor outruns the on-disk CRDT
+        // state, and the next frame materializes on top of a hole → permanent
+        // prover-root divergence from the committee. Propagate so the caller
+        // (the materializer driver) stops rather than corrupting state; a
+        // restart re-materializes this frame cleanly.
+        // Atomically stage the durable GLOBAL materialization cursor
+        // (= frame_number) into THIS commit's batch. The cursor rides the
+        // same `db.write` as the frame's reward-balance / prover / shard
+        // mutations, so on any crash the durable cursor equals the CRDT
+        // frontier exactly. Startup then re-materializes only the
+        // un-committed tail `[cursor+1..=head]` — never a frame already
+        // reflected in the CRDT — which is the sole safe window given
+        // `apply_reward` is additive with no per-frame idempotency
+        // (re-running a committed frame would double-mint).
+        if let Err(e) = self
+            .execution_manager
+            .commit_frame_with_global_cursor(frame_number)
+        {
+            error!(frame = frame_number, error = %e, "CRDT commit_frame failed — aborting materialize");
+            return Err(e);
         }
         if let (Some(eviction_reg), Some(rocks_store)) =
             (self.eviction_registry.as_ref(), self.rocks_hg_store.as_ref())
@@ -1064,6 +1084,20 @@ impl FrameMaterializer {
     /// The last materialized frame number.
     pub fn last_materialized_frame(&self) -> u64 {
         self.last_materialized_frame.load(Ordering::SeqCst)
+    }
+
+    /// Seed the in-memory `last_materialized_frame` cursor from the durable
+    /// GLOBAL materialization cursor at startup (before wiring the live
+    /// finalized feed). The ctor hardcodes 0; without this seed a restart
+    /// would re-materialize the entire chain from frame 1 — double-minting
+    /// every already-committed reward.
+    ///
+    /// After seeding to `m`, the caller re-materializes `[m+1..=head]` from
+    /// the clock records; the idempotency gate (`frame_number <= last`) then
+    /// guarantees no frame at or below the durable cursor is ever re-run.
+    /// Monotonic: never lowers an already-higher in-memory cursor.
+    pub fn seed_cursor(&self, m: u64) {
+        self.last_materialized_frame.fetch_max(m, Ordering::SeqCst);
     }
 }
 

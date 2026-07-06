@@ -566,7 +566,23 @@ impl GlobalIntrinsic {
                     )?;
                     Ok(true)
                 } else {
-                    super::kick_verify::verify_equivocation_structural(&op)
+                    // Fail-closed. Structural-only checks (same frame number,
+                    // different output) do NOT prove the victim signed both
+                    // conflicting frames — only the full BLS verify does. Without
+                    // the crypto deps we cannot run it, so REJECT rather than
+                    // accept on faith (accepting would let a fabricated ProverKick
+                    // evict an honest prover). Matches SHARD_SPLIT / SHARD_MERGE /
+                    // SENIORITY_MERGE / FRAME_HEADER, which all fail-closed on
+                    // missing deps. Safe: eviction materialization (`invoke_kick`)
+                    // is archive-only and archives hold the full deps, so nodes
+                    // that lack them don't apply kicks anyway (they sync the
+                    // already-materialized prover tree from archives).
+                    let _ = &op;
+                    Err(QuilError::InvalidArgument(
+                        "ProverKick: crypto deps unavailable — cannot verify \
+                         equivocation signatures; rejecting rather than accepting \
+                         a structurally-plausible-but-unverified kick".into(),
+                    ))
                 }
             }
             TYPE_FRAME_HEADER => {
@@ -653,28 +669,21 @@ impl GlobalIntrinsic {
                     })?;
                     let participant_indices: Vec<usize> =
                         quil_consensus::bitmask::set_bit_indices(&sig.bitmask).collect();
-                    let (_throwaway_signer, throwaway_pub) = bls
-                        .new_key()
+                    let active_pks: Vec<&[u8]> = active
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| participant_indices.contains(i))
+                        .map(|(_, prover)| prover.public_key.as_slice())
+                        .collect();
+                    let reconstructed_pubkey = bls
+                        .aggregate_public_keys(&active_pks)
                         .map_err(|e| QuilError::Crypto(format!(
-                            "FrameHeader: throwaway key: {e}"
-                        )))?;
-                    let mut active_pks: Vec<&[u8]> = Vec::new();
-                    let mut throwaway_list: Vec<&[u8]> = Vec::new();
-                    for (i, prover) in active.iter().enumerate() {
-                        if participant_indices.contains(&i) {
-                            active_pks.push(&prover.public_key);
-                            throwaway_list.push(&throwaway_pub);
-                        }
-                    }
-                    let aggregate = bls
-                        .aggregate(&active_pks, &throwaway_list)
-                        .map_err(|e| QuilError::Crypto(format!(
-                            "FrameHeader: aggregate: {e}"
+                            "FrameHeader: aggregate_public_keys: {e}"
                         )))?;
                     let sig_pubkey_bytes: &[u8] = sig.public_key.as_ref()
                         .map(|k| k.key_value.as_slice())
                         .unwrap_or(&[]);
-                    if aggregate.public_key.as_slice() != sig_pubkey_bytes {
+                    if reconstructed_pubkey.as_slice() != sig_pubkey_bytes {
                         let active_summary: Vec<String> = active
                             .iter()
                             .map(|p| hex::encode(&p.address[..p.address.len().min(8)]))
@@ -686,7 +695,7 @@ impl GlobalIntrinsic {
                             active_count = active.len(),
                             active_first_addrs = ?active_summary,
                             reconstructed_pubkey_prefix = %hex::encode(
-                                &aggregate.public_key[..aggregate.public_key.len().min(16)]
+                                &reconstructed_pubkey[..reconstructed_pubkey.len().min(16)]
                             ),
                             sig_declared_pubkey_prefix = %hex::encode(
                                 &sig_pubkey_bytes[..sig_pubkey_bytes.len().min(16)]
@@ -1071,6 +1080,32 @@ impl GlobalIntrinsic {
             return Err(QuilError::InvalidArgument("invoke_step join: no public key".into()));
         }
 
+        // Defense-in-depth: re-verify the join SIGNATURE at materialize, matching
+        // invoke_filter_op / invoke_update / invoke_seniority_merge (which all
+        // re-verify). Materialize is normally reached only after validate_message
+        // gates the op, but a caller that invokes materialize without validating
+        // first must not be able to write prover/allocation/reward state on an
+        // unsigned join. This is the SIGNATURE check only (BLS main + PoP) —
+        // structural/VDF checks stay in validate. `verify_prover_join_signatures`
+        // reads only `validation.public_key`, so the other fields are unused.
+        {
+            let jv = verify::ProverJoinValidation {
+                public_key: pubkey.clone(),
+                prover_address: [0u8; 32],
+                filter_count: 0,
+            };
+            if !verify::verify_prover_join_signatures(
+                op,
+                &jv,
+                self.key_manager.as_ref(),
+                None,
+            )? {
+                return Err(QuilError::InvalidArgument(
+                    "invoke_step join: signature verification failed".into(),
+                ));
+            }
+        }
+
         // Phase F join-freeze (decision #2): a shard with a pending split/merge
         // (recorded between the proposal epoch E and the E+2 flip) cannot accept
         // new joins — its existence/identity is about to change, and the
@@ -1269,17 +1304,30 @@ impl GlobalIntrinsic {
         // `poseidon(QUIL_TOKEN_ADDRESS || prover_address)` —
         // `materialize::reward_address` matches.
         let reward_addr = materialize::reward_address(&output.prover_address)?;
-        let mut reward_tree = quil_tries::VectorCommitmentTree::new();
-        let delegate = if op.delegate_address.len() == 32 {
-            op.delegate_address.clone()
-        } else {
-            output.prover_address.to_vec()
+        // Only INITIALIZE the reward vertex when it does not already exist. A
+        // prover that left (Status=4) holding an unclaimed accrued balance and
+        // later rejoins (allowed once its allocations expire past the 720-frame
+        // window) must NOT have its balance zeroed or its delegate reset. Go
+        // wrote this vertex unconditionally — a silent fund-loss on rejoin that
+        // we no longer carry. When absent, initialize with a zero balance and
+        // the supplied/default delegate.
+        let reward_exists = match state.get(domain, &reward_addr, va_disc) {
+            Ok(Some(b)) => !b.is_empty(),
+            _ => false,
         };
-        materialize::set_reward_delegate_address(&mut reward_tree, &delegate)?;
-        // 32-byte zero balance — matches Go's `make([]byte, 32)`.
-        materialize::set_reward_balance(&mut reward_tree, &[0u8; 32])?;
-        let reward_blob = crate::prover_registry::vertex_tree_to_blob(&reward_tree);
-        state.set(domain, &reward_addr, va_disc, frame_number, reward_blob)?;
+        if !reward_exists {
+            let mut reward_tree = quil_tries::VectorCommitmentTree::new();
+            let delegate = if op.delegate_address.len() == 32 {
+                op.delegate_address.clone()
+            } else {
+                output.prover_address.to_vec()
+            };
+            materialize::set_reward_delegate_address(&mut reward_tree, &delegate)?;
+            // 32-byte zero balance — matches Go's `make([]byte, 32)`.
+            materialize::set_reward_balance(&mut reward_tree, &[0u8; 32])?;
+            let reward_blob = crate::prover_registry::vertex_tree_to_blob(&reward_tree);
+            state.set(domain, &reward_addr, va_disc, frame_number, reward_blob)?;
+        }
 
         Ok(())
     }

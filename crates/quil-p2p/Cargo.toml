@@ -10,6 +10,7 @@ quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-lifecycle = { path = "../quil-lifecycle" }
 quil-crypto = { path = "../quil-crypto" }
+blossomsub = { path = "../blossomsub" }
 libp2p = { version = "0.54", features = [
     "tokio",
     "noise",

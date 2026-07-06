@@ -337,7 +337,7 @@ impl<S: Unique, V: Unique> Validator<S, V> for ConsensusValidator<S, V> {
 ///    aggregate signature (`validate_proposal` validates that TC
 ///    internally, so it is not re-checked here).
 /// 3. **Proposer's own vote** (`VerifyVote`). Requires a committee-aware
-///    verifier (see [`crate::bls_verifier::BlsConsensusVerifier::new_with_committee`]).
+///    verifier (see [`crate::bls_verifier::BlsConsensusVerifier::new`]).
 /// 4/5. **State + frame**: the VDF + BLS frame check, supplied by the
 ///    caller as `frame_check` since the frame-validator type differs
 ///    between the global and app paths.

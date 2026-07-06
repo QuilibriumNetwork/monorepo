@@ -649,7 +649,15 @@ impl BlsAppFrameValidator {
                 header.frame_number,
                 &rho_n,
                 &bitmask,
-                quil_crypto::sdr::BLOCK_POLY_SIZE,
+                // Must match the poly_size every producer/audit/encode site
+                // uses (app_glue, app_shard_metadata, prover_pipeline,
+                // intrinsic reward audit). derive_challenge_index folds
+                // poly_size into both the challenge point and the modulus, so
+                // a mismatch here re-derives different points than the producer
+                // and rejects every storage-bearing frame. The crypto-layer
+                // sdr::BLOCK_POLY_SIZE (256) is the SDR block partition, NOT the
+                // consensus opening domain.
+                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
                 active_epoch,
                 |member: &[u8], leaf_id: &[u8]| {
                     registry.get_leaf_root(member, leaf_id).ok().flatten()

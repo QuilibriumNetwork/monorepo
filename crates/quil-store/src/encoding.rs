@@ -39,6 +39,17 @@ pub const CONSENSUS_LIVENESS: u8 = 0x01;
 /// already advanced past). Go has no equivalent record, so 0x02 under
 /// CONSENSUS is unused by a migrated Go store.
 pub const CONSENSUS_MATERIALIZED_CURSOR: u8 = 0x02;
+/// Rust-node-only: highest GLOBAL frame whose `requests` have been
+/// materialized into the hypergraph CRDT (reward balances + prover/shard
+/// state). Unlike [`CONSENSUS_MATERIALIZED_CURSOR`] this is a SINGLE global
+/// key (no filter) and is written ATOMICALLY inside the CRDT commit's own
+/// RocksTxn batch — so the durable cursor can never diverge from the CRDT
+/// frontier. On restart the materializer re-materializes only the
+/// un-committed tail `[cursor+1 ..= clock_head]`, which is the only safe
+/// window given reward minting is additive (no per-frame idempotency).
+/// Go has no equivalent record, so 0x03 under CONSENSUS is unused by a
+/// migrated Go store.
+pub const CONSENSUS_GLOBAL_MATERIALIZED_CURSOR: u8 = 0x03;
 pub const MIGRATION: u8 = 0xF0;
 pub const WORKER: u8 = 0xFF;
 
@@ -717,6 +728,14 @@ pub fn consensus_materialized_cursor_key(filter: &[u8]) -> Vec<u8> {
     k.push(CONSENSUS_MATERIALIZED_CURSOR);
     k.extend_from_slice(filter);
     k
+}
+
+/// Key for the single GLOBAL "highest materialized frame" cursor. Value is
+/// an 8-byte big-endian `u64`. There is exactly ONE such key (no filter) —
+/// it tracks the global materializer's CRDT frontier and is staged into the
+/// CRDT commit's own batch. See [`CONSENSUS_GLOBAL_MATERIALIZED_CURSOR`].
+pub fn global_materialized_cursor_key() -> Vec<u8> {
+    vec![CONSENSUS, CONSENSUS_GLOBAL_MATERIALIZED_CURSOR]
 }
 
 // -----------------------------------------------------------------------

@@ -197,12 +197,26 @@ impl Default for ArchiveEndpointPool {
 /// they arrive.
 pub type OnFrameCallback = Arc<dyn Fn(&GlobalFrame) + Send + Sync>;
 
+/// Validates a frame BEFORE it is persisted. Returns `true` to accept
+/// (store + fire `on_frame`), `false` to drop. Wired from the node's
+/// genesis-prover allowlist + VDF/BLS `GlobalFrameVerifier` so the
+/// archive-poll path gates identically to the gossip `GLOBAL_FRAME`
+/// handler — a forged frame served by a peer archive is dropped, never
+/// stored and never fired to `on_frame`. `None` disables the gate
+/// (e.g. a trusted/test caller).
+pub type FrameValidator = Arc<dyn Fn(&GlobalFrame) -> bool + Send + Sync>;
+
 /// Poller configuration. Defaults match Go's `pollFramesFromArchive`.
 pub struct ArchivePollerConfig {
     pub poll_interval: Duration,
     pub call_timeout: Duration,
     /// Optional callback fired for each frame after storage.
     pub on_frame: Option<OnFrameCallback>,
+    /// Optional genesis-prover + VDF/BLS gate applied to every frame
+    /// BEFORE it is stored. Frames failing this check are dropped
+    /// (not stored, `on_frame` not fired), mirroring the gossip
+    /// `GLOBAL_FRAME` handler's drop-before-store semantics.
+    pub frame_validator: Option<FrameValidator>,
     /// When true, the poller forward-fills every missed frame
     /// between the previously-seen head and the current head — the
     /// archive case where retaining full history is the point.
@@ -212,6 +226,13 @@ pub struct ArchivePollerConfig {
     /// state is wasted bandwidth, and the prover-tree sync provides
     /// the registry view we actually need.
     pub forward_fill: bool,
+    /// Optional one-shot barrier the poller awaits (after endpoint discovery,
+    /// before reading its starting cursor). Used by the far-behind archive
+    /// state-jump: the jump fast-forwards the clock head, and the poller must
+    /// not read its `last_frame` — nor start forward-filling — until the jump
+    /// has committed, or it would replay (re-materialize) frames the jump
+    /// already synced. `None` = no wait.
+    pub startup_barrier: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl Default for ArchivePollerConfig {
@@ -220,7 +241,9 @@ impl Default for ArchivePollerConfig {
             poll_interval: Duration::from_secs(1),
             call_timeout: Duration::from_secs(30),
             on_frame: None,
+            frame_validator: None,
             forward_fill: false,
+            startup_barrier: None,
         }
     }
 }
@@ -233,7 +256,7 @@ pub async fn run_archive_poller(
     pool: Arc<ArchiveEndpointPool>,
     clock_store: Arc<RocksClockStore>,
     ed448_seed: [u8; 57],
-    config: ArchivePollerConfig,
+    mut config: ArchivePollerConfig,
     cancel: CancellationToken,
 ) {
     info!("archive frame poller started");
@@ -241,13 +264,42 @@ pub async fn run_archive_poller(
     if cancel.is_cancelled() {
         return;
     }
+    // Wait for the far-behind state-jump (if any) to commit its fast-forward
+    // before reading our starting cursor — otherwise we'd forward-fill from the
+    // pre-jump head and re-materialize frames the jump already synced.
+    if let Some(barrier) = config.startup_barrier.take() {
+        info!("archive poller: waiting for state-jump barrier before forward-fill");
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = barrier => {}
+        }
+    }
 
-    // Reuse a single client for as long as it works. Switch endpoints
-    // only when an RPC fails.
+    // Reuse a single client for as long as it works AND it keeps us moving
+    // forward. Switch endpoints on an RPC failure OR when an endpoint stops
+    // being ahead of us (see the no-progress handling below).
     let mut current_client: Option<(String, ArchiveClient)> = None;
     // Use the local store's latest as our starting "last seen", so a
     // restart doesn't re-fetch frames we already have.
     let mut last_frame: u64 = clock_store.get_latest_frame_number().unwrap_or(0);
+    // Consecutive ticks where the current endpoint was not ahead of us. The
+    // pool can contain endpoints that are behind, at our height, or even THIS
+    // node itself (the mainnet genesis static-IP pool includes self). Latching
+    // onto such an endpoint used to wedge catch-up silently forever — we never
+    // rotated on no-progress, only on error. After a few no-progress ticks we
+    // rotate to keep searching for an endpoint that IS ahead.
+    let mut no_progress: u32 = 0;
+    const NO_PROGRESS_ROTATE_THRESHOLD: u32 = 3;
+    // Back off between no-progress polls. `poll_interval` is 1s (tuned for
+    // catch-up throughput while advancing); hammering the head every 1s — and
+    // reconnecting on every rotation — when there's nothing new would be a
+    // reconnect storm onto the shared :8340 path. When not advancing, poll far
+    // more slowly.
+    const NO_PROGRESS_BACKOFF: Duration = Duration::from_secs(5);
+    // Throttled liveness heartbeat so a not-advancing poller is diagnosable
+    // without enabling debug logs (previously it was completely silent).
+    let mut last_heartbeat = tokio::time::Instant::now();
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
     let mut ticker = tokio::time::interval(config.poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -318,9 +370,45 @@ pub async fn run_archive_poller(
         };
         let new_number = head.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
         if new_number == 0 || new_number <= last_frame {
-            // No progress.
+            // This endpoint is not ahead of us. It may be genuinely behind, at
+            // our exact height, or this node's own endpoint. Do NOT silently
+            // latch onto it forever (the old behavior — an extremely-behind
+            // archive whose poller happened to grab a non-advancing endpoint
+            // would sit here with zero log output). Count consecutive
+            // no-progress ticks and, past a small threshold, rotate to a
+            // different endpoint to keep looking for one that IS ahead. This is
+            // NOT a blacklist: the endpoint isn't broken, just not useful now.
+            no_progress = no_progress.saturating_add(1);
+            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                info!(
+                    %addr,
+                    local_frame = last_frame,
+                    endpoint_head = new_number,
+                    no_progress,
+                    "archive poller: not advancing — current endpoint is not ahead of us",
+                );
+                last_heartbeat = tokio::time::Instant::now();
+            }
+            if no_progress >= NO_PROGRESS_ROTATE_THRESHOLD {
+                debug!(
+                    %addr,
+                    local_frame = last_frame,
+                    endpoint_head = new_number,
+                    "archive poller: rotating off non-advancing endpoint",
+                );
+                current_client = None;
+                no_progress = 0;
+            }
+            // Back off (cancel-aware) so a not-advancing poller neither hot-loops
+            // the head nor reconnect-storms :8340 on rotation.
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(NO_PROGRESS_BACKOFF) => {}
+            }
             continue;
         }
+        // The endpoint is ahead — we're going to make progress this tick.
+        no_progress = 0;
 
         // 2. Forward-fill any missed frames in (last_frame, new_number).
         //    Archive nodes need the full history; everyone else
@@ -343,6 +431,20 @@ pub async fn run_archive_poller(
                 .await
                 {
                     Ok(Ok(frame)) => {
+                        // Gate BEFORE persist — genesis-prover allowlist +
+                        // VDF/BLS, mirroring the gossip GLOBAL_FRAME handler.
+                        // A frame that fails validation is never stored and
+                        // never fired to on_frame. Treat it like an
+                        // unavailable frame: rotate to another endpoint (an
+                        // honest archive may serve the real record at this
+                        // height) rather than persisting forged data.
+                        if let Some(ref validate) = config.frame_validator {
+                            if !validate(&frame) {
+                                warn!(%addr, frame = fn_, "catchup frame failed validation — rotating endpoint");
+                                failed_frame = Some(fn_);
+                                break;
+                            }
+                        }
                         if let Err(e) = clock_store.put_global_frame(&frame, None) {
                             warn!(error = %e, frame = fn_, "store catchup frame failed");
                         }
@@ -390,6 +492,16 @@ pub async fn run_archive_poller(
         }
 
         // 3. Process the new head.
+        // Gate BEFORE persist, same as the forward-fill path above and the
+        // gossip GLOBAL_FRAME handler. A head frame failing validation is
+        // dropped: don't store, don't fire on_frame, and don't advance
+        // last_frame (the next tick re-polls the head).
+        if let Some(ref validate) = config.frame_validator {
+            if !validate(&head) {
+                warn!(%addr, frame = new_number, "head frame failed validation — dropping");
+                continue;
+            }
+        }
         if let Err(e) = clock_store.put_global_frame(&head, None) {
             warn!(error = %e, frame = new_number, "store head frame failed");
             continue;

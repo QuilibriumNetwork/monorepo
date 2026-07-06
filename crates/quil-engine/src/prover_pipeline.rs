@@ -413,6 +413,38 @@ impl ProverPipeline {
             }
         }
 
+        // Seniority merge targets: our own + enrolled Ed448 seeds. The join op
+        // itself only carries the BLS prover key, so the ONLY way the join can
+        // factor in our libp2p peer-id(s)' premainnet seniority is to attach
+        // them as merge targets — each Ed448 seed signs our BLS pubkey under
+        // the `PROVER_JOIN_MERGE` domain (the same domain `verify_prover_join`
+        // checks and `invoke_join` derives peer-ids from). Without this the
+        // prover joins at seniority 0 regardless of what its peer-id earned,
+        // and only a later `ProverSeniorityMerge` could raise it. A seed whose
+        // peer-id has no premainnet seniority contributes 0 — harmless. This is
+        // the same seed set used for `submit_seniority_merge` (own key first,
+        // then `multisig_prover_enrollment_paths`).
+        let merge_targets: Vec<quil_execution::global_intrinsic::SeniorityMerge> = {
+            let mut mts =
+                Vec::with_capacity(self.multisig_ed448_seeds.len());
+            for seed in &self.multisig_ed448_seeds {
+                let helper_pubkey = quil_p2p::ed448_identity::derive_public_key(seed);
+                let helper_signer =
+                    quil_crypto::Ed448Signer::from_bytes(seed, &helper_pubkey)?;
+                let helper_sig = <quil_crypto::Ed448Signer as Signer>::sign_with_domain(
+                    &helper_signer,
+                    &self.bls_pubkey,
+                    b"PROVER_JOIN_MERGE",
+                )?;
+                mts.push(quil_execution::global_intrinsic::SeniorityMerge {
+                    signature: helper_sig,
+                    key_type: quil_types::crypto::KeyType::Ed448 as u32,
+                    prover_public_key: helper_pubkey,
+                });
+            }
+            mts
+        };
+
         // Build + sign. Go signs the full ProverJoin canonical bytes
         // with signature=nil, then fills in the signature:
         // see global_prover_join.go:1074-1079.
@@ -422,7 +454,7 @@ impl ProverPipeline {
             frame_number,
             public_key_signature_bls48581: None,
             delegate_address: self.delegate_address.clone(),
-            merge_targets: vec![],
+            merge_targets: merge_targets.clone(),
             proof: all_proofs.clone(),
         };
         let join_message = unsigned.to_canonical_bytes()?;
@@ -440,7 +472,7 @@ impl ProverPipeline {
                 pop_signature,
             }),
             delegate_address: self.delegate_address.clone(),
-            merge_targets: vec![],
+            merge_targets,
             proof: all_proofs,
         };
         let bytes = signed.to_canonical_bytes()?;

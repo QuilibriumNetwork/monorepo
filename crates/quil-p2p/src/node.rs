@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 use quil_config::P2PConfig;
 use quil_types::error::QuilError;
 
-use crate::behaviour::{BlossomSubBehaviour, BlossomSubEvent};
+use crate::blossomsub_behaviour::{BlossomSubBehaviour, BlossomSubEvent};
 
 /// A received message from the network.
 #[derive(Debug, Clone)]
@@ -904,17 +904,17 @@ impl P2PNode {
                                 swarm.behaviour_mut().blossomsub.blacklist_peer(peer_id);
                             }
                             Some(P2PCommand::GetPeerScore { peer, ack }) => {
-                                let s = swarm.behaviour().blossomsub.scorer.score(&peer);
+                                let s = swarm.behaviour().blossomsub.score(&peer);
                                 let _ = ack.send(s);
                             }
                             Some(P2PCommand::SetPeerScore { peer, score }) => {
                                 swarm.behaviour_mut()
-                                    .blossomsub.scorer
+                                    .blossomsub
                                     .set_application_score(peer, score);
                             }
                             Some(P2PCommand::AddPeerScore { peer, delta }) => {
                                 swarm.behaviour_mut()
-                                    .blossomsub.scorer
+                                    .blossomsub
                                     .add_application_score(peer, delta);
                             }
                             Some(P2PCommand::Reconnect { peer, ack }) => {

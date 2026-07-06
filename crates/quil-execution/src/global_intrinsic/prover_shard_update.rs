@@ -1126,4 +1126,305 @@ mod tests {
         assert_eq!(reward_balance(&state, &provers[1]), BigInt::from(0), "index 1 (skipped) not credited");
         assert_eq!(reward_balance(&state, &provers[2]), BigInt::from(1_000), "index 2 credited");
     }
+
+    // =================================================================
+    // HIGH-2: durable atomic materialization cursor + crash-gap
+    // re-materialize (no double-mint / no under-mint).
+    //
+    // These tests exercise the REAL materialize order, because the defect
+    // lives in that order's interaction with the same-frame commit cache:
+    //   1. crdt.commit(N)                 [pre-reward: caches frame-N root]
+    //   2. apply_reward(N) + state.commit [drains reward INTO the CRDT tree
+    //                                       → the global-intrinsic tree is
+    //                                       now DIRTY, but its frame-N root is
+    //                                       already cached]
+    //   3. crdt.commit_with_global_cursor(N)  [cursor batch — MUST also flush
+    //                                           the dirty reward nodes, or the
+    //                                           cursor certifies rewards that
+    //                                           only reach disk in a LATER,
+    //                                           cursor-free commit → under-mint]
+    // Durability is asserted by RELOADING a fresh CRDT from the SAME store
+    // (models a restart), NOT by reading the live in-memory tree.
+    // =================================================================
+
+    /// InclusionProver that returns 74-byte commitments, so a non-empty
+    /// shard's committed root is a REAL (non-placeholder) value. This is
+    /// what makes the idempotency guard's cache-hit path fire in step 3
+    /// (`len != 64`) — exactly as production KZG roots do. The 64-byte
+    /// `StubProver` would never reach that path, so it can't reproduce the
+    /// cache-hit-dirty defect.
+    struct Prover74;
+    impl InclusionProver for Prover74 {
+        fn commit_raw(&self, data: &[u8], _: u64) -> Result<Vec<u8>> {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            data.hash(&mut h);
+            let mut out = vec![0u8; 74];
+            out[..8].copy_from_slice(&h.finish().to_be_bytes());
+            Ok(out)
+        }
+        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 74]) }
+        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
+        fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+            Err(QuilError::Internal("batch not supported".into()))
+        }
+        fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+    }
+
+    /// Materialize one frame in the REAL order (pre-reward commit → apply
+    /// additive reward → drain into the tree → cursor commit). Mirrors
+    /// `FrameMaterializer::materialize`'s commit sequence for a single
+    /// reward-bearing frame.
+    fn materialize_reward_frame(
+        state: &HypergraphState,
+        crdt: &quil_hypergraph::HypergraphCrdt,
+        cursor_key: &[u8],
+        frame_n: u64,
+        prover: &ProverInfo,
+        share: &BigInt,
+    ) {
+        crdt.commit(frame_n).unwrap(); // 1. pre-reward root (caches frame-N)
+        apply_reward(state, frame_n, prover, share).unwrap(); // 2. additive mint
+        state.commit().unwrap(); //           drain reward → CRDT tree (dirty)
+        crdt.commit_with_global_cursor(frame_n, cursor_key).unwrap(); // 3. cursor
+    }
+
+    /// Seed TWO reward leaves (`p` and `q`) at frame 0 and commit with the
+    /// cursor, so the global-intrinsic vertex_adds root is a real 74-byte
+    /// BRANCH commitment for every subsequent frame. This is essential: a
+    /// single-leaf tree's root is the leaf's 64-byte hash, which the
+    /// idempotency guard treats as a placeholder (`len == 64`) and never
+    /// caches — so with one leaf the cache-hit-dirty path (the defect) is
+    /// never reached. Two leaves force a branch whose root comes from the
+    /// prover (74 bytes), exactly like production KZG roots. Returns the
+    /// committed shard keys for the reload probe.
+    fn seed_two_leaf_baseline(
+        state: &HypergraphState,
+        crdt: &quil_hypergraph::HypergraphCrdt,
+        cursor_key: &[u8],
+        p: &ProverInfo,
+        q: &ProverInfo,
+        share: &BigInt,
+    ) -> Vec<quil_types::store::ShardKey> {
+        apply_reward(state, 0, p, share).unwrap();
+        apply_reward(state, 0, q, share).unwrap();
+        state.commit().unwrap();
+        crdt.commit_with_global_cursor(0, cursor_key).unwrap();
+        crdt.commit(0).unwrap().keys().cloned().collect()
+    }
+
+    /// The global cursor is written ATOMICALLY inside the CRDT commit batch
+    /// (one `db.write`, cross-store readable) and ONLY by
+    /// `commit_with_global_cursor` — a plain `commit` never touches it.
+    #[test]
+    fn global_cursor_written_atomically_and_cross_store_readable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = quil_store::RocksDb::open(tmp.path()).unwrap();
+        let inner = db.inner();
+        let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(inner.clone()));
+        let clock = quil_store::RocksClockStore::new(inner);
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(hg_store, Arc::new(StubProver)));
+        let key = quil_store::encoding::global_materialized_cursor_key();
+
+        // Absent on a fresh store.
+        assert_eq!(clock.get_global_materialized_cursor(), None);
+
+        // A PLAIN commit must NOT write the global cursor.
+        crdt.commit(7).unwrap();
+        assert_eq!(
+            clock.get_global_materialized_cursor(),
+            None,
+            "plain commit must never stage the global cursor"
+        );
+
+        // commit_with_global_cursor writes cursor == frame, atomically, and
+        // the value is visible through the clock store on the shared DB.
+        crdt.commit_with_global_cursor(8, &key).unwrap();
+        assert_eq!(clock.get_global_materialized_cursor(), Some(8));
+
+        // Advancing to the next frame overwrites the single global key.
+        crdt.commit_with_global_cursor(9, &key).unwrap();
+        assert_eq!(clock.get_global_materialized_cursor(), Some(9));
+    }
+
+    /// THE critical test: frame N's reward-tree NODES must land durably in
+    /// the SAME `db.write` as `cursor = N`. Reproduces the exact production
+    /// order — a pre-reward `commit(N)` caches frame N's (real, 74-byte)
+    /// global-intrinsic root, then the reward mutates that same tree, then
+    /// `commit_with_global_cursor(N)` runs. The same-frame cache would
+    /// otherwise let the guard skip the DIRTY reward tree, leaving the reward
+    /// to reach disk only in a later cursor-free commit (under-mint on crash).
+    ///
+    /// FAILS on the pre-fix code (reload sees 1·share), PASSES after the fix
+    /// (reload sees 2·share).
+    #[test]
+    fn cursor_commit_flushes_dirty_reward_nodes_atomically() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = quil_store::RocksDb::open(tmp.path()).unwrap();
+        let inner = db.inner();
+        let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(inner.clone()));
+        let clock = quil_store::RocksClockStore::new(inner.clone());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(hg_store, Arc::new(Prover74)));
+        let state = HypergraphState::new(crdt.clone());
+        let key = quil_store::encoding::global_materialized_cursor_key();
+        let filter = vec![0xAAu8; 32];
+        let p = fake_prover(1, 1, 0, &filter);
+        let q = fake_prover(2, 2, 0, &filter);
+        let share = BigInt::from(1_000);
+
+        // Read a prover's reward balance from a FRESH CRDT over the SAME db —
+        // i.e. only what is DURABLE in the store (models a restart).
+        let reload = |shard_keys: &Vec<quil_types::store::ShardKey>| -> BigInt {
+            let s = Arc::new(quil_store::RocksHypergraphStore::new(inner.clone()));
+            let c = Arc::new(quil_hypergraph::HypergraphCrdt::new(s, Arc::new(Prover74)));
+            for sk in shard_keys {
+                c.ensure_all_phase_trees(sk);
+            }
+            reward_balance(&HypergraphState::new(c), &p)
+        };
+
+        // Baseline frame 0: two reward leaves → the global-intrinsic root is a
+        // real 74-byte branch, so frame 1's pre-reward commit caches a "real"
+        // root and the cache-hit-dirty guard path fires.
+        let shard_keys = seed_two_leaf_baseline(&state, &crdt, &key, &p, &q, &share);
+        assert_eq!(reload(&shard_keys), share.clone(), "baseline reward durable");
+
+        // Frame 1 in the REAL order (pre-reward commit caches the root; the
+        // reward then dirties the same tree; the cursor commit follows).
+        materialize_reward_frame(&state, &crdt, &key, 1, &p, &share);
+
+        // A restart must read 2·share (frames 0 AND 1). Pre-fix, the cache-hit
+        // guard skipped the dirty reward tree in the cursor batch, so only the
+        // baseline reached disk here (1·share) and this assertion FAILS.
+        assert_eq!(
+            reload(&shard_keys),
+            BigInt::from(2) * &share,
+            "frame N's reward MUST be durable in the same atomic batch as cursor=N"
+        );
+        assert_eq!(clock.get_global_materialized_cursor(), Some(1));
+    }
+
+    /// Crash-gap re-materialize, faithful order + durable read-back. Reward
+    /// minting is additive with no per-frame idempotency, so re-running a
+    /// committed frame double-mints. Model: frames 0,1 materialized
+    /// (durable cursor=1), then head H=3 with frames 2,3 uncommitted. On
+    /// restart, seed from the durable cursor and re-materialize
+    /// `[cursor+1..=H]`. The DURABLE balance must equal the single-pass total
+    /// (frames 0,1,2,3 each minted once), NOT doubled, and cursor == H.
+    #[test]
+    fn crash_gap_re_materialize_no_double_mint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = quil_store::RocksDb::open(tmp.path()).unwrap();
+        let inner = db.inner();
+        let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(inner.clone()));
+        let clock = quil_store::RocksClockStore::new(inner.clone());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(hg_store, Arc::new(Prover74)));
+        let state = HypergraphState::new(crdt.clone());
+        let key = quil_store::encoding::global_materialized_cursor_key();
+        let filter = vec![0xAAu8; 32];
+        let p = fake_prover(1, 1, 0, &filter);
+        let q = fake_prover(2, 2, 0, &filter);
+        let share = BigInt::from(1_000);
+
+        let reload = |shard_keys: &Vec<quil_types::store::ShardKey>| -> BigInt {
+            let s = Arc::new(quil_store::RocksHypergraphStore::new(inner.clone()));
+            let c = Arc::new(quil_hypergraph::HypergraphCrdt::new(s, Arc::new(Prover74)));
+            for sk in shard_keys {
+                c.ensure_all_phase_trees(sk);
+            }
+            reward_balance(&HypergraphState::new(c), &p)
+        };
+
+        // --- Pre-crash: baseline (frame 0: p+q leaves, cursor=0) then frame 1
+        // fully materialized (real order). p's durable balance = 2·share
+        // (frames 0,1); cursor=1. ---
+        let shard_keys = seed_two_leaf_baseline(&state, &crdt, &key, &p, &q, &share);
+        materialize_reward_frame(&state, &crdt, &key, 1, &p, &share);
+        assert_eq!(clock.get_global_materialized_cursor(), Some(1));
+        assert_eq!(reload(&shard_keys), BigInt::from(2) * &share, "frames 0,1 durable");
+
+        // --- Crash: head H=3, frames 2,3 uncommitted; in-memory cursor lost. ---
+        let head: u64 = 3;
+
+        // --- Restart: seed from the durable cursor (=1), re-materialize
+        // [cursor+1..=H] with the idempotency gate. Because the DURABLE cursor
+        // correctly excludes frame 1, the gap is [2,3] — frame 1 is NEVER
+        // re-run (had the cursor been lost → 0, we'd re-run [1..3] → 4·share
+        // for those + double-count frame 1). ---
+        let durable = clock.get_global_materialized_cursor().unwrap_or(0);
+        assert_eq!(durable, 1);
+        let mut last = durable; // == FrameMaterializer::seed_cursor(durable)
+        for n in (durable + 1)..=head {
+            if n <= last {
+                continue; // gate: never re-run a frame at/below the cursor
+            }
+            materialize_reward_frame(&state, &crdt, &key, n, &p, &share);
+            last = n;
+        }
+
+        // Durable balance = frames 0,1,2,3 each minted exactly ONCE = 4·share.
+        // A regression (lost/lagging cursor re-running frame 1) shows 5·share.
+        assert_eq!(
+            reload(&shard_keys),
+            BigInt::from(4) * &share,
+            "gap re-materialize must not double-mint the already-committed frame"
+        );
+        assert_eq!(clock.get_global_materialized_cursor(), Some(3), "cursor advanced to head");
+        assert_eq!(last, 3);
+    }
+
+    /// With the cursor already at the head, feeding a frame at or below it is
+    /// a gate no-op — no reward is re-minted (durable balance unchanged).
+    #[test]
+    fn no_re_run_at_or_below_cursor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = quil_store::RocksDb::open(tmp.path()).unwrap();
+        let inner = db.inner();
+        let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(inner.clone()));
+        let clock = quil_store::RocksClockStore::new(inner.clone());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(hg_store, Arc::new(Prover74)));
+        let state = HypergraphState::new(crdt.clone());
+        let key = quil_store::encoding::global_materialized_cursor_key();
+        let filter = vec![0xAAu8; 32];
+        let p = fake_prover(1, 1, 0, &filter);
+        let q = fake_prover(2, 2, 0, &filter);
+        let share = BigInt::from(1_000);
+
+        let reload = |shard_keys: &Vec<quil_types::store::ShardKey>| -> BigInt {
+            let s = Arc::new(quil_store::RocksHypergraphStore::new(inner.clone()));
+            let c = Arc::new(quil_hypergraph::HypergraphCrdt::new(s, Arc::new(Prover74)));
+            for sk in shard_keys {
+                c.ensure_all_phase_trees(sk);
+            }
+            reward_balance(&HypergraphState::new(c), &p)
+        };
+
+        // Baseline (frame 0, cursor=0) then materialize frames 1..=3 →
+        // p durable = 4·share (frames 0,1,2,3), cursor 3.
+        let shard_keys = seed_two_leaf_baseline(&state, &crdt, &key, &p, &q, &share);
+        let mut last = 0u64;
+        for n in 1..=3u64 {
+            materialize_reward_frame(&state, &crdt, &key, n, &p, &share);
+            last = n;
+        }
+        assert_eq!(reload(&shard_keys), BigInt::from(4) * &share);
+        assert_eq!(clock.get_global_materialized_cursor(), Some(3));
+
+        // Re-feed frames 2 and 3 (both <= cursor 3): the gate skips them, so
+        // NO reward is applied and the durable balance stays put.
+        for n in [2u64, 3u64] {
+            if n <= last {
+                continue;
+            }
+            materialize_reward_frame(&state, &crdt, &key, n, &p, &share);
+            last = n;
+        }
+        assert_eq!(
+            reload(&shard_keys),
+            BigInt::from(4) * &share,
+            "frames at/below the cursor must not re-mint"
+        );
+        assert_eq!(clock.get_global_materialized_cursor(), Some(3));
+    }
 }

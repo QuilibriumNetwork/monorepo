@@ -351,6 +351,19 @@ pub fn validator_global_peer_info() -> TopicValidator {
                 if info.signature.len() != 114 {
                     return Reject("pi_bad_sig_len");
                 }
+                // Bind the claimed peer_id to the SIGNING public key. Without
+                // this, an attacker can sign a PeerInfo with their OWN key
+                // (passing the signature check below) while setting `peer_id`
+                // to a genesis archive's (public) peer id — the archive-pool
+                // admission gate trusts `info.peer_id`, so the spoof would let
+                // the attacker's endpoint impersonate a genesis archive and
+                // serve a forged prover tree to bootstrapping nodes. The
+                // libp2p peer id is a deterministic function of the pubkey, so
+                // require them to match. (Cheap — rejects the spoof before the
+                // expensive Ed448 verify.)
+                if info.peer_id != quil_p2p::peer_id_from_ed448_pubkey(&info.public_key) {
+                    return Reject("pi_peer_id_pubkey_mismatch");
+                }
                 // Re-check timestamps post-decode in case the peek was
                 // skipped (unknown type prefix path) or a malicious
                 // peer crafted a payload where peek and full decode

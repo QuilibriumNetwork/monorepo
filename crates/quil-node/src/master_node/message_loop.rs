@@ -655,13 +655,26 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             Ok(reg) => {
                                                 let identity_len = reg.ed448_pubkey.len();
                                                 let prover_len = reg.bls_pubkey.len();
-                                                sr_for_recv.update(reg);
-                                                debug!(
-                                                    identity_len,
-                                                    prover_len,
-                                                    total_entries = sr_for_recv.len(),
-                                                    "ingested KeyRegistry"
-                                                );
+                                                // Finding B: `update` verifies the
+                                                // identity↔prover cross-signatures and
+                                                // rejects (returns false) any binding
+                                                // whose sigs don't validate, so a peer
+                                                // can't inject an arbitrary Ed448→BLS
+                                                // pairing.
+                                                if sr_for_recv.update(reg) {
+                                                    debug!(
+                                                        identity_len,
+                                                        prover_len,
+                                                        total_entries = sr_for_recv.len(),
+                                                        "ingested KeyRegistry"
+                                                    );
+                                                } else {
+                                                    warn!(
+                                                        identity_len,
+                                                        prover_len,
+                                                        "rejected KeyRegistry: invalid cross-signature, empty key, or stale replay"
+                                                    );
+                                                }
                                             }
                                             Err(e) => {
                                                 warn!(error = %e, "failed to decode KeyRegistry");
@@ -931,17 +944,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             quil_engine::consensus_wire::GLOBAL_PROPOSAL_TYPE => {
                                                 match quil_engine::consensus_wire::GlobalProposal::from_canonical_bytes(&received.data) {
                                                     Ok(wire) => {
-                                                        // Persist the proposer vote so this node can
-                                                        // serve it via GetGlobalProposal for a peer's
-                                                        // catch-up sync. Keyed (filter, rank, selector).
+                                                        // The proposer vote is persisted only AFTER the
+                                                        // gate passes (Finding 4) so an unverified vote
+                                                        // never lands in the clock store. Compute the
+                                                        // owned proto here, before `wire` is consumed by
+                                                        // the bridge conversion below, and move it into
+                                                        // the `gate_ok` block.
                                                         let vote_proto = wire.vote.to_proto();
-                                                        if let Err(e) = quil_types::store::ClockStore::put_proposal_vote(
-                                                            clock_store_recv.as_ref(),
-                                                            &NoTxn,
-                                                            &vote_proto,
-                                                        ) {
-                                                            debug!(error = %e, "persist proposal vote failed");
-                                                        }
                                                         // Decode the embedded frame for the gate's
                                                         // frame check before `wire` is consumed by
                                                         // the bridge conversion.
@@ -1005,6 +1014,18 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                                     }
                                                                 };
                                                                 if gate_ok {
+                                                                    // Finding 4: persist the proposer vote
+                                                                    // only now that the proposal is verified,
+                                                                    // so serving (GetGlobalProposal) never
+                                                                    // hands out an unverified vote. Keyed
+                                                                    // (filter, rank, selector).
+                                                                    if let Err(e) = quil_types::store::ClockStore::put_proposal_vote(
+                                                                        clock_store_recv.as_ref(),
+                                                                        &NoTxn,
+                                                                        &vote_proto,
+                                                                    ) {
+                                                                        debug!(error = %e, "persist proposal vote failed");
+                                                                    }
                                                                     // Verified: now safe to fast-forward
                                                                     // the pacemaker on the parent QC. The
                                                                     // embedded prior-rank TC is still NOT
