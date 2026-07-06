@@ -1,0 +1,18 @@
+# cargo-nextest configuration (passed to CI via --config-file).
+#
+# The quil-engine e2e binaries run in-process multi-node consensus:
+# each test spawns a 4–8-worker tokio runtime (one per archive) doing
+# CPU-bound BLS signing, and the HotStuff pacemaker times ranks out in
+# real time. On the 4-vCPU CI runner, nextest's default parallelism
+# runs up to 4 such tests at once — the resulting oversubscription
+# starves the pacemaker and consensus stalls past the tests' wait
+# deadlines (flaky timeouts, e.g. `non_archive_join_lands_in_archive_frame`
+# blowing its 90s budget). `threads-required = "num-test-threads"`
+# reserves every scheduling slot, so each of these tests runs with the
+# machine to itself; everything else still runs at full parallelism.
+
+nextest-version = { required = "0.9.75" }
+
+[[profile.default.overrides]]
+filter = 'package(quil-engine) and (binary(=e2e_consensus) or binary(=e2e_epoch_confirm))'
+threads-required = "num-test-threads"

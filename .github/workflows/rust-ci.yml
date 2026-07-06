@@ -80,8 +80,12 @@ jobs:
           tool: nextest
 
       # channelwasm excluded: see comment in build job above.
+      #
+      # .nextest.toml gives the multi-node consensus e2e tests exclusive
+      # scheduling slots so they aren't starved by parallel tests on the
+      # 4-vCPU runner (it no longer skips any tests).
       - name: cargo nextest run --workspace
-        run: cargo nextest run --workspace --locked --no-fail-fast --exclude channelwasm
+        run: cargo nextest run --workspace --locked --no-fail-fast --exclude channelwasm --config-file .nextest.toml
 
   # ------------------------------------------------------------------
   # release-build — verify `node/build.sh` succeeds on every supported
