@@ -218,7 +218,7 @@ impl FrameProver for StubFrameProver {
 /// Build a single-signer (`bitmask=[0x01]`) shard-FrameHeader aggregate
 /// signature whose DECLARED aggregate public key matches what the
 /// intrinsic's attestation verifier reconstructs via
-/// `bls.aggregate([member_pubkey], …)`. The 74-byte `signature` is a
+/// `bls.aggregate_public_keys([member_pubkey])`. The 74-byte `signature` is a
 /// placeholder: a 74-byte single-signer attestation carries no VDF
 /// multiproof, and `StubFrameProver::verify_frame_header_signature`
 /// accepts it. Used by the synthetic-coverage tier-2 tests so their
@@ -230,17 +230,14 @@ pub fn single_signer_agg_sig(
 ) -> quil_execution::hypergraph_intrinsic::canonical::AggregateSignature {
     use quil_types::crypto::BlsConstructor;
     let bls = quil_crypto::Bls48581KeyConstructor;
-    let (_t, throwaway_pub) = bls.new_key().expect("throwaway bls key");
-    // The aggregate's public key depends only on the input pubkeys (the
-    // signature slot is a don't-care here), so a throwaway fills it.
-    let agg = bls
-        .aggregate(&[member_pubkey], &[throwaway_pub.as_slice()])
+    let agg_pubkey = bls
+        .aggregate_public_keys(&[member_pubkey])
         .expect("aggregate single member pubkey");
     quil_execution::hypergraph_intrinsic::canonical::AggregateSignature {
         signature: vec![0u8; 74],
         public_key: Some(
             quil_execution::hypergraph_intrinsic::canonical::Bls48581G2PublicKey {
-                key_value: agg.public_key,
+                key_value: agg_pubkey,
             },
         ),
         bitmask: vec![0x01],
