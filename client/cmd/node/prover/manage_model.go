@@ -2709,13 +2709,17 @@ func (m manageModel) renderView() string {
 			workerMode = "Auto"
 		}
 		header = fmt.Sprintf(
-			" Peer ID: %s  Seniority: %s  Workers: %d/%d (%s)  Frame: %d  [%s]",
+			" Peer ID: %s  Seniority: %s  Workers: %d/%d (%s)  Frame: %d  Epoch: %d  [%s]",
 			peerDisplay,
 			m.seniority,
 			m.allocatedWorkers,
 			m.runningWorkers,
 			workerMode,
 			m.frameNumber,
+			// Derive from the displayed frame so Frame/Epoch are always
+			// consistent (epoch = frame / epoch_length; length from the node,
+			// 720 fallback).
+			epochForFrame(m.frameNumber, m.epochLength),
 			reachStr,
 		)
 		// Staleness suffix: render when the most recent refresh

@@ -245,6 +245,7 @@ async fn run_record_only_backfill(
     pool: Arc<quil_rpc::ArchiveEndpointPool>,
     clock_store: Arc<quil_store::RocksClockStore>,
     frame_validate: quil_rpc::frame_sync::FrameValidator,
+    anchor: Option<quil_types::proto::global::GlobalFrame>,
     seed: [u8; 57],
     lo: u64,
     hi: u64,
@@ -254,6 +255,77 @@ async fn run_record_only_backfill(
         return;
     }
     info!(lo, hi, "record-only frame-record backfill started");
+
+    // FIRST resort — promote LOCAL candidate frames along the ancestor chain.
+    // The hole [lo, hi] is exactly the ancestor chain of the re-seed frame
+    // (`anchor`, frame hi+1). Every frame on that chain is an ancestor of a
+    // frame the node re-seeds from and finalizes forward, so it is committed
+    // and safe to write as a canonical record. Consensus persisted these as
+    // candidates via `on_incorporated` (keyed by (frame_number,
+    // Poseidon(output))), and each frame's `parent_selector` IS its parent's
+    // candidate identity — so we can walk the chain locally with no peer.
+    //
+    // This is the case that peer-fetch cannot handle: when archives restart
+    // together they share the same record hole, so NO peer can serve it — but
+    // each one holds the missing frames locally as candidates. Walk first, then
+    // fall back to peers only for whatever isn't present locally.
+    if let Some(mut cur) = anchor {
+        let mut promoted_local = 0u64;
+        while !cancel.is_cancelled() {
+            let Some(h) = cur.header.as_ref() else { break };
+            let fnum = h.frame_number;
+            // Stop once we reach the bottom of the hole; `lo-1` (== canonical
+            // head) is already present, so there is nothing below to promote.
+            if fnum == 0 || fnum <= lo {
+                break;
+            }
+            let parent_num = fnum - 1;
+            let parent_sel = h.parent_selector.clone();
+            if parent_sel.is_empty() {
+                break;
+            }
+            // Candidate keyed by (frame_number, identity == Poseidon(output));
+            // `parent_selector` is exactly that identity for the parent. Falls
+            // back to the canonical record if the candidate key is absent.
+            let parent = match quil_types::store::ClockStore::get_global_clock_frame_candidate(
+                clock_store.as_ref(),
+                parent_num,
+                &parent_sel,
+            ) {
+                Ok(f) => f,
+                // Chain broken locally (neither candidate nor record present);
+                // we can't derive deeper parents without it — let the peer loop
+                // below recover the remaining heights.
+                Err(_) => break,
+            };
+            if parent_num >= lo
+                && parent_num <= hi
+                && clock_store.get_global_frame(parent_num).is_err()
+            {
+                if !frame_validate(&parent) {
+                    warn!(
+                        frame = parent_num,
+                        "record-only backfill: local candidate failed validation — skipping",
+                    );
+                } else if let Err(e) = clock_store.put_global_frame(&parent, None) {
+                    warn!(
+                        error = %e,
+                        frame = parent_num,
+                        "record-only backfill: local candidate promote store failed",
+                    );
+                } else {
+                    promoted_local += 1;
+                }
+            }
+            cur = parent;
+        }
+        if promoted_local > 0 {
+            info!(
+                promoted_local,
+                lo, hi, "record-only backfill: promoted local candidate frames (ancestor chain)",
+            );
+        }
+    }
     // Which heights are actually missing? (Consensus may have already
     // persisted some of the range forward.) Uses the inherent
     // `get_global_frame` point lookup on the concrete clock store.
@@ -345,6 +417,259 @@ async fn run_record_only_backfill(
              these heights are likely uncommitted/orphaned (correctly not canonical)"
         );
     }
+}
+
+/// Scan the ENTIRE persisted frame-record range for internal gaps left by
+/// prior restarts and backfill each one. The reseed-anchored backfill
+/// (`run_record_only_backfill` called from bootstrap) only covers the single
+/// open range ABOVE the head (`[canonical_head+1, reseed-1]`); it does not see
+/// the many small 2-3 frame holes scattered BELOW the head that accumulate
+/// across repeated restart rounds. This driver finds every such hole (a cheap
+/// key-only keyspace scan) and reuses `run_record_only_backfill` per hole —
+/// which promotes the locally-stashed candidate frames FIRST (the common case:
+/// the frames are present as candidates on this very node) and only falls back
+/// to peers for anything genuinely absent locally.
+async fn run_all_gap_backfill(
+    pool: Arc<quil_rpc::ArchiveEndpointPool>,
+    clock_store: Arc<quil_store::RocksClockStore>,
+    frame_validate: quil_rpc::frame_sync::FrameValidator,
+    seed: [u8; 57],
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    // The gap scan walks the whole frame keyspace (key-only, no decode) — run
+    // it on a blocking thread so it never stalls the async runtime.
+    let scan_cs = clock_store.clone();
+    let gaps = match tokio::task::spawn_blocking(move || {
+        scan_cs.find_global_frame_record_gaps()
+    })
+    .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            warn!(error = %e, "restart gap scan: scan task failed");
+            return;
+        }
+    };
+    if gaps.is_empty() {
+        info!("restart gap scan: no internal frame-record gaps");
+        return;
+    }
+    let total: u64 = gaps.iter().map(|(lo, hi)| hi - lo + 1).sum();
+    info!(
+        gap_count = gaps.len(),
+        missing_frames = total,
+        "restart gap scan: found internal frame-record holes — backfilling \
+         (local candidates first, peers as fallback)",
+    );
+    for (lo, hi) in gaps {
+        if cancel.is_cancelled() {
+            break;
+        }
+        // Anchor at the present record immediately above the hole; its
+        // `parent_selector` chain walks down through [lo, hi]. The record at
+        // hi+1 is guaranteed present (gaps are strictly BETWEEN stored frames).
+        let anchor = clock_store.get_global_frame(hi + 1).ok();
+        run_record_only_backfill(
+            pool.clone(),
+            clock_store.clone(),
+            frame_validate.clone(),
+            anchor,
+            seed,
+            lo,
+            hi,
+            cancel.clone(),
+        )
+        .await;
+    }
+    info!("restart gap scan: backfill pass complete");
+}
+
+/// The state-jump is a blind-trust recovery for archives stranded far below the
+/// network head: it syncs a peer's full state snapshot wholesale (no per-frame
+/// verification). It is confined to the migration-recovery window BELOW this
+/// frame — a node at/past it must catch up only via the verified poller/
+/// consensus, never by trusting a peer's current-era state. (Network is at
+/// ~671.7k; the whole mechanism self-disables at this boundary.)
+const STATE_JUMP_MAX_FRAME: u64 = 672_000;
+/// Only state-jump when replaying the gap would be impractical; below this the
+/// frame poller catches up fine and a blind full-state sync isn't warranted.
+const STATE_JUMP_MIN_GAP: u64 = 1_000;
+
+/// Full-state "state jump" for a far-behind archive (below
+/// [`STATE_JUMP_MAX_FRAME`]): hypersync the prover tree + EVERY app-shard tree
+/// (all four phases) to a peer's snapshot at frame N — every pull pinned to N's
+/// snapshot generation so the captured state is cross-tree CONSISTENT — then
+/// store the frame-N record (advancing the clock head) and advance the durable
+/// materialized cursor to N, so the poller/materializer resume near head
+/// instead of replaying (and re-materializing) tens of thousands of frames.
+///
+/// Consistency is why all pulls pin to ONE generation (prover tree →
+/// `prover_tree_commitment`, shards → `state_roots[0]`, both from frame N): the
+/// serving archive retains ≥128 generations ([`SNAPSHOT_MAX_GENERATIONS`]) so N
+/// survives the sequential multi-minute jump; a mid-jump eviction (`failed to
+/// acquire snapshot`) aborts this peer and retries a fresh N on the next.
+///
+/// Returns the synced frame on success. Best-effort: on any failure it returns
+/// `None` and the node falls back to the normal poller.
+async fn run_state_jump(
+    pool: Arc<quil_rpc::ArchiveEndpointPool>,
+    seed: [u8; 57],
+    clock_store: Arc<quil_store::RocksClockStore>,
+    hg_store: Arc<quil_store::RocksHypergraphStore>,
+    shards_store: Arc<dyn quil_types::store::ShardsStore>,
+    frame_validate: quil_rpc::frame_sync::FrameValidator,
+    prover_registry: Arc<quil_execution::SharedProverRegistry>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Option<u64> {
+    use quil_types::proto::application::HypergraphPhaseSet;
+    let local_head = clock_store.get_latest_frame_number().unwrap_or(0);
+    if local_head >= STATE_JUMP_MAX_FRAME {
+        return None; // recovery window closed — never blind-trust current-era state
+    }
+    let endpoints = pool.get_all().await;
+    if endpoints.is_empty() {
+        return None;
+    }
+    let phases = [
+        HypergraphPhaseSet::VertexAdds,
+        HypergraphPhaseSet::VertexRemoves,
+        HypergraphPhaseSet::HyperedgeAdds,
+        HypergraphPhaseSet::HyperedgeRemoves,
+    ];
+    for addr in endpoints {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let mut client = match quil_rpc::ArchiveClient::connect_mtls(&addr, &seed).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let head = match client.get_global_frame(0).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let hdr = match head.header.as_ref() {
+            Some(h) => h.clone(),
+            None => continue,
+        };
+        let target = hdr.frame_number;
+        // Gate: strictly below the cap, and far enough behind to justify a jump.
+        if target == 0 || target >= STATE_JUMP_MAX_FRAME {
+            continue;
+        }
+        if target <= local_head.saturating_add(STATE_JUMP_MIN_GAP) {
+            return None; // small gap — the poller handles it; don't blind-trust
+        }
+        if !frame_validate(&head) {
+            warn!(%addr, target, "state-jump: peer head failed validation — trying another peer");
+            continue;
+        }
+        // Single generation anchor for ALL pulls. `GlobalFrameHeader` commits
+        // the whole generation via `prover_tree_commitment`; the hypersync
+        // server's snapshot registry retains "(global + active app shards) per
+        // generation", so passing this one root as `expected_root` selects
+        // generation N and serves every tree (prover + each app-shard) from it
+        // → cross-tree consistent. (App-shard `state_roots` live on the
+        // app-shard `FrameHeader`, not here — the global header does not carry
+        // per-shard roots, so the generation anchor is the pin we use.)
+        let anchor = hdr.prover_tree_commitment.clone();
+        if anchor.is_empty() {
+            warn!(%addr, target, "state-jump: peer head has no prover_tree_commitment anchor — skipping");
+            continue;
+        }
+        let prover_root = anchor.clone();
+        info!(%addr, local_head, target, "state-jump: syncing FULL state pinned to frame N");
+
+        // Prover tree (VertexAdds), pinned to N's prover commitment.
+        if let Err(e) = quil_rpc::ensure_prover_tree(
+            &addr,
+            &seed,
+            HypergraphPhaseSet::VertexAdds,
+            hg_store.clone(),
+            &prover_root,
+        )
+        .await
+        {
+            warn!(%addr, error = %e, "state-jump: prover tree sync failed — trying another peer");
+            continue;
+        }
+
+        // Every app-shard tree, all four phases, pinned to N's generation anchor
+        // (state_roots[0]) so they are cross-tree consistent at frame N.
+        let shard_rows = shards_store.range_app_shards().unwrap_or_default();
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut shard_count = 0usize;
+        let mut aborted = false;
+        for row in &shard_rows {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            if !seen.insert(row.shard_key.clone()) {
+                continue;
+            }
+            if row.shard_key.len() < 35 {
+                continue;
+            }
+            let shard = quil_types::store::ShardKey {
+                l1: [row.shard_key[0], row.shard_key[1], row.shard_key[2]],
+                l2: row.shard_key[3..35].try_into().unwrap(),
+            };
+            for phase in phases {
+                if let Err(e) = quil_rpc::ensure_shard_tree_fresh(
+                    &shard,
+                    &addr,
+                    &seed,
+                    phase,
+                    hg_store.clone(),
+                    &anchor,
+                )
+                .await
+                {
+                    // A vertex-adds failure means we didn't reach generation N
+                    // (likely evicted mid-jump). Abort this peer and retry a
+                    // fresh N on the next — a partial jump must NOT be committed.
+                    if matches!(phase, HypergraphPhaseSet::VertexAdds) {
+                        warn!(
+                            %addr, error = %e,
+                            "state-jump: shard vertex-adds sync failed — aborting, retrying another peer",
+                        );
+                        aborted = true;
+                        break;
+                    }
+                    // Other phases are best-effort (an empty phase is a no-op).
+                }
+            }
+            if aborted {
+                break;
+            }
+            shard_count += 1;
+        }
+        if aborted {
+            continue;
+        }
+
+        // Commit the jump: store the head frame record (clock head → target),
+        // then advance the durable materialized cursor so the startup
+        // re-materialize does NOT replay/re-apply [local_head+1..=target].
+        if let Err(e) = clock_store.put_global_frame(&head, None) {
+            warn!(error = %e, target, "state-jump: store head frame failed — aborting");
+            return None;
+        }
+        if let Err(e) = clock_store.put_global_materialized_cursor(target) {
+            warn!(error = %e, "state-jump: cursor advance failed");
+        }
+        // Refresh the prover registry from the freshly-synced prover tree.
+        let pr = prover_registry.clone();
+        let hs = hg_store.clone();
+        let _ = tokio::task::spawn_blocking(move || pr.refresh_from_store(&hs)).await;
+        info!(
+            target,
+            shards = shard_count,
+            "state-jump complete — resuming near head (poller/consensus take over)"
+        );
+        return Some(target);
+    }
+    None
 }
 
 pub(crate) struct ArchiveSyncArgs {
@@ -475,6 +800,52 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
                 archive_frame_is_valid(frame, &addrs, &verifier)
             })
+        };
+
+        // Far-behind archive recovery: spawn a one-shot full-state jump (prover
+        // tree + every app-shard, pinned to a single peer frame N). It fires
+        // only for archives stranded far below the migration-recovery boundary
+        // (`STATE_JUMP_MAX_FRAME`); for a healthy or only-slightly-behind node
+        // it returns immediately (gate check) and is a no-op. The poller waits
+        // on `poller_startup_barrier` before reading its cursor, so it always
+        // sees the POST-jump head and never replays (re-materializes) below the
+        // synced frame. The barrier lifts whether the jump did work or no-op'd.
+        let poller_startup_barrier: Option<tokio::sync::oneshot::Receiver<()>> = if archive_mode {
+            let (sj_tx, sj_rx) = tokio::sync::oneshot::channel::<()>();
+            let sj_pool = archive_pool.clone();
+            let sj_cs = clock_store.clone();
+            let sj_hg = hg_store.clone();
+            let sj_ss: Arc<dyn quil_types::store::ShardsStore> =
+                shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
+            let sj_fv = frame_validate.clone();
+            let sj_pr = prover_registry.clone();
+            // DETACH (fire-and-forget) — NOT `sup.spawn`. The state-jump is a
+            // one-shot task that RETURNS when done (jump complete or no-op); a
+            // supervised task that exits is treated as a fatal
+            // "exited unexpectedly" and shuts the node down. Detached tasks may
+            // complete freely.
+            spawner.detach("state-jump", async move {
+                if let Some(n) = run_state_jump(
+                    sj_pool,
+                    seed,
+                    sj_cs,
+                    sj_hg,
+                    sj_ss,
+                    sj_fv,
+                    sj_pr,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                {
+                    info!(target = n, "state-jump: archive fast-forwarded to peer head");
+                }
+                // Lift the barrier regardless of outcome so the poller proceeds.
+                let _ = sj_tx.send(());
+                Ok(())
+            });
+            Some(sj_rx)
+        } else {
+            None
         };
 
         let exec_mgr_for_poller = exec_manager.clone();
@@ -663,6 +1034,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             })),
             frame_validator: Some(frame_validate.clone()),
             forward_fill: archive_mode,
+            startup_barrier: poller_startup_barrier,
             ..Default::default()
         };
         {
@@ -1041,9 +1413,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     let bf_cancel = sync_token.clone();
                                     let lo = canonical_head.saturating_add(1);
                                     let hi = reseed_frame.saturating_sub(1);
+                                    // The re-seed frame (frame hi+1) anchors the
+                                    // local ancestor-chain walk; its parent
+                                    // chain IS the [lo, hi] hole.
+                                    let bf_anchor = Some(gf.clone());
                                     spawner.detach("record-only-backfill", async move {
                                         run_record_only_backfill(
-                                            bf_pool, bf_cs, bf_validate, seed, lo, hi, bf_cancel,
+                                            bf_pool, bf_cs, bf_validate, bf_anchor, seed, lo, hi,
+                                            bf_cancel,
                                         )
                                         .await;
                                         Ok(())
@@ -1057,6 +1434,25 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 );
                             }
                         }
+                    }
+
+                    // Beyond the single reseed-anchored gap above, an archive
+                    // restarted many times accumulates many small internal
+                    // frame-record holes scattered BELOW the head (each round's
+                    // finalization-lag gap). Scan the whole keyspace for all of
+                    // them and backfill from local candidates (peers as
+                    // fallback). Archive-only (non-archives don't serve ranges);
+                    // detached + best-effort so it never blocks bringup.
+                    if sync_archive_mode {
+                        let gap_pool = sync_archive_pool.clone();
+                        let gap_cs = sync_cs.clone();
+                        let gap_validate = sync_frame_validate.clone();
+                        let gap_cancel = sync_token.clone();
+                        spawner.detach("restart-gap-backfill", async move {
+                            run_all_gap_backfill(gap_pool, gap_cs, gap_validate, seed, gap_cancel)
+                                .await;
+                            Ok(())
+                        });
                     }
 
                     // Only nodes registered as global provers (i.e. with

@@ -300,6 +300,39 @@ impl RocksClockStore {
         self.read_u64_index(&key)
     }
 
+    /// Scan the global frame-record keyspace and return every internal gap as
+    /// an inclusive `(lo, hi)` missing range. Key-only prefix scan — it does
+    /// NOT decode frame values, so it is cheap even over a full chain. Only
+    /// gaps BETWEEN stored frames are returned (holes left by prior restarts);
+    /// the open range above the highest stored frame is not a "gap" here. An
+    /// empty or fully-contiguous store returns `[]`.
+    pub fn find_global_frame_record_gaps(&self) -> Vec<(u64, u64)> {
+        // Frame record key = [CLOCK_FRAME, CLOCK_GLOBAL_FRAME, frame(8 BE)];
+        // take the 2-byte type prefix so the scan covers exactly the frame
+        // records (request/candidate keys use different second bytes).
+        let full = encoding::clock_global_frame_key(0);
+        let prefix = &full[..2];
+        let mut gaps = Vec::new();
+        let mut prev: Option<u64> = None;
+        for item in self.db.prefix_iterator(prefix) {
+            let (k, _) = match item {
+                Ok(kv) => kv,
+                Err(_) => break,
+            };
+            if !k.starts_with(prefix) || k.len() < 10 {
+                break;
+            }
+            let n = u64::from_be_bytes(k[2..10].try_into().unwrap());
+            if let Some(p) = prev {
+                if n > p + 1 {
+                    gaps.push((p + 1, n - 1));
+                }
+            }
+            prev = Some(n);
+        }
+        gaps
+    }
+
     /// Durable GLOBAL materialization cursor: the highest global frame whose
     /// `requests` have been committed into the hypergraph CRDT. `None` when
     /// absent (fresh store → treat as 0). This key is written atomically
@@ -311,6 +344,26 @@ impl RocksClockStore {
     pub fn get_global_materialized_cursor(&self) -> Option<u64> {
         let key = encoding::global_materialized_cursor_key();
         self.read_u64_index(&key)
+    }
+
+    /// Advance the durable global materialized cursor to `frame_number`.
+    /// Normally the cursor is written atomically inside the CRDT commit batch
+    /// (one frame at a time); a state-jump syncs the CRDT state WHOLESALE from
+    /// a peer snapshot (bypassing per-frame materialize), so it uses this to
+    /// move the cursor straight to the synced head — otherwise the startup
+    /// re-materialize would try (and fail) to replay `[old_cursor+1..=synced]`.
+    /// Monotonic: never regresses the cursor (a stale/lower value is ignored),
+    /// mirroring the `update_latest` guard on the frame index.
+    pub fn put_global_materialized_cursor(&self, frame_number: u64) -> Result<()> {
+        if let Some(existing) = self.get_global_materialized_cursor() {
+            if existing >= frame_number {
+                return Ok(());
+            }
+        }
+        let key = encoding::global_materialized_cursor_key();
+        self.db
+            .put(&key, frame_number.to_be_bytes())
+            .map_err(|e| QuilError::Store(e.to_string()))
     }
 
     fn read_u64_index(&self, key: &[u8]) -> Option<u64> {
