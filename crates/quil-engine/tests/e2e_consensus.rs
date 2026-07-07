@@ -215,29 +215,21 @@ impl FrameProver for StubFrameProver {
 /// Build a single-signer (`bitmask=[0x01]`) shard-FrameHeader aggregate
 /// signature whose DECLARED aggregate public key matches what the
 /// intrinsic's attestation verifier reconstructs via
-/// `bls.aggregate([member_pubkey], …)`. The 74-byte `signature` is a
-/// placeholder: a 74-byte single-signer attestation carries no VDF
-/// multiproof, and `StubFrameProver::verify_frame_header_signature`
-/// accepts it. Used by the synthetic-coverage tier-2 tests so their
-/// hand-built coverage FrameHeader survives the aggregate-pubkey
-/// consistency check (which only needs `member_pubkey` to be an Active
-/// prover under the frame's shard filter in the verifying registry).
+/// `bls.aggregate_public_keys([member_pubkey])`. The 74-byte `signature` is a
+/// placeholder.
 fn single_signer_agg_sig(
     member_pubkey: &[u8],
 ) -> quil_execution::hypergraph_intrinsic::canonical::AggregateSignature {
     use quil_types::crypto::BlsConstructor;
     let bls = quil_crypto::Bls48581KeyConstructor;
-    let (_t, throwaway_pub) = bls.new_key().expect("throwaway bls key");
-    // The aggregate's public key depends only on the input pubkeys (the
-    // signature slot is a don't-care here), so a throwaway fills it.
-    let agg = bls
-        .aggregate(&[member_pubkey], &[throwaway_pub.as_slice()])
+    let agg_pubkey = bls
+        .aggregate_public_keys(&[member_pubkey])
         .expect("aggregate single member pubkey");
     quil_execution::hypergraph_intrinsic::canonical::AggregateSignature {
         signature: vec![0u8; 74],
         public_key: Some(
             quil_execution::hypergraph_intrinsic::canonical::Bls48581G2PublicKey {
-                key_value: agg.public_key,
+                key_value: agg_pubkey,
             },
         ),
         bitmask: vec![0x01],
@@ -3677,7 +3669,11 @@ async fn tier2_storage_audit_evicts_cheating_member() {
     );
     assert_eq!(before.kick_frame_number, 0, "precondition: not yet kicked");
 
-    let coverage_frame = build_global_frame_with_bundle(10, &bundle);
+    // STRICT LOCKSTEP: a storage frame's attestation must anchor to the
+    // IMMEDIATELY PRECEDING global frame, so the enclosing global frame number
+    // must be `global_frame_number + 1` (= 1001) to satisfy the
+    // `anchor == frame_number - 1` gate in `audit_storage_attestation`.
+    let coverage_frame = build_global_frame_with_bundle(1001, &bundle);
     let result = archive
         .materializer
         .materialize(&coverage_frame)

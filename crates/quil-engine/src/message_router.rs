@@ -659,7 +659,9 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let info = quil_p2p::CanonicalPeerInfo {
-            peer_id: vec![0xAA; 38],
+            // The validator requires peer_id to be derived from the signing
+            // pubkey (anti-spoofing gate), so an arbitrary id won't pass.
+            peer_id: quil_p2p::peer_id_from_ed448_pubkey(&pubkey_bytes),
             timestamp: now_ms,
             version: vec![2, 1, 0],
             patch_number: vec![20],
