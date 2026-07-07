@@ -1,0 +1,114 @@
+# Peer id: QmYWRH2ujTmiD1m4jCQaLgUqx72AD31P51pZdtynbHi8Sc
+alias: null
+key:
+  keyManagerType: file
+  keyManagerFile:
+    path: .config/keys.yml
+    createIfMissing: false
+    encryptionKey: 6907de321dd469e3359eab12bc6f8879bfc17d1ec6e7b5db978352923197de5b
+p2p:
+  d: 0
+  dLo: 0
+  dHi: 0
+  dScore: 0
+  dOut: 0
+  historyLength: 0
+  historyGossip: 0
+  dLazy: 0
+  gossipFactor: 0
+  gossipRetransmission: 0
+  heartbeatInitialDelay: 0s
+  heartbeatInterval: 0s
+  fanoutTTL: 0s
+  prunePeers: 0
+  pruneBackoff: 0s
+  unsubscribeBackoff: 0s
+  connectors: 0
+  maxPendingConnections: 0
+  connectionTimeout: 0s
+  directConnectTicks: 0
+  directConnectInitialDelay: 0s
+  opportunisticGraftTicks: 0
+  opportunisticGraftPeers: 0
+  graftFloodThreshold: 0s
+  maxIHaveLength: 0
+  maxIHaveMessages: 0
+  maxIDontWantMessages: 0
+  iWantFollowupTime: 0s
+  iDontWantMessageThreshold: 0
+  iDontWantMessageTTL: 0
+  bootstrapPeers:
+  # self multiaddr for bootstrap node
+  - /dns/proxy/udp/8336/quic-v1/p2p/QmYWRH2ujTmiD1m4jCQaLgUqx72AD31P51pZdtynbHi8Sc
+  listenMultiaddr: /ip4/0.0.0.0/udp/8336/quic-v1
+  streamListenMultiaddr: ""
+  peerPrivKey: 4ee2b6a8ab83db96df43b1c5b0239ce3077fa14e77b23bb6b3ade66e50d4c7e1136478938e868439d2266d800c9cbd472ced584db4a651d8fdf18ebbc46deecb7007a316da06a22246cef854e241c33f295841d1e352b9c182d0b5057fac09e26c99b31dd19f80a6cc014e3b855bbabd8e80
+  traceLogFile: ""
+  traceLogStdout: false
+  network: 0
+  lowWatermarkConnections: 0
+  highWatermarkConnections: 0
+  directPeers: []
+  grpcServerRateLimit: 0
+  minBootstrapPeers: 0
+  bootstrapParallelism: 0
+  discoveryParallelism: 0
+  discoveryPeerLookupLimit: 0
+  pingTimeout: 0s
+  pingPeriod: 0s
+  pingAttempts: 0
+  validateQueueSize: 0
+  validateWorkers: 0
+  subscriptionQueueSize: 0
+  peerOutboundQueueSize: 0
+engine:
+  provingKeyId: default-proving-key
+  filter: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+  genesisSeed: 726573697374206d7563682c206f626579206c6974746c657c083fb0a4274b1f70e9aa2b3f
+  pendingCommitWorkers: 4
+  minimumPeersRequired: 0
+  statsMultiaddr: ""
+  dataWorkerBaseListenMultiaddr: ""
+  dataWorkerBaseP2PPort: 0
+  dataWorkerBaseStreamPort: 0
+  dataWorkerMemoryLimit: 0
+  dataWorkerP2PMultiaddrs: []
+  dataWorkerStreamMultiaddrs: []
+  dataWorkerCount: 0
+  dataWorkerFilters: []
+  multisigProverEnrollmentPaths: []
+  syncTimeout: 0s
+  syncCandidates: 0
+  syncMessageLimits:
+    maxRecvMsgSize: 0
+    maxSendMsgSize: 0
+  enableMasterProxy: false
+  rewardStrategy: ""
+  archiveMode: false
+  delegateAddress: ""
+  allowExcessiveGOMAXPROCS: false
+  blacklist: []
+  alertKey: ""
+  difficulty: 0
+  rebuildstart: ""
+  rebuildend: ""
+  framePublish:
+    mode: ""
+    threshold: 0
+    fragmentation:
+      algorithm: ""
+      reedSolomon:
+        dataShards: 0
+        parityShards: 0
+    ballastSize: 0
+db:
+  path: /root/store
+  workerPathPrefix: /root/worker-store/%d
+  workerPaths: []
+  noticePercentage: 0
+  warnPercentage: 0
+  terminatePercentage: 0
+  inmemorydonotuse: false
+logger: null
+listenGrpcMultiaddr: /ip4/0.0.0.0/tcp/8337
+listenRESTMultiaddr: /ip4/0.0.0.0/tcp/8338

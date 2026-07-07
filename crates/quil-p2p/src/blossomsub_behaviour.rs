@@ -153,6 +153,35 @@ impl BlossomSubBehaviour {
             .register_validator(TopicHash::from_raw(bitmask), validator);
     }
 
+    /// Install a per-(source, target) forward filter consulted before relaying
+    /// each message to a mesh peer. When the filter returns `false` for a
+    /// `(source, target)` pair, that target is skipped (the message is still
+    /// delivered to other mesh peers). Replaces any previously installed
+    /// filter. With no filter installed (the default), all forwards are
+    /// allowed. Used by the devnet test proxy to impose bipartite network
+    /// partitions; runs on the fork's relay path (`forward_msg`).
+    pub fn set_forward_filter(
+        &mut self,
+        filter: impl Fn(&PeerId, &PeerId) -> bool + Send + Sync + 'static,
+    ) {
+        self.inner.set_forward_filter(filter);
+    }
+
+    /// Same as [`Self::set_forward_filter`] but accepts an already-boxed
+    /// filter. Used to install a filter delivered over the swarm command
+    /// channel (which must erase the closure's concrete type).
+    pub fn set_forward_filter_boxed(
+        &mut self,
+        filter: Box<dyn Fn(&PeerId, &PeerId) -> bool + Send + Sync>,
+    ) {
+        self.inner.set_forward_filter_boxed(filter);
+    }
+
+    /// Remove any installed forward filter (all forwards allowed again).
+    pub fn clear_forward_filter(&mut self) {
+        self.inner.clear_forward_filter();
+    }
+
     /// Subscribe to a bitmask.
     pub fn subscribe(&mut self, bitmask: Vec<u8>) {
         let topic = IdentTopic::new(bitmask.clone());

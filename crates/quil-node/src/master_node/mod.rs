@@ -322,7 +322,20 @@ pub(crate) async fn start(
     // PeerInfo handler whenever it sees a peer advertising
     // ARCHIVE_SERVICE_CAPABILITY_ID. The poller spawned below picks one as
     // its source and forward-polls the chain head.
-    let archive_pool = std::sync::Arc::new(quil_rpc::ArchiveEndpointPool::new());
+    // `-1` disables endpoint blacklisting entirely (devnet uses this so
+    // partition recovery is instantaneous); `0` was already coerced to the
+    // default by `EngineConfig::apply_defaults`. Any other negative value is
+    // a config mistake, not a second way to spell "disabled".
+    let blacklist_ttl = match config.engine.archive_blacklist_ttl_secs {
+        -1 => std::time::Duration::ZERO,
+        n if n < 0 => anyhow::bail!(
+            "engine.archiveBlacklistTtl must be -1 (disabled), 0 (default), or a \
+             positive number of seconds; got {n}"
+        ),
+        n => std::time::Duration::from_secs(n as u64),
+    };
+    let archive_pool =
+        std::sync::Arc::new(quil_rpc::ArchiveEndpointPool::new(blacklist_ttl));
 
     // Pre-seed the archive pool. Precedence matches the Go node
     // (`node/main.go:737-741`):

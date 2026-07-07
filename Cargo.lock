@@ -1379,6 +1379,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "devnet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap 4.5.4",
+ "hex 0.4.3",
+ "quil-crypto",
+ "quil-p2p",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "subtle",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "devnet-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap 4.5.4",
+ "devnet",
+ "futures",
+ "hex 0.4.3",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper 1.9.0",
+ "hyper-util",
+ "prost",
+ "quil-config",
+ "quil-crypto",
+ "quil-engine",
+ "quil-lifecycle",
+ "quil-p2p",
+ "quil-rpc",
+ "quil-types",
+ "serde_json",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tonic",
+ "tower 0.4.13",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "digest"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5820,6 +5876,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -6252,6 +6309,17 @@ name = "utf8parse"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "711b9620af191e0cdc7468a8d14e709c3dcdb115b36f838e601583af800a370a"
+
+[[package]]
+name = "uuid"
+version = "1.23.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
+dependencies = [
+ "getrandom 0.4.2",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "valuable"

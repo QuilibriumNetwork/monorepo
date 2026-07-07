@@ -888,6 +888,9 @@ impl P2PNode {
                             Some(P2PCommand::Unsubscribe(bitmask)) => {
                                 swarm.behaviour_mut().blossomsub.unsubscribe(&bitmask);
                             }
+                            Some(P2PCommand::SetForwardFilter(filter)) => {
+                                swarm.behaviour_mut().blossomsub.set_forward_filter_boxed(filter);
+                            }
                             Some(P2PCommand::Publish { bitmask, data, ack }) => {
                                 let result = swarm.behaviour_mut().blossomsub.publish(bitmask, data);
                                 if let Err(ref e) = result {
@@ -983,6 +986,20 @@ impl P2PHandle {
 
     pub async fn unsubscribe(&self, bitmask: Vec<u8>) {
         let _ = self.cmd_tx.send(P2PCommand::Unsubscribe(bitmask)).await;
+    }
+
+    /// Install a per-(source, target) gossip forward filter. When the filter
+    /// returns `false` for a `(source, target)` pair, the relay to that target
+    /// is suppressed. Used by the devnet proxy to impose network partitions;
+    /// with no filter installed (the default) all forwards are allowed.
+    pub async fn set_forward_filter(
+        &self,
+        filter: impl Fn(&PeerId, &PeerId) -> bool + Send + Sync + 'static,
+    ) {
+        let _ = self
+            .cmd_tx
+            .send(P2PCommand::SetForwardFilter(Box::new(filter)))
+            .await;
     }
 
     /// Publish data to a bitmask topic. This is the send path —
@@ -1154,6 +1171,9 @@ impl P2PHandle {
 enum P2PCommand {
     Subscribe(Vec<u8>),
     Unsubscribe(Vec<u8>),
+    /// Install a per-(source, target) gossip forward filter. Used by the
+    /// devnet test proxy to impose bipartite network partitions.
+    SetForwardFilter(Box<dyn Fn(&PeerId, &PeerId) -> bool + Send + Sync>),
     Publish {
         bitmask: Vec<u8>,
         data: Vec<u8>,

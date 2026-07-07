@@ -63,6 +63,13 @@ pub struct EngineConfig {
     pub archive_endpoints: Vec<String>,
     #[serde(default)]
     pub blacklist: Vec<String>,
+    /// How long (seconds) the archive endpoint pool bans a failing archive
+    /// before retrying it. `-1` disables banning entirely (a failed endpoint
+    /// is retried on the next poll tick) — devnet sets this so recovery from
+    /// a network partition is instantaneous. `0`/absent falls back to the
+    /// default below. See `quil_rpc::ArchiveEndpointPool`.
+    #[serde(default = "default_archive_blacklist_ttl_secs", alias = "archiveBlacklistTtl")]
+    pub archive_blacklist_ttl_secs: i64,
     #[serde(default = "default_alert_key")]
     pub alert_key: String,
     #[serde(default)]
@@ -117,6 +124,10 @@ fn default_worker_base_stream_port() -> u16 { 32500 }
 fn default_worker_memory_limit() -> i64 { 1792 * 1024 * 1024 }
 fn default_sync_timeout_ms() -> u64 { 4000 }
 fn default_sync_candidates() -> i32 { 8 }
+// Short enough that transient network blips don't permanently drain the
+// archive pool, long enough that we don't hammer a struggling endpoint into
+// the ground. `-1` disables banning (see `archive_blacklist_ttl_secs`).
+fn default_archive_blacklist_ttl_secs() -> i64 { 60 }
 // 64 MiB — matches the de-facto cap hardcoded in
 // `quil-rpc/src/hypergraph_sync_probe.rs`. Was 600 MiB before, which
 // is far larger than any legitimate sync message and would have been
@@ -181,6 +192,10 @@ impl EngineConfig {
         }
         if self.sync_candidates == 0 {
             self.sync_candidates = default_sync_candidates();
+        }
+        // `0`/absent → default; `-1` (disabled) and positive values preserved.
+        if self.archive_blacklist_ttl_secs == 0 {
+            self.archive_blacklist_ttl_secs = default_archive_blacklist_ttl_secs();
         }
         if self.reward_strategy.is_empty() {
             self.reward_strategy = default_reward_strategy();

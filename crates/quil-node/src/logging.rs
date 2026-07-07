@@ -334,6 +334,14 @@ pub fn build_env_filter(
     directives.push("libp2p_quic=warn".to_string());
     directives.push("libp2p_tcp=warn".to_string());
     directives.push("libp2p_swarm=warn".to_string());
+    // The HTTP/2 + gRPC stack (h2 codec frame send/received, hyper, tonic
+    // service, and tower buffer/ready) logs thousands of per-frame debug lines
+    // that bury the node's own output under `--debug`. Cap at warn unless opted
+    // back in.
+    directives.push("h2=warn".to_string());
+    directives.push("hyper=warn".to_string());
+    directives.push("tonic=warn".to_string());
+    directives.push("tower=warn".to_string());
 
     for (component, level) in config_filters {
         directives.push(format!("{}={}", component, level));

@@ -303,6 +303,35 @@ rewardStrategy: ""
         assert_eq!(e.reward_strategy, "reward-greedy");
     }
 
+    /// `archiveBlacklistTtl` is special: `-1` means "disabled" and must
+    /// survive `apply_defaults`, while `0`/absent fall back to the 60s
+    /// default like every other engine field.
+    #[test]
+    fn apply_defaults_handles_archive_blacklist_ttl() {
+        // Absent → default.
+        let mut absent: EngineConfig = serde_yaml::from_str("{}").unwrap();
+        absent.apply_defaults();
+        assert_eq!(absent.archive_blacklist_ttl_secs, 60);
+
+        // Explicit 0 → default.
+        let mut zero: EngineConfig =
+            serde_yaml::from_str("archiveBlacklistTtl: 0").unwrap();
+        zero.apply_defaults();
+        assert_eq!(zero.archive_blacklist_ttl_secs, 60);
+
+        // -1 (disabled) → preserved.
+        let mut disabled: EngineConfig =
+            serde_yaml::from_str("archiveBlacklistTtl: -1").unwrap();
+        disabled.apply_defaults();
+        assert_eq!(disabled.archive_blacklist_ttl_secs, -1);
+
+        // Positive value → preserved.
+        let mut custom: EngineConfig =
+            serde_yaml::from_str("archiveBlacklistTtl: 30").unwrap();
+        custom.apply_defaults();
+        assert_eq!(custom.archive_blacklist_ttl_secs, 30);
+    }
+
     #[test]
     fn apply_defaults_preserves_non_zero_fields() {
         let yaml = r#"
