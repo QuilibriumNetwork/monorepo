@@ -891,6 +891,12 @@ impl P2PNode {
                             Some(P2PCommand::SetForwardFilter(filter)) => {
                                 swarm.behaviour_mut().blossomsub.set_forward_filter_boxed(filter);
                             }
+                            Some(P2PCommand::RegisterValidator { bitmask, validator }) => {
+                                swarm
+                                    .behaviour_mut()
+                                    .blossomsub
+                                    .register_validator(bitmask, validator);
+                            }
                             Some(P2PCommand::Publish { bitmask, data, ack }) => {
                                 let result = swarm.behaviour_mut().blossomsub.publish(bitmask, data);
                                 if let Err(ref e) = result {
@@ -982,6 +988,52 @@ pub struct P2PHandle {
 impl P2PHandle {
     pub async fn subscribe(&self, bitmask: Vec<u8>) {
         let _ = self.cmd_tx.send(P2PCommand::Subscribe(bitmask)).await;
+    }
+
+    /// Register a blossomsub-level validator on `bitmask` that DROPS
+    /// (`Ignore` — no forward, no peer penalty) PeerInfo / KeyRegistry
+    /// messages whose embedded timestamp is already stale, BEFORE the mesh
+    /// forwards them. Without this the composite broker re-gossips every stale
+    /// PeerInfo/KeyRegistry (they are only rejected later at the app router,
+    /// `*_ts_too_old`), self-amplifying the flood and bloating the dedup
+    /// caches. This is a CHEAP peek (no canonical decode / Ed448 verify);
+    /// fresh messages `Accept` and still get the full app-level validation.
+    /// Timestamp windows mirror the app router: PeerInfo −60s..+300s,
+    /// KeyRegistry −60s..+5s. Uses `Ignore` (not `Reject`) because a message
+    /// can age in transit through honest relayers who shouldn't be penalised.
+    pub async fn register_peer_info_staleness_validator(&self, bitmask: Vec<u8>) {
+        let validator: Box<
+            dyn Fn(&PeerId, &[u8]) -> blossomsub::ValidationResult + Send + Sync,
+        > = Box::new(|_peer, data| {
+            use blossomsub::ValidationResult;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            if data.len() >= 4 {
+                let tp = u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4]));
+                if tp == crate::peer_info::PEER_INFO_TYPE {
+                    if let Some(ts) = crate::peer_info::peek_peer_info_timestamp(data) {
+                        if ts < now_ms - 60_000 || ts > now_ms + 300_000 {
+                            return ValidationResult::Ignore;
+                        }
+                    }
+                } else if tp == crate::peer_info::KEY_REGISTRY_TYPE {
+                    if let Some(ts) =
+                        crate::peer_info::peek_key_registry_timestamp(data).map(|v| v as i64)
+                    {
+                        if ts < now_ms - 60_000 || ts > now_ms + 5_000 {
+                            return ValidationResult::Ignore;
+                        }
+                    }
+                }
+            }
+            ValidationResult::Accept
+        });
+        let _ = self
+            .cmd_tx
+            .send(P2PCommand::RegisterValidator { bitmask, validator })
+            .await;
     }
 
     pub async fn unsubscribe(&self, bitmask: Vec<u8>) {
@@ -1174,6 +1226,14 @@ enum P2PCommand {
     /// Install a per-(source, target) gossip forward filter. Used by the
     /// devnet test proxy to impose bipartite network partitions.
     SetForwardFilter(Box<dyn Fn(&PeerId, &PeerId) -> bool + Send + Sync>),
+    /// Register a blossomsub-level per-bitmask validator. It runs on the
+    /// receive path BEFORE the mesh forwards or the app is notified, so a
+    /// `Reject`/`Ignore` stops re-gossip at the source (used to drop stale
+    /// PeerInfo/KeyRegistry before the composite broker re-broadcasts them).
+    RegisterValidator {
+        bitmask: Vec<u8>,
+        validator: Box<dyn Fn(&PeerId, &[u8]) -> blossomsub::ValidationResult + Send + Sync>,
+    },
     Publish {
         bitmask: Vec<u8>,
         data: Vec<u8>,

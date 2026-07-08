@@ -44,7 +44,19 @@ pub(crate) struct TimeCache<Key, Value> {
     list: VecDeque<ExpiringElement<Key>>,
     /// The time elements remain in the cache.
     ttl: Duration,
+    /// Hard upper bound on retained entries — see [`MAX_ENTRIES`].
+    max_len: usize,
 }
+
+/// Hard upper bound on entries retained by ANY `TimeCache`, independent of TTL.
+/// A `TimeCache` is otherwise time-pruned ONLY, so under a message flood — a
+/// bloated peer set or a gossip storm inserting far faster than the TTL window
+/// would naturally drain — the `map`+`list` grow without bound and OOM the node
+/// (observed: 15 GB, ~tens of millions of entries, one 2.5 GB HashMap backing
+/// array). This caps each cache (evicting oldest-first past it), bounding worst
+/// case to a few hundred MB regardless of rate. 1M msg-ids ≈ ~150 MB; normal
+/// traffic stays far below the cap so it only engages under a genuine flood.
+const MAX_ENTRIES: usize = 1_000_000;
 
 pub(crate) struct OccupiedEntry<'a, K, V> {
     entry: hash_map::OccupiedEntry<'a, K, ExpiringElement<V>>,
@@ -113,6 +125,7 @@ where
             map: FnvHashMap::default(),
             list: VecDeque::new(),
             ttl,
+            max_len: MAX_ENTRIES,
         }
     }
 
@@ -130,9 +143,26 @@ where
         }
     }
 
+    /// Evict oldest-first while over the hard size cap (a memory guard against a
+    /// message flood the TTL alone can't bound). Mirrors `remove_expired_keys`'
+    /// stale-entry guard: a key re-inserted with a later expiry than the popped
+    /// list element is still fresh — skip it (only its own newer list entry
+    /// evicts it) so we never drop a live entry ahead of a stale one.
+    fn enforce_capacity(&mut self) {
+        while self.map.len() > self.max_len {
+            let Some(element) = self.list.pop_front() else { break };
+            if let Occupied(entry) = self.map.entry(element.element.clone()) {
+                if entry.get().expires <= element.expires {
+                    entry.remove();
+                }
+            }
+        }
+    }
+
     pub(crate) fn entry(&mut self, key: Key) -> Entry<Key, Value> {
         let now = Instant::now();
         self.remove_expired_keys(now);
+        self.enforce_capacity();
         match self.map.entry(key) {
             Occupied(entry) => Entry::Occupied(OccupiedEntry { entry }),
             Vacant(entry) => Entry::Vacant(VacantEntry {
