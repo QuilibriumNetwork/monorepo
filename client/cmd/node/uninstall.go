@@ -2,14 +2,23 @@ package node
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 )
+
+// isDirNotEmpty reports whether err represents a non-empty-directory
+// error from os.Remove. Used so uninstall can silently skip removing
+// a state dir that still has user files in it.
+func isDirNotEmpty(err error) bool {
+	return errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST)
+}
 
 var (
 	Force bool
@@ -27,7 +36,7 @@ The following will be removed:
   - All node binaries and signatures
   - Node symlink
   - Log files
-  - Logrotate configuration
+  - Any leftover legacy logrotate configuration from older installs
 
 The following will NOT be removed:
   - Configuration files (~/.quilibrium/configs/)
@@ -72,28 +81,64 @@ func uninstallNode() {
 	fmt.Println("Removing node service...")
 	removeNodeService()
 
+	binDir := utils.GetNodeBinaryDir()
+	symlinkPath := utils.GetNodeSymlinkPath()
+	logDirs := utils.ResolveAllNodeLogDirs()
+	if resolved, err := utils.ResolveActiveNodeLog(); err == nil && resolved.FileBased {
+		present := false
+		for _, d := range logDirs {
+			if d == resolved.LogDir {
+				present = true
+				break
+			}
+		}
+		if !present {
+			logDirs = append(logDirs, resolved.LogDir)
+		}
+	}
+	envPath := utils.GetNodeEnvFilePath()
+
 	// 3. Remove all binaries
 	fmt.Println("Removing node binaries...")
-	if err := os.RemoveAll(utils.NodeDataPath); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not remove binaries at %s: %v\n", utils.NodeDataPath, err)
+	if err := os.RemoveAll(binDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not remove binaries at %s: %v\n", binDir, err)
 	}
 
 	// 4. Remove symlink
 	fmt.Println("Removing node symlink...")
-	if err := os.Remove(utils.DefaultNodeSymlinkPath); err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Warning: could not remove symlink at %s: %v\n", utils.DefaultNodeSymlinkPath, err)
+	if err := os.Remove(symlinkPath); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Warning: could not remove symlink at %s: %v\n", symlinkPath, err)
 	}
 
 	// 5. Remove logs
 	fmt.Println("Removing log files...")
-	if err := os.RemoveAll(utils.LogPath); err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Warning: could not remove logs at %s: %v\n", utils.LogPath, err)
+	for _, logDir := range logDirs {
+		if err := os.RemoveAll(logDir); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove logs at %s: %v\n", logDir, err)
+		}
 	}
 
-	// 6. Remove logrotate config
-	logrotateConfig := "/etc/logrotate.d/" + utils.NodeServiceName
-	if err := os.Remove(logrotateConfig); err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Warning: could not remove logrotate config at %s: %v\n", logrotateConfig, err)
+	// 6. Best-effort removal of any legacy logrotate config left over
+	// from previous qclient versions. Current installs don't create
+	// one; the node rotates its own logs.
+	legacyLogrotate := "/etc/logrotate.d/" + utils.NodeServiceName
+	if err := os.Remove(legacyLogrotate); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Warning: could not remove legacy logrotate config at %s: %v\n", legacyLogrotate, err)
+	}
+
+	// 7. Remove environment file, and the state dir itself if empty.
+	fmt.Println("Removing environment file...")
+	if err := os.Remove(envPath); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Warning: could not remove environment file at %s: %v\n", envPath, err)
+	}
+	stateDir := utils.GetNodeStateDir()
+	if err := os.Remove(stateDir); err != nil && !os.IsNotExist(err) {
+		// Non-empty or permission error: leave it alone, but only
+		// report unexpected errors (ENOTEMPTY is expected when the
+		// user has other state files in there).
+		if !isDirNotEmpty(err) {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove state directory at %s: %v\n", stateDir, err)
+		}
 	}
 
 	fmt.Println()
@@ -112,7 +157,7 @@ func stopNodeService() {
 			fmt.Fprintf(os.Stderr, "  Note: could not stop service (may not be running): %v\n", err)
 		}
 	} else {
-		cmd := exec.Command("sudo", "systemctl", "stop", utils.NodeServiceName)
+		cmd := exec.Command("sudo", "systemctl", "stop", utils.GetNodeServiceName())
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "  Note: could not stop service (may not be running): %v\n", err)
 		}
@@ -121,12 +166,13 @@ func stopNodeService() {
 
 func removeNodeService() {
 	if OsType == "linux" {
+		serviceName := utils.GetNodeServiceName()
 		// Disable service first
-		disableCmd := exec.Command("sudo", "systemctl", "disable", utils.NodeServiceName)
+		disableCmd := exec.Command("sudo", "systemctl", "disable", serviceName)
 		disableCmd.Run() // ignore error
 
 		// Remove service file
-		servicePath := "/etc/systemd/system/" + utils.NodeServiceName + ".service"
+		servicePath := "/etc/systemd/system/" + serviceName + ".service"
 		if err := os.Remove(servicePath); err != nil && !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "  Warning: could not remove service file: %v\n", err)
 		}

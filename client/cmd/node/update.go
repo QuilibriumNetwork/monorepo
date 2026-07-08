@@ -76,7 +76,7 @@ func restartNode() {
 // updateNode handles the node update process
 func updateNode(version string) {
 	// Check if we need sudo privileges
-	if err := utils.CheckAndRequestSudo(fmt.Sprintf("Updating node at %s requires root privileges", utils.NodeDataPath)); err != nil {
+	if err := utils.CheckAndRequestSudo(fmt.Sprintf("Updating node at %s requires root privileges", utils.GetNodeBinaryDir())); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}

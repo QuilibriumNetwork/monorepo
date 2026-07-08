@@ -25,7 +25,11 @@ func GetVersion() []byte {
 }
 
 func GetVersionString() string {
-	return FormatVersion(GetVersion())
+	base := FormatVersion(GetVersion())
+	if patch := GetPatchNumber(); patch != 0x00 {
+		return fmt.Sprintf("%s.%d", base, patch)
+	}
+	return base
 }
 
 func FormatVersion(version []byte) string {

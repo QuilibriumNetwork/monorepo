@@ -87,21 +87,25 @@ func updateClient(version string) {
 		return
 	}
 
+	qclientBinDir := utils.GetQClientBinaryDir()
+
 	// Check if we need sudo privileges
-	if err := utils.CheckAndRequestSudo(fmt.Sprintf("Updating client at %s requires root privileges", utils.ClientDataPath)); err != nil {
+	if err := utils.CheckAndRequestSudo(fmt.Sprintf("Updating client at %s requires root privileges", qclientBinDir)); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
 
+	warnLegacyQClientLayout()
+
 	// Create version-specific installation directory
-	versionDir := filepath.Join(utils.ClientDataPath, version)
+	versionDir := filepath.Join(qclientBinDir, version)
 	if err := os.MkdirAll(versionDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating installation directory: %v\n", err)
 		return
 	}
 
-	// Create data directory
-	versionDataDir := filepath.Join(utils.ClientDataPath, version)
+	// Create data directory (same as versionDir today).
+	versionDataDir := versionDir
 	if err := os.MkdirAll(versionDataDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating data directory: %v\n", err)
 		return
@@ -136,7 +140,7 @@ func updateClient(version string) {
 func finishInstallation(version string) {
 
 	// Construct executable path
-	execPath := filepath.Join(utils.ClientDataPath, version, "qclient-"+version+"-"+osType+"-"+arch)
+	execPath := filepath.Join(utils.GetQClientBinaryDir(), version, "qclient-"+version+"-"+osType+"-"+arch)
 
 	// Make the binary executable
 	if err := os.Chmod(execPath, 0755); err != nil {
@@ -164,4 +168,58 @@ func finishInstallation(version string) {
 	fmt.Fprintf(os.Stdout, "Successfully updated qclient to version %s\n", version)
 	fmt.Fprintf(os.Stdout, "Executable: %s\n", execPath)
 	fmt.Fprintf(os.Stdout, "Symlink: %s\n", symlinkPath)
+}
+
+// warnLegacyQClientLayout emits a one-shot warning when the qclient
+// update would land in (or leave behind) the pre-FHS-split
+// /var/quilibrium/bin/qclient layout. No files are moved; the user is
+// told how to opt in to the new defaults.
+func warnLegacyQClientLayout() {
+	cfg, err := utils.LoadClientConfig()
+	if err != nil {
+		return
+	}
+
+	resolved := utils.GetQClientBinaryDir()
+	pinned := filepath.Clean(cfg.DataDir) == utils.LegacyQClientBinaryDir ||
+		filepath.Clean(resolved) == utils.LegacyQClientBinaryDir
+	legacyTreeExists := utils.FileExists(utils.LegacyQClientBinaryDir)
+
+	if !pinned && !legacyTreeExists {
+		return
+	}
+
+	defaultInstall := utils.DefaultQClientInstallDir()
+	defaultBin := filepath.Join(defaultInstall, "bin", string(utils.ReleaseTypeQClient))
+
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr,
+		"Notice: the default qclient install layout has moved off "+
+			utils.LegacyQClientBinaryDir+".")
+	fmt.Fprintf(os.Stderr,
+		"  New default: %s.\n", defaultBin,
+	)
+	if pinned {
+		fmt.Fprintf(os.Stderr,
+			"  Your qclient config currently pins the qclient binary dir to %s;\n"+
+				"  this update will keep writing there.\n",
+			resolved,
+		)
+		fmt.Fprintln(os.Stderr,
+			"  To adopt the new default, clear 'dataDir' and "+
+				"'qclientInstallDir' from your qclient-config.yaml and "+
+				"re-run this update.")
+	} else if legacyTreeExists {
+		fmt.Fprintf(os.Stderr,
+			"  A legacy qclient tree was detected under %s but this update "+
+				"will use the new default (%s).\n",
+			utils.LegacyQClientBinaryDir, resolved,
+		)
+		fmt.Fprintf(os.Stderr,
+			"  Files under %s are NOT moved automatically; remove them "+
+				"manually once you've verified the new install.\n",
+			utils.LegacyQClientBinaryDir,
+		)
+	}
+	fmt.Fprintln(os.Stderr)
 }

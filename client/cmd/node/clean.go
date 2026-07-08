@@ -49,38 +49,59 @@ To remove the current version of the node, use 'qclient node uninstall'`,
 	},
 }
 
-// cleanNodeLogs removes all log files from the node's log directory
+// cleanNodeLogs removes all log files from every node config's logger
+// directory. Configs without a logger block (stdout/journal logging) are
+// skipped — use the system log tooling to rotate/clean those.
 func cleanNodeLogs() {
 	if err := utils.CheckAndRequestSudo("Cleaning logs requires root privileges"); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
 
-	logDir := utils.LogPath
-	entries, err := os.ReadDir(logDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			fmt.Println("No logs directory found.")
-		} else {
-			fmt.Fprintf(os.Stderr, "Error reading log directory: %v\n", err)
+	logDirs := utils.ResolveAllNodeLogDirs()
+	// Include the active config's log dir too in case it isn't listed
+	// by name (e.g. when the user only has a "default" symlink).
+	if resolved, err := utils.ResolveActiveNodeLog(); err == nil && resolved.FileBased {
+		present := false
+		for _, d := range logDirs {
+			if d == resolved.LogDir {
+				present = true
+				break
+			}
 		}
+		if !present {
+			logDirs = append(logDirs, resolved.LogDir)
+		}
+	}
+
+	if len(logDirs) == 0 {
+		fmt.Println("No node configs have a logger block set; nothing to clean.")
 		return
 	}
 
-	removed := 0
-	for _, entry := range entries {
-		name := entry.Name()
-		if strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.gz") {
-			path := filepath.Join(logDir, name)
-			if err := os.Remove(path); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not remove %s: %v\n", name, err)
+	for _, logDir := range logDirs {
+		entries, err := os.ReadDir(logDir)
+		if err != nil {
+			if os.IsNotExist(err) {
 				continue
 			}
-			removed++
+			fmt.Fprintf(os.Stderr, "Error reading log directory %s: %v\n", logDir, err)
+			continue
 		}
+		removed := 0
+		for _, entry := range entries {
+			name := entry.Name()
+			if strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.gz") {
+				path := filepath.Join(logDir, name)
+				if err := os.Remove(path); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: could not remove %s: %v\n", name, err)
+					continue
+				}
+				removed++
+			}
+		}
+		fmt.Printf("Removed %d log file(s) from %s\n", removed, logDir)
 	}
-
-	fmt.Printf("Removed %d log file(s) from %s\n", removed, logDir)
 }
 
 // cleanNodeBinaries removes old node binary versions and signatures,
@@ -91,16 +112,17 @@ func cleanNodeBinaries() {
 		return
 	}
 
+	binDir := utils.GetNodeBinaryDir()
 	// Determine which version is currently active via the symlink
 	currentVersion := ""
-	target, err := os.Readlink(utils.DefaultNodeSymlinkPath)
+	target, err := os.Readlink(utils.GetNodeSymlinkPath())
 	if err == nil {
-		// target looks like /var/quilibrium/bin/node/<version>/node-<version>-<os>-<arch>
+		// target looks like <install>/bin/node/<version>/node-<version>-<os>-<arch>
 		dir := filepath.Dir(target)
 		currentVersion = filepath.Base(dir)
 	}
 
-	entries, err := os.ReadDir(utils.NodeDataPath)
+	entries, err := os.ReadDir(binDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			fmt.Println("No node binaries directory found.")
@@ -118,7 +140,7 @@ func cleanNodeBinaries() {
 		if entry.Name() == currentVersion {
 			continue
 		}
-		path := filepath.Join(utils.NodeDataPath, entry.Name())
+		path := filepath.Join(binDir, entry.Name())
 		if err := os.RemoveAll(path); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: could not remove %s: %v\n", entry.Name(), err)
 			continue
@@ -126,7 +148,7 @@ func cleanNodeBinaries() {
 		removed++
 	}
 
-	fmt.Printf("Removed %d old version(s) from %s\n", removed, utils.NodeDataPath)
+	fmt.Printf("Removed %d old version(s) from %s\n", removed, binDir)
 	if currentVersion != "" {
 		fmt.Printf("Kept current version: %s\n", currentVersion)
 	}
@@ -134,8 +156,9 @@ func cleanNodeBinaries() {
 
 // RemoveNodeBinary removes a specific version's binary directory.
 func RemoveNodeBinary(version string) error {
+	binDir := utils.GetNodeBinaryDir()
 	// Determine which version is currently active via the symlink
-	target, err := os.Readlink(utils.DefaultNodeSymlinkPath)
+	target, err := os.Readlink(utils.GetNodeSymlinkPath())
 	if err == nil {
 		dir := filepath.Dir(target)
 		currentVersion := filepath.Base(dir)
@@ -144,9 +167,9 @@ func RemoveNodeBinary(version string) error {
 		}
 	}
 
-	versionDir := filepath.Join(utils.NodeDataPath, version)
+	versionDir := filepath.Join(binDir, version)
 	if _, err := os.Stat(versionDir); os.IsNotExist(err) {
-		return fmt.Errorf("version %s not found in %s", version, utils.NodeDataPath)
+		return fmt.Errorf("version %s not found in %s", version, binDir)
 	}
 
 	return os.RemoveAll(versionDir)
