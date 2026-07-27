@@ -529,6 +529,40 @@ pub trait ShardsStore: Send + Sync {
 }
 
 /// Hypergraph tree backing store (vector commitment trees).
+/// One coin's accumulator membership witness (see [`CoinWitnessProvider`]).
+#[derive(Debug, Clone)]
+pub struct CoinWitnessData {
+    pub one_time_key: Vec<u8>,
+    pub found: bool,
+    pub leaf_index: u64,
+    pub auth_path: Vec<Vec<u8>>,
+}
+
+/// One enumerated domain coin (see [`CoinWitnessProvider::list_domain_coins`]).
+#[derive(Debug, Clone)]
+pub struct DomainCoinData {
+    pub address: Vec<u8>,
+    pub one_time_key: Vec<u8>,
+    pub commitment: Vec<u8>,
+    pub memo: Vec<u8>,
+}
+
+/// Node-side backing for the lattice confidential-transaction wallet RPCs
+/// (`GetCoinSpendWitness` / `ListDomainCoins`). Implemented by the layer that
+/// holds the live `HypergraphState` (so it can rebuild the coin accumulator),
+/// and injected into the RPC server like the other store providers.
+pub trait CoinWitnessProvider: Send + Sync {
+    /// `(depth, root, per-key witnesses)` for a lattice spend.
+    fn coin_spend_witnesses(
+        &self,
+        domain: &[u8],
+        one_time_keys: &[Vec<u8>],
+    ) -> Result<(u32, Vec<u8>, Vec<CoinWitnessData>)>;
+
+    /// Enumerate the domain's committed coins (for wallet scanning).
+    fn list_domain_coins(&self, domain: &[u8]) -> Result<Vec<DomainCoinData>>;
+}
+
 pub trait HypergraphStore: Send + Sync {
     fn new_transaction(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
 
@@ -662,6 +696,108 @@ pub trait HypergraphStore: Send + Sync {
         shard_key: &ShardKey,
         callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
     ) -> Result<usize>;
+
+    // -------------------------------------------------------------------
+    // Versioned (MVCC) blob store + root→version index + split-app manifest.
+    // See crates/quil-hypergraph/VERSIONED_SNAPSHOT_SYNC.md. Default impls make
+    // the versioned store degrade to the legacy unversioned behavior so mocks
+    // and alternate backends compile unchanged; RocksHypergraphStore overrides
+    // them with real MVCC semantics.
+    // -------------------------------------------------------------------
+
+    /// Persist a vertex blob at a specific per-`(shard,phase)` commit `version`,
+    /// staged into `txn`. The read path (`load_vertex_underlying_at`) resolves
+    /// the latest write with version ≤ a requested version.
+    fn save_vertex_underlying_versioned(
+        &self,
+        txn: &dyn Transaction,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        vertex_key: &[u8],
+        data: &[u8],
+        _version: u64,
+    ) -> Result<()> {
+        // Default: fall back to the unversioned write (latest-only).
+        self.save_vertex_underlying(txn, set_type, phase_type, shard_key, vertex_key, data)
+    }
+
+    /// MVCC read: the blob for `vertex_key` as-of `version` (latest write ≤ V).
+    fn load_vertex_underlying_at(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        vertex_key: &[u8],
+        _version: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        // Default: no versioning — return the latest.
+        self.load_vertex_underlying_raw(set_type, phase_type, shard_key, vertex_key)
+    }
+
+    /// Record `root_hash → (version, global_frame)` for a `(shard, phase)` tree,
+    /// staged into `txn`. Written atomically with the tree/blob commit so any
+    /// committed root resolves to the local version that can fully serve it.
+    fn put_root_version(
+        &self,
+        _txn: &dyn Transaction,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_id: &[u8],
+        _root_hash: &[u8],
+        _version: u64,
+        _frame_number: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Resolve a `(shard, phase)` tree root → `(version, global_frame)` on this
+    /// node. `None` if this node never committed that root (behind or pruned).
+    fn get_root_version(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_id: &[u8],
+        _root_hash: &[u8],
+    ) -> Result<Option<(u64, u64)>> {
+        Ok(None)
+    }
+
+    /// Record a split app's `app_root → [(prefix, sub_root, version)]` manifest,
+    /// staged into `txn`, so a sync-by-hash of the aggregate root can be split
+    /// into per-sub-shard syncs. `entries` are `(prefix_bytes, sub_root(32), ver)`.
+    fn put_app_manifest(
+        &self,
+        _txn: &dyn Transaction,
+        _set_type: &str,
+        _phase_type: &str,
+        _app_address: &[u8],
+        _app_root: &[u8],
+        _entries: &[(Vec<u8>, [u8; 32], u64)],
+        _frame_number: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Resolve a split app's `app_root` → its sub-shard manifest on this node.
+    fn get_app_manifest(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _app_address: &[u8],
+        _app_root: &[u8],
+    ) -> Result<Option<Vec<(Vec<u8>, [u8; 32], u64)>>> {
+        Ok(None)
+    }
+
+    /// Prune superseded versioned state older than the 2-epoch retention
+    /// watermark derived from `cull_frame` (the versioned blob keyspace, the
+    /// `root→version` index, and split-app manifests). Returns per-tree
+    /// `(shard_id, phase_idx, min_readable_version)` so the caller can prune the
+    /// matching forest trees in lockstep. Default: no-op (unversioned backends).
+    fn prune_versioned(&self, _cull_frame: u64) -> Result<Vec<(Vec<u8>, usize, u64)>> {
+        Ok(Vec::new())
+    }
 
     fn apply_snapshot(&self, db_path: &str) -> Result<()>;
 

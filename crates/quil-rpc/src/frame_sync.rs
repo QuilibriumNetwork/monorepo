@@ -10,7 +10,7 @@
 //! What this module is *not*:
 //! - Not a backward chain walker. Non-archive nodes don't store full history.
 //! - Not the prover tree syncer. That's `HypergraphComparisonService.PerformSync`,
-//!   which is a 4-phase CRDT walk and lives in a separate module (TBD).
+//! which is a 4-phase CRDT walk and lives in a separate module (TBD).
 //!
 //! Architecture mirror:
 //! - Go: `pollFramesFromArchive` (lines 2161-2231)
@@ -253,7 +253,7 @@ impl Default for ArchivePollerConfig {
 pub async fn run_archive_poller(
     pool: Arc<ArchiveEndpointPool>,
     clock_store: Arc<RocksClockStore>,
-    ed448_seed: [u8; 57],
+    falcon_signing_key: Vec<u8>,
     mut config: ArchivePollerConfig,
     cancel: CancellationToken,
 ) {
@@ -299,6 +299,29 @@ pub async fn run_archive_poller(
     let mut last_heartbeat = tokio::time::Instant::now();
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
+    // Unfillable-gap detection for forward-fill. A single frame that NO
+    // committee archive will ever serve — e.g. a hole left when the whole
+    // archive fleet was restarted together and the re-bootstrapped chain
+    // never produced that number — otherwise wedges catch-up FOREVER: the
+    // loop breaks at `bad`, rotates endpoints, and retries `bad` every 5s
+    // against peer after peer, all returning NotFound, never advancing past
+    // it. We track the stuck frame and the DISTINCT endpoints that have
+    // returned NotFound for it; once enough distinct archives agree it's
+    // missing AND the network head is well beyond it (so it's not merely
+    // "not produced yet"), we abandon it — advance `last_frame` past the
+    // hole so catch-up proceeds to the frames that DO exist. Only a genuine
+    // `NotFound` counts; transient errors/timeouts never trip the skip.
+    let mut stall_frame: Option<u64> = None;
+    let mut stall_endpoints: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Distinct archives that must independently report NotFound for the same
+    // frame before we treat it as a permanent hole.
+    const UNFILLABLE_DISTINCT_ENDPOINTS: usize = 3;
+    // The head must be at least this far past the stuck frame before we skip
+    // it — a recently-produced frame that's briefly unavailable is served by
+    // its producer within a few frames, so a large lag means "permanent".
+    const UNFILLABLE_HEAD_MARGIN: u64 = 16;
+
     let mut ticker = tokio::time::interval(config.poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -311,7 +334,7 @@ pub async fn run_archive_poller(
         // Acquire a working client.
         if current_client.is_none() {
             if let Some(addr) = pool.next().await {
-                match ArchiveClient::connect_mtls(&addr, &ed448_seed).await {
+                match ArchiveClient::connect_mtls(&addr, &falcon_signing_key).await {
                     Ok(c) => {
                         info!(%addr, "archive poller connected");
                         current_client = Some((addr, c));
@@ -421,6 +444,11 @@ pub async fn run_archive_poller(
             // catch-up permanently, which is exactly the "far-behind node
             // never catches up" symptom.
             let mut failed_frame: Option<u64> = None;
+            // Whether the failure was a genuine gRPC NotFound (the peer
+            // affirmatively has no such frame), as opposed to a transient
+            // transport error / timeout. Only NotFound counts toward
+            // declaring a frame permanently unfillable.
+            let mut failed_not_found = false;
             for fn_ in (last_frame + 1)..new_number {
                 match tokio::time::timeout(
                     config.call_timeout,
@@ -454,6 +482,10 @@ pub async fn run_archive_poller(
                     }
                     Ok(Err(e)) => {
                         warn!(%addr, frame = fn_, error = %e, "catchup fetch error");
+                        failed_not_found = matches!(
+                            &e,
+                            ArchiveClientError::Rpc(s) if s.code() == tonic::Code::NotFound
+                        );
                         failed_frame = Some(fn_);
                         break;
                     }
@@ -465,6 +497,43 @@ pub async fn run_archive_poller(
                 }
             }
             if let Some(bad) = failed_frame {
+                // Track distinct archives that report this exact frame as a
+                // genuine NotFound. A new stuck frame resets the tally.
+                if stall_frame != Some(bad) {
+                    stall_frame = Some(bad);
+                    stall_endpoints.clear();
+                }
+                if failed_not_found {
+                    stall_endpoints.insert(addr.clone());
+                }
+
+                // Abandon a permanently-unfillable gap. When enough DISTINCT
+                // archives have each affirmatively returned NotFound for the
+                // same frame, and the network head sits well beyond it, no
+                // peer will ever serve it (a hole from a coordinated fleet
+                // restart the re-bootstrapped chain never produced). Retrying
+                // forever wedges catch-up at `bad` and never reaches the
+                // frames that DO exist. Skip it: advance `last_frame` past the
+                // hole so the poller resumes at `bad + 1`. The separate
+                // record-gap backfill/scan still tracks the hole for any later
+                // fill; this only unblocks forward progress.
+                let head_far_past = new_number >= bad.saturating_add(UNFILLABLE_HEAD_MARGIN);
+                if stall_endpoints.len() >= UNFILLABLE_DISTINCT_ENDPOINTS && head_far_past {
+                    warn!(
+                        failed_frame = bad,
+                        head = new_number,
+                        distinct_endpoints = stall_endpoints.len(),
+                        skip_to = bad + 1,
+                        "catchup: frame is unfillable (NotFound across multiple archives, head far past) — abandoning gap and skipping past it"
+                    );
+                    last_frame = bad;
+                    stall_frame = None;
+                    stall_endpoints.clear();
+                    // Keep the current endpoint (it IS ahead and serving) and
+                    // continue straight into head processing / next fill.
+                    continue;
+                }
+
                 // `last_frame` already sits at the last good frame, so we
                 // resume from `bad` next tick — never redoing work. Rotate
                 // to a DIFFERENT endpoint (a mere missing/slow frame is not
@@ -478,6 +547,8 @@ pub async fn run_archive_poller(
                     failed_frame = bad,
                     resume_from = bad,
                     head = new_number,
+                    not_found = failed_not_found,
+                    distinct_notfound = stall_endpoints.len(),
                     "catchup stalled at frame; rotating endpoint and retrying from last good frame"
                 );
                 current_client = None;

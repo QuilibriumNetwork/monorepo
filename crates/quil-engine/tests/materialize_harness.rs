@@ -64,8 +64,6 @@ impl MaterializeHarness {
             inclusion_prover.clone(),
             stubs.key_manager.clone(),
             crdt.clone(),
-            stubs.bulletproof_prover.clone(),
-            stubs.decaf_constructor.clone(),
             stubs.circuit_compiler.clone(),
             clock_store.clone() as Arc<dyn ClockStore>,
             hg_resolver,
@@ -340,7 +338,7 @@ fn shard_split_bytes(shard_address: &[u8], proposer: &[u8; 32]) -> Vec<u8> {
         proposed_shards: vec![c0, c1],
         frame_number: 1,
         public_key_signature_bls48581: Some(AddressedSignature {
-            signature: vec![0u8; 74],
+            signature: vec![0u8; 666],
             address: proposer.to_vec(),
         }),
     }
@@ -356,7 +354,7 @@ fn shard_merge_bytes(parent: &[u8], children: &[Vec<u8>], proposer: &[u8; 32]) -
         parent_address: parent.to_vec(),
         frame_number: 1,
         public_key_signature_bls48581: Some(AddressedSignature {
-            signature: vec![0u8; 74],
+            signature: vec![0u8; 666],
             address: proposer.to_vec(),
         }),
     }
@@ -463,9 +461,9 @@ fn pending_split_freezes_joins_to_affected_shard_until_e2() {
             filters: vec![filter],
             frame_number: frame,
             public_key_signature_bls48581: Some(SignatureWithPop {
-                signature: vec![0u8; 74],
-                public_key: Some(vec![0xABu8; 585]),
-                pop_signature: vec![0u8; 74],
+                signature: vec![0u8; 666],
+                public_key: Some(vec![0xABu8; 897]),
+                pop_signature: vec![0u8; 666],
             }),
             delegate_address: vec![],
             merge_targets: vec![],
@@ -574,7 +572,7 @@ fn split_at_e2_reassigns_active_prover_to_deterministic_child() {
 
     // Sanity: the registry sees the data prover on the parent shard.
     assert_eq!(
-        registry.get_active_provers(&parent).unwrap().len(),
+        registry.get_active_provers(&parent, 0).unwrap().len(),
         1,
         "data prover must be active on the parent shard"
     );
@@ -660,8 +658,8 @@ fn merge_at_e2_reassigns_active_provers_to_parent() {
     let (a_addr, a_child_alloc) = seed_data_prover(&state, &hg_store, &registry, &a_pk, &child1);
     let (_b_addr, b_child_alloc) = seed_data_prover(&state, &hg_store, &registry, &b_pk, &child0);
 
-    assert_eq!(registry.get_active_provers(&child1).unwrap().len(), 1, "A on child1");
-    assert_eq!(registry.get_active_provers(&child0).unwrap().len(), 1, "B on child0");
+    assert_eq!(registry.get_active_provers(&child1, 0).unwrap().len(), 1, "A on child1");
+    assert_eq!(registry.get_active_provers(&child0, 0).unwrap().len(), 1, "B on child0");
 
     // Stage the merge (epoch 0 → effective epoch 2) and apply at E+2.
     gi.invoke_step(1, &shard_merge_bytes(&parent, &[child0.clone(), child1.clone()], &proposer), &state)
@@ -713,9 +711,9 @@ fn build_join_op(pubkey: &[u8], filter: &[u8], frame: u64) -> Vec<u8> {
         filters: vec![filter.to_vec()],
         frame_number: frame,
         public_key_signature_bls48581: Some(SignatureWithPop {
-            signature: vec![0u8; 74],
+            signature: vec![0u8; 666],
             public_key: Some(pubkey.to_vec()),
-            pop_signature: vec![0u8; 74],
+            pop_signature: vec![0u8; 666],
         }),
         delegate_address: vec![],
         merge_targets: vec![],
@@ -732,7 +730,7 @@ fn invoke_join_rejects_previously_kicked_prover() {
     use quil_execution::global_intrinsic::materialize::prover_address_from_pubkey;
     let quil = quil_execution::domains::QUIL_TOKEN;
     let (gi, state, _ss, _reg, _hg) = split_fixture();
-    let pubkey = vec![0xABu8; 585];
+    let pubkey = vec![0xABu8; 897];
     let prover_addr = prover_address_from_pubkey(&pubkey).unwrap();
 
     // Seed a KICKED prover vertex at its canonical address.
@@ -757,7 +755,7 @@ fn invoke_join_rejects_rejoin_while_allocation_still_active() {
     use quil_execution::global_intrinsic::materialize::{allocation_address, prover_address_from_pubkey};
     let quil = quil_execution::domains::QUIL_TOKEN;
     let (gi, state, _ss, _reg, _hg) = split_fixture();
-    let pubkey = vec![0xACu8; 585];
+    let pubkey = vec![0xACu8; 897];
     let prover_addr = prover_address_from_pubkey(&pubkey).unwrap();
     let filter = quil.to_vec();
     let va = quil_execution::hypergraph_state::vertex_adds_discriminator().unwrap();
@@ -797,7 +795,7 @@ fn invoke_join_preserves_existing_seniority_via_max() {
     use quil_execution::global_intrinsic::materialize::prover_address_from_pubkey;
     let quil = quil_execution::domains::QUIL_TOKEN;
     let (gi, state, _ss, _reg, _hg) = split_fixture();
-    let pubkey = vec![0xADu8; 585];
+    let pubkey = vec![0xADu8; 897];
     let prover_addr = prover_address_from_pubkey(&pubkey).unwrap();
     let va = quil_execution::hypergraph_state::vertex_adds_discriminator().unwrap();
 

@@ -15,10 +15,10 @@ use quil_types::error::Result;
 /// locally-recomputed root matches `expected_root` after sync.
 ///
 /// Implementations should:
-///   1. Connect to an archive endpoint (mTLS)
-///   2. Pull the prover tree via `ensure_prover_tree_incremental`
-///      with `expected_root` pinned
-///   3. Return whether the final root matches
+/// 1. Connect to an archive endpoint (mTLS)
+/// 2. Pull the prover tree via `ensure_prover_tree_incremental`
+/// with `expected_root` pinned
+/// 3. Return whether the final root matches
 #[async_trait]
 pub trait ProverTreeSyncer: Send + Sync {
     /// Sync the global prover tree, pinning to `expected_root`.

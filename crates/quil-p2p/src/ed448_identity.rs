@@ -131,7 +131,7 @@ pub fn derive_public_key(seed: &[u8; 57]) -> Vec<u8> {
 ///
 /// ```text
 /// seed = SHAKE256(real_priv || "/worker/<core_id>")[:64]
-/// key  = Ed448(seed)
+/// key = Ed448(seed)
 /// ```
 ///
 /// The synthetic key is used as the worker's libp2p host identity

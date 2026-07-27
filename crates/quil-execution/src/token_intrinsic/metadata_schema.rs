@@ -4,16 +4,16 @@
 //!
 //! Fields on `config:TokenConfiguration`:
 //!
-//! | Order | Field                | Size (bytes) | RDF type   |
+//! | Order | Field | Size (bytes) | RDF type   |
 //! |-------|----------------------|--------------|------------|
-//! | 0     | Behavior             | 2            | Uint       |
-//! | 1     | MintStrategy         | 701          | ByteArray  |
-//! | 2     | Units                | 32           | ByteArray  |
-//! | 3     | Supply               | 32           | ByteArray  |
-//! | 4     | Name                 | 64           | String     |
-//! | 5     | Symbol               | 8            | String     |
-//! | 6     | AdditionalReference  | 64           | ByteArray  |
-//! | 7     | OwnerPublicKey       | 585          | ByteArray  |
+//! | 0 | Behavior             | 2            | Uint       |
+//! | 1 | MintStrategy         | 701          | ByteArray  |
+//! | 2 | Units                | 32           | ByteArray  |
+//! | 3 | Supply               | 32           | ByteArray  |
+//! | 4 | Name                 | 64           | String     |
+//! | 5 | Symbol               | 8            | String     |
+//! | 6 | AdditionalReference  | 64           | ByteArray  |
+//! | 7 | OwnerPublicKey       | 585          | ByteArray  |
 //!
 //! This module exposes a helper `field_key(name) -> Vec<u8>` built on
 //! top of the shared `order_to_key` encoder from `global_schema`.
@@ -53,7 +53,7 @@ pub const OUTER_CONFIG_KEY: [u8; 1] = [16u8 << 2]; // 0x40
 /// `unpackAndVerifyTokenConfigurationMetadata`:
 ///
 /// 1. Load `[domain || HYPERGRAPH_METADATA_ADDRESS]` vertex data (outer
-///    tree serialized blob).
+/// tree serialized blob).
 /// 2. Deserialize as a `VectorCommitmentTree`.
 /// 3. Read key `[0x40]` → serialized inner tree bytes.
 /// 4. Deserialize the inner tree.

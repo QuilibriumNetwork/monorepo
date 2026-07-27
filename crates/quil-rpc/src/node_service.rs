@@ -50,6 +50,9 @@ pub struct NodeRpcServer {
     pub shard_info_provider: Option<Arc<dyn ShardInfoProvider>>,
     pub clock_store: Option<Arc<dyn ClockStore>>,
     pub hypergraph_store: Option<Arc<dyn quil_types::store::HypergraphStore>>,
+    /// Lattice confidential-transaction wallet support (coin accumulator
+    /// witnesses + coin enumeration).
+    pub coin_witness_provider: Option<Arc<dyn quil_types::store::CoinWitnessProvider>>,
     pub submit_handler: Option<UserSubmitHandler>,
     /// Optional Prometheus text-format snapshot handle. When present,
     /// `get_metrics` returns the rendered text as response bytes.
@@ -152,6 +155,7 @@ impl NodeRpcServer {
             shard_info_provider: None,
             clock_store: None,
             hypergraph_store: None,
+            coin_witness_provider: None,
             submit_handler: None,
             metrics_renderer: None,
             worker_control: None,
@@ -210,6 +214,13 @@ impl NodeRpcServer {
         store: Arc<dyn quil_types::store::HypergraphStore>,
     ) -> Self {
         self.hypergraph_store = Some(store);
+        self
+    }
+    pub fn with_coin_witness_provider(
+        mut self,
+        provider: Arc<dyn quil_types::store::CoinWitnessProvider>,
+    ) -> Self {
+        self.coin_witness_provider = Some(provider);
         self
     }
     pub fn with_submit_handler(mut self, handler: UserSubmitHandler) -> Self {
@@ -519,6 +530,56 @@ impl NodeService for NodeRpcServer {
             legacy_coins: Vec::new(),
             transactions,
             pending_transactions,
+        }))
+    }
+
+    async fn get_coin_spend_witness(
+        &self,
+        request: Request<node::GetCoinSpendWitnessRequest>,
+    ) -> Result<Response<node::GetCoinSpendWitnessResponse>, Status> {
+        let provider = self.coin_witness_provider.as_ref().ok_or_else(|| {
+            Status::unavailable("coin witness provider not available")
+        })?;
+        let req = request.into_inner();
+        let (depth, root, witnesses) = provider
+            .coin_spend_witnesses(&req.domain, &req.one_time_keys)
+            .map_err(|e| Status::internal(format!("coin spend witness: {e}")))?;
+        Ok(Response::new(node::GetCoinSpendWitnessResponse {
+            depth,
+            root,
+            witnesses: witnesses
+                .into_iter()
+                .map(|w| node::CoinSpendWitness {
+                    one_time_key: w.one_time_key,
+                    leaf_index: w.leaf_index,
+                    auth_path: w.auth_path,
+                    found: w.found,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn list_domain_coins(
+        &self,
+        request: Request<node::ListDomainCoinsRequest>,
+    ) -> Result<Response<node::ListDomainCoinsResponse>, Status> {
+        let provider = self.coin_witness_provider.as_ref().ok_or_else(|| {
+            Status::unavailable("coin witness provider not available")
+        })?;
+        let req = request.into_inner();
+        let coins = provider
+            .list_domain_coins(&req.domain)
+            .map_err(|e| Status::internal(format!("list domain coins: {e}")))?;
+        Ok(Response::new(node::ListDomainCoinsResponse {
+            coins: coins
+                .into_iter()
+                .map(|c| node::DomainCoin {
+                    address: c.address,
+                    one_time_key: c.one_time_key,
+                    commitment: c.commitment,
+                    memo: c.memo,
+                })
+                .collect(),
         }))
     }
 

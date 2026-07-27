@@ -60,22 +60,30 @@ pub(crate) async fn start(
     // process owns its own RocksDB store (per `worker_path_prefix`)
     // and therefore its own crdt + execution manager.
     let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
-        Arc::new(quil_crypto::KzgInclusionProver);
-    let bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor> =
-        Arc::new(quil_crypto::Bls48581KeyConstructor);
+        Arc::new(quil_tries::ShaInclusionProver);
     let key_manager: Arc<dyn quil_types::crypto::KeyManager> =
-        Arc::new(quil_crypto::DefaultKeyManager::new(bls_constructor));
+        Arc::new(quil_crypto::DefaultKeyManager::new());
     let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
         hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
         inclusion_prover.clone(),
     ));
+    // Phase-3: commit state into the JMT forest. Install the persistent forest on
+    // a migrated OR brand-new/fresh worker store (a fresh worker builds on the
+    // persistent forest from the start rather than the ephemeral in-memory
+    // default). A store with un-migrated legacy state is skipped (must
+    // `--migrate-db`).
+    let store_is_fresh = clock_store
+        .get_latest_global_clock_frame()
+        .ok()
+        .and_then(|f| f.header.map(|h| h.frame_number))
+        .map(|n| n == 0)
+        .unwrap_or(true);
+    if quil_forest_migrate::install_forest_boot(crdt.as_ref(), hg_store.as_ref(), store_is_fresh) {
+        tracing::info!("Phase-3 JMT forest installed — committing state to the forest");
+    }
     // Same crypto setup as the master node — bulletproof is real;
     // Decaf / circuit compiler are still noop stubs pending production
     // impls. See the master block earlier in this file for rationale.
-    let bulletproof_prover_worker: Arc<dyn quil_types::crypto::BulletproofProver> =
-        Arc::new(quil_crypto::Decaf448BulletproofProver);
-    let decaf_constructor_worker: Arc<dyn quil_types::crypto::DecafConstructor> =
-        Arc::new(quil_execution::testing::NoopDecafConstructor);
     let circuit_compiler_worker: Arc<dyn quil_types::execution::CircuitCompiler> =
         Arc::new(quil_execution::testing::NoopCircuitCompiler);
     let clock_store_for_exec_worker: Arc<dyn quil_types::store::ClockStore> =
@@ -86,8 +94,6 @@ pub(crate) async fn start(
         inclusion_prover.clone(),
         key_manager.clone(),
         crdt.clone(),
-        bulletproof_prover_worker,
-        decaf_constructor_worker,
         circuit_compiler_worker,
         clock_store_for_exec_worker,
         hypergraph_resolver_worker,
@@ -95,7 +101,7 @@ pub(crate) async fn start(
     ));
 
     // Key management — same keys as master
-    let bls_ctor = quil_crypto::Bls48581KeyConstructor;
+    let bls_ctor = quil_crypto::FalconKeyConstructor;
     let keys_path = config.key.key_store_file.path.clone();
     let proving_key_id = if config.engine.proving_key_id.is_empty() {
         "q-prover-key".to_string()
@@ -109,7 +115,7 @@ pub(crate) async fn start(
         Box::new(bls_ctor),
     )?);
     file_key_manager.set_peer_priv_key_hex(&config.p2p.peer_priv_key);
-    let bls_pubkey = file_key_manager.get_public_key(quil_types::crypto::KeyType::Bls48581G1)?;
+    let bls_pubkey = file_key_manager.get_public_key(quil_types::crypto::KeyType::Falcon512)?;
     let prover_address = quil_crypto::poseidon::hash_bytes_to_32(&bls_pubkey)?;
 
     // Shared prover registry (syncs from store)
@@ -126,7 +132,7 @@ pub(crate) async fn start(
     let fkm = file_key_manager.clone();
     let signer_factory: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync> =
         Arc::new(move || {
-            fkm.get_signer(quil_types::crypto::KeyType::Bls48581G1)
+            fkm.get_signer(quil_types::crypto::KeyType::Falcon512)
                 .expect("BLS signer should be available")
         });
 
@@ -169,9 +175,14 @@ pub(crate) async fn start(
         );
     }
     let factory_endpoint = master_endpoint.clone();
+    // Worker dials the master's :8340 with the node's FALCON identity, so the
+    // handshake peer-id == the node's peer-id (the master's self-identity gate).
+    let worker_dialer_falcon_sk: Option<Vec<u8>> = file_key_manager
+        .get_private_key(quil_types::crypto::KeyType::Falcon512)
+        .ok();
     let channel_factory: quil_engine::worker_node::MasterChannelFactory = Arc::new(move || {
         let endpoint_str = factory_endpoint.clone();
-        let seed = worker_mtls_seed;
+        let seed = worker_dialer_falcon_sk.clone();
         Box::pin(async move {
             use tonic::transport::Endpoint;
             let endpoint = Endpoint::from_shared(endpoint_str)
@@ -181,10 +192,14 @@ pub(crate) async fn start(
                 .keep_alive_while_idle(true);
             match seed {
                 Some(seed) => {
-                    let client_config = quil_rpc::build_quil_client_config(&seed)
-                        .map_err(|e| Box::new(std::io::Error::other(format!("tls cfg: {}", e)))
-                            as Box<dyn std::error::Error + Send + Sync>)?;
-                    let connector = quil_rpc::QuilTlsConnector::new(client_config);
+                    // sntrup761 PQNoise (post-quantum), matching the master's
+                    // pqnoise-only :8340 acceptor. The worker dials with the
+                    // node's OWN Ed448 seed, so the handshake authenticates its
+                    // peer_id == the node's peer_id — which the master's
+                    // self-identity gate on worker-privileged RPCs enforces.
+                    // (Was Ed448/X.509 mTLS via QuilTlsConnector — a transport
+                    // mismatch against the pqnoise server + not post-quantum.)
+                    let connector = quil_rpc::QuilPqNoiseConnector::new(seed);
                     let channel = endpoint.connect_with_connector(connector).await
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                     Ok(channel)
@@ -226,7 +241,7 @@ pub(crate) async fn start(
         reward_greedy,
         min_active_provers_for_propose,
     )
-    .with_state_engines(crdt, exec_manager, inclusion_prover);
+    .with_state_engines(crdt.clone(), exec_manager, inclusion_prover);
 
     // Wire the prover-tree syncer so the worker can sync the global
     // prover tree from the master at startup and before materializing
@@ -234,26 +249,32 @@ pub(crate) async fn start(
     // `HyperSyncSelf` which dials the master's
     // HypergraphComparisonService. We reuse the master_endpoint (the
     // same one the gRPC message stream connects to — port 8340).
-    if let Some(seed) = worker_mtls_seed {
+    if worker_mtls_seed.is_some() {
         // Extract `host:port` from the master endpoint URL
-        // (`http://host:port`) for the syncer.
+        // (`http://host:port`) for the syncer. Dials with the Falcon network
+        // identity (the same one the master's :8340 acceptor expects).
         let stream_addr = master_endpoint_for_syncer
             .strip_prefix("http://")
             .unwrap_or(&master_endpoint_for_syncer)
             .to_string();
-        let syncer: Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer> =
-            Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
-                master_stream_addr: stream_addr,
-                hg_store: hg_store.clone(),
-                ed448_seed: seed,
-            });
-        worker_node = worker_node.with_prover_tree_syncer(syncer);
+        if let Ok(falcon_sk) =
+            file_key_manager.get_private_key(quil_types::crypto::KeyType::Falcon512)
+        {
+            let syncer: Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer> =
+                Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
+                    master_stream_addr: stream_addr,
+                    hg_store: hg_store.clone(),
+                    falcon_signing_key: falcon_sk,
+                    crdt: crdt.clone(),
+                });
+            worker_node = worker_node.with_prover_tree_syncer(syncer);
+        }
     } else {
         warn!("worker has no mTLS seed — prover-tree sync will be unavailable");
     }
 
     // Outbound pubsub. Two mutually exclusive modes:
-    //   * `engine.enable_master_proxy = true`  → dial the master's
+    //   * `engine.enable_master_proxy = true` → dial the master's
     //     PubSubProxy on the peer mTLS listener and route all pubsub
     //     through it. Used when one machine should be the only mesh
     //     participant (homogenous LAN layouts, gateway-style setups).
@@ -297,8 +318,15 @@ pub(crate) async fn start(
         Arc<quil_p2p::P2PHandle>,
         tokio::sync::mpsc::Receiver<quil_p2p::ReceivedMessage>,
     )> = if !config.engine.enable_master_proxy {
-        let p2p_node = quil_p2p::P2PNode::new_for_worker(&config.p2p, core_id)
-            .map_err(|e| anyhow::anyhow!("worker p2p node init: {}", e))?;
+        // Falcon q-prover-key = the node's real network identity; the worker
+        // signs pubsub as it (msg.from = real Falcon peer-id) while keeping a
+        // synthetic Ed448 host identity.
+        let worker_falcon_sk = file_key_manager
+            .get_private_key(quil_types::crypto::KeyType::Falcon512)
+            .map_err(|e| anyhow::anyhow!("worker load Falcon identity key: {}", e))?;
+        let p2p_node =
+            quil_p2p::P2PNode::new_for_worker(&config.p2p, core_id, Some(&worker_falcon_sk))
+                .map_err(|e| anyhow::anyhow!("worker p2p node init: {}", e))?;
         let worker_listen = quil_p2p::P2PNode::worker_listen_multiaddr(
             &config.engine,
             core_id,

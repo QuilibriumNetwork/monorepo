@@ -131,12 +131,12 @@ impl GlobalLeaderProvider {
     /// Mirrors Go's `consensus_leader_provider.go:256-307`:
     ///
     /// ```go
-    ///   requestTree := &tries.VectorCommitmentTree{}
-    ///   for _, msgData := range collectedMessages {
-    ///     id := sha3.Sum256(msgData)
-    ///     requestTree.Insert(id[:], msgData, nil, big.NewInt(0))
-    ///   }
-    ///   requestRoot := requestTree.Commit(inclusionProver, false)
+    /// requestTree := &tries.VectorCommitmentTree{}
+    /// for _, msgData := range collectedMessages {
+    /// id := sha3.Sum256(msgData)
+    /// requestTree.Insert(id[:], msgData, nil, big.NewInt(0))
+    /// }
+    /// requestRoot := requestTree.Commit(inclusionProver, false)
     /// ```
     ///
     /// Empty inputs yield the canonical empty-root `[0u8; 64]` produced
@@ -189,8 +189,13 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
 
         // Get provers ordered by VDF distance to the parent selector.
         // Empty filter = global chain (matches Go's `nil` filter).
-        let ordered_addresses =
-            self.prover_registry.get_ordered_provers(&parent_selector, &[])?;
+        // Committee/leader-rotation set for the frame being decided
+        // (parent + 1) — the epoch-aligned membership at that frame.
+        let ordered_addresses = self.prover_registry.get_ordered_provers(
+            &parent_selector,
+            &[],
+            prior.state.frame_number + 1,
+        )?;
 
         if ordered_addresses.is_empty() {
             return Err(QuilError::Consensus(
@@ -230,32 +235,37 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         &self,
         rank: u64,
         _filter: &[u8],
+        prior_frame_number: u64,
         prior_state_id: &Identity,
     ) -> Result<State<GlobalState>> {
         // ------------------------------------------------------------------
-        // 1. Resolve the prior frame via the latest QC
-        // ------------------------------------------------------------------
-        let latest_qc = self
-            .clock_store
-            .get_latest_quorum_certificate(&[])
-            .map_err(|e| {
-                tracing::debug!(error = %e, "could not fetch latest quorum certificate");
-                QuilError::Consensus(format!("could not fetch latest QC: {}", e))
-            })?;
-
-        let prior = if latest_qc.frame_number == 0 {
-            self.clock_store.get_global_clock_frame(latest_qc.frame_number)?
+        // 1. Resolve the prior frame the CONSENSUS layer chose to build on.
+        //
+        // `(prior_frame_number, prior_state_id)` come straight from the
+        // newest QC the pacemaker handed the state producer. We must build
+        // on EXACTLY that parent. Historically this re-read the clock
+        // store's OWN `get_latest_quorum_certificate`, but that QC can
+        // diverge from the consensus newest-QC — e.g. after a coordinated
+        // halt the clock store may still name an uncommitted candidate
+        // (frame N) that consensus has NOT adopted (its newest-QC is the
+        // committed head N-1), or a peer's candidate this node never
+        // received. Reading it there made the producer try to load a frame
+        // that isn't local (`frame N not found`) or build on a different
+        // parent than consensus asked for (a fork). Resolving purely from
+        // the passed parent removes that whole divergence class.
+        //
+        // Look up committed first, then the candidate keyed by the SAME
+        // consensus-chosen identity — so a holder can build on an
+        // uncommitted tip candidate, while a node that lacks it fails
+        // cleanly (skip + catch-up) instead of loading the wrong frame.
+        let prior = if prior_frame_number == 0 {
+            self.clock_store.get_global_clock_frame(0)?
         } else {
-            // Fetch the candidate frame that matches the QC's
-            // frame number + the caller's prior_state_id as selector.
-            // `prior_state_id` is already raw 32-byte Identity bytes
-            // (post-Tier-1 fix). Mirrors Go's `[]byte(priorState)` at
-            // `consensus_leader_provider.go:99-101`.
             self.clock_store
-                .get_global_clock_frame_candidate(latest_qc.frame_number, prior_state_id)
+                .get_global_clock_frame(prior_frame_number)
                 .or_else(|_| {
-                    // Fall back to the canonical frame at this number
-                    self.clock_store.get_global_clock_frame(latest_qc.frame_number)
+                    self.clock_store
+                        .get_global_clock_frame_candidate(prior_frame_number, prior_state_id)
                 })?
         };
 
@@ -264,36 +274,18 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         })?;
 
         // ------------------------------------------------------------------
-        // 2. Validate prior frame identity matches prior_state_id
+        // 2. Validate the resolved frame's identity matches what consensus
+        //    asked for. A mismatch means this node doesn't hold the parent
+        //    consensus wants (it needs to sync it) — a clean, recoverable
+        //    skip, not a fork.
         // ------------------------------------------------------------------
         let prior_identity = Self::frame_identity(prior_header);
         if prior_identity != *prior_state_id {
-            // Check if the QC itself matches -- could be a fork
-            let qc_id = Self::qc_identity(&latest_qc);
-            if qc_id == *prior_state_id {
-                if prior_header.rank < latest_qc.rank {
-                    return Err(QuilError::Consensus(format!(
-                        "needs sync: prior rank {} behind latest QC rank {}",
-                        prior_header.rank, latest_qc.rank,
-                    )));
-                }
-                if prior_header.frame_number == latest_qc.frame_number {
-                    return Err(QuilError::Consensus(format!(
-                        "fork detected at rank {} (local: {}, qc: {})",
-                        latest_qc.rank,
-                        hex::encode(&prior_identity),
-                        hex::encode(&qc_id),
-                    )));
-                }
-            }
-
             return Err(QuilError::Consensus(format!(
-                "building on fork or needs sync: frame {}, rank {}, parent_id: {}, \
-                 asked: rank {}, id: {}",
-                prior_header.frame_number,
-                prior_header.rank,
-                hex::encode(&prior_header.parent_selector),
-                rank,
+                "needs sync: local frame {} has identity {} but consensus parent is {} — \
+                 fetch the parent via catch-up and retry",
+                prior_frame_number,
+                hex::encode(&prior_identity),
                 hex::encode(prior_state_id),
             )));
         }
@@ -391,7 +383,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // ------------------------------------------------------------------
         // 5. Verify this node is an active prover and find our index
         // ------------------------------------------------------------------
-        let active_provers = self.prover_registry.get_active_provers(&[])?;
+        let active_provers = self.prover_registry.get_active_provers(&[], frame_number)?;
         let prover_index = active_provers
             .iter()
             .position(|p| p.address == self.local_prover_address);
@@ -422,12 +414,12 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // 7. VDF prove + sign — blocks for seconds.
         //
         // ProveGlobalFrameHeader internally computes
-        //   parent     = poseidon(previous_frame.output[:516])
-        //   challenge  = sha3(frame# || timestamp || difficulty ||
+        //   parent = poseidon(previous_frame.output[:516])
+        //   challenge = sha3(frame# || timestamp || difficulty ||
         //                     parent || commitments... || prover_root ||
         //                     request_root)
-        //   output     = WesolowskiSolve(challenge, difficulty)
-        //   signature  = signer.SignWithDomain(challenge||output, "global")
+        //   output = WesolowskiSolve(challenge, difficulty)
+        //   signature = signer.SignWithDomain(challenge||output, "global")
         //
         // shard `commitments` and `prover_root` here are still
         // placeholders pending Tier 2 wiring of the materializer's
@@ -437,6 +429,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         let prover_index_u8 = prover_index.map(|i| i as u8).unwrap_or(0);
         let commitments: Vec<Vec<u8>> = Vec::new();
         let prover_root: Vec<u8> = Vec::new();
+        let prove_start = std::time::Instant::now();
         let header = self.frame_prover.prove_global_frame_header(
             prior_header,
             &commitments,
@@ -447,6 +440,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             difficulty as u32,
             prover_index_u8,
         )?;
+        crate::metrics::record_vdf_prove_duration(prove_start.elapsed().as_secs_f64());
 
         // ------------------------------------------------------------------
         // 9. Assemble GlobalState

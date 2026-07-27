@@ -53,7 +53,9 @@ fn main() {
     // Global shard = empty filter.
     // Use the inherent method (returns Vec<&ProverInfo>); the trait
     // returns owned Vec<ProverInfo> with QuilResult — either works.
-    let active = reg.get_active_provers(&[]);
+    // Diagnostic snapshot at frame 0 (the empty/global filter is exempt from
+    // epoch obligations, so Active-byte allocations show regardless of frame).
+    let active = reg.get_active_provers(&[], 0);
     println!("active provers under global filter: {}", active.len());
     let mut total_weight: u64 = 0;
     for (i, p) in active.iter().enumerate() {

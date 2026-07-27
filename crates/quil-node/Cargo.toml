@@ -30,9 +30,14 @@ quil-p2p = { path = "../quil-p2p" }
 quil-consensus = { path = "../quil-consensus" }
 quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-engine = { path = "../quil-engine" }
+# Commonware simplex consensus backend (P2 cutover): committee assembly + the
+# channel Message types for the :8340 inbound routing.
+quil-cw-consensus = { path = "../quil-cw-consensus" }
 quil-rpc = { path = "../quil-rpc" }
 quil-explorer = { path = "../quil-explorer" }
 quil-tries = { path = "../quil-tries" }
+quil-forest-migrate = { path = "../quil-forest-migrate" }
+quil-forest = { path = "../quil-forest" }
 prost = "0.13"
 tonic = "0.12"
 hex = "0.4"
@@ -55,6 +60,14 @@ sha3 = "0.10"
 num-bigint = "0.4"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+# Peer-gRPC request-count middleware (rpc_metrics.rs) — versions match what
+# tonic 0.12 already pulls transitively, so no new dependency trees.
+tower = "0.4"
+http = "1"
+# Live metrics dashboard (`--metrics-tui`, metrics_tui.rs).
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 async-stream = "0.3"
 parking_lot = "0.12"

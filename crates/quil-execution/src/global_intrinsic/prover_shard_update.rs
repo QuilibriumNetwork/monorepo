@@ -83,6 +83,75 @@ pub fn verify_frame_header_attestation(
     bls: &dyn quil_types::crypto::BlsConstructor,
     active_provers: &[ProverInfo],
 ) -> Result<Vec<u8>> {
+    // CW path: a commonware-simplex-finalized shard frame carries no
+    // BLS aggregate — its `public_key_signature_bls48581` field holds the
+    // magic-prefixed simplex FINALIZATION certificate instead. Verify it against
+    // the shard committee (the active provers' Falcon keys) + the frame's VDF,
+    // and read the participant set (signers) off the cert.
+    if let Some(cert_bytes) =
+        quil_cw_consensus::app_cert::unwrap_cert_from_header(&frame_header.public_key_signature_bls48581)
+    {
+        // Proof-of-time over the header. Storage attestation is always-on: a
+        // frame anchored to a real global frame (`global_frame_number > 0`) is a
+        // storage frame whose `output` is the deterministic ρ_N-bound value
+        // (`deterministic_app_frame_output`, a SHA3 hash) — NOT a Wesolowski
+        // VDF. Only genesis/no-chain frames (== 0) carry the legacy app-shard
+        // VDF, so only they are VDF-verified (mirroring `frame_validator.rs`).
+        // For storage frames the output integrity is guaranteed instead by the CW
+        // finalization cert (which signs `poseidon(output)`, verified below
+        // against the committee) plus the ρ_N storage-attestation audit
+        // (`audit_storage_attestation`) the caller runs after this.
+        if frame_header.global_frame_number == 0 {
+            let vdf_proto = quil_types::proto::global::FrameHeader {
+                address: frame_header.address.clone(),
+                frame_number: frame_header.frame_number,
+                rank: frame_header.rank,
+                timestamp: frame_header.timestamp,
+                difficulty: frame_header.difficulty,
+                output: frame_header.output.clone(),
+                parent_selector: frame_header.parent_selector.clone(),
+                requests_root: frame_header.requests_root.clone(),
+                state_roots: frame_header.state_roots.clone(),
+                prover: frame_header.prover.clone(),
+                fee_multiplier_vote: frame_header.fee_multiplier_vote as u64,
+                public_key_signature_bls48581: None,
+                storage_attestation_root: frame_header.storage_attestation_root.clone(),
+                global_frame_number: frame_header.global_frame_number,
+                storage_attestation: frame_header.storage_attestation.clone(),
+            };
+            frame_prover.verify_frame_header(&vdf_proto)?;
+        }
+
+        // Verify the finalization cert against the shard committee. Namespace =
+        // b"appshard" ++ app_address; the app address is the header address.
+        let mut namespace = b"appshard".to_vec();
+        namespace.extend_from_slice(&frame_header.address);
+        let committee_pubkeys: Vec<Vec<u8>> =
+            active_provers.iter().map(|p| p.public_key.clone()).collect();
+        let output_digest = quil_crypto::poseidon::hash_bytes_to_32(&frame_header.output)
+            .map_err(|e| QuilError::Crypto(format!("cw cert: poseidon(output): {e}")))?;
+        let signer_pubkeys = quil_cw_consensus::app_cert::verify_finalization(
+            cert_bytes,
+            &committee_pubkeys,
+            &namespace,
+            output_digest,
+        )
+        .ok_or_else(|| {
+            QuilError::InvalidSignature(
+                "frame header attestation: CW finalization cert invalid / below quorum".into(),
+            )
+        })?;
+
+        // Build the participant bitmask: index of each signer in the active set.
+        let mut bitmask: Vec<u8> = Vec::new();
+        for pk in &signer_pubkeys {
+            if let Some(idx) = active_provers.iter().position(|p| &p.public_key == pk) {
+                quil_consensus::bitmask::set_bit(&mut bitmask, idx);
+            }
+        }
+        return Ok(bitmask);
+    }
+
     if frame_header.public_key_signature_bls48581.is_empty() {
         return Err(QuilError::InvalidArgument(
             "frame header attestation: missing aggregate signature".into(),
@@ -131,7 +200,13 @@ pub fn verify_frame_header_attestation(
         storage_attestation: frame_header.storage_attestation.clone(),
     };
 
-    frame_prover.verify_frame_header(&proto)?;
+    // Same storage-vs-legacy gate as the CW path above: a storage frame
+    // (`global_frame_number > 0`) carries a deterministic ρ_N-bound hash output,
+    // not a Wesolowski VDF, so `verify_frame_header` (→ `wesolowski_verify`) must
+    // not run on it. Legacy/genesis frames (== 0) keep the VDF check.
+    if frame_header.global_frame_number == 0 {
+        frame_prover.verify_frame_header(&proto)?;
+    }
 
     let participant_ids: Vec<Vec<u8>> = {
         let indices = quil_consensus::bitmask::set_bit_indices(&agg.bitmask)
@@ -160,11 +235,11 @@ pub fn verify_frame_header_attestation(
     // `vdf::wesolowski_verify_multi_sparse`.
     let committee_refs: Vec<&[u8]> =
         active_provers.iter().map(|p| p.address.as_slice()).collect();
-    // 74-byte aggregate = single signer, no multi-proofs to verify.
-    let ids_arg: Option<&[&[u8]]> = if agg.signature.len() == 74 {
+    // 666-byte signature = single signer, no multi-proofs to verify.
+    let ids_arg: Option<&[&[u8]]> = if agg.signature.len() == 666 {
         if participant_ids.len() != 1 {
             return Err(QuilError::InvalidSignature(
-                "frame header attestation: 74-byte signature requires exactly 1 participant".into(),
+                "frame header attestation: 666-byte signature requires exactly 1 participant".into(),
             ));
         }
         None
@@ -273,7 +348,7 @@ pub fn build_shard_update_context(
 ///
 /// Sort order (descending priority):
 /// 1. `JoinFrameNumber` ascending (fallback to `JoinConfirmFrameNumber`
-///    if Join is 0 and Confirm is set).
+/// if Join is 0 and Confirm is set).
 /// 2. `Seniority` descending.
 /// 3. Address bytes ascending.
 ///
@@ -367,17 +442,17 @@ pub fn validate_prover_shard_update(
 /// Arguments:
 /// - `frame_header`: the header being applied.
 /// - `current_frame_number`: the consensus-engine frame that contains
-///   this header (= `frame_header.frame_number + 1`).
+/// this header (= `frame_header.frame_number + 1`).
 /// - `state`: the hypergraph changeset.
 /// - `prover_registry`: used only in `build_shard_update_context`
-///   (via `active_provers` the caller supplies).
+/// (via `active_provers` the caller supplies).
 /// - `frame_prover`: used only in `build_shard_update_context` (via
-///   `participant_bitmask` the caller supplies).
+/// `participant_bitmask` the caller supplies).
 /// - `reward_issuance`: per-ring reward calculator.
 /// - `world_state_size`: `Hypergraph.GetSize(nil, nil)` — the full
-///   state size passed to the issuance calculator as `worldSize`.
+/// state size passed to the issuance calculator as `worldSize`.
 /// - `active_provers`, `participant_bitmask`, `shard_metadata`: the
-///   precomputed inputs (see `build_shard_update_context`).
+/// precomputed inputs (see `build_shard_update_context`).
 pub fn materialize_prover_shard_update(
     frame_header: &FrameHeader,
     current_frame_number: u64,
@@ -818,9 +893,9 @@ mod tests {
         struct NoopRegistry;
         impl ProverRegistry for NoopRegistry {
             fn get_prover_info(&self, _: &[u8]) -> Result<Option<ProverInfo>> { Ok(None) }
-            fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<u8>> { Ok(Vec::new()) }
-            fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
-            fn get_active_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
+            fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(Vec::new()) }
+            fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
+            fn get_active_provers(&self, _: &[u8], _: u64) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
             fn get_prover_count(&self, _: &[u8]) -> Result<usize> { Ok(0) }
             fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
             fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
@@ -913,9 +988,9 @@ mod tests {
         struct R;
         impl ProverRegistry for R {
             fn get_prover_info(&self, _: &[u8]) -> Result<Option<ProverInfo>> { Ok(None) }
-            fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<u8>> { Ok(Vec::new()) }
-            fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
-            fn get_active_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
+            fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(Vec::new()) }
+            fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
+            fn get_active_provers(&self, _: &[u8], _: u64) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
             fn get_prover_count(&self, _: &[u8]) -> Result<usize> { Ok(0) }
             fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
             fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
@@ -1133,12 +1208,12 @@ mod tests {
     //
     // These tests exercise the REAL materialize order, because the defect
     // lives in that order's interaction with the same-frame commit cache:
-    //   1. crdt.commit(N)                 [pre-reward: caches frame-N root]
+    //   1. crdt.commit(N) [pre-reward: caches frame-N root]
     //   2. apply_reward(N) + state.commit [drains reward INTO the CRDT tree
     //                                       → the global-intrinsic tree is
     //                                       now DIRTY, but its frame-N root is
     //                                       already cached]
-    //   3. crdt.commit_with_global_cursor(N)  [cursor batch — MUST also flush
+    //   3. crdt.commit_with_global_cursor(N) [cursor batch — MUST also flush
     //                                           the dirty reward nodes, or the
     //                                           cursor certifies rewards that
     //                                           only reach disk in a LATER,

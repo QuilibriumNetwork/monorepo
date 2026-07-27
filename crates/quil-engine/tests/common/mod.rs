@@ -62,8 +62,6 @@ pub fn build_test_exec_manager(
         inclusion_prover,
         stubs.key_manager.clone(),
         crdt,
-        stubs.bulletproof_prover,
-        stubs.decaf_constructor,
         stubs.circuit_compiler,
         stubs.clock_store,
         hg_resolver,
@@ -229,12 +227,12 @@ pub fn single_signer_agg_sig(
     member_pubkey: &[u8],
 ) -> quil_execution::hypergraph_intrinsic::canonical::AggregateSignature {
     use quil_types::crypto::BlsConstructor;
-    let bls = quil_crypto::Bls48581KeyConstructor;
+    let bls = quil_crypto::FalconKeyConstructor;
     let agg_pubkey = bls
         .aggregate_public_keys(&[member_pubkey])
         .expect("aggregate single member pubkey");
     quil_execution::hypergraph_intrinsic::canonical::AggregateSignature {
-        signature: vec![0u8; 74],
+        signature: vec![0u8; 666],
         public_key: Some(
             quil_execution::hypergraph_intrinsic::canonical::Bls48581G2PublicKey {
                 key_value: agg_pubkey,
@@ -278,7 +276,7 @@ impl Clone for TestProver {
 
 impl TestProver {
     pub fn generate() -> Self {
-        let ctor = quil_crypto::Bls48581KeyConstructor;
+        let ctor = quil_crypto::FalconKeyConstructor;
         let (signer, pubkey) = ctor.new_key().expect("bls keygen");
         let address = quil_crypto::poseidon::hash_bytes_to_32(&pubkey)
             .map(|h| h.to_vec())
@@ -291,7 +289,7 @@ impl TestProver {
     }
 
     pub fn signer_clone(&self) -> Box<dyn Signer> {
-        let ctor = quil_crypto::Bls48581KeyConstructor;
+        let ctor = quil_crypto::FalconKeyConstructor;
         ctor.from_bytes(self.bls_signer.private_key(), self.bls_signer.public_key())
             .expect("bls signer from bytes")
     }
@@ -391,7 +389,7 @@ pub fn build_signed_genesis_qc(
         pks.push(p.bls_pubkey.clone());
     }
 
-    let ctor = quil_crypto::Bls48581KeyConstructor;
+    let ctor = quil_crypto::FalconKeyConstructor;
     let pk_refs: Vec<&[u8]> = pks.iter().map(|v| v.as_slice()).collect();
     let sig_refs: Vec<&[u8]> = sigs.iter().map(|v| v.as_slice()).collect();
     let agg = ctor.aggregate(&pk_refs, &sig_refs).expect("bls aggregate");
@@ -544,450 +542,6 @@ impl InMemoryNetwork {
     }
 }
 
-/// `ConsensusPublisher` impl that funnels bytes through `InMemoryNetwork`.
-pub struct InMemoryPublisher {
-    network: Arc<InMemoryNetwork>,
-    sender_addr: Vec<u8>,
-}
-
-impl InMemoryPublisher {
-    pub fn new(network: Arc<InMemoryNetwork>, sender_addr: Vec<u8>) -> Self {
-        Self {
-            network,
-            sender_addr,
-        }
-    }
-}
-
-impl quil_engine::consensus_glue::ConsensusPublisher for InMemoryPublisher {
-    fn publish_frame(&self, data: Vec<u8>) {
-        // GLOBAL_FRAME bitmask carries the GlobalProposal canonical bytes.
-        self.network
-            .broadcast(&self.sender_addr, WireMsg::Proposal(data));
-    }
-    fn publish_consensus(&self, data: Vec<u8>) {
-        // GLOBAL_CONSENSUS carries GlobalProposal, ProposalVote, OR
-        // TimeoutState (mirror of main.rs:3280-3349). Production sends
-        // proposals on this bitmask too — `publish_frame` is reserved
-        // for a separate code path. Disambiguate via the type prefix.
-        if let Some(tp) = quil_engine::consensus_wire::peek_consensus_type(&data) {
-            if tp == quil_engine::consensus_wire::GLOBAL_PROPOSAL_TYPE {
-                self.network
-                    .broadcast(&self.sender_addr, WireMsg::Proposal(data));
-            } else if tp == quil_engine::consensus_wire::PROPOSAL_VOTE_TYPE {
-                self.network
-                    .broadcast(&self.sender_addr, WireMsg::Vote(data));
-            } else if tp == quil_engine::consensus_wire::TIMEOUT_STATE_TYPE {
-                self.network
-                    .broadcast(&self.sender_addr, WireMsg::Timeout(data));
-            }
-        }
-    }
-    fn publish_prover_message(&self, data: Vec<u8>) {
-        self.network
-            .broadcast(&self.sender_addr, WireMsg::Prover(data));
-    }
-}
-
-// ===================================================================
-// NodeRig — per-node bundle of handle + aggregators + inbound task.
-// ===================================================================
-
-pub struct NodeRig {
-    pub prover: TestProver,
-    pub handle: quil_consensus::event_loop::EventLoopHandle<
-        quil_engine::consensus_types::GlobalState,
-        quil_engine::consensus_types::GlobalVote,
-    >,
-    pub clock_store: Arc<InMemoryClockStore>,
-    pub finalized: Arc<Mutex<Vec<u64>>>,
-    pub vote_agg: Arc<quil_engine::vote_aggregation::VoteAggregation>,
-    pub timeout_agg: Arc<quil_engine::timeout_aggregation::TimeoutAggregation>,
-    pub message_collector: Arc<quil_engine::message_collector::MessageCollector>,
-    pub finalized_frames: Arc<Mutex<Vec<gpb::GlobalFrame>>>,
-}
-
-/// Build one node's rig and spawn its inbound consensus message
-/// processor. The processor consumes `WireMsg`s from `inbox_rx`,
-/// decodes them into typed values, and forwards to the appropriate
-/// handle / aggregator.
-pub fn build_node(
-    prover: TestProver,
-    all_provers: &[quil_types::consensus::ProverInfo],
-    genesis: gpb::GlobalFrame,
-    genesis_qc: quil_engine::consensus_wire::QuorumCertificate,
-    network: Arc<InMemoryNetwork>,
-    inbox_rx: mpsc::UnboundedReceiver<WireMsg>,
-) -> NodeRig {
-    let registry = Arc::new(TestProverRegistry::with_provers(all_provers.to_vec()));
-    let clock_store = Arc::new(InMemoryClockStore::new());
-    clock_store.seed_frame(genesis.clone());
-
-    // Also seed the QC into the clock store — the leader's
-    // `prove_next_state` reads `get_latest_quorum_certificate(filter)`
-    // when generating rank-N proposals. Without this seed, the event
-    // loop exits at startup with "could not fetch latest QC: no QC".
-    // Mirrors `genesis::establish_testnet_genesis_provers` line 391.
-    let proto_qc = gpb::QuorumCertificate {
-        filter: genesis_qc.filter.clone(),
-        rank: genesis_qc.rank,
-        frame_number: genesis_qc.frame_number,
-        selector: genesis_qc.selector.clone(),
-        timestamp: genesis_qc.timestamp,
-        aggregate_signature: Some(quil_types::proto::keys::Bls48581AggregateSignature {
-            public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
-                key_value: genesis_qc.aggregate_signature.public_key.clone(),
-            }),
-            signature: genesis_qc.aggregate_signature.signature.clone(),
-            bitmask: genesis_qc.aggregate_signature.bitmask.clone(),
-        }),
-    };
-    let qc_txn = clock_store.new_transaction(false).expect("new_transaction");
-    clock_store
-        .put_quorum_certificate(&proto_qc, qc_txn.as_ref())
-        .expect("seed genesis QC");
-    qc_txn.commit().expect("qc commit");
-
-    let frame_prover: Arc<dyn FrameProver> = Arc::new(StubFrameProver);
-    let difficulty_adjuster: Arc<dyn DifficultyAdjuster> = Arc::new(ConstDifficulty(100_000));
-    let message_collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
-    let inclusion_prover: Arc<dyn InclusionProver + Send + Sync> = Arc::new(NoopInclusionProver);
-
-    let publisher: Arc<dyn quil_engine::consensus_glue::ConsensusPublisher> = Arc::new(
-        InMemoryPublisher::new(network.clone(), prover.address.clone()),
-    );
-
-    let finalized: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
-    let finalized_frames: Arc<Mutex<Vec<gpb::GlobalFrame>>> = Arc::new(Mutex::new(Vec::new()));
-    let finalized_clone = finalized.clone();
-    let finalized_frames_clone = finalized_frames.clone();
-    let finalized_hook: quil_engine::consensus_glue::FinalizedStateHook = Arc::new(move |state| {
-        let app = &state.state;
-        finalized_clone.lock().push(app.frame_number);
-        let header = gpb::GlobalFrameHeader {
-            frame_number: app.frame_number,
-            rank: app.rank,
-            timestamp: app.timestamp,
-            difficulty: app.difficulty,
-            output: app.output.clone(),
-            parent_selector: app.parent_selector.clone(),
-            prover: app.prover.clone(),
-            prover_tree_commitment: app.prover_tree_commitment.clone(),
-            requests_root: app.requests_root.clone(),
-            ..Default::default()
-        };
-        let frame = gpb::GlobalFrame {
-            header: Some(header),
-            requests: app.messages.clone(),
-        };
-        finalized_frames_clone.lock().push(frame);
-    });
-
-    // Persist incorporated (forks-tree) frames as candidates so the
-    // leader can chain rank+1 proposals via
-    // `prove_next_state → get_global_clock_frame_candidate`.
-    // Mirror of main.rs:2467-2524.
-    let cs_for_inc = clock_store.clone();
-    let incorporated_hook: quil_engine::consensus_glue::IncorporatedStateHook =
-        Arc::new(move |state| {
-            let app = &state.state;
-            let header = gpb::GlobalFrameHeader {
-                frame_number: app.frame_number,
-                rank: app.rank,
-                timestamp: app.timestamp,
-                difficulty: app.difficulty,
-                output: app.output.clone(),
-                parent_selector: app.parent_selector.clone(),
-                prover: app.prover.clone(),
-                prover_tree_commitment: app.prover_tree_commitment.clone(),
-                requests_root: app.requests_root.clone(),
-                ..Default::default()
-            };
-            let frame = gpb::GlobalFrame {
-                header: Some(header),
-                requests: Vec::new(),
-            };
-            if let Ok(txn) = cs_for_inc.new_transaction(false) {
-                let _ = cs_for_inc.put_global_clock_frame_candidate(&frame, txn.as_ref());
-                let _ = txn.commit();
-            }
-        });
-
-    // Persist observed QCs so `get_latest_quorum_certificate` resolves
-    // to the freshest QC. Mirror of main.rs:2531-2584.
-    let cs_for_qc = clock_store.clone();
-    let qc_observed_hook: quil_engine::consensus_glue::QcObservedHook = Arc::new(move |qc| {
-        let proto_qc = gpb::QuorumCertificate {
-            filter: qc.filter().to_vec(),
-            rank: qc.rank(),
-            frame_number: qc.frame_number(),
-            selector: qc.identity().clone(),
-            timestamp: qc.timestamp(),
-            aggregate_signature: Some(quil_types::proto::keys::Bls48581AggregateSignature {
-                public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
-                    key_value: qc.aggregated_signature().public_key().to_vec(),
-                }),
-                signature: qc.aggregated_signature().signature().to_vec(),
-                bitmask: qc.aggregated_signature().bitmask().to_vec(),
-            }),
-        };
-        if let Ok(txn) = cs_for_qc.new_transaction(false) {
-            let _ = cs_for_qc.put_quorum_certificate(&proto_qc, txn.as_ref());
-            let _ = txn.commit();
-        }
-    });
-
-    let mut cfg = quil_engine::consensus_bootstrap::ConsensusConfig::default();
-    cfg.startup_delay = std::time::Duration::ZERO;
-    // Generous timing: proposal_duration is the cadence at which the
-    // leader emits a proposal; min_timeout is how long the loop
-    // waits for a quorum before declaring a local timeout. Keep
-    // min_timeout >> proposal_duration so the leader has many
-    // proposal opportunities before the round times out.
-    cfg.proposal_duration = std::time::Duration::from_millis(500);
-    cfg.min_timeout = std::time::Duration::from_secs(20);
-    cfg.max_timeout = std::time::Duration::from_secs(60);
-
-    let params = quil_engine::consensus_activation::ConsensusActivationParams {
-        prover_registry: registry.clone() as Arc<dyn ProverRegistry>,
-        frame_prover,
-        difficulty_adjuster,
-        clock_store: clock_store.clone() as Arc<dyn ClockStore>,
-        message_collector: message_collector.clone(),
-        local_prover_address: prover.address.clone(),
-        local_bls_pubkey: prover.bls_pubkey.clone(),
-        bls_signer: prover.signer_clone(),
-        inclusion_prover,
-        message_validator: None,
-        genesis_frame: genesis,
-        publisher: Some(publisher),
-        on_finalized_state: Some(finalized_hook),
-        on_incorporated_state: Some(incorporated_hook),
-        on_qc_observed: Some(qc_observed_hook),
-        on_missing_parent: std::sync::Arc::new(|| {}),
-        config_override: Some(cfg),
-        genesis_qc_override: Some(genesis_qc),
-        kv_db: None,
-    };
-
-    let activation =
-        quil_engine::consensus_activation::activate_consensus(params).expect("activate_consensus");
-    // Drive the event loop. In production this is handed to the
-    // supervisor; tests spawn it directly since they don't run a
-    // supervisor.
-    tokio::spawn(activation.run_future);
-
-    // Build vote + timeout aggregators (mirrors main.rs:2615-2638).
-    let handle_cell: Arc<
-        std::sync::OnceLock<
-            quil_consensus::event_loop::EventLoopHandle<
-                quil_engine::consensus_types::GlobalState,
-                quil_engine::consensus_types::GlobalVote,
-            >,
-        >,
-    > = Arc::new(std::sync::OnceLock::new());
-    let _ = handle_cell.set(activation.handle.clone());
-
-    let bls_ctor: Arc<dyn quil_types::crypto::BlsConstructor> =
-        Arc::new(quil_crypto::Bls48581KeyConstructor);
-    let vote_agg = Arc::new(quil_engine::vote_aggregation::VoteAggregation::new(
-        activation.committee.clone(),
-        activation.voting_provider.clone(),
-        handle_cell.clone(),
-        bls_ctor.clone(),
-        activation.vote_domain.clone(),
-    ));
-    let timeout_agg = Arc::new(quil_engine::timeout_aggregation::TimeoutAggregation::new(
-        activation.committee.clone(),
-        activation.voting_provider.clone(),
-        handle_cell.clone(),
-        bls_ctor,
-        activation.vote_domain.clone(),
-        activation.timeout_domain.clone(),
-    ));
-
-    // Spawn the inbound message processor. Mirrors main.rs:3280-3349 —
-    // decode by type prefix, route into handle.submit_* + aggregators.
-    let handle_for_recv = activation.handle.clone();
-    let va_for_recv = vote_agg.clone();
-    let ta_for_recv = timeout_agg.clone();
-    let mc_for_recv = message_collector.clone();
-    tokio::spawn(async move {
-        let mut rx = inbox_rx;
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                WireMsg::Proposal(data) => {
-                    if let Ok(wire) =
-                        quil_engine::consensus_wire::GlobalProposal::from_canonical_bytes(&data)
-                    {
-                        if let Ok((sp, qc, tc)) =
-                            quil_engine::consensus_types::wire_proposal_to_signed(wire)
-                        {
-                            handle_for_recv.submit_quorum_certificate(qc);
-                            if let Some(tc) = tc {
-                                handle_for_recv.submit_timeout_certificate(tc);
-                            }
-                            va_for_recv.handle_proposal(&sp);
-                            let h = handle_for_recv.clone();
-                            tokio::spawn(async move {
-                                h.submit_proposal(sp).await;
-                            });
-                        }
-                    }
-                }
-                WireMsg::Vote(data) => {
-                    if let Ok(wire) =
-                        quil_engine::consensus_wire::ProposalVote::from_canonical_bytes(&data)
-                    {
-                        let gv = quil_engine::vote_aggregation::wire_vote_to_global_vote(wire);
-                        va_for_recv.handle_vote(gv);
-                    }
-                }
-                WireMsg::Timeout(data) => {
-                    if let Ok(ts) =
-                        quil_engine::consensus_wire::TimeoutState::from_canonical_bytes(&data)
-                    {
-                        let qc = ts.latest_quorum_certificate.clone().into_trait_object();
-                        handle_for_recv.submit_quorum_certificate(qc);
-                        if let Some(tc) = ts.prior_rank_timeout_certificate.clone() {
-                            handle_for_recv.submit_timeout_certificate(tc.into_trait_object());
-                        }
-                        let typed = quil_engine::timeout_aggregation::wire_timeout_to_typed(ts);
-                        ta_for_recv.handle_timeout(typed);
-                    }
-                }
-                WireMsg::Prover(data) => {
-                    // GLOBAL_PROVER bitmask: prover-admin messages
-                    // (ProverJoin / ProverLeave / ProverConfirm /
-                    // ProverReject / ProverSeniorityMerge) — feed
-                    // into the local message_collector so the leader
-                    // includes them in the next proposal's
-                    // `requests`. Mirror of main.rs:3354-3357.
-                    //
-                    // Rank 0 ensures `collect_for_rank(N)` (which
-                    // drains all ranks <= N) picks it up at any
-                    // proposal rank.
-                    mc_for_recv.add_message(0, data);
-                }
-            }
-        }
-    });
-
-    NodeRig {
-        prover,
-        handle: activation.handle,
-        clock_store,
-        finalized,
-        vote_agg,
-        timeout_agg,
-        message_collector,
-        finalized_frames,
-    }
-}
-
-// ===================================================================
-// Multi-node harness
-// ===================================================================
-
-pub struct MultiNodeHarness {
-    pub network: Arc<InMemoryNetwork>,
-    pub nodes: Vec<NodeRig>,
-}
-
-impl MultiNodeHarness {
-    /// Build a harness with `n` archive nodes. The first prover is
-    /// the genesis proposer.
-    pub fn build_archives(n: usize) -> Self {
-        assert!(n >= 1, "need at least one archive");
-
-        // Generate provers; first is the genesis proposer. All provers
-        // get the SAME seniority so the leader-rotation path doesn't
-        // depend on the per-prover weight distribution — and so the
-        // peer-vote-only quorum threshold (excluding the leader's
-        // own vote, which never enters its local aggregator in the
-        // current architecture) is reached comfortably rather than
-        // exactly at the threshold boundary.
-        let provers: Vec<TestProver> = (0..n).map(|_| TestProver::generate()).collect();
-        let all_prover_infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
-
-        let genesis = build_genesis_frame(&provers[0]);
-        let genesis_qc = build_signed_genesis_qc(&provers, &genesis);
-        let network = InMemoryNetwork::new();
-
-        let mut nodes = Vec::with_capacity(n);
-        // Move each prover into the node rig.
-        for prover in provers {
-            let (tx, rx) = mpsc::unbounded_channel();
-            network.register(prover.address.clone(), tx);
-            let node = build_node(
-                prover,
-                &all_prover_infos,
-                genesis.clone(),
-                genesis_qc.clone(),
-                network.clone(),
-                rx,
-            );
-            nodes.push(node);
-        }
-
-        Self { network, nodes }
-    }
-
-    /// Wait up to `timeout` for every node to observe at least one
-    /// finalization. Returns true if all nodes finalized at least once.
-    pub async fn wait_for_finalization_all(&self, timeout: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            let all_finalized = self.nodes.iter().all(|n| !n.finalized.lock().is_empty());
-            if all_finalized {
-                return true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        false
-    }
-
-    /// Wait up to `timeout` for any node to finalize a frame whose
-    /// `requests` field contains at least `min_bundles` MessageBundle
-    /// entries. The injected prover message goes through:
-    ///   InMemoryNetwork → archive inbound task → message_collector.add_message
-    ///   → leader's `collect_for_rank` → state.with_messages → proposal
-    ///   → QC → 3-chain finalization → on_finalized_state hook
-    ///   → finalized_frames Vec
-    /// Asserting on the bundle count proves the full round-trip
-    /// without needing to deserialize the inner ProverJoin payload
-    /// (which would require valid BLS sigs / VDF outputs the test
-    /// doesn't construct).
-    pub async fn wait_for_finalized_bundles(
-        &self,
-        min_bundles: usize,
-        timeout: std::time::Duration,
-    ) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            for node in &self.nodes {
-                let frames = node.finalized_frames.lock();
-                let total: usize = frames.iter().map(|f| f.requests.len()).sum();
-                if total >= min_bundles {
-                    return true;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        false
-    }
-
-    /// Broadcast a canonical prover-admin message to all archive nodes'
-    /// message collectors. Mimics what a non-archive's
-    /// `prover_pipeline::publish_prover_message` does when its
-    /// payload crosses the wire on the GLOBAL_PROVER bitmask.
-    pub fn inject_prover_message(&self, data: Vec<u8>) {
-        // Use an empty sender address so broadcast delivers to ALL
-        // nodes (a non-archive's address is not registered with the
-        // network — the message effectively comes "from outside").
-        self.network.broadcast(&[], WireMsg::Prover(data));
-    }
-}
 
 // ===================================================================
 // Tests
@@ -1205,6 +759,8 @@ impl AppShardHarness {
             let bls_signer = prover.signer_clone();
             let deps = quil_engine::app_engine::AppEngineDeps {
                 clock_store: clock_store as Arc<dyn ClockStore>,
+                global_anchor_store: None,
+                storage_source_hypergraph: None,
                 prover_registry: registry.clone() as Arc<dyn ProverRegistry>,
                 frame_prover,
                 message_collector,
@@ -1231,6 +787,7 @@ impl AppShardHarness {
                     Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
                 ),
                 kv_db: kv_db_dep,
+                app_consensus_cw: false,
             };
 
             let (engine, handle) = quil_engine::app_engine::AppConsensusEngine::new(
@@ -1333,6 +890,13 @@ impl AppShardHarness {
                         E::ParentSealed { .. } => {
                             events_log.lock().push("ParentSealed".into());
                         }
+                        E::CwOut { .. } => {
+                            // Legacy (non-CW) app harness: the CW path
+                            // is disabled (`app_consensus_cw: false`),
+                            // so this event never fires. Present only
+                            // to keep the match exhaustive.
+                            events_log.lock().push("CwOut".into());
+                        }
                     }
                 }
             });
@@ -1395,15 +959,15 @@ impl AppShardHarness {
 // confirm window.
 
 /// Build the genesis-seed hex string for `initialize_testnet_genesis_state`.
-/// Concatenates every prover's BLS pubkey (each 585 bytes) into a single
-/// hex-encoded blob.
+/// Concatenates every prover's Falcon consensus pubkey (each 897 bytes) into a
+/// single hex-encoded blob.
 pub fn build_genesis_seed_hex(provers: &[TestProver]) -> String {
-    let mut blob = Vec::with_capacity(provers.len() * 585);
+    let mut blob = Vec::with_capacity(provers.len() * 897);
     for p in provers {
         assert_eq!(
             p.bls_pubkey.len(),
-            585,
-            "Bls48581 pubkey must be 585 bytes; got {}",
+            897,
+            "Falcon consensus pubkey must be 897 bytes; got {}",
             p.bls_pubkey.len(),
         );
         blob.extend_from_slice(&p.bls_pubkey);
@@ -1544,8 +1108,6 @@ pub fn build_tier2_archive_rig_with_key_manager(
         inclusion_prover.clone(),
         exec_key_manager,
         crdt.clone(),
-        exec_stubs.bulletproof_prover,
-        exec_stubs.decaf_constructor,
         exec_stubs.circuit_compiler,
         // Use the REAL clock store (not the noop stub) — mirrors production
         // (`master_node/engines.rs` wires `storage.clock_store`). The
@@ -1564,7 +1126,7 @@ pub fn build_tier2_archive_rig_with_key_manager(
     let reward_issuer_for_intrinsic: Arc<dyn quil_types::consensus::RewardIssuance> =
         Arc::new(quil_engine::OptRewardIssuance);
     let bls_for_intrinsic: Arc<dyn quil_types::crypto::BlsConstructor> =
-        Arc::new(quil_crypto::Bls48581KeyConstructor);
+        Arc::new(quil_crypto::FalconKeyConstructor);
     let frame_prover_for_intrinsic: Arc<dyn quil_types::crypto::FrameProver> =
         Arc::new(StubFrameProver);
     exec_manager

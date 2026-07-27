@@ -141,6 +141,13 @@ pub struct MessageCollector {
     /// of Go's per-frame `lockCollectorMessage`, which prevents an
     /// already-included message from being proposed again.
     finalized: RwLock<FinalizedSet>,
+    /// The set of CURRENT valid shard addresses (a shard `FrameHeader`'s
+    /// `address` — the L2‖prefix filter). Refreshed from the shards store. Used
+    /// to preemptively reject shard frames whose address is not a real current
+    /// shard (e.g. an old 4096-grid division that no longer exists). Empty =
+    /// "not yet loaded" → the address check is skipped (fail-open) so a fresh
+    /// node doesn't drop everything before its first refresh.
+    valid_shard_addresses: RwLock<HashSet<Vec<u8>>>,
 }
 
 impl MessageCollector {
@@ -150,7 +157,16 @@ impl MessageCollector {
             prover_only_mode: std::sync::atomic::AtomicBool::new(false),
             shard_frame_dedup: RwLock::new(HashMap::new()),
             finalized: RwLock::new(FinalizedSet::new()),
+            valid_shard_addresses: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Replace the set of valid current shard addresses (called from the
+    /// shard-info refresh with the L2‖prefix filter of every current shard).
+    /// Once populated, shard frames whose address isn't in the set are rejected
+    /// at ingestion.
+    pub fn set_valid_shard_addresses(&self, addresses: HashSet<Vec<u8>>) {
+        *self.valid_shard_addresses.write().unwrap() = addresses;
     }
 
     /// Reject a bundle if any of its embedded shard frames is at or
@@ -231,7 +247,35 @@ impl MessageCollector {
         // and then skip — the backlog explosion behind the halt. The
         // dedup commits the new high-water marks as a side effect. A stale
         // shard frame means we hold a newer one — a duplicate, not a drop.
-        let shard_frames = extract_shard_frame_keys(&data);
+        let checks = extract_shard_frame_checks(&data);
+
+        // Preemptive shard-frame validation: reject a bundle whose embedded
+        // shard frame(s) have NO chance of being valid, before it enters the
+        // mempool and the leader spends per-proof BLS work on it —
+        //   1. a storage frame (global_frame_number > 0) carrying NO storage
+        //      attestation (empty `storage_attestation_root`), and
+        //   2. an `address` that isn't a real current shard (e.g. an old
+        //      4096-grid division that no longer exists in the 64-shard
+        //      topology).
+        // The address check only engages once the valid-shard set has been
+        // populated from the shards store (fail-open before the first refresh
+        // so a just-started node doesn't drop everything).
+        if !checks.is_empty() {
+            let valid = self.valid_shard_addresses.read().unwrap();
+            for c in &checks {
+                if c.global_frame_number > 0 && !c.has_attestation {
+                    return SubmitOutcome::Filtered;
+                }
+                if !valid.is_empty() && !valid.contains(&c.address) {
+                    return SubmitOutcome::Filtered;
+                }
+            }
+        }
+
+        let shard_frames: Vec<(Vec<u8>, u64)> = checks
+            .iter()
+            .map(|c| (c.address.clone(), c.frame_number))
+            .collect();
         if !shard_frames.is_empty() && !self.dedup_shard_frames(&shard_frames) {
             return SubmitOutcome::Duplicate;
         }
@@ -421,7 +465,14 @@ pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
     use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
     use quil_execution::message_envelope::CanonicalMessageBundle;
 
+    // WINDOWED LOCKSTEP (must mirror the materializer's `audit_storage_attestation`
+    // exactly, or a packed frame would be rejected by followers → halt): a storage
+    // shard proof is includable iff its anchor is 0 (genesis/legacy) OR within
+    // `[expected - W, expected]`. Multi-member shards anchor to `latest − K`, so a
+    // strict `== expected` is unsatisfiable; the window absorbs K + transit.
+    use quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW;
     let expected = frame_number.saturating_sub(1);
+    let oldest = expected.saturating_sub(STORAGE_ANCHOR_LOCKSTEP_WINDOW);
     let bundle = match CanonicalMessageBundle::from_canonical_bytes(data) {
         Ok(b) => b,
         Err(_) => return true,
@@ -430,7 +481,7 @@ pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
         if req.inner_type_prefix == TYPE_FRAME_HEADER {
             if let Ok(fh) = FrameHeader::from_canonical_bytes(&req.inner_bytes) {
                 let anchor = fh.global_frame_number;
-                if anchor != 0 && anchor != expected {
+                if anchor != 0 && (anchor > expected || anchor < oldest) {
                     return false;
                 }
             }
@@ -439,7 +490,20 @@ pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
     true
 }
 
-fn extract_shard_frame_keys(data: &[u8]) -> Vec<(Vec<u8>, u64)> {
+/// A shard `FrameHeader` carried by a bundle, with the fields needed for both
+/// dedup and preemptive ingestion validation.
+struct ShardFrameCheck {
+    address: Vec<u8>,
+    frame_number: u64,
+    /// The global frame this shard frame anchors to. `> 0` ⇒ a storage frame
+    /// (must carry storage attestation); `== 0` ⇒ genesis/legacy VDF frame.
+    global_frame_number: u64,
+    /// True iff the header commits to a storage attestation
+    /// (`storage_attestation_root` non-empty).
+    has_attestation: bool,
+}
+
+fn extract_shard_frame_checks(data: &[u8]) -> Vec<ShardFrameCheck> {
     use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
     use quil_execution::message_envelope::CanonicalMessageBundle;
 
@@ -447,17 +511,29 @@ fn extract_shard_frame_keys(data: &[u8]) -> Vec<(Vec<u8>, u64)> {
         Ok(b) => b,
         Err(_) => return Vec::new(),
     };
-    let mut keys = Vec::new();
+    let mut out = Vec::new();
     for req in bundle.requests.into_iter().flatten() {
         if req.inner_type_prefix == TYPE_FRAME_HEADER {
             if let Ok(fh) = FrameHeader::from_canonical_bytes(&req.inner_bytes) {
                 if !fh.address.is_empty() {
-                    keys.push((fh.address, fh.frame_number));
+                    out.push(ShardFrameCheck {
+                        address: fh.address,
+                        frame_number: fh.frame_number,
+                        global_frame_number: fh.global_frame_number,
+                        has_attestation: !fh.storage_attestation_root.is_empty(),
+                    });
                 }
             }
         }
     }
-    keys
+    out
+}
+
+fn extract_shard_frame_keys(data: &[u8]) -> Vec<(Vec<u8>, u64)> {
+    extract_shard_frame_checks(data)
+        .into_iter()
+        .map(|c| (c.address, c.frame_number))
+        .collect()
 }
 
 /// SHA3-256 digest of `data`. Mirrors Go's
@@ -765,10 +841,13 @@ mod tests {
                 .unwrap()
         };
 
-        // Building global frame 100: in lockstep iff anchor == 99 (frame-1) or 0.
+        // Building global frame 100: in lockstep iff anchor ∈ [99-W, 99] or 0.
+        // With W = STORAGE_ANCHOR_LOCKSTEP_WINDOW, the window is [87, 99].
         assert!(bundle_shard_frames_in_lockstep(&make(99), 100), "anchor==frame-1 in lockstep");
         assert!(bundle_shard_frames_in_lockstep(&make(0), 100), "genesis anchor exempt");
-        assert!(!bundle_shard_frames_in_lockstep(&make(98), 100), "stale anchor dropped");
+        assert!(bundle_shard_frames_in_lockstep(&make(98), 100), "anchor just inside window accepted");
+        assert!(bundle_shard_frames_in_lockstep(&make(87), 100), "oldest in-window anchor accepted");
+        assert!(!bundle_shard_frames_in_lockstep(&make(86), 100), "anchor older than window dropped");
         assert!(!bundle_shard_frames_in_lockstep(&make(100), 100), "future anchor dropped");
         // Non-bundle / non-shard-frame data passes (this gate only governs shard frames).
         assert!(bundle_shard_frames_in_lockstep(b"not a bundle", 100));

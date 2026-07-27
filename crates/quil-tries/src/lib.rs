@@ -5,6 +5,7 @@ mod nibble;
 mod node;
 mod serialize;
 mod tree;
+mod vertex_commit;
 
 pub use compare::compare_trees_at_height;
 pub use go_format::{deserialize_go_tree, serialize_go_tree};
@@ -15,6 +16,9 @@ pub use serialize::{
     deserialize_node_solo, deserialize_tree, serialize_node_solo, serialize_tree,
 };
 pub use tree::{MultiKeyTraversalProof, TraversalSubProof, VectorCommitmentTree};
+pub use vertex_commit::{
+    split_vertex_leaf, vertex_commitment, vertex_leaf_value, ShaInclusionProver, VERTEX_LEAF_LEN,
+};
 
 /// 64-way branching factor (6 bits per nibble).
 pub const BRANCH_NODES: usize = 64;

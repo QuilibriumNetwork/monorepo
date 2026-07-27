@@ -197,7 +197,7 @@ pub const GLOBAL_FRAME_OUTPUT_LEN: usize = 516;
 /// 1. Checking structural fields on the header.
 /// 2. Running the VDF proof through `FrameProver`.
 /// 3. Aggregating the public keys of active provers selected by the
-///    VDF's returned bitmask and comparing to the claimed aggregate.
+/// VDF's returned bitmask and comparing to the claimed aggregate.
 ///
 /// Genesis frames (frame_number == 0) skip signature checks entirely.
 pub struct BlsGlobalFrameValidator {
@@ -290,7 +290,7 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
         // Go uses `proverRegistry.GetActiveProvers(nil)` for the
         // global filter case, which for our Rust impl means an
         // empty byte slice.
-        let active = self.prover_registry.get_active_provers(&[])?;
+        let active = self.prover_registry.get_active_provers(&[], header.frame_number)?;
         let mut active_public_keys: Vec<&[u8]> = Vec::new();
         let mut throwaway: Vec<&[u8]> = Vec::new();
         for (i, prover) in active.iter().enumerate() {
@@ -372,10 +372,10 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
 /// `node/consensus/validator/bls_app_shard_frame_validator.go`.
 /// Validates an `AppShardFrame` by:
 /// 1. Checking structural fields (non-empty address, exactly 4 state
-///    roots of length 64 or 74).
+/// roots of length 64 or 74).
 /// 2. Running the VDF proof through `FrameProver::verify_frame_header`.
 /// 3. Aggregating public keys of active provers under the app shard's
-///    address filter whose indices are in the VDF bitmask.
+/// address filter whose indices are in the VDF bitmask.
 pub struct BlsAppFrameValidator {
     prover_registry: Arc<dyn ProverRegistryTrait>,
     bls_constructor: Arc<dyn BlsConstructor>,
@@ -436,7 +436,9 @@ impl BlsAppFrameValidator {
             )));
         }
         for (i, root) in header.state_roots.iter().enumerate() {
-            if root.len() != 64 && root.len() != 74 {
+            // 32 = Phase-3 forest (JMT) root; 64 = empty/placeholder phase;
+            // 74 = legacy KZG commitment (tests / pre-migration).
+            if root.len() != 32 && root.len() != 64 && root.len() != 74 {
                 return Err(QuilError::InvalidArgument(format!(
                     "invalid state root length at index {}: {}",
                     i,
@@ -536,7 +538,7 @@ impl BlsAppFrameValidator {
             let participant_indices: Vec<usize> =
                 quil_consensus::bitmask::set_bit_indices(&sig.bitmask).collect();
 
-            let active = self.prover_registry.get_active_provers(&header.address)?;
+            let active = self.prover_registry.get_active_provers(&header.address, header.frame_number)?;
 
             // Generate a throwaway key pair once — Go does this via
             // `blsConstructor.New()`. The throwaway signature bytes

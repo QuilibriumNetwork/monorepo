@@ -10,12 +10,12 @@
 //!
 //! What's NOT ported here (needs cross-crate service wiring):
 //! - `prove` — requires `quil-crypto` signer + `VerifiableEncryptor`,
-//!   neither of which have a clean trait bound on the execution side yet.
+//! neither of which have a clean trait bound on the execution side yet.
 //! - `verify` — same dependency story plus an Ed448 key-manager trait.
 //! - `materialize` — requires the hypergraph state bridge
-//!   (task #64 / `HypergraphCrdt` lazy-tree integration).
+//! (`HypergraphCrdt` lazy-tree integration).
 //!
-//! The intrinsic dispatcher (task #63) will import these pure helpers
+//! The intrinsic dispatcher will import these pure helpers
 //! and compose them with service traits it gets from the engine.
 
 use num_bigint::BigInt;
@@ -35,192 +35,95 @@ pub const VERTEX_ADD_TAG: &[u8] = b"VERTEX_ADD";
 pub const VERTEX_REMOVE_TAG: &[u8] = b"VERTEX_REMOVE";
 
 /// Per-proof size charged by the vertex-add cost model (Go: `len(Data)*55`).
-pub const VERENC_PROOF_CHARGE_BYTES: i64 = 55;
+pub const CONFIDENTIAL_FIELD_CHARGE_BYTES: i64 = 55;
 
 /// Upper bound on vertex-add disk payload. Go:
 /// `if diskSize > 1024*1024*5 { return error }`
 pub const MAX_VERTEX_ADD_DISK_SIZE: usize = 5 * 1024 * 1024;
 
 // =====================================================================
-// EncryptedToVertexTree (Go `types/hypergraph/vertex_data.go:14-31`)
+// Confidential vertex fields (commit-and-encrypt, post-quantum)
 // =====================================================================
 
-/// MPCitH `VerEncProof` proof-form byte length (Go
-/// `MPCitHVerEncProofFromBytes` size check).
-pub const VERENC_PROOF_BYTES: usize = 9268;
-/// MPCitH `VerEnc` compressed-form byte length (Go
-/// `MPCitHVerEncFromBytes` size check).
-pub const VERENC_COMPRESSED_BYTES: usize = 621;
+use super::confidential;
 
-/// Parse the offsets used by `MPCitHVerEncProofFromBytes`:
-/// - blinding_pubkey: [0..57)
-/// - encryption_key: [57..114)
-/// - statement: [114..171)
-/// - challenge: [171..235)
-/// - polycom: 23 × 57-byte points starting at 235
-/// - ctexts: 42 × (57+56+8) starting at 1546
-/// - shares_rands: 22 × (56+56+8) starting at 6628
-fn parse_verenc_proof_full(data: &[u8]) -> Option<verenc::VerencProof> {
-    if data.len() != VERENC_PROOF_BYTES {
-        return None;
-    }
-    let blinding_pubkey = data[0..57].to_vec();
-    let encryption_key = data[57..114].to_vec();
-    let statement = data[114..171].to_vec();
-    let challenge = data[171..235].to_vec();
-    let mut polycom = Vec::with_capacity(23);
-    for i in 0..23 {
-        polycom.push(data[235 + i * 57..292 + i * 57].to_vec());
-    }
-    let mut ctexts = Vec::with_capacity(42);
-    for i in 0..42 {
-        let base = 1546 + i * (57 + 56 + 8);
-        let c1 = data[base..base + 57].to_vec();
-        let c2 = data[base + 57..base + 113].to_vec();
-        let i_be = u64::from_be_bytes(data[base + 113..base + 121].try_into().ok()?);
-        ctexts.push(verenc::VerencCiphertext { c1, c2, i: i_be });
-    }
-    let mut shares_rands = Vec::with_capacity(22);
-    for i in 0..22 {
-        let base = 6628 + i * (56 + 56 + 8);
-        let s1 = data[base..base + 56].to_vec();
-        let s2 = data[base + 56..base + 112].to_vec();
-        let i_be = u64::from_be_bytes(data[base + 112..base + 120].try_into().ok()?);
-        shares_rands.push(verenc::VerencShare { s1, s2, i: i_be });
-    }
-    Some(verenc::VerencProof {
-        blinding_pubkey,
-        encryption_key,
-        statement,
-        challenge,
-        polycom,
-        ctexts,
-        shares_rands,
-    })
-}
-
-/// Serialize a `CompressedCiphertext` + blinding_pubkey + statement to
-/// the 621-byte `MPCitHVerEnc.ToBytes()` layout.
-fn serialize_compressed(
-    cc: &verenc::CompressedCiphertext,
-    blinding_pubkey: &[u8],
-    statement: &[u8],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(VERENC_COMPRESSED_BYTES);
-    for ct in &cc.ctexts {
-        out.extend_from_slice(&ct.c1);
-        out.extend_from_slice(&ct.c2);
-    }
-    for a in &cc.aux {
-        out.extend_from_slice(a);
-    }
-    out.extend_from_slice(blinding_pubkey);
-    out.extend_from_slice(statement);
-    out
-}
-
-/// Verify each verenc proof's cryptographic correctness. Mirrors Go
-/// `hypergraph_vertex_add.go:185-192` which calls `d.Verify()` on
-/// every proof BEFORE the signature check. Without this, a VertexAdd
-/// with byte-shaped-but-cryptographically-invalid proofs passes
-/// validation and corrupts the on-disk tree.
-///
-/// - 9268-byte (`VERENC_PROOF_BYTES`): full VerEncProof. Decode
-///   into `VerencProof` and call `verenc::verenc_verify`. Reject
-///   on any decode failure (silent-drop would let malformed proofs
-///   slip through Go's per-proof gate).
-/// - 621-byte (`VERENC_COMPRESSED_BYTES`): already-compressed form.
-///   The compression itself is integrity-bound (statement and
-///   blinding_pubkey are part of the byte layout); accept as-is.
-/// - Any other length: reject.
+/// Verify each confidential field's STRUCTURE — the public/consensus check that
+/// replaces the retired ECC verenc per-proof crypto verify. The commit-and-encrypt
+/// scheme has no public recoverability proof: consensus confirms the field is
+/// well-formed (decodes; correct KEM/AEAD sizes) and binds its 32-byte commitment
+/// by storing it in committed state; the designated reader verifies decryption
+/// against that commitment. Rejects any chunk that fails to decode or is
+/// structurally invalid (so malformed fields can't corrupt the tree).
 pub fn verify_vertex_add_proofs(proofs: &[Vec<u8>]) -> Result<()> {
     for (i, chunk) in proofs.iter().enumerate() {
-        match chunk.len() {
-            VERENC_PROOF_BYTES => {
-                let proof = parse_verenc_proof_full(chunk).ok_or_else(|| {
-                    QuilError::InvalidArgument(format!(
-                        "VertexAdd: proof {} failed structural decode", i
-                    ))
-                })?;
-                if !verenc::verenc_verify(proof) {
-                    return Err(QuilError::InvalidArgument(format!(
-                        "VertexAdd: proof {} failed verenc cryptographic verify", i
-                    )));
-                }
-            }
-            VERENC_COMPRESSED_BYTES => {
-                // Compressed proofs carry blinding_pubkey + statement
-                // in their fixed-position byte layout; the
-                // serializer enforces shape. No separate verify
-                // primitive in the Rust verenc crate yet beyond
-                // length, but rejecting unknown lengths below means
-                // a malformed compressed proof can't sneak through.
-            }
-            other => {
-                return Err(QuilError::InvalidArgument(format!(
-                    "VertexAdd: proof {} has invalid length {} (expected {} or {})",
-                    i, other, VERENC_PROOF_BYTES, VERENC_COMPRESSED_BYTES,
-                )));
-            }
+        let field = confidential::decode(chunk).ok_or_else(|| {
+            QuilError::InvalidArgument(format!(
+                "VertexAdd: confidential field {} failed to decode", i
+            ))
+        })?;
+        if !confidential::verify_structural(&field) {
+            return Err(QuilError::InvalidArgument(format!(
+                "VertexAdd: confidential field {} is structurally invalid", i
+            )));
         }
     }
     Ok(())
 }
 
-/// Convert a single VerEnc-proof or already-compressed-VerEnc input
-/// into `(compressed_bytes, statement_bytes)`. For 9268-byte inputs
-/// we run `verenc_compress`; for 621-byte inputs we extract the
-/// statement at offset [564..621] and return the input as-is.
-///
-/// Returns `None` for any other input length (Go silently drops these).
-fn compress_one_proof(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    match data.len() {
-        VERENC_PROOF_BYTES => {
-            let proof = parse_verenc_proof_full(data)?;
-            let blinding_pubkey = proof.blinding_pubkey.clone();
-            let statement = proof.statement.clone();
-            let cc = verenc::verenc_compress(proof);
-            let compressed =
-                serialize_compressed(&cc, &blinding_pubkey, &statement);
-            Some((compressed, statement))
-        }
-        VERENC_COMPRESSED_BYTES => {
-            let statement = data[564..621].to_vec();
-            Some((data.to_vec(), statement))
-        }
-        _ => None,
-    }
-}
-
-/// Build a `VertexAdd.Data` vertex tree. Mirrors Go
-/// `EncryptedToVertexTree` at `types/hypergraph/vertex_data.go:14-31`.
-///
-/// Each compressed `Encrypted.ToBytes()` is inserted at key
-/// `BE u64 index`, with the `GetStatement()` bytes as the leaf
-/// statement and a fixed leaf size of 55.
-///
-/// Input format: a slice of per-proof byte vectors as decoded by
-/// [`split_vertex_add_proof_chunks`]. Each chunk may be either
-/// 9268-byte VerEncProof (we compress) or 621-byte compressed VerEnc
-/// (we use as-is).
+/// Build a `VertexAdd.Data` vertex tree from the confidential-field chunk list.
+/// Each field is stored (canonically re-encoded) at key `BE u64 index`, with its
+/// 32-byte commitment as the leaf "statement" so the commitment is bound in
+/// committed state (the reader checks recovered plaintext against it). Malformed
+/// chunks are skipped — `verify_vertex_add_proofs` already gated them at validate.
 pub fn encrypted_to_vertex_tree(
     proofs: &[Vec<u8>],
-    inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
 ) -> Result<quil_tries::VectorCommitmentTree> {
     let mut tree = quil_tries::VectorCommitmentTree::new();
     for (i, chunk) in proofs.iter().enumerate() {
-        let (compressed, statement) = match compress_one_proof(chunk) {
-            Some(x) => x,
+        let field = match confidential::decode(chunk) {
+            Some(f) => f,
             None => continue,
         };
+        let value = confidential::encode(&field);
         let key = (i as u64).to_be_bytes();
-        tree.insert(&key, &compressed, &statement, &BigInt::from(55))
-            .map_err(|e| {
-                QuilError::Internal(format!("vertex tree insert: {}", e))
-            })?;
+        tree.insert(&key, &value, &field.commitment, &BigInt::from(value.len() as i64))
+            .map_err(|e| QuilError::Internal(format!("vertex tree insert: {}", e)))?;
     }
-    let _ = tree.commit(inclusion_prover);
     Ok(tree)
+}
+
+/// Reconstruct the original plaintext bytes from a serialized Go-format vertex
+/// sub-tree (`GetVertexData{full_data}` `raw_data`) using the reader's sntrup761
+/// secret key. Inverse of [`encrypted_to_vertex_tree`] + decryption: read the
+/// sequential 8-byte-BE-indexed confidential fields (0,1,2,…) until a gap,
+/// decode+open each with `reader_kem_sk`, and concatenate. Mirror of Go
+/// `VertexTreeToEncrypted` + `verEnc.Decrypt` (`types/hypergraph/vertex_data.go`).
+///
+/// Used by the client's `deploy get` to reassemble a deployed file (and its
+/// `FILEINDX` index) from the node.
+pub fn vertex_tree_to_plaintext(raw_tree: &[u8], reader_kem_sk: &[u8]) -> Result<Vec<u8>> {
+    let root = quil_tries::deserialize_go_tree(raw_tree)
+        .map_err(|e| QuilError::InvalidArgument(format!("deserialize vertex tree: {e}")))?;
+    let tree = quil_tries::VectorCommitmentTree { root };
+    let mut out = Vec::new();
+    let mut index: u64 = 0;
+    loop {
+        let key = index.to_be_bytes();
+        let Some(value) = tree.get(&key) else { break };
+        let field = confidential::decode(value).ok_or_else(|| {
+            QuilError::InvalidArgument(format!(
+                "vertex tree to plaintext: field {index} is not a valid confidential field"
+            ))
+        })?;
+        let pt = confidential::open(&field, reader_kem_sk).ok_or_else(|| {
+            QuilError::InvalidArgument(format!(
+                "vertex tree to plaintext: could not open field {index} (wrong read key?)"
+            ))
+        })?;
+        out.extend_from_slice(&pt);
+        index += 1;
+    }
+    Ok(out)
 }
 
 // =====================================================================
@@ -235,7 +138,7 @@ pub fn encrypted_to_vertex_tree(
 ///
 /// Callers that have parsed proof chunks can pass `proof_count` directly.
 pub fn vertex_add_cost_from_proof_count(proof_count: usize) -> BigInt {
-    BigInt::from(proof_count as i64 * VERENC_PROOF_CHARGE_BYTES)
+    BigInt::from(proof_count as i64 * CONFIDENTIAL_FIELD_CHARGE_BYTES)
 }
 
 /// Compute the vertex-add cost from raw (unencrypted) data. Mirror of
@@ -243,9 +146,9 @@ pub fn vertex_add_cost_from_proof_count(proof_count: usize) -> BigInt {
 /// `((len(rawData) + 54) / 55) * 55` — the raw-bytes length rounded up
 /// to the next multiple of 55.
 pub fn vertex_add_cost_from_raw_len(raw_len: usize) -> BigInt {
-    let chunks = (raw_len + (VERENC_PROOF_CHARGE_BYTES as usize - 1))
-        / VERENC_PROOF_CHARGE_BYTES as usize;
-    BigInt::from(chunks as i64 * VERENC_PROOF_CHARGE_BYTES)
+    let chunks = (raw_len + (CONFIDENTIAL_FIELD_CHARGE_BYTES as usize - 1))
+        / CONFIDENTIAL_FIELD_CHARGE_BYTES as usize;
+    BigInt::from(chunks as i64 * CONFIDENTIAL_FIELD_CHARGE_BYTES)
 }
 
 /// Cost for a vertex-remove operation. Mirror of Go:
@@ -583,43 +486,66 @@ mod tests {
     // EncryptedToVertexTree
     // -----------------------------------------------------------------
 
+    fn sample_confidential_chunk(reader_pk: &[u8], tag: u8, data: &[u8]) -> Vec<u8> {
+        let field = super::super::confidential::seal(data, reader_pk, &[tag; 32], &[tag; 12])
+            .expect("seal");
+        super::super::confidential::encode(&field)
+    }
+
     #[test]
     fn encrypted_to_vertex_tree_keys_are_be_u64_indices() {
-        use quil_types::crypto::NoopInclusionProver;
-        // Use 621-byte already-compressed inputs so we exercise the
-        // pass-through path without needing the full proof->compressed
-        // crypto pipeline.
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
-        for i in 0..3u8 {
-            let mut chunk = vec![0u8; VERENC_COMPRESSED_BYTES];
-            // Tag the chunk with a per-index byte so we can confirm
-            // round-tripping into the tree.
-            chunk[0] = i;
-            // Statement at [564..621] — give it a recognizable pattern.
-            for b in &mut chunk[564..621] {
-                *b = i ^ 0xA5;
-            }
-            chunks.push(chunk);
-        }
-        let tree = encrypted_to_vertex_tree(&chunks, &NoopInclusionProver).unwrap();
-        // Each chunk lives at key = BE u64 index
-        for (i, _chunk) in chunks.iter().enumerate() {
+        let kp = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
+        let chunks: Vec<Vec<u8>> =
+            (0..3u8).map(|i| sample_confidential_chunk(&kp.public, i, &[i; 16])).collect();
+        let tree = encrypted_to_vertex_tree(&chunks).unwrap();
+        for (i, chunk) in chunks.iter().enumerate() {
             let key = (i as u64).to_be_bytes();
             let stored = tree.get(&key).expect("entry must exist");
-            assert_eq!(stored.len(), VERENC_COMPRESSED_BYTES);
-            assert_eq!(stored[0], i as u8);
+            // Stored verbatim (canonical decode→re-encode is the identity).
+            assert_eq!(&stored, chunk);
         }
     }
 
     #[test]
-    fn encrypted_to_vertex_tree_skips_wrong_size_chunks() {
-        use quil_types::crypto::NoopInclusionProver;
+    fn vertex_tree_to_plaintext_reassembles_sealed_chunks() {
+        let kp = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
+        // Three sealed slices whose concatenation is the "file".
+        let parts: [&[u8]; 3] = [b"hello ", b"lattice ", b"world"];
+        let chunks: Vec<Vec<u8>> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| sample_confidential_chunk(&kp.public, i as u8, p))
+            .collect();
+        let mut tree = encrypted_to_vertex_tree(&chunks).unwrap();
+        // The reconstruction path consumes the serialized Go-format tree, so
+        // exercise the real serialize→deserialize round trip.
+        let _ = tree.commit(&quil_tries::ShaInclusionProver);
+        let raw = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+
+        let out = vertex_tree_to_plaintext(&raw, &kp.secret).unwrap();
+        assert_eq!(out, b"hello lattice world");
+    }
+
+    #[test]
+    fn vertex_tree_to_plaintext_wrong_key_fails() {
+        let kp = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
+        let other = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
+        let chunks = vec![sample_confidential_chunk(&kp.public, 0, b"secret")];
+        let mut tree = encrypted_to_vertex_tree(&chunks).unwrap();
+        let _ = tree.commit(&quil_tries::ShaInclusionProver);
+        let raw = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        assert!(vertex_tree_to_plaintext(&raw, &other.secret).is_err());
+    }
+
+    #[test]
+    fn encrypted_to_vertex_tree_skips_undecodable_chunks() {
+        let kp = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
         let chunks: Vec<Vec<u8>> = vec![
-            vec![0u8; VERENC_COMPRESSED_BYTES],
-            vec![0u8; 100],            // junk size — skipped
-            vec![1u8; VERENC_COMPRESSED_BYTES],
+            sample_confidential_chunk(&kp.public, 0, b"a"),
+            vec![0u8; 100], // junk — too short to decode, skipped
+            sample_confidential_chunk(&kp.public, 2, b"b"),
         ];
-        let tree = encrypted_to_vertex_tree(&chunks, &NoopInclusionProver).unwrap();
+        let tree = encrypted_to_vertex_tree(&chunks).unwrap();
         // Index 0 and 2 present; index 1 absent.
         assert!(tree.get(&0u64.to_be_bytes()).is_some());
         assert!(tree.get(&1u64.to_be_bytes()).is_none());

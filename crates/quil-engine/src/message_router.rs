@@ -7,16 +7,16 @@
 //! This module exposes two layers:
 //!
 //! 1. Stateless classification helpers (`classify_message`,
-//!    `classify_inner_type`, `classify_consensus_message`) used by the
-//!    consensus engine to decide where a message should go once it has
-//!    been admitted.
+//! `classify_inner_type`, `classify_consensus_message`) used by the
+//! consensus engine to decide where a message should go once it has
+//! been admitted.
 //! 2. A stateful [`MessageRouter`] that holds per-bitmask validator
-//!    closures so malformed bytes are dropped before they reach a
-//!    queue. The Go reference (`node/consensus/global/message_router.go`)
-//!    achieves the same thing via `pubsub.RegisterValidator`; in Rust
-//!    the network plumbing isn't pubsub, so we run the validator from
-//!    inside [`MessageRouter::route`] before the dispatcher invokes the
-//!    real handler.
+//! closures so malformed bytes are dropped before they reach a
+//! queue. The Go reference (`node/consensus/global/message_router.go`)
+//! achieves the same thing via `pubsub.RegisterValidator`; in Rust
+//! the network plumbing isn't pubsub, so we run the validator from
+//! inside [`MessageRouter::route`] before the dispatcher invokes the
+//! real handler.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -345,10 +345,12 @@ pub fn validator_global_peer_info() -> TopicValidator {
                 if info.peer_id.is_empty() {
                     return Reject("pi_empty_peer_id");
                 }
-                if info.public_key.len() != 57 {
+                // PeerInfo is now Falcon-signed by the network identity (the
+                // q-prover-key): 897-byte pubkey, 666-byte signature.
+                if info.public_key.len() != 897 {
                     return Reject("pi_bad_pubkey_len");
                 }
-                if info.signature.len() != 114 {
+                if info.signature.len() != 666 {
                     return Reject("pi_bad_sig_len");
                 }
                 // Bind the claimed peer_id to the SIGNING public key. Without
@@ -360,8 +362,8 @@ pub fn validator_global_peer_info() -> TopicValidator {
                 // serve a forged prover tree to bootstrapping nodes. The
                 // libp2p peer id is a deterministic function of the pubkey, so
                 // require them to match. (Cheap — rejects the spoof before the
-                // expensive Ed448 verify.)
-                if info.peer_id != quil_p2p::peer_id_from_ed448_pubkey(&info.public_key) {
+                // expensive Falcon verify.)
+                if info.peer_id != quil_p2p::peer_id_from_falcon_pubkey(&info.public_key) {
                     return Reject("pi_peer_id_pubkey_mismatch");
                 }
                 // Re-check timestamps post-decode in case the peek was
@@ -380,13 +382,14 @@ pub fn validator_global_peer_info() -> TopicValidator {
                     &info.public_key,
                     &[],
                 );
-                let pubkey = match ed448_rust::PublicKey::try_from(
-                    info.public_key.as_slice(),
+                // Falcon verify with an empty domain (matches `Signer::sign`,
+                // which is `sign_with_domain(msg, &[])`).
+                if quil_crypto::falcon_verify(
+                    &info.public_key,
+                    &info.signature,
+                    &signing_payload,
+                    &[],
                 ) {
-                    Ok(pk) => pk,
-                    Err(_) => return Reject("pi_pubkey_decode"),
-                };
-                if pubkey.verify(&signing_payload, &info.signature, None).is_ok() {
                     Accept
                 } else {
                     Reject("pi_sig_invalid")

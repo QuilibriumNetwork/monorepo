@@ -6,7 +6,7 @@
 //! `proof_of_meaningful_work.go`:
 //!
 //! ```text
-//! per_ring  = (basis * shard_size / world_bytes) / (2^(ring+1) * sqrt(data_shards))
+//! per_ring = (basis * shard_size / world_bytes) / (2^(ring+1) * sqrt(data_shards))
 //! per_prover = per_ring / 8
 //! ```
 //!
@@ -115,7 +115,7 @@ fn compute_shard_ring_info(total_active_joining: usize) -> ShardRingInfo {
 /// - `is_allocated`: whether the local prover is allocated to this shard.
 /// - `self_address`: the local prover's address (may be empty).
 /// - `candidate_addrs`: sorted candidate addresses (only used when
-///   `is_allocated && !self_address.is_empty()`).
+/// `is_allocated && !self_address.is_empty()`).
 ///
 /// Returns `(ring, on_ring)`.
 pub fn resolve_prover_ring(
@@ -200,11 +200,11 @@ pub fn isqrt_big(n: &BigInt) -> BigInt {
 ///
 /// Formula (matching `proof_of_meaningful_work.go` Materialize):
 /// ```text
-/// factor    = shard_size * basis / world_bytes
-/// divisor   = 2^(ring + 1)
-/// factor   /= divisor
-/// factor   /= sqrt(data_shards)   [when data_shards > 1]
-/// factor   /= 8                   [constant max ring size]
+/// factor = shard_size * basis / world_bytes
+/// divisor = 2^(ring + 1)
+/// factor /= divisor
+/// factor /= sqrt(data_shards)   [when data_shards > 1]
+/// factor /= 8                   [constant max ring size]
 /// ```
 ///
 /// Returns zero for degenerate inputs.
@@ -445,7 +445,7 @@ where
 ///
 /// # Arguments
 /// * `include_all` — when false, only return shards the local prover
-///   is allocated to.
+/// is allocated to.
 /// * `self_address` — local prover address (empty slice if unknown).
 /// * `allocated_filters` — set of filters this prover is actively on.
 /// * `current_frame` — current frame number from the prover registry.
@@ -1086,9 +1086,9 @@ mod tests {
     }
     impl ProverRegistry for StubRegistry {
         fn get_prover_info(&self, _: &[u8]) -> QResult<Option<ProverInfo>> { Ok(None) }
-        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> QResult<Vec<u8>> { Ok(vec![]) }
-        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> QResult<Vec<Vec<u8>>> { Ok(vec![]) }
-        fn get_active_provers(&self, _: &[u8]) -> QResult<Vec<ProverInfo>> { Ok(vec![]) }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<u8>> { Ok(vec![]) }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<Vec<u8>>> { Ok(vec![]) }
+        fn get_active_provers(&self, _: &[u8], _: u64) -> QResult<Vec<ProverInfo>> { Ok(vec![]) }
         fn get_prover_count(&self, _: &[u8]) -> QResult<usize> { Ok(0) }
         fn get_provers(&self, filter: &[u8]) -> QResult<Vec<ProverInfo>> {
             // Single Active prover on every queried filter.

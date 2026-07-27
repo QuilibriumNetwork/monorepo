@@ -28,3 +28,11 @@ func VerifyRocksDBMigration(rocksdbPath string) error {
 		"migration verification requires RocksDB support; rebuild with: go build -tags rocksdb",
 	)
 }
+
+// VerifyRocksDBMigration is a stub when built without the "rocksdb" tag.
+// Build with: go build -tags rocksdb
+func VerifyRocksDBMigration(rocksdbPath string) error {
+	return fmt.Errorf(
+		"migration verification requires RocksDB support; rebuild with: go build -tags rocksdb",
+	)
+}

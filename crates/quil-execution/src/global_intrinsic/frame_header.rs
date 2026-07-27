@@ -8,6 +8,24 @@ use crate::canonical_cursor::{
 
 pub const TYPE_GLOBAL_FRAME_HEADER: u32 = 0x0309;
 pub const TYPE_FRAME_HEADER: u32 = 0x030A;
+
+/// Freshness/liveness window for the storage-attestation ρ_N anchor. A storage
+/// shard frame anchored to global frame `G` (`global_frame_number = G`) may be
+/// packed into any global frame in `[G+1, G+1+W]` rather than strictly `G+1`.
+///
+/// Why a window (and not strict `== frame-1`): app-shard committees are
+/// multi-member, and members' synced global heads differ by a few frames, so a
+/// proposer anchors to `latest − K` (a frame every member has) — which then can
+/// never equal the *packing* global frame minus one. `W` absorbs that `K` plus
+/// the app-production → global-pack transit + inter-node sync skew.
+///
+/// SECURITY: `W` bounds ρ_N staleness — a prover has at most ~`W` global frames
+/// (~`W`×frame-time) to respond to a revealed beacon before its attestation can
+/// no longer be packed, so `W` is the storage-freshness knob. Keep it as small
+/// as liveness allows. CONSENSUS-CRITICAL: the leader's
+/// `bundle_shard_frames_in_lockstep` and the materializer's
+/// `audit_storage_attestation` MUST use this exact value or nodes fork.
+pub const STORAGE_ANCHOR_LOCKSTEP_WINDOW: u64 = 12;
 fn read_opt_sig(buf: &[u8], c: &mut usize) -> Result<Vec<u8>> {
     read_lp(buf, c) // 0-length = absent, otherwise nested canonical bytes
 }

@@ -265,3 +265,319 @@ proptest! {
         prop_assert_eq!(snapshot(&crdt, &locs), expected);
     }
 }
+
+// ---------------------------------------------------------------------
+// Forest membership proof: producer (CRDT) → verifier round-trip
+// ---------------------------------------------------------------------
+
+/// The producer side (`build_membership_proof`, used by the node's
+/// CreateTraversalProof RPC) must yield a proof that the verifier side
+/// (`quil_forest::verify_vertex_membership`, used by the token/kick/PoMW
+/// engines) accepts against the shard's committed vertex-adds root. This
+/// closes the whole forest spend loop that replaced the KZG traversal proof.
+#[test]
+fn forest_membership_producer_verifier_round_trip() {
+    use num_bigint::BigInt;
+
+    let crdt = fresh_crdt();
+    let loc = Location { app_address: [0x2a; 32], data_address: [0x07; 32] };
+
+    // A coin-shaped vertex: commitment @ [0x04], type @ [0xFF; 32].
+    let commitment = vec![0xAAu8; 56];
+    let type_hash = vec![0xBBu8; 32];
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    tree.insert(&[0x04u8], &commitment, &[], &BigInt::from(56u64)).unwrap();
+    tree.insert(&[0xFFu8; 32], &type_hash, &[], &BigInt::from(32u64)).unwrap();
+    let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+
+    crdt.add_vertex(&loc, &blob).unwrap();
+    let commits = crdt.commit(10).unwrap();
+
+    let shard_key = quil_hypergraph::shard_key_for_location(&loc);
+    let roots = commits.get(&shard_key).expect("shard committed");
+    let root32: [u8; 32] = roots[0].as_slice().try_into().expect("32-byte vertex-adds root");
+
+    // Producer: build a membership proof for the vertex's two fields.
+    let vertex_id = loc.to_id().to_vec();
+    let field_keys = vec![vec![0x04u8], vec![0xFFu8; 32]];
+    let mp = crdt
+        .build_membership_proof("vertex", "adds", &shard_key, &[(vertex_id.clone(), field_keys)])
+        .expect("build membership proof");
+    assert_eq!(mp.inputs.len(), 1);
+    assert_eq!(mp.inputs[0].vertex_address, vertex_id);
+
+    // Wire round-trip, then verify against the committed root.
+    let decoded = quil_forest::MembershipProof::from_bytes(&mp.to_bytes()).unwrap();
+    let expected = vec![
+        (vec![0x04u8], commitment.clone()),
+        (vec![0xFFu8; 32], type_hash.clone()),
+    ];
+    quil_forest::verify_vertex_membership(&root32, &decoded.inputs[0], &expected)
+        .expect("produced proof verifies against the committed vertex-adds root");
+
+    // A tampered expected value is rejected.
+    let bad = vec![
+        (vec![0x04u8], vec![0xCCu8; 56]),
+        (vec![0xFFu8; 32], type_hash),
+    ];
+    assert!(quil_forest::verify_vertex_membership(&root32, &decoded.inputs[0], &bad).is_err());
+}
+
+/// The QUIL-split path in `commit_inner`: an app declared with a 64-way
+/// partition routes its vertices into sub-shards (by data-address top-6-bits)
+/// and aggregates the sub-shard roots into the app root. The result must be
+/// deterministic and MUST differ from committing the same vertices as one tree
+/// — proving the split actually happened.
+#[test]
+fn quil_split_commit_is_deterministic_and_differs_from_single_shard() {
+    let quil = [0xABu8; 32];
+    // data[0]=0x00 → shard 0; 0xFF → shard 63 (top-6-bits differ).
+    let mk = |d0: u8| {
+        let mut a = [0u8; 32];
+        a[0] = d0;
+        Location { app_address: quil, data_address: a }
+    };
+    let (v0, v63) = (mk(0x00), mk(0xFF));
+
+    let build_split = || {
+        let c = fresh_crdt();
+        c.set_shard_partition(quil, 1);
+        c.add_vertex(&v0, b"a").unwrap();
+        c.add_vertex(&v63, b"b").unwrap();
+        c.commit(1).unwrap()
+    };
+    let r1 = build_split();
+    let r2 = build_split();
+
+    // Both vertices share the app → one ShardKey entry with the four phase roots.
+    let split_root = &r1.values().next().unwrap()[0];
+    assert_eq!(split_root.len(), 32, "aggregated app root is a 32-byte JMT/Merkle root");
+    assert_eq!(split_root, &r2.values().next().unwrap()[0], "split commit is deterministic");
+
+    // Same vertices, no partition → one tree. The root must differ.
+    let single = fresh_crdt();
+    single.add_vertex(&v0, b"a").unwrap();
+    single.add_vertex(&v63, b"b").unwrap();
+    let rs = single.commit(1).unwrap();
+    assert_ne!(
+        split_root,
+        &rs.values().next().unwrap()[0],
+        "splitting into sub-shards changes the app root vs a single tree"
+    );
+}
+
+/// The full model-B membership chain for a SPLIT app (QUIL): a vertex lives in
+/// a sub-shard, so its field proof is against the sub-shard root and the proof
+/// carries a co-path binding that sub-shard root up to the AGGREGATED app phase
+/// root the header advertises. The verifier accepts it against the app root and
+/// rejects it against any other root (the co-path is load-bearing).
+#[test]
+fn quil_split_membership_round_trip_binds_subshard_to_app_root() {
+    use num_bigint::BigInt;
+
+    let quil = [0xABu8; 32];
+    let crdt = fresh_crdt();
+    crdt.set_shard_partition(quil, 1);
+
+    // data[0]=0x07 → sub-shard 0x07>>2 = 1.
+    let loc = Location { app_address: quil, data_address: [0x07; 32] };
+    let commitment = vec![0xAAu8; 56];
+    let type_hash = vec![0xBBu8; 32];
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    tree.insert(&[0x04u8], &commitment, &[], &BigInt::from(56u64)).unwrap();
+    tree.insert(&[0xFFu8; 32], &type_hash, &[], &BigInt::from(32u64)).unwrap();
+    let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+
+    crdt.add_vertex(&loc, &blob).unwrap();
+    let commits = crdt.commit(10).unwrap();
+
+    let shard_key = quil_hypergraph::shard_key_for_location(&loc);
+    // The AGGREGATED app vertex-adds root (over all 64 sub-shards).
+    let app_root: [u8; 32] = commits.get(&shard_key).unwrap()[0]
+        .as_slice()
+        .try_into()
+        .expect("32-byte aggregated app root");
+
+    let vertex_id = loc.to_id().to_vec();
+    let field_keys = vec![vec![0x04u8], vec![0xFFu8; 32]];
+    let mp = crdt
+        .build_membership_proof("vertex", "adds", &shard_key, &[(vertex_id, field_keys)])
+        .expect("build membership proof");
+    assert!(
+        mp.inputs[0].shard_aggregation.is_some(),
+        "a split-app proof must carry the sub-shard aggregation co-path"
+    );
+
+    let decoded = quil_forest::MembershipProof::from_bytes(&mp.to_bytes()).unwrap();
+    let expected = vec![
+        (vec![0x04u8], commitment.clone()),
+        (vec![0xFFu8; 32], type_hash.clone()),
+    ];
+    quil_forest::verify_vertex_membership(&app_root, &decoded.inputs[0], &expected)
+        .expect("split-app proof verifies against the aggregated app root");
+
+    // The co-path binding is load-bearing: a different app root is rejected.
+    let mut wrong = app_root;
+    wrong[0] ^= 0xFF;
+    assert!(
+        quil_forest::verify_vertex_membership(&wrong, &decoded.inputs[0], &expected).is_err(),
+        "proof must not verify against a different app root"
+    );
+    // A tampered field value is still rejected (the JMT field proof).
+    let bad = vec![(vec![0x04u8], vec![0xCCu8; 56]), (vec![0xFFu8; 32], type_hash)];
+    assert!(quil_forest::verify_vertex_membership(&app_root, &decoded.inputs[0], &bad).is_err());
+}
+
+/// A NON-QUIL binary split (the case the encoding reconciliation fixes): the
+/// shard set is the rebalancer's marker-byte prefixes `[0]`/`[128]` (filter
+/// suffix `0x00`/`0x80`), NOT QUIL 6-bit indices. Routing sends a leaf by its
+/// data-address TOP BIT, canonical bit-paths give "0"/"1", and the commit is
+/// deterministic + differs from a single unsplit tree.
+#[test]
+fn binary_split_marker_prefixes_commit_deterministically() {
+    let app = [0xCDu8; 32];
+    let mk = |d0: u8| {
+        let mut a = [0u8; 32];
+        a[0] = d0;
+        Location { app_address: app, data_address: a }
+    };
+    // data[0] top bit 0 → sub-shard [0]; top bit 1 → sub-shard [128].
+    let (v_lo, v_hi) = (mk(0x00), mk(0x80));
+
+    let build_split = || {
+        let c = fresh_crdt();
+        c.set_app_shard_prefixes(app, vec![vec![0], vec![128]]);
+        c.add_vertex(&v_lo, b"a").unwrap();
+        c.add_vertex(&v_hi, b"b").unwrap();
+        c.commit(1).unwrap()
+    };
+    let r1 = build_split();
+    let r2 = build_split();
+    let split_root = &r1.values().next().unwrap()[0];
+    assert_eq!(split_root.len(), 32, "aggregated binary-split app root is 32 bytes");
+    assert_eq!(split_root, &r2.values().next().unwrap()[0], "binary split is deterministic");
+
+    let single = fresh_crdt();
+    single.add_vertex(&v_lo, b"a").unwrap();
+    single.add_vertex(&v_hi, b"b").unwrap();
+    let rs = single.commit(1).unwrap();
+    assert_ne!(
+        split_root,
+        &rs.values().next().unwrap()[0],
+        "binary split changes the app root vs a single tree"
+    );
+}
+
+/// Full membership chain for a binary-split app: a vertex in the `0x80` sub-shard
+/// proves against that sub-shard root, and the co-path binds it to the aggregated
+/// app root — verifying the marker-byte prefix path end to end.
+#[test]
+fn binary_split_membership_binds_subshard_to_app_root() {
+    use num_bigint::BigInt;
+
+    let app = [0xCDu8; 32];
+    let crdt = fresh_crdt();
+    crdt.set_app_shard_prefixes(app, vec![vec![0], vec![128]]);
+
+    // data[0]=0x80 → top bit 1 → sub-shard [128].
+    let loc = Location { app_address: app, data_address: [0x80; 32] };
+    let commitment = vec![0xAAu8; 56];
+    let type_hash = vec![0xBBu8; 32];
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    tree.insert(&[0x04u8], &commitment, &[], &BigInt::from(56u64)).unwrap();
+    tree.insert(&[0xFFu8; 32], &type_hash, &[], &BigInt::from(32u64)).unwrap();
+    let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+
+    crdt.add_vertex(&loc, &blob).unwrap();
+    let commits = crdt.commit(10).unwrap();
+    let shard_key = quil_hypergraph::shard_key_for_location(&loc);
+    let app_root: [u8; 32] =
+        commits.get(&shard_key).unwrap()[0].as_slice().try_into().unwrap();
+
+    let vertex_id = loc.to_id().to_vec();
+    let field_keys = vec![vec![0x04u8], vec![0xFFu8; 32]];
+    let mp = crdt
+        .build_membership_proof("vertex", "adds", &shard_key, &[(vertex_id, field_keys)])
+        .expect("build membership proof");
+    assert!(
+        mp.inputs[0].shard_aggregation.is_some(),
+        "binary-split proof carries the sub-shard co-path"
+    );
+    let decoded = quil_forest::MembershipProof::from_bytes(&mp.to_bytes()).unwrap();
+    let expected = vec![(vec![0x04u8], commitment), (vec![0xFFu8; 32], type_hash)];
+    quil_forest::verify_vertex_membership(&app_root, &decoded.inputs[0], &expected)
+        .expect("binary-split proof verifies against the aggregated app root");
+    let mut wrong = app_root;
+    wrong[0] ^= 0xFF;
+    assert!(
+        quil_forest::verify_vertex_membership(&wrong, &decoded.inputs[0], &expected).is_err(),
+        "co-path binding is load-bearing"
+    );
+}
+
+/// Interleaved commits of different apps must NOT corrupt each other's trees.
+/// JMT needs contiguous per-tree versions; commit_inner uses a global version
+/// counter, so app A committed at frames 1 and 3 (with app B at frame 2 bumping
+/// the counter) gets non-contiguous versions. This asserts A keeps BOTH its
+/// vertices — i.e. the incremental commit built on A's real prior root, not an
+/// empty one.
+#[test]
+fn interleaved_app_commits_preserve_each_others_state() {
+    let crdt = fresh_crdt();
+    let a1 = Location { app_address: [0xA1; 32], data_address: [0x01; 32] };
+    let a2 = Location { app_address: [0xA1; 32], data_address: [0x02; 32] };
+    let b1 = Location { app_address: [0xB2; 32], data_address: [0x01; 32] };
+
+    // Frame 1: app A vertex 1.
+    crdt.add_vertex(&a1, b"a1").unwrap();
+    crdt.commit(1).unwrap();
+    // Frame 2: app B (bumps the global forest version).
+    crdt.add_vertex(&b1, b"b1").unwrap();
+    crdt.commit(2).unwrap();
+    // Frame 3: app A vertex 2 (incremental commit of A's tree, non-contiguous).
+    crdt.add_vertex(&a2, b"a2").unwrap();
+    crdt.commit(3).unwrap();
+
+    // Both of A's vertices must still be present.
+    assert_eq!(crdt.get_vertex_data(&a1).as_deref(), Some(&b"a1"[..]), "A vertex 1 survived");
+    assert_eq!(crdt.get_vertex_data(&a2).as_deref(), Some(&b"a2"[..]), "A vertex 2 present");
+}
+
+/// The FOREST tree (not just blobs) must survive interleaved commits: app A's
+/// frame-1 vertex must still prove against A's committed root after app B's
+/// frame-2 commit bumped the global version and A was re-committed at frame 3.
+/// This directly exercises whether commit_inner's global version counter builds
+/// each incremental commit on the tree's real prior root.
+#[test]
+fn interleaved_commits_keep_forest_tree_intact() {
+    use num_bigint::BigInt;
+
+    let crdt = fresh_crdt();
+    let app_a = [0xA1u8; 32];
+    let a1 = Location { app_address: app_a, data_address: [0x01; 32] };
+    let a2 = Location { app_address: app_a, data_address: [0x02; 32] };
+    let b1 = Location { app_address: [0xB2; 32], data_address: [0x01; 32] };
+
+    // A coin-shaped vertex for a1 so we can prove it.
+    let commitment = vec![0xAAu8; 56];
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    tree.insert(&[0x04u8], &commitment, &[], &BigInt::from(56u64)).unwrap();
+    let a1_blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+
+    crdt.add_vertex(&a1, &a1_blob).unwrap();
+    crdt.commit(1).unwrap(); // frame 1: A
+    crdt.add_vertex(&b1, b"b1").unwrap();
+    crdt.commit(2).unwrap(); // frame 2: B (bumps global version)
+    crdt.add_vertex(&a2, b"a2").unwrap();
+    let commits = crdt.commit(3).unwrap(); // frame 3: A incremental
+
+    let sk = quil_hypergraph::shard_key_for_location(&a1);
+    let root: [u8; 32] = commits.get(&sk).unwrap()[0].as_slice().try_into().unwrap();
+
+    // Prove a1's commitment field against A's frame-3 root.
+    let mp = crdt
+        .build_membership_proof("vertex", "adds", &sk, &[(a1.to_id().to_vec(), vec![vec![0x04u8]])])
+        .expect("build proof");
+    quil_forest::verify_vertex_membership(&root, &mp.inputs[0], &[(vec![0x04u8], commitment)])
+        .expect("a1 still proves against the forest root after interleaved commits");
+}

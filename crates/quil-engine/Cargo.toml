@@ -12,9 +12,14 @@ quil-crypto = { path = "../quil-crypto" }
 quil-store = { path = "../quil-store" }
 quil-tries = { path = "../quil-tries" }
 quil-hypergraph = { path = "../quil-hypergraph" }
+# Phase-3 forest: hash-Merkle requests_root on migrated nodes.
+quil-forest = { path = "../quil-forest" }
 quil-keys = { path = "../quil-keys" }
 quil-p2p = { path = "../quil-p2p" }
 quil-consensus = { path = "../quil-consensus" }
+# Commonware simplex consensus backend (P2 cutover). Provides the three seam
+# traits (GlobalProposer/FrameSink/FrameFinalizer) implemented in cw_global_seams.rs.
+quil-cw-consensus = { path = "../quil-cw-consensus" }
 quil-execution = { path = "../quil-execution" }
 tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
 tokio-util = "0.7"
@@ -40,6 +45,7 @@ tonic = "0.12"
 libc = "0.2"
 http = "1"
 async-trait = "0.1"
+bs58 = "0.5"
 
 [dev-dependencies]
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }

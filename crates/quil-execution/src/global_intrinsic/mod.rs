@@ -15,10 +15,10 @@
 //! dispatcher in `global_engine.rs` can route to today:
 //!
 //! - [`addressed_signature`] — the `BLS48581AddressedSignature`
-//!   canonical-bytes envelope (type 0x011B).
+//! canonical-bytes envelope (type 0x011B).
 //! - [`prover_filter_ops`] — canonical-bytes for `ProverLeave`,
-//!   `ProverPause`, `ProverResume`. All three share a
-//!   filter(s) + frame_number + addressed-signature layout.
+//! `ProverPause`, `ProverResume`. All three share a
+//! filter(s) + frame_number + addressed-signature layout.
 //!
 //! Further ops (`ProverJoin`, `ProverConfirm`, `ProverReject`,
 //! `ProverKick`, `ProverUpdate`, `SeniorityMerge`, `ShardSplit`,

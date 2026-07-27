@@ -4,16 +4,16 @@
 //! sites with subtly different rules:
 //!
 //! - `LocalShardInfoProvider::get_shard_info` (server-side RPC) read
-//!   `registry.current_frame()`, falling back to a clock-store load,
-//!   falling back to `last_received_frame`. Each iteration of the
-//!   resolution rule introduced a new bug.
+//! `registry.current_frame()`, falling back to a clock-store load,
+//! falling back to `last_received_frame`. Each iteration of the
+//! resolution rule introduced a new bug.
 //! - `NodeRpcServer::get_node_info` re-implemented the same idiom
-//!   with slightly different semantics.
+//! with slightly different semantics.
 //! - `prover_registry::current_frame()` only advanced when the
-//!   materializer called `process_state_transition` — stale on
-//!   observer nodes.
+//! materializer called `process_state_transition` — stale on
+//! observer nodes.
 //! - The frame-receive sites in `main.rs` used a mix of plain `store`
-//!   (which could regress) and `fetch_max` (which can't).
+//! (which could regress) and `fetch_max` (which can't).
 //!
 //! `CurrentFrame` collapses all of these into one shared atomic
 //! triple. Every site that needs "the current frame" reads

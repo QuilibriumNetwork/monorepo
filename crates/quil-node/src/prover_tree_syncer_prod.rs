@@ -1,12 +1,15 @@
-//! Production [`ProverTreeSyncer`] impl.
+//! Production [`ProverTreeSyncer`] impl — efficient forest Merkle-diff sync.
 //!
-//! Syncs the global prover tree from the master's
-//! HypergraphComparisonService via mTLS. In Go, workers call
-//! `HyperSyncSelf` which dials the master — the master hosts the
-//! snapshot of the prover tree. This Rust port does the same: it
-//! connects to the master's stream port (the same one that serves
-//! `GlobalService`) and uses `ensure_prover_tree_incremental` to pull
-//! the vertex-adds tree for the global shard.
+//! A behind worker catches its shard/phase trees up to a peer archive by
+//! walking the peer's JMT top-down and pulling only the nodes whose hash
+//! differs from its own ([`quil_forest::diff_leaves`], via a gRPC-backed
+//! [`RemoteTreeReader`]). The diff is self-authenticating against the trusted
+//! header root, and the pulled leaves are applied into the live CRDT's forest at
+//! a COORDINATED version (so they never collide with `commit_inner`).
+//!
+//! Replaces the legacy KZG `ensure_prover_tree_incremental` /
+//! `ensure_shard_tree_fresh` node-by-node walk (which rebuilt a
+//! `VectorCommitmentTree`); that path is retired with the forest cutover.
 
 use std::sync::Arc;
 
@@ -14,105 +17,150 @@ use async_trait::async_trait;
 use tracing::{info, warn};
 
 use quil_engine::prover_tree_syncer::ProverTreeSyncer;
+use quil_rpc::ArchiveClient;
 use quil_types::error::{QuilError, Result};
 
 /// Syncs from a fixed endpoint (typically the master's stream port).
 pub struct ProdProverTreeSyncer {
     /// `host:port` of the master's peer gRPC listener.
     pub master_stream_addr: String,
-    /// Worker's HypergraphStore — synced tree data is persisted here.
+    /// Worker's HypergraphStore (the forest shares its RocksDB).
     pub hg_store: Arc<quil_store::RocksHypergraphStore>,
-    /// Ed448 seed for mTLS to the master.
-    pub ed448_seed: [u8; 57],
+    /// Falcon q-prover-key signing key (1281B) — the `:8340` network identity
+    /// used for the PQNoise handshake to the master.
+    pub falcon_signing_key: Vec<u8>,
+    /// The live CRDT — sync applies into ITS forest at coordinated versions.
+    pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+}
+
+impl ProdProverTreeSyncer {
+    /// Sync one SINGLE-shard tree (its `shard_id` is the app address) via the
+    /// efficient Merkle diff. For each of the four phases: discover the peer's
+    /// `(version, root)`, verify the vertex-adds root (phase 0) against
+    /// `expected_va_root` (the header root the caller pinned), then diff + apply
+    /// into the CRDT forest. Returns whether phase 0 converged to that root.
+    /// Phases 1–3 pin to the same generation but have no separately-advertised
+    /// header root, so they are pulled best-effort behind the phase-0 anchor.
+    async fn sync_single_shard(&self, shard_id: Vec<u8>, expected_va_root: &[u8]) -> Result<bool> {
+        let mut client = ArchiveClient::connect_mtls(&self.master_stream_addr, &self.falcon_signing_key)
+            .await
+            .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
+        let handle = tokio::runtime::Handle::current();
+        let mut va_converged = false;
+        for phase in 0u32..4 {
+            let head = client
+                .get_forest_head(shard_id.clone(), phase)
+                .await
+                .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))?;
+            let Some((v_s, root_s)) = head else {
+                continue; // peer has no tree for this phase (empty) — nothing to pull
+            };
+            if phase == 0 && root_s.as_slice() != expected_va_root {
+                warn!(
+                    peer = %hex::encode(&root_s),
+                    expected = %hex::encode(expected_va_root),
+                    "peer vertex-adds root != expected — not syncing this shard"
+                );
+                return Ok(false);
+            }
+            let got = crate::forest_sync::sync_one_phase(
+                &mut client, &handle, &self.crdt, &shard_id, phase, v_s,
+            )
+            .await?;
+            if phase == 0 {
+                va_converged = got.as_slice() == expected_va_root;
+                if !va_converged {
+                    warn!("post-sync vertex-adds root still differs from expected");
+                }
+            }
+        }
+        Ok(va_converged)
+    }
+
+    /// Sync a SPLIT app (QUIL: 64 sub-shards). For each phase: fetch every
+    /// sub-shard's `(version, root)`; on phase 0, verify the whole set aggregates
+    /// to the header app root (`expected_va_root`) — one binding that
+    /// authenticates all 64 sub-shard roots at once (model B) — then diff + apply
+    /// each present sub-shard. Absent sub-shards contribute the empty root, so
+    /// the aggregate matches `commit_inner`. Returns whether phase 0 converged.
+    async fn sync_split_shard(&self, app: [u8; 32], expected_va_root: &[u8]) -> Result<bool> {
+        let mut client = ArchiveClient::connect_mtls(&self.master_stream_addr, &self.falcon_signing_key)
+            .await
+            .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
+        let handle = tokio::runtime::Handle::current();
+        let sub_shards = self.crdt.app_sub_shards(&app);
+        let mut va_converged = false;
+        for phase in 0u32..4 {
+            // Fetch every sub-shard's head for this phase.
+            let mut heads: Vec<(Vec<u8>, Vec<bool>, Option<(u64, [u8; 32])>)> =
+                Vec::with_capacity(sub_shards.len());
+            for (shard_id, bits) in &sub_shards {
+                let h = client
+                    .get_forest_head(shard_id.clone(), phase)
+                    .await
+                    .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))?;
+                let h32 = h.and_then(|(v, r)| {
+                    <[u8; 32]>::try_from(r.as_slice()).ok().map(|a| (v, a))
+                });
+                heads.push((shard_id.clone(), bits.clone(), h32));
+            }
+            // Phase 0: the aggregate of all sub-shard roots must equal the trusted
+            // header app root, which authenticates every root before we pull it.
+            if phase == 0 {
+                let sub_roots: Vec<(Vec<bool>, [u8; 32])> = heads
+                    .iter()
+                    .map(|(_, bits, h)| (bits.clone(), h.map(|(_, r)| r).unwrap_or([0u8; 32])))
+                    .collect();
+                if !self.crdt.app_root_matches(&sub_roots, expected_va_root) {
+                    warn!("QUIL sub-shard roots do not aggregate to the expected app root — not syncing");
+                    return Ok(false);
+                }
+            }
+            // Diff + apply each present sub-shard (identical ones transfer nothing).
+            for (shard_id, _, head) in &heads {
+                let Some((v_s, root_s)) = *head else { continue };
+                let got = crate::forest_sync::sync_one_phase(
+                    &mut client, &handle, &self.crdt, shard_id, phase, v_s,
+                )
+                .await?;
+                if got != root_s {
+                    warn!(phase, "QUIL sub-shard post-sync root mismatch");
+                    if phase == 0 {
+                        return Ok(false);
+                    }
+                }
+            }
+            if phase == 0 {
+                va_converged = true;
+            }
+        }
+        Ok(va_converged)
+    }
 }
 
 #[async_trait]
 impl ProverTreeSyncer for ProdProverTreeSyncer {
     async fn sync_prover_tree(&self, expected_root: &[u8]) -> Result<bool> {
-        info!(addr = %self.master_stream_addr, "syncing prover tree from master");
-        let stats = quil_rpc::ensure_prover_tree_incremental(
-            &self.master_stream_addr,
-            &self.ed448_seed,
-            quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
-            self.hg_store.clone(),
-            expected_root,
-        )
-        .await
-        .map_err(|e| QuilError::Internal(format!("prover tree sync failed: {}", e)))?;
-        if stats.leaves_pulled > 0 {
-            info!(
-                leaves = stats.leaves_pulled,
-                matched = stats.commitments_match,
-                "prover tree sync complete"
-            );
-        }
-        Ok(stats.commitments_match)
+        // The global prover shard is a single-shard app: L2 = [0xff; 32].
+        info!(addr = %self.master_stream_addr, "syncing global prover tree (forest diff)");
+        self.sync_single_shard(vec![0xffu8; 32], expected_root).await
     }
 
     async fn sync_shard_tree(&self, filter: &[u8], expected_root: &[u8]) -> Result<bool> {
-        use quil_types::proto::application::HypergraphPhaseSet;
-        // Derive the shard key from the filter (same as the prove path:
-        // l1 = bloom indices, l2 = filter[..32]).
         let n = filter.len().min(32);
-        let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&filter[..n], 256, 3);
         let mut l2 = [0u8; 32];
         l2[..n].copy_from_slice(&filter[..n]);
-        let shard = quil_types::store::ShardKey { l1, l2 };
+        // QUIL splits 64-way: its state lives in sub-shard trees (app‖prefix),
+        // verified as a set via the aggregation binding.
+        if l2 == quil_execution::domains::QUIL_TOKEN {
+            info!(addr = %self.master_stream_addr, "syncing QUIL app (forest diff, 64 sub-shards)");
+            return self.sync_split_shard(l2, expected_root).await;
+        }
         info!(
             addr = %self.master_stream_addr,
             filter = %hex::encode(&filter[..n]),
-            "syncing app-shard tree from archive (all phase sets)"
+            "syncing app-shard tree (forest diff, single-shard)"
         );
-        // Sync ALL FOUR phase sets, mirroring Go's HyperSync
-        // (sync_provider.go:411-414 `phaseSyncs`): app-shard state lives
-        // across vertex adds/removes AND hyperedge adds/removes (token
-        // spends move coins into the remove set; spent-markers + outputs
-        // into adds). Syncing only VertexAdds would leave the other phase
-        // trees stale. Every phase is pinned to the SAME `expected_root`
-        // — the frame's `state_roots[0]` (vertex-adds root), which the
-        // server uses as the snapshot-generation anchor; each phase pulls
-        // its own tree from that one consistent generation.
-        let phases = [
-            HypergraphPhaseSet::VertexAdds,
-            HypergraphPhaseSet::VertexRemoves,
-            HypergraphPhaseSet::HyperedgeAdds,
-            HypergraphPhaseSet::HyperedgeRemoves,
-        ];
-        let mut adds_converged = false;
-        for phase in phases {
-            match quil_rpc::ensure_shard_tree_fresh(
-                &shard,
-                &self.master_stream_addr,
-                &self.ed448_seed,
-                phase,
-                self.hg_store.clone(),
-                expected_root,
-            )
-            .await
-            {
-                Ok(stats) => {
-                    // The vertex-adds phase root IS the generation anchor,
-                    // so its convergence confirms we caught the tree up to
-                    // the pinned frame; the engine keys its cursor
-                    // fast-forward on this.
-                    if matches!(phase, HypergraphPhaseSet::VertexAdds) {
-                        adds_converged = stats.commitments_match;
-                    }
-                }
-                Err(e) => {
-                    warn!(?phase, error = %e, "app-shard phase sync failed");
-                    // A vertex-adds failure means we didn't reach the
-                    // generation at all — surface it; the others are
-                    // best-effort (an empty phase is a no-op).
-                    if matches!(phase, HypergraphPhaseSet::VertexAdds) {
-                        return Err(QuilError::Internal(format!(
-                            "shard vertex-adds sync failed: {}",
-                            e
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(adds_converged)
+        self.sync_single_shard(l2.to_vec(), expected_root).await
     }
 }

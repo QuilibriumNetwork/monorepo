@@ -22,6 +22,22 @@ use quil_hypergraph::addressing::Location;
 // Discriminator constants
 // =====================================================================
 
+/// A PQ-safe content digest of a vector-commitment tree: `SHA-512` over its flat
+/// `(field_key, value)` leaves. Replaces the KZG/BLS48-581 `commit()` for the
+/// vestigial metadata `hash_target` and the compute-deploy domain — hashes tree
+/// CONTENT, not a curve commitment. Deterministic ⇒ consensus-safe.
+pub(crate) fn tree_content_digest(tree: &VectorCommitmentTree) -> Vec<u8> {
+    use sha2::{Digest, Sha512};
+    let mut h = Sha512::new();
+    for (k, v) in tree.leaves() {
+        h.update((k.len() as u32).to_be_bytes());
+        h.update(&k);
+        h.update((v.len() as u32).to_be_bytes());
+        h.update(&v);
+    }
+    h.finalize().to_vec()
+}
+
 /// `poseidon("vertex:adds")` — 32 bytes.
 pub fn vertex_adds_discriminator() -> Result<[u8; 32]> {
     hash_bytes_to_32(b"vertex:adds")
@@ -59,14 +75,17 @@ pub fn seal_metadata_state_at_index(
     metadata: &mut VectorCommitmentTree,
     sub_data: &mut VectorCommitmentTree,
     index: u8,
-    prover: &(dyn InclusionProver + Sync),
+    _prover: &(dyn InclusionProver + Sync),
 ) -> Result<()> {
     if index > 63 {
         return Err(QuilError::InvalidArgument(
             "seal metadata state at index: index out of range".into(),
         ));
     }
-    let sub_commit = sub_data.commit(prover);
+    // hash_target = SHA-512 content digest (retired from the KZG commit; it is a
+    // vestigial go-tree leaf annotation, not a forest L3 leaf, so this only
+    // changes stored-blob bytes, never a state root).
+    let sub_commit = tree_content_digest(sub_data);
     let sub_bytes = serialize_go_tree(sub_data.root.as_ref())
         .map_err(|e| QuilError::Internal(format!("seal metadata: serialize: {e}")))?;
     let sub_size = sub_data
@@ -202,15 +221,15 @@ impl HypergraphState {
     /// Initialize a deployed intrinsic's metadata vertex — the Rust port
     /// of Go `HypergraphState.Init` (hypergraph_state.go:531-630). Builds
     /// the `publicStateInformation` tree:
-    ///   - `[0<<2]`  consensus metadata sub-tree (sealed; empty for all
-    ///              current intrinsics)
-    ///   - `[1<<2]`  sumcheck info sub-tree (sealed; empty)
-    ///   - `[2<<2]`  RDF schema, raw string bytes
-    ///   - `[(i+3)<<2]` each `additional_data[i]` with `i+3 >= 16`
-    ///              (sealed). `additional_data[13]` → key `[0x40]` is the
-    ///              intrinsic's configuration tree. Indices `i+3 < 16` are
-    ///              reserved and MUST be `None`.
-    ///   - `0xff*32` the `intrinsic_type` (base domain), raw
+    ///   - `[0<<2]` consensus metadata sub-tree (sealed; empty for all
+    /// current intrinsics)
+    ///   - `[1<<2]` sumcheck info sub-tree (sealed; empty)
+    ///   - `[2<<2]` RDF schema, raw string bytes
+    /// - `[(i+3)<<2]` each `additional_data[i]` with `i+3 >= 16`
+    /// (sealed). `additional_data[13]` → key `[0x40]` is the
+    /// intrinsic's configuration tree. Indices `i+3 < 16` are
+    /// reserved and MUST be `None`.
+    /// - `0xff*32` the `intrinsic_type` (base domain), raw
     /// then writes it as a vertex at `(domain, HYPERGRAPH_METADATA_ADDRESS)`
     /// in the vertex-adds set. `domain` must be 32 bytes. The metadata
     /// vertex is committed before serialization so the stored blob carries
@@ -276,9 +295,9 @@ impl HypergraphState {
             )
             .map_err(|e| QuilError::Internal(format!("init metadata: type-domain insert: {e}")))?;
 
-        // Commit so the serialized blob carries node commitments, then
-        // write the metadata vertex.
-        let _ = public.commit(prover);
+        // Node commitments in the serialized blob are no longer KZG-computed
+        // (retired — they are forest-irrelevant; the flattened leaf values, not
+        // node commitments, form the state root). Serialize as-is.
         let public_blob = serialize_go_tree(public.root.as_ref())
             .map_err(|e| QuilError::Internal(format!("init metadata: serialize: {e}")))?;
         let va_disc = vertex_adds_discriminator()?;

@@ -60,6 +60,18 @@ async fn main() -> anyhow::Result<()> {
     let key_bytes = hex::decode(&config.p2p.peer_priv_key)?;
     anyhow::ensure!(key_bytes.len() >= 57, "need Ed448 key");
     let ed448_seed: [u8; 57] = key_bytes[..57].try_into().unwrap();
+    // :8340 network identity = the node's Falcon q-prover-key (from keystore);
+    // the Ed448 seed above stays as the seniority/identity key.
+    let falcon_signing_key = {
+        use quil_keys::KeyManager as _;
+        let fkm = quil_keys::FileKeyManager::new(
+            std::path::PathBuf::from(&config.key.key_store_file.path),
+            &config.key.key_store_file.encryption_key,
+            "default-proving-key".to_string(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )?;
+        fkm.get_private_key(quil_types::crypto::KeyType::Falcon512)?
+    };
     let ed448_pubkey = quil_p2p::ed448_identity::derive_public_key(&ed448_seed);
     let ed448_peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&ed448_pubkey);
     info!(
@@ -69,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // BLS prover key
-    let bls_ctor = quil_crypto::Bls48581KeyConstructor;
+    let bls_ctor = quil_crypto::FalconKeyConstructor;
     let (bls_signer_box, bls_pubkey) = quil_types::crypto::BlsConstructor::new_key(&bls_ctor)?;
     // Wrap in Arc for sharing across tasks
     let bls_signer: Arc<dyn quil_types::crypto::Signer> = Arc::from(bls_signer_box);
@@ -89,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
 
     // P2P
-    let p2p_node = quil_p2p::node::P2PNode::new_with_options(&config.p2p, false)?;
+    let p2p_node = quil_p2p::node::P2PNode::new_with_options(&config.p2p, false, None)?;
     let listen_addr = if config.p2p.listen_multiaddr.is_empty() {
         "/ip4/0.0.0.0/udp/8336/quic-v1".to_string()
     } else {
@@ -264,7 +276,7 @@ async fn main() -> anyhow::Result<()> {
                 info!(elapsed = ?start.elapsed(), head = hf, "SYNCING");
                 let addr = archive_addrs.lock().await.first().cloned();
                 if let Some(addr) = addr {
-                    if let Ok(mut c) = quil_rpc::ArchiveClient::connect_mtls(&addr, &ed448_seed).await {
+                    if let Ok(mut c) = quil_rpc::ArchiveClient::connect_mtls(&addr, &falcon_signing_key).await {
                         if let Ok(f) = c.get_global_frame(0).await {
                             let fn_ = f.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
                             head_frame.store(fn_, Ordering::Relaxed);
@@ -279,17 +291,9 @@ async fn main() -> anyhow::Result<()> {
             Phase::FindingShards => {
                 info!(elapsed = ?start.elapsed(), "FINDING_SHARDS");
 
-                // Fresh sync prover tree — must be current data to pick correct filters
-                let addr = archive_addrs.lock().await.first().cloned();
-                if let Some(addr) = addr {
-                    let s = hg_store.clone();
-                    let _ = quil_rpc::ensure_prover_tree_fresh(
-                        &addr, &ed448_seed,
-                        quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
-                        s,
-                        &[], // test binary: no expected_root pin
-                    ).await;
-                }
+                // (Prover-tree sync removed: the forest Merkle-diff sync applies
+                // into a live CRDT, which this diagnostic binary doesn't build.
+                // The legacy KZG ensure_prover_tree_* path was retired.)
 
                 let reg = Arc::new(quil_execution::SharedProverRegistry::new());
                 {
@@ -341,7 +345,7 @@ async fn main() -> anyhow::Result<()> {
                 // join's FrameNumber is rejected if >10 frames stale.
                 let addr = archive_addrs.lock().await.first().cloned();
                 let (output, fn_, diff) = if let Some(a) = addr {
-                    match quil_rpc::ArchiveClient::connect_mtls(&a, &ed448_seed).await {
+                    match quil_rpc::ArchiveClient::connect_mtls(&a, &falcon_signing_key).await {
                         Ok(mut c) => match c.get_global_frame(0).await {
                             Ok(f) => {
                                 let h = f.header.as_ref().unwrap();
@@ -482,7 +486,7 @@ async fn main() -> anyhow::Result<()> {
                                             for addr in &addrs {
                                                 let stream_addr = addr.replace(":8336", ":8340");
                                                 match quil_rpc::ArchiveClient::connect_mtls(
-                                                    &stream_addr, &ed448_seed,
+                                                    &stream_addr, &falcon_signing_key,
                                                 ).await {
                                                     Ok(mut client) => {
                                                         match client.submit_global_message(bytes.clone()).await {
@@ -528,7 +532,7 @@ async fn main() -> anyhow::Result<()> {
                     let addr = archive_addrs.lock().await.first().cloned();
                     if let Some(addr) = addr {
                         // Update head frame
-                        if let Ok(mut c) = quil_rpc::ArchiveClient::connect_mtls(&addr, &ed448_seed).await {
+                        if let Ok(mut c) = quil_rpc::ArchiveClient::connect_mtls(&addr, &falcon_signing_key).await {
                             if let Ok(f) = c.get_global_frame(0).await {
                                 let new_hf = f.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
                                 head_frame.store(new_hf, Ordering::Relaxed);
@@ -536,15 +540,8 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
 
-                        // Incremental sync — compares commitments and only
-                        // fetches changed branches (seconds vs 9 minutes).
-                        let hs = hg_store.clone();
-                        let _ = quil_rpc::ensure_prover_tree_incremental(
-                            &addr, &ed448_seed,
-                            quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
-                            hs.clone(),
-                            &[], // test binary: no expected_root pin
-                        ).await;
+                        // (Incremental prover-tree sync removed with the KZG
+                        // ensure_prover_tree_* retirement — see note above.)
 
                         let reg = Arc::new(quil_execution::SharedProverRegistry::new());
                         let hs2 = hg_store.clone();
@@ -578,7 +575,7 @@ async fn main() -> anyhow::Result<()> {
                     last_sync = hf;
                     let addr = archive_addrs.lock().await.first().cloned();
                     if let Some(addr) = addr {
-                        if let Ok(mut c) = quil_rpc::ArchiveClient::connect_mtls(&addr, &ed448_seed).await {
+                        if let Ok(mut c) = quil_rpc::ArchiveClient::connect_mtls(&addr, &falcon_signing_key).await {
                             if let Ok(f) = c.get_global_frame(0).await {
                                 head_frame.store(f.header.as_ref().map(|h| h.frame_number).unwrap_or(0), Ordering::Relaxed);
                             }

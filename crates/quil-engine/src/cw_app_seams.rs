@@ -1,0 +1,464 @@
+//! Real-state implementations of the commonware-simplex consensus seams for
+//! APP-SHARD consensus (P3). Analogous to [`crate::cw_global_seams`] but for the
+//! per-shard chains. See `crates/quil-cw-consensus/CUTOVER.md` §7.
+//!
+//! Structural differences from the global path (why this can't be a copy-paste):
+//! - The app leader provider (`AppLeaderProvider`) is PRIVATE to `app_engine.rs`
+//! and tightly coupled to the engine (it shares the `frame_requests` map and
+//! `halted` flag). So instead of extracting it, the CW app path is activated
+//! INSIDE `AppConsensusEngine::start_consensus`, reusing the `Arc<dyn
+//! LeaderProvider<AppShardState>>` already built there.
+//! - The full `AppShardFrame{header, requests}` cannot be rebuilt from the
+//! consensus `State` alone — the `requests` live in the engine's per-frame
+//! `frame_requests` map. So the engine supplies an ASSEMBLER callback that
+//! turns a produced `State<AppShardState>` into the full frame.
+//! - `verify` only needs the header (`BlsAppFrameValidator::validate_proposal`
+//! checks VDF + structure, not requests), but the block shipped to peers must
+//! carry the FULL frame so `on_finalized` can materialize it.
+//!
+//! The three commonware seam traits are reused verbatim from
+//! `quil_cw_consensus::adapters` — they are generic over the 32-byte `Sha256`
+//! digest, so the `Global*` naming is incidental.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use quil_cw_consensus::adapters::{
+    digest_from_identity, digest_to_identity, Digest, FrameFinalizer, FrameSink, GlobalProposer,
+    Recipients,
+};
+use quil_cw_consensus::falcon_base::FalconPublicKey;
+
+use quil_consensus::leader_provider::LeaderProvider;
+use quil_consensus::models::State;
+use quil_types::proto::global::AppShardFrame;
+
+use crate::app_types::AppShardState;
+use crate::frame_validator::BlsAppFrameValidator;
+
+/// simplex channel id reserved for out-of-band app block (frame-bytes) delivery
+/// — the app analog of `cw_global_seams::CW_BLOCK_CHANNEL`.
+pub const CW_APP_BLOCK_CHANNEL: u64 = 3;
+
+/// Build the full `AppShardFrame{header, requests}` from a produced consensus
+/// state. Supplied by `AppConsensusEngine` (it owns the per-frame `frame_requests`
+/// map the leader recorded); returns `None` if assembly fails.
+pub type AppFrameAssembler =
+    Arc<dyn Fn(&State<AppShardState>) -> Option<AppShardFrame> + Send + Sync>;
+
+/// Called with a finalized `AppShardFrame` — the engine materializes its requests
+/// (`materialize_app_shard_requests`) and publishes the full frame on
+/// `shard_frame_bitmask` for archives/followers.
+pub type AppFrameSink = Arc<dyn Fn(AppShardFrame) + Send + Sync>;
+
+/// Like [`AppFrameSink`] but also carries the serialized simplex finalization
+/// certificate (proposal + Falcon quorum cert), so the engine can attach it to
+/// the reward-coverage bundle for global-level verification.
+pub type AppFinalizedSink = Arc<dyn Fn(AppShardFrame, Vec<u8>) + Send + Sync>;
+
+/// Build the full `AppShardFrame` from a produced consensus state + the leader's
+/// recorded request bundles. Mirrors the finalized-frame rebuild at
+/// `app_engine.rs:2805` but sourced from `AppShardState` (the fields carry
+/// through losslessly). At propose time there is no committee quorum signature
+/// yet — `verify` uses `validate_proposal` (VDF + structure), which doesn't
+/// require one — so `public_key_signature_bls48581` is left `None`.
+///
+/// This is the pure core of the engine-supplied `AppFrameAssembler`: the engine's
+/// closure reads `frame_requests[state.frame_number]` and calls this.
+pub fn app_frame_from_state(
+    state: &State<AppShardState>,
+    requests: Vec<quil_types::proto::global::MessageBundle>,
+    storage_attestation: Vec<u8>,
+) -> AppShardFrame {
+    let app = &state.state;
+    let header = quil_types::proto::global::FrameHeader {
+        address: app.filter.clone(),
+        frame_number: app.frame_number,
+        rank: app.rank,
+        timestamp: app.timestamp,
+        difficulty: app.difficulty,
+        output: app.output.clone(),
+        parent_selector: app.parent_selector.clone(),
+        requests_root: app.requests_root.clone(),
+        state_roots: app.state_roots.clone(),
+        prover: app.prover.clone(),
+        fee_multiplier_vote: app.fee_multiplier,
+        public_key_signature_bls48581: None,
+        storage_attestation_root: app.storage_attestation_root.clone(),
+        global_frame_number: app.global_frame_number,
+        ..Default::default()
+    };
+    // Proposer self storage-attestation (CW PoRep port): the serialized
+    // `StorageAttestation` openings the leader stashed at prove time, decoded onto
+    // the full frame so followers/archives + the global reward audit see them.
+    // Empty blob → no attestation (pre-storage-fork / uncovered frame).
+    let storage_attestation = if storage_attestation.is_empty() {
+        None
+    } else {
+        <quil_types::proto::global::StorageAttestation as prost::Message>::decode(
+            storage_attestation.as_slice(),
+        )
+        .ok()
+    };
+    AppShardFrame {
+        header: Some(header),
+        requests,
+        storage_attestation,
+    }
+}
+
+/// Frame identity (`Poseidon(output)[..32]`) as the consensus digest — identical
+/// scheme to global (`AppShardState`/`GlobalFrame` share `compute_output_identity`).
+fn app_frame_digest(frame: &AppShardFrame) -> Option<Digest> {
+    let output = &frame.header.as_ref()?.output;
+    let id = quil_crypto::poseidon::hash_bytes_to_32(output).ok()?;
+    Some(digest_from_identity(id))
+}
+
+fn encode_app_frame(frame: &AppShardFrame) -> Vec<u8> {
+    prost::Message::encode_to_vec(frame)
+}
+
+fn decode_app_frame(bytes: &[u8]) -> Option<AppShardFrame> {
+    <AppShardFrame as prost::Message>::decode(bytes).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Proposer (GlobalProposer seam)
+// ---------------------------------------------------------------------------
+
+/// Builds/validates app-shard frames via the engine's own `AppLeaderProvider`
+/// (passed as `Arc<dyn LeaderProvider<AppShardState>>`) + `BlsAppFrameValidator`.
+pub struct AppSeamProposer {
+    leader_provider: Arc<dyn LeaderProvider<AppShardState>>,
+    validator: Arc<BlsAppFrameValidator>,
+    assemble: AppFrameAssembler,
+    filter: Vec<u8>,
+    /// digest → frame_number (resolves the parent frame number from the simplex
+    /// parent digest, which carries only the identity).
+    block_meta: Arc<Mutex<HashMap<Digest, u64>>>,
+}
+
+impl AppSeamProposer {
+    pub fn new(
+        leader_provider: Arc<dyn LeaderProvider<AppShardState>>,
+        validator: Arc<BlsAppFrameValidator>,
+        assemble: AppFrameAssembler,
+        filter: Vec<u8>,
+    ) -> Self {
+        Self {
+            leader_provider,
+            validator,
+            assemble,
+            filter,
+            block_meta: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Record digest → frame_number (used by inbound-block ingestion so a synced
+    /// parent resolves its number).
+    pub fn note_frame(&self, digest: Digest, frame_number: u64) {
+        self.block_meta.lock().unwrap().insert(digest, frame_number);
+    }
+}
+
+impl GlobalProposer for AppSeamProposer {
+    fn propose(&self, view: u64, parent_digest: Digest) -> Option<(Digest, Vec<u8>)> {
+        let prior_state_id: Vec<u8> = digest_to_identity(&parent_digest).to_vec();
+        let prior_frame_number = self
+            .block_meta
+            .lock()
+            .unwrap()
+            .get(&parent_digest)
+            .copied()
+            .unwrap_or(0);
+
+        // App shards resolve their parent from the shard clock store internally,
+        // so `prior_frame_number` is advisory; `prior_state_id` is the identity.
+        let state = self
+            .leader_provider
+            .prove_next_state(view, &self.filter, prior_frame_number, &prior_state_id)
+            .ok()?;
+
+        // The engine assembles the FULL frame (header + recorded requests).
+        let frame = (self.assemble)(&state)?;
+        let digest = app_frame_digest(&frame)?;
+        let frame_number = frame.header.as_ref()?.frame_number;
+        let bytes = encode_app_frame(&frame);
+
+        self.block_meta.lock().unwrap().insert(digest, frame_number);
+        Some((digest, bytes))
+    }
+
+    fn verify(&self, _view: u64, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
+        let Some(bytes) = bytes else {
+            tracing::warn!("cw app verify: block not delivered (nullify)");
+            return false;
+        };
+        let Some(frame) = decode_app_frame(&bytes) else {
+            tracing::warn!("cw app verify: undecodable block (nullify)");
+            return false;
+        };
+        let Some(header) = frame.header.as_ref() else {
+            return false;
+        };
+        if app_frame_digest(&frame) != Some(digest) {
+            tracing::warn!(frame = header.frame_number, "cw app verify: digest mismatch");
+            return false;
+        }
+        // Proposal-mode validation: VDF + structure, no committee QC required yet.
+        match self.validator.validate_proposal(&frame) {
+            Ok(true) => {
+                self.block_meta
+                    .lock()
+                    .unwrap()
+                    .insert(digest, header.frame_number);
+                true
+            }
+            other => {
+                tracing::warn!(frame = header.frame_number, result = ?other, "cw app verify: validate failed");
+                false
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sink (FrameSink seam) — ships block bytes to the shard committee.
+// ---------------------------------------------------------------------------
+
+/// Carries app-shard simplex channel messages over the node's per-shard gossip
+/// (`shard_consensus_bitmask`) — the app analog of `GlobalConsensusTransport`.
+/// The node implements this over BlossomSub; `channel` is tagged so the peer
+/// demuxes back to the right simplex channel (0=vote,1=cert,2=resolver,3=block).
+pub trait AppConsensusTransport: Send + Sync + 'static {
+    fn deliver(&self, channel: u64, recipients: Vec<FalconPublicKey>, bytes: Vec<u8>);
+}
+
+/// Ships the full app frame bytes to the shard committee over the CW block channel.
+pub struct AppSeamSink {
+    transport: Arc<dyn AppConsensusTransport>,
+    peers: Arc<[FalconPublicKey]>,
+}
+
+impl AppSeamSink {
+    pub fn new(transport: Arc<dyn AppConsensusTransport>, peers: Arc<[FalconPublicKey]>) -> Self {
+        Self { transport, peers }
+    }
+}
+
+impl FrameSink for AppSeamSink {
+    fn broadcast(&self, _digest: Digest, bytes: Vec<u8>, recipients: Recipients<FalconPublicKey>) {
+        let to: Vec<FalconPublicKey> = match recipients {
+            Recipients::All => self.peers.to_vec(),
+            Recipients::Some(r) => r,
+            Recipients::One(r) => vec![r],
+        };
+        self.transport.deliver(CW_APP_BLOCK_CHANNEL, to, bytes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finalizer (FrameFinalizer seam) — materialize on finalize.
+// ---------------------------------------------------------------------------
+
+/// Materializes finalized app frames + writes candidates on notarize, via
+/// engine-supplied callbacks (materialize + full-frame publish live in the
+/// engine, keyed by the per-shard hypergraph the seam has no handle to).
+pub struct AppSeamFinalizer {
+    /// Called on notarize with the (uncommitted) frame — optional candidate persist.
+    on_notarized: AppFrameSink,
+    /// Called on finalize — materialize + publish the full frame + coverage. Also
+    /// receives the serialized finalization certificate for reward attribution.
+    on_finalized: AppFinalizedSink,
+}
+
+impl AppSeamFinalizer {
+    pub fn new(on_notarized: AppFrameSink, on_finalized: AppFinalizedSink) -> Self {
+        Self { on_notarized, on_finalized }
+    }
+}
+
+impl FrameFinalizer for AppSeamFinalizer {
+    fn on_notarized(&self, _view: u64, _digest: Digest, bytes: Option<Vec<u8>>) {
+        let Some(bytes) = bytes else { return };
+        let Some(frame) = decode_app_frame(&bytes) else { return };
+        (self.on_notarized)(frame);
+    }
+
+    fn on_finalized(&self, _view: u64, _digest: Digest, bytes: Option<Vec<u8>>, cert: Option<Vec<u8>>) {
+        let Some(bytes) = bytes else { return };
+        let Some(frame) = decode_app_frame(&bytes) else { return };
+        (self.on_finalized)(frame, cert.unwrap_or_default());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live activation (analog of `cw_global_seams::activate_global_consensus_cw`).
+// ---------------------------------------------------------------------------
+
+use quil_cw_consensus::adapters::BlockStore;
+use quil_cw_consensus::engine_host::{spawn_global_host, GlobalEngineParams, GlobalHostHandle};
+use quil_cw_consensus::falcon_simplex::SimplexFalconScheme;
+
+/// Assemble an app-shard CW committee from the shard's active provers.
+///
+/// EQUAL VOTES: reuses the count-based [`build_global_committee`] — there is no
+/// seniority weighting in the CW path (that was the legacy app-shard model this
+/// migration drops). The committee members are the active provers' Falcon
+/// `public_key`s (the same keys `BlsAppFrameValidator` verifies votes against);
+/// this node signs with its own q-prover-key (`my_signing_key`/`my_public_key`).
+/// The domain namespace is `b"appshard"‖app_address`, matching the legacy app
+/// vote domain so the Falcon domain separation is shard-scoped.
+///
+/// Returns `None` if any key is malformed, the set is empty, or this node's key
+/// is not in the active set.
+pub fn build_app_committee(
+    member_pubkeys: &[Vec<u8>],
+    my_signing_key: &[u8],
+    my_public_key: &[u8],
+    app_address: &[u8],
+) -> Option<(SimplexFalconScheme, Arc<[FalconPublicKey]>)> {
+    let mut namespace = b"appshard".to_vec();
+    namespace.extend_from_slice(app_address);
+    let committee = quil_cw_consensus::committee::build_global_committee(
+        member_pubkeys,
+        my_signing_key,
+        my_public_key,
+        &namespace,
+    )?;
+    Some((committee.scheme, committee.peers))
+}
+
+/// The engine's handle to a running simplex-backed app-shard consensus. On each
+/// inbound CW‑tagged shard‑consensus message the node demuxes the channel id:
+/// - channels 0/1/2 (vote/cert/resolver) → `inbound[channel].send(...)`;
+/// - channel 3 (block) → `ingest_block(bytes)` (feeds the shared `BlockStore`).
+pub struct AppConsensusCwHandle {
+    pub inbound:
+        [tokio::sync::mpsc::UnboundedSender<quil_cw_consensus::p2p_bridge::Message<FalconPublicKey>>; 3],
+    /// Feed a peer-delivered app frame's bytes into the engine's `BlockStore`
+    /// (so `verify` finds the block behind a proposed digest) and record its
+    /// digest→frame_number. Idempotent; drops malformed bytes.
+    pub ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+}
+
+/// Assemble + start the simplex-backed app-shard consensus for one shard.
+/// Must be called from within the node's tokio runtime (spawns the outbound
+/// drain there); the engine runs on its own runtime thread.
+///
+/// `namespace` = `b"appshard"‖app_address` (matches the legacy app vote domain).
+/// `partition` should be unique per shard (e.g. `app-<filter-hex>`).
+#[allow(clippy::too_many_arguments)]
+pub fn activate_app_consensus_cw(
+    scheme: SimplexFalconScheme,
+    peers: Arc<[FalconPublicKey]>,
+    leader_provider: Arc<dyn LeaderProvider<AppShardState>>,
+    validator: Arc<BlsAppFrameValidator>,
+    assemble: AppFrameAssembler,
+    on_notarized: AppFrameSink,
+    on_finalized: AppFinalizedSink,
+    filter: Vec<u8>,
+    partition: String,
+    epoch: u64,
+    genesis_digest: Digest,
+    genesis_frame_number: u64,
+    leader_timeout_secs: u64,
+    transport: Arc<dyn AppConsensusTransport>,
+) -> AppConsensusCwHandle {
+    let proposer = Arc::new(AppSeamProposer::new(
+        leader_provider,
+        validator,
+        assemble,
+        filter,
+    ));
+    // Seed the genesis parent so the first proposal resolves its frame number.
+    proposer.note_frame(genesis_digest, genesis_frame_number);
+    let sink = Arc::new(AppSeamSink::new(transport.clone(), peers.clone()));
+    let finalizer = Arc::new(AppSeamFinalizer::new(on_notarized, on_finalized));
+
+    let store = BlockStore::new();
+
+    let GlobalHostHandle { inbound, mut outbound } = spawn_global_host(
+        scheme,
+        peers,
+        proposer.clone(),
+        sink,
+        finalizer,
+        store.clone(),
+        GlobalEngineParams::new(partition, epoch, genesis_digest)
+            .with_leader_timeout_secs(leader_timeout_secs),
+    );
+
+    // Drain the engine's outbound (votes/certs/resolver) onto the shard transport.
+    tokio::spawn(async move {
+        while let Some(ob) = outbound.recv().await {
+            transport.deliver(ob.channel, ob.recipients, ob.bytes);
+        }
+    });
+
+    // Block ingress: decode a peer app frame, compute identity digest, store it,
+    // and note digest→frame_number for parent resolution.
+    let ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync> = {
+        let store = store.clone();
+        let proposer = proposer.clone();
+        Arc::new(move |bytes: Vec<u8>| {
+            let Some(frame) = decode_app_frame(&bytes) else {
+                tracing::debug!("cw app block ingress: undecodable frame, dropping");
+                return;
+            };
+            let Some(header) = frame.header.as_ref() else { return };
+            let Some(digest) = app_frame_digest(&frame) else { return };
+            let frame_number = header.frame_number;
+            store.put(digest, bytes);
+            proposer.note_frame(digest, frame_number);
+            tracing::debug!(frame = frame_number, "cw app block ingress: stored peer frame");
+        })
+    };
+
+    AppConsensusCwHandle { inbound, ingest_block }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_types::crypto::Signer as _;
+
+    #[test]
+    fn app_committee_builds_and_scopes_by_shard() {
+        // This node + 2 other shard members.
+        let me = quil_crypto::FalconSigner::generate();
+        let others: Vec<quil_crypto::FalconSigner> =
+            (0..2).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let mut members: Vec<Vec<u8>> = others.iter().map(|s| s.public_key().to_vec()).collect();
+        members.push(me.public_key().to_vec());
+
+        let app_a = vec![0xAAu8; 32];
+        let (_scheme, peers) = build_app_committee(
+            &members,
+            me.private_key(),
+            me.public_key(),
+            &app_a,
+        )
+        .expect("app committee builds");
+        assert_eq!(peers.len(), 3);
+
+        // A different shard address yields a distinct domain (scheme differs),
+        // but the same member set → same peer set.
+        let app_b = vec![0xBBu8; 32];
+        let (_scheme_b, peers_b) =
+            build_app_committee(&members, me.private_key(), me.public_key(), &app_b)
+                .expect("app committee builds for shard B");
+        assert_eq!(peers_b.len(), 3);
+
+        // A node not in the active set cannot build a signer.
+        let outsider = quil_crypto::FalconSigner::generate();
+        assert!(build_app_committee(
+            &members,
+            outsider.private_key(),
+            outsider.public_key(),
+            &app_a,
+        )
+        .is_none());
+    }
+}

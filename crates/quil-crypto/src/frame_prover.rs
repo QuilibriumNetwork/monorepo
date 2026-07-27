@@ -38,7 +38,7 @@ fn frame_header_bls_inputs(
 ) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
     let sig = header.public_key_signature_bls48581.as_ref()?;
     let pubkey = sig.public_key.as_ref().map(|k| k.key_value.clone()).unwrap_or_default();
-    if pubkey.is_empty() || sig.signature.len() < 74 {
+    if pubkey.is_empty() || sig.signature.len() < 666 {
         return None;
     }
     let identity = crate::poseidon::hash_bytes_to_32(&header.output).ok()?;
@@ -51,7 +51,7 @@ fn frame_header_bls_inputs(
     let mut domain = Vec::with_capacity(8 + header.address.len());
     domain.extend_from_slice(b"appshard");
     domain.extend_from_slice(&header.address);
-    Some((pubkey, sig.signature[..74].to_vec(), payload, domain))
+    Some((pubkey, sig.signature[..666].to_vec(), payload, domain))
 }
 
 /// Hash the full BLS verification tuple → the preverified-set key.
@@ -227,7 +227,8 @@ impl FrameProver for WesolowskiFrameProver {
         // signers populate it; mirror Go's `switch pubkeyType`.
         let bls_sig = match signer.key_type() {
             quil_types::crypto::KeyType::Bls48581G1
-            | quil_types::crypto::KeyType::Bls48581G2 => {
+            | quil_types::crypto::KeyType::Bls48581G2
+            | quil_types::crypto::KeyType::Falcon512 => {
                 let mut bitmask = vec![0u8; 32];
                 let byte_idx = (prover_index / 8) as usize;
                 let bit_idx = prover_index % 8;
@@ -362,7 +363,7 @@ impl FrameProver for WesolowskiFrameProver {
         let pubkey_bytes = sig.public_key.as_ref()
             .map(|k| k.key_value.as_slice())
             .unwrap_or(&[]);
-        if pubkey_bytes.is_empty() || sig.signature.len() < 74 {
+        if pubkey_bytes.is_empty() || sig.signature.len() < 666 {
             tracing::warn!(
                 pubkey_len = pubkey_bytes.len(),
                 sig_len = sig.signature.len(),
@@ -383,13 +384,52 @@ impl FrameProver for WesolowskiFrameProver {
         domain.extend_from_slice(b"appshard");
         domain.extend_from_slice(&header.address);
 
-        // Skip the (expensive) BLS pairing if this exact signature tuple
-        // was already verified valid in a batch this frame; the VDF
-        // multiproof below still runs. Falls back to the full pairing
-        // verify when not preverified.
-        let bls_key = bls_tuple_key(pubkey_bytes, &sig.signature[..74], &payload, &domain);
+        // Falcon (FN-DSA) concat semantics — Falcon does not aggregate, so an
+        // app-shard frame signature is the present committee members'
+        // 666-byte signatures CONCATENATED (bitmask order, ascending
+        // committee index), each over the SAME vote-message payload,
+        // optionally followed by a VDF multi-proof tail (`u32 count ||
+        // count×516`). The declared pubkey is the same members' 897-byte keys
+        // concatenated in the same order (the caller validates it against the
+        // committee via `aggregate_public_keys`). We verify each (key, sig)
+        // component individually.
+        let present_count =
+            sig.bitmask.iter().map(|b| b.count_ones()).sum::<u32>() as usize;
+        if present_count == 0 {
+            tracing::warn!(
+                bitmask_hex = %hex::encode(&sig.bitmask),
+                "verify_frame_header_signature: empty bitmask (no present signers)"
+            );
+            return Ok(false);
+        }
+        let sig_concat_len = present_count * crate::falcon::FALCON_SIGNATURE_LEN;
+        let pk_concat_len = present_count * crate::falcon::FALCON_PUBLIC_KEY_LEN;
+        if sig.signature.len() < sig_concat_len || pubkey_bytes.len() != pk_concat_len {
+            tracing::warn!(
+                present_count,
+                sig_len = sig.signature.len(),
+                pubkey_len = pubkey_bytes.len(),
+                expected_sig_concat = sig_concat_len,
+                expected_pk_concat = pk_concat_len,
+                "verify_frame_header_signature: sig/pubkey concat length mismatch for present-signer count"
+            );
+            return Ok(false);
+        }
+        let member_pks: Vec<&[u8]> = (0..present_count)
+            .map(|i| {
+                &pubkey_bytes[i * crate::falcon::FALCON_PUBLIC_KEY_LEN
+                    ..(i + 1) * crate::falcon::FALCON_PUBLIC_KEY_LEN]
+            })
+            .collect();
+        let msgs: Vec<&[u8]> = vec![payload.as_slice(); present_count];
+        let concat_sig = &sig.signature[..sig_concat_len];
+
+        // Skip the (expensive) per-signer verify if this exact tuple was
+        // already verified valid in a batch this frame; the VDF multiproof
+        // below still runs. Falls back to the full verify when not preverified.
+        let bls_key = bls_tuple_key(pubkey_bytes, concat_sig, &payload, &domain);
         let bls_ok = self.bls_preverified.read().unwrap().contains(&bls_key)
-            || bls.verify_signature_raw(pubkey_bytes, &sig.signature[..74], &payload, &domain);
+            || bls.verify_multi_pubkey_multi_message_raw(&member_pks, concat_sig, &msgs, &domain);
         if !bls_ok {
             tracing::warn!(
                 header_address_prefix = %hex::encode(&header.address[..header.address.len().min(16)]),
@@ -400,22 +440,16 @@ impl FrameProver for WesolowskiFrameProver {
                 sig_prefix = %hex::encode(&sig.signature[..16]),
                 domain = %String::from_utf8_lossy(&domain[..8]),
                 payload_len = payload.len(),
-                "verify_frame_header_signature: BLS verify of agg sig over vote-message payload FAILED"
+                present_count,
+                "verify_frame_header_signature: Falcon verify of concatenated member sigs over vote-message payload FAILED"
             );
             return Ok(false);
         }
 
-        // Multiproof verify is only required for multi-signer aggregates.
-        let set_bits: u32 = sig.bitmask.iter().map(|b| b.count_ones()).sum();
-        if sig.signature.len() == 74 && set_bits != 1 {
-            tracing::warn!(
-                set_bits,
-                bitmask_hex = %hex::encode(&sig.bitmask),
-                "verify_frame_header_signature: 74-byte sig must have exactly 1 set bit"
-            );
-            return Ok(false);
-        }
-        if sig.signature.len() == 74 && ids.is_none() {
+        // A single present signer carries no VDF multi-proof tail — its own
+        // signature is the whole attestation. Multiple present members must
+        // each supply a VDF multiproof.
+        if present_count == 1 {
             return Ok(true);
         }
 
@@ -423,7 +457,7 @@ impl FrameProver for WesolowskiFrameProver {
             Some(i) => i,
             None => return Ok(true),
         };
-        let mp = &sig.signature[74..];
+        let mp = &sig.signature[sig_concat_len..];
         if mp.len() < 4 {
             tracing::warn!(
                 tail_len = mp.len(),
@@ -625,7 +659,7 @@ mod batch_tests {
     #[test]
     fn batch_preverify_skips_and_matches_individual() {
         crate::init();
-        let bls = crate::Bls48581KeyConstructor;
+        let bls = crate::FalconKeyConstructor;
         let fp = WesolowskiFrameProver::new(2048);
 
         let mut headers = Vec::new();

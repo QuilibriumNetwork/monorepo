@@ -91,7 +91,7 @@ pub fn process_memory() -> Option<ProcessMemory> {
 
 #[cfg(target_os = "linux")]
 fn parse_kb(line: &str) -> Option<u64> {
-    // "  123456 kB"
+    // " 123456 kB"
     let trimmed = line.trim();
     let num: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
     num.parse().ok()
@@ -160,10 +160,10 @@ pub fn fmt_mb(bytes: u64) -> String {
 /// worker thread, AND the C++ RocksDB allocations, since jemalloc overrides
 /// `malloc` process-wide). This is the decisive OOM signal:
 ///
-/// - `allocated` rising over time  → a TRUE live-heap leak (find it with
-///   `MALLOC_CONF=prof:true` + `jeprof`, or the SIGUSR1 dump).
+/// - `allocated` rising over time → a TRUE live-heap leak (find it with
+/// `MALLOC_CONF=prof:true` + `jeprof`, or the SIGUSR1 dump).
 /// - `allocated` flat but `resident`/`retained` high → allocator
-///   fragmentation / retained pages, NOT a leak (tune, don't chase).
+/// fragmentation / retained pages, NOT a leak (tune, don't chase).
 /// - `resident − allocated` is the overhead jemalloc holds beyond live data.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JemallocStats {
@@ -206,10 +206,10 @@ pub fn jemalloc_stats() -> Option<JemallocStats> {
 /// into a size class (small "bins" + "large extents"); `curregs`/`curlextents`
 /// is how many are live right now. The class holding the most live bytes is
 /// where the memory is going:
-///   - dominant SMALL class (e.g. 48B, 4KiB) → many tiny objects leaking
-///     (a HashMap/Vec/Box accumulating entries).
-///   - dominant LARGE/huge class (e.g. 1MiB, 16MiB) → a few big buffers
-///     leaking (trees, replicas, messages, decoded frames).
+/// - dominant SMALL class (e.g. 48B, 4KiB) → many tiny objects leaking
+/// (a HashMap/Vec/Box accumulating entries).
+/// - dominant LARGE/huge class (e.g. 1MiB, 16MiB) → a few big buffers
+/// leaking (trees, replicas, messages, decoded frames).
 /// Cross-reference the size against suspect allocations to pin the source.
 #[derive(Debug, Clone, Default)]
 pub struct JemallocBreakdown {

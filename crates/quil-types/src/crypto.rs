@@ -12,6 +12,11 @@ pub enum KeyType {
     Secp256k1Sha256 = 5,
     Secp256k1Sha3 = 6,
     Ed25519 = 7,
+    /// Falcon / FN-DSA-512 post-quantum signatures (consensus).
+    Falcon512 = 8,
+    /// Streamlined NTRU Prime (sntrup761) post-quantum KEM — key agreement for
+    /// onion routing and config read keys (replaces X448).
+    Sntrup761 = 9,
 }
 
 /// A cryptographic signer that can produce signatures over messages.
@@ -215,11 +220,11 @@ pub trait FrameProver: Send + Sync {
     /// Mirrors Go's `WesolowskiFrameProver.ProveGlobalFrameHeader` at
     /// `vdf/wesolowski_frame_prover.go:397-493` exactly:
     ///
-    ///   parent     = poseidon(previous_frame.output[:516])
-    ///   challenge  = sha3(frame#||timestamp||difficulty||parent||
-    ///                     commitments...||prover_root||request_root)
-    ///   output     = WesolowskiSolve(challenge, difficulty)
-    ///   signature  = signer.SignWithDomain(challenge||output, "global")
+    ///   parent = poseidon(previous_frame.output[:516])
+    ///   challenge = sha3(frame#||timestamp||difficulty||parent||
+    /// commitments...||prover_root||request_root)
+    ///   output = WesolowskiSolve(challenge, difficulty)
+    ///   signature = signer.SignWithDomain(challenge||output, "global")
     fn prove_global_frame_header(
         &self,
         previous_frame: &crate::proto::global::GlobalFrameHeader,

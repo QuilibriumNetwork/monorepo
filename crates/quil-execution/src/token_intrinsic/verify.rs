@@ -38,14 +38,14 @@ pub const RANGE_PROOF_BIT_SIZE: u64 = 128;
 ///
 /// ```text
 /// transcript = Domain
-///   || foreach output:
-///        Commitment
-///     || FrameNumber
-///     || RecipientOutput.CoinBalance
-///     || RecipientOutput.Mask
-///     || RecipientOutput.OneTimeKey
-///     || RecipientOutput.VerificationKey
-///     || (if len(AdditionalReference) == 64) AdditionalReference || AdditionalReferenceKey
+/// || foreach output:
+/// Commitment
+/// || FrameNumber
+/// || RecipientOutput.CoinBalance
+/// || RecipientOutput.Mask
+/// || RecipientOutput.OneTimeKey
+/// || RecipientOutput.VerificationKey
+/// || (if len(AdditionalReference) == 64) AdditionalReference || AdditionalReferenceKey
 /// ```
 ///
 /// The returned bytes are NOT the challenge itself — they're the input
@@ -159,7 +159,7 @@ pub fn verify_input_hidden_signature(
 /// - Commitment is 56 bytes
 /// - Signature is 336 bytes
 /// - Commitment matches the commitment embedded in the signature
-///   (bytes [280..336] must equal the commitment field)
+/// (bytes [280..336] must equal the commitment field)
 pub fn validate_input_structural(
     commitment: &[u8],
     signature: &[u8],
@@ -424,15 +424,15 @@ pub fn build_pending_transaction_transcript(
 /// Port of `token_intrinsic_transaction.go:1532-1541`:
 /// ```go
 /// if tx.config.Behavior&Divisible == 0 {
-///     if !bytes.Equal(
-///         o.RecipientOutput.AdditionalReference,
-///         tx.Inputs[i].Proofs[len(tx.Inputs[i].Proofs)-1][:64],
-///     ) || !bytes.Equal(
-///         o.RecipientOutput.AdditionalReferenceKey,
-///         tx.Inputs[i].Proofs[len(tx.Inputs[i].Proofs)-1][64:],
-///     ) {
-///         return false, errors.Wrap(errors.New("invalid reference"), ...)
-///     }
+/// if !bytes.Equal(
+/// o.RecipientOutput.AdditionalReference,
+/// tx.Inputs[i].Proofs[len(tx.Inputs[i].Proofs)-1][:64],
+/// ) || !bytes.Equal(
+/// o.RecipientOutput.AdditionalReferenceKey,
+/// tx.Inputs[i].Proofs[len(tx.Inputs[i].Proofs)-1][64:],
+/// ) {
+/// return false, errors.Wrap(errors.New("invalid reference"), ...)
+/// }
 /// }
 /// ```
 pub fn check_non_divisible_propagation(

@@ -102,6 +102,9 @@ enum KeyPairInner {
     /// An Ed448 keypair.
     #[cfg(feature = "ed448")]
     Ed448(crate::ed448::Keypair),
+    /// A Falcon (FN-DSA-512) keypair.
+    #[cfg(feature = "falcon")]
+    Falcon(crate::falcon::Keypair),
 }
 
 impl Keypair {
@@ -205,6 +208,23 @@ impl Keypair {
         }
     }
 
+    /// Construct a Falcon (FN-DSA-512) keypair from raw signing-key bytes
+    /// (1281 bytes).
+    #[cfg(feature = "falcon")]
+    pub fn falcon_from_bytes(bytes: &[u8]) -> Result<Keypair, DecodingError> {
+        Ok(Keypair {
+            keypair: KeyPairInner::Falcon(crate::falcon::Keypair::from_bytes(bytes)?),
+        })
+    }
+
+    /// Generate a new Falcon (FN-DSA-512) keypair.
+    #[cfg(all(feature = "falcon", feature = "rand"))]
+    pub fn generate_falcon() -> Keypair {
+        Keypair {
+            keypair: KeyPairInner::Falcon(crate::falcon::Keypair::generate()),
+        }
+    }
+
     /// Sign a message using the private key of this keypair, producing
     /// a signature that can be verified using the corresponding public key.
     #[allow(unused_variables)]
@@ -220,6 +240,8 @@ impl Keypair {
             KeyPairInner::Ecdsa(ref pair) => Ok(pair.secret().sign(msg)),
             #[cfg(feature = "ed448")]
             KeyPairInner::Ed448(ref pair) => pair.sign(msg),
+            #[cfg(feature = "falcon")]
+            KeyPairInner::Falcon(ref pair) => pair.sign(msg),
         }
     }
 
@@ -246,6 +268,10 @@ impl Keypair {
             KeyPairInner::Ed448(ref pair) => PublicKey {
                 publickey: PublicKeyInner::Ed448(pair.public()),
             },
+            #[cfg(feature = "falcon")]
+            KeyPairInner::Falcon(ref pair) => PublicKey {
+                publickey: PublicKeyInner::Falcon(pair.public()),
+            },
         }
     }
 
@@ -256,6 +282,7 @@ impl Keypair {
             feature = "secp256k1",
             feature = "ed25519",
             feature = "ed448",
+            feature = "falcon",
             feature = "rsa"
         ))]
         {
@@ -283,6 +310,11 @@ impl Keypair {
                     Type: proto::KeyType::Ed448,
                     Data: data.secret_bytes(),
                 },
+                #[cfg(feature = "falcon")]
+                KeyPairInner::Falcon(ref data) => proto::PrivateKey {
+                    Type: proto::KeyType::Falcon,
+                    Data: data.secret_bytes(),
+                },
             };
 
             let mut buf = Vec::with_capacity(pk.get_size());
@@ -297,6 +329,7 @@ impl Keypair {
             feature = "secp256k1",
             feature = "ed25519",
             feature = "ed448",
+            feature = "falcon",
             feature = "rsa"
         )))]
         unreachable!()
@@ -310,6 +343,7 @@ impl Keypair {
             feature = "secp256k1",
             feature = "ed25519",
             feature = "ed448",
+            feature = "falcon",
             feature = "rsa"
         ))]
         {
@@ -371,6 +405,17 @@ impl Keypair {
                     #[allow(unreachable_code)]
                     Err(DecodingError::missing_feature("ed448"))
                 }
+                proto::KeyType::Falcon => {
+                    #[cfg(feature = "falcon")]
+                    return crate::falcon::Keypair::from_bytes(&private_key.Data).map(|kp| {
+                        Keypair {
+                            keypair: KeyPairInner::Falcon(kp),
+                        }
+                    });
+
+                    #[allow(unreachable_code)]
+                    Err(DecodingError::missing_feature("falcon"))
+                }
             }
         }
 
@@ -379,6 +424,7 @@ impl Keypair {
             feature = "secp256k1",
             feature = "ed25519",
             feature = "ed448",
+            feature = "falcon",
             feature = "rsa"
         )))]
         unreachable!()
@@ -397,6 +443,8 @@ impl Keypair {
             KeyPairInner::Ecdsa(_) => KeyType::Ecdsa,
             #[cfg(feature = "ed448")]
             KeyPairInner::Ed448(_) => KeyType::Ed448,
+            #[cfg(feature = "falcon")]
+            KeyPairInner::Falcon(_) => KeyType::Falcon,
         }
     }
 
@@ -465,6 +513,8 @@ impl Keypair {
             ),
             #[cfg(feature = "ed448")]
             KeyPairInner::Ed448(_) => None, // Ed448 keys are 57 bytes, not 32
+            #[cfg(feature = "falcon")]
+            KeyPairInner::Falcon(_) => None, // Falcon signing keys are 1281 bytes, not 32
         }
     }
 }
@@ -520,6 +570,8 @@ impl TryInto<ed25519::Keypair> for Keypair {
             KeyPairInner::Ecdsa(_) => Err(OtherVariantError::new(crate::KeyType::Ecdsa)),
             #[cfg(feature = "ed448")]
             KeyPairInner::Ed448(_) => Err(OtherVariantError::new(crate::KeyType::Ed448)),
+            #[cfg(feature = "falcon")]
+            KeyPairInner::Falcon(_) => Err(OtherVariantError::new(crate::KeyType::Falcon)),
         }
     }
 }
@@ -537,6 +589,10 @@ impl TryInto<ecdsa::Keypair> for Keypair {
             KeyPairInner::Rsa(_) => Err(OtherVariantError::new(crate::KeyType::RSA)),
             #[cfg(feature = "secp256k1")]
             KeyPairInner::Secp256k1(_) => Err(OtherVariantError::new(crate::KeyType::Secp256k1)),
+            #[cfg(feature = "ed448")]
+            KeyPairInner::Ed448(_) => Err(OtherVariantError::new(crate::KeyType::Ed448)),
+            #[cfg(feature = "falcon")]
+            KeyPairInner::Falcon(_) => Err(OtherVariantError::new(crate::KeyType::Falcon)),
         }
     }
 }
@@ -556,6 +612,8 @@ impl TryInto<secp256k1::Keypair> for Keypair {
             KeyPairInner::Ecdsa(_) => Err(OtherVariantError::new(crate::KeyType::Ecdsa)),
             #[cfg(feature = "ed448")]
             KeyPairInner::Ed448(_) => Err(OtherVariantError::new(crate::KeyType::Ed448)),
+            #[cfg(feature = "falcon")]
+            KeyPairInner::Falcon(_) => Err(OtherVariantError::new(crate::KeyType::Falcon)),
         }
     }
 }
@@ -575,6 +633,8 @@ impl TryInto<rsa::Keypair> for Keypair {
             KeyPairInner::Ecdsa(_) => Err(OtherVariantError::new(crate::KeyType::Ecdsa)),
             #[cfg(feature = "ed448")]
             KeyPairInner::Ed448(_) => Err(OtherVariantError::new(crate::KeyType::Ed448)),
+            #[cfg(feature = "falcon")]
+            KeyPairInner::Falcon(_) => Err(OtherVariantError::new(crate::KeyType::Falcon)),
         }
     }
 }
@@ -596,6 +656,9 @@ pub(crate) enum PublicKeyInner {
     /// A public Ed448 key.
     #[cfg(feature = "ed448")]
     Ed448(crate::ed448::PublicKey),
+    /// A public Falcon (FN-DSA-512) key.
+    #[cfg(feature = "falcon")]
+    Falcon(crate::falcon::PublicKey),
 }
 
 /// The public key of a node's identity keypair.
@@ -623,6 +686,8 @@ impl PublicKey {
             PublicKeyInner::Ecdsa(ref pk) => pk.verify(msg, sig),
             #[cfg(feature = "ed448")]
             PublicKeyInner::Ed448(ref pk) => pk.verify(msg, sig),
+            #[cfg(feature = "falcon")]
+            PublicKeyInner::Falcon(ref pk) => pk.verify(msg, sig),
         }
     }
 
@@ -654,6 +719,7 @@ impl PublicKey {
             feature = "secp256k1",
             feature = "ed25519",
             feature = "ed448",
+            feature = "falcon",
             feature = "rsa"
         ))]
         {
@@ -674,6 +740,7 @@ impl PublicKey {
             feature = "secp256k1",
             feature = "ed25519",
             feature = "ed448",
+            feature = "falcon",
             feature = "rsa"
         )))]
         unreachable!()
@@ -688,6 +755,7 @@ impl PublicKey {
             feature = "secp256k1",
             feature = "ed25519",
             feature = "ed448",
+            feature = "falcon",
             feature = "rsa"
         ))]
         {
@@ -705,6 +773,7 @@ impl PublicKey {
             feature = "secp256k1",
             feature = "ed25519",
             feature = "ed448",
+            feature = "falcon",
             feature = "rsa"
         )))]
         unreachable!()
@@ -729,6 +798,8 @@ impl PublicKey {
             PublicKeyInner::Ecdsa(_) => KeyType::Ecdsa,
             #[cfg(feature = "ed448")]
             PublicKeyInner::Ed448(_) => KeyType::Ed448,
+            #[cfg(feature = "falcon")]
+            PublicKeyInner::Falcon(_) => KeyType::Falcon,
         }
     }
 }
@@ -801,6 +872,17 @@ impl TryFrom<proto::PublicKey> for PublicKey {
                 tracing::debug!("support for Ed448 was disabled at compile-time");
                 Err(DecodingError::missing_feature("ed448"))
             }
+            #[cfg(feature = "falcon")]
+            proto::KeyType::Falcon => Ok(crate::falcon::PublicKey::from_bytes(&pubkey.Data).map(
+                |kp| PublicKey {
+                    publickey: PublicKeyInner::Falcon(kp),
+                },
+            )?),
+            #[cfg(not(feature = "falcon"))]
+            proto::KeyType::Falcon => {
+                tracing::debug!("support for Falcon was disabled at compile-time");
+                Err(DecodingError::missing_feature("falcon"))
+            }
         }
     }
 }
@@ -820,6 +902,8 @@ impl TryInto<ed25519::PublicKey> for PublicKey {
             PublicKeyInner::Ecdsa(_) => Err(OtherVariantError::new(crate::KeyType::Ecdsa)),
             #[cfg(feature = "ed448")]
             PublicKeyInner::Ed448(_) => Err(OtherVariantError::new(crate::KeyType::Ed448)),
+            #[cfg(feature = "falcon")]
+            PublicKeyInner::Falcon(_) => Err(OtherVariantError::new(crate::KeyType::Falcon)),
         }
     }
 }
@@ -837,6 +921,10 @@ impl TryInto<ecdsa::PublicKey> for PublicKey {
             PublicKeyInner::Rsa(_) => Err(OtherVariantError::new(crate::KeyType::RSA)),
             #[cfg(feature = "secp256k1")]
             PublicKeyInner::Secp256k1(_) => Err(OtherVariantError::new(crate::KeyType::Secp256k1)),
+            #[cfg(feature = "ed448")]
+            PublicKeyInner::Ed448(_) => Err(OtherVariantError::new(crate::KeyType::Ed448)),
+            #[cfg(feature = "falcon")]
+            PublicKeyInner::Falcon(_) => Err(OtherVariantError::new(crate::KeyType::Falcon)),
         }
     }
 }
@@ -856,6 +944,8 @@ impl TryInto<secp256k1::PublicKey> for PublicKey {
             PublicKeyInner::Ecdsa(_) => Err(OtherVariantError::new(crate::KeyType::Ecdsa)),
             #[cfg(feature = "ed448")]
             PublicKeyInner::Ed448(_) => Err(OtherVariantError::new(crate::KeyType::Ed448)),
+            #[cfg(feature = "falcon")]
+            PublicKeyInner::Falcon(_) => Err(OtherVariantError::new(crate::KeyType::Falcon)),
         }
     }
 }
@@ -875,6 +965,8 @@ impl TryInto<rsa::PublicKey> for PublicKey {
             PublicKeyInner::Ecdsa(_) => Err(OtherVariantError::new(crate::KeyType::Ecdsa)),
             #[cfg(feature = "ed448")]
             PublicKeyInner::Ed448(_) => Err(OtherVariantError::new(crate::KeyType::Ed448)),
+            #[cfg(feature = "falcon")]
+            PublicKeyInner::Falcon(_) => Err(OtherVariantError::new(crate::KeyType::Falcon)),
         }
     }
 }

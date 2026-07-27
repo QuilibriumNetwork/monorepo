@@ -4,9 +4,9 @@
 //!
 //! ```text
 //! [u32 BE type_prefix = 0x0310]
-//! [u32 BE sig_len]         [sig_len bytes signature]
+//! [u32 BE sig_len] [sig_len bytes signature]
 //! [u32 BE key_type]
-//! [u32 BE pubkey_len]      [pubkey_len bytes prover_public_key]
+//! [u32 BE pubkey_len] [pubkey_len bytes prover_public_key]
 //! ```
 //!
 //! Validation: sig_len <= 114, pubkey_len <= 585.

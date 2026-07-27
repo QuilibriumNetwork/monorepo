@@ -170,11 +170,12 @@ pub fn token_update_from_proto(p: &pb::TokenUpdate) -> Result<TokenUpdate> {
         Some(c) => token_config_from_proto(c)?.to_canonical_bytes()?,
         None => Vec::new(),
     };
+    // The canonical field carries the RAW Falcon signature bytes (the verify
+    // path `engines.rs` passes it straight to `validate_signature`/falcon_verify
+    // — no 0x011C aggregate envelope). Use the proto's inner `signature` field,
+    // not the wrapped envelope.
     let sig = match &p.public_key_signature_bls48581 {
-        Some(s) => {
-            use crate::hypergraph_intrinsic::conversions::aggregate_sig_from_proto;
-            aggregate_sig_from_proto(s)?.to_canonical_bytes()?
-        }
+        Some(s) => s.signature.clone(),
         None => Vec::new(),
     };
     Ok(TokenUpdate {

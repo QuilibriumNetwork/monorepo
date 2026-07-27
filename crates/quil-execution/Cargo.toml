@@ -13,14 +13,20 @@ description = "Execution engines (Global, Token, Compute, Hypergraph) for the Qu
 testing-stubs = []
 
 [dependencies]
+rayon = "1"
 quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-crypto = { path = "../quil-crypto" }
+# Commonware-simplex finalization-cert verify (reward attribution for CW-finalized
+# app-shard frames, task #61). Acyclic: quil-cw-consensus doesn't depend on us.
+quil-cw-consensus = { path = "../quil-cw-consensus" }
 once_cell = "1"
 quil-tries = { path = "../quil-tries" }
+quil-forest = { path = "../quil-forest" }
 quil-hypergraph = { path = "../quil-hypergraph" }
 quil-store = { path = "../quil-store" }
 quil-consensus = { path = "../quil-consensus" }
+quil-lattice-ct = { path = "../quil-lattice-ct" }
 verenc = { path = "../verenc" }
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
@@ -31,6 +37,7 @@ hex = "0.4"
 prost = "0.13"
 sha2 = "0.10"
 sha3 = "0.10"
+aes-gcm = "0.10"
 bs58 = "0.5"
 metrics = "0.24"
 serde = { version = "1", features = ["derive"] }

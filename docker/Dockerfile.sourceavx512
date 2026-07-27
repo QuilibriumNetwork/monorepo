@@ -191,7 +191,7 @@ WORKDIR /opt/ceremonyclient
 
 # Restore .a files. gen-avx512's target/ is a cache mount that doesn't
 # persist into this stage's filesystem; the libs were stashed at /out/.
-# client/build.sh and qns-api/build.sh expect them at target/release/
+# The Rust node/qclient builds expect them at target/release/
 # (BINARIES_DIR default).
 RUN mkdir -p target/release && cp /out/*.a target/release/
 
@@ -220,27 +220,16 @@ RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=lo
 FROM build-avx512 AS build-qclient-avx512
 ARG TARGETOS
 ARG TARGETARCH
-# Build and install qclient
-COPY ./node /opt/ceremonyclient/node
-
-WORKDIR /opt/ceremonyclient/node
-
-RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
-    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
-    go mod download
-
-COPY ./client /opt/ceremonyclient/client
-WORKDIR /opt/ceremonyclient/client
-
-RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
-    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
-    go mod download
-
-ARG BINARIES_DIR=/opt/ceremonyclient/target/release
-RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
-    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
-    GOOS=${TARGETOS} GOARCH=${TARGETARCH} ./build.sh -o qclient
-RUN cp qclient /usr/bin
+# Build and install the Rust `qclient` (crates/quil-client) — the post-quantum
+# replacement for the retired Go client. qclient needs no AVX-512 tuning (that
+# targets the node's VDF/crypto), so this is a plain release build. The `cp`
+# runs in the same RUN as the build because target/ is a cache mount.
+WORKDIR /opt/ceremonyclient
+RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=cargo-target-qclient,target=/opt/ceremonyclient/target \
+    cargo build --release -p quil-client --bin qclient && \
+    cp target/release/qclient /usr/bin/qclient
 
 # Allows exporting single binary
 FROM scratch AS node
@@ -280,7 +269,7 @@ LABEL org.opencontainers.image.revision=$GIT_COMMIT
 RUN apt-get update && apt-get install -y ca-certificates
 
 COPY --from=build-node-avx512 /usr/bin/node /usr/local/bin
-COPY --from=build-qclient-avx512 /opt/ceremonyclient/client/qclient /usr/local/bin
+COPY --from=build-qclient-avx512 /usr/bin/qclient /usr/local/bin
 
 WORKDIR /root
 

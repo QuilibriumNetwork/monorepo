@@ -34,8 +34,6 @@ impl ExecutionEngineManager {
         inclusion_prover: Arc<dyn InclusionProver>,
         key_manager: Arc<dyn quil_types::crypto::KeyManager>,
         crdt: Arc<quil_hypergraph::HypergraphCrdt>,
-        bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver>,
-        decaf_constructor: Arc<dyn quil_types::crypto::DecafConstructor>,
         circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler>,
         clock_store: Arc<dyn quil_types::store::ClockStore>,
         hypergraph_config_resolver: Arc<
@@ -69,8 +67,6 @@ impl ExecutionEngineManager {
                 mode,
                 inclusion_prover.clone(),
                 crdt.clone(),
-                bulletproof_prover.clone(),
-                decaf_constructor,
                 key_manager.clone(),
                 clock_store,
             )),
@@ -80,7 +76,6 @@ impl ExecutionEngineManager {
             Box::new(ComputeExecutionEngine::new_with_state(
                 mode,
                 crdt.clone(),
-                bulletproof_prover,
                 key_manager.clone(),
                 circuit_compiler,
             )),
@@ -103,6 +98,12 @@ impl ExecutionEngineManager {
         }
     }
 
+    /// The hypergraph CRDT these engines commit to — used by the forest sync,
+    /// which applies pulled state into this same CRDT (coordinated versions).
+    pub fn crdt(&self) -> Arc<quil_hypergraph::HypergraphCrdt> {
+        self.crdt.clone()
+    }
+
     /// Persist the in-memory hypergraph phase trees for the given
     /// frame to the underlying store. Mirrors Go's
     /// `frame_materializer.go:316` `hg.Commit(frame)` after the
@@ -111,7 +112,13 @@ impl ExecutionEngineManager {
     /// frame's trees, so new vertices stay invisible to the prover
     /// registry refresh and to peer HyperSync.
     pub fn commit_frame(&self, frame_number: u64) -> Result<()> {
-        self.crdt.commit(frame_number)?;
+        // The CRDT commit is the tree-flush hot path (per-branch KZG multiexp
+        // across four shard trees) — the suspected #1 cost center. Timed under
+        // engine_type="crdt", op="commit".
+        let start = std::time::Instant::now();
+        let res = self.crdt.commit(frame_number);
+        crate::metrics::observe_execution_duration("crdt", "commit", start.elapsed().as_secs_f64());
+        res?;
         Ok(())
     }
 
@@ -128,7 +135,10 @@ impl ExecutionEngineManager {
     /// only re-runs un-committed frames and never double-mints.
     pub fn commit_frame_with_global_cursor(&self, frame_number: u64) -> Result<()> {
         let cursor_key = quil_store::encoding::global_materialized_cursor_key();
-        self.crdt.commit_with_global_cursor(frame_number, &cursor_key)?;
+        let start = std::time::Instant::now();
+        let res = self.crdt.commit_with_global_cursor(frame_number, &cursor_key);
+        crate::metrics::observe_execution_duration("crdt", "commit", start.elapsed().as_secs_f64());
+        res?;
         Ok(())
     }
 
@@ -226,15 +236,23 @@ impl ExecutionEngineManager {
         message: &[u8],
     ) -> Result<()> {
         let engine_name = self.select_engine(address)?;
+        let label = crate::metrics::engine_label(&engine_name);
+        crate::metrics::inc_execution_requests(label, "validate");
+        let start = std::time::Instant::now();
         let engines = self.engines.read().unwrap();
-        if let Some(engine) = engines.get(&engine_name) {
+        let res = if let Some(engine) = engines.get(&engine_name) {
             engine.validate_message(frame_number, address, message)
         } else {
             Err(QuilError::NotFound(format!(
                 "engine '{}' not found",
                 engine_name
             )))
+        };
+        crate::metrics::observe_execution_duration(label, "validate", start.elapsed().as_secs_f64());
+        if res.is_err() {
+            crate::metrics::inc_execution_errors(label, "validate");
         }
+        res
     }
 
     /// Route a message to the appropriate engine and process it.
@@ -246,15 +264,23 @@ impl ExecutionEngineManager {
         message: &[u8],
     ) -> Result<ProcessMessageResult> {
         let engine_name = self.select_engine(address)?;
+        let label = crate::metrics::engine_label(&engine_name);
+        crate::metrics::inc_execution_requests(label, "process");
+        let start = std::time::Instant::now();
         let engines = self.engines.read().unwrap();
-        if let Some(engine) = engines.get(&engine_name) {
+        let res = if let Some(engine) = engines.get(&engine_name) {
             engine.process_message(frame_number, fee_multiplier, address, message)
         } else {
             Err(QuilError::NotFound(format!(
                 "engine '{}' not found",
                 engine_name
             )))
+        };
+        crate::metrics::observe_execution_duration(label, "process", start.elapsed().as_secs_f64());
+        if res.is_err() {
+            crate::metrics::inc_execution_errors(label, "process");
         }
+        res
     }
 
     /// Acquire address locks for a message by routing to the
@@ -304,15 +330,15 @@ impl ExecutionEngineManager {
     /// Select the engine for a given domain address. Port of Go
     /// `ExecutionEngineManager.ProcessMessage`'s routing
     /// (execution_manager.go:357-549):
-    ///   - `0xff*32` (GLOBAL) → global engine.
-    ///   - a base domain (COMPUTE / HYPERGRAPH_BASE / TOKEN_BASE /
-    ///     QUIL_TOKEN) → that engine directly.
-    ///   - any other address is a DEPLOYED app: read its base type-domain
-    ///     from the metadata vertex at `(addr, 0xff*32)`, key `0xff*32`
-    ///     (written at deploy by `init_metadata_vertex`), and route by it.
-    ///   - no metadata / unknown type-domain → error (Go errors "no
-    ///     execution engine found"; we do NOT silently default to
-    ///     hypergraph — that was the prior bug that mis-routed everything).
+    /// - `0xff*32` (GLOBAL) → global engine.
+    /// - a base domain (COMPUTE / HYPERGRAPH_BASE / TOKEN_BASE /
+    /// QUIL_TOKEN) → that engine directly.
+    /// - any other address is a DEPLOYED app: read its base type-domain
+    /// from the metadata vertex at `(addr, 0xff*32)`, key `0xff*32`
+    /// (written at deploy by `init_metadata_vertex`), and route by it.
+    /// - no metadata / unknown type-domain → error (Go errors "no
+    /// execution engine found"; we do NOT silently default to
+    /// hypergraph — that was the prior bug that mis-routed everything).
     fn select_engine(&self, address: &[u8]) -> Result<String> {
         if address.len() < 32 {
             return Err(QuilError::InvalidArgument("address too short".into()));
@@ -403,8 +429,6 @@ mod tests {
             inclusion_prover,
             stubs.key_manager.clone(),
             crdt,
-            stubs.bulletproof_prover,
-            stubs.decaf_constructor,
             stubs.circuit_compiler,
             stubs.clock_store,
             hg_resolver,
@@ -573,8 +597,6 @@ mod tests {
             inclusion_prover,
             stubs.key_manager.clone(),
             crdt,
-            stubs.bulletproof_prover,
-            stubs.decaf_constructor,
             stubs.circuit_compiler,
             stubs.clock_store,
             hg_resolver,
@@ -634,8 +656,6 @@ mod tests {
                 inclusion_prover,
                 stubs.key_manager.clone(),
                 crdt,
-                stubs.bulletproof_prover,
-                stubs.decaf_constructor,
                 stubs.circuit_compiler,
                 stubs.clock_store,
                 hg_resolver,
@@ -747,7 +767,7 @@ mod tests {
         // config COMMITMENT, so a trivial (constant) commitment would collide
         // with the token base domain. This also exercises the real KZG path.
         quil_crypto::init(); // load the SRS (idempotent)
-        let prover: Arc<dyn InclusionProver> = Arc::new(quil_crypto::KzgInclusionProver);
+        let prover: Arc<dyn InclusionProver> = Arc::new(quil_tries::ShaInclusionProver);
         let cfg = crate::token_intrinsic::config::TokenConfiguration {
             behavior: (crate::token_intrinsic::constants::DIVISIBLE
                 | crate::token_intrinsic::constants::ACCEPTABLE
@@ -792,8 +812,6 @@ mod tests {
             prover.clone(),
             stubs.key_manager.clone(),
             crdt,
-            stubs.bulletproof_prover,
-            stubs.decaf_constructor,
             stubs.circuit_compiler,
             stubs.clock_store,
             hg_resolver,

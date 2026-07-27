@@ -45,7 +45,8 @@ fn bytes_fixed(len: usize) -> impl Strategy<Value = Vec<u8>> {
 }
 
 fn addressed_sig() -> impl Strategy<Value = AddressedSignature> {
-    (bytes_fixed(74), bytes_fixed(32)).prop_map(|(signature, address)| AddressedSignature {
+    // Falcon-512 single-signer signature is 666 bytes.
+    (bytes_fixed(666), bytes_fixed(32)).prop_map(|(signature, address)| AddressedSignature {
         signature,
         address,
     })
@@ -53,9 +54,9 @@ fn addressed_sig() -> impl Strategy<Value = AddressedSignature> {
 
 fn sig_with_pop() -> impl Strategy<Value = SignatureWithPop> {
     (
-        bytes_fixed(74),
-        prop::option::of(bytes_fixed(585)),
-        bytes_fixed(74),
+        bytes_fixed(666),
+        prop::option::of(bytes_fixed(897)),
+        bytes_fixed(666),
     )
         .prop_map(|(signature, public_key, pop_signature)| SignatureWithPop {
             signature,
@@ -65,17 +66,20 @@ fn sig_with_pop() -> impl Strategy<Value = SignatureWithPop> {
 }
 
 fn aggregate_sig() -> impl Strategy<Value = AggregateSignature> {
-    // signature: 74 (single signer) or 78 + N*516 for N in 1..=4
+    // Falcon concat semantics: a QC/TC (or single-signer frame) signature is
+    // N×666 (N concatenated 666-byte Falcon sigs, no tail); a multi-signer
+    // frame-header signature is M×666 concatenated member sigs + u32 count +
+    // M×516 VDF multiproofs ⇒ M×1182 + 4.
     let sig_strategy = prop_oneof![
-        Just(74usize),
-        Just(78 + 516),
-        Just(78 + 516 * 2),
-        Just(78 + 516 * 3),
+        Just(666usize),
+        Just(1182 + 4),
+        Just(1182 * 2 + 4),
+        Just(1182 * 3 + 4),
     ]
     .prop_flat_map(|n| bytes_fixed(n));
     (
         sig_strategy,
-        prop::option::of(bytes_fixed(585).prop_map(|kv| {
+        prop::option::of(bytes_fixed(897).prop_map(|kv| {
             quil_execution::hypergraph_intrinsic::canonical::Bls48581G2PublicKey {
                 key_value: kv,
             }

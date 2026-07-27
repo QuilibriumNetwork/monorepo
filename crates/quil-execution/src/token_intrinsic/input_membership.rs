@@ -16,10 +16,10 @@
 //!
 //! Two layouts, selected exactly as Go does (by `Acceptable` behavior +
 //! proof length):
-//!   * coin-spend branch — non-`Acceptable` tokens.
-//!   * pending-claim branch — `Acceptable` tokens (this is the LIVE
-//!     QUIL path: QUIL is Mintable|Burnable|Divisible|Acceptable|
-//!     Expirable|Tenderable).
+//! * coin-spend branch — non-`Acceptable` tokens.
+//! * pending-claim branch — `Acceptable` tokens (this is the LIVE
+//! QUIL path: QUIL is Mintable|Burnable|Divisible|Acceptable|
+//! Expirable|Tenderable).
 //!
 //! The `sha512(0x00 || key || data)` evaluation construction is
 //! validated byte-for-byte against vectors dumped from the real Go
@@ -208,6 +208,51 @@ fn build_layout(
     }
 }
 
+/// The flat Level-3 field key a KZG membership position maps to, under the
+/// forest. The legacy per-vertex vector-commitment tree stored each field at
+/// key `[(index << 2) as u8]` (see `create_coin_vertex_tree`) except the
+/// final type field, at the 32-byte meta key `0xFF*32`. The flatten kept
+/// those keys verbatim as L3 field keys, so a membership position becomes the
+/// forest leaf key `l3_leaf_key(vertex_address, field_key)`.
+fn forest_field_key(index: u64, is_last: bool) -> Vec<u8> {
+    if is_last {
+        META_KEY.to_vec()
+    } else {
+        vec![(index as u8) << 2]
+    }
+}
+
+/// Build the forest-native expected `(field_key, value)` layout for one
+/// input, plus the pending-claim alt spent-marker key. This is the
+/// forest replacement for `verify_input_membership`'s inner KZG multiproof:
+/// where the KZG path proved the leaf opens at `indices` to
+/// `sha512(0x00||key||data)`, the forest path proves each field's flat L3
+/// leaf `l3_leaf_key(vertex_address, field_key)` equals the raw `data`
+/// (JMT authenticates the leaf itself, so the `sha512` evaluation wrapper
+/// falls away). The caller pairs this with a
+/// [`quil_forest::VertexMembershipProof`] and calls
+/// [`quil_forest::verify_vertex_membership`].
+///
+/// The returned pairs are in the same order as the KZG `Layout` (positions
+/// ascending, type field last), which the membership proof's field order
+/// must match.
+pub fn forest_expected_layout(
+    input: &TransactionInput,
+    domain: &[u8],
+    behavior: u16,
+    frame_number: u64,
+) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Option<[u8; 32]>)> {
+    let layout = build_layout(input, domain, behavior, frame_number)?;
+    let n = layout.data.len();
+    let pairs = layout
+        .data
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (forest_field_key(layout.indices[i], i == n - 1), d.clone()))
+        .collect();
+    Ok((pairs, layout.alt_spent_key))
+}
+
 /// Compute `sha512(0x00 || key || data)` exactly as Go `verifyProof`.
 /// The non-final fields use `[(index << 2) as u8]` as the key; the final
 /// field uses the 0xFF*32 metadata key.
@@ -311,7 +356,7 @@ mod tests {
     // sha512(0x00 || key || data) evaluation construction byte-for-byte.
     // data[0]: idx=1, key=index-byte, data="valid-commitment"+zeros (56B)
     // data[1]: idx=3, key=index-byte, same data
-    // data[2]: idx=63, key=0xFF*32,   data=coin-type hash (32B)
+    // data[2]: idx=63, key=0xFF*32, data=coin-type hash (32B)
     fn commitment_data() -> Vec<u8> {
         let mut v = b"valid-commitment".to_vec();
         v.resize(56, 0);
@@ -525,6 +570,64 @@ mod tests {
             ],
         };
         assert!(build_layout(&input, &DOMAIN, behavior, 0).is_err());
+    }
+
+    #[test]
+    fn forest_expected_layout_maps_positions_to_flat_field_keys() {
+        // The forest membership layout must map each KZG position to the SAME
+        // flat L3 field key the coin vertex is actually stored under
+        // (`create_coin_vertex_tree`): position i → [(i<<2) as u8], the type
+        // field → the 0xFF*32 meta key. If this drifts, the JMT lookup misses
+        // the leaf and every spend fails to verify.
+        let behavior = DIVISIBLE; // coin branch, indices [1,3,63]
+        let (pairs, alt) = forest_expected_layout(&coin_input(), &DOMAIN, behavior, 0).unwrap();
+        assert!(alt.is_none(), "coin branch has no pending alt-spent key");
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].0, vec![0x04u8], "commitment at position 1 → key [1<<2]");
+        assert_eq!(pairs[1].0, vec![0x0cu8], "key image at position 3 → key [3<<2]");
+        assert_eq!(pairs[2].0, vec![0xFFu8; 32], "type at final position → meta key");
+        // Values mirror build_layout's data (raw, not sha512-wrapped).
+        assert_eq!(pairs[0].1, vec![0x02u8; 56], "commitment = sig[56*5..56*6]");
+        assert_eq!(pairs[2].1, coin_type_hash(&DOMAIN).unwrap().to_vec());
+    }
+
+    #[test]
+    fn forest_field_keys_match_coin_vertex_tree_insertion_keys() {
+        // Cross-check against the ACTUAL on-chain coin vertex: the field keys
+        // the membership layout expects must be exactly the keys
+        // `create_coin_vertex_tree` inserts under, so the flattened L3 leaves
+        // line up. The commitment (position 1) and type (meta key) are the two
+        // positions the coin branch binds that the tree also stores directly.
+        use crate::token_intrinsic::materialize::create_coin_vertex_tree;
+        use crate::token_intrinsic::transaction::RecipientBundle;
+        let type_hash = coin_type_hash(&DOMAIN).unwrap();
+        let output = crate::token_intrinsic::materialize::TransactionOutput {
+            frame_number: vec![0u8; 8],
+            commitment: vec![0x02u8; 56], // == coin_input()'s sig[56*5..56*6]
+            recipient: RecipientBundle {
+                one_time_key: vec![0x11u8; 56],
+                verification_key: vec![0x02u8; 56], // == coin_input()'s key image
+                coin_balance: vec![0x33u8; 56],
+                mask: vec![0x44u8; 56],
+                additional_reference: vec![],
+                additional_reference_key: vec![],
+            },
+        };
+        let tree = create_coin_vertex_tree(&output, &type_hash).unwrap();
+        // The flattened leaf set: (field_key, value).
+        let leaves: std::collections::HashMap<Vec<u8>, Vec<u8>> = tree.leaves().into_iter().collect();
+
+        let (pairs, _) = forest_expected_layout(&coin_input(), &DOMAIN, DIVISIBLE, 0).unwrap();
+        for (field_key, expected_value) in &pairs {
+            let on_chain = leaves
+                .get(field_key)
+                .unwrap_or_else(|| panic!("coin tree has no leaf at field key {:?}", field_key));
+            assert_eq!(
+                on_chain, expected_value,
+                "membership value at {:?} must equal the coin vertex's stored field",
+                field_key
+            );
+        }
     }
 
     #[test]

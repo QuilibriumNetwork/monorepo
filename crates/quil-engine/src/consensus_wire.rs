@@ -2,12 +2,12 @@
 //! protobuf types on GLOBAL_CONSENSUS and GLOBAL_FRAME bitmasks.
 //!
 //! Type prefixes from `protobufs/canonical_types.go`:
-//!   0x030C = ProposalVote
-//!   0x030D = QuorumCertificate
-//!   0x030E = GlobalFrame (header + requests)
-//!   0x0317 = GlobalProposal
-//!   0x031C = TimeoutState
-//!   0x031D = TimeoutCertificate
+//! 0x030C = ProposalVote
+//! 0x030D = QuorumCertificate
+//! 0x030E = GlobalFrame (header + requests)
+//! 0x0317 = GlobalProposal
+//! 0x031C = TimeoutState
+//! 0x031D = TimeoutCertificate
 
 use std::sync::Arc;
 
@@ -104,8 +104,8 @@ impl AggregateSignature {
     /// Empty aggregate signature for genesis QC.
     pub fn empty() -> Self {
         Self {
-            public_key: vec![0u8; 585],
-            signature: vec![0u8; 74],
+            public_key: vec![0u8; 897],
+            signature: vec![0u8; 666],
             bitmask: vec![0xffu8; 32],
         }
     }
@@ -696,7 +696,7 @@ impl TimeoutState {
 ///
 /// Wire format:
 /// [u32 type=0x030E][u32 header_len][header_bytes][u32 requests_count]
-///   [for each: u32 request_len, request_bytes (MessageBundle canonical)]
+/// [for each: u32 request_len, request_bytes (MessageBundle canonical)]
 ///
 /// Header format (0x0309):
 /// [u32 type=0x0309][u64 frame_number][u64 rank][i64 timestamp][u32 difficulty]
@@ -1152,8 +1152,8 @@ mod tests {
         let qc = QuorumCertificate::genesis(0, vec![0xAA; 32]);
         assert_eq!(qc.rank, 0);
         assert_eq!(qc.frame_number, 0);
-        assert_eq!(qc.aggregate_signature.public_key.len(), 585);
-        assert_eq!(qc.aggregate_signature.signature.len(), 74);
+        assert_eq!(qc.aggregate_signature.public_key.len(), 897);
+        assert_eq!(qc.aggregate_signature.signature.len(), 666);
         assert_eq!(qc.aggregate_signature.bitmask.len(), 32);
         assert!(qc.aggregate_signature.bitmask.iter().all(|&b| b == 0xFF));
     }
@@ -1201,7 +1201,7 @@ mod tests {
             filter: vec![0xAAu8; 32],
             frame_number: 7,
             public_key_signature_bls48581: Some(AddressedSignature {
-                signature: vec![0xBBu8; 74],
+                signature: vec![0xBBu8; 666],
                 address: vec![0xCCu8; 32],
             }),
         }

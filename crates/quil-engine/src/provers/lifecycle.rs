@@ -6,17 +6,17 @@
 //! in `node/consensus/global/worker_allocator.go`.
 //!
 //! Split of responsibilities with `WorkerAllocator`:
-//!   - `WorkerAllocator::on_new_frame`: reconciles registry state with
-//!     running workers (assigns filters to idle cores, clears stale
-//!     filters). Pure state sync, no proposals.
-//!   - `ProverLifecycle::evaluate`: examines registry + worker state
-//!     and returns the full list of actions to submit this frame
-//!     (matching Go's `evaluateForProposals`, which can emit Propose
-//!     + Decide actions in the same cycle). The caller dispatches each
-//!     through the submission pipeline; per-address locking in the
-//!     consensus engine serializes them so only one takes effect per
-//!     affected prover address per frame. The single cooldown timer
-//!     lives on the `WorkerAllocator`.
+//! - `WorkerAllocator::on_new_frame`: reconciles registry state with
+//! running workers (assigns filters to idle cores, clears stale
+//! filters). Pure state sync, no proposals.
+//! - `ProverLifecycle::evaluate`: examines registry + worker state
+//! and returns the full list of actions to submit this frame
+//! (matching Go's `evaluateForProposals`, which can emit Propose
+//! + Decide actions in the same cycle). The caller dispatches each
+//! through the submission pipeline; per-address locking in the
+//! consensus engine serializes them so only one takes effect per
+//! affected prover address per frame. The single cooldown timer
+//! lives on the `WorkerAllocator`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -25,6 +25,7 @@ pub trait LeaderProvider<S: Unique>: Send + Sync {
         &self,
         rank: u64,
         filter: &[u8],
+        prior_frame_number: u64,
         prior_state: &Identity,
     ) -> Result<State<S>>;
 }

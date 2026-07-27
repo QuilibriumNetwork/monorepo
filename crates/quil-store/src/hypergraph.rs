@@ -18,9 +18,81 @@ pub struct RocksHypergraphStore {
     db: Arc<rocksdb::DB>,
 }
 
+/// Reserved key namespace for the Phase-3 JMT forest when it shares this
+/// store's RocksDB. Prefixes every forest key so the forest sub-range is
+/// disjoint from all hypergraph keys (whose tags are `< 0xF7`). Both the
+/// migration (which writes the forest into the migrated DB) and the runtime
+/// (which commits to it) must use this exact prefix.
+pub const FOREST_NAMESPACE: &[u8] = &[0xF7];
+
+/// Reverse of `encoding::set_type_byte` — recover the set-type string a
+/// versioned key encodes (0 ⇒ "vertex", 1 ⇒ "hyperedge"). `None` for an
+/// unknown byte, so the pruner skips malformed keys rather than mis-classifying.
+fn byte_set_str(b: u8) -> Option<&'static str> {
+    match b {
+        0 => Some("vertex"),
+        1 => Some("hyperedge"),
+        _ => None,
+    }
+}
+
+/// Reverse of `encoding::phase_type_byte` (0 ⇒ "adds", 1 ⇒ "removes").
+fn byte_phase_str(b: u8) -> Option<&'static str> {
+    match b {
+        0 => Some("adds"),
+        1 => Some("removes"),
+        _ => None,
+    }
+}
+
 impl RocksHypergraphStore {
     pub fn new(db: Arc<rocksdb::DB>) -> Self {
         Self { db }
+    }
+
+    /// The raw RocksDB handle backing this store. Exposed so startup can build
+    /// the Phase-3 forest (`quil_forest::Forest::with_namespace(store.raw_db(),
+    /// FOREST_NAMESPACE)`) sharing this DB — the `HypergraphStore` trait
+    /// deliberately doesn't surface it, so this is the concrete-store escape
+    /// hatch the forest installation needs.
+    pub fn raw_db(&self) -> Arc<rocksdb::DB> {
+        self.db.clone()
+    }
+
+    /// Whether this DB already contains Phase-3 forest data (any key under
+    /// [`FOREST_NAMESPACE`]). The runtime uses this to gate the forest
+    /// commitment path: only a migrated DB — one the `--migrate-db` converter
+    /// has populated — reads `true`, so non-migrated nodes keep the KZG path
+    /// and never silently switch to empty forest roots.
+    pub fn has_forest_data(&self) -> bool {
+        let mut it = self.db.raw_iterator();
+        it.seek(FOREST_NAMESPACE);
+        it.valid() && it.key().map(|k| k.starts_with(FOREST_NAMESPACE)).unwrap_or(false)
+    }
+
+    /// Delete the entire JMT forest (every key under [`FOREST_NAMESPACE`]) so it
+    /// can be rebuilt fresh. Used by the coin-rescale corrective pass, which
+    /// changes coin content addresses and must recommit the forest from a clean
+    /// slate rather than layering onto the stale (inflated) generation.
+    pub fn clear_forest_data(&self) -> Result<()> {
+        // FOREST_NAMESPACE is the single byte 0xF7; the exclusive upper bound is
+        // 0xF8 (delete_range is [lower, upper)).
+        let lower = FOREST_NAMESPACE.to_vec();
+        let mut upper = FOREST_NAMESPACE.to_vec();
+        *upper.last_mut().unwrap() += 1; // 0xF7 -> 0xF8
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_range(&lower, &upper);
+        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+    }
+
+    /// Whether any `root_version` (sync-by-hash) index entry exists — i.e. the DB
+    /// was committed/migrated by a build that seeds the versioned-sync indexes. A
+    /// DB migrated before index seeding returns `false`, signalling a backfill.
+    pub fn has_sync_indexes(&self) -> bool {
+        let prefix = [crate::encoding::HG_ROOT_VERSION];
+        let mut it = self.db.raw_iterator();
+        it.seek(&prefix);
+        it.valid() && it.key().map(|k| k.first() == Some(&crate::encoding::HG_ROOT_VERSION)).unwrap_or(false)
     }
 
     /// Capture a point-in-time snapshot of all tree blobs. The returned
@@ -145,9 +217,15 @@ impl RocksHypergraphStore {
             .map_err(|e| QuilError::Store(e.to_string()))
     }
 
-    /// Iterate every `(vertex_key, underlying_data)` pair persisted for
-    /// the given `(set, phase, shard)`. The callback receives owned
-    /// bytes so it can move them into a caller-owned collection.
+    /// Iterate every `(vertex_key, latest_underlying_data)` pair persisted for
+    /// the given `(set, phase, shard)`. The callback receives owned bytes so it
+    /// can move them into a caller-owned collection.
+    ///
+    /// Reads the versioned (v2) keyspace — keeping the LATEST version per vertex
+    /// — UNION the legacy unversioned keyspace for vertices not yet re-written
+    /// versioned. The commit path writes v2, so this MUST see v2 or provers
+    /// vanish from the registry (this is the sole enumerator the registry
+    /// refresh uses). Mirrors the trait impl of the same name.
     pub fn for_each_vertex_underlying<F>(
         &self,
         set_type: &str,
@@ -158,19 +236,52 @@ impl RocksHypergraphStore {
     where
         F: FnMut(Vec<u8>, Vec<u8>),
     {
-        let prefix = hypergraph_vertex_data_prefix(set_type, phase_type, shard_key);
-        // Seek to the first key ≥ prefix and walk forward until we leave
-        // the prefix. Avoids the correctness pitfalls of
-        // `set_iterate_upper_bound` when the shard or vertex keys have
-        // high byte values — incrementing 0xFF bytes is error-prone, so
-        // we just compare each yielded key against the prefix.
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            &prefix,
-            rocksdb::Direction::Forward,
-        ));
-        let prefix_len = prefix.len();
+        use std::collections::{HashMap, HashSet};
+        // v2 (versioned): accumulate the max-version blob per vertex_key. Keys
+        // interleave across variable-length vertex keys, so use a map rather
+        // than assume per-key contiguity.
+        let v2_prefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix(
+            set_type, phase_type, shard_key,
+        );
+        let mut latest: HashMap<Vec<u8>, (u64, Vec<u8>)> = HashMap::new();
+        for entry in self
+            .db
+            .iterator(rocksdb::IteratorMode::From(&v2_prefix, rocksdb::Direction::Forward))
+        {
+            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if !k.starts_with(&v2_prefix) {
+                break;
+            }
+            if k.len() < v2_prefix.len() + 8 {
+                continue;
+            }
+            let vk = k[v2_prefix.len()..k.len() - 8].to_vec();
+            let ver = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
+            match latest.get_mut(&vk) {
+                Some((mv, mb)) if ver > *mv => {
+                    *mv = ver;
+                    *mb = v.into_vec();
+                }
+                Some(_) => {}
+                None => {
+                    latest.insert(vk, (ver, v.into_vec()));
+                }
+            }
+        }
         let mut count = 0usize;
-        for entry in iter {
+        let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(latest.len());
+        for (vk, (_ver, blob)) in latest {
+            seen.insert(vk.clone());
+            callback(vk, blob);
+            count += 1;
+        }
+        // Legacy (unversioned) fills any vertex not yet re-written v2.
+        let prefix = hypergraph_vertex_data_prefix(set_type, phase_type, shard_key);
+        let prefix_len = prefix.len();
+        for entry in self
+            .db
+            .iterator(rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward))
+        {
             let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
             if !k.starts_with(&prefix) {
                 break;
@@ -179,11 +290,171 @@ impl RocksHypergraphStore {
                 continue;
             }
             let vertex_key = k[prefix_len..].to_vec();
+            if seen.contains(&vertex_key) {
+                continue;
+            }
             callback(vertex_key, v.into_vec());
             count += 1;
         }
         Ok(count)
     }
+
+    /// Prune superseded MVCC blob versions of one `(set, phase, shard)` keyspace
+    /// to `watermark`: per vertex keep the greatest version ≤ `watermark` (the
+    /// value readable AT the watermark) and every version above it, deleting the
+    /// strictly-older ones. Staged into `txn`. Returns the number deleted.
+    fn prune_blob_versions(
+        &self,
+        txn: &dyn Transaction,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        watermark: u64,
+    ) -> Result<usize> {
+        use std::collections::HashMap;
+        let sprefix =
+            crate::encoding::hypergraph_vertex_data_v2_shard_prefix(set_type, phase_type, shard_key);
+        // vertex_key -> [(version, full_key)]
+        let mut by_vk: HashMap<Vec<u8>, Vec<(u64, Vec<u8>)>> = HashMap::new();
+        for entry in self
+            .db
+            .iterator(rocksdb::IteratorMode::From(&sprefix, rocksdb::Direction::Forward))
+        {
+            let (k, _v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if !k.starts_with(&sprefix) {
+                break;
+            }
+            if k.len() < sprefix.len() + 8 {
+                continue;
+            }
+            let vk = k[sprefix.len()..k.len() - 8].to_vec();
+            let ver = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
+            by_vk.entry(vk).or_default().push((ver, k.to_vec()));
+        }
+        let mut deleted = 0usize;
+        for (_vk, versions) in by_vk {
+            // Floor = greatest version ≤ watermark (the value current at the
+            // watermark). If none exists (all versions above), keep them all.
+            let floor = versions
+                .iter()
+                .filter(|(v, _)| *v <= watermark)
+                .map(|(v, _)| *v)
+                .max();
+            if let Some(floor) = floor {
+                for (v, key) in &versions {
+                    if *v < floor {
+                        txn.delete(key)?;
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Streaming, bounded-memory migration over a domain's committed
+    /// `("vertex","adds", shard)` keyspace. Reads a point-in-time snapshot in
+    /// `chunk_size`-row chunks — so the puts/deletes this makes into the same
+    /// keyspace are never re-seen by the forward scan — and hands
+    /// each chunk of `(vertex_key, blob)` pairs to `process_chunk`. The chunk
+    /// handler returns `(migrated_in_chunk, writes)`; the [`VertexWrite`]s are
+    /// applied as one `WriteBatch` per chunk. Peak memory is O(chunk_size)
+    /// regardless of the coin count (essential at 100+ GB coin sets that cannot
+    /// be collected into RAM). `progress(scanned, migrated)` fires after every
+    /// chunk. Returns `(scanned, migrated)`.
+    ///
+    /// Chunking (rather than row-at-a-time) exists so the caller can fan the
+    /// expensive per-coin transform out across a thread pool while this method
+    /// keeps the snapshot scan and the RocksDB writes single-threaded. Writes go
+    /// straight to the KV keyspace, bypassing the CRDT tree — for offline
+    /// `--migrate-*` passes whose forest is rebuilt afterward — emitting the
+    /// identical vertex-store bytes a normal `commit` would (same
+    /// [`hypergraph_vertex_data_key`]), without any tree recompute.
+    pub fn stream_migrate_vertex_adds<F, P>(
+        &self,
+        shard: &quil_types::store::ShardKey,
+        chunk_size: usize,
+        mut process_chunk: F,
+        mut progress: P,
+    ) -> Result<(usize, usize)>
+    where
+        F: FnMut(&[(Vec<u8>, Vec<u8>)]) -> Result<(usize, Vec<VertexWrite>)>,
+        P: FnMut(usize, usize),
+    {
+        let prefix = hypergraph_vertex_data_prefix("vertex", "adds", shard);
+        let prefix_len = prefix.len();
+        let chunk_size = chunk_size.max(1);
+        let snapshot = self.db.snapshot();
+        let iter = snapshot.iterator(rocksdb::IteratorMode::From(
+            &prefix,
+            rocksdb::Direction::Forward,
+        ));
+        let mut chunk: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(chunk_size);
+        let mut scanned = 0usize;
+        let mut migrated = 0usize;
+
+        // Apply one chunk: run the (possibly parallel) transform, then commit its
+        // writes in a single batch. Kept as a closure so the tail chunk reuses it.
+        let mut flush = |chunk: &[(Vec<u8>, Vec<u8>)],
+                         migrated: &mut usize,
+                         process_chunk: &mut F|
+         -> Result<()> {
+            let (m, writes) = process_chunk(chunk)?;
+            *migrated += m;
+            if !writes.is_empty() {
+                let mut batch = rocksdb::WriteBatch::default();
+                for w in &writes {
+                    match w {
+                        VertexWrite::Put { set, phase, vertex_key, blob } => {
+                            let key = hypergraph_vertex_data_key(set, phase, shard, vertex_key);
+                            batch.put(&key, blob);
+                        }
+                        VertexWrite::Delete { set, phase, vertex_key } => {
+                            let key = hypergraph_vertex_data_key(set, phase, shard, vertex_key);
+                            batch.delete(&key);
+                        }
+                    }
+                }
+                self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))?;
+            }
+            Ok(())
+        };
+
+        for entry in iter {
+            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            if k.len() <= prefix_len {
+                continue;
+            }
+            chunk.push((k[prefix_len..].to_vec(), v.to_vec()));
+            if chunk.len() >= chunk_size {
+                scanned += chunk.len();
+                flush(&chunk, &mut migrated, &mut process_chunk)?;
+                chunk.clear();
+                progress(scanned, migrated);
+            }
+        }
+        if !chunk.is_empty() {
+            scanned += chunk.len();
+            flush(&chunk, &mut migrated, &mut process_chunk)?;
+        }
+        progress(scanned, migrated);
+        Ok((scanned, migrated))
+    }
+}
+
+/// A single vertex-store operation staged by
+/// [`RocksHypergraphStore::stream_migrate_vertex_adds`]. `set`/`phase` name the
+/// CRDT phase keyspace (`"vertex"`/`"adds"`, etc.) and `vertex_key` is the full
+/// `app‖data` id.
+pub enum VertexWrite {
+    /// Write `blob` at `(set, phase, vertex_key)`.
+    Put { set: &'static str, phase: &'static str, vertex_key: Vec<u8>, blob: Vec<u8> },
+    /// Physically remove `(set, phase, vertex_key)` from the keyspace — used to
+    /// erase migrated-away originals as though they never existed (no tombstone).
+    Delete { set: &'static str, phase: &'static str, vertex_key: Vec<u8> },
 }
 
 use std::collections::HashMap;
@@ -290,6 +561,27 @@ impl SnapshotReadable for RocksHypergraphSnapshot {
         shard_key: &quil_types::store::ShardKey,
         vertex_key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
+        // MVCC "latest at capture" within the pinned snapshot: seek_for_prev to
+        // `vk_prefix ‖ u64::MAX`; the largest key still sharing `vk_prefix` (which
+        // is exactly `vk_prefix.len() + 8` bytes) is this vertex's latest version
+        // as-of the captured sequence. Mirrors the live `load_vertex_underlying_at`.
+        let vk_prefix = crate::encoding::hypergraph_vertex_data_v2_vk_prefix(
+            set_type, phase_type, shard_key, vertex_key,
+        );
+        let seek = crate::encoding::hypergraph_vertex_data_v2_key(
+            set_type, phase_type, shard_key, vertex_key, u64::MAX,
+        );
+        let mut iter = self.snapshot.raw_iterator();
+        iter.seek_for_prev(&seek);
+        if iter.valid() {
+            if let Some(k) = iter.key() {
+                if k.len() == vk_prefix.len() + 8 && k.starts_with(&vk_prefix) {
+                    return Ok(iter.value().map(|v| v.to_vec()));
+                }
+            }
+        }
+        // Legacy fallback: an un-migrated (unversioned) blob captured before the
+        // version dimension existed.
         let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
         self.snapshot
             .get(&key)
@@ -330,7 +622,11 @@ impl SnapshotReadable for RocksHypergraphStore {
         shard_key: &quil_types::store::ShardKey,
         vertex_key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        self.load_vertex_underlying(set_type, phase_type, shard_key, vertex_key)
+        // Live fallback (not isolated) — delegate to the HypergraphStore impl so
+        // the versioned (v2) latest ∪ legacy keyspace is read, not legacy only.
+        <Self as HypergraphStore>::load_vertex_underlying_raw(
+            self, set_type, phase_type, shard_key, vertex_key,
+        )
     }
 }
 
@@ -619,7 +915,8 @@ impl HypergraphStore for RocksHypergraphStore {
         shard_key: &ShardKey,
         vertex_key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        self.load_vertex_underlying(set_type, phase_type, shard_key, vertex_key)
+        // Latest = MVCC read at u64::MAX (falls back to the legacy keyspace).
+        self.load_vertex_underlying_at(set_type, phase_type, shard_key, vertex_key, u64::MAX)
     }
 
     fn save_vertex_underlying(
@@ -636,6 +933,55 @@ impl HypergraphStore for RocksHypergraphStore {
         )
     }
 
+    fn save_vertex_underlying_versioned(
+        &self,
+        txn: &dyn Transaction,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        vertex_key: &[u8],
+        data: &[u8],
+        version: u64,
+    ) -> Result<()> {
+        let key = crate::encoding::hypergraph_vertex_data_v2_key(
+            set_type, phase_type, shard_key, vertex_key, version,
+        );
+        RocksTxn::from_dyn(txn)?.batch.lock().unwrap().put(&key, data);
+        Ok(())
+    }
+
+    fn load_vertex_underlying_at(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        vertex_key: &[u8],
+        version: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        // MVCC: reverse-seek to `vk_prefix ‖ V`; the first (largest ≤ V) key that
+        // still shares `vk_prefix` is the latest write with version ≤ V. Version
+        // is a fixed 8-byte non-inverted suffix, so a matching key has length
+        // exactly `vk_prefix.len() + 8`.
+        let vk_prefix = crate::encoding::hypergraph_vertex_data_v2_vk_prefix(
+            set_type, phase_type, shard_key, vertex_key,
+        );
+        let seek = crate::encoding::hypergraph_vertex_data_v2_key(
+            set_type, phase_type, shard_key, vertex_key, version,
+        );
+        let mut iter = self
+            .db
+            .iterator(rocksdb::IteratorMode::From(&seek, rocksdb::Direction::Reverse));
+        if let Some(entry) = iter.next() {
+            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if k.len() == vk_prefix.len() + 8 && k.starts_with(&vk_prefix) {
+                return Ok(Some(v.into_vec()));
+            }
+        }
+        // Legacy fallback: an un-migrated (unversioned) blob written before the
+        // version dimension existed. The next commit re-writes it versioned.
+        self.load_vertex_underlying(set_type, phase_type, shard_key, vertex_key)
+    }
+
     fn for_each_vertex_underlying(
         &self,
         set_type: &str,
@@ -643,9 +989,285 @@ impl HypergraphStore for RocksHypergraphStore {
         shard_key: &ShardKey,
         callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
     ) -> Result<usize> {
-        RocksHypergraphStore::for_each_vertex_underlying(
-            self, set_type, phase_type, shard_key, |vk, data| callback(vk, data),
-        )
+        use std::collections::{HashMap, HashSet};
+        // v2 (versioned) keyspace: keep the LATEST version per vertex_key. Keys
+        // may interleave across variable-length vertex keys, so accumulate into a
+        // map rather than assume per-key contiguity.
+        let v2_prefix =
+            crate::encoding::hypergraph_vertex_data_v2_shard_prefix(set_type, phase_type, shard_key);
+        let mut latest: HashMap<Vec<u8>, (u64, Vec<u8>)> = HashMap::new();
+        for entry in self
+            .db
+            .iterator(rocksdb::IteratorMode::From(&v2_prefix, rocksdb::Direction::Forward))
+        {
+            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if !k.starts_with(&v2_prefix) {
+                break;
+            }
+            if k.len() < v2_prefix.len() + 8 {
+                continue;
+            }
+            let vk = k[v2_prefix.len()..k.len() - 8].to_vec();
+            let ver = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
+            match latest.get_mut(&vk) {
+                Some((mv, mb)) if ver > *mv => {
+                    *mv = ver;
+                    *mb = v.into_vec();
+                }
+                Some(_) => {}
+                None => {
+                    latest.insert(vk, (ver, v.into_vec()));
+                }
+            }
+        }
+        let mut count = 0usize;
+        let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(latest.len());
+        for (vk, (_ver, blob)) in latest {
+            seen.insert(vk.clone());
+            callback(vk, blob);
+            count += 1;
+        }
+        // Legacy (unversioned) keyspace fills any vertex not yet re-written v2.
+        let old_prefix =
+            crate::encoding::hypergraph_vertex_data_prefix(set_type, phase_type, shard_key);
+        for entry in self
+            .db
+            .iterator(rocksdb::IteratorMode::From(&old_prefix, rocksdb::Direction::Forward))
+        {
+            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if !k.starts_with(&old_prefix) {
+                break;
+            }
+            if k.len() <= old_prefix.len() {
+                continue;
+            }
+            let vk = k[old_prefix.len()..].to_vec();
+            if seen.contains(&vk) {
+                continue;
+            }
+            callback(vk, v.into_vec());
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn put_root_version(
+        &self,
+        txn: &dyn Transaction,
+        set_type: &str,
+        phase_type: &str,
+        shard_id: &[u8],
+        root_hash: &[u8],
+        version: u64,
+        frame_number: u64,
+    ) -> Result<()> {
+        // Repeated roots collapse to the LATEST (version, frame): a `put` keyed by
+        // root overwrites, and commits happen in version order, so the last write
+        // for a recurring root wins.
+        let key = crate::encoding::hypergraph_root_version_key(
+            set_type, phase_type, shard_id, root_hash,
+        );
+        let mut val = Vec::with_capacity(16);
+        val.extend_from_slice(&version.to_be_bytes());
+        val.extend_from_slice(&frame_number.to_be_bytes());
+        RocksTxn::from_dyn(txn)?.batch.lock().unwrap().put(&key, &val);
+        Ok(())
+    }
+
+    fn get_root_version(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_id: &[u8],
+        root_hash: &[u8],
+    ) -> Result<Option<(u64, u64)>> {
+        let key = crate::encoding::hypergraph_root_version_key(
+            set_type, phase_type, shard_id, root_hash,
+        );
+        match self.db.get(&key).map_err(|e| QuilError::Store(e.to_string()))? {
+            Some(v) if v.len() == 16 => Ok(Some((
+                u64::from_be_bytes(v[..8].try_into().unwrap()),
+                u64::from_be_bytes(v[8..16].try_into().unwrap()),
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    fn put_app_manifest(
+        &self,
+        txn: &dyn Transaction,
+        set_type: &str,
+        phase_type: &str,
+        app_address: &[u8],
+        app_root: &[u8],
+        entries: &[(Vec<u8>, [u8; 32], u64)],
+        frame_number: u64,
+    ) -> Result<()> {
+        // frame(u64) ‖ count(u32) then per entry: prefix_len(u16) ‖ prefix ‖
+        // sub_root(32) ‖ ver(u64). The leading frame lets the pruner drop stale
+        // manifests by age without re-deriving each aggregate root's version.
+        let key = crate::encoding::hypergraph_app_manifest_key(
+            set_type, phase_type, app_address, app_root,
+        );
+        let mut val = Vec::new();
+        val.extend_from_slice(&frame_number.to_be_bytes());
+        val.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (prefix, root, ver) in entries {
+            val.extend_from_slice(&(prefix.len() as u16).to_be_bytes());
+            val.extend_from_slice(prefix);
+            val.extend_from_slice(root);
+            val.extend_from_slice(&ver.to_be_bytes());
+        }
+        RocksTxn::from_dyn(txn)?.batch.lock().unwrap().put(&key, &val);
+        Ok(())
+    }
+
+    fn get_app_manifest(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        app_address: &[u8],
+        app_root: &[u8],
+    ) -> Result<Option<Vec<(Vec<u8>, [u8; 32], u64)>>> {
+        let key = crate::encoding::hypergraph_app_manifest_key(
+            set_type, phase_type, app_address, app_root,
+        );
+        let raw = match self.db.get(&key).map_err(|e| QuilError::Store(e.to_string()))? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        // Skip the leading frame(u64) — retained only for the pruner.
+        let mut p = 8usize;
+        if raw.len() < p {
+            return Err(QuilError::Store("manifest: short frame".into()));
+        }
+        let rd_u32 = |b: &[u8], p: &mut usize| -> Option<u32> {
+            if *p + 4 > b.len() { return None; }
+            let v = u32::from_be_bytes(b[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            Some(v)
+        };
+        let n = rd_u32(&raw, &mut p).ok_or_else(|| QuilError::Store("manifest: short".into()))?;
+        let mut out = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            if p + 2 > raw.len() { return Err(QuilError::Store("manifest: short prefix_len".into())); }
+            let plen = u16::from_be_bytes(raw[p..p + 2].try_into().unwrap()) as usize;
+            p += 2;
+            if p + plen + 32 + 8 > raw.len() { return Err(QuilError::Store("manifest: short entry".into())); }
+            let prefix = raw[p..p + plen].to_vec();
+            p += plen;
+            let mut root = [0u8; 32];
+            root.copy_from_slice(&raw[p..p + 32]);
+            p += 32;
+            let ver = u64::from_be_bytes(raw[p..p + 8].try_into().unwrap());
+            p += 8;
+            out.push((prefix, root, ver));
+        }
+        Ok(Some(out))
+    }
+
+    fn prune_versioned(&self, cull_frame: u64) -> Result<Vec<(Vec<u8>, usize, u64)>> {
+        use std::collections::HashMap;
+        // ---- 1. Watermarks from the root→(version,frame) index -------------
+        // Per tree `(set_byte, phase_byte, shard_id)` the retention watermark is
+        // `min_readable_version = max{ version : frame ≤ cull_frame }` — the state
+        // that was current as-of the cull frame. Everything strictly older is
+        // superseded and prunable. Version and frame are jointly monotonic, so a
+        // version below the watermark also has frame ≤ cull_frame.
+        let rv_first = [crate::encoding::HG_ROOT_VERSION];
+        // (set,phase,shard_id) -> (min_ver, [(root_key, version)])
+        let mut trees: HashMap<(u8, u8, Vec<u8>), (u64, Vec<(Vec<u8>, u64)>)> = HashMap::new();
+        for entry in self
+            .db
+            .iterator(rocksdb::IteratorMode::From(&rv_first, rocksdb::Direction::Forward))
+        {
+            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if k.first() != Some(&crate::encoding::HG_ROOT_VERSION) {
+                break;
+            }
+            // key = [0x35][set][phase][shard_id(var)][root(32)]; value = ver(8)‖frame(8)
+            if k.len() < 1 + 1 + 1 + 32 || v.len() != 16 {
+                continue;
+            }
+            let set_b = k[1];
+            let phase_b = k[2];
+            let shard_id = k[3..k.len() - 32].to_vec();
+            let version = u64::from_be_bytes(v[..8].try_into().unwrap());
+            let frame = u64::from_be_bytes(v[8..16].try_into().unwrap());
+            let e = trees.entry((set_b, phase_b, shard_id)).or_insert((0u64, Vec::new()));
+            if frame <= cull_frame && version > e.0 {
+                e.0 = version;
+            }
+            e.1.push((k.to_vec(), version));
+        }
+
+        let txn = self.new_transaction(false)?;
+        let mut watermarks: Vec<(Vec<u8>, usize, u64)> = Vec::new();
+        // Blob watermark per (set, phase, app_l2): a split app packs many
+        // sub-shards under one app ShardKey, each with its own version counter,
+        // so use the MIN sub-shard watermark — a safe (never-under-prune) floor,
+        // since a vertex is only read at versions ≥ its own sub-shard watermark.
+        let mut blob_wm: HashMap<(u8, u8, [u8; 32]), u64> = HashMap::new();
+        for ((set_b, phase_b, shard_id), (min_ver, roots)) in &trees {
+            if *min_ver == 0 {
+                continue; // no commit ≤ cull_frame — too new to prune
+            }
+            // Drop root→version entries strictly below the watermark (their
+            // forest generation is about to be pruned, so they'd be un-servable).
+            for (rk, ver) in roots {
+                if *ver < *min_ver {
+                    txn.delete(rk)?;
+                }
+            }
+            let phase_idx = (*set_b as usize) * 2 + (*phase_b as usize);
+            if phase_idx < 4 {
+                watermarks.push((shard_id.clone(), phase_idx, *min_ver));
+            }
+            if shard_id.len() >= 32 {
+                let mut app = [0u8; 32];
+                app.copy_from_slice(&shard_id[..32]); // addr_path_shard_id = app‖prefix
+                let w = blob_wm.entry((*set_b, *phase_b, app)).or_insert(u64::MAX);
+                if *min_ver < *w {
+                    *w = *min_ver;
+                }
+            }
+        }
+
+        // ---- 2. Prune superseded blob versions per app ShardKey ------------
+        for ((set_b, phase_b, app), wm) in &blob_wm {
+            if *wm == u64::MAX || *wm == 0 {
+                continue;
+            }
+            let (set_s, phase_s) = match (byte_set_str(*set_b), byte_phase_str(*phase_b)) {
+                (Some(s), Some(p)) => (s, p),
+                _ => continue,
+            };
+            let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3);
+            let shard = ShardKey { l1, l2: *app };
+            self.prune_blob_versions(txn.as_ref(), set_s, phase_s, &shard, *wm)?;
+        }
+
+        // ---- 3. Prune stale split-app manifests (frame < cull_frame) --------
+        let mf_first = [crate::encoding::HG_APP_MANIFEST];
+        for entry in self
+            .db
+            .iterator(rocksdb::IteratorMode::From(&mf_first, rocksdb::Direction::Forward))
+        {
+            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if k.first() != Some(&crate::encoding::HG_APP_MANIFEST) {
+                break;
+            }
+            if v.len() < 8 {
+                continue;
+            }
+            let frame = u64::from_be_bytes(v[..8].try_into().unwrap());
+            if frame < cull_frame {
+                txn.delete(&k)?;
+            }
+        }
+
+        txn.commit()?;
+        Ok(watermarks)
     }
 
     fn apply_snapshot(&self, db_path: &str) -> Result<()> {
@@ -1145,5 +1767,107 @@ mod tests {
             Some(&b"v-adds-POST"[..])
         );
 
+    }
+
+    // The registry-refresh path (`for_each_vertex_underlying`) must see blobs
+    // written by the versioned commit path, or provers vanish from the registry.
+    #[test]
+    fn test_for_each_reads_versioned_and_legacy() {
+        use quil_types::store::HypergraphStore as _;
+        let tmp = TempDir::new().unwrap();
+        let db = RocksDb::open(tmp.path()).unwrap();
+        let store = RocksHypergraphStore::new(Arc::new(db).inner());
+        let shard = ShardKey { l1: [1, 2, 3], l2: [0xffu8; 32] };
+
+        // A v2 (versioned-commit) vertex and a legacy (pre-migration) vertex.
+        let vk_v2 = vec![0xAAu8; 64];
+        let vk_legacy = vec![0xBBu8; 64];
+        let txn = store.new_transaction(false).unwrap();
+        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk_v2, b"newest", 2).unwrap();
+        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk_v2, b"OLD", 1).unwrap();
+        txn.commit().unwrap();
+        store.save_vertex_underlying("vertex", "adds", &shard, &vk_legacy, b"legacy").unwrap();
+
+        let mut seen: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+        store.for_each_vertex_underlying("vertex", "adds", &shard, |vk: Vec<u8>, d: Vec<u8>| {
+            seen.insert(vk, d);
+        }).unwrap();
+        assert_eq!(seen.get(&vk_v2).map(|v| v.as_slice()), Some(&b"newest"[..]), "v2 latest version");
+        assert_eq!(seen.get(&vk_legacy).map(|v| v.as_slice()), Some(&b"legacy"[..]), "legacy fallback");
+        assert_eq!(seen.len(), 2);
+    }
+
+    // A captured snapshot must read the versioned (v2) latest blob too, or a
+    // generation-isolated read (sync full-load) would miss committed state.
+    #[test]
+    fn test_snapshot_reads_versioned_latest() {
+        use quil_types::store::{HypergraphStore as _, SnapshotReadable as _};
+        let tmp = TempDir::new().unwrap();
+        let db = RocksDb::open(tmp.path()).unwrap();
+        let store = RocksHypergraphStore::new(Arc::new(db).inner());
+        let shard = ShardKey { l1: [9, 9, 9], l2: [0x77u8; 32] };
+        let vk = vec![0xCDu8; 48];
+
+        let txn = store.new_transaction(false).unwrap();
+        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"gen-old", 1).unwrap();
+        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"gen-new", 2).unwrap();
+        txn.commit().unwrap();
+
+        // Live adapter (SnapshotReadable for RocksHypergraphStore) → v2 latest.
+        assert_eq!(
+            SnapshotReadable::load_vertex_underlying_raw(&store, "vertex", "adds", &shard, &vk).unwrap().as_deref(),
+            Some(&b"gen-new"[..])
+        );
+        // Captured snapshot → v2 latest at capture.
+        let snap = store.capture_snapshot().unwrap();
+        assert_eq!(
+            snap.load_vertex_underlying_raw("vertex", "adds", &shard, &vk).unwrap().as_deref(),
+            Some(&b"gen-new"[..])
+        );
+    }
+
+    // Versioned-snapshot sync building blocks: MVCC blob reads, root→version
+    // resolution, and the 2-epoch pruner. Exercises the store half of the
+    // versionless-blob race fix.
+    #[test]
+    fn test_versioned_blob_mvcc_resolve_and_prune() {
+        use quil_types::store::HypergraphStore as _;
+        let tmp = TempDir::new().unwrap();
+        let db = RocksDb::open(tmp.path()).unwrap();
+        let store = RocksHypergraphStore::new(Arc::new(db).inner());
+
+        let shard = ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+        let vk = vec![0x11u8; 32];
+
+        // Three versioned writes of the same vertex at versions 1,2,3.
+        let txn = store.new_transaction(false).unwrap();
+        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"v1", 1).unwrap();
+        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"v2", 2).unwrap();
+        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"v3", 3).unwrap();
+        // Root→(version,frame) index: rootA@(1,50), rootB@(2,100), rootC@(3,200).
+        store.put_root_version(txn.as_ref(), "vertex", "adds", &shard.l2, &[0xA1u8; 32], 1, 50).unwrap();
+        store.put_root_version(txn.as_ref(), "vertex", "adds", &shard.l2, &[0xB2u8; 32], 2, 100).unwrap();
+        store.put_root_version(txn.as_ref(), "vertex", "adds", &shard.l2, &[0xC3u8; 32], 3, 200).unwrap();
+        txn.commit().unwrap();
+
+        // MVCC "latest write ≤ V".
+        assert_eq!(store.load_vertex_underlying_at("vertex", "adds", &shard, &vk, 1).unwrap().as_deref(), Some(&b"v1"[..]));
+        assert_eq!(store.load_vertex_underlying_at("vertex", "adds", &shard, &vk, 2).unwrap().as_deref(), Some(&b"v2"[..]));
+        assert_eq!(store.load_vertex_underlying_at("vertex", "adds", &shard, &vk, 5).unwrap().as_deref(), Some(&b"v3"[..]));
+
+        // Root resolution.
+        assert_eq!(store.get_root_version("vertex", "adds", &shard.l2, &[0xB2u8; 32]).unwrap(), Some((2, 100)));
+
+        // Prune at cull_frame=150 → tree watermark = max{ver : frame ≤ 150} = 2.
+        let watermarks = store.prune_versioned(150).unwrap();
+        assert_eq!(watermarks, vec![(shard.l2.to_vec(), 0usize, 2u64)]);
+
+        // Blob version 1 (< watermark) is gone; 2 (the floor) and 3 remain.
+        assert_eq!(store.load_vertex_underlying_at("vertex", "adds", &shard, &vk, 2).unwrap().as_deref(), Some(&b"v2"[..]));
+        assert_eq!(store.load_vertex_underlying_at("vertex", "adds", &shard, &vk, 5).unwrap().as_deref(), Some(&b"v3"[..]));
+        // rootA (ver 1 < watermark) is dropped from the index; rootB/rootC remain.
+        assert_eq!(store.get_root_version("vertex", "adds", &shard.l2, &[0xA1u8; 32]).unwrap(), None);
+        assert_eq!(store.get_root_version("vertex", "adds", &shard.l2, &[0xB2u8; 32]).unwrap(), Some((2, 100)));
+        assert_eq!(store.get_root_version("vertex", "adds", &shard.l2, &[0xC3u8; 32]).unwrap(), Some((3, 200)));
     }
 }

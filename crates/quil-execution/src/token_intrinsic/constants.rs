@@ -72,7 +72,11 @@ pub const FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END: u64 = FRAME_2_1_EXTENDED_ENROLL
 /// shard isn't a dead zone where only prover-lifecycle ops can be
 /// processed. NEW protocol rule (no Go equivalent) — gated so all nodes
 /// switch behavior at the same height. See the global frame materializer.
-pub const FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX: u64 = 670000;
+///
+/// Set to the first CW-driven frame (the mainnet BLS/KZG→commonware flag day,
+/// where 669975 is the last legacy frame), so uncovered-shard global routing is
+/// live from the very first frame the new consensus produces.
+pub const FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX: u64 = 669976;
 
 // =====================================================================
 // Domain addresses (Poseidon-derived)

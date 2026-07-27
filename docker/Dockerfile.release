@@ -17,9 +17,12 @@ RUN for i in $(seq 1 ${MAX_KEY_ID}); do \
       fi \
     done
 
-WORKDIR /opt/ceremonyclient/client
-
-RUN go build -o qclient ./main.go
+# qclient is now the Rust `crates/quil-client` binary (the Go client was
+# retired). Like the node, the release image assembles a pre-built qclient
+# release binary — built by the `build_qclient_*` Taskfile targets via
+# Dockerfile.source — rather than compiling from source here (this stage is a
+# golang-alpine image with no Rust/FLINT toolchain).
+RUN cp "qclient-${NODE_VERSION}-linux-amd64" "qclient"
 
 RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.1
 
@@ -46,7 +49,7 @@ COPY --from=build /opt/ceremonyclient/node/node /usr/local/bin
 COPY --from=build /opt/ceremonyclient/node/node.dgst /usr/local/bin
 COPY --from=build /opt/ceremonyclient/node/node.dgst.sig.* /usr/local/bin
 
-COPY --from=build /opt/ceremonyclient/client/qclient /usr/local/bin
+COPY --from=build /opt/ceremonyclient/qclient /usr/local/bin
 
 COPY --from=build /go/bin/grpcurl /usr/local/bin
 

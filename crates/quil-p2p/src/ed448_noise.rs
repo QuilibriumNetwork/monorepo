@@ -11,9 +11,9 @@
 //! **Wire format**:
 //! ```text
 //! NoiseHandshakePayload (protobuf):
-//!   bytes identity_key = 1;   // protobuf(PublicKey{Type:4, Data:ed448_pubkey_57})
-//!   bytes identity_sig = 2;   // ed448_sign(seed, "noise-libp2p-static-key:" || dh_pubkey)
-//!   NoiseExtensions extensions = 4;
+//!   bytes identity_key = 1; // protobuf(PublicKey{Type:4, Data:ed448_pubkey_57})
+//!   bytes identity_sig = 2; // ed448_sign(seed, "noise-libp2p-static-key:" || dh_pubkey)
+//! NoiseExtensions extensions = 4;
 //! ```
 
 use quil_types::error::{QuilError, Result};

@@ -12,13 +12,13 @@ pub trait WorkerManager: Send + Sync {
     }
 
     /// Bind `core_id` to `filter`. `start_consensus`:
-    ///   * `true`  — also (re)start `AppConsensusEngine` for this
-    ///     filter. Use for `Active`/`Paused` allocations.
-    ///   * `false` — record the filter binding only; do NOT spawn a
-    ///     consensus engine. Use for `Joining` allocations whose
-    ///     prover isn't Active yet (the engine's `leader_for_rank`
-    ///     would die immediately). Mirrors Go's
-    ///     `worker.Filter`-set / `worker.Allocated=false` state.
+    ///   * `true` — also (re)start `AppConsensusEngine` for this
+    /// filter. Use for `Active`/`Paused` allocations.
+    /// * `false` — record the filter binding only; do NOT spawn a
+    /// consensus engine. Use for `Joining` allocations whose
+    /// prover isn't Active yet (the engine's `leader_for_rank`
+    /// would die immediately). Mirrors Go's
+    /// `worker.Filter`-set / `worker.Allocated=false` state.
     fn set_worker_filter(
         &self,
         core_id: u32,

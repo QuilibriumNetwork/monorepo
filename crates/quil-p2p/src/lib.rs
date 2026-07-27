@@ -1,13 +1,17 @@
 pub mod blossomsub_behaviour;
 pub mod ed448_identity;
+pub mod falcon_identity;
 pub mod ed448_noise;
 pub mod ed448_noise_transport;
 pub mod ed448_peer;
 pub mod handler;
+pub mod metrics;
 pub mod node;
 pub mod onion;
 pub mod peer_authenticator;
 pub mod peer_info;
+pub mod pqnoise;
+pub mod pqnoise_transport;
 pub mod protocol;
 pub mod signer_registry;
 pub mod tls_debug;
@@ -17,9 +21,12 @@ pub mod tls_debug;
 // deleted the old in-crate `behaviour` / `scoring` / `blossomsub` / bitmask
 // modules; the fork is now the sole implementation.)
 pub use blossomsub_behaviour::{BlossomSubBehaviour, BlossomSubEvent, ValidationResult};
+pub use libp2p::identity::Keypair;
 pub use libp2p::PeerId;
 pub use ed448_identity::{peer_id_from_ed448_pubkey, Ed448Identity};
+pub use falcon_identity::peer_id_from_falcon_pubkey;
 pub use node::{P2PHandle, P2PNode, ReceivedMessage};
+pub use pqnoise_transport::{upgrade as pq_upgrade, PqNoiseError, PqOutput};
 pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{
     build_worker_reachability, classify_peer_info_message, decode_canonical_key_registry,

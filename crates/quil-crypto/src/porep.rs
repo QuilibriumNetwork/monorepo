@@ -6,16 +6,16 @@
 //! — which together make the batch both sound and non-replayable:
 //!
 //! - Each opening's evaluation-domain index is **recomputed by the verifier**
-//!   from the frame's global-VDF output `ρ_N` and the member id
-//!   ([`derive_challenge_index`]); it is never trusted from the wire. So a
-//!   prover cannot open at a self-chosen easy point, and a proof produced for
-//!   frame `N` cannot be replayed at frame `N+1`: a different `ρ_N` yields a
-//!   different index, and the carried proof no longer matches.
+//! from the frame's global-VDF output `ρ_N` and the member id
+//! ([`derive_challenge_index`]); it is never trusted from the wire. So a
+//! prover cannot open at a self-chosen easy point, and a proof produced for
+//! frame `N` cannot be replayed at frame `N+1`: a different `ρ_N` yields a
+//! different index, and the carried proof no longer matches.
 //! - The random-linear-combination scalar `γ` is bound to the **entire**
-//!   transcript — frame number, `ρ_N`, the committee bitmask, and every
-//!   `(member, query, commitment, index, value, proof)` — so the prover cannot
-//!   adapt proofs after seeing `γ` (the standard small-exponents-batch
-//!   requirement that, if violated, makes the aggregate forgeable).
+//! transcript — frame number, `ρ_N`, the committee bitmask, and every
+//! `(member, query, commitment, index, value, proof)` — so the prover cannot
+//! adapt proofs after seeing `γ` (the standard small-exponents-batch
+//! requirement that, if violated, makes the aggregate forgeable).
 //!
 //! The challenge selects an evaluation-domain index within the challenged
 //! leaf's polynomial (sector = one ≤1 GB logical-shard leaf; per the storage
@@ -84,7 +84,7 @@ pub fn is_audited(rho_n: &[u8], id: &[u8], sample_num: u64, sample_den: u64) -> 
     let mut first8 = [0u8; 8];
     first8.copy_from_slice(&digest[..8]);
     let h_u64 = u64::from_be_bytes(first8);
-    // h_u64 / 2^64 < num/den  ⟺  h_u64 * den < num * 2^64  (u128, no overflow:
+    // h_u64 / 2^64 < num/den ⟺  h_u64 * den < num * 2^64  (u128, no overflow:
     // both sides < 2^128 since num,den,h_u64 < 2^64).
     (h_u64 as u128) * (sample_den as u128) < (sample_num as u128) << 64
 }
@@ -320,14 +320,14 @@ pub fn verify_frame_storage_attestation_proto(
 /// against a leaf the member actually **registered** for the **current epoch**:
 ///
 /// - `lookup(member_id, leaf_id)` returns the member's registered
-///   `(leaf_root, num_blocks, epoch)` for that leaf, or `None`. `leaf_id` is the
-///   opening's `shard_id` (which the producer sets to `leaf_id_bytes(filter,
-///   prefix)`), so a member can only open leaves it registered.
+/// `(leaf_root, num_blocks, epoch)` for that leaf, or `None`. `leaf_id` is the
+/// opening's `shard_id` (which the producer sets to `leaf_id_bytes(filter,
+/// prefix)`), so a member can only open leaves it registered.
 /// - The registered `leaf_root` and `num_blocks` must match the opening (a
-///   prover can't open a self-chosen junk leaf), and both the registered and
-///   the opening's `epoch` must equal `active_epoch` (a stale-epoch root —
-///   never re-registered this epoch — is rejected, matching the epoch-bound
-///   allocation semantics).
+/// prover can't open a self-chosen junk leaf), and both the registered and
+/// the opening's `epoch` must equal `active_epoch` (a stale-epoch root —
+/// never re-registered this epoch — is rejected, matching the epoch-bound
+/// allocation semantics).
 ///
 /// Returns `true` iff all cross-checks pass AND the possession batch verifies.
 pub fn verify_frame_storage_attestation_registered<F>(

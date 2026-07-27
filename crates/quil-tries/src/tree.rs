@@ -593,9 +593,9 @@ fn insert_recursive(
 /// `found` is true iff a leaf with the exact key was removed somewhere in
 /// the sub-tree. `replacement_node` is what the caller should put in place
 /// of `node`:
-///   - `None` if the sub-tree is now empty
-///   - `Some(leaf)` if a branch collapsed down to its single remaining leaf
-///   - `Some(branch)` with refreshed metadata otherwise
+/// - `None` if the sub-tree is now empty
+/// - `Some(leaf)` if a branch collapsed down to its single remaining leaf
+/// - `Some(branch)` with refreshed metadata otherwise
 ///
 /// Mirrors Go's `Delete` recursion at `types/tries/lazy_proof_tree.go:2056`
 /// and `mergeBranchWithChild` at line 2242, minus the
@@ -710,12 +710,12 @@ fn delete_recursive(
 /// branch-split.
 ///
 /// - If the child is a leaf, the branch disappears entirely; the leaf
-///   takes its place. Insert would never have created the parent branch
-///   in the first place if only one leaf existed under it.
+/// takes its place. Insert would never have created the parent branch
+/// in the first place if only one leaf existed under it.
 /// - If the child is a branch, fold the parent's prefix + the child-slot
-///   nibble + the child's prefix into a single new prefix, and let the
-///   merged branch take the parent's place. Counters carry over from the
-///   child unchanged: it's the same set of leaves at the same depths.
+/// nibble + the child's prefix into a single new prefix, and let the
+/// merged branch take the parent's place. Counters carry over from the
+/// child unchanged: it's the same set of leaves at the same depths.
 fn merge_branch_with_child(
     branch: BranchNode,
     child_index: usize,

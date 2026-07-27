@@ -45,23 +45,23 @@ pub struct ConfigFilterApplyStats {
 /// Behavior:
 ///
 /// - Empty / whitespace entries are skipped — they encode "operator
-///   deliberately wants worker (i+1) left idle / auto-managed."
+/// deliberately wants worker (i+1) left idle / auto-managed."
 /// - Invalid hex is logged and counted as `invalid`. Decoding is
-///   tolerant: leading `0x` (any case) is stripped first.
+/// tolerant: leading `0x` (any case) is stripped first.
 /// - If no worker exists at `core_id` (the operator declared more
-///   filters than CPU cores), the entry is skipped with a warning.
+/// filters than CPU cores), the entry is skipped with a warning.
 /// - **Persisted state wins**: if a worker already has a non-empty
-///   `filter` (restored from the worker store from a prior gRPC edit,
-///   or already pinned by some earlier startup step), config does NOT
-///   override it. This means an operator who flipped the assignment
-///   via `NodeService::set_manually_managed` + `request_join` keeps
-///   their runtime decision across restarts.
+/// `filter` (restored from the worker store from a prior gRPC edit,
+/// or already pinned by some earlier startup step), config does NOT
+/// override it. This means an operator who flipped the assignment
+/// via `NodeService::set_manually_managed` + `request_join` keeps
+/// their runtime decision across restarts.
 /// - Otherwise: pin the filter with `set_worker_filter(core_id,
-///   filter, start_consensus=false)` and mark the worker
-///   `manually_managed=true`. `start_consensus=false` because we
-///   don't yet know whether a matching registry allocation exists —
-///   the auto-allocator will start the consensus engine when it
-///   observes the alloc transition to Active.
+/// filter, start_consensus=false)` and mark the worker
+/// `manually_managed=true`. `start_consensus=false` because we
+/// don't yet know whether a matching registry allocation exists —
+/// the auto-allocator will start the consensus engine when it
+/// observes the alloc transition to Active.
 ///
 /// **NOTE on parity with Go.** Go's reference uses
 /// `engine.DataWorkerFilters` only to build per-shard PeerInfo

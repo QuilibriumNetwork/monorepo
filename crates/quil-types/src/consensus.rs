@@ -508,9 +508,27 @@ pub trait ProverRegistry: Send + Sync {
     ) -> Result<Option<(Vec<u8>, u64, u64)>> {
         Ok(None)
     }
-    fn get_next_prover(&self, input: &[u8; 32], filter: &[u8]) -> Result<Vec<u8>>;
-    fn get_ordered_provers(&self, input: &[u8; 32], filter: &[u8]) -> Result<Vec<Vec<u8>>>;
-    fn get_active_provers(&self, filter: &[u8]) -> Result<Vec<ProverInfo>>;
+    fn get_next_prover(&self, input: &[u8; 32], filter: &[u8], frame_number: u64) -> Result<Vec<u8>>;
+    fn get_ordered_provers(
+        &self,
+        input: &[u8; 32],
+        filter: &[u8],
+        frame_number: u64,
+    ) -> Result<Vec<Vec<u8>>>;
+    /// The epoch-aligned committee under `filter` as of `frame_number` — the
+    /// same `effective_status` view the rest of the node uses. Includes `Active`
+    /// and `Leaving`-within-grace (a departing member stays in the frozen
+    /// committee until the E+2 boundary); excludes `Joining` (incl.
+    /// deferred-activation — a just-confirmed prover that is pre-E+2 and not yet
+    /// running its consensus loop), `ExpiredEpoch` (storage-stale), `Leaving`
+    /// past grace, and terminal allocations. An empty-committee floor re-admits
+    /// demoted-but-raw-`Active` allocations (deferred / stale-epoch) if the
+    /// strict set would leave a non-empty filter with no members (see
+    /// `committee_eligible`). The empty/global filter is exempt from the epoch
+    /// checks, so GLOBAL consensus is unaffected. `frame_number` is the frame
+    /// whose committee is being evaluated (produced/validated), so all nodes
+    /// agree by construction.
+    fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Result<Vec<ProverInfo>>;
     fn get_prover_count(&self, filter: &[u8]) -> Result<usize>;
     fn get_provers(&self, filter: &[u8]) -> Result<Vec<ProverInfo>>;
     fn get_provers_by_status(
@@ -540,7 +558,10 @@ pub trait ProverRegistry: Send + Sync {
     /// test stubs don't need to special-case "any filter" semantics.
     /// Production overrides to walk the per-prover cache directly.
     fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>> {
-        self.get_active_provers(&[])
+        // Test-stub fallback only (production overrides this to walk the
+        // per-prover rollup). Stubs ignore the frame arg, so the value is
+        // immaterial here.
+        self.get_active_provers(&[], 0)
     }
     /// Per-filter prover count grouped by allocation status, with the
     /// 720-frame grace check applied so expired Joining/Leaving

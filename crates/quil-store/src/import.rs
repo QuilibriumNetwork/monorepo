@@ -50,8 +50,8 @@ pub struct ImportResult {
 /// [version: u32 BE]
 /// [entry_count: u64 BE]
 /// repeated {
-///   [key_len: u32 BE][key bytes]
-///   [value_len: u32 BE][value bytes]
+/// [key_len: u32 BE][key bytes]
+/// [value_len: u32 BE][value bytes]
 /// }
 /// [sha256: 32 bytes checksum]
 /// ```

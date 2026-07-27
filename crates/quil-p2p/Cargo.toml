@@ -5,13 +5,20 @@ edition = "2021"
 license = "Apache-2.0"
 description = "P2P networking with BlossomSub pubsub for the Quilibrium node"
 
+[dev-dependencies]
+tokio-util = { version = "0.7", features = ["compat"] }
+
 [dependencies]
 quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-lifecycle = { path = "../quil-lifecycle" }
 quil-crypto = { path = "../quil-crypto" }
-blossomsub = { path = "../blossomsub" }
-libp2p = { version = "0.54", features = [
+# Phase 1: the pubsub layer is now stock `libp2p::gossipsub` (the `blossomsub`
+# fork crate stays in the workspace but is no longer a dependency here). Must
+# stay version-compatible with gossipsub's prometheus-client — the two share one
+# Registry, so the `Registry` type must unify.
+prometheus-client = "0.23"
+libp2p = { version = "0.56", features = [
     "tokio",
     "noise",
     "yamux",
@@ -22,8 +29,13 @@ libp2p = { version = "0.54", features = [
     "ping",
     "kad",
     "autonat",
+    "gossipsub",
     "macros",
 ] }
+# Enable gossipsub's own `metrics` feature (not enabled by the libp2p umbrella)
+# so `Behaviour::with_metrics` / `MetricsConfig` are available. Same version
+# libp2p 0.56 resolves; Cargo unifies the features onto one crate instance.
+libp2p-gossipsub = { version = "0.49", features = ["metrics"] }
 prost = "0.13"
 tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
 tracing = "0.1"
@@ -34,14 +46,32 @@ aes-gcm = "0.10"
 lru = "0.12"
 rand = "0.8"
 async-trait = "0.1"
+zeroize = "1.7"
 anyhow = "1"
 hex = "0.4"
 futures = "0.3"
 ed448-rust = { path = "../ed448-rust" }
-libp2p-identity = { version = "0.2", features = ["ed448"] }
+libp2p-identity = { version = "0.2", features = ["ed448", "falcon"] }
 void = "1"
 snow = "0.9"
 bs58 = "0.5"
+# Post-quantum forward-secret Noise (PQNoise framework) + audited NTRU KEM.
+# `clatter` implements the vetted KEM-based Noise handshake (Angel/Dowling/
+# Hülsing/Schwabe); we supply Streamlined NTRU Prime (sntrup761, PQClean via
+# pqcrypto-ntruprime — the OpenSSH-deployed NTRU-family KEM) through clatter's
+# `Kem` trait. Non-hybrid, pure-NTRU. Kyber/ML-KEM features intentionally OFF.
+clatter = { version = "2.2", default-features = false, features = [
+    "alloc",
+    "getrandom",
+    "use-chacha20poly1305",
+    "use-sha",
+] }
+pqcrypto-ntruprime = "0.1"
+pqcrypto-traits = "0.3"
+# Length-delimited AEAD framing for the PQNoise libp2p security transport
+# (mirrors libp2p-noise's io layer).
+bytes = "1"
+asynchronous-codec = "0.7"
 
 [build-dependencies]
 prost-build = "0.13"

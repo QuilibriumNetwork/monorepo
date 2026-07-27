@@ -1,7 +1,7 @@
 //! Tab-separated log lines with a JSON tail; `coreId` always present.
 //!
 //! ```text
-//! 2026-04-22T01:00:00Z  info  quil_node:490  P2P identity ready  {"coreId": 0, "peer_id": "Qm..."}
+//! 2026-04-22T01:00:00Z info  quil_node:490  P2P identity ready  {"coreId": 0, "peer_id": "Qm..."}
 //! ```
 //!
 //! Per-core file separation (`master.log` / `worker-N.log`) plus
@@ -370,10 +370,10 @@ pub fn log_filename_for_core(core_id: u32) -> String {
 /// at `<cfg.path>/<core>.log` and keeps stderr as a mirror.
 ///
 /// Rotation:
-///   * `max_size` MB — rotation trigger (0 → daily).
-///   * `max_backups` — rotated files retained (0 → 1024 cap).
-///   * `max_age` days — reaper deletes older rotations.
-///   * `compress` — gzip on rotation.
+/// * `max_size` MB — rotation trigger (0 → daily).
+/// * `max_backups` — rotated files retained (0 → 1024 cap).
+/// * `max_age` days — reaper deletes older rotations.
+/// * `compress` — gzip on rotation.
 pub fn init_logging(
     cfg: &quil_config::LogConfig,
     core_id: u32,

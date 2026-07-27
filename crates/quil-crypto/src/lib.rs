@@ -1,7 +1,7 @@
-mod bls;
 mod bulletproof_adapter;
 mod ed25519;
 mod ed448;
+mod falcon;
 #[cfg(feature = "vdf-prover")]
 mod frame_prover;
 mod inclusion;
@@ -10,14 +10,23 @@ pub mod poseidon;
 pub mod porep;
 pub mod sdr;
 mod secp256k1;
+pub mod sntrup761;
 
-pub use bls::{Bls48581KeyConstructor, Bls48581Signer};
+pub use falcon::{
+    falcon_public_from_signing_key, falcon_verify, FalconKeyConstructor, FalconSigner,
+    FALCON_PUBLIC_KEY_LEN,
+    FALCON_SIGNATURE_LEN, FALCON_SIGNING_KEY_LEN,
+};
 pub use bulletproof_adapter::Decaf448BulletproofProver;
 pub use ed25519::{ed25519_verify, Ed25519Signer};
 pub use ed448::{
     ed448_verify, peer_id_multihash_from_ed448_pubkey, Ed448Signer,
 };
 pub use secp256k1::{secp256k1_sha256_verify, secp256k1_sha3_verify, Secp256k1Signer};
+pub use sntrup761::{
+    Sntrup761KeyPair, SNTRUP761_CIPHERTEXT_LEN, SNTRUP761_PUBLIC_KEY_LEN,
+    SNTRUP761_SECRET_KEY_LEN, SNTRUP761_SHARED_SECRET_LEN,
+};
 #[cfg(feature = "vdf-prover")]
 pub use frame_prover::WesolowskiFrameProver;
 pub use inclusion::KzgInclusionProver;

@@ -349,6 +349,32 @@ pub fn check_proof_of_time_wesolowski<T: BigNum, V: ClassGroup<BigNum = T>>(
 where
     T: BigNumExt,
 {
+    // SECURITY: a decoded proof/output form can be degenerate (e.g. `a == 0`) and
+    // panic deep in the class-group arithmetic on a `Mpz` division. This verify is
+    // on the synchronous consensus/frame-acceptance path with no upstream
+    // `catch_unwind`, so an attacker-crafted frame output could otherwise crash
+    // the validating task / poison a lock. Verification is a pure function of the
+    // inputs, so a caught panic is simply a verification failure.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_proof_of_time_wesolowski_inner::<T, V>(
+            challenge,
+            proof_blob,
+            iterations,
+            int_size_bits,
+        )
+    }))
+    .unwrap_or(Err(()))
+}
+
+fn check_proof_of_time_wesolowski_inner<T: BigNum, V: ClassGroup<BigNum = T>>(
+    challenge: &[u8],
+    proof_blob: &[u8],
+    iterations: u64,
+    int_size_bits: u16,
+) -> Result<(), ()>
+where
+    T: BigNumExt,
+{
     let discriminant: T = super::create_discriminant::create_discriminant(challenge, int_size_bits);
     let x = V::from_ab_discriminant(2.into(), 1.into(), discriminant.clone());
     if (usize::MAX - 16) < int_size_bits.into() {

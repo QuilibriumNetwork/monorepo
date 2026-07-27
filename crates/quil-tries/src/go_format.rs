@@ -14,24 +14,24 @@
 //!
 //! ```text
 //! Nil node:
-//!   [u8 = 0]
+//! [u8 = 0]
 //!
 //! Leaf node:
-//!   [u8 = 1]
-//!   [u64 len][key bytes]
-//!   [u64 len][value bytes]
-//!   [u64 len][hash_target bytes]
-//!   [u64 len][commitment bytes]
-//!   [u64 len][size bytes]        // BigInt absolute-value, unsigned BE
+//! [u8 = 1]
+//! [u64 len][key bytes]
+//! [u64 len][value bytes]
+//! [u64 len][hash_target bytes]
+//! [u64 len][commitment bytes]
+//!   [u64 len][size bytes] // BigInt absolute-value, unsigned BE
 //!
 //! Branch node:
-//!   [u8 = 2]
-//!   [u32 len][i32 * len]         // prefix (compressed nibbles)
-//!   [64 child nodes]             // recursive, nil for empty slot
-//!   [u64 len][commitment bytes]
-//!   [u64 len][size bytes]
-//!   [i64 leaf_count]
-//!   [i32 longest_branch]
+//! [u8 = 2]
+//!   [u32 len][i32 * len] // prefix (compressed nibbles)
+//!   [64 child nodes] // recursive, nil for empty slot
+//! [u64 len][commitment bytes]
+//! [u64 len][size bytes]
+//! [i64 leaf_count]
+//! [i32 longest_branch]
 //! ```
 
 use num_bigint::BigInt;

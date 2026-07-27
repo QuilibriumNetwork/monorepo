@@ -4,9 +4,9 @@
 //!
 //! Mirrors the Go node's gate at `global_consensus_engine.go`:
 //! - join proposals block while any shard is halted (so a struggling
-//!   shard doesn't get flooded with new joiners before recovery)
+//! shard doesn't get flooded with new joiners before recovery)
 //! - archive-node eviction skips entirely while any halt is active
-//!   (otherwise evictions would cascade during the halt window)
+//! (otherwise evictions would cascade during the halt window)
 
 use std::collections::HashSet;
 use std::sync::RwLock;

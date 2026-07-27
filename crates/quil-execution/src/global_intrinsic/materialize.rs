@@ -196,17 +196,17 @@ pub fn update_prover_status_from_allocations(
 /// paths:
 ///
 /// - **Confirm join** (status 0→1): set Status=Active, JoinConfirmFrameNumber,
-///   LastActiveFrameNumber, Epoch=epoch_for_frame(frame)+1. The flipped Active
-///   byte does NOT make the prover a committee member until the activation
-///   boundary E+2 — `effective_status` reads it as `Joining` until then
-///   (deferred activation, keyed on JoinConfirmFrameNumber).
+/// LastActiveFrameNumber, Epoch=epoch_for_frame(frame)+1. The flipped Active
+/// byte does NOT make the prover a committee member until the activation
+/// boundary E+2 — `effective_status` reads it as `Joining` until then
+/// (deferred activation, keyed on JoinConfirmFrameNumber).
 /// - **Re-confirm** (status 1, stays Active): renew Epoch one ahead +
-///   LastActiveFrameNumber. Does NOT touch JoinConfirmFrameNumber (so the
-///   established member's activation epoch stays in the past).
+/// LastActiveFrameNumber. Does NOT touch JoinConfirmFrameNumber (so the
+/// established member's activation epoch stays in the past).
 /// - **Confirm leave** (status 3, stays Leaving): set LeaveConfirmFrameNumber.
-///   The byte stays Leaving; the prover serves notice through the rest of the
-///   epoch and departs at E+2 via `effective_status` (ExpiredLeaving). Keeping
-///   the byte avoids changing committee membership mid-epoch.
+/// The byte stays Leaving; the prover serves notice through the rest of the
+/// epoch and departs at E+2 via `effective_status` (ExpiredLeaving). Keeping
+/// the byte avoids changing committee membership mid-epoch.
 ///
 /// Returns `Err` if the allocation is not in status 0, 1, or 3.
 pub fn materialize_prover_confirm(
@@ -260,9 +260,9 @@ pub fn materialize_prover_confirm(
 /// Materialize a ProverReject for a single allocation. Two paths:
 ///
 /// - **Reject join** (status 0→4): set Status=Kicked,
-///   JoinRejectFrameNumber.
+/// JoinRejectFrameNumber.
 /// - **Reject leave** (status 3→1): set Status=Active,
-///   LeaveRejectFrameNumber, LastActiveFrameNumber.
+/// LeaveRejectFrameNumber, LastActiveFrameNumber.
 pub fn materialize_prover_reject(
     allocation_tree: &mut quil_tries::VectorCommitmentTree,
     frame_number: u64,
@@ -863,14 +863,14 @@ pub fn create_spent_merge_tree(
 ///
 /// 1. Reads the prover's current Seniority from `prover_tree`.
 /// 2. Adds `merge_seniority` (pre-computed from the merge targets'
-///    Ed448 peer IDs via `compat::GetAggregatedSeniority`).
+/// Ed448 peer IDs via `compat::GetAggregatedSeniority`).
 /// 3. Writes the new Seniority value.
 /// 4. Creates spent-merge marker trees for each merge target.
 ///
 /// The caller is responsible for:
 /// - Computing `merge_seniority` from the merge targets (requires
-///   Ed448 key → peer ID conversion + seniority DB lookup, which are
-///   not available in the pure-data layer).
+/// Ed448 key → peer ID conversion + seniority DB lookup, which are
+/// not available in the pure-data layer).
 /// - Writing the prover tree and spent markers to the CRDT.
 ///
 /// Go equivalent: `ProverSeniorityMerge::Materialize` at
@@ -1037,11 +1037,11 @@ pub fn materialize_shard_merge(
 /// each participating prover on the shard:
 ///
 /// 1. **Reward distribution**: calculates the per-ring reward share
-///    based on difficulty, world size, and prover ring assignment, then
-///    adds it to the prover's reward balance.
+/// based on difficulty, world size, and prover ring assignment, then
+/// adds it to the prover's reward balance.
 ///
 /// 2. **Activity tracking**: updates the allocation's
-///    `LastActiveFrameNumber` to the current frame number.
+/// `LastActiveFrameNumber` to the current frame number.
 ///
 /// Both require runtime dependencies (prover registry, frame prover
 /// for BLS signature verification, reward issuance calculator,

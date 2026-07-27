@@ -7,16 +7,16 @@
 //! `:8340` endpoint also fails archive↔archive sync — so this probe
 //! separates the failure surfaces:
 //!
-//!   step 1  connect_mtls          — TCP + Ed448 mTLS handshake (refused /
-//!                                    `tls handshake eof` / deadline show here)
-//!   step 2  get_app_shards        — resolve a real shard filter to join
-//!   step 3  loop, a few attempts:
-//!             get_global_frame     — fetch the head frame (VDF challenge +
-//!                                    fresh frame_number for the join)
-//!             compute VDF proof    — a genuine Wesolowski multi-proof over
-//!                                    the head frame's output (rebuilt when
-//!                                    the head advances)
-//!             submit_global_message — the unary RPC round-trip
+//!   step 1 connect_mtls          — TCP + Ed448 mTLS handshake (refused /
+//! `tls handshake eof` / deadline show here)
+//!   step 2 get_app_shards        — resolve a real shard filter to join
+//!   step 3 loop, a few attempts:
+//!             get_global_frame — fetch the head frame (VDF challenge +
+//! fresh frame_number for the join)
+//!             compute VDF proof — a genuine Wesolowski multi-proof over
+//! the head frame's output (rebuilt when
+//! the head advances)
+//! submit_global_message — the unary RPC round-trip
 //!
 //! The payload is a FULLY VALID `ProverJoin`: a fresh BLS prover identity, a
 //! real per-filter VDF proof bound to the head frame, and a BLS signature +
@@ -35,7 +35,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use sha3::{Digest, Sha3_256};
 
 /// Number of submit attempts and the delay between them.
 const ATTEMPTS: usize = 4;
@@ -65,7 +64,7 @@ pub async fn run_check_submit(
     // Fresh BLS prover identity for the join. Using a brand-new key (rather
     // than the node's own prover key) keeps this a clean, self-contained
     // "a new prover wants to join" probe with seniority 0.
-    let bls_ctor = quil_crypto::Bls48581KeyConstructor;
+    let bls_ctor = quil_crypto::FalconKeyConstructor;
     let (bls_signer_box, bls_pubkey) = quil_types::crypto::BlsConstructor::new_key(&bls_ctor)
         .map_err(|e| anyhow::anyhow!("generate BLS prover key: {e}"))?;
     let bls_signer: Arc<dyn quil_types::crypto::Signer> = Arc::from(bls_signer_box);
@@ -77,10 +76,26 @@ pub async fn run_check_submit(
     println!("[check-submit] prover address : {}", hex::encode(&prover_address));
     println!("[check-submit] prover pubkey  : {}", hex::encode(&bls_pubkey));
 
+    // The :8340 network identity is the node's Falcon q-prover-key (loaded
+    // from the keystore), not the Ed448 seed.
+    let falcon_signing_key = {
+        use quil_keys::KeyManager as _;
+        let keys_path = std::path::PathBuf::from(&config.key.key_store_file.path);
+        let fkm = quil_keys::FileKeyManager::new(
+            keys_path,
+            &config.key.key_store_file.encryption_key,
+            "default-proving-key".to_string(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .context("open keystore for Falcon network identity")?;
+        fkm.get_private_key(quil_types::crypto::KeyType::Falcon512)
+            .context("load Falcon q-prover-key")?
+    };
+
     // ---- step 1: connect_mtls (transport + handshake) ----
     println!("[check-submit] step 1: connect_mtls ...");
     let t0 = Instant::now();
-    let mut client = match quil_rpc::ArchiveClient::connect_mtls(addr, &ed448_seed).await {
+    let mut client = match quil_rpc::ArchiveClient::connect_mtls(addr, &falcon_signing_key).await {
         Ok(c) => {
             println!("[check-submit]   OK  connected in {:?}", t0.elapsed());
             c
@@ -173,36 +188,21 @@ pub async fn run_check_submit(
             continue;
         };
         let frame_number = header.frame_number;
-        let difficulty = header.difficulty;
 
         // Rebuild the join only when the head advanced (or on first build).
-        // The frame_number/VDF challenge are bound to the head, so reusing a
-        // stale bundle past the freshness window would get it rejected.
+        // frame_number is bound to the head; reusing a stale bundle past the
+        // freshness window would get it rejected.
         if built_frame != Some(frame_number) {
-            let challenge: [u8; 32] = Sha3_256::digest(&header.output).into();
-            // id = prover_address || filter || index(u32 BE); single filter → 0.
-            let mut id = Vec::with_capacity(32 + filter.len() + 4);
-            id.extend_from_slice(&prover_address);
-            id.extend_from_slice(&filter);
-            id.extend_from_slice(&0u32.to_be_bytes());
-
-            println!(
-                "[check-submit]   building join for frame {frame_number} (VDF difficulty={difficulty}) ..."
-            );
-            let tv = Instant::now();
-            let proof = compute_vdf_proof(id, challenge, difficulty).await?;
-            println!(
-                "[check-submit]   proof computed + self-verified in {:?} ({} bytes)",
-                tv.elapsed(),
-                proof.len()
-            );
+            println!("[check-submit]   building join for frame {frame_number} ...");
+            // VDF proof-of-sequential-work was removed from joins — carry
+            // an empty proof.
             bundle = build_join_bundle(
                 std::slice::from_ref(&filter),
                 frame_number,
                 &bls_pubkey,
                 bls_signer.as_ref(),
                 &prover_address,
-                &proof,
+                &[],
             )?;
             built_frame = Some(frame_number);
         } else {
@@ -252,31 +252,6 @@ pub async fn run_check_submit(
     }
 }
 
-/// Compute a single-filter Wesolowski multi-proof on the blocking pool, and
-/// self-verify it before returning (catches our own VDF bugs).
-async fn compute_vdf_proof(
-    id: Vec<u8>,
-    challenge: [u8; 32],
-    difficulty: u32,
-) -> anyhow::Result<Vec<u8>> {
-    tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-        use quil_types::crypto::FrameProver;
-        let fp = quil_crypto::WesolowskiFrameProver::new(2048);
-        let refs: Vec<&[u8]> = vec![id.as_slice()];
-        let proof = fp
-            .calculate_multi_proof(&challenge, difficulty, &refs, 0)
-            .map_err(|e| anyhow::anyhow!("calculate_multi_proof: {e}"))?;
-        let sol_refs: Vec<&[u8]> = vec![proof.as_slice()];
-        match fp.verify_multi_proof(&challenge, difficulty, &refs, &sol_refs) {
-            Ok(true) => {}
-            Ok(false) => anyhow::bail!("self-verify FAILED: VDF proof is invalid"),
-            Err(e) => anyhow::bail!("self-verify error: {e}"),
-        }
-        Ok(proof)
-    })
-    .await
-    .context("VDF proof task panicked")?
-}
 
 /// Build a `MessageBundle` carrying one fully-signed `ProverJoin`.
 ///

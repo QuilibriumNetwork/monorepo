@@ -8,19 +8,19 @@
 //! values:
 //!
 //! ```text
-//!     Stopped
-//!       |
-//!       v
-//!     Starting -> Loading
-//!                   |
-//!                   v
-//!     Collecting <-> LivenessCheck <-> Proving <-> Publishing
-//!                         |
-//!                         v
-//!                     Voting <-> Finalizing <-> Verifying
-//!                                     |
-//!                                     v
-//!                                 Stopping -> Stopped
+//! Stopped
+//! |
+//! v
+//! Starting -> Loading
+//! |
+//! v
+//! Collecting <-> LivenessCheck <-> Proving <-> Publishing
+//! |
+//! v
+//! Voting <-> Finalizing <-> Verifying
+//! |
+//! v
+//! Stopping -> Stopped
 //! ```
 //!
 //! Rather than encode the DAG exactly, we allow any forward-or-backward

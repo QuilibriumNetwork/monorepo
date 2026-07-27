@@ -162,9 +162,9 @@ pub fn process_global_frame_with_rewards(
                     // call for each (prover_address, amount) pair:
                     //
                     //   state.set(
-                    //       &GLOBAL_ADDRESS,          // domain
-                    //       &prover_address,          // vertex address
-                    //       &vertex_adds_disc,        // discriminator
+                    //       &GLOBAL_ADDRESS, // domain
+                    //       &prover_address, // vertex address
+                    //       &vertex_adds_disc, // discriminator
                     //       frame_number,
                     //       serialized_reward_vertex, // RDF-encoded ProverReward
                     //   )
@@ -315,8 +315,6 @@ mod tests {
             inclusion_prover,
             stubs.key_manager.clone(),
             crdt,
-            stubs.bulletproof_prover,
-            stubs.decaf_constructor,
             stubs.circuit_compiler,
             stubs.clock_store,
             hg_resolver,

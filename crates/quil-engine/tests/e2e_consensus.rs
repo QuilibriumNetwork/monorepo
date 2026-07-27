@@ -59,8 +59,6 @@ fn build_test_exec_manager(
         inclusion_prover,
         stubs.key_manager.clone(),
         crdt,
-        stubs.bulletproof_prover,
-        stubs.decaf_constructor,
         stubs.circuit_compiler,
         stubs.clock_store,
         hg_resolver,
@@ -221,12 +219,12 @@ fn single_signer_agg_sig(
     member_pubkey: &[u8],
 ) -> quil_execution::hypergraph_intrinsic::canonical::AggregateSignature {
     use quil_types::crypto::BlsConstructor;
-    let bls = quil_crypto::Bls48581KeyConstructor;
+    let bls = quil_crypto::FalconKeyConstructor;
     let agg_pubkey = bls
         .aggregate_public_keys(&[member_pubkey])
         .expect("aggregate single member pubkey");
     quil_execution::hypergraph_intrinsic::canonical::AggregateSignature {
-        signature: vec![0u8; 74],
+        signature: vec![0u8; 666],
         public_key: Some(
             quil_execution::hypergraph_intrinsic::canonical::Bls48581G2PublicKey {
                 key_value: agg_pubkey,
@@ -270,7 +268,7 @@ impl Clone for TestProver {
 
 impl TestProver {
     pub fn generate() -> Self {
-        let ctor = quil_crypto::Bls48581KeyConstructor;
+        let ctor = quil_crypto::FalconKeyConstructor;
         let (signer, pubkey) = ctor.new_key().expect("bls keygen");
         let address = quil_crypto::poseidon::hash_bytes_to_32(&pubkey)
             .map(|h| h.to_vec())
@@ -283,7 +281,7 @@ impl TestProver {
     }
 
     pub fn signer_clone(&self) -> Box<dyn Signer> {
-        let ctor = quil_crypto::Bls48581KeyConstructor;
+        let ctor = quil_crypto::FalconKeyConstructor;
         ctor.from_bytes(self.bls_signer.private_key(), self.bls_signer.public_key())
             .expect("bls signer from bytes")
     }
@@ -383,7 +381,7 @@ fn build_signed_genesis_qc(
         pks.push(p.bls_pubkey.clone());
     }
 
-    let ctor = quil_crypto::Bls48581KeyConstructor;
+    let ctor = quil_crypto::FalconKeyConstructor;
     let pk_refs: Vec<&[u8]> = pks.iter().map(|v| v.as_slice()).collect();
     let sig_refs: Vec<&[u8]> = sigs.iter().map(|v| v.as_slice()).collect();
     let agg = ctor.aggregate(&pk_refs, &sig_refs).expect("bls aggregate");
@@ -410,627 +408,10 @@ fn build_signed_genesis_qc(
     }
 }
 
-// ===================================================================
-// InMemoryNetwork — routes ConsensusPublisher bytes between nodes.
-// ===================================================================
-//
-// Production: ConsensusPublisher → BlossomSub → peer recv loop → decode → submit to handle.
-// Test: ConsensusPublisher (InMemoryPublisher) → InMemoryNetwork → each peer's inbox channel
-//       → spawned task decodes → submits to peer handle + aggregators.
-//
-// The network identifies each node by its prover address. A
-// publisher tagged with `sender_addr` skips delivery to itself
-// (matches BlossomSub's self-echo suppression).
-
-#[derive(Clone, Debug)]
-pub enum WireMsg {
-    Proposal(Vec<u8>),
-    Vote(Vec<u8>),
-    Timeout(Vec<u8>),
-    Prover(Vec<u8>),
-}
-
-type NodeInbox = mpsc::UnboundedSender<WireMsg>;
-
-/// Per-link latency model for the in-memory network. Each broadcast
-/// delivery to a peer waits `base_ms + uniform(0, jitter_ms)` before
-/// the peer's inbox receives the message. Mirrors typical LAN/WAN
-/// one-way latency; tunable per-test.
-///
-/// Default (`base_ms=0, jitter_ms=0`) preserves the old
-/// "instant-delivery" behavior so existing tests are unaffected.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NetworkLatency {
-    pub base_ms: u64,
-    pub jitter_ms: u64,
-}
-
-impl NetworkLatency {
-    pub fn instant() -> Self {
-        Self {
-            base_ms: 0,
-            jitter_ms: 0,
-        }
-    }
-
-    /// Realistic WAN: ~80ms mean, ±50ms jitter — matches common
-    /// commercial internet round-trip / 2.
-    pub fn realistic_wan() -> Self {
-        Self {
-            base_ms: 30,
-            jitter_ms: 100,
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct InMemoryNetwork {
-    /// All registered nodes' inboxes, keyed by prover address.
-    nodes: Mutex<HashMap<Vec<u8>, NodeInbox>>,
-    /// Latency model applied per broadcast delivery. Cheap clone (Copy).
-    latency: Mutex<NetworkLatency>,
-}
-
-impl InMemoryNetwork {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    pub fn register(&self, addr: Vec<u8>, inbox: NodeInbox) {
-        self.nodes.lock().insert(addr, inbox);
-    }
-
-    /// Configure per-link latency. Each broadcast delivery sleeps
-    /// `base_ms + uniform(0, jitter_ms)` before reaching the peer's
-    /// inbox. Affects all subsequent broadcasts on this network.
-    pub fn set_latency(&self, l: NetworkLatency) {
-        *self.latency.lock() = l;
-    }
-
-    /// Broadcast `msg` to every node except `sender_addr` for votes
-    /// and timeouts. For proposals, broadcasts to ALL nodes including
-    /// the sender — this surfaces an architectural gap: the leader's
-    /// own `vote_aggregator` requires `handle_proposal` to transition
-    /// out of `Caching` state, and that transition only happens via
-    /// the inbound message path. In production, BlossomSub's
-    /// self-echo behavior determines whether this works; the safe
-    /// path here is to deliver self-proposals back so the leader's
-    /// aggregator collects its own self-vote (embedded in the
-    /// SignedProposal) AND transitions to Verifying so peer votes
-    /// get processed instead of just cached.
-    pub fn broadcast(&self, sender_addr: &[u8], msg: WireMsg) {
-        let include_self = matches!(msg, WireMsg::Proposal(_));
-        let inboxes: Vec<NodeInbox> = self
-            .nodes
-            .lock()
-            .iter()
-            .filter(|(addr, _)| include_self || addr.as_slice() != sender_addr)
-            .map(|(_, inbox)| inbox.clone())
-            .collect();
-        let latency = *self.latency.lock();
-        for inbox in inboxes {
-            let msg = msg.clone();
-            if latency.base_ms == 0 && latency.jitter_ms == 0 {
-                // Fast path — preserve zero-overhead delivery for
-                // tests that didn't opt in.
-                let _ = inbox.send(msg);
-            } else {
-                // Spawn one per-delivery task so each peer's link
-                // sees an independent latency draw (mirrors real
-                // BlossomSub fan-out, where deliveries don't
-                // serialize on each other).
-                let base = latency.base_ms;
-                let jitter = latency.jitter_ms;
-                tokio::spawn(async move {
-                    let extra = if jitter == 0 {
-                        0
-                    } else {
-                        use rand::Rng;
-                        rand::thread_rng().gen_range(0..jitter)
-                    };
-                    tokio::time::sleep(std::time::Duration::from_millis(base + extra)).await;
-                    let _ = inbox.send(msg);
-                });
-            }
-        }
-    }
-}
-
-/// `ConsensusPublisher` impl that funnels bytes through `InMemoryNetwork`.
-pub struct InMemoryPublisher {
-    network: Arc<InMemoryNetwork>,
-    sender_addr: Vec<u8>,
-}
-
-impl InMemoryPublisher {
-    pub fn new(network: Arc<InMemoryNetwork>, sender_addr: Vec<u8>) -> Self {
-        Self {
-            network,
-            sender_addr,
-        }
-    }
-}
-
-impl quil_engine::consensus_glue::ConsensusPublisher for InMemoryPublisher {
-    fn publish_frame(&self, data: Vec<u8>) {
-        // GLOBAL_FRAME bitmask carries the GlobalProposal canonical bytes.
-        self.network
-            .broadcast(&self.sender_addr, WireMsg::Proposal(data));
-    }
-    fn publish_consensus(&self, data: Vec<u8>) {
-        // GLOBAL_CONSENSUS carries GlobalProposal, ProposalVote, OR
-        // TimeoutState (mirror of main.rs:3280-3349). Production sends
-        // proposals on this bitmask too — `publish_frame` is reserved
-        // for a separate code path. Disambiguate via the type prefix.
-        if let Some(tp) = quil_engine::consensus_wire::peek_consensus_type(&data) {
-            if tp == quil_engine::consensus_wire::GLOBAL_PROPOSAL_TYPE {
-                self.network
-                    .broadcast(&self.sender_addr, WireMsg::Proposal(data));
-            } else if tp == quil_engine::consensus_wire::PROPOSAL_VOTE_TYPE {
-                self.network
-                    .broadcast(&self.sender_addr, WireMsg::Vote(data));
-            } else if tp == quil_engine::consensus_wire::TIMEOUT_STATE_TYPE {
-                self.network
-                    .broadcast(&self.sender_addr, WireMsg::Timeout(data));
-            }
-        }
-    }
-    fn publish_prover_message(&self, data: Vec<u8>) {
-        self.network
-            .broadcast(&self.sender_addr, WireMsg::Prover(data));
-    }
-}
-
-// ===================================================================
-// NodeRig — per-node bundle of handle + aggregators + inbound task.
-// ===================================================================
-
-pub struct NodeRig {
-    pub prover: TestProver,
-    pub handle: quil_consensus::event_loop::EventLoopHandle<
-        quil_engine::consensus_types::GlobalState,
-        quil_engine::consensus_types::GlobalVote,
-    >,
-    pub clock_store: Arc<InMemoryClockStore>,
-    pub finalized: Arc<Mutex<Vec<u64>>>,
-    pub vote_agg: Arc<quil_engine::vote_aggregation::VoteAggregation>,
-    pub timeout_agg: Arc<quil_engine::timeout_aggregation::TimeoutAggregation>,
-    pub message_collector: Arc<quil_engine::message_collector::MessageCollector>,
-    pub finalized_frames: Arc<Mutex<Vec<gpb::GlobalFrame>>>,
-}
-
-/// Build one node's rig and spawn its inbound consensus message
-/// processor. The processor consumes `WireMsg`s from `inbox_rx`,
-/// decodes them into typed values, and forwards to the appropriate
-/// handle / aggregator.
-pub fn build_node(
-    prover: TestProver,
-    all_provers: &[quil_types::consensus::ProverInfo],
-    genesis: gpb::GlobalFrame,
-    genesis_qc: quil_engine::consensus_wire::QuorumCertificate,
-    network: Arc<InMemoryNetwork>,
-    inbox_rx: mpsc::UnboundedReceiver<WireMsg>,
-) -> NodeRig {
-    let registry = Arc::new(TestProverRegistry::with_provers(all_provers.to_vec()));
-    let clock_store = Arc::new(InMemoryClockStore::new());
-    clock_store.seed_frame(genesis.clone());
-
-    // Also seed the QC into the clock store — the leader's
-    // `prove_next_state` reads `get_latest_quorum_certificate(filter)`
-    // when generating rank-N proposals. Without this seed, the event
-    // loop exits at startup with "could not fetch latest QC: no QC".
-    // Mirrors `genesis::establish_testnet_genesis_provers` line 391.
-    let proto_qc = gpb::QuorumCertificate {
-        filter: genesis_qc.filter.clone(),
-        rank: genesis_qc.rank,
-        frame_number: genesis_qc.frame_number,
-        selector: genesis_qc.selector.clone(),
-        timestamp: genesis_qc.timestamp,
-        aggregate_signature: Some(quil_types::proto::keys::Bls48581AggregateSignature {
-            public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
-                key_value: genesis_qc.aggregate_signature.public_key.clone(),
-            }),
-            signature: genesis_qc.aggregate_signature.signature.clone(),
-            bitmask: genesis_qc.aggregate_signature.bitmask.clone(),
-        }),
-    };
-    let qc_txn = clock_store.new_transaction(false).expect("new_transaction");
-    clock_store
-        .put_quorum_certificate(&proto_qc, qc_txn.as_ref())
-        .expect("seed genesis QC");
-    qc_txn.commit().expect("qc commit");
-
-    let frame_prover: Arc<dyn FrameProver> = Arc::new(StubFrameProver);
-    let difficulty_adjuster: Arc<dyn DifficultyAdjuster> = Arc::new(ConstDifficulty(100_000));
-    let message_collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
-    let inclusion_prover: Arc<dyn InclusionProver + Send + Sync> = Arc::new(NoopInclusionProver);
-
-    let publisher: Arc<dyn quil_engine::consensus_glue::ConsensusPublisher> = Arc::new(
-        InMemoryPublisher::new(network.clone(), prover.address.clone()),
-    );
-
-    let finalized: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
-    let finalized_frames: Arc<Mutex<Vec<gpb::GlobalFrame>>> = Arc::new(Mutex::new(Vec::new()));
-    let finalized_clone = finalized.clone();
-    let finalized_frames_clone = finalized_frames.clone();
-    let finalized_hook: quil_engine::consensus_glue::FinalizedStateHook = Arc::new(move |state| {
-        let app = &state.state;
-        finalized_clone.lock().push(app.frame_number);
-        let header = gpb::GlobalFrameHeader {
-            frame_number: app.frame_number,
-            rank: app.rank,
-            timestamp: app.timestamp,
-            difficulty: app.difficulty,
-            output: app.output.clone(),
-            parent_selector: app.parent_selector.clone(),
-            prover: app.prover.clone(),
-            prover_tree_commitment: app.prover_tree_commitment.clone(),
-            requests_root: app.requests_root.clone(),
-            ..Default::default()
-        };
-        let frame = gpb::GlobalFrame {
-            header: Some(header),
-            requests: app.messages.clone(),
-        };
-        finalized_frames_clone.lock().push(frame);
-    });
-
-    // Persist incorporated (forks-tree) frames as candidates so the
-    // leader can chain rank+1 proposals via
-    // `prove_next_state → get_global_clock_frame_candidate`.
-    // Mirror of main.rs:2467-2524.
-    let cs_for_inc = clock_store.clone();
-    let incorporated_hook: quil_engine::consensus_glue::IncorporatedStateHook =
-        Arc::new(move |state| {
-            let app = &state.state;
-            let header = gpb::GlobalFrameHeader {
-                frame_number: app.frame_number,
-                rank: app.rank,
-                timestamp: app.timestamp,
-                difficulty: app.difficulty,
-                output: app.output.clone(),
-                parent_selector: app.parent_selector.clone(),
-                prover: app.prover.clone(),
-                prover_tree_commitment: app.prover_tree_commitment.clone(),
-                requests_root: app.requests_root.clone(),
-                ..Default::default()
-            };
-            let frame = gpb::GlobalFrame {
-                header: Some(header),
-                requests: Vec::new(),
-            };
-            if let Ok(txn) = cs_for_inc.new_transaction(false) {
-                let _ = cs_for_inc.put_global_clock_frame_candidate(&frame, txn.as_ref());
-                let _ = txn.commit();
-            }
-        });
-
-    // Persist observed QCs so `get_latest_quorum_certificate` resolves
-    // to the freshest QC. Mirror of main.rs:2531-2584.
-    let cs_for_qc = clock_store.clone();
-    let qc_observed_hook: quil_engine::consensus_glue::QcObservedHook = Arc::new(move |qc| {
-        let proto_qc = gpb::QuorumCertificate {
-            filter: qc.filter().to_vec(),
-            rank: qc.rank(),
-            frame_number: qc.frame_number(),
-            selector: qc.identity().clone(),
-            timestamp: qc.timestamp(),
-            aggregate_signature: Some(quil_types::proto::keys::Bls48581AggregateSignature {
-                public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
-                    key_value: qc.aggregated_signature().public_key().to_vec(),
-                }),
-                signature: qc.aggregated_signature().signature().to_vec(),
-                bitmask: qc.aggregated_signature().bitmask().to_vec(),
-            }),
-        };
-        if let Ok(txn) = cs_for_qc.new_transaction(false) {
-            let _ = cs_for_qc.put_quorum_certificate(&proto_qc, txn.as_ref());
-            let _ = txn.commit();
-        }
-    });
-
-    let mut cfg = quil_engine::consensus_bootstrap::ConsensusConfig::default();
-    cfg.startup_delay = std::time::Duration::ZERO;
-    // Generous timing: proposal_duration is the cadence at which the
-    // leader emits a proposal; min_timeout is how long the loop
-    // waits for a quorum before declaring a local timeout. Keep
-    // min_timeout >> proposal_duration so the leader has many
-    // proposal opportunities before the round times out.
-    cfg.proposal_duration = std::time::Duration::from_millis(500);
-    cfg.min_timeout = std::time::Duration::from_secs(20);
-    cfg.max_timeout = std::time::Duration::from_secs(60);
-
-    let params = quil_engine::consensus_activation::ConsensusActivationParams {
-        prover_registry: registry.clone() as Arc<dyn ProverRegistry>,
-        frame_prover,
-        difficulty_adjuster,
-        clock_store: clock_store.clone() as Arc<dyn ClockStore>,
-        message_collector: message_collector.clone(),
-        local_prover_address: prover.address.clone(),
-        local_bls_pubkey: prover.bls_pubkey.clone(),
-        bls_signer: prover.signer_clone(),
-        inclusion_prover,
-        message_validator: None,
-        genesis_frame: genesis,
-        publisher: Some(publisher),
-        on_finalized_state: Some(finalized_hook),
-        on_incorporated_state: Some(incorporated_hook),
-        on_qc_observed: Some(qc_observed_hook),
-        on_missing_parent: std::sync::Arc::new(|| {}),
-        config_override: Some(cfg),
-        genesis_qc_override: Some(genesis_qc),
-        kv_db: None,
-    };
-
-    let activation =
-        quil_engine::consensus_activation::activate_consensus(params).expect("activate_consensus");
-    // Drive the event loop. In production this is handed to the
-    // supervisor; tests spawn it directly since they don't run a
-    // supervisor.
-    tokio::spawn(activation.run_future);
-
-    // Build vote + timeout aggregators (mirrors main.rs:2615-2638).
-    let handle_cell: Arc<
-        std::sync::OnceLock<
-            quil_consensus::event_loop::EventLoopHandle<
-                quil_engine::consensus_types::GlobalState,
-                quil_engine::consensus_types::GlobalVote,
-            >,
-        >,
-    > = Arc::new(std::sync::OnceLock::new());
-    let _ = handle_cell.set(activation.handle.clone());
-
-    let bls_ctor: Arc<dyn quil_types::crypto::BlsConstructor> =
-        Arc::new(quil_crypto::Bls48581KeyConstructor);
-    let vote_agg = Arc::new(quil_engine::vote_aggregation::VoteAggregation::new(
-        activation.committee.clone(),
-        activation.voting_provider.clone(),
-        handle_cell.clone(),
-        bls_ctor.clone(),
-        activation.vote_domain.clone(),
-    ));
-    let timeout_agg = Arc::new(quil_engine::timeout_aggregation::TimeoutAggregation::new(
-        activation.committee.clone(),
-        activation.voting_provider.clone(),
-        handle_cell.clone(),
-        bls_ctor,
-        activation.vote_domain.clone(),
-        activation.timeout_domain.clone(),
-    ));
-
-    // Spawn the inbound message processor. Mirrors main.rs:3280-3349 —
-    // decode by type prefix, route into handle.submit_* + aggregators.
-    let handle_for_recv = activation.handle.clone();
-    let va_for_recv = vote_agg.clone();
-    let ta_for_recv = timeout_agg.clone();
-    let mc_for_recv = message_collector.clone();
-    tokio::spawn(async move {
-        let mut rx = inbox_rx;
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                WireMsg::Proposal(data) => {
-                    if let Ok(wire) =
-                        quil_engine::consensus_wire::GlobalProposal::from_canonical_bytes(&data)
-                    {
-                        if let Ok((sp, qc, tc)) =
-                            quil_engine::consensus_types::wire_proposal_to_signed(wire)
-                        {
-                            handle_for_recv.submit_quorum_certificate(qc);
-                            if let Some(tc) = tc {
-                                handle_for_recv.submit_timeout_certificate(tc);
-                            }
-                            va_for_recv.handle_proposal(&sp);
-                            let h = handle_for_recv.clone();
-                            tokio::spawn(async move {
-                                h.submit_proposal(sp).await;
-                            });
-                        }
-                    }
-                }
-                WireMsg::Vote(data) => {
-                    if let Ok(wire) =
-                        quil_engine::consensus_wire::ProposalVote::from_canonical_bytes(&data)
-                    {
-                        let gv = quil_engine::vote_aggregation::wire_vote_to_global_vote(wire);
-                        va_for_recv.handle_vote(gv);
-                    }
-                }
-                WireMsg::Timeout(data) => {
-                    if let Ok(ts) =
-                        quil_engine::consensus_wire::TimeoutState::from_canonical_bytes(&data)
-                    {
-                        let qc = ts.latest_quorum_certificate.clone().into_trait_object();
-                        handle_for_recv.submit_quorum_certificate(qc);
-                        if let Some(tc) = ts.prior_rank_timeout_certificate.clone() {
-                            handle_for_recv.submit_timeout_certificate(tc.into_trait_object());
-                        }
-                        let typed = quil_engine::timeout_aggregation::wire_timeout_to_typed(ts);
-                        ta_for_recv.handle_timeout(typed);
-                    }
-                }
-                WireMsg::Prover(data) => {
-                    // GLOBAL_PROVER bitmask: prover-admin messages
-                    // (ProverJoin / ProverLeave / ProverConfirm /
-                    // ProverReject / ProverSeniorityMerge) — feed
-                    // into the local message_collector so the leader
-                    // includes them in the next proposal's
-                    // `requests`. Mirror of main.rs:3354-3357.
-                    //
-                    // Rank 0 ensures `collect_for_rank(N)` (which
-                    // drains all ranks <= N) picks it up at any
-                    // proposal rank.
-                    mc_for_recv.add_message(0, data);
-                }
-            }
-        }
-    });
-
-    NodeRig {
-        prover,
-        handle: activation.handle,
-        clock_store,
-        finalized,
-        vote_agg,
-        timeout_agg,
-        message_collector,
-        finalized_frames,
-    }
-}
-
-// ===================================================================
-// Multi-node harness
-// ===================================================================
-
-pub struct MultiNodeHarness {
-    pub network: Arc<InMemoryNetwork>,
-    pub nodes: Vec<NodeRig>,
-}
-
-impl MultiNodeHarness {
-    /// Build a harness with `n` archive nodes. The first prover is
-    /// the genesis proposer.
-    pub fn build_archives(n: usize) -> Self {
-        assert!(n >= 1, "need at least one archive");
-
-        // Generate provers; first is the genesis proposer. All provers
-        // get the SAME seniority so the leader-rotation path doesn't
-        // depend on the per-prover weight distribution — and so the
-        // peer-vote-only quorum threshold (excluding the leader's
-        // own vote, which never enters its local aggregator in the
-        // current architecture) is reached comfortably rather than
-        // exactly at the threshold boundary.
-        let provers: Vec<TestProver> = (0..n).map(|_| TestProver::generate()).collect();
-        let all_prover_infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
-
-        let genesis = build_genesis_frame(&provers[0]);
-        let genesis_qc = build_signed_genesis_qc(&provers, &genesis);
-        let network = InMemoryNetwork::new();
-
-        let mut nodes = Vec::with_capacity(n);
-        // Move each prover into the node rig.
-        for prover in provers {
-            let (tx, rx) = mpsc::unbounded_channel();
-            network.register(prover.address.clone(), tx);
-            let node = build_node(
-                prover,
-                &all_prover_infos,
-                genesis.clone(),
-                genesis_qc.clone(),
-                network.clone(),
-                rx,
-            );
-            nodes.push(node);
-        }
-
-        Self { network, nodes }
-    }
-
-    /// Wait up to `timeout` for every node to observe at least one
-    /// finalization. Returns true if all nodes finalized at least once.
-    pub async fn wait_for_finalization_all(&self, timeout: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            let all_finalized = self.nodes.iter().all(|n| !n.finalized.lock().is_empty());
-            if all_finalized {
-                return true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        false
-    }
-
-    /// Wait up to `timeout` for any node to finalize a frame whose
-    /// `requests` field contains at least `min_bundles` MessageBundle
-    /// entries. The injected prover message goes through:
-    ///   InMemoryNetwork → archive inbound task → message_collector.add_message
-    ///   → leader's `collect_for_rank` → state.with_messages → proposal
-    ///   → QC → 3-chain finalization → on_finalized_state hook
-    ///   → finalized_frames Vec
-    /// Asserting on the bundle count proves the full round-trip
-    /// without needing to deserialize the inner ProverJoin payload
-    /// (which would require valid BLS sigs / VDF outputs the test
-    /// doesn't construct).
-    pub async fn wait_for_finalized_bundles(
-        &self,
-        min_bundles: usize,
-        timeout: std::time::Duration,
-    ) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            for node in &self.nodes {
-                let frames = node.finalized_frames.lock();
-                let total: usize = frames.iter().map(|f| f.requests.len()).sum();
-                if total >= min_bundles {
-                    return true;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        false
-    }
-
-    /// Broadcast a canonical prover-admin message to all archive nodes'
-    /// message collectors. Mimics what a non-archive's
-    /// `prover_pipeline::publish_prover_message` does when its
-    /// payload crosses the wire on the GLOBAL_PROVER bitmask.
-    pub fn inject_prover_message(&self, data: Vec<u8>) {
-        // Use an empty sender address so broadcast delivers to ALL
-        // nodes (a non-archive's address is not registered with the
-        // network — the message effectively comes "from outside").
-        self.network.broadcast(&[], WireMsg::Prover(data));
-    }
-}
 
 // ===================================================================
 // Tests
 // ===================================================================
-
-#[tokio::test]
-async fn single_archive_node_activates_consensus() {
-    // Foundational: 1-node activate_consensus succeeds and returns
-    // a handle with valid domain bytes.
-    let proposer = TestProver::generate();
-    let registry = Arc::new(TestProverRegistry::with_prover(proposer.to_prover_info(1)));
-    let clock_store = Arc::new(InMemoryClockStore::new());
-    let genesis = build_genesis_frame(&proposer);
-    clock_store.seed_frame(genesis.clone());
-
-    let frame_prover: Arc<dyn FrameProver> = Arc::new(StubFrameProver);
-    let difficulty_adjuster: Arc<dyn DifficultyAdjuster> = Arc::new(ConstDifficulty(100_000));
-    let message_collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
-    let inclusion_prover: Arc<dyn InclusionProver + Send + Sync> = Arc::new(NoopInclusionProver);
-
-    let mut cfg = quil_engine::consensus_bootstrap::ConsensusConfig::default();
-    cfg.startup_delay = std::time::Duration::ZERO;
-
-    let params = quil_engine::consensus_activation::ConsensusActivationParams {
-        prover_registry: registry as Arc<dyn ProverRegistry>,
-        frame_prover,
-        difficulty_adjuster,
-        clock_store: clock_store.clone() as Arc<dyn ClockStore>,
-        message_collector,
-        local_prover_address: proposer.address.clone(),
-        local_bls_pubkey: proposer.bls_pubkey.clone(),
-        bls_signer: proposer.signer_clone(),
-        inclusion_prover,
-        message_validator: None,
-        genesis_frame: genesis,
-        publisher: None,
-        on_finalized_state: None,
-        on_incorporated_state: None,
-        on_qc_observed: None,
-        on_missing_parent: std::sync::Arc::new(|| {}),
-        config_override: Some(cfg),
-        genesis_qc_override: None,
-        kv_db: None,
-    };
-
-    let activation =
-        quil_engine::consensus_activation::activate_consensus(params).expect("activate_consensus");
-    assert!(!activation.vote_domain.is_empty());
-    assert!(!activation.timeout_domain.is_empty());
-    let _ = activation;
-}
 
 /// Initialize tracing once per test run. Subsequent calls are no-ops.
 fn init_tracing() {
@@ -1046,213 +427,6 @@ fn init_tracing() {
     });
 }
 
-/// 4-archive consensus drives genesis → rank 1 finalization via real
-/// BLS-aggregated votes. Verifies the full happy-path glue: leader
-/// election, proposal broadcast, vote aggregation, QC formation,
-/// finalization notification.
-#[tokio::test]
-async fn multi_archive_finalizes_via_quorum() {
-    init_tracing();
-    // 4 archives — minimum quorum size where `quorum_threshold(4) = 2`
-    // (floor(2*4/3) = 2). The leader (prover 0, highest seniority) proposes
-    // at rank 1, peers vote, leader's vote aggregator forms a QC, the QC
-    // is embedded in the rank-2 proposal, and rank-0 → rank-1 finalizes.
-    //
-    // Wall-clock budget: startup_delay=ZERO, proposal_duration=500ms.
-    // Two ranks of progression to see rank-0 finalize → ~1-2s of work
-    // plus inter-task scheduling slop. Generous 30s timeout to absorb
-    // CI jitter.
-    let harness = MultiNodeHarness::build_archives(4);
-    // HotStuff 3-chain finalization needs rank N+2's QC to finalize
-    // rank N. With proposal_duration=500ms + leader-rotation latency
-    // through the in-memory pubsub, expect ~10-15s per rank in this
-    // harness (real BLS signing + aggregation per rank is the
-    // dominant cost). 90s absorbs the genesis ramp-up + the first
-    // few finalizations across all 4 nodes.
-    let _ = harness
-        .wait_for_finalization_all(std::time::Duration::from_secs(90))
-        .await;
-
-    let observations: Vec<Vec<u64>> = harness
-        .nodes
-        .iter()
-        .map(|n| n.finalized.lock().clone())
-        .collect();
-    eprintln!("per-node finalized frame numbers: {:?}", observations);
-
-    // Assert directly against the captured state — `wait_for_finalization_all`
-    // can race against the final-tick finalization (it returns when
-    // its polling loop sees all-non-empty, but in a tight test where
-    // finalizations happen between polls, the polling can miss the
-    // window even though the data is correct by the time we inspect).
-    let all_finalized = observations.iter().all(|v| !v.is_empty());
-    assert!(
-        all_finalized,
-        "expected all 4 archive nodes to finalize at least one frame; \
-         per-node observations: {:?}",
-        observations
-    );
-    // Verify the chain advanced past genesis: at least one node
-    // finalized frame>=1.
-    let any_post_genesis = observations.iter().any(|v| v.iter().any(|&f| f >= 1));
-    assert!(
-        any_post_genesis,
-        "expected at least one finalized frame >= 1; observations: {:?}",
-        observations
-    );
-    // Drop the harness explicitly to terminate the spawned consensus tasks.
-    drop(harness);
-}
-
-/// Same shape as `multi_archive_finalizes_via_quorum`, but with
-/// realistic WAN latency (`30ms` base + up to `100ms` jitter) on
-/// every in-memory broadcast. Catches timing assumptions that hold
-/// at zero-latency but break under real network conditions:
-///
-///   * pacemaker `proposal_duration` < min_timeout buffer
-///   * QC formation racing with proposal arrival at peers
-///   * vote-aggregator caching/verifying state-machine races
-///
-/// If the system has any non-trivial dependency on order or
-/// instant delivery, finalization will stall and the assertion fires.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn multi_archive_finalizes_under_wan_latency() {
-    init_tracing();
-    let harness = MultiNodeHarness::build_archives(4);
-    harness.network.set_latency(NetworkLatency::realistic_wan());
-
-    // Looser budget than the zero-latency variant. With ~80ms median
-    // delivery + 4 nodes × 3-chain finalization, expect ~3-5s per
-    // rank. 180s absorbs CI jitter, genesis ramp, AND tokio runtime
-    // contention when this test runs in parallel with the 15+ others
-    // in the suite (rocksdb temp dirs + shared executor slow each
-    // other down enough that the original 120s budget became flaky).
-    let _ = harness
-        .wait_for_finalization_all(std::time::Duration::from_secs(180))
-        .await;
-
-    let observations: Vec<Vec<u64>> = harness
-        .nodes
-        .iter()
-        .map(|n| n.finalized.lock().clone())
-        .collect();
-    eprintln!("WAN-latency per-node finalized: {:?}", observations);
-
-    // Assertion: at QUORUM strength (≥ 2/3 of nodes) finalized at
-    // least one frame. Under latency, some peers may temporarily fall
-    // behind — if proposal A is delivered to peer P after a later
-    // proposal B that references A as parent, B is rejected with
-    // "missing parent state" and P stalls. Real production recovers
-    // via BlossomSub gossip + active sync, which this test doesn't
-    // model. The quorum-strength assertion mirrors what consensus
-    // itself needs: as long as ≥ 2/3 of weighted stake makes progress,
-    // the chain advances and the lagging node will catch up once
-    // network sync paths are wired in.
-    let finalized_count = observations.iter().filter(|v| !v.is_empty()).count();
-    let quorum_size = (observations.len() * 2 / 3) + 1;
-    assert!(
-        finalized_count >= quorum_size,
-        "under realistic WAN latency, ≥{}/{} archives should finalize ≥1 frame within 120s \
-         (consensus quorum threshold); got {}/{}; observations={:?}",
-        quorum_size,
-        observations.len(),
-        finalized_count,
-        observations.len(),
-        observations,
-    );
-    let any_post_genesis = observations.iter().any(|v| v.iter().any(|&f| f >= 1));
-    assert!(
-        any_post_genesis,
-        "WAN-latency chain stalled before frame >= 1; observations={:?}",
-        observations
-    );
-    drop(harness);
-}
-
-// 4-archive consensus needs at least one tokio worker per node so
-// BLS signing and inbound message handling can interleave; using the
-// default `current_thread` flavor here serialises all 4 archives on
-// one OS thread and the pacemaker times rank 1 out under realistic
-// parallel-test load before the leader's `prove_next_state` finishes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn non_archive_join_lands_in_archive_frame() {
-    // Models a non-archive's `ProverJoin` submission round-tripping
-    // through global consensus. The non-archive's role is the
-    // CanonicalMessageBundle producer: it would normally invoke
-    // `prover_pipeline::publish_prover_message` which broadcasts on
-    // the GLOBAL_PROVER bitmask. Here we synthesize that broadcast
-    // directly via `harness.inject_prover_message`.
-    //
-    // The full path:
-    //   1. Test injects bundle bytes → InMemoryNetwork →
-    //      4 archives' inbox channels.
-    //   2. Each archive's inbound task: `message_collector.add_message(0, bytes)`.
-    //   3. Leader's `prove_next_state` calls `collect_for_rank(rank)`
-    //      which drains the message into the proposal's `messages`.
-    //   4. `decode_message_bundle` turns the canonical bytes into a
-    //      proto `MessageBundle` attached to the proposal's state.
-    //   5. Consensus runs 3-chain finalization.
-    //   6. The `on_finalized_state` hook captures the finalized
-    //      frame including the embedded bundle.
-    //
-    // Assertion: at least one finalized frame on at least one node
-    // has a non-empty `requests` Vec (the bundle survived).
-    init_tracing();
-
-    let harness = MultiNodeHarness::build_archives(4);
-
-    // Construct a minimal canonical MessageBundle wrapping a
-    // ProverJoin-shaped marker payload. The marker bytes don't need
-    // to decode to a valid ProverJoin — `decode_message_bundle`
-    // creates a default `MessageRequest` entry for unknown inner
-    // type prefixes. We just need the bundle envelope to survive.
-    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
-    // 0x0301 is the ProverJoin type prefix — picked to look like a
-    // real prover-admin message so the message_collector accepts it
-    // even in prover-only mode (the test doesn't enable that mode,
-    // but this matches production traffic shape).
-    let mut inner_bytes = Vec::with_capacity(36);
-    inner_bytes.extend_from_slice(&0x0301u32.to_be_bytes());
-    // Pad with arbitrary bytes — the bundle's canonical encoding
-    // length-prefixes everything, so unrecognized payload shape
-    // doesn't break the envelope.
-    inner_bytes.extend_from_slice(&[0xCAu8; 32]);
-    let req = CanonicalMessageRequest::wrap(inner_bytes).expect("wrap request");
-    let bundle = CanonicalMessageBundle {
-        requests: vec![Some(req)],
-        timestamp: 0,
-    };
-    let bundle_bytes = bundle.to_canonical_bytes().expect("encode bundle");
-
-    harness.inject_prover_message(bundle_bytes);
-
-    let _ = harness
-        .wait_for_finalized_bundles(1, std::time::Duration::from_secs(90))
-        .await;
-
-    let snapshot: Vec<(usize, usize)> = harness
-        .nodes
-        .iter()
-        .map(|n| {
-            let frames = n.finalized_frames.lock();
-            let total_bundles: usize = frames.iter().map(|f| f.requests.len()).sum();
-            (frames.len(), total_bundles)
-        })
-        .collect();
-    eprintln!("per-node (finalized_frames, total_bundles): {:?}", snapshot);
-
-    // Assert on the captured state directly — the polling loop can
-    // race against the final-tick finalization (same pattern as in
-    // `multi_archive_finalizes_via_quorum`).
-    let any_bundle = snapshot.iter().any(|(_, b)| *b >= 1);
-    assert!(
-        any_bundle,
-        "expected at least one finalized frame to contain the injected message bundle; \
-         per-node (frames, bundles): {:?}",
-        snapshot
-    );
-    drop(harness);
-}
 
 // ===================================================================
 // App-shard harness — N workers running AppConsensusEngine for the
@@ -1359,7 +533,20 @@ impl AppShardHarness {
         provers: Vec<TestProver>,
         registry: Arc<dyn ProverRegistry>,
     ) -> Self {
-        Self::build_inner(provers, registry, None)
+        Self::build_inner(provers, registry, None, false)
+    }
+
+    /// (P3) Build `n` workers driving the shard with commonware-simplex + Falcon
+    /// (`app_consensus_cw = true`). For `n == 1` the single committee member
+    /// self-proposes + self-finalizes (the `NoopAppTransport` in the engine has
+    /// no peers to reach); multi-worker CW needs the gossip transport wired.
+    pub fn build_cw(n: usize) -> Self {
+        assert!(n >= 1, "need at least one worker");
+        let provers: Vec<TestProver> = (0..n).map(|_| TestProver::generate()).collect();
+        let all_prover_infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
+        let registry =
+            Arc::new(TestProverRegistry::with_provers(all_prover_infos)) as Arc<dyn ProverRegistry>;
+        Self::build_inner(provers, registry, None, true)
     }
 
     /// Active-path PoRep variant: every worker gets a shared committed CRDT, an
@@ -1373,13 +560,14 @@ impl AppShardHarness {
         registry: Arc<dyn ProverRegistry>,
         storage: StorageHarness,
     ) -> Self {
-        Self::build_inner(provers, registry, Some(storage))
+        Self::build_inner(provers, registry, Some(storage), false)
     }
 
     fn build_inner(
         provers: Vec<TestProver>,
         registry: Arc<dyn ProverRegistry>,
         storage: Option<StorageHarness>,
+        app_cw: bool,
     ) -> Self {
         let n = provers.len();
         assert!(n >= 1, "need at least one worker");
@@ -1452,6 +640,8 @@ impl AppShardHarness {
             let bls_signer = prover.signer_clone();
             let deps = quil_engine::app_engine::AppEngineDeps {
                 clock_store: clock_store as Arc<dyn ClockStore>,
+            global_anchor_store: None,
+            storage_source_hypergraph: None,
                 prover_registry: registry.clone() as Arc<dyn ProverRegistry>,
                 frame_prover,
                 message_collector,
@@ -1478,6 +668,7 @@ impl AppShardHarness {
                     Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
                 ),
                 kv_db: kv_db_dep,
+                app_consensus_cw: app_cw,
             };
 
             let (engine, handle) = quil_engine::app_engine::AppConsensusEngine::new(
@@ -1505,6 +696,10 @@ impl AppShardHarness {
         // to broadcast to peers (= every worker except self).
         let all_handles: Vec<quil_engine::app_engine::AppEngineHandle> =
             workers.iter().map(|w| w.handle.clone()).collect();
+        // (P3) Each worker's committee Falcon pubkey, so the CW event drain can
+        // tag `CwIn.from` when routing `CwOut` to peers (in-memory transport).
+        let all_pubkeys: Vec<Vec<u8>> =
+            workers.iter().map(|w| w.prover.bls_pubkey.clone()).collect();
         let events_per_worker: Vec<Arc<Mutex<Vec<String>>>> =
             workers.iter().map(|w| w.events.clone()).collect();
         let full_frames_per_worker: Vec<Arc<Mutex<Vec<Vec<u8>>>>> =
@@ -1526,6 +721,7 @@ impl AppShardHarness {
                 .collect();
             let events_log = events_per_worker[idx].clone();
             let full_frames_log = full_frames_per_worker[idx].clone();
+            let my_pubkey = all_pubkeys[idx].clone();
             let mut rx = pending.event_rx;
             tokio::spawn(async move {
                 while let Some(ev) = rx.recv().await {
@@ -1579,6 +775,18 @@ impl AppShardHarness {
                         }
                         E::ParentSealed { .. } => {
                             events_log.lock().push("ParentSealed".into());
+                        }
+                        E::CwOut { channel, bytes, .. } => {
+                            events_log.lock().push("CwOut".into());
+                            // In-memory CW transport: deliver to every peer's
+                            // `CwIn`, tagged with this worker's committee key.
+                            for h in &peer_handles {
+                                h.send(quil_engine::app_engine::AppEngineMessage::CwIn {
+                                    channel: *channel,
+                                    from: my_pubkey.clone(),
+                                    data: bytes.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -1673,6 +881,73 @@ async fn worker_activates_after_confirm_and_emits_proof() {
     );
 }
 
+/// (P3) A single-prover shard driven by commonware-simplex + Falcon
+/// (`app_consensus_cw = true`, EQUAL VOTES, quorum 1) self-proposes and
+/// self-finalizes app frames end-to-end: `start_consensus_cw` builds the
+/// committee (this node's Falcon key, the only active prover), the seam
+/// proposer proves + assembles + verifies each frame, simplex finalizes it,
+/// and `handle_cw_finalized_frame` persists the shard clock frame + materializes
+/// + emits `FullFrameProduced`. Asserts a full `AppShardFrame` is produced and
+/// the chain advances past genesis (frame_number >= 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_consensus_cw_single_prover_finalizes() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let harness = AppShardHarness::build_cw(1);
+    let frame = harness
+        .wait_for_full_frame(std::time::Duration::from_secs(60))
+        .await;
+    assert!(
+        frame.is_some(),
+        "app CW single-prover did not finalize a shard frame within 60s"
+    );
+    let header = frame.unwrap().header.expect("finalized frame has a header");
+    assert!(
+        header.frame_number >= 1,
+        "app CW chain did not advance past genesis (frame_number = {})",
+        header.frame_number
+    );
+}
+
+/// (P3) A 3-prover shard committee driven by commonware-simplex + Falcon
+/// (EQUAL VOTES, quorum 3) finalizes app frames via CROSS-NODE voting: the
+/// RoundRobin leader proves + ships its block over the CW block channel, each
+/// follower ingests it (`CwIn` → `BlockStore`), verifies (`validate_proposal`),
+/// and votes (`CwIn` vote channel, sender resolved to its committee Falcon key);
+/// quorum finalizes. Exercises the full in-memory CW transport (CwOut → CwIn)
+/// end-to-end — the same round-trip the master's BlossomSub path will carry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn app_consensus_cw_multi_prover_finalizes() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let harness = AppShardHarness::build_cw(3);
+    let frame = harness
+        .wait_for_full_frame(std::time::Duration::from_secs(90))
+        .await;
+    assert!(
+        frame.is_some(),
+        "3-prover app CW committee did not finalize a shard frame within 90s"
+    );
+    let header = frame.unwrap().header.expect("finalized frame has a header");
+    assert!(
+        header.frame_number >= 1,
+        "app CW chain did not advance past genesis (frame_number = {})",
+        header.frame_number
+    );
+}
+
 /// Active PoRep path end-to-end through the live consensus harness.
 ///
 /// Each of the 4 workers gets a shared committed CRDT (vertices under the
@@ -1690,6 +965,12 @@ async fn worker_activates_after_confirm_and_emits_proof() {
 /// Asserts the finalized `AppShardFrame` carries that attestation + root —
 /// the inverse of every other harness test, where the (un-activated) path
 /// leaves both empty and byte-identical to the legacy frame.
+// P4/CW FOLLOW-UP: PoRep storage-attestation assembly is a LEGACY-consensus
+// feature — the old app path assembled the committee `StorageAttestation` from
+// per-vote openings at QC time. The commonware-simplex path votes are plain
+// simplex votes (no openings), so CW-finalized frames carry no attestation yet.
+// Porting PoRep to CW (openings in CW votes + assembly on finalize) is tracked
+// separately; the core consensus migration does not depend on it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn worker_active_storage_attestation() {
     let _ = tracing_subscriber::fmt()
@@ -1702,11 +983,52 @@ async fn worker_active_storage_attestation() {
 
     let provers: Vec<TestProver> = (0..4).map(|_| TestProver::generate()).collect();
     let infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
-    let registry = Arc::new(TestProverRegistry::with_provers(infos)) as Arc<dyn ProverRegistry>;
+    let registry = Arc::new(TestProverRegistry::with_provers(infos));
 
     // `seeded` lowers `storage_activation_frame()` to 1000 and builds the
     // shared CRDT + a global frame at 1000 (≥ activation → fork live).
     let storage = StorageHarness::seeded(1000);
+
+    // Register every member's storage leaf roots into the registry so the frame
+    // validator's registered-leaf cross-check on the proposer's self
+    // storage-attestation passes. Production writes these via the confirm
+    // intrinsic (prover trie); the harness wires them directly, mirroring the
+    // per-worker `compute_storage_confirm` seeding inside `build_inner`. The
+    // filter/epoch match `build_inner` (`[0x55;32]`, `epoch_for_frame(1000)`).
+    {
+        let filter: Vec<u8> = vec![0x55; 32];
+        let epoch = quil_types::consensus::epoch_for_frame(1000);
+        let rocks = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let rs = quil_store::replica_store::ReplicaStore::new(
+            rocks as Arc<dyn quil_types::store::KvDb>,
+        );
+        for p in &provers {
+            let roots = quil_engine::app_shard_metadata::compute_storage_confirm(
+                &storage.crdt,
+                &rs,
+                std::slice::from_ref(&filter),
+                &p.address,
+                epoch,
+                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+                &quil_crypto::sdr::SdrParams::default(),
+            )
+            .expect("compute leaf roots for registration");
+            for cr in &roots {
+                for e in &cr.entries {
+                    let lid = quil_execution::global_intrinsic::leaf_id_bytes(&filter, &e.prefix);
+                    registry.register_leaf_root(
+                        &p.address,
+                        &lid,
+                        e.leaf_root.clone(),
+                        e.num_blocks,
+                        epoch,
+                    );
+                }
+            }
+        }
+    }
+
+    let registry = registry as Arc<dyn ProverRegistry>;
     let harness = AppShardHarness::build_with_storage(provers, registry, storage);
 
     let frame = harness
@@ -1784,6 +1106,12 @@ async fn worker_active_storage_attestation() {
 /// bytes. A leader-produced frame with our injected message has a
 /// non-zero `requests_root` (the first 32 bytes are
 /// `sha3_256(commitment)`, non-zero for any real commit).
+// CW EVENT MODEL: the commonware-simplex path does NOT emit the legacy
+// `FrameProduced` proposal-broadcast event — the CW proposer proves the frame
+// inside the seam and ships the block over `CwOut`, surfacing `FullFrameProduced`
+// on finalize. So this test locates the leader (and confirms production) via
+// `FullFrameProduced`. The kept-request assembly is unchanged, so the injected
+// dispatch still rides the frame's `requests_root`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn worker_carries_real_dispatch_message_in_shard_frame() {
     let _ = tracing_subscriber::fmt()
@@ -1837,14 +1165,15 @@ async fn worker_carries_real_dispatch_message_in_shard_frame() {
             ));
     }
 
-    // Wait for at least one shard frame to be produced — `events`
-    // log records "FrameProduced" once per produced frame.
+    // Wait for at least one shard frame to be produced. Under commonware-simplex
+    // the drain records "FullFrameProduced" (the CW analog of the legacy
+    // "FrameProduced") once a frame finalizes and its full block is shipped.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     let mut leader_idx: Option<usize> = None;
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         for (i, w) in harness.workers.iter().enumerate() {
-            if w.events.lock().iter().any(|e| e == "FrameProduced") {
+            if w.events.lock().iter().any(|e| e == "FullFrameProduced") {
                 leader_idx = Some(i);
                 break;
             }
@@ -1854,7 +1183,7 @@ async fn worker_carries_real_dispatch_message_in_shard_frame() {
         }
     }
     let leader_idx = leader_idx
-        .expect("no worker produced a FrameProduced event within 90s — frame production stalled");
+        .expect("no worker produced a FullFrameProduced event within 90s — frame production stalled");
     eprintln!("leader is worker {}", leader_idx);
 
     // Give the leader an extra tick to finish encoding the proposal.
@@ -1921,104 +1250,6 @@ async fn worker_carries_real_dispatch_message_in_shard_frame() {
         hex::encode(&header.requests_root[..16.min(header.requests_root.len())]),
     );
 }
-
-/// Assertion: at least one archive finalized frame contains a request
-/// bundle whose canonical bytes match what a worker emitted.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn worker_coverage_reaches_archive_frame() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_test_writer()
-        .try_init();
-
-    let archives = MultiNodeHarness::build_archives(4);
-    let workers = AppShardHarness::build(4);
-
-    // Drain task: scan each worker's coverage_published Vec, wrap any
-    // new entries in a CanonicalMessageBundle and inject into the
-    // archive harness.
-    let archives_net = archives.network.clone();
-    let worker_coverage: Vec<Arc<Mutex<Vec<Vec<u8>>>>> = workers
-        .workers
-        .iter()
-        .map(|w| w.coverage_published.clone())
-        .collect();
-    let drain_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let drain_cancel_for_task = drain_cancel.clone();
-    let drain = tokio::spawn(async move {
-        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
-        let mut seen: Vec<usize> = vec![0; worker_coverage.len()];
-        loop {
-            if drain_cancel_for_task.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            for (idx, cov) in worker_coverage.iter().enumerate() {
-                let snap = cov.lock().clone();
-                if snap.len() > seen[idx] {
-                    for bytes in snap.iter().skip(seen[idx]) {
-                        let req = match CanonicalMessageRequest::wrap(bytes.clone()) {
-                            Ok(r) => r,
-                            Err(_) => continue,
-                        };
-                        let bundle = CanonicalMessageBundle {
-                            requests: vec![Some(req)],
-                            timestamp: 0,
-                        };
-                        if let Ok(bundle_bytes) = bundle.to_canonical_bytes() {
-                            archives_net.broadcast(&[], WireMsg::Prover(bundle_bytes));
-                        }
-                    }
-                    seen[idx] = snap.len();
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    });
-
-    // First wait: the worker harness must produce coverage bytes.
-    let got_coverage = workers
-        .wait_for_coverage(std::time::Duration::from_secs(90))
-        .await;
-    let worker_counts: Vec<usize> = workers
-        .workers
-        .iter()
-        .map(|w| w.coverage_published.lock().len())
-        .collect();
-    assert!(
-        got_coverage,
-        "no worker emitted coverage. counts={worker_counts:?}"
-    );
-
-    // Second wait: an archive must finalize a frame with the bundle.
-    let _ = archives
-        .wait_for_finalized_bundles(1, std::time::Duration::from_secs(90))
-        .await;
-
-    let snapshot: Vec<(usize, usize)> = archives
-        .nodes
-        .iter()
-        .map(|n| {
-            let frames = n.finalized_frames.lock();
-            let total_bundles: usize = frames.iter().map(|f| f.requests.len()).sum();
-            (frames.len(), total_bundles)
-        })
-        .collect();
-    eprintln!(
-        "worker coverage counts: {worker_counts:?}; archive (finalized, bundles): {snapshot:?}"
-    );
-
-    drain_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = drain.await;
-
-    assert!(
-        snapshot.iter().any(|(_, b)| *b >= 1),
-        "expected at least one archive frame to include a coverage bundle; snapshot={snapshot:?}",
-    );
-}
-
 // =====================================================================
 // Tier 2 — full non-archive → confirm → activation flow
 // =====================================================================
@@ -2040,12 +1271,12 @@ async fn worker_coverage_reaches_archive_frame() {
 /// Concatenates every prover's BLS pubkey (each 585 bytes) into a single
 /// hex-encoded blob.
 fn build_genesis_seed_hex(provers: &[TestProver]) -> String {
-    let mut blob = Vec::with_capacity(provers.len() * 585);
+    let mut blob = Vec::with_capacity(provers.len() * 897);
     for p in provers {
         assert_eq!(
             p.bls_pubkey.len(),
-            585,
-            "Bls48581 pubkey must be 585 bytes; got {}",
+            897,
+            "Falcon consensus pubkey must be 897 bytes; got {}",
             p.bls_pubkey.len(),
         );
         blob.extend_from_slice(&p.bls_pubkey);
@@ -2186,8 +1417,6 @@ pub fn build_tier2_archive_rig_with_key_manager(
         inclusion_prover.clone(),
         exec_key_manager,
         crdt.clone(),
-        exec_stubs.bulletproof_prover,
-        exec_stubs.decaf_constructor,
         exec_stubs.circuit_compiler,
         // Use the REAL clock store (not the noop stub) — mirrors production
         // (`master_node/engines.rs` wires `storage.clock_store`). The
@@ -2206,7 +1435,7 @@ pub fn build_tier2_archive_rig_with_key_manager(
     let reward_issuer_for_intrinsic: Arc<dyn quil_types::consensus::RewardIssuance> =
         Arc::new(quil_engine::OptRewardIssuance);
     let bls_for_intrinsic: Arc<dyn quil_types::crypto::BlsConstructor> =
-        Arc::new(quil_crypto::Bls48581KeyConstructor);
+        Arc::new(quil_crypto::FalconKeyConstructor);
     let frame_prover_for_intrinsic: Arc<dyn quil_types::crypto::FrameProver> =
         Arc::new(StubFrameProver);
     exec_manager
@@ -2510,94 +1739,6 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
     );
 }
 
-/// Cadence test — verify that finalization arrives at a steady,
-/// proposal_duration-driven cadence. Note: finalization lag is NOT
-/// equal to `proposal_duration`; it's ~3 × (proposal_duration +
-/// round-trip-time) because HotStuff's 3-chain rule requires three
-/// successive QCs to commit a frame. With `proposal_duration=500ms`
-/// in this harness and ~1.5-2s per rank-round-trip, expect ~5-10s
-/// per finalization.
-///
-/// Asserts: in a 60s window, at least 4 finalizations arrive AND
-/// the median inter-arrival delta is within `[1s, 20s]` (loose
-/// bounds to absorb CI jitter, leader-rotation slop, and the
-/// first-rank ramp).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn multi_archive_finalization_cadence_is_steady() {
-    init_tracing();
-    let harness = MultiNodeHarness::build_archives(4);
-
-    let warmup = std::time::Duration::from_secs(10);
-    let window = std::time::Duration::from_secs(60);
-
-    // Sample finalized-frame counts every 200ms over the window.
-    let start = std::time::Instant::now();
-    let mut arrivals: Vec<(std::time::Instant, usize)> = Vec::new();
-    let deadline = start + window;
-    let mut last_count = 0usize;
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let count = harness.nodes[0].finalized.lock().len();
-        if count > last_count {
-            arrivals.push((std::time::Instant::now(), count));
-            last_count = count;
-        }
-    }
-
-    eprintln!(
-        "captured {} new finalization arrivals on node 0 over {:.1}s",
-        arrivals.len(),
-        start.elapsed().as_secs_f32(),
-    );
-
-    // Drop arrivals inside the warmup — pacemaker hasn't stabilized.
-    let warmup_end = start + warmup;
-    let stable: Vec<_> = arrivals
-        .iter()
-        .filter(|(t, _)| *t >= warmup_end)
-        .copied()
-        .collect();
-
-    assert!(
-        stable.len() >= 4,
-        "need ≥4 post-warmup finalizations for cadence; got {} \
-         (entire-window arrivals: {})",
-        stable.len(),
-        arrivals.len(),
-    );
-
-    // Compute inter-arrival deltas.
-    let mut deltas: Vec<std::time::Duration> = Vec::new();
-    for w in stable.windows(2) {
-        deltas.push(w[1].0 - w[0].0);
-    }
-    deltas.sort();
-    let median = deltas[deltas.len() / 2];
-    eprintln!("cadence deltas: {:?} (median={:?})", deltas, median);
-
-    // Production-realistic bounds: finalization should arrive at a
-    // STEADY cadence (no minutes-long stalls, no consensus-free runaway).
-    // We don't pin to proposal_duration because the lag adds 3-chain
-    // rounds. The lower bound only needs to catch a genuine runaway
-    // (frames finalizing with no real consensus rounds → sub-100ms): on
-    // a fast/uncontended machine the post-warmup median settles around
-    // ~0.9 s (the startup catch-up burst leaks past the warmup filter and
-    // pulls the median onto the old 1 s floor, making it flake by machine
-    // speed). 500 ms cleanly separates healthy cadence from runaway while
-    // staying robust to host load.
-    let lower = std::time::Duration::from_millis(500);
-    let upper = std::time::Duration::from_secs(20);
-    assert!(
-        median >= lower && median <= upper,
-        "median inter-finalization delta {:?} outside the steady-cadence window \
-         [{:?}, {:?}] — pacemaker may have stalled or runaway-proposed",
-        median,
-        lower,
-        upper,
-    );
-
-    drop(harness);
-}
 
 // =====================================================================
 // Tier 2 — adversarial tests (real BLS verifier)
@@ -2625,9 +1766,9 @@ async fn tier2_adversarial_forged_join_signature_rejected() {
     let seed_hex = build_genesis_seed_hex(&genesis_provers);
 
     // Real BLS verifier — DefaultKeyManager dispatches to
-    // Bls48581KeyConstructor::verify_signature_raw.
+    // FalconKeyConstructor::verify_signature_raw.
     let real_km: Arc<dyn quil_types::crypto::KeyManager> = Arc::new(
-        quil_crypto::DefaultKeyManager::new(Arc::new(quil_crypto::Bls48581KeyConstructor)),
+        quil_crypto::DefaultKeyManager::new(),
     );
     let archive = build_tier2_archive_rig_with_key_manager(
         genesis_provers[0].clone(),
@@ -2778,7 +1919,7 @@ async fn tier2_adversarial_premature_confirm_rejected() {
     let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
     let seed_hex = build_genesis_seed_hex(&genesis_provers);
     let real_km: Arc<dyn quil_types::crypto::KeyManager> = Arc::new(
-        quil_crypto::DefaultKeyManager::new(Arc::new(quil_crypto::Bls48581KeyConstructor)),
+        quil_crypto::DefaultKeyManager::new(),
     );
     let archive = build_tier2_archive_rig_with_key_manager(
         genesis_provers[0].clone(),
@@ -2964,7 +2105,7 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
     let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
     let seed_hex = build_genesis_seed_hex(&genesis_provers);
     let real_km: Arc<dyn quil_types::crypto::KeyManager> = Arc::new(
-        quil_crypto::DefaultKeyManager::new(Arc::new(quil_crypto::Bls48581KeyConstructor)),
+        quil_crypto::DefaultKeyManager::new(),
     );
     let archive = build_tier2_archive_rig_with_key_manager(
         genesis_provers[0].clone(),
@@ -3143,6 +2284,16 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
 /// (in a full deployment) credit the prover's reward + update shard
 /// commitments. Asserts that `materialize.processed >= 1` for the
 /// coverage frame.
+// P4/CW FOLLOW-UP — the significant one: REWARD ATTRIBUTION under CW. The
+// coverage bundle DOES reach the archive now (CW finalizer emits ShardFrameFinalized
+// + coverage_publish), but the archive materializer SKIPS it (processed=0,
+// skipped=1) because a CW-finalized shard-frame header has no BLS AGGREGATE
+// SIGNATURE (simplex certifies the frame via its own Falcon cert, not a header
+// agg sig). The global reward path currently verifies that agg sig to credit
+// shard work, so CW shard provers would not be credited. This needs a design
+// decision: how the GLOBAL level verifies CW-finalized shard work (accept the
+// VDF + a CW committee attestation, or carry the simplex cert into the coverage
+// bundle). PRIORITY follow-up — see CUTOVER §7.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn tier2_shard_coverage_reaches_archive_materializer() {
     let _ = tracing_subscriber::fmt()
@@ -3594,13 +2745,13 @@ async fn tier2_storage_audit_evicts_cheating_member() {
         epoch: quil_types::consensus::epoch_for_frame(1000),
         member_id: prover.address.clone(),
         query: 0,
-        leaf_root: vec![0u8; 74],
+        leaf_root: vec![0u8; 666],
         num_blocks: 1,
         path_commits: vec![],
         path_proofs: vec![],
-        commitment: vec![0u8; 74],
+        commitment: vec![0u8; 666],
         value: vec![0u8; 32],
-        proof: vec![0u8; 74],
+        proof: vec![0u8; 666],
     };
     let att = quil_types::proto::global::StorageAttestation {
         openings: vec![opening],
@@ -3624,7 +2775,7 @@ async fn tier2_storage_audit_evicts_cheating_member() {
         public_key_signature_bls48581: single_signer_agg_sig(&prover.bls_pubkey)
             .to_canonical_bytes()
             .expect("agg sig"),
-        storage_attestation_root: vec![0u8; 74],
+        storage_attestation_root: vec![0u8; 666],
         global_frame_number: 1000,
         storage_attestation: prost::Message::encode_to_vec(&att),
     };
@@ -3794,6 +2945,8 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
 
         let deps = quil_engine::app_engine::AppEngineDeps {
             clock_store: clock_store as Arc<dyn ClockStore>,
+            global_anchor_store: None,
+            storage_source_hypergraph: None,
             prover_registry: registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
             frame_prover: frame_prover.clone(),
             message_collector,
@@ -3813,6 +2966,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
                 Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
             ),
             kv_db: None,
+            app_consensus_cw: false,
         };
 
         let (engine, handle) =
@@ -3847,6 +3001,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
                     Halted { .. } => "Halted",
                     AncestorSyncRequested { .. } => "AncestorSyncRequested",
                     ParentSealed { .. } => "ParentSealed",
+                    CwOut { .. } => "CwOut",
                 };
                 event_log.lock().push(name.to_string());
             }

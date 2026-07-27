@@ -5,16 +5,16 @@
 //!
 //! ```text
 //! MessageRequest:
-//!   [u32 BE type_prefix = 0x0311]
-//!   [u32 BE inner_len]
-//!   [inner_len bytes — starts with its own u32 type discriminator]
+//! [u32 BE type_prefix = 0x0311]
+//! [u32 BE inner_len]
+//! [inner_len bytes — starts with its own u32 type discriminator]
 //!
 //! MessageBundle:
-//!   [u32 BE type_prefix = 0x0312]
-//!   [u32 BE num_requests]
-//!     (for each request:)
-//!       [u32 BE req_len] [req_len bytes of MessageRequest canonical]
-//!   [i64 BE timestamp]
+//! [u32 BE type_prefix = 0x0312]
+//! [u32 BE num_requests]
+//! (for each request:)
+//! [u32 BE req_len] [req_len bytes of MessageRequest canonical]
+//! [i64 BE timestamp]
 //! ```
 //!
 //! The decode path peeks at the inner type discriminator to tag the
@@ -236,27 +236,71 @@ pub fn proto_message_request_to_canonical_inner_bytes(
             crate::global_intrinsic::conversions::prover_update_from_proto(p)
                 .to_canonical_bytes()
         }
-        // Variants below haven't had `*_from_proto` helpers ported yet.
+        Inner::AltShardUpdate(p) => {
+            crate::global_intrinsic::consensus_types::AltShardUpdate {
+                public_key: p.public_key.clone(),
+                frame_number: p.frame_number,
+                vertex_adds_root: p.vertex_adds_root.clone(),
+                vertex_removes_root: p.vertex_removes_root.clone(),
+                hyperedge_adds_root: p.hyperedge_adds_root.clone(),
+                hyperedge_removes_root: p.hyperedge_removes_root.clone(),
+                signature: p.signature.clone(),
+            }
+            .to_canonical_bytes()
+        }
+
+        // Hypergraph ops (mirror `hypergraph_engine::request_to_payload`).
+        Inner::VertexAdd(p) => {
+            crate::hypergraph_intrinsic::types::VertexAdd::from_proto(p).to_canonical_bytes()
+        }
+        Inner::VertexRemove(p) => {
+            crate::hypergraph_intrinsic::types::VertexRemove::from_proto(p).to_canonical_bytes()
+        }
+        Inner::HyperedgeAdd(p) => {
+            crate::hypergraph_intrinsic::types::HyperedgeAdd::from_proto(p).to_canonical_bytes()
+        }
+        Inner::HyperedgeRemove(p) => {
+            crate::hypergraph_intrinsic::types::HyperedgeRemove::from_proto(p).to_canonical_bytes()
+        }
+        Inner::HypergraphDeploy(p) => {
+            crate::hypergraph_intrinsic::types::HypergraphDeploy::from_proto(p)?.to_canonical_bytes()
+        }
+        Inner::HypergraphUpdate(p) => {
+            crate::hypergraph_intrinsic::types::HypergraphUpdate::from_proto(p)?.to_canonical_bytes()
+        }
+
+        // Token deploy / update (the confidential Transaction path is a
+        // separate lattice TxEnvelope, not this proto variant).
+        Inner::TokenDeploy(p) => {
+            crate::token_intrinsic::conversions::token_deploy_from_proto(p)?.to_canonical_bytes()
+        }
+        Inner::TokenUpdate(p) => {
+            crate::token_intrinsic::conversions::token_update_from_proto(p)?.to_canonical_bytes()
+        }
+
+        // Compute deploy / update / code.
+        Inner::ComputeDeploy(p) => {
+            crate::compute_intrinsic::conversions::compute_deploy_from_proto(p)?.to_canonical_bytes()
+        }
+        Inner::ComputeUpdate(p) => {
+            crate::compute_intrinsic::conversions::compute_update_from_proto(p)?.to_canonical_bytes()
+        }
+        Inner::CodeDeploy(p) => {
+            crate::compute_intrinsic::conversions::code_deployment_from_proto(p).to_canonical_bytes()
+        }
+        Inner::CodeExecute(p) => {
+            crate::compute_intrinsic::conversions::code_execute_from_proto(p)?.to_canonical_bytes()
+        }
+
+        // Still unsupported: retired decaf Transaction path (0x0509) and
+        // consensus-internal variants not submitted via the client.
         Inner::SeniorityMerge(_)
         | Inner::Kick(_)
-        | Inner::TokenDeploy(_)
-        | Inner::TokenUpdate(_)
         | Inner::Transaction(_)
         | Inner::PendingTransaction(_)
         | Inner::MintTransaction(_)
-        | Inner::HypergraphDeploy(_)
-        | Inner::HypergraphUpdate(_)
-        | Inner::VertexAdd(_)
-        | Inner::VertexRemove(_)
-        | Inner::HyperedgeAdd(_)
-        | Inner::HyperedgeRemove(_)
-        | Inner::ComputeDeploy(_)
-        | Inner::ComputeUpdate(_)
-        | Inner::CodeDeploy(_)
-        | Inner::CodeExecute(_)
         | Inner::CodeFinalize(_)
         | Inner::Shard(_)
-        | Inner::AltShardUpdate(_)
         | Inner::ShardSplit(_)
         | Inner::ShardMerge(_) => Err(quil_types::error::QuilError::Internal(
             "proto_message_request_to_canonical_inner_bytes: variant not yet supported"
@@ -304,7 +348,7 @@ mod tests {
             filter: vec![0xAAu8; 32],
             frame_number: 42,
             public_key_signature_bls48581: Some(AddressedSignature {
-                signature: vec![0xBBu8; 74],
+                signature: vec![0xBBu8; 666],
                 address: vec![0xCCu8; 32],
             }),
         };
@@ -320,7 +364,7 @@ mod tests {
             filters: vec![vec![0x01u8; 8], vec![0x02u8; 16]],
             frame_number: 9_999_999,
             public_key_signature_bls48581: Some(keys_pb::Bls48581AddressedSignature {
-                signature: vec![0xBBu8; 74],
+                signature: vec![0xBBu8; 666],
                 address: vec![0xCCu8; 32],
             }),
         };
@@ -348,7 +392,7 @@ mod tests {
         let sig = leave_decoded
             .public_key_signature_bls48581
             .expect("sig present");
-        assert_eq!(sig.signature, vec![0xBBu8; 74]);
+        assert_eq!(sig.signature, vec![0xBBu8; 666]);
         assert_eq!(sig.address, vec![0xCCu8; 32]);
     }
 
@@ -362,7 +406,7 @@ mod tests {
             filter: vec![],
             frame_number: 12345,
             public_key_signature_bls48581: Some(keys_pb::Bls48581AddressedSignature {
-                signature: vec![0xAAu8; 74],
+                signature: vec![0xAAu8; 666],
                 address: vec![0xDDu8; 32],
             }),
             filters: vec![vec![0x10u8; 8]],
@@ -383,7 +427,7 @@ mod tests {
             filter: vec![],
             frame_number: 12345,
             public_key_signature_bls48581: Some(AddressedSignature {
-                signature: vec![0xAAu8; 74],
+                signature: vec![0xAAu8; 666],
                 address: vec![0xDDu8; 32],
             }),
             filters: vec![vec![0x10u8; 8]],

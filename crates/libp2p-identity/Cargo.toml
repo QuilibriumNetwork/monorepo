@@ -58,6 +58,14 @@ ed448 = [
     "dep:hkdf",
     "dep:quick-protobuf",
 ]
+falcon = [
+    "dep:fn-dsa",
+    "dep:rand",
+    "dep:sha2",
+    "dep:hkdf",
+    "dep:zeroize",
+    "dep:quick-protobuf",
+]
 peerid = [
     "dep:multihash",
     "dep:bs58",
@@ -113,6 +121,10 @@ optional = true
 
 [dependencies.ed448-rust]
 path = "../ed448-rust"
+optional = true
+
+[dependencies.fn-dsa]
+version = "0.3"
 optional = true
 
 [dependencies.hkdf]

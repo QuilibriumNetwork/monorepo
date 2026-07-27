@@ -697,14 +697,13 @@ pub async fn handle_vertex(
         Some(v) => v,
         None => return error(StatusCode::NOT_FOUND, "vertex not found"),
     };
-    // Go `vertex.ToBytes()` == the stored value (0x00||app||data||commitment
-    // ||size.FillBytes(32)); GetSize() is the trailing 32 bytes as a
-    // big-endian integer.
-    let size = if value.len() >= 32 {
-        BigInt::from_bytes_be(Sign::Plus, &value[value.len() - 32..])
-    } else {
-        BigInt::from(0)
-    };
+    // Forest-era: `get_vertex_data` returns the vertex's serialized data blob
+    // (a Go-serialized tree), and its on-chain size is that blob's BYTE LENGTH —
+    // exactly what `vertex_leaf_value` commits (`commitment ‖ blob.len()`). The
+    // old trailing-32-bytes reading assumed the pre-forest Go `vertex.ToBytes()`
+    // layout (`0x00||app||data||commitment||size`), which is NOT what is stored
+    // now, so it reported a garbage size derived from the tree's tail bytes.
+    let size = BigInt::from(value.len() as u64);
     let std = base64::engine::general_purpose::STANDARD;
     let response = AtomJson {
         id: hex::encode(id),
@@ -1121,12 +1120,586 @@ pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) ->
     json_ok(&response, None)
 }
 
+// ---------------------------------------------------------------------------
+// /token/supply, /token/coin/{address}, /token/coins/{owner}
+//
+// Token state is the hypergraph CRDT: coins are "vertex/adds" vertices under
+// the QUIL_TOKEN domain, keyed `domain(32) ‖ content_address(32)`. Only
+// TRANSPARENT coins expose a readable owner + plaintext amount; lattice RingCT
+// and decaf `coin:Coin` coins hide the amount (commitment/encrypted) and carry
+// no linkable owner — those are reported as value-hidden. There is no live
+// supply counter and no owner→coins index, so supply's audited figure is the
+// migration receipt and owner listing is a full single-shard scan.
+// ---------------------------------------------------------------------------
+
+fn parse_hex_32(input: &str) -> Result<[u8; 32], &'static str> {
+    let bytes = hex::decode(input).map_err(|_| "invalid hex address")?;
+    if bytes.len() != 32 {
+        return Err("address must be 32 bytes");
+    }
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&bytes);
+    Ok(a)
+}
+
+/// Exact sub-units → QUIL decimal string. `QUIL_TOKEN_UNITS = 8e9 = 2^12·5^9`,
+/// so the expansion terminates in ≤12 places: value·10^12/8e9 = value·125.
+fn quil_str(sub: u128) -> String {
+    let scaled = sub.saturating_mul(125); // sub × 10^12 / 8e9
+    let whole = scaled / 1_000_000_000_000u128;
+    let frac = scaled % 1_000_000_000_000u128;
+    let mut s = format!("{whole}.{frac:012}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    s
+}
+
+/// Big-endian bytes → u128, saturating if the value exceeds 128 bits (reward
+/// balances are stored as 32-byte BE `FillBytes`; realistic values fit u128).
+fn be_bytes_to_u128(bytes: &[u8]) -> u128 {
+    let start = bytes.len().saturating_sub(16);
+    if bytes[..start].iter().any(|&b| b != 0) {
+        return u128::MAX;
+    }
+    let mut v = 0u128;
+    for &b in &bytes[start..] {
+        v = (v << 8) | b as u128;
+    }
+    v
+}
+
+/// The reserved (non-coin) vertex addresses under the token domain.
+fn is_reserved_token_addr(addr: &[u8]) -> bool {
+    use quil_execution::token_intrinsic::legacy_migration::MIGRATION_RECEIPT_ADDRESS;
+    use quil_execution::token_intrinsic::shadow_accumulator::ACC_ROOT_ADDRESS;
+    addr == MIGRATION_RECEIPT_ADDRESS.as_slice()
+        || addr == ACC_ROOT_ADDRESS.as_slice()
+        || addr == [0xFFu8; 32].as_slice() // token metadata/config vertex
+}
+
+#[derive(Serialize)]
+struct CoinJson {
+    address: String,
+    /// "transparent" | "private" | "unknown"
+    kind: &'static str,
+    value_hidden: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_subunits: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_quil: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commitment: Option<String>,
+}
+
+/// Decode a coin vertex blob at `address` (32-byte content address) into a
+/// `CoinJson`. `None` if the blob isn't a decodable coin tree.
+fn decode_coin(domain: &[u8], address: &[u8; 32], blob: &[u8]) -> Option<CoinJson> {
+    let root = quil_tries::deserialize_go_tree(blob).ok().flatten();
+    let tree = quil_tries::VectorCommitmentTree { root };
+    let ty = tree.get(&[0xFFu8; 32])?; // every coin carries a type leaf
+    let transparent = quil_execution::token_intrinsic::legacy_migration::transparent_type_hash(domain).ok()?;
+    let private = quil_execution::token_intrinsic::materialize::coin_type_hash(domain).ok()?;
+    let addr_hex = hex::encode(address);
+    if ty == transparent.as_slice() {
+        let owner = tree.get(&[0x00]).map(hex::encode);
+        let (amount_subunits, amount_quil) = match tree.get(&[1u8 << 2]) {
+            Some(a) => {
+                let mut b = [0u8; 16];
+                let n = a.len().min(16);
+                b[..n].copy_from_slice(&a[..n]);
+                let v = u128::from_le_bytes(b);
+                (Some(v.to_string()), Some(quil_str(v)))
+            }
+            None => (None, None),
+        };
+        let origin = tree.get(&[2u8 << 2]).map(hex::encode);
+        Some(CoinJson {
+            address: addr_hex,
+            kind: "transparent",
+            value_hidden: false,
+            owner,
+            amount_subunits,
+            amount_quil,
+            origin,
+            commitment: None,
+        })
+    } else if ty == private.as_slice() {
+        // Lattice RingCT and decaf coins share the `coin:Coin` type hash; both
+        // hide the amount and carry no linkable owner. Surface the value
+        // commitment for reference (lattice cv at [2<<2], decaf Commitment at
+        // [1<<2]) — best-effort, whichever is present.
+        let commitment = tree
+            .get(&[2u8 << 2])
+            .or_else(|| tree.get(&[1u8 << 2]))
+            .map(hex::encode);
+        Some(CoinJson {
+            address: addr_hex,
+            kind: "private",
+            value_hidden: true,
+            owner: None,
+            amount_subunits: None,
+            amount_quil: None,
+            origin: None,
+            commitment,
+        })
+    } else {
+        Some(CoinJson {
+            address: addr_hex,
+            kind: "unknown",
+            value_hidden: true,
+            owner: None,
+            amount_subunits: None,
+            amount_quil: None,
+            origin: None,
+            commitment: None,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct SupplyResponse {
+    units_per_quil: u64,
+    /// Audited migration baseline (the transparent set at migration time).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migration_baseline: Option<SupplyBaseline>,
+    /// Present only when `?scan=1`: a live sum over the PUBLIC supply — the
+    /// transparent coin set plus the earned/mined reward balances.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_public: Option<SupplyLive>,
+    note: &'static str,
+}
+
+#[derive(Serialize)]
+struct SupplyBaseline {
+    coins: u64,
+    total_subunits: String,
+    total_quil: String,
+}
+
+#[derive(Serialize)]
+struct SupplyLive {
+    transparent_coins: u64,
+    transparent_subunits: String,
+    /// Earned/mined QUIL held in per-prover `reward:ProverReward` balances
+    /// (public plaintext, under the GLOBAL intrinsic domain).
+    reward_provers: u64,
+    reward_subunits: String,
+    /// transparent coins + reward balances — the full PUBLIC supply. Only
+    /// shielded (lattice) coins are value-hidden and excluded.
+    total_public_subunits: String,
+    total_public_quil: String,
+    value_hidden_coins: u64,
+    scanned: usize,
+}
+
+pub async fn handle_token_supply(
+    method: Method,
+    State(state): State<ExplorerState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !is_get(&method) {
+        return method_not_allowed();
+    }
+    let domain = quil_execution::domains::QUIL_TOKEN;
+    let units = quil_execution::token_intrinsic::constants::QUIL_TOKEN_UNITS;
+
+    // The `?scan=1` path is O(all coins) — serve a cached result (short TTL) so
+    // the full scan runs at most once per window, not per request.
+    let want_scan = params
+        .get("scan")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if want_scan {
+        if let Some(body) = cache_get(&state, "token_supply_scan") {
+            return build_response(StatusCode::OK, body, Some(CACHE_60));
+        }
+    }
+
+    // Audited baseline: the migration receipt (count, Σ). Read via the canonical
+    // reader so it matches how the intrinsic wrote it.
+    let hstate = quil_execution::hypergraph_state::HypergraphState::new(state.crdt.clone());
+    let migration_baseline =
+        quil_execution::token_intrinsic::legacy_migration::read_migration_receipt(&hstate, &domain)
+            .ok()
+            .flatten()
+            .map(|(coins, total)| SupplyBaseline {
+                coins,
+                total_subunits: total.to_string(),
+                total_quil: quil_str(total),
+            });
+
+    // Optional (expensive) live PUBLIC-supply scan: transparent coins (QUIL_TOKEN
+    // domain) + earned reward balances (GLOBAL intrinsic domain). Only shielded
+    // (lattice) coins are value-hidden and left uncounted.
+    let live_public = if want_scan {
+        let transparent =
+            quil_execution::token_intrinsic::legacy_migration::transparent_type_hash(&domain).ok();
+        let private =
+            quil_execution::token_intrinsic::materialize::coin_type_hash(&domain).ok();
+        // 1. Transparent coins + value-hidden coin count (QUIL_TOKEN domain).
+        let (mut tcoins, mut tsum, mut hidden) = (0u64, 0u128, 0u64);
+        let mut coin_cb = |vk: Vec<u8>, blob: Vec<u8>| {
+            if vk.len() < 64 || is_reserved_token_addr(&vk[32..64]) {
+                return;
+            }
+            let root = quil_tries::deserialize_go_tree(&blob).ok().flatten();
+            let tree = quil_tries::VectorCommitmentTree { root };
+            let ty = match tree.get(&[0xFFu8; 32]) {
+                Some(t) => t.to_vec(),
+                None => return,
+            };
+            if Some(ty.as_slice()) == transparent.as_ref().map(|h| h.as_slice()) {
+                if let Some(a) = tree.get(&[1u8 << 2]) {
+                    let mut b = [0u8; 16];
+                    let n = a.len().min(16);
+                    b[..n].copy_from_slice(&a[..n]);
+                    tsum = tsum.saturating_add(u128::from_le_bytes(b));
+                    tcoins += 1;
+                }
+            } else if Some(ty.as_slice()) == private.as_ref().map(|h| h.as_slice()) {
+                hidden += 1;
+            }
+        };
+        let mut scanned = state.crdt.for_each_vertex_adds_blob(&domain, &mut coin_cb).unwrap_or(0);
+        // 2. Earned/mined reward balances (GLOBAL intrinsic domain, plaintext).
+        let (mut rprovers, mut rsum) = (0u64, 0u128);
+        let mut reward_cb = |_vk: Vec<u8>, blob: Vec<u8>| {
+            let tree = quil_execution::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+            if quil_execution::global_schema::read_type(&tree) != Some("reward:ProverReward") {
+                return;
+            }
+            let bal = quil_execution::global_intrinsic::materialize::read_reward_balance(&tree);
+            if bal.is_empty() {
+                return;
+            }
+            let v = be_bytes_to_u128(&bal);
+            if v > 0 {
+                rsum = rsum.saturating_add(v);
+                rprovers += 1;
+            }
+        };
+        scanned += state
+            .crdt
+            .for_each_vertex_adds_blob(&quil_execution::domains::GLOBAL, &mut reward_cb)
+            .unwrap_or(0);
+        let total_public = tsum.saturating_add(rsum);
+        Some(SupplyLive {
+            transparent_coins: tcoins,
+            transparent_subunits: tsum.to_string(),
+            reward_provers: rprovers,
+            reward_subunits: rsum.to_string(),
+            total_public_subunits: total_public.to_string(),
+            total_public_quil: quil_str(total_public),
+            value_hidden_coins: hidden,
+            scanned,
+        })
+    } else {
+        None
+    };
+
+    let response = SupplyResponse {
+        units_per_quil: units,
+        migration_baseline,
+        live_public,
+        note: "migration_baseline is the audited transparent total at migration. ?scan=1 sums \
+               the full PUBLIC supply: transparent coins (QUIL_TOKEN) + earned/mined \
+               reward balances (public plaintext, GLOBAL intrinsic domain). Only SHIELDED \
+               lattice coins are value-hidden and excluded — everything else is derivable. \
+               (?scan=1 is a full scan; result cached ~60s.)",
+    };
+    let body = json_value(&response);
+    if want_scan {
+        cache_put(&state, "token_supply_scan".to_string(), body.clone());
+        return build_response(StatusCode::OK, body, Some(CACHE_60));
+    }
+    build_response(StatusCode::OK, body, None)
+}
+
+pub async fn handle_token_coin(
+    method: Method,
+    State(state): State<ExplorerState>,
+    Path(addr_hex): Path<String>,
+) -> Response {
+    if !is_get(&method) {
+        return method_not_allowed();
+    }
+    let addr = match parse_hex_32(addr_hex.trim()) {
+        Ok(a) => a,
+        Err(msg) => return error(StatusCode::BAD_REQUEST, msg),
+    };
+    let domain = quil_execution::domains::QUIL_TOKEN;
+    let mut id = [0u8; 64];
+    id[..32].copy_from_slice(&domain);
+    id[32..].copy_from_slice(&addr);
+    let location = quil_hypergraph::Location::from_id(&id);
+    let blob = match state.crdt.get_vertex_data(&location) {
+        Some(b) => b,
+        None => return error(StatusCode::NOT_FOUND, "coin not found"),
+    };
+    match decode_coin(&domain, &addr, &blob) {
+        Some(coin) => json_ok(&coin, None),
+        None => error(StatusCode::UNPROCESSABLE_ENTITY, "vertex is not a decodable coin"),
+    }
+}
+
+#[derive(Serialize)]
+struct OwnerCoinsResponse {
+    owner: String,
+    units_per_quil: u64,
+    count: u64,
+    total_subunits: String,
+    total_quil: String,
+    coins: Vec<CoinJson>,
+    scanned: usize,
+    truncated: bool,
+    note: &'static str,
+}
+
+pub async fn handle_token_coins(
+    method: Method,
+    State(state): State<ExplorerState>,
+    Path(owner_hex): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !is_get(&method) {
+        return method_not_allowed();
+    }
+    let owner = match parse_hex_32(owner_hex.trim()) {
+        Ok(a) => a,
+        Err(msg) => return error(StatusCode::BAD_REQUEST, msg),
+    };
+    let cache_key = format!("token_coins:{}", hex::encode(owner));
+    if let Some(body) = cache_get(&state, &cache_key) {
+        return build_response(StatusCode::OK, body, Some(CACHE_60));
+    }
+    // Cap the number of returned coins to bound the response; the SUM is over
+    // all matches (not just the returned page).
+    let limit: usize = params
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000)
+        .min(10_000);
+
+    let domain = quil_execution::domains::QUIL_TOKEN;
+    let transparent =
+        quil_execution::token_intrinsic::legacy_migration::transparent_type_hash(&domain).ok();
+    let (mut count, mut total, mut truncated) = (0u64, 0u128, false);
+    let mut coins: Vec<CoinJson> = Vec::new();
+    let mut cb = |vk: Vec<u8>, blob: Vec<u8>| {
+        if vk.len() < 64 || is_reserved_token_addr(&vk[32..64]) {
+            return;
+        }
+        let root = quil_tries::deserialize_go_tree(&blob).ok().flatten();
+        let tree = quil_tries::VectorCommitmentTree { root };
+        let ty = match tree.get(&[0xFFu8; 32]) {
+            Some(t) => t,
+            None => return,
+        };
+        if Some(ty) != transparent.as_ref().map(|h| h.as_slice()) {
+            return; // private coins have no readable owner — not enumerable here
+        }
+        if tree.get(&[0x00]) != Some(owner.as_slice()) {
+            return;
+        }
+        let amount = tree
+            .get(&[1u8 << 2])
+            .map(|a| {
+                let mut b = [0u8; 16];
+                let n = a.len().min(16);
+                b[..n].copy_from_slice(&a[..n]);
+                u128::from_le_bytes(b)
+            })
+            .unwrap_or(0);
+        total = total.saturating_add(amount);
+        count += 1;
+        if coins.len() < limit {
+            let mut addr = [0u8; 32];
+            addr.copy_from_slice(&vk[32..64]);
+            coins.push(CoinJson {
+                address: hex::encode(addr),
+                kind: "transparent",
+                value_hidden: false,
+                owner: Some(hex::encode(owner)),
+                amount_subunits: Some(amount.to_string()),
+                amount_quil: Some(quil_str(amount)),
+                origin: tree.get(&[2u8 << 2]).map(hex::encode),
+                commitment: None,
+            });
+        } else {
+            truncated = true;
+        }
+    };
+    let scanned = state.crdt.for_each_vertex_adds_blob(&domain, &mut cb).unwrap_or(0);
+
+    let response = OwnerCoinsResponse {
+        owner: hex::encode(owner),
+        units_per_quil: quil_execution::token_intrinsic::constants::QUIL_TOKEN_UNITS,
+        count,
+        total_subunits: total.to_string(),
+        total_quil: quil_str(total),
+        coins,
+        scanned,
+        truncated,
+        note: "TRANSPARENT coins only — lattice/decaf private coins have no linkable owner. \
+               `total_*` covers all matches; `coins` is capped by ?limit (default 1000). This \
+               is a full single-shard scan (no owner index); cached 60s.",
+    };
+    let body = json_value(&response);
+    cache_put(&state, cache_key, body.clone());
+    build_response(StatusCode::OK, body, Some(CACHE_60))
+}
+
+#[derive(Serialize)]
+struct RewardResponse {
+    prover: String,
+    reward_address: String,
+    units_per_quil: u64,
+    balance_subunits: String,
+    balance_quil: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delegate_address: Option<String>,
+}
+
+/// A prover's earned/mined QUIL — the public `reward:ProverReward` balance,
+/// looked up directly by its deterministic address (no scan).
+pub async fn handle_token_reward(
+    method: Method,
+    State(state): State<ExplorerState>,
+    Path(prover_hex): Path<String>,
+) -> Response {
+    if !is_get(&method) {
+        return method_not_allowed();
+    }
+    let prover = match parse_hex_32(prover_hex.trim()) {
+        Ok(a) => a,
+        Err(msg) => return error(StatusCode::BAD_REQUEST, msg),
+    };
+    let reward_addr =
+        match quil_execution::global_intrinsic::materialize::reward_address(&prover) {
+            Ok(a) => a,
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "reward address"),
+        };
+    let mut id = [0u8; 64];
+    id[..32].copy_from_slice(&quil_execution::domains::GLOBAL);
+    id[32..].copy_from_slice(&reward_addr);
+    let location = quil_hypergraph::Location::from_id(&id);
+
+    let (balance, delegate) = match state.crdt.get_vertex_data(&location) {
+        Some(blob) => {
+            let tree = quil_execution::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+            if quil_execution::global_schema::read_type(&tree) == Some("reward:ProverReward") {
+                let bal = quil_execution::global_intrinsic::materialize::read_reward_balance(&tree);
+                let deleg = quil_execution::global_schema::read_field(
+                    &tree,
+                    "reward:ProverReward",
+                    "DelegateAddress",
+                )
+                .map(hex::encode);
+                (be_bytes_to_u128(&bal), deleg)
+            } else {
+                (0u128, None)
+            }
+        }
+        None => (0u128, None), // no reward vertex yet ⇒ zero earned
+    };
+
+    let response = RewardResponse {
+        prover: hex::encode(prover),
+        reward_address: hex::encode(reward_addr),
+        units_per_quil: quil_execution::token_intrinsic::constants::QUIL_TOKEN_UNITS,
+        balance_subunits: balance.to_string(),
+        balance_quil: quil_str(balance),
+        delegate_address: delegate,
+    };
+    json_ok(&response, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn to_str<T: Serialize>(v: &T) -> String {
         String::from_utf8(serde_json::to_vec(v).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn quil_str_is_exact() {
+        assert_eq!(quil_str(8_000_000_000), "1");
+        assert_eq!(quil_str(4_000_000_000), "0.5");
+        assert_eq!(quil_str(12_000_000_000), "1.5");
+        assert_eq!(quil_str(1), "0.000000000125"); // 1/8e9 exactly
+        assert_eq!(quil_str(0), "0");
+    }
+
+    #[test]
+    fn decode_transparent_coin_reads_owner_and_amount() {
+        use quil_execution::token_intrinsic::legacy_migration::{
+            create_transparent_coin_tree, transparent_type_hash, TransparentCoin,
+        };
+        let domain = quil_execution::domains::QUIL_TOKEN;
+        let th = transparent_type_hash(&domain).unwrap();
+        let coin = TransparentCoin { owner_address: [0x7Au8; 32], amount: 16_000_000_000 }; // 2 QUIL
+        let tree = create_transparent_coin_tree(&coin, &th, &[0x33u8; 32]).unwrap();
+        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+
+        let c = decode_coin(&domain, &[0xABu8; 32], &blob).unwrap();
+        assert_eq!(c.kind, "transparent");
+        assert!(!c.value_hidden);
+        assert_eq!(c.owner.as_deref(), Some(hex::encode([0x7Au8; 32]).as_str()));
+        assert_eq!(c.amount_subunits.as_deref(), Some("16000000000"));
+        assert_eq!(c.amount_quil.as_deref(), Some("2"));
+        assert_eq!(c.origin.as_deref(), Some(hex::encode([0x33u8; 32]).as_str()));
+        assert_eq!(c.commitment, None);
+    }
+
+    #[test]
+    fn be_bytes_to_u128_reads_fillbytes_and_guards_overflow() {
+        let mut b = [0u8; 32];
+        b[24..].copy_from_slice(&1000u64.to_be_bytes()); // 32-byte BE FillBytes(1000)
+        assert_eq!(be_bytes_to_u128(&b), 1000);
+        let mut big = [0u8; 32];
+        big[0] = 1; // > 2^128
+        assert_eq!(be_bytes_to_u128(&big), u128::MAX);
+    }
+
+    #[test]
+    fn reward_balance_decodes_as_public_quil() {
+        use quil_execution::global_intrinsic::materialize::{read_reward_balance, set_reward_balance};
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        let mut bal = [0u8; 32];
+        bal[24..].copy_from_slice(&(2u64 * 8_000_000_000).to_be_bytes()); // 2 QUIL
+        set_reward_balance(&mut tree, &bal).unwrap();
+        assert_eq!(quil_execution::global_schema::read_type(&tree), Some("reward:ProverReward"));
+        let raw = read_reward_balance(&tree);
+        assert_eq!(be_bytes_to_u128(&raw), 16_000_000_000);
+        assert_eq!(quil_str(be_bytes_to_u128(&raw)), "2");
+    }
+
+    #[test]
+    fn decode_private_coin_hides_amount() {
+        // A `coin:Coin`-typed vertex (lattice/decaf) must decode as value-hidden
+        // with no owner. Build a minimal tree with just the private type leaf.
+        let domain = quil_execution::domains::QUIL_TOKEN;
+        let private = quil_execution::token_intrinsic::materialize::coin_type_hash(&domain).unwrap();
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[2u8 << 2], &[0xCDu8; 40], &[], &num_bigint::BigInt::from(40)).unwrap();
+        tree.insert(&[0xFFu8; 32], &private, &[], &num_bigint::BigInt::from(32)).unwrap();
+        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+
+        let c = decode_coin(&domain, &[0x01u8; 32], &blob).unwrap();
+        assert_eq!(c.kind, "private");
+        assert!(c.value_hidden);
+        assert_eq!(c.owner, None);
+        assert_eq!(c.amount_subunits, None);
+        assert_eq!(c.commitment.as_deref(), Some(hex::encode([0xCDu8; 40]).as_str()));
     }
 
     #[test]

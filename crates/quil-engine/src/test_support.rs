@@ -34,6 +34,13 @@ pub struct TestProverRegistry {
     /// `None`, falls back to the first prover's address. Matches
     /// the leader-pin behavior the `committee` tests need.
     next_prover: Mutex<Option<Vec<u8>>>,
+    /// Registered storage leaf roots, keyed by `(member, leaf_id)` →
+    /// `(leaf_root, num_blocks, epoch)`. Production populates the equivalent via
+    /// the confirm intrinsic writing the prover trie; tests register directly so
+    /// the frame validator's registered-leaf cross-check on storage attestations
+    /// can pass. See [`Self::register_leaf_root`] / [`ProverRegistry::get_leaf_root`].
+    #[allow(clippy::type_complexity)]
+    leaf_roots: Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)>>,
 }
 
 impl Default for TestProverRegistry {
@@ -48,7 +55,25 @@ impl TestProverRegistry {
             provers: Mutex::new(Vec::new()),
             summaries: Mutex::new(Vec::new()),
             next_prover: Mutex::new(None),
+            leaf_roots: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Register a member's storage leaf root so `get_leaf_root` returns it (the
+    /// frame validator cross-checks every storage-attestation opening against
+    /// this). `leaf_id` is the opening's `shard_id` (`leaf_id_bytes(filter, prefix)`).
+    pub fn register_leaf_root(
+        &self,
+        member: &[u8],
+        leaf_id: &[u8],
+        leaf_root: Vec<u8>,
+        num_blocks: u64,
+        epoch: u64,
+    ) {
+        self.leaf_roots.lock().unwrap().insert(
+            (member.to_vec(), leaf_id.to_vec()),
+            (leaf_root, num_blocks, epoch),
+        );
     }
 
     pub fn with_provers(provers: Vec<ProverInfo>) -> Self {
@@ -94,7 +119,20 @@ impl ProverRegistry for TestProverRegistry {
             .cloned())
     }
 
-    fn get_next_prover(&self, _input: &[u8; 32], _filter: &[u8]) -> Result<Vec<u8>> {
+    fn get_leaf_root(
+        &self,
+        member: &[u8],
+        leaf_id: &[u8],
+    ) -> Result<Option<(Vec<u8>, u64, u64)>> {
+        Ok(self
+            .leaf_roots
+            .lock()
+            .unwrap()
+            .get(&(member.to_vec(), leaf_id.to_vec()))
+            .cloned())
+    }
+
+    fn get_next_prover(&self, _input: &[u8; 32], _filter: &[u8], _frame_number: u64) -> Result<Vec<u8>> {
         if let Some(addr) = self.next_prover.lock().unwrap().clone() {
             return Ok(addr);
         }
@@ -107,7 +145,7 @@ impl ProverRegistry for TestProverRegistry {
             .unwrap_or_default())
     }
 
-    fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<Vec<u8>>> {
+    fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _frame_number: u64) -> Result<Vec<Vec<u8>>> {
         Ok(self
             .provers
             .lock()
@@ -117,7 +155,7 @@ impl ProverRegistry for TestProverRegistry {
             .collect())
     }
 
-    fn get_active_provers(&self, _filter: &[u8]) -> Result<Vec<ProverInfo>> {
+    fn get_active_provers(&self, _filter: &[u8], _frame_number: u64) -> Result<Vec<ProverInfo>> {
         Ok(self
             .provers
             .lock()
@@ -164,13 +202,13 @@ impl ProverRegistry for TestProverRegistry {
 /// `HashMap<core_id, WorkerInfo>` so test setup is uniform:
 ///
 /// - `add(info)` inserts/replaces a worker directly (use for
-///   tests that need pre-populated state).
+/// tests that need pre-populated state).
 /// - `set_worker_filter(core_id, filter, start_consensus)`
-///   matches the production trait method and creates missing
-///   workers on demand.
+/// matches the production trait method and creates missing
+/// workers on demand.
 /// - `set_manually_managed` is also wired so tests can flip
-///   the manual flag without going through the full Worker
-///   plumbing.
+/// the manual flag without going through the full Worker
+/// plumbing.
 pub struct TestWorkerManager {
     workers: Mutex<HashMap<u32, WorkerInfo>>,
 }
@@ -514,11 +552,9 @@ impl quil_keys::KeyManager for TestKeyManager {
         key_type: quil_types::crypto::KeyType,
     ) -> quil_types::error::Result<Box<dyn quil_types::crypto::Signer>> {
         match key_type {
-            quil_types::crypto::KeyType::Bls48581G1 => {
-                use quil_types::crypto::BlsConstructor;
-                let ctor = quil_crypto::Bls48581KeyConstructor;
-                ctor.from_bytes(&self.bls_private, &self.bls_public)
-            }
+            quil_types::crypto::KeyType::Falcon512 => Ok(Box::new(
+                quil_crypto::FalconSigner::from_bytes(&self.bls_private, &self.bls_public),
+            )),
             other => Err(quil_types::error::QuilError::Internal(format!(
                 "TestKeyManager does not support key type {:?}",
                 other
@@ -531,7 +567,7 @@ impl quil_keys::KeyManager for TestKeyManager {
         key_type: quil_types::crypto::KeyType,
     ) -> quil_types::error::Result<Vec<u8>> {
         match key_type {
-            quil_types::crypto::KeyType::Bls48581G1 => Ok(self.bls_public.clone()),
+            quil_types::crypto::KeyType::Falcon512 => Ok(self.bls_public.clone()),
             other => Err(quil_types::error::QuilError::Internal(format!(
                 "TestKeyManager does not support key type {:?}",
                 other
@@ -544,7 +580,7 @@ impl quil_keys::KeyManager for TestKeyManager {
         key_type: quil_types::crypto::KeyType,
     ) -> quil_types::error::Result<Vec<u8>> {
         match key_type {
-            quil_types::crypto::KeyType::Bls48581G1 => Ok(self.bls_private.clone()),
+            quil_types::crypto::KeyType::Falcon512 => Ok(self.bls_private.clone()),
             other => Err(quil_types::error::QuilError::Internal(format!(
                 "TestKeyManager does not support key type {:?}",
                 other

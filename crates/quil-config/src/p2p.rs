@@ -113,6 +113,12 @@ pub struct P2PConfig {
     pub peer_outbound_queue_size: i32,
     #[serde(default = "default_reconnect_interval_ms", alias = "peerReconnectCheckInterval", deserialize_with = "crate::deserialize_go_duration_ms")]
     pub peer_reconnect_check_interval_ms: u64,
+    /// Disable the live onion-routing relay (default: false, i.e. onion routing
+    /// is ON). When true, the node neither runs the onion dispatcher nor
+    /// advertises the routing capability, so no circuits traverse it. The
+    /// `OnionService` transport is still served either way.
+    #[serde(default, alias = "disableOnionRouting")]
+    pub disable_onion_routing: bool,
 }
 
 fn default_stream_listen() -> String { "/ip4/0.0.0.0/tcp/8340".into() }

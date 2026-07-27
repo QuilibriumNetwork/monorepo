@@ -2,7 +2,7 @@
 //! `node/execution/engines/token_execution_engine.go`.
 //!
 //! - [`token_engine_capabilities`] — the four protocol IDs (token v1,
-//!   Double Ratchet, Triple Ratchet, Onion Routing).
+//! Double Ratchet, Triple Ratchet, Onion Routing).
 //! - [`request_is_token_op`] — boolean predicate for bundle routing.
 //! - [`MessageKindToken`] — the five token operation types.
 //! - [`get_cost_from_request`] — stub cost dispatch.
@@ -41,7 +41,7 @@ pub fn token_engine_capabilities() -> Vec<Capability> {
 // Re-export from the canonical token_intrinsic modules.
 pub use crate::token_intrinsic::{
     TYPE_TOKEN_DEPLOY, TYPE_TOKEN_UPDATE, TYPE_TRANSACTION,
-    TYPE_PENDING_TRANSACTION, TYPE_MINT_TRANSACTION,
+    TYPE_PENDING_TRANSACTION, TYPE_MINT_TRANSACTION, TYPE_LATTICE_TRANSACTION, TYPE_LATTICE_MINT, TYPE_LATTICE_PENDING, TYPE_LATTICE_PENDING_CLAIM, TYPE_LATTICE_SHIELD,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -190,6 +190,11 @@ pub fn is_token_type_prefix(tp: u32) -> bool {
             | TYPE_TRANSACTION
             | TYPE_PENDING_TRANSACTION
             | TYPE_MINT_TRANSACTION
+            | TYPE_LATTICE_TRANSACTION
+            | TYPE_LATTICE_MINT
+            | TYPE_LATTICE_PENDING
+            | TYPE_LATTICE_PENDING_CLAIM
+            | TYPE_LATTICE_SHIELD
     )
 }
 

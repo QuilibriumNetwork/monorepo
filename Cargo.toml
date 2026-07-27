@@ -36,6 +36,10 @@ members = [
     "crates/quil-crypto",
     "crates/quil-tries",
     "crates/quil-tries-ffi",
+    "crates/quil-forest",
+    "crates/quil-cw-consensus",
+    "crates/quil-forest-migrate",
+    "crates/quil-lattice-ct",
     "crates/quil-store",
     "crates/quil-hypergraph",
     "crates/quil-keys",
@@ -49,32 +53,35 @@ members = [
     "crates/quil-node",
     "crates/quil-compiler",
     "crates/quil-wallet",
+    "crates/quil-client",
     "crates/quil-explorer",
-    "crates/blossomsub",
     "crates/libp2p-identity",
+    "crates/libp2p-tls",
     "crates/devnet",
     "crates/devnet/proxy",
 ]
 
 [patch.crates-io]
+# jmt: vendored 0.11.0 with a visibility-only patch (gen_child_node_key +
+# NibblePath::new made pub) so the forest's efficient Merkle-diff sync
+# (quil-forest/src/sync.rs) can walk two trees top-down and transfer only
+# differing subtrees. No behavior change; see crates/jmt patch comments.
+jmt = { path = "crates/jmt" }
 # Fork libp2p-identity to add Ed448 (KeyType=4) support for Quilibrium peer IDs
 libp2p-identity = { path = "crates/libp2p-identity" }
-# Local patch for libp2p-autonat 0.13.0 — one-line fix for a server-side
-# panic at `v1/behaviour/as_server.rs:304` ("Peer is connected.") that
-# fires when an inbound dial-back request races with the sender's
-# disconnect, killing the entire swarm event loop. Upstream master
-# still has the bug. See the crate's
-# `src/v1/behaviour/as_server.rs` for the patched lines.
+# libp2p-autonat: re-vendored to 0.15.0 for the libp2p 0.56 bump; the
+# Quilibrium-local panic guard at `v1/behaviour/as_server.rs:321` (inbound
+# dial-back racing the sender's disconnect — upstream 0.15 still `.expect`s
+# "Peer is connected." and kills the swarm task) is re-applied there.
 libp2p-autonat = { path = "crates/libp2p-autonat" }
-# Local patch for libp2p-kad 0.46.2 (the version libp2p 0.54.1
-# pulls in transitively) — bumps the per-handler
-# `MAX_NUM_STREAMS` cap from 32 to 256 so a single peer can hold
-# more simultaneous inbound kad substreams. The upstream constant
-# is private and unconfigurable; on a busy DHT the 32-cap caused
-# warnings at handler.rs:534 ("New inbound substream … exceeds
-# inbound substream limit. … Dropping new substream.") and lost
-# DHT queries. See `crates/libp2p-kad/src/handler.rs:43`.
-libp2p-kad = { path = "crates/libp2p-kad" }
+# libp2p-kad: fork DROPPED for the 0.56 bump — the only local delta was the
+# MAX_NUM_STREAMS 32→256 bump, which we are intentionally not carrying
+# forward; stock libp2p-kad 0.48 is used from crates.io.
+# libp2p-tls: vendored 0.6.2 fork adding a post-quantum, pure-NTRU QUIC
+# key-exchange group (sntrup761) — `make_client_config`/`make_server_config`
+# set `provider.kx_groups = [SNTRUP761]`, so QUIC (libp2p-quic → quinn → rustls)
+# negotiates NTRU instead of X25519. See `crates/libp2p-tls/src/sntrup761_kx.rs`.
+libp2p-tls = { path = "crates/libp2p-tls" }
 
 [profile.release]
 # rpath = false is important to make Go bindings work

@@ -8,23 +8,23 @@
 //!
 //! - `prover_cache: HashMap<Vec<u8>, ProverInfo>` — address → info
 //! - `filter_cache: HashMap<Vec<u8>, Vec<Vec<u8>>>` — confirmation
-//!   filter → sorted list of prover addresses with an active
-//!   allocation under that filter
+//! filter → sorted list of prover addresses with an active
+//! allocation under that filter
 //! - `address_to_filters: HashMap<Vec<u8>, Vec<Vec<u8>>>` — reverse
-//!   index from prover address to the filters it's allocated under
+//! index from prover address to the filters it's allocated under
 //!
 //! Differences from Go:
 //!
 //! 1. We don't yet implement the `RollingFrecencyCritbitTrie` that Go
-//!    uses for `FindNearestAndApproximateNeighbors`. For now we store
-//!    filter → sorted `Vec<Vec<u8>>` and do a linear scan. Fine up to
-//!    ~10 K provers per filter.
+//! uses for `FindNearestAndApproximateNeighbors`. For now we store
+//! filter → sorted `Vec<Vec<u8>>` and do a linear scan. Fine up to
+//! ~10 K provers per filter.
 //! 2. We iterate the persisted blob cache
-//!    (`RocksHypergraphStore::for_each_vertex_underlying`), not a
-//!    live hypergraph iterator.
+//! (`RocksHypergraphStore::for_each_vertex_underlying`), not a
+//! live hypergraph iterator.
 //! 3. No locking — the registry is rebuilt from scratch on each
-//!    `refresh()` and is read-only after that. Concurrent readers can
-//!    wrap in an `Arc<RwLock<_>>` at the call site if needed.
+//! `refresh()` and is read-only after that. Concurrent readers can
+//! wrap in an `Arc<RwLock<_>>` at the call site if needed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -304,30 +304,35 @@ impl InMemoryProverRegistry {
             .collect()
     }
 
-    pub fn get_active_provers(&self, filter: &[u8]) -> Vec<&ProverInfo> {
+    pub fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Vec<&ProverInfo> {
         let Some(addrs) = self.filter_cache.get(filter) else {
             return Vec::new();
         };
-        addrs
-            .iter()
-            .filter_map(|a| self.prover_cache.get(a))
-            .filter(|p| {
-                // Eligibility is determined by ALLOCATION status only, matching
-                // `get_ordered_provers` (which documents why) and Go's
-                // authoritative committee filter. The prover's aggregate
-                // `status` is a derived rollup whose freshness depends on
-                // materializer ordering; gating on it here excludes a
-                // newly-confirmed prover (allocation just flipped Active but the
-                // per-filter Confirm hasn't refreshed the prover rollup) from
-                // leader rotation and the quorum weight, stalling the committee
-                // until the rollup catches up. A terminal prover (kicked/
-                // rejected) has no Active allocation, so it's still excluded.
-                p.allocations.iter().any(|alloc| {
-                    alloc.status == ProverStatus::Active
-                        && alloc.confirmation_filter == filter
-                })
-            })
-            .collect()
+        let members = |lenient: bool| -> Vec<&ProverInfo> {
+            addrs
+                .iter()
+                .filter_map(|a| self.prover_cache.get(a))
+                .filter(|p| p.allocations.iter().any(|alloc| {
+                    alloc.confirmation_filter == filter
+                        && committee_eligible(alloc, frame_number, lenient)
+                }))
+                .collect()
+        };
+        let strict = members(false);
+        // Empty-committee guard: a non-empty (app-shard) committee must never
+        // vanish just because every member was demoted by `effective_status`
+        // (a sole freshly-joined prover in its deferred window, or every member
+        // transiently stale mid-re-confirm) — that would strand an otherwise-
+        // live shard. Fall back to the raw-`Active` floor. Applied identically
+        // by producer + verifier (same `frame_number`), so it can't fork; only
+        // ever LOOSENS the set, never below the old raw-Active set. The global
+        // (empty) filter never needs it — its allocations are never demoted —
+        // so `strict` there already equals the full set.
+        if !strict.is_empty() || filter.is_empty() {
+            strict
+        } else {
+            members(true)
+        }
     }
 
     pub fn get_prover_count(&self, filter: &[u8]) -> usize {
@@ -348,28 +353,27 @@ impl InMemoryProverRegistry {
     /// which it cannot produce proposals (the consensus event loop
     /// is intentionally not activated for non-global provers) and
     /// the chain stalls timing out for the rest of its rank window.
-    pub fn get_ordered_provers(&self, input: &[u8], filter: &[u8]) -> Vec<Vec<u8>> {
+    pub fn get_ordered_provers(&self, input: &[u8], filter: &[u8], frame_number: u64) -> Vec<Vec<u8>> {
         let modulus = bn254_modulus();
         let target = BigInt::from_bytes_be(num_bigint::Sign::Plus, input);
 
-        // Eligibility for leader rotation is determined by *allocation*
-        // status, not the prover's aggregate `status` field. The prover
-        // record's status is a derived rollup whose freshness depends
-        // on the materializer ordering — relying on it here causes a
-        // newly-confirmed prover (allocation just flipped Joining→Active
-        // but the per-filter Confirm hasn't yet refreshed the prover
-        // rollup) to be excluded from leader rotation, stalling the
-        // shard until the rollup catches up.
+        // Eligibility for leader rotation is the SAME committee set as
+        // `get_active_provers` (they MUST agree — the leader at a rank must be a
+        // member others count toward quorum), including the same empty-committee
+        // guard. Determined by allocation `effective_status` via
+        // `committee_eligible` at `frame_number`, not the prover's aggregate
+        // `status` rollup (whose freshness lags the materializer).
         let candidates: Vec<Vec<u8>> = if filter.is_empty() {
-            // Global view: provers with at least one Active allocation
-            // under the empty (global) filter — the genesis allocation.
+            // Global view: provers with a live allocation under the empty
+            // (global) filter — the genesis allocation. Empty-filter
+            // allocations are never ExpiredEpoch, so `lenient` is irrelevant.
             let mut all: Vec<Vec<u8>> = self
                 .prover_cache
                 .iter()
                 .filter(|(_, p)| {
                     p.allocations.iter().any(|a| {
-                        a.status == ProverStatus::Active
-                            && a.confirmation_filter.is_empty()
+                        a.confirmation_filter.is_empty()
+                            && committee_eligible(a, frame_number, false)
                     })
                 })
                 .map(|(addr, _)| addr.clone())
@@ -377,26 +381,37 @@ impl InMemoryProverRegistry {
             all.sort();
             all
         } else {
-            // Per-filter view: provers with an Active allocation under
-            // this filter — not Joining/Leaving/Rejected/Kicked.
+            // Per-filter view: committee members under this filter at
+            // `frame_number` — Active or Leaving-within-grace; not Joining
+            // (incl. deferred-activation), ExpiredLeaving, or terminal. Falls
+            // back to the raw-Active floor if the strict set is empty (same
+            // empty-committee guard as `get_active_provers`).
             let Some(addrs) = self.filter_cache.get(filter) else {
                 return Vec::new();
             };
-            addrs
-                .iter()
-                .filter(|a| {
-                    self.prover_cache
-                        .get(*a)
-                        .map(|p| {
-                            p.allocations.iter().any(|alloc| {
-                                alloc.status == ProverStatus::Active
-                                    && alloc.confirmation_filter == filter
+            let pick = |lenient: bool| -> Vec<Vec<u8>> {
+                addrs
+                    .iter()
+                    .filter(|a| {
+                        self.prover_cache
+                            .get(*a)
+                            .map(|p| {
+                                p.allocations.iter().any(|alloc| {
+                                    alloc.confirmation_filter == filter
+                                        && committee_eligible(alloc, frame_number, lenient)
+                                })
                             })
-                        })
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect()
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            };
+            let strict = pick(false);
+            if strict.is_empty() {
+                pick(true)
+            } else {
+                strict
+            }
         };
 
         let mut scored: Vec<(BigInt, BigInt, Vec<u8>)> = candidates
@@ -417,8 +432,8 @@ impl InMemoryProverRegistry {
     /// Return the single closest prover address to `input` under
     /// `filter`, or `None` if the filter has no provers. Mirrors Go's
     /// `GetNextProver`.
-    pub fn get_next_prover(&self, input: &[u8], filter: &[u8]) -> Option<Vec<u8>> {
-        self.get_ordered_provers(input, filter).into_iter().next()
+    pub fn get_next_prover(&self, input: &[u8], filter: &[u8], frame_number: u64) -> Option<Vec<u8>> {
+        self.get_ordered_provers(input, filter, frame_number).into_iter().next()
     }
 
     pub fn get_all_active_app_shard_provers(&self) -> Vec<&ProverInfo> {
@@ -667,16 +682,16 @@ impl InMemoryProverRegistry {
 /// - `Paused` → `Some(Paused)`
 /// - `Leaving` (within grace) → `Some(Leaving)`
 /// - `ExpiredLeaving` (leave attempt never confirmed/rejected) →
-///   `None` (excluded). The prover socially left the shard even
-///   though the LeaveConfirm never landed — they stopped proving
-///   when they submitted the Leave. Counting them as Active would
-///   inflate every shard's live coverage by the number of stuck
-///   leaves, which hides real halt-risk shards from the proposer
-///   and coverage monitor. Observed in the wild 2026-06-05: 147
-///   halt-risk shards (active ≤ 3) on the network were invisible
-///   to a node that classified every one of them as ≥4 active
-///   because each had 1+ ExpiredLeaving allocations bumping the
-///   count.
+/// `None` (excluded). The prover socially left the shard even
+/// though the LeaveConfirm never landed — they stopped proving
+/// when they submitted the Leave. Counting them as Active would
+/// inflate every shard's live coverage by the number of stuck
+/// leaves, which hides real halt-risk shards from the proposer
+/// and coverage monitor. Observed in the wild 2026-06-05: 147
+/// halt-risk shards (active ≤ 3) on the network were invisible
+/// to a node that classified every one of them as ≥4 active
+/// because each had 1+ ExpiredLeaving allocations bumping the
+/// count.
 /// - `ExpiredJoining`, `Rejected`, `Kicked` → `None` (excluded)
 /// - `Unknown` → `None`
 ///
@@ -701,6 +716,48 @@ fn live_allocation_status(
     }
 }
 
+/// Is `alloc` a member of the epoch-aligned consensus committee at
+/// `frame_number`? SHARED predicate behind both `get_active_provers`
+/// (quorum membership) and `get_ordered_provers` (leader rotation) — they
+/// must agree on the set or a leader could be picked from outside the
+/// quorum. Aligns the committee with the `effective_status` view the rest
+/// of the node (coverage, lifecycle buckets, worker allocator) already
+/// uses; the committee filter was the last holdout on raw `status`.
+///
+/// Included: `Active`, and `Leaving`-within-grace (a departing prover
+/// keeps serving notice — still proving, still counted — and stays in the
+/// FROZEN committee until the E+2 boundary).
+///
+/// Excluded: `Joining` — including a just-confirmed prover still inside
+/// its deferred-activation window (raw `Active` byte but pre-E+2; it is
+/// NOT running its consensus loop yet, so counting it inflated the quorum
+/// denominator and could pick it as a leader that can't produce);
+/// `ExpiredLeaving` (socially left); terminal (kicked/rejected).
+///
+/// The `lenient` flag is the EMPTY-COMMITTEE FLOOR (see the guard in
+/// `get_active_provers`/`get_ordered_provers`). When the strict pass would
+/// leave a non-empty (app-shard) filter with NO members, the lenient pass
+/// re-admits any allocation whose RAW status is still `Active` but which
+/// `effective_status` demoted — i.e. a deferred-activation prover
+/// (raw `Active`, reads `Joining`) or a stale-epoch prover (reads
+/// `ExpiredEpoch`). This guarantees a live shard's committee never vanishes
+/// (a sole freshly-joined prover can still bootstrap its shard; a shard
+/// mid-re-confirm never stalls) — never worse than the old raw-`Active`
+/// filter. It does NOT re-admit never-confirmed joins (raw `Joining`),
+/// `ExpiredLeaving`, or terminal allocations — those genuinely aren't
+/// members. The empty/global filter can never be demoted (`effective_status`
+/// exempts it), so GLOBAL consensus is completely unaffected either way.
+fn committee_eligible(alloc: &ProverAllocationInfo, frame_number: u64, lenient: bool) -> bool {
+    match alloc.effective_status(frame_number) {
+        EffectiveStatus::Active | EffectiveStatus::Leaving => true,
+        // Demoted-but-raw-Active: re-admitted only by the empty-committee floor.
+        EffectiveStatus::Joining | EffectiveStatus::ExpiredEpoch => {
+            lenient && alloc.status == ProverStatus::Active
+        }
+        _ => false,
+    }
+}
+
 /// no-op because the trait doesn't know which store to read from.
 #[derive(Clone)]
 pub struct SharedProverRegistry {
@@ -717,12 +774,10 @@ impl SharedProverRegistry {
     /// Rebuild the cache from the given hypergraph store. Takes a
     /// write lock for the duration of the refresh.
     ///
-    /// Emits a temporary diagnostic `info!("local prover allocations changed", ...)`
-    /// whenever any field of the LOCAL prover (the one whose address
-    /// matches `LOCAL_PROVER_ADDRESS`) or any of its allocations
-    /// changes across a refresh. Useful for diagnosing why a ProverJoin
-    /// never converts to a Confirm — we should see the allocation
-    /// appear as `status=Joining` here after the join materializes.
+    /// Logs an `info!` whenever any field of the LOCAL prover (the one whose
+    /// address matches `LOCAL_PROVER_ADDRESS`) or any of its allocations changes
+    /// across a refresh, giving operators visibility into the join → confirm
+    /// lifecycle (e.g. a freshly-materialized join appearing as `status=Joining`).
     pub fn refresh_from_store(&self, hg_store: &Arc<RocksHypergraphStore>) {
         // Snapshot the local prover BEFORE we take the write lock for
         // the refresh; we'll snapshot again after and diff.
@@ -991,9 +1046,8 @@ impl Default for SharedProverRegistry {
 /// `status_change` event when archives finally materialize the
 /// confirm.
 ///
-/// This is a **temporary diagnostic** for the join-never-confirms
-/// investigation. Remove once the lifecycle's
-/// "registry never sees self" bug is fixed.
+/// Gives operators visibility into whether the local prover's join eventually
+/// converges to a confirmed, active allocation.
 fn log_local_prover_diff(before: Option<&ProverInfo>, after: Option<&ProverInfo>) {
     match (before, after) {
         (None, None) => {}
@@ -1174,13 +1228,13 @@ impl ProverRegistryTrait for SharedProverRegistry {
             .cloned())
     }
 
-    fn get_next_prover(&self, input: &[u8; 32], filter: &[u8]) -> QuilResult<Vec<u8>> {
+    fn get_next_prover(&self, input: &[u8; 32], filter: &[u8], frame_number: u64) -> QuilResult<Vec<u8>> {
         let guard = self
             .inner
             .read()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
         guard
-            .get_next_prover(input, filter)
+            .get_next_prover(input, filter, frame_number)
             .ok_or_else(|| QuilError::NotFound("shard trie empty".into()))
     }
 
@@ -1188,20 +1242,21 @@ impl ProverRegistryTrait for SharedProverRegistry {
         &self,
         input: &[u8; 32],
         filter: &[u8],
+        frame_number: u64,
     ) -> QuilResult<Vec<Vec<u8>>> {
         let guard = self
             .inner
             .read()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-        Ok(guard.get_ordered_provers(input, filter))
+        Ok(guard.get_ordered_provers(input, filter, frame_number))
     }
 
-    fn get_active_provers(&self, filter: &[u8]) -> QuilResult<Vec<ProverInfo>> {
+    fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> QuilResult<Vec<ProverInfo>> {
         let guard = self
             .inner
             .read()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-        Ok(guard.get_active_provers(filter).into_iter().cloned().collect())
+        Ok(guard.get_active_provers(filter, frame_number).into_iter().cloned().collect())
     }
 
     fn get_prover_count(&self, filter: &[u8]) -> QuilResult<usize> {
@@ -1780,7 +1835,7 @@ mod tests {
         assert_eq!(prov_list[0].address, prover_addr);
 
         // Active-filter query too.
-        let active = reg.get_active_provers(&filter);
+        let active = reg.get_active_provers(&filter, 0);
         assert_eq!(active.len(), 1);
     }
 
@@ -1886,13 +1941,13 @@ mod tests {
         // (all zeros), and addr[2] (lowest non-zero bit) should come
         // next.
         let zero = [0u8; 32];
-        let order = reg.get_ordered_provers(&zero, &filter);
+        let order = reg.get_ordered_provers(&zero, &filter, 0);
         assert_eq!(order[0], addrs[0]);
         assert_eq!(order[1], addrs[2]);
         assert_eq!(order.len(), 4);
 
         // get_next_prover returns the single nearest.
-        let next = reg.get_next_prover(&zero, &filter).unwrap();
+        let next = reg.get_next_prover(&zero, &filter, 0).unwrap();
         assert_eq!(next, addrs[0]);
     }
 
@@ -2089,7 +2144,7 @@ mod tests {
 
         assert_eq!(trait_obj.get_prover_count(&filter).unwrap(), 1);
         assert_eq!(trait_obj.get_provers(&filter).unwrap().len(), 1);
-        assert_eq!(trait_obj.get_active_provers(&filter).unwrap().len(), 1);
+        assert_eq!(trait_obj.get_active_provers(&filter, 0).unwrap().len(), 1);
         assert_eq!(
             trait_obj
                 .get_provers_by_status(&filter, ProverStatus::Active)
@@ -2390,23 +2445,23 @@ mod tests {
     /// each scenario.
     ///
     /// Scenarios (10 provers each):
-    ///   1. Join only → Joining
-    ///   2. Join + Confirm → Active
-    ///   3. Join + Reject → excluded
-    ///   4. Join + Expire (grace elapsed) → excluded
-    ///   5. Join + Confirm + Leave → Leaving
-    ///   6. Join + Confirm + Leave + ConfirmLeave (Kicked) → excluded
-    ///   7. Join + Confirm + Leave + RejectLeave → Active again
-    ///   8. Join + Confirm + Leave + ExpireLeave → Active (leave failed)
-    ///   9. Join + Confirm + Pause → Paused
-    ///  10. Join + Confirm + Pause + Resume → Active
+    /// 1. Join only → Joining
+    /// 2. Join + Confirm → Active
+    /// 3. Join + Reject → excluded
+    /// 4. Join + Expire (grace elapsed) → excluded
+    /// 5. Join + Confirm + Leave → Leaving
+    /// 6. Join + Confirm + Leave + ConfirmLeave (Kicked) → excluded
+    /// 7. Join + Confirm + Leave + RejectLeave → Active again
+    /// 8. Join + Confirm + Leave + ExpireLeave → Active (leave failed)
+    /// 9. Join + Confirm + Pause → Paused
+    /// 10. Join + Confirm + Pause + Resume → Active
     ///
     /// Expected counts at frame=1000 with grace=720:
-    ///   Active = 40 (scenarios 2, 7, 8, 10)
-    ///   Joining = 10 (scenario 1)
-    ///   Leaving = 10 (scenario 5)
-    ///   Paused = 10 (scenario 9)
-    ///   excluded = 30 (scenarios 3, 4, 6)
+    /// Active = 40 (scenarios 2, 7, 8, 10)
+    /// Joining = 10 (scenario 1)
+    /// Leaving = 10 (scenario 5)
+    /// Paused = 10 (scenario 9)
+    /// excluded = 30 (scenarios 3, 4, 6)
     #[test]
     fn lifecycle_scenarios_produce_correct_live_summary() {
         use crate::global_intrinsic::materialize::allocation_address;

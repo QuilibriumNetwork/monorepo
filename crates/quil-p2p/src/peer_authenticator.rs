@@ -80,12 +80,12 @@ pub enum AllowedPeerPolicy {
 /// This mirrors the core fields from `PeerAuthenticator` in Go:
 ///
 /// - **authenticated_peers** corresponds to the auth cache maps
-///   (`anyProverCache`, `globalProverCache`, `shardProverCache`) but unified
-///   into a single map keyed by `PeerId`.
+/// (`anyProverCache`, `globalProverCache`, `shardProverCache`) but unified
+/// into a single map keyed by `PeerId`.
 /// - **auth_challenges** holds pending random challenges for peers that have
-///   not yet completed authentication.
+/// not yet completed authentication.
 /// - **service_policies** / **method_policies** mirror the Go struct's
-///   `servicePolicies` and `methodPolicies` for per-RPC authorization.
+/// `servicePolicies` and `methodPolicies` for per-RPC authorization.
 pub struct PeerAuthenticator {
     /// Peers that have completed authentication.
     authenticated_peers: HashMap<PeerId, AuthState>,

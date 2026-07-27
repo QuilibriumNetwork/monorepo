@@ -113,13 +113,37 @@ fn parse_peer_multiaddrs(entries: &[String]) -> Vec<(PeerId, Multiaddr)> {
 
 impl P2PNode {
     pub fn new(config: &P2PConfig) -> quil_types::error::Result<Self> {
-        Self::new_with_options(config, false)
+        Self::new_with_options(config, false, None)
     }
 
-    pub fn new_with_options(config: &P2PConfig, force_ed25519: bool) -> quil_types::error::Result<Self> {
+    /// Construct with the Falcon `q-prover-key` as the libp2p network identity
+    /// (the Rust-only flag-day peer-id). `falcon_signing_key` is the raw
+    /// 1281-byte Falcon-512 signing key from the keystore
+    /// (`FileKeyManager::get_private_key(Falcon512)`). The Ed448
+    /// `config.peer_priv_key` is retained untouched as the seniority root and
+    /// no longer derives the network peer-id.
+    pub fn new_with_falcon_identity(
+        config: &P2PConfig,
+        falcon_signing_key: &[u8],
+    ) -> quil_types::error::Result<Self> {
+        Self::new_with_options(config, false, Some(falcon_signing_key))
+    }
+
+    pub fn new_with_options(
+        config: &P2PConfig,
+        force_ed25519: bool,
+        falcon_signing_key: Option<&[u8]>,
+    ) -> quil_types::error::Result<Self> {
         let (keypair, generated_key_hex) = if force_ed25519 {
             debug!("using Ed25519 identity (--ed25519 flag)");
             (Keypair::generate_ed25519(), None)
+        } else if let Some(falcon_sk) = falcon_signing_key {
+            // Network identity = the Falcon q-prover-key. The Ed448
+            // config.peer_priv_key stays as the seniority root and is NOT the
+            // network peer-id.
+            let kp = Keypair::falcon_from_bytes(falcon_sk)
+                .map_err(|e| QuilError::P2p(format!("falcon identity key: {}", e)))?;
+            (kp, None)
         } else if config.peer_priv_key.is_empty() {
             // Generate Ed448 key
             let id = crate::ed448_identity::Ed448Identity::generate()?;
@@ -197,6 +221,7 @@ impl P2PNode {
     pub fn new_for_worker(
         p2p: &P2PConfig,
         core_id: u32,
+        falcon_signing_key: Option<&[u8]>,
     ) -> quil_types::error::Result<Self> {
         if p2p.peer_priv_key.is_empty() {
             return Err(QuilError::P2p(
@@ -224,11 +249,25 @@ impl P2PNode {
                 )));
             }
         };
-        let real_keypair = Keypair::ed448_from_bytes(&real_seed)
-            .map_err(|e| QuilError::P2p(format!("real ed448 key: {}", e)))?;
-        let real_peer_id = real_keypair.public().to_peer_id();
+        // Real signing identity = the node's network identity. Under the
+        // Falcon flag day this is the Falcon q-prover-key (so a worker's pubsub
+        // messages carry the real node's Falcon peer-id in `msg.from`); falls
+        // back to the legacy Ed448 identity when no Falcon key is supplied.
+        let (real_keypair, real_peer_id) = if let Some(falcon_sk) = falcon_signing_key {
+            let kp = Keypair::falcon_from_bytes(falcon_sk)
+                .map_err(|e| QuilError::P2p(format!("real falcon key: {}", e)))?;
+            let pid = kp.public().to_peer_id();
+            (kp, pid)
+        } else {
+            let kp = Keypair::ed448_from_bytes(&real_seed)
+                .map_err(|e| QuilError::P2p(format!("real ed448 key: {}", e)))?;
+            let pid = kp.public().to_peer_id();
+            (kp, pid)
+        };
 
-        // Synthetic worker key for host identity.
+        // Synthetic worker key for host identity (connection-level only, keeps
+        // worker processes from colliding on the real node's peer-id). Remains
+        // a deterministic Ed448 synthetic derived from the Ed448 seed + core_id.
         let worker_identity =
             crate::ed448_identity::derive_worker_identity(&real_seed, core_id)?;
         let mut worker_seed = [0u8; 57];
@@ -247,7 +286,7 @@ impl P2PNode {
         // Reuse the master's bootstrap-peer parsing logic by calling
         // `new_with_options` first, then swap in the worker-specific
         // identity + signing config.
-        let mut base = Self::new_with_options(p2p, false)?;
+        let mut base = Self::new_with_options(p2p, false, None)?;
         base.keypair = worker_keypair;
         base.peer_id = worker_peer_id;
         base.pubsub_signing_keypair = Some(real_keypair);
@@ -331,7 +370,13 @@ impl P2PNode {
             .with_tokio()
             .with_tcp(
                 libp2p::tcp::Config::default(),
-                libp2p::noise::Config::new,
+                // Post-quantum, forward-secret security upgrade: PQNoise
+                // (sntrup761 KEM) replaces classical Noise_XX_25519 on the TCP
+                // path. See `crate::pqnoise_transport`. QUIC (`.with_quic()`
+                // below) is ALSO post-quantum now: the vendored `libp2p-tls`
+                // fork negotiates the sntrup761 TLS key-exchange group, so both
+                // transports are pure-NTRU — no classical fallback.
+                crate::pqnoise_transport::PqNoiseConfig::new,
                 yamux_config_fn,
             )
             .map_err(|e| QuilError::P2p(format!("tcp: {}", e)))?
@@ -507,6 +552,17 @@ impl P2PNode {
         let observed_addrs: std::sync::Arc<std::sync::RwLock<Vec<String>>> =
             std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
         let observed_addrs_writer = observed_addrs.clone();
+        // P2P prometheus registry: the blossomsub behaviour owns it (its
+        // `blossomsub_*` families are registered at construction); add the
+        // swarm-level `libp2p_*` connection families alongside, and hand the
+        // registry to the P2PHandle so the node can render it.
+        let metrics_registry = swarm.behaviour().blossomsub.metrics_registry();
+        let swarm_metrics = {
+            let mut reg = metrics_registry
+                .lock()
+                .expect("fresh registry lock cannot be poisoned");
+            crate::metrics::SwarmMetrics::register(reg.sub_registry_with_prefix("libp2p"))
+        };
 
         sup.spawn("p2p-swarm", move |cancel_token| async move {
             debug!("P2P swarm event loop started");
@@ -671,17 +727,29 @@ impl P2PNode {
                             libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 let count = swarm.connected_peers().count();
                                 pc_writer.store(count, std::sync::atomic::Ordering::Relaxed);
+                                swarm_metrics
+                                    .connections_established
+                                    .get_or_create(&crate::metrics::SwarmMetrics::direction_of(&endpoint))
+                                    .inc();
+                                swarm_metrics.connected_peers.set(count as i64);
                                 debug!(%peer_id, peers = count, "peer connected");
                             }
-                            libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                            libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, endpoint, .. } => {
                                 let count = swarm.connected_peers().count();
                                 pc_writer.store(count, std::sync::atomic::Ordering::Relaxed);
+                                swarm_metrics
+                                    .connections_closed
+                                    .get_or_create(&crate::metrics::SwarmMetrics::direction_of(&endpoint))
+                                    .inc();
+                                swarm_metrics.connected_peers.set(count as i64);
                                 debug!(%peer_id, cause = ?cause, peers = count, "peer disconnected");
                             }
                             libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                                swarm_metrics.dial_failures.inc();
                                 debug!(peer = ?peer_id, error = %error, "outgoing connection failed");
                             }
                             libp2p::swarm::SwarmEvent::IncomingConnectionError { error, .. } => {
+                                swarm_metrics.incoming_failures.inc();
                                 debug!(error = %error, "incoming connection failed");
                             }
                             libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
@@ -969,7 +1037,7 @@ impl P2PNode {
         });
 
         Ok((
-            P2PHandle { peer_id, cmd_tx, observed_addrs, peer_count },
+            P2PHandle { peer_id, cmd_tx, observed_addrs, peer_count, metrics_registry },
             msg_rx,
         ))
     }
@@ -983,6 +1051,9 @@ pub struct P2PHandle {
     observed_addrs: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
     /// Connected peer count, updated by the swarm event loop.
     peer_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// P2P prometheus registry (`blossomsub_*` + `libp2p_*` families),
+    /// rendered on demand via [`render_metrics`](Self::render_metrics).
+    metrics_registry: crate::metrics::SharedRegistry,
 }
 
 impl P2PHandle {
@@ -1003,9 +1074,9 @@ impl P2PHandle {
     /// can age in transit through honest relayers who shouldn't be penalised.
     pub async fn register_peer_info_staleness_validator(&self, bitmask: Vec<u8>) {
         let validator: Box<
-            dyn Fn(&PeerId, &[u8]) -> blossomsub::ValidationResult + Send + Sync,
+            dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync,
         > = Box::new(|_peer, data| {
-            use blossomsub::ValidationResult;
+            use crate::ValidationResult;
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1177,6 +1248,13 @@ impl P2PHandle {
         self.peer_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Render the p2p prometheus registry (blossomsub mesh/graft/prune/
+    /// message families + libp2p connection families) to prometheus text.
+    /// Empty string if the registry is unavailable — never fails.
+    pub fn render_metrics(&self) -> String {
+        crate::metrics::render(&self.metrics_registry)
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.cmd_tx.send(P2PCommand::Shutdown).await;
     }
@@ -1216,6 +1294,9 @@ impl P2PHandle {
             cmd_tx,
             observed_addrs: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
             peer_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            metrics_registry: std::sync::Arc::new(std::sync::Mutex::new(
+                prometheus_client::registry::Registry::default(),
+            )),
         }
     }
 }
@@ -1232,7 +1313,7 @@ enum P2PCommand {
     /// PeerInfo/KeyRegistry before the composite broker re-broadcasts them).
     RegisterValidator {
         bitmask: Vec<u8>,
-        validator: Box<dyn Fn(&PeerId, &[u8]) -> blossomsub::ValidationResult + Send + Sync>,
+        validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync>,
     },
     Publish {
         bitmask: Vec<u8>,

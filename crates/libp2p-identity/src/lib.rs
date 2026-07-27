@@ -40,6 +40,7 @@
     feature = "secp256k1",
     feature = "ed25519",
     feature = "ed448",
+    feature = "falcon",
     feature = "rsa"
 ))]
 mod proto {
@@ -55,6 +56,9 @@ pub mod ed25519;
 
 #[cfg(feature = "ed448")]
 pub mod ed448;
+
+#[cfg(feature = "falcon")]
+pub mod falcon;
 
 #[cfg(all(feature = "rsa", not(target_arch = "wasm32")))]
 pub mod rsa;
@@ -72,6 +76,7 @@ mod peer_id;
     feature = "secp256k1",
     feature = "ed25519",
     feature = "ed448",
+    feature = "falcon",
     feature = "rsa"
 ))]
 impl zeroize::Zeroize for proto::PrivateKey {
@@ -85,6 +90,7 @@ impl zeroize::Zeroize for proto::PrivateKey {
     feature = "secp256k1",
     feature = "ed25519",
     feature = "ed448",
+    feature = "falcon",
     feature = "rsa"
 ))]
 impl From<&PublicKey> for proto::PublicKey {
@@ -115,6 +121,11 @@ impl From<&PublicKey> for proto::PublicKey {
                 Type: proto::KeyType::Ed448,
                 Data: key.to_bytes(),
             },
+            #[cfg(feature = "falcon")]
+            keypair::PublicKeyInner::Falcon(key) => proto::PublicKey {
+                Type: proto::KeyType::Falcon,
+                Data: key.to_bytes(),
+            },
         }
     }
 }
@@ -133,6 +144,7 @@ pub enum KeyType {
     Secp256k1,
     Ecdsa,
     Ed448,
+    Falcon,
 }
 
 impl std::fmt::Display for KeyType {
@@ -143,6 +155,7 @@ impl std::fmt::Display for KeyType {
             KeyType::Secp256k1 => f.write_str("Secp256k1"),
             KeyType::Ecdsa => f.write_str("Ecdsa"),
             KeyType::Ed448 => f.write_str("Ed448"),
+            KeyType::Falcon => f.write_str("Falcon"),
         }
     }
 }

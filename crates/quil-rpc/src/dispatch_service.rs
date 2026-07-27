@@ -57,10 +57,10 @@ const DOMAIN_DELETE: &[u8] = b"delete";
 /// (`node/dispatch/dispatch_service.go` ~397-440). Both operations sign
 /// the *same* two messages, differing only in the domain string:
 ///
-///   - hub signature:   `domain || inbox_public_key`, verified against
-///     `hub_public_key` with `hub_signature`.
-///   - inbox signature: `domain || hub_public_key`, verified against
-///     `inbox_public_key` with `inbox_signature`.
+///   - hub signature: `domain || inbox_public_key`, verified against
+/// `hub_public_key` with `hub_signature`.
+/// - inbox signature: `domain || hub_public_key`, verified against
+/// `inbox_public_key` with `inbox_signature`.
 ///
 /// Uses `quil_crypto::ed448_verify` (RFC 8032 pure Ed448, empty
 /// context) which mirrors Go's
@@ -112,11 +112,11 @@ pub struct DispatchRpcServer {
     /// Set of 3-byte shard filters this node is responsible for storing.
     ///
     /// Semantics (SAFE-by-default, differs intentionally from Go):
-    ///   - `None`     => responsible for ALL filters (permissive). This is
-    ///     the default and preserves current behavior — external dispatch
-    ///     keeps working. Archive nodes stay `None` (they store all).
-    ///   - `Some(set)` => enforce membership; puts/gets/syncs for a filter
-    ///     not in the set are `permission_denied`.
+    ///   - `None` => responsible for ALL filters (permissive). This is
+    /// the default and preserves current behavior — external dispatch
+    /// keeps working. Archive nodes stay `None` (they store all).
+    /// - `Some(set)` => enforce membership; puts/gets/syncs for a filter
+    /// not in the set are `permission_denied`.
     ///
     /// Mirrors Go `dispatch_service.go`'s `SetResponsibleFilters` /
     /// `IsResponsibleForFilter`, except Go defaults to an EMPTY set

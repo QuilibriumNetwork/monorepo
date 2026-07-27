@@ -8,12 +8,12 @@
 //! - [`request_to_payload`] -- serialize a `MessageRequest` into canonical bytes.
 //!
 //! NOT ported (service-dependent; needs the HypergraphIntrinsic
-//! + HypergraphCrdt bridge from task #64):
+//! + HypergraphCrdt bridge):
 //!
 //! - `ValidateMessage`, `ProcessMessage`, `handleBundle`,
-//!   `processIndividualMessage`, `handleDeploy`, `tryGetIntrinsic`
+//! `processIndividualMessage`, `handleDeploy`, `tryGetIntrinsic`
 //! - `Prove`, `Lock`, `Unlock` — Lock can compose on top of
-//!   `HypergraphLockState` once wiring lands.
+//! `HypergraphLockState` once wiring lands.
 
 use num_bigint::BigInt;
 use quil_types::error::{QuilError, Result};
@@ -115,11 +115,11 @@ pub fn peek_top_level_kind(input: &[u8]) -> Result<MessageKindTopLevel> {
 ///
 /// ```go
 /// isHypergraphOp := op.GetHypergraphDeploy() != nil ||
-///     op.GetHypergraphUpdate() != nil ||
-///     op.GetVertexAdd() != nil ||
-///     op.GetVertexRemove() != nil ||
-///     op.GetHyperedgeAdd() != nil ||
-///     op.GetHyperedgeRemove() != nil
+/// op.GetHypergraphUpdate() != nil ||
+/// op.GetVertexAdd() != nil ||
+/// op.GetVertexRemove() != nil ||
+/// op.GetHyperedgeAdd() != nil ||
+/// op.GetHyperedgeRemove() != nil
 /// ```
 pub fn request_is_hypergraph_op(request: &MessageRequest) -> bool {
     matches!(
@@ -141,19 +141,19 @@ pub fn request_is_hypergraph_op(request: &MessageRequest) -> bool {
 /// engine's rules.
 ///
 /// - **HypergraphDeploy**: `len(rdf_schema) + len(read) + len(write) + len(owner)`
-///   (concatenated byte count across the three keys + schema).
+/// (concatenated byte count across the three keys + schema).
 /// - **HypergraphUpdate**: same shape.
 /// - **VertexAdd**: delegates to the per-op helper via the packed
-///   proof-chunk count (55 bytes per proof).
+/// proof-chunk count (55 bytes per proof).
 /// - **VertexRemove**: constant 64.
 /// - **HyperedgeAdd**: cost = atom count under the extrinsic tree.
-///   We can't decode that without the lazy tree — callers pass a
-///   `hyperedge_atom_count_hint` when they know it, else cost defaults
-///   to zero.
+/// We can't decode that without the lazy tree — callers pass a
+/// `hyperedge_atom_count_hint` when they know it, else cost defaults
+/// to zero.
 /// - **HyperedgeRemove**: constant 64.
 /// - Any other request variant (including `None`, prover ops, token
-///   ops, compute ops): `0`, matching Go's final
-///   `return big.NewInt(0), nil`.
+/// ops, compute ops): `0`, matching Go's final
+/// `return big.NewInt(0), nil`.
 pub fn get_cost_from_request(
     request: &MessageRequest,
     hyperedge_atom_count_hint: u64,

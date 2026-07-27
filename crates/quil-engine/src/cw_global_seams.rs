@@ -1,0 +1,408 @@
+//! Real-state implementations of the commonware-simplex consensus seams for
+//! GLOBAL consensus (P2b). These bridge `quil-cw-consensus`'s three narrow seam
+//! traits to Quilibrium's existing global-chain machinery:
+//!
+//! - [`GlobalSeamProposer`] (`GlobalProposer`) — `propose` builds the next frame
+//! via `LeaderProvider::prove_next_state`; `verify` runs `GlobalFrameVerifier`.
+//! - [`GlobalSeamSink`] (`FrameSink`) — ships frame bytes to the committee over
+//! the CW `:8340` transport on the dedicated block channel (channel 3).
+//! - [`GlobalSeamFinalizer`] (`FrameFinalizer`) — persists + materializes on
+//! finalize, writes a candidate on notarize.
+//!
+//! The simplex digest is the 32-byte global-frame identity
+//! (`Poseidon(header.output)`), so `digest ↔ Identity` is a direct byte map.
+//!
+//! This module is self-contained (it does not yet replace the live
+//! `activate_consensus` path — that swap is P2c). It compiles against the real
+//! interfaces so the type bridges are validated ahead of wiring.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use quil_cw_consensus::adapters::{
+    digest_from_identity, digest_to_identity, Digest, FrameFinalizer, FrameSink, GlobalProposer,
+    Recipients,
+};
+use quil_cw_consensus::falcon_base::FalconPublicKey;
+
+use quil_consensus::leader_provider::LeaderProvider;
+use quil_consensus::models::State;
+use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+use quil_types::store::{ClockStore, Transaction};
+
+use crate::consensus_types::GlobalState;
+use crate::consensus_wire::{decode_global_frame, encode_global_frame};
+use crate::frame_validator::GlobalFrameVerifier;
+
+/// No-op transaction for the non-batched clock-store writes on the consensus
+/// path (mirrors the local `NoTxn` in `archive_sync.rs`).
+struct NoopTxn;
+impl Transaction for NoopTxn {
+    fn get(&self, _: &[u8]) -> quil_types::error::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn set(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> {
+        Ok(())
+    }
+    fn commit(self: Box<Self>) -> quil_types::error::Result<()> {
+        Ok(())
+    }
+    fn delete(&self, _: &[u8]) -> quil_types::error::Result<()> {
+        Ok(())
+    }
+    fn abort(self: Box<Self>) -> quil_types::error::Result<()> {
+        Ok(())
+    }
+    fn new_iter(
+        &self,
+        _: &[u8],
+        _: &[u8],
+    ) -> quil_types::error::Result<Box<dyn quil_types::store::Iterator>> {
+        Err(quil_types::error::QuilError::NotFound("noop".into()))
+    }
+    fn delete_range(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> {
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Rebuild a `GlobalFrame` from a produced/finalized `State<GlobalState>`.
+/// Mirrors the finalized-frame rebuild at `archive_sync.rs:1932`.
+fn global_frame_from_state(state: &State<GlobalState>) -> GlobalFrame {
+    let app = &state.state;
+    let header = GlobalFrameHeader {
+        frame_number: app.frame_number,
+        rank: app.rank,
+        timestamp: app.timestamp,
+        difficulty: app.difficulty,
+        output: app.output.clone(),
+        parent_selector: app.parent_selector.clone(),
+        prover: app.prover.clone(),
+        prover_tree_commitment: app.prover_tree_commitment.clone(),
+        requests_root: app.requests_root.clone(),
+        ..Default::default()
+    };
+    GlobalFrame {
+        header: Some(header),
+        requests: app.messages.clone(),
+    }
+}
+
+/// Frame identity (`Poseidon(output)[..32]`) as the consensus digest.
+fn frame_digest(header: &GlobalFrameHeader) -> Option<Digest> {
+    let id = quil_crypto::poseidon::hash_bytes_to_32(&header.output).ok()?;
+    Some(digest_from_identity(id))
+}
+
+// ---------------------------------------------------------------------------
+// GlobalProposer
+// ---------------------------------------------------------------------------
+
+/// Builds/validates global frames via the existing leader-provider + verifier.
+pub struct GlobalSeamProposer {
+    leader_provider: Arc<dyn LeaderProvider<GlobalState>>,
+    verifier: Arc<GlobalFrameVerifier>,
+    filter: Vec<u8>,
+    /// digest → frame_number, so `propose` can resolve the parent frame number
+    /// from the simplex parent digest (simplex only carries the digest).
+    block_meta: Arc<Mutex<HashMap<Digest, u64>>>,
+}
+
+impl GlobalSeamProposer {
+    pub fn new(
+        leader_provider: Arc<dyn LeaderProvider<GlobalState>>,
+        verifier: Arc<GlobalFrameVerifier>,
+        filter: Vec<u8>,
+    ) -> Self {
+        Self {
+            leader_provider,
+            verifier,
+            filter,
+            block_meta: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Record digest → frame_number (also used by inbound-frame ingestion so a
+    /// synced parent resolves its number).
+    pub fn note_frame(&self, digest: Digest, frame_number: u64) {
+        self.block_meta.lock().unwrap().insert(digest, frame_number);
+    }
+}
+
+impl GlobalProposer for GlobalSeamProposer {
+    fn propose(&self, view: u64, parent_digest: Digest) -> Option<(Digest, Vec<u8>)> {
+        // parent digest bytes == prior frame identity (Poseidon(output)).
+        let prior_state_id: Vec<u8> = digest_to_identity(&parent_digest).to_vec();
+        let prior_frame_number = self
+            .block_meta
+            .lock()
+            .unwrap()
+            .get(&parent_digest)
+            .copied()
+            .unwrap_or(0);
+
+        let state = self
+            .leader_provider
+            .prove_next_state(view, &self.filter, prior_frame_number, &prior_state_id)
+            .ok()?;
+
+        let frame = global_frame_from_state(&state);
+        let header = frame.header.as_ref()?;
+        let digest = frame_digest(header)?;
+        let frame_number = header.frame_number;
+        let bytes = encode_global_frame(&frame).ok()?;
+
+        self.block_meta.lock().unwrap().insert(digest, frame_number);
+        Some((digest, bytes))
+    }
+
+    fn verify(&self, view: u64, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
+        let Some(bytes) = bytes else {
+            // Block not yet delivered — nullify rather than vote blind.
+            tracing::warn!(view, "cw verify: block not delivered (nullify)");
+            return false;
+        };
+        let Ok(frame) = decode_global_frame(&bytes) else {
+            tracing::warn!(view, "cw verify: undecodable block (nullify)");
+            return false;
+        };
+        let Some(header) = frame.header.as_ref() else {
+            return false;
+        };
+        // The digest must bind to this frame's identity.
+        if frame_digest(header) != Some(digest) {
+            tracing::warn!(view, frame = header.frame_number, "cw verify: digest mismatch (nullify)");
+            return false;
+        }
+        // Structural + VDF/BLS validation.
+        match self.verifier.validate(&frame) {
+            Ok(true) => {
+                self.block_meta.lock().unwrap().insert(digest, header.frame_number);
+                tracing::debug!(view, frame = header.frame_number, "cw verify: OK (vote)");
+                true
+            }
+            other => {
+                tracing::warn!(view, frame = header.frame_number, result = ?other, "cw verify: validate failed (nullify)");
+                false
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FrameSink
+// ---------------------------------------------------------------------------
+
+/// simplex channel id reserved for out-of-band block (frame-bytes) delivery.
+/// Distinct from the engine's three channels (0=vote, 1=cert, 2=resolver); the
+/// node's inbound router feeds channel-3 payloads into the [`BlockStore`] rather
+/// than the engine.
+pub const CW_BLOCK_CHANNEL: u64 = 3;
+
+/// Ships frame bytes to the committee over the CW `:8340` transport on the
+/// dedicated block channel. The peer's inbound router demuxes channel 3 into its
+/// `BlockStore` so `verify` can find the block behind a proposed digest.
+pub struct GlobalSeamSink {
+    transport: Arc<dyn GlobalConsensusTransport>,
+    peers: Arc<[FalconPublicKey]>,
+}
+
+impl GlobalSeamSink {
+    pub fn new(transport: Arc<dyn GlobalConsensusTransport>, peers: Arc<[FalconPublicKey]>) -> Self {
+        Self { transport, peers }
+    }
+}
+
+impl FrameSink for GlobalSeamSink {
+    fn broadcast(&self, _digest: Digest, bytes: Vec<u8>, recipients: Recipients<FalconPublicKey>) {
+        // Expand recipients; the transport fans out to the whole committee
+        // regardless, so `All` and a forward-subset both deliver safely.
+        let to: Vec<FalconPublicKey> = match recipients {
+            Recipients::All => self.peers.to_vec(),
+            Recipients::Some(r) => r,
+            Recipients::One(r) => vec![r],
+        };
+        self.transport.deliver(CW_BLOCK_CHANNEL, to, bytes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FrameFinalizer
+// ---------------------------------------------------------------------------
+
+/// Hook the node supplies to bump head atomics / `CurrentFrame` when a frame
+/// finalizes (so PeerInfo advertises the real head, catch-up starts from the
+/// right point, and status reflects progress). Called with `(frame_number, rank)`.
+pub type HeadHook = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// Persists + materializes finalized frames; writes candidates on notarize.
+pub struct GlobalSeamFinalizer {
+    clock_store: Arc<dyn ClockStore>,
+    /// Hand finalized frames to the node's existing global-materializer worker
+    /// (which commits the CRDT/prover tree, verifies the root, evicts, marks
+    /// bundles consumed, and drives split/merge rebalance). Reuses the exact
+    /// same `(frame, frame_number)` channel the quil-consensus path fed, so no
+    /// materialize logic is duplicated. Materialize MUST run off the consensus
+    /// task — a slow commit must not stall the engine.
+    mat_job_tx: tokio::sync::mpsc::UnboundedSender<(GlobalFrame, u64)>,
+    /// Bump head atomics / CurrentFrame (node-supplied).
+    head_hook: HeadHook,
+}
+
+impl GlobalSeamFinalizer {
+    pub fn new(
+        clock_store: Arc<dyn ClockStore>,
+        mat_job_tx: tokio::sync::mpsc::UnboundedSender<(GlobalFrame, u64)>,
+        head_hook: HeadHook,
+    ) -> Self {
+        Self { clock_store, mat_job_tx, head_hook }
+    }
+}
+
+impl FrameFinalizer for GlobalSeamFinalizer {
+    fn on_notarized(&self, _view: u64, _digest: Digest, bytes: Option<Vec<u8>>) {
+        // Write the notarized (uncommitted) frame as a candidate so a later
+        // `propose` can build on this tip before it finalizes (the leader
+        // provider resolves the parent from committed-or-candidate).
+        let Some(bytes) = bytes else { return };
+        let Ok(frame) = decode_global_frame(&bytes) else { return };
+        if let Err(e) = self
+            .clock_store
+            .put_global_clock_frame_candidate(&frame, &NoopTxn)
+        {
+            tracing::warn!(error = %e, "put candidate frame failed");
+        }
+    }
+
+    fn on_finalized(&self, _view: u64, _digest: Digest, bytes: Option<Vec<u8>>, _cert: Option<Vec<u8>>) {
+        // Global consensus doesn't need the finalization cert for coverage —
+        // the archives ARE the global committee (no reward-attribution hop).
+        let Some(bytes) = bytes else { return };
+        let Ok(frame) = decode_global_frame(&bytes) else { return };
+        let (frame_number, rank) = match frame.header.as_ref() {
+            Some(h) => (h.frame_number, h.rank),
+            None => return,
+        };
+        // Durable commit, bump head atomics, then hand off to the materialize
+        // worker (non-blocking send; the worker materializes in finalize order).
+        if let Err(e) = self.clock_store.put_global_clock_frame(&frame, &NoopTxn) {
+            tracing::warn!(error = %e, "put finalized frame failed");
+        }
+        (self.head_hook)(frame_number, rank);
+        let _ = self.mat_job_tx.send((frame, frame_number));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live activation orchestration (P2c). Additive: this does NOT replace the
+// existing `activate_consensus` yet — it assembles the simplex-backed global
+// consensus from real dependencies and exposes the minimal contract the node
+// must satisfy (implement `GlobalConsensusTransport`, feed inbound RPC into the
+// returned `inbound` senders). Deleting the quil-consensus glue + swapping the
+// `activate_consensus` call site is the final node-session step (P2c hookup).
+// ---------------------------------------------------------------------------
+
+use quil_cw_consensus::adapters::BlockStore;
+use quil_cw_consensus::engine_host::{spawn_global_host, GlobalEngineParams, GlobalHostHandle};
+use quil_cw_consensus::falcon_simplex::SimplexFalconScheme;
+
+/// Carries simplex's consensus channel messages over the node's `:8340`
+/// transport. The node implements this (over `DirectGlobalConsensusPublisher`),
+/// tagging `channel` so the receiving peer can demux back to the right channel.
+pub trait GlobalConsensusTransport: Send + Sync + 'static {
+    /// Deliver a simplex message on `channel` (0=vote, 1=certificate,
+    /// 2=resolver) to `recipients` over `:8340`.
+    fn deliver(&self, channel: u64, recipients: Vec<FalconPublicKey>, bytes: Vec<u8>);
+}
+
+/// The node's handle to the running simplex-backed global consensus. On each
+/// inbound `:8340` message the node demuxes the channel id:
+/// - channels 0/1/2 (vote/cert/resolver) → `inbound[channel].send(...)`;
+/// - channel 3 (block) → `ingest_block(bytes)` (feeds the shared `BlockStore`).
+pub struct GlobalConsensusCwHandle {
+    pub inbound: [tokio::sync::mpsc::UnboundedSender<quil_cw_consensus::p2p_bridge::Message<FalconPublicKey>>; 3],
+    /// Feed a peer-delivered frame's canonical bytes into the engine's
+    /// `BlockStore` (so `verify` finds the block behind a proposed digest) and
+    /// record its digest→frame_number mapping. Idempotent; drops malformed bytes.
+    pub ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+}
+
+/// Assemble + start the simplex-backed global consensus from real dependencies.
+/// Must be called from within the node's tokio runtime (spawns the outbound
+/// drain task there); the engine itself runs on its own runtime thread.
+///
+/// `mat_job_tx` is the node's existing global-materializer channel (reused so
+/// finalized frames run through the same commit/evict/rebalance worker). The
+/// block bytes are shipped by the sink over the CW transport (channel 3); the
+/// node must route inbound channel-3 payloads back into `ingest_block`.
+#[allow(clippy::too_many_arguments)]
+pub fn activate_global_consensus_cw(
+    scheme: SimplexFalconScheme,
+    peers: Arc<[FalconPublicKey]>,
+    leader_provider: Arc<dyn LeaderProvider<GlobalState>>,
+    verifier: Arc<GlobalFrameVerifier>,
+    clock_store: Arc<dyn ClockStore>,
+    mat_job_tx: tokio::sync::mpsc::UnboundedSender<(GlobalFrame, u64)>,
+    head_hook: HeadHook,
+    filter: Vec<u8>,
+    epoch: u64,
+    genesis_digest: quil_cw_consensus::adapters::Digest,
+    genesis_frame_number: u64,
+    leader_timeout_secs: u64,
+    transport: Arc<dyn GlobalConsensusTransport>,
+) -> GlobalConsensusCwHandle {
+    // Seams over real state.
+    let proposer = Arc::new(GlobalSeamProposer::new(leader_provider, verifier, filter));
+    // Seed the parent map so the FIRST proposal resolves the genesis parent's
+    // frame number (block_meta is otherwise empty → prior_frame_number 0).
+    proposer.note_frame(genesis_digest, genesis_frame_number);
+    let sink = Arc::new(GlobalSeamSink::new(transport.clone(), peers.clone()));
+    let finalizer = Arc::new(GlobalSeamFinalizer::new(clock_store, mat_job_tx, head_hook));
+
+    // Shared block store: `propose` inserts our own frame; the node inserts
+    // peer-delivered frames via `ingest_block`; `verify`/`Relay`/`Reporter`
+    // read it.
+    let store = BlockStore::new();
+
+    // Host the engine on its own runtime thread.
+    let GlobalHostHandle { inbound, mut outbound } = spawn_global_host(
+        scheme,
+        peers,
+        proposer.clone(),
+        sink,
+        finalizer,
+        store.clone(),
+        GlobalEngineParams::new("global", epoch, genesis_digest)
+            .with_leader_timeout_secs(leader_timeout_secs),
+    );
+
+    // Drain the engine's outbound (votes/certs/resolver) onto the :8340 transport.
+    tokio::spawn(async move {
+        while let Some(ob) = outbound.recv().await {
+            transport.deliver(ob.channel, ob.recipients, ob.bytes);
+        }
+    });
+
+    // Block ingress: decode a peer frame, compute its identity digest, insert
+    // into the store, and note digest→frame_number for parent resolution.
+    let ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync> = {
+        let store = store.clone();
+        let proposer = proposer.clone();
+        Arc::new(move |bytes: Vec<u8>| {
+            let Ok(frame) = decode_global_frame(&bytes) else {
+                tracing::debug!("cw block ingress: undecodable frame, dropping");
+                return;
+            };
+            let Some(header) = frame.header.as_ref() else { return };
+            let Some(digest) = frame_digest(header) else { return };
+            let frame_number = header.frame_number;
+            store.put(digest, bytes);
+            proposer.note_frame(digest, frame_number);
+            tracing::debug!(frame = frame_number, "cw block ingress: stored peer frame");
+        })
+    };
+
+    GlobalConsensusCwHandle { inbound, ingest_block }
+}

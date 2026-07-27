@@ -91,20 +91,20 @@ pub struct CanonicalCapability {
 /// `node/consensus/global/global_consensus_engine.go:1585-1647`):
 ///
 /// - **Process mode** — if either `worker_p2p_multiaddrs` or
-///   `worker_stream_multiaddrs` contains a non-empty entry, the node
-///   is running workers as separate processes with their own ports.
-///   For each worker, the reachability uses that worker's own
-///   addresses: announce variant first (`worker_announce_p2p[i]` /
-///   `worker_announce_stream[i]`), then listen variant
-///   (`worker_p2p_multiaddrs[i]` / `worker_stream_multiaddrs[i]`),
-///   then falling back to master's addresses if neither is set for
-///   that index.
+/// `worker_stream_multiaddrs` contains a non-empty entry, the node
+/// is running workers as separate processes with their own ports.
+/// For each worker, the reachability uses that worker's own
+/// addresses: announce variant first (`worker_announce_p2p[i]` /
+/// `worker_announce_stream[i]`), then listen variant
+/// (`worker_p2p_multiaddrs[i]` / `worker_stream_multiaddrs[i]`),
+/// then falling back to master's addresses if neither is set for
+/// that index.
 ///
 /// - **Thread mode** — otherwise, workers run as in-process tokio
-///   tasks sharing the master's BlossomSub instance. Each worker's
-///   reachability uses the master's `pubsub_addr` and `stream_addrs`
-///   verbatim; only the filter varies. This is the default for the
-///   Rust port.
+/// tasks sharing the master's BlossomSub instance. Each worker's
+/// reachability uses the master's `pubsub_addr` and `stream_addrs`
+/// verbatim; only the filter varies. This is the default for the
+/// Rust port.
 ///
 /// Index `i` into the per-worker config arrays corresponds to
 /// `core_id = i + 1` (core 0 is reserved for the master). Workers with

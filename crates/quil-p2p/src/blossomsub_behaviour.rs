@@ -1,29 +1,50 @@
-//! Bridge from the hardened `blossomsub` crate (a fork of libp2p-gossipsub with
-//! bitmask-composite topics) to the public surface that `node.rs` and the rest
-//! of `quil-p2p` expect.
+//! Bridge from stock libp2p `gossipsub` to the public surface that `node.rs`
+//! and the rest of `quil-p2p` expect.
 //!
-//! Historically the BlossomSub `NetworkBehaviour` lived in-crate (in a
-//! now-deleted `behaviour` module). Stage 6 of the rewrite re-pointed the
-//! production path at the `blossomsub` crate while preserving the exact public
-//! API, and Stage 7 deleted the old in-crate implementation entirely. The fork
-//! is now the sole implementation. `BlossomSubBehaviour` is a thin newtype
-//! `NetworkBehaviour` wrapper around [`blossomsub::Behaviour`]:
+//! swaps the hardened `blossomsub` fork for stock
+//! [`libp2p::gossipsub`] to remove the custom mesh layer as a variable. The
+//! public API of this module is unchanged (`BlossomSubBehaviour`,
+//! `BlossomSubEvent`, `ValidationResult`, every method `node.rs` calls), so no
+//! consumer outside this file changes shape.
 //!
-//!  * It maps the fork's [`blossomsub::Event`] to the historical
-//!    [`BlossomSubEvent`] at the swarm boundary (decoding the fork's internal
-//!    `Message` back into a `pb::Message` plus the 33-byte message id).
-//!  * It generates the `NeedPeers` event (the fork, like upstream gossipsub,
-//!    has no such event) from a heartbeat-cadence low-mesh / direct-peer
-//!    disconnect check.
-//!  * Signing-identity late-binding and per-bitmask validators live INSIDE the
-//!    fork (`set_signing_identity` / `register_validator`); the wrapper only
-//!    forwards to them so they run on the fork's own receive/publish paths.
+//! ## Wire note (deliberate, flag-day)
+//! Stock gossipsub uses **String** topics (`TopicHash { hash: String }`) and a
+//! `topic: string` RPC proto field; it cannot carry raw-byte bitmasks on the
+//! wire the way the fork's `bitmask: bytes` proto did. We therefore hex-encode
+//! each bitmask as the gossipsub topic string (identity-hash `IdentTopic`, so
+//! the topic bytes == `hex(bitmask)` verbatim). The public API stays
+//! `Vec<u8>` bitmasks — the hex is purely internal. This makes the gossip wire
+//! a new **Rust-only** wire (not compatible with Go / old-blossomsub peers),
+//! consistent with the rest of the re-substrate hard fork (Falcon sigs, tree).
+//!
+//! ## Feature parity notes
+//! * **Late-bind signing identity.** Stock gossipsub fixes
+//! `MessageAuthenticity` at construction. We bootstrap with a throwaway
+//! signed key and rebuild the behaviour with the real key in
+//! [`set_signing_identity`](BlossomSubBehaviour::set_signing_identity)
+//! (always called before the swarm polls / before any subscribe, so no
+//! state is lost).
+//! * **Per-bitmask validators.** Stock gossipsub validates asynchronously via
+//! `ValidationMode` + `report_message_validation_result`. We enable
+//! `validate_messages()` and run the registered validator in `poll`,
+//! reporting Accept/Reject/Ignore before surfacing the message — so a
+//! validator still gates forwarding, matching the fork's receive-path hook.
+//! * **Composite/overlapping-bitmask mesh: dropped** (each bitmask is an
+//! exact-match topic). This is the deliberate "remove the variable" step.
+//! * **Forward filter (devnet partitions): not supported on stock gossipsub.**
+//! The methods remain (API compat) but are no-ops; installing one logs a
+//! one-time warning. Devnet bipartite-partition tests won't partition until
+//! this is re-implemented behind a wrapper hook.
+//! * **`send_subscriptions_to_peer`: no-op.** Stock gossipsub re-sends
+//! subscriptions automatically when a connection is (re)established.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use libp2p::core::transport::PortUse;
 use libp2p::core::Endpoint;
+use libp2p::gossipsub;
 use libp2p::identity::Keypair;
 use libp2p::swarm::{
     ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
@@ -31,18 +52,39 @@ use libp2p::swarm::{
 };
 use libp2p::{Multiaddr, PeerId};
 
-use blossomsub::pb;
-use blossomsub::{IdentTopic, TopicHash};
+use crate::protocol::pb;
 
-pub use blossomsub::ValidationResult;
+/// The concrete stock gossipsub behaviour we wrap.
+type Inner = gossipsub::Behaviour;
 
-/// The concrete `blossomsub` behaviour we wrap (identity transform, allow-all
-/// subscription filter — the BlossomSub defaults).
-type Inner = blossomsub::Behaviour;
+/// Result of a per-bitmask message validator. Mirrors the historical
+/// `blossomsub::ValidationResult` so `node.rs`'s validators are unchanged;
+/// maps onto stock gossipsub's [`gossipsub::MessageAcceptance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationResult {
+    /// Deliver and forward the message.
+    Accept,
+    /// Drop the message and penalise the sender's score.
+    Reject,
+    /// Drop the message without penalising the sender (e.g. aged in transit).
+    Ignore,
+}
 
-/// Events emitted by the BlossomSub behaviour to the swarm. Identical in shape
-/// to the historical in-crate `BlossomSubEvent` so `node.rs`'s match arms are
-/// unchanged.
+impl ValidationResult {
+    fn to_acceptance(self) -> gossipsub::MessageAcceptance {
+        match self {
+            ValidationResult::Accept => gossipsub::MessageAcceptance::Accept,
+            ValidationResult::Reject => gossipsub::MessageAcceptance::Reject,
+            ValidationResult::Ignore => gossipsub::MessageAcceptance::Ignore,
+        }
+    }
+}
+
+/// A per-bitmask validator closure.
+type Validator = Arc<dyn Fn(&PeerId, &[u8]) -> ValidationResult + Send + Sync>;
+
+/// Events emitted by the behaviour to the swarm. Identical in shape to the
+/// historical `BlossomSubEvent` so `node.rs`'s match arms are unchanged.
 #[derive(Debug)]
 pub enum BlossomSubEvent {
     /// A message was received from the network.
@@ -62,79 +104,133 @@ pub enum BlossomSubEvent {
     },
 }
 
-/// BlossomSub `NetworkBehaviour`, backed by the `blossomsub` crate.
+/// BlossomSub-compatible `NetworkBehaviour`, backed by stock gossipsub.
 pub struct BlossomSubBehaviour {
-    /// The hardened fork behaviour that does all the real work.
+    /// The stock gossipsub behaviour that does the real work.
     inner: Inner,
-    /// Runtime-tunable mesh/gossip parameters (used for the NeedPeers cadence
-    /// and low-mesh threshold `d_lo`).
+    /// The gossipsub config, kept so `set_signing_identity` can rebuild `inner`
+    /// with the real signing key (stock gossipsub can't re-key in place).
+    config: gossipsub::Config,
+    /// Runtime-tunable mesh/gossip parameters (NeedPeers cadence, `d_lo`).
     params: crate::BlossomsubParams,
-    /// Mirror of our own subscriptions (bitmask bytes), for the getters and
-    /// the NeedPeers computation. The fork's authoritative set is keyed by
-    /// `TopicHash`; this keeps the public `Vec<u8>` view cheap.
+    /// Mirror of our own subscriptions (bitmask bytes), for the getters and the
+    /// NeedPeers computation.
     subscriptions: HashSet<Vec<u8>>,
     /// Direct (always-connected) peers — a disconnect triggers NeedPeers.
     direct_peers: HashSet<PeerId>,
     /// Currently connected peers → live connection count.
     connected_peers: HashMap<PeerId, usize>,
-    /// Peers' advertised subscriptions, tracked from mapped Subscribed/
-    /// Unsubscribed events, for `peer_subscribed_to`.
+    /// Peers' advertised subscriptions, tracked from Subscribed/Unsubscribed.
     peer_subscriptions: HashMap<PeerId, HashSet<Vec<u8>>>,
-    /// Local peer id (author of outgoing messages); set via
-    /// `set_signing_identity` / `set_local_peer_id`.
+    /// Per-bitmask validators, run on the receive path before delivery.
+    validators: HashMap<Vec<u8>, Validator>,
+    /// Local peer id (author of outgoing messages).
     local_peer_id: Option<PeerId>,
-    /// Application-level score overrides, mirrored into the fork's peer score
-    /// (P5). Kept here as the source of truth so `add_application_score` can
-    /// read the current value (the fork exposes only a total-score getter).
+    /// Application-level score overrides (source of truth for the getter).
     application_scores: HashMap<PeerId, f64>,
     /// Wrapper-generated events (NeedPeers) awaiting emission.
     pending_events: VecDeque<BlossomSubEvent>,
     /// Last time the NeedPeers cadence check ran.
     last_need_peers_check: std::time::Instant,
+    /// Whether gossipsub metric families have been registered (guards against
+    /// double-registration on a repeated `set_signing_identity`).
+    metrics_registered: bool,
+    /// Whether we've already warned that forward filters are unsupported.
+    warned_forward_filter: bool,
+    /// Prometheus registry carrying gossipsub's metric families plus the
+    /// swarm-level `libp2p_*` families that `node.rs` registers afterward.
+    metrics_registry: crate::metrics::SharedRegistry,
 }
 
 impl BlossomSubBehaviour {
-    /// Construct with default BlossomSub parameters for `network`.
+    /// Construct with default parameters for `network`.
     pub fn new(network: u8) -> Self {
         Self::with_params(network, crate::BlossomsubParams::default())
     }
 
-    /// Construct with custom mesh/gossip parameters (typically
-    /// `BlossomsubParams::from_p2p_config(...)`). Maps `params` onto a
-    /// `blossomsub::Config` and selects the per-network protocol id.
+    /// Construct with custom mesh/gossip parameters. Bootstraps with a
+    /// throwaway signed key; `set_signing_identity` rebinds the real one.
     pub fn with_params(network: u8, params: crate::BlossomsubParams) -> Self {
         let config = build_config(network, &params);
-        // The fork fixes MessageAuthenticity at construction and its default
-        // ValidationMode is Strict (which requires a signing authenticity).
-        // The real signing key isn't known yet (node.rs installs it right
-        // after via `set_signing_identity`), so bootstrap with a throwaway
-        // signed key and late-bind the real one.
+        // Bootstrap authenticity: Strict validation requires a signing key, and
+        // the real one isn't known yet. `set_signing_identity` (called right
+        // after construction, before the swarm polls or we subscribe) rebuilds
+        // `inner` with the real key.
         let placeholder = Keypair::generate_ed25519();
         let inner = Inner::new(
-            blossomsub::MessageAuthenticity::Signed(placeholder),
-            config,
+            gossipsub::MessageAuthenticity::Signed(placeholder),
+            config.clone(),
         )
-        .expect("valid blossomsub config");
+        .expect("valid gossipsub config");
         Self {
             inner,
+            config,
             params,
             subscriptions: HashSet::new(),
             direct_peers: HashSet::new(),
             connected_peers: HashMap::new(),
             peer_subscriptions: HashMap::new(),
+            validators: HashMap::new(),
             local_peer_id: None,
             application_scores: HashMap::new(),
             pending_events: VecDeque::new(),
             last_need_peers_check: std::time::Instant::now(),
+            metrics_registered: false,
+            warned_forward_filter: false,
+            metrics_registry: Arc::new(std::sync::Mutex::new(
+                prometheus_client::registry::Registry::default(),
+            )),
         }
     }
 
-    /// Late-bind the signing identity for published messages. `peer_id` must be
-    /// the peer id of `keypair` (matches the reference behaviour, which stores
-    /// both); the fork derives the author from the keypair.
+    /// Shared handle to this behaviour's prometheus registry.
+    pub fn metrics_registry(&self) -> crate::metrics::SharedRegistry {
+        self.metrics_registry.clone()
+    }
+
+    /// Late-bind the signing identity for published messages. Rebuilds `inner`
+    /// with the real key (stock gossipsub can't re-key in place), registers the
+    /// gossipsub metric families (once), and enables peer scoring so
+    /// application-score overrides take effect.
     pub fn set_signing_identity(&mut self, peer_id: PeerId, keypair: Keypair) {
         self.local_peer_id = Some(peer_id);
-        self.inner.set_signing_identity(keypair);
+        let inner = if !self.metrics_registered {
+            let mut guard = self.metrics_registry.lock().unwrap();
+            let sub = guard.sub_registry_with_prefix("gossipsub");
+            let inner = Inner::new(
+                gossipsub::MessageAuthenticity::Signed(keypair),
+                self.config.clone(),
+            )
+            .expect("valid gossipsub config")
+            .with_metrics(sub, gossipsub::MetricsConfig::default());
+            drop(guard);
+            self.metrics_registered = true;
+            inner
+        } else {
+            Inner::new(
+                gossipsub::MessageAuthenticity::Signed(keypair),
+                self.config.clone(),
+            )
+            .expect("valid gossipsub config")
+        };
+        self.inner = inner;
+        // Enable peer scoring so `set_application_score` is effective. Default
+        // params are permissive; the application-score channel is what the node
+        // actually drives (peer_authenticator / peer_info).
+        if let Err(e) = self.inner.with_peer_score(
+            gossipsub::PeerScoreParams::default(),
+            gossipsub::PeerScoreThresholds::default(),
+        ) {
+            tracing::warn!(error = %e, "gossipsub peer-score init failed");
+        }
+        // Re-apply any subscriptions / explicit peers registered before the
+        // rebind (defensive; in practice none exist yet).
+        for bitmask in self.subscriptions.clone() {
+            let _ = self.inner.subscribe(&topic_for(&bitmask));
+        }
+        for peer in self.direct_peers.clone() {
+            self.inner.add_explicit_peer(&peer);
+        }
     }
 
     /// Set only the local peer id (test-harness / non-signing path).
@@ -142,78 +238,74 @@ impl BlossomSubBehaviour {
         self.local_peer_id = Some(peer_id);
     }
 
-    /// Register a per-bitmask message validator. Runs on the fork's receive
-    /// path before delivery/forwarding.
+    /// Register a per-bitmask message validator. Runs on the receive path
+    /// (in `poll`) before delivery/forwarding.
     pub fn register_validator(
         &mut self,
         bitmask: Vec<u8>,
         validator: impl Fn(&PeerId, &[u8]) -> ValidationResult + Send + Sync + 'static,
     ) {
-        self.inner
-            .register_validator(TopicHash::from_raw(bitmask), validator);
+        self.validators.insert(bitmask, Arc::new(validator));
     }
 
-    /// Install a per-(source, target) forward filter consulted before relaying
-    /// each message to a mesh peer. When the filter returns `false` for a
-    /// `(source, target)` pair, that target is skipped (the message is still
-    /// delivered to other mesh peers). Replaces any previously installed
-    /// filter. With no filter installed (the default), all forwards are
-    /// allowed. Used by the devnet test proxy to impose bipartite network
-    /// partitions; runs on the fork's relay path (`forward_msg`).
+    /// Install a per-(source, target) forward filter. **Unsupported on stock
+    /// gossipsub** — kept for API compatibility; a no-op with a one-time warning.
     pub fn set_forward_filter(
         &mut self,
-        filter: impl Fn(&PeerId, &PeerId) -> bool + Send + Sync + 'static,
+        _filter: impl Fn(&PeerId, &PeerId) -> bool + Send + Sync + 'static,
     ) {
-        self.inner.set_forward_filter(filter);
+        self.warn_forward_filter_unsupported();
     }
 
-    /// Same as [`Self::set_forward_filter`] but accepts an already-boxed
-    /// filter. Used to install a filter delivered over the swarm command
-    /// channel (which must erase the closure's concrete type).
+    /// Same as [`Self::set_forward_filter`] but boxed. No-op on stock gossipsub.
     pub fn set_forward_filter_boxed(
         &mut self,
-        filter: Box<dyn Fn(&PeerId, &PeerId) -> bool + Send + Sync>,
+        _filter: Box<dyn Fn(&PeerId, &PeerId) -> bool + Send + Sync>,
     ) {
-        self.inner.set_forward_filter_boxed(filter);
+        self.warn_forward_filter_unsupported();
     }
 
-    /// Remove any installed forward filter (all forwards allowed again).
-    pub fn clear_forward_filter(&mut self) {
-        self.inner.clear_forward_filter();
+    /// Remove any installed forward filter. No-op on stock gossipsub.
+    pub fn clear_forward_filter(&mut self) {}
+
+    fn warn_forward_filter_unsupported(&mut self) {
+        if !self.warned_forward_filter {
+            self.warned_forward_filter = true;
+            tracing::warn!(
+                "gossip forward filter is unsupported on stock gossipsub; \
+                 devnet network partitions will not be enforced"
+            );
+        }
     }
 
     /// Subscribe to a bitmask.
     pub fn subscribe(&mut self, bitmask: Vec<u8>) {
-        let topic = IdentTopic::new(bitmask.clone());
-        match self.inner.subscribe(&topic) {
+        match self.inner.subscribe(&topic_for(&bitmask)) {
             Ok(_) => {
                 self.subscriptions.insert(bitmask);
             }
             Err(e) => {
-                tracing::debug!(error = %e, "blossomsub subscribe failed");
+                tracing::debug!(error = %e, "gossipsub subscribe failed");
             }
         }
     }
 
     /// Unsubscribe from a bitmask.
     pub fn unsubscribe(&mut self, bitmask: &[u8]) {
-        let topic = IdentTopic::new(bitmask.to_vec());
-        let _ = self.inner.unsubscribe(&topic);
+        let _ = self.inner.unsubscribe(&topic_for(bitmask));
         self.subscriptions.remove(bitmask);
     }
 
-    /// Publish `data` to `bitmask`. Returns `Ok(())` on success or when the
-    /// message was already published (dedup), `Err` when not subscribed or on
-    /// a publish error — matching the reference behaviour's contract.
+    /// Publish `data` to `bitmask`. `Ok(())` on success or dedup; `Err` when not
+    /// subscribed or on a publish error — matching the historical contract.
     pub fn publish(&mut self, bitmask: Vec<u8>, data: Vec<u8>) -> Result<(), String> {
         if !self.subscriptions.contains(&bitmask) {
             return Err(format!("not subscribed to bitmask {}", hex::encode(&bitmask)));
         }
-        match self.inner.publish(TopicHash::from_raw(bitmask), data) {
+        match self.inner.publish(topic_for(&bitmask).hash(), data) {
             Ok(_) => Ok(()),
-            // Already-seen message: the reference behaviour treated this as a
-            // successful no-op.
-            Err(blossomsub::PublishError::Duplicate) => Ok(()),
+            // Already-seen message: historically a successful no-op.
+            Err(gossipsub::PublishError::Duplicate) => Ok(()),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -229,14 +321,14 @@ impl BlossomSubBehaviour {
         self.inner.blacklist_peer(&peer);
     }
 
-    /// (Re)send our subscriptions to a single peer.
-    pub fn send_subscriptions_to_peer(&mut self, peer: PeerId) {
-        self.inner.send_subscriptions_to_peer(peer);
-    }
+    /// (Re)send our subscriptions to a single peer. **No-op on stock
+    /// gossipsub**, which re-sends subscriptions automatically on (re)connect.
+    pub fn send_subscriptions_to_peer(&mut self, _peer: PeerId) {}
 
     // -- Scoring (P5 application score) ----------------------------------
 
-    /// Total score for a peer (0.0 if unknown to the scorer).
+    /// Total score for a peer (falls back to the mirrored application score if
+    /// the scorer has no entry).
     pub fn score(&self, peer: &PeerId) -> f64 {
         self.inner.peer_score(peer).unwrap_or_else(|| {
             self.application_scores.get(peer).copied().unwrap_or(0.0)
@@ -266,11 +358,9 @@ impl BlossomSubBehaviour {
 
     // -- Introspection getters -------------------------------------------
 
-    /// Mesh peer count for a bitmask. Composite-aware: for a multi-slice
-    /// (composite) bitmask this reports the composite mesh size, not 0.
+    /// Mesh peer count for a bitmask.
     pub fn mesh_peers(&self, bitmask: &[u8]) -> usize {
-        self.inner
-            .mesh_peers_for_subscription(&TopicHash::from_raw(bitmask.to_vec()))
+        self.inner.mesh_peers(&topic_for(bitmask).hash()).count()
     }
 
     /// Read-only access to our own subscription set.
@@ -300,25 +390,18 @@ impl BlossomSubBehaviour {
         self.connected_peers.len()
     }
 
-    /// Sum of mesh peer counts across every subscription — a coarse gauge of
-    /// overall mesh health. Composite-aware (see `mesh_peers`): sums over our
-    /// own subscriptions using `mesh_peers_for_subscription` so composite
-    /// bitmasks contribute their real mesh size instead of 0.
+    /// Sum of mesh peer counts across every subscription.
     pub fn mesh_peer_counts(&self) -> usize {
         self.subscriptions
             .iter()
-            .map(|b| {
-                self.inner
-                    .mesh_peers_for_subscription(&TopicHash::from_raw(b.clone()))
-            })
+            .map(|b| self.inner.mesh_peers(&topic_for(b).hash()).count())
             .sum()
     }
 
     // -- NeedPeers generation --------------------------------------------
 
     /// On a heartbeat cadence, emit `NeedPeers` if any direct peer is
-    /// disconnected or any subscription's mesh is below `d_lo`. Ported from the
-    /// reference behaviour's heartbeat low-mesh + direct-peer disconnect paths.
+    /// disconnected or any subscription's mesh is below `d_lo`.
     fn maybe_emit_need_peers(&mut self) {
         let now = std::time::Instant::now();
         if now.duration_since(self.last_need_peers_check) < self.params.heartbeat_interval {
@@ -336,11 +419,7 @@ impl BlossomSubBehaviour {
 
         let mut low_mesh = false;
         for bitmask in &self.subscriptions {
-            // Composite-aware count: a healthy composite mesh (keyed by slices)
-            // would otherwise read as 0 and fire NeedPeers every heartbeat.
-            let count = self
-                .inner
-                .mesh_peers_for_subscription(&TopicHash::from_raw(bitmask.clone()));
+            let count = self.inner.mesh_peers(&topic_for(bitmask).hash()).count();
             if count < self.params.d_lo {
                 low_mesh = true;
                 break;
@@ -362,11 +441,23 @@ impl Default for BlossomSubBehaviour {
     }
 }
 
-/// Decode the fork's transformed `Message` back into the wire `pb::Message`
-/// that `node.rs` consumes. `node.rs` reads `from`, `data`, and `bitmask`; the
-/// signature/key are not needed post-validation (the fork already verified
-/// them) and are left empty.
-fn to_pb_message(message: blossomsub::Message) -> pb::Message {
+/// The identity-hash gossipsub topic for a bitmask: the topic string is
+/// `hex(bitmask)`, so the on-wire topic bytes are a lossless, UTF-8-safe
+/// encoding of the arbitrary bitmask bytes.
+fn topic_for(bitmask: &[u8]) -> gossipsub::IdentTopic {
+    gossipsub::IdentTopic::new(hex::encode(bitmask))
+}
+
+/// Recover the bitmask bytes from a gossipsub topic hash (identity hash, so the
+/// hash string is the hex topic we published).
+fn bitmask_from_topic(topic: &gossipsub::TopicHash) -> Vec<u8> {
+    hex::decode(topic.as_str()).unwrap_or_default()
+}
+
+/// Decode a stock gossipsub message into the wire `pb::Message` that `node.rs`
+/// consumes. `node.rs` reads `from`, `data`, and `bitmask`; the signature/key
+/// are not needed post-validation (gossipsub already verified them).
+fn to_pb_message(message: gossipsub::Message, bitmask: Vec<u8>) -> pb::Message {
     pb::Message {
         from: message.source.map(|p| p.to_bytes()).unwrap_or_default(),
         data: message.data,
@@ -374,7 +465,7 @@ fn to_pb_message(message: blossomsub::Message) -> pb::Message {
             .sequence_number
             .map(|s| s.to_be_bytes().to_vec())
             .unwrap_or_default(),
-        bitmask: message.topic.into_bytes(),
+        bitmask,
         signature: Vec::new(),
         key: Vec::new(),
     }
@@ -457,30 +548,47 @@ impl NetworkBehaviour for BlossomSubBehaviour {
         loop {
             match self.inner.poll(cx) {
                 Poll::Ready(ToSwarm::GenerateEvent(ev)) => match ev {
-                    blossomsub::Event::Message {
+                    gossipsub::Event::Message {
                         propagation_source,
                         message_id,
                         message,
                     } => {
-                        return Poll::Ready(ToSwarm::GenerateEvent(BlossomSubEvent::Message {
-                            propagation_source,
-                            message_id: message_id.0,
-                            message: to_pb_message(message),
-                        }));
+                        let bitmask = bitmask_from_topic(&message.topic);
+                        // `validate_messages()` is on, so we must report an
+                        // outcome for every message before it is forwarded.
+                        let outcome = match self.validators.get(&bitmask) {
+                            Some(v) => v(&propagation_source, &message.data),
+                            None => ValidationResult::Accept,
+                        };
+                        let _ = self.inner.report_message_validation_result(
+                            &message_id,
+                            &propagation_source,
+                            outcome.to_acceptance(),
+                        );
+                        if outcome == ValidationResult::Accept {
+                            return Poll::Ready(ToSwarm::GenerateEvent(
+                                BlossomSubEvent::Message {
+                                    propagation_source,
+                                    message_id: message_id.0,
+                                    message: to_pb_message(message, bitmask),
+                                },
+                            ));
+                        }
+                        // Rejected / ignored: don't surface, keep polling.
+                        continue;
                     }
-                    blossomsub::Event::Subscribed { peer_id, topic } => {
-                        let bitmask = topic.into_bytes();
+                    gossipsub::Event::Subscribed { peer_id, topic } => {
+                        let bitmask = bitmask_from_topic(&topic);
                         self.peer_subscriptions
                             .entry(peer_id)
                             .or_default()
                             .insert(bitmask.clone());
-                        return Poll::Ready(ToSwarm::GenerateEvent(BlossomSubEvent::Subscribed {
-                            peer_id,
-                            bitmask,
-                        }));
+                        return Poll::Ready(ToSwarm::GenerateEvent(
+                            BlossomSubEvent::Subscribed { peer_id, bitmask },
+                        ));
                     }
-                    blossomsub::Event::Unsubscribed { peer_id, topic } => {
-                        let bitmask = topic.into_bytes();
+                    gossipsub::Event::Unsubscribed { peer_id, topic } => {
+                        let bitmask = bitmask_from_topic(&topic);
                         if let Some(s) = self.peer_subscriptions.get_mut(&peer_id) {
                             s.remove(&bitmask);
                         }
@@ -488,17 +596,16 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                             BlossomSubEvent::Unsubscribed { peer_id, bitmask },
                         ));
                     }
-                    // Not part of the historical event surface — drop and keep
-                    // polling.
-                    blossomsub::Event::GossipsubNotSupported { .. } => continue,
+                    // GossipsubNotSupported / SlowPeer / etc. — not part of the
+                    // historical event surface; drop and keep polling.
+                    _ => continue,
                 },
-                // Non-GenerateEvent ToSwarm variants (NotifyHandler, Dial, ...)
-                // carry the same handler-in type; rewrap with our event type.
-                // `map_out`'s closure never runs for these variants.
+                // Non-GenerateEvent ToSwarm variants carry the same handler-in
+                // type; rewrap with our event type (closure never runs).
                 Poll::Ready(other) => {
-                    return Poll::Ready(other.map_out(|_| {
-                        unreachable!("GenerateEvent handled above")
-                    }));
+                    return Poll::Ready(
+                        other.map_out(|_| unreachable!("GenerateEvent handled above")),
+                    );
                 }
                 Poll::Pending => {
                     self.maybe_emit_need_peers();
@@ -512,24 +619,16 @@ impl NetworkBehaviour for BlossomSubBehaviour {
     }
 }
 
-/// Map [`crate::BlossomsubParams`] onto a [`blossomsub::Config`], selecting the
-/// per-network protocol id. Ported from the reference construction path in
-/// `quil-p2p` (the `pos()`/`dur_ms()` overrides already applied when building
-/// `BlossomsubParams`); here we translate the field names onto the fork's
-/// gossipsub-style config knobs:
-///   d → mesh_n, d_lo → mesh_n_low, d_hi → mesh_n_high,
-///   d_lazy → gossip_lazy, d_out → mesh_outbound_min.
-/// Fields without a fork equivalent (`d_score`, `max_idont_want_messages`) keep
-/// the fork's WAN-hardened defaults (which match the `params::*` defaults).
-fn build_config(network: u8, params: &crate::BlossomsubParams) -> blossomsub::Config {
-    let mut builder = blossomsub::ConfigBuilder::default();
+/// Map [`crate::BlossomsubParams`] onto a [`gossipsub::Config`], selecting the
+/// per-network protocol id and setting the BlossomSub message id
+/// (`[0x01] ++ SHA256(data)`). Fork-only knobs without a stock equivalent
+/// (`mesh_peers_per_subnet`, `mcache_max_bytes`) are dropped.
+fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Config {
+    let mut builder = gossipsub::ConfigBuilder::default();
     builder
-        // Per-network protocol id: mainnet `/blossomsub/2.1.0`, others suffixed
-        // `-network-N`. Stage-2 left `protocol_id_for_network` unused; wire it
-        // here so non-mainnet nodes negotiate a distinct protocol.
         .protocol_id(
             crate::protocol::protocol_id_for_network(network),
-            blossomsub::Version::V1_1,
+            gossipsub::Version::V1_1,
         )
         .history_length(params.history_length)
         .history_gossip(params.history_gossip)
@@ -546,36 +645,33 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> blossomsub::Co
         .unsubscribe_backoff(params.unsubscribe_backoff.as_secs())
         .iwant_followup_time(params.iwant_followup_time)
         .idontwant_message_size_threshold(params.idont_want_message_threshold)
-        .mesh_peers_per_subnet(params.mesh_peers_per_subnet)
-        .mcache_max_bytes(params.mcache_max_bytes)
+        // Per-message size cap (fork used `mcache_max_bytes` for the mcache; the
+        // stock knob is the per-message transmit cap). 16 MiB matches the RPC
+        // frame cap in `protocol.rs`.
+        .max_transmit_size(crate::protocol::MAX_MESSAGE_SIZE)
         // Keep de-duplicated message IDs at least as long as the peer-score
-        // delivery-record cache (TIME_CACHE_DURATION = 120s). If the dedup
-        // cache forgets a message while it is still circulating (heavy
-        // full-coverage forwarders like archives keep messages alive well past
-        // the 60s default under WAN latency), the node re-accepts and
-        // re-forwards a stale message and the scoring layer logs an
-        // "Unexpected delivery trace" (record still `Valid`). 300s covers the
-        // 120s scoring window with WAN margin; the cost is holding msg IDs
-        // (~32B each) a bit longer.
+        // delivery-record window (WAN margin); cost is holding 33-byte ids a bit
+        // longer.
         .duplicate_cache_time(std::time::Duration::from_secs(300))
-        // Inbound signature verification (Go nodes StrictSign). Signed
-        // outbound is late-bound via `set_signing_identity`.
-        .validation_mode(blossomsub::ValidationMode::Strict);
-    builder.build().expect("valid blossomsub config")
+        // Run per-bitmask validators before forwarding (see module docs).
+        .validate_messages()
+        // BlossomSub message id = `[0x01] ++ SHA256(data)`. Stock gossipsub's
+        // default id differs, so we set it explicitly to keep the dedup key
+        // stable across the network.
+        .message_id_fn(|message: &gossipsub::Message| {
+            gossipsub::MessageId::from(crate::node::message_id(&message.data))
+        })
+        // Inbound signature verification (StrictSign); signed outbound is
+        // late-bound via `set_signing_identity`.
+        .validation_mode(gossipsub::ValidationMode::Strict);
+    builder.build().expect("valid gossipsub config")
 }
 
-/// Multi-node end-to-end propagation over REAL libp2p swarms.
-///
-/// The old in-crate `test_harness::TestNetwork` wired several behaviours
-/// together in-memory but only ever asserted connectivity bookkeeping — it had
-/// no true "publish at A is delivered at B/C" assertion, and it depended on the
-/// old behaviour's private test hooks that the `blossomsub` fork doesn't
-/// expose. This is the additive coverage that fills that gap: it spins up three
-/// real swarms (TCP + noise + yamux) around the production
-/// [`BlossomSubBehaviour`] bridge and exercises the entire pipeline —
-/// subscription exchange, StrictSign publish, LEB128+prost wire codec, real
-/// transport, inbound signature verification, and event delivery — which no
-/// single-behaviour unit test in either crate covers.
+/// Multi-node end-to-end propagation over REAL libp2p swarms, now over stock
+/// gossipsub. Spins up three real swarms (TCP + noise + yamux) around the
+/// production [`BlossomSubBehaviour`] bridge and exercises the whole pipeline —
+/// subscription exchange, StrictSign publish, hex-topic mapping, real
+/// transport, inbound signature verification, and event delivery.
 #[cfg(test)]
 mod propagation_tests {
     use super::*;
@@ -595,8 +691,6 @@ mod propagation_tests {
             .expect("tcp transport")
             .with_behaviour(|key| {
                 let mut b = BlossomSubBehaviour::new(0);
-                // Sign with the swarm's own identity so `msg.from` is the local
-                // peer id and StrictSign verification passes on the receiver.
                 b.set_signing_identity(key.public().to_peer_id(), key.clone());
                 Ok(b)
             })
@@ -606,12 +700,8 @@ mod propagation_tests {
     }
 
     /// A message published at the hub reaches every subscribed leaf. Star
-    /// topology (hub + two leaves); `flood_publish` (the BlossomSub default)
-    /// delivers to all subscribed topic peers, so this is deterministic once
-    /// the subscription RPCs have been exchanged — no wall-clock heartbeat
-    /// dependency. Uses a single-bit bitmask so the topic is "simple" (a
-    /// multi-bit bitmask would slice into composite meshes, which the
-    /// `blossomsub` crate's composite tests already cover).
+    /// topology (hub + two leaves); flood-publish (the gossipsub default)
+    /// delivers to all subscribed topic peers once SUBSCRIBE RPCs are exchanged.
     #[tokio::test]
     async fn multi_node_publish_propagates_to_all_subscribers() {
         let bitmask = vec![0x80u8];
@@ -631,7 +721,6 @@ mod propagation_tests {
         hub.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .expect("listen");
 
-        // Learn the hub's concrete listen address.
         let hub_addr: Multiaddr = loop {
             if let SwarmEvent::NewListenAddr { address, .. } = hub.select_next_some().await {
                 break address;
@@ -665,8 +754,6 @@ mod propagation_tests {
                     }
                 }
 
-                // Publish once the hub knows both leaves are subscribed to the
-                // bitmask (their SUBSCRIBE RPCs have arrived).
                 if !published
                     && hub.behaviour().peer_subscribed_to(&a_id, &bitmask)
                     && hub.behaviour().peer_subscribed_to(&b_id, &bitmask)

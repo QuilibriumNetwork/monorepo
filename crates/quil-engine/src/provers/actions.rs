@@ -204,7 +204,9 @@ pub fn build_merge_helpers(
 
     Ok(vec![SeniorityMerge {
         signature: signature.to_vec(),
-        key_type: 4, // KeyTypeEd448
+        // Ed448 seniority key. FIX: was `4` (Decaf448's value, mislabeled
+        // "KeyTypeEd448") — the verify map is Ed448-only now and Ed448 = 0.
+        key_type: quil_types::crypto::KeyType::Ed448 as u32,
         prover_public_key: ed448_pubkey_bytes,
     }])
 }
@@ -278,7 +280,7 @@ pub fn build_shard_merge_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_crypto::Bls48581KeyConstructor;
+    use quil_crypto::FalconKeyConstructor;
     use quil_types::crypto::BlsConstructor;
 
     /// Decode a bundle's single inner request bytes (after stripping the
@@ -294,7 +296,10 @@ mod tests {
 
     /// Generate a real BLS keypair (signer + public key bytes).
     fn bls_keypair() -> (Box<dyn Signer>, Vec<u8>) {
-        Bls48581KeyConstructor.new_key().expect("bls keypair")
+        // Consensus is now Falcon-512 (FN-DSA); the prover bundle
+        // helpers embed `SignatureWithPop`, whose decode gate requires
+        // 666-byte Falcon signatures / 897-byte keys.
+        FalconKeyConstructor.new_key().expect("falcon keypair")
     }
 
     #[test]
@@ -361,7 +366,7 @@ mod tests {
         dp.extend_from_slice(b"PROVER_JOIN");
         let domain = quil_crypto::poseidon::hash_bytes_to_32(&dp).unwrap();
 
-        let bls = Bls48581KeyConstructor;
+        let bls = FalconKeyConstructor;
         assert!(bls.verify_signature_raw(&pk, &sig.signature, &join_message, &domain));
         // POP signature verifies over the pubkey under the POP domain.
         assert!(bls.verify_signature_raw(&pk, &sig.pop_signature, &pk, b"BLS48_POP_SK"));
@@ -372,7 +377,7 @@ mod tests {
         let (signer, pk) = bls_keypair();
         let merge = SeniorityMerge {
             signature: vec![0xAAu8; 114],
-            key_type: 4,
+            key_type: quil_types::crypto::KeyType::Ed448 as u32,
             prover_public_key: vec![0xBBu8; 57],
         };
         let bytes = build_join_bundle(
@@ -388,7 +393,7 @@ mod tests {
         let inner = decode_single_inner(&bytes);
         let join = ProverJoin::from_canonical_bytes(&inner).unwrap();
         assert_eq!(join.merge_targets.len(), 1);
-        assert_eq!(join.merge_targets[0].key_type, 4);
+        assert_eq!(join.merge_targets[0].key_type, quil_types::crypto::KeyType::Ed448 as u32);
         assert_eq!(join.merge_targets[0].prover_public_key, vec![0xBBu8; 57]);
     }
 
@@ -524,7 +529,7 @@ mod tests {
         dp.extend_from_slice(b"PROVER_CONFIRM");
         let domain = quil_crypto::poseidon::hash_bytes_to_32(&dp).unwrap();
 
-        let bls = Bls48581KeyConstructor;
+        let bls = FalconKeyConstructor;
         assert!(bls.verify_signature_raw(&pk, &sig.signature, &msg, &domain));
     }
 
@@ -535,7 +540,7 @@ mod tests {
         let merges = build_merge_helpers(&seed, &bls_pubkey).expect("merge helpers");
         assert_eq!(merges.len(), 1);
         let m = &merges[0];
-        assert_eq!(m.key_type, 4);
+        assert_eq!(m.key_type, quil_types::crypto::KeyType::Ed448 as u32);
         assert!(!m.signature.is_empty());
 
         // The prover_public_key must be the Ed448 public key derived

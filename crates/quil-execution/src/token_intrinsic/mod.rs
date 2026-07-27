@@ -9,17 +9,21 @@
 //! - `pending` — PendingTransactionInput, PendingTransactionOutput, PendingTransaction
 //! - `mint` — MintTransactionInput, MintTransactionOutput, MintTransaction
 
+pub mod coin_accumulator;
 pub mod config;
 pub mod config_resolver;
 pub mod constants;
 pub mod conversions;
 pub mod deploy;
 pub mod input_membership;
+pub mod lattice_ct;
+pub mod legacy_migration;
 pub mod materialize;
 pub mod metadata_schema;
 pub mod mint;
 pub mod rdf_schema;
 pub mod pending;
+pub mod shadow_accumulator;
 pub mod spent_check;
 pub mod transaction;
 pub mod verify;
@@ -41,6 +45,7 @@ pub use pending::{
     TYPE_PENDING_TRANSACTION_INPUT, TYPE_PENDING_TRANSACTION_OUTPUT,
     TYPE_PENDING_TRANSACTION,
 };
+pub use lattice_ct::{TYPE_LATTICE_TRANSACTION, TYPE_LATTICE_MINT, TYPE_LATTICE_PENDING, TYPE_LATTICE_PENDING_CLAIM, TYPE_LATTICE_SHIELD};
 pub use mint::{
     MintTransactionInput, MintTransactionOutput, MintTransaction,
     TYPE_MINT_TRANSACTION_INPUT, TYPE_MINT_TRANSACTION_OUTPUT,

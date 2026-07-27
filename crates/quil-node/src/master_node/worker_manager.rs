@@ -238,30 +238,32 @@ pub(crate) fn init(
                 let clock_store: Arc<dyn quil_types::store::ClockStore> = Arc::new(
                     quil_store::RocksClockStore::new(db_arc.inner()),
                 );
-                let hg_store: Arc<dyn quil_types::store::HypergraphStore> = Arc::new(
-                    quil_store::RocksHypergraphStore::new(db_arc.inner()),
-                );
+                let hg_store_concrete =
+                    Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
+                let hg_store: Arc<dyn quil_types::store::HypergraphStore> =
+                    hg_store_concrete.clone();
                 let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
-                    Arc::new(quil_crypto::KzgInclusionProver);
+                    Arc::new(quil_tries::ShaInclusionProver);
                 let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
                     hg_store,
                     inclusion_prover.clone(),
                 ));
+                // Phase-3: migrated DB → commit this worker shard's state to
+                // the JMT forest. No-op on a non-migrated DB.
+                if quil_forest_migrate::install_forest_if_migrated(
+                    crdt.as_ref(),
+                    hg_store_concrete.as_ref(),
+                ) {
+                    tracing::info!("Phase-3 JMT forest installed on worker-manager CRDT");
+                }
                 // Workers don't sign or verify identities — a default
                 // key manager satisfies the execution engine's
                 // `KeyManager` requirement for state materialization.
-                let bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor> =
-                    Arc::new(quil_crypto::Bls48581KeyConstructor);
                 let worker_key_manager: Arc<dyn quil_types::crypto::KeyManager> =
-                    Arc::new(quil_crypto::DefaultKeyManager::new(bls_constructor));
-                // Bulletproof prover is real; Decaf448 / circuit
-                // compiler still use the noop stubs (no production
-                // impl yet). See the analogous block in the master
-                // setup above for the rationale.
-                let bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver> =
-                    Arc::new(quil_crypto::Decaf448BulletproofProver);
-                let decaf_constructor: Arc<dyn quil_types::crypto::DecafConstructor> =
-                    Arc::new(quil_execution::testing::NoopDecafConstructor);
+                    Arc::new(quil_crypto::DefaultKeyManager::new());
+                // decaf448 bulletproof/decaf providers are retired (the
+                // confidential-value path is now lattice-CT); the circuit
+                // compiler still uses a noop stub (no production impl yet).
                 let circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler> =
                     Arc::new(quil_execution::testing::NoopCircuitCompiler);
                 let clock_store_for_exec: Arc<dyn quil_types::store::ClockStore> =
@@ -273,8 +275,6 @@ pub(crate) fn init(
                         inclusion_prover.clone(),
                         worker_key_manager,
                         crdt.clone(),
-                        bulletproof_prover,
-                        decaf_constructor,
                         circuit_compiler,
                         clock_store_for_exec,
                         hypergraph_resolver,
@@ -307,11 +307,12 @@ pub(crate) fn init(
                 local_prover_address: prover_address.to_vec(),
                 local_bls_pubkey: bls_pubkey.clone(),
                 bls_signer_factory: Arc::new(move || {
-                    fkm_for_factory.get_signer(quil_types::crypto::KeyType::Bls48581G1)
+                    fkm_for_factory.get_signer(quil_types::crypto::KeyType::Falcon512)
                         .expect("BLS signer should be available")
                 }),
                 reward_greedy,
                 min_active_provers_for_propose,
+                app_consensus_cw: config.engine.app_consensus_cw,
                 coverage_publish: Some(coverage_publish),
                 // Master's global state, used as fallback when the
                 // per-worker builder fails or isn't wired.
@@ -501,6 +502,27 @@ pub(crate) fn init(
                                             Ok(())
                                         });
                                     }
+                                    WorkerToMaster::CwConsensus { core_id, filter, channel, bytes } => {
+                                        // (P3) commonware-simplex message → one shard CW
+                                        // gossip topic; channel tagged into the payload.
+                                        if drain_halt.any_halted() {
+                                            continue;
+                                        }
+                                        let p2p = drain_p2p.clone();
+                                        drain_spawner.detach("shard-cw-publish", async move {
+                                            if let Err(e) = p2p
+                                                .publish(
+                                                    quil_engine::bitmasks::shard_cw_bitmask(&filter),
+                                                    quil_engine::bitmasks::shard_cw_frame_payload(channel, &bytes),
+                                                )
+                                                .await
+                                            {
+                                                warn!(core_id, filter = %hex::encode(&filter),
+                                                    error = %e, "shard cw publish failed");
+                                            }
+                                            Ok(())
+                                        });
+                                    }
                                     WorkerToMaster::VoteProduced { core_id, filter, vote_data } => {
                                         // Per-shard consensus bitmask = `0x00 || filter`.
                                         if drain_halt.any_halted() {
@@ -573,6 +595,9 @@ pub(crate) fn init(
                                             p2p.subscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub)).await;
                                             p2p.subscribe(quil_engine::bitmasks::shard_prover_bitmask(&filter_for_sub)).await;
                                             p2p.subscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&filter_for_sub)).await;
+                                            // (P3) Subscribe the shard's commonware-simplex topic so
+                                            // committee peers' votes/certs/blocks reach this engine.
+                                            p2p.subscribe(quil_engine::bitmasks::shard_cw_bitmask(&filter_for_sub)).await;
                                             Ok(())
                                         });
                                         info!(

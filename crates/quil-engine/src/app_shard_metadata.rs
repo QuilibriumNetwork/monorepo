@@ -232,6 +232,53 @@ pub fn leaf_data_for(
     Ok(out)
 }
 
+/// Worker-side shard-data sync (per-prover PoRep possession). Copies a covered
+/// app's committed vertex-adds from a SOURCE crdt (the master's, which the frame
+/// poller forest-fills) into the prover's OWN crdt, so a thread-worker holds and
+/// proves its own copy of the shard data rather than reading a shared store. This
+/// is the in-process analogue of the network forest-sync a cluster/process worker
+/// would run. Idempotent (re-adding a vertex overwrites); commits only when it
+/// copied something so it's cheap once the worker is caught up.
+pub fn sync_app_shard_to_own_crdt(
+    source: &HypergraphCrdt,
+    own: &HypergraphCrdt,
+    app_address: &[u8],
+    frame_number: u64,
+) -> quil_types::error::Result<usize> {
+    let mut copied = 0usize;
+    source.for_each_vertex_adds_blob(app_address, &mut |key, blob| {
+        if key.len() == 64 && !blob.is_empty() {
+            let mut id = [0u8; 64];
+            id.copy_from_slice(&key);
+            let loc = quil_hypergraph::addressing::Location::from_id(&id);
+            if own.add_vertex(&loc, &blob).is_ok() {
+                copied += 1;
+            }
+        }
+    })?;
+    if copied > 0 {
+        own.commit(frame_number)?;
+    }
+    Ok(copied)
+}
+
+/// Split a coverage `filter` into its `(app_address(≤32B), forest sub-shard
+/// prefix)`. A split-app (QUIL) sub-shard filter is `app(32) ‖ prefix-bytes`
+/// (`coverage.rs` appends `prefix as u8` per level); an unsplit app is the bare
+/// 32-byte address (empty prefix). The shard-key is ALWAYS over the 32-byte app —
+/// `shard_key_from_bytes` requires exactly 35 bytes — so the trailing bytes are
+/// threaded as the forest sub-shard prefix instead.
+pub(crate) fn split_coverage_filter(filter: &[u8]) -> (&[u8], Vec<u32>) {
+    let app = &filter[..filter.len().min(32)];
+    let prefix = filter
+        .get(32..)
+        .unwrap_or(&[])
+        .iter()
+        .map(|&b| b as u32)
+        .collect();
+    (app, prefix)
+}
+
 /// Worker confirm / epoch-boundary hook (PoRep wiring E). For each shard
 /// `filter` the prover is confirming, partition its committed subtree into
 /// storage leaves, SDR-encode each into the member's UNIQUE replica, register
@@ -257,16 +304,19 @@ pub fn compute_storage_confirm(
     use quil_execution::global_intrinsic::leaf_id_bytes;
     let mut all = Vec::with_capacity(filters.len());
     for filter in filters {
-        // 35-byte shard key: L1 (3-byte bloom) ++ L2 (the filter address).
-        let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(filter, 256, 3);
-        let mut shard_key_bytes = Vec::with_capacity(3 + filter.len());
+        // 35-byte shard key over the 32-byte APP (a split-app sub-shard filter is
+        // `app(32) ‖ prefix`; the trailing bytes are the forest sub-shard prefix,
+        // NOT part of the shard key — see `split_coverage_filter`).
+        let (app, sub_prefix) = split_coverage_filter(filter);
+        let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3);
+        let mut shard_key_bytes = Vec::with_capacity(3 + app.len());
         shard_key_bytes.extend_from_slice(&l1);
-        shard_key_bytes.extend_from_slice(filter);
+        shard_key_bytes.extend_from_slice(app);
         let Some(typed) = shard_key_from_bytes(&shard_key_bytes) else {
             continue;
         };
 
-        let prefixes = partition_shard_leaves(crdt, &shard_key_bytes, &[]);
+        let prefixes = partition_shard_leaves(crdt, &shard_key_bytes, &sub_prefix);
         if prefixes.is_empty() {
             // Empty shard: nothing to attest, register an empty set so the
             // confirm still records (epoch, filter) coverage.
@@ -358,11 +408,19 @@ pub fn build_vote_openings(
     epoch: u64,
     rho_n: &[u8],
 ) -> quil_types::error::Result<Vec<u8>> {
-    let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(filter, 256, 3);
-    let mut shard_key = Vec::with_capacity(3 + filter.len());
+    // A split-app (QUIL) sub-shard filter is `app(32) ‖ prefix-bytes`
+    // (`coverage.rs` appends `prefix as u8` per level). The shard-key is ALWAYS
+    // over the 32-byte APP (`shard_key_from_bytes` requires exactly 35 bytes =
+    // L1[3]+L2[32]); the trailing bytes are the forest sub-shard prefix. Without
+    // this split, a 33-byte QUIL sub-shard filter yields a 36-byte shard-key that
+    // `shard_key_from_bytes` rejects → the shard is silently skipped and NOTHING
+    // is ever attested (breaks storage rewards for every split app).
+    let (app, sub_prefix) = split_coverage_filter(filter);
+    let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3);
+    let mut shard_key = Vec::with_capacity(3 + app.len());
     shard_key.extend_from_slice(&l1);
-    shard_key.extend_from_slice(filter);
-    let prefixes = partition_shard_leaves(crdt, &shard_key, &[]);
+    shard_key.extend_from_slice(app);
+    let prefixes = partition_shard_leaves(crdt, &shard_key, &sub_prefix);
     if prefixes.is_empty() {
         return Ok(Vec::new());
     }

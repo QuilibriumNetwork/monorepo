@@ -1,6 +1,6 @@
 mod file_key_manager;
 
-pub use file_key_manager::FileKeyManager;
+pub use file_key_manager::{FileKeyManager, KeyEntry};
 
 use quil_types::crypto::{KeyType, Signer};
 use quil_types::error::Result;

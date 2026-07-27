@@ -159,7 +159,10 @@ pub fn verify_op_signature(
     signed.extend_from_slice(&separator);
     signed.extend_from_slice(&message);
 
-    if quil_crypto::ed448_verify(&write_key, &signed, signature) {
+    // Post-quantum write-key authorization: a FALCON (FN-DSA-512) signature over
+    // `separator || message` (the op separator already carries the domain
+    // separation, so the FN-DSA context is empty). Replaces the Ed448 write sig.
+    if quil_crypto::falcon_verify(&write_key, signature, &signed, &[]) {
         Ok(AuthCheck::Verified)
     } else {
         Ok(AuthCheck::Invalid)
@@ -173,11 +176,11 @@ pub fn verify_op_signature(
 ///
 /// ```go
 /// validSig, err := h.keyManager.ValidateSignature(
-///     crypto.KeyTypeBLS48581G1,
-///     h.config.OwnerPublicKey,
-///     message,                         // canonical bytes with sig nilified
-///     updatePb.PublicKeySignatureBls48581.Signature,
-///     slices.Concat(domain[:], []byte("HYPERGRAPH_UPDATE")),
+/// crypto.KeyTypeBLS48581G1,
+/// h.config.OwnerPublicKey,
+///     message, // canonical bytes with sig nilified
+/// updatePb.PublicKeySignatureBls48581.Signature,
+/// slices.Concat(domain[:], []byte("HYPERGRAPH_UPDATE")),
 /// )
 /// ```
 ///
@@ -199,7 +202,7 @@ pub fn verify_update_signature(
     domain_sep.extend_from_slice(domain);
     domain_sep.extend_from_slice(b"HYPERGRAPH_UPDATE");
     let ok = key_manager.validate_signature(
-        quil_types::crypto::KeyType::Bls48581G1,
+        quil_types::crypto::KeyType::Falcon512,
         &owner_key,
         update_bytes_without_sig,
         signature,
@@ -235,7 +238,8 @@ impl<'a> OpForAuth<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed448_rust::PrivateKey;
+    use quil_crypto::FalconSigner;
+    use quil_types::crypto::Signer;
 
     struct StaticResolver(Vec<u8>);
     impl HypergraphConfigResolver for StaticResolver {
@@ -244,57 +248,53 @@ mod tests {
         }
     }
 
-    fn sign_with_domain(seed: &[u8; 57], domain: &[u8], tag: &[u8], message: &[u8]) -> Vec<u8> {
-        let sk = PrivateKey::from(seed);
+    // Falcon-sign `separator (domain||tag) || message` (empty FN-DSA context) —
+    // matching `verify_op_signature`'s signed-message construction.
+    fn falcon_signed(signer: &FalconSigner, domain: &[u8], tag: &[u8], message: &[u8]) -> Vec<u8> {
         let mut signed = Vec::with_capacity(domain.len() + tag.len() + message.len());
         signed.extend_from_slice(domain);
         signed.extend_from_slice(tag);
         signed.extend_from_slice(message);
-        sk.sign(&signed, None).unwrap().to_vec()
-    }
-
-    fn pubkey_from_seed(seed: &[u8; 57]) -> Vec<u8> {
-        let sk = PrivateKey::from(seed);
-        let pk = ed448_rust::PublicKey::from(&sk);
-        pk.as_byte().to_vec()
+        signer.sign_with_domain(&signed, &[]).unwrap()
     }
 
     #[test]
     fn vertex_remove_verifies_against_resolved_key() {
-        let seed = [7u8; 57];
-        let pubkey = pubkey_from_seed(&seed);
+        let signer = FalconSigner::generate();
         let domain = vec![0xABu8; 32];
         let data_address = vec![0x42u8; 32];
 
         let msg = vertex_remove_signing_message(&domain, &data_address).unwrap();
-        let sig = sign_with_domain(&seed, &domain, b"VERTEX_REMOVE", &msg);
+        let sig = falcon_signed(&signer, &domain, b"VERTEX_REMOVE", &msg);
 
         let op = VertexRemove {
             domain: domain.clone(),
             data_address: data_address.clone(),
             signature: sig,
         };
-        let resolver: Arc<dyn HypergraphConfigResolver> = Arc::new(StaticResolver(pubkey));
+        let resolver: Arc<dyn HypergraphConfigResolver> =
+            Arc::new(StaticResolver(signer.public_key().to_vec()));
         let check = verify_op_signature(&resolver, &OpForAuth::VertexRemove(&op)).unwrap();
         assert_eq!(check, AuthCheck::Verified);
     }
 
     #[test]
     fn vertex_remove_rejects_wrong_key() {
-        let seed = [7u8; 57];
-        let other = pubkey_from_seed(&[9u8; 57]);
+        let signer = FalconSigner::generate();
+        let other = FalconSigner::generate();
         let domain = vec![0xABu8; 32];
         let data_address = vec![0x42u8; 32];
 
         let msg = vertex_remove_signing_message(&domain, &data_address).unwrap();
-        let sig = sign_with_domain(&seed, &domain, b"VERTEX_REMOVE", &msg);
+        let sig = falcon_signed(&signer, &domain, b"VERTEX_REMOVE", &msg);
 
         let op = VertexRemove {
             domain,
             data_address,
             signature: sig,
         };
-        let resolver: Arc<dyn HypergraphConfigResolver> = Arc::new(StaticResolver(other));
+        let resolver: Arc<dyn HypergraphConfigResolver> =
+            Arc::new(StaticResolver(other.public_key().to_vec()));
         let check = verify_op_signature(&resolver, &OpForAuth::VertexRemove(&op)).unwrap();
         assert_eq!(check, AuthCheck::Invalid);
     }

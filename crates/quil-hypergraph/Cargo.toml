@@ -11,6 +11,8 @@ test-utils = []
 [dependencies]
 quil-types = { path = "../quil-types" }
 quil-tries = { path = "../quil-tries" }
+# Phase-3 state tree: JMT forest (commitment authority post-migration).
+quil-forest = { path = "../quil-forest" }
 tonic = "0.12"
 tokio = { version = "1", features = ["sync", "rt"] }
 tracing = "0.1"
@@ -22,6 +24,9 @@ hex = "0.4"
 
 [dev-dependencies]
 proptest = "1"
+# Open a real DB for the forest in commit_to_forest tests.
+rocksdb = { version = "0.22", default-features = false, features = ["snappy", "lz4"] }
+tempfile = "3"
 
 # Integration tests live in `tests/` and import the gated `testing`
 # module via `quil_hypergraph::testing`. Enable the feature on the

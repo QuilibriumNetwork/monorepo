@@ -1,7 +1,7 @@
 // Handle-based FFI wrapper for quil-hypergraph CRDT operations.
 //
 // UniFFI cannot pass trait objects across FFI, so we use u64 handles
-// into a global HashMap<u64, CrdtInstance>.  The Go side calls
+// into a global HashMap<u64, CrdtInstance>. The Go side calls
 // create_crdt() to obtain a handle and destroy_crdt() to release it.
 
 use std::collections::HashMap;
@@ -40,7 +40,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Compute the shard key (3-byte L1 bloom + 32-byte L2) for a 32-byte
-/// L2 application address.  Returns a 35-byte vector: [L1(3) || L2(32)].
+/// L2 application address. Returns a 35-byte vector: [L1(3) || L2(32)].
 pub fn shard_key_for_location(l2_address: Vec<u8>) -> Vec<u8> {
     assert!(
         l2_address.len() == 32,
@@ -66,9 +66,9 @@ pub fn shard_key_for_location(l2_address: Vec<u8>) -> Vec<u8> {
 /// Compute bloom filter bucket indices for a key.
 ///
 /// Uses SHA-256-based double hashing:
-///   h1 = SHA256(key)[0..4] mod num_buckets
-///   h2 = SHA256(key)[4..8] mod num_buckets
-///   index_i = (h1 + i * h2) mod num_buckets, for i in 0..num_hashes
+/// h1 = SHA256(key)[0..4] mod num_buckets
+/// h2 = SHA256(key)[4..8] mod num_buckets
+/// index_i = (h1 + i * h2) mod num_buckets, for i in 0..num_hashes
 ///
 /// Returns a packed byte vector: num_hashes * 4 bytes, each index as
 /// big-endian u32.
@@ -153,7 +153,7 @@ fn location_from_shard_and_key(shard_l2: &[u8], key: &[u8]) -> Location {
 
 /// Insert a value into a specific CRDT phase-set tree.
 ///
-/// `set_type`:   "vertex" or "hyperedge"
+/// `set_type`: "vertex" or "hyperedge"
 /// `phase_type`: "adds" or "removes"
 pub fn set_vertex(
     handle: u64,
@@ -224,7 +224,7 @@ pub fn get_vertex(
             // the removes set); we return empty vec as a sentinel.
             ("vertex", "removes") => {
                 // A vertex that has been removed will NOT be returned by
-                // get_vertex_data (it returns None).  The caller can
+                // get_vertex_data (it returns None). The caller can
                 // detect removal by checking adds returns None.
                 crdt.get_vertex_data(&location)
             }
@@ -237,7 +237,7 @@ pub fn get_vertex(
     })
 }
 
-/// Delete a vertex/hyperedge entry.  For CRDT semantics this records
+/// Delete a vertex/hyperedge entry. For CRDT semantics this records
 /// a removal (adds to the removes set).
 pub fn delete_vertex(
     handle: u64,

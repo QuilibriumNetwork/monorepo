@@ -6,13 +6,13 @@
 //! whole thing.
 //!
 //! - On `ensure_root_loaded`, reads only the root node via the
-//!   by-path index (`HypergraphStore::get_node_by_path(&[])`).
+//! by-path index (`HypergraphStore::get_node_by_path(&[])`).
 //! - During `insert`, walks the tree lazily — child branches are
-//!   pulled from the store one slot at a time as the walker
-//!   descends, never materializing untouched subtrees.
+//! pulled from the store one slot at a time as the walker
+//! descends, never materializing untouched subtrees.
 //! - During `commit`, persists each touched node individually via
-//!   the dual by-key + by-path index (per-node format —
-//!   `crate::serialize::serialize_node_solo`).
+//! the dual by-key + by-path index (per-node format —
+//! `crate::serialize::serialize_node_solo`).
 //!
 //! Mutating ops stage changes in an in-memory working set; `commit`
 //! flushes them through the caller-supplied `txn` and resets the
@@ -901,15 +901,14 @@ impl LazyVectorCommitmentTree {
             )?;
         }
 
-        // The legacy whole-tree blob write was removed. With the lazy
-        // tree, `serialize_tree(root)` produces a stub that records
-        // `TYPE_NIL` for every child slot whose lazy node hasn't been
-        // pulled in this session — and `deserialize_tree` then hands
-        // the consumer a branch tagged `fully_loaded = true` with no
-        // children, so lazy walks early-exit and the sync server sees
-        // an empty tree even when the per-node store is populated.
-        // The canonical storage is the per-node by-path / by-key
-        // index; readers should always go through that.
+        // The legacy whole-tree blob write is intentionally omitted. With the
+        // lazy tree, `serialize_tree(root)` produces a stub that records
+        // `TYPE_NIL` for every child slot whose lazy node is not currently
+        // resident in memory — and `deserialize_tree` then hands the consumer a
+        // branch tagged `fully_loaded = true` with no children, so lazy walks
+        // early-exit and the sync server sees an empty tree even when the
+        // per-node store is populated. The canonical storage is the per-node
+        // by-path / by-key index; readers should always go through that.
 
         // Persist every leaf's underlying value into the per-vertex
         // keyspace — same as the legacy commit (vertex content lives

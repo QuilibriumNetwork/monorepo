@@ -143,6 +143,10 @@ pub fn register_engine_metrics() {
         "engine_grpc_submits_rejected_total",
         "Inbound gRPC submit_global_message calls rejected"
     );
+    describe_counter!(
+        "engine_grpc_submits_duplicate_total",
+        "Inbound gRPC submit_global_message calls deduplicated (already delivered)"
+    );
     describe_histogram!(
         "engine_vdf_prove_seconds",
         "VDF proof computation duration"
@@ -150,6 +154,14 @@ pub fn register_engine_metrics() {
     describe_histogram!(
         "engine_archive_submit_seconds",
         "Round-trip duration of an outbound archive submit"
+    );
+    describe_histogram!(
+        "engine_materialize_seconds",
+        "Full frame materialization duration (verify + apply + commit)"
+    );
+    describe_histogram!(
+        "engine_sig_verify_seconds",
+        "Consensus aggregate signature verification duration"
     );
 }
 
@@ -277,4 +289,12 @@ pub fn record_vdf_prove_duration(seconds: f64) {
 #[inline]
 pub fn record_archive_submit_duration(seconds: f64) {
     histogram!("engine_archive_submit_seconds").record(seconds);
+}
+#[inline]
+pub fn record_materialize_duration(seconds: f64) {
+    histogram!("engine_materialize_seconds").record(seconds);
+}
+#[inline]
+pub fn record_sig_verify_duration(seconds: f64) {
+    histogram!("engine_sig_verify_seconds").record(seconds);
 }

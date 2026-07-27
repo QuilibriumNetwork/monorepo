@@ -7,10 +7,10 @@
 //! Two entry points:
 //!
 //! - `hash_bytes_to_32(msg)` → 32-byte big-endian hash. Mirrors
-//!   `poseidon.HashBytes(msg).FillBytes(make([]byte, 32))` from
-//!   `node/execution/intrinsics/global/...` usages.
+//! `poseidon.HashBytes(msg).FillBytes(make([]byte, 32))` from
+//! `node/execution/intrinsics/global/...` usages.
 //! - `hash_elements(inputs)` → one 32-byte hash from at most 16
-//!   field elements. Direct wrapper around `Poseidon::hash`.
+//! field elements. Direct wrapper around `Poseidon::hash`.
 //!
 //! The sponge parameters match iden3 exactly:
 //! - `SPONGE_CHUNK_SIZE = 31` — bytes per field element

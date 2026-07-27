@@ -7,15 +7,15 @@
 //!
 //! Mirror of Go's `qclient` transfer build flow:
 //! 1. Compute Pedersen commitments on new output values with random
-//!    blinding factors chosen such that ∑input_blindings = ∑output_blindings.
+//! blinding factors chosen such that ∑input_blindings = ∑output_blindings.
 //! 2. Generate a bulletproof range proof over the output values
-//!    (proves each is in `[0, 2^64)` without revealing them).
+//! (proves each is in `[0, 2^64)` without revealing them).
 //! 3. Build [`TransactionInput`] records, each carrying the spent
-//!    coin's commitment + a BLS48-581 signature authorizing the spend.
+//! coin's commitment + a BLS48-581 signature authorizing the spend.
 //! 4. Build [`TransactionOutput`] records with the output commitments
-//!    and optional `RecipientBundle` (encrypted amount + blinding for
-//!    the recipient — we leave empty here; the recipient encryption
-//!    scheme is layered on top of this builder).
+//! and optional `RecipientBundle` (encrypted amount + blinding for
+//! the recipient — we leave empty here; the recipient encryption
+//! scheme is layered on top of this builder).
 //! 5. Assemble, canonicalize, and return the [`Transaction`] bytes.
 //!
 //! The canonical-bytes serialization is byte-compatible with Go.
@@ -118,12 +118,12 @@ impl TransferBuilder {
     ///
     /// Flow:
     /// 1. Sum input blindings, allocate fresh blindings for each
-    ///    output so the total matches (balance-preserving).
+    /// output so the total matches (balance-preserving).
     /// 2. Generate a bulletproof range proof over the outputs.
     /// 3. BLS-sign each input's commitment under the transaction
-    ///    identity digest.
+    /// identity digest.
     /// 4. Assemble `TransactionInput`s, `TransactionOutput`s, and
-    ///    the `Transaction` envelope.
+    /// the `Transaction` envelope.
     pub fn build_and_sign(self) -> core::result::Result<Vec<u8>, WalletError> {
         if self.inputs.is_empty() {
             return Err(WalletError::InvalidValue("no inputs".into()));
@@ -243,7 +243,7 @@ mod tests {
     use quil_types::crypto::BlsConstructor;
 
     fn bls_signer() -> Arc<dyn Signer> {
-        let ctor = quil_crypto::Bls48581KeyConstructor;
+        let ctor = quil_crypto::FalconKeyConstructor;
         let (boxed, _pk) = ctor.new_key().expect("bls keygen");
         Arc::from(boxed)
     }

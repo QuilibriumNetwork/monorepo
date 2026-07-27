@@ -255,6 +255,18 @@ impl FrameMaterializer {
             });
         }
 
+        // Time the full materialization (verify + apply + commit) — records on
+        // every real exit path (success or `?`-error) below the idempotency
+        // skip. RAII so we don't have to thread the record call through each
+        // return point.
+        struct MatTimer(std::time::Instant);
+        impl Drop for MatTimer {
+            fn drop(&mut self) {
+                crate::metrics::record_materialize_duration(self.0.elapsed().as_secs_f64());
+            }
+        }
+        let _materialize_timer = MatTimer(std::time::Instant::now());
+
         // 2. Compute local prover root and verify against frame
         let expected_root = &header.prover_tree_commitment;
         let local_root = self.compute_local_prover_root(frame_number);
@@ -429,7 +441,7 @@ impl FrameMaterializer {
                     // target shard is uncovered (otherwise the covered
                     // shard's own consensus owns them).
                     match bundle_target_domain(bundle) {
-                        Some(domain) if self.shard_is_uncovered(&domain) => domain,
+                        Some(domain) if self.shard_is_uncovered(&domain, frame_number) => domain,
                         _ => global_addr.clone(),
                     }
                 }
@@ -868,7 +880,11 @@ impl FrameMaterializer {
                 };
                 if let Some(phase_roots) = commits.get(&global_shard) {
                     if let Some(root) = phase_roots.first() {
-                        if root.len() >= 64 {
+                        // A real prover root is a 32-byte JMT root (Phase-3
+                        // forest) or a ≥64-byte KZG commitment (legacy/tests);
+                        // the 64-byte all-zero placeholder never appears here
+                        // (the global vertex_adds tree is always present).
+                        if root.len() == 32 || root.len() >= 64 {
                             // Publish to the snapshot generation registry,
                             // binding a real point-in-time DB snapshot so a
                             // follower that pins to this root gets
@@ -975,10 +991,10 @@ impl FrameMaterializer {
     /// Read from the prover registry (consensus-deterministic), so all
     /// nodes agree on the venue for a given bundle at a given frame. This
     /// gates the uncovered-shard global execution path.
-    fn shard_is_uncovered(&self, domain: &[u8]) -> bool {
+    fn shard_is_uncovered(&self, domain: &[u8], frame_number: u64) -> bool {
         let active = self
             .prover_registry
-            .get_active_provers(domain)
+            .get_active_provers(domain, frame_number)
             .map(|p| p.len())
             .unwrap_or(0);
         (active as u64) <= crate::provers::proposer::HALT_RISK_PROVER_COUNT
@@ -1408,7 +1424,7 @@ mod tests {
 
     /// Verifies the per-bundle fee math matches Go's
     /// `frame_materializer.go:202-213`:
-    ///   fee = GetBaselineFee(difficulty, world_size, costBasis, 8e9) / costBasis
+    /// fee = GetBaselineFee(difficulty, world_size, costBasis, 8e9) / costBasis
     /// when costBasis > 0, else 0.
     ///
     /// The materializer's cost source is the global engine, which always

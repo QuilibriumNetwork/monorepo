@@ -9,15 +9,15 @@
 //! **Precision strategy.** We use a hybrid approach:
 //!
 //! - Pure big-integer ops where Go uses pure big-integer ops
-//!   (`GetBaselineFee`'s Sub/Exp/Quo pipeline).
+//! (`GetBaselineFee`'s Sub/Exp/Quo pipeline).
 //! - Integer nth-root for the `result^(1/2^n)` step in `pomw_basis`
-//!   (`num_integer::Roots::nth_root`). For `n=1` (mainnet typical)
-//!   this is an integer square root. For larger `n` it's integer
-//!   2^n-th root.
+//! (`num_integer::Roots::nth_root`). For `n=1` (mainnet typical)
+//! this is an integer square root. For larger `n` it's integer
+//! 2^n-th root.
 //! - Scaling by a large fixed-point factor (`POMW_SCALE = 1 << 53`)
-//!   inside the root so we retain ~53 bits of fractional precision,
-//!   then dividing back out after the final multiply. This matches
-//!   shopspring/decimal's effective precision bound.
+//! inside the root so we retain ~53 bits of fractional precision,
+//! then dividing back out after the final multiply. This matches
+//! shopspring/decimal's effective precision bound.
 //!
 //! This approach is **not guaranteed** byte-identical to Go in the
 //! least-significant digits under all inputs, because shopspring's
@@ -108,12 +108,12 @@ pub fn pomw_basis(difficulty: u64, world_state_bytes: u64, units: u64) -> BigInt
 ///
 /// The math is:
 /// ```text
-/// current  = pomw_basis(difficulty, world_state_bytes, units)
+/// current = pomw_basis(difficulty, world_state_bytes, units)
 /// affected = pomw_basis(difficulty, world_state_bytes + total_added, units)
-/// delta    = current - affected
-/// lhs      = delta^2 / world_state_bytes
-/// rhs      = total_added
-/// result   = max(lhs, rhs)
+/// delta = current - affected
+/// lhs = delta^2 / world_state_bytes
+/// rhs = total_added
+/// result = max(lhs, rhs)
 /// ```
 pub fn get_baseline_fee(
     difficulty: u64,

@@ -130,7 +130,7 @@ pub const HG_VERTEX_DATA_PREFIX: u8 = 0x30;
 // `quil_tries::serialize_node_solo`). Go's on-disk node bytes are
 // never read by Rust — the migration is the only point of contact.
 //
-// [0x33, set_byte, phase_byte, l1(1), l2(32), node_key]            → solo-node bytes
+// [0x33, set_byte, phase_byte, l1(1), l2(32), node_key] → solo-node bytes
 // [0x34, set_byte, phase_byte, l1(1), l2(32), path_i32_BE × depth] → by-key pointer
 //
 // `set_byte` and `phase_byte` are the same single-byte encoding as
@@ -626,6 +626,98 @@ pub fn hypergraph_vertex_data_key(
 ) -> Vec<u8> {
     let mut k = hypergraph_vertex_data_prefix(set_type, phase_type, shard_key);
     k.extend_from_slice(vertex_key);
+    k
+}
+
+// -----------------------------------------------------------------------
+// Versioned (MVCC) blob keyspace — see crates/quil-hypergraph/VERSIONED_SNAPSHOT_SYNC.md
+//
+// The forest is version-addressable but the blob KV historically was not, which
+// let an incremental sync diff the forest at a pinned version while fetching the
+// LATEST blob → a race. The v2 keyspace carries the per-`(shard,phase)` commit
+// version (NON-inverted, big-endian) as an 8-byte SUFFIX so a reverse-seek to
+// `vk_prefix ‖ V` lands on the latest write with version ≤ V (MVCC read). The
+// version is fixed-width, so `vk = key[shard_prefix .. len-8]` recovers it
+// regardless of vertex-key length. Distinct prefix byte (0x31) from the legacy
+// unversioned keyspace (0x30) so the two coexist during migration.
+// -----------------------------------------------------------------------
+pub const HG_VERTEX_DATA_V2: u8 = 0x31;
+/// `root_hash → (version, global_frame)` index — written atomically with the
+/// forest+blobs so any committed root resolves to the local version that serves it.
+pub const HG_ROOT_VERSION: u8 = 0x35;
+/// `app_root → [(prefix, sub_root, version)]` manifest for split apps, so a
+/// sync-by-hash of an aggregate app root can be broken into per-sub-shard syncs.
+pub const HG_APP_MANIFEST: u8 = 0x36;
+
+/// `[0x31][set][phase][l1(3)][l2(32)]` — scan prefix for all versioned blobs of a shard.
+pub fn hypergraph_vertex_data_v2_shard_prefix(
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &quil_types::store::ShardKey,
+) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 1 + 1 + 3 + 32);
+    k.push(HG_VERTEX_DATA_V2);
+    k.push(set_type_byte(set_type));
+    k.push(phase_type_byte(phase_type));
+    k.extend_from_slice(&shard_key.l1);
+    k.extend_from_slice(&shard_key.l2);
+    k
+}
+
+/// `…shard_prefix ‖ vertex_key` — the per-vertex prefix a version suffix appends to.
+pub fn hypergraph_vertex_data_v2_vk_prefix(
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &quil_types::store::ShardKey,
+    vertex_key: &[u8],
+) -> Vec<u8> {
+    let mut k = hypergraph_vertex_data_v2_shard_prefix(set_type, phase_type, shard_key);
+    k.extend_from_slice(vertex_key);
+    k
+}
+
+/// `…vk_prefix ‖ version_be(8)` — the full MVCC key for one vertex at one version.
+pub fn hypergraph_vertex_data_v2_key(
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &quil_types::store::ShardKey,
+    vertex_key: &[u8],
+    version: u64,
+) -> Vec<u8> {
+    let mut k = hypergraph_vertex_data_v2_vk_prefix(set_type, phase_type, shard_key, vertex_key);
+    k.extend_from_slice(&version.to_be_bytes());
+    k
+}
+
+/// `[0x35][set][phase][l1(3)][l2(32)][root_hash(32)]` — root→version index key.
+pub fn hypergraph_root_version_key(
+    set_type: &str,
+    phase_type: &str,
+    shard_id: &[u8],
+    root_hash: &[u8],
+) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 1 + 1 + shard_id.len() + root_hash.len());
+    k.push(HG_ROOT_VERSION);
+    k.push(set_type_byte(set_type));
+    k.push(phase_type_byte(phase_type));
+    k.extend_from_slice(shard_id);
+    k.extend_from_slice(root_hash);
+    k
+}
+
+/// `[0x36][set][phase][app(32)][app_root(32)]` — split-app manifest key.
+pub fn hypergraph_app_manifest_key(
+    set_type: &str,
+    phase_type: &str,
+    app_address: &[u8],
+    app_root: &[u8],
+) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 1 + 1 + app_address.len() + app_root.len());
+    k.push(HG_APP_MANIFEST);
+    k.push(set_type_byte(set_type));
+    k.push(phase_type_byte(phase_type));
+    k.extend_from_slice(app_address);
+    k.extend_from_slice(app_root);
     k
 }
 

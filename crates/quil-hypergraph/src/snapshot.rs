@@ -14,16 +14,16 @@
 //! Behavioural parity with Go:
 //!
 //! - `publish(root, frame)` adds a new generation. Duplicate roots
-//!   are no-ops (matches Go's "same root → no change").
+//! are no-ops (matches Go's "same root → no change").
 //! - `publish_with_snapshot(root, frame, snap)` is the same but
-//!   binds an opaque DB-snapshot reference to the generation, which
-//!   `acquire` returns to the caller for point-in-time reads.
+//! binds an opaque DB-snapshot reference to the generation, which
+//! `acquire` returns to the caller for point-in-time reads.
 //! - `acquire(expected_root)` returns the matching generation handle
-//!   or `None` if the requested root is unknown. With no
-//!   `expected_root`, returns the latest generation.
+//! or `None` if the requested root is unknown. With no
+//! `expected_root`, returns the latest generation.
 //! - Up to `MAX_GENERATIONS` retained — older entries evicted FIFO.
-//!   Evicted generations drop their snapshot Arc, releasing the
-//!   underlying frozen bytes.
+//! Evicted generations drop their snapshot Arc, releasing the
+//! underlying frozen bytes.
 //! - Closed managers reject all subsequent operations.
 
 use std::collections::VecDeque;
@@ -185,7 +185,7 @@ impl SnapshotManager {
     ///
     /// - If `expected_root` is empty, returns the latest generation.
     /// - Otherwise, returns the generation matching `expected_root`,
-    ///   or `None` if no such generation exists.
+    /// or `None` if no such generation exists.
     pub fn acquire(&self, expected_root: &[u8]) -> Option<GenerationHandle> {
         let g = self.inner.read().unwrap();
         if g.closed || g.generations.is_empty() {

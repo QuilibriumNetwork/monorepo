@@ -401,7 +401,16 @@ impl ClassGroup for GmpClassGroup {
     fn from_ab_discriminant(a: Self::BigNum, b: Self::BigNum, discriminant: Self::BigNum) -> Self {
         let mut four_a: Self::BigNum = 4u64.into();
         four_a *= &a;
-        let c = (&b * &b - &discriminant) / four_a;
+        // SECURITY: `a` may be decoded from untrusted proof/output bytes; `a == 0`
+        // makes `four_a == 0` and the division below a divide-by-zero PANIC —
+        // a remote DoS on every VDF verify path. Produce a deterministic
+        // (invalid, `a == 0`) form instead; verification compares against a
+        // canonically-recomputed value, so such a form simply fails to verify.
+        let c = if four_a == Self::BigNum::from(0u64) {
+            Self::BigNum::from(0u64)
+        } else {
+            (&b * &b - &discriminant) / four_a
+        };
         Self {
             a,
             b,

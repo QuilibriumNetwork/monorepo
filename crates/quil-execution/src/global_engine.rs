@@ -10,14 +10,14 @@
 //! Not ported (needs service wiring + intrinsic state transitions):
 //!
 //! - `ValidateMessage`, `ProcessMessage`, `handleBundle`,
-//!   `processIndividualMessage`, `tryGetIntrinsic` — these all route
-//!   through `GlobalIntrinsic`'s `Validate`/`InvokeStep` entry points,
-//!   which in turn touch the prover registry, clock store, shards
-//!   store, and BLS constructor. None of those have a Rust surface yet.
+//! `processIndividualMessage`, `tryGetIntrinsic` — these all route
+//! through `GlobalIntrinsic`'s `Validate`/`InvokeStep` entry points,
+//! which in turn touch the prover registry, clock store, shards
+//! store, and BLS constructor. None of those have a Rust surface yet.
 //! - `Prove` — Go returns unimplemented.
 //! - `tryExtractMessageForIntrinsic` — the shard-store-backed `Join`
-//!   validation path requires `ShardsStore`.
-//!   We still port the non-Join cases in [`request_to_payload`] below.
+//! validation path requires `ShardsStore`.
+//! We still port the non-Join cases in [`request_to_payload`] below.
 //! - `Lock` / `Unlock` — wiring needs the global intrinsic.
 
 use num_bigint::BigInt;

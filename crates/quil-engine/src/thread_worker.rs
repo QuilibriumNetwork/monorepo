@@ -23,16 +23,16 @@ pub enum MasterToWorker {
     /// Assign a new filter (shard) to this worker.
     ///
     /// `start_consensus`:
-    ///   * `true`  — tear down any existing engine and (re)spawn the
-    ///     `AppConsensusEngine`. Used for `Active`/`Paused`
-    ///     allocations.
-    ///   * `false` — record the filter binding for TUI visibility,
-    ///     cancel any running engine, but do NOT spawn a new one.
-    ///     Used while an allocation is `Joining` and there is no
-    ///     Active prover under this filter yet (the engine's
-    ///     `leader_for_rank` would fail and the loop would die).
-    ///     Mirrors Go's `worker.Filter`-set / `worker.Allocated=false`
-    ///     state from `worker_allocator.go:421-440`.
+    ///   * `true` — tear down any existing engine and (re)spawn the
+    /// `AppConsensusEngine`. Used for `Active`/`Paused`
+    /// allocations.
+    /// * `false` — record the filter binding for TUI visibility,
+    /// cancel any running engine, but do NOT spawn a new one.
+    /// Used while an allocation is `Joining` and there is no
+    /// Active prover under this filter yet (the engine's
+    /// `leader_for_rank` would fail and the loop would die).
+    /// Mirrors Go's `worker.Filter`-set / `worker.Allocated=false`
+    /// state from `worker_allocator.go:421-440`.
     Respawn { filter: Vec<u8>, start_consensus: bool },
     /// Request the worker to compute a join proof.
     CreateJoinProof {
@@ -92,6 +92,15 @@ pub enum WorkerToMaster {
         core_id: u32,
         filter: Vec<u8>,
     },
+    /// (P3) An outbound commonware-simplex message for a shard's committee.
+    /// The master publishes it on `shard_cw_bitmask(filter)` with the channel
+    /// tagged into the payload (`shard_cw_frame_payload(channel, bytes)`).
+    CwConsensus {
+        core_id: u32,
+        filter: Vec<u8>,
+        channel: u64,
+        bytes: Vec<u8>,
+    },
     /// A shard worker has spun up an `AppConsensusEngine` for `filter`.
     /// The master uses this to populate a `filter → AppEngineHandle`
     /// registry so peer messages on the per-shard bitmasks can be
@@ -150,6 +159,8 @@ pub struct WorkerConsensusDeps {
     /// testnet=1 (single-prover clusters still progress). See
     /// `AppLeaderProvider::min_active_provers_for_propose`.
     pub min_active_provers_for_propose: u64,
+    /// (P3) Drive app-shard consensus with commonware-simplex + Falcon.
+    pub app_consensus_cw: bool,
     /// Callback that publishes finalized canonical FrameHeader bytes
     /// on `GLOBAL_PROVER` so archives credit our shard work toward
     /// rewards. AppFollower invokes this directly from the consensus
@@ -449,7 +460,7 @@ impl ThreadWorkerManager {
                                             let filter_clone = filter.clone();
                                             let deps = consensus_deps.clone();
                                             let owned = worker_owned.clone();
-                                            // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+                                            // TODO
                                             tokio::spawn(async move {
                                                 info!(core_id, filter = hex::encode(&filter_clone), "app engine spawned");
 
@@ -481,6 +492,13 @@ impl ThreadWorkerManager {
                                                     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
                                                     let engine_deps = crate::app_engine::AppEngineDeps {
                                                         clock_store,
+                                                        // Global anchor ALWAYS comes from the master's
+                                                        // shared store (`deps.clock_store`), which the
+                                                        // frame poller fills with synced global frames.
+                                                        // The worker-owned `clock_store` above holds only
+                                                        // this shard's chain, so anchoring to it would give
+                                                        // `anchor_gfn = 0` → legacy VDF path → no rewards.
+                                                        global_anchor_store: Some(deps.clock_store.clone()),
                                                         prover_registry: deps.prover_registry.clone(),
                                                         frame_prover: deps.frame_prover.clone(),
                                                         message_collector: deps.message_collector.clone(),
@@ -492,9 +510,20 @@ impl ThreadWorkerManager {
                                                         min_active_provers_for_propose: deps.min_active_provers_for_propose,
                                                         coverage_publish: deps.coverage_publish.clone(),
                                                         hypergraph,
+                                                        // Storage-attestation SOURCE = the MASTER's
+                                                        // hypergraph (`deps.hypergraph`), which the
+                                                        // master's forest-sync fills with the covered
+                                                        // shard's committed coin data. The worker
+                                                        // replicates FROM this into its own replica_store
+                                                        // (per-prover PoRep possession). The per-worker
+                                                        // `hypergraph` above only holds this shard's own
+                                                        // materialized app-frames, so attesting from it
+                                                        // would find no coins.
+                                                        storage_source_hypergraph: deps.hypergraph.clone(),
                                                         execution_engine,
                                                         inclusion_prover,
                                                         kv_db,
+                                                        app_consensus_cw: deps.app_consensus_cw,
                                                     };
                                                     let (engine, app_handle) = crate::app_engine::AppConsensusEngine::new(
                                                         core_id,
@@ -526,7 +555,7 @@ impl ThreadWorkerManager {
                                                     let master_tx_events = master_tx_clone.clone();
                                                     let loopback_handle = app_handle.clone();
                                                     let _filter_for_events = filter_clone.clone();
-                                                    // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+                                                    // TODO
                                                     tokio::spawn(async move {
                                                         while let Some(event) = event_rx.recv().await {
                                                             match event {
@@ -602,6 +631,16 @@ impl ThreadWorkerManager {
                                                                         }
                                                                     ).await;
                                                                 }
+                                                                crate::app_engine::AppEngineEvent::CwOut { filter, channel, bytes } => {
+                                                                    let _ = master_tx_events.send(
+                                                                        WorkerToMaster::CwConsensus {
+                                                                            core_id,
+                                                                            filter,
+                                                                            channel,
+                                                                            bytes,
+                                                                        }
+                                                                    ).await;
+                                                                }
                                                                 _ => {
                                                                     // Equivocation/Halted/AncestorSyncRequested/
                                                                     // ParentSealed — informational; engine handles
@@ -619,7 +658,7 @@ impl ThreadWorkerManager {
                                                     // Sharing a task via `tokio::select!` here was making
                                                     // the engine's own select starve under load.
                                                     let bls_signer = (deps.bls_signer_factory)();
-                                                    // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+                                                    // TODO
                                                     let mut engine_handle = tokio::spawn(async move {
                                                         engine.run(bls_signer).await;
                                                     });

@@ -7,29 +7,29 @@
 //!
 //! Verify (per-input + tx-level wrappers):
 //! - `verify_authority` — `MintWithAuthority` (genesis + coinbase),
-//!   the canonical 9-check chain (Go `verifyWithMintWithAuthority`).
+//! the canonical 9-check chain (Go `verifyWithMintWithAuthority`).
 //! - `verify_with_signature` / `verify_mint_transaction_signature` —
-//!   `MintWithSignature`. Same 9 input checks as authority plus the
-//!   per-output `output[i].VerificationKey == input[i].proofs[0][32..88]`
-//!   constraint (Go `MintTransactionOutput.Verify` line 2061-2070).
+//! `MintWithSignature`. Same 9 input checks as authority plus the
+//! per-output `output[i].VerificationKey == input[i].proofs[0][32..88]`
+//! constraint (Go `MintTransactionOutput.Verify` line 2061-2070).
 //! - `verify_verkle_multiproof_input` /
-//!   `verify_mint_transaction_verkle` — `MintWithProof +
-//!   VerkleMultiproofWithSignature` (Go
-//!   `verifyWithVerkleMultiproofSignature`).
+//! `verify_mint_transaction_verkle` — `MintWithProof +
+//! VerkleMultiproofWithSignature` (Go
+//! `verifyWithVerkleMultiproofSignature`).
 //! - `verify_with_payment_input` / `verify_mint_transaction_payment` —
-//!   `MintWithPayment` (free-mint and paid-mint flows; nested
-//!   PendingTransaction verification is delegated to a caller-supplied
-//!   closure).
+//! `MintWithPayment` (free-mint and paid-mint flows; nested
+//! PendingTransaction verification is delegated to a caller-supplied
+//! closure).
 //! - `verify_pomw_input` + `verify_mint_transaction_pomw` — the
-//!   13-check `MintWithProof + ProofOfMeaningfulWork` chain.
+//! 13-check `MintWithProof + ProofOfMeaningfulWork` chain.
 //!
 //! Materialize:
 //! - `materialize_authority` — shared output writer for Authority,
-//!   Signature, Verkle, and Payment variants. Writes each output as a
-//!   coin vertex plus a spent marker per input at `poseidon(proofs[0])`.
+//! Signature, Verkle, and Payment variants. Writes each output as a
+//! coin vertex plus a spent marker per input at `poseidon(proofs[0])`.
 //! - `materialize_pomw` — the PoMW supply-invariant variant; decrements
-//!   the prover reward balance for each input before delegating coin
-//!   creation to `materialize_authority`.
+//! the prover reward balance for each input before delegating coin
+//! creation to `materialize_authority`.
 //!
 //! Wire format: all variants share the same canonical-bytes triple
 //! (0x050D / 0x050E / 0x050F). The variant in force is selected by the
@@ -225,18 +225,18 @@ fn signature_size_for_key_type(kt: KeyType) -> Result<usize> {
 ///
 /// ```text
 /// transcript =
-///     concat(input[i].proofs concatenated, for i in inputs)
-///     || domain
-///     || concat over outputs:
-///          output.commitment
-///          || output.frame_number
-///          || (if output.recipient.additional_reference is 64 bytes:
-///                output.recipient.additional_reference
-///                || output.recipient.additional_reference_key)
-///          || output.recipient.coin_balance
-///          || output.recipient.mask
-///          || output.recipient.one_time_key
-///          || output.recipient.verification_key
+/// concat(input[i].proofs concatenated, for i in inputs)
+/// || domain
+/// || concat over outputs:
+/// output.commitment
+/// || output.frame_number
+/// || (if output.recipient.additional_reference is 64 bytes:
+/// output.recipient.additional_reference
+/// || output.recipient.additional_reference_key)
+/// || output.recipient.coin_balance
+/// || output.recipient.mask
+/// || output.recipient.one_time_key
+/// || output.recipient.verification_key
 ///
 /// challenge = decaf.hash_to_scalar(transcript).Private()
 /// ```
@@ -289,28 +289,28 @@ pub fn compute_mint_transaction_challenge(
 ///
 /// Performs:
 /// 1. Structural validation (I/O counts, fees bounded, non-divisible
-///    tokens have matching I/O counts).
+/// tokens have matching I/O counts).
 /// 2. For each input:
-///    a. Commitment length check.
-///    b. Non-divisible token checks (unitary value, additional
-///       reference fields).
-///    c. Single proof present, length `88 + signature_size(key_type)`.
-///    d. First 32 bytes of proof equal the claimed `Value`.
-///    e. Authority signature verification via `KeyManager`:
-///       message=`proof[:88]`, signature=`proof[88:]`, context=`domain`.
-///    f. Key image match: `proof[32..88] == signature[56*4..56*5]`.
-///    g. Commitment match: `commitment == signature[56*5..56*6]`.
-///    h. Hidden bulletproof signature verification against
-///       `build_mint_transaction_transcript`.
-///    i. Key image uniqueness across inputs (double-spend).
+/// a. Commitment length check.
+/// b. Non-divisible token checks (unitary value, additional
+/// reference fields).
+/// c. Single proof present, length `88 + signature_size(key_type)`.
+/// d. First 32 bytes of proof equal the claimed `Value`.
+/// e. Authority signature verification via `KeyManager`:
+/// message=`proof[:88]`, signature=`proof[88:]`, context=`domain`.
+/// f. Key image match: `proof[32..88] == signature[56*4..56*5]`.
+/// g. Commitment match: `commitment == signature[56*5..56*6]`.
+/// h. Hidden bulletproof signature verification against
+/// `build_mint_transaction_transcript`.
+/// i. Key image uniqueness across inputs (double-spend).
 /// 3. For each output:
-///    a. Structural output validation (commitment length, bundle
-///       lengths, frame number).
-///    b. `frame_number_arg > output.frame_number` (big-endian u64).
+/// a. Structural output validation (commitment length, bundle
+/// lengths, frame number).
+/// b. `frame_number_arg > output.frame_number` (big-endian u64).
 /// 4. Bulletproof range proof verification over concatenated output
-///    commitments.
+/// commitments.
 /// 5. Bulletproof sum check: input commitments sum == output
-///    commitments sum (no fees for mints).
+/// commitments sum (no fees for mints).
 ///
 /// Note: Spent-coin lookups (poseidon(proof) → vertex exists) are the
 /// caller's responsibility — this function is pure crypto. The
@@ -612,11 +612,11 @@ pub fn verify_with_signature(
 ///
 /// Proof layout (`input.proofs[0]`):
 /// ```text
-/// [0 .. n-88)    traversal proof (parsed by `parse_go_traversal_proof`)
+/// [0 .. n-88) traversal proof (parsed by `parse_go_traversal_proof`)
 /// [n-88 .. n-56) amount — big-endian 32-byte big.Int that must equal
-///                input.value
-/// [n-56 .. n)    key image — 56 bytes that must equal
-///                input.signature[56*4 .. 56*5]
+/// input.value
+/// [n-56 .. n) key image — 56 bytes that must equal
+/// input.signature[56*4 .. 56*5]
 /// ```
 ///
 /// `verkle_root` is the token config's `MintStrategy.VerkleRoot`.
@@ -741,10 +741,10 @@ pub struct MintWithPaymentConfig<'a> {
 /// Proof `[0]` layout:
 /// ```text
 /// <... nested PendingTransaction bytes (free-mint: empty)>
-/// [n-224..n-168)  synthetic blind scalar (56)
-/// [n-168..n-112)  ephemeral key scalar (56)
-/// [n-112..n-56)   paymentAddress preimage part 1 (56)
-/// [n-56 .. n)     paymentAddress preimage part 2 (56)
+/// [n-224..n-168) synthetic blind scalar (56)
+/// [n-168..n-112) ephemeral key scalar (56)
+/// [n-112..n-56) paymentAddress preimage part 1 (56)
+/// [n-56 .. n) paymentAddress preimage part 2 (56)
 /// ```
 ///
 /// For a free mint (fee baseline absent or zero), `proof[0]` must be
@@ -1285,8 +1285,8 @@ pub fn materialize_authority(
         // Touch the commit so it matches the Go path which calls
         // `coinTree.Commit(inclusionProver, false)` — we don't use the
         // returned root, but the operation ensures internal state is
-        // consistent for any downstream readers.
-        let _ = tree.commit(inclusion_prover);
+        // consistent for any downstream readers. (KZG node-commit retired —
+        // forest-irrelevant.)
         coins.push((addr, tree));
     }
 
@@ -1430,15 +1430,15 @@ use crate::traversal_proof::{TraversalProof, TraversalSubProof, verify_traversal
 ///
 /// ```text
 /// u32 multiproof_len
-/// [multiproof_len bytes]     (inner: u32 d_len, [d], u32 proof_len, [proof])
+/// [multiproof_len bytes] (inner: u32 d_len, [d], u32 proof_len, [proof])
 /// u32 sub_proofs_count
 /// for each subproof:
-///   u32 commits_count
-///   {u32 commit_len, [commit_len bytes]} × commits_count
-///   u32 ys_count
-///   {u32 y_len, [y_len bytes]} × ys_count
-///   u32 paths_count
-///   {u32 path_len, u64 × path_len} × paths_count
+/// u32 commits_count
+/// {u32 commit_len, [commit_len bytes]} × commits_count
+/// u32 ys_count
+/// {u32 y_len, [y_len bytes]} × ys_count
+/// u32 paths_count
+/// {u32 path_len, u64 × path_len} × paths_count
 /// ```
 ///
 /// The inner multiproof is a pair `(d, proof)` where `d` is the
@@ -1681,7 +1681,7 @@ pub fn verify_multiproof_against_leaves(
 
 /// Verify the address-derivation check:
 /// `sha512(0x00 || prover_root_domain || delegated_address || last_y)
-///  == last_commit`.
+/// == last_commit`.
 ///
 /// Mirrors Go lines 1832-1850. Returns `Ok(())` if the derivation
 /// matches; `Err(InvalidArgument)` otherwise.
@@ -1711,21 +1711,21 @@ pub fn verify_pomw_address_derivation(
 ///
 /// ### Inputs
 ///
-/// - `input`:             the mint transaction input being verified
-/// - `tx_domain`:         the enclosing transaction's 32-byte domain
+/// - `input`: the mint transaction input being verified
+/// - `tx_domain`: the enclosing transaction's 32-byte domain
 /// - `output_transcript`: SHA3 transcript of output commitments,
-///                        produced by the caller's
-///                        `build_mint_transaction_transcript`
-/// - `reward_root`:       the reward-tree root to verify the
-///                        traversal proof against. For QUIL: the
-///                        cited frame's `ProverTreeCommitment`; for
-///                        other tokens: the per-domain vertex_adds
-///                        shard commit at the input's frame number.
-///                        The caller resolves this because it
-///                        requires the clock/hypergraph store.
-/// - `inclusion_prover`:  for KZG multiproof verification
+/// produced by the caller's
+/// `build_mint_transaction_transcript`
+/// - `reward_root`: the reward-tree root to verify the
+/// traversal proof against. For QUIL: the
+/// cited frame's `ProverTreeCommitment`; for
+/// other tokens: the per-domain vertex_adds
+/// shard commit at the input's frame number.
+/// The caller resolves this because it
+/// requires the clock/hypergraph store.
+/// - `inclusion_prover`: for KZG multiproof verification
 /// - `bulletproof_prover`: for the hidden-Schnorr sig check
-/// - `key_manager`:       for the BLS48-581 signature check
+/// - `key_manager`: for the BLS48-581 signature check
 ///
 /// ### Returns
 ///
@@ -1783,9 +1783,6 @@ pub fn verify_pomw_input(
         )));
     }
 
-    // 5. Decode the traversal proof from proofs[0].
-    let traversal = parse_go_traversal_proof(&input.proofs[0])?;
-
     // 6. Extract owner prover address, signer pubkey, and BLS sig.
     // `pubkey` is the SIGNER's pubkey (may be the prover's own or a
     // configured delegate's). `owner_prover_address` is the prover
@@ -1799,115 +1796,159 @@ pub fn verify_pomw_input(
 
     // 7. Compute the addressing derivation. `leaf_owner_address` is
     // the reward vertex's location on chain — bound to the owner,
-    // not the signer. Spend authority is verified separately in
-    // step 11 below by reading the leaf's `DelegateAddress` field.
+    // not the signer. Spend authority is verified separately below.
     let (prover_root_domain, leaf_owner_address) =
         derive_pomw_addressing(tx_domain, owner_prover_address)?;
 
-    // 8. Verify the traversal proof against `reward_root`.
-    if !verify_traversal_proof(inclusion_prover, reward_root, &traversal)? {
-        return Err(QuilError::InvalidArgument(
-            "pomw: traversal proof failed (reward root mismatch)".into(),
-        ));
-    }
-
-    // 9. Verify the multiproof — proves the balance/address pair.
-    //
-    // Go builds the leaves from `[proofs[1][:32] (prover addr), value
-    // as 32-byte BE]` with indices `[0, 1]` and `keys = [nil, nil]`.
-    let sp0 = traversal.sub_proofs.first().ok_or_else(|| {
-        QuilError::InvalidArgument("pomw: no subproof[0] for multiproof".into())
-    })?;
-    let last_y = sp0.ys.last().ok_or_else(|| {
-        QuilError::InvalidArgument("pomw: subproof[0] has no ys".into())
-    })?;
-    let last_commit = sp0.commits.last().ok_or_else(|| {
-        QuilError::InvalidArgument("pomw: subproof[0] has no commits".into())
-    })?;
-
+    // Go builds the multiproof leaves from `[proofs[1][:32] (prover addr),
+    // value as 32-byte BE]` at indices `[0, 1]` (keys `[nil, nil]` → the
+    // reward vertex's `[0x00]`=DelegateAddress and `[0x04]`=Balance fields).
     let value_padded = pad_be_to_32(&input.value)?;
-    let addr_bytes = &input.proofs[1][..PROVER_ADDR_LEN];
 
-    // Decode the outer multiproof envelope from proofs[2]: same
-    // format as the inner multiproof — `(u32 d_len, [d], u32 p_len,
-    // [p])`.
-    let mut mc = 0usize;
-    let outer_d_len = read_go_u32(&input.proofs[2], &mut mc)? as usize;
-    let outer_d = read_go_bytes(&input.proofs[2], &mut mc, outer_d_len)?;
-    let outer_p_len = read_go_u32(&input.proofs[2], &mut mc)? as usize;
-    let outer_p = read_go_bytes(&input.proofs[2], &mut mc, outer_p_len)?;
+    // 8-11. Prove the reward vertex exists and binds (owner address @ [0x00],
+    // value @ [0x04]), then enforce spend authority. On a migrated node the
+    // reward tree is the forest GLOBAL_INTRINSIC-shard vertex-adds JMT —
+    // `reward_root` is a 32-byte forest phase root and the two-level KZG
+    // traversal + inner multiproof collapse into per-field JMT existence
+    // proofs; step-10's KZG-commit address derivation is subsumed because the
+    // L3 key prefix IS `leaf_owner_address`. The legacy KZG path (a 64-byte
+    // BLS48-581 commitment root) keeps the original checks. Both branches
+    // reach the SAME accept/reject decision on the same facts — no behavior
+    // change across the cutover.
+    if reward_root.len() == 32 {
+        // ---- FOREST PoMW ----
+        let root32: [u8; 32] = reward_root.try_into().map_err(|_| {
+            QuilError::InvalidArgument("pomw: forest reward root not 32 bytes".into())
+        })?;
+        // The reward vertex's L3 id: `prover_root_domain ‖ leaf_owner_address`
+        // (`Location::to_id` = app_address ‖ data_address).
+        let mut vertex_id = [0u8; 64];
+        vertex_id[..32].copy_from_slice(&prover_root_domain);
+        vertex_id[32..].copy_from_slice(&leaf_owner_address);
+        // Field keys from the schema so a reorder can't silently diverge nodes.
+        let deleg_key = crate::global_schema::field_key("reward:ProverReward", "DelegateAddress")
+            .ok_or_else(|| QuilError::Internal(
+                "pomw: reward:ProverReward.DelegateAddress missing from schema".into(),
+            ))?;
+        let balance_key = crate::global_schema::field_key("reward:ProverReward", "Balance")
+            .ok_or_else(|| QuilError::Internal(
+                "pomw: reward:ProverReward.Balance missing from schema".into(),
+            ))?;
+        let expected = vec![
+            (deleg_key, owner_prover_address.to_vec()),
+            (balance_key, value_padded.to_vec()),
+        ];
+        let mp = quil_forest::MembershipProof::from_bytes(&input.proofs[0]).map_err(|e| {
+            QuilError::InvalidArgument(format!("pomw: decode forest membership proof: {}", e))
+        })?;
+        let vertex = mp.inputs.first().ok_or_else(|| {
+            QuilError::InvalidArgument("pomw: forest membership proof has no vertex".into())
+        })?;
+        if vertex.vertex_address != vertex_id {
+            return Err(QuilError::InvalidArgument(
+                "pomw: forest proof vertex address != reward vertex".into(),
+            ));
+        }
+        // Existence + (owner @ [0x00], value @ [0x04]) binding — steps 8,9,10.
+        quil_forest::verify_vertex_membership(&root32, vertex, &expected).map_err(|e| {
+            QuilError::InvalidArgument(format!(
+                "pomw: forest membership failed (reward vertex not present/bound): {}", e
+            ))
+        })?;
+        // 11. Spend authority: `poseidon(signer_pubkey) == DelegateAddress`.
+        // The proof binds DelegateAddress == owner_prover_address, so this is
+        // exactly the KZG path's combined constraint (see the KZG branch).
+        let signer_addr = quil_crypto::poseidon::hash_bytes_to_32(pubkey)?;
+        if signer_addr.as_slice() != owner_prover_address {
+            return Err(QuilError::InvalidArgument(
+                "pomw: signer pubkey does not match the reward vertex's DelegateAddress \
+                 (signer is neither the owner nor the configured delegate)"
+                    .into(),
+            ));
+        }
+    } else {
+        // ---- KZG PoMW (legacy 64-byte BLS48-581 commitment root) ----
+        // 5. Decode the traversal proof from proofs[0].
+        let traversal = parse_go_traversal_proof(&input.proofs[0])?;
 
-    let valid_mp = verify_multiproof_against_leaves(
-        inclusion_prover,
-        &[addr_bytes, &value_padded[..]],
-        &[0, 1],
-        &[&[], &[]],
-        outer_d,
-        outer_p,
-        last_y,
-    )?;
-    if !valid_mp {
-        return Err(QuilError::InvalidArgument(
-            "pomw: multiproof rejected".into(),
-        ));
-    }
+        // 8. Verify the traversal proof against `reward_root`.
+        if !verify_traversal_proof(inclusion_prover, reward_root, &traversal)? {
+            return Err(QuilError::InvalidArgument(
+                "pomw: traversal proof failed (reward root mismatch)".into(),
+            ));
+        }
 
-    // 10. Verify address derivation at the leaf. The recomputed leaf
-    // commit uses the OWNER-derived address — proving the
-    // `last_y` blob is the reward vertex content for this prover's
-    // on-chain leaf.
-    verify_pomw_address_derivation(
-        &prover_root_domain,
-        &leaf_owner_address,
-        last_y,
-        last_commit,
-    )?;
+        // 9. Verify the inner multiproof — proves the balance/address pair.
+        let sp0 = traversal.sub_proofs.first().ok_or_else(|| {
+            QuilError::InvalidArgument("pomw: no subproof[0] for multiproof".into())
+        })?;
+        let last_y = sp0.ys.last().ok_or_else(|| {
+            QuilError::InvalidArgument("pomw: subproof[0] has no ys".into())
+        })?;
+        let last_commit = sp0.commits.last().ok_or_else(|| {
+            QuilError::InvalidArgument("pomw: subproof[0] has no commits".into())
+        })?;
+        let addr_bytes = &input.proofs[1][..PROVER_ADDR_LEN];
 
-    // 11. Spend authority. Parse the leaf value (`last_y`) as the
-    // reward sub-tree, read its `DelegateAddress` field, and verify
-    // `poseidon(signer_pubkey) == DelegateAddress`. This is the
-    // single rule that covers both self-spend and delegate-spend:
-    //
-    //   * Self-spend: the owner never configured a delegate. Join-time
-    //     materialize wrote `DelegateAddress = prover.address =
-    //     poseidon(prover_pubkey)`. The signer is the prover, so
-    //     `poseidon(signer_pubkey) == DelegateAddress` holds.
-    //
-    //   * Delegate-spend: the owner set `delegate_address =
-    //     poseidon(delegate_pubkey)` via `ProverJoin.DelegateAddress`
-    //     (or rotated to it via `ProverUpdate`). Only a signer whose
-    //     pubkey hashes to the configured delegate address can pass
-    //     this check.
-    //
-    // The original derivation (pre-fork) baked spend authority into
-    // the leaf address by deriving it from `poseidon(signer_pubkey)`,
-    // which made the `DelegateAddress` field informational only. This
-    // hard-fork change moves authority out of the address into an
-    // explicit check, letting delegate-spend actually work.
-    let signer_addr = quil_crypto::poseidon::hash_bytes_to_32(pubkey)?;
-    let leaf_subtree = crate::prover_registry::rebuild_vertex_tree_from_blob(last_y);
-    let delegate_address_field = crate::global_schema::read_field(
-        &leaf_subtree,
-        "reward:ProverReward",
-        "DelegateAddress",
-    )
-    .ok_or_else(|| {
-        QuilError::InvalidArgument(
-            "pomw: reward vertex missing DelegateAddress field".into(),
+        // Decode the outer multiproof envelope from proofs[2]:
+        // `(u32 d_len, [d], u32 p_len, [p])`.
+        let mut mc = 0usize;
+        let outer_d_len = read_go_u32(&input.proofs[2], &mut mc)? as usize;
+        let outer_d = read_go_bytes(&input.proofs[2], &mut mc, outer_d_len)?;
+        let outer_p_len = read_go_u32(&input.proofs[2], &mut mc)? as usize;
+        let outer_p = read_go_bytes(&input.proofs[2], &mut mc, outer_p_len)?;
+
+        let valid_mp = verify_multiproof_against_leaves(
+            inclusion_prover,
+            &[addr_bytes, &value_padded[..]],
+            &[0, 1],
+            &[&[], &[]],
+            outer_d,
+            outer_p,
+            last_y,
+        )?;
+        if !valid_mp {
+            return Err(QuilError::InvalidArgument(
+                "pomw: multiproof rejected".into(),
+            ));
+        }
+
+        // 10. Verify address derivation at the leaf (OWNER-derived address).
+        verify_pomw_address_derivation(
+            &prover_root_domain,
+            &leaf_owner_address,
+            last_y,
+            last_commit,
+        )?;
+
+        // 11. Spend authority. Read the leaf's `DelegateAddress` field and
+        // verify `poseidon(signer_pubkey) == DelegateAddress` (self- or
+        // delegate-spend). See [[delegate_spend_fork]].
+        let signer_addr = quil_crypto::poseidon::hash_bytes_to_32(pubkey)?;
+        let leaf_subtree = crate::prover_registry::rebuild_vertex_tree_from_blob(last_y);
+        let delegate_address_field = crate::global_schema::read_field(
+            &leaf_subtree,
+            "reward:ProverReward",
+            "DelegateAddress",
         )
-    })?;
-    if delegate_address_field.len() != 32 {
-        return Err(QuilError::InvalidArgument(format!(
-            "pomw: reward vertex DelegateAddress is {} bytes (expected 32)",
-            delegate_address_field.len()
-        )));
-    }
-    if signer_addr.as_slice() != delegate_address_field.as_slice() {
-        return Err(QuilError::InvalidArgument(
-            "pomw: signer pubkey does not match the reward vertex's DelegateAddress \
-             (signer is neither the owner nor the configured delegate)"
-                .into(),
-        ));
+        .ok_or_else(|| {
+            QuilError::InvalidArgument(
+                "pomw: reward vertex missing DelegateAddress field".into(),
+            )
+        })?;
+        if delegate_address_field.len() != 32 {
+            return Err(QuilError::InvalidArgument(format!(
+                "pomw: reward vertex DelegateAddress is {} bytes (expected 32)",
+                delegate_address_field.len()
+            )));
+        }
+        if signer_addr.as_slice() != delegate_address_field.as_slice() {
+            return Err(QuilError::InvalidArgument(
+                "pomw: signer pubkey does not match the reward vertex's DelegateAddress \
+                 (signer is neither the owner nor the configured delegate)"
+                    .into(),
+            ));
+        }
     }
 
     // 12. BLS48-581 G2 signature over Signature[56*4..56*5] (the key
@@ -1988,13 +2029,13 @@ use quil_types::store::ClockStore;
 ///
 /// 1. Resolve the cited frame number from `outputs[0].frame_number`.
 /// 2. Fetch the reward root:
-///    - **QUIL**: `ClockStore::get_global_clock_frame(frame).header
-///      .prover_tree_commitment`
-///    - **non-QUIL**: `HypergraphCrdt::get_shard_commits(frame,
-///      tx.domain)[0]` (vertex_adds commit)
+/// - **QUIL**: `ClockStore::get_global_clock_frame(frame).header
+/// .prover_tree_commitment`
+/// - **non-QUIL**: `HypergraphCrdt::get_shard_commits(frame,
+/// tx.domain)[0]` (vertex_adds commit)
 /// 3. Build the output transcript via `build_mint_transaction_transcript`.
 /// 4. For each input, call `verify_proof_of_meaningful_work_with_root`
-///    (spend-check + `verify_pomw_input` — the 13-check chain).
+/// (spend-check + `verify_pomw_input` — the 13-check chain).
 ///
 /// This function is fail-closed — missing ClockStore (for QUIL) or a
 /// missing shard commit (for non-QUIL) returns `Err`.
@@ -2153,6 +2194,89 @@ mod tests {
         BulletproofProver, DecafAgreement, DecafConstructor, InclusionProver, KeyManager,
         KeyType, Multiproof, RangeProofResult,
     };
+
+    // --- Forest PoMW reward-vertex membership (Phase-3 cutover) ---
+
+    #[test]
+    fn forest_pomw_reward_field_keys_are_stable() {
+        // The forest PoMW branch binds DelegateAddress @ [0x00] and Balance @
+        // [0x04] — the flat L3 keys the reward vertex is stored under. If these
+        // drift, the JMT lookup misses and every reward spend fails.
+        assert_eq!(
+            crate::global_schema::field_key("reward:ProverReward", "DelegateAddress"),
+            Some(vec![0x00])
+        );
+        assert_eq!(
+            crate::global_schema::field_key("reward:ProverReward", "Balance"),
+            Some(vec![0x04])
+        );
+    }
+
+    #[test]
+    fn forest_pomw_reward_membership_round_trips() {
+        // Mirrors the forest branch of `verify_pomw_input` steps 8-10: commit a
+        // reward vertex as ONE per-vertex leaf (subtree commitment ‖ size, keyed
+        // by its 32-byte data address), build the two-level membership proof, and
+        // verify the (DelegateAddress, Balance) binding against the committed
+        // vertex-adds phase root.
+        use quil_forest::{verify_vertex_membership, Forest, Phase};
+        use quil_tries::VectorCommitmentTree;
+
+        let forest = Forest::in_memory();
+        let prover_root_domain = [0xFFu8; 32];
+        let leaf_owner_address = [0xABu8; 32];
+        let mut vertex_id = [0u8; 64];
+        vertex_id[..32].copy_from_slice(&prover_root_domain);
+        vertex_id[32..].copy_from_slice(&leaf_owner_address);
+
+        // DelegateAddress binds to the owner address; Balance to the value.
+        let owner_value = leaf_owner_address.to_vec(); // step-9 idx0 == owner addr
+        let mut balance = [0u8; 32];
+        balance[31] = 100; // step-9 idx1 == value (32-byte BE)
+
+        let deleg_key =
+            crate::global_schema::field_key("reward:ProverReward", "DelegateAddress").unwrap();
+        let bal_key = crate::global_schema::field_key("reward:ProverReward", "Balance").unwrap();
+
+        // Build the vertex subtree blob and commit its per-vertex leaf.
+        let mut vtree = VectorCommitmentTree::new();
+        vtree
+            .insert(&deleg_key, &owner_value, &[], &num_bigint::BigInt::from(owner_value.len()))
+            .unwrap();
+        vtree
+            .insert(&bal_key, &balance, &[], &num_bigint::BigInt::from(balance.len()))
+            .unwrap();
+        let blob = quil_tries::serialize_go_tree(vtree.root.as_ref()).unwrap();
+        let leaf = quil_tries::vertex_leaf_value(&blob).unwrap();
+        let root = forest
+            .commit_shard_phase_raw(
+                b"global-shard",
+                Phase::VertexAdds,
+                0,
+                vec![(vertex_id[32..].to_vec(), leaf)],
+            )
+            .unwrap();
+
+        let vertex = forest
+            .build_vertex_membership_proof(b"global-shard", Phase::VertexAdds, 0, &vertex_id, &blob)
+            .unwrap();
+        assert_eq!(vertex.vertex_address, vertex_id.to_vec());
+
+        let expected = vec![
+            (deleg_key.clone(), owner_value.clone()),
+            (bal_key.clone(), balance.to_vec()),
+        ];
+        verify_vertex_membership(&root, &vertex, &expected)
+            .expect("reward vertex membership verifies (existence + owner/value binding)");
+
+        // A wrong claimed value (spending more than the on-chain balance) must
+        // be rejected — the Balance leaf won't match.
+        let bad_expected = vec![
+            (deleg_key, owner_value),
+            (bal_key, vec![0xFFu8; 32]),
+        ];
+        assert!(verify_vertex_membership(&root, &vertex, &bad_expected).is_err());
+    }
 
     // --- Canonical-bytes round-trip tests (pre-existing) ---
 

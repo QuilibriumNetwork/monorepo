@@ -162,6 +162,7 @@ impl ArchiveAppShardIngest {
             frame_number,
             Some(self.execution_manager.as_ref()),
             Some(self.inclusion_prover.as_ref()),
+            self.hypergraph.has_forest(),
         ) {
             Ok(r) => r,
             Err(_) => return,

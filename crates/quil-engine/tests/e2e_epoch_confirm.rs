@@ -390,7 +390,15 @@ async fn tier2_confirm_materializes_to_active_and_allocator_starts_worker() {
         .set_remote_shard_sizes(shard_sizes);
 
     let joiner_cf = joiner_pipeline.current_frame.clone();
-    for frame_num in 6u64..=21 {
+    // Tick the joiner's lifecycle across the epoch boundary. The ConfirmJoins
+    // action is `tokio::spawn`-published, so instead of a single post-loop
+    // drain (which races the spawned publish), we drain + materialize every
+    // spawned bundle at frame 17 on EACH tick and stop once the allocation
+    // flips to Active.
+    let mut confirm_result_processed = 0usize;
+    let mut confirm_result_skipped = 0usize;
+    let mut status_after_confirm = None;
+    'outer: for frame_num in 6u64..=40 {
         joiner_cf.observe(frame_num);
         joiner_cf.materialize(frame_num);
         joiner_pipeline
@@ -410,52 +418,39 @@ async fn tier2_confirm_materializes_to_active_and_allocator_starts_worker() {
         for action in actions {
             joiner_pipeline.pipeline.dispatch(action);
         }
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    // Drain after the loop — dispatch is async and the bundle may
-    // arrive at the transport a few hundred ms after the action fires.
-    for _ in 0..50 {
-        if joiner_transport.outbound_len() > 0 {
-            break;
+        // Let spawned submit tasks publish, then drain + materialize.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            for bundle in &joiner_transport.drain_outbound() {
+                if let Ok(r) =
+                    archive.materializer.materialize(&build_global_frame_with_bundle(17, bundle))
+                {
+                    confirm_result_processed += r.processed;
+                    confirm_result_skipped += r.skipped;
+                }
+            }
+            archive.prover_registry.refresh_from_store(&archive.hg_store);
+            status_after_confirm = archive.prover_registry.read(|r| {
+                r.get_prover_info(&joiner.address).and_then(|info| {
+                    info.allocations
+                        .iter()
+                        .find(|a| a.confirmation_filter == filter)
+                        .map(|a| a.status)
+                })
+            });
+            if status_after_confirm == Some(quil_types::consensus::ProverStatus::Active) {
+                break 'outer;
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let mut drained = joiner_transport.drain_outbound();
-    eprintln!("joiner emitted {} bundles total", drained.len());
-    let confirm_bytes = drained
-        .pop()
-        .expect("joiner pipeline never emitted a ProverConfirm");
-
-    // Step C: archive materializes the ProverConfirm at frame 17 →
-    // allocation flips Joining → Active.
-    let confirm_frame = build_global_frame_with_bundle(17, &confirm_bytes);
-    let confirm_result = archive
-        .materializer
-        .materialize(&confirm_frame)
-        .expect("materialize ProverConfirm");
-    eprintln!(
-        "ProverConfirm materialize: processed={} skipped={}",
-        confirm_result.processed, confirm_result.skipped,
-    );
-    archive
-        .prover_registry
-        .refresh_from_store(&archive.hg_store);
-
-    let status_after_confirm = archive.prover_registry.read(|r| {
-        let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
-        info.allocations
-            .iter()
-            .find(|a| a.confirmation_filter == filter)
-            .map(|a| a.status)
-    });
     assert_eq!(
         status_after_confirm,
         Some(quil_types::consensus::ProverStatus::Active),
         "expected joiner allocation to flip Joining→Active after ProverConfirm; \
          processed={} skipped={}",
-        confirm_result.processed,
-        confirm_result.skipped,
+        confirm_result_processed,
+        confirm_result_skipped,
     );
 
     // Step D: WorkerAllocator.on_new_frame sees the Active allocation
@@ -537,7 +532,7 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
     let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
     let seed_hex = build_genesis_seed_hex(&genesis_provers);
     let real_km: Arc<dyn quil_types::crypto::KeyManager> = Arc::new(
-        quil_crypto::DefaultKeyManager::new(Arc::new(quil_crypto::Bls48581KeyConstructor)),
+        quil_crypto::DefaultKeyManager::new(),
     );
     let archive = build_tier2_archive_rig_with_key_manager(
         genesis_provers[0].clone(),
@@ -635,14 +630,13 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let confirm_bytes = joiner_transport
-        .drain_outbound()
-        .pop()
-        .expect("joiner pipeline never emitted a ProverConfirm");
-    archive
-        .materializer
-        .materialize(&build_global_frame_with_bundle(17, &confirm_bytes))
-        .expect("materialize confirm");
+    // Materialize every drained bundle at frame 17 (confirm order is
+    // non-deterministic due to spawn); the ProverConfirm one flips to Active.
+    for bundle in &joiner_transport.drain_outbound() {
+        let _ = archive
+            .materializer
+            .materialize(&build_global_frame_with_bundle(17, bundle));
+    }
     archive
         .prover_registry
         .refresh_from_store(&archive.hg_store);
@@ -730,7 +724,7 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
     use quil_types::consensus::ProverRegistry as _;
     let active = archive
         .prover_registry
-        .get_active_provers(&filter)
+        .get_active_provers(&filter, coverage_frame_number)
         .expect("get_active_provers");
     eprintln!(
         "active provers for filter {}: {}",
@@ -948,13 +942,13 @@ async fn tier2_composite_end_to_end() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let mut drained = joiner_transport.drain_outbound();
-    let confirm_bytes = drained.pop().expect("joiner never emitted ProverConfirm");
-    let confirm_frame = build_global_frame_with_bundle(17, &confirm_bytes);
-    archive
-        .materializer
-        .materialize(&confirm_frame)
-        .expect("materialize ProverConfirm");
+    // Materialize every drained bundle at frame 17 (confirm order is
+    // non-deterministic due to spawn); the ProverConfirm one flips to Active.
+    for bundle in &joiner_transport.drain_outbound() {
+        let _ = archive
+            .materializer
+            .materialize(&build_global_frame_with_bundle(17, bundle));
+    }
     archive
         .prover_registry
         .refresh_from_store(&archive.hg_store);
@@ -1000,6 +994,8 @@ async fn tier2_composite_end_to_end() {
 
         let deps = quil_engine::app_engine::AppEngineDeps {
             clock_store: clock_store as Arc<dyn ClockStore>,
+            global_anchor_store: None,
+            storage_source_hypergraph: None,
             prover_registry: registry_for_engine.clone()
                 as Arc<dyn quil_types::consensus::ProverRegistry>,
             frame_prover: Arc::new(StubFrameProver) as Arc<dyn FrameProver>,
@@ -1021,6 +1017,7 @@ async fn tier2_composite_end_to_end() {
                 Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
             ),
             kv_db: None,
+            app_consensus_cw: false,
         };
         let (engine, handle) =
             quil_engine::app_engine::AppConsensusEngine::new(core_id, filter_bytes, deps, event_tx);
@@ -1042,6 +1039,7 @@ async fn tier2_composite_end_to_end() {
                     Halted { .. } => "Halted",
                     AncestorSyncRequested { .. } => "AncestorSyncRequested",
                     ParentSealed { .. } => "ParentSealed",
+                    CwOut { .. } => "CwOut",
                 };
                 event_drain.lock().push(name.to_string());
             }
@@ -1124,7 +1122,7 @@ async fn tier2_composite_end_to_end() {
     use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
 
     let _ = AggregateSignature {
-        signature: vec![0u8; 74],
+        signature: vec![0u8; 666],
         public_key: None,
         bitmask: vec![0x01],
     };

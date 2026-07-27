@@ -35,12 +35,7 @@
 
 use std::sync::Arc;
 
-use quil_consensus::models::{State, Unique};
-use quil_consensus::verification::make_vote_message;
-use quil_consensus::voting_provider::VotingProvider;
-use quil_crypto::{Bls48581KeyConstructor, WesolowskiFrameProver};
-use quil_engine::app_types::{AppShardState, AppShardVote, AppShardVoteFactory};
-use quil_engine::voting_provider::{AddressDerivation, BlsVotingProvider};
+use quil_crypto::{FalconKeyConstructor, WesolowskiFrameProver};
 use quil_execution::global_intrinsic::frame_header::FrameHeader;
 use quil_execution::global_intrinsic::prover_shard_update::verify_frame_header_attestation;
 use quil_execution::hypergraph_intrinsic::canonical::{
@@ -50,6 +45,16 @@ use quil_types::consensus::{
     ProverAllocationInfo, ProverInfo, ProverStatus,
 };
 use quil_types::crypto::{BlsConstructor, FrameProver, Signer};
+
+/// Construct the byte buffer that a vote signs: `filter || stateID || rank:u64(BE)`.
+/// Local copy of the former `quil_consensus::verification::make_vote_message`.
+fn make_vote_message(filter: &[u8], rank: u64, state_id: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(filter.len() + state_id.len() + 8);
+    out.extend_from_slice(filter);
+    out.extend_from_slice(state_id);
+    out.extend_from_slice(&rank.to_be_bytes());
+    out
+}
 
 /// Compute the app shard's wire address: `poseidon(filter)`. Mirrors
 /// `app_engine::new_with_filter` at `app_engine.rs:530`.
@@ -155,7 +160,7 @@ fn build_and_verify_partial_with_filter(
 ) -> Result<(quil_execution::global_intrinsic::frame_header::FrameHeader, Vec<ProverInfo>), Box<dyn std::error::Error>>
 {
     assert!(signer_count >= 1 && signer_count <= committee_size);
-    let bls = Bls48581KeyConstructor;
+    let bls = FalconKeyConstructor;
     let frame_prover = WesolowskiFrameProver::new(2048);
     let filter = filter.to_vec();
     let app_address = filter.clone(); // live invariant — Go alias
@@ -165,7 +170,7 @@ fn build_and_verify_partial_with_filter(
         signers.iter().map(|(_, info)| info.clone()).collect();
     let prover_address = active_provers[0].address.clone();
     let requests_root = vec![0u8; 64];
-    let state_roots: Vec<Vec<u8>> = vec![vec![0u8; 74]; 4];
+    let state_roots: Vec<Vec<u8>> = vec![vec![0u8; 666]; 4];
     let difficulty: u32 = 200;
     let timestamp: i64 = 1_700_000_000_000;
     let frame_number: u64 = 1;
@@ -193,7 +198,8 @@ fn build_and_verify_partial_with_filter(
     let pk_refs: Vec<&[u8]> = pks.iter().map(|v| v.as_slice()).collect();
     let sig_refs: Vec<&[u8]> = sigs.iter().map(|v| v.as_slice()).collect();
     let agg = bls.aggregate(&pk_refs, &sig_refs)?;
-    assert_eq!(agg.signature.len(), 74);
+    // Falcon concat: the aggregate is the signers' 666-byte sigs concatenated.
+    assert_eq!(agg.signature.len(), signer_count * 666);
 
     // Bitmask covers ONLY the first `signer_count` positions, even
     // though `committee_size` may be larger. Each committee member
@@ -229,7 +235,7 @@ fn build_and_verify_partial_with_filter(
                 i as u32,
             )?);
         }
-        let mut packed = Vec::with_capacity(74 + 4 + 516 * signer_count);
+        let mut packed = Vec::with_capacity(signer_count * 666 + 4 + 516 * signer_count);
         packed.extend_from_slice(&agg.signature);
         packed.extend_from_slice(&(signer_count as u32).to_be_bytes());
         for p in &proofs {
@@ -292,7 +298,7 @@ fn single_signer_with_three_prover_committee_verifies() {
 }
 
 fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let bls = Bls48581KeyConstructor;
+    let bls = FalconKeyConstructor;
     // 2048-bit Wesolowski VDF, same as mainnet (`main.rs:765`).
     let frame_prover = WesolowskiFrameProver::new(2048);
     let filter = test_filter();
@@ -308,7 +314,7 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
     //    challenge poseidon-input round-trip.
     let prover_address = active_provers[0].address.clone();
     let requests_root = vec![0u8; 64]; // empty-frame root
-    let state_roots: Vec<Vec<u8>> = vec![vec![0u8; 74]; 4];
+    let state_roots: Vec<Vec<u8>> = vec![vec![0u8; 666]; 4];
     let difficulty: u32 = 200; // small enough to keep the test fast
     let timestamp: i64 = 1_700_000_000_000;
     let frame_number: u64 = 1;
@@ -350,7 +356,12 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
     let pk_refs: Vec<&[u8]> = per_signer_pks.iter().map(|v| v.as_slice()).collect();
     let sig_refs: Vec<&[u8]> = per_signer_sigs.iter().map(|v| v.as_slice()).collect();
     let agg = bls.aggregate(&pk_refs, &sig_refs)?;
-    assert_eq!(agg.signature.len(), 74, "BLS aggregate signature is 74 bytes");
+    // Falcon concat: the aggregate is the committee's 666-byte sigs concatenated.
+    assert_eq!(
+        agg.signature.len(),
+        committee_size * 666,
+        "Falcon aggregate is committee_size × 666 bytes"
+    );
 
     let packed_sig: Vec<u8> = if committee_size <= 1 {
         agg.signature.clone()
@@ -376,7 +387,7 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
             assert_eq!(proof.len(), 516);
             multi_proofs.push(proof);
         }
-        let mut packed = Vec::with_capacity(74 + 4 + 516 * committee_size);
+        let mut packed = Vec::with_capacity(committee_size * 666 + 4 + 516 * committee_size);
         packed.extend_from_slice(&agg.signature);
         packed.extend_from_slice(&(committee_size as u32).to_be_bytes());
         for mp in &multi_proofs {
@@ -464,7 +475,7 @@ fn three_prover_frame_header_round_trips() {
 /// pins the contract so the next refactor can't silently break it.
 #[test]
 fn signing_with_raw_filter_instead_of_app_address_must_fail_verify() {
-    let bls = Bls48581KeyConstructor;
+    let bls = FalconKeyConstructor;
     // 2048-bit Wesolowski VDF, same as mainnet (`main.rs:765`).
     let frame_prover = WesolowskiFrameProver::new(2048);
     let filter = test_filter();
@@ -475,7 +486,7 @@ fn signing_with_raw_filter_instead_of_app_address_must_fail_verify() {
         signers.iter().map(|(_, info)| info.clone()).collect();
     let prover_address = active_provers[0].address.clone();
     let requests_root = vec![0u8; 64];
-    let state_roots: Vec<Vec<u8>> = vec![vec![0u8; 74]; 4];
+    let state_roots: Vec<Vec<u8>> = vec![vec![0u8; 666]; 4];
     let difficulty: u32 = 200;
     let timestamp: i64 = 1_700_000_000_000;
     let frame_number: u64 = 1;
@@ -551,214 +562,6 @@ fn signing_with_raw_filter_instead_of_app_address_must_fail_verify() {
     );
 }
 
-// =====================================================================
-// Production-wiring tests
-// =====================================================================
-//
-// The tests above call `bls.sign_with_domain` + `bls.aggregate`
-// directly. They prove the verifier round-trips when the producer
-// signs the canonical payload + domain by hand. But the live
-// failures we've been chasing aren't in the primitives — they're
-// in the wiring between `BlsVotingProvider::sign_vote(state)`,
-// `AppShardVoteFactory`, and the post-aggregation FrameHeader
-// emission. The tests below drive that real wiring so a future
-// regression in any field (sign_filter, vote_domain, identifier
-// derivation, voter_address derivation) trips a unit test instead
-// of a 15-minute testnet roundtrip.
-
-/// Build a minimal `State<AppShardState>` whose identifier matches
-/// the production-time derivation (`compute_output_identity(output) =
-/// poseidon(output)` — see `app_types.rs`). The State's `rank` is
-/// set independently of any AppShardState rank since the consensus
-/// State wraps the AppShardState with its own pacemaker rank.
-fn build_state(
-    filter: &[u8],
-    rank: u64,
-    output: &[u8],
-    parent_selector: &[u8],
-    frame_number: u64,
-) -> State<AppShardState> {
-    let inner = AppShardState::new(
-        filter.to_vec(),
-        frame_number,
-        rank,
-        0,                 // timestamp
-        200,               // difficulty
-        output.to_vec(),
-        parent_selector.to_vec(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        0,
-        Vec::new(),
-        0,
-    );
-    let identity = <AppShardState as Unique>::identity(&inner).clone();
-    State {
-        rank,
-        identifier: identity.clone(),
-        proposer_id: Vec::new(),
-        parent_qc_identity: identity,
-        parent_qc_rank: rank.saturating_sub(1),
-        parent_quorum_certificate: None,
-        timestamp: 0,
-        state: inner,
-    }
-}
-
-/// End-to-end through the actual `BlsVotingProvider::sign_vote`
-/// path that production uses. Catches:
-///   - `sign_filter` field set to the wrong value (this whole
-///     producer/verifier saga).
-///   - `vote_domain` byte sequence diverging from `"appshard" ||
-///     header.address`.
-///   - `state.identifier` ≠ `poseidon(state.output)` (the verifier
-///     reconstructs identity from `header.output`).
-///   - `AppShardVoteFactory` failing to round-trip the signature
-///     bytes onto the produced vote.
-#[test]
-fn bls_voting_provider_sign_vote_round_trips_through_verifier() {
-    let bls: Arc<dyn BlsConstructor> = Arc::new(Bls48581KeyConstructor);
-    let frame_prover = WesolowskiFrameProver::new(2048);
-    let filter = test_filter();
-    // Match the live invariant: `app_address = filter` (Go alias).
-    let app_address = filter.clone();
-
-    // Single signer at committee position 0.
-    let (signer, pubkey) = bls.new_key().expect("bls new_key");
-    let prover_address = quil_crypto::poseidon::hash_bytes_to_32(&pubkey)
-        .expect("poseidon")
-        .to_vec();
-    let active_provers = vec![ProverInfo {
-        public_key: pubkey.clone(),
-        address: prover_address.clone(),
-        status: ProverStatus::Active,
-        kick_frame_number: 0,
-        allocations: vec![ProverAllocationInfo {
-            status: ProverStatus::Active,
-            confirmation_filter: filter.clone(),
-            rejection_filter: Vec::new(),
-            join_frame_number: 0,
-            leave_frame_number: 0,
-            pause_frame_number: 0,
-            resume_frame_number: 0,
-            kick_frame_number: 0,
-            join_confirm_frame_number: 0,
-            join_reject_frame_number: 0,
-            leave_confirm_frame_number: 0,
-            leave_reject_frame_number: 0,
-            last_active_frame_number: 0,
-            epoch: 0,
-            vertex_address: Vec::new(),
-        }],
-        available_storage: 0,
-        seniority: 1000,
-        delegate_address: Vec::new(),
-    }];
-
-    // Generate a real VDF output so identity = poseidon(output)
-    // matches what the verifier reconstructs from `header.output`.
-    let proto = frame_prover
-        .prove_frame_header(
-            &[],
-            &app_address,
-            &vec![0u8; 64],
-            &vec![vec![0u8; 74]; 4],
-            &prover_address,
-            1_700_000_000_000,
-            200,
-            0,
-            1,
-            &[],
-            0,
-        )
-        .expect("prove_frame_header");
-
-    let rank: u64 = 42;
-    let state = build_state(&filter, rank, &proto.output, &proto.parent_selector, 1);
-
-    // Mirror the production wiring in `app_engine.rs::start_consensus`:
-    //   sign_filter = self.app_address (now == filter),
-    //   vote_domain = "appshard" || self.app_address,
-    //   derive_address = poseidon(pubkey) → 32 bytes,
-    //   factory = AppShardVoteFactory { filter }.
-    let mut vote_domain = b"appshard".to_vec();
-    vote_domain.extend_from_slice(&app_address);
-    let mut timeout_domain = b"appshardtimeout".to_vec();
-    timeout_domain.extend_from_slice(&app_address);
-    let derive_address: AddressDerivation = Arc::new(|pk: &[u8]| {
-        quil_crypto::poseidon::hash_bytes_to_32(pk)
-            .unwrap_or_default()
-            .to_vec()
-    });
-    let factory = Arc::new(AppShardVoteFactory {
-        filter: filter.clone(),
-    });
-    let voting_provider: BlsVotingProvider<
-        AppShardState,
-        AppShardVote,
-        AppShardVoteFactory,
-    > = BlsVotingProvider::new_with_filter(
-        Arc::from(signer),
-        vote_domain,
-        timeout_domain,
-        derive_address,
-        factory,
-        // Critical: must equal `app_address`, NOT raw `filter` if
-        // they differ. With the production fix they're the same.
-        app_address.clone(),
-    );
-
-    let vote = voting_provider
-        .sign_vote(&state)
-        .expect("sign_vote must succeed");
-    assert_eq!(vote.rank(), rank, "vote.rank reflects state.rank");
-
-    // Aggregate just this single signer's vote. Production uses
-    // `WeightedSignatureAggregatorImpl::aggregate` here, but for one
-    // signer it reduces to `bls.aggregate([pk], [sig])`.
-    let agg = bls
-        .aggregate(&[pubkey.as_slice()], &[vote.signature_bytes.as_slice()])
-        .expect("bls aggregate");
-    assert_eq!(agg.signature.len(), 74);
-
-    let agg_canonical = AggregateSignature {
-        signature: agg.signature,
-        public_key: Some(Bls48581G2PublicKey {
-            key_value: agg.public_key,
-        }),
-        bitmask: bitmask_full(1),
-    };
-    let frame_header = FrameHeader {
-        address: app_address,
-        frame_number: 1,
-        rank,
-        timestamp: 1_700_000_000_000,
-        difficulty: 200,
-        output: proto.output,
-        parent_selector: proto.parent_selector,
-        requests_root: vec![0u8; 64],
-        state_roots: vec![vec![0u8; 74]; 4],
-        prover: prover_address,
-        fee_multiplier_vote: 0,
-        public_key_signature_bls48581: agg_canonical
-            .to_canonical_bytes()
-            .expect("canonical encode"),
-        storage_attestation_root: Vec::new(),
-        global_frame_number: 0,
-        storage_attestation: Vec::new(),
-    };
-
-    let bitmask = verify_frame_header_attestation(
-        &frame_header,
-        &frame_prover,
-        bls.as_ref(),
-        &active_provers,
-    )
-    .expect("verify_frame_header_attestation must succeed end-to-end");
-    assert_eq!(bitmask, vec![0x01u8]);
-}
 
 // =====================================================================
 // Condition 1 — shard-frame BLS + VDF-multiproof + 2/3 quorum gate
@@ -799,7 +602,7 @@ fn shard_frame_quorum_outcome_with_filter(
 
     // Re-run the attestation exactly as invoke_frame_header does to obtain
     // the verified, bit-packed worker bitmask.
-    let bls = Bls48581KeyConstructor;
+    let bls = FalconKeyConstructor;
     let frame_prover = WesolowskiFrameProver::new(2048);
     let bitmask_bytes = verify_frame_header_attestation(
         &frame_header,

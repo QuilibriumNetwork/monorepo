@@ -5,6 +5,7 @@ mod explorer;
 mod keys;
 mod logger;
 mod p2p;
+mod signatories;
 mod version;
 
 pub use config::*;
@@ -14,6 +15,7 @@ pub use explorer::*;
 pub use keys::*;
 pub use logger::*;
 pub use p2p::*;
+pub use signatories::*;
 pub use version::*;
 
 use serde::{Deserialize, Deserializer};

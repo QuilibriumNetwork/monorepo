@@ -17,6 +17,9 @@ pub(crate) async fn init(
     config_dir: &std::path::Path,
     network: u8,
     archive_mode: bool,
+    // Raw 1281-byte Falcon-512 signing key (the q-prover-key) — the libp2p
+    // NETWORK identity under the Rust-only flag day.
+    falcon_signing_key: &[u8],
 ) -> anyhow::Result<P2pHandles> {
     // ---------------------------------------------------------------
     // 5. Start P2P networking
@@ -33,24 +36,30 @@ pub(crate) async fn init(
     // the mainnet variant on testnet runs.
     let mut p2p_config = config.p2p.clone();
     p2p_config.network = network;
-    let p2p_node = quil_p2p::node::P2PNode::new(&p2p_config)?;
-    let peer_id = p2p_node.peer_id;
-    info!(
-        key_type = if config.p2p.peer_priv_key.is_empty() { "generated Ed448" } else { "loaded from config" },
-        %peer_id,
-        "P2P identity ready"
-    );
 
-    // Persist newly generated Ed448 key to config
-    if let Some(key_hex) = &p2p_node.generated_key_hex {
+    // Ensure the Ed448 SENIORITY-ROOT key exists (persisted in
+    // config.p2p.peer_priv_key). It is NO LONGER the network identity — that is
+    // the Falcon q-prover-key below — but seniority is anchored to it, so a
+    // fresh node must still have one.
+    if p2p_config.peer_priv_key.is_empty() {
+        let id = quil_p2p::Ed448Identity::generate()?;
+        let key_hex = id.to_config_hex();
+        p2p_config.peer_priv_key = key_hex.clone();
         let mut updated_config = config.clone();
-        updated_config.p2p.peer_priv_key = key_hex.clone();
+        updated_config.p2p.peer_priv_key = key_hex;
         if let Err(e) = quil_config::save_config(config_dir, &updated_config) {
-            warn!(error = %e, "failed to save generated peer key to config");
+            warn!(error = %e, "failed to save generated Ed448 seniority-root key to config");
         } else {
-            info!("saved new Ed448 peer key to config (peer ID is now stable)");
+            info!("generated Ed448 seniority-root key (saved to config)");
         }
     }
+
+    // Network identity = the Falcon q-prover-key. The Ed448 key above is kept
+    // only as the seniority root and never derives the peer-id.
+    let p2p_node =
+        quil_p2p::node::P2PNode::new_with_falcon_identity(&p2p_config, falcon_signing_key)?;
+    let peer_id = p2p_node.peer_id;
+    info!(%peer_id, "P2P identity ready (Falcon network identity)");
 
     info!(%peer_id, "starting P2P networking");
 
@@ -58,11 +67,9 @@ pub(crate) async fn init(
     info!(listen = %listen_addr, "P2P swarm started");
 
     // Self-loopback channel for consensus messages — used by
-    // `BlossomsubConsensusPublisher::publish_consensus` to feed the
-    // local node's own outbound proposal/vote back into the dispatcher
-    // (BlossomSub does not echo self-published messages, so without
-    // this the proposer's own state never reaches its own
-    // `vote_aggregator` / event_loop).
+    // `DirectGlobalConsensusPublisher::fan_out` to feed the local node's
+    // own outbound message back into the dispatcher when loopback is
+    // requested (the :8340 fan-out does not deliver to self).
     // Capacity sized to absorb bursts of peer proposals/votes without
     // dropping. The delivery handler drops a peer's consensus message when
     // this fills (grpc.rs), and dropped peer votes directly threaten the

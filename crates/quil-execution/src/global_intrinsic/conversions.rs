@@ -319,14 +319,14 @@ mod tests {
 
     fn sample_addr_sig() -> AddressedSignature {
         AddressedSignature {
-            signature: vec![0xAAu8; 74],
+            signature: vec![0xAAu8; 666],
             address: vec![0xBBu8; 32],
         }
     }
 
     fn sample_pb_addr_sig() -> keys_pb::Bls48581AddressedSignature {
         keys_pb::Bls48581AddressedSignature {
-            signature: vec![0xAAu8; 74],
+            signature: vec![0xAAu8; 666],
             address: vec![0xBBu8; 32],
         }
     }
@@ -346,11 +346,11 @@ mod tests {
             frame_number: 42,
             public_key_signature_bls48581: Some(
                 keys_pb::Bls48581SignatureWithProofOfPossession {
-                    signature: vec![0xAAu8; 74],
+                    signature: vec![0xAAu8; 666],
                     public_key: Some(keys_pb::Bls48581g2PublicKey {
-                        key_value: vec![0xBBu8; 585],
+                        key_value: vec![0xBBu8; 897],
                     }),
-                    pop_signature: vec![0xCCu8; 74],
+                    pop_signature: vec![0xCCu8; 666],
                 },
             ),
             delegate_address: vec![0xDDu8; 32],
@@ -447,9 +447,9 @@ mod tests {
             frame_number: 0xCAFE,
             public_key_signature_bls48581: Some(
                 keys_pb::Bls48581SignatureWithProofOfPossession {
-                    signature: vec![0xAAu8; 74],
+                    signature: vec![0xAAu8; 666],
                     public_key: None,
-                    pop_signature: vec![0xBBu8; 74],
+                    pop_signature: vec![0xBBu8; 666],
                 },
             ),
             delegate_address: vec![0xDDu8; 32],
@@ -476,6 +476,17 @@ pub fn frame_header_from_proto(pb: &pb::FrameHeader) -> FrameHeader {
         .public_key_signature_bls48581
         .as_ref()
         .and_then(|sig_pb| {
+            // CW finalization cert: a simplex-finalized shard frame
+            // carries its magic-prefixed cert opaquely in the proto `signature`
+            // field (pk/bitmask empty). Pass it through verbatim — it is not a
+            // BLS aggregate and must NOT be re-wrapped as one.
+            if sig_pb.public_key.is_none()
+                && sig_pb
+                    .signature
+                    .starts_with(quil_cw_consensus::app_cert::CW_CERT_MAGIC)
+            {
+                return Some(sig_pb.signature.clone());
+            }
             // Convert proto aggregate sig → canonical aggregate sig → bytes.
             let pk = sig_pb.public_key.as_ref().and_then(|p| {
                 if p.key_value.is_empty() {
@@ -520,6 +531,18 @@ pub fn frame_header_from_proto(pb: &pb::FrameHeader) -> FrameHeader {
 pub fn frame_header_to_proto(h: &FrameHeader) -> pb::FrameHeader {
     let sig_pb = if h.public_key_signature_bls48581.is_empty() {
         None
+    } else if h
+        .public_key_signature_bls48581
+        .starts_with(quil_cw_consensus::app_cert::CW_CERT_MAGIC)
+    {
+        // CW finalization cert: opaque blob, not a BLS aggregate.
+        // Carry it raw in the proto `signature` field; pk/bitmask stay empty so
+        // `frame_header_from_proto` recognizes and passes it through untouched.
+        Some(keys_pb::Bls48581AggregateSignature {
+            signature: h.public_key_signature_bls48581.clone(),
+            public_key: None,
+            bitmask: Vec::new(),
+        })
     } else {
         // Canonical sig bytes decode → split into signature/pubkey/bitmask
         // for the proto. If decoding fails, treat as no signature.

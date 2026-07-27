@@ -1,0 +1,39 @@
+[package]
+name = "quil-cw-consensus"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Commonware simplex consensus backend for Quilibrium: Falcon certificate::Scheme + simplex Engine adapters (Automaton/Relay/Reporter) over the :8340 transport. Replaces the quil-consensus global driver (equal votes)."
+
+[dependencies]
+# commonware consensus + its crypto/runtime/codec/utils. Pinned to the current
+# crates.io release; the migration decision is equal-votes (count-based quorum),
+# so no threshold/BLS crates are needed.
+commonware-consensus = "=2026.7.0"
+commonware-cryptography = "=2026.7.0"
+commonware-runtime = "=2026.7.0"
+commonware-codec = "=2026.7.0"
+commonware-utils = "=2026.7.0"
+# The `Random` supertrait of `commonware_cryptography::Signer` lives here.
+commonware-math = "=2026.7.0"
+commonware-parallel = "=2026.7.0"
+# Adapter deps: Feedback (actor), Recipients + simulated (p2p).
+commonware-actor = "=2026.7.0"
+commonware-p2p = "=2026.7.0"
+# Channel-backed p2p Sender/Receiver bridge to the node's :8340 transport.
+tokio = { version = "1", features = ["sync"] }
+# Matches commonware's rand_core so the `CryptoRng` bound in `Random::random`
+# resolves to the same trait.
+rand_core = "0.10"
+bytes = "1"
+# Quilibrium's Falcon primitives (the scheme wraps these).
+quil-crypto = { path = "../quil-crypto" }
+quil-types = { path = "../quil-types" }
+rand = "0.8"
+
+[dev-dependencies]
+# The simplex mock Automaton/Relay/Reporter + simulated network, used by the
+# end-to-end finalizing-round test (tests/falcon_finalize.rs).
+commonware-consensus = { version = "=2026.7.0", features = ["mocks"] }
+commonware-p2p = "=2026.7.0"
+futures = "0.3"

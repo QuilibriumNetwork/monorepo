@@ -44,7 +44,7 @@ tasks:
       - node/build.sh -o build/arm64_macos/node
 
   build_qclient_arm64_macos:
-    desc: Build the QClient node binary for MacOS ARM. Outputs to client/build
+    desc: Build the qclient binary (Rust crates/quil-client) for MacOS ARM. Outputs to crates/quil-client/build.
     cmds:
       - vdf/generate.sh
       - bls48581/generate.sh
@@ -53,7 +53,7 @@ tasks:
       - ferret/generate.sh
       - channel/generate.sh
       - rpm/generate.sh
-      - client/build.sh -o build/arm64_macos/qclient
+      - CRATE_NAME=quil-client BIN_NAME=qclient OUT_BIN_NAME=qclient OUT_BASE_DIR=crates/quil-client/build node/build.sh
 
   backup:
     desc: Create a backup file with the critical configuration files.
@@ -125,9 +125,9 @@ tasks:
       - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output node/build/arm64_linux --target=node .
 
   build_qclient_arm64_linux:
-    desc: Build the QClient node binary for ARM64 Linux. Outputs to client/build.
+    desc: Build the qclient binary (Rust crates/quil-client) for ARM64 Linux. Outputs to crates/quil-client/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output client/build/arm64_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output crates/quil-client/build/arm64_linux --target=qclient .
 
   build_node_amd64_linux:
     desc: Build the Quilibrium node binary for AMD64 Linux. Outputs to node/build.
@@ -177,14 +177,14 @@ tasks:
       - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output node/build/amd64_avx512_linux --target=node .
 
   build_qclient_amd64_linux:
-    desc: Build the QClient node binary for AMD64 Linux. Outputs to client/build.
+    desc: Build the qclient binary (Rust crates/quil-client) for AMD64 Linux. Outputs to crates/quil-client/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output client/build/amd64_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output crates/quil-client/build/amd64_linux --target=qclient .
 
   build_qclient_amd64_avx512_linux:
-    desc: Build the QClient node binary for AMD64 Linux with AVX-512 extensions. Outputs to client/build.
+    desc: Build the qclient binary (Rust crates/quil-client) for AMD64 Linux with AVX-512 extensions. Outputs to crates/quil-client/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output client/build/amd64_avx512_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output crates/quil-client/build/amd64_avx512_linux --target=qclient .
 
   build:source:
     desc: Build the Quilibrium docker image from source.
@@ -241,9 +241,9 @@ tasks:
       - docker push ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:latest
 
   test:qclient:
-    desc: Test the Quilibrium docker image.
+    desc: Test the Rust qclient (crates/quil-client).
     cmds:
-      - client/test/run_tests.sh -d 'ubuntu' -v '24.04'
+      - cargo test -p quil-client
 
   config:gen:
     desc: Generate configuration and keys using Go.

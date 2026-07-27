@@ -74,6 +74,41 @@ pub struct EngineConfig {
     pub alert_key: String,
     #[serde(default)]
     pub frame_publish: FramePublishConfig,
+    /// Hex-encoded Falcon-512 public keys of the global consensus committee
+    /// (commonware simplex). Each member's committee identity is its
+    /// **proving key** (`q-prover-key`) — the prover and consensus roles share
+    /// one Falcon-512 key, so these are the same values as the members'
+    /// `BLS_PUBKEY`/prover pubkeys. Every member (including this node) is
+    /// listed; the committee `Set<FalconPublicKey>` is assembled from these
+    /// (order-independent — the Set sorts). Empty until the simplex cutover is
+    /// enabled. Populated from `--print-identity`'s `CONSENSUS_PUBKEY` lines at
+    /// genesis (see `scripts/localnet.sh`).
+    #[serde(default)]
+    pub consensus_committee: Vec<String>,
+    /// Parallel to [`consensus_committee`]: each member's libp2p peer id
+    /// (base58), in the SAME order, so an inbound `:8340` simplex message
+    /// resolves from its authenticated mTLS peer id to the sender's committee
+    /// Falcon key. Populated from `--print-identity`'s `PEER_ID` lines at
+    /// genesis alongside the `CONSENSUS_PUBKEY` lines.
+    #[serde(default)]
+    pub consensus_committee_peer_ids: Vec<String>,
+    /// commonware-simplex leader timeout (seconds): how long a replica waits for
+    /// the leader's proposal before nullifying the view. MUST exceed the leader's
+    /// in-`propose` VDF prove time under real contention, or every view nullifies
+    /// before the proposal lands. Certification timeout is derived as this + 5s.
+    /// Default 30 (localnet-validated); raise for higher difficulty / slower CPUs.
+    #[serde(default = "default_consensus_leader_timeout_secs")]
+    pub consensus_leader_timeout_secs: u64,
+    /// (P3) Drive APP-SHARD consensus with commonware-simplex + Falcon (EQUAL
+    /// VOTES) instead of the legacy quil-consensus HotStuff loop. Off by default;
+    /// the legacy per-shard path is unchanged until this is set. Independent of
+    /// [`consensus_committee`] (which gates GLOBAL consensus).
+    #[serde(default)]
+    pub app_consensus_cw: bool,
+}
+
+fn default_consensus_leader_timeout_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

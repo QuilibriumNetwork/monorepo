@@ -93,6 +93,7 @@ where
 }
 
 #[test]
+#[ignore = "Go golden corpus uses BLS48-581 sigs; consensus cut over to Falcon-512 (Rust-only network) so byte-exact Go parity is intentionally broken. Regenerate corpus if a Falcon generator lands."]
 fn prover_join_round_trip() {
     assert_round_trip(
         "ProverJoin",
@@ -102,6 +103,7 @@ fn prover_join_round_trip() {
 }
 
 #[test]
+#[ignore = "Go golden corpus uses BLS48-581 sigs; consensus cut over to Falcon-512 (Rust-only network) so byte-exact Go parity is intentionally broken. Regenerate corpus if a Falcon generator lands."]
 fn prover_leave_round_trip() {
     assert_round_trip(
         "ProverLeave",
@@ -111,6 +113,7 @@ fn prover_leave_round_trip() {
 }
 
 #[test]
+#[ignore = "Go golden corpus uses BLS48-581 sigs; consensus cut over to Falcon-512 (Rust-only network) so byte-exact Go parity is intentionally broken. Regenerate corpus if a Falcon generator lands."]
 fn prover_confirm_round_trip() {
     assert_round_trip(
         "ProverConfirm",
@@ -120,6 +123,7 @@ fn prover_confirm_round_trip() {
 }
 
 #[test]
+#[ignore = "Go golden corpus uses BLS48-581 sigs; consensus cut over to Falcon-512 (Rust-only network) so byte-exact Go parity is intentionally broken. Regenerate corpus if a Falcon generator lands."]
 fn prover_reject_round_trip() {
     assert_round_trip(
         "ProverReject",
@@ -129,6 +133,7 @@ fn prover_reject_round_trip() {
 }
 
 #[test]
+#[ignore = "Go golden corpus uses BLS48-581 sigs; consensus cut over to Falcon-512 (Rust-only network) so byte-exact Go parity is intentionally broken. Regenerate corpus if a Falcon generator lands."]
 fn prover_pause_round_trip() {
     assert_round_trip(
         "ProverPause",
@@ -147,6 +152,7 @@ fn prover_resume_round_trip() {
 }
 
 #[test]
+#[ignore = "Go golden corpus uses BLS48-581 sigs; consensus cut over to Falcon-512 (Rust-only network) so byte-exact Go parity is intentionally broken. Regenerate corpus if a Falcon generator lands."]
 fn shard_split_round_trip() {
     assert_round_trip(
         "ShardSplit",
@@ -156,6 +162,7 @@ fn shard_split_round_trip() {
 }
 
 #[test]
+#[ignore = "Go golden corpus uses BLS48-581 sigs; consensus cut over to Falcon-512 (Rust-only network) so byte-exact Go parity is intentionally broken. Regenerate corpus if a Falcon generator lands."]
 fn shard_merge_round_trip() {
     assert_round_trip(
         "ShardMerge",
@@ -201,6 +208,7 @@ fn prover_kick_round_trip() {
 }
 
 #[test]
+#[ignore = "Go golden corpus uses BLS48-581 sigs; consensus cut over to Falcon-512 (Rust-only network) so byte-exact Go parity is intentionally broken. Regenerate corpus if a Falcon generator lands."]
 fn prover_update_round_trip() {
     assert_round_trip(
         "ProverUpdate",
@@ -210,6 +218,7 @@ fn prover_update_round_trip() {
 }
 
 #[test]
+#[ignore = "Go golden corpus uses BLS48-581 sigs; consensus cut over to Falcon-512 (Rust-only network) so byte-exact Go parity is intentionally broken. Regenerate corpus if a Falcon generator lands."]
 fn prover_seniority_merge_round_trip() {
     assert_round_trip(
         "ProverSeniorityMerge",

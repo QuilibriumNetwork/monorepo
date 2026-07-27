@@ -263,7 +263,7 @@ impl WorkerOnlyNode {
         // 1. Start parent process monitor (if parent PID given)
         if let Some(parent_pid) = self.config.parent_pid {
             let cancel = self.cancel.clone();
-            // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+            // TODO
             tokio::spawn(async move {
                 monitor_parent_process(parent_pid, cancel).await;
             });
@@ -277,7 +277,7 @@ impl WorkerOnlyNode {
             .map_err(|e| QuilError::Internal(format!("bad listen addr: {}", e)))?;
 
         let server_cancel = self.cancel.clone();
-        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+        // TODO
         let server_handle = tokio::spawn(async move {
             info!("DataIPC gRPC server starting on {}", listen_addr);
             if let Err(e) = Server::builder()
@@ -304,7 +304,7 @@ impl WorkerOnlyNode {
             let master_endpoint = self.config.master_endpoint.clone();
             let worker_ref = self.clone();
             let stream_cancel = self.cancel.clone();
-            // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+            // TODO
             tokio::spawn(async move {
                 stream_global_messages_from_master(
                     &master_endpoint,
@@ -342,7 +342,7 @@ impl WorkerOnlyNode {
                 // so it clears its own slot on completion.
                 let syncing_filters: Arc<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>> =
                     Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+                // TODO
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -396,6 +396,18 @@ impl WorkerOnlyNode {
                                             continue;
                                         }
                                         publish(crate::bitmasks::shard_consensus_bitmask(&filter), timeout_data).await;
+                                    }
+                                    // (P3) Commonware-simplex message → one shard CW
+                                    // gossip topic, channel tagged in the payload.
+                                    CwOut { filter, channel, bytes } => {
+                                        if halted {
+                                            continue;
+                                        }
+                                        publish(
+                                            crate::bitmasks::shard_cw_bitmask(&filter),
+                                            crate::bitmasks::shard_cw_frame_payload(channel, &bytes),
+                                        )
+                                        .await;
                                     }
                                     // Shard catch-up: a frame gap was detected
                                     // (step 4). Pull the shard's vertex-adds
@@ -508,6 +520,12 @@ impl WorkerOnlyNode {
         // Create new AppConsensusEngine
         let deps = AppEngineDeps {
             clock_store: self.clock_store.clone(),
+            // Cluster-mode worker: its own store currently holds only shard
+            // frames, so the global anchor is unavailable here the same way it
+            // was for thread mode. Fall back to `clock_store` for now; cluster
+            // mode needs a master→worker global-frame feed to fully fix (thread
+            // mode is fixed via the master's shared store in `thread_worker`).
+            global_anchor_store: None,
             prover_registry: self.prover_registry.clone(),
             frame_prover: self.frame_prover.clone(),
             message_collector: self.message_collector.clone(),
@@ -529,12 +547,19 @@ impl WorkerOnlyNode {
             // `db.worker_path_prefix`) and therefore its own
             // CRDT/exec-mgr instance, mirroring Go's cluster mode.
             hypergraph: self.hypergraph.clone(),
+            // Cluster-mode worker: falls back to `hypergraph` for the storage
+            // source (per-worker possession in cluster mode needs the same
+            // master-source wiring as thread mode — separate follow-up).
+            storage_source_hypergraph: None,
             execution_engine: self.execution_engine.clone(),
             inclusion_prover: self.inclusion_prover.clone(),
             // Cluster mode: worker process owns its own DB and can
             // back this with a real KV handle once the wiring is in
             // place. Until then, fall through to the in-memory store.
             kv_db: None,
+            // (P3) Cluster-mode app-shard CW not wired yet (localnet uses the
+            // in-process thread_worker path, which is config-gated). Legacy.
+            app_consensus_cw: false,
         };
 
         let (engine, handle) = AppConsensusEngine::new(
@@ -552,7 +577,7 @@ impl WorkerOnlyNode {
 
         // Run engine in background
         let bls_signer = (self.bls_signer_factory)();
-        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+        // TODO
         tokio::spawn(async move {
             engine.run(bls_signer).await;
         });
@@ -631,7 +656,9 @@ impl WorkerOnlyNode {
             }
             None => Vec::new(),
         };
-        if local_root.is_empty() || local_root == expected.as_slice() {
+        let matched = local_root.is_empty() || local_root == expected.as_slice();
+        crate::metrics::record_root_verification(matched);
+        if matched {
             return;
         }
         // Root mismatch — sync.
@@ -726,14 +753,14 @@ impl WorkerOnlyNode {
 
     /// Route an incoming message from the master to the active engine.
     /// Bitmask dispatch:
-    ///   - `[0x00, 0x00, 0x00, 0x00]` → global peer info
-    ///   - `[0x00, 0x00, 0x00]`       → global prover
-    ///   - `[0x00, 0x00]`             → global frame
-    ///   - `[0x00]`                   → global consensus
-    ///   - `shard_frame_bitmask(f)`     → Frame
-    ///   - `shard_consensus_bitmask(f)` → Consensus
-    ///   - `shard_prover_bitmask(f)`    → Prover
-    ///   - `shard_dispatch_bitmask(f)`  → Dispatch
+    /// - `[0x00, 0x00, 0x00, 0x00]` → global peer info
+    ///   - `[0x00, 0x00, 0x00]` → global prover
+    ///   - `[0x00, 0x00]` → global frame
+    ///   - `[0x00]` → global consensus
+    ///   - `shard_frame_bitmask(f)` → Frame
+    /// - `shard_consensus_bitmask(f)` → Consensus
+    ///   - `shard_prover_bitmask(f)` → Prover
+    ///   - `shard_dispatch_bitmask(f)` → Dispatch
     pub fn route_message(&self, data: &[u8], bitmask: &[u8]) {
         let handle = {
             let guard = self.engine_handle.lock().unwrap();
@@ -991,14 +1018,14 @@ fn is_process_alive(_pid: u32) -> bool {
 /// preprocessing.
 ///
 /// Resolution order (decreasing preference):
-///   1. `data_worker_stream_multiaddrs[core_id - 1]` if set. Accepts
-///      either `host:port` directly or a libp2p multiaddr
-///      `/ip4/HOST/tcp/PORT` (extracted into `HOST:PORT`).
-///   2. `data_worker_base_listen_multiaddr` template with `%d` →
-///      `data_worker_base_stream_port + (core_id - 1)`. Core 1 gets
-///      `base_stream_port` itself.
-///   3. Same as (2) but with the serde defaults for those two fields
-///      (which is what you get when the config doesn't set them).
+/// 1. `data_worker_stream_multiaddrs[core_id - 1]` if set. Accepts
+/// either `host:port` directly or a libp2p multiaddr
+/// `/ip4/HOST/tcp/PORT` (extracted into `HOST:PORT`).
+/// 2. `data_worker_base_listen_multiaddr` template with `%d` →
+/// `data_worker_base_stream_port + (core_id - 1)`. Core 1 gets
+/// `base_stream_port` itself.
+/// 3. Same as (2) but with the serde defaults for those two fields
+/// (which is what you get when the config doesn't set them).
 pub fn worker_listen_addr(
     core_id: u32,
     base_listen: &str,

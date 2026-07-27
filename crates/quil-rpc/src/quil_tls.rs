@@ -4,13 +4,13 @@
 //! The scheme works around Go's x509 lacking native Ed448 support:
 //!
 //! 1. Derive an Ed25519 seed deterministically:
-//!      `ed25519_seed = SHA256(ed448_seed || "tls-cert-derivation")[..32]`
+//! `ed25519_seed = SHA256(ed448_seed || "tls-cert-derivation")[..32]`
 //! 2. Generate an Ed25519 keypair from that seed.
 //! 3. Cross-sign the Ed25519 public key with the Ed448 private key:
-//!      `xsign = ed448_priv.sign("tls-cert-derivation" || ed25519_pub)`
+//! `xsign = ed448_priv.sign("tls-cert-derivation" || ed25519_pub)`
 //! 4. Self-sign an x509 cert with the Ed25519 key, embedding
-//!      `hex(ed448_pub || xsign)` (171 bytes hex => 342 chars) as the
-//!    cert's single SAN DNS name.
+//! `hex(ed448_pub || xsign)` (171 bytes hex => 342 chars) as the
+//! cert's single SAN DNS name.
 //!
 //! On the receiving side, peers parse the DNS name back into the Ed448 pubkey
 //! + signature, verify the cross-sig, and re-derive the libp2p peer ID.
@@ -45,12 +45,21 @@ pub struct QuilTlsCert {
     pub xsign_hex: String,
 }
 
-/// Build a Quilibrium TLS certificate for the given Ed448 seed (57 bytes,
-/// matching `ed448::SeedSize`).
-pub fn build_quil_tls_cert(ed448_seed: &[u8; 57]) -> Result<QuilTlsCert, QuilTlsError> {
-    // 1. Derive Ed25519 seed.
+/// Build a Quilibrium TLS certificate bound to the node's FALCON network
+/// identity. `falcon_signing_key` is the 1281-byte q-prover-key signing key;
+/// `falcon_pubkey` is its 897-byte public key. The Ed25519 cert key is derived
+/// from the Falcon signing key and cross-signed by it (proof of possession);
+/// the SAN carries `hex(falcon_pub_897 || xsign_666)`.
+pub fn build_quil_tls_cert(falcon_signing_key: &[u8]) -> Result<QuilTlsCert, QuilTlsError> {
+    use quil_types::crypto::Signer as _;
+
+    let falcon_pubkey = quil_crypto::falcon_public_from_signing_key(falcon_signing_key)
+        .ok_or_else(|| QuilTlsError::Ed448("falcon signing key decode".into()))?;
+    let falcon_pubkey = falcon_pubkey.as_slice();
+
+    // 1. Derive Ed25519 cert seed from the Falcon signing key.
     let mut hasher = Sha256::new();
-    hasher.update(ed448_seed);
+    hasher.update(falcon_signing_key);
     hasher.update(TLS_CERT_DERIVATION_CTX);
     let digest = hasher.finalize();
     let mut ed25519_seed = [0u8; 32];
@@ -60,20 +69,20 @@ pub fn build_quil_tls_cert(ed448_seed: &[u8; 57]) -> Result<QuilTlsCert, QuilTls
     let signing_key = SigningKey::from_bytes(&ed25519_seed);
     let ed25519_pub = signing_key.verifying_key().to_bytes();
 
-    // 3. Cross-sign with Ed448.
-    let ed448_priv = Ed448PrivateKey::from(*ed448_seed);
-    let ed448_pub = Ed448PublicKey::try_from(&ed448_priv)
-        .map_err(|e| QuilTlsError::Ed448(format!("derive pub: {:?}", e)))?;
+    // 3. Cross-sign the Ed25519 pubkey with the Falcon identity key (empty
+    //    domain — matches `falcon_verify(.., &[])` on the receiving side).
     let mut to_sign = Vec::with_capacity(TLS_CERT_DERIVATION_CTX.len() + ed25519_pub.len());
     to_sign.extend_from_slice(TLS_CERT_DERIVATION_CTX);
     to_sign.extend_from_slice(&ed25519_pub);
-    let xsign = ed448_priv
-        .sign(&to_sign, None)
-        .map_err(|e| QuilTlsError::Ed448(format!("sign: {:?}", e)))?;
+    let falcon_signer =
+        quil_crypto::FalconSigner::from_bytes(falcon_signing_key, falcon_pubkey);
+    let xsign = falcon_signer
+        .sign_with_domain(&to_sign, &[])
+        .map_err(|e| QuilTlsError::Ed448(format!("falcon sign: {:?}", e)))?;
 
-    // 4. Build the SAN string: hex(ed448_pub || xsign)
-    let mut san_buf = Vec::with_capacity(57 + 114);
-    san_buf.extend_from_slice(&ed448_pub.as_byte());
+    // 4. Build the SAN string: hex(falcon_pub || xsign)
+    let mut san_buf = Vec::with_capacity(897 + 666);
+    san_buf.extend_from_slice(falcon_pubkey);
     san_buf.extend_from_slice(&xsign);
     let xsign_hex = hex::encode(&san_buf);
 
@@ -118,12 +127,12 @@ pub fn build_quil_tls_cert(ed448_seed: &[u8; 57]) -> Result<QuilTlsCert, QuilTls
 ///
 /// Structure:
 /// ```text
-/// SEQUENCE                      (0x30 0x53)
-///   INTEGER 1                   (0x02 0x01 0x01)
-///   AlgorithmIdentifier         (0x30 0x05 0x06 0x03 0x2b 0x65 0x70)  -- 1.3.101.112
-///   OCTET STRING wrapping
-///     OCTET STRING(seed[32])    (0x04 0x22 0x04 0x20 || seed)
-///   [1] BIT STRING(pubkey[32])  (0xa1 0x23 0x03 0x21 0x00 || pubkey)
+/// SEQUENCE (0x30 0x53)
+///   INTEGER 1 (0x02 0x01 0x01)
+///   AlgorithmIdentifier (0x30 0x05 0x06 0x03 0x2b 0x65 0x70)  -- 1.3.101.112
+/// OCTET STRING wrapping
+///     OCTET STRING(seed[32]) (0x04 0x22 0x04 0x20 || seed)
+///   [1] BIT STRING(pubkey[32]) (0xa1 0x23 0x03 0x21 0x00 || pubkey)
 /// ```
 fn ed25519_pkcs8_v2(seed: &[u8; 32], public_key: &[u8; 32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(85);
@@ -175,12 +184,12 @@ use rustls::{ServerConfig, SignatureScheme};
 ///
 /// 1. Parse the presented end-entity cert.
 /// 2. Extract the cert's Ed25519 public key from its
-///    `SubjectPublicKeyInfo`.
+/// `SubjectPublicKeyInfo`.
 /// 3. Pull the single SAN DNS name and decode it as
-///    `hex(ed448_pub_57 || xsign_114)`.
+/// `hex(ed448_pub_57 || xsign_114)`.
 /// 4. Verify the Ed448 signature `xsign` over the message
-///    `b"tls-cert-derivation" || ed25519_pub` under the SAN's Ed448
-///    public key.
+/// `b"tls-cert-derivation" || ed25519_pub` under the SAN's Ed448
+/// public key.
 ///
 /// Any failure rejects the handshake. Per-peer authorization
 /// (membership in prover/signer registries, whitelist, etc.) is still
@@ -272,29 +281,25 @@ impl XsignClientCertVerifier {
 
         let blob = hex::decode(dns)
             .map_err(|e| rustls::Error::General(format!("decode SAN hex: {e}")))?;
-        // 57-byte Ed448 pubkey || 114-byte Ed448 signature
-        if blob.len() != 57 + 114 {
+        // 897-byte Falcon pubkey || 666-byte Falcon signature
+        if blob.len() != 897 + 666 {
             return Err(rustls::Error::General(format!(
                 "client cert SAN xsign blob has wrong length: {}",
                 blob.len()
             )));
         }
-        let ed448_pub_bytes: [u8; 57] = blob[..57]
-            .try_into()
-            .map_err(|_| rustls::Error::General("ed448 pubkey slice".into()))?;
-        let xsign = &blob[57..];
-
-        let ed448_pub = ed448_rust::PublicKey::from(ed448_pub_bytes);
+        let falcon_pub = &blob[..897];
+        let xsign = &blob[897..];
 
         let mut signed = Vec::with_capacity(TLS_CERT_DERIVATION_CTX.len() + ed25519_pub.len());
         signed.extend_from_slice(TLS_CERT_DERIVATION_CTX);
         signed.extend_from_slice(ed25519_pub);
 
-        ed448_pub
-            .verify(&signed, xsign, None)
-            .map_err(|e| rustls::Error::General(format!("xsign verify failed: {e:?}")))?;
+        if !quil_crypto::falcon_verify(falcon_pub, xsign, &signed, &[]) {
+            return Err(rustls::Error::General("xsign verify failed".into()));
+        }
 
-        let pubkey = blob[..57].to_vec();
+        let pubkey = falcon_pub.to_vec();
         {
             let mut c = cache.lock().unwrap();
             if c.len() >= XSIGN_VERIFY_CACHE_CAP {
@@ -369,13 +374,13 @@ pub type AcceptAnyClientCert = XsignClientCertVerifier;
 /// client to present one (verified permissively — trust is at the
 /// application layer via the peer-auth interceptor).
 pub fn build_quil_server_tls_config(
-    ed448_seed: &[u8; 57],
+    falcon_signing_key: &[u8],
 ) -> Result<Arc<ServerConfig>, QuilTlsError> {
     // SAFETY: install the default rustls crypto provider once; errors
     // just mean another provider is already installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let tls_cert = build_quil_tls_cert(ed448_seed)?;
+    let tls_cert = build_quil_tls_cert(falcon_signing_key)?;
     let cert_chain: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut tls_cert.cert_pem.as_bytes())
             .filter_map(|r| r.ok())

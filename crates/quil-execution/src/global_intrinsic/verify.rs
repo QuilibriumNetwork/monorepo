@@ -101,7 +101,7 @@ pub fn verify_prover_pause(
 
     // 5. Verify BLS48-581 G1 signature
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &message,
         &sig.signature,
@@ -148,7 +148,7 @@ pub fn verify_prover_resume(
     let domain = prover_verify::prover_resume_domain()?;
 
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &message,
         &sig.signature,
@@ -216,7 +216,7 @@ pub fn verify_prover_leave(
     let domain = prover_verify::prover_leave_domain()?;
 
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &message,
         &sig.signature,
@@ -240,11 +240,15 @@ pub const JOIN_FRESHNESS_WINDOW: u64 = 10;
 ///
 /// Checks:
 /// 1. All filters are >= 32 bytes
-/// 2. Proof size == 516 * len(filters)
-/// 3. frame_number + 10 >= current_frame (not too stale)
-/// 4. Signature-with-PoP is present
-/// 5. Public key in signature is non-empty
-/// 6. Prover address derivation succeeds
+/// 2. frame_number + 10 >= current_frame (not too stale)
+/// 3. Signature-with-PoP is present
+/// 4. Public key in signature is non-empty
+/// 5. Prover address derivation succeeds
+///
+/// The proof-of-sequential-work VDF gate was removed from joins: the
+/// `proof` field is no longer validated (it is retained in the wire
+/// format only so historical joins still decode, and is ignored — new
+/// joins carry an empty proof).
 pub fn validate_prover_join_structural(
     op: &ProverJoin,
     current_frame_number: u64,
@@ -261,18 +265,7 @@ pub fn validate_prover_join_structural(
         }
     }
 
-    // 2. Proof size
-    let expected_proof_size = PROOF_CHUNK_SIZE * op.filters.len();
-    if op.proof.len() != expected_proof_size {
-        return Err(QuilError::InvalidArgument(format!(
-            "prover join: proof size {} != expected {} (516 * {} filters)",
-            op.proof.len(),
-            expected_proof_size,
-            op.filters.len()
-        )));
-    }
-
-    // 3. Freshness
+    // 2. Freshness
     if op.frame_number + JOIN_FRESHNESS_WINDOW < current_frame_number {
         return Err(QuilError::InvalidArgument(format!(
             "prover join: request frame {} is too old (current {})",
@@ -280,12 +273,12 @@ pub fn validate_prover_join_structural(
         )));
     }
 
-    // 4. Signature present
+    // 3. Signature present
     let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
         QuilError::InvalidArgument("prover join: missing signature with PoP".into())
     })?;
 
-    // 5. Public key non-empty
+    // 4. Public key non-empty
     let public_key = sig.public_key.as_ref().ok_or_else(|| {
         QuilError::InvalidArgument("prover join: signature has no public key".into())
     })?;
@@ -295,7 +288,7 @@ pub fn validate_prover_join_structural(
         ));
     }
 
-    // 6. Derive prover address
+    // 5. Derive prover address
     let prover_address = prover_address_from_pubkey(public_key)?;
 
     Ok(ProverJoinValidation {
@@ -303,56 +296,6 @@ pub fn validate_prover_join_structural(
         prover_address,
         filter_count: op.filters.len(),
     })
-}
-
-/// Full ProverJoin verification including VDF multi-proof.
-///
-/// Requires:
-/// - `frame_output`: the VDF output of the frame referenced by `op.frame_number`
-/// - `frame_difficulty`: the difficulty of that frame
-/// - `frame_prover`: the VDF prover for multi-proof verification
-///
-/// This is the complete verify path that Go's `ProverJoin.Verify` runs.
-pub fn verify_prover_join_vdf(
-    op: &ProverJoin,
-    current_frame_number: u64,
-    frame_output: &[u8],
-    frame_difficulty: u32,
-    frame_prover: &dyn quil_types::crypto::FrameProver,
-) -> Result<bool> {
-    // 1. Structural validation
-    let validation = validate_prover_join_structural(op, current_frame_number)?;
-
-    // 2. Compute challenge from frame output (Go: sha3.Sum256)
-    use sha3::Digest;
-    let challenge: [u8; 32] = sha3::Sha3_256::digest(frame_output).into();
-
-    // 3. Build ID list: for each filter, id = prover_address || filter || index_be
-    let mut ids: Vec<Vec<u8>> = Vec::with_capacity(op.filters.len());
-    for (idx, filter) in op.filters.iter().enumerate() {
-        let mut id = Vec::with_capacity(32 + filter.len() + 4);
-        id.extend_from_slice(&validation.prover_address);
-        id.extend_from_slice(filter);
-        id.extend_from_slice(&(idx as u32).to_be_bytes());
-        ids.push(id);
-    }
-
-    // 4. Split proof into 516-byte chunks
-    let mut solutions: Vec<Vec<u8>> = Vec::with_capacity(op.filters.len());
-    for i in 0..op.filters.len() {
-        solutions.push(op.proof[i * PROOF_CHUNK_SIZE..(i + 1) * PROOF_CHUNK_SIZE].to_vec());
-    }
-
-    // 5. Verify VDF multi-proof
-    let id_refs: Vec<&[u8]> = ids.iter().map(|id| id.as_slice()).collect();
-    let sol_refs: Vec<&[u8]> = solutions.iter().map(|s| s.as_slice()).collect();
-
-    frame_prover.verify_multi_proof(
-        &challenge,
-        frame_difficulty,
-        &id_refs,
-        &sol_refs,
-    )
 }
 
 /// Output of structural validation — carries the derived values
@@ -373,12 +316,12 @@ pub struct ProverJoinValidation {
 ///
 /// Checks:
 /// 1. BLS sig over `concat(filters) || frame_number_be_u64` with domain
-///    `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_JOIN")`.
+/// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_JOIN")`.
 /// 2. Proof-of-possession: BLS sig over pubkey with ASCII domain
-///    `"BLS48_POP_SK"` (Go uses the domain bytes literally, not a
-///    poseidon hash — matches `global_prover_join.go:1093`).
+/// `"BLS48_POP_SK"` (Go uses the domain bytes literally, not a
+/// poseidon hash — matches `global_prover_join.go:1093`).
 /// 3. Each merge target's signature over pubkey with Ed448 context
-///    `"PROVER_JOIN_MERGE"` (skipped for already-consumed targets).
+/// `"PROVER_JOIN_MERGE"` (skipped for already-consumed targets).
 ///
 /// Go skips merge-sig verification when the merge's spent-vertex
 /// already exists in the hypergraph (replay guard). This port takes
@@ -414,7 +357,7 @@ pub fn verify_prover_join_signatures(
     clone.public_key_signature_bls48581 = None;
     let join_message = clone.to_canonical_bytes()?;
     let ok = key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &validation.public_key,
         &join_message,
         &sig.signature,
@@ -428,7 +371,7 @@ pub fn verify_prover_join_signatures(
     //    domain bytes "BLS48_POP_SK" (no poseidon wrapping in Go).
     const POP_DOMAIN: &[u8] = b"BLS48_POP_SK";
     let ok = key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &validation.public_key,
         &validation.public_key,
         &sig.pop_signature,
@@ -448,16 +391,14 @@ pub fn verify_prover_join_signatures(
                 continue;
             }
         }
+        // Merge targets are Ed448-only: seniority is Ed448-peer-key-bound, so the
+        // key that carries it forward (signing the new Falcon consensus pubkey) is
+        // always Ed448. No BLS/X448/Decaf/Falcon merge targets exist.
         let key_type = match mt.key_type {
             0 => KeyType::Ed448,
-            1 => KeyType::X448,
-            2 => KeyType::Bls48581G1,
-            3 => KeyType::Bls48581G2,
-            4 => KeyType::Decaf448,
             other => {
                 return Err(QuilError::InvalidArgument(format!(
-                    "prover join verify: merge target has unknown key_type {}",
-                    other
+                    "prover join verify: merge target key_type {other} unsupported (Ed448-only)"
                 )));
             }
         };
@@ -525,11 +466,11 @@ where
 /// `global_prover_seniority_merge.go:476-540`. For each merge target,
 /// look up two tombstone vertices in the global domain:
 ///
-///   - `spent_seniority_merge_address(target_pubkey)` —
-///     PROVER_SENIORITY_MERGE was already consumed.
-///   - `spent_join_merge_address(target_pubkey)` —
-///     PROVER_JOIN_MERGE consumed the same target during a
-///     ProverJoin's merge_targets list.
+/// - `spent_seniority_merge_address(target_pubkey)` —
+/// PROVER_SENIORITY_MERGE was already consumed.
+/// - `spent_join_merge_address(target_pubkey)` —
+/// PROVER_JOIN_MERGE consumed the same target during a
+/// ProverJoin's merge_targets list.
 ///
 /// Finding EITHER marker means the merge target has already been
 /// claimed by some prover; allowing the current op would split the
@@ -707,7 +648,7 @@ pub fn verify_prover_update(
     let domain = super::prover_update_materialize::prover_update_domain()?;
 
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         message,
         &sig.signature,
@@ -743,7 +684,7 @@ pub fn verify_prover_confirm(
     let domain = prover_verify::prover_confirm_domain()?;
 
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &message,
         &sig.signature,
@@ -760,9 +701,9 @@ pub fn verify_prover_confirm(
 /// - Join confirm (status=0): `epoch_for_frame(frame) == epoch_for_frame(JoinFrameNumber)+1`.
 /// - Leave confirm (status=3): `epoch_for_frame(frame) == epoch_for_frame(LeaveFrameNumber)+1`.
 /// - Re-confirm (status=1): a data shard registering its NEXT epoch — allowed
-///   iff `!filter.is_empty() && Epoch <= epoch_for_frame(frame)` (renews for
-///   frame_epoch+1; rejects the empty/global filter and a double re-confirm that
-///   already registered ahead).
+/// iff `!filter.is_empty() && Epoch <= epoch_for_frame(frame)` (renews for
+/// frame_epoch+1; rejects the empty/global filter and a double re-confirm that
+/// already registered ahead).
 pub fn validate_confirm_timing(
     frame_number: u64,
     allocation_tree: &quil_tries::VectorCommitmentTree,
@@ -874,7 +815,7 @@ pub fn verify_prover_reject(
     let domain = prover_verify::prover_reject_domain()?;
 
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &message,
         &sig.signature,
@@ -941,7 +882,7 @@ fn verify_addressed_bls(
         return Ok(false);
     }
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         message,
         signature,
@@ -951,11 +892,11 @@ fn verify_addressed_bls(
 
 /// Verify a `ShardSplit` op. Mirrors Go's `ShardSplitOp.Verify` at
 /// `global_shard_split.go:53-133`:
-///   - shard_address 32–63 bytes
-///   - proposed_shards has 2–8 entries, each of parent_len+1 or
-///     parent_len+2 and prefixed by shard_address
-///   - BLS sig over `frame_be_u64 || shard_address` with domain
-///     `poseidon(GLOBAL_INTRINSIC_ADDRESS || "SHARD_SPLIT")`
+/// - shard_address 32–63 bytes
+/// - proposed_shards has 2–8 entries, each of parent_len+1 or
+/// parent_len+2 and prefixed by shard_address
+/// - BLS sig over `frame_be_u64 || shard_address` with domain
+/// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "SHARD_SPLIT")`
 pub fn verify_shard_split(
     op: &super::prover_ops::ShardSplit,
     prover_tree: &quil_tries::VectorCommitmentTree,
@@ -1012,11 +953,11 @@ pub fn verify_shard_split(
 
 /// Verify a `ShardMerge` op. Mirrors Go's `ShardMergeOp.Verify` at
 /// `global_shard_merge.go:51-125`:
-///   - parent_address 32 bytes
-///   - shard_addresses has 2–8 entries, each parent_len+1 or parent_len+2
-///     and each prefixed by parent_address
-///   - BLS sig over `frame_be_u64 || parent_address` with domain
-///     `poseidon(GLOBAL_INTRINSIC_ADDRESS || "SHARD_MERGE")`
+/// - parent_address 32 bytes
+/// - shard_addresses has 2–8 entries, each parent_len+1 or parent_len+2
+/// and each prefixed by parent_address
+/// - BLS sig over `frame_be_u64 || parent_address` with domain
+/// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "SHARD_MERGE")`
 pub fn verify_shard_merge(
     op: &super::prover_ops::ShardMerge,
     prover_tree: &quil_tries::VectorCommitmentTree,
@@ -1076,13 +1017,13 @@ pub fn verify_shard_merge(
 /// `global_prover_seniority_merge.go:391-618`.
 ///
 /// Checks:
-///   - addressed signature present, address 32 bytes
-///   - 10-frame freshness: `op.frame_number + 10 >= current_frame_number`
-///   - each merge-target signs `pubKeyBytes` with its own `key_type` under
-///     the literal ASCII domain `"PROVER_SENIORITY_MERGE"`
-///   - main BLS sig over `frame_be_u64 || concat(helper_pubkeys)` under
-///     domain `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_SENIORITY_MERGE")`
-///   - address-binding: `poseidon(pubKeyBytes) == sig.address`
+/// - addressed signature present, address 32 bytes
+/// - 10-frame freshness: `op.frame_number + 10 >= current_frame_number`
+/// - each merge-target signs `pubKeyBytes` with its own `key_type` under
+/// the literal ASCII domain `"PROVER_SENIORITY_MERGE"`
+/// - main BLS sig over `frame_be_u64 || concat(helper_pubkeys)` under
+/// domain `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_SENIORITY_MERGE")`
+/// - address-binding: `poseidon(pubKeyBytes) == sig.address`
 ///
 /// NOT checked here (requires hypergraph state the dispatcher doesn't
 /// have): spent-merge tombstones, `mergeSeniority > existingSeniority`
@@ -1135,15 +1076,12 @@ pub fn verify_prover_seniority_merge(
     // literal ASCII domain — mirrors Go's :462-468.
     const MERGE_TARGET_DOMAIN: &[u8] = b"PROVER_SENIORITY_MERGE";
     for mt in &op.merge_targets {
+        // Ed448-only: seniority is Ed448-peer-key-bound (see the join-verify note).
         let key_type = match mt.key_type {
             0 => KeyType::Ed448,
-            1 => KeyType::X448,
-            2 => KeyType::Bls48581G1,
-            3 => KeyType::Bls48581G2,
-            4 => KeyType::Decaf448,
             other => {
                 return Err(QuilError::InvalidArgument(format!(
-                    "prover seniority merge: merge target has unknown key_type {other}"
+                    "prover seniority merge: merge target key_type {other} unsupported (Ed448-only)"
                 )));
             }
         };
@@ -1159,7 +1097,7 @@ pub fn verify_prover_seniority_merge(
         }
     }
 
-    // Main BLS sig over `frame_be || concat(helper_pubkeys)` under
+    // Main Falcon sig over `frame_be || concat(helper_pubkeys)` under
     // the poseidon-wrapped domain.
     let mut message = Vec::with_capacity(8);
     message.extend_from_slice(&op.frame_number.to_be_bytes());
@@ -1168,7 +1106,7 @@ pub fn verify_prover_seniority_merge(
     }
     let domain = intrinsic_domain(b"PROVER_SENIORITY_MERGE")?;
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &message,
         &sig.signature,
@@ -1469,10 +1407,15 @@ mod tests {
     }
 
     #[test]
-    fn join_structural_rejects_wrong_proof_size() {
+    fn join_structural_ignores_proof_field() {
+        // VDF was removed from joins: proof size is no longer validated.
+        // An empty proof (new joins) and a populated proof (historical
+        // joins, on replay) must both pass structural validation.
         let mut op = sample_join(vec![vec![0x01u8; 32]]);
-        op.proof = vec![0u8; 100]; // should be 516
-        assert!(validate_prover_join_structural(&op, 105).is_err());
+        op.proof = vec![]; // new joins carry no proof
+        assert!(validate_prover_join_structural(&op, 105).is_ok());
+        op.proof = vec![0u8; 100]; // arbitrary legacy blob
+        assert!(validate_prover_join_structural(&op, 105).is_ok());
     }
 
     #[test]
@@ -1527,62 +1470,6 @@ mod tests {
         };
         let v = validate_prover_join_structural(&op, 105).unwrap();
         assert_eq!(v.filter_count, 0);
-    }
-
-    // -----------------------------------------------------------------
-    // verify_prover_join_vdf — regression for test #548
-    //
-    // Builds a real VDF multi-proof with the signer-side algorithm
-    // (SHA3-256 challenge over frame_output, matching Go's
-    // `sha3.Sum256` and Rust's prover_pipeline) and feeds it through
-    // the actual verifier. Pins the cross-implementation hash
-    // agreement; would have caught the original sha2/sha3 mismatch.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn verify_prover_join_vdf_accepts_real_proof() {
-        use quil_types::crypto::FrameProver;
-
-        let frame_prover = quil_crypto::WesolowskiFrameProver::new(2048);
-        let difficulty: u32 = 200;
-        let frame_output: &[u8] = b"deadbeef-test-frame-output";
-        let filters: Vec<Vec<u8>> = vec![vec![0x01u8; 32], vec![0x02u8; 48]];
-
-        let stub = sample_join(filters.clone());
-        let prover_address = validate_prover_join_structural(&stub, 105)
-            .unwrap()
-            .prover_address;
-
-        use sha3::Digest as _;
-        let challenge: [u8; 32] = sha3::Sha3_256::digest(frame_output).into();
-
-        let ids: Vec<Vec<u8>> = filters
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let mut id = Vec::with_capacity(32 + f.len() + 4);
-                id.extend_from_slice(&prover_address);
-                id.extend_from_slice(f);
-                id.extend_from_slice(&(i as u32).to_be_bytes());
-                id
-            })
-            .collect();
-        let id_refs: Vec<&[u8]> = ids.iter().map(|v| v.as_slice()).collect();
-
-        let mut proof = Vec::with_capacity(filters.len() * PROOF_CHUNK_SIZE);
-        for i in 0..filters.len() {
-            let chunk = frame_prover
-                .calculate_multi_proof(&challenge, difficulty, &id_refs, i as u32)
-                .unwrap();
-            assert_eq!(chunk.len(), PROOF_CHUNK_SIZE);
-            proof.extend_from_slice(&chunk);
-        }
-
-        let op = ProverJoin { proof, ..stub };
-
-        let ok = verify_prover_join_vdf(&op, 105, frame_output, difficulty, &frame_prover)
-            .expect("verify_prover_join_vdf returned an error");
-        assert!(ok, "real ProverJoin proof must verify (regression testfor #548)");
     }
 
     // -----------------------------------------------------------------

@@ -1,0 +1,11 @@
+[package]
+name = "quil-lattice-ct"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Post-quantum confidential-transaction primitives (module-lattice) — the PQ replacement for the decaf448 Pedersen/Bulletproof/verenc privacy stack. PHASE 5, PRE-AUDIT."
+
+[dependencies]
+sha2 = "0.10"
+
+[dev-dependencies]

@@ -570,7 +570,7 @@ pub fn decide_joins(
                 //
                 // Rust-only divergence from Go's `proposer.go:DecideJoins`,
                 // which applies a flat threshold. Decision pinned 2026-06-01
-                // by operator (caheart).
+                // by the operator.
                 let is_halt_risk = desc_by_hex
                     .get(&key)
                     .map(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)

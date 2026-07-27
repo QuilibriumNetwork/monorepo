@@ -18,6 +18,6 @@ pub use clock::RocksClockStore;
 pub use token::RocksTokenStore;
 pub use key::RocksKeyStore;
 pub use shards::RocksShardsStore;
-pub use hypergraph::{RocksHypergraphSnapshot, RocksHypergraphStore};
+pub use hypergraph::{RocksHypergraphSnapshot, RocksHypergraphStore, VertexWrite, FOREST_NAMESPACE};
 pub use dispatch::RocksInboxStore;
 pub use worker::RocksWorkerStore;

@@ -8,7 +8,11 @@ use super::addressed_signature::AddressedSignature;
 use super::seniority_merge::SeniorityMerge;
 fn read_opt_addr_sig(buf: &[u8], c: &mut usize) -> Result<Option<AddressedSignature>> {
     let l = read_u32(buf, c)? as usize;
-    if l > 118 { return Err(QuilError::InvalidArgument(format!("sig too long: {}", l))); }
+    // Falcon-512 addressed-sig envelope: 710 (single) / 1226 (aggregate-1).
+    // See `MAX_ADDRESSED_SIG_LEN`.
+    if l > super::addressed_signature::MAX_ADDRESSED_SIG_LEN {
+        return Err(QuilError::InvalidArgument(format!("sig too long: {}", l)));
+    }
     if l == 0 { return Ok(None); }
     let b = read_bytes(buf, c, l)?;
     Ok(Some(AddressedSignature::from_canonical_bytes(&b)?))
@@ -149,7 +153,7 @@ impl ProverKick {
         let tp = read_u32(data, &mut c)?;
         if tp != TYPE_PROVER_KICK { return Err(QuilError::InvalidArgument(format!("ProverKick: bad type 0x{:08x}", tp))); }
         let frame_number = read_u64(data, &mut c)?;
-        let kl = read_u32(data, &mut c)?; if kl > 585 { return Err(QuilError::InvalidArgument("ProverKick: key too long".into())); }
+        let kl = read_u32(data, &mut c)?; if kl > 897 { return Err(QuilError::InvalidArgument("ProverKick: key too long".into())); }
         let kicked = read_bytes(data, &mut c, kl as usize)?;
         let cf1l = read_u32(data, &mut c)?; if cf1l > 34825 { return Err(QuilError::InvalidArgument("ProverKick: cf1 too long".into())); }
         let cf1 = read_bytes(data, &mut c, cf1l as usize)?;
@@ -324,7 +328,7 @@ mod tests {
     use super::*;
 
     fn addr_sig() -> AddressedSignature {
-        AddressedSignature { signature: vec![0xAAu8; 74], address: vec![0xBBu8; 32] }
+        AddressedSignature { signature: vec![0xAAu8; 666], address: vec![0xBBu8; 32] }
     }
 
     fn merge_target() -> SeniorityMerge {

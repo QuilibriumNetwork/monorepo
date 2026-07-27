@@ -37,6 +37,21 @@ pub(crate) async fn start(
     // the join→confirm→activate lifecycle runs in minutes. Every epoch timing
     // rule reads `epoch_length_frames()`, so this one call scales them all.
     quil_types::consensus::init_epoch_length_for_network(network);
+    // Localnet-only shortcut: `QUIL_EPOCH_LENGTH_FRAMES=<n>` shrinks the epoch so
+    // the join→confirm→activate lifecycle completes in a handful of frames (the
+    // confirm is gated to the epoch AFTER join). CONSENSUS PARAMETER — every node
+    // in the net MUST set the same value; localnet.sh sets it uniformly. Never
+    // set on a shared testnet/mainnet. Ignored on mainnet (network 0).
+    if network != 0 {
+        if let Ok(v) = std::env::var("QUIL_EPOCH_LENGTH_FRAMES") {
+            if let Ok(frames) = v.parse::<u64>() {
+                if frames > 0 {
+                    quil_types::consensus::set_epoch_length_frames(frames);
+                    warn!(frames, "QUIL_EPOCH_LENGTH_FRAMES override active (localnet only)");
+                }
+            }
+        }
+    }
     if network != 0 {
         info!(
             network,
@@ -95,11 +110,70 @@ pub(crate) async fn start(
     let bls_pubkey = keys.bls_pubkey.clone();
     let prover_address = keys.prover_address;
 
+    // Raw Falcon-512 signing key (q-prover-key) — the libp2p network identity.
+    let falcon_signing_key = {
+        use quil_keys::KeyManager as _;
+        file_key_manager
+            .get_private_key(quil_types::crypto::KeyType::Falcon512)
+            .map_err(|e| anyhow::anyhow!("load Falcon network identity key: {e}"))?
+    };
+
     let engines = engines::init_engines(&storage);
     let inclusion_prover = engines.inclusion_prover.clone();
     let crdt = engines.crdt.clone();
     let exec_manager = engines.exec_manager.clone();
     engines::bootstrap_genesis(network, config, &storage, &engines, &bls_pubkey)?;
+
+    // One-time corrective restore of the global-committee provers' Seniority.
+    // The re-bootstrapped mainnet left the genesis archive provers at
+    // Seniority=0 (a pre-fix eviction that kicked global provers zeroes
+    // Seniority). Since the global consensus quorum threshold is
+    // `(Σ seniority · 2) / 3`, zero total weight makes the threshold 0 — a
+    // single vote forms a QC/TC, the committee forks into per-archive solo
+    // chains, and global consensus can't finalize. This deterministically
+    // restores the genesis seniority (idempotent no-op once correct), so all
+    // archives converge on the same corrected prover-tree root and a real
+    // quorum is required again. It ALSO SEEDS the global committee when the
+    // prover tree is empty — the case on a freshly-migrated DB (the KZG→JMT
+    // migration only carries shards that hold state, so an emptied global prover
+    // shard is dropped), which is the only post-genesis path that installs the
+    // Falcon global provers. Archive-only: non-archives converge via hypersync
+    // of the corrected/seeded tree. See
+    // `quil_engine::genesis::restore_global_prover_seniority`.
+    if network == 0 && archive_mode {
+        let head = storage.clock_store.get_latest_frame_number().unwrap_or(0);
+        match quil_engine::genesis::restore_global_prover_seniority(&crdt, head) {
+            Ok(n) => {
+                if n > 0 {
+                    info!(corrected = n, head, "restored global prover seniority");
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to restore global prover seniority: {}",
+                    e
+                ));
+            }
+        }
+        // Remove the permanently-offline genesis archive prover from the
+        // global committee, so the active set is exactly 5 members and the
+        // hard-set count-based quorum resolves to 4-of-5. Deterministic +
+        // idempotent; must run on every archive so they converge on the same
+        // corrected prover-tree root before consensus resumes.
+        match quil_engine::genesis::remove_offline_global_prover(&crdt, head) {
+            Ok(changed) => {
+                if changed {
+                    info!(head, "removed offline global prover from committee");
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to remove offline global prover: {}",
+                    e
+                ));
+            }
+        }
+    }
 
 
     let frame_pipeline::FramePipeline {
@@ -115,7 +189,17 @@ pub(crate) async fn start(
         consensus_loopback_tx,
         consensus_loopback_rx,
         listen_addr,
-    } = networking::init(&mut sup, config, config_dir, network, archive_mode).await?;
+    } = networking::init(&mut sup, config, config_dir, network, archive_mode, &falcon_signing_key).await?;
+
+    // Bridge the p2p prometheus registry (blossomsub_* mesh/graft/prune/
+    // message families + libp2p_* connection families) into every metrics
+    // exposition (HTTP /metrics, gRPC GetMetrics, --metrics, TUI).
+    {
+        let p2p_for_metrics = p2p_handle.clone();
+        crate::rpc_metrics::set_extra_metrics_render(std::sync::Arc::new(move || {
+            p2p_for_metrics.render_metrics()
+        }));
+    }
 
     // Frame tracking — single source of truth for "what frame is
     // this node on right now." Updated by the BlossomSub receive
@@ -213,6 +297,7 @@ pub(crate) async fn start(
         exec_manager: exec_manager.clone(),
         archive_mode,
         network,
+        onion_routing_enabled: !config.p2p.disable_onion_routing,
     });
 
     let runtime_state::RuntimeState {
@@ -265,9 +350,6 @@ pub(crate) async fn start(
 
     let allocator_and_lifecycle::LifecycleHandles {
         worker_allocator,
-        consensus_handle,
-        vote_aggregator,
-        timeout_aggregator,
         prover_lifecycle,
         frame_materializer,
     } = allocator_and_lifecycle::init(&mut sup, allocator_and_lifecycle::LifecycleInitArgs {
@@ -307,14 +389,16 @@ pub(crate) async fn start(
         Some(seed)
     })();
 
-    // Log Ed448 identity if available
+    // Log the Ed448 SENIORITY-ROOT identity if available. NOTE: this is no
+    // longer the network peer-id (that's the Falcon q-prover-key — see
+    // networking::init); the Ed448 key is retained only as the seniority root.
     if let Some(ref seed) = mtls_seed {
         let ed448_pubkey = quil_p2p::ed448_identity::derive_public_key(seed);
         let ed448_peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&ed448_pubkey);
         info!(
             ed448_peer_id = hex::encode(&ed448_peer_id),
             ed448_pubkey_len = ed448_pubkey.len(),
-            "Ed448 identity ready (Go-compatible peer ID)"
+            "Ed448 seniority-root identity ready (NOT the network peer-id)"
         );
     }
 
@@ -526,7 +610,9 @@ pub(crate) async fn start(
             archive_pool: archive_pool.clone(),
             clock_store: clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
             p2p_handle: p2p_handle.clone(),
-            ed448_seed: mtls_seed,
+            // Falcon network identity for :8340 dials (present iff we have a
+            // transport identity, gated by mtls_seed as before).
+            falcon_signing_key: mtls_seed.map(|_| falcon_signing_key.clone()),
             publish_to_blossomsub: archive_mode,
         });
 
@@ -616,18 +702,12 @@ pub(crate) async fn start(
         info!("shard orchestration subscriber spawned");
     }
 
-    // Inbound consensus-message verifier for the global chain.
-    // Published by `archive_sync` once the consensus loop activates
-    // (it needs the activation's committee + vote/timeout domains), and
-    // read by the message loop to gate inbound proposals / certs before
-    // they reach fork-choice, the pacemaker, or a vote. Mirrors the
-    // `vote_aggregator` OnceLock plumbing.
-    let global_validator: Arc<std::sync::OnceLock<Arc<
-        quil_engine::validator::ConsensusValidator<
-            quil_engine::consensus_types::GlobalState,
-            quil_engine::consensus_types::GlobalVote,
-        >,
-    >>> = Arc::new(std::sync::OnceLock::new());
+    // Commonware-simplex inbound router (P2c cutover). Shared, set post-spawn at
+    // the archive-sync activation site when the committee is configured; unset
+    // (the default) leaves the simplex path off.
+    let cw_router: Arc<
+        std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>,
+    > = Arc::new(std::sync::OnceLock::new());
 
     archive_sync::spawn_all(&mut sup, archive_sync::ArchiveSyncArgs {
         mtls_seed,
@@ -653,16 +733,14 @@ pub(crate) async fn start(
         bls_pubkey: bls_pubkey.clone(),
         prover_address,
         genesis_prover_addrs: genesis_prover_addrs.clone(),
-        p2p_handle: p2p_handle.clone(),
-        consensus_handle: consensus_handle.clone(),
-        vote_aggregator: vote_aggregator.clone(),
-        timeout_aggregator: timeout_aggregator.clone(),
-        global_validator: global_validator.clone(),
-        db_arc: db_arc.clone(),
         frame_materializer: frame_materializer.clone(),
         consensus_loopback_tx: consensus_loopback_tx.clone(),
         peer_id,
         spawner: detached_spawner.clone(),
+        consensus_committee: config.engine.consensus_committee.clone(),
+        consensus_committee_peer_ids: config.engine.consensus_committee_peer_ids.clone(),
+        consensus_leader_timeout_secs: config.engine.consensus_leader_timeout_secs,
+        cw_router: cw_router.clone(),
     });
 
 
@@ -680,7 +758,7 @@ pub(crate) async fn start(
     let archive_app_shard_ingest = if archive_mode {
         Some(quil_engine::archive_ingest::ArchiveAppShardIngest::new(
             prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
-            Arc::new(quil_crypto::Bls48581KeyConstructor)
+            Arc::new(quil_crypto::FalconKeyConstructor)
                 as Arc<dyn quil_types::crypto::BlsConstructor>,
             frame_prover.clone(),
             exec_manager.clone(),
@@ -714,20 +792,20 @@ pub(crate) async fn start(
         global_msg_tx: global_msg_tx.clone(),
         archive_pool: archive_pool.clone(),
         mtls_seed,
+        // Falcon network identity for the prover-tree bootstrap :8340 dial
+        // (present iff we have a transport identity, gated by mtls_seed).
+        prover_falcon_key: mtls_seed.map(|_| falcon_signing_key.clone()),
         hg_store: hg_store.clone(),
         frame_validator,
         message_collector: message_collector.clone(),
         coverage_monitor: coverage_monitor.clone(),
         worker_allocator: worker_allocator.clone(),
         prover_pipeline: prover_pipeline.clone(),
-        consensus_handle: consensus_handle.clone(),
-        vote_aggregator: vote_aggregator.clone(),
-        timeout_aggregator: timeout_aggregator.clone(),
-        global_validator: global_validator.clone(),
         peer_info_cache: peer_info_cache.clone(),
         shard_engines: shard_engines.clone(),
         signer_registry: signer_registry.clone(),
         current_frame: current_frame.clone(),
+        cw_router: cw_router.clone(),
         last_global_head_frame: last_global_head_frame.clone(),
         genesis_archive_peer_ids: genesis_archive_peer_ids.clone(),
         genesis_prover_addrs: genesis_prover_addrs.clone(),
@@ -765,6 +843,7 @@ pub(crate) async fn start(
         prover_address,
         token_store: token_store.clone(),
         prover_registry: prover_registry.clone(),
+        signer_registry: signer_registry.clone(),
         prover_pipeline: prover_pipeline.clone(),
         worker_manager: worker_manager.clone(),
         inclusion_prover: inclusion_prover.clone(),

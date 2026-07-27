@@ -596,6 +596,83 @@ message SubmitGlobalConsensusRequest {
 
 message SubmitGlobalConsensusResponse {}
 
+// Forest-sync RPCs (JMT commitment diff + readable vertex blobs). Restored to
+// match global_service.rs / archive_client.rs.
+message GetForestNodeRequest {
+  bytes shard_id = 1;
+  uint32 phase = 2;
+  bytes node_key = 3;
+}
+message GetForestNodeResponse {
+  bool found = 1;
+  bytes node = 2;
+}
+message GetForestValueRequest {
+  bytes shard_id = 1;
+  uint32 phase = 2;
+  uint64 version = 3;
+  bytes key_hash = 4;
+}
+message GetForestValueResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+message GetForestHeadRequest {
+  bytes shard_id = 1;
+  uint32 phase = 2;
+}
+message GetForestHeadResponse {
+  bool found = 1;
+  uint64 version = 2;
+  bytes root = 3;
+}
+message GetForestPreimageRequest {
+  bytes shard_id = 1;
+  uint32 phase = 2;
+  bytes key_hash = 3;
+}
+message GetForestPreimageResponse {
+  bool found = 1;
+  bytes raw_key = 2;
+}
+message GetVertexBlobRequest {
+  bytes shard_key = 1;  // app ShardKey (l1[3] ‖ l2[32])
+  uint32 phase = 2;
+  bytes id = 3;         // 64-byte vertex id (app ‖ data)
+  // MVCC pin: read the vertex "as-of" this tree version (latest write <= version),
+  // matching the forest leaf that the diff addressed. 0 => latest (back-compat
+  // with unversioned callers; real commit versions start at 1).
+  uint64 version = 4;
+}
+message GetVertexBlobResponse {
+  bool found = 1;
+  bytes blob = 2;
+}
+message ResolveRootRequest {
+  bytes shard_id = 1;  // addr_path_shard_id(app, prefix) or single-shard id
+  uint32 phase = 2;
+  bytes root = 3;      // 32-byte authenticated tree root
+}
+message ResolveRootResponse {
+  bool found = 1;
+  uint64 version = 2;       // peer's local version whose tree root == `root`
+  uint64 global_frame = 3;  // global frame at which that version committed
+}
+message GetAppManifestRequest {
+  bytes app_address = 1;  // 32-byte app address
+  uint32 phase = 2;
+  bytes app_root = 3;     // 32-byte authenticated aggregate app root
+}
+message AppManifestEntry {
+  bytes prefix = 1;   // sub-shard bit-path prefix (u32 BE words concatenated)
+  bytes root = 2;     // 32-byte sub-shard tree root
+  uint64 version = 3; // sub-shard local version
+}
+message GetAppManifestResponse {
+  bool found = 1;
+  repeated AppManifestEntry entries = 2;
+}
+
 service GlobalService {
   rpc GetGlobalFrame (GetGlobalFrameRequest) returns (GlobalFrameResponse);
   rpc GetGlobalProposal (GetGlobalProposalRequest) returns (GlobalProposalResponse);
@@ -606,6 +683,13 @@ service GlobalService {
   rpc StreamGlobalMessages(StreamGlobalMessagesRequest) returns (stream StreamGlobalMessagesResponse);
   rpc SubmitGlobalMessage(SubmitGlobalMessageRequest) returns (SubmitGlobalMessageResponse);
   rpc SubmitGlobalConsensus(SubmitGlobalConsensusRequest) returns (SubmitGlobalConsensusResponse);
+  rpc GetForestNode(GetForestNodeRequest) returns (GetForestNodeResponse);
+  rpc GetForestValue(GetForestValueRequest) returns (GetForestValueResponse);
+  rpc GetForestHead(GetForestHeadRequest) returns (GetForestHeadResponse);
+  rpc GetForestPreimage(GetForestPreimageRequest) returns (GetForestPreimageResponse);
+  rpc GetVertexBlob(GetVertexBlobRequest) returns (GetVertexBlobResponse);
+  rpc ResolveRoot(ResolveRootRequest) returns (ResolveRootResponse);
+  rpc GetAppManifest(GetAppManifestRequest) returns (GetAppManifestResponse);
 }
 
 service AppShardService {

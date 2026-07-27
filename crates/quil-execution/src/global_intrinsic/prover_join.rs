@@ -5,14 +5,14 @@
 //! ```text
 //! [u32 BE type_prefix = 0x0301]
 //! [u32 BE filters_count]
-//!   for each filter:
-//!     [u32 BE filter_len] [filter_len bytes]
+//! for each filter:
+//! [u32 BE filter_len] [filter_len bytes]
 //! [u64 BE frame_number]
 //! [u32 BE sig_len] [sig_len bytes BLS48581SignatureWithProofOfPossession]
 //! [u32 BE delegate_address_len] [delegate_address_len bytes]
 //! [u32 BE merge_targets_count]
-//!   for each:
-//!     [u32 BE target_len] [target_len bytes SeniorityMerge]
+//! for each:
+//! [u32 BE target_len] [target_len bytes SeniorityMerge]
 //! [u32 BE proof_len] [proof_len bytes]
 //! ```
 
@@ -25,7 +25,7 @@ pub const TYPE_PROVER_JOIN: u32 = 0x0301;
 
 const MAX_FILTERS: u32 = 100;
 const MAX_FILTER_LEN: u32 = 64;
-const MAX_SIG_LEN: u32 = 753;
+const MAX_SIG_LEN: u32 = 2249; // Falcon SignatureWithPop: 4+(4+666)+(4+901)+(4+666)
 const MAX_DELEGATE_ADDR_LEN: u32 = 32;
 const MAX_MERGE_TARGET_LEN: u32 = 675;
 const MAX_PROOF_LEN: u32 = 51600;
@@ -180,9 +180,9 @@ mod tests {
 
     fn sample_sig_with_pop() -> SignatureWithPop {
         SignatureWithPop {
-            signature: vec![0xAAu8; 74],
-            public_key: Some(vec![0xBBu8; 585]),
-            pop_signature: vec![0xCCu8; 74],
+            signature: vec![0xAAu8; 666],
+            public_key: Some(vec![0xBBu8; 897]),
+            pop_signature: vec![0xCCu8; 666],
         }
     }
 

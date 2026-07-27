@@ -1,0 +1,31 @@
+[package]
+name = "quil-forest"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Three-tier authenticated Merkle forest (256 global trees + per-app shard-commitment trees + per-shard state trees) over a battle-tested JMT primitive, RocksDB-backed with per-tree-id namespacing, speculative overlays, and stale-node pruning."
+
+[dependencies]
+# Battle-tested Jellyfish Merkle Tree primitive (Aptos-origin, Penumbra fork).
+# One instance per forest tree; hash commits (BLAKE3/SHA-256) instead of KZG.
+jmt = "0.11"
+# Per-vertex-subtree commitment: verify_vertex_membership recomputes the
+# vertex's own hash-Merkle commitment (`vertex_leaf_value`) from its blob.
+quil-tries = { path = "../quil-tries" }
+rocksdb = { version = "0.22", default-features = false, features = ["snappy", "lz4"] }
+sha2 = "0.10"
+borsh = { version = "1", features = ["derive"] }
+hex = "0.4"
+thiserror = "2"
+anyhow = "1"
+tempfile = "3"
+
+[dev-dependencies]
+criterion = "0.5"
+# `mocks` gives MockTreeStore for the sync (Merkle-diff) round-trip tests.
+jmt = { version = "0.11", features = ["mocks"] }
+num-bigint = "0.4"
+
+[[bench]]
+name = "bench_forest"
+harness = false

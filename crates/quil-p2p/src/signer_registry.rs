@@ -37,29 +37,29 @@ pub const KEY_REGISTRY_DOMAIN: &[u8] = b"KEY_REGISTRY";
 /// `node/explorer/main.go:2943-2985`):
 ///
 /// 1. **identity_to_prover** — the Ed448 *identity* key signs
-///    `KEY_REGISTRY ‖ prover_pubkey_bytes`:
-///    ```go
-///    identityMsg := slices.Concat(keyRegistryDomain, keyRegistry.ProverKey.KeyValue)
-///    ValidateSignature(KeyTypeEd448, IdentityKey.KeyValue, identityMsg,
-///                      IdentityToProver.Signature, nil)
-///    ```
-///    Ed448 `ValidateSignature` (`node/keys/inmem.go:33-39`) verifies
-///    `ed448.Verify(pubkey, concat(domain=nil, msg), sig, "")` — i.e. the
-///    domain is already baked into `identityMsg`, ctx empty. Mirrored by
-///    [`quil_crypto::ed448_verify`].
+/// `KEY_REGISTRY ‖ prover_pubkey_bytes`:
+/// ```go
+/// identityMsg := slices.Concat(keyRegistryDomain, keyRegistry.ProverKey.KeyValue)
+/// ValidateSignature(KeyTypeEd448, IdentityKey.KeyValue, identityMsg,
+/// IdentityToProver.Signature, nil)
+/// ```
+/// Ed448 `ValidateSignature` (`node/keys/inmem.go:33-39`) verifies
+/// `ed448.Verify(pubkey, concat(domain=nil, msg), sig, "")` — i.e. the
+/// domain is already baked into `identityMsg`, ctx empty. Mirrored by
+/// [`quil_crypto::ed448_verify`].
 ///
 /// 2. **prover_to_identity** — the BLS48-581 *prover* key signs the
-///    Ed448 identity pubkey bytes under the `KEY_REGISTRY` domain:
-///    ```go
-///    ValidateSignature(KeyTypeBLS48581G1, ProverKey.KeyValue,
-///                      IdentityKey.KeyValue, ProverToIdentity.Signature,
-///                      keyRegistryDomain)
-///    ```
-///    BLS `ValidateSignature` (`node/keys/inmem.go:40-48`) forwards to
-///    `VerifySignatureRaw(pubkey, sig, message, domain)`, which hashes
-///    `domain ‖ message` — identical to [`bls48581::bls_verify`] used
-///    here via [`quil_crypto::Bls48581KeyConstructor`]. The prover pubkey
-///    is the 585-byte G2 key; the signature is the G1 point.
+/// Ed448 identity pubkey bytes under the `KEY_REGISTRY` domain:
+/// ```go
+/// ValidateSignature(KeyTypeBLS48581G1, ProverKey.KeyValue,
+/// IdentityKey.KeyValue, ProverToIdentity.Signature,
+/// keyRegistryDomain)
+/// ```
+/// BLS `ValidateSignature` (`node/keys/inmem.go:40-48`) forwards to
+/// `VerifySignatureRaw(pubkey, sig, message, domain)`, which hashes
+/// `domain ‖ message` — identical to [`bls48581::bls_verify`] used
+/// here via [`quil_crypto::FalconKeyConstructor`]. The prover pubkey
+/// is the 585-byte G2 key; the signature is the G1 point.
 ///
 /// Both signatures must be present and valid, matching Go's hard
 /// rejection of missing/invalid cross-signatures.
@@ -82,9 +82,9 @@ fn verify_key_registry_bindings(reg: &CanonicalKeyRegistry) -> bool {
         return false;
     }
 
-    // (2) BLS prover (G2) key signs the Ed448 identity pubkey under the
-    // KEY_REGISTRY domain.
-    let bls = quil_crypto::Bls48581KeyConstructor;
+    // (2) Falcon consensus key signs the Ed448 identity pubkey under the
+    // KEY_REGISTRY domain (post-BLS cutover).
+    let bls = quil_crypto::FalconKeyConstructor;
     if !bls.verify_signature_raw(
         &reg.bls_pubkey,
         &reg.prover_to_identity_sig,
@@ -127,6 +127,14 @@ struct Inner {
     /// identity key (not the full entry) to halve the per-entry
     /// footprint; full entries are reachable via `by_identity`.
     by_prover: HashMap<Vec<u8>, Vec<u8>>,
+    /// Index libp2p `PeerId::to_bytes()` → prover (consensus/Falcon) pubkey.
+    /// Derived from the Falcon prover pubkey (`peer_id_from_falcon_pubkey`, the
+    /// network identity) at insert time. Lets an inbound connection —
+    /// authenticated by peer_id from
+    /// the PQNoise handshake, which carries no raw Ed448 pubkey — be resolved to
+    /// its prover so submit auth can require an ACTIVE prover (Go
+    /// `authenticateProverFromContext`).
+    by_peer_id: HashMap<Vec<u8>, Vec<u8>>,
     /// Insertion / update order of Ed448 identities. Used to evict
     /// the oldest-touched entry when `by_identity.len()` exceeds
     /// `MAX_SIGNER_ENTRIES`.
@@ -218,6 +226,9 @@ impl SignerRegistry {
                     if let Some(victim_id) = inner.order.pop_front() {
                         if let Some(victim) = inner.by_identity.remove(&victim_id) {
                             inner.by_prover.remove(&victim.bls_pubkey);
+                            let victim_peer =
+                                crate::falcon_identity::peer_id_from_falcon_pubkey(&victim.bls_pubkey);
+                            inner.by_peer_id.remove(&victim_peer);
                         }
                     }
                 }
@@ -225,9 +236,24 @@ impl SignerRegistry {
             }
         }
         let id_key = reg.ed448_pubkey.clone();
+        // peer_id (libp2p multihash of the FALCON prover key — the network
+        // identity) → prover pubkey. The Ed448 pubkey remains the KeyRegistry
+        // index (`by_identity`) + seniority root, but the live connection
+        // identity is the Falcon prover key, so `by_peer_id` keys on it.
+        let peer_id = crate::falcon_identity::peer_id_from_falcon_pubkey(&reg.bls_pubkey);
+        inner.by_peer_id.insert(peer_id, reg.bls_pubkey.clone());
         inner.by_prover.insert(reg.bls_pubkey, id_key.clone());
         inner.by_identity.insert(id_key, entry);
         true
+    }
+
+    /// Resolve an inbound connection's libp2p `PeerId::to_bytes()` to the prover
+    /// (consensus/Falcon) pubkey it published in its KeyRegistry, or `None` if no
+    /// verified binding is known. The submit-auth path hashes this to a prover
+    /// address and requires it to be ACTIVE.
+    pub fn prover_key_for_peer_id(&self, peer_id: &[u8]) -> Option<Vec<u8>> {
+        let inner = self.inner.read().unwrap();
+        inner.by_peer_id.get(peer_id).cloned()
     }
 
     /// Look up the BLS G2 pubkey associated with an Ed448 identity.
@@ -468,7 +494,7 @@ mod tests {
         let ed448_pubkey = ed_signer.public_key().to_vec();
 
         // BLS48-581 prover keypair.
-        let bls = quil_crypto::Bls48581KeyConstructor;
+        let bls = quil_crypto::FalconKeyConstructor;
         let (bls_signer, bls_pubkey) = bls.new_key().unwrap();
 
         // identity_to_prover: Ed448 signs KEY_REGISTRY || bls_pubkey

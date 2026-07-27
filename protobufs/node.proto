@@ -358,6 +358,45 @@ service NodeService {
   rpc GetLatestFrame(quilibrium.node.global.pb.GetGlobalFrameRequest)
     returns (quilibrium.node.global.pb.GlobalFrameResponse);
   rpc SubmitMessage(SubmitMessageRequest) returns (SubmitMessageResponse);
+  // Lattice confidential-transaction wallet support: coin accumulator
+  // membership witnesses + coin enumeration for scanning.
+  rpc GetCoinSpendWitness(GetCoinSpendWitnessRequest)
+    returns (GetCoinSpendWitnessResponse);
+  rpc ListDomainCoins(ListDomainCoinsRequest) returns (ListDomainCoinsResponse);
+}
+
+// Request per-coin accumulator membership witnesses for the wallet to build a
+// lattice confidential spend.
+message GetCoinSpendWitnessRequest {
+  // 32-byte token domain (empty ⇒ QUIL).
+  bytes domain = 1;
+  // Wire-encoded one-time keys `P` for coins the wallet is spending.
+  repeated bytes one_time_keys = 2;
+}
+message CoinSpendWitness {
+  bytes one_time_key = 1;   // echoes the requested P
+  uint64 leaf_index = 2;    // canonical (ascending-address) index
+  repeated bytes auth_path = 3; // wire-encoded sibling nodes, bottom→top
+  bool found = 4;           // false if P is not currently in the committed set
+}
+message GetCoinSpendWitnessResponse {
+  uint32 depth = 1;         // accumulator current depth (proofs bind to this)
+  bytes root = 2;           // wire-encoded committed root at `depth`
+  repeated CoinSpendWitness witnesses = 3;
+}
+
+// Enumerate a domain's committed lattice coins for wallet scanning.
+message ListDomainCoinsRequest {
+  bytes domain = 1;
+}
+message DomainCoin {
+  bytes address = 1;      // 32-byte coin content address
+  bytes one_time_key = 2; // wire-encoded P
+  bytes commitment = 3;   // wire-encoded cv
+  bytes memo = 4;         // opaque recipient memo (kem_ciphertext ‖ ring_memo)
+}
+message ListDomainCoinsResponse {
+  repeated DomainCoin coins = 1;
 }
 
 message ConnectivityTestRequest {

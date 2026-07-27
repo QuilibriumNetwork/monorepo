@@ -141,13 +141,13 @@ impl TokenConfiguration {
 /// ```text
 /// u16 mint_behavior
 /// u16 proof_basis
-/// u8  has_verkle_root
-///   if has: u16 len, [len bytes]
-/// u8  has_authority
-///   if has: u16 key_type, u16 pk_len, [pk_len bytes], u8 can_burn
+/// u8 has_verkle_root
+/// if has: u16 len, [len bytes]
+/// u8 has_authority
+/// if has: u16 key_type, u16 pk_len, [pk_len bytes], u8 can_burn
 /// u16 payment_addr_len, [payment_addr_len bytes]
-/// u8  has_fee_basis
-///   if has: u16 fee_type, u16 baseline_len, [baseline_len bytes]
+/// u8 has_fee_basis
+/// if has: u16 fee_type, u16 baseline_len, [baseline_len bytes]
 /// ```
 ///
 /// Ports Go `token_configuration.go:980-1113`.

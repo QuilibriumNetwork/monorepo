@@ -26,6 +26,29 @@ pub struct StoredKey {
     pub private_key: String,
 }
 
+/// Short type name for the `-legacy-<type>` suffix used when a keystore
+/// entry's type is upgraded (see [`FileKeyManager::ensure_key_type`]).
+fn key_type_name(t: u8) -> &'static str {
+    match t {
+        0 => "ed448",
+        1 => "x448",
+        2 => "bls48581",
+        3 => "bls48581g2",
+        4 => "decaf448",
+        8 => "falcon512",
+        9 => "sntrup761",
+        _ => "unknown",
+    }
+}
+
+/// A keystore entry summary returned by [`FileKeyManager::list_keys`].
+#[derive(Debug, Clone)]
+pub struct KeyEntry {
+    pub id: String,
+    pub key_type: u8,
+    pub public_key: Vec<u8>,
+}
+
 /// File-based key manager that stores AES-GCM encrypted keys in YAML.
 pub struct FileKeyManager {
     keys_path: PathBuf,
@@ -51,7 +74,19 @@ impl FileKeyManager {
         bls_constructor: Box<dyn BlsConstructor>,
     ) -> Result<Self> {
         let encryption_key = if encryption_key_hex.is_empty() {
-            vec![0u8; 32] // Default key (insecure, for development)
+            // SECURITY: with no configured key the keystore is AES-GCM-"encrypted"
+            // under a publicly-known all-zero key — i.e. every private key in
+            // keys.yml (Falcon prover/consensus, Ed448 peer, sntrup/decaf agreement
+            // keys) is effectively stored in PLAINTEXT. Anyone who reads the file
+            // off disk or a backup recovers all secrets. Loudly warn so an operator
+            // running in production notices; set `keyManagerFile.encryptionKey`
+            // (32-byte hex) to enable real at-rest encryption.
+            tracing::warn!(
+                "keystore encryption DISABLED: keyManagerFile.encryptionKey is unset, so \
+                 private keys are stored under a known all-zero key (effectively plaintext). \
+                 Set a 32-byte hex encryptionKey to protect keys at rest."
+            );
+            vec![0u8; 32]
         } else {
             hex::decode(encryption_key_hex)
                 .map_err(|e| QuilError::Crypto(format!("invalid encryption key hex: {}", e)))?
@@ -62,6 +97,16 @@ impl FileKeyManager {
                 "encryption key must be 32 bytes, got {}",
                 encryption_key.len()
             )));
+        }
+
+        // Also warn if an operator explicitly configured an all-zero key (32 zero
+        // bytes in hex) — same plaintext-at-rest exposure as the unset default,
+        // which the empty-string check above would otherwise miss.
+        if !encryption_key_hex.is_empty() && encryption_key.iter().all(|&b| b == 0) {
+            tracing::warn!(
+                "keystore encryption key is all-zero: private keys are effectively \
+                 stored in plaintext. Configure a non-zero 32-byte hex encryptionKey."
+            );
         }
 
         let mut manager = Self {
@@ -127,13 +172,15 @@ impl FileKeyManager {
             2 => KeyType::Bls48581G1,
             3 => KeyType::Bls48581G2,
             4 => KeyType::Decaf448,
+            8 => KeyType::Falcon512,
+            9 => KeyType::Sntrup761,
             _ => return Err(QuilError::Crypto(format!("unknown key type: {}", stored.key_type))),
         };
 
         match key_type {
             // Go uses BLS48581G1 (type 2) for prover keys, Rust uses
             // BLS48581G2 (type 3). Both map to the same underlying
-            // BLS48-581 implementation.  Store the signer under both
+            // BLS48-581 implementation. Store the signer under both
             // variants so callers find it regardless of which enum
             // value they request.
             KeyType::Bls48581G1 | KeyType::Bls48581G2 => {
@@ -159,8 +206,8 @@ impl FileKeyManager {
                 signers.insert(KeyType::Ed448, Box::new(signer));
                 tracing::info!(key_id = %stored.id, "loaded Ed448 key");
             }
-            KeyType::X448 | KeyType::Decaf448 => {
-                // Agreement keys (onion / view / spend). These are
+            KeyType::X448 | KeyType::Decaf448 | KeyType::Sntrup761 => {
+                // Agreement / KEM keys (onion / view / spend). These are
                 // stored for KeyRegistry publication but don't need a
                 // Signer trait — they produce shared secrets, not
                 // signatures. Keep them in the raw-bytes table only.
@@ -202,6 +249,16 @@ impl FileKeyManager {
                 let mut signers = self.signers.write().unwrap();
                 signers.insert(KeyType::Secp256k1Sha3, Box::new(signer));
                 tracing::info!(key_id = %stored.id, "loaded Secp256k1Sha3 key");
+            }
+            KeyType::Falcon512 => {
+                // Post-quantum signing key. The `q-prover-key` is the node's
+                // single Falcon identity (proving + consensus), so it owns the
+                // type-keyed `signers[Falcon512]` slot.
+                let signer =
+                    quil_crypto::FalconSigner::from_bytes(&private_bytes, &public_bytes);
+                let mut signers = self.signers.write().unwrap();
+                signers.insert(KeyType::Falcon512, Box::new(signer));
+                tracing::info!(key_id = %stored.id, "loaded Falcon512 key");
             }
         }
 
@@ -299,23 +356,63 @@ impl FileKeyManager {
         Ok(public_key)
     }
 
+    /// Create the post-quantum Falcon-512 proving key — the node's single
+    /// Falcon identity (proving + commonware-simplex consensus). Replaces the
+    /// pre-cutover BLS proving key; the Ed448 peer key (which carries seniority)
+    /// is retained separately. Signing key 1281 B, public key 897 B,
+    /// `key_type = 8`.
+    pub fn create_falcon_key(&self, key_id: &str) -> Result<Vec<u8>> {
+        let signer = quil_crypto::FalconSigner::generate();
+        let private_key = signer.private_key().to_vec();
+        let public_key = signer.public_key().to_vec();
+
+        let encrypted = self.encrypt_private_key(&private_key)?;
+        let stored = StoredKey {
+            id: key_id.to_string(),
+            key_type: 8, // Falcon512
+            public_key: hex::encode(&public_key),
+            private_key: encrypted,
+        };
+        self.stored_keys
+            .write()
+            .unwrap()
+            .insert(key_id.to_string(), stored);
+        {
+            let mut signers = self.signers.write().unwrap();
+            signers.insert(
+                KeyType::Falcon512,
+                Box::new(quil_crypto::FalconSigner::from_bytes(&private_key, &public_key)),
+            );
+        }
+        self.save_to_file()?;
+        tracing::info!(key_id, "created and saved new Falcon512 consensus key");
+
+        Ok(public_key)
+    }
+
     /// Create a key pair for agreement-type keys (X448, Decaf448).
     /// Generates a random scalar and derives the public key via
     /// elliptic curve point multiplication.
     ///
     /// Key formats match what qclient/Go expects:
-    ///   - key_type=1 (X448): 57-byte seed → 57-byte Ed448-shaped pubkey
-    ///     (X448 isn't yet used by qclient read paths; Ed448 shape
-    ///     is adequate for storage and future port).
-    ///   - key_type=4 (Decaf448): 56-byte scalar → 56-byte compressed
-    ///     Decaf448 point. Go qclient's `Concat(vk.Public(), sk.Public())`
-    ///     produces a 112-byte token-address prefix that Rust's
-    ///     `GetTokensByAccount` validates against.
+    /// - key_type=1 (X448): 57-byte seed → 57-byte Ed448-shaped pubkey
+    /// (X448 isn't yet used by qclient read paths; Ed448 shape
+    /// is adequate for storage and future port).
+    /// - key_type=4 (Decaf448): 56-byte scalar → 56-byte compressed
+    /// Decaf448 point. Go qclient's `Concat(vk.Public(), sk.Public())`
+    /// produces a 112-byte token-address prefix that Rust's
+    /// `GetTokensByAccount` validates against.
     pub fn create_agreement_key(&self, key_id: &str, key_type: u8) -> Result<()> {
         use rand::RngCore;
         use ed448_goldilocks_plus::{DecafPoint, Scalar};
 
         let (public_key, private_key) = match key_type {
+            9 => {
+                // sntrup761 (Streamlined NTRU Prime) KEM — post-quantum key
+                // agreement (onion routing). Public key 1158 B, secret 1763 B.
+                let kp = quil_crypto::Sntrup761KeyPair::generate();
+                (kp.public, kp.secret)
+            }
             4 => {
                 // Decaf448: 56-byte compressed point public key,
                 // 57-byte RFC 8032 private scalar (matches qclient).
@@ -357,34 +454,80 @@ impl FileKeyManager {
         Ok(())
     }
 
-    /// Ensure all standard keys exist, creating any that are missing.
+    /// Ensure all standard keys exist AND have the expected key type,
+    /// creating (or type-upgrading) any that are missing or stale.
+    ///
+    /// Migration note (re-substrate cutover): older keystores carry a
+    /// **BLS48581** `q-prover-key` (type 2), but the proving key is now
+    /// **Falcon-512** (type 8). A presence-only check would leave the old
+    /// BLS key in place and the Falcon signer slot empty (the node then
+    /// can't sign as a prover). So this is type-aware: when a standard key
+    /// exists but has the wrong type, the old entry is PRESERVED under a
+    /// `-legacy-<type>` id (never deleted — key material is never lost) and
+    /// a fresh correct-type key is generated. The Ed448 `q-peer-key`
+    /// (the seniority root) is not in this set and is never touched.
     pub fn ensure_standard_keys(&self) -> Result<()> {
-        let keys = self.stored_keys.read().unwrap();
-        let needs_prover = !keys.contains_key("q-prover-key");
-        let needs_onion = !keys.contains_key("q-onion-key");
-        let needs_view = !keys.contains_key("q-view-key");
-        let needs_spend = !keys.contains_key("q-spend-key");
-        let needs_device = !keys.contains_key("q-device-key");
-        let needs_device_pre = !keys.contains_key("q-device-pre-key");
-        drop(keys);
+        // Falcon-512 proving key (was BLS48581 pre-cutover — upgraded here).
+        // This is the node's SINGLE Falcon identity: it is both the proving
+        // key AND the commonware-simplex consensus committee identity (the
+        // `Set<FalconPublicKey>` member key). There is no separate
+        // `q-consensus-key` — consensus reads this same key (see
+        // `master_node/archive_sync.rs`). Legacy keystores may still contain a
+        // distinct `q-consensus-key`; it is left untouched (never deleted) but
+        // is no longer consulted.
+        self.ensure_key_type("q-prover-key", 8, &|s| {
+            s.create_falcon_key("q-prover-key").map(|_| ())
+        })?;
+        // sntrup761 (post-quantum KEM) onion-routing key.
+        self.ensure_key_type("q-onion-key", 9, &|s| s.create_agreement_key("q-onion-key", 9))?;
+        // Decaf448 agreement keys (unchanged across the cutover).
+        self.ensure_key_type("q-view-key", 4, &|s| s.create_agreement_key("q-view-key", 4))?;
+        self.ensure_key_type("q-spend-key", 4, &|s| s.create_agreement_key("q-spend-key", 4))?;
+        self.ensure_key_type("q-device-key", 4, &|s| s.create_agreement_key("q-device-key", 4))?;
+        self.ensure_key_type("q-device-pre-key", 4, &|s| {
+            s.create_agreement_key("q-device-pre-key", 4)
+        })?;
+        Ok(())
+    }
 
-        if needs_prover {
-            self.create_bls_key("q-prover-key")?;
-        }
-        if needs_onion {
-            self.create_agreement_key("q-onion-key", 1)?; // X448
-        }
-        if needs_view {
-            self.create_agreement_key("q-view-key", 4)?; // Decaf448
-        }
-        if needs_spend {
-            self.create_agreement_key("q-spend-key", 4)?; // Decaf448
-        }
-        if needs_device {
-            self.create_agreement_key("q-device-key", 4)?; // Decaf448
-        }
-        if needs_device_pre {
-            self.create_agreement_key("q-device-pre-key", 4)?; // Decaf448
+    /// Ensure a single standard key exists with `expected_type`. Missing →
+    /// create via `create`. Present with the right type → no-op. Present with
+    /// the WRONG type → move the old entry to `<id>-legacy-<oldtype>`
+    /// (preserved, not deleted) and generate a fresh correct-type key.
+    fn ensure_key_type(
+        &self,
+        id: &str,
+        expected_type: u8,
+        create: &dyn Fn(&Self) -> Result<()>,
+    ) -> Result<()> {
+        let existing = self.stored_keys.read().unwrap().get(id).cloned();
+        match existing {
+            None => create(self)?,
+            Some(k) if k.key_type == expected_type => {}
+            Some(k) => {
+                let legacy_id = format!("{}-legacy-{}", id, key_type_name(k.key_type));
+                let mut legacy = k.clone();
+                legacy.id = legacy_id.clone();
+                {
+                    let mut w = self.stored_keys.write().unwrap();
+                    // Don't clobber a legacy entry preserved by an earlier run.
+                    if !w.contains_key(&legacy_id) {
+                        w.insert(legacy_id.clone(), legacy);
+                    }
+                    // Drop the stale primary entry so `create` writes the new
+                    // key cleanly under `id` (the old key survives as legacy).
+                    w.remove(id);
+                }
+                tracing::warn!(
+                    key_id = id,
+                    old_type = k.key_type,
+                    expected_type,
+                    legacy_id = %legacy_id,
+                    "keystore key has outdated type; preserved old key as a legacy \
+                     entry and generating a replacement"
+                );
+                create(self)?;
+            }
         }
         Ok(())
     }
@@ -427,6 +570,164 @@ impl FileKeyManager {
         Ok(Some((seed, pub_key)))
     }
 
+    /// Return the stored public key bytes for a key id, if present.
+    ///
+    /// Used by the client to read agreement-key publics (e.g.
+    /// `q-view-key` / `q-spend-key`) without materializing a signer.
+    pub fn public_key_by_id(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        let keys = self.stored_keys.read().unwrap();
+        match keys.get(id) {
+            Some(stored) => {
+                let pk = hex::decode(&stored.public_key).map_err(|e| {
+                    QuilError::Crypto(format!("invalid public key hex for {id}: {e}"))
+                })?;
+                Ok(Some(pk))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Enumerate the keystore entries (id, type, public key). Port of
+    /// `KeyManager.ListKeys` for the `qclient key list` command.
+    pub fn list_keys(&self) -> Vec<KeyEntry> {
+        let keys = self.stored_keys.read().unwrap();
+        let mut out: Vec<KeyEntry> = keys
+            .values()
+            .filter(|k| !k.id.is_empty())
+            .map(|k| KeyEntry {
+                id: k.id.clone(),
+                key_type: k.key_type,
+                public_key: hex::decode(&k.public_key).unwrap_or_default(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// Verify a `signature` over `message` under `domain` for the given
+    /// `key_type` and `public_key` — the exact primitive the node's verify path
+    /// uses, so `qclient`-produced signatures (prover leave/pause/update) can be
+    /// checked against it. Mirrors `quil_crypto`'s `KeyManager::validate_signature`
+    /// (Ed448 signs `concat(domain, message)` with an empty RFC-8032 ctx;
+    /// Falcon-512 uses `domain` as the FN-DSA context).
+    pub fn validate_signature(
+        &self,
+        key_type: KeyType,
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+        domain: &[u8],
+    ) -> Result<bool> {
+        match key_type {
+            KeyType::Ed448 => {
+                if public_key.len() != 57 {
+                    return Err(QuilError::InvalidArgument(format!(
+                        "Ed448: invalid public key length {}",
+                        public_key.len()
+                    )));
+                }
+                if signature.len() != 114 {
+                    return Err(QuilError::InvalidArgument(format!(
+                        "Ed448: invalid signature length {}",
+                        signature.len()
+                    )));
+                }
+                let pk = ed448_rust::PublicKey::try_from(public_key)
+                    .map_err(|e| QuilError::Internal(format!("Ed448 key decode: {:?}", e)))?;
+                let mut digest = Vec::with_capacity(domain.len() + message.len());
+                digest.extend_from_slice(domain);
+                digest.extend_from_slice(message);
+                match pk.verify(&digest, signature, None) {
+                    Ok(()) => Ok(true),
+                    Err(_) => Ok(false),
+                }
+            }
+            KeyType::Falcon512 => {
+                Ok(quil_crypto::falcon_verify(public_key, signature, message, domain))
+            }
+            other => Err(QuilError::InvalidArgument(format!(
+                "KeyManager: unsupported key type {:?} for signature verification",
+                other
+            ))),
+        }
+    }
+
+    /// Delete a key by id, returning whether it existed. Port of
+    /// `KeyManager.DeleteKey`.
+    pub fn delete_key(&self, id: &str) -> Result<bool> {
+        let removed = self.stored_keys.write().unwrap().remove(id).is_some();
+        if removed {
+            self.save_to_file()?;
+        }
+        Ok(removed)
+    }
+
+    /// Create a signing key of the given type, returning its public key.
+    /// Port of `KeyManager.CreateSigningKey` (the proof-of-possession is
+    /// not surfaced here — BLS/Falcon PoP is computed on demand elsewhere).
+    pub fn create_signing_key(&self, id: &str, key_type: u8) -> Result<Vec<u8>> {
+        match key_type {
+            0 => self.create_ed448_key(id),
+            1 | 4 => {
+                self.create_agreement_key(id, key_type)?;
+                self.public_key_by_id(id)?
+                    .ok_or_else(|| QuilError::Crypto(format!("no public key for {id}")))
+            }
+            2 | 3 => self.create_bls_key(id),
+            8 => self.create_falcon_key(id),
+            _ => Err(QuilError::Crypto(format!(
+                "unsupported key type for create: {key_type}"
+            ))),
+        }
+    }
+
+    /// Create an Ed448 signing key.
+    fn create_ed448_key(&self, id: &str) -> Result<Vec<u8>> {
+        use rand::RngCore;
+        let mut seed = [0u8; 57];
+        rand::thread_rng().fill_bytes(&mut seed);
+        let public_key = quil_crypto::Ed448Signer::derive_public(&seed)?;
+
+        let encrypted = self.encrypt_private_key(&seed)?;
+        let stored = StoredKey {
+            id: id.to_string(),
+            key_type: 0,
+            public_key: hex::encode(&public_key),
+            private_key: encrypted,
+        };
+        self.stored_keys
+            .write()
+            .unwrap()
+            .insert(id.to_string(), stored);
+        self.save_to_file()?;
+        Ok(public_key)
+    }
+
+    /// Import a raw private key of the given type, deriving and returning
+    /// the public key where possible (empty when derivation isn't
+    /// available for that type). Port of `KeyManager.PutRawKey`.
+    pub fn import_signing_key(&self, id: &str, key_type: u8, private_key: &[u8]) -> Result<Vec<u8>> {
+        // Derive the public key for types with a clean private→public map.
+        let public_key: Vec<u8> = match key_type {
+            0 => quil_crypto::Ed448Signer::derive_public(private_key)?,
+            _ => Vec::new(),
+        };
+
+        let encrypted = self.encrypt_private_key(private_key)?;
+        let stored = StoredKey {
+            id: id.to_string(),
+            key_type,
+            public_key: hex::encode(&public_key),
+            private_key: encrypted,
+        };
+        self.stored_keys
+            .write()
+            .unwrap()
+            .insert(id.to_string(), stored);
+        self.save_to_file()?;
+        Ok(public_key)
+    }
+
     /// Get the peer private key bytes for P2P identity (Ed448).
     pub fn get_peer_key(&self) -> Result<Vec<u8>> {
         if let Some((seed, _)) = self.decoded_peer_priv_key()? {
@@ -436,6 +737,31 @@ impl FileKeyManager {
         let stored = keys
             .get("q-peer-key")
             .ok_or_else(|| QuilError::NotFound("q-peer-key not found".into()))?;
+        self.decrypt_private_key(&stored.private_key)
+    }
+
+    /// Return the raw public-key bytes for a key id from the keystore (e.g. the
+    /// `q-onion-key` sntrup761 public key). Used to PUBLISH the onion key in the
+    /// signed PeerInfo so peers can authenticate it before building circuits.
+    pub fn get_public_key_bytes_by_id(&self, id: &str) -> Result<Vec<u8>> {
+        let map = self.stored_keys.read().unwrap();
+        let stored = map
+            .get(id)
+            .ok_or_else(|| QuilError::NotFound(format!("no key with id {:?}", id)))?;
+        hex::decode(&stored.public_key)
+            .map_err(|e| QuilError::Crypto(format!("invalid public key hex: {}", e)))
+    }
+
+    /// Decrypt and return the raw secret-key bytes for an agreement / KEM key id
+    /// (e.g. `q-onion-key`, an sntrup761 key with no `Signer`). Used by the onion
+    /// relay to decapsulate CREATE cells with its onion secret.
+    pub fn get_secret_key_bytes_by_id(&self, id: &str) -> Result<Vec<u8>> {
+        let stored = {
+            let map = self.stored_keys.read().unwrap();
+            map.get(id)
+                .cloned()
+                .ok_or_else(|| QuilError::NotFound(format!("no key with id {:?}", id)))?
+        };
         self.decrypt_private_key(&stored.private_key)
     }
 
@@ -471,6 +797,8 @@ impl FileKeyManager {
             2 => KeyType::Bls48581G1,
             3 => KeyType::Bls48581G2,
             4 => KeyType::Decaf448,
+            8 => KeyType::Falcon512,
+            9 => KeyType::Sntrup761,
             _ => {
                 return Err(QuilError::Crypto(format!(
                     "unknown key type for id {:?}: {}",
@@ -506,10 +834,13 @@ impl FileKeyManager {
                 &private_bytes,
                 &public_bytes,
             )?)),
-            KeyType::X448 | KeyType::Decaf448 => Err(QuilError::Crypto(format!(
-                "no signer for agreement-only key type {:?}",
-                key_type
+            KeyType::Falcon512 => Ok(Box::new(quil_crypto::FalconSigner::from_bytes(
+                &private_bytes,
+                &public_bytes,
             ))),
+            KeyType::X448 | KeyType::Decaf448 | KeyType::Sntrup761 => Err(QuilError::Crypto(
+                format!("no signer for agreement-only key type {:?}", key_type),
+            )),
         }
     }
 }
@@ -545,10 +876,15 @@ impl KeyManager for FileKeyManager {
                         let s = quil_crypto::Secp256k1Signer::sha3(&private, &public)?;
                         Ok(Box::new(s))
                     }
-                    KeyType::X448 | KeyType::Decaf448 => Err(QuilError::Crypto(format!(
-                        "no signer for agreement-only key type {:?}",
-                        key_type
-                    ))),
+                    KeyType::Falcon512 => {
+                        Ok(Box::new(quil_crypto::FalconSigner::from_bytes(&private, &public)))
+                    }
+                    KeyType::X448 | KeyType::Decaf448 | KeyType::Sntrup761 => {
+                        Err(QuilError::Crypto(format!(
+                            "no signer for agreement-only key type {:?}",
+                            key_type
+                        )))
+                    }
                 }
             }
             None => Err(QuilError::NotFound(format!(
@@ -612,7 +948,7 @@ fn peer_id_from_ed448(public_key: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::path::Path;
-    use quil_crypto::Bls48581KeyConstructor;
+    use quil_crypto::FalconKeyConstructor;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -639,7 +975,7 @@ mod tests {
         "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
     fn bls_constructor() -> Box<dyn BlsConstructor> {
-        Box::new(Bls48581KeyConstructor)
+        Box::new(FalconKeyConstructor)
     }
 
     fn make_manager(name: &str) -> (FileKeyManager, PathBuf) {
@@ -702,6 +1038,63 @@ mod tests {
     fn constructor_stores_proving_key_id() {
         let (m, dir) = make_manager("stores_id");
         assert_eq!(m.get_proving_key_id(), "test-key-id");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn ensure_standard_keys_upgrades_stale_bls_prover_key_to_falcon() {
+        let (m, dir) = make_manager("prover_key_type_upgrade");
+
+        // Simulate an old keystore: a type-2 (BLS48581) `q-prover-key`.
+        m.create_bls_key("q-prover-key").unwrap();
+        let old = m
+            .list_keys()
+            .into_iter()
+            .find(|k| k.id == "q-prover-key")
+            .unwrap();
+        assert_eq!(old.key_type, 2, "precondition: old prover key is BLS type 2");
+        let old_pub = old.public_key.clone();
+
+        // Type-aware migration.
+        m.ensure_standard_keys().unwrap();
+        let after = m.list_keys();
+
+        // 1. `q-prover-key` is upgraded to Falcon-512 (type 8), fresh material.
+        let prover = after.iter().find(|k| k.id == "q-prover-key").unwrap();
+        assert_eq!(prover.key_type, 8, "prover key upgraded to Falcon-512");
+        assert_ne!(prover.public_key, old_pub, "a fresh Falcon key was generated");
+
+        // 2. The old BLS key is PRESERVED, never lost.
+        let legacy = after
+            .iter()
+            .find(|k| k.id == "q-prover-key-legacy-bls48581")
+            .expect("old BLS key preserved as legacy entry");
+        assert_eq!(legacy.key_type, 2);
+        assert_eq!(legacy.public_key, old_pub, "legacy key material unchanged");
+
+        // 3. The Falcon prover signer slot is now populated (the bug this fixes:
+        //    presence-only checks left it empty and the node couldn't sign).
+        assert!(
+            m.get_public_key(KeyType::Falcon512).is_ok(),
+            "Falcon prover signer must be available after migration"
+        );
+
+        // 4. Idempotent: a second run neither duplicates the legacy entry nor
+        //    rotates the prover key again.
+        m.ensure_standard_keys().unwrap();
+        let again = m.list_keys();
+        let legacy_count = again
+            .iter()
+            .filter(|k| k.id.starts_with("q-prover-key-legacy"))
+            .count();
+        assert_eq!(legacy_count, 1, "re-run must not duplicate the legacy entry");
+        let prover2 = again.iter().find(|k| k.id == "q-prover-key").unwrap();
+        assert_eq!(prover2.key_type, 8);
+        assert_eq!(
+            prover2.public_key, prover.public_key,
+            "prover key must be stable across re-runs"
+        );
+
         cleanup(&dir);
     }
 
@@ -809,6 +1202,36 @@ mod tests {
     }
 
     #[test]
+    fn consensus_identity_is_the_prover_key() {
+        let (m, dir) = make_manager("consensus_is_prover");
+        m.ensure_standard_keys().unwrap();
+
+        // Prover and consensus roles share ONE Falcon-512 key: there is no
+        // separate `q-consensus-key`, and the type-keyed Falcon slot resolves
+        // to the proving key.
+        let prover = m.get_signer_by_id("q-prover-key").unwrap().public_key().to_vec();
+        assert_eq!(prover.len(), 897);
+        assert!(
+            m.get_signer_by_id("q-consensus-key").is_err(),
+            "no separate consensus key must be generated"
+        );
+        let type_pub = m.get_public_key(KeyType::Falcon512).unwrap();
+        assert_eq!(type_pub, prover, "consensus identity (Falcon slot) == prover key");
+
+        // Survives a reload from disk deterministically.
+        let m2 = FileKeyManager::new(
+            m.keys_path.clone(),
+            TEST_KEY_HEX,
+            "test-key-id".into(),
+            bls_constructor(),
+        )
+        .unwrap();
+        assert_eq!(m2.get_public_key(KeyType::Falcon512).unwrap(), prover);
+
+        cleanup(&dir);
+    }
+
+    #[test]
     fn create_bls_key_and_reload_from_disk_preserves_identity() {
         let dir = tempdir("reload_from_disk");
         let keys_path = dir.join("keys.yml");
@@ -880,7 +1303,7 @@ mod tests {
         let domain = b"test-domain";
         let sig = signer.sign_with_domain(message, domain).unwrap();
 
-        let verifier = Bls48581KeyConstructor;
+        let verifier = FalconKeyConstructor;
         assert!(verifier.verify_signature_raw(&pubkey, &sig, message, domain));
         assert!(!verifier.verify_signature_raw(&pubkey, &sig, b"tampered", domain));
 
@@ -991,7 +1414,7 @@ mod tests {
     /// produced by the Go node.
     ///
     /// Go creates prover keys with KeyTypeBLS48581G1 (type: 2) while
-    /// Rust historically used KeyTypeBLS48581G2 (type: 3).  Both map
+    /// Rust historically used KeyTypeBLS48581G2 (type: 3). Both map
     /// to the same underlying BLS48-581 implementation.
     ///
     /// The Go YAML format (from gopkg.in/yaml.v2 serializing
@@ -999,16 +1422,16 @@ mod tests {
     ///
     /// ```yaml
     /// q-prover-key:
-    ///   id: q-prover-key
-    ///   type: 2
-    ///   privateKey: <hex of [12-byte IV][AES-GCM ciphertext]>
-    ///   publicKey: <hex of raw public key>
+    /// id: q-prover-key
+    /// type: 2
+    /// privateKey: <hex of [12-byte IV][AES-GCM ciphertext]>
+    /// publicKey: <hex of raw public key>
     /// ```
     #[test]
     fn load_go_format_keys_yml_with_bls_g1_type() {
         // Step 1: Generate a real BLS key pair and encrypt the private
         // key using Rust (the AES-256-GCM scheme is identical).
-        let bls = Bls48581KeyConstructor;
+        let bls = FalconKeyConstructor;
         let (signer, _pop_key) = bls.new_key().unwrap();
         let private_bytes = signer.private_key().to_vec();
         let public_bytes = signer.public_key().to_vec();
@@ -1094,10 +1517,10 @@ mod tests {
     }
 
     /// Test that a Go-formatted keystore with multiple keys (prover +
-    /// agreement keys) can be loaded.  Go creates:
-    ///   - q-prover-key with type 2 (BLS48581G1)
-    ///   - q-onion-key with type 1 (X448)
-    ///   - q-view-key with type 4 (Decaf448)
+    /// agreement keys) can be loaded. Go creates:
+    /// - q-prover-key with type 2 (BLS48581G1)
+    /// - q-onion-key with type 1 (X448)
+    /// - q-view-key with type 4 (Decaf448)
     #[test]
     fn load_go_format_multi_key_keystore() {
         let dir = tempdir("go_multi_key");
@@ -1112,7 +1535,7 @@ mod tests {
         .unwrap();
 
         // Generate a BLS key for the prover entry.
-        let bls = Bls48581KeyConstructor;
+        let bls = FalconKeyConstructor;
         let (signer, _) = bls.new_key().unwrap();
         let prover_priv_enc = tmp_mgr.encrypt_private_key(signer.private_key()).unwrap();
         let prover_pub = hex::encode(signer.public_key());

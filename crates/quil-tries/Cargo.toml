@@ -17,3 +17,12 @@ tracing = "0.1"
 hex = "0.4"
 
 [dev-dependencies]
+# Real KZG prover for the branch-commit bench (no cycle: quil-crypto does not
+# depend on quil-tries). Phase 0 profiling: isolates the per-branch BLS48-581
+# multiexp cost that the verkle-vs-hash-Merkle decision hinges on.
+quil-crypto = { path = "../quil-crypto" }
+criterion = "0.5"
+
+[[bench]]
+name = "bench_tree"
+harness = false

@@ -1,0 +1,48 @@
+[package]
+name = "quil-client"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "qclient — the Quilibrium command-line client. Rust port of the Go client/ CLI: token, prover, key, deploy, hypergraph, message, config, alias, compute commands plus node install/update/service plumbing. Uses the post-quantum (Falcon-512) crypto primitives."
+
+[[bin]]
+name = "qclient"
+path = "src/main.rs"
+
+[lib]
+name = "quil_client"
+path = "src/lib.rs"
+
+[dependencies]
+quil-types = { path = "../quil-types" }
+quil-config = { path = "../quil-config" }
+quil-keys = { path = "../quil-keys" }
+quil-crypto = { path = "../quil-crypto" }
+quil-execution = { path = "../quil-execution" }
+quil-wallet = { path = "../quil-wallet" }
+quil-p2p = { path = "../quil-p2p" }
+quil-rpc = { path = "../quil-rpc" }
+quil-hypergraph = { path = "../quil-hypergraph" }
+quil-lattice-ct = { path = "../quil-lattice-ct" }
+
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.12", features = ["transport", "tls", "tls-roots"] }
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+hex = "0.4"
+sha2 = "0.10"
+sha3 = "0.10"
+md-5 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+num-bigint = "0.4"
+rand = "0.8"
+reqwest = "0.13"
+
+[dev-dependencies]
+tempfile = "3"

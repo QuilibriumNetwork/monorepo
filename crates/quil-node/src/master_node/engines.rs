@@ -15,16 +15,42 @@ pub(crate) fn init_engines(storage: &StorageHandles) -> EngineHandles {
     // 3. Create execution engines with full crypto verification
     // ---------------------------------------------------------------
     let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
-        Arc::new(quil_crypto::KzgInclusionProver);
-    let bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor> =
-        Arc::new(quil_crypto::Bls48581KeyConstructor);
+        Arc::new(quil_tries::ShaInclusionProver);
     let key_manager: Arc<dyn quil_types::crypto::KeyManager> =
-        Arc::new(quil_crypto::DefaultKeyManager::new(bls_constructor));
+        Arc::new(quil_crypto::DefaultKeyManager::new());
     // CRDT backed by RocksDB for real persistence
     let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
         storage.hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
         inclusion_prover.clone(),
     ));
+    // Phase-3: commit global-consensus state into the JMT forest. Install the
+    // persistent forest when the DB is migrated OR brand-new/fresh (a new
+    // forest-native node builds on the persistent forest from genesis instead of
+    // the ephemeral in-memory default). A store with un-migrated legacy state
+    // (committed frames, no forest) is skipped — it must run `--migrate-db`.
+    let store_is_fresh = storage
+        .clock_store
+        .get_latest_frame_number()
+        .map(|n| n == 0)
+        .unwrap_or(true);
+    if quil_forest_migrate::install_forest_boot(
+        crdt.as_ref(),
+        storage.hg_store.as_ref(),
+        store_is_fresh,
+    ) {
+        tracing::info!("Phase-3 JMT forest installed on global CRDT — state commits to the forest");
+    }
+    // Feed the CRDT each app's REAL shard-prefix set from the shards store so
+    // `commit_inner` aggregates the actual (possibly non-uniform, dynamically
+    // split) shard set — not just the uniform QUIL default from
+    // `install_forest_boot`. Empty store (pre-genesis) → the QUIL default stands.
+    // Re-run each frame by the poller so a mid-run split (applied at an epoch
+    // boundary) is picked up deterministically on every node.
+    let populated =
+        refresh_crdt_shard_prefixes(crdt.as_ref(), storage.shards_store.as_ref());
+    if populated > 0 {
+        info!(apps = populated, "populated CRDT shard-prefix sets from shards store");
+    }
     // Pre-create the lazy tree for the global prover shard so the
     // first commit materializes its root. Without this, migrated
     // stores skip the shard and the sync server returns None for the
@@ -94,18 +120,10 @@ pub(crate) fn init_engines(storage: &StorageHandles) -> EngineHandles {
         }
         Err(e) => warn!(error = %e, "startup hypergraph commit failed"),
     }
-    // ExecutionEngineManager::new takes the full crypto + store
-    // provider set as mandatory inputs. Production bulletproof prover
-    // ships in `quil_crypto::Decaf448BulletproofProver`; the Decaf448
-    // constructor and circuit compiler aren't wired to real
-    // implementations yet (no production impl exists in the Rust
-    // tree), so we plug in the testing-stubs noop variants. Those
-    // engines' verify paths return `false` for every signature, so
-    // any signed op fails closed rather than silently passing.
-    let bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver> =
-        Arc::new(quil_crypto::Decaf448BulletproofProver);
-    let decaf_constructor: Arc<dyn quil_types::crypto::DecafConstructor> =
-        Arc::new(quil_execution::testing::NoopDecafConstructor);
+    // ExecutionEngineManager::new takes the crypto + store provider set
+    // as mandatory inputs. The decaf448 bulletproof/decaf providers are
+    // retired (the confidential-value path is now lattice-CT); the circuit
+    // compiler isn't wired to a real impl yet, so it stays a noop stub.
     let circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler> =
         Arc::new(quil_execution::testing::NoopCircuitCompiler);
     let clock_store_for_exec: Arc<dyn quil_types::store::ClockStore> =
@@ -122,8 +140,6 @@ pub(crate) fn init_engines(storage: &StorageHandles) -> EngineHandles {
         inclusion_prover.clone(),
         key_manager.clone(),
         crdt.clone(),
-        bulletproof_prover,
-        decaf_constructor,
         circuit_compiler,
         clock_store_for_exec,
         hypergraph_resolver,
@@ -208,4 +224,37 @@ pub(crate) fn bootstrap_genesis(
         }
     }
     Ok(())
+}
+
+/// Feed the CRDT each app's REAL shard-prefix set from the shards store, so
+/// `commit_inner` aggregates the actual (possibly non-uniform, dynamically
+/// split) shard set rather than the uniform QUIL default. Groups `ShardInfo`
+/// rows by app address (`shard_key[3..35]`); `set_app_shard_prefixes` resolves
+/// the QUIL-vs-split-marker prefix overload via canonical bit-paths. Returns the
+/// number of apps populated (0 = empty store ⇒ the QUIL default stands). Called
+/// at engine init AND every frame by the poller, so a mid-run split (applied at
+/// an epoch boundary, written to the shards store there) is reflected in the
+/// committed state root deterministically on every node — no restart needed.
+pub(crate) fn refresh_crdt_shard_prefixes(
+    crdt: &quil_hypergraph::HypergraphCrdt,
+    shards_store: &dyn quil_types::store::ShardsStore,
+) -> usize {
+    let rows = match shards_store.range_app_shards() {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let mut by_app: std::collections::HashMap<[u8; 32], Vec<Vec<u32>>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        if row.shard_key.len() >= 35 {
+            let mut l2 = [0u8; 32];
+            l2.copy_from_slice(&row.shard_key[3..35]);
+            by_app.entry(l2).or_default().push(row.prefix);
+        }
+    }
+    let app_count = by_app.len();
+    for (app, prefixes) in by_app {
+        crdt.set_app_shard_prefixes(app, prefixes);
+    }
+    app_count
 }

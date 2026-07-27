@@ -58,11 +58,10 @@ pub fn compute_update_from_proto(p: &pb::ComputeUpdate) -> Result<ComputeUpdate>
         Some(c) => compute_config_from_proto(c).to_canonical_bytes()?,
         None => Vec::new(),
     };
+    // Raw Falcon signature bytes (verify uses the field directly — no 0x011C
+    // aggregate envelope). Matches the token-update fix.
     let sig = match &p.public_key_signature_bls48581 {
-        Some(s) => {
-            use crate::hypergraph_intrinsic::conversions::aggregate_sig_from_proto;
-            aggregate_sig_from_proto(s)?.to_canonical_bytes()?
-        }
+        Some(s) => s.signature.clone(),
         None => Vec::new(),
     };
     Ok(ComputeUpdate { config, rdf_schema: p.rdf_schema.clone(), public_key_signature_bls48581: sig })
@@ -188,7 +187,7 @@ mod tests {
     #[test]
     fn compute_config_round_trip() {
         let pb = pb::ComputeConfiguration {
-            read_public_key: vec![1u8; 57],
+            read_public_key: vec![1u8; 1158],
             write_public_key: vec![2u8; 57],
             owner_public_key: vec![3u8; 585],
         };
@@ -201,7 +200,7 @@ mod tests {
     fn compute_deploy_round_trip() {
         let pb = pb::ComputeDeploy {
             config: Some(pb::ComputeConfiguration {
-                read_public_key: vec![1u8; 57],
+                read_public_key: vec![1u8; 1158],
                 write_public_key: vec![2u8; 57],
                 owner_public_key: vec![],
             }),
@@ -228,7 +227,7 @@ mod tests {
     #[test]
     fn compute_config_full_pipeline() {
         let pb = pb::ComputeConfiguration {
-            read_public_key: vec![0xAAu8; 57],
+            read_public_key: vec![0xAAu8; 1158],
             write_public_key: vec![0xBBu8; 57],
             owner_public_key: vec![0xCCu8; 585],
         };

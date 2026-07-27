@@ -1,0 +1,32 @@
+[package]
+name = "quil-forest-migrate"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "KZG→JMT converter: reads the legacy quil-tries (KZG) state DB and re-commits it into the quil-forest 3-tier JMT at the migration rewind point. Keeps quil-tries as the read side; quil-forest is the write side."
+
+[dependencies]
+# Read side: decode legacy per-vertex KZG tree blobs.
+quil-tries = { path = "../quil-tries" }
+# Write side: the JMT 3-tier forest.
+quil-forest = { path = "../quil-forest" }
+# Read side: the legacy hypergraph store + ShardKey + HypergraphStore trait.
+quil-store = { path = "../quil-store" }
+quil-types = { path = "../quil-types" }
+# Shard-address → bloom-index (l1) derivation.
+quil-hypergraph = { path = "../quil-hypergraph" }
+# QUIL_TOKEN domain address, to detect the 64-shard app in the default split.
+quil-execution = { path = "../quil-execution" }
+# Open the fresh destination forest DB in the run_conversion helper.
+rocksdb = { version = "0.22", default-features = false, features = ["snappy", "lz4"] }
+anyhow = "1"
+
+[dev-dependencies]
+# Build sample legacy trees in tests (VectorCommitmentTree::insert takes a BigInt size).
+num-bigint = "0.4"
+# Seed a RocksHypergraphStore (test-utils) in tests.
+quil-store = { path = "../quil-store", features = ["test-utils"] }
+tempfile = "3"
+# Verify forest inclusion proofs in tests (quil-forest returns jmt proof types).
+jmt = "0.11"
+sha2 = "0.10"

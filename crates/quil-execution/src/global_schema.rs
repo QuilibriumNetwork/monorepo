@@ -8,8 +8,8 @@
 //! - `class_field_key` — point lookup for a class's field by name.
 //! - `max_order` — determines the key width (single/double/triple byte).
 //! - `TYPE_HASH_*` — hard-coded Poseidon type hashes observed from
-//!   mainnet on 2026-04-11. Replace with computed values once Poseidon
-//!   is ported.
+//! mainnet on 2026-04-11. Replace with computed values once Poseidon
+//! is ported.
 //!
 //! Source: see `GLOBAL_RDF_SCHEMA` at
 //! `node/execution/intrinsics/global/global_intrinsic.go:44-161`.
@@ -383,12 +383,12 @@ mod tests {
         // Observed from the inspection probe on 2026-04-11:
         // allocation:ProverAllocation keys that appeared in live data
         // were 0x00, 0x04, 0x08, 0x10, 0x24, 0x34 — single byte.
-        //   Prover           → order 0  → 0x00
-        //   Status           → order 1  → 0x04
+        //   Prover → order 0  → 0x00
+        //   Status → order 1  → 0x04
         //   ConfirmationFilter → order 2 → 0x08
-        //   JoinFrameNumber  → order 4  → 0x10
-        //   JoinConfirmFrameNumber → order 9  → 0x24
-        //   LastActiveFrameNumber  → order 13 → 0x34
+        //   JoinFrameNumber → order 4  → 0x10
+        //   JoinConfirmFrameNumber → order 9 → 0x24
+        //   LastActiveFrameNumber → order 13 → 0x34
         let cls = "allocation:ProverAllocation";
         assert_eq!(field_key(cls, "Prover"), Some(vec![0x00]));
         assert_eq!(field_key(cls, "Status"), Some(vec![0x04]));

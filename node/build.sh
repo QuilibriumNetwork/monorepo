@@ -21,8 +21,16 @@ set -euxo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$( cd "$(dirname "$(realpath "$( dirname "${BASH_SOURCE[0]}" )")")" >/dev/null 2>&1 && pwd )}"
 NODE_DIR="$ROOT_DIR/node"
-CRATE_NAME="quil-node"
+# Which workspace crate/binary to build, and where to publish it. The defaults
+# preserve the node build; overriding them lets the same script build any
+# workspace binary (identical FLINT/native-lib static-link path). For the
+# qclient, the Taskfile passes:
+#   CRATE_NAME=quil-client BIN_NAME=qclient OUT_BIN_NAME=qclient \
+#     OUT_BASE_DIR=crates/quil-client/build node/build.sh
+CRATE_NAME="${CRATE_NAME:-quil-node}"
 BIN_NAME="${BIN_NAME:-quil-node}"
+OUT_BIN_NAME="${OUT_BIN_NAME:-node}"
+OUT_BASE_DIR="${OUT_BASE_DIR:-$NODE_DIR/build}"
 
 # Build profile. Release is the default — matches the Go build script
 # which only produced optimized binaries. Override with CARGO_PROFILE=dev
@@ -176,15 +184,20 @@ if [[ ! -f "$BIN_SRC" ]]; then
 fi
 
 # ---------------------------------------------------------------
-# Publish to node/build/<platform>/node
+# Publish to <OUT_BASE_DIR>/<platform>/<OUT_BIN_NAME>
 # ---------------------------------------------------------------
-OUT_DIR="$NODE_DIR/build/$PLATFORM"
+# Resolve a relative OUT_BASE_DIR against the repo root.
+case "$OUT_BASE_DIR" in
+    /*) ;;
+    *) OUT_BASE_DIR="$ROOT_DIR/$OUT_BASE_DIR" ;;
+esac
+OUT_DIR="$OUT_BASE_DIR/$PLATFORM"
 mkdir -p "$OUT_DIR"
-# Install as `node` so Docker/systemd scripts expecting the Go
-# output path keep working unchanged.
-cp "$BIN_SRC" "$OUT_DIR/node"
-chmod +x "$OUT_DIR/node"
+# Install under the fixed output name (default `node`, so Docker/systemd
+# scripts expecting the Go output path keep working unchanged).
+cp "$BIN_SRC" "$OUT_DIR/$OUT_BIN_NAME"
+chmod +x "$OUT_DIR/$OUT_BIN_NAME"
 
 popd > /dev/null
 
-echo "built $OUT_DIR/node ($(du -h "$OUT_DIR/node" | cut -f1))"
+echo "built $OUT_DIR/$OUT_BIN_NAME ($(du -h "$OUT_DIR/$OUT_BIN_NAME" | cut -f1))"

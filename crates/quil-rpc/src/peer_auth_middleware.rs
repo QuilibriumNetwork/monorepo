@@ -20,14 +20,14 @@
 //! [`crate::quil_tls::XsignClientCertVerifier`], which rustls invokes
 //! during the handshake. Two distinct checks run there, and both are
 //! required for the identity to be trustworthy:
-//!   1. **xsign cross-signature** (`verify_xsign`) — proves the cert's
-//!      Ed25519 key was authorized by the Ed448 identity named in the
-//!      SAN (the cert is internally well-formed). This is static and
-//!      replayable on its own.
-//!   2. **proof-of-possession** (`verify_tls1x_signature`) — the TLS
-//!      `CertificateVerify` check, proving the live peer on *this*
-//!      connection actually holds the cert key's private half. Without
-//!      it a public peer cert could be replayed by anyone.
+//! 1. **xsign cross-signature** (`verify_xsign`) — proves the cert's
+//! Ed25519 key was authorized by the Ed448 identity named in the
+//! SAN (the cert is internally well-formed). This is static and
+//! replayable on its own.
+//! 2. **proof-of-possession** (`verify_tls1x_signature`) — the TLS
+//! `CertificateVerify` check, proving the live peer on *this*
+//! connection actually holds the cert key's private half. Without
+//! it a public peer cert could be replayed by anyone.
 //! By the time a request reaches this interceptor both checks have
 //! passed, so the SAN's Ed448 → libp2p PeerID mapping is bound to a
 //! live key-holder; this interceptor only re-decodes it from the cert
@@ -91,6 +91,25 @@ pub fn peer_identity_from_cert(cert_der: &[u8]) -> Option<(Vec<u8>, PeerId)> {
 /// plaintext calls.
 pub fn peer_auth_interceptor(mut req: Request<()>) -> Result<Request<()>, Status> {
     if req.extensions().get::<AuthenticatedPeer>().is_some() {
+        return Ok(req);
+    }
+
+    // PQNoise path (the post-quantum :8340 transport): identity is the
+    // handshake-verified PeerId, surfaced via the custom `Connected` impl as a
+    // `PqConnectInfo` extension — no TLS cert. The signature over the
+    // channel-binding handshake hash IS the proof-of-possession the mTLS
+    // `CertificateVerify` provided. `ed448_public_key` is left empty because no
+    // downstream consumer reads it — the identity gate is on the peer_id.
+    if let Some(pq) = req
+        .extensions()
+        .get::<crate::pqnoise_channel::PqConnectInfo>()
+        .cloned()
+    {
+        debug!(peer_id = %pq.peer_id, "authenticated inbound peer from pqnoise handshake");
+        req.extensions_mut().insert(AuthenticatedPeer {
+            peer_id: pq.peer_id,
+            ed448_public_key: Vec::new(),
+        });
         return Ok(req);
     }
 

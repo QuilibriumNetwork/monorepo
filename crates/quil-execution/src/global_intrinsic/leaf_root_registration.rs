@@ -37,7 +37,9 @@ const MAX_SHARD_FILTER_LEN: u32 = 64;
 /// few levels deep, but bound generously.
 const MAX_PREFIX_LEN: u32 = 256;
 const MAX_LEAF_ROOT_LEN: u32 = 128;
-const MAX_SIG_LEN: u32 = 753;
+// Falcon-512 `SignatureWithProofOfPossession` envelope:
+// 4 type + (4+666) sig + (4+901) wrapped-pubkey + (4+666) pop = 2249.
+const MAX_SIG_LEN: u32 = 2249;
 
 /// A member's storage registration for one leaf in one epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -285,9 +287,9 @@ mod tests {
             frame_number: 900_000,
             public_key_signature_bls48581: if sig {
                 Some(SignatureWithPop {
-                    signature: vec![0x22; 74],
-                    public_key: Some(vec![0x33; 585]),
-                    pop_signature: vec![0x44; 74],
+                    signature: vec![0x22; 666],
+                    public_key: Some(vec![0x33; 897]),
+                    pop_signature: vec![0x44; 666],
                 })
             } else {
                 None

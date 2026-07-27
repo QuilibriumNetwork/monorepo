@@ -6,11 +6,11 @@
 //! captures the rules for:
 //!
 //! - Which message types **produce** fee outputs when their `domain`
-//!   matches `Policy::producer_domain` — currently token.Transaction,
-//!   token.PendingTransaction, and token.MintTransaction carry a
-//!   `fees: Vec<Vec<u8>>` field of serialized BigInts.
+//! matches `Policy::producer_domain` — currently token.Transaction,
+//! token.PendingTransaction, and token.MintTransaction carry a
+//! `fees: Vec<Vec<u8>>` field of serialized BigInts.
 //! - Which message types **consume** a single fee, based on the boolean
-//!   toggles in `Policy`.
+//! toggles in `Policy`.
 //!
 //! Exported helpers:
 //!
@@ -20,7 +20,7 @@
 //! - [`needs_one_fee`] — per-request boolean predicate
 //! - [`pop_fee`] — pop next fee (zero on underflow, matching Go)
 //! - [`default_fee_market`] — the mainnet policy used by all three app
-//!   engines (token, compute, hypergraph)
+//! engines (token, compute, hypergraph)
 
 use num_bigint::BigInt;
 use num_traits::Zero;

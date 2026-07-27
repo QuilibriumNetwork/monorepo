@@ -218,6 +218,41 @@ pub type AppShardsProvider = Arc<
     dyn Fn(&[u8], &[u32]) -> Option<(Vec<u8>, u64, [Vec<u8>; 4])> + Send + Sync,
 >;
 
+/// Serves forest-sync data (JMT nodes/values of a shard/phase tree) from the
+/// local CRDT's forest, for [`GlobalRpcServer::get_forest_node`] /
+/// `get_forest_value`. A pure read proxy: the diff client authenticates every
+/// node against the trusted header root, so nothing served here is trusted on
+/// its own. Installed by the node (which owns the CRDT).
+pub trait ForestServer: Send + Sync {
+    /// `borsh(NodeKey)` → `borsh(Node)` (None if absent / malformed key).
+    fn serve_node(&self, shard_id: &[u8], phase: u32, node_key: &[u8]) -> Option<Vec<u8>>;
+    /// `(version, key_hash)` → leaf value (None if absent).
+    fn serve_value(&self, shard_id: &[u8], phase: u32, version: u64, key_hash: [u8; 32])
+        -> Option<Vec<u8>>;
+    /// Head `(version, root)` of a shard/phase tree, for the client's
+    /// version-discovery step. None if the tree was never committed.
+    fn serve_head(&self, shard_id: &[u8], phase: u32) -> Option<(u64, [u8; 32])>;
+    /// The raw l3 key (`vertex_id ‖ field_key`) a `key_hash` was committed from.
+    fn serve_preimage(&self, shard_id: &[u8], phase: u32, key_hash: [u8; 32]) -> Option<Vec<u8>>;
+    /// A vertex's committed blob (the readable data), keyed under the app
+    /// ShardKey bytes (`l1[3] ‖ l2[32]`). `version` MVCC-pins the read to the
+    /// tree version the diff addressed (0 ⇒ latest).
+    fn serve_vertex_blob(&self, shard_key: &[u8], phase: u32, id: &[u8], version: u64)
+        -> Option<Vec<u8>>;
+    /// Sync-by-hash: authenticated tree `root` → local `(version, global_frame)`
+    /// for a `(shard_id, phase)` tree. None if never committed here or pruned.
+    fn resolve_root(&self, shard_id: &[u8], phase: u32, root: [u8; 32]) -> Option<(u64, u64)>;
+    /// Sync-by-hash (split apps): the sub-shard manifest folding into an
+    /// aggregate `app_root` — `[(prefix_words, sub_root, sub_version)]`.
+    #[allow(clippy::type_complexity)]
+    fn serve_app_manifest(
+        &self,
+        app_address: &[u8],
+        phase: u32,
+        app_root: [u8; 32],
+    ) -> Option<Vec<(Vec<u8>, [u8; 32], u64)>>;
+}
+
 /// gRPC GlobalService implementation. Serves frames from the clock
 /// store so other nodes can sync from us.
 pub struct GlobalRpcServer {
@@ -228,10 +263,25 @@ pub struct GlobalRpcServer {
     worker_snapshot: Option<WorkerSnapshotFn>,
     global_shards: Option<GlobalShardsProvider>,
     app_shards: Option<AppShardsProvider>,
+    forest_server: Option<Arc<dyn ForestServer>>,
     /// Broadcast channel for `StreamGlobalMessages`. Producers
     /// (BlossomSub recv loop) send each received message; every
     /// connected streamer gets a `Receiver` clone.
     message_broadcast: Option<broadcast::Sender<global::StreamGlobalMessagesResponse>>,
+    /// The node's OWN peer id (`PeerId::to_bytes()`). When set, worker-privileged
+    /// RPCs (`StreamGlobalMessages`, `GetWorkerInfo`, `GetAppShards`) require the
+    /// authenticated caller to present THIS identity — i.e. only the node's own
+    /// data-worker processes (which dial with the node's Ed448 seed) may invoke
+    /// them, mirroring Go's `bytes.Equal(GetPeerID(), peerID)` self-gate. A remote
+    /// machine handshakes as a different peer_id and is denied. `None` ⇒ no gate
+    /// (single-machine/thread mode, where there is no gRPC boundary).
+    self_peer_id: Option<Vec<u8>>,
+    /// Authorizer for prover-gated RPCs (`GetGlobalProposal`): returns `true` iff
+    /// the authenticated caller is the node's own identity OR resolves to an
+    /// ACTIVE prover (Go `authenticateProverFromContext`). `None` ⇒ no gate.
+    #[allow(clippy::type_complexity)]
+    prover_authorizer:
+        Option<Arc<dyn Fn(&crate::peer_auth_middleware::AuthenticatedPeer) -> bool + Send + Sync>>,
 }
 
 impl GlobalRpcServer {
@@ -244,12 +294,70 @@ impl GlobalRpcServer {
             worker_snapshot: None,
             global_shards: None,
             app_shards: None,
+            forest_server: None,
             message_broadcast: None,
+            self_peer_id: None,
+            prover_authorizer: None,
+        }
+    }
+
+    /// Install the prover authorizer for `GetGlobalProposal` (self OR active
+    /// prover). See [`prover_authorizer`](Self::prover_authorizer).
+    #[allow(clippy::type_complexity)]
+    pub fn with_prover_authorizer(
+        mut self,
+        f: Arc<dyn Fn(&crate::peer_auth_middleware::AuthenticatedPeer) -> bool + Send + Sync>,
+    ) -> Self {
+        self.prover_authorizer = Some(f);
+        self
+    }
+
+    /// Guard a prover-gated RPC (`GetGlobalProposal`): the authenticated caller
+    /// must be the node's own identity OR an active prover. No-op when no
+    /// authorizer is configured.
+    fn require_prover(&self, ext: &tonic::Extensions) -> Result<(), tonic::Status> {
+        let Some(ref authz) = self.prover_authorizer else {
+            return Ok(());
+        };
+        match ext.get::<crate::peer_auth_middleware::AuthenticatedPeer>() {
+            Some(auth) if authz(auth) => Ok(()),
+            _ => Err(tonic::Status::permission_denied(
+                "GetGlobalProposal: caller is not this node's identity or an active prover",
+            )),
+        }
+    }
+
+    /// Set the node's own peer id so worker-privileged RPCs are gated to the
+    /// node's own identity (see [`self_peer_id`](Self::self_peer_id)).
+    pub fn with_self_peer_id(mut self, peer_id: Vec<u8>) -> Self {
+        self.self_peer_id = Some(peer_id);
+        self
+    }
+
+    /// Guard a worker-privileged RPC: the authenticated caller must be the node's
+    /// OWN identity. Returns `PermissionDenied` otherwise. No-op when no self
+    /// peer id is configured (thread mode). `ext` is the request's extensions.
+    fn require_self_identity(&self, ext: &tonic::Extensions) -> Result<(), tonic::Status> {
+        let Some(ref me) = self.self_peer_id else {
+            return Ok(());
+        };
+        match ext.get::<crate::peer_auth_middleware::AuthenticatedPeer>() {
+            Some(auth) if auth.peer_id.to_bytes() == *me => Ok(()),
+            _ => Err(tonic::Status::permission_denied(
+                "worker-privileged RPC: caller is not this node's own identity",
+            )),
         }
     }
 
     pub fn with_global_shards_provider(mut self, p: GlobalShardsProvider) -> Self {
         self.global_shards = Some(p);
+        self
+    }
+
+    /// Install the forest-sync server (serves JMT nodes/values). Without it, the
+    /// `GetForestNode`/`GetForestValue` RPCs report "not found".
+    pub fn with_forest_server(mut self, s: Arc<dyn ForestServer>) -> Self {
+        self.forest_server = Some(s);
         self
     }
 
@@ -305,15 +413,28 @@ impl GlobalService for GlobalRpcServer {
         let req = request.into_inner();
         let frame_number = req.frame_number;
 
-        let frame = if frame_number == 0 {
-            self.frames
-                .get_latest_frame()
-                .map_err(|e| Status::not_found(format!("no frames: {}", e)))?
-        } else {
-            self.frames
-                .get_frame(frame_number)
-                .map_err(|e| Status::not_found(format!("frame {} not found: {}", frame_number, e)))?
-        };
+        // Store read runs on the blocking pool, NOT inline on a peer-gRPC
+        // runtime worker. This is the hottest serving RPC on the network
+        // (every archive poller + proposal catch-up hits it in a loop) and
+        // a global frame record can be multi-MB — a burst of inline
+        // synchronous RocksDB reads occupies the runtime's workers and
+        // starves the latency-critical consensus delivery (votes/proposals)
+        // sharing them. Same treatment as `get_app_shards` below.
+        let frames = self.frames.clone();
+        let frame = tokio::task::spawn_blocking(move || {
+            if frame_number == 0 {
+                frames
+                    .get_latest_frame()
+                    .map_err(|e| format!("no frames: {}", e))
+            } else {
+                frames
+                    .get_frame(frame_number)
+                    .map_err(|e| format!("frame {} not found: {}", frame_number, e))
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
+        .map_err(Status::not_found)?;
 
         Ok(Response::new(global::GlobalFrameResponse {
             frame: Some(frame),
@@ -325,13 +446,27 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::GetGlobalProposalRequest>,
     ) -> Result<Response<global::GlobalProposalResponse>, Status> {
+        // Prover-gated (Go `authenticateProverFromContext`, services.go:95): the
+        // global proposal is served only to this node's own identity or an ACTIVE
+        // prover.
+        self.require_prover(request.extensions())?;
         let req = request.into_inner();
         // Assemble state + parent QC + prior TC + vote from the clock store
         // (see `FrameLookup::get_global_proposal`). Mirrors Go
         // `GlobalConsensusEngine.GetGlobalProposal`; on any lookup miss Go
         // returns an empty response rather than an error (qclient shows
         // "no proposal at frame N"), so we do the same.
-        match self.frames.get_global_proposal(req.frame_number) {
+        //
+        // Offloaded to the blocking pool for the same reason as
+        // `get_global_frame`: multiple synchronous store reads (frame,
+        // parent frame, QC, TC, vote) that must not hold a peer-gRPC
+        // runtime worker while catch-up peers hammer this in a loop.
+        let frames = self.frames.clone();
+        let frame_number = req.frame_number;
+        let result = tokio::task::spawn_blocking(move || frames.get_global_proposal(frame_number))
+            .await
+            .map_err(|e| Status::internal(format!("get_global_proposal task panicked: {e}")))?;
+        match result {
             Ok(proposal) => Ok(Response::new(global::GlobalProposalResponse {
                 proposal: Some(proposal),
             })),
@@ -460,13 +595,12 @@ impl GlobalService for GlobalRpcServer {
 
     async fn get_worker_info(
         &self,
-        _request: Request<global::GlobalGetWorkerInfoRequest>,
+        request: Request<global::GlobalGetWorkerInfoRequest>,
     ) -> Result<Response<global::GlobalGetWorkerInfoResponse>, Status> {
-        // NOTE: Go gates this on `peer_id == self.peer_id` — an
-        // operator-only check. Our peer-auth interceptor gives us
-        // `AuthenticatedPeer`; we could add the self-peer check here
-        // but for archive-node parity we trust the caller (reads
-        // only).
+        // Worker-privileged: only the node's own data-worker processes may read
+        // the worker roster (Go `services.go:413` self-gate). A remote peer is
+        // denied.
+        self.require_self_identity(request.extensions())?;
         let workers = match &self.worker_snapshot {
             Some(s) => s(),
             None => Vec::new(),
@@ -484,8 +618,13 @@ impl GlobalService for GlobalRpcServer {
 
     async fn stream_global_messages(
         &self,
-        _request: Request<global::StreamGlobalMessagesRequest>,
+        request: Request<global::StreamGlobalMessagesRequest>,
     ) -> Result<Response<Self::StreamGlobalMessagesStream>, Status> {
+        // Worker-privileged: the full global dispatch stream is for this node's
+        // OWN data-workers only — "only local workers may stream global messages"
+        // (Go `services.go:452`). A remote machine that completes the handshake as
+        // a different peer_id must NOT be able to subscribe to our dispatch.
+        self.require_self_identity(request.extensions())?;
         let sender = self.message_broadcast.as_ref().ok_or_else(|| {
             Status::unavailable("global message broadcast not wired")
         })?;
@@ -507,12 +646,16 @@ impl GlobalService for GlobalRpcServer {
     ) -> Result<Response<global::SubmitGlobalMessageResponse>, Status> {
         match &self.submit_handler {
             Some(handler) => {
-                handler(request)
-                    .map_err(|e| Status::invalid_argument(format!("submit rejected: {}", e)))?;
-                Ok(Response::new(global::SubmitGlobalMessageResponse {}))
+                match handler(request) {
+                    Ok(()) => Ok(Response::new(global::SubmitGlobalMessageResponse {})),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "global message submit rejected by collector");
+                        Err(Status::invalid_argument(format!("submit rejected: {}", e)))
+                    }
+                }
             }
             None => {
-                debug!("submit_global_message called with no handler installed — dropping");
+                tracing::warn!("global message submit received but no handler installed — dropping");
                 Ok(Response::new(global::SubmitGlobalMessageResponse {}))
             }
         }
@@ -533,6 +676,215 @@ impl GlobalService for GlobalRpcServer {
                 Ok(Response::new(global::SubmitGlobalConsensusResponse {}))
             }
         }
+    }
+
+    async fn get_forest_node(
+        &self,
+        request: Request<global::GetForestNodeRequest>,
+    ) -> Result<Response<global::GetForestNodeResponse>, Status> {
+        let req = request.into_inner();
+        let node = self
+            .forest_server
+            .as_ref()
+            .and_then(|s| s.serve_node(&req.shard_id, req.phase, &req.node_key));
+        Ok(Response::new(global::GetForestNodeResponse {
+            found: node.is_some(),
+            node: node.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_forest_value(
+        &self,
+        request: Request<global::GetForestValueRequest>,
+    ) -> Result<Response<global::GetForestValueResponse>, Status> {
+        let req = request.into_inner();
+        let key_hash: [u8; 32] = req
+            .key_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("key_hash must be 32 bytes"))?;
+        let value = self
+            .forest_server
+            .as_ref()
+            .and_then(|s| s.serve_value(&req.shard_id, req.phase, req.version, key_hash));
+        Ok(Response::new(global::GetForestValueResponse {
+            found: value.is_some(),
+            value: value.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_forest_head(
+        &self,
+        request: Request<global::GetForestHeadRequest>,
+    ) -> Result<Response<global::GetForestHeadResponse>, Status> {
+        let req = request.into_inner();
+        let head = self
+            .forest_server
+            .as_ref()
+            .and_then(|s| s.serve_head(&req.shard_id, req.phase));
+        Ok(Response::new(match head {
+            Some((version, root)) => global::GetForestHeadResponse {
+                found: true,
+                version,
+                root: root.to_vec(),
+            },
+            None => global::GetForestHeadResponse { found: false, version: 0, root: Vec::new() },
+        }))
+    }
+
+    async fn get_forest_preimage(
+        &self,
+        request: Request<global::GetForestPreimageRequest>,
+    ) -> Result<Response<global::GetForestPreimageResponse>, Status> {
+        let req = request.into_inner();
+        let key_hash: [u8; 32] = req
+            .key_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("key_hash must be 32 bytes"))?;
+        let raw = self
+            .forest_server
+            .as_ref()
+            .and_then(|s| s.serve_preimage(&req.shard_id, req.phase, key_hash));
+        Ok(Response::new(global::GetForestPreimageResponse {
+            found: raw.is_some(),
+            raw_key: raw.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_vertex_blob(
+        &self,
+        request: Request<global::GetVertexBlobRequest>,
+    ) -> Result<Response<global::GetVertexBlobResponse>, Status> {
+        let req = request.into_inner();
+        let blob = self
+            .forest_server
+            .as_ref()
+            .and_then(|s| s.serve_vertex_blob(&req.shard_key, req.phase, &req.id, req.version));
+        Ok(Response::new(global::GetVertexBlobResponse {
+            found: blob.is_some(),
+            blob: blob.unwrap_or_default(),
+        }))
+    }
+
+    async fn resolve_root(
+        &self,
+        request: Request<global::ResolveRootRequest>,
+    ) -> Result<Response<global::ResolveRootResponse>, Status> {
+        let req = request.into_inner();
+        let root: [u8; 32] = req
+            .root
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("root must be 32 bytes"))?;
+        let resolved = self
+            .forest_server
+            .as_ref()
+            .and_then(|s| s.resolve_root(&req.shard_id, req.phase, root));
+        Ok(Response::new(match resolved {
+            Some((version, global_frame)) => global::ResolveRootResponse {
+                found: true,
+                version,
+                global_frame,
+            },
+            None => global::ResolveRootResponse { found: false, version: 0, global_frame: 0 },
+        }))
+    }
+
+    async fn get_app_manifest(
+        &self,
+        request: Request<global::GetAppManifestRequest>,
+    ) -> Result<Response<global::GetAppManifestResponse>, Status> {
+        let req = request.into_inner();
+        let app_root: [u8; 32] = req
+            .app_root
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("app_root must be 32 bytes"))?;
+        let manifest = self
+            .forest_server
+            .as_ref()
+            .and_then(|s| s.serve_app_manifest(&req.app_address, req.phase, app_root));
+        Ok(Response::new(match manifest {
+            Some(entries) => global::GetAppManifestResponse {
+                found: true,
+                entries: entries
+                    .into_iter()
+                    .map(|(prefix, root, version)| global::AppManifestEntry {
+                        prefix,
+                        root: root.to_vec(),
+                        version,
+                    })
+                    .collect(),
+            },
+            None => global::GetAppManifestResponse { found: false, entries: Vec::new() },
+        }))
+    }
+}
+
+#[cfg(test)]
+mod identity_gate_tests {
+    use super::*;
+    use crate::peer_auth_middleware::AuthenticatedPeer;
+
+    struct NoopLookup;
+    impl FrameLookup for NoopLookup {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+            Err("n/a".into())
+        }
+        fn get_frame(&self, _: u64) -> Result<global::GlobalFrame, String> {
+            Err("n/a".into())
+        }
+        fn get_global_proposal(&self, _: u64) -> Result<global::GlobalProposal, String> {
+            Err("n/a".into())
+        }
+    }
+
+    fn auth_ext(peer_id: quil_p2p::PeerId) -> tonic::Extensions {
+        let mut ext = tonic::Extensions::new();
+        ext.insert(AuthenticatedPeer { peer_id, ed448_public_key: Vec::new() });
+        ext
+    }
+
+    #[test]
+    fn self_gate_allows_self_denies_others_and_missing() {
+        let me = quil_p2p::PeerId::random();
+        let other = quil_p2p::PeerId::random();
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup)).with_self_peer_id(me.to_bytes());
+        // The node's own identity (its data-workers) → allowed.
+        assert!(server.require_self_identity(&auth_ext(me)).is_ok());
+        // A different machine's identity → denied (the security fix).
+        assert!(server.require_self_identity(&auth_ext(other)).is_err());
+        // Unauthenticated (no handshake identity) → denied.
+        assert!(server.require_self_identity(&tonic::Extensions::new()).is_err());
+    }
+
+    #[test]
+    fn no_self_peer_id_configured_is_ungated() {
+        // Thread mode (workers in-process, no gRPC boundary): no gate installed,
+        // so the check is a no-op.
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup));
+        assert!(server.require_self_identity(&auth_ext(quil_p2p::PeerId::random())).is_ok());
+        assert!(server.require_self_identity(&tonic::Extensions::new()).is_ok());
+    }
+
+    #[test]
+    fn require_prover_honors_authorizer_and_presence() {
+        // Authorizer that only accepts one specific peer (the "active prover").
+        let prover = quil_p2p::PeerId::random();
+        let prover_bytes = prover.to_bytes();
+        let authz: Arc<dyn Fn(&AuthenticatedPeer) -> bool + Send + Sync> =
+            Arc::new(move |a: &AuthenticatedPeer| a.peer_id.to_bytes() == prover_bytes);
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup)).with_prover_authorizer(authz);
+        // active prover → allowed
+        assert!(server.require_prover(&auth_ext(prover)).is_ok());
+        // non-prover → denied
+        assert!(server.require_prover(&auth_ext(quil_p2p::PeerId::random())).is_err());
+        // unauthenticated → denied
+        assert!(server.require_prover(&tonic::Extensions::new()).is_err());
+        // no authorizer configured → ungated
+        let ungated = GlobalRpcServer::new(Arc::new(NoopLookup));
+        assert!(ungated.require_prover(&tonic::Extensions::new()).is_ok());
     }
 }
 

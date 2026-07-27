@@ -397,43 +397,12 @@ impl GlobalIntrinsic {
                         },
                     )?;
                 }
-                // VDF multi-proof chain. Go's `ProverJoin.Verify` runs
-                // this unconditionally — without it, anyone can craft
-                // a ProverJoin with a valid BLS signature but bogus
-                // VDF proof and pass validation. Look up the
-                // referenced frame's output + difficulty from the
-                // clock store; the verify chain is gated on both the
-                // clock store and the frame prover being installed
-                // (mandatory in production but the intrinsic can be
-                // constructed without them in legacy test setups).
-                let frame_prover = self.frame_prover.as_ref().ok_or_else(|| {
-                    QuilError::Internal(
-                        "ProverJoin: frame_prover not installed — cannot verify VDF".into(),
-                    )
-                })?;
-                let clock_store = self.clock_store.as_ref().ok_or_else(|| {
-                    QuilError::Internal(
-                        "ProverJoin: clock_store not installed — cannot look up referenced frame".into(),
-                    )
-                })?;
-                let referenced = clock_store
-                    .get_global_clock_frame(op.frame_number)
-                    .map_err(|e| QuilError::InvalidArgument(format!(
-                        "ProverJoin: referenced frame {} not in clock store: {}",
-                        op.frame_number, e,
-                    )))?;
-                let header = referenced.header.as_ref().ok_or_else(|| {
-                    QuilError::InvalidArgument(
-                        "ProverJoin: referenced frame has no header".into(),
-                    )
-                })?;
-                verify::verify_prover_join_vdf(
-                    &op,
-                    frame_number,
-                    &header.output,
-                    header.difficulty,
-                    frame_prover.as_ref(),
-                )
+                // VDF proof-of-sequential-work was removed from joins.
+                // Once the structural, signature/PoP, not-kicked, and
+                // allocation-expiry gates pass, the join is valid. The
+                // `proof` field is ignored (kept in the wire format only
+                // so historical joins still decode).
+                Ok(true)
             }
             TYPE_PROVER_UPDATE => {
                 let op = super::prover_ops::ProverUpdate::from_canonical_bytes(input)?;
@@ -611,6 +580,24 @@ impl GlobalIntrinsic {
                         "FrameHeader: bls_constructor not installed — cannot verify".into(),
                     )
                 })?;
+                // CW path: a simplex-finalized shard frame's sig field
+                // holds the magic-prefixed finalization certificate, not a BLS
+                // aggregate. Verify it via the shared attestation helper (VDF +
+                // committee cert) and accept — the BLS-specific aggregate-pubkey /
+                // multiproof checks below don't apply to a Falcon cert.
+                if quil_cw_consensus::app_cert::unwrap_cert_from_header(
+                    &op.public_key_signature_bls48581,
+                )
+                .is_some()
+                {
+                    let active = pr.get_active_provers(&op.address, frame_number).map_err(|e| {
+                        QuilError::Internal(format!("FrameHeader: get_active_provers: {e}"))
+                    })?;
+                    super::prover_shard_update::verify_frame_header_attestation(
+                        &op, fp, bls, &active,
+                    )?;
+                    return Ok(true);
+                }
                 {
                     let sig = match op.public_key_signature_bls48581.is_empty() {
                         true => return Err(QuilError::InvalidArgument(
@@ -662,7 +649,7 @@ impl GlobalIntrinsic {
                     // pubkey aggregate must equal the signature's
                     // declared aggregate pubkey. Mirrors what the
                     // outer frame validator does for GlobalFrame.
-                    let active = pr.get_active_provers(&op.address).map_err(|e| {
+                    let active = pr.get_active_provers(&op.address, frame_number).map_err(|e| {
                         QuilError::Internal(format!(
                             "FrameHeader: get_active_provers: {e}"
                         ))
@@ -719,7 +706,7 @@ impl GlobalIntrinsic {
                         .iter()
                         .map(|p| p.address.as_slice())
                         .collect();
-                    let ids_arg: Option<&[&[u8]]> = if sig.signature.len() == 74 {
+                    let ids_arg: Option<&[&[u8]]> = if sig.signature.len() == 666 {
                         None
                     } else {
                         Some(&ids)
@@ -847,6 +834,7 @@ impl GlobalIntrinsic {
                                 filter,
                                 current_status,
                                 self.prover_registry.as_deref(),
+                                fn_,
                             )?;
 
                             materialize::materialize_prover_confirm(alloc_tree, fn_)
@@ -1634,21 +1622,25 @@ impl GlobalIntrinsic {
             return Ok(());
         }
 
-        // STRICT LOCKSTEP: a storage frame (global_frame_number > 0) MUST anchor
-        // to the IMMEDIATELY PRECEDING global frame. This makes app-shard frames
-        // 1:1 lockstepped with the global chain — exactly one fresh storage
-        // attestation per global frame — and rejects stale, replayed, or
-        // early/future anchors. Hard-reject: an out-of-lockstep op invalidates
-        // the entire global frame (Err propagates out of invoke_frame_header →
-        // materialize), so a correct leader may include ONLY shard proofs whose
-        // beacon anchors to `frame_number - 1`. A prover that can't land a fresh
-        // proof every frame stops proving current storage and earns nothing.
+        // WINDOWED LOCKSTEP: a storage frame (global_frame_number > 0) anchors to
+        // a RECENT global frame — within `[frame_number-1-W, frame_number-1]`.
+        // A strict `== frame_number-1` is unsatisfiable for MULTI-MEMBER app
+        // shards: members' synced global heads differ, so a proposer must anchor
+        // to `latest − K` (a frame every committee member already holds), which
+        // then lags the packing frame by K + transit. The window absorbs that.
+        // Still rejects FUTURE anchors (> frame-1) and STALE ones (older than the
+        // window). Hard-reject: an out-of-window op invalidates the whole global
+        // frame (Err → invoke_frame_header → materialize), so a correct leader
+        // includes ONLY shard proofs whose beacon anchors within the window.
+        // `W = STORAGE_ANCHOR_LOCKSTEP_WINDOW` bounds ρ_N staleness (freshness).
         let expected_anchor = frame_number.saturating_sub(1);
-        if op.global_frame_number != expected_anchor {
+        let oldest_anchor = expected_anchor
+            .saturating_sub(crate::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW);
+        if op.global_frame_number > expected_anchor || op.global_frame_number < oldest_anchor {
             return Err(QuilError::InvalidArgument(format!(
                 "storage attestation out of lockstep: anchor global_frame_number={} \
-                 but global frame {} requires anchor {} (frame_number - 1)",
-                op.global_frame_number, frame_number, expected_anchor
+                 but global frame {} requires anchor in [{}, {}]",
+                op.global_frame_number, frame_number, oldest_anchor, expected_anchor
             )));
         }
 
@@ -1757,7 +1749,7 @@ impl GlobalIntrinsic {
             "invoke_frame_header: prover_registry not installed — cannot resolve active provers".into(),
         ))?;
         let active_provers = pr
-            .get_active_provers(&op.address)
+            .get_active_provers(&op.address, frame_number)
             .map_err(|e| QuilError::InvalidArgument(format!(
                 "invoke_frame_header: get_active_provers failed: {e}"
             )))?;
@@ -1793,7 +1785,13 @@ impl GlobalIntrinsic {
             .filter_map(|idx| u8::try_from(idx).ok())
             .collect();
 
-        let hg_md = hg.shard_metadata_for_address(&op.address);
+        // Per-SUB-SHARD reward basis: `op.address` is the coverage filter
+        // `app(32) ‖ prefix-byte-per-level`. Read the size of the SPECIFIC
+        // sub-shard subtree the worker covers, not the whole app — otherwise
+        // every one of a split app's N sub-shards is credited the full app size
+        // (an N× over-reward). An unsplit app (bare 32-byte filter) still
+        // resolves to whole-app metadata.
+        let hg_md = hg.sub_shard_metadata_for_filter(&op.address);
         let (state_size_u64, shard_count_u64) = match hg_md {
             Some(md) => {
                 let s = md.size.to_string().parse::<u64>().unwrap_or(0);
@@ -1806,6 +1804,9 @@ impl GlobalIntrinsic {
             shard_count: shard_count_u64,
         };
 
+        // World size for reward issuance EXCLUDES the global prover shard (0xff)
+        // — `total_size()` now enforces that exclusion at the live counter (the
+        // prover registry / leaf-root registry / reward vertices don't count).
         let world_state_size = hg.total_size();
         let world_size_u64 = world_state_size
             .to_string()
@@ -1880,7 +1881,8 @@ impl GlobalIntrinsic {
         // coverage credit above — so a cheating member's eviction (Status=4,
         // Seniority→0) is the final write and isn't clobbered by the
         // LastActiveFrameNumber update that `materialize_prover_shard_update`
-        // applies from the pre-audit active-prover snapshot. Archive-only (past
+        // applies from the active-prover snapshot taken before this possession
+        // audit. Archive-only (past
         // the ri/hg gate); deterministic over committed state (ρ_N from the
         // anchored global frame's committed VDF output + the on-chain leaf-root
         // registry), so every archive evicts identically and non-archive nodes
@@ -2132,8 +2134,8 @@ impl GlobalIntrinsic {
     /// its `ConfirmationFilter` in committed hypergraph state.
     ///
     /// - Split: each ACTIVE prover on the parent → exactly one child, chosen
-    ///   deterministically by [`reassignment::assign_child_index`] over the
-    ///   prover's address (frozen-committee, consensus-identical).
+    /// deterministically by [`reassignment::assign_child_index`] over the
+    /// prover's address (frozen-committee, consensus-identical).
     /// - Merge: every ACTIVE prover on any child → the parent.
     ///
     /// The active set is read from the SAME `prover_registry` the frame-header
@@ -2161,7 +2163,7 @@ impl GlobalIntrinsic {
                 if change.children.is_empty() {
                     return Ok(());
                 }
-                let provers = pr.get_active_provers(&change.parent).map_err(|e| {
+                let provers = pr.get_active_provers(&change.parent, frame_number).map_err(|e| {
                     QuilError::InvalidArgument(format!(
                         "reassign split: get_active_provers failed: {e}"
                     ))
@@ -2178,7 +2180,7 @@ impl GlobalIntrinsic {
             }
             ShardChangeKind::Merge => {
                 for child in &change.children {
-                    let provers = pr.get_active_provers(child).map_err(|e| {
+                    let provers = pr.get_active_provers(child, frame_number).map_err(|e| {
                         QuilError::InvalidArgument(format!(
                             "reassign merge: get_active_provers failed: {e}"
                         ))
@@ -2308,6 +2310,7 @@ fn check_leave_confirm_halt_risk(
     filter: &[u8],
     current_alloc_status: u8,
     registry: Option<&dyn quil_types::consensus::ProverRegistry>,
+    frame_number: u64,
 ) -> Result<()> {
     // Only applies when we're confirming a leave. Join-confirms and
     // any pathological status pass through.
@@ -2318,7 +2321,7 @@ fn check_leave_confirm_halt_risk(
         return Ok(());
     };
     let active_count = registry
-        .get_active_provers(filter)
+        .get_active_provers(filter, frame_number)
         .map(|p| p.len())
         .unwrap_or(0);
     if active_count <= materialize::HALT_RISK_PROVER_COUNT + 1 {
@@ -2373,7 +2376,7 @@ mod tests {
             filter: vec![0xAAu8; 32],
             frame_number: 42,
             public_key_signature_bls48581: Some(AddressedSignature {
-                signature: vec![0xBBu8; 74],
+                signature: vec![0xBBu8; 666],
                 address: vec![0xCCu8; 32],
             }),
         }
@@ -2412,20 +2415,22 @@ mod tests {
     }
 
     #[test]
-    fn validate_join_without_frame_prover_rejects() {
-        // ProverJoin validation requires the VDF chain. Without a
-        // frame_prover + clock_store installed on the intrinsic,
-        // validate must return Err — accepting joins on structural+BLS
-        // alone would let forged VDF proofs through.
+    fn validate_join_without_frame_prover_ok() {
+        // ProverJoin no longer carries a VDF proof (the join VDF was
+        // removed — PoRep storage attestation replaced it), so join
+        // validation does NOT require a frame_prover/clock_store. A join
+        // with valid structure + BLS PoP (AcceptAll signer) validates on
+        // its own; the `proof` field is ignored. (Regression guard for
+        // the VDF-removal: this must NOT fail-closed on missing deps.)
         let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
         let join = crate::global_intrinsic::ProverJoin {
             filters: vec![vec![0x01u8; 32]],
             frame_number: 100,
             public_key_signature_bls48581: Some(
                 crate::global_intrinsic::SignatureWithPop {
-                    signature: vec![0xAAu8; 74],
-                    public_key: Some(vec![0xBBu8; 585]),
-                    pop_signature: vec![0xCCu8; 74],
+                    signature: vec![0xAAu8; 666],
+                    public_key: Some(vec![0xBBu8; 897]),
+                    pop_signature: vec![0xCCu8; 666],
                 },
             ),
             delegate_address: vec![],
@@ -2434,13 +2439,9 @@ mod tests {
         }
         .to_canonical_bytes()
         .unwrap();
-        let err = gi.validate(105, &join, None, None).unwrap_err();
-        let msg = format!("{}", err);
         assert!(
-            msg.contains("frame_prover not installed")
-                || msg.contains("clock_store not installed"),
-            "expected fail-closed error about missing deps, got: {}",
-            msg,
+            gi.validate(105, &join, None, None).unwrap(),
+            "join must validate on structural+BLS alone now that the VDF is gone",
         );
     }
 
@@ -2473,19 +2474,21 @@ mod tests {
         ) -> Result<Option<quil_types::consensus::ProverInfo>> {
             Ok(None)
         }
-        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<u8>> {
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<u8>> {
             Ok(Vec::new())
         }
         fn get_ordered_provers(
             &self,
             _: &[u8; 32],
             _: &[u8],
+            _: u64,
         ) -> Result<Vec<Vec<u8>>> {
             Ok(Vec::new())
         }
         fn get_active_provers(
             &self,
             _: &[u8],
+            _: u64,
         ) -> Result<Vec<quil_types::consensus::ProverInfo>> {
             // Return `count` dummy ProverInfos — only the length is
             // read by the gate.
@@ -2538,6 +2541,7 @@ mod tests {
             b"filterX",
             materialize::STATUS_JOINING,
             Some(&registry),
+            0,
         );
         assert!(result.is_ok(), "join-confirm must pass: {:?}", result.err());
     }
@@ -2553,6 +2557,7 @@ mod tests {
             b"filterX",
             materialize::STATUS_LEAVING,
             Some(&registry),
+            0,
         );
         assert!(result.is_ok(), "healthy shard leave-confirm must pass: {:?}", result.err());
     }
@@ -2571,6 +2576,7 @@ mod tests {
             b"filterX",
             materialize::STATUS_LEAVING,
             Some(&registry),
+            0,
         );
         assert!(result.is_err(),
             "leave-confirm at floor+1 must be rejected, got {:?}", result);
@@ -2590,6 +2596,7 @@ mod tests {
                 b"filterX",
                 materialize::STATUS_LEAVING,
                 Some(&registry),
+            0,
             );
             assert!(
                 result.is_err(),
@@ -2611,6 +2618,7 @@ mod tests {
             b"filterX",
             materialize::STATUS_LEAVING,
             Some(&registry),
+            0,
         );
         assert!(result.is_ok(),
             "leave-confirm at floor+2 must pass: {:?}", result.err());
@@ -2625,6 +2633,7 @@ mod tests {
             b"filterX",
             materialize::STATUS_LEAVING,
             None,
+            0,
         );
         assert!(result.is_ok(),
             "gate must degrade open when no registry: {:?}", result.err());
@@ -2637,7 +2646,7 @@ mod tests {
             filter: vec![],
             frame_number: 500,
             public_key_signature_bls48581: Some(AddressedSignature {
-                signature: vec![0xBBu8; 74],
+                signature: vec![0xBBu8; 666],
                 address: vec![0xCCu8; 32],
             }),
             filters: vec![vec![0xDDu8; 32]],
@@ -2710,7 +2719,7 @@ mod tests {
             ProverSeniorityMergeOp {
                 frame_number: 100,
                 public_key_signature_bls48581: Some(AddressedSignature {
-                    signature: vec![0xBBu8; 74],
+                    signature: vec![0xBBu8; 666],
                     address: prover_address.to_vec(),
                 }),
                 merge_targets: targets
@@ -2995,7 +3004,7 @@ mod tests {
         #[test]
         fn kick_with_two_allocations_marks_both_status_4() {
             let state = make_state();
-            let pubkey = vec![0xAAu8; 585];
+            let pubkey = vec![0xAAu8; 897];
             let prover_addr = prover_address_from_pubkey(&pubkey).unwrap();
             let prover_tree = create_prover_vertex_tree(&pubkey, 100).unwrap();
             let va_disc = vertex_adds_discriminator().unwrap();
@@ -3116,7 +3125,7 @@ mod tests {
 
             // Cheating member: prover vertex present + active, but no
             // leaf-root registration → registry cross-check fails → evicted.
-            let bad_pubkey = vec![0xA1u8; 585];
+            let bad_pubkey = vec![0xA1u8; 897];
             let bad_addr = prover_address_from_pubkey(&bad_pubkey).unwrap();
             state.set(
                 &GLOBAL_INTRINSIC_ADDRESS[..],
@@ -3125,7 +3134,7 @@ mod tests {
             ).unwrap();
 
             // Bystander prover: never named in the attestation → untouched.
-            let other_pubkey = vec![0xB2u8; 585];
+            let other_pubkey = vec![0xB2u8; 897];
             let other_addr = prover_address_from_pubkey(&other_pubkey).unwrap();
             state.set(
                 &GLOBAL_INTRINSIC_ADDRESS[..],
@@ -3161,7 +3170,7 @@ mod tests {
             quil_crypto::init();
             let state = make_state();
             let va_disc = vertex_adds_discriminator().unwrap();
-            let bad_pubkey = vec![0xC3u8; 585];
+            let bad_pubkey = vec![0xC3u8; 897];
             let bad_addr = prover_address_from_pubkey(&bad_pubkey).unwrap();
             state.set(
                 &GLOBAL_INTRINSIC_ADDRESS[..],
@@ -3205,28 +3214,42 @@ mod tests {
             quil_crypto::init();
             let state = make_state();
             let va_disc = vertex_adds_discriminator().unwrap();
-            let member_pubkey = vec![0xD4u8; 585];
+            let member_pubkey = vec![0xD4u8; 897];
             let member_addr = prover_address_from_pubkey(&member_pubkey).unwrap();
             let filter = vec![0x55u8; 32];
             let att = quil_types::proto::global::StorageAttestation {
                 openings: vec![storage_opening_proto(&member_addr, &vec![0x07u8; 32], 1)],
             };
-            // Anchor=1000 but materializing frame=7 → anchor must be 6 (frame-1).
+            // FUTURE anchor: anchor=1000 while materializing frame=7 (expected ≤ 6)
+            // → out of window → hard-reject.
             let op = frame_header_with_attestation(&filter, 1_000, &att);
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
                 .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
             let err = gi
                 .audit_storage_attestation(7, &op, &[], &state, &va_disc)
-                .expect_err("out-of-lockstep anchor must hard-reject");
+                .expect_err("future anchor must hard-reject");
             assert!(
                 format!("{err}").contains("lockstep"),
                 "error should name the lockstep violation, got: {err}"
             );
 
+            // STALE-BEYOND-WINDOW: at frame 100 the window is [100-1-W, 99]. An
+            // anchor older than `99 - W` is rejected.
+            let w = crate::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW;
+            let too_old = frame_header_with_attestation(&filter, 99 - w - 1, &att);
+            gi.audit_storage_attestation(100, &too_old, &[], &state, &va_disc)
+                .expect_err("anchor older than the window must hard-reject");
+
             // The exact preceding frame (anchor == frame-1) is accepted.
             let ok = frame_header_with_attestation(&filter, 6, &att);
             gi.audit_storage_attestation(7, &ok, &[], &state, &va_disc)
                 .expect("anchor == frame_number-1 is in lockstep");
+
+            // An anchor INSIDE the window (older than frame-1 but within W) is
+            // now accepted (the multi-member case the window exists for).
+            let in_window = frame_header_with_attestation(&filter, 99 - w, &att);
+            gi.audit_storage_attestation(100, &in_window, &[], &state, &va_disc)
+                .expect("anchor at the oldest edge of the window is in lockstep");
         }
 
         // -------------------------------------------------------------
@@ -3241,7 +3264,7 @@ mod tests {
         #[test]
         fn join_creates_hyperedge_linking_prover_to_allocations() {
             let state = make_state();
-            let pubkey = vec![0xBBu8; 585];
+            let pubkey = vec![0xBBu8; 897];
             let prover_addr = prover_address_from_pubkey(&pubkey).unwrap();
             let filter_a = vec![0x33u8; 32];
             let filter_b = vec![0x44u8; 32];
@@ -3250,9 +3273,9 @@ mod tests {
                 filters: vec![filter_a.clone(), filter_b.clone()],
                 frame_number: 10,
                 public_key_signature_bls48581: Some(SignatureWithPop {
-                    signature: vec![0xAAu8; 74],
+                    signature: vec![0xAAu8; 666],
                     public_key: Some(pubkey.clone()),
-                    pop_signature: vec![0xCCu8; 74],
+                    pop_signature: vec![0xCCu8; 666],
                 }),
                 delegate_address: vec![],
                 merge_targets: vec![],
@@ -3319,7 +3342,7 @@ mod tests {
         #[test]
         fn join_with_merge_targets_aggregates_seniority() {
             let state = make_state();
-            let pubkey = vec![0xEEu8; 585];
+            let pubkey = vec![0xEEu8; 897];
             let prover_addr = prover_address_from_pubkey(&pubkey).unwrap();
             let mt_pubkey = vec![0x55u8; 57];
 
@@ -3339,9 +3362,9 @@ mod tests {
                 filters: vec![vec![0x66u8; 32]],
                 frame_number,
                 public_key_signature_bls48581: Some(SignatureWithPop {
-                    signature: vec![0xAAu8; 74],
+                    signature: vec![0xAAu8; 666],
                     public_key: Some(pubkey.clone()),
-                    pop_signature: vec![0xCCu8; 74],
+                    pop_signature: vec![0xCCu8; 666],
                 }),
                 delegate_address: vec![],
                 merge_targets: vec![SeniorityMergeTarget {

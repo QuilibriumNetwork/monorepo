@@ -27,7 +27,9 @@ use tracing::{debug, info};
 
 use quil_types::proto::global::global_service_client::GlobalServiceClient;
 use quil_types::proto::global::{
-    AppShardInfo, GetAppShardsRequest, GetGlobalFrameRequest, GetGlobalProposalRequest,
+    AppShardInfo, GetAppShardsRequest, GetForestHeadRequest, GetForestNodeRequest,
+    GetForestPreimageRequest, GetForestValueRequest, GetGlobalFrameRequest,
+    GetAppManifestRequest, GetGlobalProposalRequest, GetVertexBlobRequest, ResolveRootRequest,
     GlobalFrame, GlobalProposal, SubmitGlobalConsensusRequest, SubmitGlobalMessageRequest,
 };
 
@@ -91,12 +93,11 @@ impl ArchiveClient {
     /// trust comes from the application-layer cross-signature in the SAN).
     pub async fn connect_mtls(
         addr: &str,
-        ed448_seed: &[u8; 57],
+        falcon_signing_key: &[u8],
     ) -> Result<Self, ArchiveClientError> {
-        let client_config = build_quil_client_config(ed448_seed)?;
-        // Note: scheme is `http://` here even though we wrap TLS — tonic's
-        // Endpoint refuses `https://` unless its own `tls_config(...)` is set,
-        // and we explicitly want to bypass that to install our own connector.
+        // Note: scheme is `http://` — tonic's Endpoint refuses `https://`
+        // unless its own `tls_config(...)` is set; we bypass that to install
+        // our own PQNoise connector (no rustls/TLS on :8340 anymore).
         let url = format!("http://{}", addr);
         let endpoint = Endpoint::from_shared(url)
             .map_err(|e| ArchiveClientError::InvalidEndpoint(e.to_string()))?
@@ -120,8 +121,8 @@ impl ArchiveClient {
             .http2_keep_alive_interval(Duration::from_secs(10))
             .keep_alive_while_idle(true);
 
-        debug!(%addr, "dialing archive node (mTLS)");
-        let connector = QuilTlsConnector::new(client_config);
+        debug!(%addr, "dialing archive node (PQNoise)");
+        let connector = QuilPqNoiseConnector::new(falcon_signing_key.to_vec());
         let channel = match endpoint.connect_with_connector(connector).await {
             Ok(ch) => ch,
             Err(e) => {
@@ -198,6 +199,139 @@ impl ArchiveClient {
             .await?
             .into_inner();
         Ok(resp.info)
+    }
+
+    /// Forest sync: fetch one JMT node (`borsh(NodeKey)` → `borsh(Node)`) of a
+    /// shard/phase tree. `None` if the peer has no such node. Drives the
+    /// client-side Merkle diff (see [`crate::forest_sync_reader::RemoteTreeReader`]).
+    pub async fn get_forest_node(
+        &mut self,
+        shard_id: Vec<u8>,
+        phase: u32,
+        node_key: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_forest_node(GetForestNodeRequest { shard_id, phase, node_key })
+            .await?
+            .into_inner();
+        Ok(resp.found.then_some(resp.node))
+    }
+
+    /// Forest sync: fetch a leaf value by `key_hash` (32 bytes) at `version`.
+    pub async fn get_forest_value(
+        &mut self,
+        shard_id: Vec<u8>,
+        phase: u32,
+        version: u64,
+        key_hash: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_forest_value(GetForestValueRequest { shard_id, phase, version, key_hash })
+            .await?
+            .into_inner();
+        Ok(resp.found.then_some(resp.value))
+    }
+
+    /// Forest sync: the peer's head `(version, root)` for a shard/phase tree, so
+    /// the client can verify the root and diff at that version. `None` if the
+    /// peer never committed the tree.
+    pub async fn get_forest_head(
+        &mut self,
+        shard_id: Vec<u8>,
+        phase: u32,
+    ) -> Result<Option<(u64, Vec<u8>)>, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_forest_head(GetForestHeadRequest { shard_id, phase })
+            .await?
+            .into_inner();
+        Ok(resp.found.then_some((resp.version, resp.root)))
+    }
+
+    /// Forest sync: the raw l3 key (`vertex_id ‖ field_key`) a diff's `key_hash`
+    /// was committed from, so the client learns which vertices changed.
+    pub async fn get_forest_preimage(
+        &mut self,
+        shard_id: Vec<u8>,
+        phase: u32,
+        key_hash: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_forest_preimage(GetForestPreimageRequest { shard_id, phase, key_hash })
+            .await?
+            .into_inner();
+        Ok(resp.found.then_some(resp.raw_key))
+    }
+
+    /// Forest sync: a changed vertex's committed blob (the readable data).
+    /// `shard_key` is the app ShardKey bytes (`l1[3] ‖ l2[32]`).
+    pub async fn get_vertex_blob(
+        &mut self,
+        shard_key: Vec<u8>,
+        phase: u32,
+        id: Vec<u8>,
+        version: u64,
+    ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
+        // `version` MVCC-pins the read to the tree version the diff addressed, so
+        // the served blob matches the committed `commitment‖size` the sync just
+        // applied. `0` ⇒ latest (immutable content-addressed vertices are safe at
+        // latest; MUTABLE vertices — e.g. the 0xff prover shard's reward balances
+        // and registry — MUST pin, else the archive serves a newer blob whose
+        // leaf value no longer matches the diff → "peer served unbound data").
+        let resp = self
+            .inner
+            .get_vertex_blob(GetVertexBlobRequest { shard_key, phase, id, version })
+            .await?
+            .into_inner();
+        Ok(resp.found.then_some(resp.blob))
+    }
+
+    /// Sync-by-hash: translate an authenticated tree `root` to the serving
+    /// peer's local `(version, global_frame)`. `None` ⇒ that peer never
+    /// committed this root (behind) or pruned it; the caller then fails over
+    /// to another peer or a full snapshot sync.
+    pub async fn resolve_root(
+        &mut self,
+        shard_id: Vec<u8>,
+        phase: u32,
+        root: Vec<u8>,
+    ) -> Result<Option<(u64, u64)>, ArchiveClientError> {
+        let resp = self
+            .inner
+            .resolve_root(ResolveRootRequest { shard_id, phase, root })
+            .await?
+            .into_inner();
+        Ok(resp.found.then_some((resp.version, resp.global_frame)))
+    }
+
+    /// Sync-by-hash (split apps): the manifest of sub-shards that fold into an
+    /// aggregate `app_root`: `[(prefix_words, sub_root, sub_version)]`. The
+    /// caller MUST verify these aggregate back to the authenticated `app_root`
+    /// before trusting any sub-root. `None` ⇒ not a known aggregate root here.
+    #[allow(clippy::type_complexity)]
+    pub async fn get_app_manifest(
+        &mut self,
+        app_address: Vec<u8>,
+        phase: u32,
+        app_root: Vec<u8>,
+    ) -> Result<Option<Vec<(Vec<u8>, Vec<u8>, u64)>>, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_app_manifest(GetAppManifestRequest { app_address, phase, app_root })
+            .await?
+            .into_inner();
+        if !resp.found {
+            return Ok(None);
+        }
+        Ok(Some(
+            resp.entries
+                .into_iter()
+                .map(|e| (e.prefix, e.root, e.version))
+                .collect(),
+        ))
     }
 
     /// Fetch a single global frame. Pass `frame_number = 0` to request the
@@ -336,21 +470,25 @@ impl ServerCertVerifier for AcceptAnyServerCert {
 /// (thousands per node under reconnect churn), starving the `:8340`
 /// handshake path that consensus delivery depends on. Build once, reuse.
 static CLIENT_CONFIG_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<[u8; 57], Arc<ClientConfig>>>,
+    std::sync::Mutex<std::collections::HashMap<Vec<u8>, Arc<ClientConfig>>>,
 > = std::sync::OnceLock::new();
 
-pub fn build_quil_client_config(ed448_seed: &[u8; 57]) -> Result<Arc<ClientConfig>, ArchiveClientError> {
+pub fn build_quil_client_config(
+    falcon_signing_key: &[u8],
+) -> Result<Arc<ClientConfig>, ArchiveClientError> {
     let cache = CLIENT_CONFIG_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(cfg) = cache.lock().unwrap().get(ed448_seed) {
+    if let Some(cfg) = cache.lock().unwrap().get(falcon_signing_key) {
         return Ok(cfg.clone());
     }
-    let cfg = build_quil_client_config_uncached(ed448_seed)?;
-    cache.lock().unwrap().insert(*ed448_seed, cfg.clone());
+    let cfg = build_quil_client_config_uncached(falcon_signing_key)?;
+    cache.lock().unwrap().insert(falcon_signing_key.to_vec(), cfg.clone());
     Ok(cfg)
 }
 
-fn build_quil_client_config_uncached(ed448_seed: &[u8; 57]) -> Result<Arc<ClientConfig>, ArchiveClientError> {
-    let tls_cert = build_quil_tls_cert(ed448_seed)?;
+fn build_quil_client_config_uncached(
+    falcon_signing_key: &[u8],
+) -> Result<Arc<ClientConfig>, ArchiveClientError> {
+    let tls_cert = build_quil_tls_cert(falcon_signing_key)?;
     let cert_chain = rustls_pemfile::certs(&mut tls_cert.cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ArchiveClientError::TlsInit(format!("parse cert pem: {}", e)))?;
@@ -420,6 +558,50 @@ impl Service<Uri> for QuilTlsConnector {
                 .map_err(|e| format!("invalid sni: {}", e))?;
             let tls = connector.connect(dns_name, tcp).await?;
             Ok(TokioIo::new(tls))
+        })
+    }
+}
+
+/// Custom tonic connector that runs the sntrup761 **PQNoise** handshake — the
+/// post-quantum replacement for the Ed448-mTLS path — and hands tonic the
+/// secured tokio stream. Same handshake + identity binding as the libp2p
+/// transport (`quil_rpc::pqnoise_channel`), so no rustls/cert material is
+/// involved; the server's Ed448 identity is authenticated by its signature
+/// over the channel-binding handshake hash.
+#[derive(Clone)]
+pub struct QuilPqNoiseConnector {
+    /// The node's 1281-byte Falcon q-prover-key signing key — the `:8340`
+    /// network identity presented in the PQNoise handshake.
+    falcon_signing_key: Arc<Vec<u8>>,
+}
+
+impl QuilPqNoiseConnector {
+    pub fn new(falcon_signing_key: Vec<u8>) -> Self {
+        Self { falcon_signing_key: Arc::new(falcon_signing_key) }
+    }
+}
+
+impl Service<Uri> for QuilPqNoiseConnector {
+    type Response = TokioIo<crate::pqnoise_channel::PqTokioStream>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let falcon_signing_key = self.falcon_signing_key.clone();
+        Box::pin(async move {
+            let host = uri
+                .host()
+                .ok_or_else(|| "missing host in uri".to_string())?
+                .to_string();
+            let port = uri.port_u16().unwrap_or(443);
+            let tcp = TcpStream::connect((host.as_str(), port)).await?;
+            let (_peer, stream) =
+                crate::pqnoise_channel::pq_client_handshake(tcp, falcon_signing_key.as_ref()).await?;
+            Ok(TokioIo::new(stream))
         })
     }
 }

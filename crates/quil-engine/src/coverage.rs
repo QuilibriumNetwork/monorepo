@@ -10,14 +10,14 @@
 //! computation parts of the Go `CoverageMonitor`:
 //!
 //! - [`CoverageStreak`] tracks how long a shard has been in a
-//!   low-coverage state.
+//! low-coverage state.
 //! - [`LowCoverageStreakTracker`] manages the per-shard streak map,
-//!   providing `bump`, `clear`, and snapshot methods.
+//! providing `bump`, `clear`, and snapshot methods.
 //! - [`CoverageThresholds`] captures the mainnet vs testnet halt
-//!   parameters.
+//! parameters.
 //! - [`compute_shard_halt_durations`] walks per-shard summaries +
-//!   the streak map and returns the eviction-suppression duration
-//!   map used by `evict_inactive_provers`.
+//! the streak map and returns the eviction-suppression duration
+//! map used by `evict_inactive_provers`.
 //!
 //! The event-distribution + async coverage-check-loop plumbing from
 //! the Go side is left for a later port — it requires infrastructure
@@ -71,17 +71,17 @@ pub struct CoverageThresholds {
 /// PLUS a complete back-to-back retry if the first attempt fails:
 ///
 /// ```text
-///   720   first cycle  : ProposeLeave → ConfirmLeaves → ProposeJoin
-///                        → ConfirmJoins  (2 × CONFIRM_WINDOW)
-///   720   second cycle : full retry if the first never landed an
-///                        alloc (archive silently drops a bundle,
-///                        lifecycle re-proposes after the 10-frame
-///                        PROPOSAL_TIMEOUT_FRAMES expires)
-///   360   slack budget : evaluate cadence + 4-frame join cooldown
-///                        + archive sync skew + a single
-///                        ProposalTimeout detection window
-///   ────
-///   1800
+///   720 first cycle  : ProposeLeave → ConfirmLeaves → ProposeJoin
+///                        → ConfirmJoins (2 × CONFIRM_WINDOW)
+///   720 second cycle : full retry if the first never landed an
+/// alloc (archive silently drops a bundle,
+/// lifecycle re-proposes after the 10-frame
+/// PROPOSAL_TIMEOUT_FRAMES expires)
+///   360 slack budget : evaluate cadence + 4-frame join cooldown
+/// + archive sync skew + a single
+/// ProposalTimeout detection window
+/// ────
+/// 1800
 /// ```
 ///
 /// Rationale: a transaction can create a new vertex at an address
@@ -253,12 +253,12 @@ impl LowCoverageStreakTracker {
 ///
 /// Semantics:
 /// - Shards at or below `halt_threshold` → `u64::MAX` (eviction
-///   fully suppressed).
+/// fully suppressed).
 /// - Shards with a non-empty streak but above the halt threshold →
-///   their streak count, giving recently-recovered shards a grace
-///   period proportional to how long they were halted.
+/// their streak count, giving recently-recovered shards a grace
+/// period proportional to how long they were halted.
 /// - Shards with no streak and above the halt threshold → no entry
-///   (normal eviction rules apply).
+/// (normal eviction rules apply).
 pub fn compute_shard_halt_durations(
     tracker: &LowCoverageStreakTracker,
     summaries: &[ProverShardSummary],
@@ -426,6 +426,7 @@ pub fn build_shard_inventory(
     crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
     shards_store: std::sync::Arc<dyn quil_types::store::ShardsStore>,
     prover_registry: &dyn ProverRegistry,
+    frame_number: u64,
 ) -> Vec<ShardCoverageEntry> {
     let get_sizes = crate::shard_info::local_app_shard_get_sizes(crdt, shards_store.clone());
     let mut out: Vec<ShardCoverageEntry> = Vec::new();
@@ -459,7 +460,7 @@ pub fn build_shard_inventory(
                 filter.push(p as u8);
             }
             let active = prover_registry
-                .get_active_provers(&filter)
+                .get_active_provers(&filter, frame_number)
                 .map(|v| v.len() as u64)
                 .unwrap_or(0);
             out.push(ShardCoverageEntry { filter, size: bytes, active_count: active });
@@ -864,11 +865,11 @@ impl CoverageMonitor {
     ///
     /// Three gates, all leader-side:
     /// - TRIGGER: each child's active count `< min_provers` (both starved →
-    ///   consolidation is warranted).
+    /// consolidation is warranted).
     /// - COVERAGE (decision #3): combined active `<= max_provers` — never
-    ///   merge into an over-crowded shard.
+    /// merge into an over-crowded shard.
     /// - SIZE (decision #4, REQUIRED): combined size `<= MERGE_MAX_SIZE_BYTES`
-    ///   (16 GiB) — never merge into an over-large shard.
+    /// (16 GiB) — never merge into an over-large shard.
     ///
     /// v1 scope: only depth-1 factor-2 shards (33-byte filters, suffix
     /// `0x00`/`0x80`) collapsing to a 32-byte root — exactly what
@@ -1334,17 +1335,17 @@ mod tests {
     /// complete before a CoverageHalt event fires.
     ///
     /// Timeline modeled (frame numbers relative to migration start):
-    ///   T=0          shard X goes to active=0 (or stays at 0); coverage
-    ///                monitor begins bumping its streak each frame
-    ///   T=0          prover lifecycle observes halt-risk + no free
-    ///                worker → `plan_leaves` bypass triggers ProposeLeave
-    ///                on a heavily-covered shard Y
-    ///   T=CONFIRM    DecideLeaves matures → ConfirmLeaves submitted →
-    ///                worker freed
-    ///   T=CONFIRM+1  free worker observed → `plan_and_allocate` picks
-    ///                halt-risk shard X → ProposeJoin
-    ///   T=2*CONFIRM  DecideJoins matures → ConfirmJoins → alloc flips
-    ///                to Active → shard X now covered → streak clears
+    ///   T=0 shard X goes to active=0 (or stays at 0); coverage
+    /// monitor begins bumping its streak each frame
+    ///   T=0 prover lifecycle observes halt-risk + no free
+    /// worker → `plan_leaves` bypass triggers ProposeLeave
+    /// on a heavily-covered shard Y
+    ///   T=CONFIRM DecideLeaves matures → ConfirmLeaves submitted →
+    /// worker freed
+    ///   T=CONFIRM+1 free worker observed → `plan_and_allocate` picks
+    /// halt-risk shard X → ProposeJoin
+    ///   T=2*CONFIRM DecideJoins matures → ConfirmJoins → alloc flips
+    /// to Active → shard X now covered → streak clears
     ///
     /// Total cycle = 2 × CONFIRM_WINDOW = 720 frames. The grace must
     /// be wide enough to absorb BOTH a complete first-attempt
@@ -1467,6 +1468,7 @@ mod tests {
             &self,
             _: &[u8; 32],
             _: &[u8],
+            _: u64,
         ) -> quil_types::error::Result<Vec<u8>> {
             Ok(Vec::new())
         }
@@ -1474,12 +1476,14 @@ mod tests {
             &self,
             _: &[u8; 32],
             _: &[u8],
+            _: u64,
         ) -> quil_types::error::Result<Vec<Vec<u8>>> {
             Ok(Vec::new())
         }
         fn get_active_provers(
             &self,
             _: &[u8],
+            _: u64,
         ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> {
             Ok(Vec::new())
         }
@@ -1555,9 +1559,9 @@ mod tests {
     }
     impl quil_types::consensus::ProverRegistry for HotShardRegistry {
         fn get_prover_info(&self, _: &[u8]) -> quil_types::error::Result<Option<quil_types::consensus::ProverInfo>> { Ok(None) }
-        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> quil_types::error::Result<Vec<u8>> { Ok(Vec::new()) }
-        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> quil_types::error::Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
-        fn get_active_provers(&self, _: &[u8]) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> quil_types::error::Result<Vec<u8>> { Ok(Vec::new()) }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> quil_types::error::Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
+        fn get_active_provers(&self, _: &[u8], _: u64) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
         fn get_prover_count(&self, _: &[u8]) -> quil_types::error::Result<usize> { Ok(0) }
         fn get_provers(&self, _: &[u8]) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
         fn get_provers_by_status(&self, _: &[u8], _: quil_types::consensus::ProverStatus) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }

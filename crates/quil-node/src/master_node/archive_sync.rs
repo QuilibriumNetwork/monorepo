@@ -53,167 +53,111 @@ fn archive_frame_is_valid(
     }
 }
 
-/// Consensus catch-up sync. Woken by `notify` (the engine fires
-/// `on_missing_parent` when it orphans a proposal because the node is behind),
-/// it pulls the missing proposals from a peer's `GlobalService` and submits them
-/// into the consensus loop so the node rejoins consensus rather than just
-/// mirroring frames into the store. Mirrors Go's `SyncProvider` /
-/// `GlobalSyncClient` (`GetGlobalProposal` → `AddProposal`, ascending from the
-/// finalized head). The partition is applied to this path for free: the proxy
-/// gates `GetGlobalProposal` exactly like `GetGlobalFrame`.
-#[allow(clippy::too_many_arguments)]
-async fn run_proposal_catchup(
-    pool: Arc<quil_rpc::ArchiveEndpointPool>,
-    consensus_handle: Arc<
-        std::sync::OnceLock<quil_engine::consensus_types::GlobalEventLoopHandle>,
-    >,
-    global_validator: Arc<
-        std::sync::OnceLock<
-            Arc<
-                quil_engine::validator::ConsensusValidator<
-                    quil_engine::consensus_types::GlobalState,
-                    quil_engine::consensus_types::GlobalVote,
-                >,
-            >,
-        >,
-    >,
-    frame_verifier: Arc<quil_engine::frame_validator::GlobalFrameVerifier>,
-    notify: Arc<tokio::sync::Notify>,
-    finalized: Arc<std::sync::atomic::AtomicU64>,
-    seed: [u8; 57],
-    cancel: tokio_util::sync::CancellationToken,
-) {
-    use std::sync::atomic::Ordering::Relaxed;
-    info!("consensus proposal-catchup task started");
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = notify.notified() => {}
-        }
-        // Coalesce bursts of orphan signals into one catch-up round.
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
-        }
-        // Need the live consensus handle (set once activation completes).
-        let Some(handle) = consensus_handle.get() else { continue };
-
-        // Try known archive endpoints until one serves the gap. During a
-        // partition every peer returns UNAVAILABLE here; the next orphan signal
-        // retries, so recovery happens on the first poll after the heal.
-        for addr in pool.get_all().await {
-            if cancel.is_cancelled() {
-                return;
-            }
-            let mut client = match quil_rpc::ArchiveClient::connect_mtls(&addr, &seed).await {
-                Ok(c) => c,
-                Err(e) => {
-                    debug!(%addr, error = %e, "catchup: connect failed");
-                    continue;
-                }
-            };
-            let mut next = finalized.load(Relaxed) + 1;
-            let mut synced = 0u64;
-            loop {
-                if cancel.is_cancelled() {
-                    return;
-                }
-                let proposal = match client.get_global_proposal(next).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        // No proposal at `next` (caught up to source head) or the
-                        // peer is partitioned/erroring — stop this endpoint.
-                        debug!(%addr, frame = next, error = %e, "catchup: stop (no proposal)");
-                        break;
-                    }
-                };
-                match quil_engine::consensus_types::proto_proposal_to_signed(&proposal) {
-                    Ok((sp, qc, _tc)) => {
-                        // Gate BEFORE any consensus side effect — the SAME gate
-                        // the gossip GLOBAL_CONSENSUS proposal path runs
-                        // (`gate_proposal`): parent-QC aggregate signature,
-                        // proposer-is-leader + Jolteon rank rules + embedded
-                        // prior-rank TC, the proposer's own vote, and the frame
-                        // VDF/BLS. On failure we DROP: never submit the parent
-                        // QC, never submit the proposal. The standalone prior-
-                        // rank TC is intentionally NOT pre-submitted (gate_proposal
-                        // already validated it as part of the proposal); a real TC
-                        // surfaces through the local timeout aggregator, exactly as
-                        // on the gossip path.
-                        let gate_ok = match global_validator.get() {
-                            Some(validator) => {
-                                let frame_check = || match proposal.state.as_ref() {
-                                    Some(frame) => {
-                                        // Panic-contain like the gossip path — a
-                                        // malformed VDF output can panic inside the
-                                        // classgroup code; a peer message must be
-                                        // dropped, not unwind the catch-up task.
-                                        let validated = std::panic::catch_unwind(
-                                            std::panic::AssertUnwindSafe(|| {
-                                                frame_verifier.validate(frame)
-                                            }),
-                                        );
-                                        match validated {
-                                            Ok(Ok(true)) => Ok(()),
-                                            Ok(Ok(false)) => Err(quil_types::error::QuilError::Crypto(
-                                                "catch-up proposal frame failed validation".into(),
-                                            )),
-                                            Ok(Err(e)) => Err(e),
-                                            Err(_) => Err(quil_types::error::QuilError::Crypto(
-                                                "catch-up proposal frame validation panicked (malformed input)".into(),
-                                            )),
-                                        }
-                                    }
-                                    None => Err(quil_types::error::QuilError::InvalidArgument(
-                                        "catch-up proposal missing state".into(),
-                                    )),
-                                };
-                                match quil_engine::validator::gate_proposal(validator, &sp, frame_check) {
-                                    Ok(()) => true,
-                                    Err(e) => {
-                                        warn!(
-                                            %addr,
-                                            frame = next,
-                                            rank = sp.proposal.state.rank,
-                                            error = %e,
-                                            "catchup: rejecting unverified proposal — dropping",
-                                        );
-                                        false
-                                    }
-                                }
-                            }
-                            None => {
-                                debug!("catchup: global validator not ready — dropping proposal");
-                                false
-                            }
-                        };
-                        if !gate_ok {
-                            // A forged / unverifiable proposal at `next` can't be
-                            // trusted and its successors would orphan on a missing
-                            // parent — stop this endpoint (drop, never submit).
-                            break;
-                        }
-                        // Verified: now safe to fast-forward the pacemaker on the
-                        // parent QC and submit the proposal.
-                        handle.submit_quorum_certificate(qc);
-                        if !handle.submit_proposal(sp).await {
-                            break; // loop shutting down
-                        }
-                        synced += 1;
-                        next += 1;
-                    }
-                    Err(e) => {
-                        debug!(%addr, frame = next, error = %e, "catchup: decode failed");
-                        break;
-                    }
-                }
-            }
-            if synced > 0 {
-                info!(%addr, synced, "catchup: submitted synced proposals to consensus");
-                break; // made progress; done for this round
+/// Reconstruct a `GlobalProposal` for frame `n` from the LOCAL clock store,
+/// mirroring `ClockStoreFrameLookup::get_global_proposal` (grpc.rs): state +
+/// parent QC (from the parent frame's cert) + prior-rank TC + proposer vote,
+/// all best-effort from what's persisted. `Err` when the frame isn't present.
+/// Load the frame at `n`, falling back to an uncommitted candidate — the TIP or
+/// ANY intermediate frame between the committed head and the newest QC — when
+/// there is no committed frame at `n`.
+///
+/// This is the crux of surviving a coordinated halt AND a restart during one.
+/// When the committee stalls, the frames above the committed head are
+/// *uncommitted candidates*: produced (into `clock_global_frame_candidate_key(n,
+/// selector)`) and CERTIFIED (a QC formed) but never finalized. Jolteon holds
+/// those certified states only in the in-memory forks tree — a restart loses
+/// them, re-seeding the forks tree at the committed head. To rebuild the chain,
+/// every uncommitted frame `[committed_head+1 .. newest_qc]` must be loadable,
+/// not just the tip. Both the serve path (`get_global_proposal`) and the local
+/// replay path read only the committed index, so without this a restart-during-
+/// halt permanently wedges: the leader's newest-QC parent state is gone, it
+/// skips forever, and no manual-free recovery exists.
+///
+/// `on_qc_observed` persists EVERY observed QC per-rank, so each uncommitted
+/// frame's `(frame_number, selector)` is recoverable from the stored QC chain.
+/// We scan ranks `[committed_head_rank+1 .. newest_qc.rank]` for the QC naming
+/// frame `n` and load that candidate. The gap is tiny (a handful of ranks), so
+/// the scan is cheap. The candidate is finalized normally later by the real
+/// 2-chain built on top of it — never blessed as final on its own QC.
+pub(crate) fn load_committed_or_tip_candidate(
+    clock_store: &dyn quil_types::store::ClockStore,
+    n: u64,
+) -> Result<quil_types::proto::global::GlobalFrame, String> {
+    use quil_types::store::ClockStore;
+    if let Ok(f) = clock_store.get_global_clock_frame(n) {
+        return Ok(f);
+    }
+    // Not committed — resolve the uncommitted candidate via the stored QC chain.
+    let newest = clock_store
+        .get_latest_quorum_certificate(&[])
+        .map_err(|e| format!("no committed frame at {n} and no latest QC: {e}"))?;
+    if n > newest.frame_number {
+        return Err(format!(
+            "frame {n} is above the newest QC frame {} — nothing to load",
+            newest.frame_number
+        ));
+    }
+    // Fast path: the tip candidate is named directly by the latest QC.
+    if newest.frame_number == n {
+        return clock_store
+            .get_global_clock_frame_candidate(n, &newest.selector)
+            .map_err(|e| e.to_string());
+    }
+    // Intermediate candidate: scan the per-rank QC chain from the committed
+    // head up to the newest QC for the one certifying frame `n`.
+    let committed_rank = clock_store
+        .get_latest_global_clock_frame()
+        .ok()
+        .and_then(|f| f.header.as_ref().map(|h| h.rank))
+        .unwrap_or(0);
+    for rank in (committed_rank.saturating_add(1))..=newest.rank {
+        if let Ok(qc) = clock_store.get_quorum_certificate(&[], rank) {
+            if qc.frame_number == n {
+                return clock_store
+                    .get_global_clock_frame_candidate(n, &qc.selector)
+                    .map_err(|e| e.to_string());
             }
         }
     }
+    Err(format!(
+        "no committed frame at {n} and no certified candidate found in the QC chain \
+         (committed_rank={committed_rank}, newest_qc_rank={}, newest_qc_frame={})",
+        newest.rank, newest.frame_number
+    ))
+}
+
+pub(crate) fn reconstruct_local_proposal(
+    clock_store: &dyn quil_types::store::ClockStore,
+    n: u64,
+) -> Result<quil_types::proto::global::GlobalProposal, String> {
+    use quil_types::store::ClockStore;
+    let frame = load_committed_or_tip_candidate(clock_store, n)?;
+    if n == 0 {
+        return Ok(quil_types::proto::global::GlobalProposal {
+            state: Some(frame),
+            parent_quorum_certificate: None,
+            prior_rank_timeout_certificate: None,
+            vote: None,
+        });
+    }
+    let header = frame.header.as_ref().ok_or("frame missing header")?;
+    let rank = header.rank;
+    let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+        .map(|h| h.to_vec())
+        .map_err(|e| format!("frame identity: {e}"))?;
+    let vote = clock_store.get_proposal_vote(&[], rank, &selector).ok();
+    let prior_rank_timeout_certificate = clock_store
+        .get_timeout_certificate(&[], rank.saturating_sub(1))
+        .ok();
+    let parent = clock_store.get_global_clock_frame(n - 1).map_err(|e| e.to_string())?;
+    let parent_rank = parent.header.as_ref().map(|h| h.rank).unwrap_or(0);
+    let parent_quorum_certificate = clock_store.get_quorum_certificate(&[], parent_rank).ok();
+    Ok(quil_types::proto::global::GlobalProposal {
+        state: Some(frame),
+        parent_quorum_certificate,
+        prior_rank_timeout_certificate,
+        vote,
+    })
 }
 
 /// Record-only frame backfill for the restart "hole" `[lo, hi]`.
@@ -246,7 +190,7 @@ async fn run_record_only_backfill(
     clock_store: Arc<quil_store::RocksClockStore>,
     frame_validate: quil_rpc::frame_sync::FrameValidator,
     anchor: Option<quil_types::proto::global::GlobalFrame>,
-    seed: [u8; 57],
+    seed: Vec<u8>,
     lo: u64,
     hi: u64,
     cancel: tokio_util::sync::CancellationToken,
@@ -433,7 +377,7 @@ async fn run_all_gap_backfill(
     pool: Arc<quil_rpc::ArchiveEndpointPool>,
     clock_store: Arc<quil_store::RocksClockStore>,
     frame_validate: quil_rpc::frame_sync::FrameValidator,
-    seed: [u8; 57],
+    seed: Vec<u8>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     // The gap scan walks the whole frame keyspace (key-only, no decode) — run
@@ -474,7 +418,7 @@ async fn run_all_gap_backfill(
             clock_store.clone(),
             frame_validate.clone(),
             anchor,
-            seed,
+            seed.clone(),
             lo,
             hi,
             cancel.clone(),
@@ -513,15 +457,15 @@ const STATE_JUMP_MIN_GAP: u64 = 1_000;
 /// `None` and the node falls back to the normal poller.
 async fn run_state_jump(
     pool: Arc<quil_rpc::ArchiveEndpointPool>,
-    seed: [u8; 57],
+    seed: Vec<u8>,
     clock_store: Arc<quil_store::RocksClockStore>,
     hg_store: Arc<quil_store::RocksHypergraphStore>,
     shards_store: Arc<dyn quil_types::store::ShardsStore>,
     frame_validate: quil_rpc::frame_sync::FrameValidator,
     prover_registry: Arc<quil_execution::SharedProverRegistry>,
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Option<u64> {
-    use quil_types::proto::application::HypergraphPhaseSet;
     let local_head = clock_store.get_latest_frame_number().unwrap_or(0);
     if local_head >= STATE_JUMP_MAX_FRAME {
         return None; // recovery window closed — never blind-trust current-era state
@@ -530,12 +474,6 @@ async fn run_state_jump(
     if endpoints.is_empty() {
         return None;
     }
-    let phases = [
-        HypergraphPhaseSet::VertexAdds,
-        HypergraphPhaseSet::VertexRemoves,
-        HypergraphPhaseSet::HyperedgeAdds,
-        HypergraphPhaseSet::HyperedgeRemoves,
-    ];
     for addr in endpoints {
         if cancel.is_cancelled() {
             return None;
@@ -580,22 +518,34 @@ async fn run_state_jump(
         let prover_root = anchor.clone();
         info!(%addr, local_head, target, "state-jump: syncing FULL state pinned to frame N");
 
-        // Prover tree (VertexAdds), pinned to N's prover commitment.
-        if let Err(e) = quil_rpc::ensure_prover_tree(
-            &addr,
-            &seed,
-            HypergraphPhaseSet::VertexAdds,
-            hg_store.clone(),
-            &prover_root,
-        )
-        .await
+        // Onboarding: a fresh node boots on the ephemeral in-memory forest, so
+        // `sync_shard_phase_from` below would write into memory (never persisted)
+        // and the node would produce with the wrong (un-QUIL-split) root. Swap in
+        // the persistent RocksDB forest + declare the QUIL partition BEFORE the
+        // pulls so synced + produced state lands on disk consistently. No-op once
+        // persistent (migrated node / prior jump).
+        if quil_forest_migrate::install_forest_for_sync(crdt.as_ref(), hg_store.as_ref()) {
+            info!("state-jump: installed persistent forest for onboarding sync");
+        }
+
+        // Prover tree — the global prover shard is a single-shard forest app
+        // (L2 = [0xff; 32]). Pull it (all phases) from the peer via the efficient
+        // Merkle diff. (`prover_root` / `anchor` are the peer's generation pin;
+        // the diff authenticates against the peer's own tree root.)
+        let _ = &prover_root;
+        if let Err(e) =
+            crate::forest_sync::pull_shard_from_peer(&addr, &seed, crdt.clone(), &[0xffu8; 32]).await
         {
             warn!(%addr, error = %e, "state-jump: prover tree sync failed — trying another peer");
             continue;
         }
 
-        // Every app-shard tree, all four phases, pinned to N's generation anchor
-        // (state_roots[0]) so they are cross-tree consistent at frame N.
+        // Every app-shard forest tree. `range_app_shards` yields one `ShardInfo`
+        // per sub-shard (a QUIL app has 64, each with its own `prefix`), which
+        // maps directly to the forest sub-shard id `addr_path_shard_id(l2,
+        // prefix)`. Dedup by that id (QUIL sub-shards share an l1‖l2 shard_key
+        // but differ in prefix, so we must NOT dedup on shard_key).
+        let _ = &anchor;
         let shard_rows = shards_store.range_app_shards().unwrap_or_default();
         let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let mut shard_count = 0usize;
@@ -604,42 +554,26 @@ async fn run_state_jump(
             if cancel.is_cancelled() {
                 return None;
             }
-            if !seen.insert(row.shard_key.clone()) {
-                continue;
-            }
             if row.shard_key.len() < 35 {
                 continue;
             }
-            let shard = quil_types::store::ShardKey {
-                l1: [row.shard_key[0], row.shard_key[1], row.shard_key[2]],
-                l2: row.shard_key[3..35].try_into().unwrap(),
-            };
-            for phase in phases {
-                if let Err(e) = quil_rpc::ensure_shard_tree_fresh(
-                    &shard,
-                    &addr,
-                    &seed,
-                    phase,
-                    hg_store.clone(),
-                    &anchor,
-                )
-                .await
-                {
-                    // A vertex-adds failure means we didn't reach generation N
-                    // (likely evicted mid-jump). Abort this peer and retry a
-                    // fresh N on the next — a partial jump must NOT be committed.
-                    if matches!(phase, HypergraphPhaseSet::VertexAdds) {
-                        warn!(
-                            %addr, error = %e,
-                            "state-jump: shard vertex-adds sync failed — aborting, retrying another peer",
-                        );
-                        aborted = true;
-                        break;
-                    }
-                    // Other phases are best-effort (an empty phase is a no-op).
-                }
+            let mut l2 = [0u8; 32];
+            l2.copy_from_slice(&row.shard_key[3..35]);
+            let shard_id = quil_forest::Forest::addr_path_shard_id(&l2, &row.prefix);
+            if !seen.insert(shard_id.clone()) {
+                continue;
             }
-            if aborted {
+            if let Err(e) =
+                crate::forest_sync::pull_shard_from_peer(&addr, &seed, crdt.clone(), &shard_id).await
+            {
+                // A vertex-adds (anchor) failure means we didn't reach the peer's
+                // generation for this shard — abort and retry a fresh N on another
+                // peer (a partial jump must NOT be committed).
+                warn!(
+                    %addr, error = %e,
+                    "state-jump: shard sync failed — aborting, retrying another peer",
+                );
+                aborted = true;
                 break;
             }
             shard_count += 1;
@@ -699,24 +633,22 @@ pub(crate) struct ArchiveSyncArgs {
     /// gossip GLOBAL_FRAME handler checks. Used to gate every archive-sourced
     /// frame BEFORE it is persisted, mirroring that path.
     pub genesis_prover_addrs: std::collections::HashSet<Vec<u8>>,
-    pub p2p_handle: quil_p2p::node::P2PHandle,
-    pub consensus_handle:
-        Arc<std::sync::OnceLock<quil_engine::consensus_types::GlobalEventLoopHandle>>,
-    pub vote_aggregator:
-        Arc<std::sync::OnceLock<Arc<quil_engine::vote_aggregation::VoteAggregation>>>,
-    pub timeout_aggregator:
-        Arc<std::sync::OnceLock<Arc<quil_engine::timeout_aggregation::TimeoutAggregation>>>,
-    pub global_validator: Arc<std::sync::OnceLock<Arc<
-        quil_engine::validator::ConsensusValidator<
-            quil_engine::consensus_types::GlobalState,
-            quil_engine::consensus_types::GlobalVote,
-        >,
-    >>>,
-    pub db_arc: Arc<quil_store::RocksDb>,
     pub frame_materializer: Option<Arc<quil_engine::frame_materializer::FrameMaterializer>>,
     pub consensus_loopback_tx: tokio::sync::mpsc::Sender<quil_p2p::node::ReceivedMessage>,
     pub peer_id: quil_p2p::PeerId,
     pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
+    /// commonware-simplex committee (`q-consensus-key` pubkeys, hex). Empty ⇒
+    /// legacy quil-consensus path; non-empty ⇒ simplex + Falcon global consensus.
+    pub consensus_committee: Vec<String>,
+    /// Parallel to `consensus_committee`: each member's libp2p peer id (base58),
+    /// so inbound `:8340` messages resolve to the sender's committee key.
+    pub consensus_committee_peer_ids: Vec<String>,
+    /// simplex leader timeout (seconds); 0 = engine default (30s).
+    pub consensus_leader_timeout_secs: u64,
+    /// Shared cell the simplex inbound router is published into once activated;
+    /// the receive loop routes CW-channel `:8340` messages through it.
+    pub cw_router:
+        Arc<std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>>,
 }
 
 pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncArgs) {
@@ -744,35 +676,34 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         bls_pubkey,
         prover_address,
         genesis_prover_addrs,
-        p2p_handle,
-        consensus_handle,
-        vote_aggregator,
-        timeout_aggregator,
-        global_validator,
-        db_arc,
         frame_materializer,
         consensus_loopback_tx,
         peer_id,
         spawner,
+        consensus_committee,
+        consensus_committee_peer_ids,
+        consensus_leader_timeout_secs,
+        cw_router,
     } = args;
 
-    if let Some(seed) = mtls_seed {
-        // Catch-up sync (Part C): the engine fires `on_missing_parent` when it
-        // orphans a proposal (node fell behind, e.g. after a partition); that
-        // notifies `catchup_notify`, and the task below pulls the missing
-        // proposals from a peer's GlobalService and submits them into the
-        // consensus loop so the node rejoins consensus. `consensus_finalized`
-        // tracks the engine's finalized frame (updated only by the finalized
-        // hook — distinct from the poller-written store head) so the sync starts
-        // from the right point.
-        let catchup_notify = Arc::new(tokio::sync::Notify::new());
-        // Seed from the persisted finalized head so post-restart proposal
-        // catch-up starts at head+1, not frame 1. Only canonical (2-chain
-        // finalized) frames are persisted via `get_latest_global_frame`, so
-        // this is the correct finalized watermark. Starting at 0 made
-        // `run_proposal_catchup` scan from frame 1, which misses on any chain
-        // past genesis (mainnet genesis is ~244200) → zero progress → the
-        // finalized hook that would advance this counter never fires → wedged.
+    // The archive-sync transport identity is the FALCON network key (all
+    // outbound :8340 dials below use it). `mtls_seed` (Ed448) presence still
+    // gates whether we have any transport identity at all.
+    let mtls_falcon: Option<Vec<u8>> = if mtls_seed.is_some() {
+        use quil_keys::KeyManager as _;
+        file_key_manager
+            .get_private_key(quil_types::crypto::KeyType::Falcon512)
+            .ok()
+    } else {
+        None
+    };
+    if let Some(seed) = mtls_falcon {
+        // `consensus_finalized` tracks the engine's finalized frame (updated by
+        // the finalized hook — distinct from the poller-written store head).
+        // Seeded from the persisted finalized head; consumed by the incremental
+        // hypersync task below. Only canonical (2-chain finalized) frames are
+        // persisted via `get_latest_global_frame`, so this is the correct
+        // finalized watermark.
         let consensus_finalized = Arc::new(std::sync::atomic::AtomicU64::new(
             clock_store
                 .get_latest_global_frame()
@@ -788,7 +719,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         let frame_verifier: Arc<quil_engine::frame_validator::GlobalFrameVerifier> =
             Arc::new(quil_engine::frame_validator::GlobalFrameVerifier::with_bls(
                 frame_prover.clone(),
-                Arc::new(quil_crypto::Bls48581KeyConstructor)
+                Arc::new(quil_crypto::FalconKeyConstructor)
                     as Arc<dyn quil_types::crypto::BlsConstructor>,
             ));
         // Genesis-prover-allowlist + VDF/BLS gate packaged as a closure so the
@@ -819,20 +750,24 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
             let sj_fv = frame_validate.clone();
             let sj_pr = prover_registry.clone();
+            let sj_crdt = crdt.clone();
             // DETACH (fire-and-forget) — NOT `sup.spawn`. The state-jump is a
             // one-shot task that RETURNS when done (jump complete or no-op); a
             // supervised task that exits is treated as a fatal
             // "exited unexpectedly" and shuts the node down. Detached tasks may
             // complete freely.
-            spawner.detach("state-jump", async move {
+            spawner.detach("state-jump", {
+                let seed = seed.clone();
+                async move {
                 if let Some(n) = run_state_jump(
                     sj_pool,
-                    seed,
+                    seed.clone(),
                     sj_cs,
                     sj_hg,
                     sj_ss,
                     sj_fv,
                     sj_pr,
+                    sj_crdt,
                     tokio_util::sync::CancellationToken::new(),
                 )
                 .await
@@ -842,6 +777,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // Lift the barrier regardless of outcome so the poller proceeds.
                 let _ = sj_tx.send(());
                 Ok(())
+                }
             });
             Some(sj_rx)
         } else {
@@ -906,6 +842,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 warn!(error = %e, frame = frame_num, "hypergraph commit failed");
                             }
                             pr_for_poller.refresh_from_store(&hg_for_poller);
+                            // Keep the CRDT's per-app shard sets in sync with the
+                            // shards store so a split applied this frame (at an
+                            // epoch boundary) is reflected in the NEXT frame's app
+                            // root — deterministically on every node. Cheap: reuses
+                            // the store the poller already reads.
+                            super::engines::refresh_crdt_shard_prefixes(
+                                crdt_for_poller.as_ref(),
+                                shards_store_for_poller.as_ref(),
+                            );
                         }
                     }
                     Err(e) => {
@@ -1033,35 +978,31 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 }
             })),
             frame_validator: Some(frame_validate.clone()),
-            forward_fill: archive_mode,
+            // Forward-fill EVERY global frame (not just the head), on regulars too
+            // — NOT only archives. A regular runs app-shard workers whose storage
+            // attestation anchors ρ_N to a recent global frame (`latest − K`) and
+            // requires that exact frame to be present in the local clock store; a
+            // peer validator likewise needs the proposer's anchored frame. With
+            // head-jumping (the old `archive_mode`-gated behavior) the regular's
+            // store had HOLES, so anchors landed in gaps → "anchored global frame
+            // unavailable for ρ_N" → the multi-member app shard never finalized.
+            // The state-jump barrier still bounds the initial backfill.
+            forward_fill: true,
             startup_barrier: poller_startup_barrier,
             ..Default::default()
         };
         {
             let pool = archive_pool.clone();
             let cs = clock_store.clone();
-            sup.run_until_cancelled("archive-poller", move |cancel| async move {
-                quil_rpc::run_archive_poller(pool, cs, seed, poller_config, cancel).await;
-                Ok(())
+            sup.run_until_cancelled("archive-poller", {
+                let seed = seed.clone();
+                move |cancel| async move {
+                    quil_rpc::run_archive_poller(pool, cs, seed, poller_config, cancel).await;
+                    Ok(())
+                }
             });
         }
         info!("archive frame poller spawned (with execution pipeline)");
-
-        // Consensus catch-up sync task — replays missing proposals into the
-        // consensus loop when the engine signals it's behind (Part C).
-        {
-            let pool = archive_pool.clone();
-            let ch = consensus_handle.clone();
-            let gv = global_validator.clone();
-            let fverifier = frame_verifier.clone();
-            let notify = catchup_notify.clone();
-            let finalized = consensus_finalized.clone();
-            sup.run_until_cancelled("global-consensus-catchup", move |cancel| async move {
-                run_proposal_catchup(pool, ch, gv, fverifier, notify, finalized, seed, cancel).await;
-                Ok(())
-            });
-        }
-        info!("consensus proposal-catchup task spawned");
 
         // Periodic incremental HyperSync — refreshes prover registry every ~5 minutes.
         // After initial full sync, subsequent syncs use commitment comparison
@@ -1088,22 +1029,21 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sync_pa = prover_address;
             let sync_crdt = crdt.clone();
             let sync_shards_store = shards_store.clone();
-            let sync_p2p = p2p_handle.clone();
-            let sync_ch = consensus_handle.clone();
-            let sync_va = vote_aggregator.clone();
-            let sync_ta = timeout_aggregator.clone();
-            let sync_gv = global_validator.clone();
             let sync_cov = coverage_monitor.clone();
             let sync_cf = current_frame.clone();
             let sync_lhf = last_global_head_frame.clone();
             let sync_consensus_finalized = consensus_finalized.clone();
-            let sync_catchup_notify = catchup_notify.clone();
             let sync_archive_mode = archive_mode;
-            let sync_db_for_consensus: Arc<dyn quil_types::store::KvDb> = db_arc.clone();
             // Committee endpoints for the direct global-consensus publisher.
             let sync_archive_pool = archive_pool.clone();
             // Frame gate for the record-only backfill spawned inside this task.
             let sync_frame_validate = frame_validate.clone();
+            // commonware-simplex committee + inbound router (moved into the task).
+            let sync_consensus_committee = consensus_committee.clone();
+            let sync_consensus_committee_peer_ids = consensus_committee_peer_ids.clone();
+            let sync_consensus_leader_timeout_secs = consensus_leader_timeout_secs;
+            let sync_cw_router = cw_router.clone();
+            let seed = std::sync::Arc::new(seed.clone());
             sup.spawn("archive-prover-tree-sync", move |sync_token| async move {
                 // Archive nodes ARE the source of truth — they don't wait
                 // for some other archive to be discovered before activating
@@ -1137,11 +1077,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         // Subsequent periodic syncs DO pin against the
                         // most-recent verified frame's
                         // prover_tree_commitment.
-                        match quil_rpc::ensure_prover_tree(
-                            addr, &seed,
-                            quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
-                            sync_hg.clone(),
-                            &[],
+                        // Forest sync of the global prover shard (single-shard,
+                        // L2 = [0xff; 32]). Empty expected root ⇒ trust the
+                        // archive's latest snapshot (bootstrap; no verified frame
+                        // yet). Pulls the commitment diff + the changed vertices'
+                        // blobs.
+                        match crate::forest_sync::sync_single_shard_verified(
+                            addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &[],
                         ).await {
                             Ok(_) => {
                                 initial_sync_data_ok = true;
@@ -1315,11 +1257,20 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     let genesis_frame_result = {
                         use quil_types::store::ClockStore;
                         let cs_trait: &dyn ClockStore = sync_cs.as_ref();
+                        // Canonical committed head — the frame all honest nodes
+                        // share (their fork-ladders match). The forks forest must
+                        // anchor here, not above it.
+                        let committed_head_fn = cs_trait
+                            .get_latest_global_clock_frame()
+                            .ok()
+                            .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
+                            .unwrap_or(0);
                         let latest_qc = cs_trait.get_latest_quorum_certificate(&[]);
                         match &latest_qc {
                             Ok(qc) => info!(
                                 rank = qc.rank,
                                 frame_number = qc.frame_number,
+                                committed_head = committed_head_fn,
                                 selector = %hex::encode(&qc.selector),
                                 "bootstrap: latest QC in store",
                             ),
@@ -1329,10 +1280,65 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             ),
                         }
                         let candidate = latest_qc.ok().and_then(|qc| {
+                            // A latest-QC candidate ABOVE the committed head is an
+                            // uncommitted but QC-CERTIFIED frame — normal at the head
+                            // of a chain mid-round. Anchor the forks forest there when
+                            // we actually hold the frame locally (persisted by
+                            // `on_incorporated`), because:
+                            //
+                            //  - A post-grandfather (rank >= 587000) QC is a real
+                            //    4-of-5 certificate, so >=4 nodes incorporated + kept
+                            //    the frame and will anchor at the SAME candidate ->
+                            //    the committee converges. Anchoring at the committed
+                            //    head instead strands the leader: its newest-QC parent
+                            //    isn't in the forest so it skips forever, and the
+                            //    intermediate chain can't be rebuilt from local data
+                            //    (frame_number is the chain HEIGHT, with multiple
+                            //    competing fork candidates per height, and the
+                            //    intermediate per-rank QCs aren't all stored).
+                            //
+                            //  - The ONLY unsafe case is a PRE-587000 single-signer
+                            //    candidate (the degenerate/grandfathered era's
+                            //    self-certified "latest QC", e.g. 2e5e08ad): it may
+                            //    exist on just ONE node, so anchoring there forks that
+                            //    node off alone. For those, fall back to the shared
+                            //    committed head.
+                            //
+                            //  - If the frame isn't on disk at all (genuinely
+                            //    dangling), the load below fails and we also fall back.
+                            const GRANDFATHER_CUTOFF_RANK: u64 = 587_000;
+                            if qc.frame_number > committed_head_fn
+                                && qc.rank < GRANDFATHER_CUTOFF_RANK
+                            {
+                                warn!(
+                                    qc_frame = qc.frame_number,
+                                    qc_rank = qc.rank,
+                                    committed_head = committed_head_fn,
+                                    selector = %hex::encode(&qc.selector),
+                                    "bootstrap: PRE-cutoff uncommitted latest-QC candidate — \
+                                     anchoring on the shared committed head (single-signer-era \
+                                     safety; such a candidate may be held by only one node)",
+                                );
+                                return None;
+                            }
                             match cs_trait
                                 .get_global_clock_frame_candidate(qc.frame_number, &qc.selector)
                             {
-                                Ok(frame) => Some(frame),
+                                Ok(frame) => {
+                                    if qc.frame_number > committed_head_fn {
+                                        info!(
+                                            qc_frame = qc.frame_number,
+                                            qc_rank = qc.rank,
+                                            committed_head = committed_head_fn,
+                                            selector = %hex::encode(&qc.selector),
+                                            "bootstrap: anchoring forks forest at the PERSISTED \
+                                             newest-QC candidate above the committed head \
+                                             (post-cutoff 4-of-5 QC — peers hold it too and \
+                                             converge here; no chain rebuild needed)",
+                                        );
+                                    }
+                                    Some(frame)
+                                }
                                 Err(e) => {
                                     warn!(
                                         error = %e,
@@ -1417,9 +1423,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     // local ancestor-chain walk; its parent
                                     // chain IS the [lo, hi] hole.
                                     let bf_anchor = Some(gf.clone());
+                                    let seed = seed.clone();
                                     spawner.detach("record-only-backfill", async move {
                                         run_record_only_backfill(
-                                            bf_pool, bf_cs, bf_validate, bf_anchor, seed, lo, hi,
+                                            bf_pool, bf_cs, bf_validate, bf_anchor, (*seed).clone(), lo, hi,
                                             bf_cancel,
                                         )
                                         .await;
@@ -1448,8 +1455,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         let gap_cs = sync_cs.clone();
                         let gap_validate = sync_frame_validate.clone();
                         let gap_cancel = sync_token.clone();
+                        let seed = seed.clone();
                         spawner.detach("restart-gap-backfill", async move {
-                            run_all_gap_backfill(gap_pool, gap_cs, gap_validate, seed, gap_cancel)
+                            run_all_gap_backfill(gap_pool, gap_cs, gap_validate, (*seed).clone(), gap_cancel)
                                 .await;
                             Ok(())
                         });
@@ -1501,34 +1509,35 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         );
                     } else if genesis_frame_result.is_ok() {
                         if let Ok(genesis_frame) = genesis_frame_result {
-                            if let Ok(bls_signer) = sync_km.get_signer(quil_types::crypto::KeyType::Bls48581G1) {
+                            if let Ok(bls_signer) = sync_km.get_signer(quil_types::crypto::KeyType::Falcon512) {
                                 // Global consensus is delivered point-to-point over
                                 // the :8340 mTLS channel to the committee archives
                                 // (a full-coverage proposal exceeds the gossip
                                 // message-size cap); app consensus stays on gossip.
                                 // Falls back to the BlossomSub publisher only if we
                                 // lack an mTLS identity (not a global prover archive).
-                                let publisher: Arc<dyn quil_engine::consensus_glue::ConsensusPublisher> =
-                                    match mtls_seed {
-                                        Some(seed) => Arc::new(
-                                            crate::direct_global_consensus_publisher::DirectGlobalConsensusPublisher::new(
-                                                sync_archive_pool.clone(),
-                                                seed,
-                                                consensus_loopback_tx.clone(),
-                                                peer_id.to_bytes(),
-                                                sync_p2p.clone(),
-                                                spawner.clone(),
-                                            ),
-                                        ),
-                                        None => Arc::new(
-                                            crate::blossomsub_consensus_publisher::BlossomsubConsensusPublisher {
-                                                p2p_handle: sync_p2p.clone(),
-                                                loopback_tx: consensus_loopback_tx.clone(),
-                                                self_peer_id: peer_id.to_bytes(),
-                                                spawner: spawner.clone(),
-                                            },
-                                        ),
-                                    };
+                                // Keep the CONCRETE `DirectGlobalConsensusPublisher`
+                                // Arc (when we have an mTLS identity) so the simplex
+                                // cutover's `Cw8340Transport` can call its crate-private
+                                // `submit_cw_channel`; the old path uses it as the
+                                // `dyn ConsensusPublisher` below.
+                                let direct_publisher: Option<Arc<crate::direct_global_consensus_publisher::DirectGlobalConsensusPublisher>> = {
+                                    use quil_keys::KeyManager as _;
+                                    file_key_manager
+                                        .get_private_key(quil_types::crypto::KeyType::Falcon512)
+                                        .ok()
+                                        .map(|falcon_sk| {
+                                            Arc::new(
+                                                crate::direct_global_consensus_publisher::DirectGlobalConsensusPublisher::new(
+                                                    sync_archive_pool.clone(),
+                                                    falcon_sk,
+                                                    consensus_loopback_tx.clone(),
+                                                    peer_id.to_bytes(),
+                                                    spawner.clone(),
+                                                ),
+                                            )
+                                        })
+                                };
                                 // Build an on-finalized hook that prunes per-rank
                                 // aggregator state below the finalized watermark.
                                 // Captures the OnceLocks so the callback stays valid
@@ -1618,6 +1627,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                             crdt_for_merge.clone(),
                                                             shards_store_for_merge.clone(),
                                                             registry_for_merge.as_ref(),
+                                                            frame_number,
                                                         );
                                                     cov.propose_merge_rebalance(
                                                         frame_number,
@@ -1676,477 +1686,150 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 } else {
                                     None
                                 };
-                                let finalized_hook: quil_engine::consensus_glue::FinalizedStateHook = {
-                                    let va_cell = sync_va.clone();
-                                    let ta_cell = sync_ta.clone();
-                                    let cs_for_fin = sync_cs.clone();
-                                    let cf_for_fin = sync_cf.clone();
-                                    let lhf_for_fin = sync_lhf.clone();
-                                    let consensus_finalized_for_fin = sync_consensus_finalized.clone();
-                                    Arc::new(move |state| {
-                                        if let Some(va) = va_cell.get() {
-                                            va.advance_min_active_rank(state.rank);
-                                        }
-                                        if let Some(ta) = ta_cell.get() {
-                                            ta.advance_min_active_rank(state.rank);
-                                        }
-                                        // Persist the finalized frame to the
-                                        // canonical clock-store path so:
-                                        //   1. archive nodes report a real
-                                        //      `last_global_head_frame` in
-                                        //      PeerInfo (rather than 0),
-                                        //   2. peers can fetch the frame via
-                                        //      gRPC through the archive pool,
-                                        //   3. the archive_poller's per-frame
-                                        //      execution pipeline + lifecycle
-                                        //      evaluator runs at all (it's
-                                        //      driven by `get_latest_global_clock_frame`).
-                                        // Without this hook, every node's
-                                        // status block reads `frame: 0`
-                                        // forever even though Forks contains
-                                        // 100+ finalized states.
-                                        let app = &state.state;
-                                        let header = quil_types::proto::global::GlobalFrameHeader {
-                                            frame_number: app.frame_number,
-                                            rank: app.rank,
-                                            timestamp: app.timestamp,
-                                            difficulty: app.difficulty,
-                                            output: app.output.clone(),
-                                            parent_selector: app.parent_selector.clone(),
-                                            prover: app.prover.clone(),
-                                            prover_tree_commitment: app.prover_tree_commitment.clone(),
-                                            requests_root: app.requests_root.clone(),
-                                            ..Default::default()
-                                        };
-                                        let frame = quil_types::proto::global::GlobalFrame {
-                                            header: Some(header),
-                                            // Carry the proposal's message bundles
-                                            // through to the persisted frame so the
-                                            // materializer sees them on finalization.
-                                            requests: app.messages.clone(),
-                                        };
-                                        struct NoTxn;
-                                        impl quil_types::store::Transaction for NoTxn {
-                                            fn get(&self, _: &[u8]) -> quil_types::error::Result<Option<Vec<u8>>> { Ok(None) }
-                                            fn set(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn commit(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn delete(&self, _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn abort(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn new_iter(
-                                                &self,
-                                                _: &[u8],
-                                                _: &[u8],
-                                            ) -> quil_types::error::Result<Box<dyn quil_types::store::Iterator>> {
-                                                Err(quil_types::error::QuilError::NotFound("noop".into()))
-                                            }
-                                            fn delete_range(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn as_any(&self) -> &dyn std::any::Any { self }
-                                        }
-                                        let no_txn = NoTxn;
-                                        let cs_trait: &dyn quil_types::store::ClockStore = cs_for_fin.as_ref();
-                                        if let Err(e) = cs_trait.put_global_clock_frame(&frame, &no_txn) {
-                                            tracing::warn!(
-                                                error = %e,
-                                                frame = app.frame_number,
-                                                rank = app.rank,
-                                                "failed to persist finalized frame",
-                                            );
-                                        }
-                                        // Bump head-frame atomics so PeerInfo
-                                        // advertises the real chain head.
-                                        // `observe` / `fetch_max` keep these
-                                        // monotonic even if finalization
-                                        // callbacks arrive out of order.
-                                        cf_for_fin.observe(app.frame_number);
-                                        // Track the consensus RANK (distinct from
-                                        // the frame number) so the gRPC submit path
-                                        // and the GLOBAL_PROVER relay tag mempool
-                                        // messages in the rank space the leader's
-                                        // `collect_for_rank` actually reads.
-                                        cf_for_fin.observe_rank(app.rank);
-                                        lhf_for_fin.fetch_max(
-                                            app.frame_number,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                        // Track the engine's finalized frame for
-                                        // the catch-up sync's start point (only
-                                        // the consensus path bumps this, unlike
-                                        // the poller-shared head atomic above).
-                                        consensus_finalized_for_fin.fetch_max(
-                                            app.frame_number,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
 
-                                        // Hand the finalized frame to the dedicated
-                                        // materializer worker (archive nodes only) —
-                                        // a non-blocking send so the consensus event
-                                        // loop is never stalled by materialization
-                                        // (hypergraph commit + per-proof BLS verifies).
-                                        // The worker materializes in finalize order:
-                                        // commits the hypergraph, verifies the prover
-                                        // root, processes bundles, prunes orphan joins,
-                                        // evicts inactive provers, persists alt-shard
-                                        // updates, publishes the post-materialize
-                                        // snapshot, and marks the frame's bundles
-                                        // consumed in the mempool. Non-archive masters
-                                        // have no worker (`mat_job_tx` is None) and pull
-                                        // materialized state from archives via the poller.
-                                        if let Some(tx) = &mat_job_tx {
-                                            if let Err(e) = tx.send((frame, app.frame_number)) {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    frame = app.frame_number,
-                                                    "materializer worker channel closed",
+                                    // ── commonware-simplex + Falcon GLOBAL consensus ──
+                                    match (mat_job_tx.clone(), direct_publisher.clone()) {
+                                        (Some(mat_tx), Some(direct_pub)) => {
+                                            // Genesis digest = Poseidon(genesis output)[..32].
+                                            let genesis_header =
+                                                genesis_frame.header.clone().unwrap_or_default();
+                                            let genesis_frame_number = genesis_header.frame_number;
+                                            let genesis_id = quil_crypto::poseidon::hash_bytes_to_32(
+                                                &genesis_header.output,
+                                            )
+                                            .unwrap_or([0u8; 32]);
+                                            let genesis_digest =
+                                                quil_cw_consensus::adapters::digest_from_identity(
+                                                    genesis_id,
                                                 );
-                                            }
-                                        }
-                                    })
-                                };
 
-                                // When a state is incorporated into forks (before
-                                // finalization), persist its frame as a candidate
-                                // in the clock store so the leader can chain a
-                                // rank+1 proposal on top of it via
-                                // `prove_next_state` -> `get_global_clock_frame_candidate`.
-                                let incorporated_hook: quil_engine::consensus_glue::IncorporatedStateHook = {
-                                    let cs = sync_cs.clone();
-                                    let cf_for_inc = sync_cf.clone();
-                                    Arc::new(move |state| {
-                                        let app = &state.state;
-                                        // Freshest consensus-rank signal — incorporation
-                                        // fires per proposal, ahead of finalization.
-                                        cf_for_inc.observe_rank(app.rank);
-                                        let header = quil_types::proto::global::GlobalFrameHeader {
-                                            frame_number: app.frame_number,
-                                            rank: app.rank,
-                                            timestamp: app.timestamp,
-                                            difficulty: app.difficulty,
-                                            output: app.output.clone(),
-                                            parent_selector: app.parent_selector.clone(),
-                                            prover: app.prover.clone(),
-                                            prover_tree_commitment: app.prover_tree_commitment.clone(),
-                                            requests_root: app.requests_root.clone(),
-                                            ..Default::default()
-                                        };
-                                        let frame = quil_types::proto::global::GlobalFrame {
-                                            header: Some(header),
-                                            requests: Vec::new(),
-                                        };
-                                        // No transaction context here — pass a
-                                        // no-op transaction shim. The clock
-                                        // store's candidate writer doesn't
-                                        // require atomicity with anything else.
-                                        struct NoTxn;
-                                        impl quil_types::store::Transaction for NoTxn {
-                                            fn get(&self, _: &[u8]) -> quil_types::error::Result<Option<Vec<u8>>> { Ok(None) }
-                                            fn set(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn commit(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn delete(&self, _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn abort(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn new_iter(
-                                                &self,
-                                                _: &[u8],
-                                                _: &[u8],
-                                            ) -> quil_types::error::Result<Box<dyn quil_types::store::Iterator>> {
-                                                Err(quil_types::error::QuilError::NotFound("noop".into()))
-                                            }
-                                            fn delete_range(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn as_any(&self) -> &dyn std::any::Any { self }
-                                        }
-                                        let no_txn = NoTxn;
-                                        let cs_trait: &dyn quil_types::store::ClockStore = cs.as_ref();
-                                        let identity = quil_crypto::poseidon::hash_bytes_to_32(&app.output)
-                                            .map(hex::encode)
-                                            .unwrap_or_else(|_| "<poseidon-failed>".into());
-                                        match cs_trait.put_global_clock_frame_candidate(&frame, &no_txn) {
-                                            Ok(()) => tracing::info!(
-                                                frame = app.frame_number,
-                                                rank = app.rank,
-                                                identity = %identity,
-                                                "persisted candidate frame",
-                                            ),
-                                            Err(e) => tracing::warn!(
-                                                error = %e,
-                                                frame = app.frame_number,
-                                                rank = app.rank,
-                                                identity = %identity,
-                                                "failed to persist candidate frame",
-                                            ),
-                                        }
-                                    })
-                                };
+                                            // Leader provider — same inputs the legacy
+                                            // activation used. The signer here is the
+                                            // PROVER key (signs the frame-header VDF
+                                            // proof), distinct from the committee key
+                                            // that signs simplex votes below.
+                                            let cw_signer: Arc<dyn quil_types::crypto::Signer> =
+                                                Arc::from(bls_signer);
+                                            let leader_provider: Arc<dyn quil_consensus::leader_provider::LeaderProvider<quil_engine::consensus_types::GlobalState>> =
+                                                Arc::new(quil_engine::leader_provider::GlobalLeaderProvider::new(
+                                                    sync_pr.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+                                                    sync_fp.clone(),
+                                                    sync_da.clone() as Arc<dyn quil_types::consensus::DifficultyAdjuster>,
+                                                    sync_cs.clone() as Arc<dyn quil_types::store::ClockStore>,
+                                                    sync_mc.clone(),
+                                                    sync_pa.to_vec(),
+                                                    sync_bls_pub.clone(),
+                                                    cw_signer,
+                                                    Arc::new(quil_tries::ShaInclusionProver)
+                                                        as Arc<dyn quil_types::crypto::InclusionProver + Send + Sync>,
+                                                    Some(sync_em.clone()),
+                                                ));
 
-                                // When the consumer observes a fresh QC (from
-                                // local aggregation or wire receive), persist
-                                // it to the clock store so the leader's
-                                // `prove_next_state` for rank+1 finds the
-                                // correct latest QC.
-                                let qc_observed_hook: quil_engine::consensus_glue::QcObservedHook = {
-                                    let cs = sync_cs.clone();
-                                    Arc::new(move |qc| {
-                                        // NoTxn shim — clock store's QC writer
-                                        // doesn't require atomicity with
-                                        // anything else here.
-                                        struct NoTxn2;
-                                        impl quil_types::store::Transaction for NoTxn2 {
-                                            fn get(&self, _: &[u8]) -> quil_types::error::Result<Option<Vec<u8>>> { Ok(None) }
-                                            fn set(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn commit(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn delete(&self, _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn abort(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn new_iter(
-                                                &self,
-                                                _: &[u8],
-                                                _: &[u8],
-                                            ) -> quil_types::error::Result<Box<dyn quil_types::store::Iterator>> {
-                                                Err(quil_types::error::QuilError::NotFound("noop".into()))
-                                            }
-                                            fn delete_range(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-                                            fn as_any(&self) -> &dyn std::any::Any { self }
-                                        }
-                                        // Build a proto QC from the trait
-                                        // object's fields.
-                                        let proto_qc = quil_types::proto::global::QuorumCertificate {
-                                            filter: qc.filter().to_vec(),
-                                            rank: qc.rank(),
-                                            frame_number: qc.frame_number(),
-                                            selector: qc.identity().clone(),
-                                            timestamp: qc.timestamp(),
-                                            aggregate_signature: Some(
-                                                quil_types::proto::keys::Bls48581AggregateSignature {
-                                                    signature: qc.aggregated_signature().signature().to_vec(),
-                                                    public_key: Some(
-                                                        quil_types::proto::keys::Bls48581g2PublicKey {
-                                                            key_value: qc.aggregated_signature().public_key().to_vec(),
-                                                        },
-                                                    ),
-                                                    bitmask: qc.aggregated_signature().bitmask().to_vec(),
-                                                },
-                                            ),
-                                        };
-                                        let no_txn = NoTxn2;
-                                        let cs_trait: &dyn quil_types::store::ClockStore = cs.as_ref();
-                                        if let Err(e) = cs_trait.put_quorum_certificate(&proto_qc, &no_txn) {
-                                            tracing::debug!(
-                                                error = %e,
-                                                rank = qc.rank(),
-                                                "failed to persist QC",
-                                            );
-                                        }
-                                    })
-                                };
-                                // Load the persisted QC for the trusted
-                                // root's rank so the pacemaker boots
-                                // with a real BLS-aggregated QC instead
-                                // of a zero-signature stub (which peers
-                                // would reject on signature verify).
-                                let trusted_rank_for_qc: u64 = genesis_frame
-                                    .header
-                                    .as_ref()
-                                    .map(|h| h.rank)
-                                    .unwrap_or(0);
-                                // Genesis-QC identity for the global
-                                // validator's rank-0 trust. Computed here,
-                                // before `genesis_frame` is moved into the
-                                // activation params below. `Some` only on a
-                                // true cold start (bootstrap rank 0); `None`
-                                // for a checkpoint-seeded chain so any
-                                // rank-0 QC is rejected.
-                                let genesis_qc_identity_for_validator: Option<Vec<u8>> =
-                                    if trusted_rank_for_qc == 0 {
-                                        genesis_frame
-                                            .header
-                                            .as_ref()
-                                            .and_then(|h| {
-                                                quil_crypto::poseidon::hash_bytes_to_32(&h.output).ok()
-                                            })
-                                            .map(|h| h.to_vec())
-                                    } else {
-                                        None
-                                    };
-                                let genesis_qc_override = {
-                                    use quil_types::store::ClockStore;
-                                    let cs_trait: &dyn ClockStore = sync_cs.as_ref();
-                                    match cs_trait.get_quorum_certificate(&[], trusted_rank_for_qc) {
-                                        Ok(qc_proto) => {
-                                            info!(
-                                                rank = qc_proto.rank,
-                                                frame_number = qc_proto.frame_number,
-                                                "seeding consensus with persisted QC",
-                                            );
-                                            Some(quil_engine::consensus_wire::QuorumCertificate::from_proto(&qc_proto))
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                rank = trusted_rank_for_qc,
-                                                error = %e,
-                                                "no persisted QC at trusted rank — \
-                                                 falling back to stub genesis QC \
-                                                 (peers will reject embedded QC)",
-                                            );
-                                            None
-                                        }
-                                    }
-                                };
-                                match quil_engine::consensus_activation::activate_consensus(
-                                    quil_engine::consensus_activation::ConsensusActivationParams {
-                                        prover_registry: sync_pr.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
-                                        frame_prover: sync_fp.clone(),
-                                        difficulty_adjuster: sync_da.clone() as Arc<dyn quil_types::consensus::DifficultyAdjuster>,
-                                        clock_store: sync_cs.clone() as Arc<dyn quil_types::store::ClockStore>,
-                                        message_collector: sync_mc.clone(),
-                                        local_prover_address: sync_pa.to_vec(),
-                                        local_bls_pubkey: sync_bls_pub.clone(),
-                                        bls_signer,
-                                        // Must be the REAL KZG prover (not Noop):
-                                        // the leader provider commits the global
-                                        // requests tree through this to produce
-                                        // `requests_root`. With Noop, any frame
-                                        // whose request tree forms a branch
-                                        // (≥2 messages) committed to 64 zero bytes,
-                                        // so every non-trivial frame shipped a
-                                        // zero requests_root. Verification uses the
-                                        // CARRIED header value, so this is
-                                        // self-consistent / not a fork.
-                                        inclusion_prover: Arc::new(quil_crypto::KzgInclusionProver)
-                                            as Arc<dyn quil_types::crypto::InclusionProver + Send + Sync>,
-                                        // Drop protocol-invalid global messages
-                                        // from the mempool at collect time
-                                        // instead of re-proposing them until
-                                        // they age out (Go liveness-provider
-                                        // ValidateMessage + collector.Remove).
-                                        message_validator: Some(sync_em.clone()),
-                                        genesis_frame,
-                                        publisher: Some(publisher),
-                                        on_finalized_state: Some(finalized_hook),
-                                        on_incorporated_state: Some(incorporated_hook),
-                                        on_qc_observed: Some(qc_observed_hook),
-                                        // Real catch-up trigger: wake the
-                                        // proposal-catchup task when the engine
-                                        // orphans a proposal (node is behind).
-                                        // Cheap + sync-safe (just stores a permit).
-                                        on_missing_parent: {
-                                            let n = sync_catchup_notify.clone();
-                                            std::sync::Arc::new(move || n.notify_one())
-                                        },
-                                        config_override: None,
-                                        genesis_qc_override,
-                                        // Persist consensus + liveness
-                                        // state in the node's RocksDB so
-                                        // finalized_rank / latest_qc
-                                        // survive restarts (without this
-                                        // a restart can re-vote for a
-                                        // conflicting QC).
-                                        kv_db: Some(sync_db_for_consensus.clone()),
-                                    },
-                                ) {
-                                    Ok(activation) => {
-                                        // Register the consensus event loop with the
-                                        // supervisor BEFORE publishing the handle —
-                                        // otherwise a panic in the loop leaves the
-                                        // handle pointing at a dead task and we'd
-                                        // never know. `Ok(())` here means the loop
-                                        // exited cleanly via cancellation; anything
-                                        // else (Err or panic) shuts the node down.
-                                        let run_future = activation.run_future;
-                                        spawner.detach("global-consensus-event-loop", async move {
-                                            match run_future.await {
-                                                Ok(()) => Ok(()),
-                                                Err(e) => Err(anyhow::anyhow!(
-                                                    "consensus event loop exited with error: {}", e
-                                                )),
-                                            }
-                                        });
-                                        if sync_ch.set(activation.handle).is_err() {
-                                            warn!("consensus event loop already activated once");
-                                        } else {
-                                            // Publish VoteAggregation state so the
-                                            // receive loop can feed ProposalVote +
-                                            // proposal messages into the per-rank
-                                            // collectors. Uses the same committee/
-                                            // voting provider/vote domain built
-                                            // inside activation to guarantee byte-
-                                            // identical signature verification.
-                                            let bls_ctor: Arc<dyn quil_types::crypto::BlsConstructor> =
-                                                Arc::new(quil_crypto::Bls48581KeyConstructor);
-
-                                            // Inbound-cert verifier.
-                                            // Committee-aware so it can also verify the
-                                            // proposer's own vote; the global chain signs
-                                            // vote messages with an empty filter. Built
-                                            // from the same committee + domains the
-                                            // aggregators use, so peer-formed certs verify.
-                                            let global_validator_instance = {
-                                                let raw_agg: Arc<dyn quil_consensus::signature_aggregator::SignatureAggregator> =
-                                                    Arc::new(quil_engine::bls_signature_aggregator::BlsSignatureAggregator::new(
-                                                        bls_ctor.clone(),
-                                                    ));
-                                                let verifier = quil_engine::bls_verifier::BlsConsensusVerifier::new(
-                                                    raw_agg,
-                                                    activation.vote_domain.clone(),
-                                                    activation.timeout_domain.clone(),
-                                                    activation.committee.clone()
-                                                        as Arc<dyn quil_consensus::committee::Replicas>,
-                                                    Vec::new(),
-                                                );
-                                                Arc::new(quil_engine::validator::ConsensusValidator::new(
-                                                    activation.committee.clone()
-                                                        as Arc<dyn quil_consensus::committee::Replicas>,
-                                                    Arc::new(verifier),
-                                                )
-                                                .with_genesis_qc_identity(
-                                                    genesis_qc_identity_for_validator.clone(),
-                                                ))
+                                            // This node's committee identity IS its proving key
+                                            // (`q-prover-key`): the prover and consensus committee
+                                            // roles share one Falcon-512 key.
+                                            let (my_sk, my_pk) = match sync_km
+                                                .get_signer_by_id("q-prover-key")
+                                            {
+                                                Ok(s) => (
+                                                    s.private_key().to_vec(),
+                                                    s.public_key().to_vec(),
+                                                ),
+                                                Err(e) => {
+                                                    warn!(error = %e, "no q-prover-key — cannot join simplex committee");
+                                                    (Vec::new(), Vec::new())
+                                                }
                                             };
 
-                                            let va = Arc::new(
-                                                quil_engine::vote_aggregation::VoteAggregation::new(
-                                                    activation.committee.clone(),
-                                                    activation.voting_provider.clone(),
-                                                    sync_ch.clone(),
-                                                    bls_ctor.clone(),
-                                                    activation.vote_domain.clone(),
+                                            // resolve_peer: inbound mTLS peer-id bytes →
+                                            // committee Falcon pubkey (parallel config lists).
+                                            let resolve_peer: crate::cw_consensus_bridge::PeerResolver = {
+                                                let mut map: std::collections::HashMap<
+                                                    Vec<u8>,
+                                                    quil_cw_consensus::falcon_base::FalconPublicKey,
+                                                > = std::collections::HashMap::new();
+                                                for (pid_b58, pk_hex) in sync_consensus_committee_peer_ids
+                                                    .iter()
+                                                    .zip(sync_consensus_committee.iter())
+                                                {
+                                                    let Ok(pid) =
+                                                        bs58::decode(pid_b58).into_vec()
+                                                    else {
+                                                        continue;
+                                                    };
+                                                    let Ok(pk_bytes) = hex::decode(pk_hex) else {
+                                                        continue;
+                                                    };
+                                                    if let Some(pk) = quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&pk_bytes) {
+                                                        map.insert(pid, pk);
+                                                    }
+                                                }
+                                                info!(committee = map.len(), "cw resolve_peer map built");
+                                                Arc::new(move |from: &[u8]| map.get(from).cloned())
+                                            };
+
+                                            // Bump head atomics / CurrentFrame on finalize.
+                                            let head_hook: quil_engine::cw_global_seams::HeadHook = {
+                                                let cf = sync_cf.clone();
+                                                let lhf = sync_lhf.clone();
+                                                let cfin = sync_consensus_finalized.clone();
+                                                Arc::new(move |frame_number: u64, rank: u64| {
+                                                    cf.observe(frame_number);
+                                                    cf.observe_rank(rank);
+                                                    lhf.fetch_max(
+                                                        frame_number,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    cfin.fetch_max(
+                                                        frame_number,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                })
+                                            };
+
+                                            let transport: Arc<dyn quil_engine::cw_global_seams::GlobalConsensusTransport> =
+                                                Arc::new(crate::cw_consensus_bridge::Cw8340Transport::new(direct_pub));
+
+                                            let deps = crate::cw_consensus_bridge::CwGlobalDeps {
+                                                committee_hex: sync_consensus_committee.clone(),
+                                                my_signing_key: my_sk,
+                                                my_public_key: my_pk,
+                                                leader_provider,
+                                                verifier: frame_verifier.clone(),
+                                                clock_store: sync_cs.clone()
+                                                    as Arc<dyn quil_types::store::ClockStore>,
+                                                mat_job_tx: mat_tx,
+                                                head_hook,
+                                                filter: Vec::new(),
+                                                epoch: 0,
+                                                genesis_digest,
+                                                genesis_frame_number,
+                                                leader_timeout_secs: sync_consensus_leader_timeout_secs,
+                                                transport,
+                                                resolve_peer,
+                                            };
+                                            match crate::cw_consensus_bridge::start_cw_global_consensus(deps) {
+                                                Some(router) => {
+                                                    if sync_cw_router.set(Arc::new(router)).is_err() {
+                                                        warn!("cw_router already set");
+                                                    } else {
+                                                        info!(
+                                                            frame = genesis_frame_number,
+                                                            "commonware-simplex global consensus activated",
+                                                        );
+                                                    }
+                                                }
+                                                None => warn!(
+                                                    "start_cw_global_consensus returned None (committee empty or key absent)",
                                                 ),
-                                            );
-                                            let ta = Arc::new(
-                                                quil_engine::timeout_aggregation::TimeoutAggregation::new(
-                                                    activation.committee,
-                                                    activation.voting_provider,
-                                                    sync_ch.clone(),
-                                                    bls_ctor,
-                                                    activation.vote_domain,
-                                                    activation.timeout_domain,
-                                                ),
-                                            );
-                                            // Seed the aggregators' min_active_rank
-                                            // to the bootstrap rank. Without this they
-                                            // sit at 0 and the `rank > min + MAX_RANK_LOOKAHEAD`
-                                            // guard drops every peer vote/timeout for a
-                                            // chain that has already advanced more than
-                                            // 1024 ranks past genesis — symptom: the
-                                            // leader proposes, peers presumably vote, but
-                                            // the aggregator silently discards every
-                                            // vote and the chain perpetual-times-out.
-                                            va.advance_min_active_rank(trusted_rank_for_qc);
-                                            ta.advance_min_active_rank(trusted_rank_for_qc);
-                                            info!(
-                                                bootstrap_rank = trusted_rank_for_qc,
-                                                "seeded vote + timeout aggregator min_active_rank",
-                                            );
-                                            let va_ok = sync_va.set(va).is_ok();
-                                            let ta_ok = sync_ta.set(ta).is_ok();
-                                            let gv_ok = sync_gv.set(global_validator_instance).is_ok();
-                                            if va_ok && ta_ok && gv_ok {
-                                                info!("consensus event loop started, handle + vote/timeout aggregators + validator published");
-                                            } else {
-                                                warn!(va_ok, ta_ok, gv_ok, "aggregators/validator already set");
                                             }
                                         }
+                                        _ => {
+                                            warn!(
+                                                "simplex consensus configured but no materializer / mTLS publisher — not activating (archive + mTLS required)",
+                                            );
+                                        }
                                     }
-                                    Err(e) => {
-                                        warn!(error = %e, "consensus activation failed");
-                                    }
-                                }
                             }
                         }
                     }
@@ -2187,48 +1870,38 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     .ok()
                                     .and_then(|f| f.header.map(|h| h.prover_tree_commitment))
                                     .unwrap_or_default();
-                                match quil_rpc::ensure_prover_tree_incremental(
-                                    addr, &seed,
-                                    quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
-                                    sync_hg.clone(),
-                                    &expected_root,
+                                // Forest sync of the global prover shard, pinned
+                                // to the latest verified frame's
+                                // prover_tree_commitment (empty ⇒ trust). Pulls
+                                // the commitment diff + changed vertices' blobs.
+                                match crate::forest_sync::sync_single_shard_verified(
+                                    addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &expected_root,
                                 ).await {
-                                    Ok(stats) => {
-                                        if stats.leaves_pulled > 0 {
-                                            info!(
-                                                leaves_pulled = stats.leaves_pulled,
-                                                match_ok = stats.commitments_match,
-                                                "incremental prover tree sync complete"
-                                            );
-                                            // Refresh registry with updated data
-                                            let pr = sync_pr.clone();
-                                            let hs3 = sync_hg.clone();
-                                            let _ = tokio::task::spawn_blocking(move || pr.refresh_from_store(&hs3)).await;
+                                    Ok(converged) => {
+                                        info!(match_ok = converged, "incremental prover tree sync complete");
+                                        // Refresh registry with updated data.
+                                        let pr = sync_pr.clone();
+                                        let hs3 = sync_hg.clone();
+                                        let _ = tokio::task::spawn_blocking(move || pr.refresh_from_store(&hs3)).await;
 
-                                            // Compare reward balance for the
-                                            // local prover before/after; log
-                                            // when it changed so the operator
-                                            // sees synced-in credits.
-                                            let post_balance = quil_execution::global_intrinsic::prover_shard_update::
-                                                read_reward_balance_for(&sync_crdt, &sync_pa)
-                                                .unwrap_or_else(|_| num_bigint::BigInt::from(0));
-                                            if post_balance != pre_balance {
-                                                let delta = &post_balance - &pre_balance;
-                                                info!(
-                                                    prover = %hex::encode(&sync_pa),
-                                                    delta = %delta,
-                                                    new_balance = %post_balance,
-                                                    "local prover reward balance updated by sync"
-                                                );
-                                            }
-                                        } else {
-                                            debug!("incremental sync: tree unchanged");
+                                        // Compare reward balance for the local
+                                        // prover before/after; log when it changed
+                                        // so the operator sees synced-in credits.
+                                        let post_balance = quil_execution::global_intrinsic::prover_shard_update::
+                                            read_reward_balance_for(&sync_crdt, &sync_pa)
+                                            .unwrap_or_else(|_| num_bigint::BigInt::from(0));
+                                        if post_balance != pre_balance {
+                                            let delta = &post_balance - &pre_balance;
+                                            info!(
+                                                prover = %hex::encode(&sync_pa),
+                                                delta = %delta,
+                                                new_balance = %post_balance,
+                                                "local prover reward balance updated by sync"
+                                            );
                                         }
                                         // Recovery path: if the initial sync at
-                                        // startup failed (no archive reachable
-                                        // yet, transient error), the lifecycle
-                                        // gate stayed held. Unblock it now that
-                                        // we have data.
+                                        // startup failed, the lifecycle gate stayed
+                                        // held. Unblock it now that we have data.
                                         sync_pl.set_sync_complete();
                                     }
                                     Err(e) => warn!(error = %e, "incremental prover tree sync failed"),
@@ -2258,8 +1931,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let pool = archive_pool.clone();
             let lifecycle = prover_lifecycle.clone();
             let cf_for_refresh = current_frame.clone();
-            let seed_for_refresh = seed;
+            let seed_for_refresh = seed.clone();
             let shards_store_for_refresh = shards_store.clone();
+            let mc_for_refresh = message_collector.clone();
             sup.spawn("archive-shard-info-refresh", move |cancel| async move {
                 const REFRESH_CADENCE_FRAMES: u64 = 60;
                 let mut last_refresh_frame: u64 = 0;
@@ -2291,6 +1965,28 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             let count = sizes.len();
                             lifecycle.set_remote_shard_sizes(sizes);
                             last_refresh_frame = now_frame.max(1);
+                            // Refresh the message collector's valid-shard set so
+                            // preemptive ingestion validation can reject shard
+                            // frames whose address isn't a real current shard
+                            // (e.g. an old 4096-grid division). A shard frame's
+                            // `address` is the L2‖prefix filter, which is
+                            // `shard_key[3..35] ‖ prefix_bytes` for each row.
+                            if let Ok(rows) = shards_store_for_refresh.range_app_shards() {
+                                let mut valid: std::collections::HashSet<Vec<u8>> =
+                                    std::collections::HashSet::with_capacity(rows.len());
+                                for r in &rows {
+                                    if r.shard_key.len() >= 35 {
+                                        let mut addr = r.shard_key[3..35].to_vec();
+                                        for &p in &r.prefix {
+                                            addr.push(p as u8);
+                                        }
+                                        valid.insert(addr);
+                                    }
+                                }
+                                if !valid.is_empty() {
+                                    mc_for_refresh.set_valid_shard_addresses(valid);
+                                }
+                            }
                             info!(
                                 shards = count,
                                 frame = now_frame,
@@ -2331,7 +2027,7 @@ mod validation_tests {
     fn verifier() -> quil_engine::frame_validator::GlobalFrameVerifier {
         quil_engine::frame_validator::GlobalFrameVerifier::with_bls(
             Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
-            Arc::new(quil_crypto::Bls48581KeyConstructor),
+            Arc::new(quil_crypto::FalconKeyConstructor),
         )
     }
 
