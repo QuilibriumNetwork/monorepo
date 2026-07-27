@@ -75,6 +75,7 @@ pub(crate) fn init_engines(storage: &StorageHandles) -> EngineHandles {
         let mut primed_keys: std::collections::HashSet<Vec<u8>> =
             std::collections::HashSet::new();
         let mut primed_count = 0usize;
+        let mut committed_apps: Vec<[u8; 32]> = Vec::new();
         if let Ok(shards) = storage.shards_store.range_app_shards() {
             for s in shards {
                 if s.shard_key.len() != 35 {
@@ -88,10 +89,22 @@ pub(crate) fn init_engines(storage: &StorageHandles) -> EngineHandles {
                 let mut l2 = [0u8; 32];
                 l2.copy_from_slice(&s.shard_key[3..35]);
                 crdt.ensure_all_phase_trees(&quil_types::store::ShardKey { l1, l2 });
+                committed_apps.push(l2);
                 primed_count += 1;
             }
         }
         info!(shards = primed_count, "app shards primed in CRDT phase_sets");
+        // Seed the per-sub-shard live-size buckets from the migrated committed
+        // baseline ONCE, before any frame is processed — the world-size
+        // denominator + per-sub-shard reward `state_size` are Σ of these live
+        // buckets, and the migrated coins never passed through `add_vertex`, so
+        // without this they'd be omitted. Steady-state growth is then tracked
+        // incrementally by the mutation counters (never re-scanned).
+        if let Err(e) = crdt.warm_sizes(&committed_apps) {
+            tracing::warn!(error = %e, "warm_sizes (live-size baseline) failed");
+        } else {
+            info!(apps = committed_apps.len(), "seeded per-sub-shard live-size baseline");
+        }
     }
     // Eagerly run one commit at startup so the per-shard tree blob
     // lands at `[0x2F, vertex, adds, {l1=[0;3], l2=[0xff;32]}]`

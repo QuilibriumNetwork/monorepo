@@ -22,7 +22,7 @@
 //! atomic `Transaction` so they can never diverge.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use num_bigint::BigInt;
@@ -129,32 +129,24 @@ pub struct HypergraphCrdt {
     pending_blobs: RwLock<HashMap<(ShardKey, usize), PhaseBlobs>>,
     /// Latest committed per-shard metadata.
     shard_metadata: RwLock<HashMap<ShardKey, ShardMetadata>>,
-    /// Running total live byte size.
-    size: RwLock<BigInt>,
+    /// Per-sub-shard live state metadata: `forest shard_id -> (raw_count, size)`.
+    /// `size` is the LIVE byte size accounting for ALL four phases — Σ present
+    /// vertices' blob size (adds MINUS removes) + Σ present hyperedges' blob size
+    /// (adds MINUS removes) — bucketed by the real forest partition. `raw_count`
+    /// is the vertex-adds leaf count (monotonic, tombstone-inclusive), the reward
+    /// `shard_count`. `total_size()` is Σ of all sizes (the prover shard 0xff is
+    /// excluded — its registry/reward vertices aren't reward-bearing state).
+    /// Maintained live in the mutation methods; the migrated baseline is seeded
+    /// once by [`warm_sizes`](Self::warm_sizes) at startup.
+    sub_meta: RwLock<HashMap<Vec<u8>, (u64, i128)>>,
+    /// Set once `warm_sizes` has seeded the committed baseline.
+    sizes_warmed: AtomicBool,
     /// Snapshot-generation registry for sync `expected_root` gating.
     snapshot_mgr: SnapshotManager,
     /// Covered nibble prefix (address gating). Empty = accept all.
     covered_prefix: RwLock<Vec<i32>>,
     /// Serializes commits against each other.
     commit_lock: std::sync::Mutex<()>,
-    /// O(1) metadata memoization: `(shard, path) -> (generation, [NodeMetadata;4])`.
-    /// [`phase_set_metadata_at_path`](Self::phase_set_metadata_at_path) is
-    /// otherwise an O(shard) KV scan (a RocksDB iterator + full-phase-set
-    /// materialization into a `HashMap`/`BTreeMap`) run PER call. The explorer
-    /// REST provider, the gRPC `GetAppShards` provider, and the reward path all
-    /// call it repeatedly with the same `(shard, path)`; on a large shard (the
-    /// QUIL token tree) that pinned ~150k live RocksDB iterators / superversions
-    /// and grew RSS to 140 GB → archive OOM. Metadata only changes on a mutation
-    /// (`stage`) or `commit`, so a generation-stamped memo returns repeated reads
-    /// in O(1) with BYTE-IDENTICAL values (no change to the consensus-critical
-    /// reward `state_size`/`shard_count`). `metadata_gen` bumps on every state
-    /// change; a hit requires a matching generation. Keyed by `(shard, path)`
-    /// (bounded: one entry per queried sub-shard prefix), so the map stays small.
-    #[allow(clippy::type_complexity)]
-    metadata_cache:
-        RwLock<HashMap<(ShardKey, Vec<i32>), (u64, [Option<quil_tries::NodeMetadata>; 4])>>,
-    /// Bumped on every mutation/commit; stamps + validates `metadata_cache`.
-    metadata_gen: AtomicU64,
 }
 
 impl HypergraphCrdt {
@@ -169,20 +161,12 @@ impl HypergraphCrdt {
             pending: RwLock::new(HashMap::new()),
             pending_blobs: RwLock::new(HashMap::new()),
             shard_metadata: RwLock::new(HashMap::new()),
-            size: RwLock::new(BigInt::zero()),
+            sub_meta: RwLock::new(HashMap::new()),
+            sizes_warmed: AtomicBool::new(false),
             snapshot_mgr: SnapshotManager::new(),
             covered_prefix: RwLock::new(Vec::new()),
             commit_lock: std::sync::Mutex::new(()),
-            metadata_cache: RwLock::new(HashMap::new()),
-            metadata_gen: AtomicU64::new(0),
         }
-    }
-
-    /// Invalidate the [`metadata_cache`](Self::metadata_cache) by advancing the
-    /// generation. Called on every state change (`stage`, `commit`) so a
-    /// subsequent metadata read recomputes rather than serving a stale memo.
-    fn bump_metadata_gen(&self) {
-        self.metadata_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Install the state-commitment forest (production: the namespaced RocksDB
@@ -390,8 +374,6 @@ impl HypergraphCrdt {
                 .or_default()
                 .insert(id.to_vec(), blob.to_vec());
         }
-        // Committed+pending metadata just changed for this (shard, phase).
-        self.bump_metadata_gen();
         Ok(())
     }
 
@@ -416,21 +398,47 @@ impl HypergraphCrdt {
         self.read_blob(shard, phase_idx, id).is_some()
     }
 
+    // ---- per-sub-shard live metadata (size + raw count) -----------------
+
+    /// The forest sub-shard id (`addr_path_shard_id(app, prefix)`) a vertex's
+    /// DATA address routes to — the same top-6-bit partition the state trees
+    /// commit under. Single-shard app ⇒ the app id itself.
+    fn sub_shard_id_for(&self, app: &[u8; 32], data_addr: &[u8]) -> Vec<u8> {
+        let prefixes = self.app_prefixes(app);
+        if prefixes.len() == 1 && prefixes[0].is_empty() {
+            Forest::addr_path_shard_id(app, &[])
+        } else {
+            let bit_paths = quil_forest::canonical_shard_bit_paths(&prefixes);
+            let pi = quil_forest::address_shard_index(data_addr, &bit_paths);
+            Forest::addr_path_shard_id(app, &prefixes[pi])
+        }
+    }
+
+    /// Apply `(Δcount, Δsize)` to a vertex's sub-shard bucket. The global prover
+    /// shard (`l2 == 0xff`) is EXCLUDED from world size: its prover registry /
+    /// per-epoch leaf-root registry / reward vertices are not proven or stored by
+    /// regular workers, so they must never count toward the issuance denominator.
+    fn bump_meta(&self, shard: &ShardKey, data_addr: &[u8], d_count: i64, d_size: i128) {
+        if shard.l2 == [0xFFu8; 32] {
+            return;
+        }
+        let shard_id = self.sub_shard_id_for(&shard.l2, data_addr);
+        let mut m = self.sub_meta.write().unwrap();
+        let e = m.entry(shard_id).or_insert((0, 0));
+        e.0 = (e.0 as i64 + d_count).max(0) as u64;
+        e.1 += d_size;
+    }
+
     // ---- mutations ------------------------------------------------------
 
     pub fn add_vertex(&self, location: &Location, data: &[u8]) -> Result<()> {
         let shard = shard_key_for_location(location);
         let id = location.to_id();
+        let is_new = !self.has_entry(&shard, 0, &id);
         self.stage(&shard, 0, &id, data)?;
-        // World size EXCLUDES the global prover shard (0xff): its prover
-        // registry + per-epoch leaf-root registry + reward vertices are not
-        // proven/stored by regular workers, so they must never count toward the
-        // reward/fee issuance denominator. Excluding here (at the live counter)
-        // rather than subtracting a committed snapshot is what makes the
-        // exclusion correct MID-frame, as the registry grows within a frame.
-        if shard.l2 != [0xFFu8; 32] {
-            *self.size.write().unwrap() += BigInt::from(data.len() as u64);
-        }
+        // Live size (present vertex) + raw vertex-adds count (a NEW leaf only),
+        // bucketed by the forest sub-shard.
+        self.bump_meta(&shard, &location.data_address, i64::from(is_new), data.len() as i128);
         Ok(())
     }
 
@@ -442,20 +450,24 @@ impl HypergraphCrdt {
         let in_removes = self.has_entry(&shard, 1, &id);
         let present = existing.as_ref().map(|b| !b.is_empty()).unwrap_or(false) && !in_removes;
         let value_size = if present {
-            existing.as_ref().map(|b| BigInt::from(b.len() as u64)).unwrap_or_default()
+            existing.as_ref().map(|b| b.len()).unwrap_or(0)
         } else {
-            BigInt::zero()
+            0
         };
-
-        // Add-side placeholder for a removed-but-never-added id.
-        if existing.is_none() {
+        // A removed-but-never-added id gets an empty add-side placeholder — a NEW
+        // phase-0 leaf (raw count +1), matching the scan's leaf enumeration.
+        let new_placeholder = existing.is_none();
+        if new_placeholder {
             self.stage(&shard, 0, &id, &[])?;
         }
         // Tombstone in the removes phase.
         self.stage(&shard, 1, &id, &[])?;
 
-        if present && shard.l2 != [0xFFu8; 32] {
-            *self.size.write().unwrap() -= &value_size;
+        // Removing a present vertex frees its live size (adds MINUS removes).
+        let d_size = if present { -(value_size as i128) } else { 0 };
+        let d_count = i64::from(new_placeholder);
+        if present || new_placeholder {
+            self.bump_meta(&shard, &location.data_address, d_count, d_size);
         }
         Ok(())
     }
@@ -467,9 +479,8 @@ impl HypergraphCrdt {
             return Ok(()); // in hyperedge_removes → no-op
         }
         self.stage(&shard, 2, &id, data)?;
-        if shard.l2 != [0xFFu8; 32] {
-            *self.size.write().unwrap() += BigInt::from(data.len() as u64);
-        }
+        // Hyperedges contribute to LIVE size but not the vertex-adds count.
+        self.bump_meta(&shard, &location.data_address, 0, data.len() as i128);
         Ok(())
     }
 
@@ -477,10 +488,23 @@ impl HypergraphCrdt {
         let shard = shard_key_for_location(location);
         let id = location.to_id();
         let existing = self.read_blob(&shard, 2, &id);
+        let in_removes = self.has_entry(&shard, 3, &id);
+        let present = existing.as_ref().map(|b| !b.is_empty()).unwrap_or(false) && !in_removes;
+        let value_size = if present {
+            existing.as_ref().map(|b| b.len()).unwrap_or(0)
+        } else {
+            0
+        };
         if existing.is_none() {
             self.stage(&shard, 2, &id, &[])?;
         }
         self.stage(&shard, 3, &id, &[])?;
+        // FIX: a removed hyperedge frees its live size — previously this was never
+        // subtracted (hyperedges have only existed on the excluded prover shard,
+        // so it was a latent no-op until now).
+        if present {
+            self.bump_meta(&shard, &location.data_address, 0, -(value_size as i128));
+        }
         Ok(())
     }
 
@@ -532,9 +556,6 @@ impl HypergraphCrdt {
             std::mem::take(&mut *self.pending.write().unwrap());
         let pending_blobs: HashMap<(ShardKey, usize), PhaseBlobs> =
             std::mem::take(&mut *self.pending_blobs.write().unwrap());
-        // Commit rewrites committed metadata (and drains pending) — invalidate
-        // the memo so post-commit reads recompute against the new committed root.
-        self.bump_metadata_gen();
 
         let txn = self.store.new_transaction(false)?;
         let forest = self.forest.read().unwrap();
@@ -740,21 +761,111 @@ impl HypergraphCrdt {
         if let Some(cursor_key) = cursor_key {
             txn.set(cursor_key, &frame_number.to_be_bytes())?;
         }
+        // Persist the live-size buckets ATOMICALLY with the tree commit, so a
+        // restart loads the small per-sub-shard baseline (O(#sub-shards)) instead
+        // of re-streaming the whole state. The buckets already reflect this
+        // frame's committed mutations (they are bumped at stage time).
+        txn.set(SIZE_BUCKETS_KEY, &serialize_buckets(&self.sub_meta.read().unwrap()))?;
         txn.commit()?;
         Ok(result)
     }
 
     // ---- roots / metadata ----------------------------------------------
 
-    /// World-state size for reward/fee issuance. EXCLUDES the global prover shard
-    /// (`GLOBAL_INTRINSIC_ADDRESS` = `[0xff; 32]`) — its prover registry, per-epoch
-    /// leaf-root registry, and reward vertices are not proven/stored by regular
-    /// workers, so they must never count toward the issuance denominator. The
-    /// exclusion is enforced at the live `self.size` counter (see `add_vertex` /
-    /// `add_hyperedge` / `remove_vertex`), so it holds MID-frame as the prover
-    /// shard grows, not just at commit boundaries.
+    /// World-state size for reward/fee issuance = Σ of every sub-shard's LIVE
+    /// size (all four phases, tombstone-accounted). EXCLUDES the global prover
+    /// shard (`0xff`) — its registry / reward vertices are not reward-bearing
+    /// state (enforced in [`bump_meta`](Self::bump_meta), so no `0xff` bucket
+    /// ever exists). Held MID-frame as shards grow (live mutation counters), not
+    /// just at commit boundaries. Requires [`warm_sizes`](Self::warm_sizes) to
+    /// have seeded the migrated baseline.
     pub fn total_size(&self) -> BigInt {
-        self.size.read().unwrap().clone()
+        let sum: i128 = self.sub_meta.read().unwrap().values().map(|(_, s)| *s).sum();
+        BigInt::from(sum.max(0))
+    }
+
+    /// Summed `(raw_count, live_size)` of every declared sub-shard at/under a
+    /// query `(app, prefix)` — an O(#sub-shards) read of the maintained buckets,
+    /// no tree scan. `prefix` empty ⇒ whole app.
+    fn sub_meta_for(&self, app: &[u8; 32], prefix: &[u32]) -> (u64, i128) {
+        let m = self.sub_meta.read().unwrap();
+        self.app_prefixes(app)
+            .into_iter()
+            .filter(|p| p.starts_with(prefix))
+            .filter_map(|p| m.get(&Forest::addr_path_shard_id(app, &p)).copied())
+            .fold((0u64, 0i128), |(c, s), (pc, ps)| (c + pc, s + ps))
+    }
+
+    /// Load (or, on first upgrade, compute) the per-sub-shard live-size buckets.
+    /// MUST be called ONCE at startup, BEFORE any frame is processed (mutation
+    /// counters accumulate on top). Idempotent (`sizes_warmed`).
+    ///
+    /// FAST PATH: the buckets are persisted atomically with every commit (see
+    /// `commit_inner`), keyed `SIZE_BUCKETS_KEY`, so a restart just deserializes
+    /// the SMALL per-sub-shard map — O(#sub-shards), never O(state).
+    ///
+    /// COLD PATH (no persisted baseline — a freshly upgraded / migrated store):
+    /// stream each committed app's vertex-adds (raw count for every leaf, live
+    /// size only for present not-tombstoned leaves) + present hyperedge-adds,
+    /// bucket by the forest partition, then persist. `apps` is the COMPLETE set
+    /// of committed app addresses (the node passes it from
+    /// `shards_store.range_app_shards()`). Runs at most once ever.
+    pub fn warm_sizes(&self, apps: &[[u8; 32]]) -> Result<()> {
+        if self.sizes_warmed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        // Fast path: restore the persisted buckets.
+        let read_txn = self.store.new_transaction(false)?;
+        if let Some(blob) = read_txn.get(SIZE_BUCKETS_KEY)? {
+            *self.sub_meta.write().unwrap() = deserialize_buckets(&blob);
+            return Ok(());
+        }
+        drop(read_txn);
+        let mut buckets: HashMap<Vec<u8>, (u64, i128)> = HashMap::new();
+        for &app in apps {
+            if app == [0xFFu8; 32] {
+                continue; // prover shard excluded from world size
+            }
+            let l1 = crate::addressing::get_bloom_filter_indices(&app, 256, 3);
+            let shard_key = ShardKey { l1, l2: app };
+            let prefixes = self.app_prefixes(&app);
+            let single = prefixes.len() == 1 && prefixes[0].is_empty();
+            let bit_paths = if single {
+                Vec::new()
+            } else {
+                quil_forest::canonical_shard_bit_paths(&prefixes)
+            };
+            let route = |vk: &[u8]| -> Vec<u8> {
+                let data: &[u8] = if vk.len() >= 64 { &vk[32..64] } else { vk };
+                let pi = if single {
+                    0
+                } else {
+                    quil_forest::address_shard_index(data, &bit_paths)
+                };
+                Forest::addr_path_shard_id(&app, &prefixes[pi])
+            };
+            // Vertex adds: raw count for every leaf; live size only if present.
+            self.store.for_each_vertex_underlying("vertex", "adds", &shard_key, &mut |vk, blob| {
+                let e = buckets.entry(route(&vk)).or_insert((0, 0));
+                e.0 += 1;
+                if !blob.is_empty() && !self.has_entry(&shard_key, 1, &vk) {
+                    e.1 += blob.len() as i128;
+                }
+            })?;
+            // Hyperedge adds: live size only (no vertex-count contribution).
+            self.store.for_each_vertex_underlying("hyperedge", "adds", &shard_key, &mut |vk, blob| {
+                if !blob.is_empty() && !self.has_entry(&shard_key, 3, &vk) {
+                    buckets.entry(route(&vk)).or_insert((0, 0)).1 += blob.len() as i128;
+                }
+            })?;
+        }
+        // Persist the freshly-computed baseline so subsequent restarts take the
+        // fast path.
+        let txn = self.store.new_transaction(false)?;
+        txn.set(SIZE_BUCKETS_KEY, &serialize_buckets(&buckets))?;
+        txn.commit()?;
+        *self.sub_meta.write().unwrap() = buckets;
+        Ok(())
     }
 
     pub fn shard_metadata_for_address(&self, filter: &[u8]) -> Option<ShardMetadata> {
@@ -779,23 +890,26 @@ impl HypergraphCrdt {
     /// (otherwise every one of an app's N sub-shards would be credited the full
     /// app size = N× over-reward). An unsplit app (bare 32-byte filter, empty
     /// prefix) yields whole-app metadata, matching `shard_metadata_for_address`.
-    /// Reads committed state via `collect_phase_leaves`, so it is deterministic
-    /// across nodes given the same committed forest. `None` if malformed or empty.
+    /// Reads the maintained per-sub-shard bucket (live size + raw count) — O(1),
+    /// no tree scan, deterministic across nodes given the same committed state +
+    /// warm. `size` is the LIVE all-phase size; `leaf_count` the raw vertex-adds
+    /// count. `None` if malformed or the sub-shard is empty.
     pub fn sub_shard_metadata_for_filter(&self, filter: &[u8]) -> Option<quil_tries::NodeMetadata> {
         if filter.len() < 32 {
             return None;
         }
         let mut app = [0u8; 32];
         app.copy_from_slice(&filter[..32]);
-        let l1 = crate::addressing::get_bloom_filter_indices(&app, 256, 3);
-        let shard_key = ShardKey { l1, l2: app };
-        let mut full_path = quil_tries::get_full_path(&app);
-        for &b in &filter[32..] {
-            full_path.push(b as i32);
+        let prefix: Vec<u32> = filter[32..].iter().map(|&b| b as u32).collect();
+        let (count, size) = self.sub_meta_for(&app, &prefix);
+        if count == 0 && size == 0 {
+            return None;
         }
-        self.phase_set_metadata_at_path(&shard_key, &full_path)
-            .ok()
-            .and_then(|metas| metas[0].clone())
+        Some(quil_tries::NodeMetadata {
+            commitment: Vec::new(),
+            leaf_count: count,
+            size: BigInt::from(size.max(0)),
+        })
     }
 
     /// The current 32-byte forest root for one shard/phase (read-only).
@@ -1179,9 +1293,6 @@ impl HypergraphCrdt {
         self.store
             .save_vertex_underlying_versioned(txn.as_ref(), set, phase, shard, id, blob, version)?;
         txn.commit()?;
-        // Sync writes committed state directly (bypassing stage/commit) — the
-        // memo must recompute afterward.
-        self.bump_metadata_gen();
         Ok(())
     }
 
@@ -1330,42 +1441,33 @@ impl HypergraphCrdt {
     }
 
     /// `[vertex_adds, vertex_removes, hyperedge_adds, hyperedge_removes]`
-    /// leaf-count/size metadata at `full_path`, from the KV. `longest_branch`
-    /// is not meaningful for a JMT and is left zero.
+    /// metadata at `full_path`. Slot 0 (the only one consumed by
+    /// `get_app_shard_metadata`) carries the maintained per-sub-shard LIVE size +
+    /// raw vertex-adds count — an O(1) bucket read, no tree scan. Slots 1–3 are
+    /// `None` (their commitments already decode as zero downstream).
     pub fn phase_set_metadata_at_path(
         &self,
         shard_key: &ShardKey,
         full_path: &[i32],
     ) -> Result<[Option<quil_tries::NodeMetadata>; 4]> {
-        // O(1) memo (see `metadata_cache`): serve a prior result iff no state
-        // change (stage/commit/sync) has bumped the generation since. The value
-        // is byte-identical to the scan below — this only removes the repeated
-        // RocksDB iterator + full-phase-set materialization that OOM'd archives.
-        let gen = self.metadata_gen.load(std::sync::atomic::Ordering::Relaxed);
-        let cache_key = (shard_key.clone(), full_path.to_vec());
-        if let Some((g, cached)) = self.metadata_cache.read().unwrap().get(&cache_key) {
-            if *g == gen {
-                return Ok(cached.clone());
-            }
-        }
-        let mut out: [Option<quil_tries::NodeMetadata>; 4] = [None, None, None, None];
-        for phase_idx in 0..4 {
-            let leaves = self.collect_phase_leaves(shard_key, phase_idx, full_path)?;
-            if leaves.is_empty() {
-                continue;
-            }
-            let size: u64 = leaves.iter().map(|(_, v)| v.len() as u64).sum();
-            out[phase_idx] = Some(quil_tries::NodeMetadata {
+        let app = shard_key.l2;
+        let app_path_len = quil_tries::get_full_path(&app).len();
+        let prefix: Vec<u32> = if full_path.len() > app_path_len {
+            full_path[app_path_len..].iter().map(|&n| n as u32).collect()
+        } else {
+            Vec::new()
+        };
+        let (count, size) = self.sub_meta_for(&app, &prefix);
+        let phase0 = if count == 0 && size == 0 {
+            None
+        } else {
+            Some(quil_tries::NodeMetadata {
                 commitment: Vec::new(),
-                leaf_count: leaves.len() as u64,
-                size: BigInt::from(size),
-            });
-        }
-        // Stamp with the generation observed BEFORE computing: if state changed
-        // mid-scan the entry is already stale and won't be served (a reader at
-        // the new generation recomputes), so we never serve a torn value.
-        self.metadata_cache.write().unwrap().insert(cache_key, (gen, out.clone()));
-        Ok(out)
+                leaf_count: count,
+                size: BigInt::from(size.max(0)),
+            })
+        };
+        Ok([phase0, None, None, None])
     }
 
     /// Canonical PoRep leaf-data body: per phase (fixed order)
@@ -1459,6 +1561,50 @@ impl HypergraphCrdt {
 /// Whether an id's 6-bit-nibble representation begins with `path`. The KZG
 /// vector trie branched 64-ary (6 bits per level); the PoRep path is such a
 /// nibble sequence. Bytes are big-endian bit order.
+/// KV key for the persisted per-sub-shard live-size buckets (one small blob).
+const SIZE_BUCKETS_KEY: &[u8] = b"hgsz:buckets";
+
+/// `[count u32][ (klen u32)(shard_id)(count u64)(size i128) ]*` — the persisted
+/// per-sub-shard `(raw_count, live_size)` map. Small (one entry per sub-shard).
+fn serialize_buckets(m: &HashMap<Vec<u8>, (u64, i128)>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + m.len() * 40);
+    out.extend_from_slice(&(m.len() as u32).to_be_bytes());
+    for (k, (c, s)) in m {
+        out.extend_from_slice(&(k.len() as u32).to_be_bytes());
+        out.extend_from_slice(k);
+        out.extend_from_slice(&c.to_be_bytes());
+        out.extend_from_slice(&s.to_be_bytes());
+    }
+    out
+}
+
+fn deserialize_buckets(b: &[u8]) -> HashMap<Vec<u8>, (u64, i128)> {
+    let mut m = HashMap::new();
+    if b.len() < 4 {
+        return m;
+    }
+    let n = u32::from_be_bytes(b[0..4].try_into().unwrap());
+    let mut i = 4usize;
+    for _ in 0..n {
+        if i + 4 > b.len() {
+            break;
+        }
+        let kl = u32::from_be_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+        i += 4;
+        if i + kl + 8 + 16 > b.len() {
+            break;
+        }
+        let k = b[i..i + kl].to_vec();
+        i += kl;
+        let c = u64::from_be_bytes(b[i..i + 8].try_into().unwrap());
+        i += 8;
+        let s = i128::from_be_bytes(b[i..i + 16].try_into().unwrap());
+        i += 16;
+        m.insert(k, (c, s));
+    }
+    m
+}
+
 fn id_matches_path(id: &[u8], path: &[i32]) -> bool {
     for (level, &nib) in path.iter().enumerate() {
         let bit = level * 6;

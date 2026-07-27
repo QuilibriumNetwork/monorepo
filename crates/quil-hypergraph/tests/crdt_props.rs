@@ -627,3 +627,69 @@ fn phase_metadata_memo_is_transparent_and_invalidates() {
     assert_eq!(m3.leaf_count, 2);
     assert_eq!(m3.size, BigInt::from(14u64));
 }
+
+/// The maintained live-size accounting: `state_size` = Σ present vertices'
+/// blob size (adds − removes) + Σ present hyperedges' blob size (adds − removes),
+/// bucketed by the forest partition; `leaf_count` = RAW vertex-adds count;
+/// `total_size()` = Σ per-sub-shard sizes (prover shard 0xff excluded); and the
+/// `remove_hyperedge` bug (size never freed) is fixed. All maintained live in
+/// the mutation path — no scan — and `warm_sizes` recomputes the same value.
+#[test]
+fn live_size_all_phases_tombstones_and_world_sum() {
+    use num_bigint::BigInt;
+    let c = fresh_crdt();
+    let app = [0x11u8; 32];
+    c.set_shard_partition(app, 1); // 64-way split
+    let v = |d0: u8, tag: u8| {
+        let mut d = [0u8; 32];
+        d[0] = d0; // top 6 bits pick the sub-shard: 0x00 & 0x01 → 0; 0xFF → 63
+        d[31] = tag;
+        Location { app_address: app, data_address: d }
+    };
+    let s0 = |c: &HypergraphCrdt| {
+        c.sub_shard_metadata_for_filter(&[app.as_slice(), &[0u8]].concat())
+            .map(|m| (m.leaf_count, m.size))
+    };
+
+    c.add_vertex(&v(0x00, 1), b"aaaa").unwrap(); // 4  → shard 0
+    c.add_vertex(&v(0x00, 2), b"bbbbb").unwrap(); // 5 → shard 0
+    c.add_vertex(&v(0xFF, 3), b"cccccc").unwrap(); // 6 → shard 63
+    assert_eq!(c.total_size(), BigInt::from(15));
+    assert_eq!(s0(&c), Some((2, BigInt::from(9))));
+
+    // Remove a present vertex: LIVE size drops, RAW count is unchanged.
+    c.remove_vertex(&v(0x00, 1)).unwrap(); // -4
+    assert_eq!(c.total_size(), BigInt::from(11));
+    assert_eq!(s0(&c), Some((2, BigInt::from(5))));
+
+    // Hyperedge add contributes to size but NOT the vertex count.
+    c.add_hyperedge(&v(0x00, 4), b"eeeeeee").unwrap(); // +7
+    assert_eq!(s0(&c), Some((2, BigInt::from(12))));
+    assert_eq!(c.total_size(), BigInt::from(18));
+
+    // Hyperedge remove frees size — the bug fix (was never subtracted before).
+    c.remove_hyperedge(&v(0x00, 4)).unwrap(); // -7
+    assert_eq!(s0(&c), Some((2, BigInt::from(5))));
+    assert_eq!(c.total_size(), BigInt::from(11));
+
+    // Correct top-6-bit sharding: data 0x01 → shard 0 (the scan's bug misrouted it).
+    c.add_vertex(&v(0x01, 5), b"ff").unwrap(); // +2 → shard 0
+    assert_eq!(s0(&c), Some((3, BigInt::from(7))));
+
+    // The prover shard (app 0xff) is EXCLUDED from world size.
+    let before = c.total_size();
+    let pv = {
+        let mut d = [0u8; 32];
+        d[31] = 9;
+        Location { app_address: [0xFFu8; 32], data_address: d }
+    };
+    c.add_vertex(&pv, b"zzzzzzzz").unwrap();
+    assert_eq!(c.total_size(), before, "prover shard excluded from world size");
+    assert_eq!(c.total_size(), BigInt::from(13)); // Σ: shard0=7 + shard63=6
+
+    // Warm recomputes the SAME value from committed state (idempotent vs live).
+    c.commit(1).unwrap();
+    c.warm_sizes(&[app]).unwrap();
+    assert_eq!(c.total_size(), BigInt::from(13));
+    assert_eq!(s0(&c), Some((3, BigInt::from(7))));
+}
