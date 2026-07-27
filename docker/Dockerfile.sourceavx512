@@ -225,6 +225,12 @@ ARG TARGETARCH
 # targets the node's VDF/crypto), so this is a plain release build. The `cp`
 # runs in the same RUN as the build because target/ is a cache mount.
 WORKDIR /opt/ceremonyclient
+# quil-client depends on quil-execution, which embeds the genesis seniority
+# compat data from node/execution/... (retro JSONs via include_bytes! +
+# mainnet_244200_seniority.json via build.rs). build-avx512 was COPY'd with
+# --exclude=node (to keep Go source changes from busting the Rust cache), so
+# bring in just that data dir here so the qclient's quil-execution build finds it.
+COPY ./node/execution/intrinsics/global/compat /opt/ceremonyclient/node/execution/intrinsics/global/compat
 RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,id=cargo-target-qclient,target=/opt/ceremonyclient/target \

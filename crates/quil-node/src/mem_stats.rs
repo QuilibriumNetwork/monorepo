@@ -275,6 +275,42 @@ pub fn jemalloc_size_classes() -> JemallocBreakdown {
     JemallocBreakdown::default()
 }
 
+/// Trigger a jemalloc heap-profile dump on demand (the SIGUSR1 handler in
+/// `main` calls this). Heap profiling is COMPILED IN (tikv-jemallocator's
+/// `profiling` feature) but only ACTIVE when the process was started with
+/// `MALLOC_CONF=prof:true` (see the `MALLOC_CONF` note atop `main.rs`); if it
+/// wasn't, `prof.dump` returns an error and we surface a hint rather than
+/// silently no-op.
+///
+/// We write a NULL filename to `prof.dump`, so jemalloc names the file
+/// `<prof_prefix>.<pid>.<seq>.heap` and auto-increments `<seq>` on every dump.
+/// That's the point of a signal-driven dump on a remote box: fire it twice as
+/// RSS climbs, then diff the two on any machine that has the binary:
+///   `jeprof --base=<prefix>.<pid>.0.heap ./quil-node <prefix>.<pid>.1.heap`
+/// The base-diff shows exactly which allocation stacks GREW between the two
+/// samples — i.e. the leak — instead of the whole live heap.
+#[cfg(not(target_env = "msvc"))]
+pub fn dump_heap_profile() -> Result<(), String> {
+    use tikv_jemalloc_ctl::raw;
+    // `prof.dump`'s value is a `const char *` filename; a NULL pointer is the
+    // documented sentinel for "use prof_prefix + an auto seq number".
+    // SAFETY: "prof.dump\0" is a real mallctl whose C value type is
+    // `const char *`; we pass a correctly-typed null pointer of that width.
+    unsafe {
+        raw::write(b"prof.dump\0", std::ptr::null::<std::os::raw::c_char>()).map_err(|e| {
+            format!(
+                "prof.dump failed ({e}); start the node with \
+                 MALLOC_CONF=prof:true,prof_prefix:/tmp/jeprof to enable heap profiling"
+            )
+        })
+    }
+}
+
+#[cfg(target_env = "msvc")]
+pub fn dump_heap_profile() -> Result<(), String> {
+    Err("heap profiling is not available on MSVC builds".to_string())
+}
+
 /// Render the breakdown as a compact one-line string for logging, e.g.
 /// `small=120.0MB large=38000.0MB | 2.0MiB=36000.0MB×18000 4.0KiB=80.0MB×20480 …`.
 pub fn fmt_breakdown(b: &JemallocBreakdown) -> String {

@@ -137,6 +137,24 @@ pub struct HypergraphCrdt {
     covered_prefix: RwLock<Vec<i32>>,
     /// Serializes commits against each other.
     commit_lock: std::sync::Mutex<()>,
+    /// O(1) metadata memoization: `(shard, path) -> (generation, [NodeMetadata;4])`.
+    /// [`phase_set_metadata_at_path`](Self::phase_set_metadata_at_path) is
+    /// otherwise an O(shard) KV scan (a RocksDB iterator + full-phase-set
+    /// materialization into a `HashMap`/`BTreeMap`) run PER call. The explorer
+    /// REST provider, the gRPC `GetAppShards` provider, and the reward path all
+    /// call it repeatedly with the same `(shard, path)`; on a large shard (the
+    /// QUIL token tree) that pinned ~150k live RocksDB iterators / superversions
+    /// and grew RSS to 140 GB → archive OOM. Metadata only changes on a mutation
+    /// (`stage`) or `commit`, so a generation-stamped memo returns repeated reads
+    /// in O(1) with BYTE-IDENTICAL values (no change to the consensus-critical
+    /// reward `state_size`/`shard_count`). `metadata_gen` bumps on every state
+    /// change; a hit requires a matching generation. Keyed by `(shard, path)`
+    /// (bounded: one entry per queried sub-shard prefix), so the map stays small.
+    #[allow(clippy::type_complexity)]
+    metadata_cache:
+        RwLock<HashMap<(ShardKey, Vec<i32>), (u64, [Option<quil_tries::NodeMetadata>; 4])>>,
+    /// Bumped on every mutation/commit; stamps + validates `metadata_cache`.
+    metadata_gen: AtomicU64,
 }
 
 impl HypergraphCrdt {
@@ -155,7 +173,16 @@ impl HypergraphCrdt {
             snapshot_mgr: SnapshotManager::new(),
             covered_prefix: RwLock::new(Vec::new()),
             commit_lock: std::sync::Mutex::new(()),
+            metadata_cache: RwLock::new(HashMap::new()),
+            metadata_gen: AtomicU64::new(0),
         }
+    }
+
+    /// Invalidate the [`metadata_cache`](Self::metadata_cache) by advancing the
+    /// generation. Called on every state change (`stage`, `commit`) so a
+    /// subsequent metadata read recomputes rather than serving a stale memo.
+    fn bump_metadata_gen(&self) {
+        self.metadata_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Install the state-commitment forest (production: the namespaced RocksDB
@@ -363,6 +390,8 @@ impl HypergraphCrdt {
                 .or_default()
                 .insert(id.to_vec(), blob.to_vec());
         }
+        // Committed+pending metadata just changed for this (shard, phase).
+        self.bump_metadata_gen();
         Ok(())
     }
 
@@ -503,6 +532,9 @@ impl HypergraphCrdt {
             std::mem::take(&mut *self.pending.write().unwrap());
         let pending_blobs: HashMap<(ShardKey, usize), PhaseBlobs> =
             std::mem::take(&mut *self.pending_blobs.write().unwrap());
+        // Commit rewrites committed metadata (and drains pending) — invalidate
+        // the memo so post-commit reads recompute against the new committed root.
+        self.bump_metadata_gen();
 
         let txn = self.store.new_transaction(false)?;
         let forest = self.forest.read().unwrap();
@@ -1147,6 +1179,9 @@ impl HypergraphCrdt {
         self.store
             .save_vertex_underlying_versioned(txn.as_ref(), set, phase, shard, id, blob, version)?;
         txn.commit()?;
+        // Sync writes committed state directly (bypassing stage/commit) — the
+        // memo must recompute afterward.
+        self.bump_metadata_gen();
         Ok(())
     }
 
@@ -1302,6 +1337,17 @@ impl HypergraphCrdt {
         shard_key: &ShardKey,
         full_path: &[i32],
     ) -> Result<[Option<quil_tries::NodeMetadata>; 4]> {
+        // O(1) memo (see `metadata_cache`): serve a prior result iff no state
+        // change (stage/commit/sync) has bumped the generation since. The value
+        // is byte-identical to the scan below — this only removes the repeated
+        // RocksDB iterator + full-phase-set materialization that OOM'd archives.
+        let gen = self.metadata_gen.load(std::sync::atomic::Ordering::Relaxed);
+        let cache_key = (shard_key.clone(), full_path.to_vec());
+        if let Some((g, cached)) = self.metadata_cache.read().unwrap().get(&cache_key) {
+            if *g == gen {
+                return Ok(cached.clone());
+            }
+        }
         let mut out: [Option<quil_tries::NodeMetadata>; 4] = [None, None, None, None];
         for phase_idx in 0..4 {
             let leaves = self.collect_phase_leaves(shard_key, phase_idx, full_path)?;
@@ -1315,6 +1361,10 @@ impl HypergraphCrdt {
                 size: BigInt::from(size),
             });
         }
+        // Stamp with the generation observed BEFORE computing: if state changed
+        // mid-scan the entry is already stale and won't be served (a reader at
+        // the new generation recomputes), so we never serve a torn value.
+        self.metadata_cache.write().unwrap().insert(cache_key, (gen, out.clone()));
         Ok(out)
     }
 

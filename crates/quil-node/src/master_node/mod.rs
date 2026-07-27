@@ -709,6 +709,44 @@ pub(crate) async fn start(
         std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>,
     > = Arc::new(std::sync::OnceLock::new());
 
+    // CW global-consensus committee roster. On mainnet (network 0) the committee
+    // IS the embedded genesis data — the same `archive_peers` (peer_id ->
+    // Falcon-512 pubkey) that already seeds `genesis_prover_addrs` and the
+    // static archive pool. It is fixed by the binary, NOT a hand-populated
+    // operator config: every archive would otherwise have to carry an identical
+    // `consensusCommittee`/`consensusCommitteePeerIds` list, and any one archive
+    // shipping it empty (as happened on the flag-day) leaves that node unable to
+    // start simplex (`start_cw_global_consensus returned None`), stranding it at
+    // the last legacy head forever. `genesis_archive_peers()` derives each
+    // member's peer id via `peer_id_from_falcon_pubkey`, so the resolve_peer map
+    // keys match exactly what the :8340 PQNoise transport authenticates inbound
+    // peers as. Non-mainnet networks keep the config-driven lists (localnet.sh
+    // populates them from `--print-identity`).
+    let (consensus_committee, consensus_committee_peer_ids): (Vec<String>, Vec<String>) =
+        if network == 0 {
+            match quil_engine::genesis::genesis_archive_peers() {
+                Ok(peers) => {
+                    let mut hexes = Vec::with_capacity(peers.len());
+                    let mut pids = Vec::with_capacity(peers.len());
+                    for (peer_id, pubkey) in peers {
+                        pids.push(peer_id);
+                        hexes.push(hex::encode(&pubkey));
+                    }
+                    info!(committee = hexes.len(), "CW committee loaded from genesis data");
+                    (hexes, pids)
+                }
+                Err(e) => {
+                    warn!(error = %e, "could not load genesis archive peers for CW committee");
+                    (Vec::new(), Vec::new())
+                }
+            }
+        } else {
+            (
+                config.engine.consensus_committee.clone(),
+                config.engine.consensus_committee_peer_ids.clone(),
+            )
+        };
+
     archive_sync::spawn_all(&mut sup, archive_sync::ArchiveSyncArgs {
         mtls_seed,
         network,
@@ -737,8 +775,8 @@ pub(crate) async fn start(
         consensus_loopback_tx: consensus_loopback_tx.clone(),
         peer_id,
         spawner: detached_spawner.clone(),
-        consensus_committee: config.engine.consensus_committee.clone(),
-        consensus_committee_peer_ids: config.engine.consensus_committee_peer_ids.clone(),
+        consensus_committee,
+        consensus_committee_peer_ids,
         consensus_leader_timeout_secs: config.engine.consensus_leader_timeout_secs,
         cw_router: cw_router.clone(),
     });

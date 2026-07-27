@@ -581,3 +581,49 @@ fn interleaved_commits_keep_forest_tree_intact() {
     quil_forest::verify_vertex_membership(&root, &mp.inputs[0], &[(vec![0x04u8], commitment)])
         .expect("a1 still proves against the forest root after interleaved commits");
 }
+
+/// The O(1) metadata memo (`metadata_cache`) MUST be transparent: repeated
+/// reads return the same value, and every mutation (stage) or `commit` is
+/// reflected on the very next read — never a stale cached `size`/`leaf_count`.
+/// This is consensus-critical: the reward path derives `state_size` /
+/// `shard_count` from `sub_shard_metadata_for_filter` (→ this memo), so a stale
+/// value would mis-mint and fork. Prior to the memo this path did a full
+/// RocksDB-iterator KV scan per call (the archive-OOM leak); the memoized value
+/// must equal what that scan produced.
+#[test]
+fn phase_metadata_memo_is_transparent_and_invalidates() {
+    use num_bigint::BigInt;
+
+    let crdt = fresh_crdt();
+    let app = [0x11u8; 32];
+    let mk = |d0: u8| {
+        let mut a = [0u8; 32];
+        a[0] = d0;
+        Location { app_address: app, data_address: a }
+    };
+
+    // Empty shard → no vertex-adds metadata (and a repeat read agrees).
+    assert!(crdt.sub_shard_metadata_for_filter(&app).is_none());
+    assert!(crdt.sub_shard_metadata_for_filter(&app).is_none());
+
+    // First add → next read reflects it (memo was invalidated by `stage`).
+    crdt.add_vertex(&mk(0x01), b"hello").unwrap(); // 5 bytes
+    let m1 = crdt.sub_shard_metadata_for_filter(&app).expect("metadata after add");
+    assert_eq!(m1.leaf_count, 1);
+    assert_eq!(m1.size, BigInt::from(5u64));
+    // Repeat read is a memo HIT → identical.
+    let m1b = crdt.sub_shard_metadata_for_filter(&app).expect("memo hit");
+    assert_eq!((m1b.leaf_count, m1b.size.clone()), (m1.leaf_count, m1.size.clone()));
+
+    // Second add → must UPDATE, not serve the stale memo.
+    crdt.add_vertex(&mk(0x02), b"worldwide").unwrap(); // 9 bytes
+    let m2 = crdt.sub_shard_metadata_for_filter(&app).expect("metadata after 2nd add");
+    assert_eq!(m2.leaf_count, 2);
+    assert_eq!(m2.size, BigInt::from(14u64));
+
+    // Commit also invalidates; the committed read matches the pre-commit live value.
+    crdt.commit(1).unwrap();
+    let m3 = crdt.sub_shard_metadata_for_filter(&app).expect("metadata after commit");
+    assert_eq!(m3.leaf_count, 2);
+    assert_eq!(m3.size, BigInt::from(14u64));
+}

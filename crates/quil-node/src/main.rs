@@ -493,9 +493,45 @@ async fn main() -> anyhow::Result<ExitCode> {
         info!(path = %path.display(), "CPU profiling requested (requires pprof crate integration)");
     }
 
-    // Memory profiling (placeholder — requires jemalloc-ctl or similar)
+    // On-demand jemalloc heap-profile dump via SIGUSR1. Heap profiling is
+    // compiled in (tikv-jemallocator `profiling` feature); it only produces
+    // output when the process was started with `MALLOC_CONF=prof:true`
+    // (+ `prof_prefix:<path>`). This is the remote-box workflow: the operator
+    // runs `kill -USR1 <pid>` once, watches RSS climb, runs it again, then
+    // diffs the two `.heap` files with `jeprof --base=` to name the leaking
+    // allocation stacks. Armed unconditionally on unix so no restart/flag is
+    // needed to capture a dump; a no-prof build just logs the enabling hint.
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sig = match signal(SignalKind::user_defined1()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "SIGUSR1 heap-dump handler unavailable");
+                    return;
+                }
+            };
+            info!(
+                "SIGUSR1 heap-profile handler armed — `kill -USR1 <pid>` dumps a jemalloc \
+                 profile (requires MALLOC_CONF=prof:true,prof_prefix:/tmp/jeprof at startup)"
+            );
+            while sig.recv().await.is_some() {
+                match crate::mem_stats::dump_heap_profile() {
+                    Ok(()) => info!(
+                        "jemalloc heap profile dumped to the MALLOC_CONF prof_prefix path \
+                         (<prefix>.<pid>.<seq>.heap)"
+                    ),
+                    Err(e) => warn!(error = %e, "heap profile dump failed"),
+                }
+            }
+        });
+    }
     if let Some(ref path) = args.memprofile {
-        info!(path = %path.display(), "memory profiling requested (will write after 20 minutes)");
+        info!(
+            path = %path.display(),
+            "note: --memprofile is superseded by the SIGUSR1 heap dump (MALLOC_CONF=prof:true)"
+        );
     }
 
     info!(
