@@ -23,6 +23,7 @@
     feature = "secp256k1",
     feature = "ed25519",
     feature = "ed448",
+    feature = "falcon",
     feature = "rsa"
 ))]
 use quick_protobuf::{BytesReader, Writer};
@@ -51,6 +52,7 @@ use crate::error::OtherVariantError;
     feature = "secp256k1",
     feature = "ed25519",
     feature = "ed448",
+    feature = "falcon",
     feature = "rsa"
 ))]
 use crate::proto;
@@ -809,6 +811,7 @@ impl PublicKey {
     feature = "secp256k1",
     feature = "ed25519",
     feature = "ed448",
+    feature = "falcon",
     feature = "rsa"
 ))]
 impl TryFrom<proto::PublicKey> for PublicKey {

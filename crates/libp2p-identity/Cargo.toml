@@ -36,6 +36,11 @@ repository = "https://github.com/libp2p/rust-libp2p"
 all-features = true
 
 [features]
+# Quilibrium fork: `falcon` (KeyType=5) is the mandatory network identity, so it
+# is ON BY DEFAULT here. A hard `compile_error!` in src/lib.rs additionally
+# refuses to build this crate without it — see the note there. Consumers that
+# pass `default-features = false` MUST re-add `falcon`.
+default = ["falcon"]
 ecdsa = [
     "dep:p256",
     "dep:zeroize",

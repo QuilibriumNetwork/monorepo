@@ -35,6 +35,28 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![allow(unreachable_pub)]
+
+// Quilibrium REQUIRES the Falcon (FN-DSA-512, libp2p `KeyType = 5`) key type:
+// it is the network peer identity (the `q-prover-key`). This fork is only ever
+// built as part of the Quilibrium workspace, where Falcon must always be
+// present — otherwise `KeyType = 5` peer keys silently fail to decode (the
+// match arm below is `#[cfg]`'d out) and the node cannot parse any peer.
+//
+// `falcon` is a DEFAULT feature (see Cargo.toml), so it is on unless a consumer
+// explicitly passes `default-features = false` without re-enabling it. This
+// tripwire converts that mistake — or a feature-unification / patch-resolution
+// slip that drops `falcon` — from a silent, confusing runtime failure into a
+// loud, actionable build failure. Do NOT relax it: if you hit this, add
+// `falcon` back to the `libp2p-identity` dependency's feature list.
+#[cfg(not(feature = "falcon"))]
+compile_error!(
+    "libp2p-identity was built WITHOUT the `falcon` feature, but Quilibrium \
+     mandates the Falcon (KeyType=5) network identity. Enable it on the \
+     `libp2p-identity` dependency (`features = [\"falcon\", ...]`) or keep \
+     default features enabled — do not build with `default-features = false` \
+     unless you re-add `falcon`."
+);
+
 #[cfg(any(
     feature = "ecdsa",
     feature = "secp256k1",

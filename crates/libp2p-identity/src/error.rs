@@ -45,6 +45,7 @@ impl DecodingError {
         feature = "secp256k1",
         feature = "ed25519",
         feature = "ed448",
+        feature = "falcon",
         feature = "rsa"
     ))]
     pub(crate) fn failed_to_parse<E, S>(what: &'static str, source: S) -> Self
@@ -66,6 +67,7 @@ impl DecodingError {
         feature = "secp256k1",
         feature = "ed25519",
         feature = "ed448",
+        feature = "falcon",
         feature = "rsa"
     ))]
     pub(crate) fn bad_protobuf(
@@ -108,7 +110,11 @@ pub struct SigningError {
 
 /// An error during encoding of key material.
 impl SigningError {
-    #[cfg(any(all(feature = "rsa", not(target_arch = "wasm32")), feature = "ed448"))]
+    #[cfg(any(
+        all(feature = "rsa", not(target_arch = "wasm32")),
+        feature = "ed448",
+        feature = "falcon"
+    ))]
     pub(crate) fn new<S: ToString>(msg: S) -> Self {
         Self {
             msg: msg.to_string(),
