@@ -139,15 +139,18 @@ mod tests {
     /// PeerId, and round-trip gRPC-shaped bytes through the encrypted channel.
     #[tokio::test]
     async fn pq_8340_loopback_round_trips_over_tcp() {
-        let server_seed = [0x11u8; 57];
-        let client_seed = [0x22u8; 57];
+        // The `:8340` identity is the node's Falcon q-prover-key (1281-byte
+        // signing key), NOT an Ed448 seed — the handshake keys on the same
+        // Falcon bytes the p2p transport + allowlist use.
+        let server_seed = quil_p2p::generate_falcon_signing_key();
+        let client_seed = quil_p2p::generate_falcon_signing_key();
 
         // Expected identities (same derivation the allowlist uses).
-        let server_id = keypair_from_ed448_seed(&server_seed)
+        let server_id = Keypair::falcon_from_bytes(&server_seed)
             .unwrap()
             .public()
             .to_peer_id();
-        let client_id = keypair_from_ed448_seed(&client_seed)
+        let client_id = Keypair::falcon_from_bytes(&client_seed)
             .unwrap()
             .public()
             .to_peer_id();

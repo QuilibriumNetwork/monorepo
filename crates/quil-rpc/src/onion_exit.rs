@@ -291,7 +291,7 @@ mod tests {
         let mut allowed = HashSet::new();
         allowed.insert("/allowed/Method".to_string());
         let lookup: PeerRoutingLookup = Arc::new(|_| panic!("must not dial on auth failure"));
-        let proxy = OnionExitProxy::new([7u8; 57], lookup, allowed);
+        let proxy = OnionExitProxy::new(quil_p2p::generate_falcon_signing_key(), lookup, allowed);
 
         let req = build_onion_rpc(b"peer", "/forbidden/Method", b"x");
         let err = proxy.process(req).await.unwrap_err();
@@ -300,7 +300,8 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_payload_is_rejected() {
-        let proxy = OnionExitProxy::new([0u8; 57], Arc::new(|_| None), HashSet::new());
+        let proxy =
+            OnionExitProxy::new(quil_p2p::generate_falcon_signing_key(), Arc::new(|_| None), HashSet::new());
         let err = proxy.process(vec![0x00]).await.unwrap_err();
         assert!(err.contains("malformed"), "got: {err}");
     }

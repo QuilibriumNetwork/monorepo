@@ -468,6 +468,11 @@ async fn run_state_jump(
     frame_validate: quil_rpc::frame_sync::FrameValidator,
     prover_registry: Arc<quil_execution::SharedProverRegistry>,
     crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    // Archives pull EVERY app-shard so they can serve full state. A regular
+    // (non-archive) passes `false`: it pulls only the global prover tree +
+    // advances the cursor — enough to STOP replaying ancient pre-migration
+    // history — and syncs its own assigned shards via the worker path.
+    sync_all_shards: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Option<u64> {
     let local_head = clock_store.get_latest_frame_number().unwrap_or(0);
@@ -550,40 +555,44 @@ async fn run_state_jump(
         // prefix)`. Dedup by that id (QUIL sub-shards share an l1‖l2 shard_key
         // but differ in prefix, so we must NOT dedup on shard_key).
         let _ = &anchor;
-        let shard_rows = shards_store.range_app_shards().unwrap_or_default();
-        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        // Regulars skip the ALL-shards pull (see `sync_all_shards`): prover tree
+        // + cursor advance is enough to stop them replaying ancient history.
         let mut shard_count = 0usize;
-        let mut aborted = false;
-        for row in &shard_rows {
-            if cancel.is_cancelled() {
-                return None;
+        if sync_all_shards {
+            let shard_rows = shards_store.range_app_shards().unwrap_or_default();
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            let mut aborted = false;
+            for row in &shard_rows {
+                if cancel.is_cancelled() {
+                    return None;
+                }
+                if row.shard_key.len() < 35 {
+                    continue;
+                }
+                let mut l2 = [0u8; 32];
+                l2.copy_from_slice(&row.shard_key[3..35]);
+                let shard_id = quil_forest::Forest::addr_path_shard_id(&l2, &row.prefix);
+                if !seen.insert(shard_id.clone()) {
+                    continue;
+                }
+                if let Err(e) =
+                    crate::forest_sync::pull_shard_from_peer(&addr, &seed, crdt.clone(), &shard_id).await
+                {
+                    // A vertex-adds (anchor) failure means we didn't reach the peer's
+                    // generation for this shard — abort and retry a fresh N on another
+                    // peer (a partial jump must NOT be committed).
+                    warn!(
+                        %addr, error = %e,
+                        "state-jump: shard sync failed — aborting, retrying another peer",
+                    );
+                    aborted = true;
+                    break;
+                }
+                shard_count += 1;
             }
-            if row.shard_key.len() < 35 {
+            if aborted {
                 continue;
             }
-            let mut l2 = [0u8; 32];
-            l2.copy_from_slice(&row.shard_key[3..35]);
-            let shard_id = quil_forest::Forest::addr_path_shard_id(&l2, &row.prefix);
-            if !seen.insert(shard_id.clone()) {
-                continue;
-            }
-            if let Err(e) =
-                crate::forest_sync::pull_shard_from_peer(&addr, &seed, crdt.clone(), &shard_id).await
-            {
-                // A vertex-adds (anchor) failure means we didn't reach the peer's
-                // generation for this shard — abort and retry a fresh N on another
-                // peer (a partial jump must NOT be committed).
-                warn!(
-                    %addr, error = %e,
-                    "state-jump: shard sync failed — aborting, retrying another peer",
-                );
-                aborted = true;
-                break;
-            }
-            shard_count += 1;
-        }
-        if aborted {
-            continue;
         }
 
         // Commit the jump: store the head frame record (clock head → target),
@@ -743,15 +752,22 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             })
         };
 
-        // Far-behind archive recovery: spawn a one-shot full-state jump (prover
-        // tree + every app-shard, pinned to a single peer frame N). It fires
-        // only for archives stranded far below the migration-recovery boundary
-        // (`STATE_JUMP_MAX_FRAME`); for a healthy or only-slightly-behind node
-        // it returns immediately (gate check) and is a no-op. The poller waits
-        // on `poller_startup_barrier` before reading its cursor, so it always
-        // sees the POST-jump head and never replays (re-materializes) below the
+        // Far-behind recovery: spawn a one-shot state jump pinned to a single
+        // peer frame N. It fires for ANY node stranded far below the
+        // migration-recovery boundary (`STATE_JUMP_MAX_FRAME`) — NOT just
+        // archives — so a regular that has been offline since the flag day
+        // doesn't try to replay ancient (pre-migration, now-invalid) history
+        // from the poller. For a healthy or only-slightly-behind node the jump
+        // returns immediately (gate check) and is a no-op.
+        //
+        // `sync_all_shards = archive_mode`: archives pull the prover tree AND
+        // every app-shard (they must serve full state); a regular pulls only
+        // the prover tree + advances the cursor, and syncs its own assigned
+        // shards via the worker path. The poller waits on
+        // `poller_startup_barrier` before reading its cursor, so it always sees
+        // the POST-jump head and never replays (re-materializes) below the
         // synced frame. The barrier lifts whether the jump did work or no-op'd.
-        let poller_startup_barrier: Option<tokio::sync::oneshot::Receiver<()>> = if archive_mode {
+        let poller_startup_barrier: Option<tokio::sync::oneshot::Receiver<()>> = {
             let (sj_tx, sj_rx) = tokio::sync::oneshot::channel::<()>();
             let sj_pool = archive_pool.clone();
             let sj_cs = clock_store.clone();
@@ -761,6 +777,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sj_fv = frame_validate.clone();
             let sj_pr = prover_registry.clone();
             let sj_crdt = crdt.clone();
+            let sj_all_shards = archive_mode;
             // DETACH (fire-and-forget) — NOT `sup.spawn`. The state-jump is a
             // one-shot task that RETURNS when done (jump complete or no-op); a
             // supervised task that exits is treated as a fatal
@@ -778,11 +795,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     sj_fv,
                     sj_pr,
                     sj_crdt,
+                    sj_all_shards,
                     tokio_util::sync::CancellationToken::new(),
                 )
                 .await
                 {
-                    info!(target = n, "state-jump: archive fast-forwarded to peer head");
+                    info!(target = n, "state-jump: fast-forwarded to peer head");
                 }
                 // Lift the barrier regardless of outcome so the poller proceeds.
                 let _ = sj_tx.send(());
@@ -790,8 +808,6 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 }
             });
             Some(sj_rx)
-        } else {
-            None
         };
 
         let exec_mgr_for_poller = exec_manager.clone();

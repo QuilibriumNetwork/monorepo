@@ -314,6 +314,16 @@ pub async fn run_archive_poller(
     let mut stall_frame: Option<u64> = None;
     let mut stall_endpoints: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // Distinct archives that served a frame at the stuck height which FAILED
+    // validation (forged, or — the real case — a legacy pre-migration frame
+    // whose VDF/allowlist can never pass under the new chain). Tracked apart
+    // from `stall_endpoints` (NotFound) because it's a different failure mode,
+    // but it trips the same skip: if enough distinct honest archives all serve
+    // an unvalidatable frame at the same height with the head far past, no peer
+    // will ever serve a valid one, so the gap must be abandoned to make
+    // progress rather than looping "failed validation — rotating" forever.
+    let mut stall_invalid_endpoints: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     // Distinct archives that must independently report NotFound for the same
     // frame before we treat it as a permanent hole.
     const UNFILLABLE_DISTINCT_ENDPOINTS: usize = 3;
@@ -449,6 +459,10 @@ pub async fn run_archive_poller(
             // transport error / timeout. Only NotFound counts toward
             // declaring a frame permanently unfillable.
             let mut failed_not_found = false;
+            // Whether the failure was a served-but-unvalidatable frame (as
+            // opposed to NotFound / transport). Counts toward the same skip via
+            // its own distinct-endpoint tally.
+            let mut failed_validation = false;
             for fn_ in (last_frame + 1)..new_number {
                 match tokio::time::timeout(
                     config.call_timeout,
@@ -468,6 +482,7 @@ pub async fn run_archive_poller(
                             if !validate(&frame) {
                                 warn!(%addr, frame = fn_, "catchup frame failed validation — rotating endpoint");
                                 failed_frame = Some(fn_);
+                                failed_validation = true;
                                 break;
                             }
                         }
@@ -498,37 +513,49 @@ pub async fn run_archive_poller(
             }
             if let Some(bad) = failed_frame {
                 // Track distinct archives that report this exact frame as a
-                // genuine NotFound. A new stuck frame resets the tally.
+                // genuine NotFound OR serve an unvalidatable frame at it. A new
+                // stuck frame resets both tallies.
                 if stall_frame != Some(bad) {
                     stall_frame = Some(bad);
                     stall_endpoints.clear();
+                    stall_invalid_endpoints.clear();
                 }
                 if failed_not_found {
                     stall_endpoints.insert(addr.clone());
                 }
+                if failed_validation {
+                    stall_invalid_endpoints.insert(addr.clone());
+                }
 
                 // Abandon a permanently-unfillable gap. When enough DISTINCT
                 // archives have each affirmatively returned NotFound for the
-                // same frame, and the network head sits well beyond it, no
-                // peer will ever serve it (a hole from a coordinated fleet
-                // restart the re-bootstrapped chain never produced). Retrying
-                // forever wedges catch-up at `bad` and never reaches the
-                // frames that DO exist. Skip it: advance `last_frame` past the
-                // hole so the poller resumes at `bad + 1`. The separate
-                // record-gap backfill/scan still tracks the hole for any later
-                // fill; this only unblocks forward progress.
+                // same frame — OR each served a frame at it that fails
+                // validation (a legacy pre-migration height the new chain can
+                // never validate) — and the network head sits well beyond it,
+                // no peer will ever serve a valid record. Retrying forever
+                // wedges catch-up at `bad` and never reaches the frames that DO
+                // exist. Skip it: advance `last_frame` past the hole so the
+                // poller resumes at `bad + 1`. The separate record-gap
+                // backfill/scan still tracks the hole for any later fill; this
+                // only unblocks forward progress.
                 let head_far_past = new_number >= bad.saturating_add(UNFILLABLE_HEAD_MARGIN);
-                if stall_endpoints.len() >= UNFILLABLE_DISTINCT_ENDPOINTS && head_far_past {
+                let notfound_unfillable =
+                    stall_endpoints.len() >= UNFILLABLE_DISTINCT_ENDPOINTS;
+                let invalid_unfillable =
+                    stall_invalid_endpoints.len() >= UNFILLABLE_DISTINCT_ENDPOINTS;
+                if (notfound_unfillable || invalid_unfillable) && head_far_past {
                     warn!(
                         failed_frame = bad,
                         head = new_number,
-                        distinct_endpoints = stall_endpoints.len(),
+                        distinct_notfound = stall_endpoints.len(),
+                        distinct_invalid = stall_invalid_endpoints.len(),
                         skip_to = bad + 1,
-                        "catchup: frame is unfillable (NotFound across multiple archives, head far past) — abandoning gap and skipping past it"
+                        "catchup: frame is unfillable (NotFound or unvalidatable across multiple archives, head far past) — abandoning gap and skipping past it"
                     );
                     last_frame = bad;
                     stall_frame = None;
                     stall_endpoints.clear();
+                    stall_invalid_endpoints.clear();
                     // Keep the current endpoint (it IS ahead and serving) and
                     // continue straight into head processing / next fill.
                     continue;
@@ -548,7 +575,9 @@ pub async fn run_archive_poller(
                     resume_from = bad,
                     head = new_number,
                     not_found = failed_not_found,
+                    validation_failed = failed_validation,
                     distinct_notfound = stall_endpoints.len(),
+                    distinct_invalid = stall_invalid_endpoints.len(),
                     "catchup stalled at frame; rotating endpoint and retrying from last good frame"
                 );
                 current_client = None;

@@ -59,6 +59,15 @@ pub fn peer_id_from_falcon_pubkey(public_key: &[u8]) -> Vec<u8> {
     multihash
 }
 
+/// Generate a fresh random Falcon-512 keypair and return its raw 1281-byte
+/// signing key. Feed this into `Keypair::falcon_from_bytes` (for the peer-id)
+/// and to the `:8340` PQNoise handshake (which keys on the same signing bytes).
+/// Test/tooling support for exercising the Falcon `:8340` identity path without
+/// a keystore.
+pub fn generate_falcon_signing_key() -> Vec<u8> {
+    libp2p::identity::falcon::Keypair::generate().secret_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
