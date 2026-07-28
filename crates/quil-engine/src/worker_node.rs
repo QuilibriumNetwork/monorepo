@@ -560,6 +560,10 @@ impl WorkerOnlyNode {
             // (P3) Cluster-mode app-shard CW not wired yet (localnet uses the
             // in-process thread_worker path, which is config-gated). Legacy.
             app_consensus_cw: false,
+            // Cluster-mode worker: no config.db path here (store comes via the
+            // owned bundle / channel factory). FOLLOW-UP: thread the worker's
+            // db path so cluster app-shard journals persist too. Ephemeral for now.
+            db_config: quil_config::DbConfig::default(),
         };
 
         let (engine, handle) = AppConsensusEngine::new(

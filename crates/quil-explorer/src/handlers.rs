@@ -114,14 +114,44 @@ pub async fn handle_frames(
             Err(_) => return error(StatusCode::BAD_REQUEST, "invalid frame number"),
         }
     };
-    match frame {
-        Ok(frame) => protojson_ok(
-            protojson::GLOBAL_FRAME,
-            &frame,
-            if cacheable { Some(CACHE_LONG) } else { None },
-        ),
-        Err(e) => store_error(&e),
+    let frame = match frame {
+        Ok(f) => f,
+        Err(e) => return store_error(&e),
+    };
+    let fnum = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+    // Serialize the frame, then merge per-bundle MATERIALIZATION outcomes so the
+    // UI can show whether each request actually applied (a frame carries every
+    // structurally-valid bundle, but some are rejected/failed at materialize).
+    // `requestOutcomes[i]` aligns to `requests[i]`.
+    let bytes = match protojson::to_protojson(protojson::GLOBAL_FRAME, &frame) {
+        Ok(b) => b,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let outcomes = state
+        .clock_store
+        .get_global_clock_frame_outcomes(fnum)
+        .unwrap_or_default();
+    // Don't cache a frame immutably until its outcomes exist (materialization
+    // runs a beat after finalization); an empty-request frame needs none.
+    let cacheable = cacheable && (frame.requests.is_empty() || !outcomes.is_empty());
+    let out_json: Vec<serde_json::Value> = outcomes
+        .iter()
+        .map(|o| serde_json::json!({ "status": o.status.name(), "error": o.error }))
+        .collect();
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "requestOutcomes".to_string(),
+            serde_json::Value::Array(out_json),
+        );
     }
+    let merged = serde_json::to_vec(&v).unwrap_or(bytes);
+    build_response(
+        StatusCode::OK,
+        merged,
+        if cacheable { Some(CACHE_LONG) } else { None },
+    )
 }
 
 pub async fn handle_certified(

@@ -77,19 +77,34 @@ pub async fn run_check_submit(
     println!("[check-submit] prover pubkey  : {}", hex::encode(&bls_pubkey));
 
     // The :8340 network identity is the node's Falcon q-prover-key (loaded
-    // from the keystore), not the Ed448 seed.
+    // from the keystore), not the Ed448 seed. If the keystore has no Falcon
+    // key (e.g. a probe run from a pre-Falcon-migration config), fall back to
+    // a FRESH ephemeral Falcon identity — archives accept any authenticated
+    // peer for `SubmitGlobalMessage`, so this still exercises the full PQNoise
+    // handshake + submit path end-to-end.
     let falcon_signing_key = {
         use quil_keys::KeyManager as _;
         let keys_path = std::path::PathBuf::from(&config.key.key_store_file.path);
-        let fkm = quil_keys::FileKeyManager::new(
+        let loaded = quil_keys::FileKeyManager::new(
             keys_path,
             &config.key.key_store_file.encryption_key,
             "default-proving-key".to_string(),
             Box::new(quil_crypto::FalconKeyConstructor),
         )
-        .context("open keystore for Falcon network identity")?;
-        fkm.get_private_key(quil_types::crypto::KeyType::Falcon512)
-            .context("load Falcon q-prover-key")?
+        .and_then(|fkm| fkm.get_private_key(quil_types::crypto::KeyType::Falcon512));
+        match loaded {
+            Ok(k) => k,
+            Err(e) => {
+                println!(
+                    "[check-submit] no Falcon q-prover-key in keystore ({e}); \
+                     using a fresh ephemeral Falcon network identity for the probe"
+                );
+                let (net_signer, _pk) =
+                    quil_types::crypto::BlsConstructor::new_key(&quil_crypto::FalconKeyConstructor)
+                        .map_err(|e| anyhow::anyhow!("generate ephemeral Falcon net key: {e}"))?;
+                net_signer.private_key().to_vec()
+            }
+        }
     };
 
     // ---- step 1: connect_mtls (transport + handshake) ----

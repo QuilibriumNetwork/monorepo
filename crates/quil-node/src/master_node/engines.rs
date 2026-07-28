@@ -100,6 +100,7 @@ pub(crate) fn init_engines(storage: &StorageHandles) -> EngineHandles {
         // buckets, and the migrated coins never passed through `add_vertex`, so
         // without this they'd be omitted. Steady-state growth is then tracked
         // incrementally by the mutation counters (never re-scanned).
+        info!(apps = committed_apps.len(), "seeding per-sub-shard live-size baseline (one-time; persisted after)");
         if let Err(e) = crdt.warm_sizes(&committed_apps) {
             tracing::warn!(error = %e, "warm_sizes (live-size baseline) failed");
         } else {

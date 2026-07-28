@@ -115,6 +115,14 @@ pub struct HypergraphCrdt {
     /// address ‖ the sub-shard prefix, so each of the 64 sub-shard trees tracks
     /// its own version.
     phase_versions: RwLock<HashMap<(Vec<u8>, usize), u64>>,
+    /// The exact JMT version each Level-1 global bucket tree (keyed by first
+    /// address byte `0..=255`) was last committed at — the L1 analogue of
+    /// [`phase_versions`](Self::phase_versions). Seeded from the persisted
+    /// head marker (`forest.read_global_head_version`, written by the
+    /// migration and every live commit) so version-exact reads
+    /// ([`global_commitments`](Self::global_commitments)) address the current
+    /// bucket root across restarts and on the mem backend.
+    global_versions: RwLock<HashMap<u8, u64>>,
     /// Apps that split into address-path sub-shards, mapped to their COMPLETE
     /// shard-prefix set (each prefix a `ShardInfo.prefix`: QUIL 6-bit indices or
     /// split-marker bytes — see [`canonical_shard_bit_paths`]). Absent ⇒ the app
@@ -157,6 +165,7 @@ impl HypergraphCrdt {
             forest: RwLock::new(Forest::in_memory()),
             forest_version: AtomicU64::new(0),
             phase_versions: RwLock::new(HashMap::new()),
+            global_versions: RwLock::new(HashMap::new()),
             app_shard_prefixes: RwLock::new(HashMap::new()),
             pending: RwLock::new(HashMap::new()),
             pending_blobs: RwLock::new(HashMap::new()),
@@ -276,6 +285,19 @@ impl HypergraphCrdt {
             .get(&(shard_id.to_vec(), phase_idx))
             .copied()
             .or_else(|| forest.read_head_version(shard_id, PHASES[phase_idx]).ok().flatten())
+    }
+
+    /// The last-committed version of Level-1 global bucket `index`: the
+    /// in-memory cache (covers the mem backend / same-process commits) falling
+    /// back to the persisted head marker. `None` before the bucket has ever
+    /// been committed. L1 analogue of [`resolve_phase_version_with`].
+    fn resolve_global_version(&self, forest: &Forest, index: u8) -> Option<u64> {
+        self.global_versions
+            .read()
+            .unwrap()
+            .get(&index)
+            .copied()
+            .or_else(|| forest.read_global_head_version(index).ok().flatten())
     }
 
     /// The current 32-byte root of one shard/phase tree at its last committed
@@ -576,6 +598,12 @@ impl HypergraphCrdt {
 
         let empty_root = vec![0u8; 32];
         let mut result: HashMap<ShardKey, Vec<Vec<u8>>> = HashMap::new();
+        // Level-1 global buckets touched this frame: first address byte →
+        // apps' `(app_address, AppEntry)` leaves. Committed after the shard
+        // loop into the same txn so `global_commitments` can retrieve the
+        // per-bucket roots. The global prover shard (`0xff..ff`) is excluded —
+        // its root is carried separately as `prover_tree_commitment`.
+        let mut l1_buckets: HashMap<u8, Vec<(Vec<u8>, quil_forest::AppEntry)>> = HashMap::new();
 
         for shard in &shard_keys {
             let cached_row = cached.get(shard);
@@ -755,7 +783,63 @@ impl HypergraphCrdt {
                 shard.clone(),
                 ShardMetadata { commitment: roots.to_vec(), leaf_count: va_leaf_count, size: va_size },
             );
+
+            // Accumulate this app's Level-1 leaf: value = AppEntry(app_root ‖
+            // num_leaves ‖ total_size ‖ metadata). `app_root` rolls the four
+            // committed phase roots up (same as the migration's `convert_app`);
+            // num_leaves/total_size are the app's maintained LIVE totals
+            // (`sub_meta`, all four phases, tombstone-accounted — consistent
+            // with `total_size()`). The global prover shard is excluded.
+            if shard.l2 != [0xffu8; 32] {
+                let mut phase_roots = [[0u8; 32]; 4];
+                for (p, slot) in phase_roots.iter_mut().enumerate() {
+                    if roots[p].len() == 32 {
+                        slot.copy_from_slice(&roots[p]);
+                    }
+                }
+                let app_root = quil_forest::rollup_phase_roots(&phase_roots);
+                let (num_leaves, live_size) = self.sub_meta_for(&shard.l2, &[]);
+                l1_buckets
+                    .entry(shard.l2[0])
+                    .or_default()
+                    .push((
+                        shard.l2.to_vec(),
+                        quil_forest::AppEntry {
+                            app_root,
+                            num_leaves,
+                            total_size: live_size.max(0) as u128,
+                            metadata: Vec::new(),
+                        },
+                    ));
+            }
             result.insert(shard.clone(), roots.to_vec());
+        }
+
+        // Commit the touched Level-1 global buckets into the SAME txn (atomic
+        // with the L2/L3 shard commits). Each call upserts only this frame's
+        // touched apps; untouched apps in the bucket persist because
+        // `put_value_set` builds on the bucket tree's prior version. The head
+        // version is staged + cached so version-exact reads
+        // (`global_commitments`) address the new root.
+        for (bucket, apps) in l1_buckets {
+            let ver = self
+                .resolve_global_version(&forest, bucket)
+                .map(|v| v + 1)
+                .unwrap_or(0);
+            match forest.commit_global_staged(bucket, ver, apps) {
+                Ok((_root, puts)) => {
+                    for (k, v) in puts {
+                        txn.set(&k, &v)?;
+                    }
+                    if let Some((hk, hv)) = forest.global_head_version_put(bucket, ver) {
+                        txn.set(&hk, &hv)?;
+                    }
+                    self.global_versions.write().unwrap().insert(bucket, ver);
+                }
+                Err(e) => {
+                    tracing::warn!(bucket, error = %e, "L1 global bucket commit failed");
+                }
+            }
         }
 
         if let Some(cursor_key) = cursor_key {
@@ -779,6 +863,28 @@ impl HypergraphCrdt {
     /// ever exists). Held MID-frame as shards grow (live mutation counters), not
     /// just at commit boundaries. Requires [`warm_sizes`](Self::warm_sizes) to
     /// have seeded the migrated baseline.
+    /// The 256 Level-1 global bucket roots. `global_commitments[i]` is the
+    /// root of the tree whose leaves are the `AppEntry`s (`app_root ‖
+    /// num_leaves ‖ total_size ‖ metadata`) of every app whose FIRST address
+    /// byte is `i` — empty (`vec![]`) for a bucket with no apps. Retrieved
+    /// live from the forest (maintained per-frame by `commit_inner`), read at
+    /// each bucket's exact committed version. The leader binds these into the
+    /// global frame header's `global_commitments`. Always length 256.
+    pub fn global_commitments(&self) -> Vec<Vec<u8>> {
+        let forest = self.forest.read().unwrap();
+        (0u8..=255)
+            .map(|i| match self.resolve_global_version(&forest, i) {
+                Some(ver) => forest
+                    .global_root(i, ver)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.to_vec())
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            })
+            .collect()
+    }
+
     pub fn total_size(&self) -> BigInt {
         let sum: i128 = self.sub_meta.read().unwrap().values().map(|(_, s)| *s).sum();
         BigInt::from(sum.max(0))
@@ -844,17 +950,30 @@ impl HypergraphCrdt {
                 };
                 Forest::addr_path_shard_id(&app, &prefixes[pi])
             };
+            // Load the tombstone sets ONCE (a streaming pass), so "present" is an
+            // O(1) membership test — NOT a per-leaf versioned store lookup, which
+            // on a large migrated shard is millions of reads and appears to hang.
+            let mut v_removed: std::collections::HashSet<Vec<u8>> =
+                std::collections::HashSet::new();
+            self.store.for_each_vertex_underlying("vertex", "removes", &shard_key, &mut |vk, _| {
+                v_removed.insert(vk);
+            })?;
+            let mut he_removed: std::collections::HashSet<Vec<u8>> =
+                std::collections::HashSet::new();
+            self.store.for_each_vertex_underlying("hyperedge", "removes", &shard_key, &mut |vk, _| {
+                he_removed.insert(vk);
+            })?;
             // Vertex adds: raw count for every leaf; live size only if present.
             self.store.for_each_vertex_underlying("vertex", "adds", &shard_key, &mut |vk, blob| {
                 let e = buckets.entry(route(&vk)).or_insert((0, 0));
                 e.0 += 1;
-                if !blob.is_empty() && !self.has_entry(&shard_key, 1, &vk) {
+                if !blob.is_empty() && !v_removed.contains(&vk) {
                     e.1 += blob.len() as i128;
                 }
             })?;
             // Hyperedge adds: live size only (no vertex-count contribution).
             self.store.for_each_vertex_underlying("hyperedge", "adds", &shard_key, &mut |vk, blob| {
-                if !blob.is_empty() && !self.has_entry(&shard_key, 3, &vk) {
+                if !blob.is_empty() && !he_removed.contains(&vk) {
                     buckets.entry(route(&vk)).or_insert((0, 0)).1 += blob.len() as i128;
                 }
             })?;

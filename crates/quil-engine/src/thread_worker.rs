@@ -161,6 +161,8 @@ pub struct WorkerConsensusDeps {
     pub min_active_provers_for_propose: u64,
     /// (P3) Drive app-shard consensus with commonware-simplex + Falcon.
     pub app_consensus_cw: bool,
+    /// DB config → persistent per-shard simplex-journal dir (Go parity).
+    pub db_config: quil_config::DbConfig,
     /// Callback that publishes finalized canonical FrameHeader bytes
     /// on `GLOBAL_PROVER` so archives credit our shard work toward
     /// rewards. AppFollower invokes this directly from the consensus
@@ -524,6 +526,7 @@ impl ThreadWorkerManager {
                                                         inclusion_prover,
                                                         kv_db,
                                                         app_consensus_cw: deps.app_consensus_cw,
+                                                        db_config: deps.db_config.clone(),
                                                     };
                                                     let (engine, app_handle) = crate::app_engine::AppConsensusEngine::new(
                                                         core_id,

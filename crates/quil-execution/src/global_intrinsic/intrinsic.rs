@@ -1799,6 +1799,26 @@ impl GlobalIntrinsic {
             }
             None => (0u64, 0u64),
         };
+        // PROOF-OF-STORAGE GATE: a storage frame (anchored to a real global
+        // frame, `global_frame_number > 0`) that covers a shard WITH committed
+        // data (`state_size > 0`) MUST carry a storage attestation proving the
+        // prover possesses the replica. If the attestation is absent, the prover
+        // has not proven storage → WITHHOLD its reward for this shard (zero the
+        // reward basis) — `shard_md` feeds ONLY the issuance calc, so this pays 0
+        // without halting the frame or evicting (`audit_storage_attestation` is
+        // the hard-reject path for a PRESENT-but-invalid attestation). The
+        // decision is deterministic: `op.storage_attestation` /
+        // `global_frame_number` are header fields and `state_size` derives from
+        // committed state, so every node withholds identically. An empty shard
+        // (`state_size == 0`) has nothing to attest and is unaffected.
+        let unproven_storage = op.global_frame_number > 0
+            && state_size_u64 > 0
+            && op.storage_attestation.is_empty();
+        let (state_size_u64, shard_count_u64) = if unproven_storage {
+            (0u64, 0u64)
+        } else {
+            (state_size_u64, shard_count_u64)
+        };
         let shard_md = super::prover_shard_update::ShardMetadata {
             state_size: state_size_u64,
             shard_count: shard_count_u64,

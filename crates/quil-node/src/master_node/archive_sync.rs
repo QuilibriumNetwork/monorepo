@@ -24,11 +24,15 @@ fn archive_frame_is_valid(
     };
     let frame_num = h.frame_number;
     // 1. Genesis-prover allowlist (frame header `prover` is the 32-byte address).
+    // Common + benign on startup: the frame poller backfills over LEGACY
+    // pre-migration frames whose producer isn't a genesis archive. Log at debug
+    // so it isn't noisy; the gossip path (`message_loop.rs`) keeps `warn` since
+    // an unsolicited non-genesis frame there is a possible attacker.
     if !genesis_prover_addrs.contains(&h.prover) {
-        warn!(
+        debug!(
             frame = frame_num,
             prover = %hex::encode(&h.prover),
-            "archive frame: INVALID PROVER — not a genesis prover, dropping"
+            "archive frame: non-genesis prover, dropping (expected for legacy pre-migration frames)"
         );
         return false;
     }
@@ -649,6 +653,11 @@ pub(crate) struct ArchiveSyncArgs {
     /// the receive loop routes CW-channel `:8340` messages through it.
     pub cw_router:
         Arc<std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>>,
+    /// Persistent directory for the simplex consensus journal (a stable subdir
+    /// of the node's data dir). Without a fixed path the CW runtime defaults to
+    /// a random temp dir and every restart replays consensus from the migration
+    /// head instead of resuming.
+    pub cw_storage_dir: std::path::PathBuf,
 }
 
 pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncArgs) {
@@ -684,6 +693,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         consensus_committee_peer_ids,
         consensus_leader_timeout_secs,
         cw_router,
+        cw_storage_dir,
     } = args;
 
     // The archive-sync transport identity is the FALCON network key (all
@@ -1043,6 +1053,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sync_consensus_committee_peer_ids = consensus_committee_peer_ids.clone();
             let sync_consensus_leader_timeout_secs = consensus_leader_timeout_secs;
             let sync_cw_router = cw_router.clone();
+            let sync_cw_storage_dir = cw_storage_dir.clone();
             let seed = std::sync::Arc::new(seed.clone());
             sup.spawn("archive-prover-tree-sync", move |sync_token| async move {
                 // Archive nodes ARE the source of truth — they don't wait
@@ -1723,6 +1734,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     Arc::new(quil_tries::ShaInclusionProver)
                                                         as Arc<dyn quil_types::crypto::InclusionProver + Send + Sync>,
                                                     Some(sync_em.clone()),
+                                                    // CRDT for the prover_tree_commitment the leader
+                                                    // binds into each frame header + VDF challenge.
+                                                    Some(sync_crdt.clone()),
                                                 ));
 
                                             // This node's committee identity IS its proving key
@@ -1807,6 +1821,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 leader_timeout_secs: sync_consensus_leader_timeout_secs,
                                                 transport,
                                                 resolve_peer,
+                                                storage_directory: sync_cw_storage_dir.clone(),
                                             };
                                             match crate::cw_consensus_bridge::start_cw_global_consensus(deps) {
                                                 Some(router) => {

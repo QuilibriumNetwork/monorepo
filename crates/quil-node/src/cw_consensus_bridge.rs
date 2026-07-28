@@ -108,6 +108,10 @@ pub struct CwGlobalDeps {
     pub leader_timeout_secs: u64,
     pub transport: Arc<dyn GlobalConsensusTransport>,
     pub resolve_peer: PeerResolver,
+    /// Persistent directory for the simplex journal. MUST be stable under the
+    /// node's data dir so consensus resumes across restarts (the default is a
+    /// random temp dir → every restart replays from the migration head).
+    pub storage_directory: std::path::PathBuf,
 }
 
 /// Build the committee, start the simplex engine, and return the inbound router.
@@ -146,6 +150,7 @@ pub fn start_cw_global_consensus(deps: CwGlobalDeps) -> Option<CwInboundRouter> 
         deps.genesis_frame_number,
         deps.leader_timeout_secs,
         deps.transport,
+        deps.storage_directory,
     );
 
     tracing::info!("commonware-simplex global consensus started");

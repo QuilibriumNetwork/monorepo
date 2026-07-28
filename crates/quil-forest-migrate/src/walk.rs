@@ -288,12 +288,19 @@ pub fn convert_db(
         global_apps.entry(g).or_default().push((shard_key.l2.to_vec(), app_entry));
     }
 
-    // L1: commit each touched global tree.
+    // L1: commit each touched global tree. Record each bucket's head version
+    // (as the shard-phase trees do) so the LIVE commit path can resolve the
+    // next version (`head + 1`) after the forest version advances past the
+    // migration version — without it, the first live L1 commit would start at
+    // version 0 and JMT would reject the out-of-order write.
     let mut global_roots = BTreeMap::new();
     for (g, apps) in global_apps {
         let root = forest
             .commit_global(g, version, apps)
             .map_err(|e| anyhow::anyhow!("commit_global: {e}"))?;
+        forest
+            .write_global_head_version(g, version)
+            .map_err(|e| anyhow::anyhow!("write_global_head_version: {e}"))?;
         global_roots.insert(g, root);
     }
 

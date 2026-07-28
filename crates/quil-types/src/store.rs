@@ -115,6 +115,59 @@ impl PendingShardChange {
 // Domain-specific stores
 // ---------------------------------------------------------------------------
 
+/// The result of MATERIALIZING one request bundle in a finalized frame.
+/// A frame carries every structurally-valid bundle, but that does not mean the
+/// bundle's op actually applied — it may fail signature validation or execution.
+/// Recorded per bundle (in frame order) so the explorer can show whether each
+/// request took effect. Deterministic across nodes (same frame → same outcomes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestStatus {
+    /// `process_message` succeeded — the op applied.
+    Succeeded,
+    /// Failed signature / PoP / protocol validation before execution.
+    Rejected,
+    /// Passed validation but `process_message` returned an error.
+    Failed,
+    /// Structurally unusable (canonical-encode failure / too short).
+    Skipped,
+}
+
+impl RequestStatus {
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            RequestStatus::Succeeded => 0,
+            RequestStatus::Rejected => 1,
+            RequestStatus::Failed => 2,
+            RequestStatus::Skipped => 3,
+        }
+    }
+    pub fn from_u8(b: u8) -> Self {
+        match b {
+            1 => RequestStatus::Rejected,
+            2 => RequestStatus::Failed,
+            3 => RequestStatus::Skipped,
+            _ => RequestStatus::Succeeded,
+        }
+    }
+    /// Lowercase wire name for the explorer JSON.
+    pub fn name(&self) -> &'static str {
+        match self {
+            RequestStatus::Succeeded => "succeeded",
+            RequestStatus::Rejected => "rejected",
+            RequestStatus::Failed => "failed",
+            RequestStatus::Skipped => "skipped",
+        }
+    }
+}
+
+/// One bundle's materialization outcome: status + a short reason (empty for
+/// `Succeeded`/`Skipped`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestOutcome {
+    pub status: RequestStatus,
+    pub error: String,
+}
+
 /// Clock/frame storage.
 pub trait ClockStore: Send + Sync {
     fn new_transaction(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
@@ -138,6 +191,25 @@ pub trait ClockStore: Send + Sync {
         frame_number: u64,
         selector: &[u8],
     ) -> Result<proto::global::GlobalFrame>;
+    /// Persist the per-bundle MATERIALIZATION outcomes for a frame (in frame
+    /// order, one per `frame.requests` bundle). Written by the materializer
+    /// AFTER the frame + its requests are stored. Default no-op for backends
+    /// that don't record outcomes (tests / in-memory).
+    fn put_global_clock_frame_outcomes(
+        &self,
+        _frame_number: u64,
+        _outcomes: &[RequestOutcome],
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Read the per-bundle materialization outcomes for a frame (empty if the
+    /// frame hasn't materialized yet or the backend doesn't record them).
+    fn get_global_clock_frame_outcomes(
+        &self,
+        _frame_number: u64,
+    ) -> Result<Vec<RequestOutcome>> {
+        Ok(Vec::new())
+    }
     /// Returns up to `limit` candidate frames in
     /// `[min_frame_number, max_frame_number]` (any selector). Used as
     /// a fallback when the certified frame isn't available — mirrors

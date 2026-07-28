@@ -38,8 +38,8 @@ pub struct FrameMaterializer {
     execution_manager: Arc<quil_execution::ExecutionEngineManager>,
     /// Prover registry for state transitions and eviction.
     prover_registry: Arc<dyn ProverRegistry>,
-    /// Clock store for frame data.
-    _clock_store: Arc<dyn ClockStore>,
+    /// Clock store for frame data (also stores per-frame materialization outcomes).
+    clock_store: Arc<dyn ClockStore>,
     /// Hypergraph CRDT for commit and snapshot operations.
     hypergraph: Arc<quil_hypergraph::HypergraphCrdt>,
     /// Hypergraph store for alt-shard commit persistence.
@@ -149,7 +149,7 @@ impl FrameMaterializer {
         Self {
             execution_manager,
             prover_registry,
-            _clock_store: clock_store,
+            clock_store,
             hypergraph,
             hypergraph_store,
             _reward_issuance: reward_issuance,
@@ -267,9 +267,21 @@ impl FrameMaterializer {
         }
         let _materialize_timer = MatTimer(std::time::Instant::now());
 
-        // 2. Compute local prover root and verify against frame
+        // 2. Compute local prover root and verify against frame.
+        //
+        // Read the LIVE forest root (state through the PARENT frame N-1, which
+        // is already materialized) — the SAME `compute_shard_root` value the
+        // leader binds into `header.prover_tree_commitment` at proposal time.
+        // This makes the check a REAL cross-check: a node whose N-1 state
+        // diverges gets a mismatch → prover sync. (The prior
+        // `compute_local_prover_root(frame_number)` here went through
+        // `commit(N)`, which returns an EMPTY global-shard root at this point —
+        // nothing is staged for frame N yet — so `verify_prover_root` always
+        // hit its empty-root tolerance and never actually verified anything.)
+        // Read-only: it neither commits nor publishes — the real state commit +
+        // snapshot publish happen in the post-apply call at step 8.
         let expected_root = &header.prover_tree_commitment;
-        let local_root = self.compute_local_prover_root(frame_number);
+        let local_root = self.read_local_prover_root();
         let prover_root_matched = self.verify_prover_root(
             frame_number,
             expected_root,
@@ -311,6 +323,11 @@ impl FrameMaterializer {
         // to `MessageCollector::mark_finalized` by the caller so consumed
         // messages leave the mempool.
         let mut finalized_bundles: Vec<Vec<u8>> = Vec::with_capacity(frame.requests.len());
+        // Per-bundle materialization outcome, ONE per `frame.requests` entry in
+        // order (so the explorer can align it to each request). Every path
+        // through the loop below pushes exactly one. Persisted after the loop.
+        use quil_types::store::{RequestOutcome, RequestStatus};
+        let mut outcomes: Vec<RequestOutcome> = Vec::with_capacity(frame.requests.len());
 
         // Batch-verify this frame's shard-`FrameHeader` BLS aggregate
         // signatures up front — one multi-pairing + one final
@@ -458,6 +475,10 @@ impl FrameMaterializer {
                         "skipping bundle that failed canonical encoding"
                     );
                     skipped += 1;
+                    outcomes.push(RequestOutcome {
+                        status: RequestStatus::Skipped,
+                        error: format!("canonical encode failed: {e}"),
+                    });
                     continue;
                 }
             };
@@ -467,6 +488,10 @@ impl FrameMaterializer {
                     "skipping bundle: encoded payload < 4 bytes (no type prefix)"
                 );
                 skipped += 1;
+                outcomes.push(RequestOutcome {
+                    status: RequestStatus::Skipped,
+                    error: "encoded payload < 4 bytes (no type prefix)".into(),
+                });
                 continue;
             }
             // This bundle is part of the finalized frame → it is consumed
@@ -515,7 +540,8 @@ impl FrameMaterializer {
             // Use the parallel pre-pass verdict for FrameHeader bundles;
             // validate everything else here (sequentially, against the
             // mid-loop CRDT state those ops legitimately depend on).
-            let valid = match fh_validation.get(&bundle_bytes) {
+            // `None` = valid; `Some(reason)` = rejected (with the reason).
+            let reject_reason: Option<String> = match fh_validation.get(&bundle_bytes) {
                 Some(&ok) => {
                     if !ok {
                         info!(
@@ -523,15 +549,17 @@ impl FrameMaterializer {
                             request_type = format!("0x{:08x}", request_type),
                             "skipping message that failed signature validation (parallel pre-pass)"
                         );
+                        Some("signature validation failed".into())
+                    } else {
+                        None
                     }
-                    ok
                 }
                 None => match self.execution_manager.validate_message(
                     frame_number,
                     &route_addr,
                     &bundle_bytes,
                 ) {
-                    Ok(()) => true,
+                    Ok(()) => None,
                     Err(e) => {
                         info!(
                             frame = frame_number,
@@ -539,12 +567,16 @@ impl FrameMaterializer {
                             error = %e,
                             "skipping message that failed signature validation"
                         );
-                        false
+                        Some(format!("{e}"))
                     }
                 },
             };
-            if !valid {
+            if let Some(reason) = reject_reason {
                 skipped += 1;
+                outcomes.push(RequestOutcome {
+                    status: RequestStatus::Rejected,
+                    error: reason,
+                });
                 continue;
             }
             match self.execution_manager.process_message(
@@ -553,7 +585,13 @@ impl FrameMaterializer {
                 &route_addr,
                 &bundle_bytes,
             ) {
-                Ok(_) => processed += 1,
+                Ok(_) => {
+                    processed += 1;
+                    outcomes.push(RequestOutcome {
+                        status: RequestStatus::Succeeded,
+                        error: String::new(),
+                    });
+                }
                 Err(e) => {
                     info!(
                         frame = frame_number,
@@ -562,7 +600,23 @@ impl FrameMaterializer {
                         "skipping message that failed processing"
                     );
                     skipped += 1;
+                    outcomes.push(RequestOutcome {
+                        status: RequestStatus::Failed,
+                        error: format!("{e}"),
+                    });
                 }
+            }
+        }
+        // Persist the per-bundle outcomes for this frame (best-effort: a write
+        // failure must not abort materialization). Aligned by index to
+        // `frame.requests`. Read back by the explorer to show which requests
+        // actually took effect vs. were rejected/failed.
+        if !outcomes.is_empty() {
+            if let Err(e) = self
+                .clock_store
+                .put_global_clock_frame_outcomes(frame_number, &outcomes)
+            {
+                warn!(frame = frame_number, error = %e, "failed to persist frame request outcomes");
             }
         }
 
@@ -862,6 +916,26 @@ impl FrameMaterializer {
     /// this publish step, sync clients pinned to a prover root will
     /// always be rejected by the (newly-enforced) `expected_root`
     /// check.
+    /// Read-only global prover shard root (vertex-adds, `L1=[0;3]`,
+    /// `L2=[0xff;32]`) from the LIVE forest — the state through the last
+    /// committed (parent) frame. Byte-identical to the leader's
+    /// `GlobalLeaderProvider::compute_prover_root`, so comparing it to the
+    /// header's `prover_tree_commitment` is a genuine cross-check. Does NOT
+    /// commit or publish a snapshot (that is [`compute_local_prover_root`]'s
+    /// job on the post-apply path); use this only for the pre-apply verify.
+    pub fn read_local_prover_root(&self) -> Vec<u8> {
+        use quil_types::store::ShardKey;
+        let global_shard = ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+        let root = self
+            .hypergraph
+            .compute_shard_root("vertex", "adds", &global_shard);
+        if root.len() == 32 || root.len() >= 64 {
+            root
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn compute_local_prover_root(&self, frame_number: u64) -> Vec<u8> {
         use quil_types::store::ShardKey;
 

@@ -313,6 +313,10 @@ pub(crate) fn init(
                 reward_greedy,
                 min_active_provers_for_propose,
                 app_consensus_cw: config.engine.app_consensus_cw,
+                // Persistent per-shard simplex-journal base (Go parity): master
+                // core 0 → db.path, worker core N → worker path. Threaded so
+                // app-shard consensus resumes across restarts.
+                db_config: config.db.clone(),
                 coverage_publish: Some(coverage_publish),
                 // Master's global state, used as fallback when the
                 // per-worker builder fails or isn't wired.

@@ -491,6 +491,79 @@ mod tests {
         );
     }
 
+    /// The committed head must SURVIVE a restart. Mimics the CW `on_finalized`
+    /// durable write (`put_global_clock_frame(&frame, &NoopTxn)` → falls to
+    /// `put_global_frame(frame, None)` → `self.db.write` + `latest_index`),
+    /// then closes and reopens the DB at the SAME path (a node restart). If the
+    /// head reverts to the migration frame, the write path is not durable; if
+    /// it survives here, the field revert-to-669975 is a STARTUP reset, not the
+    /// write.
+    #[test]
+    fn committed_head_survives_reopen() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let make_frame = |n: u64| global::GlobalFrame {
+            header: Some(global::GlobalFrameHeader {
+                frame_number: n,
+                output: vec![0u8; 516],
+                parent_selector: vec![0u8; 32],
+                prover: vec![0u8; 32],
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        };
+
+        // Session 1: migration head 669975, then finalize 669976 + 669977.
+        {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            let db = Arc::new(rocksdb::DB::open(&opts, &path).unwrap());
+            let store = RocksClockStore::new(db.clone());
+            store.put_global_frame(&make_frame(669975), None).unwrap();
+            assert_eq!(store.get_latest_frame_number(), Some(669975));
+            store.put_global_frame(&make_frame(669976), None).unwrap();
+            store.put_global_frame(&make_frame(669977), None).unwrap();
+            assert_eq!(store.get_latest_frame_number(), Some(669977));
+            drop(store);
+            drop(db); // close (shutdown)
+        }
+
+        // Session 2: reopen SAME path (restart). Head must still be 669977.
+        {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            let db = Arc::new(rocksdb::DB::open(&opts, &path).unwrap());
+            let store = RocksClockStore::new(db);
+            assert_eq!(
+                store.get_latest_frame_number(),
+                Some(669977),
+                "committed head must survive restart (not revert to migration head)"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_outcomes_round_trip() {
+        use store::{ClockStore, RequestOutcome, RequestStatus};
+        let s = test_db();
+        // Absent → empty.
+        assert!(s.get_global_clock_frame_outcomes(7).unwrap().is_empty());
+        let outcomes = vec![
+            RequestOutcome { status: RequestStatus::Succeeded, error: String::new() },
+            RequestOutcome { status: RequestStatus::Rejected, error: "bad signature".into() },
+            RequestOutcome { status: RequestStatus::Failed, error: "insufficient balance".into() },
+            RequestOutcome { status: RequestStatus::Skipped, error: "encoded payload < 4 bytes (no type prefix)".into() },
+        ];
+        s.put_global_clock_frame_outcomes(7, &outcomes).unwrap();
+        assert_eq!(s.get_global_clock_frame_outcomes(7).unwrap(), outcomes);
+        // Distinct frames are independent.
+        assert!(s.get_global_clock_frame_outcomes(8).unwrap().is_empty());
+        // Overwrite replaces.
+        let one = vec![RequestOutcome { status: RequestStatus::Succeeded, error: String::new() }];
+        s.put_global_clock_frame_outcomes(7, &one).unwrap();
+        assert_eq!(s.get_global_clock_frame_outcomes(7).unwrap(), one);
+    }
+
     #[test]
     fn test_latest_earliest() {
         let store = test_db();
@@ -715,6 +788,65 @@ impl store::ClockStore for RocksClockStore {
             header: Some(header),
             requests,
         })
+    }
+    fn put_global_clock_frame_outcomes(
+        &self,
+        frame_number: u64,
+        outcomes: &[store::RequestOutcome],
+    ) -> Result<()> {
+        // [count u32][ (status u8)(err_len u32)(err utf8) ]*
+        let mut buf = Vec::with_capacity(4 + outcomes.len() * 8);
+        buf.extend_from_slice(&(outcomes.len() as u32).to_be_bytes());
+        for o in outcomes {
+            buf.push(o.status.as_u8());
+            let e = o.error.as_bytes();
+            buf.extend_from_slice(&(e.len() as u32).to_be_bytes());
+            buf.extend_from_slice(e);
+        }
+        let key = encoding::clock_global_frame_outcomes_key(frame_number);
+        self.db
+            .put(&key, &buf)
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn get_global_clock_frame_outcomes(
+        &self,
+        frame_number: u64,
+    ) -> Result<Vec<store::RequestOutcome>> {
+        let key = encoding::clock_global_frame_outcomes_key(frame_number);
+        let bytes = match self
+            .db
+            .get(&key)
+            .map_err(|e| QuilError::Store(e.to_string()))?
+        {
+            Some(b) => b,
+            None => return Ok(Vec::new()),
+        };
+        let rd_u32 = |b: &[u8], c: &mut usize| -> Option<u32> {
+            if *c + 4 > b.len() {
+                return None;
+            }
+            let v = u32::from_be_bytes([b[*c], b[*c + 1], b[*c + 2], b[*c + 3]]);
+            *c += 4;
+            Some(v)
+        };
+        let mut c = 0usize;
+        let count = rd_u32(&bytes, &mut c).unwrap_or(0) as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            if c >= bytes.len() {
+                break;
+            }
+            let status = store::RequestStatus::from_u8(bytes[c]);
+            c += 1;
+            let elen = rd_u32(&bytes, &mut c).unwrap_or(0) as usize;
+            if c + elen > bytes.len() {
+                break;
+            }
+            let error = String::from_utf8_lossy(&bytes[c..c + elen]).into_owned();
+            c += elen;
+            out.push(store::RequestOutcome { status, error });
+        }
+        Ok(out)
     }
     fn delete_global_clock_frame_range(&self, min_frame: u64, max_frame: u64) -> Result<()> {
         let lower = encoding::clock_global_frame_key(min_frame);

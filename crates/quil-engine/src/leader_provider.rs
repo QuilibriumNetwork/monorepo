@@ -56,6 +56,16 @@ pub struct GlobalLeaderProvider {
     /// re-proposed every rank until it ages out. `None` disables the gate
     /// (tests / nodes without an execution manager wired).
     message_validator: Option<Arc<quil_execution::ExecutionEngineManager>>,
+    /// Hypergraph CRDT used to compute the `prover_tree_commitment` the
+    /// leader binds into the frame header (and the VDF challenge) at
+    /// proving time. Mirrors Go's `rebuildShardCommitments`, which commits
+    /// the CRDT and reads the global prover shard's (`L1=[0;3]`,
+    /// `L2=[0xff;32]`) phase-0 root — the state-through-parent commitment
+    /// every follower re-derives and cross-checks in the materializer
+    /// (`verify_prover_root`), POMW mint, prover-kick verification, and
+    /// state-jump sync anchoring. `None` (unit tests without a store)
+    /// leaves the commitment empty, which those consumers tolerate.
+    hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
 }
 
 impl GlobalLeaderProvider {
@@ -70,6 +80,7 @@ impl GlobalLeaderProvider {
         signer: Arc<dyn Signer>,
         inclusion_prover: Arc<dyn InclusionProver + Send + Sync>,
         message_validator: Option<Arc<quil_execution::ExecutionEngineManager>>,
+        hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
     ) -> Self {
         Self {
             prover_registry,
@@ -82,6 +93,42 @@ impl GlobalLeaderProvider {
             signer,
             inclusion_prover,
             message_validator,
+            hypergraph,
+        }
+    }
+
+    /// Compute the `prover_tree_commitment` for the frame being proved:
+    /// the global prover shard's (`L1=[0;3]`, `L2=[0xff;32]`) vertex-adds
+    /// forest root over the CURRENT committed state (which, at proposal
+    /// time, reflects the parent frame — the last one materialized on
+    /// finalization).
+    ///
+    /// Reads the LIVE forest root via `compute_shard_root`, whose doc
+    /// contract is "the same value `commit_inner` puts in the header."
+    /// This deliberately does NOT go through `commit(frame_number)`: at
+    /// proposal time nothing is staged for the new frame and no root is
+    /// persisted at that frame number yet, so `commit()` (union of
+    /// pending + per-frame cached commits) would return an EMPTY set for
+    /// the global shard. The forest read is the authoritative
+    /// point-in-time root.
+    ///
+    /// Returns empty only when no CRDT is wired (unit tests) or the shard
+    /// truly has no root — tolerated by the empty-root branch in
+    /// `verify_prover_root`.
+    fn compute_prover_root(&self) -> Vec<u8> {
+        let Some(hg) = self.hypergraph.as_ref() else {
+            return Vec::new();
+        };
+        let global_shard = quil_types::store::ShardKey {
+            l1: [0u8; 3],
+            l2: [0xffu8; 32],
+        };
+        let root = hg.compute_shard_root("vertex", "adds", &global_shard);
+        // A real forest root is 32 bytes; reject the empty/degenerate case.
+        if root.len() == 32 || root.len() >= 64 {
+            root
+        } else {
+            Vec::new()
         }
     }
 
@@ -293,6 +340,47 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         let frame_number = prior_header.frame_number + 1;
 
         // ------------------------------------------------------------------
+        // 2b. Pace the chain to the mainnet inter-frame interval.
+        //
+        // commonware-simplex has no minimum block time: it proposes,
+        // finalizes, and immediately opens the next view as fast as the
+        // network + VDF prove allow. With the VDF difficulty pinned near
+        // the floor that round is ~3s, so frames land at the testnet rate
+        // regardless of `IDEAL_FRAME_TIME`. The VDF is NOT the pace-setter
+        // under CW — the proposer is. So gate proposal production here.
+        //
+        // Each header's `timestamp` is set to `production_now + IDEAL`
+        // (step 6 below), so the parent's timestamp is 1 interval ahead of
+        // the instant the parent was produced. Sleeping until
+        // `now >= prior_header.timestamp` therefore spaces our production
+        // instant exactly one `IDEAL_FRAME_TIME` after the parent's — a
+        // clean 10s cadence in both wall-clock and recorded timestamps —
+        // without any dependence on VDF difficulty.
+        //
+        // Capped at one interval so a parent timestamp far in the future
+        // (cross-leader clock skew, or a misbehaving prior leader) can
+        // never stall this node more than a single frame; if the parent
+        // timestamp is already in the past we proceed immediately (we're
+        // catching up, don't slow down).
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let target = prior_header.timestamp;
+            let wait_ms = (target - now_ms)
+                .clamp(0, crate::difficulty::IDEAL_FRAME_TIME);
+            if wait_ms > 0 {
+                tracing::debug!(
+                    frame = frame_number,
+                    wait_ms,
+                    "pacing global proposal to mainnet interval",
+                );
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms as u64));
+            }
+        }
+
+        // ------------------------------------------------------------------
         // 3. Collect pending messages, then drop protocol-invalid ones.
         //
         // Collection is non-destructive (so a timed-out proposal doesn't
@@ -421,14 +509,32 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         //   output = WesolowskiSolve(challenge, difficulty)
         //   signature = signer.SignWithDomain(challenge||output, "global")
         //
-        // shard `commitments` and `prover_root` here are still
-        // placeholders pending Tier 2 wiring of the materializer's
-        // shardCommitments + proverRoot output. `requests_root` is the
-        // partial commit we already have. Once Tier 2 lands, these
-        // become the real values. (See audit BLOCKER list, Tier 2.)
+        // `prover_root` is the global prover shard commitment over the
+        // committed state through the parent frame — bound into the VDF
+        // challenge here AND carried on the header (`prover_tree_commitment`)
+        // so every follower re-derives and cross-checks it in the
+        // materializer, POMW mint, prover-kick verification, and state
+        // sync. Computed from the CRDT (Go's `rebuildShardCommitments`
+        // proverRoot). The per-L1 `global_commitments` array is still a
+        // placeholder (not cross-checked at runtime, only VDF-bound) —
+        // follow-up wiring.
         let prover_index_u8 = prover_index.map(|i| i as u8).unwrap_or(0);
-        let commitments: Vec<Vec<u8>> = Vec::new();
-        let prover_root: Vec<u8> = Vec::new();
+        // The 256 Level-1 global bucket commitments (per first address byte),
+        // retrieved live from the CRDT forest. Bound into the VDF challenge and
+        // carried on the header via `GlobalState.global_commitments`.
+        let commitments: Vec<Vec<u8>> = self
+            .hypergraph
+            .as_ref()
+            .map(|hg| hg.global_commitments())
+            .unwrap_or_default();
+        let prover_root: Vec<u8> = self.compute_prover_root();
+        if prover_root.is_empty() {
+            tracing::warn!(
+                frame = frame_number,
+                "proving global frame with EMPTY prover_tree_commitment — \
+                 CRDT root unavailable (rewards/kick/sync anchoring degraded for this frame)",
+            );
+        }
         let prove_start = std::time::Instant::now();
         let header = self.frame_prover.prove_global_frame_header(
             prior_header,
@@ -445,11 +551,14 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // ------------------------------------------------------------------
         // 9. Assemble GlobalState
         // ------------------------------------------------------------------
-        // The prover_tree_commitment is empty here and populated after
-        // the hypergraph CRDT commit in rebuildShardCommitments (which
-        // runs during the consensus commit path, not during proving).
-        // Similarly, the signature is populated by the consensus signing
-        // step after the proposal is voted on.
+        // The prover_tree_commitment is the CRDT prover-shard root we just
+        // bound into the VDF challenge above — it MUST equal the
+        // `prover_root` passed to `prove_global_frame_header`, since the
+        // stored header is rebuilt from THIS `GlobalState`
+        // (`cw_global_seams::global_frame_from_state`) and every follower's
+        // `verify_global_frame_header` recomputes the challenge from the
+        // header's own `prover_tree_commitment`. The signature is populated
+        // by the consensus signing step after the proposal is voted on.
         // Decode each canonical bundle into a prost `MessageBundle`
         // (the proto type the materializer expects). Bundles that
         // fail decode are skipped — `requests_root` was hashed over
@@ -470,14 +579,17 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             header.output.clone(),
             header.parent_selector.clone(),
             self.local_prover_address.clone(),
-            Vec::new(), // prover_tree_commitment — populated after hypergraph commit
+            prover_root.clone(), // prover_tree_commitment — must match the VDF challenge
             requests_root,
             Vec::new(), // signature — populated by consensus signing step
         )
         // Attach the collected messages so they ride with the proposal
         // into `GlobalFrame.requests` and reach every replica's
         // materializer on finalization.
-        .with_messages(proto_messages);
+        .with_messages(proto_messages)
+        // Carry the 256 global commitments bound into the VDF challenge so the
+        // rebuilt header (`global_frame_from_state`) reproduces them verbatim.
+        .with_global_commitments(commitments);
 
         // ------------------------------------------------------------------
         // 10. Build and return State<GlobalState>
@@ -602,6 +714,8 @@ mod tests {
             // No execution manager in these unit tests — the validate-and-
             // drop gate is exercised via integration tests on real stores.
             None,
+            // No CRDT wired — prover_tree_commitment stays empty (tolerated).
+            None,
         )
     }
 
@@ -619,6 +733,7 @@ mod tests {
             vec![0xABu8; 96],
             signer,
             prover,
+            None,
             None,
         )
     }
@@ -758,5 +873,88 @@ mod tests {
         assert_ne!(empty, nonempty);
         // Deterministic for the same input.
         assert_eq!(empty, p.compute_requests_root(&[]));
+    }
+
+    /// Build a leader whose only non-default wiring is the hypergraph CRDT,
+    /// so `compute_prover_root` can be exercised in isolation.
+    fn provider_with_crdt(
+        crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    ) -> GlobalLeaderProvider {
+        let signer: Arc<dyn Signer> = Arc::new(DummySigner);
+        GlobalLeaderProvider::new(
+            Arc::new(TestProverRegistry::new()),
+            Arc::new(StubFrameProver),
+            Arc::new(AsertDifficultyAdjuster::new(0, 0, 100)),
+            Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            Arc::new(MessageCollector::new()),
+            vec![0xABu8; 32],
+            vec![0xABu8; 96],
+            signer,
+            Arc::new(quil_crypto::KzgInclusionProver),
+            None,
+            crdt,
+        )
+    }
+
+    /// The `prover_tree_commitment` the leader binds into the VDF challenge
+    /// is the global prover shard's (`L1=[0;3]`, `L2=[0xff;32]`) live
+    /// vertex-adds forest root — read via `compute_shard_root`, the same
+    /// value `commit_inner` writes into the header, and the value every
+    /// follower re-derives. Seeding that shard and committing must yield a
+    /// real (32-byte, non-zero) root that `compute_prover_root` returns,
+    /// matching a direct `compute_shard_root`, while a populated distractor
+    /// shard's root is NOT returned (targets the global shard specifically).
+    #[test]
+    fn compute_prover_root_reads_live_global_shard_root() {
+        use quil_hypergraph::testing::{MemStore, StubProver};
+        use quil_hypergraph::Location;
+        use quil_types::store::ShardKey;
+
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(StubProver),
+        ));
+        let global_shard = ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+        // Seed real state into the global prover shard (app == global
+        // address) plus a distractor app shard, then commit to the forest.
+        crdt.add_vertex(
+            &Location { app_address: [0xff; 32], data_address: [0x01; 32] },
+            b"prover-state",
+        )
+        .unwrap();
+        crdt.add_vertex(
+            &Location { app_address: [0x2a; 32], data_address: [0x07; 32] },
+            b"distractor",
+        )
+        .unwrap();
+        crdt.commit(1).unwrap();
+
+        let expected = crdt.compute_shard_root("vertex", "adds", &global_shard);
+        let distractor = crdt.compute_shard_root(
+            "vertex",
+            "adds",
+            &ShardKey { l1: [0u8; 3], l2: [0x2a; 32] },
+        );
+
+        let provider = provider_with_crdt(Some(crdt.clone()));
+        let got = provider.compute_prover_root();
+
+        assert_eq!(
+            got, expected,
+            "compute_prover_root must return the live global-shard vertex-adds root",
+        );
+        assert_eq!(got.len(), 32, "a real forest root is 32 bytes");
+        assert!(got.iter().any(|&b| b != 0), "global shard has data → non-zero root");
+        assert_ne!(got, distractor, "must target the global shard, not another app shard");
+        // Deterministic across re-proves of the same committed state.
+        assert_eq!(got, provider.compute_prover_root());
+    }
+
+    /// No CRDT wired (unit-test / degraded node) → empty commitment, which
+    /// `verify_prover_root`'s empty-root branch tolerates without a halt.
+    #[test]
+    fn compute_prover_root_empty_without_crdt() {
+        let provider = provider_with_crdt(None);
+        assert!(provider.compute_prover_root().is_empty());
     }
 }

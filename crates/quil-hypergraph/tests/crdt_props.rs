@@ -693,3 +693,49 @@ fn live_size_all_phases_tombstones_and_world_sum() {
     assert_eq!(c.total_size(), BigInt::from(13));
     assert_eq!(s0(&c), Some((3, BigInt::from(7))));
 }
+
+/// Level-1 global commitments: each of the 256 buckets is the root of a tree
+/// of `AppEntry` leaves for the apps whose FIRST address byte equals the bucket
+/// index. `commit_inner` maintains them live; `global_commitments()` retrieves
+/// all 256 and touching a bucket updates only that bucket's root.
+#[test]
+fn global_commitments_maintained_per_bucket() {
+    let c = fresh_crdt();
+    // Two apps in bucket 0x2a, one in bucket 0x50, none elsewhere.
+    let app_a = { let mut a = [0u8; 32]; a[0] = 0x2a; a[31] = 0x01; a };
+    let app_b = { let mut a = [0u8; 32]; a[0] = 0x2a; a[31] = 0x02; a };
+    let app_c = { let mut a = [0u8; 32]; a[0] = 0x50; a };
+    c.add_vertex(&Location { app_address: app_a, data_address: [0x11; 32] }, b"a").unwrap();
+    c.add_vertex(&Location { app_address: app_b, data_address: [0x22; 32] }, b"b").unwrap();
+    c.add_vertex(&Location { app_address: app_c, data_address: [0x33; 32] }, b"c").unwrap();
+    c.commit(1).unwrap();
+
+    let gc = c.global_commitments();
+    assert_eq!(gc.len(), 256, "always 256 buckets");
+    assert!(!gc[0x2a].is_empty(), "bucket 0x2a has apps → non-empty root");
+    assert!(!gc[0x50].is_empty(), "bucket 0x50 has an app → non-empty root");
+    assert!(gc[0x00].is_empty(), "bucket 0x00 has no apps → empty");
+    assert_eq!(gc[0x2a].len(), 32, "a bucket root is a 32-byte JMT root");
+    assert_ne!(gc[0x2a], gc[0x50], "distinct buckets commit distinct app sets");
+
+    // Touching an app in bucket 0x2a changes THAT bucket's root only.
+    let before_2a = gc[0x2a].clone();
+    let before_50 = gc[0x50].clone();
+    c.add_vertex(&Location { app_address: app_a, data_address: [0x44; 32] }, b"more").unwrap();
+    c.commit(2).unwrap();
+    let gc2 = c.global_commitments();
+    assert_ne!(gc2[0x2a], before_2a, "touching bucket 0x2a updates its root");
+    assert_eq!(gc2[0x50], before_50, "untouched bucket 0x50 root is unchanged");
+}
+
+/// The global prover shard (`0xff..ff`) is excluded from L1 global commitments
+/// — its root is carried separately as `prover_tree_commitment`.
+#[test]
+fn global_prover_shard_excluded_from_l1() {
+    let c = fresh_crdt();
+    let global = [0xffu8; 32];
+    c.add_vertex(&Location { app_address: global, data_address: [0x01; 32] }, b"prover").unwrap();
+    c.commit(1).unwrap();
+    let gc = c.global_commitments();
+    assert!(gc[0xff].is_empty(), "global prover shard must NOT create an L1 bucket leaf");
+}

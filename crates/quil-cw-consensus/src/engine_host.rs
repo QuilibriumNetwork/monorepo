@@ -183,6 +183,13 @@ pub fn spawn_global_host<Pr, Sk, Fin>(
     finalizer: Arc<Fin>,
     store: BlockStore,
     params: GlobalEngineParams,
+    // Persistent on-disk directory for the simplex journal (view state,
+    // notarizations, finalizations). `Some(dir)` MUST be a stable path under
+    // the node's data dir so consensus resumes across restarts. `None` uses the
+    // runtime default (a RANDOM TEMP dir) — ephemeral, so the engine restarts
+    // from `Floor::Genesis` every launch; acceptable only for tests or callers
+    // that intentionally don't persist.
+    storage_directory: Option<std::path::PathBuf>,
 ) -> GlobalHostHandle
 // NOTE: `store` is supplied by the caller (not created here) so the node can
 // hold a clone and insert peer-delivered frame bytes into it — followers must
@@ -207,7 +214,11 @@ where
     let (s2, r2) = (ch2.sender, ch2.receiver);
 
     std::thread::spawn(move || {
-        let runner = cw_tokio::Runner::new(cw_tokio::Config::new());
+        let cfg = match storage_directory {
+            Some(dir) => cw_tokio::Config::new().with_storage_directory(dir),
+            None => cw_tokio::Config::new(),
+        };
+        let runner = cw_tokio::Runner::new(cfg);
         runner.start(move |context| async move {
             let engine = build_global_engine(
                 context,

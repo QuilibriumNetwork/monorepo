@@ -365,6 +365,9 @@ pub fn activate_app_consensus_cw(
     genesis_frame_number: u64,
     leader_timeout_secs: u64,
     transport: Arc<dyn AppConsensusTransport>,
+    // Persistent per-shard simplex-journal dir. `Some(dir)` resumes across
+    // restarts; `None` uses the runtime default (ephemeral random temp).
+    storage_directory: Option<std::path::PathBuf>,
 ) -> AppConsensusCwHandle {
     let proposer = Arc::new(AppSeamProposer::new(
         leader_provider,
@@ -388,6 +391,7 @@ pub fn activate_app_consensus_cw(
         store.clone(),
         GlobalEngineParams::new(partition, epoch, genesis_digest)
             .with_leader_timeout_secs(leader_timeout_secs),
+        storage_directory,
     );
 
     // Drain the engine's outbound (votes/certs/resolver) onto the shard transport.

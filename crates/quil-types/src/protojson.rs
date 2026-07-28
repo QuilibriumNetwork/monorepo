@@ -96,4 +96,35 @@ mod tests {
         // bytes -> standard base64.
         assert_eq!(header["output"], serde_json::json!("AQID"));
     }
+
+    /// The explorer UI derives a request's type as `Object.keys(req).find(k =>
+    /// k !== "timestamp")`. That is only correct if protojson emits EXACTLY the
+    /// set oneof variant plus `timestamp` (no other keys) — even under
+    /// EmitUnpopulated (`skip_default_fields(false)`), which emits zero-valued
+    /// SCALAR fields but must NOT emit unset oneof cases. Pin that contract.
+    #[test]
+    fn message_request_oneof_emits_only_set_variant_plus_timestamp() {
+        use crate::proto::global::{message_request, MessageRequest, ProverJoin};
+        let req = MessageRequest {
+            request: Some(message_request::Request::Join(ProverJoin::default())),
+            timestamp: 12345,
+        };
+        let bytes =
+            to_protojson("quilibrium.node.global.pb.MessageRequest", &req).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let obj = v.as_object().expect("request is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["join", "timestamp"],
+            "protojson must emit only the set oneof variant + timestamp, else the \
+             UI's single-key type detection breaks"
+        );
+        // The UI's detector resolves to the variant name.
+        assert_eq!(
+            obj.keys().find(|k| k.as_str() != "timestamp").map(String::as_str),
+            Some("join"),
+        );
+    }
 }

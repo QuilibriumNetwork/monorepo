@@ -28,6 +28,13 @@ pub struct GlobalState {
     pub parent_selector: Vec<u8>,
     pub prover: Vec<u8>,
     pub prover_tree_commitment: Vec<u8>,
+    /// The 256 Level-1 global bucket commitments (per first address byte). Set
+    /// by the leader from the CRDT (`global_commitments()`), bound into the
+    /// VDF challenge, and carried onto the rebuilt header
+    /// (`cw_global_seams::global_frame_from_state`) so a follower's
+    /// `verify_global_frame_header` recomputes the same challenge. Empty on
+    /// nodes without a CRDT wired (tolerated).
+    pub global_commitments: Vec<Vec<u8>>,
     pub requests_root: Vec<u8>,
     pub signature: Vec<u8>,
     /// Inbound message bundles attached to this proposal, decoded
@@ -77,12 +84,21 @@ impl GlobalState {
             parent_selector,
             prover,
             prover_tree_commitment,
+            global_commitments: Vec::new(),
             requests_root,
             signature,
             messages: Vec::new(),
             identity_cache,
             source_cache,
         }
+    }
+
+    /// Attach the leader's 256 Level-1 global bucket commitments. Called in
+    /// `prove_next_state` with the value bound into the VDF challenge, so the
+    /// rebuilt header carries the identical bytes the challenge was hashed over.
+    pub fn with_global_commitments(mut self, commitments: Vec<Vec<u8>>) -> Self {
+        self.global_commitments = commitments;
+        self
     }
 
     /// Attach the leader's collected message bundles to this state.
@@ -110,6 +126,7 @@ impl GlobalState {
             parent_selector: h.parent_selector.clone(),
             prover: h.prover.clone(),
             prover_tree_commitment: h.prover_tree_commitment.clone(),
+            global_commitments: h.global_commitments.clone(),
             requests_root: h.requests_root.clone(),
             signature: h
                 .public_key_signature_bls48581

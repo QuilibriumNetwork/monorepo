@@ -81,6 +81,7 @@ fn global_frame_from_state(state: &State<GlobalState>) -> GlobalFrame {
         parent_selector: app.parent_selector.clone(),
         prover: app.prover.clone(),
         prover_tree_commitment: app.prover_tree_commitment.clone(),
+        global_commitments: app.global_commitments.clone(),
         requests_root: app.requests_root.clone(),
         ..Default::default()
     };
@@ -352,6 +353,10 @@ pub fn activate_global_consensus_cw(
     genesis_frame_number: u64,
     leader_timeout_secs: u64,
     transport: Arc<dyn GlobalConsensusTransport>,
+    // Persistent simplex-journal directory (see `spawn_global_host`). A stable
+    // path under the node's data dir so consensus resumes across restarts
+    // instead of replaying from the migration head.
+    storage_directory: std::path::PathBuf,
 ) -> GlobalConsensusCwHandle {
     // Seams over real state.
     let proposer = Arc::new(GlobalSeamProposer::new(leader_provider, verifier, filter));
@@ -376,6 +381,7 @@ pub fn activate_global_consensus_cw(
         store.clone(),
         GlobalEngineParams::new("global", epoch, genesis_digest)
             .with_leader_timeout_secs(leader_timeout_secs),
+        Some(storage_directory),
     );
 
     // Drain the engine's outbound (votes/certs/resolver) onto the :8340 transport.

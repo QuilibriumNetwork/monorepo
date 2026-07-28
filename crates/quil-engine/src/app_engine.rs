@@ -921,6 +921,39 @@ pub struct AppEngineDeps {
     /// Falcon (EQUAL VOTES) instead of the legacy quil-consensus HotStuff loop.
     /// Off by default → legacy path unchanged.
     pub app_consensus_cw: bool,
+    /// DB config used to derive the PERSISTENT per-shard simplex-journal
+    /// directory (Go parity: `app_consensus_engine.go:718` — core 0 →
+    /// `db.path`, worker core N → `worker_paths[N-1]` / `worker_path_prefix`).
+    /// An empty resolved path ⇒ ephemeral journal (tests). Default is fine for
+    /// callers that don't persist app-shard consensus.
+    pub db_config: quil_config::DbConfig,
+}
+
+/// The persistent base directory for a core's app-shard simplex journals,
+/// mirroring Go's `app_consensus_engine.go:718-726`: core 0 (master) uses
+/// `db.path`; a worker core `N` uses `worker_paths[N-1]` when present, else
+/// `worker_path_prefix` with `%d` → `N`. An empty resolved path yields `None`
+/// (ephemeral random-temp journal — tests / callers without a data dir).
+pub(crate) fn cw_app_storage_base(
+    db: &quil_config::DbConfig,
+    core_id: u32,
+) -> Option<std::path::PathBuf> {
+    let path = if core_id > 0 {
+        if (db.worker_paths.len() as u32) >= core_id {
+            db.worker_paths[(core_id - 1) as usize].clone()
+        } else if !db.worker_path_prefix.is_empty() {
+            db.worker_path_prefix.replace("%d", &core_id.to_string())
+        } else {
+            db.path.clone()
+        }
+    } else {
+        db.path.clone()
+    };
+    if path.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(path))
+    }
 }
 
 /// App shard consensus engine. Owns a HotStuff event loop and
@@ -930,6 +963,9 @@ pub struct AppConsensusEngine {
     // GLOBAL frame anchor; `clock_store` serves this shard's own chain.
     /// CPU core this engine runs on.
     pub core_id: u32,
+    /// Persistent base dir for this core's app-shard simplex journals (Go
+    /// parity, `cw_app_storage_base`). `None` ⇒ ephemeral journal.
+    cw_storage_base: Option<std::path::PathBuf>,
     /// Shard filter (bloom filter bytes).
     pub filter: Vec<u8>,
     /// App address (Poseidon hash of filter).
@@ -1084,8 +1120,10 @@ impl AppConsensusEngine {
             .global_anchor_store
             .unwrap_or_else(|| deps.clock_store.clone());
 
+        let cw_storage_base = cw_app_storage_base(&deps.db_config, core_id);
         let engine = Self {
             core_id,
+            cw_storage_base,
             filter: filter.clone(),
             app_address,
             clock_store: deps.clock_store,
@@ -1622,6 +1660,13 @@ impl AppConsensusEngine {
             });
 
         let partition = format!("app-{}", hex::encode(&app_address));
+        // Persistent per-shard journal dir (Go parity) so app-shard consensus
+        // resumes across restarts instead of replaying from its genesis floor;
+        // `None` (no data dir → tests / cluster workers) stays ephemeral.
+        let cw_app_storage_dir = self
+            .cw_storage_base
+            .as_ref()
+            .map(|base| base.join("cw-app-consensus").join(&partition));
         let handle = crate::cw_app_seams::activate_app_consensus_cw(
             scheme,
             peers,
@@ -1637,6 +1682,7 @@ impl AppConsensusEngine {
             genesis_frame_number,
             30, // leader_timeout_secs (localnet default; app VDF ~ shard difficulty)
             transport,
+            cw_app_storage_dir,
         );
         Ok(handle)
     }
@@ -3030,6 +3076,31 @@ fn validate_app_frame_panic_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Go parity (`app_consensus_engine.go:718`): core 0 → `db.path`; worker
+    /// core N → `worker_paths[N-1]` else `worker_path_prefix` (`%d`→N); empty
+    /// resolved path → `None` (ephemeral).
+    #[test]
+    fn cw_app_storage_base_matches_go_derivation() {
+        use std::path::PathBuf;
+        let db = quil_config::DbConfig {
+            path: "/data/store".into(),
+            worker_path_prefix: "/data/worker-%d".into(),
+            worker_paths: vec!["/data/w1".into(), "/data/w2".into()],
+            ..Default::default()
+        };
+        // master
+        assert_eq!(cw_app_storage_base(&db, 0), Some(PathBuf::from("/data/store")));
+        // worker cores covered by explicit worker_paths
+        assert_eq!(cw_app_storage_base(&db, 1), Some(PathBuf::from("/data/w1")));
+        assert_eq!(cw_app_storage_base(&db, 2), Some(PathBuf::from("/data/w2")));
+        // worker core beyond worker_paths → prefix with %d substitution
+        assert_eq!(cw_app_storage_base(&db, 3), Some(PathBuf::from("/data/worker-3")));
+
+        // Empty db.path (test default) → None (ephemeral journal).
+        let empty = quil_config::DbConfig { path: String::new(), worker_path_prefix: String::new(), worker_paths: vec![], ..Default::default() };
+        assert_eq!(cw_app_storage_base(&empty, 0), None);
+    }
 
     /// Build an Application-mode ExecutionEngineManager backed by an
     /// in-memory CRDT + noop crypto, for exercising the app-shard

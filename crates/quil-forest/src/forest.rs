@@ -687,6 +687,38 @@ impl Forest {
         }
     }
 
+    // ---- Level 1: global bucket head-version tracking --------------------
+
+    /// Synthetic shard id under which a Level-1 global bucket tree's head
+    /// version is persisted. The global buckets have no shard/phase of their
+    /// own, but reusing the shard/phase head-version keyspace lets both the
+    /// migration and the live commit path address them uniformly. The fixed
+    /// marker prefix keeps it disjoint from any real 32-byte shard address.
+    fn global_head_shard_id(index: u8) -> Vec<u8> {
+        let mut s = b"__l1_global_head__".to_vec();
+        s.push(index);
+        s
+    }
+
+    /// Staged `(key, value)` to persist global bucket `index`'s head version
+    /// (fold into the commit txn). `None` for a mem forest. Live-path analogue
+    /// of [`head_version_put`](Self::head_version_put).
+    pub fn global_head_version_put(&self, index: u8, version: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.head_version_put(&Self::global_head_shard_id(index), Phase::VertexAdds, version)
+    }
+
+    /// Persist global bucket `index`'s head version DIRECTLY — for the
+    /// migration converter (mirrors [`write_head_version`](Self::write_head_version)).
+    pub fn write_global_head_version(&self, index: u8, version: u64) -> Result<()> {
+        self.write_head_version(&Self::global_head_shard_id(index), Phase::VertexAdds, version)
+    }
+
+    /// Read global bucket `index`'s persisted head version. `None` if the
+    /// bucket has never been committed (or a mem forest).
+    pub fn read_global_head_version(&self, index: u8) -> Result<Option<u64>> {
+        self.read_head_version(&Self::global_head_shard_id(index), Phase::VertexAdds)
+    }
+
     // ---- Level 2: per-app shard-commitment tree --------------------------
 
     /// Commit the app's Level-2 shard-commitment tree at `version`. Each
@@ -719,6 +751,43 @@ impl Forest {
         let store = self.store(&TreeId::global(index));
         let leaves = entries.into_iter().map(|(addr, e)| (addr, e.to_bytes()));
         Ok(commit_pruning(&store, version, leaves)?.0)
+    }
+
+    /// Staged variant of [`commit_global`] for the live commit path: commits
+    /// the Level-1 global bucket `index` (leaves = `app_address → AppEntry`,
+    /// hashed keys, matching `commit_global`/the migration) at `version` and
+    /// returns the root plus the raw KV puts to fold into the caller's commit
+    /// transaction (so the L1 update is atomic with the L2/L3 shard commits).
+    /// Mirrors [`commit_shard_phase_raw_staged`](Self::commit_shard_phase_raw_staged).
+    /// `put_value_set` builds on the tree's prior version, so passing only the
+    /// apps TOUCHED this frame upserts them while untouched apps in the bucket
+    /// persist.
+    pub fn commit_global_staged(
+        &self,
+        index: u8,
+        version: u64,
+        entries: impl IntoIterator<Item = (Vec<u8>, crate::AppEntry)>,
+    ) -> Result<([u8; 32], Vec<(Vec<u8>, Vec<u8>)>)> {
+        let store = self.store(&TreeId::global(index));
+        let leaves = entries.into_iter().map(|(addr, e)| (addr, e.to_bytes()));
+        let (root, batch) = crate::commit_update(&store, version, leaves)?;
+        match &store {
+            TreeStore::Rocks(s) => Ok((root.0, s.update_puts(&batch)?)),
+            TreeStore::Mem(_) => {
+                store.apply_update(&batch)?;
+                Ok((root.0, Vec::new()))
+            }
+        }
+    }
+
+    /// The current 32-byte root of the Level-1 global bucket `index` at
+    /// `version` (the version it was last committed at — track it via a head
+    /// marker, as the shard-phase trees do). `None` when the bucket has never
+    /// been committed (no app has that first address byte).
+    pub fn global_root(&self, index: u8, version: u64) -> Result<Option<[u8; 32]>> {
+        let store = self.store(&TreeId::global(index));
+        let tree = Sha256Jmt::new(&store);
+        Ok(tree.get_root_hash_option(version)?.map(|r| r.0))
     }
 
     // ---- Pruning ---------------------------------------------------------

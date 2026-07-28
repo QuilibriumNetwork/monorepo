@@ -779,6 +779,18 @@ pub(crate) async fn start(
         consensus_committee_peer_ids,
         consensus_leader_timeout_secs: config.engine.consensus_leader_timeout_secs,
         cw_router: cw_router.clone(),
+        // A STABLE subdir of the node's data dir for the simplex journal, so
+        // consensus resumes across restarts instead of replaying from the
+        // migration head (the CW runtime otherwise defaults to a random temp
+        // dir). Mirrors `storage::init`'s db-path default.
+        cw_storage_dir: {
+            let base = if config.db.path.is_empty() {
+                std::path::PathBuf::from(".config/store")
+            } else {
+                std::path::PathBuf::from(&config.db.path)
+            };
+            base.join("cw-global-consensus")
+        },
     });
 
 

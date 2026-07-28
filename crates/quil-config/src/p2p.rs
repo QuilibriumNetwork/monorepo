@@ -140,14 +140,23 @@ impl Default for P2PConfig {
     }
 }
 
-/// Current mainnet bootstrap peers (mirrors config/config.go BootstrapPeers).
+/// Current mainnet bootstrap peers = the five genesis ARCHIVE servers (which
+/// double as the DHT bootstrap nodes). Their `/p2p/<peer_id>` MUST be the
+/// Falcon-derived peer IDs the archives actually present post-migration —
+/// these are `peer_id_from_falcon_pubkey(archive_pubkey)` for each genesis
+/// `archive_peers` entry (kept identical to
+/// `quil_engine::genesis::genesis_archive_static_multiaddrs`, the sole other
+/// copy, which reuses this list). The prior quinoa/qualia/quetzalcoatl hosts
+/// with pre-Falcon `Qm…` peer IDs are GONE: dialing them yields a peer-ID
+/// mismatch, the node never joins the gossip mesh, no PeerInfo is learned, and
+/// archive `:8340` discovery (and thus prover submits) silently dies.
+/// Update when an operator rotates IPs.
 pub const MAINNET_BOOTSTRAP_PEERS: &[&str] = &[
-    "/dns4/quinoa.quilibrium.com/udp/8336/quic-v1/p2p/QmP9NNzAzRjCL8gdQBkKHwyBCWJGVb3jPrQzTveYdU24kH",
-    "/dns4/qualia.quilibrium.com/udp/8336/quic-v1/p2p/QmRP1UPiDg1enHgN6wEL1Y4uUh1XKg7V3QExdBKV9BUUQf",
-    "/dns4/quetzalcoatl.quilibrium.com/udp/8336/quic-v1/p2p/QmNq4xSqrxTKKtK7J6UFEa4unjsoULP2G4qWwwH5EKmoJj",
-    "/ip4/65.109.17.13/udp/8336/quic-v1/p2p/Qmc35n99eojSvW3PkbfBczJoSX92WmnnKh3Fg114ok3oo4",
-    "/ip4/65.108.194.84/udp/8336/quic-v1/p2p/QmP8C7g9ZRiWzhqN2AgFu5onS6HwHzR6Vv1TCHxAhnCSnq",
-    "/ip4/15.204.100.222/udp/8336/quic-v1/p2p/Qmef3Z3RvGg49ZpDPcf2shWtJNgPJNpXrowjUcfz23YQ3V",
+    "/ip4/165.140.86.86/udp/8336/quic-v1/p2p/QmRECrGL6yDoMgSydFDN5bhnnpJLAByKVuieAbwmmAiodC",
+    "/ip4/191.96.166.157/udp/8336/quic-v1/p2p/QmdjbsbkDmsuxgawTkZmUihCoqJ5dVmciExQ2wKr11Nwjz",
+    "/ip4/109.94.96.183/udp/8336/quic-v1/p2p/QmQfp3dpBdX48o1P2HxDLQNtoEJaXvSKejSDBUyxewsHRr",
+    "/ip4/147.124.199.194/udp/8336/quic-v1/p2p/QmYajrEX6uk1xzobw1vvUUd2a69vJYKnmGwq1KFciuHzaF",
+    "/ip4/192.154.103.90/udp/8336/quic-v1/p2p/QmQr15mPeMExsrymb9Q6episZbzPJduJRCKwpyLierXRHA",
 ];
 
 impl P2PConfig {
@@ -249,10 +258,15 @@ impl P2PConfig {
             self.stream_listen_multiaddr = default_stream_listen();
         }
 
-        // Migrate stale bootstrap peers to current list
-        let stale = self.bootstrap_peers.is_empty()
-            || self.bootstrap_peers.iter().any(|p| p.contains("bootstrap.quilibrium.com"));
-        if stale {
+        // On MAINNET (network 0) the bootstrap peers are hardcoded and
+        // UNCONDITIONALLY supersede whatever is in the config. The archive
+        // servers are the DHT bootstraps, their peer IDs are the Falcon
+        // identities they present, and a config carrying stale peers (old
+        // quinoa/qualia hosts, or pre-Falcon `Qm…` IDs) must not be honored —
+        // dialing a mismatched peer ID drops the connection and the node never
+        // joins the mesh. Non-mainnet networks keep their own configured
+        // bootstrap list (never inject mainnet archives onto a testnet/devnet).
+        if self.network == 0 {
             self.bootstrap_peers = MAINNET_BOOTSTRAP_PEERS.iter().map(|s| s.to_string()).collect();
         }
     }

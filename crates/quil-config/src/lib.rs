@@ -436,6 +436,42 @@ rewardStrategy: "custom-strategy"
         assert_eq!(c2.p2p.bootstrap_peers[0], "/ip4/1.2.3.4/tcp/100");
     }
 
+    /// On mainnet (network 0) the hardcoded archive bootstrap list
+    /// UNCONDITIONALLY supersedes the config (even a non-empty, non-old-domain
+    /// list) — the archives are the DHT bootstraps and their Falcon peer IDs
+    /// must be dialed, not stale `Qm…` ones. Non-mainnet keeps its own list.
+    #[test]
+    fn mainnet_forces_archive_bootstrap_peers() {
+        let mut c = Config::default();
+        c.p2p.network = 0;
+        // A stale config list that the OLD heuristic would have KEPT.
+        c.p2p.bootstrap_peers = vec![
+            "/dns4/quinoa.quilibrium.com/udp/8336/quic-v1/p2p/QmP9NNzAzRjCL8gdQBkKHwyBCWJGVb3jPrQzTveYdU24kH".into(),
+        ];
+        c.apply_defaults();
+        let expected: Vec<String> =
+            crate::MAINNET_BOOTSTRAP_PEERS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(c.p2p.bootstrap_peers, expected, "mainnet must force the archive list");
+        assert!(
+            c.p2p
+                .bootstrap_peers
+                .iter()
+                .any(|p| p.contains("QmRECrGL6yDoMgSydFDN5bhnnpJLAByKVuieAbwmmAiodC")),
+            "must contain the Falcon archive peer IDs"
+        );
+        assert!(
+            !c.p2p.bootstrap_peers.iter().any(|p| p.contains("quinoa.quilibrium.com")),
+            "the stale quinoa/qualia hosts must be gone"
+        );
+
+        // Non-mainnet keeps its configured list (never inject mainnet archives).
+        let mut t = Config::default();
+        t.p2p.network = 7;
+        t.p2p.bootstrap_peers = vec!["/ip4/10.0.0.1/udp/8336/quic-v1/p2p/QmTest".into()];
+        t.apply_defaults();
+        assert_eq!(t.p2p.bootstrap_peers, vec!["/ip4/10.0.0.1/udp/8336/quic-v1/p2p/QmTest".to_string()]);
+    }
+
     #[test]
     fn yaml_field_names_use_camel_case() {
         let mut c = Config::default();

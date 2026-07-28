@@ -178,13 +178,14 @@ pub fn genesis_archive_peers() -> Result<Vec<(String, Vec<u8>)>> {
 /// genesis archives — they should be kept in sync with mainnet
 /// operator records. Update when an operator rotates IPs.
 pub fn genesis_archive_static_multiaddrs() -> Vec<&'static str> {
-    vec![
-        "/ip4/165.140.86.86/udp/8336/quic-v1/p2p/QmRECrGL6yDoMgSydFDN5bhnnpJLAByKVuieAbwmmAiodC",
-        "/ip4/191.96.166.157/udp/8336/quic-v1/p2p/QmdjbsbkDmsuxgawTkZmUihCoqJ5dVmciExQ2wKr11Nwjz",
-        "/ip4/109.94.96.183/udp/8336/quic-v1/p2p/QmQfp3dpBdX48o1P2HxDLQNtoEJaXvSKejSDBUyxewsHRr",
-        "/ip4/147.124.199.194/udp/8336/quic-v1/p2p/QmYajrEX6uk1xzobw1vvUUd2a69vJYKnmGwq1KFciuHzaF",
-        "/ip4/192.154.103.90/udp/8336/quic-v1/p2p/QmQr15mPeMExsrymb9Q6episZbzPJduJRCKwpyLierXRHA",
-    ]
+    // Single source of truth: the P2P mainnet bootstrap list (the archives ARE
+    // the DHT bootstraps). Kept here as the `:8340` archive-pool seed derives
+    // `host:8340` from these same `host:8336` multiaddrs
+    // (`genesis_archive_static_ips`). Deduped against `quil-config` so the
+    // gossip-bootstrap and archive-pool lists can never drift apart (a drift
+    // that once left the pre-Falcon peer IDs in the bootstrap list while the
+    // archives presented Falcon identities → dead gossip mesh).
+    quil_config::MAINNET_BOOTSTRAP_PEERS.to_vec()
 }
 
 /// Helper: extract `(peer_id_str, ip_str)` from each genesis-archive
@@ -1288,6 +1289,30 @@ pub fn initialize_genesis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every mainnet bootstrap peer id MUST equal a genesis archive's DERIVED
+    /// Falcon peer id (`peer_id_from_falcon_pubkey`, what the archive actually
+    /// presents on the wire) — otherwise libp2p rejects the dial on peer-id
+    /// mismatch and the node never joins the mesh (the exact bug this fixed).
+    /// Compared as SETS since `genesis_archive_peers()` order is map-derived.
+    #[test]
+    fn mainnet_bootstrap_peer_ids_are_the_derived_falcon_archive_ids() {
+        use std::collections::BTreeSet;
+        let derived: BTreeSet<String> = genesis_archive_peers()
+            .unwrap()
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect();
+        let boot: BTreeSet<String> = quil_config::MAINNET_BOOTSTRAP_PEERS
+            .iter()
+            .map(|ma| ma.rsplit("/p2p/").next().unwrap().to_string())
+            .collect();
+        assert_eq!(derived.len(), 5, "expected 5 genesis archives");
+        assert_eq!(
+            boot, derived,
+            "bootstrap peer IDs must be exactly the derived Falcon archive IDs the archives present"
+        );
+    }
 
     #[test]
     fn parse_mainnet_genesis() {

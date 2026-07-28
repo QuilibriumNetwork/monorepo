@@ -669,6 +669,7 @@ impl AppShardHarness {
                 ),
                 kv_db: kv_db_dep,
                 app_consensus_cw: app_cw,
+            db_config: quil_config::DbConfig { path: String::new(), worker_path_prefix: String::new(), worker_paths: vec![], ..Default::default() }, // ephemeral journal in tests
             };
 
             let (engine, handle) = quil_engine::app_engine::AppConsensusEngine::new(
@@ -2967,6 +2968,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
             ),
             kv_db: None,
             app_consensus_cw: false,
+            db_config: quil_config::DbConfig { path: String::new(), worker_path_prefix: String::new(), worker_paths: vec![], ..Default::default() }, // ephemeral journal in tests
         };
 
         let (engine, handle) =

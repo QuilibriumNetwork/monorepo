@@ -71,6 +71,9 @@ pub const CLOCK_COMPACTION: u8 = 0x05;
 pub const CLOCK_PEER_SENIORITY: u8 = 0x06;
 pub const CLOCK_APP_CERTIFIED_STATE: u8 = 0x07;
 pub const CLOCK_GLOBAL_FRAME_REQUEST: u8 = 0x08;
+/// Rust-node-only: per-frame MATERIALIZATION outcomes (one per request bundle).
+/// Not a Go concept; keyed like the frame itself so it prunes with the frame.
+pub const CLOCK_GLOBAL_FRAME_OUTCOMES: u8 = 0x09;
 pub const CLOCK_GLOBAL_CERTIFIED_STATE: u8 = 0x09;
 pub const CLOCK_SHARD_CERTIFIED_STATE: u8 = 0x0A;
 pub const CLOCK_QUORUM_CERTIFICATE: u8 = 0x0B;
@@ -210,6 +213,15 @@ pub fn clock_global_frame_request_key(frame_number: u64, request_index: u16) -> 
     key.push(CLOCK_GLOBAL_FRAME_REQUEST);
     key.extend_from_slice(&frame_number.to_be_bytes());
     key.extend_from_slice(&request_index.to_be_bytes());
+    key
+}
+
+/// Per-frame materialization outcomes: [CLOCK_FRAME, 0x09, frame_number(8 BE)]
+pub fn clock_global_frame_outcomes_key(frame_number: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10);
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_GLOBAL_FRAME_OUTCOMES);
+    key.extend_from_slice(&frame_number.to_be_bytes());
     key
 }
 
