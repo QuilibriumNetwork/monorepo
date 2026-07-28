@@ -1061,18 +1061,34 @@ impl P2PHandle {
         let _ = self.cmd_tx.send(P2PCommand::Subscribe(bitmask)).await;
     }
 
-    /// Register a blossomsub-level validator on `bitmask` that DROPS
-    /// (`Ignore` — no forward, no peer penalty) PeerInfo / KeyRegistry
-    /// messages whose embedded timestamp is already stale, BEFORE the mesh
-    /// forwards them. Without this the composite broker re-gossips every stale
-    /// PeerInfo/KeyRegistry (they are only rejected later at the app router,
-    /// `*_ts_too_old`), self-amplifying the flood and bloating the dedup
-    /// caches. This is a CHEAP peek (no canonical decode / Ed448 verify);
-    /// fresh messages `Accept` and still get the full app-level validation.
-    /// Timestamp windows mirror the app router: PeerInfo −60s..+300s,
-    /// KeyRegistry −60s..+5s. Uses `Ignore` (not `Reject`) because a message
-    /// can age in transit through honest relayers who shouldn't be penalised.
+    /// Register a blossomsub-level validator on `bitmask` that filters stale
+    /// PeerInfo / KeyRegistry BEFORE the mesh forwards them, so stale gossip is
+    /// never re-broadcast (self-amplifying the flood) and only reaches the app
+    /// router's `*_ts_too_old` reject as a fallback. This is a CHEAP peek (no
+    /// canonical decode / signature verify); fresh messages `Accept` and still
+    /// get full app-level validation.
+    ///
+    /// The response is GRADUATED by how stale the timestamp is:
+    /// - within `STALE_IGNORE_PAST_MS` of now (plus the small future skew
+    ///   allowance) → `Accept`;
+    /// - moderately stale (past `STALE_IGNORE_PAST_MS` but within
+    ///   `STALE_REJECT_PAST_MS`), or future-skewed → `Ignore` (drop, NO peer
+    ///   penalty) — a message can legitimately age in transit through an honest
+    ///   relayer, who must not be punished for it;
+    /// - grossly stale (older than `STALE_REJECT_PAST_MS` ≈ 5 min) → `Reject`,
+    ///   which feeds gossipsub's P₄ invalid-message peer score. An honest,
+    ///   roughly-NTP-synced relayer never forwards a 5-minute-old PeerInfo (it
+    ///   would `Ignore` it too), so reaching us with one means the sender is
+    ///   replaying / grossly clock-skewed / flooding — a sustained stream of
+    ///   these graylists the peer (see the topic-score params in
+    ///   `set_signing_identity`).
     pub async fn register_peer_info_staleness_validator(&self, bitmask: Vec<u8>) {
+        // Fresh window (Accept below this age). Past this but within the reject
+        // bound → Ignore (possible honest transit aging).
+        const STALE_IGNORE_PAST_MS: i64 = 60_000;
+        // Beyond this age → Reject + penalize; no honest relayer forwards
+        // something this old.
+        const STALE_REJECT_PAST_MS: i64 = 300_000; // 5 min
         let validator: Box<
             dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync,
         > = Box::new(|_peer, data| {
@@ -1085,7 +1101,10 @@ impl P2PHandle {
                 let tp = u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4]));
                 if tp == crate::peer_info::PEER_INFO_TYPE {
                     if let Some(ts) = crate::peer_info::peek_peer_info_timestamp(data) {
-                        if ts < now_ms - 60_000 || ts > now_ms + 300_000 {
+                        if ts < now_ms - STALE_REJECT_PAST_MS {
+                            return ValidationResult::Reject;
+                        }
+                        if ts < now_ms - STALE_IGNORE_PAST_MS || ts > now_ms + 300_000 {
                             return ValidationResult::Ignore;
                         }
                     }
@@ -1093,7 +1112,10 @@ impl P2PHandle {
                     if let Some(ts) =
                         crate::peer_info::peek_key_registry_timestamp(data).map(|v| v as i64)
                     {
-                        if ts < now_ms - 60_000 || ts > now_ms + 5_000 {
+                        if ts < now_ms - STALE_REJECT_PAST_MS {
+                            return ValidationResult::Reject;
+                        }
+                        if ts < now_ms - STALE_IGNORE_PAST_MS || ts > now_ms + 5_000 {
                             return ValidationResult::Ignore;
                         }
                     }

@@ -409,6 +409,19 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
     };
 
+    // Preflight: Falcon (KeyType=5) is the network peer identity. Prove this
+    // binary can round-trip a Falcon key through the peer-decode path BEFORE any
+    // handshake, so a falcon-incapable build (stale artifact / mis-provisioned
+    // feature / fn-dsa platform issue) fails here with one clear message instead
+    // of a storm of "cargo feature `falcon` is not enabled" per-peer errors.
+    match quil_p2p::falcon_identity_self_check() {
+        Ok(()) => info!("Falcon (KeyType=5) network identity: enabled"),
+        Err(e) => {
+            error!("{e}");
+            return Err(anyhow::anyhow!(e));
+        }
+    }
+
     // Register all engine metric descriptors once, AFTER the recorder
     // is installed so `describe_*` calls attach to it.
     quil_engine::metrics::register_engine_metrics();

@@ -171,6 +171,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         // validators emit; size <= ~20 keys in practice.
         let mut router_drops_by_reason: std::collections::HashMap<&'static str, u64> =
             std::collections::HashMap::new();
+        // Per-SOURCE aggregation (propagation peer -> dropped-message count).
+        // Distinguishes a targeted flood (drops concentrated on one/few peers →
+        // blacklist candidate) from systemic backlog aging (drops spread across
+        // every mesh peer → this node is overloaded, not attacked). Keyed by the
+        // authenticated `from` peer, so it is bounded by the live connection set.
+        let mut router_drops_by_source: std::collections::HashMap<Vec<u8>, u64> =
+            std::collections::HashMap::new();
         let mut status_timer = tokio::time::interval(std::time::Duration::from_secs(30));
         status_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Track the highest frame number we've fully executed (through
@@ -251,6 +258,22 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             entries.sort_by(|a, b| b.1.cmp(a.1));
                             entries.into_iter().take(8)
                                 .map(|(k, v)| format!("{}={}", k, v))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        },
+                        // Top drop sources: `peer(short-hex)=count`, most first.
+                        // A single peer dominating ⇒ targeted flood; even spread
+                        // ⇒ this node is backlog-aging (overloaded), not attacked.
+                        drop_sources = %{
+                            let mut entries: Vec<(&Vec<u8>, &u64)> =
+                                router_drops_by_source.iter().collect();
+                            entries.sort_by(|a, b| b.1.cmp(a.1));
+                            entries.into_iter().take(8)
+                                .map(|(k, v)| {
+                                    let h = hex::encode(k);
+                                    let short = if h.len() > 12 { &h[..12] } else { &h };
+                                    format!("{}={}", short, v)
+                                })
                                 .collect::<Vec<_>>()
                                 .join(",")
                         },
@@ -387,6 +410,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 router_drops += 1;
                                 if let Some(reason) = route_outcome.reject_reason() {
                                     *router_drops_by_reason.entry(reason).or_insert(0) += 1;
+                                }
+                                // Attribute the drop to the peer that forwarded
+                                // it (bounded by the live connection set).
+                                if !received.from.is_empty() {
+                                    *router_drops_by_source
+                                        .entry(received.from.clone())
+                                        .or_insert(0) += 1;
                                 }
                                 // Categorize for operator visibility.
                                 let topic = match received.bitmask.as_slice() {

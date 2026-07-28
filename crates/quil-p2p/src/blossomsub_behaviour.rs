@@ -214,13 +214,18 @@ impl BlossomSubBehaviour {
             .expect("valid gossipsub config")
         };
         self.inner = inner;
-        // Enable peer scoring so `set_application_score` is effective. Default
-        // params are permissive; the application-score channel is what the node
-        // actually drives (peer_authenticator / peer_info).
-        if let Err(e) = self.inner.with_peer_score(
-            gossipsub::PeerScoreParams::default(),
-            gossipsub::PeerScoreThresholds::default(),
-        ) {
+        // Enable peer scoring. Two channels are active:
+        //  (1) application score (`set_application_score`) — driven by the node
+        //      (peer_authenticator / per-source drop-rate penalties);
+        //  (2) topic P₄ (invalid-message) on GLOBAL_PEER_INFO — a `Reject` from
+        //      the graduated staleness validator (only fires on >5-min-stale
+        //      PeerInfo/KeyRegistry, which an honest relayer never forwards)
+        //      accrues a QUADRATIC penalty, so a sustained stale/replay flood
+        //      graylists the offending peer while a one-off aged message does
+        //      not.
+        // Every other topic-score term is ZEROED (see `build_peer_score`).
+        let (score_params, thresholds) = build_peer_score();
+        if let Err(e) = self.inner.with_peer_score(score_params, thresholds) {
             tracing::warn!(error = %e, "gossipsub peer-score init failed");
         }
         // Re-apply any subscriptions / explicit peers registered before the
@@ -623,6 +628,49 @@ impl NetworkBehaviour for BlossomSubBehaviour {
 /// per-network protocol id and setting the BlossomSub message id
 /// (`[0x01] ++ SHA256(data)`). Fork-only knobs without a stock equivalent
 /// (`mesh_peers_per_subnet`, `mcache_max_bytes`) are dropped.
+/// Peer-score config. Two channels are active: (1) the application score
+/// (`set_application_score`, driven by the node — peer_authenticator + per-source
+/// drop-rate penalties); (2) topic P₄ (invalid-message) on GLOBAL_PEER_INFO, so
+/// a `Reject` from the graduated staleness validator (fires ONLY on >5-min-stale
+/// PeerInfo/KeyRegistry, which an honest relayer never forwards) accrues a
+/// QUADRATIC penalty — a sustained stale/replay flood graylists the peer while a
+/// one-off aged message does not. Every honest-peer-affecting topic term
+/// (time-in-mesh, first/mesh deliveries, mesh-failure) is ZEROED: those punish
+/// peers for normal WAN delivery variance and cause mesh flapping.
+fn build_peer_score() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresholds) {
+    let mut pi_topic = gossipsub::TopicScoreParams::default();
+    pi_topic.topic_weight = 1.0;
+    pi_topic.time_in_mesh_weight = 0.0;
+    pi_topic.first_message_deliveries_weight = 0.0;
+    pi_topic.mesh_message_deliveries_weight = 0.0;
+    pi_topic.mesh_failure_penalty_weight = 0.0;
+    pi_topic.invalid_message_deliveries_weight = -50.0; // P₄ = weight × counter²
+    pi_topic.invalid_message_deliveries_decay = 0.5; // ~halves each decay_interval → recovers
+    // Keep `PeerScoreParams::default()` for everything else — notably
+    // `app_specific_weight` (the existing `set_application_score` channel),
+    // `ip_colocation_factor_weight` and `behaviour_penalty_weight`.
+    let mut score_params = gossipsub::PeerScoreParams::default();
+    // GLOBAL_PEER_INFO bitmask `[0,0,0,0]` → topic `hex("00000000")`.
+    score_params
+        .topics
+        .insert(topic_for(&[0u8, 0, 0, 0]).hash(), pi_topic);
+    // Thresholds MUST be negative now that scores can go negative (the all-zero
+    // default would graylist on ANY negative — hair-trigger, since default
+    // params already carry ip-colocation/behaviour penalties; negative
+    // thresholds relax those too, the safer standard config). Ordered
+    // gossip ≥ publish ≥ graylist. With P₄ weight −50: counter 2 → −200 (below
+    // gossip, reduced IHAVE/IWANT), counter 3 → −450 (< graylist, peer ignored);
+    // a one-off (counter 1 → −50) stays above all thresholds.
+    let thresholds = gossipsub::PeerScoreThresholds {
+        gossip_threshold: -100.0,
+        publish_threshold: -200.0,
+        graylist_threshold: -400.0,
+        accept_px_threshold: 0.0,
+        opportunistic_graft_threshold: 0.0,
+    };
+    (score_params, thresholds)
+}
+
 fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Config {
     let mut builder = gossipsub::ConfigBuilder::default();
     builder
@@ -632,11 +680,12 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         )
         .history_length(params.history_length)
         .history_gossip(params.history_gossip)
-        .mesh_n(params.d)
-        .mesh_n_low(params.d_lo)
-        .mesh_n_high(params.d_hi)
-        .gossip_lazy(params.d_lazy)
-        .mesh_outbound_min(params.d_out)
+        // Mesh-degree (D) family is DELIBERATELY left at gossipsub's own
+        // defaults (mesh_n=6, mesh_n_low=5, mesh_n_high=12, gossip_lazy=6,
+        // mesh_outbound_min=2) rather than the blossomsub-tuned config values
+        // (D=8/D_lo=6). Higher fan-out multiplies traffic on high-rate topics
+        // (e.g. GLOBAL_PEER_INFO); `params.{d,d_lo,d_hi,d_lazy,d_out}` are
+        // intentionally NOT applied here.
         .gossip_factor(params.gossip_factor)
         .heartbeat_interval(params.heartbeat_interval)
         .heartbeat_initial_delay(params.heartbeat_initial_delay)
@@ -679,6 +728,29 @@ mod propagation_tests {
     use libp2p::swarm::SwarmEvent;
     use libp2p::{Multiaddr, Swarm, SwarmBuilder};
     use std::time::Duration;
+
+    // The peer-score config must pass gossipsub's own validation, or
+    // `with_peer_score` errors and scoring silently stays OFF (warn path).
+    #[test]
+    fn peer_score_config_is_valid_and_scores_peer_info() {
+        let (params, thresholds) = build_peer_score();
+        params.validate().expect("peer-score params must validate");
+        thresholds.validate().expect("thresholds must validate");
+        // GLOBAL_PEER_INFO carries the P₄ invalid-message penalty...
+        let topic = topic_for(&[0u8, 0, 0, 0]).hash();
+        let tp = params
+            .topics
+            .get(&topic)
+            .expect("GLOBAL_PEER_INFO must be scored");
+        assert!(
+            tp.invalid_message_deliveries_weight < 0.0,
+            "P4 must penalize invalid deliveries"
+        );
+        // ...but must NOT prune honest peers on normal delivery variance.
+        assert_eq!(tp.mesh_message_deliveries_weight, 0.0);
+        assert_eq!(tp.first_message_deliveries_weight, 0.0);
+        assert_eq!(tp.time_in_mesh_weight, 0.0);
+    }
 
     fn build_swarm() -> Swarm<BlossomSubBehaviour> {
         SwarmBuilder::with_new_identity()

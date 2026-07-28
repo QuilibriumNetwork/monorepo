@@ -68,6 +68,43 @@ pub fn generate_falcon_signing_key() -> Vec<u8> {
     libp2p::identity::falcon::Keypair::generate().secret_bytes()
 }
 
+/// Boot-time preflight: prove THIS binary's `libp2p-identity` can round-trip a
+/// Falcon (KeyType=5) public key through the SAME protobuf decode path the
+/// `:8340` PQNoise transport ([`crate::pqnoise_transport`]) and PeerInfo /
+/// KeyRegistry use for every peer. Falcon is the network peer identity, so a
+/// binary whose libp2p-identity lacks the `falcon` feature fails EVERY handshake
+/// with `decode pubkey: cargo feature \`falcon\` is not enabled` — a symptom that
+/// otherwise only shows up as a storm of buried per-peer errors. Call this once
+/// at startup and abort loudly on failure.
+///
+/// (`Keypair::generate_falcon` won't even compile without the feature, so in a
+/// correctly-built binary this always succeeds; it exists to convert a
+/// mis-provisioned/stale/two-instance build — or an fn-dsa platform issue — into
+/// one clear boot error, and to emit a positive "Falcon enabled" log line whose
+/// ABSENCE flags a pre-fix binary in a user's logs.)
+pub fn falcon_identity_self_check() -> Result<(), String> {
+    use libp2p::identity::{Keypair, PublicKey};
+    let kp = Keypair::generate_falcon();
+    let proto = kp.public().encode_protobuf();
+    let decoded = PublicKey::try_decode_protobuf(&proto).map_err(|e| {
+        format!(
+            "Falcon (KeyType=5) self-check FAILED: {e}. This binary's \
+             libp2p-identity cannot decode Falcon peer keys — Falcon is the \
+             network peer identity, so this node cannot handshake with ANY peer. \
+             Rebuild with the `falcon` feature (it is default in the vendored \
+             libp2p-identity fork); a falcon-less build should no longer be \
+             buildable, so suspect a stale target/build cache or a \
+             `default-features = false` on libp2p-identity."
+        )
+    })?;
+    if decoded != kp.public() {
+        return Err("Falcon (KeyType=5) self-check FAILED: public-key round-trip \
+                    mismatch — Falcon support in this build is broken (fn-dsa?)."
+            .to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
