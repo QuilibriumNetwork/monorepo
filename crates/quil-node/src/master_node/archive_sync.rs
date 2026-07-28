@@ -432,19 +432,30 @@ async fn run_all_gap_backfill(
     info!("restart gap scan: backfill pass complete");
 }
 
-/// The state-jump is a blind-trust recovery for archives stranded far below the
-/// network head: it syncs a peer's full state snapshot wholesale (no per-frame
-/// verification). It is confined to the migration-recovery window BELOW this
-/// frame — a node at/past it must catch up only via the verified poller/
-/// consensus, never by trusting a peer's current-era state. (Network is at
-/// ~671.7k; the whole mechanism self-disables at this boundary.)
+/// ARCHIVES ONLY: an archive must not blind-trust another archive's current-era
+/// state — archives are the authoritative state servers for each other, so a
+/// far-behind archive catches up strictly via the verified poller/consensus once
+/// it reaches this frame, never by wholesale-snapshotting a peer's live tree.
+/// (Archives migrate from the same legacy head, so they start current-era anyway
+/// and never need to cross the legacy range.)
+///
+/// This ceiling is NOT applied to non-archives: a non-archive is a state
+/// CONSUMER, not a server, and jumping it to a `frame_validate`'d checkpoint
+/// (produced by a GENESIS ARCHIVE per the allowlist, VDF/BLS-valid, with every
+/// pulled tree Merkle-authenticated against that frame's committed root) trusts a
+/// genesis-archive checkpoint — the same root as genesis bootstrap, not an
+/// arbitrary peer's unverified state. Without this exemption a fresh non-archive
+/// is stranded grinding the poller one frame at a time across the ~425k
+/// pre-migration LEGACY frames the new chain can never validate.
 const STATE_JUMP_MAX_FRAME: u64 = 672_000;
-/// Only state-jump when replaying the gap would be impractical; below this the
-/// frame poller catches up fine and a blind full-state sync isn't warranted.
+/// Only state-jump when the gap to the network head is large enough that
+/// replaying it via the verified poller is impractical; within this many frames
+/// of head the poller catches up fine and a full-state snapshot isn't warranted.
+/// For non-archives this is the SOLE gate on when a jump fires.
 const STATE_JUMP_MIN_GAP: u64 = 1_000;
 
-/// Full-state "state jump" for a far-behind archive (below
-/// [`STATE_JUMP_MAX_FRAME`]): hypersync the prover tree + EVERY app-shard tree
+/// Full-state "state jump" for a far-behind node (gap to head ≥
+/// [`STATE_JUMP_MIN_GAP`]): hypersync the prover tree + EVERY app-shard tree
 /// (all four phases) to a peer's snapshot at frame N — every pull pinned to N's
 /// snapshot generation so the captured state is cross-tree CONSISTENT — then
 /// store the frame-N record (advancing the clock head) and advance the durable
@@ -476,8 +487,12 @@ async fn run_state_jump(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Option<u64> {
     let local_head = clock_store.get_latest_frame_number().unwrap_or(0);
-    if local_head >= STATE_JUMP_MAX_FRAME {
-        return None; // recovery window closed — never blind-trust current-era state
+    // Archive ceiling (see STATE_JUMP_MAX_FRAME): once an archive is current-era
+    // it must verify, not blind-trust a peer. Non-archives have no ceiling —
+    // whether they jump is decided per-peer purely by the gap to that peer's
+    // (validated) head (`STATE_JUMP_MIN_GAP` below).
+    if sync_all_shards && local_head >= STATE_JUMP_MAX_FRAME {
+        return None;
     }
     let endpoints = pool.get_all().await;
     if endpoints.is_empty() {
@@ -500,12 +515,19 @@ async fn run_state_jump(
             None => continue,
         };
         let target = hdr.frame_number;
-        // Gate: strictly below the cap, and far enough behind to justify a jump.
-        if target == 0 || target >= STATE_JUMP_MAX_FRAME {
+        // A peer with no head (0) tells us nothing — try the next.
+        if target == 0 {
             continue;
         }
+        // Archives won't snapshot a current-era peer (see STATE_JUMP_MAX_FRAME);
+        // non-archives have no such ceiling.
+        if sync_all_shards && target >= STATE_JUMP_MAX_FRAME {
+            continue;
+        }
+        // Within MIN_GAP of head → the verified poller catches up fine; don't
+        // snapshot. For non-archives this is the sole "should I jump" gate.
         if target <= local_head.saturating_add(STATE_JUMP_MIN_GAP) {
-            return None; // small gap — the poller handles it; don't blind-trust
+            return None;
         }
         if !frame_validate(&head) {
             warn!(%addr, target, "state-jump: peer head failed validation — trying another peer");
@@ -753,12 +775,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         };
 
         // Far-behind recovery: spawn a one-shot state jump pinned to a single
-        // peer frame N. It fires for ANY node stranded far below the
-        // migration-recovery boundary (`STATE_JUMP_MAX_FRAME`) — NOT just
-        // archives — so a regular that has been offline since the flag day
-        // doesn't try to replay ancient (pre-migration, now-invalid) history
-        // from the poller. For a healthy or only-slightly-behind node the jump
-        // returns immediately (gate check) and is a no-op.
+        // peer frame N. It fires for ANY node whose gap to the network head
+        // exceeds `STATE_JUMP_MIN_GAP` — NOT just archives — so a regular that
+        // has been offline since the flag day doesn't try to replay ancient
+        // (pre-migration, now-invalid) history from the poller. Non-archives can
+        // jump to a validated current-era checkpoint; archives keep the
+        // conservative `STATE_JUMP_MAX_FRAME` ceiling (must verify, not
+        // blind-trust a peer's live state). For a healthy or only-slightly-behind
+        // node the jump returns immediately (gap check) and is a no-op.
         //
         // `sync_all_shards = archive_mode`: archives pull the prover tree AND
         // every app-shard (they must serve full state); a regular pulls only
