@@ -17,7 +17,7 @@ use base64::Engine as _;
 use num_bigint::{BigInt, Sign};
 use serde::Serialize;
 
-use quil_types::consensus::{ProverAllocationInfo, ProverInfo, ProverStatus};
+use quil_types::consensus::{EffectiveStatus, ProverAllocationInfo, ProverInfo, ProverStatus};
 use quil_types::error::QuilError;
 use quil_types::protojson;
 
@@ -865,7 +865,12 @@ fn assess_allocation(
     frame: u64,
     halts: &HashMap<Vec<u8>, u64>,
 ) -> Option<Assessment> {
-    if alloc.status != ProverStatus::Active || alloc.confirmation_filter.is_empty() {
+    // Frame-aware: mirror `find_eviction_candidates` (raw `alloc.status` wrongly
+    // flags epoch-EXPIRED allocations, which the committee/shard summaries
+    // already exclude via `live_allocation_status`).
+    if alloc.effective_status(frame) != EffectiveStatus::Active
+        || alloc.confirmation_filter.is_empty()
+    {
         return None;
     }
     let halt_duration = halts.get(&alloc.confirmation_filter).copied().unwrap_or(0);

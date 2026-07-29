@@ -595,7 +595,21 @@ impl InMemoryProverRegistry {
             }
             let mut should_evict = false;
             for alloc in &info.allocations {
-                if alloc.status != ProverStatus::Active {
+                // Frame-aware: only an allocation that is EFFECTIVELY Active for
+                // this frame accrues inactivity. Gating on the RAW `alloc.status`
+                // wrongly evicted epoch-EXPIRED allocations — the raw status
+                // stays `Active` after the epoch ends, but `effective_status`
+                // returns `ExpiredEpoch`. Such allocations are already excluded
+                // from the committee and the shard summaries (both go through
+                // `live_allocation_status`), so evicting them for "inactivity"
+                // when they aren't even expected to be active was inconsistent
+                // (the "up for eviction but no active shards" contradiction).
+                // This matches the committee filter's frame-aware gating; an
+                // epoch-expired prover is handled by the epoch lifecycle, not
+                // inactivity eviction. Orphan (`Unknown`-prover) allocations
+                // whose epoch is still valid remain `Active` here and are still
+                // kicked.
+                if alloc.effective_status(frame_number) != EffectiveStatus::Active {
                     continue;
                 }
                 // Global provers (empty confirmation filter) are never
@@ -2026,6 +2040,13 @@ mod tests {
                 field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
             ])
         };
+        // `Epoch` must satisfy `epoch >= epoch_for_frame(frame)` so the
+        // frame-aware eviction gate reads these as effectively Active (a fresh,
+        // re-confirmed member). Without it the allocation would read as
+        // ExpiredEpoch and be (correctly) exempt from inactivity eviction.
+        let cur_epoch = quil_types::consensus::epoch_for_frame(
+            quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900,
+        );
         let mk_alloc = |prover: &[u8; 32], filter: &[u8]| {
             build_sub_tree(vec![
                 type_hash_leaf("allocation:ProverAllocation"),
@@ -2036,6 +2057,11 @@ mod tests {
                     "allocation:ProverAllocation",
                     "LastActiveFrameNumber",
                     100u64.to_be_bytes().to_vec(),
+                ),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "Epoch",
+                    cur_epoch.to_be_bytes().to_vec(),
                 ),
             ])
         };
@@ -2325,6 +2351,50 @@ mod tests {
     }
 
     #[test]
+    fn find_eviction_candidates_exempts_expired_epoch() {
+        // A raw-Active allocation whose recorded `Epoch` is STALE (missed its
+        // per-epoch re-confirm) reads as `ExpiredEpoch` via `effective_status`.
+        // It's already excluded from the committee / shard summaries, so it must
+        // NOT be evicted for inactivity — this is the "up for eviction but no
+        // active shards" fix. Identical to the evictable case except the epoch
+        // is old; would evict under the prior raw-`alloc.status` gate.
+        let prover = [0x71u8; 32];
+        let filter = vec![0x33u8; 64];
+        let mk_prover = build_sub_tree(vec![
+            type_hash_leaf("prover:Prover"),
+            field_leaf("prover:Prover", "PublicKey", vec![0xCD; 57]),
+            field_leaf("prover:Prover", "Status", vec![1u8]),
+            field_leaf("prover:Prover", "AvailableStorage", 0u64.to_be_bytes().to_vec()),
+            field_leaf("prover:Prover", "Seniority", 0u64.to_be_bytes().to_vec()),
+            field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
+        ]);
+        let alloc = build_sub_tree(vec![
+            type_hash_leaf("allocation:ProverAllocation"),
+            field_leaf("allocation:ProverAllocation", "Prover", prover.to_vec()),
+            field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+            field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.clone()),
+            field_leaf("allocation:ProverAllocation", "LastActiveFrameNumber", 100u64.to_be_bytes().to_vec()),
+            // STALE epoch (0) → effective_status == ExpiredEpoch at the test frame.
+            field_leaf("allocation:ProverAllocation", "Epoch", 0u64.to_be_bytes().to_vec()),
+        ]);
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x71), &mk_prover).unwrap();
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x72), &alloc).unwrap();
+
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(&store);
+
+        let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900;
+        let halts: HashMap<Vec<u8>, u64> = HashMap::new();
+        let evict = reg.find_eviction_candidates(frame, 500, &halts);
+        assert!(
+            evict.is_empty(),
+            "epoch-expired prover must not be evicted for inactivity"
+        );
+    }
+
+    #[test]
     fn find_eviction_candidates_selects_unknown_stub() {
         // After a prover vertex is kicked (Status byte 4 → decode_prover
         // returns None), refresh synthesizes an `Unknown` stub from the
@@ -2341,6 +2411,16 @@ mod tests {
             field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
             field_leaf("allocation:ProverAllocation", "ConfirmationFilter", vec![0x77u8; 64]),
             field_leaf("allocation:ProverAllocation", "LastActiveFrameNumber", 100u64.to_be_bytes().to_vec()),
+            // Current epoch so the frame-aware gate reads it as effectively
+            // Active (the orphan's allocation is still live, just its parent
+            // prover vertex was kicked).
+            field_leaf(
+                "allocation:ProverAllocation",
+                "Epoch",
+                quil_types::consensus::epoch_for_frame(
+                    quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900,
+                ).to_be_bytes().to_vec(),
+            ),
         ]);
         let (_tmp, store) = temp_store();
         let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };

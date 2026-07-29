@@ -31,6 +31,8 @@ use quil_crypto::{
     falcon_verify, FalconSigner, FALCON_PUBLIC_KEY_LEN, FALCON_SIGNATURE_LEN,
 };
 use quil_types::crypto::Signer as QuilSigner;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 /// Boilerplate: turn a fixed-length `[u8; N]` newtype into a commonware `Array`
 /// (the supertrait bundle `Signature`/`PublicKey` require) — mirrors the manual
@@ -111,12 +113,43 @@ impl commonware_cryptography::Verifier for FalconPublicKey {
 
 impl commonware_cryptography::PublicKey for FalconPublicKey {}
 
+/// Bounded, insertion-ordered signature cache. Falcon (FN-DSA) signing is
+/// NON-DETERMINISTIC — the Gaussian sampler draws fresh randomness, so signing
+/// the SAME message twice yields DIFFERENT bytes. commonware-simplex re-signs a
+/// vote on every rebroadcast and compares two votes from the same signer by
+/// their full attestation (signature) bytes (`Nullify::eq` etc.); a re-signed
+/// nullify/notarize/finalize therefore looks like a CONFLICTING vote, trips
+/// equivocation detection (`batcher/round.rs` "conflicting nullify") and gets the
+/// honest peer BLOCKED. Caching the first signature per signed payload and
+/// returning it verbatim on re-sign makes rebroadcasts byte-identical — the
+/// behaviour commonware assumes for deterministic BLS/ed25519.
+struct SigCache {
+    map: HashMap<Vec<u8>, FalconSignature>,
+    order: VecDeque<Vec<u8>>,
+}
+
+/// Enough for every in-flight view's votes (notarize/nullify/finalize across the
+/// handful of concurrently-active rounds) many times over; oldest-evicted.
+const SIG_CACHE_CAP: usize = 4096;
+
+impl SigCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
 /// Falcon-512 private key. Holds the encoded signing key (1281 B) alongside the
 /// public key (897 B) so `public_key()` is free.
 #[derive(Clone)]
 pub struct FalconPrivateKey {
     signing_key: Vec<u8>,
     public_key: [u8; FALCON_PUBLIC_KEY_LEN],
+    /// Shared across clones (commonware clones the signer): a re-sign of an
+    /// already-signed payload returns the SAME cached signature. See [`SigCache`].
+    sig_cache: Arc<Mutex<SigCache>>,
 }
 
 impl core::fmt::Debug for FalconPrivateKey {
@@ -136,6 +169,7 @@ impl FalconPrivateKey {
         Some(Self {
             signing_key: signing_key.to_vec(),
             public_key: pk,
+            sig_cache: Arc::new(Mutex::new(SigCache::new())),
         })
     }
 }
@@ -156,6 +190,7 @@ impl Random for FalconPrivateKey {
         Self {
             signing_key: signer.private_key().to_vec(),
             public_key: pk,
+            sig_cache: Arc::new(Mutex::new(SigCache::new())),
         }
     }
 }
@@ -171,6 +206,15 @@ impl commonware_cryptography::Signer for FalconPrivateKey {
     fn sign(&self, namespace: &[u8], msg: &[u8]) -> Self::Signature {
         // Mirror `Verifier::verify`: separation via namespace, empty context.
         let payload = union_unique(namespace, msg);
+        // NEVER produce a second signature for a payload we've already signed —
+        // Falcon is non-deterministic, so a fresh signature over the SAME vote
+        // reads as an equivocation to commonware and blocks us (see [`SigCache`]).
+        // Hold the lock across signing so a concurrent re-sign of the same
+        // payload can't race in a distinct signature.
+        let mut cache = self.sig_cache.lock().expect("sig cache poisoned");
+        if let Some(sig) = cache.map.get(&payload) {
+            return sig.clone();
+        }
         let signer = FalconSigner::from_bytes(&self.signing_key, &self.public_key);
         let sig = signer
             .sign_with_domain(&payload, &[])
@@ -178,7 +222,15 @@ impl commonware_cryptography::Signer for FalconPrivateKey {
         let arr: [u8; FALCON_SIGNATURE_LEN] = sig
             .try_into()
             .expect("fn-dsa signature is FALCON_SIGNATURE_LEN");
-        FalconSignature(arr)
+        let fsig = FalconSignature(arr);
+        cache.map.insert(payload.clone(), fsig.clone());
+        cache.order.push_back(payload);
+        if cache.order.len() > SIG_CACHE_CAP {
+            if let Some(old) = cache.order.pop_front() {
+                cache.map.remove(&old);
+            }
+        }
+        fsig
     }
 }
 
@@ -202,6 +254,27 @@ mod tests {
         assert!(!pk.verify(b"globaltimeout", msg, &sig));
         // Wrong message must fail.
         assert!(!pk.verify(ns, b"tampered", &sig));
+    }
+
+    #[test]
+    fn resigning_same_payload_returns_identical_bytes() {
+        // Falcon signing is non-deterministic, so WITHOUT the cache two signs of
+        // the same payload differ — which commonware reads as an equivocation
+        // ("conflicting nullify") and blocks the peer. The cache must make a
+        // re-sign byte-identical (as a deterministic scheme would be).
+        let sk = FalconPrivateKey::random(test_rng());
+        let ns = b"global";
+        let msg = b"view-7-nullify";
+        let a = sk.sign(ns, msg);
+        let b = sk.sign(ns, msg);
+        assert_eq!(a, b, "re-sign of the same payload must return the cached signature");
+        // A clone shares the cache (commonware clones the signer).
+        let b2 = sk.clone().sign(ns, msg);
+        assert_eq!(a, b2, "cache is shared across clones");
+        // A DIFFERENT payload still gets its own (valid) signature.
+        let c = sk.sign(ns, b"view-8-nullify");
+        assert_ne!(a, c);
+        assert!(sk.public_key().verify(ns, b"view-8-nullify", &c));
     }
 
     #[test]

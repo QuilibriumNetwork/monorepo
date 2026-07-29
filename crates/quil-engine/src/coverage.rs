@@ -210,7 +210,16 @@ impl LowCoverageStreakTracker {
                     effective_coverage.insert(key.clone(), 0);
                     last_frame.insert(key.clone(), alloc.last_active_frame_number);
                 }
-                if alloc.status == ProverStatus::Active {
+                // Frame-aware, matching the LIVE coverage path
+                // (`get_active_provers`): an epoch-EXPIRED allocation (raw
+                // status still `Active`, `effective_status` = ExpiredEpoch) is
+                // NOT effectively covering the shard, so it must not seed
+                // coverage — otherwise a shard held only by expired provers looks
+                // covered at startup and suppresses joins until the first live
+                // update corrects it.
+                if alloc.effective_status(current_frame)
+                    == quil_types::consensus::EffectiveStatus::Active
+                {
                     *effective_coverage.entry(key.clone()).or_insert(0) += 1;
                     let entry = last_frame.entry(key).or_insert(0);
                     if alloc.last_active_frame_number > *entry {

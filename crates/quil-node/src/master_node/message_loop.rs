@@ -482,6 +482,47 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 match quil_p2p::classify_peer_info_message(&received.data) {
                                     Ok(quil_p2p::PeerInfoMessage::PeerInfo(info)) => {
                                         peer_infos_received += 1;
+                                        // Signature validation MOVED here from the
+                                        // route validator (which now does timestamp
+                                        // only — Falcon verify inline on the recv
+                                        // loop was starving it and overflowing the
+                                        // per-peer send queue). Runs AFTER retrieval,
+                                        // BEFORE the entry is cached/trusted, so an
+                                        // unverified/spoofed PeerInfo never reaches
+                                        // the peer_info_cache or the archive
+                                        // admission gate below.
+                                        //   1. Falcon key/sig lengths (897 / 666).
+                                        //   2. peer_id ↔ signing-pubkey binding —
+                                        //      without it an attacker signs with
+                                        //      their OWN key but sets peer_id to a
+                                        //      genesis archive's, impersonating it to
+                                        //      the admission gate.
+                                        //   3. Falcon verify (empty domain, matching
+                                        //      `Signer::sign` = sign_with_domain(m,&[])).
+                                        if info.peer_id.is_empty()
+                                            || info.public_key.len() != 897
+                                            || info.signature.len() != 666
+                                        {
+                                            continue;
+                                        }
+                                        if info.peer_id
+                                            != quil_p2p::peer_id_from_falcon_pubkey(&info.public_key)
+                                        {
+                                            continue;
+                                        }
+                                        let signing_payload = quil_p2p::encode_canonical_peer_info(
+                                            &info,
+                                            &info.public_key,
+                                            &[],
+                                        );
+                                        if !quil_crypto::falcon_verify(
+                                            &info.public_key,
+                                            &info.signature,
+                                            &signing_payload,
+                                            &[],
+                                        ) {
+                                            continue;
+                                        }
                                         // Dedup: hash PeerInfo with timestamp zeroed
                                         // (mirrors Go's hashPeerInfo). Skip if seen.
                                         let mut dedup_info = info.clone();
@@ -522,7 +563,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 || genesis_archive_peer_ids_for_recv
                                                     .contains(&info.peer_id);
                                             if !is_genesis_archive {
-                                                warn!(
+                                                debug!(
                                                     peer = peer_hex,
                                                     from = bs58::encode(&received.from).into_string(),
                                                     "FAKE ARCHIVE — peer claims archive capability but is not a genesis archive peer"
@@ -684,7 +725,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                         "ingested KeyRegistry"
                                                     );
                                                 } else {
-                                                    warn!(
+                                                    debug!(
                                                         identity_len,
                                                         prover_len,
                                                         "rejected KeyRegistry: invalid cross-signature, empty key, or stale replay"
@@ -692,16 +733,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!(error = %e, "failed to decode KeyRegistry");
+                                                debug!(error = %e, "failed to decode KeyRegistry");
                                             }
                                         }
                                     }
                                     Ok(quil_p2p::PeerInfoMessage::Unknown(prefix)) => {
-                                        warn!(prefix = format!("0x{:04x}", prefix),
+                                        debug!(prefix = format!("0x{:04x}", prefix),
                                             "unknown PEER_INFO bitmask message type");
                                     }
                                     Err(e) => {
-                                        warn!(error = %e, "failed to decode PeerInfo");
+                                        debug!(error = %e, "failed to decode PeerInfo");
                                     }
                                 }
                             }
@@ -711,7 +752,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 let frame_result: std::result::Result<quil_types::proto::global::GlobalFrame, _> =
                                     quil_engine::consensus_wire::decode_global_frame(&received.data)
                                         .or_else(|canonical_err| {
-                                            warn!(error = %canonical_err, "canonical decode failed, trying proto");
+                                            debug!(error = %canonical_err, "canonical decode failed, trying proto");
                                             prost::Message::decode(received.data.as_slice())
                                                 .map_err(|e| quil_types::error::QuilError::InvalidArgument(
                                                     format!("failed to decode Protobuf message: {} (canonical: {})", e, canonical_err)
@@ -725,7 +766,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         // Validate prover is a genesis prover
                                         if let Some(h) = frame.header.as_ref() {
                                             if !genesis_prover_addrs_for_recv.contains(&h.prover) {
-                                                warn!(
+                                                debug!(
                                                     frame = frame_num,
                                                     prover = hex::encode(&h.prover),
                                                     from = bs58::encode(&received.from).into_string(),
@@ -747,15 +788,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 // Validator returned false — either VDF or BLS
                                                 // signature check rejected it. The specific
                                                 // reason is logged by `GlobalFrameVerifier::validate`.
-                                                warn!(frame = frame_num, "frame rejected by validator — dropping");
+                                                debug!(frame = frame_num, "frame rejected by validator — dropping");
                                                 continue;
                                             }
                                             Ok(Err(e)) => {
-                                                warn!(frame = frame_num, error = %e, "VDF validation error — dropping frame");
+                                                debug!(frame = frame_num, error = %e, "VDF validation error — dropping frame");
                                                 continue;
                                             }
                                             Err(_) => {
-                                                warn!(
+                                                debug!(
                                                     frame = frame_num,
                                                     output_len = frame.header.as_ref().map(|h| h.output.len()).unwrap_or(0),
                                                     "VDF validation PANIC — frame output likely corrupted, dropping"
@@ -931,7 +972,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         } else {
                                             hex::encode(&received.data)
                                         };
-                                        warn!(
+                                        debug!(
                                             error = %e,
                                             bytes = received.data.len(),
                                             prefix = %prefix,

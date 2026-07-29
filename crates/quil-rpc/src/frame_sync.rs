@@ -480,7 +480,7 @@ pub async fn run_archive_poller(
                         // height) rather than persisting forged data.
                         if let Some(ref validate) = config.frame_validator {
                             if !validate(&frame) {
-                                warn!(%addr, frame = fn_, "catchup frame failed validation — rotating endpoint");
+                                debug!(%addr, frame = fn_, "catchup frame failed validation — rotating endpoint");
                                 failed_frame = Some(fn_);
                                 failed_validation = true;
                                 break;
@@ -596,7 +596,7 @@ pub async fn run_archive_poller(
         // last_frame (the next tick re-polls the head).
         if let Some(ref validate) = config.frame_validator {
             if !validate(&head) {
-                warn!(%addr, frame = new_number, "head frame failed validation — dropping");
+                debug!(%addr, frame = new_number, "head frame failed validation — dropping");
                 continue;
             }
         }

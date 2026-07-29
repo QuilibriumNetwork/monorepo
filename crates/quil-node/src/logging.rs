@@ -334,6 +334,16 @@ pub fn build_env_filter(
     directives.push("libp2p_quic=warn".to_string());
     directives.push("libp2p_tcp=warn".to_string());
     directives.push("libp2p_swarm=warn".to_string());
+    // Stock gossipsub emits "Send Queue full" (per-peer outbound backpressure)
+    // at WARN. Under load that is routine and NOT operator-actionable, but the
+    // message lives in the dependency so we can't relabel that one line without
+    // vendoring the crate. Treat it as debug-level instead: cap gossipsub's WARN
+    // floor at `error` in normal (info) runs so it's hidden, but leave it (and
+    // the rest of gossipsub) visible under `--debug` for diagnosis. Overridable
+    // via config `logFilters` / `--log-filter` (appended after this).
+    if !debug {
+        directives.push("libp2p_gossipsub=error".to_string());
+    }
     // The HTTP/2 + gRPC stack (h2 codec frame send/received, hyper, tonic
     // service, and tower buffer/ready) logs thousands of per-frame debug lines
     // that bury the node's own output under `--debug`. Cap at warn unless opted

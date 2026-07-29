@@ -19,7 +19,7 @@ fn archive_frame_is_valid(
     frame_validator: &quil_engine::frame_validator::GlobalFrameVerifier,
 ) -> bool {
     let Some(h) = frame.header.as_ref() else {
-        warn!("archive frame validation: frame has no header — dropping");
+        debug!("archive frame validation: frame has no header — dropping");
         return false;
     };
     let frame_num = h.frame_number;
@@ -43,15 +43,15 @@ fn archive_frame_is_valid(
     match validate_result {
         Ok(Ok(true)) => true,
         Ok(Ok(false)) => {
-            warn!(frame = frame_num, "archive frame rejected by validator — dropping");
+            debug!(frame = frame_num, "archive frame rejected by validator — dropping");
             false
         }
         Ok(Err(e)) => {
-            warn!(frame = frame_num, error = %e, "archive frame VDF validation error — dropping");
+            debug!(frame = frame_num, error = %e, "archive frame VDF validation error — dropping");
             false
         }
         Err(_) => {
-            warn!(frame = frame_num, "archive frame VDF validation PANIC — dropping");
+            debug!(frame = frame_num, "archive frame VDF validation PANIC — dropping");
             false
         }
     }
@@ -328,7 +328,7 @@ async fn run_record_only_backfill(
                     // skipped by design (record-only). Re-queue so another
                     // endpoint may still serve the honest record for `n`.
                     if !frame_validate(&frame) {
-                        warn!(%addr, frame = n, "record-only backfill: frame failed validation — skipping");
+                        debug!(%addr, frame = n, "record-only backfill: frame failed validation — skipping");
                         still.push(n);
                         continue;
                     }
@@ -530,7 +530,7 @@ async fn run_state_jump(
             return None;
         }
         if !frame_validate(&head) {
-            warn!(%addr, target, "state-jump: peer head failed validation — trying another peer");
+            debug!(%addr, target, "state-jump: peer head failed validation — trying another peer");
             continue;
         }
         // Single generation anchor for ALL pulls. `GlobalFrameHeader` commits
