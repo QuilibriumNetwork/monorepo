@@ -301,19 +301,24 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // parent than consensus asked for (a fork). Resolving purely from
         // the passed parent removes that whole divergence class.
         //
-        // Look up committed first, then the candidate keyed by the SAME
-        // consensus-chosen identity — so a holder can build on an
-        // uncommitted tip candidate, while a node that lacks it fails
-        // cleanly (skip + catch-up) instead of loading the wrong frame.
+        // Resolve the parent by the consensus-chosen IDENTITY, not merely by
+        // height. The committed frame at `prior_frame_number` can be a DIFFERENT
+        // fork candidate than the one consensus certified (`prior_state_id`) —
+        // e.g. this node materialized fork A while the newest QC is on fork B at
+        // the same height. Looking up the COMMITTED frame first and only falling
+        // back to the candidate on error (the previous order) accepted that
+        // wrong-fork committed frame and never consulted the candidate the node
+        // actually anchored on, wedging the leader in a permanent "needs sync".
+        // So query the candidate keyed by the exact consensus identity FIRST
+        // (returns the anchored tip when we hold it), then fall back to the
+        // committed frame — whose identity is validated just below, yielding a
+        // clean "needs sync + catch-up" only when we genuinely lack the parent.
         let prior = if prior_frame_number == 0 {
             self.clock_store.get_global_clock_frame(0)?
         } else {
             self.clock_store
-                .get_global_clock_frame(prior_frame_number)
-                .or_else(|_| {
-                    self.clock_store
-                        .get_global_clock_frame_candidate(prior_frame_number, prior_state_id)
-                })?
+                .get_global_clock_frame_candidate(prior_frame_number, prior_state_id)
+                .or_else(|_| self.clock_store.get_global_clock_frame(prior_frame_number))?
         };
 
         let prior_header = prior.header.as_ref().ok_or_else(|| {

@@ -109,6 +109,13 @@ pub struct GlobalSeamProposer {
     /// digest → frame_number, so `propose` can resolve the parent frame number
     /// from the simplex parent digest (simplex only carries the digest).
     block_meta: Arc<Mutex<HashMap<Digest, u64>>>,
+    /// Fallback resolver. `block_meta` is in-memory and empty after a restart,
+    /// so the notarized parent digest can't be mapped to a frame number →
+    /// `propose` would default to 0 and fail "frame 0 not found" forever. The
+    /// clock store's latest committed frame is exactly the head the explorer
+    /// surfaces; building the next frame on it recovers liveness (any
+    /// unfinalized candidates above it are simply re-derived).
+    clock_store: Arc<dyn ClockStore>,
 }
 
 impl GlobalSeamProposer {
@@ -116,12 +123,14 @@ impl GlobalSeamProposer {
         leader_provider: Arc<dyn LeaderProvider<GlobalState>>,
         verifier: Arc<GlobalFrameVerifier>,
         filter: Vec<u8>,
+        clock_store: Arc<dyn ClockStore>,
     ) -> Self {
         Self {
             leader_provider,
             verifier,
             filter,
             block_meta: Arc::new(Mutex::new(HashMap::new())),
+            clock_store,
         }
     }
 
@@ -135,19 +144,64 @@ impl GlobalSeamProposer {
 impl GlobalProposer for GlobalSeamProposer {
     fn propose(&self, view: u64, parent_digest: Digest) -> Option<(Digest, Vec<u8>)> {
         // parent digest bytes == prior frame identity (Poseidon(output)).
-        let prior_state_id: Vec<u8> = digest_to_identity(&parent_digest).to_vec();
-        let prior_frame_number = self
-            .block_meta
-            .lock()
-            .unwrap()
-            .get(&parent_digest)
-            .copied()
-            .unwrap_or(0);
+        let meta_hit = self.block_meta.lock().unwrap().get(&parent_digest).copied();
+        let (prior_frame_number, prior_state_id): (u64, Vec<u8>) = match meta_hit {
+            Some(n) => (n, digest_to_identity(&parent_digest).to_vec()),
+            None => {
+                // block_meta is in-memory and only holds frames THIS node built
+                // or verified this run; after a restart it's empty (seeded only
+                // with the genesis floor), so the notarized parent digest can't
+                // be mapped → we'd default to 0 → "frame 0 not found" → permanent
+                // nullify. Fall back to the clock store's latest committed frame
+                // (exactly the head the explorer shows) and build the next frame
+                // on it. Any unfinalized candidates above it are re-derived.
+                match self.clock_store.get_latest_global_clock_frame() {
+                    Ok(latest) => match latest.header.as_ref().and_then(frame_digest) {
+                        Some(head_digest) => {
+                            let n = latest.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+                            tracing::warn!(
+                                view,
+                                parent = %hex::encode(&parent_digest),
+                                resolved_frame = n,
+                                head = %hex::encode(head_digest),
+                                "cw propose: parent not in block map (restart) — building on clock-store head"
+                            );
+                            (n, digest_to_identity(&head_digest).to_vec())
+                        }
+                        None => (0, digest_to_identity(&parent_digest).to_vec()),
+                    },
+                    Err(e) => {
+                        tracing::warn!(view, error = %e, "cw propose: parent not in block map and no latest frame");
+                        (0, digest_to_identity(&parent_digest).to_vec())
+                    }
+                }
+            }
+        };
 
-        let state = self
-            .leader_provider
-            .prove_next_state(view, &self.filter, prior_frame_number, &prior_state_id)
-            .ok()?;
+        let state = match self.leader_provider.prove_next_state(
+            view,
+            &self.filter,
+            prior_frame_number,
+            &prior_state_id,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                // Surface WHY we can't propose — a swallowed error here means the
+                // leader silently nullifies its own view, which (across all
+                // leaders) stalls global production into a perpetual nullify
+                // loop with no on-disk signal. Common causes: "needs sync"
+                // (local parent frame identity ≠ the consensus parent) or "not a
+                // prover".
+                tracing::warn!(
+                    view,
+                    prior_frame_number,
+                    parent = %hex::encode(&prior_state_id),
+                    error = %e,
+                    "cw propose: prove_next_state failed — cannot build a proposal (view nullifies)"
+                );
+                return None;
+            }
+        };
 
         let frame = global_frame_from_state(&state);
         let header = frame.header.as_ref()?;
@@ -358,18 +412,25 @@ pub fn activate_global_consensus_cw(
     // instead of replaying from the migration head.
     storage_directory: std::path::PathBuf,
 ) -> GlobalConsensusCwHandle {
-    // Seams over real state.
-    let proposer = Arc::new(GlobalSeamProposer::new(leader_provider, verifier, filter));
+    // Shared block store: `propose` inserts our own frame; the node inserts
+    // peer-delivered frames via `ingest_block`; `verify`/`Relay`/`Reporter`
+    // read it.
+    let store = BlockStore::new();
+
+    // Seams over real state. The proposer keeps a clock-store handle so it can
+    // recover the parent frame number from the latest committed head when the
+    // in-memory block map misses it after a restart.
+    let proposer = Arc::new(GlobalSeamProposer::new(
+        leader_provider,
+        verifier,
+        filter,
+        clock_store.clone(),
+    ));
     // Seed the parent map so the FIRST proposal resolves the genesis parent's
     // frame number (block_meta is otherwise empty → prior_frame_number 0).
     proposer.note_frame(genesis_digest, genesis_frame_number);
     let sink = Arc::new(GlobalSeamSink::new(transport.clone(), peers.clone()));
     let finalizer = Arc::new(GlobalSeamFinalizer::new(clock_store, mat_job_tx, head_hook));
-
-    // Shared block store: `propose` inserts our own frame; the node inserts
-    // peer-delivered frames via `ingest_block`; `verify`/`Relay`/`Reporter`
-    // read it.
-    let store = BlockStore::new();
 
     // Host the engine on its own runtime thread.
     let GlobalHostHandle { inbound, mut outbound } = spawn_global_host(

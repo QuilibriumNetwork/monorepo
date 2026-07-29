@@ -956,6 +956,83 @@ pub(crate) fn cw_app_storage_base(
     }
 }
 
+/// Discard a stale persistent simplex journal when the committee changed.
+///
+/// commonware's journal records THIS node's own votes by their participant
+/// INDEX (position in the committee) and, on replay, asserts every journaled
+/// vote is our own (`is_signer`) — it PANICS otherwise ("replaying notarize
+/// from another signer", `voter/round.rs:569`). That assumes a STATIC validator
+/// set. App-shard committees are DYNAMIC — as provers join/leave the shard the
+/// participant set (and hence our index) shifts — so a journal written under one
+/// committee is invalid under a changed one and would crash the node on restart.
+///
+/// Guard: fingerprint the committee (SHA-256 over the ordered peer keys — the
+/// exact order commonware assigns indices from) and compare it to the
+/// fingerprint the journal was written for (kept in a SIBLING file so wiping the
+/// journal dir preserves it). On a mismatch, delete the stale journal so
+/// consensus restarts cleanly from its genesis floor instead of panicking. On a
+/// match, keep it (a genuine crash-recovery resume, the whole point of
+/// persistence). Global consensus uses a fixed genesis-archive committee, so it
+/// never trips this; only app-shard journals need the guard.
+/// Discard a stale persistent CW simplex journal when the `fingerprint` it was
+/// written for no longer matches. The fingerprint MUST fold in everything that,
+/// if changed, makes the journal's stored state unusable on replay:
+///  - the **committee** (participant set + order → vote indices; a change trips
+///    commonware's "replaying notarize from another signer" panic);
+///  - the **re-seed point** (genesis identity — the frame the engine floors at).
+///    The journal is persistent but `block_meta` (digest→frame-number) is NOT,
+///    so on restart the journal can restore the engine to a parent whose digest
+///    the freshly-seeded `block_meta` can't resolve — the proposer then defaults
+///    `prior_frame_number` to 0 and `prove_next_state` fails with "frame 0 not
+///    found", so the leader silently nullifies its own view → total production
+///    halt. This happens whenever the committed head MOVES between runs (the
+///    fresh genesis differs from the journal's floor). Resetting re-floors
+///    consensus at the current committed head, consistent with `block_meta`.
+///
+/// The fingerprint is kept in a SIBLING file so wiping the journal dir preserves
+/// it. On a match the journal is a valid crash-recovery resume and is kept.
+pub fn reset_stale_cw_journal(journal_dir: &std::path::Path, fingerprint: &[u8]) {
+    let fp_path = journal_dir.with_extension("cw-fp");
+    if std::fs::read(&fp_path).ok().as_deref() == Some(fingerprint) {
+        return; // same committee + re-seed → resume the journal
+    }
+    if journal_dir.exists() {
+        warn!(
+            dir = %journal_dir.display(),
+            "CW committee or re-seed point changed since last run — discarding \
+             stale simplex journal (replaying it would panic or stall production)"
+        );
+        let _ = std::fs::remove_dir_all(journal_dir);
+    }
+    if let Some(parent) = fp_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&fp_path, fingerprint);
+}
+
+/// App-shard journal guard: fingerprint = committee (ordered peer keys) ONLY.
+///
+/// This resets the journal ONLY when the COMMITTEE changes (participant set /
+/// order → vote indices), which is the case that trips commonware's "replaying
+/// notarize from another signer" panic. It deliberately does NOT fold in the
+/// re-seed head: a moved head is NORMAL (consensus finalizes ahead of
+/// materialization), and resetting on it would DISCARD finalized-but-
+/// unmaterialized progress and re-floor consensus at the materialized head. The
+/// restart/block_meta case is handled by resolving the parent from the
+/// BlockStore/candidate store, not by deleting the journal.
+fn reset_stale_app_journal(
+    journal_dir: &std::path::Path,
+    peers: &[quil_cw_consensus::falcon_base::FalconPublicKey],
+) {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for pk in peers {
+        h.update(pk.as_ref());
+    }
+    let fp: [u8; 32] = h.finalize().into();
+    reset_stale_cw_journal(journal_dir, &fp);
+}
+
 /// App shard consensus engine. Owns a HotStuff event loop and
 /// processes messages for a single shard identified by `filter`.
 pub struct AppConsensusEngine {
@@ -1667,6 +1744,12 @@ impl AppConsensusEngine {
             .cw_storage_base
             .as_ref()
             .map(|base| base.join("cw-app-consensus").join(&partition));
+        // Before commonware opens the journal, discard it if this shard's
+        // committee changed since it was written (else replay panics with
+        // "replaying notarize from another signer"). See `reset_stale_app_journal`.
+        if let Some(dir) = cw_app_storage_dir.as_ref() {
+            reset_stale_app_journal(dir, &peers);
+        }
         let handle = crate::cw_app_seams::activate_app_consensus_cw(
             scheme,
             peers,
@@ -3100,6 +3183,43 @@ mod tests {
         // Empty db.path (test default) → None (ephemeral journal).
         let empty = quil_config::DbConfig { path: String::new(), worker_path_prefix: String::new(), worker_paths: vec![], ..Default::default() };
         assert_eq!(cw_app_storage_base(&empty, 0), None);
+    }
+
+    #[test]
+    fn reset_stale_app_journal_keeps_same_committee_wipes_changed() {
+        use quil_cw_consensus::falcon_base::FalconPublicKey;
+        let pk = |b: u8| FalconPublicKey::from_bytes(&[b; 897]).unwrap();
+        let committee_a = vec![pk(0x01), pk(0x02), pk(0x03)];
+        let committee_b = vec![pk(0x01), pk(0x02), pk(0x04)]; // one member replaced
+
+        let base = std::env::temp_dir().join(format!(
+            "quil-cwjournal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let journal_dir = base.join("cw-app-consensus").join("app-deadbeef");
+        let file = journal_dir.join("journal-file");
+        let repopulate = || {
+            std::fs::create_dir_all(&journal_dir).unwrap();
+            std::fs::write(&file, b"votes").unwrap();
+        };
+
+        // First call has no stored fingerprint → treated as a change (wipes),
+        // then records committee A's fingerprint.
+        repopulate();
+        reset_stale_app_journal(&journal_dir, &committee_a);
+        // Same committee → journal preserved (a moved head does NOT reset it).
+        repopulate();
+        reset_stale_app_journal(&journal_dir, &committee_a);
+        assert!(file.exists(), "same committee must keep the journal");
+        // Changed committee → journal wiped.
+        reset_stale_app_journal(&journal_dir, &committee_b);
+        assert!(!file.exists(), "changed committee must discard the stale journal");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Build an Application-mode ExecutionEngineManager backed by an

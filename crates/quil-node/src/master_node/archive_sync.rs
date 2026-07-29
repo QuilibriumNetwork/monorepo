@@ -432,6 +432,17 @@ async fn run_all_gap_backfill(
     info!("restart gap scan: backfill pass complete");
 }
 
+/// Switch for the reseed-anchored record-only backfill (the "record-only-backfill"
+/// task that fills `[canonical_head+1, reseed_frame-1]`). DISABLED: on restart the
+/// consensus re-seed point routinely sits above the canonical frame records, so
+/// this fires and attempts a large contiguous range whose heights are legitimately
+/// uncommitted/orphaned — no peer can ever serve them (the observed
+/// `attempted=4970, unrecoverable=4970`). It completed its useful work once;
+/// re-running it every restart just spews `*_ts_too_old`-style noise and churn.
+/// Flip to `true` to restore it. (The whole-keyspace `run_all_gap_backfill` gap
+/// scan is a SEPARATE mechanism and stays enabled.)
+const RESEED_GAP_BACKFILL_ENABLED: bool = false;
+
 /// ARCHIVES ONLY: an archive must not blind-trust another archive's current-era
 /// state — archives are the authoritative state servers for each other, so a
 /// far-behind archive catches up strictly via the verified poller/consensus once
@@ -1463,7 +1474,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 // Record-only — no re-materialization (see
                                 // run_record_only_backfill). Non-archive nodes
                                 // don't serve ranges, so skip.
-                                if sync_archive_mode {
+                                if sync_archive_mode && RESEED_GAP_BACKFILL_ENABLED {
                                     let bf_pool = sync_archive_pool.clone();
                                     let bf_cs = sync_cs.clone();
                                     let bf_validate = sync_frame_validate.clone();
@@ -1863,6 +1874,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 resolve_peer,
                                                 storage_directory: sync_cw_storage_dir.clone(),
                                             };
+                                            // NOTE: deliberately NO journal reset here. Resetting
+                                            // the global journal on a re-seed/head change discards
+                                            // finalized-but-unmaterialized progress and re-floors
+                                            // consensus at the materialized clock-store head — which
+                                            // reverted every archive to the migration head. The
+                                            // global committee is fixed from genesis, so the
+                                            // committee-change panic can't happen here; the block
+                                            // resolution (block_meta miss → BlockStore/candidate) is
+                                            // the correct fix for the restart case, NOT deletion.
                                             match crate::cw_consensus_bridge::start_cw_global_consensus(deps) {
                                                 Some(router) => {
                                                     if sync_cw_router.set(Arc::new(router)).is_err() {
