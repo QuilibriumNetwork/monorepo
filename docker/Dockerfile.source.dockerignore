@@ -9,4 +9,35 @@ bls48581/generated/
 ferret/generated/
 sidecar/generated/
 verenc/generated/
+
+# In-source cmake output from a prior host-side emp build. The image runs a
+# fresh in-container cmake, and a copied-in CMakeCache.txt (which bakes the
+# absolute host source path) or a pre-existing build/ breaks the emp-builder
+# stage. These are all git-ignored generated files.
+emp-tool/build/
+emp-tool/bin/
+emp-tool/CMakeCache.txt
+emp-tool/CMakeFiles/
+emp-tool/CTestTestfile.cmake
+emp-tool/cmake_install.cmake
+emp-tool/install_manifest.txt
+emp-tool/Makefile
+emp-tool/libemp-tool.a
+emp-tool/**/CMakeFiles/
+emp-tool/**/CTestTestfile.cmake
+emp-tool/**/cmake_install.cmake
+emp-tool/**/Makefile
+emp-ot/build/
+emp-ot/bin/
+emp-ot/CMakeCache.txt
+emp-ot/CMakeFiles/
+emp-ot/CTestTestfile.cmake
+emp-ot/cmake_install.cmake
+emp-ot/install_manifest.txt
+emp-ot/Makefile
+emp-ot/**/CMakeFiles/
+emp-ot/**/CTestTestfile.cmake
+emp-ot/**/cmake_install.cmake
+emp-ot/**/Makefile
+
 Dockerfile*

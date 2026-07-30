@@ -1,9 +1,11 @@
 //! Polls archive nodes until enough of them reach the target frame, then
 //! fetches the committed frame chain for the safety check.
 //!
-//! Mirrors the Go `FrameMonitor`. Dials each archive's mTLS `GlobalService`
+//! Mirrors the Go `FrameMonitor`. Dials each archive's `:8340` `GlobalService`
 //! directly (the proxy shares every archive's network) via
-//! `quil_rpc::ArchiveClient`, reusing the production xsign mTLS connector.
+//! `quil_rpc::ArchiveClient`, reusing the production PQNoise connector. The
+//! dial identity is a Falcon `q-prover-key` signing key borrowed from an
+//! archive, since that port authenticates peers by Falcon identity.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -12,14 +14,14 @@ use quil_rpc::ArchiveClient;
 
 use crate::frame::GlobalFrameWrapper;
 
-/// A node to poll: a `host:port` mTLS GlobalService address.
+/// A node to poll: a `host:port` GlobalService address.
 #[derive(Debug, Clone)]
 pub struct FrameTarget {
     pub address: String,
 }
 
 struct NodeStatus {
-    /// Lazily (re)connected mTLS client; `None` until first connect / after error.
+    /// Lazily (re)connected client; `None` until first connect / after error.
     client: Option<ArchiveClient>,
     last_head_frame: u64,
     first_polled_at: Option<Instant>,
@@ -41,7 +43,8 @@ impl NodeStatus {
 
 /// Polls archives for frame convergence.
 pub struct FrameMonitor {
-    proxy_ed448_seed: [u8; 57],
+    /// Falcon signing key the proxy dials archives with (borrowed from an archive).
+    dial_key: Vec<u8>,
     stop_frame: u64,
     targets: Vec<FrameTarget>,
     poll_interval: Duration,
@@ -52,7 +55,7 @@ pub struct FrameMonitor {
 
 impl FrameMonitor {
     pub fn new(
-        proxy_ed448_seed: [u8; 57],
+        dial_key: Vec<u8>,
         stop_frame: u64,
         targets: Vec<FrameTarget>,
         poll_interval: Duration,
@@ -64,7 +67,7 @@ impl FrameMonitor {
             .map(|t| (t.address.clone(), NodeStatus::new()))
             .collect();
         Self {
-            proxy_ed448_seed,
+            dial_key,
             stop_frame,
             targets,
             poll_interval,
@@ -76,7 +79,7 @@ impl FrameMonitor {
 
     /// Poll one node: connect if needed, query the stop frame, update status.
     async fn poll_node(&mut self, address: &str) {
-        let seed = self.proxy_ed448_seed;
+        let dial_key = self.dial_key.clone();
         let stop_frame = self.stop_frame;
         let status = self.statuses.get_mut(address).expect("status exists");
         let now = Instant::now();
@@ -86,7 +89,7 @@ impl FrameMonitor {
 
         // (Re)connect if we don't have a live client.
         if status.client.is_none() {
-            match ArchiveClient::connect_mtls(address, &seed).await {
+            match ArchiveClient::connect_mtls(address, &dial_key).await {
                 Ok(c) => status.client = Some(c),
                 Err(e) => {
                     status.errored = true;
@@ -228,14 +231,13 @@ impl FrameMonitor {
 
         let mut frames = Vec::new();
         for address in &ready_addrs {
-            let mut client =
-                match ArchiveClient::connect_mtls(address, &self.proxy_ed448_seed).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(address, error = %e, "fetch frames: connect failed");
-                        continue;
-                    }
-                };
+            let mut client = match ArchiveClient::connect_mtls(address, &self.dial_key).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(address, error = %e, "fetch frames: connect failed");
+                    continue;
+                }
+            };
             for frame_num in 1..=self.stop_frame {
                 match tokio::time::timeout(
                     Duration::from_secs(5),

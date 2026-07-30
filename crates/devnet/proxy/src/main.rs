@@ -2,10 +2,10 @@
 //! harness.
 //!
 //! Runs a BlossomSub host that meshes with every node and applies bipartite
-//! partitions, watches consensus gossip to drive per-rank partition timing, and
-//! (once a proposal past the stop frame is seen) polls the archives for frame
-//! convergence, checks chain safety, verifies client enrollment, and POSTs the
-//! result back to the orchestrator.
+//! partitions, snoops global consensus on `:8340` to drive per-view partition
+//! timing, and (once a proposal past the stop frame is seen) polls the archives
+//! for frame convergence, checks chain safety, verifies client enrollment, and
+//! POSTs the result back to the orchestrator.
 //!
 //! All paths are wired: gossip partitioning (BlossomSub forward filter), the
 //! transparent-h2 gRPC partition proxy, frame convergence, safety, enrollment,
@@ -21,20 +21,22 @@ mod grpc_proxy;
 mod grpc_serve;
 mod partitioner;
 mod safety;
+mod simplex_view;
+mod view_schedule;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use quil_p2p::ed448_identity::Ed448Identity;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use devnet::rankpartitions::{self, RankPartitionEntry};
 use devnet::shared::{FrameNotification, NodeInfo, NotificationType};
+use devnet::viewpartitions::{self, ViewPartitionEntry};
 
 use crate::blossomsub_proxy::BlossomSubProxy;
 use crate::consensus_events::ConsensusEvent;
@@ -42,6 +44,7 @@ use crate::enrollment_monitor::{ArchiveTarget, EnrollmentMonitor, EnrollmentTarg
 use crate::frame_monitor::{FrameMonitor, FrameTarget};
 use crate::partitioner::NetworkPartitioner;
 use crate::safety::check_safety;
+use crate::view_schedule::ViewSchedule;
 
 const GRPC_BASE_PORT: u16 = 9000;
 
@@ -101,33 +104,45 @@ async fn run(cli: Cli) -> Result<()> {
     }
     let archive_count = nodes.iter().filter(|n| n.is_archive).count();
 
-    // The proxy's own Ed448 seed — used to dial archives for frame polling.
-    let proxy_seed =
-        ed448_seed_from_hex(&config.p2p.peer_priv_key).context("derive proxy Ed448 seed")?;
+    // Identity the proxy dials archives with for frame polling / enrollment
+    // checks. `:8340` is PQNoise-authenticated by a Falcon `q-prover-key`, and
+    // the proxy is not a prover so it has no such key of its own — it borrows
+    // the first archive's, which it already holds to relay that archive's
+    // traffic. Impersonating a genesis archive also guarantees the dial clears
+    // whatever caller policy the archives apply to each other.
+    let monitor_dial_key = nodes
+        .iter()
+        .find(|n| n.is_archive)
+        .context("no archive node to borrow a dial identity from")
+        .and_then(falcon_key_of)?;
 
     // Shared partition table consulted by both the gossip and gRPC paths.
     let partitioner = Arc::new(NetworkPartitioner::new());
 
-    // Parse the per-rank partition schedule and apply rank 0 immediately.
-    let rank_partitions = parse_rank_partitions_env()?;
-    if let Some(entry) = rank_partitions.get(&0) {
-        partitioner.apply_partition(&entry.partition1, &entry.partition2);
-    }
-
-    // Start the BlossomSub host (swarm + consensus-decode loop on the supervisor).
-    let mut sup = quil_lifecycle::Supervisor::<anyhow::Error>::new();
-    let (consensus_tx, consensus_rx) = mpsc::channel::<ConsensusEvent>(100);
-    let blossom = BlossomSubProxy::start(
-        &mut sup,
-        &config.p2p,
+    // The partition schedule. It owns partition timing and is applied inline by
+    // the gRPC snoop rather than from the event loop, so a view takes effect
+    // before the message that revealed it reaches the partition gate.
+    let schedule = Arc::new(ViewSchedule::new(
+        parse_view_partitions_env()?,
         Arc::clone(&partitioner),
-        consensus_tx.clone(),
-    )
-    .await
-    .context("start blossomsub proxy")?;
+    ));
+    schedule.apply_initial();
 
-    // Build the gRPC backend specs (server + per-caller client TLS) and start
-    // one transparent-h2 partition proxy listener per archive.
+    // Start the BlossomSub host (swarm on the supervisor). The binding must
+    // outlive the run: dropping it shuts the swarm down.
+    let mut sup = quil_lifecycle::Supervisor::<anyhow::Error>::new();
+    // Sized so the loop's tally cannot be truncated by a burst at a view
+    // boundary: a dropped event now fails the run.
+    let (consensus_tx, consensus_rx) = mpsc::channel::<ConsensusEvent>(8192);
+    let _blossom = BlossomSubProxy::start(&mut sup, &config.p2p, Arc::clone(&partitioner))
+        .await
+        .context("start blossomsub proxy")?;
+
+    // Build the gRPC backend specs (backend + per-caller Falcon identities) and
+    // start one transparent-h2 partition proxy listener per archive. The event
+    // loop keeps a handle on the snoop context to read its dropped-event count
+    // when it forms the verdict.
+    let mut snoop_ctx: Option<Arc<grpc_serve::SnoopContext>> = None;
     match build_grpc_backends(&nodes) {
         Ok(specs) => {
             let specs: Vec<Arc<grpc_proxy::BackendSpec>> =
@@ -135,12 +150,21 @@ async fn run(cli: Cli) -> Result<()> {
             tracing::info!(backends = specs.len(), "starting gRPC proxy");
             let part = Arc::clone(&partitioner);
             // The gRPC proxy also snoops SubmitGlobalConsensus requests for the
-            // stop-frame/rank signals that moved off gossip in v2.1.0.25.
+            // stop-frame/view signals that moved off gossip in v2.1.0.25. Events
+            // are attributed to the calling node's prover address, so the snoop
+            // needs the peer-ID → prover-address mapping up front.
+            let snoop = Arc::new(grpc_serve::SnoopContext {
+                prover_addresses: prover_addresses_by_peer(&nodes)?,
+                cursor: Default::default(),
+                schedule: Arc::clone(&schedule),
+                dropped: AtomicU64::new(0),
+            });
+            snoop_ctx = Some(Arc::clone(&snoop));
             let grpc_consensus_tx = consensus_tx.clone();
             sup.spawn("grpc-proxy", move |token| async move {
                 tokio::select! {
                     _ = token.cancelled() => Ok(()),
-                    r = grpc_serve::serve_all(specs, part, grpc_consensus_tx) => r,
+                    r = grpc_serve::serve_all(specs, part, grpc_consensus_tx, snoop) => r,
                 }
             });
         }
@@ -156,7 +180,7 @@ async fn run(cli: Cli) -> Result<()> {
         })
         .collect();
     let mut frame_monitor = FrameMonitor::new(
-        proxy_seed,
+        monitor_dial_key,
         stop_frame,
         frame_targets,
         poll_interval,
@@ -176,17 +200,18 @@ async fn run(cli: Cli) -> Result<()> {
         run_id,
     };
 
-    // Run the consensus event loop; it owns partition timing, posts per-frame
-    // progress, and on reaching the stop frame the frame/enrollment verification
-    // + terminal notification.
+    // Run the consensus event loop; it tracks frame progress and consensus
+    // participation, and on reaching the stop frame runs the frame/enrollment
+    // verification and emits the terminal notification. Partition timing lives
+    // in `schedule`, applied by the snoop.
     let outcome = consensus_event_loop(
         consensus_rx,
         &cancel,
         global_timeout,
         stop_frame,
         archive_count,
-        &rank_partitions,
-        &blossom,
+        &schedule,
+        snoop_ctx.as_deref(),
         &mut frame_monitor,
         &nodes,
         min_nodes,
@@ -214,8 +239,8 @@ async fn consensus_event_loop(
     global_timeout: Duration,
     stop_frame: u64,
     archive_count: usize,
-    rank_partitions: &HashMap<u64, RankPartitionEntry>,
-    blossom: &BlossomSubProxy,
+    schedule: &ViewSchedule,
+    snoop: Option<&grpc_serve::SnoopContext>,
     frame_monitor: &mut FrameMonitor,
     nodes: &[NodeInfo],
     min_nodes: usize,
@@ -223,15 +248,17 @@ async fn consensus_event_loop(
     node_catchup_timeout: Duration,
     notifier: &Notifier,
 ) -> Option<FrameNotification> {
-    let mut ranks_applied: HashSet<u64> = HashSet::new();
-    let mut timeout_senders: HashMap<u64, HashSet<Vec<u8>>> = HashMap::new();
     // Archives that must each originate a consensus message for the last frame
-    // to prove they rejoined consensus (vs. passively syncing frames), and the
-    // set of addresses observed voting/proposing for `stop_frame`.
+    // to prove they rejoined consensus rather than passively syncing frames.
     let required_voters = required_archive_voters(nodes);
-    let mut last_frame_voters: HashSet<Vec<u8>> = HashSet::new();
+    // Active participation per view. A vote names a view, never a frame, so
+    // attributing it to a frame means correlating through the view that
+    // *produced* that frame — which only the block channel can establish.
+    let mut active_voters_by_view: BTreeMap<u64, HashSet<Vec<u8>>> = BTreeMap::new();
+    // The view that produced `stop_frame`, learned from that frame's block.
+    let mut stop_frame_view: Option<u64> = None;
     // Highest frame observed in a consensus message so far — used only to log
-    // frame progress once per new frame (events repeat per rank and per backend).
+    // frame progress once per new frame (events repeat per view and per backend).
     let mut max_frame_seen: u64 = 0;
     let global_timer = tokio::time::sleep(global_timeout);
     tokio::pin!(global_timer);
@@ -240,7 +267,7 @@ async fn consensus_event_loop(
         tokio::select! {
             _ = cancel.cancelled() => return None,
             _ = &mut global_timer => {
-                tracing::warn!(?global_timeout, stop_frame, "global timeout expired without seeing stop frame via gossip");
+                tracing::warn!(?global_timeout, stop_frame, "global timeout expired without seeing stop frame");
                 return Some(FrameNotification {
                     run_id: String::new(),
                     stop_frame,
@@ -250,65 +277,93 @@ async fn consensus_event_loop(
                     total_nodes: archive_count as i32,
                     enrollment_error: String::new(),
                     rejoin_error: String::new(),
+                    // A timed-out run is already a failure; the harness check
+                    // still runs so the report says whether the scenario it was
+                    // asked to run actually happened.
+                    harness_error: compute_harness_error(schedule, snoop, None, false),
                 });
             }
             maybe_event = consensus_rx.recv() => {
                 let event = maybe_event?;
 
-                if event.frame_number > max_frame_seen {
-                    max_frame_seen = event.frame_number;
+                // Record active participation against the view it names. Only
+                // views at or after the stop frame's can matter, but that view
+                // isn't known until its block arrives, so keep a bounded tail.
+                if event.source.is_active() && !event.sender_address.is_empty() {
+                    active_voters_by_view
+                        .entry(event.view)
+                        .or_default()
+                        .insert(event.sender_address.clone());
+                    if let Some(prune_below) = event.view.checked_sub(VOTE_HISTORY_VIEWS) {
+                        active_voters_by_view.retain(|&v, _| v >= prune_below);
+                    }
+                }
+
+                // Everything below needs a frame. A view-only observation (a
+                // nullification, or any vote before the first block) carries
+                // none, and is exactly the case the view schedule exists to
+                // keep tracking.
+                let Some(frame_number) = event.frame_number else {
+                    continue;
+                };
+
+                // The block for `stop_frame` is what ties that frame to a view.
+                // A vote must never establish this: it names its own view but
+                // inherits its frame, and since the cursor is updated separately
+                // from the channel send, a vote for a *later* view can reach the
+                // loop before the block it inherited the frame from — pairing
+                // `stop_frame` with a view that did not produce it and shifting
+                // the rejoin window off the votes it is supposed to count.
+                if frame_number == stop_frame && event.source.states_own_frame() {
+                    stop_frame_view.get_or_insert(event.view);
+                }
+
+                if frame_number > max_frame_seen {
+                    max_frame_seen = frame_number;
                     tracing::debug!(
-                        frame = event.frame_number,
-                        rank = event.rank,
+                        frame = frame_number,
+                        view = event.view,
                         stop_frame,
                         "global consensus frame advanced"
                     );
                     // Report liveness to the orchestrator so it can show progress
                     // during the run (it otherwise only hears the terminal frame).
-                    notifier.progress(event.frame_number, archive_count as i32).await;
+                    // Spawned so the loop never stalls on network I/O while votes
+                    // are arriving — a dropped event would invalidate the run.
+                    let notifier = notifier.clone();
+                    let total = archive_count as i32;
+                    tokio::spawn(async move { notifier.progress(frame_number, total).await });
                 }
 
-                if !event.is_timeout {
-                    apply_rank_partition(event.rank, rank_partitions, blossom, &mut ranks_applied);
-                } else if !event.sender_address.is_empty() {
-                    let senders = timeout_senders.entry(event.rank).or_default();
-                    senders.insert(event.sender_address.clone());
-                    // Only archives participate in global consensus.
-                    if senders.len() >= archive_count {
-                        tracing::info!(rank = event.rank, count = senders.len(), "advancing rank due to timeout condition");
-                        apply_rank_partition(event.rank + 1, rank_partitions, blossom, &mut ranks_applied);
-                    }
-                }
-
-                // Record which archives originated a proposal/vote for the last
-                // frame — the rejoin signal. A node that only passively syncs
-                // frames never publishes consensus messages at this live rank.
-                if !event.is_timeout
-                    && event.frame_number == stop_frame
-                    && !event.sender_address.is_empty()
-                {
-                    last_frame_voters.insert(event.sender_address.clone());
-                }
-
-                if event.frame_number > stop_frame {
-                    tracing::info!(event_frame = event.frame_number, stop_frame, "observed proposal past stop frame, monitoring all nodes");
+                if frame_number > stop_frame {
+                    tracing::info!(event_frame = frame_number, stop_frame, "observed proposal past stop frame, monitoring all nodes");
                     let (reached, total) = frame_monitor.start_monitoring(cancel).await;
                     tracing::info!(reached, total, "frame monitoring complete");
 
                     let frames = frame_monitor.fetch_committed_frames().await;
                     let safety_error = compute_safety_error(&frames);
 
-                    let rejoin_error =
-                        compute_rejoin_error(&required_voters, &last_frame_voters, stop_frame);
-                    if rejoin_error.is_empty() {
-                        tracing::info!(
-                            archives = required_voters.len(),
-                            stop_frame,
-                            "all archives voted for the last frame (rejoined consensus)"
-                        );
-                    } else {
-                        tracing::error!(error = %rejoin_error, "rejoin verification failed");
-                    }
+                    // Rejoin is only answerable once the stop frame's view is
+                    // known; without it the run can't say either way, which is a
+                    // harness failure rather than a rejoin failure.
+                    let rejoin_error = match stop_frame_view {
+                        Some(view) => {
+                            let voters = active_voters_since(&active_voters_by_view, view);
+                            let err = compute_rejoin_error(&required_voters, &voters, stop_frame);
+                            if err.is_empty() {
+                                tracing::info!(
+                                    archives = required_voters.len(),
+                                    stop_frame,
+                                    stop_frame_view = view,
+                                    "all archives voted in the last frame's view (rejoined consensus)"
+                                );
+                            } else {
+                                tracing::error!(error = %err, "rejoin verification failed");
+                            }
+                            err
+                        }
+                        None => String::new(),
+                    };
 
                     let enrollment_error =
                         run_enrollment(nodes, min_nodes, poll_interval, node_catchup_timeout, cancel).await;
@@ -322,6 +377,12 @@ async fn consensus_event_loop(
                         total_nodes: total as i32,
                         enrollment_error,
                         rejoin_error,
+                        harness_error: compute_harness_error(
+                            schedule,
+                            snoop,
+                            stop_frame_view,
+                            true,
+                        ),
                     });
                 }
             }
@@ -329,26 +390,62 @@ async fn consensus_event_loop(
     }
 }
 
-/// Apply (or clear) the partition for `rank`, once per rank.
-fn apply_rank_partition(
-    rank: u64,
-    rank_partitions: &HashMap<u64, RankPartitionEntry>,
-    blossom: &BlossomSubProxy,
-    ranks_applied: &mut HashSet<u64>,
-) {
-    if rank_partitions.is_empty() || !ranks_applied.insert(rank) {
-        return;
+/// How many views of participation history to retain. The stop frame's view is
+/// unknown until its block arrives, so votes are buffered until then; a tail of
+/// this many views is far more than the gap between a vote and its block.
+const VOTE_HISTORY_VIEWS: u64 = 64;
+
+/// Every address that actively participated in `since` or any later view.
+///
+/// The window starts at the stop frame's own view rather than being pinned to
+/// it exactly: an archive that rejoins as that view is being decided may cast
+/// its first vote in the next one, which today's frame-stamp inheritance would
+/// also have counted.
+fn active_voters_since(by_view: &BTreeMap<u64, HashSet<Vec<u8>>>, since: u64) -> HashSet<Vec<u8>> {
+    by_view
+        .range(since..)
+        .flat_map(|(_, voters)| voters.iter().cloned())
+        .collect()
+}
+
+/// Describes any way the harness itself failed to run the scenario, rather than
+/// the network under test failing.
+///
+/// A run that never applied its partitions, or that lost consensus events, is
+/// not evidence of anything — reporting it as a pass is worse than reporting a
+/// real failure, because it looks like the scenario was exercised.
+fn compute_harness_error(
+    schedule: &ViewSchedule,
+    snoop: Option<&grpc_serve::SnoopContext>,
+    stop_frame_view: Option<u64>,
+    reached_terminal: bool,
+) -> String {
+    let mut problems = Vec::new();
+
+    let missed = schedule.missed_views();
+    if !missed.is_empty() {
+        problems.push(format!(
+            "scheduled partition views were never observed and so never applied: {missed:?}"
+        ));
     }
-    match rank_partitions.get(&rank) {
-        Some(entry) => {
-            tracing::info!(rank, "applying rank partition");
-            blossom.apply_partition(&entry.partition1, &entry.partition2);
-        }
-        None => {
-            tracing::info!(rank, "no rank partition entry, clearing partitions");
-            blossom.clear_partitions();
-        }
+
+    let dropped = snoop.map_or(0, |s| s.dropped.load(AtomicOrdering::Relaxed));
+    if dropped > 0 {
+        problems.push(format!(
+            "{dropped} consensus event(s) dropped; participation tallies are incomplete"
+        ));
     }
+
+    // Only meaningful once the run reached its terminal frame; on the timeout
+    // path, not reaching the stop frame is itself the reported failure.
+    if reached_terminal && stop_frame_view.is_none() {
+        problems.push(
+            "the stop frame's view was never established, so rejoin could not be verified"
+                .to_string(),
+        );
+    }
+
+    problems.join("; ")
 }
 
 /// The archive prover addresses that must each vote for the last frame, paired
@@ -476,13 +573,10 @@ fn build_grpc_backends(nodes: &[NodeInfo]) -> Result<Vec<grpc_proxy::BackendSpec
     let mut callers = Vec::new();
     let mut backends = Vec::new();
     for n in nodes {
-        let id = Ed448Identity::from_config_hex(&n.peer_priv_key)
-            .map_err(|e| anyhow::anyhow!("identity for {}: {e}", n.name))?;
         let wiring = grpc_proxy::NodeWiring {
             peer_id: quil_p2p::PeerId::from_str(&n.peer_id)
                 .map_err(|e| anyhow::anyhow!("peer id for {}: {e}", n.name))?,
-            ed448_seed: ed448_seed_from_identity(&id)?,
-            ed448_pubkey: id.public_key.clone(),
+            falcon_signing_key: falcon_key_of(n)?,
             backend_addr: n.stream_address(),
             listen_port: 0,
         };
@@ -502,58 +596,60 @@ fn build_grpc_backends(nodes: &[NodeInfo]) -> Result<Vec<grpc_proxy::BackendSpec
 
 // ---- helpers ----------------------------------------------------------------
 
-fn parse_rank_partitions_env() -> Result<HashMap<u64, RankPartitionEntry>> {
-    let raw = std::env::var("RANK_PARTITIONS").unwrap_or_default();
+fn parse_view_partitions_env() -> Result<HashMap<u64, ViewPartitionEntry>> {
+    let raw = std::env::var("VIEW_PARTITIONS").unwrap_or_default();
     if raw.is_empty() {
         return Ok(HashMap::new());
     }
-    let parsed = rankpartitions::parse_rank_partitions(&raw).context("parse RANK_PARTITIONS")?;
+    let parsed = viewpartitions::parse_view_partitions(&raw).context("parse VIEW_PARTITIONS")?;
     // Validate every peer ID decodes.
     use std::str::FromStr;
     for e in parsed.values() {
         for p in e.partition1.iter().chain(e.partition2.iter()) {
             quil_p2p::PeerId::from_str(p.trim()).map_err(|err| {
-                anyhow::anyhow!("invalid peer ID {p:?} in RANK_PARTITIONS: {err}")
+                anyhow::anyhow!("invalid peer ID {p:?} in VIEW_PARTITIONS: {err}")
             })?;
         }
     }
-    tracing::info!(entries = parsed.len(), "loaded rank partition schedule");
+    tracing::info!(entries = parsed.len(), "loaded view partition schedule");
     Ok(parsed.into_iter().collect())
 }
 
-fn ed448_seed_from_hex(hex_key: &str) -> Result<[u8; 57]> {
-    let id = Ed448Identity::from_config_hex(hex_key).map_err(|e| anyhow::anyhow!("{e}"))?;
-    ed448_seed_from_identity(&id)
+/// Map each node's peer ID to its prover address, so the gRPC snoop can name the
+/// node behind a handshake-verified caller. Nodes with no prover address are
+/// skipped — the event loop only ever looks up archives.
+fn prover_addresses_by_peer(nodes: &[NodeInfo]) -> Result<HashMap<quil_p2p::PeerId, Vec<u8>>> {
+    use std::str::FromStr;
+    let mut out = HashMap::new();
+    for n in nodes {
+        if n.prover_address.is_empty() {
+            continue;
+        }
+        let peer = quil_p2p::PeerId::from_str(&n.peer_id)
+            .map_err(|e| anyhow::anyhow!("peer id for {}: {e}", n.name))?;
+        let address = hex::decode(&n.prover_address)
+            .map_err(|e| anyhow::anyhow!("prover address for {}: {e}", n.name))?;
+        out.insert(peer, address);
+    }
+    Ok(out)
 }
 
-fn ed448_seed_from_identity(id: &Ed448Identity) -> Result<[u8; 57]> {
-    id.private_key
-        .clone()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("ed448 seed is not 57 bytes"))
+/// Decode a node's Falcon `q-prover-key` signing key from its [`NodeInfo`].
+fn falcon_key_of(n: &NodeInfo) -> Result<Vec<u8>> {
+    if n.falcon_signing_key.is_empty() {
+        anyhow::bail!("node info {} missing falcon signing key", n.name);
+    }
+    hex::decode(&n.falcon_signing_key)
+        .map_err(|e| anyhow::anyhow!("falcon signing key for {}: {e}", n.name))
 }
 
 fn env_required(key: &str) -> Result<String> {
     std::env::var(key).map_err(|_| anyhow::anyhow!("{key} environment variable is required"))
 }
 
-/// Parse a Go-style duration like `120s`, `2m`, `30s`. Falls back to `None` on
-/// anything unrecognized.
-fn parse_go_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    let (num, unit) = s.split_at(s.find(|c: char| c.is_alphabetic())?);
-    let value: u64 = num.parse().ok()?;
-    match unit {
-        "s" => Some(Duration::from_secs(value)),
-        "m" => Some(Duration::from_secs(value * 60)),
-        "ms" => Some(Duration::from_millis(value)),
-        "h" => Some(Duration::from_secs(value * 3600)),
-        _ => None,
-    }
-}
-
 /// Sends notifications (progress + terminal) to the orchestrator, stamping each
 /// with the run ID.
+#[derive(Clone)]
 struct Notifier {
     runner_address: String,
     runner_auth: String,
@@ -586,6 +682,7 @@ impl Notifier {
             total_nodes,
             enrollment_error: String::new(),
             rejoin_error: String::new(),
+            harness_error: String::new(),
         })
         .await;
     }
@@ -650,8 +747,7 @@ fn init_logging() {
     // Cap the HTTP/2 + gRPC stack (h2 codec, hyper, tonic, tower) at warn even
     // under full debug (RUST_LOG=debug): their per-frame send/received logs
     // otherwise drown the proxy's own output. Errors/warnings are kept.
-    let mut filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     for directive in ["h2=warn", "hyper=warn", "tonic=warn", "tower=warn"] {
         filter = filter.add_directive(directive.parse().expect("static directive is valid"));
     }
@@ -673,6 +769,7 @@ mod tests {
             node_port: 8337,
             peer_id: "QmTest".into(),
             peer_priv_key: String::new(),
+            falcon_signing_key: String::new(),
             is_archive: true,
             prover_address: prover_address.into(),
         }
@@ -680,6 +777,50 @@ mod tests {
 
     fn addr(b: u8) -> Vec<u8> {
         vec![b; 32]
+    }
+
+    // ---- rejoin correlation ------------------------------------------------
+
+    fn voters(pairs: &[(u64, &[u8])]) -> BTreeMap<u64, HashSet<Vec<u8>>> {
+        let mut m: BTreeMap<u64, HashSet<Vec<u8>>> = BTreeMap::new();
+        for (view, addr) in pairs {
+            m.entry(*view).or_default().insert(addr.to_vec());
+        }
+        m
+    }
+
+    /// The window opens at the stop frame's view and stays open, so an archive
+    /// that rejoins as that view is decided and first votes in the next one is
+    /// still credited.
+    #[test]
+    fn active_voters_since_includes_the_view_and_later() {
+        let by_view = voters(&[(6, &addr(1)), (7, &addr(2)), (8, &addr(3))]);
+        let got = active_voters_since(&by_view, 7);
+        assert!(!got.contains(&addr(1)), "view 6 is before the window");
+        assert!(got.contains(&addr(2)), "the stop frame's own view counts");
+        assert!(got.contains(&addr(3)), "a later view counts");
+    }
+
+    /// The defect this replaces: a vote inherited the newest block's frame
+    /// number, so activity in an *earlier* view could satisfy the rejoin gate
+    /// for the stop frame.
+    #[test]
+    fn active_voters_since_excludes_earlier_views() {
+        let by_view = voters(&[(1, &addr(1)), (2, &addr(1))]);
+        assert!(active_voters_since(&by_view, 3).is_empty());
+    }
+
+    #[test]
+    fn rejoin_fails_when_an_archive_only_participated_before_the_stop_view() {
+        let required = required_archive_voters(&[
+            archive("archive-1", &hex32(1)),
+            archive("archive-2", &hex32(2)),
+        ]);
+        // archive-2 voted only in view 5; the stop frame was decided in view 6.
+        let by_view = voters(&[(6, &addr(1)), (5, &addr(2))]);
+        let err = compute_rejoin_error(&required, &active_voters_since(&by_view, 6), 6);
+        assert!(err.contains("archive-2"), "unexpected: {err}");
+        assert!(!err.contains("archive-1"), "unexpected: {err}");
     }
 
     fn hex32(b: u8) -> String {

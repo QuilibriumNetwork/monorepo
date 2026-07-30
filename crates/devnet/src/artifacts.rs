@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use devnet::rankpartitions::RankPartitionEntry;
 use devnet::shared::NodeInfo;
+use devnet::viewpartitions::ViewPartitionEntry;
 
 use crate::docker;
 use crate::runner::TestResult;
@@ -20,7 +20,7 @@ pub struct TestConfig {
     pub nodes: Vec<NodeInfo>,
     pub minimum_nodes: i32,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub rank_partitions: Vec<RankPartitionEntry>,
+    pub view_partitions: Vec<ViewPartitionEntry>,
 }
 
 #[derive(Debug, Serialize)]

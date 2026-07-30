@@ -33,10 +33,20 @@ pub struct NodeInfo {
     pub stream_port: i32,
     /// Plaintext NodeService gRPC port, e.g. 8337.
     pub node_port: i32,
-    /// base58-encoded peer ID, empty if unknown.
+    /// base58-encoded peer ID, empty if unknown. Derived from the node's Falcon
+    /// `q-prover-key` — since the Falcon migration that key, not the Ed448 peer
+    /// key, IS the libp2p network identity, so this is what the proxy matches
+    /// handshake-verified peers and partition entries against.
     pub peer_id: String,
-    /// hex-encoded Ed448 private key.
+    /// hex-encoded Ed448 private key. Retained as the node's seniority-root
+    /// identity; it is no longer the network identity.
     pub peer_priv_key: String,
+    /// Hex-encoded Falcon `q-prover-key` SIGNING key (1281 B), read out of the
+    /// node's `keys.yml`. This is the node's `:8340` PQNoise identity, so the
+    /// proxy needs it to answer callers as a backend and to re-originate their
+    /// calls to that backend as them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub falcon_signing_key: String,
     /// true for archive nodes; false for client (non-archive) nodes.
     pub is_archive: bool,
     /// Hex-encoded 32-byte Poseidon(BLS pubkey) derived from the node's
@@ -86,6 +96,13 @@ pub struct FrameNotification {
     /// consensus message for the last frame.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub rejoin_error: String,
+    /// Set when the harness itself failed to run the scenario — a scheduled
+    /// partition view was never observed and so never applied, a consensus event
+    /// was dropped, or the stop frame's view was never established. Unlike the
+    /// other errors, which report the network under test failing, this says the
+    /// run is not evidence of anything and its other results cannot be trusted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub harness_error: String,
 }
 
 #[cfg(test)]
@@ -101,6 +118,7 @@ mod tests {
             node_port: 8337,
             peer_id: "QmAbc".into(),
             peer_priv_key: "deadbeef".into(),
+            falcon_signing_key: "c0ffee".into(),
             is_archive: true,
             prover_address: String::new(),
         };
@@ -113,6 +131,7 @@ mod tests {
             "node_port",
             "peer_id",
             "peer_priv_key",
+            "falcon_signing_key",
             "is_archive",
             "prover_address",
         ] {
@@ -148,6 +167,7 @@ mod tests {
             total_nodes: 4,
             enrollment_error: String::new(),
             rejoin_error: String::new(),
+            harness_error: String::new(),
         };
         let v: serde_json::Value = serde_json::to_value(&n).unwrap();
         assert_eq!(v.get("type").unwrap(), "frame_progress");
@@ -166,6 +186,7 @@ mod tests {
             node_port: 0,
             peer_id: String::new(),
             peer_priv_key: String::new(),
+            falcon_signing_key: String::new(),
             is_archive: true,
             prover_address: String::new(),
         };
