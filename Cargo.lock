@@ -6037,7 +6037,10 @@ dependencies = [
 name = "quil-hypergraph"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "borsh",
  "hex 0.4.3",
+ "jmt",
  "num-bigint 0.4.6",
  "num-traits",
  "proptest",

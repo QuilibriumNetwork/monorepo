@@ -235,6 +235,12 @@ message GlobalFrameHeader {
   bytes prover = 10;
   // The confirmation signatures of the frame
   quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 11;
+  // The prover shard's phase 1/2/3 subtree roots (vertex-removes,
+  // hyperedge-adds, hyperedge-removes), in that order. `prover_tree_commitment`
+  // (field 8) is the phase-0 (vertex-adds) root; together these commit ALL FOUR
+  // prover-shard phases so catch-up sync can authenticate every phase, not just
+  // vertex-adds. Bound into the VDF challenge alongside prover_tree_commitment.
+  repeated bytes prover_tree_aux_roots = 12;
 }
 
 message FrameHeader {
