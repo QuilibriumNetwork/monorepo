@@ -19,8 +19,8 @@ use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use devnet::rankpartitions::{self, RankPartitionEntry};
 use devnet::shared::NodeInfo;
+use devnet::viewpartitions::{self, ViewPartitionEntry};
 
 use crate::notification::{start_notification_server, NotificationRouter};
 use crate::registry::ProjectRegistry;
@@ -70,10 +70,13 @@ enum Command {
         /// Minimum number of nodes that must reach the stop frame (0 = all archives).
         #[arg(long = "minnodes", default_value_t = 0)]
         min_nodes: i32,
-        /// JSON array of per-rank partition configs, e.g.
-        /// '[{"rank":5,"partition1":["archive-1"],"partition2":["archive-3"]}]'.
-        #[arg(long = "rank-partitions", default_value = "")]
-        rank_partitions: String,
+        /// JSON array of per-view partition configs, keyed on the simplex
+        /// consensus view, e.g.
+        /// '[{"view":5,"partition1":["archive-1"],"partition2":["archive-3"]}]'.
+        /// A partition applies at its view and clears at the next view with no
+        /// entry; repeat an entry on consecutive views to hold it open.
+        #[arg(long = "view-partitions", default_value = "")]
+        view_partitions: String,
     },
 }
 
@@ -133,13 +136,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let Command::Single {
         stop_frame,
         min_nodes,
-        rank_partitions,
+        view_partitions,
     } = command;
 
     let (cancel, state) = prepare_run(&opts.working_dir, min_nodes).await?;
 
     let (results, interrupted) =
-        run_single_mode(&opts, &cancel, state, stop_frame, &rank_partitions).await?;
+        run_single_mode(&opts, &cancel, state, stop_frame, &view_partitions).await?;
 
     Ok(finish_run(&results, interrupted))
 }
@@ -199,15 +202,14 @@ async fn run_single_mode(
     cancel: &CancellationToken,
     state: CommonState,
     stop_frame: i32,
-    rank_partitions: &str,
+    view_partitions: &str,
 ) -> Result<(Vec<TestResult>, bool)> {
-    let (original, resolved) = resolve_rank_partitions(&state.exec_dir, rank_partitions)
-        .context("failed to resolve rank partitions")?;
+    let (original, resolved) = resolve_view_partitions(&state.exec_dir, view_partitions)
+        .context("failed to resolve view partitions")?;
 
     // The rejoin check requires the partition to heal before the last frame, so
-    // an isolated archive has time to catch up and vote for `stop_frame`. Reject
-    // schedules whose last partitioned rank is not strictly below the stop frame.
-    validate_partition_ranks(&original, stop_frame)?;
+    // an isolated archive has time to catch up and vote for `stop_frame`.
+    validate_partition_views(&original, stop_frame)?;
 
     docker::docker_compose_build(&state.exec_dir, opts.verbose)
         .await
@@ -228,8 +230,8 @@ async fn run_single_mode(
         stop_frame,
         nodes: state.node_infos.clone(),
         minimum_nodes: state.minimum_nodes,
-        rank_partitions_resolved: resolved,
-        rank_partitions_original: original,
+        view_partitions_resolved: resolved,
+        view_partitions_original: original,
         out_dir: opts.out_dir.clone(),
         save_logs_on_success: opts.save_logs_on_success,
         parallel: 1,
@@ -251,56 +253,65 @@ async fn run_single_mode(
     Ok((vec![result], interrupted))
 }
 
-/// Parses the raw JSON rank-partitions flag and resolves node names to peer IDs.
-/// Returns the original entries (service names, sorted by rank) and the
+/// Parses the raw JSON view-partitions flag and resolves node names to peer IDs.
+/// Returns the original entries (service names, sorted by view) and the
 /// peer-ID-resolved JSON for the docker env var. Both are empty if `raw` is empty.
-fn resolve_rank_partitions(exec_dir: &str, raw: &str) -> Result<(Vec<RankPartitionEntry>, String)> {
+fn resolve_view_partitions(exec_dir: &str, raw: &str) -> Result<(Vec<ViewPartitionEntry>, String)> {
     if raw.is_empty() {
         return Ok((Vec::new(), String::new()));
     }
 
     let parsed =
-        rankpartitions::parse_rank_partitions(raw).context("failed to parse --rank-partitions")?;
+        viewpartitions::parse_view_partitions(raw).context("failed to parse --view-partitions")?;
 
-    // BTreeMap iterates in ascending rank order already.
-    let original: Vec<RankPartitionEntry> = parsed.into_values().collect();
+    // BTreeMap iterates in ascending view order already.
+    let original: Vec<ViewPartitionEntry> = parsed.into_values().collect();
 
     let mut resolved_entries = Vec::with_capacity(original.len());
     for e in &original {
         let mut re = e.clone();
         if !e.partition1.is_empty() {
             re.partition1 = resolve_names(exec_dir, &e.partition1)
-                .with_context(|| format!("failed to resolve rank {} partition1", e.rank))?;
+                .with_context(|| format!("failed to resolve view {} partition1", e.view))?;
         }
         if !e.partition2.is_empty() {
             re.partition2 = resolve_names(exec_dir, &e.partition2)
-                .with_context(|| format!("failed to resolve rank {} partition2", e.rank))?;
+                .with_context(|| format!("failed to resolve view {} partition2", e.view))?;
         }
         resolved_entries.push(re);
     }
 
     let resolved =
-        serde_json::to_string(&resolved_entries).context("failed to serialize rank-partitions")?;
+        serde_json::to_string(&resolved_entries).context("failed to serialize view-partitions")?;
     Ok((original, resolved))
 }
 
-/// Ensures the last partitioned rank is strictly below `stop_frame`. The rejoin
-/// gate observes whether each archive voted for the last frame; that's only
-/// meaningful if the partition has already healed by then. A schedule still
-/// partitioned at (or past) the stop frame could never show a rejoin, so we
-/// reject it up front rather than report a spurious failure.
-fn validate_partition_ranks(entries: &[RankPartitionEntry], stop_frame: i32) -> Result<()> {
-    let Some(last_rank) = entries.iter().map(|e| e.rank).max() else {
+/// Ensures the schedule heals with a frame to spare before `stop_frame`.
+///
+/// The rejoin gate observes whether each archive voted for the last frame, which
+/// is only meaningful once the partition has healed. Healing happens at the first
+/// view *after* the last entry, so the relevant view is `last_view + 1`.
+///
+/// Relating views to frames relies on `frame_number <= view`: a frame is only
+/// produced by a notarized view, and a nullified view advances the view alone.
+/// That holds for devnet, which always starts consensus from genesis. So healing
+/// at view `last_view + 1` lands on a frame no greater than `last_view + 1`, and
+/// requiring `last_view + 1 < stop_frame` puts the heal strictly before the stop
+/// frame is voted on.
+fn validate_partition_views(entries: &[ViewPartitionEntry], stop_frame: i32) -> Result<()> {
+    let Some(last_view) = entries.iter().map(|e| e.view).max() else {
         return Ok(());
     };
     if stop_frame <= 0 {
         anyhow::bail!("stop frame must be positive, got {stop_frame}");
     }
-    if last_rank >= stop_frame as u64 {
+    if last_view + 1 >= stop_frame as u64 {
         anyhow::bail!(
-            "last partition rank ({last_rank}) must be below the stop frame ({stop_frame}); \
-             the partition must heal before the last frame so an isolated archive can rejoin \
-             consensus and vote for it — increase --stopframe or lower the partition rank"
+            "last partition view ({last_view}) heals at view {}, which is not below the stop \
+             frame ({stop_frame}); the partition must heal before the last frame so an isolated \
+             archive can rejoin consensus and vote for it — increase --stopframe or lower the \
+             partition view",
+            last_view + 1
         );
     }
     Ok(())
@@ -400,35 +411,54 @@ fn spawn_signal_handler(cancel: CancellationToken) {
 mod tests {
     use super::*;
 
-    fn entry(rank: u64) -> RankPartitionEntry {
-        RankPartitionEntry {
-            rank,
+    fn entry(view: u64) -> ViewPartitionEntry {
+        ViewPartitionEntry {
+            view,
             partition1: vec!["archive-1".into()],
             partition2: vec!["archive-2".into()],
         }
     }
 
     #[test]
-    fn validate_partition_ranks_accepts_healing_schedule() {
-        // Last partition at rank 1, stop frame 5 — heals well before the end.
-        validate_partition_ranks(&[entry(1)], 5).unwrap();
+    fn validate_partition_views_accepts_healing_schedule() {
+        // Last partition at view 1, stop frame 5 — heals at view 2, well before
+        // the end.
+        validate_partition_views(&[entry(1)], 5).unwrap();
+    }
+
+    /// The heal happens at `last_view + 1`, so the last entry must sit two views
+    /// below the stop frame, not one.
+    #[test]
+    fn validate_partition_views_boundary() {
+        validate_partition_views(&[entry(3)], 5).unwrap();
+        let err = validate_partition_views(&[entry(4)], 5).unwrap_err();
+        assert!(
+            err.to_string().contains("not below the stop frame"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    fn validate_partition_ranks_rejects_partition_at_stop_frame() {
+    fn validate_partition_views_rejects_partition_at_stop_frame() {
         // Partition still active at the stop frame: no room to observe a rejoin.
-        let err = validate_partition_ranks(&[entry(3), entry(5)], 5).unwrap_err();
-        assert!(err.to_string().contains("must be below the stop frame"));
+        let err = validate_partition_views(&[entry(3), entry(5)], 5).unwrap_err();
+        assert!(err.to_string().contains("not below the stop frame"));
     }
 
     #[test]
-    fn validate_partition_ranks_rejects_partition_past_stop_frame() {
-        let err = validate_partition_ranks(&[entry(7)], 5).unwrap_err();
-        assert!(err.to_string().contains("must be below the stop frame"));
+    fn validate_partition_views_rejects_partition_past_stop_frame() {
+        let err = validate_partition_views(&[entry(7)], 5).unwrap_err();
+        assert!(err.to_string().contains("not below the stop frame"));
     }
 
     #[test]
-    fn validate_partition_ranks_no_partitions_is_ok() {
-        validate_partition_ranks(&[], 5).unwrap();
+    fn validate_partition_views_no_partitions_is_ok() {
+        validate_partition_views(&[], 5).unwrap();
+    }
+
+    #[test]
+    fn validate_partition_views_rejects_nonpositive_stop_frame() {
+        let err = validate_partition_views(&[entry(1)], 0).unwrap_err();
+        assert!(err.to_string().contains("stop frame must be positive"));
     }
 }

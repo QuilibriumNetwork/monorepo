@@ -842,7 +842,7 @@ mod identity_gate_tests {
 
     fn auth_ext(peer_id: quil_p2p::PeerId) -> tonic::Extensions {
         let mut ext = tonic::Extensions::new();
-        ext.insert(AuthenticatedPeer { peer_id, ed448_public_key: Vec::new() });
+        ext.insert(AuthenticatedPeer { peer_id, falcon_public_key: Vec::new() });
         ext
     }
 

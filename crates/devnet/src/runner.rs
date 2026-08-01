@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use devnet::rankpartitions::RankPartitionEntry;
 use devnet::shared::{FrameNotification, NodeInfo, NotificationType};
+use devnet::viewpartitions::ViewPartitionEntry;
 
 use crate::artifacts::{self, TestConfig};
 use crate::docker::{self, ExecuteTest};
@@ -32,8 +32,8 @@ pub struct RunConfig {
     pub stop_frame: i32,
     pub nodes: Vec<NodeInfo>,
     pub minimum_nodes: i32,
-    pub rank_partitions_resolved: String,
-    pub rank_partitions_original: Vec<RankPartitionEntry>,
+    pub view_partitions_resolved: String,
+    pub view_partitions_original: Vec<ViewPartitionEntry>,
     pub out_dir: String,
     pub save_logs_on_success: bool,
     pub parallel: i32,
@@ -59,7 +59,7 @@ pub async fn run_single_test(
     // safety net (`cleanup_active_projects`) can reap whatever was created.
     registry.register(&project_name);
 
-    tracing::info!(run_id, rank_partitions = ?cfg.rank_partitions_original, "Starting test");
+    tracing::info!(run_id, view_partitions = ?cfg.view_partitions_original, "Starting test");
 
     if let Err(e) = docker::execute_test(ExecuteTest {
         run_id,
@@ -72,7 +72,7 @@ pub async fn run_single_test(
         parallel: cfg.parallel,
         nodes: &cfg.nodes,
         minimum_nodes: cfg.minimum_nodes,
-        resolved_rank_partitions: &cfg.rank_partitions_resolved,
+        resolved_view_partitions: &cfg.view_partitions_resolved,
         global_timeout: cfg.global_timeout,
         node_catchup_timeout: cfg.node_catchup_timeout,
     })
@@ -150,7 +150,7 @@ pub async fn run_single_test(
             stop_frame: cfg.stop_frame,
             nodes: cfg.nodes.clone(),
             minimum_nodes: cfg.minimum_nodes,
-            rank_partitions: cfg.rank_partitions_original.clone(),
+            view_partitions: cfg.view_partitions_original.clone(),
         };
         result.artifact_dir = artifacts::save_failure_artifacts(
             &cfg.out_dir,
@@ -196,6 +196,16 @@ fn handle_terminal_notification(run_id: &str, cfg: &RunConfig, n: FrameNotificat
         ..Default::default()
     };
 
+    // Checked first: if the harness did not actually run the scenario, every
+    // other signal in this notification is meaningless, and a pass would falsely
+    // read as "the scenario was exercised and the network held up".
+    if !n.harness_error.is_empty() {
+        return TestResult {
+            success: false,
+            error_message: format!("harness verification failed: {}", n.harness_error),
+            ..base()
+        };
+    }
     if !n.safety_error.is_empty() {
         return TestResult {
             success: false,
@@ -289,8 +299,8 @@ mod evaluate_notification_tests {
             stop_frame: 30,
             nodes: Vec::new(),
             minimum_nodes,
-            rank_partitions_resolved: String::new(),
-            rank_partitions_original: Vec::new(),
+            view_partitions_resolved: String::new(),
+            view_partitions_original: Vec::new(),
             out_dir: String::new(),
             save_logs_on_success: false,
             parallel: 1,
@@ -310,7 +320,44 @@ mod evaluate_notification_tests {
             total_nodes: reached,
             enrollment_error: String::new(),
             rejoin_error: String::new(),
+            harness_error: String::new(),
         }
+    }
+
+    /// A run that did not execute its scenario must never report success, even
+    /// though every other signal looks clean — that is exactly the false pass
+    /// this check exists to prevent.
+    #[test]
+    fn harness_error_fails_an_otherwise_clean_run() {
+        let n = FrameNotification {
+            harness_error: "scheduled partition views were never observed: [1]".into(),
+            ..ok_notification(3)
+        };
+        let r = handle_terminal_notification("run", &cfg(3), n);
+        assert!(!r.success);
+        assert!(
+            r.error_message.contains("harness verification failed"),
+            "unexpected: {}",
+            r.error_message
+        );
+    }
+
+    /// The harness check outranks the others: if the scenario did not run, the
+    /// other verdicts are not evidence of anything.
+    #[test]
+    fn harness_error_takes_precedence_over_safety_error() {
+        let n = FrameNotification {
+            harness_error: "consensus event dropped".into(),
+            safety_error: "fork detected".into(),
+            ..ok_notification(3)
+        };
+        let r = handle_terminal_notification("run", &cfg(3), n);
+        assert!(!r.success);
+        assert!(
+            r.error_message.contains("harness verification failed"),
+            "unexpected: {}",
+            r.error_message
+        );
     }
 
     #[test]

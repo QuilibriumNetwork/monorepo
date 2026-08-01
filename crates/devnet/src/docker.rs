@@ -1,9 +1,14 @@
 //! Docker Compose interaction and node-identity resolution.
 //!
 //! Like the Go original, this shells out to the `docker compose` CLI rather than
-//! using a Docker SDK. Peer IDs are derived from each node's `config.yml`
-//! `p2p.peerPrivKey` using `quil-p2p`'s Ed448 identity (which produces the same
-//! base58 `QmX…` form as Go's libp2p `peer.ID`).
+//! using a Docker SDK.
+//!
+//! Peer IDs are derived from each node's Falcon `q-prover-key`: since the Falcon
+//! migration that key IS the node's libp2p network identity (and its `:8340`
+//! PQNoise identity), so the Ed448 `p2p.peerPrivKey` no longer yields the peer
+//! ID the network uses. The signing key itself is also read out of `keys.yml`
+//! and handed to the proxy, which must impersonate each node on both sides of
+//! its gRPC relay.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -23,6 +28,8 @@ const NODE_PORT: i32 = 8337;
 #[derive(Debug, Deserialize)]
 struct NodeConfigYaml {
     p2p: P2pSection,
+    #[serde(default)]
+    key: KeySection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +38,19 @@ struct P2pSection {
     peer_priv_key: String,
     #[serde(rename = "streamListenMultiaddr", default)]
     stream_listen_multiaddr: String,
+}
+
+/// `key.keyManagerFile.encryptionKey` — needed to decrypt `keys.yml`.
+#[derive(Debug, Default, Deserialize)]
+struct KeySection {
+    #[serde(rename = "keyManagerFile", default)]
+    key_manager_file: KeyManagerFileSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KeyManagerFileSection {
+    #[serde(rename = "encryptionKey", default)]
+    encryption_key: String,
 }
 
 /// Minimal view of a node's `keys.yml` — just the prover key's public key.
@@ -46,11 +66,14 @@ struct StoredKeyYaml {
     public_key: String,
 }
 
-/// Peer ID and raw (hex) private key for a node.
+/// Peer ID and raw (hex) private keys for a node.
 #[derive(Debug, Clone)]
 pub struct NodeIdentity {
+    /// base58 peer ID derived from the Falcon `q-prover-key` (the network identity).
     pub peer_id: String,
     pub peer_priv_key: String,
+    /// Hex-encoded Falcon `q-prover-key` signing key.
+    pub falcon_signing_key: String,
 }
 
 fn config_path(exec_dir: &str, name: &str) -> PathBuf {
@@ -151,6 +174,7 @@ pub async fn get_node_services(exec_dir: &str) -> Result<Vec<NodeInfo>> {
             node_port: NODE_PORT,
             peer_id: id.peer_id.clone(),
             peer_priv_key: id.peer_priv_key.clone(),
+            falcon_signing_key: id.falcon_signing_key.clone(),
             is_archive: name.starts_with("archive-"),
             prover_address,
         });
@@ -159,8 +183,38 @@ pub async fn get_node_services(exec_dir: &str) -> Result<Vec<NodeInfo>> {
     Ok(nodes)
 }
 
-/// Derives the peer ID and preserves the hex-encoded private key for each named
-/// node from its `config.yml`.
+/// Reads a node's Falcon `q-prover-key` from its `keys.yml`, decrypting with the
+/// `encryptionKey` from its `config.yml`. Returns the (signing key, public key).
+fn read_falcon_key(exec_dir: &str, name: &str, encryption_key: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    let path = keys_path(exec_dir, name);
+    let fkm = quil_keys::FileKeyManager::new(
+        path,
+        encryption_key,
+        "q-prover-key".to_string(),
+        Box::new(quil_crypto::FalconKeyConstructor),
+    )
+    .with_context(|| format!("failed to open keystore for node {name}"))?;
+    let signing_key = fkm
+        .get_secret_key_bytes_by_id("q-prover-key")
+        .with_context(|| format!("failed to read q-prover-key secret for node {name}"))?;
+    let public_key = fkm
+        .get_public_key_bytes_by_id("q-prover-key")
+        .with_context(|| format!("failed to read q-prover-key public for node {name}"))?;
+    if public_key.len() != quil_crypto::FALCON_PUBLIC_KEY_LEN {
+        bail!(
+            "node {name} q-prover-key is not a Falcon key ({} byte pubkey) — the \
+             bundled config/ fixtures predate the Falcon migration and must be \
+             re-cut (fresh Falcon prover keys, a genesisSeed that concatenates the \
+             archive pubkeys, engine.consensusCommittee, and the peer IDs in each \
+             announceListenMultiaddr plus the docker-compose healthchecks)",
+            public_key.len()
+        );
+    }
+    Ok((signing_key, public_key))
+}
+
+/// Derives the network peer ID (from the Falcon `q-prover-key`) and preserves
+/// the hex-encoded private keys for each named node.
 pub fn resolve_node_identities(
     exec_dir: &str,
     node_names: &[String],
@@ -172,17 +226,32 @@ pub fn resolve_node_identities(
         if cfg.p2p.peer_priv_key.is_empty() {
             bail!("p2p.peerPrivKey not found in config for node {name}");
         }
-        let identity = Ed448Identity::from_config_hex(&cfg.p2p.peer_priv_key)
+        // Parsed for validation only — the Ed448 key is the seniority root, not
+        // the network identity, so it no longer determines the peer ID.
+        Ed448Identity::from_config_hex(&cfg.p2p.peer_priv_key)
             .map_err(|e| anyhow!("failed to parse peerPrivKey for node {name}: {e}"))?;
+
+        let (signing_key, public_key) =
+            read_falcon_key(exec_dir, name, &cfg.key.key_manager_file.encryption_key)?;
         result.insert(
             name.to_string(),
             NodeIdentity {
-                peer_id: identity.peer_id_base58(),
+                peer_id: falcon_peer_id_base58(&public_key)
+                    .with_context(|| format!("failed to derive peer ID for node {name}"))?,
                 peer_priv_key: cfg.p2p.peer_priv_key,
+                falcon_signing_key: hex::encode(&signing_key),
             },
         );
     }
     Ok(result)
+}
+
+/// Base58btc (`Qm…`) peer ID for a Falcon public key — the same derivation the
+/// node applies to its own `q-prover-key` at startup.
+fn falcon_peer_id_base58(falcon_pubkey: &[u8]) -> Result<String> {
+    let mh = quil_p2p::peer_id_from_falcon_pubkey(falcon_pubkey);
+    let pid = quil_p2p::PeerId::from_bytes(&mh).context("peer ID from falcon multihash")?;
+    Ok(pid.to_base58())
 }
 
 /// Reads the TCP port from `p2p.streamListenMultiaddr` in a node's `config.yml`.
@@ -216,7 +285,7 @@ pub struct ExecuteTest<'a> {
     pub parallel: i32,
     pub nodes: &'a [NodeInfo],
     pub minimum_nodes: i32,
-    pub resolved_rank_partitions: &'a str,
+    pub resolved_view_partitions: &'a str,
     pub global_timeout: Duration,
     pub node_catchup_timeout: Duration,
 }
@@ -252,7 +321,7 @@ pub async fn execute_test(args: ExecuteTest<'_>) -> Result<()> {
         ("STOP_FRAME", args.stop_frame.to_string()),
         ("NODE_INFOS", node_infos_json),
         ("MIN_NODES", args.minimum_nodes.to_string()),
-        ("RANK_PARTITIONS", args.resolved_rank_partitions.to_string()),
+        ("VIEW_PARTITIONS", args.resolved_view_partitions.to_string()),
         ("GLOBAL_TIMEOUT", args.global_timeout.as_secs().to_string()),
         (
             "NODE_CATCHUP_TIMEOUT",
@@ -405,10 +474,15 @@ fn stdio(show: bool) -> Stdio {
 mod tests {
     use super::*;
 
-    /// Parity check: the peer IDs derived from each node's `peerPrivKey` must
-    /// exactly match the IDs documented in `config/*/config.yml` (and pinned in
-    /// the docker-compose healthchecks). This guards the Ed448 → base58 peer-id
-    /// derivation reused from `quil-p2p` against the Go libp2p behaviour.
+    /// Guards the Ed448 → base58 peer-id derivation reused from `quil-p2p`
+    /// against the Go libp2p behaviour.
+    ///
+    /// These are each node's *seniority-root* Ed448 identity. Since the Falcon
+    /// migration they are NOT the network peer IDs — those come from the Falcon
+    /// `q-prover-key` and are covered by
+    /// [`network_peer_ids_match_config_announce_addrs`]. The pinned values here
+    /// are therefore fixed vectors for the derivation itself, not a claim about
+    /// what the configs or compose healthchecks contain.
     #[test]
     fn peer_id_derivation_matches_pinned_ids() {
         let cases = [
@@ -447,18 +521,65 @@ mod tests {
         }
     }
 
-    /// Parity check: `derive_prover_address` from client-1's real `keys.yml`
-    /// must reproduce the prover address previously pinned for client-1
-    /// (`04c6d96f…`, derived once via the node helper). This guards the prover-
-    /// address derivation — used to attribute consensus messages to nodes —
-    /// against the value the rest of the system computes. Tests run with the
-    /// crate root as CWD, so the bundled `config/` is resolvable at ".".
+    /// The network peer ID the harness resolves for each node must equal the one
+    /// baked into that node's own `p2p.announceListenMultiaddr` — i.e. the
+    /// identity it announces to peers, and (for the archives and client) the one
+    /// the compose healthcheck pings. Because the announce address is what the
+    /// running node publishes, this catches fixtures that drift out of sync with
+    /// the derivation the orchestrator and proxy rely on — the failure that made
+    /// every node's peer ID stale after the Falcon migration.
     #[test]
-    fn prover_address_derivation_matches_pinned_client_1() {
+    fn network_peer_ids_match_config_announce_addrs() {
+        let names: Vec<String> = [
+            "archive-1",
+            "archive-2",
+            "archive-3",
+            "archive-4",
+            "client-1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let ids = resolve_node_identities(".", &names).expect("resolve node identities");
+        for name in &names {
+            let cfg = std::fs::read_to_string(config_path(".", name)).expect("read config");
+            let announce = cfg
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with("announceListenMultiaddr:"))
+                .expect("config has announceListenMultiaddr");
+            let announced = announce
+                .rsplit("/p2p/")
+                .next()
+                .expect("announce address has a /p2p/ segment");
+            assert_eq!(
+                ids[name].peer_id, announced,
+                "{name}: resolved network peer ID does not match its announced one"
+            );
+        }
+    }
+
+    /// Parity check: `derive_prover_address` over the bundled `keys.yml`
+    /// fixtures must reproduce the prover addresses the rest of the system
+    /// computes. This guards the prover-address derivation — used to attribute
+    /// consensus messages to nodes — against the node's own implementation
+    /// (`master_node::keys`, which logs `prover_address` at startup); the
+    /// archive-1 value below is copied from that log line, so the two
+    /// independent derivations are pinned against each other rather than
+    /// against a value this function produced. Tests run with the crate root as
+    /// CWD, so the bundled `config/` is resolvable at ".".
+    #[test]
+    fn prover_address_derivation_matches_pinned_nodes() {
+        let addr =
+            derive_prover_address(".", "archive-1").expect("derive archive-1 prover address");
+        assert_eq!(
+            addr,
+            "09044ff1352126f57dc21b483ad653dd670fd8506a51d78456f1e8d9ad1e9ccc"
+        );
         let addr = derive_prover_address(".", "client-1").expect("derive client-1 prover address");
         assert_eq!(
             addr,
-            "04c6d96f9b108107c62adf098b2994777da4b9f1d80e52ee303be72961df23bd"
+            "2b52688ada787c2317c984c97e83bde02116730044c17052aac1b9a5f72ff689"
         );
     }
 }

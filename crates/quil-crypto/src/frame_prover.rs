@@ -635,7 +635,7 @@ mod batch_tests {
     use super::*;
     use quil_types::crypto::{BlsConstructor, FrameProver, Signer};
 
-    /// Build a shard `FrameHeader` with a real single-signer BLS aggregate
+    /// Build a shard `FrameHeader` with a real single-signer Falcon
     /// signature over the exact `(payload, domain)` that
     /// `verify_frame_header_signature` reconstructs.
     fn make_signed_header(
@@ -653,7 +653,11 @@ mod batch_tests {
         let mut domain = b"appshard".to_vec();
         domain.extend_from_slice(&address);
         let sig = signer.sign_with_domain(&payload, &domain).unwrap();
-        assert_eq!(sig.len(), 74, "single-signer aggregate must be 74 bytes");
+        assert_eq!(
+            sig.len(),
+            crate::falcon::FALCON_SIGNATURE_LEN,
+            "single-signer aggregate must be one 666-byte Falcon signature"
+        );
         global::FrameHeader {
             address,
             output,
@@ -682,7 +686,7 @@ mod batch_tests {
             let addr = vec![i as u8; 32];
             let output = vec![(i + 1) as u8; 516];
             let h = make_signed_header(signer.as_ref(), &pk, addr, output, 100 + i);
-            // Ground truth: individual verify passes (74-byte sig, ids None).
+            // Ground truth: individual verify passes (666-byte sig, ids None).
             assert!(fp.verify_frame_header_signature(&h, &bls, None).unwrap(), "individual {i}");
             headers.push(h);
             _signers.push(signer);

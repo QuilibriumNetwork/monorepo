@@ -62,7 +62,7 @@ services:
       - RUNNER_AUTH=${RUNNER_AUTH}
       - NODE_INFOS=${NODE_INFOS}
       - MIN_NODES=${MIN_NODES}
-      - RANK_PARTITIONS=${RANK_PARTITIONS}
+      - VIEW_PARTITIONS=${VIEW_PARTITIONS}
       - GLOBAL_TIMEOUT=${GLOBAL_TIMEOUT}
       - NODE_CATCHUP_TIMEOUT=${NODE_CATCHUP_TIMEOUT}
       - RUST_LOG=${RUST_LOG:-info}
@@ -110,7 +110,7 @@ services:
     volumes:
        - ./config/archive-1-config:/root/config
     healthcheck:
-      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmUTm2VphyTw3ZxFEP5Bsmf7oEbNm9odWfWVfq2uMWE71G"]
+      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmVySjiTTnwDQ83xUWxCPCWaSxdcFMWHkzhx8A7rtFLG7z"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -138,7 +138,7 @@ services:
     volumes:
        - ./config/archive-2-config:/root/config
     healthcheck:
-      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmabWWynnmuommyVP1cQDxrGESweGmzrG84p24uERR5sYh"]
+      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmUybD21GTrBrkWAFZEqasQZqkp3K7RaTT1xnsccAdDBBU"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -166,7 +166,7 @@ services:
     volumes:
        - ./config/archive-3-config:/root/config
     healthcheck:
-      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmdgHiGSSHD25cTjfZmYCXzajhdXzPKpPC9sXRFtZgUePX"]
+      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmeQmSa8SV11qpRd2WaeEH7WDi5G8cxANVgRVxSiTEJf7z"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -194,7 +194,7 @@ services:
     volumes:
        - ./config/archive-4-config:/root/config
     healthcheck:
-      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmRTd8oGd75wjYhoVxkffpzmmCm9MF6oqYpoXNL7n3rjGk"]
+      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmU9YAXibCBse6dWk8rS9TbF5KPKMCxbdS78EBbx4nJxDc"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -239,7 +239,7 @@ services:
     volumes:
        - ./config/client-1-config:/root/config
     healthcheck:
-      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmeR2GE77KwyavM7RHn2C415wDxytvh3Q119v7JSSjK6KM"]
+      test: ["CMD", "p2p-ping", "-timeout", "5s", "/ip4/127.0.0.1/udp/8336/quic-v1/p2p/QmU69pvLMYqcvaGvthhi1qJFyRmkGv3Ht9xjtLdjgvruNk"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -41,24 +41,22 @@ impl NetworkPartitioner {
         !blocked
     }
 
-    /// Suppresses forwarding between `peer_a` and `peer_b`. Idempotent.
-    pub fn partition_peers(&self, peer_a: PeerId, peer_b: PeerId) {
-        self.partitioned_pairs
-            .write()
-            .unwrap()
-            .insert(pair_key(peer_a, peer_b));
-    }
-
     /// Removes all active partitions.
     pub fn clear_partitions(&self) {
         self.partitioned_pairs.write().unwrap().clear();
     }
 
-    /// Clears existing partitions and blocks all `group1 × group2` pairs. Each
+    /// Replaces the partition state with all `group1 × group2` pairs. Each
     /// element is a base58-encoded peer ID string; unparseable entries are
     /// skipped (with a warning), matching the Go proxy's lenient decode.
+    ///
+    /// The new set is built first and swapped in under a single write lock, so
+    /// a concurrent [`Self::forward_filter`] never sees a cleared or half-built
+    /// table. That matters because the view schedule re-applies the same
+    /// partition on consecutive views to hold it open; a clear-then-refill would
+    /// open a forwarding window on every re-apply.
     pub fn apply_partition(&self, group1: &[String], group2: &[String]) {
-        self.clear_partitions();
+        let mut next = HashSet::new();
         for p1 in group1 {
             let Some(pid1) = parse_peer_id(p1) else {
                 continue;
@@ -67,9 +65,10 @@ impl NetworkPartitioner {
                 let Some(pid2) = parse_peer_id(p2) else {
                     continue;
                 };
-                self.partition_peers(pid1, pid2);
+                next.insert(pair_key(pid1, pid2));
             }
         }
+        *self.partitioned_pairs.write().unwrap() = next;
     }
 }
 
@@ -107,10 +106,10 @@ mod tests {
 
     #[test]
     fn partition_blocks_both_directions() {
-        let (a, _) = peer(1);
-        let (b, _) = peer(2);
+        let (a, a58) = peer(1);
+        let (b, b58) = peer(2);
         let p = NetworkPartitioner::new();
-        p.partition_peers(a, b);
+        p.apply_partition(&[a58], &[b58]);
         assert!(!p.forward_filter(&a, &b));
         assert!(!p.forward_filter(&b, &a), "partition is symmetric");
     }
@@ -146,12 +145,51 @@ mod tests {
         assert!(!p.forward_filter(&a, &c));
     }
 
+    /// Re-applying the same partition is how the view schedule holds a partition
+    /// across consecutive views. A reader must never catch the table mid-swap
+    /// and forward a message that should have been dropped.
+    #[test]
+    fn repeated_apply_never_exposes_a_forwarding_window() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (a, a58) = peer(1);
+        let (b, b58) = peer(2);
+        let p = Arc::new(NetworkPartitioner::new());
+        p.apply_partition(std::slice::from_ref(&a58), std::slice::from_ref(&b58));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let leaked = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (p, stop, leaked) = (Arc::clone(&p), Arc::clone(&stop), Arc::clone(&leaked));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if p.forward_filter(&a, &b) {
+                        leaked.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            })
+        };
+
+        for _ in 0..10_000 {
+            p.apply_partition(std::slice::from_ref(&a58), std::slice::from_ref(&b58));
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        assert!(
+            !leaked.load(Ordering::Relaxed),
+            "forwarding was allowed while the partition was continuously in effect"
+        );
+    }
+
     #[test]
     fn clear_partitions_unblocks() {
-        let (a, _) = peer(1);
-        let (b, _) = peer(2);
+        let (a, a58) = peer(1);
+        let (b, b58) = peer(2);
         let p = NetworkPartitioner::new();
-        p.partition_peers(a, b);
+        p.apply_partition(&[a58], &[b58]);
         p.clear_partitions();
         assert!(p.forward_filter(&a, &b));
     }

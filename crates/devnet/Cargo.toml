@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 quil-p2p = { path = "../quil-p2p" }
 quil-crypto = { path = "../quil-crypto" }
+quil-keys = { path = "../quil-keys" }
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }

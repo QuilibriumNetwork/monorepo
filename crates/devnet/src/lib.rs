@@ -3,7 +3,7 @@
 //! This exposes the pure, dependency-light pieces that are reused by both the
 //! `devnet` orchestrator binary and (in phase 2) the `devnet-proxy` binary:
 //! the wire types exchanged between them ([`shared`]) and the partition-schedule
-//! algorithm ([`rankpartitions`]).
+//! algorithm ([`viewpartitions`]).
 
-pub mod rankpartitions;
 pub mod shared;
+pub mod viewpartitions;

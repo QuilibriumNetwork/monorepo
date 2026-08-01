@@ -37,3 +37,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1"
 thiserror = "2"
 hex = "0.4"
+
+[dev-dependencies]
+# Test-only: encode view/epoch varints with the same codec the nodes use, so the
+# hand-rolled reader in `simplex_view` is checked against the real encoder.
+commonware-codec = "=2026.7.0"

@@ -16,7 +16,6 @@
 //! + signature, verify the cross-sig, and re-derive the libp2p peer ID.
 
 use ed25519_dalek::SigningKey;
-use ed448_rust::{PrivateKey as Ed448PrivateKey, PublicKey as Ed448PublicKey};
 use rcgen::{
     Certificate, CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS_ED25519,
 };
@@ -416,8 +415,15 @@ mod tests {
     // XsignClientCertVerifier — accepts good certs, rejects tampered
     // =================================================================
 
-    fn cert_der_from_seed(seed: &[u8; 57]) -> Vec<u8> {
-        let tls = build_quil_tls_cert(seed).unwrap();
+    /// A fresh Falcon-512 signing key — the node identity
+    /// `build_quil_tls_cert` binds the cert to.
+    fn falcon_signing_key() -> Vec<u8> {
+        use quil_types::crypto::Signer as _;
+        quil_crypto::FalconSigner::generate().private_key().to_vec()
+    }
+
+    fn cert_der_from_key(falcon_sk: &[u8]) -> Vec<u8> {
+        let tls = build_quil_tls_cert(falcon_sk).unwrap();
         let pem = tls.cert_pem.clone();
         let mut reader = pem.as_bytes();
         let cert = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
@@ -426,11 +432,11 @@ mod tests {
 
     #[test]
     fn xsign_verifier_accepts_well_formed_cert() {
-        let seed = [0x71u8; 57];
-        let der = cert_der_from_seed(&seed);
+        let sk = falcon_signing_key();
+        let der = cert_der_from_key(&sk);
         let pubkey = XsignClientCertVerifier::verify_xsign(&der)
             .expect("xsign verify must accept a freshly-built cert");
-        assert_eq!(pubkey.len(), 57);
+        assert_eq!(pubkey.len(), quil_crypto::FALCON_PUBLIC_KEY_LEN);
     }
 
     #[test]
@@ -443,8 +449,8 @@ mod tests {
     fn xsign_verifier_rejects_tampered_san() {
         // Take a real cert, flip a bit in the xsign signature half of
         // the SAN, and confirm verification fails.
-        let seed = [0x55u8; 57];
-        let tls = build_quil_tls_cert(&seed).unwrap();
+        let sk = falcon_signing_key();
+        let tls = build_quil_tls_cert(&sk).unwrap();
         // Mutate the SAN string (still valid hex of valid length) by
         // flipping the last hex digit. This corrupts the signature
         // while keeping the encoding parseable.
@@ -456,7 +462,7 @@ mod tests {
         // the rcgen flow from scratch since the existing helper
         // computes its own SAN.
         let mut hasher = sha2::Sha256::new();
-        hasher.update(&seed);
+        hasher.update(&sk);
         hasher.update(TLS_CERT_DERIVATION_CTX);
         let digest = hasher.finalize();
         let mut ed25519_seed = [0u8; 32];
@@ -490,29 +496,30 @@ mod tests {
     // =================================================================
 
     #[test]
-    fn build_cert_from_known_seed() {
-        let seed = [0x42u8; 57];
-        let tls = build_quil_tls_cert(&seed).expect("build cert");
+    fn build_cert_from_generated_key() {
+        let sk = falcon_signing_key();
+        let tls = build_quil_tls_cert(&sk).expect("build cert");
         assert!(tls.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(tls.key_pem.contains("BEGIN PRIVATE KEY"));
-        // xsign is hex(57 + 114) = 342 chars
-        assert_eq!(tls.xsign_hex.len(), (57 + 114) * 2);
+        // xsign is hex(897 + 666) chars
+        assert_eq!(
+            tls.xsign_hex.len(),
+            (quil_crypto::FALCON_PUBLIC_KEY_LEN + quil_crypto::FALCON_SIGNATURE_LEN) * 2
+        );
     }
 
     #[test]
-    fn build_cert_from_zero_seed() {
-        let seed = [0u8; 57];
-        let tls = build_quil_tls_cert(&seed).expect("build cert");
-        assert!(tls.cert_pem.contains("BEGIN CERTIFICATE"));
-        assert!(tls.cert_pem.contains("END CERTIFICATE"));
-        assert!(tls.key_pem.contains("BEGIN PRIVATE KEY"));
-        assert!(tls.key_pem.contains("END PRIVATE KEY"));
+    fn build_cert_rejects_malformed_signing_key() {
+        // An all-zero buffer of the right length is not a decodable
+        // Falcon signing key, and neither is a legacy 57-byte Ed448 seed.
+        assert!(build_quil_tls_cert(&[0u8; quil_crypto::FALCON_SIGNING_KEY_LEN]).is_err());
+        assert!(build_quil_tls_cert(&[0x42u8; 57]).is_err());
     }
 
     #[test]
     fn build_cert_xsign_is_valid_hex() {
-        let seed = [0x17u8; 57];
-        let tls = build_quil_tls_cert(&seed).unwrap();
+        let sk = falcon_signing_key();
+        let tls = build_quil_tls_cert(&sk).unwrap();
         // Every character must be a valid hex digit.
         for c in tls.xsign_hex.chars() {
             assert!(
@@ -523,83 +530,77 @@ mod tests {
         }
         // Round-trip decodes cleanly.
         let decoded = hex::decode(&tls.xsign_hex).unwrap();
-        assert_eq!(decoded.len(), 57 + 114);
+        assert_eq!(
+            decoded.len(),
+            quil_crypto::FALCON_PUBLIC_KEY_LEN + quil_crypto::FALCON_SIGNATURE_LEN
+        );
     }
 
     #[test]
-    fn build_cert_xsign_starts_with_ed448_pubkey() {
-        // The first 57 bytes of the xsign blob are the Ed448 public key
-        // derived from the seed. Compute it independently and compare.
-        let seed = [0x99u8; 57];
-        let tls = build_quil_tls_cert(&seed).unwrap();
+    fn build_cert_xsign_starts_with_falcon_pubkey() {
+        // The first 897 bytes of the xsign blob are the Falcon public key
+        // recomputed from the signing key. Compute it independently and
+        // compare.
+        let sk = falcon_signing_key();
+        let tls = build_quil_tls_cert(&sk).unwrap();
         let decoded = hex::decode(&tls.xsign_hex).unwrap();
 
-        let priv_key = Ed448PrivateKey::from(seed);
-        let pub_key = Ed448PublicKey::try_from(&priv_key).unwrap();
-        assert_eq!(&decoded[..57], pub_key.as_byte());
+        let pub_key = quil_crypto::falcon_public_from_signing_key(&sk).unwrap();
+        assert_eq!(&decoded[..quil_crypto::FALCON_PUBLIC_KEY_LEN], &pub_key[..]);
     }
 
     #[test]
-    fn build_cert_xsign_signature_portion_has_ed448_sig_length() {
-        // The last 114 bytes of xsign are the Ed448 signature over
-        // `"tls-cert-derivation" || ed25519_pub`. We don't verify the
-        // signature directly (that's a property of ed448-rust, not
-        // our TLS cert code), but we lock down the length and the
-        // split point between pub key and signature.
-        let seed = [0x33u8; 57];
-        let tls = build_quil_tls_cert(&seed).unwrap();
+    fn build_cert_xsign_signature_portion_verifies() {
+        // The last 666 bytes of xsign are the Falcon signature over
+        // `"tls-cert-derivation" || ed25519_pub` (empty domain). Recompute
+        // the derived Ed25519 pubkey and verify the cross-signature the
+        // same way `verify_xsign` does.
+        let sk = falcon_signing_key();
+        let tls = build_quil_tls_cert(&sk).unwrap();
         let decoded = hex::decode(&tls.xsign_hex).unwrap();
-        assert_eq!(decoded.len(), 57 + 114);
-        let signature = &decoded[57..];
-        assert_eq!(signature.len(), 114);
-        // Sanity: the signature must not be all zero (a degenerate
-        // ed448 sig would be suspicious).
-        assert!(!signature.iter().all(|&b| b == 0));
-    }
+        let (falcon_pub, signature) = decoded.split_at(quil_crypto::FALCON_PUBLIC_KEY_LEN);
+        assert_eq!(signature.len(), quil_crypto::FALCON_SIGNATURE_LEN);
 
-    #[test]
-    fn build_cert_xsign_is_deterministic_for_same_seed() {
-        // Extracted as its own property: the xsign_hex output is a
-        // deterministic function of the seed alone. This is a stronger
-        // claim than `same_seed_produces_same_xsign_but_different_cert`
-        // below because it verifies the determinism across multiple
-        // invocations, not just two.
-        let seed = [0x55u8; 57];
-        let results: Vec<String> = (0..5)
-            .map(|_| build_quil_tls_cert(&seed).unwrap().xsign_hex)
-            .collect();
-        // All 5 outputs must be identical.
-        for r in &results[1..] {
-            assert_eq!(r, &results[0]);
-        }
+        let mut hasher = Sha256::new();
+        hasher.update(&sk);
+        hasher.update(TLS_CERT_DERIVATION_CTX);
+        let digest = hasher.finalize();
+        let mut ed25519_seed = [0u8; 32];
+        ed25519_seed.copy_from_slice(&digest[..32]);
+        let ed25519_pub = SigningKey::from_bytes(&ed25519_seed)
+            .verifying_key()
+            .to_bytes();
+        let mut signed = Vec::new();
+        signed.extend_from_slice(TLS_CERT_DERIVATION_CTX);
+        signed.extend_from_slice(&ed25519_pub);
+        assert!(quil_crypto::falcon_verify(falcon_pub, signature, &signed, &[]));
     }
 
     // =================================================================
-    // Deterministic derivation
+    // Derivation properties
     // =================================================================
 
     #[test]
-    fn same_seed_produces_same_xsign_but_different_cert() {
-        // The `xsign_hex` is deterministic from the seed (SHA-256
-        // derivation + Ed25519 key + Ed448 sig). The x509 cert body
-        // may include a randomly-generated serial number and
-        // timestamps, so cert_pem can differ between calls while
-        // xsign_hex stays identical.
-        let seed = [0xABu8; 57];
-        let a = build_quil_tls_cert(&seed).unwrap();
-        let b = build_quil_tls_cert(&seed).unwrap();
-        assert_eq!(a.xsign_hex, b.xsign_hex);
+    fn same_key_produces_same_key_pem_and_pubkey_half() {
+        // The derived Ed25519 key (and so key_pem) and the Falcon-pubkey
+        // half of the xsign blob are deterministic functions of the
+        // signing key. The signature half is NOT deterministic (Falcon
+        // signing is randomized), and the x509 cert body may include a
+        // randomly-generated serial number and timestamps.
+        let sk = falcon_signing_key();
+        let a = build_quil_tls_cert(&sk).unwrap();
+        let b = build_quil_tls_cert(&sk).unwrap();
         assert_eq!(a.key_pem, b.key_pem);
-        // cert_pem structure contains the SAN which contains xsign_hex;
-        // both certs should include it.
+        let pub_hex_len = quil_crypto::FALCON_PUBLIC_KEY_LEN * 2;
+        assert_eq!(a.xsign_hex[..pub_hex_len], b.xsign_hex[..pub_hex_len]);
         assert!(a.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(b.cert_pem.contains("BEGIN CERTIFICATE"));
     }
 
     #[test]
-    fn different_seeds_produce_different_xsign() {
-        let a = build_quil_tls_cert(&[0x01u8; 57]).unwrap();
-        let b = build_quil_tls_cert(&[0x02u8; 57]).unwrap();
+    fn different_keys_produce_different_xsign() {
+        let a = build_quil_tls_cert(&falcon_signing_key()).unwrap();
+        let b = build_quil_tls_cert(&falcon_signing_key()).unwrap();
         assert_ne!(a.xsign_hex, b.xsign_hex);
         assert_ne!(a.key_pem, b.key_pem);
     }
@@ -778,16 +779,16 @@ mod tests {
 
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-    fn cert_chain_from_seed(seed: &[u8; 57]) -> Vec<CertificateDer<'static>> {
-        vec![CertificateDer::from(cert_der_from_seed(seed))]
+    fn cert_chain_from_key(falcon_sk: &[u8]) -> Vec<CertificateDer<'static>> {
+        vec![CertificateDer::from(cert_der_from_key(falcon_sk))]
     }
 
-    /// Load the Ed25519 signing key derived from `seed`. Pairing this with a
-    /// *different* seed's cert chain (via `CertifiedKey::new`, which — unlike
-    /// `from_der` — does not check the key matches the cert) is the forgery:
-    /// present someone else's cert, sign with your own key.
-    fn signing_key_from_seed(seed: &[u8; 57]) -> Arc<dyn rustls::sign::SigningKey> {
-        let tls = build_quil_tls_cert(seed).unwrap();
+    /// Load the Ed25519 signing key derived from `falcon_sk`. Pairing this
+    /// with a *different* key's cert chain (via `CertifiedKey::new`, which —
+    /// unlike `from_der` — does not check the key matches the cert) is the
+    /// forgery: present someone else's cert, sign with your own key.
+    fn signing_key_from_key(falcon_sk: &[u8]) -> Arc<dyn rustls::sign::SigningKey> {
+        let tls = build_quil_tls_cert(falcon_sk).unwrap();
         let key: PrivateKeyDer<'static> =
             rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
                 .unwrap()
@@ -870,12 +871,13 @@ mod tests {
     #[tokio::test]
     async fn acceptor_completes_handshake_with_forged_client_signature() {
         // Production server, built exactly as the node does.
-        let acceptor = TlsAcceptor::from(build_quil_server_tls_config(&[0x71u8; 57]).unwrap());
+        let acceptor =
+            TlsAcceptor::from(build_quil_server_tls_config(&falcon_signing_key()).unwrap());
 
         // Attacker: victim's public cert + attacker's own (different) key.
         let forged = Arc::new(rustls::sign::CertifiedKey::new(
-            cert_chain_from_seed(&[0x61u8; 57]),
-            signing_key_from_seed(&[0x62u8; 57]),
+            cert_chain_from_key(&falcon_signing_key()),
+            signing_key_from_key(&falcon_signing_key()),
         ));
         let client_cfg = rustls::ClientConfig::builder()
             .dangerous()
@@ -915,11 +917,12 @@ mod tests {
     /// the fix (all possession is legitimate).
     #[tokio::test]
     async fn acceptor_completes_handshake_with_legitimate_client() {
-        let acceptor = TlsAcceptor::from(build_quil_server_tls_config(&[0x71u8; 57]).unwrap());
+        let acceptor =
+            TlsAcceptor::from(build_quil_server_tls_config(&falcon_signing_key()).unwrap());
 
         // Legit client: presents its own cert signed with its own key.
-        let seed = [0x61u8; 57];
-        let tls = build_quil_tls_cert(&seed).unwrap();
+        let sk = falcon_signing_key();
+        let tls = build_quil_tls_cert(&sk).unwrap();
         let key: PrivateKeyDer<'static> =
             rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
                 .unwrap()
@@ -927,7 +930,7 @@ mod tests {
         let client_cfg = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(XsignServerVerifier::new()))
-            .with_client_auth_cert(cert_chain_from_seed(&seed), key)
+            .with_client_auth_cert(cert_chain_from_key(&sk), key)
             .unwrap();
         let connector = TlsConnector::from(Arc::new(client_cfg));
 

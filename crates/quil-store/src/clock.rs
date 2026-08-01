@@ -471,6 +471,7 @@ mod tests {
                 parent_selector: vec![0u8; 32],
                 global_commitments: Vec::new(),
                 prover_tree_commitment: Vec::new(),
+                prover_tree_aux_roots: Vec::new(),
                 requests_root: Vec::new(),
                 prover: vec![0u8; 32],
                 public_key_signature_bls48581: None,
