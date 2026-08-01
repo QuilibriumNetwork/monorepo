@@ -2173,8 +2173,14 @@ mod tests {
         assert_eq!(fixed2, 0, "re-run must be a no-op");
     }
 
+    /// The Falcon-recut genesis dropped [`REMOVED_GLOBAL_PROVER_PEER_ID`]
+    /// from `archive_peers` entirely (its slot now carries the beacon's own
+    /// Falcon key), baking the removal into genesis itself: establishing
+    /// genesis already yields the fixed 5-member committee (beacon + 4
+    /// archives). The startup kick must therefore take its graceful no-op
+    /// branch and leave every established prover Active.
     #[test]
-    fn remove_offline_global_prover_kicks_and_is_idempotent() {
+    fn remove_offline_global_prover_is_noop_and_idempotent_on_falcon_genesis() {
         let crdt = test_crdt();
         let genesis_data = get_mainnet_genesis_data().unwrap();
 
@@ -2183,14 +2189,13 @@ mod tests {
         state.commit().unwrap();
         crdt.commit(0).unwrap();
 
-        // The removed peer must be one of the genesis archive peers.
-        let pubkey_hex = genesis_data
-            .archive_peers
-            .get(REMOVED_GLOBAL_PROVER_PEER_ID)
-            .expect("removed peer must be in genesis archive_peers");
-        let pubkey = hex::decode(pubkey_hex).unwrap();
-        let prover_addr = materialize::prover_address_from_pubkey(&pubkey).unwrap();
-        let alloc_addr = materialize::allocation_address(&pubkey, &[]).unwrap();
+        // The removal is baked into the re-cut genesis: the offline peer is
+        // no longer in archive_peers at all.
+        assert!(
+            !genesis_data.archive_peers.contains_key(REMOVED_GLOBAL_PROVER_PEER_ID),
+            "offline peer must already be absent from the Falcon genesis archive_peers"
+        );
+
         let va = hypergraph_state::vertex_adds_discriminator().unwrap();
         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
 
@@ -2201,22 +2206,25 @@ mod tests {
             quil_execution::global_schema::read_field(&tree, cls, "Status")
         };
 
-        // Established Active.
-        assert_eq!(read_status(&alloc_addr, "allocation:ProverAllocation"), Some(vec![1]));
+        // With nothing to kick, removal is a graceful no-op.
+        assert!(!remove_offline_global_prover(&crdt, 1).unwrap(), "removal must be a no-op");
 
-        // Remove → both allocation and prover Status become Kicked (4).
-        let changed = remove_offline_global_prover(&crdt, 1).unwrap();
-        assert!(changed, "removal should change state on first run");
-        assert_eq!(
-            read_status(&alloc_addr, "allocation:ProverAllocation"),
-            Some(vec![4]),
-            "global allocation must be Kicked"
-        );
-        assert_eq!(
-            read_status(&prover_addr, "prover:Prover"),
-            Some(vec![4]),
-            "prover vertex must be Kicked"
-        );
+        // Every established genesis prover stays Active (1).
+        for pubkey_hex in genesis_data.archive_peers.values() {
+            let pubkey = hex::decode(pubkey_hex).unwrap();
+            let prover_addr = materialize::prover_address_from_pubkey(&pubkey).unwrap();
+            let alloc_addr = materialize::allocation_address(&pubkey, &[]).unwrap();
+            assert_eq!(
+                read_status(&alloc_addr, "allocation:ProverAllocation"),
+                Some(vec![1]),
+                "global allocation must stay Active"
+            );
+            assert_eq!(
+                read_status(&prover_addr, "prover:Prover"),
+                Some(vec![1]),
+                "prover vertex must stay Active"
+            );
+        }
 
         // Idempotent.
         assert!(!remove_offline_global_prover(&crdt, 2).unwrap(), "second run is a no-op");

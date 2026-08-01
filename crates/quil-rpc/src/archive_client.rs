@@ -641,19 +641,26 @@ mod tests {
     use rustls::ServerConfig;
     use tokio_rustls::TlsAcceptor;
 
-    fn cert_chain_from_seed(seed: &[u8; 57]) -> Vec<CertificateDer<'static>> {
-        let tls = build_quil_tls_cert(seed).unwrap();
+    /// A fresh Falcon-512 signing key — the node identity
+    /// `build_quil_tls_cert` binds the cert to.
+    fn falcon_signing_key() -> Vec<u8> {
+        use quil_types::crypto::Signer as _;
+        quil_crypto::FalconSigner::generate().private_key().to_vec()
+    }
+
+    fn cert_chain_from_key(falcon_sk: &[u8]) -> Vec<CertificateDer<'static>> {
+        let tls = build_quil_tls_cert(falcon_sk).unwrap();
         rustls_pemfile::certs(&mut tls.cert_pem.as_bytes())
             .map(|r| r.unwrap())
             .collect()
     }
 
-    /// Load the Ed25519 signing key derived from `seed`. Pairing this with a
-    /// *different* seed's cert chain via `CertifiedKey::new` (which — unlike
-    /// `from_der` — does not check the key matches the cert) is the forgery:
-    /// present someone else's cert, sign with your own key.
-    fn signing_key_from_seed(seed: &[u8; 57]) -> Arc<dyn rustls::sign::SigningKey> {
-        let tls = build_quil_tls_cert(seed).unwrap();
+    /// Load the Ed25519 signing key derived from `falcon_sk`. Pairing this
+    /// with a *different* key's cert chain via `CertifiedKey::new` (which —
+    /// unlike `from_der` — does not check the key matches the cert) is the
+    /// forgery: present someone else's cert, sign with your own key.
+    fn signing_key_from_key(falcon_sk: &[u8]) -> Arc<dyn rustls::sign::SigningKey> {
+        let tls = build_quil_tls_cert(falcon_sk).unwrap();
         let key: PrivateKeyDer<'static> =
             rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
                 .unwrap()
@@ -690,16 +697,17 @@ mod tests {
 
     #[tokio::test]
     async fn client_rejects_forged_server_signature() {
-        // Attacker server: victim's public cert (0x61) + attacker's own,
-        // different key (0x62) — a server that does NOT possess the cert key.
+        // Attacker server: victim's public cert + attacker's own, different
+        // key — a server that does NOT possess the cert key.
         let forged = Arc::new(CertifiedKey::new(
-            cert_chain_from_seed(&[0x61u8; 57]),
-            signing_key_from_seed(&[0x62u8; 57]),
+            cert_chain_from_key(&falcon_signing_key()),
+            signing_key_from_key(&falcon_signing_key()),
         ));
         let acceptor = acceptor_for(forged);
 
         // Production client, built exactly as the node does.
-        let connector = TlsConnector::from(build_quil_client_config(&[0x71u8; 57]).unwrap());
+        let connector =
+            TlsConnector::from(build_quil_client_config(&falcon_signing_key()).unwrap());
 
         let (client_io, server_io) = tokio::io::duplex(16 * 1024);
         let server_name = ServerName::try_from("localhost").unwrap();
@@ -724,14 +732,15 @@ mod tests {
     /// after the fix (all possession is legitimate).
     #[tokio::test]
     async fn client_accepts_legitimate_server() {
-        let seed = [0x61u8; 57];
+        let sk = falcon_signing_key();
         let legit = Arc::new(CertifiedKey::new(
-            cert_chain_from_seed(&seed),
-            signing_key_from_seed(&seed),
+            cert_chain_from_key(&sk),
+            signing_key_from_key(&sk),
         ));
         let acceptor = acceptor_for(legit);
 
-        let connector = TlsConnector::from(build_quil_client_config(&[0x71u8; 57]).unwrap());
+        let connector =
+            TlsConnector::from(build_quil_client_config(&falcon_signing_key()).unwrap());
 
         let (client_io, server_io) = tokio::io::duplex(16 * 1024);
         let server_name = ServerName::try_from("localhost").unwrap();

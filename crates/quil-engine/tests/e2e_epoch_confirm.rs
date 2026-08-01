@@ -1022,9 +1022,17 @@ async fn tier2_composite_end_to_end() {
         };
         let (engine, handle) =
             quil_engine::app_engine::AppConsensusEngine::new(core_id, filter_bytes, deps, event_tx);
-        let bls = joiner_for_engine.signer_clone();
+        // `run` takes a signer FACTORY (for CW-activation retry); rebuild
+        // the signer from its key each call.
+        let sk = joiner_for_engine.bls_signer.private_key().to_vec();
+        let pk = joiner_for_engine.bls_signer.public_key().to_vec();
+        let bls_factory: std::sync::Arc<
+            dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync,
+        > = std::sync::Arc::new(move || {
+            Box::new(quil_crypto::FalconSigner::from_bytes(&sk, &pk))
+        });
         tokio::spawn(async move {
-            engine.run(bls).await;
+            engine.run(bls_factory).await;
         });
         let event_drain = event_for_cb.clone();
         tokio::spawn(async move {
