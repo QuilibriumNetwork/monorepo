@@ -57,6 +57,36 @@ pub async fn run(tc: &TokenCtx) -> anyhow::Result<()> {
         count += 1;
     }
 
+    // Claimable lattice escrows (pending transfers) addressed to this wallet.
+    if let Ok(w) = super::lattice::Wallet::load(tc) {
+        if let Ok(escrows) = super::lattice::list_escrows(&mut client, &QUIL_TOKEN.to_vec()).await {
+            for e in &escrows {
+                let mine_to = e.to_key == w.falcon_pk;
+                let mine_refund = e.refund_key == w.falcon_pk;
+                if !mine_to && !mine_refund {
+                    continue;
+                }
+                let Some((amt, _)) = quil_execution::token_intrinsic::lattice_ct::open_escrow_memo(
+                    w.np, &w.kem_sk, &e.cv, &e.memo,
+                ) else {
+                    continue;
+                };
+                let role = if mine_to {
+                    "accept".to_string()
+                } else {
+                    format!("refund @frame {}", e.expiration)
+                };
+                println!(
+                    "{} base units (Escrow 0x{} — {})",
+                    amt,
+                    hex::encode(&e.address),
+                    role
+                );
+                count += 1;
+            }
+        }
+    }
+
     if count == 0 {
         println!("No coins found");
     }

@@ -102,6 +102,8 @@ enum Commands {
         #[arg(long)]
         version: Option<String>,
     },
+    /// Create a symlink to the qclient binary in /usr/local/bin (requires sudo).
+    Link,
 }
 
 fn main() {
@@ -131,6 +133,7 @@ fn real_main() -> anyhow::Result<()> {
         Commands::Config { command } => commands::config::run(command),
         Commands::Alias { command } => commands::alias::run(global, command),
         Commands::Key { command } => commands::key::run(global, command),
+        Commands::Link => commands::link::run(),
 
         // Async (RPC-bearing) commands run on a Tokio runtime.
         Commands::Token(args) => runtime()?.block_on(commands::token::run(global, args)),

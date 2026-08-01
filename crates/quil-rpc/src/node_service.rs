@@ -583,6 +583,53 @@ impl NodeService for NodeRpcServer {
         }))
     }
 
+    async fn list_domain_escrows(
+        &self,
+        request: Request<node::ListDomainEscrowsRequest>,
+    ) -> Result<Response<node::ListDomainEscrowsResponse>, Status> {
+        let provider = self
+            .coin_witness_provider
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("coin witness provider not available"))?;
+        let req = request.into_inner();
+        let escrows = provider
+            .list_domain_escrows(&req.domain)
+            .map_err(|e| Status::internal(format!("list domain escrows: {e}")))?;
+        Ok(Response::new(node::ListDomainEscrowsResponse {
+            escrows: escrows
+                .into_iter()
+                .map(|e| node::DomainEscrow {
+                    address: e.address,
+                    cv: e.cv,
+                    to_key: e.to_key,
+                    refund_key: e.refund_key,
+                    expiration: e.expiration,
+                    memo: e.memo,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn get_prover_reward_witness(
+        &self,
+        request: Request<node::GetProverRewardWitnessRequest>,
+    ) -> Result<Response<node::GetProverRewardWitnessResponse>, Status> {
+        let provider = self
+            .coin_witness_provider
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("coin witness provider not available"))?;
+        let req = request.into_inner();
+        let w = provider
+            .prover_reward_witness(&req.domain, &req.owner_prover_address)
+            .map_err(|e| Status::internal(format!("prover reward witness: {e}")))?;
+        Ok(Response::new(node::GetProverRewardWitnessResponse {
+            found: w.found,
+            forest_proof: w.forest_proof,
+            value: w.value.to_le_bytes().to_vec(),
+            cited_frame: w.cited_frame,
+        }))
+    }
+
     async fn get_metrics(
         &self,
         request: Request<node::GetMetricsRequest>,

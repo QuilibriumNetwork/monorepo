@@ -164,7 +164,7 @@ pub enum WindowState {
 }
 
 impl ConfirmWindow {
-    fn for_frame(propose_frame: u64, epoch_length: u64) -> Self {
+    pub fn for_frame(propose_frame: u64, epoch_length: u64) -> Self {
         let el = epoch_len(epoch_length);
         let ce = propose_frame / el + 1;
         ConfirmWindow {

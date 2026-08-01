@@ -766,11 +766,16 @@ pub fn build_pending_create(
         refund_key,
         expiration,
         memo,
+        change_commitments: Vec::new(),
+        change_otks: Vec::new(),
+        change_memos: Vec::new(),
     })
 }
 
 /// Wallet: build an escrow CLAIM/REFUND. The claimant knows the escrow amount +
 /// randomness (`escrow_r`, from the memo) and holds the `to`/`refund` Falcon key.
+/// Returns `(envelope, r_out)` — the claimant fills `envelope.output_memo` from
+/// `r_out` (via [`build_output_memo`]) so the new coin is scannable + spendable.
 #[allow(clippy::too_many_arguments)]
 pub fn build_pending_claim(
     np: &NetworkParams,
@@ -782,7 +787,7 @@ pub fn build_pending_claim(
     recipient_falcon: &quil_crypto::FalconSigner,
     recipient_otk: Vec<u8>,
     seed: u64,
-) -> Result<PendingClaimEnvelope> {
+) -> Result<(PendingClaimEnvelope, quil_lattice_ct::module::PolyVec)> {
     use quil_lattice_ct::value_link::prove_value_link;
     use quil_types::crypto::Signer;
 
@@ -801,7 +806,7 @@ pub fn build_pending_claim(
     let falcon_sig = recipient_falcon
         .sign_with_domain(&mint_auth_message(is_to as u128, &mu), domain)
         .map_err(|e| QuilError::Internal(format!("pending claim: falcon sign: {e:?}")))?;
-    Ok(PendingClaimEnvelope {
+    let env = PendingClaimEnvelope {
         escrow_address,
         is_to,
         falcon_sig,
@@ -809,7 +814,9 @@ pub fn build_pending_claim(
         output_range_proof: Vec::new(), // range inherited from the escrow (value-linked)
         output_otk: recipient_otk,
         value_link_proof: wire::encode_opening(&vl),
-    })
+        output_memo: Vec::new(), // caller fills from r_out
+    };
+    Ok((env, r_out))
 }
 
 /// The transaction challenge `mu` the spend proofs bind to — a domain-separated
@@ -936,6 +943,12 @@ pub struct PendingCreateEnvelope {
     pub refund_key: Vec<u8>, // Falcon pubkey of the refunder
     pub expiration: u64,
     pub memo: Vec<u8>,
+    /// Optional change coins back to the sender (so inputs need not sum exactly to
+    /// the escrow amount). Each is a regular coin output — commitment + one-time
+    /// key + memo — folded into the same balance proof. Empty ⇒ no change.
+    pub change_commitments: Vec<Vec<u8>>,
+    pub change_otks: Vec<Vec<u8>>,
+    pub change_memos: Vec<Vec<u8>>,
 }
 
 /// Escrow CLAIM/REFUND on the wire.
@@ -947,6 +960,11 @@ pub struct PendingClaimEnvelope {
     pub output_range_proof: Vec<u8>,
     pub output_otk: Vec<u8>,
     pub value_link_proof: Vec<u8>,
+    /// Per-output memo (`kem_ciphertext ‖ ring_memo`, [`build_output_memo`]) for
+    /// the NEW claimed coin, so the claimant can later scan + spend it. Consensus-
+    /// opaque (verify ignores it; materialize stores it in the coin vertex). Empty
+    /// ⇒ no memo (the coin is then unscannable — always set it for a real claim).
+    pub output_memo: Vec<u8>,
 }
 
 pub fn encode_pending_create(e: &PendingCreateEnvelope) -> Vec<u8> {
@@ -960,6 +978,9 @@ pub fn encode_pending_create(e: &PendingCreateEnvelope) -> Vec<u8> {
     put_one(&mut out, &e.refund_key);
     out.extend_from_slice(&e.expiration.to_le_bytes());
     put_one(&mut out, &e.memo);
+    put_vecs(&mut out, &e.change_commitments);
+    put_vecs(&mut out, &e.change_otks);
+    put_vecs(&mut out, &e.change_memos);
     out
 }
 pub fn decode_pending_create(b: &[u8]) -> Result<PendingCreateEnvelope> {
@@ -978,6 +999,11 @@ pub fn decode_pending_create(b: &[u8]) -> Result<PendingCreateEnvelope> {
         u64::from_le_bytes(s.try_into().unwrap())
     };
     let memo = take_one(b, &mut p)?;
+    // Change fields were appended after the initial format; tolerate their
+    // absence so an old-format escrow-create still decodes (no change).
+    let change_commitments = take_vecs(b, &mut p).unwrap_or_default();
+    let change_otks = take_vecs(b, &mut p).unwrap_or_default();
+    let change_memos = take_vecs(b, &mut p).unwrap_or_default();
     Ok(PendingCreateEnvelope {
         input_spend_proofs,
         escrow_commitment,
@@ -988,6 +1014,9 @@ pub fn decode_pending_create(b: &[u8]) -> Result<PendingCreateEnvelope> {
         refund_key,
         expiration,
         memo,
+        change_commitments,
+        change_otks,
+        change_memos,
     })
 }
 
@@ -1000,6 +1029,7 @@ pub fn encode_pending_claim(e: &PendingClaimEnvelope) -> Vec<u8> {
     put_one(&mut out, &e.output_range_proof);
     put_one(&mut out, &e.output_otk);
     put_one(&mut out, &e.value_link_proof);
+    put_one(&mut out, &e.output_memo);
     out
 }
 pub fn decode_pending_claim(b: &[u8]) -> Result<PendingClaimEnvelope> {
@@ -1010,14 +1040,23 @@ pub fn decode_pending_claim(b: &[u8]) -> Result<PendingClaimEnvelope> {
     p = 32;
     let is_to = *b.get(p).ok_or_else(|| QuilError::InvalidArgument("lattice-ct: claim eof".into()))? != 0;
     p += 1;
+    let falcon_sig = take_one(b, &mut p)?;
+    let output_commitment = take_one(b, &mut p)?;
+    let output_range_proof = take_one(b, &mut p)?;
+    let output_otk = take_one(b, &mut p)?;
+    let value_link_proof = take_one(b, &mut p)?;
+    // `output_memo` was appended after the initial format; tolerate its absence
+    // so an old-format claim still decodes (empty memo ⇒ unscannable coin).
+    let output_memo = take_one(b, &mut p).unwrap_or_default();
     Ok(PendingClaimEnvelope {
         escrow_address,
         is_to,
-        falcon_sig: take_one(b, &mut p)?,
-        output_commitment: take_one(b, &mut p)?,
-        output_range_proof: take_one(b, &mut p)?,
-        output_otk: take_one(b, &mut p)?,
-        value_link_proof: take_one(b, &mut p)?,
+        falcon_sig,
+        output_commitment,
+        output_range_proof,
+        output_otk,
+        value_link_proof,
+        output_memo,
     })
 }
 
@@ -1026,6 +1065,7 @@ pub fn decode_pending_claim(b: &[u8]) -> Result<PendingClaimEnvelope> {
 /// `Σ inputs = escrow_amount + fee` (the escrow is the single "output"). Returns
 /// the input key images (nullifiers) + the escrow's `cv = H_B(C)` for the pending
 /// vertex. This is a confidential transfer with one escrow output.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_lattice_pending_create(
     np: &NetworkParams,
     state: &HypergraphState,
@@ -1033,10 +1073,20 @@ pub fn verify_lattice_pending_create(
     input_spend_proofs: &[Vec<u8>],
     escrow_commitment: &[u8],
     escrow_range_proof: &[u8],
+    change_commitments: &[Vec<u8>],
+    change_otks: &[Vec<u8>],
     balance_proof: &[u8],
     fee: u128,
-) -> Result<Option<(Vec<Vec<u8>>, Vec<u8>)>> {
-    let outs = vec![escrow_commitment.to_vec()];
+) -> Result<Option<(Vec<Vec<u8>>, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)>> {
+    if change_otks.len() != change_commitments.len() {
+        return Ok(None);
+    }
+    // Outputs are the escrow followed by any change coins; the balance proof
+    // conserves over all of them (Σ inputs = escrow + Σ change + fee).
+    let mut outs = vec![escrow_commitment.to_vec()];
+    outs.extend(change_commitments.iter().cloned());
+    let mut range_proofs = vec![escrow_range_proof.to_vec()];
+    range_proofs.extend(std::iter::repeat(Vec::new()).take(change_commitments.len()));
     let mu = tx_challenge(domain, &outs, fee);
     let key_images = match verify_lattice_transaction(
         np,
@@ -1044,7 +1094,7 @@ pub fn verify_lattice_pending_create(
         domain,
         input_spend_proofs,
         &outs,
-        &[escrow_range_proof.to_vec()],
+        &range_proofs,
         balance_proof,
         fee,
         true,
@@ -1055,7 +1105,12 @@ pub fn verify_lattice_pending_create(
     };
     let vlink = np.value_link_params();
     let cv = wire::encode_polyvec(&vlink.compress(&decode_commit(escrow_commitment)?));
-    Ok(Some((key_images, cv)))
+    let mut change_coins = Vec::with_capacity(change_commitments.len());
+    for (i, cc) in change_commitments.iter().enumerate() {
+        let ccv = wire::encode_polyvec(&vlink.compress(&decode_commit(cc)?));
+        change_coins.push((change_otks[i].clone(), ccv));
+    }
+    Ok(Some((key_images, cv, change_coins)))
 }
 
 /// Verify an escrow CLAIM (or REFUND): the claimant is the escrow's `to` (or
@@ -1147,6 +1202,50 @@ pub fn build_output_memo(kem_ciphertext: &[u8], amount: u128, r_out: &PolyVec, s
     put_one(&mut out, kem_ciphertext);
     put_one(&mut out, &ring_memo);
     out
+}
+
+/// Build an escrow memo carrying `(amount, escrow_r)` recoverable by EITHER the
+/// `to` or the `refund` party. Each half is a [`build_output_memo`] blob KEM-
+/// encrypted to that party's `q-onion-key`; layout is `put_one(to) ‖ put_one(refund)`.
+/// Consensus-opaque (stored verbatim in the escrow vertex).
+pub fn build_escrow_memo(
+    to_kem_pk: &[u8],
+    refund_kem_pk: &[u8],
+    amount: u128,
+    escrow_r: &PolyVec,
+) -> Result<Vec<u8>> {
+    let half = |kem_pk: &[u8]| -> Result<Vec<u8>> {
+        let (ss, kem_ct) = quil_crypto::sntrup761::encapsulate(kem_pk)
+            .map_err(|e| QuilError::Internal(format!("escrow memo encapsulate: {e:?}")))?;
+        Ok(build_output_memo(&kem_ct, amount, escrow_r, &ss))
+    };
+    let mut out = Vec::new();
+    put_one(&mut out, &half(to_kem_pk)?);
+    put_one(&mut out, &half(refund_kem_pk)?);
+    Ok(out)
+}
+
+/// Recover `(amount, escrow_r)` from a [`build_escrow_memo`] blob using this
+/// wallet's KEM secret + the escrow's committed `cv`. Tries both halves; returns
+/// the first that decapsulates and opens (i.e. the half addressed to this wallet).
+pub fn open_escrow_memo(
+    np: &NetworkParams,
+    kem_sk: &[u8],
+    escrow_cv: &[u8],
+    memo: &[u8],
+) -> Option<(u128, PolyVec)> {
+    let mut p = 0usize;
+    for _ in 0..2 {
+        let half = take_one(memo, &mut p).ok()?;
+        if let Ok((kem_ct, ring_memo)) = split_output_memo(&half) {
+            if let Ok(ss) = quil_crypto::sntrup761::decapsulate(&kem_ct, kem_sk) {
+                if let Some(v) = open_ring_memo(np, &ss, escrow_cv, &ring_memo) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Split a memo blob built by [`build_output_memo`] into
@@ -1264,6 +1363,10 @@ pub struct MintEnvelope {
     pub output_range_proofs: Vec<Vec<u8>>,
     pub output_otks: Vec<Vec<u8>>,
     pub balance_proof: Vec<u8>,
+    /// Per-output memo (`kem_ciphertext ‖ ring_memo`) so each minted coin is
+    /// scannable + spendable. Consensus-opaque (verify ignores it; materialize
+    /// stores it). Empty ⇒ no memo (the minted coin is then unscannable).
+    pub output_memos: Vec<Vec<u8>>,
 }
 
 /// Encode a [`MintEnvelope`] to canonical wire bytes.
@@ -1282,6 +1385,7 @@ pub fn encode_mint_envelope(e: &MintEnvelope) -> Vec<u8> {
     put_vecs(&mut out, &e.output_range_proofs);
     put_vecs(&mut out, &e.output_otks);
     put_one(&mut out, &e.balance_proof);
+    put_vecs(&mut out, &e.output_memos);
     out
 }
 /// Decode a [`MintEnvelope`].
@@ -1304,13 +1408,20 @@ pub fn decode_mint_envelope(b: &[u8]) -> Result<MintEnvelope> {
             forest_proof: take_one(b, &mut p)?,
         });
     }
+    let output_commitments = take_vecs(b, &mut p)?;
+    let output_range_proofs = take_vecs(b, &mut p)?;
+    let output_otks = take_vecs(b, &mut p)?;
+    let balance_proof = take_one(b, &mut p)?;
+    // `output_memos` was appended after the initial format; tolerate its absence.
+    let output_memos = take_vecs(b, &mut p).unwrap_or_default();
     Ok(MintEnvelope {
         cited_frame,
         inputs,
-        output_commitments: take_vecs(b, &mut p)?,
-        output_range_proofs: take_vecs(b, &mut p)?,
-        output_otks: take_vecs(b, &mut p)?,
-        balance_proof: take_one(b, &mut p)?,
+        output_commitments,
+        output_range_proofs,
+        output_otks,
+        balance_proof,
+        output_memos,
     })
 }
 
@@ -1866,6 +1977,316 @@ mod tests {
     }
 
     #[test]
+    fn escrow_create_scan_claim_end_to_end() {
+        use super::super::materialize::{coin_type_hash, create_lattice_coin_vertex_tree};
+        use super::super::shadow_accumulator;
+        use crate::hypergraph_state::HypergraphState;
+        use quil_crypto::FalconSigner;
+        use quil_lattice_ct::accumulator::ACC_NODE_RANK;
+        use quil_lattice_ct::membership::MembershipParams;
+        use quil_lattice_ct::stealth::{
+            hash_to_short_polyvec, one_time_pubkey_ring, one_time_secret_ring, owns_ring,
+        };
+        use quil_lattice_ct::wire;
+        use quil_types::crypto::Signer;
+        use quil_types::store::HypergraphStore;
+        use std::sync::Arc;
+
+        let np = NetworkParams::with_bits(16);
+        let vkey = np.value_key();
+        let vlink = np.value_link_params();
+        let domain = &[0x51u8; 32][..];
+        let mp = MembershipParams::production(1);
+        let a_otk = &mp.a_otk;
+        let cols = a_otk.cols;
+
+        // Two wallets: S (sender/refund) and R (recipient/to).
+        let mut prg = SplitMix64::new(0xE5C204);
+        let b_s = PolyVec::sample_short(cols, 1, &mut prg);
+        let big_b_s = a_otk.matvec(&b_s);
+        let kem_s = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
+        let falcon_s = FalconSigner::generate();
+
+        let b_r = PolyVec::sample_short(cols, 1, &mut prg);
+        let big_b_r = a_otk.matvec(&b_r);
+        let kem_r = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
+        let falcon_r = FalconSigner::generate();
+
+        // ── S owns a coin worth 100 (materialized into committed state) ──
+        let src_amount = 100u128;
+        let r_src = PolyVec::sample_short(vkey.a1.cols, ETA, &mut prg);
+        let cv_src = wire::encode_polyvec(&vlink.compress(&super::commit_amount(&vkey, src_amount, &r_src)));
+        let (ss_src, kem_ct_src) = quil_crypto::sntrup761::encapsulate(&kem_s.public).unwrap();
+        let off_src = hash_to_short_polyvec(&ss_src, cols);
+        let p_src = wire::encode_polyvec(&one_time_pubkey_ring(a_otk, &off_src, &big_b_s));
+        let memo_src = build_output_memo(&kem_ct_src, src_amount, &r_src, &ss_src);
+
+        let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+        let txn = quil_types::store::HypergraphStore::new_transaction(&*store, false).unwrap();
+        let th = coin_type_hash(domain).unwrap();
+        let shard = {
+            use quil_hypergraph::addressing::{shard_key_for_location, Location};
+            let mut app = [0u8; 32];
+            app.copy_from_slice(domain);
+            shard_key_for_location(&Location { app_address: app, data_address: [0u8; 32] })
+        };
+        let insert_coin = |p_b: &[u8], cv_b: &[u8], memo: &[u8], tag: u8| {
+            let tree = create_lattice_coin_vertex_tree(&[0, 0, 0, 1], p_b, cv_b, memo, &th).unwrap();
+            let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+            let mut addr = quil_crypto::poseidon::hash_bytes_to_32(&blob).unwrap();
+            addr[0] = tag;
+            let mut key = domain.to_vec();
+            key.extend_from_slice(&addr);
+            store.save_vertex_underlying(txn.as_ref(), "vertex", "adds", &shard, &key, &blob).unwrap();
+        };
+        let decoy = |prg: &mut SplitMix64| wire::encode_polyvec(&PolyVec::sample_short(ACC_NODE_RANK, ETA, prg));
+        insert_coin(&decoy(&mut prg), &decoy(&mut prg), &[], 0x01);
+        insert_coin(&p_src, &cv_src, &memo_src, 0x02);
+
+        // Insert a materialized vertex tree (escrow or coin) produced by materialize.
+        let insert_tree = |addr: &[u8], tree: &quil_tries::VectorCommitmentTree| {
+            let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+            let mut key = domain.to_vec();
+            key.extend_from_slice(addr);
+            store.save_vertex_underlying(txn.as_ref(), "vertex", "adds", &shard, &key, &blob).unwrap();
+        };
+
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let state = HypergraphState::new(crdt);
+        shadow_accumulator::refresh_root(&state, domain).unwrap();
+
+        // S recovers its coin + fetches a spend witness.
+        let sk_src = one_time_secret_ring(&off_src, &b_s);
+        let (depth, root, ws) = shadow_accumulator::coin_spend_witnesses(&state, domain, &[p_src.clone()]).unwrap();
+        assert!(ws[0].found);
+
+        // ── S builds an escrow of 60 to R with 40 change back to S ──
+        let escrow_amount = 60u128;
+        let change_amount = src_amount - escrow_amount; // 40
+        let inputs = vec![SpendInput {
+            sk: sk_src,
+            amount: src_amount,
+            r_coin: r_src,
+            leaf_index: ws[0].leaf_index as usize,
+            auth_path: ws[0].auth_path.clone(),
+        }];
+        // Change output OTK back to S (+ its own memo so S can later spend it).
+        let (ss_chg, kem_ct_chg) = quil_crypto::sntrup761::encapsulate(&kem_s.public).unwrap();
+        let off_chg = hash_to_short_polyvec(&ss_chg, cols);
+        let change_otk = wire::encode_polyvec(&one_time_pubkey_ring(a_otk, &off_chg, &big_b_s));
+        let outputs = vec![
+            NewOutput { amount: escrow_amount, recipient_otk: Vec::new() }, // escrow (index 0)
+            NewOutput { amount: change_amount, recipient_otk: change_otk.clone() }, // change (index 1)
+        ];
+        let built = build_spend_transaction(&np, &root, depth, domain, &inputs, &outputs, 0, 11).unwrap();
+        let escrow_r = wire::decode_polyvec(&built.output_rand[0]).unwrap();
+        let change_r = wire::decode_polyvec(&built.output_rand[1]).unwrap();
+        let escrow_memo = build_escrow_memo(&kem_r.public, &kem_s.public, escrow_amount, &escrow_r).unwrap();
+        let change_memo = build_output_memo(&kem_ct_chg, change_amount, &change_r, &ss_chg);
+        let create_env = PendingCreateEnvelope {
+            input_spend_proofs: built.input_spend_proofs.clone(),
+            escrow_commitment: built.output_commitments[0].clone(),
+            escrow_range_proof: Vec::new(),
+            balance_proof: built.balance_proof.clone(),
+            fee: 0,
+            to_key: falcon_r.public_key().to_vec(),
+            refund_key: falcon_s.public_key().to_vec(),
+            expiration: 0,
+            memo: escrow_memo,
+            change_commitments: vec![built.output_commitments[1].clone()],
+            change_otks: vec![change_otk],
+            change_memos: vec![change_memo],
+        };
+
+        // ── Materialize the escrow create (verify + write escrow + change coin) ──
+        let (_ki, escrow_cv, change_coins) = verify_lattice_pending_create(
+            &np, &state, domain,
+            &create_env.input_spend_proofs, &create_env.escrow_commitment, &create_env.escrow_range_proof,
+            &create_env.change_commitments, &create_env.change_otks, &create_env.balance_proof, create_env.fee,
+        )
+        .unwrap()
+        .expect("escrow create verifies");
+        let frame = 5u64.to_be_bytes();
+        let pend = super::super::materialize::materialize_lattice_pending(
+            domain, &frame, &escrow_cv, &create_env.to_key, &create_env.refund_key,
+            create_env.expiration, &create_env.memo, &[],
+        )
+        .unwrap();
+        for (addr, tree) in &pend.coins {
+            insert_tree(addr, tree);
+        }
+        let chg = super::super::materialize::materialize_lattice_transaction(
+            domain, &frame, &change_coins, &[], &create_env.change_memos,
+        )
+        .unwrap();
+        for (addr, tree) in &chg.coins {
+            insert_tree(addr, tree);
+        }
+        shadow_accumulator::refresh_root(&state, domain).unwrap();
+
+        // ── R scans escrows, finds it, opens the dual memo ──
+        let escrows = shadow_accumulator::scan_domain_escrows(&state, domain).unwrap();
+        let mine = escrows
+            .iter()
+            .find(|e| e.to_key == falcon_r.public_key())
+            .expect("R finds the escrow addressed to it");
+        let (amt, r_open) = open_escrow_memo(&np, &kem_r.secret, &mine.cv, &mine.memo)
+            .expect("R opens the escrow memo");
+        assert_eq!(amt, escrow_amount);
+
+        // ── R builds a claim (accept) into a fresh coin to itself ──
+        let (ss_claim, kem_ct_claim) = quil_crypto::sntrup761::encapsulate(&kem_r.public).unwrap();
+        let off_claim = hash_to_short_polyvec(&ss_claim, cols);
+        let claim_otk = wire::encode_polyvec(&one_time_pubkey_ring(a_otk, &off_claim, &big_b_r));
+        let mut esc_addr = [0u8; 32];
+        esc_addr.copy_from_slice(&mine.address);
+        let (mut claim_env, r_out) = build_pending_claim(
+            &np, domain, esc_addr, amt, &r_open, true, &falcon_r, claim_otk, 21,
+        )
+        .unwrap();
+        claim_env.output_memo = build_output_memo(&kem_ct_claim, amt, &r_out, &ss_claim);
+
+        // Verify + materialize the claim as the engine would.
+        let new_cv = verify_lattice_pending_claim(
+            &np, domain, &mine.cv, mine.to_key.as_slice(), claim_env.is_to, &claim_env.falcon_sig,
+            &claim_env.output_commitment, &claim_env.output_range_proof, &claim_env.value_link_proof,
+        )
+        .unwrap()
+        .expect("claim verifies");
+        let claimed = super::super::materialize::materialize_lattice_transaction(
+            domain, &frame, &[(claim_env.output_otk.clone(), new_cv)], &[mine.address.clone()],
+            std::slice::from_ref(&claim_env.output_memo),
+        )
+        .unwrap();
+        for (addr, tree) in &claimed.coins {
+            insert_tree(addr, tree);
+        }
+        shadow_accumulator::refresh_root(&state, domain).unwrap();
+
+        // ── R scans coins, finds + opens the claimed coin (spendable) ──
+        let coins = shadow_accumulator::scan_domain_coins(&state, domain).unwrap();
+        let mut found = false;
+        for (_a, p_i, cv_i, memo_i) in &coins {
+            if memo_i.is_empty() {
+                continue;
+            }
+            let Ok((kc, ring)) = split_output_memo(memo_i) else { continue };
+            let Ok(ss_i) = quil_crypto::sntrup761::decapsulate(&kc, &kem_r.secret) else { continue };
+            let off_i = hash_to_short_polyvec(&ss_i, cols);
+            let p_dec = wire::decode_polyvec(p_i).unwrap();
+            if owns_ring(a_otk, &off_i, &big_b_r, &p_dec) {
+                let (a2, r2) = open_ring_memo(&np, &ss_i, cv_i, &ring).unwrap();
+                assert_eq!(a2, escrow_amount, "claimed coin holds the escrow amount");
+                let sk = one_time_secret_ring(&off_i, &b_r);
+                assert_eq!(a_otk.matvec(&sk), p_dec, "R can spend the claimed coin");
+                let _ = r2;
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "R finds + opens its claimed coin");
+    }
+
+    #[test]
+    fn mint_from_reward_witness_verifies_through_engine() {
+        // The client-side mint assembly (build a coin worth the reward Balance +
+        // Falcon-authorize it against a forest reward-membership proof) must be
+        // accepted by the engine's `verify_mint_envelope_and_derive`. This proves
+        // the whole mint crypto composition end-to-end; only the live node's
+        // forest_proof/cited_frame production is out of scope (integration).
+        use quil_crypto::FalconSigner;
+        use quil_forest::{Forest, MembershipProof, Phase};
+        use quil_lattice_ct::membership::MembershipParams;
+        use quil_lattice_ct::stealth::{hash_to_short_polyvec, one_time_pubkey_ring};
+        use quil_lattice_ct::wire;
+        use quil_tries::VectorCommitmentTree;
+        use quil_types::crypto::Signer;
+
+        let np = NetworkParams::with_bits(16);
+        let domain = &[0x77u8; 32][..]; // non-QUIL domain: reward_root is passed directly
+        let value = 100u128;
+
+        // Prover identity: owner = poseidon(falcon pubkey).
+        let signer = FalconSigner::generate();
+        let falcon_pk = signer.public_key().to_vec();
+        let owner = quil_crypto::poseidon::hash_bytes_to_32(&falcon_pk).unwrap().to_vec();
+
+        // ── Node: build + commit the reward:ProverReward vertex, prove membership ──
+        let (prover_root_domain, leaf_owner) =
+            crate::token_intrinsic::mint::derive_pomw_addressing(domain, &owner).unwrap();
+        let mut vertex_id = [0u8; 64];
+        vertex_id[..32].copy_from_slice(&prover_root_domain);
+        vertex_id[32..].copy_from_slice(&leaf_owner);
+
+        let deleg_key = crate::global_schema::field_key("reward:ProverReward", "DelegateAddress").unwrap();
+        let bal_key = crate::global_schema::field_key("reward:ProverReward", "Balance").unwrap();
+        let mut balance = [0u8; 32];
+        balance[16..].copy_from_slice(&value.to_be_bytes()); // Balance == claimed value
+
+        let mut vtree = VectorCommitmentTree::new();
+        vtree.insert(&deleg_key, &owner, &[], &num_bigint::BigInt::from(owner.len())).unwrap();
+        vtree.insert(&bal_key, &balance, &[], &num_bigint::BigInt::from(balance.len())).unwrap();
+        let blob = quil_tries::serialize_go_tree(vtree.root.as_ref()).unwrap();
+        let leaf = quil_tries::vertex_leaf_value(&blob).unwrap();
+
+        let forest = Forest::in_memory();
+        let reward_root = forest
+            .commit_shard_phase_raw(b"reward-shard", Phase::VertexAdds, 0, vec![(leaf_owner.to_vec(), leaf)])
+            .unwrap();
+        let vp = forest
+            .build_vertex_membership_proof(b"reward-shard", Phase::VertexAdds, 0, &vertex_id, &blob)
+            .unwrap();
+        let forest_proof = MembershipProof { inputs: vec![vp] }.to_bytes();
+
+        // ── Client: build the mint output coin + Falcon authorization ──
+        let mp = MembershipParams::production(1);
+        let cols = mp.a_otk.cols;
+        let mut prg = SplitMix64::new(0x312EE);
+        let b = PolyVec::sample_short(cols, 1, &mut prg);
+        let big_b = mp.a_otk.matvec(&b);
+        let kem = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
+        let (ss, kem_ct) = quil_crypto::sntrup761::encapsulate(&kem.public).unwrap();
+        let offset = hash_to_short_polyvec(&ss, cols);
+        let p_out = one_time_pubkey_ring(&mp.a_otk, &offset, &big_b);
+        let outputs = vec![NewOutput { amount: value, recipient_otk: wire::encode_polyvec(&p_out) }];
+
+        let built = build_mint_transaction(&np, value, &outputs, 0x9911).unwrap();
+        let r_out = wire::decode_polyvec(&built.output_rand[0]).unwrap();
+        let memo = build_output_memo(&kem_ct, value, &r_out, &ss);
+        let mu = tx_challenge(domain, &built.output_commitments, value);
+        let falcon_sig = signer.sign_with_domain(&mint_auth_message(value, &mu), domain).unwrap();
+
+        let env = MintEnvelope {
+            cited_frame: 0,
+            inputs: vec![LatticeMintInput {
+                value,
+                owner_prover_address: owner,
+                falcon_pubkey: falcon_pk,
+                falcon_sig,
+                forest_proof,
+            }],
+            output_commitments: built.output_commitments.clone(),
+            output_range_proofs: Vec::new(),
+            output_otks: built.new_coins.iter().map(|(p, _)| p.clone()).collect(),
+            balance_proof: built.balance_proof.clone(),
+            output_memos: vec![memo],
+        };
+
+        // ── Engine: verify the mint (membership + Falcon auth + conservation) ──
+        let mut root32 = [0u8; 32];
+        root32.copy_from_slice(reward_root.as_ref());
+        let (new_coins, decrements) = verify_mint_envelope_and_derive(&np, &root32, domain, &env)
+            .unwrap()
+            .expect("wallet-built mint verifies through the engine");
+        assert_eq!(new_coins.len(), 1, "one minted coin");
+        assert_eq!(decrements.len(), 1, "one reward decrement");
+        assert_eq!(decrements[0].1, value, "decrement equals the minted value");
+    }
+
+    #[test]
     fn output_memo_transport_round_trips_through_envelope() {
         let np = NetworkParams::with_bits(16);
         let vkey = np.value_key();
@@ -2184,7 +2605,7 @@ mod tests {
         let escrow_cv = wire::encode_polyvec(&vlink.compress(&escrow_c));
 
         let recipient = FalconSigner::generate();
-        let env = build_pending_claim(
+        let (env, _r_out) = build_pending_claim(
             &np, domain, [0xCD; 32], amount, &escrow_r, true, &recipient, vec![0xEE; 200], 9,
         )
         .unwrap();
@@ -2334,6 +2755,7 @@ mod tests {
             output_range_proofs: mint.output_range_proofs.clone(),
             output_otks: mint.new_coins.iter().map(|(p, _)| p.clone()).collect(),
             balance_proof: mint.balance_proof.clone(),
+            output_memos: Vec::new(),
         };
         let bytes = encode_mint_envelope(&env);
         let back = decode_mint_envelope(&bytes).unwrap();

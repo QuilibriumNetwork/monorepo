@@ -8,6 +8,7 @@ pub mod config;
 pub mod deploy;
 pub mod hypergraph;
 pub mod key;
+pub mod link;
 pub mod message;
 pub mod node;
 pub mod release_cmds;

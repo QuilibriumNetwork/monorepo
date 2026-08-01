@@ -103,7 +103,10 @@ impl quil_rpc::global_service::ForestServer for CrdtForestServer {
 /// coin accumulator from the live CRDT's committed coin vertices — the node-side
 /// backing a wallet uses to build ring-CT spends (per-input membership witness)
 /// and to enumerate/scan a domain's coins.
-struct CrdtCoinWitness(Arc<quil_hypergraph::HypergraphCrdt>);
+struct CrdtCoinWitness(
+    Arc<quil_hypergraph::HypergraphCrdt>,
+    Arc<dyn quil_types::store::ClockStore>,
+);
 
 impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
     fn coin_spend_witnesses(
@@ -149,6 +152,89 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
                 },
             )
             .collect())
+    }
+
+    fn list_domain_escrows(
+        &self,
+        domain: &[u8],
+    ) -> quil_types::error::Result<Vec<quil_types::store::DomainEscrowData>> {
+        let state = quil_execution::hypergraph_state::HypergraphState::new(self.0.clone());
+        let escrows = quil_execution::token_intrinsic::shadow_accumulator::scan_domain_escrows(
+            &state, domain,
+        )?;
+        Ok(escrows
+            .into_iter()
+            .map(|e| quil_types::store::DomainEscrowData {
+                address: e.address,
+                cv: e.cv,
+                to_key: e.to_key,
+                refund_key: e.refund_key,
+                expiration: e.expiration,
+                memo: e.memo,
+            })
+            .collect())
+    }
+
+    fn prover_reward_witness(
+        &self,
+        domain: &[u8],
+        owner: &[u8],
+    ) -> quil_types::error::Result<quil_types::store::RewardWitnessData> {
+        use quil_hypergraph::addressing::{shard_key_for_location, Location};
+
+        let is_quil = domain == quil_execution::domains::QUIL_TOKEN;
+        // Reward vertex addressing (mirrors the engine's mint verify).
+        let (prover_root_domain, leaf_owner) =
+            quil_execution::token_intrinsic::mint::derive_pomw_addressing(domain, owner)?;
+        let reward_domain: Vec<u8> = if is_quil {
+            quil_execution::domains::GLOBAL.to_vec()
+        } else {
+            domain.to_vec()
+        };
+
+        let state = quil_execution::hypergraph_state::HypergraphState::new(self.0.clone());
+        let va_disc = quil_execution::hypergraph_state::vertex_adds_discriminator()?;
+        let blob = match state.get(&reward_domain, &leaf_owner, &va_disc)? {
+            Some(b) => b,
+            None => return Ok(quil_types::store::RewardWitnessData::default()),
+        };
+        // Claimable value = the reward vertex's Balance (low 16 bytes as u128).
+        let tree = quil_execution::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+        let bal = quil_execution::global_intrinsic::materialize::read_reward_balance(&tree);
+        let mut buf = [0u8; 16];
+        if bal.len() >= 16 {
+            buf.copy_from_slice(&bal[bal.len() - 16..]);
+        } else {
+            buf[16 - bal.len()..].copy_from_slice(&bal);
+        }
+        let value = u128::from_be_bytes(buf);
+        if value == 0 {
+            return Ok(quil_types::store::RewardWitnessData::default());
+        }
+
+        // Forest membership proof of the reward vertex against the committed root.
+        let mut app = [0u8; 32];
+        app.copy_from_slice(&prover_root_domain);
+        let mut data = [0u8; 32];
+        data.copy_from_slice(&leaf_owner);
+        let shard = shard_key_for_location(&Location { app_address: app, data_address: data });
+        let mut vertex_address = prover_root_domain.to_vec();
+        vertex_address.extend_from_slice(&leaf_owner);
+        let mp = self
+            .0
+            .build_membership_proof("vertex", "adds", &shard, &[(vertex_address, Vec::new())])?;
+        let forest_proof = mp.to_bytes();
+
+        // cited_frame = the latest committed global frame; its stored header
+        // `prover_tree_commitment` is the reward root the engine resolves.
+        let cited_frame = self
+            .1
+            .get_latest_global_clock_frame()
+            .ok()
+            .and_then(|f| f.header.map(|h| h.frame_number))
+            .unwrap_or(0);
+
+        Ok(quil_types::store::RewardWitnessData { found: true, forest_proof, value, cited_frame })
     }
 }
 
@@ -550,7 +636,10 @@ pub(crate) fn spawn_all(
         .with_prover_registry(prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>)
         .with_clock_store(clock_store.clone() as Arc<dyn quil_types::store::ClockStore>)
         .with_hypergraph_store(hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>)
-        .with_coin_witness_provider(Arc::new(CrdtCoinWitness(crdt.clone())))
+        .with_coin_witness_provider(Arc::new(CrdtCoinWitness(
+            crdt.clone(),
+            clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
+        )))
         .with_submit_handler(user_submit_handler);
     if let Some(h) = metrics_handle.clone() {
         // Unified exposition: the facade recorder's snapshot plus the p2p

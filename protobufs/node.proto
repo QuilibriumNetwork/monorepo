@@ -363,6 +363,8 @@ service NodeService {
   rpc GetCoinSpendWitness(GetCoinSpendWitnessRequest)
     returns (GetCoinSpendWitnessResponse);
   rpc ListDomainCoins(ListDomainCoinsRequest) returns (ListDomainCoinsResponse);
+  rpc ListDomainEscrows(ListDomainEscrowsRequest) returns (ListDomainEscrowsResponse);
+  rpc GetProverRewardWitness(GetProverRewardWitnessRequest) returns (GetProverRewardWitnessResponse);
 }
 
 // Request per-coin accumulator membership witnesses for the wallet to build a
@@ -397,6 +399,32 @@ message DomainCoin {
 }
 message ListDomainCoinsResponse {
   repeated DomainCoin coins = 1;
+}
+
+message ListDomainEscrowsRequest {
+  bytes domain = 1;
+}
+message DomainEscrow {
+  bytes address = 1;      // 32-byte escrow (pending) vertex address
+  bytes cv = 2;           // wire-encoded escrow commitment cv = H_B(C)
+  bytes to_key = 3;       // Falcon pubkey of the claimant
+  bytes refund_key = 4;   // Falcon pubkey of the refunder
+  uint64 expiration = 5;  // frame at/after which refund is allowed
+  bytes memo = 6;         // opaque dual-party memo (to ‖ refund halves)
+}
+message ListDomainEscrowsResponse {
+  repeated DomainEscrow escrows = 1;
+}
+
+message GetProverRewardWitnessRequest {
+  bytes domain = 1;               // token domain (QUIL for the reward mint)
+  bytes owner_prover_address = 2; // poseidon(prover Falcon pubkey)
+}
+message GetProverRewardWitnessResponse {
+  bool found = 1;
+  bytes forest_proof = 2;  // quil_forest MembershipProof bytes
+  bytes value = 3;         // claimable reward Balance, 16-byte LE u128
+  uint64 cited_frame = 4;  // global frame whose prover_tree_commitment is the reward root
 }
 
 message ConnectivityTestRequest {

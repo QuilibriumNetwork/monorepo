@@ -22,6 +22,11 @@ mod account;
 mod address;
 mod balance;
 mod coins;
+mod lattice;
+mod merge;
+mod mint;
+mod pending;
+mod split;
 mod transfer;
 
 /// Flags shared by every `token` subcommand (Go `TokenCmd` persistent
@@ -61,6 +66,49 @@ pub enum TokenCommand {
     },
     /// Print this wallet's confidential (lattice) receiving address.
     ConfidentialAddress,
+    /// Merge several coins into one: `merge [all | <Coin>...]`.
+    Merge {
+        /// `all` (default), or coin identifiers (address or one-time key).
+        coins: Vec<String>,
+    },
+    /// Split one coin into several: `split <Coin> <Amounts>... | --parts N`.
+    Split {
+        /// Coin to split (address as shown by `token coins`, or one-time key).
+        coin: String,
+        /// Explicit output amounts in base units (mutually exclusive with --parts).
+        amounts: Vec<String>,
+        /// Split into N parts instead of explicit amounts.
+        #[arg(long)]
+        parts: Option<u32>,
+        /// With --parts, each part's amount (base units); remainder returned.
+        #[arg(long = "part-amount")]
+        part_amount: Option<String>,
+    },
+    /// Create an acceptable (escrow) transfer to a recipient's pending address.
+    PendingTransfer {
+        /// Recipient escrow address: hex(kem_pk ‖ falcon_pk) (see `confidential-address`).
+        recipient: String,
+        /// Amount in base units.
+        amount: String,
+        /// Frame at/after which the sender may reclaim (default: head + ~1 day).
+        #[arg(long)]
+        expiration: Option<u64>,
+    },
+    /// Accept a pending transfer addressed to this wallet: `accept <Escrow>`.
+    Accept {
+        /// Escrow address (hex) as shown by `token coins`.
+        escrow: String,
+    },
+    /// Reject/refund a pending transfer (refunder only, after expiration): `reject <Escrow>`.
+    Reject {
+        /// Escrow address (hex) as shown by `token coins`.
+        escrow: String,
+    },
+    /// Claim this prover's reward balance as new coins: `mint [<RecipientAddress>]`.
+    Mint {
+        /// Optional recipient confidential address (default: self).
+        recipient: Option<String>,
+    },
 }
 
 /// Resolved per-invocation token context (Go `TokenCmd.PersistentPreRun`).
@@ -144,5 +192,20 @@ pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
         TokenCommand::Coins => coins::run(&tc).await,
         TokenCommand::Transfer { recipient, amount } => transfer::run(&tc, recipient, amount).await,
         TokenCommand::ConfidentialAddress => address::run(&tc),
+        TokenCommand::Merge { coins } => merge::run(&tc, coins).await,
+        TokenCommand::Split {
+            coin,
+            amounts,
+            parts,
+            part_amount,
+        } => split::run(&tc, coin, amounts, *parts, part_amount.as_deref()).await,
+        TokenCommand::PendingTransfer {
+            recipient,
+            amount,
+            expiration,
+        } => pending::create(&tc, recipient, amount, *expiration).await,
+        TokenCommand::Accept { escrow } => pending::claim(&tc, escrow, true).await,
+        TokenCommand::Reject { escrow } => pending::claim(&tc, escrow, false).await,
+        TokenCommand::Mint { recipient } => mint::run(&tc, recipient.as_deref()).await,
     }
 }

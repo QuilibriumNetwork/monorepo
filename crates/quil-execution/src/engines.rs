@@ -632,7 +632,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             let frame_bytes = _frame_number.to_be_bytes();
                             let result =
                                 crate::token_intrinsic::materialize::materialize_lattice_transaction(
-                                    _address, &frame_bytes, &new_coins, &[], &[],
+                                    _address, &frame_bytes, &new_coins, &[], &env.output_memos,
                                 )?;
                             write_tx_result(state, _address, &va_disc, _frame_number, &result)?;
                             lattice_ct::apply_reward_decrements(
@@ -660,16 +660,26 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         &env.input_spend_proofs,
                         &env.escrow_commitment,
                         &env.escrow_range_proof,
+                        &env.change_commitments,
+                        &env.change_otks,
                         &env.balance_proof,
                         env.fee,
                     )? {
-                        Some((key_images, cv)) => {
+                        Some((key_images, cv, change_coins)) => {
                             let frame_bytes = _frame_number.to_be_bytes();
-                            let result = crate::token_intrinsic::materialize::materialize_lattice_pending(
+                            let mut result = crate::token_intrinsic::materialize::materialize_lattice_pending(
                                 _address, &frame_bytes, &cv, &env.to_key, &env.refund_key,
                                 env.expiration, &env.memo, &key_images,
                             )?;
+                            // Materialize any change coins back to the sender.
+                            if !change_coins.is_empty() {
+                                let change = crate::token_intrinsic::materialize::materialize_lattice_transaction(
+                                    _address, &frame_bytes, &change_coins, &[], &env.change_memos,
+                                )?;
+                                result.coins.extend(change.coins);
+                            }
                             write_tx_result(state, _address, &va_disc, _frame_number, &result)?;
+                            crate::token_intrinsic::shadow_accumulator::refresh_root(state, _address)?;
                         }
                         None => {
                             return Err(QuilError::InvalidArgument(
@@ -731,9 +741,16 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         Some(new_cv) => {
                             let frame_bytes = _frame_number.to_be_bytes();
                             let new_coins = vec![(env.output_otk.clone(), new_cv)];
+                            // Carry the claimant's per-output memo so the new coin is
+                            // scannable + spendable (empty ⇒ no memo, legacy claim).
+                            let memos: Vec<Vec<u8>> = if env.output_memo.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![env.output_memo.clone()]
+                            };
                             // Retire the escrow via a nullifier keyed on its address.
                             let result = materialize::materialize_lattice_transaction(
-                                _address, &frame_bytes, &new_coins, &[env.escrow_address.to_vec()], &[],
+                                _address, &frame_bytes, &new_coins, &[env.escrow_address.to_vec()], &memos,
                             )?;
                             write_tx_result(state, _address, &va_disc, _frame_number, &result)?;
                             crate::token_intrinsic::shadow_accumulator::refresh_root(state, _address)?;

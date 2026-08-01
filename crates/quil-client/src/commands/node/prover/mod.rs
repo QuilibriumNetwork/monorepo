@@ -20,6 +20,7 @@ use crate::rpc::ConnectOpts;
 
 pub mod epoch;
 mod join;
+mod manage;
 mod merge;
 mod ops;
 mod shardinfo;
@@ -35,6 +36,8 @@ pub enum ProverCommand {
     Shards,
     /// List all known shards with prover counts and estimated rewards.
     Shardinfo,
+    /// Interactive prover shard management TUI.
+    Manage,
     /// Joins the prover to the network for the given shard filters.
     Join {
         /// Hex-encoded 32-byte shard filters (default: all-0xFF).
@@ -162,6 +165,7 @@ pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> 
         ProverCommand::Status => status::run(&pc).await,
         ProverCommand::Shards => shards::run(&pc).await,
         ProverCommand::Shardinfo => shardinfo::run(&pc).await,
+        ProverCommand::Manage => manage::run(&pc).await,
         ProverCommand::Join { filters, delegate } => join::run(&pc, filters, delegate).await,
         ProverCommand::Leave { filters } => ops::leave(&pc, filters).await,
         ProverCommand::Confirm { filters } => ops::confirm(&pc, filters).await,

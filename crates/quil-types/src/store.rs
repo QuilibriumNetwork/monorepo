@@ -619,6 +619,30 @@ pub struct DomainCoinData {
     pub memo: Vec<u8>,
 }
 
+/// One enumerated escrow/pending vertex (see
+/// [`CoinWitnessProvider::list_domain_escrows`]).
+#[derive(Debug, Clone)]
+pub struct DomainEscrowData {
+    pub address: Vec<u8>,
+    pub cv: Vec<u8>,
+    pub to_key: Vec<u8>,
+    pub refund_key: Vec<u8>,
+    pub expiration: u64,
+    pub memo: Vec<u8>,
+}
+
+/// A PoMW reward-mint witness (see [`CoinWitnessProvider::prover_reward_witness`]):
+/// the forest membership proof of the owner's `reward:ProverReward` vertex, the
+/// current claimable `value` (the Balance field), and the `cited_frame` whose
+/// header `prover_tree_commitment` is the reward root the proof verifies against.
+#[derive(Debug, Clone, Default)]
+pub struct RewardWitnessData {
+    pub found: bool,
+    pub forest_proof: Vec<u8>,
+    pub value: u128,
+    pub cited_frame: u64,
+}
+
 /// Node-side backing for the lattice confidential-transaction wallet RPCs
 /// (`GetCoinSpendWitness` / `ListDomainCoins`). Implemented by the layer that
 /// holds the live `HypergraphState` (so it can rebuild the coin accumulator),
@@ -633,6 +657,24 @@ pub trait CoinWitnessProvider: Send + Sync {
 
     /// Enumerate the domain's committed coins (for wallet scanning).
     fn list_domain_coins(&self, domain: &[u8]) -> Result<Vec<DomainCoinData>>;
+
+    /// Enumerate the domain's committed escrows/pending vertices (for the
+    /// `accept`/`reject` wallet flow). Default empty so existing providers
+    /// compile without change.
+    fn list_domain_escrows(&self, _domain: &[u8]) -> Result<Vec<DomainEscrowData>> {
+        Ok(Vec::new())
+    }
+
+    /// Build a PoMW reward-mint witness for `owner_prover_address` in `domain`
+    /// (for the `token mint` flow). Default `found = false` so existing
+    /// providers compile without change.
+    fn prover_reward_witness(
+        &self,
+        _domain: &[u8],
+        _owner_prover_address: &[u8],
+    ) -> Result<RewardWitnessData> {
+        Ok(RewardWitnessData::default())
+    }
 }
 
 pub trait HypergraphStore: Send + Sync {

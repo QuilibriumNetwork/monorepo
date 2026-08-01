@@ -164,6 +164,83 @@ pub fn scan_domain_coins(
         .collect())
 }
 
+/// One materialized escrow (pending) vertex, decoded from its subtree.
+pub struct EscrowLeaf {
+    pub address: Vec<u8>,
+    pub cv: Vec<u8>,
+    pub to_key: Vec<u8>,
+    pub refund_key: Vec<u8>,
+    pub expiration: u64,
+    pub memo: Vec<u8>,
+}
+
+/// Decode an escrow (pending) vertex blob into its fields, or `None` for a
+/// non-escrow vertex. Field layout mirrors `create_lattice_pending_vertex_tree`.
+pub fn extract_escrow_leaf(
+    blob: &[u8],
+    domain: &[u8],
+) -> Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>, u64, Vec<u8>)>> {
+    let root = deserialize_go_tree(blob)
+        .map_err(|e| QuilError::Internal(format!("shadow-acc: escrow blob decode: {e}")))?;
+    let tree = VectorCommitmentTree { root };
+    let want_type = super::materialize::pending_type_hash(domain)?;
+    match tree.get(&[0xFFu8; 32]) {
+        Some(t) if t == want_type.as_slice() => {}
+        _ => return Ok(None),
+    }
+    let getf = |k: u8| tree.get(&[k << 2]).map(|v| v.to_vec());
+    let cv = getf(1).ok_or_else(|| QuilError::Internal("shadow-acc: escrow missing cv".into()))?;
+    let to_key =
+        getf(2).ok_or_else(|| QuilError::Internal("shadow-acc: escrow missing to_key".into()))?;
+    let refund_key = getf(3)
+        .ok_or_else(|| QuilError::Internal("shadow-acc: escrow missing refund_key".into()))?;
+    let exp_bytes = getf(4)
+        .ok_or_else(|| QuilError::Internal("shadow-acc: escrow missing expiration".into()))?;
+    let expiration = u64::from_be_bytes(
+        exp_bytes
+            .get(..8)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| QuilError::Internal("shadow-acc: escrow bad expiration".into()))?,
+    );
+    let memo = getf(5).unwrap_or_default();
+    Ok(Some((cv, to_key, refund_key, expiration, memo)))
+}
+
+/// Scan a domain's committed escrows (pending vertices) in canonical
+/// (ascending-address) order. The node-side backing for a pending-escrow list.
+pub fn scan_domain_escrows(state: &HypergraphState, domain: &[u8]) -> Result<Vec<EscrowLeaf>> {
+    let mut leaves: Vec<EscrowLeaf> = Vec::new();
+    let mut scan_err: Option<QuilError> = None;
+    state.crdt().for_each_vertex_adds_blob(domain, &mut |key, blob| {
+        if scan_err.is_some() {
+            return;
+        }
+        match extract_escrow_leaf(&blob, domain) {
+            Ok(Some((cv, to_key, refund_key, expiration, memo))) => {
+                let addr = if key.len() >= 64 { &key[32..64] } else { &key[..] };
+                let mut a = [0u8; 32];
+                let n = addr.len().min(32);
+                a[..n].copy_from_slice(&addr[..n]);
+                leaves.push(EscrowLeaf {
+                    address: a.to_vec(),
+                    cv,
+                    to_key,
+                    refund_key,
+                    expiration,
+                    memo,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => scan_err = Some(e),
+        }
+    })?;
+    if let Some(e) = scan_err {
+        return Err(e);
+    }
+    leaves.sort_by(|x, y| x.address.cmp(&y.address));
+    Ok(leaves)
+}
+
 /// A membership witness for one coin: its canonical `leaf_index` and
 /// `auth_path`, or `found = false` if the one-time key isn't in the set.
 pub struct CoinWitness {
