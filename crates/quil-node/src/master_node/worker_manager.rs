@@ -118,6 +118,22 @@ pub(crate) fn init(
             // Publish to the halt broadcaster spawned above so it can
             // SetHalted across standalone workers when coverage halts.
             let _ = remote_worker_manager_for_halt.set(remote_mgr.clone());
+            // Establish (and maintain) the gRPC channels to the remote workers.
+            // `connect_all` was previously never called — cluster workers
+            // registered but the master never connected, so the Respawn stayed
+            // deferred forever and app-shard consensus never started. Poll so a
+            // worker that boots after the master (or restarts) gets connected and
+            // its owed Respawn re-issued (see RemoteWorkerManager::connect_all).
+            {
+                let cm = remote_mgr.clone();
+                spawner.detach("remote-worker-connect", async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                    loop {
+                        tick.tick().await;
+                        cm.connect_all().await;
+                    }
+                });
+            }
             remote_mgr as Arc<dyn quil_engine::worker::WorkerManager>
         } else {
             // LOCAL MODE: core-pinned threads

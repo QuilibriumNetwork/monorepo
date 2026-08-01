@@ -193,6 +193,18 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
             .ok()
             .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
             .unwrap_or(0);
+        // Epoch of the last frame whose crossing triggered a registry refresh.
+        // Prover ALLOCATIONS only take effect at epoch boundaries
+        // (`effective_status` is epoch-quantized: activation/departure/expiry all
+        // flip on `epoch_for_frame` boundaries), so the shared prover-registry
+        // cache — which drives every worker's app-shard COMMITTEE and this loop's
+        // `on_new_frame` reconcile — only needs to be refreshed once per epoch.
+        // Refreshing per-frame is both wasteful (a full O(N) store scan) and, on
+        // the recv path, was simply ABSENT: `on_new_frame` reconciled against a
+        // never-refreshed cache on non-archive nodes. Track the epoch and refresh
+        // exactly on a boundary crossing.
+        let mut last_committee_epoch: u64 =
+            quil_types::consensus::epoch_for_frame(last_executed_frame);
         loop {
             tokio::select! {
                 _ = status_timer.tick() => {
@@ -922,6 +934,25 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                                 "received + processed GlobalFrame"
                                                             );
                                                             coverage_for_recv.check(exec_num);
+                                                            // Epoch-boundary registry refresh: repopulate the
+                                                            // shared prover-registry cache from the just-
+                                                            // materialized store when we cross into a new epoch,
+                                                            // so the committee + `on_new_frame` reconcile read
+                                                            // the new epoch's allocations. Allocations are
+                                                            // epoch-stable, so one refresh per boundary is
+                                                            // sufficient (and avoids a per-frame full scan). This
+                                                            // is the previously-missing recv-path refresh.
+                                                            let exec_epoch =
+                                                                quil_types::consensus::epoch_for_frame(exec_num);
+                                                            if exec_epoch != last_committee_epoch {
+                                                                pr_for_recv.refresh_from_store(&hg_store_for_recv);
+                                                                last_committee_epoch = exec_epoch;
+                                                                debug!(
+                                                                    frame = exec_num,
+                                                                    epoch = exec_epoch,
+                                                                    "epoch boundary — refreshed prover registry"
+                                                                );
+                                                            }
                                                             if !archive_mode_recv {
                                                                 if let Err(e) = wa_for_recv.on_new_frame(exec_num) {
                                                                     warn!(error = %e, "worker allocation failed");

@@ -864,6 +864,7 @@ fn assess_allocation(
     alloc: &ProverAllocationInfo,
     frame: u64,
     halts: &HashMap<Vec<u8>, u64>,
+    active_by_filter: &HashMap<Vec<u8>, u64>,
 ) -> Option<Assessment> {
     // Frame-aware: mirror `find_eviction_candidates` (raw `alloc.status` wrongly
     // flags epoch-EXPIRED allocations, which the committee/shard summaries
@@ -871,6 +872,18 @@ fn assess_allocation(
     if alloc.effective_status(frame) != EffectiveStatus::Active
         || alloc.confirmation_filter.is_empty()
     {
+        return None;
+    }
+    // Under-provisioned / coverage-halt exemption: mirror
+    // `find_eviction_candidates` — a shard below the consensus quorum can't
+    // produce frames, so its provers can't submit proofs and are NOT evicted;
+    // surfacing them as "at risk" is the "up for eviction but no active shards"
+    // contradiction. Derived from the same active census the evictor uses.
+    let shard_active = active_by_filter
+        .get(&alloc.confirmation_filter)
+        .copied()
+        .unwrap_or(0);
+    if shard_active < quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS {
         return None;
     }
     let halt_duration = halts.get(&alloc.confirmation_filter).copied().unwrap_or(0);
@@ -900,6 +913,26 @@ fn assess_allocation(
         total_inactive,
         effective_inactive,
     })
+}
+
+/// Per-shard census of effectively-active allocations at `frame`, keyed by
+/// confirmation filter. Mirrors the census `find_eviction_candidates` builds
+/// so the explorer's eviction views apply the SAME under-provisioned /
+/// coverage-halt exemption as the consensus evictor (a shard below
+/// `MIN_SHARD_CONSENSUS_PROVERS` can't run consensus → its provers are exempt).
+fn active_allocations_by_filter(provers: &[ProverInfo], frame: u64) -> HashMap<Vec<u8>, u64> {
+    let mut m: HashMap<Vec<u8>, u64> = HashMap::new();
+    for p in provers {
+        for alloc in &p.allocations {
+            if alloc.confirmation_filter.is_empty() {
+                continue;
+            }
+            if alloc.effective_status(frame) == EffectiveStatus::Active {
+                *m.entry(alloc.confirmation_filter.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    m
 }
 
 fn current_halts(state: &ExplorerState, frame: u64) -> HashMap<Vec<u8>, u64> {
@@ -976,13 +1009,16 @@ pub async fn handle_eviction_risk(
     let halts = current_halts(&state, frame);
     let threshold = crate::EVICTION_THRESHOLD_FRAMES;
 
+    let provers = all_provers(&state, frame);
+    let active_by_filter = active_allocations_by_filter(&provers, frame);
+
     let mut entries: Vec<EvictionRiskEntry> = Vec::new();
-    for prover in all_provers(&state, frame) {
+    for prover in &provers {
         if prover.status != ProverStatus::Active {
             continue;
         }
         for alloc in &prover.allocations {
-            let Some(a) = assess_allocation(alloc, frame, &halts) else {
+            let Some(a) = assess_allocation(alloc, frame, &halts, &active_by_filter) else {
                 continue;
             };
             let risk_ratio = a.effective_inactive as f64 / threshold as f64;
@@ -1116,6 +1152,7 @@ pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) ->
     let threshold = crate::EVICTION_THRESHOLD_FRAMES;
 
     let provers = all_provers(&state, frame);
+    let active_by_filter = active_allocations_by_filter(&provers, frame);
     let mut by_status: BTreeMap<String, i64> = BTreeMap::new();
     let mut total_seniority: u64 = 0;
     let mut eviction_pending: u64 = 0;
@@ -1128,7 +1165,7 @@ pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) ->
         if prover.status == ProverStatus::Active {
             let mut worst = 0u64;
             for alloc in &prover.allocations {
-                if let Some(a) = assess_allocation(alloc, frame, &halts) {
+                if let Some(a) = assess_allocation(alloc, frame, &halts, &active_by_filter) {
                     worst = worst.max(a.effective_inactive);
                 }
             }
@@ -1960,7 +1997,12 @@ mod tests {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: last_active,
-            epoch: 0,
+            // Current-epoch so `effective_status` reads Active (not
+            // ExpiredEpoch) at the ~EVICTION_INACTIVITY_START_FRAME test frames;
+            // epoch is well above any frame these tests use.
+            epoch: quil_types::consensus::epoch_for_frame(
+                quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 100_000,
+            ),
             vertex_address: vec![],
         }
     }
@@ -1972,42 +2014,59 @@ mod tests {
         let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
         let frame = start + 290;
         let mut halts = HashMap::new();
+        // Census that puts every shard used here AT quorum, so the
+        // under-provisioned exemption never fires and each `None` below is for
+        // its intended reason (halt / inactivity / status).
+        let quorum = quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS;
+        let census: HashMap<Vec<u8>, u64> = [
+            (vec![0xAAu8], quorum),
+            (vec![0xBBu8], quorum),
+            (vec![0xCCu8], quorum),
+        ]
+        .into_iter()
+        .collect();
 
         // Active non-global alloc, no halt: effective = inactivity since
         // the start frame (NOT since last_active, which predates it).
         let a = active_alloc(vec![0xAA], 81_000);
-        let r = assess_allocation(&a, frame, &halts).unwrap();
+        let r = assess_allocation(&a, frame, &halts, &census).unwrap();
         assert_eq!(r.total_inactive, 290);
         assert_eq!(r.effective_inactive, 290);
 
         // Before the inactivity start, nobody accrues inactivity → None,
         // even if they've been inactive "forever" by last_active.
-        assert!(assess_allocation(&a, start, &HashMap::new()).is_none());
-        assert!(assess_allocation(&a, start - 1, &HashMap::new()).is_none());
+        assert!(assess_allocation(&a, start, &HashMap::new(), &census).is_none());
+        assert!(assess_allocation(&a, start - 1, &HashMap::new(), &census).is_none());
 
         // Partial halt is subtracted.
         halts.insert(vec![0xAA], 100u64);
-        let r = assess_allocation(&a, frame, &halts).unwrap();
+        let r = assess_allocation(&a, frame, &halts, &census).unwrap();
         assert_eq!(r.effective_inactive, 190);
 
         // Full halt (u64::MAX) -> exempt -> None.
         halts.insert(vec![0xAA], u64::MAX);
-        assert!(assess_allocation(&a, frame, &halts).is_none());
+        assert!(assess_allocation(&a, frame, &halts, &census).is_none());
+
+        // Under-provisioned shard (below consensus quorum) -> exempt, mirroring
+        // the evictor: no halt entry and long inactive, yet not at risk.
+        let under: HashMap<Vec<u8>, u64> =
+            [(vec![0xAAu8], quorum - 1)].into_iter().collect();
+        assert!(assess_allocation(&a, frame, &HashMap::new(), &under).is_none());
 
         // Global allocation (empty filter) -> never at risk.
-        assert!(assess_allocation(&active_alloc(vec![], 81_000), frame, &HashMap::new()).is_none());
+        assert!(assess_allocation(&active_alloc(vec![], 81_000), frame, &HashMap::new(), &census).is_none());
 
         // last_active 0 or not-yet-inactive -> None.
-        assert!(assess_allocation(&active_alloc(vec![0xBB], 0), frame, &HashMap::new()).is_none());
+        assert!(assess_allocation(&active_alloc(vec![0xBB], 0), frame, &HashMap::new(), &census).is_none());
         assert!(
-            assess_allocation(&active_alloc(vec![0xBB], frame + 5), frame, &HashMap::new())
+            assess_allocation(&active_alloc(vec![0xBB], frame + 5), frame, &HashMap::new(), &census)
                 .is_none()
         );
 
         // Non-active allocation -> None.
         let mut paused = active_alloc(vec![0xCC], 81_000);
         paused.status = ProverStatus::Paused;
-        assert!(assess_allocation(&paused, frame, &HashMap::new()).is_none());
+        assert!(assess_allocation(&paused, frame, &HashMap::new(), &census).is_none());
     }
 
     #[test]

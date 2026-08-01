@@ -82,6 +82,7 @@ fn global_frame_from_state(state: &State<GlobalState>) -> GlobalFrame {
         prover: app.prover.clone(),
         prover_tree_commitment: app.prover_tree_commitment.clone(),
         global_commitments: app.global_commitments.clone(),
+        prover_tree_aux_roots: app.prover_tree_aux_roots.clone(),
         requests_root: app.requests_root.clone(),
         ..Default::default()
     };
@@ -331,11 +332,28 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         }
     }
 
-    fn on_finalized(&self, _view: u64, _digest: Digest, bytes: Option<Vec<u8>>, _cert: Option<Vec<u8>>) {
-        // Global consensus doesn't need the finalization cert for coverage —
-        // the archives ARE the global committee (no reward-attribution hop).
+    fn on_finalized(&self, _view: u64, _digest: Digest, bytes: Option<Vec<u8>>, cert: Option<Vec<u8>>) {
         let Some(bytes) = bytes else { return };
-        let Ok(frame) = decode_global_frame(&bytes) else { return };
+        let Ok(mut frame) = decode_global_frame(&bytes) else { return };
+        // Attach the simplex FINALIZATION cert to the frame header so followers
+        // can verify this CW-finalized global frame against the fixed global
+        // committee (genesis archives) rather than trusting VDF + the archive
+        // source alone. Rides in the sig field's `signature` bytes with the CWCT
+        // magic; `GlobalFrameVerifier` (poller path) detects + verifies it. The
+        // cert isn't needed for coverage (the archives ARE the committee), but
+        // delivering it makes synced global frames self-verifying.
+        if let Some(cert) = cert.filter(|c| !c.is_empty()) {
+            if let Some(h) = frame.header.as_mut() {
+                h.public_key_signature_bls48581 =
+                    Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                        public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
+                            key_value: Vec::new(),
+                        }),
+                        signature: quil_cw_consensus::app_cert::wrap_cert_for_header(&cert),
+                        bitmask: Vec::new(),
+                    });
+            }
+        }
         let (frame_number, rank) = match frame.header.as_ref() {
             Some(h) => (h.frame_number, h.rank),
             None => return,
@@ -443,6 +461,8 @@ pub fn activate_global_consensus_cw(
         GlobalEngineParams::new("global", epoch, genesis_digest)
             .with_leader_timeout_secs(leader_timeout_secs),
         Some(storage_directory),
+        // Global committee is fixed (genesis archives) — never rebuilt.
+        None,
     );
 
     // Drain the engine's outbound (votes/certs/resolver) onto the :8340 transport.

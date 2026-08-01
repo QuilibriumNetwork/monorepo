@@ -62,9 +62,36 @@ pub struct CwInboundRouter {
     /// (channel 3); no sender attribution needed (frames are self-validating).
     ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
     resolve_peer: PeerResolver,
+    /// Our own committee Falcon key — the attributed sender for locally-injected
+    /// certificates (see [`Self::feed_finalization_cert`]).
+    inject_from: FalconPublicKey,
 }
 
 impl CwInboundRouter {
+    /// Feed a FINALIZATION certificate the node already holds (unwrapped from a
+    /// committed frame header's `CWCT` field) straight into the engine's
+    /// certificate channel, driving RESOLVER-BASED CATCH-UP from LOCAL state.
+    ///
+    /// The simplex voter only advances a behind node when it *sees a higher-view
+    /// certificate* (`resolver.updated(Certificate::Finalization)`); a node that
+    /// resumed/reset below the live view receives only current-view VOTES on the
+    /// wire and never gets that trigger, so it freezes. But its clock store DOES
+    /// hold finalized frames (via the poller) whose headers carry the simplex
+    /// finalization cert. Injecting the highest one sets the resolver's fetch
+    /// target, so it backfills the gap and rejoins — no coordinated restart.
+    ///
+    /// Wire format: the certificate channel decodes `Certificate<S,D>` =
+    /// `[tag:u8] ++ variant`; a Finalization is tag `2`, and the raw CWCT bytes
+    /// are exactly `encode_finalization(f)` = the Finalization body. So we just
+    /// prepend the tag and inject as if received from our own committee key (a
+    /// finalization is a self-verifying aggregate — sender attribution is moot).
+    pub fn feed_finalization_cert(&self, raw_cwct_cert: &[u8]) {
+        let mut msg = Vec::with_capacity(1 + raw_cwct_cert.len());
+        msg.push(2u8); // Certificate::Finalization discriminant
+        msg.extend_from_slice(raw_cwct_cert);
+        let _ = self.inbound[1].send(inbound_message(self.inject_from.clone(), msg));
+    }
+
     /// Feed a received `:8340` message (identified by its channel bitmask) into
     /// the engine, if the bitmask is a CW channel. Channels 0/1/2 (vote/cert/
     /// resolver) need the sender's committee key; channel 3 (block) does not.
@@ -154,9 +181,13 @@ pub fn start_cw_global_consensus(deps: CwGlobalDeps) -> Option<CwInboundRouter> 
     );
 
     tracing::info!("commonware-simplex global consensus started");
+    // Our own committee key — the committee build above already validated
+    // `my_public_key`, so this decode succeeds.
+    let inject_from = FalconPublicKey::from_bytes(&deps.my_public_key)?;
     Some(CwInboundRouter {
         inbound,
         ingest_block,
         resolve_peer: deps.resolve_peer,
+        inject_from,
     })
 }

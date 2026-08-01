@@ -739,3 +739,98 @@ fn global_prover_shard_excluded_from_l1() {
     let gc = c.global_commitments();
     assert!(gc[0xff].is_empty(), "global prover shard must NOT create an L1 bucket leaf");
 }
+
+// ---------------------------------------------------------------------
+// Prover-root determinism (the archive prover-root-mismatch class)
+// ---------------------------------------------------------------------
+
+/// The global intrinsic (prover) shard: `l1=[0;3], l2=[0xff;32]`. Matches
+/// `GlobalLeaderProvider::compute_prover_root` and the materializer's
+/// prover-root read — `compute_shard_root` uses only `l2`, so `l1` is nominal.
+fn global_prover_shard() -> quil_types::store::ShardKey {
+    quil_types::store::ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] }
+}
+
+/// The PROVER ROOT (= `compute_shard_root("vertex","adds", global-shard)`) must
+/// be a pure function of the vertex SET, independent of insertion order. Two
+/// archives that applied the same prover/allocation vertices in different orders
+/// (different frame arrival, sync vs live, HashMap iteration) MUST commit to the
+/// same root — the invariant whose violation is the "prover root MISMATCH"
+/// field report. This is the core determinism guarantee that had no coverage.
+#[test]
+fn prover_root_is_insertion_order_independent() {
+    let global = [0xffu8; 32];
+    // A set of distinct prover-like vertices under the global intrinsic address.
+    let vertices: Vec<(Location, Vec<u8>)> = (0u8..12)
+        .map(|i| {
+            let mut data = [0u8; 32];
+            data[0] = i;
+            data[31] = i.wrapping_mul(7);
+            (
+                Location { app_address: global, data_address: data },
+                vec![i; 40 + i as usize],
+            )
+        })
+        .collect();
+
+    let commit_in_order = |order: &[usize]| -> Vec<u8> {
+        let c = fresh_crdt();
+        for &idx in order {
+            let (loc, blob) = &vertices[idx];
+            c.add_vertex(loc, blob).unwrap();
+        }
+        c.commit(1).unwrap();
+        // Read via the SAME entry point the leader/materializer use.
+        c.compute_shard_root("vertex", "adds", &global_prover_shard())
+    };
+
+    let forward: Vec<usize> = (0..vertices.len()).collect();
+    let reversed: Vec<usize> = (0..vertices.len()).rev().collect();
+    // A non-trivial shuffle (deterministic, no rng): odd indices then even.
+    let mut interleaved: Vec<usize> = (0..vertices.len()).filter(|i| i % 2 == 1).collect();
+    interleaved.extend((0..vertices.len()).filter(|i| i % 2 == 0));
+
+    let r_fwd = commit_in_order(&forward);
+    let r_rev = commit_in_order(&reversed);
+    let r_int = commit_in_order(&interleaved);
+
+    assert_eq!(r_fwd.len(), 32, "prover root is a 32-byte forest root");
+    assert!(r_fwd.iter().any(|&b| b != 0), "prover root must be non-empty");
+    assert_eq!(r_fwd, r_rev, "prover root must not depend on insertion order (fwd vs rev)");
+    assert_eq!(r_fwd, r_int, "prover root must not depend on insertion order (fwd vs interleaved)");
+}
+
+/// `compute_shard_root` (the verify/leader read path) must equal the root
+/// `commit` returns for the same shard/phase — the two are used
+/// interchangeably (leader binds `compute_shard_root`; the materializer's
+/// post-apply path publishes `commit`'s root), so if they ever diverged, a
+/// producer and a verifier on the SAME state would disagree → self-inflicted
+/// "mismatch". No prior test tied the compare path to a real committed tree.
+#[test]
+fn compute_shard_root_matches_commit_root_for_prover_shard() {
+    let global = [0xffu8; 32];
+    let c = fresh_crdt();
+    for i in 0u8..6 {
+        let mut data = [0u8; 32];
+        data[0] = i;
+        c.add_vertex(&Location { app_address: global, data_address: data }, &vec![i; 33])
+            .unwrap();
+    }
+    let commits = c.commit(9).unwrap();
+
+    let shard = global_prover_shard();
+    // commit() keys by the location-derived shard key (real l1); compute_shard_root
+    // ignores l1. Find the committed entry for l2 == global address.
+    let commit_root = commits
+        .iter()
+        .find(|(k, _)| k.l2 == global)
+        .map(|(_, roots)| roots[0].clone())
+        .expect("global shard committed");
+    let read_root = c.compute_shard_root("vertex", "adds", &shard);
+
+    assert_eq!(read_root.len(), 32);
+    assert_eq!(
+        read_root, commit_root,
+        "compute_shard_root (verify/leader read) must equal commit()'s vertex-adds root"
+    );
+}

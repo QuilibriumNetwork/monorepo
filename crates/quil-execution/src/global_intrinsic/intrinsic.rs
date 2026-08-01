@@ -590,7 +590,18 @@ impl GlobalIntrinsic {
                 )
                 .is_some()
                 {
-                    let active = pr.get_active_provers(&op.address, frame_number).map_err(|e| {
+                    // Reconstruct the committee at the app frame's OWN global
+                    // anchor (`op.global_frame_number`), NOT the current global
+                    // `frame_number` — the committee that signed this frame was
+                    // formed at that anchor's epoch (see AppLeaderProvider's
+                    // `committee_anchor_gfn`). Windowed-lockstep bounds the two
+                    // within W, but they can straddle an epoch boundary.
+                    let committee_frame = if op.global_frame_number > 0 {
+                        op.global_frame_number
+                    } else {
+                        frame_number
+                    };
+                    let active = pr.get_active_provers(&op.address, committee_frame).map_err(|e| {
                         QuilError::Internal(format!("FrameHeader: get_active_provers: {e}"))
                     })?;
                     super::prover_shard_update::verify_frame_header_attestation(
@@ -649,7 +660,14 @@ impl GlobalIntrinsic {
                     // pubkey aggregate must equal the signature's
                     // declared aggregate pubkey. Mirrors what the
                     // outer frame validator does for GlobalFrame.
-                    let active = pr.get_active_provers(&op.address, frame_number).map_err(|e| {
+                    // Committee at the app frame's own global anchor (see the
+                    // CW-path note above), not the current global frame.
+                    let committee_frame = if op.global_frame_number > 0 {
+                        op.global_frame_number
+                    } else {
+                        frame_number
+                    };
+                    let active = pr.get_active_provers(&op.address, committee_frame).map_err(|e| {
                         QuilError::Internal(format!(
                             "FrameHeader: get_active_provers: {e}"
                         ))
@@ -1748,8 +1766,16 @@ impl GlobalIntrinsic {
         let pr = self.prover_registry.as_ref().ok_or_else(|| QuilError::Internal(
             "invoke_frame_header: prover_registry not installed — cannot resolve active provers".into(),
         ))?;
+        // Committee at the app frame's own global anchor (`op.global_frame_number`),
+        // matching the epoch its committee was formed at — not the current global
+        // `frame_number`. See AppLeaderProvider's `committee_anchor_gfn`.
+        let committee_frame = if op.global_frame_number > 0 {
+            op.global_frame_number
+        } else {
+            frame_number
+        };
         let active_provers = pr
-            .get_active_provers(&op.address, frame_number)
+            .get_active_provers(&op.address, committee_frame)
             .map_err(|e| QuilError::InvalidArgument(format!(
                 "invoke_frame_header: get_active_provers failed: {e}"
             )))?;
@@ -1864,6 +1890,7 @@ impl GlobalIntrinsic {
                     _: &quil_types::proto::global::GlobalFrameHeader,
                     _: &[Vec<u8>],
                     _: &[u8],
+                    _: &[Vec<u8>],
                     _: &[u8],
                     _: &dyn quil_types::crypto::Signer,
                     _: i64,

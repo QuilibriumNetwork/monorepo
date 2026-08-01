@@ -190,6 +190,13 @@ pub fn spawn_global_host<Pr, Sk, Fin>(
     // from `Floor::Genesis` every launch; acceptable only for tests or callers
     // that intentionally don't persist.
     storage_directory: Option<std::path::PathBuf>,
+    // Optional cooperative shutdown flag. `None` → the engine runs until the
+    // process exits (current behavior; used by GLOBAL consensus, whose committee
+    // is fixed). `Some(flag)` → the host thread polls it and, once set, drops the
+    // engine and returns — freeing the runtime thread. App-shard consensus uses
+    // this to REBUILD its (dynamic) committee: the caller sets the flag to stop
+    // the old simplex instance, then spawns a fresh one with the new peer set.
+    shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> GlobalHostHandle
 // NOTE: `store` is supplied by the caller (not created here) so the node can
 // hold a clone and insert peer-delivered frame bytes into it — followers must
@@ -232,7 +239,19 @@ where
             );
             // Hold the engine handle alive; keep the runtime resident.
             let _handle = engine.start((s0, r0), (s1, r1), (s2, r2));
-            std::future::pending::<()>().await;
+            match shutdown {
+                // Poll the flag (cw_tokio is tokio-backed, so tokio::time works
+                // in this runtime); on set, fall through and drop the engine
+                // handle to stop this instance.
+                Some(flag) => {
+                    while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+                // No shutdown wired (global): run resident until process exit.
+                None => std::future::pending::<()>().await,
+            }
+            drop(_handle);
         });
     });
 

@@ -494,6 +494,23 @@ pub struct ProverShardSummary {
 /// eviction-risk display so they agree exactly.
 pub const EVICTION_INACTIVITY_START_FRAME: u64 = 674_000;
 
+/// Minimum number of effectively-active provers a shard needs to run its
+/// app-shard consensus (form a committee and reach quorum). A shard with
+/// FEWER than this many active provers is under a coverage halt and cannot
+/// produce a shard frame at all, so its provers physically CANNOT submit a
+/// shard proof — they must NOT be evicted for inactivity. Evicting them is a
+/// death spiral (too few provers → no frames → everyone evicted → zero
+/// provers) and punishes provers for a shortfall that isn't their fault.
+///
+/// This mirrors the coverage monitor's `halt_threshold` (a shard with
+/// `active_count <= 3` is halt-risk), but is a FIXED consensus constant, not
+/// the per-node coverage config: eviction is consensus-state-mutating, so
+/// every archive must apply the identical exemption or their prover roots
+/// diverge. The eviction path derives each shard's active-prover census from
+/// committed registry state (not the live coverage monitor) so the exemption
+/// is deterministic across the fleet.
+pub const MIN_SHARD_CONSENSUS_PROVERS: u64 = 4;
+
 /// Manages the prover trie: state transitions, lookups, eviction.
 pub trait ProverRegistry: Send + Sync {
     fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>>;

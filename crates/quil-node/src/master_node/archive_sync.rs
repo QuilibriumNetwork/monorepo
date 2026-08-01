@@ -700,6 +700,15 @@ pub(crate) struct ArchiveSyncArgs {
     /// a random temp dir and every restart replays consensus from the migration
     /// head instead of resuming.
     pub cw_storage_dir: std::path::PathBuf,
+    /// Worker fan-out channel (the same one `StreamGlobalMessages` serves). The
+    /// archive poller tees every synced GLOBAL_FRAME here so CLUSTER workers
+    /// (separate processes with no archive poller of their own) can advance their
+    /// global anchor — otherwise they read their committee at epoch 0 forever.
+    /// The master's recv loop only forwards GLOBAL_PEER_INFO, so this is the sole
+    /// global-frame path to a cluster worker.
+    pub global_msg_tx: tokio::sync::broadcast::Sender<
+        quil_types::proto::global::StreamGlobalMessagesResponse,
+    >,
 }
 
 pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncArgs) {
@@ -736,6 +745,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         consensus_leader_timeout_secs,
         cw_router,
         cw_storage_dir,
+        global_msg_tx,
     } = args;
 
     // The archive-sync transport identity is the FALCON network key (all
@@ -768,12 +778,24 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         // prover already in scope + a fresh BLS constructor (mirrors
         // `frame_pipeline::init`). Used to gate every archive-sourced frame
         // and proposal BEFORE it is persisted / submitted into consensus.
-        let frame_verifier: Arc<quil_engine::frame_validator::GlobalFrameVerifier> =
-            Arc::new(quil_engine::frame_validator::GlobalFrameVerifier::with_bls(
-                frame_prover.clone(),
-                Arc::new(quil_crypto::FalconKeyConstructor)
-                    as Arc<dyn quil_types::crypto::BlsConstructor>,
-            ));
+        let frame_verifier: Arc<quil_engine::frame_validator::GlobalFrameVerifier> = {
+            // Decode the fixed global committee (genesis archives' Falcon pubkeys)
+            // so CW-finalized global frames are verified against it via their
+            // carried finalization cert (defense-in-depth over VDF). Empty on a
+            // legacy/no-committee config → cert check is skipped.
+            let committee: Vec<Vec<u8>> = consensus_committee
+                .iter()
+                .filter_map(|s| hex::decode(s).ok())
+                .collect();
+            Arc::new(
+                quil_engine::frame_validator::GlobalFrameVerifier::with_bls(
+                    frame_prover.clone(),
+                    Arc::new(quil_crypto::FalconKeyConstructor)
+                        as Arc<dyn quil_types::crypto::BlsConstructor>,
+                )
+                .with_global_committee(committee),
+            )
+        };
         // Genesis-prover-allowlist + VDF/BLS gate packaged as a closure so the
         // (quil-rpc) poller and the record-only backfill can apply the exact
         // same drop-before-store check the gossip GLOBAL_FRAME handler applies.
@@ -856,6 +878,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         let pp_for_poller = prover_pipeline.clone();
         let hg_for_poller = hg_store.clone();
         let crdt_for_poller = crdt.clone();
+        let gmtx_for_poller = global_msg_tx.clone();
         let shards_store_for_poller: Arc<dyn quil_types::store::ShardsStore> =
             shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
         let archive_mode_poller = archive_mode;
@@ -874,6 +897,28 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 }
                 cf_for_poller.observe(frame_num);
                 lhf_for_poller.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
+
+                // Tee this frame to cluster workers (separate processes). A
+                // cluster worker has no archive poller of its own and the
+                // master's recv loop only forwards GLOBAL_PEER_INFO, so this is
+                // the ONLY way its `handle_global_frame_message` learns the
+                // global head — without it the worker's committee is read at
+                // epoch 0 forever (every prover looks `Joining`) and app-shard CW
+                // can never form a real committee. Bounded (~one per frame);
+                // `send` is a no-op when there are no worker subscribers.
+                // MUST use the consensus-wire encoding (`encode_global_frame`),
+                // NOT raw prost — the worker's `handle_global_frame_message`
+                // decodes via `decode_global_frame`, which requires the 4-byte
+                // GLOBAL_FRAME_TYPE prefix + length-prefixed fields. Raw proto
+                // fails that decode silently and the anchor never advances.
+                if let Ok(buf) = quil_engine::consensus_wire::encode_global_frame(frame) {
+                    let _ = gmtx_for_poller.send(
+                        quil_types::proto::global::StreamGlobalMessagesResponse {
+                            data: buf,
+                            bitmask: quil_engine::bitmasks::GLOBAL_FRAME.to_vec(),
+                        },
+                    );
+                }
 
                 // Process frame messages through execution pipeline
                 match quil_engine::frame_processor::process_global_frame(
@@ -1105,6 +1150,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sync_consensus_leader_timeout_secs = consensus_leader_timeout_secs;
             let sync_cw_router = cw_router.clone();
             let sync_cw_storage_dir = cw_storage_dir.clone();
+            // Materializer handle so the periodic loop can read the prover-root
+            // mismatch flag and reconcile a DIVERGED archive (see the periodic
+            // loop below — archives normally skip the sync, but a mismatch must
+            // pull from a peer to recover instead of logging forever).
+            let sync_mat = frame_materializer.clone();
             let seed = std::sync::Arc::new(seed.clone());
             sup.spawn("archive-prover-tree-sync", move |sync_token| async move {
                 // Archive nodes ARE the source of truth — they don't wait
@@ -1369,6 +1419,36 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             //  - If the frame isn't on disk at all (genuinely
                             //    dangling), the load below fails and we also fall back.
                             const GRANDFATHER_CUTOFF_RANK: u64 = 587_000;
+                            // A latest QC BELOW the committed/record head is STALE:
+                            // this node synced canonical frame records (via the
+                            // poller) PAST its last CW-finalized frame — a
+                            // lagging-consensus node (CW journal head << record
+                            // head). Anchoring CW at the stale QC strands the voter
+                            // that many frames behind the record head; it can never
+                            // build forward onto the live chain and freezes (no
+                            // propose/vote/timeout, network-wide halt). Ignore it
+                            // and anchor at the record head (the None fallback); the
+                            // now-stale CW journal is reset at the activation site
+                            // so the voter re-seeds fresh at the record head.
+                            // (This is the MIRROR of the "NO journal reset" case:
+                            // there the journal was AHEAD of a migration-era record
+                            // head, so resetting lost finalized progress — unsafe.
+                            // Here the records are AHEAD of a stale consensus head,
+                            // so re-flooring at the record head only ADVANCES
+                            // consensus — safe. The two are distinguished purely by
+                            // sign: qc.frame_number </> committed_head_fn.)
+                            if qc.frame_number < committed_head_fn {
+                                warn!(
+                                    qc_frame = qc.frame_number,
+                                    qc_rank = qc.rank,
+                                    committed_head = committed_head_fn,
+                                    selector = %hex::encode(&qc.selector),
+                                    "bootstrap: latest QC is BELOW the record head — \
+                                     STALE (consensus lagged synced records); anchoring \
+                                     at the record head and resetting the stale CW journal",
+                                );
+                                return None;
+                            }
                             if qc.frame_number > committed_head_fn
                                 && qc.rank < GRANDFATHER_CUTOFF_RANK
                             {
@@ -1752,14 +1832,106 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     // ── commonware-simplex + Falcon GLOBAL consensus ──
                                     match (mat_job_tx.clone(), direct_publisher.clone()) {
                                         (Some(mat_tx), Some(direct_pub)) => {
-                                            // Genesis digest = Poseidon(genesis output)[..32].
                                             let genesis_header =
                                                 genesis_frame.header.clone().unwrap_or_default();
-                                            let genesis_frame_number = genesis_header.frame_number;
-                                            let genesis_id = quil_crypto::poseidon::hash_bytes_to_32(
-                                                &genesis_header.output,
-                                            )
-                                            .unwrap_or([0u8; 32]);
+                                            // ── Stable, marker-persisted CW genesis ──
+                                            // The CW genesis is the simplex `Floor` (view-0
+                                            // parent). A resuming journal's view-1 parent
+                                            // MUST equal this floor, so the genesis has to be
+                                            // IDENTICAL across restarts. The Jolteon-era
+                                            // bootstrap re-derived it from the clock store
+                                            // every launch; and because CW never writes a
+                                            // clock-store QC (`on_finalized` commits the
+                                            // frame but no QC), any reset gate keyed on that
+                                            // stale QC fires on EVERY restart — wiping the
+                                            // journal each launch and stranding late nodes at
+                                            // view 1. Instead: persist (frame, id) ONCE when
+                                            // the journal is first established and reuse it
+                                            // verbatim thereafter, so the journal resumes
+                                            // cleanly against the same floor. A fresh genesis
+                                            // (wiping any stale journal) is established ONLY
+                                            // when no marker exists — a ONE-TIME re-seed that
+                                            // re-floors a stranded committee at a common head;
+                                            // every later restart just resumes. The marker is
+                                            // a SIBLING file so the journal wipe (and
+                                            // commonware's own dir scan) never touch it.
+                                            // CAVEAT: the one-time re-seed anchors at THIS
+                                            // node's committed head, so convergence requires
+                                            // the whole committee to seed at a COMMON head —
+                                            // deploy the first cutover as a coordinated
+                                            // restart once all nodes share a head.
+                                            let marker_path = {
+                                                let mut p = sync_cw_storage_dir.clone();
+                                                p.set_extension("marker");
+                                                p
+                                            };
+                                            let (genesis_frame_number, genesis_id): (u64, [u8; 32]) =
+                                                match std::fs::read(&marker_path) {
+                                                    Ok(buf) if buf.len() == 40 => {
+                                                        let mut fb = [0u8; 8];
+                                                        fb.copy_from_slice(&buf[..8]);
+                                                        let mut id = [0u8; 32];
+                                                        id.copy_from_slice(&buf[8..40]);
+                                                        let fnum = u64::from_le_bytes(fb);
+                                                        info!(
+                                                            genesis_frame = fnum,
+                                                            "cw activation: resuming on persisted \
+                                                             stable genesis (journal kept)",
+                                                        );
+                                                        (fnum, id)
+                                                    }
+                                                    _ => {
+                                                        // No marker: first activation OR a stranded
+                                                        // node needing a one-time re-seed. Anchor at
+                                                        // the record/committed head, WIPE any stale
+                                                        // journal so the fresh chain starts cleanly
+                                                        // at this floor, then persist the marker so
+                                                        // future restarts resume instead of
+                                                        // re-seeding.
+                                                        let fnum = genesis_header.frame_number;
+                                                        let id =
+                                                            quil_crypto::poseidon::hash_bytes_to_32(
+                                                                &genesis_header.output,
+                                                            )
+                                                            .unwrap_or([0u8; 32]);
+                                                        warn!(
+                                                            genesis_frame = fnum,
+                                                            dir = %sync_cw_storage_dir.display(),
+                                                            "cw activation: no genesis marker — \
+                                                             establishing a fresh stable genesis at \
+                                                             the record head and wiping any stale \
+                                                             journal (one-time re-seed; future \
+                                                             restarts resume)",
+                                                        );
+                                                        match std::fs::remove_dir_all(
+                                                            &sync_cw_storage_dir,
+                                                        ) {
+                                                            Ok(()) => {}
+                                                            Err(e)
+                                                                if e.kind()
+                                                                    == std::io::ErrorKind::NotFound => {}
+                                                            Err(e) => warn!(
+                                                                error = %e,
+                                                                dir = %sync_cw_storage_dir.display(),
+                                                                "cw activation: journal wipe failed",
+                                                            ),
+                                                        }
+                                                        if let Err(e) = std::fs::create_dir_all(
+                                                            &sync_cw_storage_dir,
+                                                        ) {
+                                                            warn!(error = %e, "cw activation: recreate journal dir failed");
+                                                        }
+                                                        let mut buf = Vec::with_capacity(40);
+                                                        buf.extend_from_slice(&fnum.to_le_bytes());
+                                                        buf.extend_from_slice(&id);
+                                                        if let Err(e) =
+                                                            std::fs::write(&marker_path, &buf)
+                                                        {
+                                                            warn!(error = %e, "cw activation: persist genesis marker failed");
+                                                        }
+                                                        (fnum, id)
+                                                    }
+                                                };
                                             let genesis_digest =
                                                 quil_cw_consensus::adapters::digest_from_identity(
                                                     genesis_id,
@@ -1892,6 +2064,62 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                             frame = genesis_frame_number,
                                                             "commonware-simplex global consensus activated",
                                                         );
+                                                        // RESOLVER CATCH-UP FEED. commonware's
+                                                        // resolver only advances a behind node
+                                                        // when the voter SEES a higher-view
+                                                        // CERTIFICATE (`resolver.updated`). A node
+                                                        // that resumed/reset below the live view
+                                                        // receives only current-view VOTES on the
+                                                        // wire and never gets that trigger, so it
+                                                        // freezes on the shared genesis. But its
+                                                        // clock store holds finalized frames (via
+                                                        // the poller) whose headers carry the
+                                                        // simplex finalization cert (CWCT). Feed
+                                                        // the highest one into the certificate
+                                                        // channel: that sets the resolver's fetch
+                                                        // target, so it backfills the gap and
+                                                        // rejoins WITHOUT a coordinated restart.
+                                                        let feed_cs = sync_cs.clone();
+                                                        let feed_router = sync_cw_router.clone();
+                                                        let feed_cancel = sync_token.clone();
+                                                        spawner.detach(
+                                                            "cw-resolver-catchup-feed",
+                                                            async move {
+                                                                let mut last_fed: u64 = 0;
+                                                                let mut tick = tokio::time::interval(
+                                                                    std::time::Duration::from_secs(8),
+                                                                );
+                                                                tick.set_missed_tick_behavior(
+                                                                    tokio::time::MissedTickBehavior::Skip,
+                                                                );
+                                                                loop {
+                                                                    tokio::select! {
+                                                                        _ = feed_cancel.cancelled() => break,
+                                                                        _ = tick.tick() => {}
+                                                                    }
+                                                                    let Some(router) = feed_router.get() else { continue };
+                                                                    let Ok(frame) = feed_cs.get_latest_global_frame() else { continue };
+                                                                    let Some(header) = frame.header.as_ref() else { continue };
+                                                                    if header.frame_number <= last_fed {
+                                                                        continue;
+                                                                    }
+                                                                    let cert: Option<Vec<u8>> = header
+                                                                        .public_key_signature_bls48581
+                                                                        .as_ref()
+                                                                        .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))
+                                                                        .map(<[u8]>::to_vec);
+                                                                    if let Some(cert) = cert {
+                                                                        router.feed_finalization_cert(&cert);
+                                                                        last_fed = header.frame_number;
+                                                                        tracing::debug!(
+                                                                            frame = header.frame_number,
+                                                                            "cw resolver catch-up: fed local finalization cert to engine",
+                                                                        );
+                                                                    }
+                                                                }
+                                                                Ok(())
+                                                            },
+                                                        );
                                                     }
                                                 }
                                                 None => warn!(
@@ -1915,14 +2143,33 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
-                            // Archives have full history locally — they
-                            // don't need to incremental-sync the prover
-                            // tree from peers, and on a fresh post-
-                            // migration topology this just trades "no
-                            // tree data available" errors with other
-                            // freshly-migrated archives.
-                            if sync_archive_mode {
+                            // Archives have full history locally — a HEALTHY
+                            // archive doesn't need to incremental-sync the prover
+                            // tree from peers (and on a fresh post-migration
+                            // topology that just trades "no tree data available"
+                            // errors with other freshly-migrated archives).
+                            //
+                            // BUT: if this archive's prover root has DIVERGED from
+                            // the network (the materializer flagged a mismatch),
+                            // it MUST reconcile by pulling the authoritative tree
+                            // from a peer — pinned to the QC'd
+                            // prover_tree_commitment below. Without this a
+                            // diverged archive stayed stuck forever, logging
+                            // "prover root MISMATCH" every frame with no recovery
+                            // path (the previous unconditional skip). Skip only
+                            // while healthy.
+                            let mismatch_recovery = sync_mat
+                                .as_ref()
+                                .map(|m| m.prover_root_mismatch_detected())
+                                .unwrap_or(false);
+                            if sync_archive_mode && !mismatch_recovery {
                                 continue;
+                            }
+                            if sync_archive_mode && mismatch_recovery {
+                                warn!(
+                                    "archive prover root diverged from network — \
+                                     reconciling via peer prover-tree sync"
+                                );
                             }
                             if let Some(addr) = sync_pool.get_all().await.first() {
                                 // Snapshot the local reward balance before the
@@ -1958,6 +2205,69 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         let pr = sync_pr.clone();
                                         let hs3 = sync_hg.clone();
                                         let _ = tokio::task::spawn_blocking(move || pr.refresh_from_store(&hs3)).await;
+
+                                        // Archive mismatch recovery: if the sync
+                                        // converged the local prover shard to the
+                                        // pinned (QC'd) root, clear the mismatch
+                                        // flag so the next materialized frame
+                                        // doesn't immediately re-trigger recovery
+                                        // before `verify_prover_root` re-runs. Only
+                                        // when pinned to a real expected root
+                                        // (converged is meaningful) — a bootstrap
+                                        // trust-sync (empty root) leaves the flag
+                                        // for the normal verify path to set.
+                                        if converged && !expected_root.is_empty() {
+                                            if let Some(m) = sync_mat.as_ref() {
+                                                let vf = sync_cs
+                                                    .get_latest_global_frame()
+                                                    .ok()
+                                                    .and_then(|f| f.header.map(|h| h.frame_number))
+                                                    .unwrap_or(0);
+                                                m.set_prover_root_synced(true, vf);
+                                                // SHARD/CURSOR CONSISTENCY. The reconcile just
+                                                // pulled the global prover shard to the head's
+                                                // (QC'd) prover_tree_commitment. If the durable
+                                                // materialize cursor LAGS that head, the prover
+                                                // shard now sits at a LATER epoch than the
+                                                // cursor — and on the next restart the startup
+                                                // gap re-materialize would replay
+                                                // [cursor+1..head] against this epoch-ahead
+                                                // shard. Every re-confirm in those old frames is
+                                                // then rejected by the idempotency guard
+                                                // ("epoch N > confirm epoch N-1", verify.rs:777),
+                                                // so the prover tree diverges AGAIN and the
+                                                // mismatch loop never breaks. Advance the cursor
+                                                // to the synced head so no stale replay runs
+                                                // against the ahead shard. The archive still
+                                                // serves history from the frame RECORDS (kept by
+                                                // the poller); only the re-derivation of
+                                                // already-committed state is skipped — exactly
+                                                // what `run_state_jump` does after a full sync.
+                                                let cursor = m.last_materialized_frame();
+                                                if vf > cursor {
+                                                    match sync_cs
+                                                        .put_global_materialized_cursor(vf)
+                                                    {
+                                                        Ok(()) => {
+                                                            m.seed_cursor(vf);
+                                                            info!(
+                                                                from = cursor,
+                                                                to = vf,
+                                                                "reconcile: advanced materialized \
+                                                                 cursor to the synced prover head \
+                                                                 (breaks the shard-ahead-of-cursor \
+                                                                 epoch-skew replay loop)",
+                                                            );
+                                                        }
+                                                        Err(e) => warn!(
+                                                            error = %e,
+                                                            cursor = vf,
+                                                            "reconcile: cursor advance failed",
+                                                        ),
+                                                    }
+                                                }
+                                            }
+                                        }
 
                                         // Compare reward balance for the local
                                         // prover before/after; log when it changed

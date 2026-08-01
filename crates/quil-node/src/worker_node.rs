@@ -219,6 +219,11 @@ pub(crate) async fn start(
         listen_addr,
         parent_pid: if parent_process > 0 { Some(parent_process) } else { None },
         channel_factory: Some(channel_factory),
+        app_consensus_cw: config.engine.app_consensus_cw,
+        // Persist the app-shard CW journal under the worker's resolved data dir
+        // (else the ephemeral temp journal panics on prune once a real committee
+        // starts producing views).
+        data_dir: Some(db_path.clone()),
     };
 
     let reward_greedy = config.engine.reward_strategy == "reward-greedy";
@@ -228,6 +233,15 @@ pub(crate) async fn start(
     let min_active_provers_for_propose: u64 =
         if config.p2p.network == 0 { 3 } else { 1 };
 
+    // Concrete registry + store for the post-sync refresh hook (the trait
+    // `refresh()` is a no-op; a cluster worker must `refresh_from_store` to
+    // repopulate its registry after syncing the prover tree, else its committee
+    // build fails and the shard engine stays passive).
+    let registry_refresh: Arc<dyn Fn() + Send + Sync> = {
+        let r = prover_registry.clone();
+        let s = hg_store.clone();
+        Arc::new(move || r.refresh_from_store(&s))
+    };
     let mut worker_node = quil_engine::worker_node::WorkerOnlyNode::new(
         worker_config,
         clock_store,
@@ -241,7 +255,8 @@ pub(crate) async fn start(
         reward_greedy,
         min_active_provers_for_propose,
     )
-    .with_state_engines(crdt.clone(), exec_manager, inclusion_prover);
+    .with_state_engines(crdt.clone(), exec_manager, inclusion_prover)
+    .with_registry_refresh(registry_refresh);
 
     // Wire the prover-tree syncer so the worker can sync the global
     // prover tree from the master at startup and before materializing
@@ -382,7 +397,9 @@ pub(crate) async fn start(
             move |_token| async move {
                 loop {
                     match rx.recv().await {
-                        Some(msg) => route_worker.route_message(&msg.data, &msg.bitmask),
+                        // `msg.from` is the gossip sender's PeerId — needed to
+                        // resolve the committee key for inbound app-shard CW.
+                        Some(msg) => route_worker.route_message(&msg.data, &msg.bitmask, &msg.from),
                         None => break,
                     }
                 }

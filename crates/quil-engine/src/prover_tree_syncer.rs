@@ -21,17 +21,22 @@ use quil_types::error::Result;
 /// 3. Return whether the final root matches
 #[async_trait]
 pub trait ProverTreeSyncer: Send + Sync {
-    /// Sync the global prover tree, pinning to `expected_root`.
-    /// Returns `Ok(true)` if post-sync root matches, `Ok(false)` if
-    /// the sync completed but roots still diverge, `Err` on failure.
-    async fn sync_prover_tree(&self, expected_root: &[u8]) -> Result<bool>;
+    /// Sync the global prover tree, pinning EACH phase to `expected_roots[phase]`
+    /// — `[prover_tree_commitment (phase 0), prover_tree_aux_roots (1,2,3)]` from
+    /// the global header (audit #5: all four phases anchored). Empty slice ⇒
+    /// trust the peer (bootstrap). Returns `Ok(true)` if post-sync roots match,
+    /// `Ok(false)` if the sync completed but roots still diverge, `Err` on failure.
+    async fn sync_prover_tree(&self, expected_roots: &[Vec<u8>]) -> Result<bool>;
 
-    /// Sync a specific app-shard's vertex-adds subtree from an archive,
-    /// pinning to `expected_root`. Used to catch a shard's CRDT up after
-    /// a frame gap / restart / late-join (step 4). `filter` is the
-    /// shard filter; the impl derives the `ShardKey`. Default is a no-op
-    /// (returns `Ok(false)`) for syncers that don't support shard sync.
-    async fn sync_shard_tree(&self, _filter: &[u8], _expected_root: &[u8]) -> Result<bool> {
+    /// Sync a specific app-shard's subtrees from an archive, pinning EACH of
+    /// the four phases to `expected_roots[phase]` — the finalized header's
+    /// `state_roots` (audit #5: all four phases anchored, not just vertex-adds).
+    /// Used to catch a shard's CRDT up after a frame gap / restart / late-join
+    /// (step 4). `filter` is the shard filter; the impl derives the `ShardKey`.
+    /// An empty entry (or empty slice) trusts the peer for that phase
+    /// (bootstrap). Default is a no-op (`Ok(false)`) for syncers without shard
+    /// sync.
+    async fn sync_shard_tree(&self, _filter: &[u8], _expected_roots: &[Vec<u8>]) -> Result<bool> {
         Ok(false)
     }
 }

@@ -132,6 +132,39 @@ impl GlobalLeaderProvider {
         }
     }
 
+    /// Compute the prover shard's phase 1/2/3 roots (vertex-removes,
+    /// hyperedge-adds, hyperedge-removes) — the companions to
+    /// [`Self::compute_prover_root`] (phase 0). The global prover shard uses
+    /// removes + hyperedge-adds (not just vertex-adds), so these must be
+    /// committed too (audit #5). An empty/degenerate phase normalizes to the
+    /// zero root so the aux vector always has exactly 3 fixed-length entries
+    /// (matching what `sync_single_shard`'s zero-anchor expects).
+    fn compute_prover_aux_roots(&self) -> Vec<Vec<u8>> {
+        let Some(hg) = self.hypergraph.as_ref() else {
+            return Vec::new();
+        };
+        let global_shard = quil_types::store::ShardKey {
+            l1: [0u8; 3],
+            l2: [0xffu8; 32],
+        };
+        let zero = vec![0u8; if hg.has_forest() { 32 } else { 64 }];
+        [
+            ("vertex", "removes"),
+            ("hyperedge", "adds"),
+            ("hyperedge", "removes"),
+        ]
+        .iter()
+        .map(|(s, p)| {
+            let r = hg.compute_shard_root(s, p, &global_shard);
+            if r.len() == 32 || r.len() >= 64 {
+                r
+            } else {
+                zero.clone()
+            }
+        })
+        .collect()
+    }
+
     /// Compute the parent selector from a VDF output: Poseidon hash of
     /// the output bytes, yielding a 32-byte selector. Falls back to
     /// SHA-256 if the Poseidon hash fails (should not happen with
@@ -540,11 +573,15 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                  CRDT root unavailable (rewards/kick/sync anchoring degraded for this frame)",
             );
         }
+        // Prover shard phases 1/2/3 roots (audit #5) — bound into the VDF
+        // challenge + carried on the header so catch-up authenticates all phases.
+        let prover_aux_roots: Vec<Vec<u8>> = self.compute_prover_aux_roots();
         let prove_start = std::time::Instant::now();
         let header = self.frame_prover.prove_global_frame_header(
             prior_header,
             &commitments,
             &prover_root,
+            &prover_aux_roots,
             &requests_root,
             self.signer.as_ref(),
             timestamp,
@@ -594,7 +631,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         .with_messages(proto_messages)
         // Carry the 256 global commitments bound into the VDF challenge so the
         // rebuilt header (`global_frame_from_state`) reproduces them verbatim.
-        .with_global_commitments(commitments);
+        .with_global_commitments(commitments)
+        // Same for the prover shard's phase 1/2/3 roots (audit #5).
+        .with_prover_aux_roots(prover_aux_roots);
 
         // ------------------------------------------------------------------
         // 10. Build and return State<GlobalState>
@@ -653,7 +692,7 @@ mod tests {
             Ok(Vec::new())
         }
         fn prove_global_frame_header(
-            &self, _: &GlobalFrameHeader, _: &[Vec<u8>], _: &[u8], _: &[u8],
+            &self, _: &GlobalFrameHeader, _: &[Vec<u8>], _: &[u8], _: &[Vec<u8>], _: &[u8],
             _: &dyn Signer, _: i64, _: u32, _: u8,
         ) -> Result<GlobalFrameHeader> {
             Err(QuilError::Internal("stub".into()))

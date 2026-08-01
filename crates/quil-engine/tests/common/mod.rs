@@ -148,6 +148,7 @@ impl FrameProver for StubFrameProver {
         previous_frame: &gpb::GlobalFrameHeader,
         _commitments: &[Vec<u8>],
         prover_root: &[u8],
+        _prover_aux_roots: &[Vec<u8>],
         request_root: &[u8],
         signer: &dyn Signer,
         timestamp: i64,
@@ -824,9 +825,16 @@ impl AppShardHarness {
         // Spawn each worker's engine + its event drain.
         for (idx, pending) in pendings.into_iter().enumerate() {
             let engine = pending.engine;
-            let bls = pending.bls_signer;
+            // `run` takes a signer FACTORY now (CW-activation retry); rebuild from key.
+            let sk = pending.bls_signer.private_key().to_vec();
+            let pk = pending.bls_signer.public_key().to_vec();
+            let factory: std::sync::Arc<
+                dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync,
+            > = std::sync::Arc::new(move || {
+                Box::new(quil_crypto::FalconSigner::from_bytes(&sk, &pk))
+            });
             tokio::spawn(async move {
-                engine.run(bls).await;
+                engine.run(factory).await;
             });
 
             let peer_handles: Vec<quil_engine::app_engine::AppEngineHandle> = all_handles

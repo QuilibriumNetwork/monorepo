@@ -27,6 +27,11 @@ proptest = "1"
 # Open a real DB for the forest in commit_to_forest tests.
 rocksdb = { version = "0.22", default-features = false, features = ["snappy", "lz4"] }
 tempfile = "3"
+# In-process forest TreeReader shim for the CRDT-level prover-tree sync
+# round-trip test (mirrors quil-rpc's RemoteTreeReader without gRPC).
+jmt = "0.11"
+borsh = { version = "1", features = ["derive"] }
+anyhow = "1"
 
 # Integration tests live in `tests/` and import the gated `testing`
 # module via `quil_hypergraph::testing`. Enable the feature on the
@@ -35,4 +40,8 @@ tempfile = "3"
 # for the integration-test compilation unit.)
 [[test]]
 name = "crdt_props"
+required-features = ["test-utils"]
+
+[[test]]
+name = "prover_tree_sync"
 required-features = ["test-utils"]

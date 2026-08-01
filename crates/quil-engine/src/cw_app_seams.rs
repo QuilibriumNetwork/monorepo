@@ -129,6 +129,24 @@ fn decode_app_frame(bytes: &[u8]) -> Option<AppShardFrame> {
 
 /// Builds/validates app-shard frames via the engine's own `AppLeaderProvider`
 /// (passed as `Arc<dyn LeaderProvider<AppShardState>>`) + `BlsAppFrameValidator`.
+/// Engine-supplied proposal predicate run in `verify` BEFORE signing; returns
+/// `true` iff the proposal is safe to sign. It performs the two body/state
+/// integrity checks the lightweight seam validator can't (no exec manager /
+/// inclusion prover / hypergraph):
+/// - **body-root (audit #2)** — recompute `requests_root` from the carried
+///   `frame.requests` and reject a mismatch, so every replica executes the one
+///   body that matches the declared+certified root (no divergence);
+/// - **pre-state `state_roots` (audit #3)** — when this node is EXACTLY at
+///   frame N-1, recompute the 4 deterministic phase roots (`compute_shard_root`)
+///   and reject if they don't equal `header.state_roots`, so an honest member
+///   never signs a leader's false pre-state root claim; a behind/lagged member
+///   abstains (signs) so it can't spuriously nullify.
+///
+/// The engine builds it capturing its deps; `None` skips both checks (tests /
+/// no-exec paths).
+pub type AppRequestsRootCheck =
+    Arc<dyn Fn(&quil_types::proto::global::AppShardFrame) -> bool + Send + Sync>;
+
 pub struct AppSeamProposer {
     leader_provider: Arc<dyn LeaderProvider<AppShardState>>,
     validator: Arc<BlsAppFrameValidator>,
@@ -137,6 +155,8 @@ pub struct AppSeamProposer {
     /// digest → frame_number (resolves the parent frame number from the simplex
     /// parent digest, which carries only the identity).
     block_meta: Arc<Mutex<HashMap<Digest, u64>>>,
+    /// Body-root cross-check (audit Finding #2); see [`AppRequestsRootCheck`].
+    requests_root_check: Option<AppRequestsRootCheck>,
 }
 
 impl AppSeamProposer {
@@ -145,6 +165,7 @@ impl AppSeamProposer {
         validator: Arc<BlsAppFrameValidator>,
         assemble: AppFrameAssembler,
         filter: Vec<u8>,
+        requests_root_check: Option<AppRequestsRootCheck>,
     ) -> Self {
         Self {
             leader_provider,
@@ -152,6 +173,7 @@ impl AppSeamProposer {
             assemble,
             filter,
             block_meta: Arc::new(Mutex::new(HashMap::new())),
+            requests_root_check,
         }
     }
 
@@ -209,6 +231,22 @@ impl GlobalProposer for AppSeamProposer {
         // Proposal-mode validation: VDF + structure, no committee QC required yet.
         match self.validator.validate_proposal(&frame) {
             Ok(true) => {
+                // Body-root cross-check (audit Finding #2). `validate_proposal`
+                // recomputes the output from the DECLARED `requests_root` but
+                // never checks the carried `frame.requests` against it, so a
+                // proposal can pair a legitimate header/root with a mismatched
+                // body. Reject before signing so no honest member certifies a
+                // body its declared (and soon certified) root does not cover.
+                if let Some(check) = self.requests_root_check.as_ref() {
+                    if !check(&frame) {
+                        tracing::warn!(
+                            frame = header.frame_number,
+                            "cw app verify: requests_root mismatch (carried body \
+                             does not match declared root) — nullify",
+                        );
+                        return false;
+                    }
+                }
                 self.block_meta
                     .lock()
                     .unwrap()
@@ -341,6 +379,10 @@ pub struct AppConsensusCwHandle {
     /// (so `verify` finds the block behind a proposed digest) and record its
     /// digest→frame_number. Idempotent; drops malformed bytes.
     pub ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    /// Cooperative shutdown flag for the simplex host thread. Set it to stop this
+    /// instance (the engine drops + the runtime thread returns) — used to REBUILD
+    /// the committee when the shard's active-prover set changes.
+    pub shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Assemble + start the simplex-backed app-shard consensus for one shard.
@@ -368,12 +410,16 @@ pub fn activate_app_consensus_cw(
     // Persistent per-shard simplex-journal dir. `Some(dir)` resumes across
     // restarts; `None` uses the runtime default (ephemeral random temp).
     storage_directory: Option<std::path::PathBuf>,
+    // Body-root cross-check for the verify path (audit Finding #2); see
+    // [`AppRequestsRootCheck`]. `None` skips it (tests / no-exec).
+    requests_root_check: Option<AppRequestsRootCheck>,
 ) -> AppConsensusCwHandle {
     let proposer = Arc::new(AppSeamProposer::new(
         leader_provider,
         validator,
         assemble,
         filter,
+        requests_root_check,
     ));
     // Seed the genesis parent so the first proposal resolves its frame number.
     proposer.note_frame(genesis_digest, genesis_frame_number);
@@ -381,6 +427,10 @@ pub fn activate_app_consensus_cw(
     let finalizer = Arc::new(AppSeamFinalizer::new(on_notarized, on_finalized));
 
     let store = BlockStore::new();
+
+    // Cooperative shutdown so the caller can stop this instance to rebuild the
+    // committee (dynamic app-shard membership).
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let GlobalHostHandle { inbound, mut outbound } = spawn_global_host(
         scheme,
@@ -392,6 +442,7 @@ pub fn activate_app_consensus_cw(
         GlobalEngineParams::new(partition, epoch, genesis_digest)
             .with_leader_timeout_secs(leader_timeout_secs),
         storage_directory,
+        Some(shutdown.clone()),
     );
 
     // Drain the engine's outbound (votes/certs/resolver) onto the shard transport.
@@ -420,7 +471,7 @@ pub fn activate_app_consensus_cw(
         })
     };
 
-    AppConsensusCwHandle { inbound, ingest_block }
+    AppConsensusCwHandle { inbound, ingest_block, shutdown }
 }
 
 #[cfg(test)]

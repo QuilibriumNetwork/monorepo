@@ -478,6 +478,9 @@ fn local_global_header_to_proto(
         parent_selector: h.parent_selector.clone(),
         global_commitments: h.global_commitments.clone(),
         prover_tree_commitment: h.prover_tree_commitment.clone(),
+        // Signature-only verify path (poseidon(output)) — aux roots aren't
+        // needed here; the local execution header doesn't carry them.
+        prover_tree_aux_roots: Vec::new(),
         requests_root: h.requests_root.clone(),
         prover: h.prover.clone(),
         public_key_signature_bls48581: decode_aggregate_signature_to_proto(

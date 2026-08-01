@@ -44,6 +44,9 @@ pub struct GlobalFrameHeader {
     pub parent_selector: Vec<u8>,
     pub global_commitments: Vec<Vec<u8>>,
     pub prover_tree_commitment: Vec<u8>,
+    /// Prover shard phase 1/2/3 roots (audit #5). Same canonical position as the
+    /// proto/consensus-wire codec: after `requests_root`, before `prover`.
+    pub prover_tree_aux_roots: Vec<Vec<u8>>,
     pub requests_root: Vec<u8>,
     pub prover: Vec<u8>,
     pub public_key_signature_bls48581: Vec<u8>,
@@ -62,6 +65,7 @@ impl GlobalFrameHeader {
         write_array(&mut out, &self.global_commitments);
         put_lp(&mut out, &self.prover_tree_commitment);
         put_lp(&mut out, &self.requests_root);
+        write_array(&mut out, &self.prover_tree_aux_roots);
         put_lp(&mut out, &self.prover);
         put_lp(&mut out, &self.public_key_signature_bls48581);
         Ok(out)
@@ -85,6 +89,7 @@ impl GlobalFrameHeader {
             global_commitments: read_array(data, &mut c)?,
             prover_tree_commitment: read_lp(data, &mut c)?,
             requests_root: read_lp(data, &mut c)?,
+            prover_tree_aux_roots: read_array(data, &mut c)?,
             prover: read_lp(data, &mut c)?,
             public_key_signature_bls48581: read_opt_sig(data, &mut c)?,
         })
@@ -204,6 +209,7 @@ mod tests {
             output: vec![0xAAu8; 516], parent_selector: vec![0xBBu8; 32],
             global_commitments: vec![vec![0xCCu8; 64], vec![0xDDu8; 64]],
             prover_tree_commitment: vec![0xEEu8; 64],
+            prover_tree_aux_roots: vec![vec![0x33u8; 64], vec![0x44u8; 64], vec![0x55u8; 64]],
             requests_root: vec![0xFFu8; 64],
             prover: vec![0x11u8; 585],
             public_key_signature_bls48581: vec![0x22u8; 74],

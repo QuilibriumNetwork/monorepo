@@ -261,6 +261,23 @@ fn app_proposal_duration() -> Duration {
 
 /// App shard leader provider. Collects messages and produces VDF-backed
 /// shard frames when this node is the elected leader.
+/// No-op transaction for direct clock-store writes (the RocksClockStore takes a
+/// direct-write fallback when the txn isn't its own `RocksClockTxn`). Used to
+/// persist received global frames into a cluster worker's clock store.
+struct AppNoopTxn;
+impl quil_types::store::Transaction for AppNoopTxn {
+    fn get(&self, _: &[u8]) -> Result<Option<Vec<u8>>> { Ok(None) }
+    fn set(&self, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
+    fn delete(&self, _: &[u8]) -> Result<()> { Ok(()) }
+    fn delete_range(&self, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
+    fn commit(self: Box<Self>) -> Result<()> { Ok(()) }
+    fn abort(self: Box<Self>) -> Result<()> { Ok(()) }
+    fn new_iter(&self, _: &[u8], _: &[u8]) -> Result<Box<dyn quil_types::store::Iterator>> {
+        Err(QuilError::Internal("iterator not supported on AppNoopTxn".into()))
+    }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
 struct AppLeaderProvider {
     filter: Vec<u8>,
     clock_store: Arc<dyn ClockStore>,
@@ -331,19 +348,76 @@ struct AppLeaderProvider {
     frame_attestations: Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>>>,
 }
 
+/// Anchor to `latest − K`, not the bleeding-edge head: app-shard committees are
+/// multi-member and each member's synced global head differs by a few frames, so
+/// anchoring to a private latest would fork cross-member verification. `K` is a
+/// small safety margin (≤ the lockstep window `W`) that keeps the anchor on a
+/// frame all members already hold.
+const GLOBAL_ANCHOR_SAFETY_MARGIN: u64 = 4;
+
+/// Resolve the GLOBAL anchor `(frame_number, output)` an app shard binds to:
+/// `latest_global − K`, present in every member's store. `(0, empty)` when the
+/// global chain is shorter than the margin (genesis/tests → legacy VDF). The
+/// frame the producer stamps as `header.global_frame_number` is this number, so
+/// proposer and verifier resolve the SAME committee epoch from it.
+///
+/// Free function so BOTH the `AppLeaderProvider` (propose/leader) and the
+/// `AppConsensusEngine` (CW committee activation) compute the identical anchor.
+pub(crate) fn resolve_global_anchor(store: &dyn ClockStore) -> (u64, Vec<u8>) {
+    let gf_to_anchor = |f: quil_types::proto::global::GlobalFrame| -> (u64, Vec<u8>) {
+        let n = f.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+        let o = f.header.as_ref().map(|h| h.output.clone()).unwrap_or_default();
+        (n, o)
+    };
+    let latest_gfn = store
+        .get_latest_global_clock_frame()
+        .ok()
+        .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
+        .unwrap_or(0);
+    if latest_gfn > GLOBAL_ANCHOR_SAFETY_MARGIN {
+        let target = latest_gfn - GLOBAL_ANCHOR_SAFETY_MARGIN;
+        match store.get_global_clock_frame(target) {
+            Ok(f) => gf_to_anchor(f),
+            Err(_) => match store.get_latest_global_clock_frame() {
+                Ok(f) => gf_to_anchor(f),
+                Err(_) => (0u64, Vec::new()),
+            },
+        }
+    } else if latest_gfn > 0 {
+        match store.get_latest_global_clock_frame() {
+            Ok(f) => gf_to_anchor(f),
+            Err(_) => (0u64, Vec::new()),
+        }
+    } else {
+        (0u64, Vec::new())
+    }
+}
+
+impl AppLeaderProvider {
+    fn resolve_global_anchor(&self) -> (u64, Vec<u8>) {
+        resolve_global_anchor(self.global_anchor_store.as_ref())
+    }
+
+    /// The GLOBAL frame whose EPOCH defines this shard's committee. Prover
+    /// lifecycle (join/leave activation, epoch re-confirm) is GLOBAL-frame-defined
+    /// (`JoinConfirmFrameNumber`/`Epoch` are written by the global intrinsic), so
+    /// the committee MUST be read at a global frame — the app-shard-local counter
+    /// is UNRELATED to global (it free-runs), so evaluating `effective_status`
+    /// against it compared app-shard-epochs to global-epoch thresholds. Use the
+    /// same `latest − K` anchor the frame stamps, so proposer and verifier agree.
+    fn committee_anchor_gfn(&self) -> u64 {
+        self.resolve_global_anchor().0
+    }
+}
+
 impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeaderProvider {
     fn get_next_leaders(&self, _prior: Option<&State<AppShardState>>) -> Result<Vec<Identity>> {
-        // Committee for the frame being decided (shard clock tip + 1). App
-        // shards resolve their frame from the clock, not the consensus-passed
-        // number (see `prove_next_state`), so every node evaluates the same
-        // epoch-aligned committee here.
-        let committee_frame = self
-            .clock_store
-            .get_latest_shard_clock_frame(&self.filter)
-            .ok()
-            .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
-            .unwrap_or(0)
-            .saturating_add(1);
+        // Committee epoch is GLOBAL-frame-defined (lifecycle activation/expiry are
+        // global-chain events), so read the committee at the GLOBAL anchor, NOT
+        // the app-shard-local clock tip (which is unrelated to global). Every
+        // member resolves the same `latest − K` anchor → same epoch → same
+        // leader set. See `committee_anchor_gfn`.
+        let committee_frame = self.committee_anchor_gfn();
         let provers = self.prover_registry.get_active_provers(&self.filter, committee_frame)?;
         if provers.is_empty() {
             return Err(QuilError::Consensus("no active provers for shard".into()));
@@ -413,13 +487,16 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // halt gate above — bubbling a `Consensus` error here
         // kills the event loop. Caught by
         // `propose_for_new_rank_if_primary`'s `is_no_vote` arm.
-        let committee_frame = self
-            .clock_store
-            .get_latest_shard_clock_frame(&self.filter)
-            .ok()
-            .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
-            .unwrap_or(0)
-            .saturating_add(1);
+        // Resolve the GLOBAL anchor ONCE, up front: it defines BOTH the committee
+        // epoch (below) AND the frame's `global_frame_number`/ρ_N (further down),
+        // and they MUST be the same value so the verifier — which reads
+        // `header.global_frame_number` — reconstructs the identical committee.
+        // (Reading `latest_global` twice could straddle a newly-arrived global
+        // frame and desync the committee from the header.)
+        let (anchor_gfn, anchor_output) = self.resolve_global_anchor();
+        // Committee epoch is GLOBAL-frame-defined; read it at the anchor, NOT the
+        // app-shard-local clock tip (unrelated to global). See `committee_anchor_gfn`.
+        let committee_frame = anchor_gfn;
         let active_count = self
             .prover_registry
             .get_active_provers(&self.filter, committee_frame)
@@ -523,6 +600,24 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // snapshot generation so sync clients can pin against the same
         // state our header advertises (`hypergraph/snapshot_manager.go`).
         let zero_roots = || vec![vec![0u8; 64]; 4];
+        // DETERMINISTIC PRE-STATE ROOTS (audit #3+#6, consensus-rule change).
+        // Previously `state_roots` came from `hg.commit(N)`, which DRAINS the
+        // pending deltas (`std::mem::take`) — but at propose time there are none
+        // (frame N's requests execute at materialize, not here), so a clean
+        // shard got `zero_roots`: a non-deterministic, near-always-zero header
+        // root that could not serve as the catch-up trust anchor and could not
+        // be execution-validated. Instead read the 4 phase roots of the CURRENT
+        // COMMITTED state (== N-1, since N is not yet materialized) via the
+        // version-exact accessor `compute_shard_root` — the SAME value
+        // `commit_inner` would put in the header, but read-only and
+        // deterministic. Every node (leader + validators) computes these
+        // identically, and `deterministic_app_frame_output` binds them, so the
+        // per-shard digest is well-defined and the verifier can compare against
+        // its own local pre-state (see the proposal check in `activate_...`).
+        // Order is canonical [vertex.adds, vertex.removes, hyperedge.adds,
+        // hyperedge.removes]; `state_roots[0]` (vertex-adds) stays the sync
+        // anchor. Empty (never-committed) phases normalize to the zero root so
+        // the 4-root shape holds.
         let state_roots: Vec<Vec<u8>> = match self.hypergraph.as_ref() {
             Some(hg) => {
                 let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(
@@ -534,42 +629,33 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 let copy_len = self.filter.len().min(32);
                 l2[..copy_len].copy_from_slice(&self.filter[..copy_len]);
                 let shard_key = quil_types::store::ShardKey { l1, l2 };
-                match hg.commit(frame_number) {
-                    Ok(by_shard) => {
-                        let four = by_shard.get(&shard_key).cloned().unwrap_or_else(zero_roots);
-                        // Pad up to 4 in case CommitShard returned fewer.
-                        let mut out = four;
-                        while out.len() < 4 {
-                            out.push(vec![0u8; 64]);
-                        }
-                        // Publish the shard's vertex-adds root as a
-                        // snapshot generation (binding a real point-in-time
-                        // DB snapshot) so sync clients pinning this header
-                        // get root-consistent CRDT data and acquire succeeds.
-                        if !out[0].is_empty() && out[0].iter().any(|b| *b != 0) {
-                            if let Err(e) =
-                                hg.publish_snapshot_capturing(out[0].clone(), frame_number)
-                            {
-                                warn!(
-                                    filter = hex::encode(&self.filter),
-                                    frame = frame_number,
-                                    error = %e,
-                                    "failed to capture snapshot for published shard root"
-                                );
-                            }
-                        }
-                        out
-                    }
-                    Err(e) => {
+                let zero = vec![0u8; if hg.has_forest() { 32 } else { 64 }];
+                let out: Vec<Vec<u8>> = [
+                    ("vertex", "adds"),
+                    ("vertex", "removes"),
+                    ("hyperedge", "adds"),
+                    ("hyperedge", "removes"),
+                ]
+                .iter()
+                .map(|(s, p)| {
+                    let r = hg.compute_shard_root(s, p, &shard_key);
+                    if r.is_empty() { zero.clone() } else { r }
+                })
+                .collect();
+                // Publish the shard's vertex-adds root as a snapshot generation
+                // (binding a real point-in-time DB snapshot) so sync clients
+                // pinning this header get root-consistent CRDT data.
+                if out[0].iter().any(|b| *b != 0) {
+                    if let Err(e) = hg.publish_snapshot_capturing(out[0].clone(), frame_number) {
                         warn!(
                             filter = hex::encode(&self.filter),
                             frame = frame_number,
                             error = %e,
-                            "hypergraph commit failed — emitting zero state_roots"
+                            "failed to capture snapshot for published shard root"
                         );
-                        zero_roots()
                     }
                 }
+                out
             }
             None => zero_roots(),
         };
@@ -608,57 +694,12 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // produced header carries an empty root.
         let storage_attestation_root: Vec<u8> = Vec::new();
         // At/after the storage fork the app-shard VDF is omitted: anchor to the
-        // latest global frame and replace `header.output` with the deterministic
-        // ρ_N-bound output (freshness from ρ_N, lockstep with the global VDF).
-        // Activation is keyed on the GLOBAL frame number (the fork is a
-        // global-chain event), NOT the app-shard frame counter — pre-activation
-        // the two are unrelated.
-        //
-        // Anchor to `latest − K`, NOT the bleeding-edge head. App-shard
-        // committees are MULTI-MEMBER, and each member's synced global head
-        // differs by a few frames; the CW storage validator requires the anchored
-        // global frame to be present in EVERY member's own clock store
-        // (`get_global_clock_frame(anchor)`), so anchoring to a member's private
-        // latest makes cross-member verification fail ("anchored global frame
-        // unavailable for ρ_N") → the shard never finalizes. `K` is a small safety
-        // margin (≤ the lockstep window `W`) that keeps the anchor on a frame all
-        // members already hold, trading a little ρ_N freshness for liveness.
-        // Chain younger than K → (0, empty) → legacy VDF (as at genesis/tests).
-        const GLOBAL_ANCHOR_SAFETY_MARGIN: u64 = 4;
-        let gf_to_anchor = |f: quil_types::proto::global::GlobalFrame| -> (u64, Vec<u8>) {
-            let n = f.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
-            let o = f.header.as_ref().map(|h| h.output.clone()).unwrap_or_default();
-            (n, o)
-        };
-        let latest_gfn = self
-            .global_anchor_store
-            .get_latest_global_clock_frame()
-            .ok()
-            .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
-            .unwrap_or(0);
-        let (anchor_gfn, anchor_output) = if latest_gfn > GLOBAL_ANCHOR_SAFETY_MARGIN {
-            let target = latest_gfn - GLOBAL_ANCHOR_SAFETY_MARGIN;
-            // Prefer the K-back frame (present in every member's store); if that
-            // exact frame is absent (a gap, or a short/seeded chain with only the
-            // tip), fall back to the latest available frame so a single-member /
-            // test harness still runs the storage path.
-            match self.global_anchor_store.get_global_clock_frame(target) {
-                Ok(f) => gf_to_anchor(f),
-                Err(_) => match self.global_anchor_store.get_latest_global_clock_frame() {
-                    Ok(f) => gf_to_anchor(f),
-                    Err(_) => (0u64, Vec::new()),
-                },
-            }
-        } else if latest_gfn > 0 {
-            // Chain shorter than the margin: anchor to the latest available (all
-            // members have it) rather than degrading to the legacy VDF path.
-            match self.global_anchor_store.get_latest_global_clock_frame() {
-                Ok(f) => gf_to_anchor(f),
-                Err(_) => (0u64, Vec::new()),
-            }
-        } else {
-            (0u64, Vec::new())
-        };
+        // global frame and replace `header.output` with the deterministic ρ_N-bound
+        // output (freshness from ρ_N, lockstep with the global VDF). `anchor_gfn` /
+        // `anchor_output` were resolved ONCE up top (`resolve_global_anchor`, =
+        // `latest − K`) — the SAME value that gated the committee epoch above — so
+        // this frame's committee, its stamped `global_frame_number`, and the
+        // verifier's committee (read from that stamped number) are all consistent.
         // Storage attestation is always-on (no fork-height gate): a frame is a
         // storage frame iff it has a real global frame to anchor ρ_N to. The
         // only non-anchored case is genesis / tests with no global chain
@@ -1092,6 +1133,13 @@ pub struct AppConsensusEngine {
     /// materialized twice (mirrors Go `lastMaterializedFrame`,
     /// app_consensus_engine.go:1444-1449).
     last_materialized_frame: u64,
+    /// Thread-safe mirror of `last_materialized_frame` for the CW proposal
+    /// check, which runs on the simplex thread (audit #3). Bumped alongside the
+    /// field via [`Self::set_materialized_frame`] wherever the materialized
+    /// shard state advances. Because it is only ever raised AFTER the state is
+    /// committed, it never OVER-reports, so the `state_roots` pre-state gate
+    /// abstains (signs) rather than false-nullifies when it lags.
+    shard_mat_frame: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Shared with the leader provider: requests this node collected for
     /// frames it proposed (proto `MessageBundle`s), keyed by frame
     /// number. Read at finalization to self-materialize + assemble the
@@ -1149,6 +1197,14 @@ pub struct AppConsensusEngine {
     /// (P3) Handle to the running simplex engine (kept alive; the outbound drain
     /// + block ingress live in it). Populated by `start_consensus_cw`.
     cw_handle: Option<crate::cw_app_seams::AppConsensusCwHandle>,
+    /// Fingerprint (sorted-member hash) of the committee the running `cw_handle`
+    /// was built with. The run loop recomputes the active-prover set each tick
+    /// and, when it changes, tears down the old simplex instance and rebuilds —
+    /// commonware-simplex has a FIXED validator set per instance, so a membership
+    /// change (a prover activating/leaving) requires a fresh instance. This is
+    /// what lets a shard grow from a 1-member floor committee (formed before the
+    /// second prover's deferred activation) to the real N-member committee.
+    cw_committee_fp: Option<[u8; 32]>,
     /// (P3) Self-clone of the inbound message sender, so `on_finalized` (running
     /// on the simplex thread) can inject `CwFinalizedFrame` into this run loop.
     self_msg_tx: mpsc::Sender<AppEngineMessage>,
@@ -1225,6 +1281,7 @@ impl AppConsensusEngine {
             pending_certified_parents: HashMap::new(),
             pending_seal_rank: None,
             last_materialized_frame: 0,
+            shard_mat_frame: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             frame_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             frame_attestations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             finalized_requests_roots: HashMap::new(),
@@ -1241,6 +1298,7 @@ impl AppConsensusEngine {
             kv_db: deps.kv_db,
             app_consensus_cw: deps.app_consensus_cw,
             cw_handle: None,
+            cw_committee_fp: None,
             self_msg_tx: msg_tx,
             sizes,
         };
@@ -1373,6 +1431,15 @@ impl AppConsensusEngine {
     /// background shard-tree sync, persist the cursor, and drop now-stale
     /// buffered frames + finalized-root entries. Idempotent: a sync that
     /// reports a height we're already past is a no-op.
+    /// Advance the materialized-frame cursor (field + thread-safe mirror for the
+    /// CW proposal check). Use this instead of assigning `last_materialized_frame`
+    /// directly so `shard_mat_frame` stays consistent (audit #3).
+    fn set_materialized_frame(&mut self, n: u64) {
+        self.last_materialized_frame = n;
+        self.shard_mat_frame
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
     async fn reconcile_with_sync(&mut self, synced_to_frame: u64) {
         if synced_to_frame <= self.last_materialized_frame {
             return;
@@ -1383,7 +1450,7 @@ impl AppConsensusEngine {
             to = synced_to_frame,
             "fast-forwarding materialized cursor from shard sync"
         );
-        self.last_materialized_frame = synced_to_frame;
+        self.set_materialized_frame(synced_to_frame);
         self.persist_materialized_cursor(synced_to_frame);
         // Anything at/below the synced height is now covered by the
         // synced tree; drop stale buffers so they can't be re-applied.
@@ -1406,7 +1473,13 @@ impl AppConsensusEngine {
     /// 5. Process consensus events (finalization/equivocation/rank changes)
     pub async fn run(
         mut self,
-        bls_signer: Box<dyn quil_types::crypto::Signer>,
+        // A FACTORY (not a single signer) so the passive-mode retry below can
+        // obtain a fresh signer: the committee may not be buildable on the first
+        // attempt (a cluster worker's registry is still syncing), and
+        // `start_consensus_cw` consumes the signer, so a retry needs another.
+        bls_signer_factory: std::sync::Arc<
+            dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync,
+        >,
     ) {
         let mut msg_rx = self.msg_rx.take().expect("msg_rx already taken");
 
@@ -1424,7 +1497,8 @@ impl AppConsensusEngine {
         // before its requests are materialized — a crash in that window
         // leaves cursor < clock height, healed by gossip replay of the
         // missing full frame or a shard sync).
-        self.last_materialized_frame = self.load_materialized_cursor();
+        let restored_cursor = self.load_materialized_cursor();
+        self.set_materialized_frame(restored_cursor);
         if self.last_materialized_frame > 0 {
             info!(
                 core_id = self.core_id,
@@ -1467,7 +1541,7 @@ impl AppConsensusEngine {
         }
 
         // Start the shard consensus driver: commonware-simplex (P3) + Falcon.
-        match self.start_consensus_cw(bls_signer) {
+        match self.start_consensus_cw((bls_signer_factory)()) {
             Ok(handle) => {
                 self.cw_handle = Some(handle);
                 info!(
@@ -1480,7 +1554,7 @@ impl AppConsensusEngine {
                 warn!(
                     core_id = self.core_id,
                     error = %e,
-                    "failed to start shard simplex consensus — running in passive mode"
+                    "failed to start shard simplex consensus — will retry (passive until committee is present)"
                 );
             }
         }
@@ -1488,6 +1562,11 @@ impl AppConsensusEngine {
         // Frame cleanup timer — remove stale cached frames every 60s
         let mut cleanup_timer = tokio::time::interval(Duration::from_secs(60));
         cleanup_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Passive-mode retry timer: if the committee wasn't buildable on the first
+        // attempt (cluster worker's registry still syncing / provers not yet
+        // Active), retry until it starts. Cheap no-op once running.
+        let mut cw_retry_timer = tokio::time::interval(Duration::from_secs(10));
+        cw_retry_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -1567,6 +1646,67 @@ impl AppConsensusEngine {
                     self.cleanup_frame_store();
                 }
 
+                // Passive-mode CW retry: keep trying to start simplex until the
+                // committee is buildable (the shard's active provers are present
+                // in this node's registry). No-op once running.
+                _ = cw_retry_timer.tick() => {
+                    if self.cw_handle.is_none() {
+                        // Passive-mode retry: keep trying until the committee is
+                        // buildable (active provers present in this registry).
+                        match self.start_consensus_cw((bls_signer_factory)()) {
+                            Ok(handle) => {
+                                self.cw_handle = Some(handle);
+                                info!(
+                                    core_id = self.core_id,
+                                    filter = hex::encode(&self.filter),
+                                    "shard commonware-simplex consensus started on retry (EQUAL VOTES)"
+                                );
+                            }
+                            Err(e) => {
+                                debug!(
+                                    core_id = self.core_id,
+                                    error = %e,
+                                    "cw retry: committee not yet buildable"
+                                );
+                            }
+                        }
+                    } else {
+                        // DYNAMIC COMMITTEE: if the shard's active-prover set
+                        // changed since this instance was built (e.g. a prover's
+                        // deferred activation reached its epoch, growing a 1-member
+                        // floor committee to the real N-member set), tear down the
+                        // old simplex instance (fixed validator set) and rebuild
+                        // with the new committee.
+                        let members = self.compute_committee_members();
+                        let fp = Self::committee_fp(&members);
+                        if !members.is_empty() && Some(fp) != self.cw_committee_fp {
+                            info!(
+                                core_id = self.core_id,
+                                filter = hex::encode(&self.filter),
+                                members = members.len(),
+                                "app-shard committee changed — rebuilding CW consensus"
+                            );
+                            if let Some(old) = self.cw_handle.take() {
+                                old.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            match self.start_consensus_cw((bls_signer_factory)()) {
+                                Ok(handle) => {
+                                    self.cw_handle = Some(handle);
+                                    info!(
+                                        core_id = self.core_id,
+                                        filter = hex::encode(&self.filter),
+                                        members = members.len(),
+                                        "app-shard CW consensus rebuilt with new committee"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(core_id = self.core_id, error = %e, "committee rebuild failed — will retry");
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Shutdown
                 _ = self.cancel.cancelled() => {
                     info!(
@@ -1609,6 +1749,39 @@ impl AppConsensusEngine {
     /// N=1 first cut: uses a no-op transport (a single-prover shard self-proposes
     /// and self-finalizes; there are no peers to deliver to). Multi-node gossip
     /// transport is the next wiring step.
+    /// The current committee's member Falcon pubkeys, read at the GLOBAL anchor
+    /// epoch (`committee_anchor_gfn`), matching the leader provider + produced/
+    /// verified frames. Empty when unresolved (drives the passive-mode retry).
+    fn compute_committee_members(&self) -> Vec<Vec<u8>> {
+        let (committee_anchor, _) = resolve_global_anchor(self.global_anchor_store.as_ref());
+        let committee_frame = if committee_anchor > 0 {
+            committee_anchor
+        } else {
+            self.clock_store
+                .get_latest_shard_clock_frame(&self.filter)
+                .ok()
+                .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
+                .unwrap_or(0)
+                .saturating_add(1)
+        };
+        self.prover_registry
+            .get_active_provers(&self.filter, committee_frame)
+            .map(|a| a.iter().map(|p| p.public_key.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Order-independent fingerprint of a committee member set.
+    fn committee_fp(members: &[Vec<u8>]) -> [u8; 32] {
+        use sha2::Digest as _;
+        let mut sorted: Vec<&[u8]> = members.iter().map(|m| m.as_slice()).collect();
+        sorted.sort_unstable();
+        let mut h = sha2::Sha256::new();
+        for m in sorted {
+            h.update(m);
+        }
+        h.finalize().into()
+    }
+
     fn start_consensus_cw(
         &mut self,
         bls_signer: Box<dyn quil_types::crypto::Signer>,
@@ -1629,13 +1802,16 @@ impl AppConsensusEngine {
         let genesis_digest = quil_cw_consensus::adapters::digest_from_identity(genesis_id);
 
         // Committee = active provers' Falcon public keys (count-based, no
-        // seniority), evaluated at the first frame this instance will produce
-        // (genesis anchor + 1) — the epoch-aligned membership.
-        let actives = self
-            .prover_registry
-            .get_active_provers(&filter, genesis_frame_number.saturating_add(1))?;
-        let member_pubkeys: Vec<Vec<u8>> =
-            actives.iter().map(|p| p.public_key.clone()).collect();
+        // seniority), evaluated at the GLOBAL anchor epoch — the SAME frame the
+        // leader provider (`committee_anchor_gfn`) and produced/verified frames
+        // use. Reading it at the app-shard `genesis_frame_number` (unrelated to
+        // global) would seed the simplex `peers` set from the wrong epoch, out of
+        // step with the leader schedule. Falls back to the shard anchor pre-fork
+        // (global chain absent → both are epoch 0).
+        let member_pubkeys = self.compute_committee_members();
+        // Record the committee fingerprint so the run loop can detect a
+        // membership change and rebuild (dynamic committee).
+        self.cw_committee_fp = Some(Self::committee_fp(&member_pubkeys));
         let my_sk = bls_signer.private_key().to_vec();
         let my_pk = bls_signer.public_key().to_vec();
         let (scheme, peers) =
@@ -1750,6 +1926,112 @@ impl AppConsensusEngine {
         if let Some(dir) = cw_app_storage_dir.as_ref() {
             reset_stale_app_journal(dir, &peers);
         }
+        // Body-root cross-check for the CW verify path (audit Finding #2). The
+        // lightweight seam validator can't recompute the body root (no exec /
+        // inclusion prover), so build a closure over THIS engine's deps that
+        // recomputes `requests_root` from the carried `frame.requests` and
+        // compares it to the declared root — exactly as the follower/archive
+        // ingest paths do. An honest member then never signs a proposal whose
+        // body doesn't match its (about-to-be-certified) root, so conflicting
+        // bodies under one digest can't diverge replica state. `None` when the
+        // engine has no exec/inclusion/hypergraph (tests) → check skipped.
+        let requests_root_check: Option<crate::cw_app_seams::AppRequestsRootCheck> =
+            match (
+                self.execution_engine.clone(),
+                self.inclusion_prover.clone(),
+                self.hypergraph.clone(),
+            ) {
+                (Some(exec), Some(incl), Some(hg)) => {
+                    let app_addr = self.app_address.clone();
+                    let shard_mat = self.shard_mat_frame.clone();
+                    // Shard key derived from the filter, same as the leader's
+                    // `state_roots` construction (single derivation, captured).
+                    let shard_key = {
+                        let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(
+                            &self.filter[..self.filter.len().min(32)],
+                            256,
+                            3,
+                        );
+                        let mut l2 = [0u8; 32];
+                        let copy_len = self.filter.len().min(32);
+                        l2[..copy_len].copy_from_slice(&self.filter[..copy_len]);
+                        quil_types::store::ShardKey { l1, l2 }
+                    };
+                    Some(Arc::new(
+                        move |frame: &quil_types::proto::global::AppShardFrame| -> bool {
+                            let Some(header) = frame.header.as_ref() else {
+                                return false;
+                            };
+                            // (a) Body-root check (audit #2) — always.
+                            let canonical: Vec<Vec<u8>> = frame
+                                .requests
+                                .iter()
+                                .filter_map(|b| {
+                                    crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b)
+                                        .ok()
+                                })
+                                .collect();
+                            if canonical.len() != frame.requests.len() {
+                                return false;
+                            }
+                            let req_ok = match compute_requests_root(
+                                &canonical,
+                                &app_addr,
+                                header.frame_number,
+                                Some(exec.as_ref()),
+                                Some(incl.as_ref()),
+                                hg.has_forest(),
+                            ) {
+                                Ok(r) => r == header.requests_root,
+                                Err(_) => false,
+                            };
+                            if !req_ok {
+                                return false;
+                            }
+                            // (b) Pre-state `state_roots` check (audit #3) — ONLY
+                            // when this node is EXACTLY at N-1 (materialized), so
+                            // the deterministic `compute_shard_root` pre-state
+                            // equals what an honest leader declared. A behind /
+                            // async-lagged member (mat < N-1) abstains here
+                            // (signs) rather than spuriously nullify; caught-up
+                            // peers gate the attack. Matches the leader's
+                            // construction: 4 phases in canonical order, empty →
+                            // zero root.
+                            let n = header.frame_number;
+                            if n > 0
+                                && shard_mat.load(std::sync::atomic::Ordering::Relaxed) + 1 == n
+                                && header.state_roots.len() == 4
+                            {
+                                let zero =
+                                    vec![0u8; if hg.has_forest() { 32 } else { 64 }];
+                                let phases = [
+                                    ("vertex", "adds"),
+                                    ("vertex", "removes"),
+                                    ("hyperedge", "adds"),
+                                    ("hyperedge", "removes"),
+                                ];
+                                for (i, (s, p)) in phases.iter().enumerate() {
+                                    let mut local = hg.compute_shard_root(s, p, &shard_key);
+                                    if local.is_empty() {
+                                        local = zero.clone();
+                                    }
+                                    if local != header.state_roots[i] {
+                                        tracing::warn!(
+                                            frame = n,
+                                            phase = i,
+                                            "cw app verify: state_roots mismatch vs local \
+                                             pre-state (false pre-state root) — nullify",
+                                        );
+                                        return false;
+                                    }
+                                }
+                            }
+                            true
+                        },
+                    ) as crate::cw_app_seams::AppRequestsRootCheck)
+                }
+                _ => None,
+            };
         let handle = crate::cw_app_seams::activate_app_consensus_cw(
             scheme,
             peers,
@@ -1766,6 +2048,7 @@ impl AppConsensusEngine {
             30, // leader_timeout_secs (localnet default; app VDF ~ shard difficulty)
             transport,
             cw_app_storage_dir,
+            requests_root_check,
         );
         Ok(handle)
     }
@@ -1792,13 +2075,108 @@ impl AppConsensusEngine {
     /// the requests, advance + persist the durable cursor, and publish the full
     /// frame for followers/archives on `shard_frame_bitmask`.
     async fn handle_cw_finalized_frame(&mut self, data: &[u8], cert: &[u8]) {
-        let frame: quil_types::proto::global::AppShardFrame = match prost::Message::decode(data) {
+        let mut frame: quil_types::proto::global::AppShardFrame = match prost::Message::decode(data) {
             Ok(f) => f,
             Err(e) => {
                 warn!(core_id = self.core_id, error = %e, "cw finalized frame: undecodable");
                 return;
             }
         };
+        // SECURITY — post-verification substitution defense (audit Finding #1).
+        // These finalized `data` bytes are a FRESH read of the mutable
+        // `BlockStore` (the reporter re-reads by digest at finalize), so they
+        // can differ from the bytes the committee actually verified at proposal
+        // time: the store is last-writer-wins and the block channel (3) has no
+        // committee admission. A substitution keeps the certified
+        // `Poseidon(output)` digest (so the finalization cert still verifies)
+        // while changing every other header field and the body. Re-run PROPOSAL
+        // validation here before anything touches the clock store or
+        // materializer: it RECOMPUTES the deterministic output from the declared
+        // fields (parent_selector, requests_root, state_roots, ρ_N, frame_number,
+        // rank, prover) and rejects any frame whose fields don't reproduce
+        // `header.output`. Honest frames (same bytes as verified) pass; a
+        // substituted/internally-inconsistent header is dropped. (Validate the
+        // PRISTINE frame, before the cert is attached below.)
+        if let Some(v) = self.app_frame_validator.as_ref() {
+            match validate_app_frame_panic_safe(v, &frame, /* proposal */ true) {
+                Ok(true) => {}
+                other => {
+                    warn!(
+                        core_id = self.core_id,
+                        result = ?other,
+                        "cw finalized frame: failed re-validation (post-verification \
+                         substitution or inconsistent header) — dropping",
+                    );
+                    return;
+                }
+            }
+        }
+        // SECURITY — body-root cross-check (audit Finding #2, and the body-swap
+        // case of #1). The re-validation above binds the DECLARED `requests_root`
+        // through output recomputation, but not the carried body; a finalize-time
+        // BlockStore overwrite can keep the whole header (hence the certified
+        // digest) while swapping `frame.requests`. Recompute the body root from
+        // the carried requests and DROP on mismatch, so no CW replica ever
+        // materializes a body its certified root does not cover. (Dropping a
+        // substituted body stalls at worst — recoverable via catch-up — whereas
+        // materializing it would be an unrecoverable state divergence.)
+        if let (Some(exec), Some(header)) =
+            (self.execution_engine.as_ref(), frame.header.as_ref())
+        {
+            let canonical: Vec<Vec<u8>> = frame
+                .requests
+                .iter()
+                .filter_map(|b| {
+                    crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok()
+                })
+                .collect();
+            let use_forest = self
+                .hypergraph
+                .as_ref()
+                .map(|h| h.has_forest())
+                .unwrap_or(false);
+            let ok = canonical.len() == frame.requests.len()
+                && compute_requests_root(
+                    &canonical,
+                    &self.app_address,
+                    header.frame_number,
+                    Some(exec.as_ref()),
+                    self.inclusion_prover.as_deref(),
+                    use_forest,
+                )
+                .map(|r| r == header.requests_root)
+                .unwrap_or(false);
+            if !ok {
+                warn!(
+                    core_id = self.core_id,
+                    frame = header.frame_number,
+                    "cw finalized frame: requests_root mismatch (carried body does not \
+                     match the certified root) — dropping (post-verification body swap)",
+                );
+                return;
+            }
+        }
+        // Attach the simplex FINALIZATION cert to the frame header so every
+        // downstream reader — the shard clock store (served to followers via
+        // sync), the full frame gossiped on `shard_frame_bitmask`, and archives —
+        // can verify this CW-finalized frame against the shard committee. CW
+        // frames carry NO header aggregate; the cert rides in the sig field's
+        // `signature` bytes with the CWCT magic, which `BlsAppFrameValidator`
+        // (follower/archive path) and the global reward path both detect and
+        // verify via `app_cert::verify_finalization`. Empty cert (shouldn't
+        // happen post-genesis) leaves the field untouched.
+        if !cert.is_empty() {
+            if let Some(h) = frame.header.as_mut() {
+                h.public_key_signature_bls48581 =
+                    Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                        public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
+                            key_value: Vec::new(),
+                        }),
+                        signature: quil_cw_consensus::app_cert::wrap_cert_for_header(cert),
+                        bitmask: Vec::new(),
+                    });
+            }
+        }
         let Some(header) = frame.header.clone() else { return };
         if !header.address.is_empty() && header.address != self.app_address {
             return;
@@ -1859,7 +2237,7 @@ impl AppConsensusEngine {
                 .await
             {
                 Ok((processed, skipped)) => {
-                    self.last_materialized_frame = frame_number;
+                    self.set_materialized_frame(frame_number);
                     self.persist_materialized_cursor(frame_number);
                     debug!(core_id = self.core_id, frame = frame_number, processed, skipped,
                         "materialized cw-finalized shard frame");
@@ -2056,6 +2434,20 @@ impl AppConsensusEngine {
             global_difficulty,
             std::sync::atomic::Ordering::Relaxed,
         );
+
+        // Persist the global frame into the (cluster worker's) clock store so the
+        // committee anchor is CURRENT. A cluster worker's `global_anchor_store`
+        // falls back to this `clock_store` (deps pass None), and the committee is
+        // read at the global anchor (`committee_anchor_gfn`) — without storing the
+        // received global frames the anchor stays 0, the committee is computed at
+        // epoch 0 where every prover is still Joining (deferred activation), and
+        // `build_app_committee` fails ("this node's key not in the active set").
+        // The master path stores its own frames; this feeds the worker's copy.
+        // (No-op-txn direct write; global frames use a distinct key prefix from
+        // the shard chain, so there's no collision with the worker's own frames.)
+        if let Err(e) = self.clock_store.put_global_clock_frame(&global_frame, &AppNoopTxn) {
+            debug!(core_id = self.core_id, error = %e, "worker: store global frame for anchor failed");
+        }
     }
 
     /// Handle a peer info message.
@@ -2266,7 +2658,7 @@ impl AppConsensusEngine {
                 .await
             {
                 Ok((processed, skipped)) => {
-                    self.last_materialized_frame = frame_number;
+                    self.set_materialized_frame(frame_number);
                     // Persist AFTER commit_frame succeeded (inside
                     // materialize_app_shard_requests) so the durable
                     // cursor never outruns the CRDT.
@@ -2376,7 +2768,7 @@ impl AppConsensusEngine {
                 .await
             {
                 Ok((processed, skipped)) => {
-                    self.last_materialized_frame = next;
+                    self.set_materialized_frame(next);
                     self.persist_materialized_cursor(next);
                     self.received_full_frames.remove(&next);
                     self.materialize_failures.remove(&next);
@@ -2553,7 +2945,7 @@ impl AppConsensusEngine {
                         // push the cursor past the CRDT (the unsafe
                         // direction) and silently skip this frame's
                         // mutations on restart.
-                        self.last_materialized_frame = frame_number;
+                        self.set_materialized_frame(frame_number);
                         self.persist_materialized_cursor(frame_number);
                         debug!(
                             core_id = self.core_id,
@@ -3090,13 +3482,19 @@ pub(crate) fn materialize_app_shard_requests(
     for bundle in requests {
         let bundle_bytes =
             match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
+                // Re-encode too short / un-encodable are DETERMINISTIC (a pure
+                // function of the bundle bytes, which are part of the finalized
+                // body every replica agreed on via `requests_root`), so every
+                // replica skips identically — safe. Log at info for visibility
+                // (a malformed bundle inside a certified frame is notable).
                 Ok(b) if b.len() >= 4 => b,
                 Ok(_) => {
+                    info!(frame = frame_number, "app-shard materialize: skipping bundle that re-encodes too short (<4B)");
                     skipped += 1;
                     continue;
                 }
                 Err(e) => {
-                    debug!(frame = frame_number, error = %e, "app-shard materialize: skipping un-encodable bundle");
+                    info!(frame = frame_number, error = %e, "app-shard materialize: skipping un-encodable bundle");
                     skipped += 1;
                     continue;
                 }
@@ -3122,7 +3520,35 @@ pub(crate) fn materialize_app_shard_requests(
         match execution_manager.process_message(frame_number, &fee, addr, &bundle_bytes) {
             Ok(_) => processed += 1,
             Err(e) => {
-                debug!(frame = frame_number, error = %e, "app-shard materialize: skipping bundle that failed processing");
+                // DIVERGENCE GUARD (audit Finding #4). Skipping a failed bundle
+                // and still advancing the cursor is only safe when the failure
+                // is DETERMINISTIC — a function of (bundle, agreed pre-state)
+                // that every replica hits identically (bad signature, semantic
+                // rejection, missing referenced entity). With pre-state now
+                // validated (audit #3), all replicas share the same N-1 state,
+                // so those skip in lockstep and stay consistent. But an
+                // INFRASTRUCTURE / TRANSIENT failure (store / IO) can succeed on
+                // one replica and fail on another; skipping it would advance the
+                // cursor past work that landed elsewhere → permanent, unrecoverable
+                // state divergence. Make those FATAL: return Err so the caller's
+                // success arm is NOT taken, the cursor does NOT advance, and the
+                // frame is retried (a transient fault clears on retry; a
+                // persistent one halts THIS node loudly rather than silently
+                // forking its state). NB deterministic errors must stay skippable
+                // — marking them fatal would permanently halt the shard, since
+                // every retry re-hits the same rejection.
+                use quil_types::error::QuilError;
+                if matches!(e, QuilError::Store(_) | QuilError::Io(_)) {
+                    warn!(
+                        frame = frame_number,
+                        error = %e,
+                        "app-shard materialize: INFRASTRUCTURE failure on a finalized \
+                         bundle — refusing to skip (would diverge state); failing the \
+                         frame for retry",
+                    );
+                    return Err(e);
+                }
+                info!(frame = frame_number, error = %e, "app-shard materialize: skipping bundle that failed deterministic validation (all replicas skip identically)");
                 skipped += 1;
             }
         }
@@ -3289,6 +3715,170 @@ mod tests {
         )
         .unwrap();
         assert_eq!(processed, 2);
+    }
+
+    /// A REAL, signed hypergraph `VertexAdd` (structurally-valid confidential
+    /// field + a genuine Falcon write-key signature) MUTATES shard state: it
+    /// materializes into the CRDT, and the committed `state_roots` (the 4
+    /// phase-tree roots the frame header advertises) change, with the vertex-adds
+    /// root becoming non-zero. This is the full write → materialize → state_roots
+    /// chain — the root the global reward audit reconstructs and PoRep's per-epoch
+    /// leaf re-registration re-encodes — now live for hypergraph shards.
+    ///
+    /// The vertex data uses the NEW commit-and-encrypt confidential scheme
+    /// (`encrypted_to_vertex_tree`), NOT Go's legacy verenc — the Rust node's
+    /// materialize (`HypergraphExecutionEngine::invoke_hypergraph_op`) already
+    /// diverges from Go there; the fix that made this test go green was flushing
+    /// the engine's `HypergraphState` changeset to the CRDT (`state.commit()` in
+    /// the hypergraph engine's `process_message`), which previously never ran.
+    #[test]
+    fn app_shard_real_write_mutates_state_and_roots() {
+        use quil_types::proto::hypergraph::VertexAdd;
+        use quil_execution::hypergraph_intrinsic::confidential;
+        use quil_execution::hypergraph_intrinsic::vertex_ops::{
+            vertex_add_domain_separator, vertex_add_signing_message,
+        };
+        use quil_types::crypto::Signer as _;
+        use std::sync::Arc;
+
+        // The hypergraph engine verifies a VertexAdd's signature with real Falcon
+        // (`falcon_verify`) against the domain's WRITE key — so use a real key +
+        // a resolver that returns its public key. (The write key IS the auth we're
+        // NOT stubbing; the KZG/inclusion prover is stubbed via NoopInclusionProver.)
+        let signer = quil_crypto::FalconSigner::generate();
+        struct KeyResolver(Vec<u8>);
+        impl quil_execution::hypergraph_intrinsic::HypergraphConfigResolver for KeyResolver {
+            fn write_public_key(&self, _domain: &[u8]) -> Option<Vec<u8>> {
+                Some(self.0.clone())
+            }
+        }
+        let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let mgr = quil_execution::ExecutionEngineManager::new(
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+            Arc::new(crate::test_support::AcceptAllKeyManager),
+            crdt.clone(),
+            crypto.circuit_compiler.clone(),
+            crypto.clock_store.clone(),
+            Arc::new(KeyResolver(signer.public_key().to_vec())),
+            false, // application mode
+        );
+
+        // The hypergraph BASE domain routes directly to the hypergraph engine
+        // (no per-domain metadata-vertex deploy needed), so a VertexAdd here
+        // materializes into the CRDT.
+        let domain = quil_execution::hypergraph_intrinsic::hypergraph_base_domain().to_vec();
+
+        // Committed shard root helper: the 4 phase-tree roots for `domain`'s shard.
+        let shard_roots = |frame: u64| -> Vec<Vec<u8>> {
+            let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&domain, 256, 3);
+            let mut l2 = [0u8; 32];
+            l2.copy_from_slice(&domain);
+            let sk = quil_types::store::ShardKey { l1, l2 };
+            crdt.commit(frame).unwrap().get(&sk).cloned().unwrap_or_default()
+        };
+
+        // Baseline: empty shard. (NB: `crdt.commit` is dirty-based — it returns
+        // only shards changed since the last commit and clears the dirty set — so
+        // we must NOT commit before the write, or the write's commit comes back
+        // empty. We commit exactly ONCE, after the write.)
+        use num_traits::Zero as _;
+        let size_before = crdt.total_size();
+        assert!(size_before.is_zero(), "fresh shard must start empty");
+
+        // A real VertexAdd carries commit-and-encrypt confidential fields. The
+        // consensus check is STRUCTURAL (correct KEM/AEAD sizes), so a
+        // well-formed field with placeholder bytes materializes — a genuine
+        // vertex write into the CRDT, not a stub that only rides `requests_root`.
+        let field = confidential::ConfidentialField {
+            commitment: [7u8; 32],
+            kem_ct: vec![0u8; confidential::KEM_CT_LEN],
+            nonce: [0u8; confidential::NONCE_LEN],
+            aead_ct: vec![0u8; confidential::SALT_LEN + confidential::TAG_LEN],
+        };
+        assert!(confidential::verify_structural(&field), "field must be structurally valid");
+        let chunks: Vec<Vec<u8>> = vec![confidential::encode(&field)];
+        let data =
+            quil_execution::hypergraph_intrinsic::conversions::pack_vertex_add_proof_chunks(&chunks)
+                .unwrap();
+        let data_address = vec![0x22u8; 32];
+
+        // Sign `separator || signing_message` over the SAME chunks with the write
+        // key (mirrors `quil_client::vertex_write::build_vertex_add`).
+        let separator = vertex_add_domain_separator(&domain).unwrap();
+        let message = vertex_add_signing_message(&domain, &data_address, &chunks).unwrap();
+        let mut signed = separator;
+        signed.extend_from_slice(&message);
+        let signature = signer.sign_with_domain(&signed, &[]).unwrap();
+
+        let proto_vadd = VertexAdd {
+            domain: domain.clone(),
+            data_address,
+            data,
+            signature,
+        };
+        // Build the CANONICAL dispatch bundle directly — the wire form the shard
+        // message collector holds and the execution engine decodes — and drive
+        // `process_message` here so we can capture `state_roots` with a single
+        // explicit `crdt.commit(1)` below. (The full production path
+        // `materialize_app_shard_requests` — proto MessageBundle → proto→canonical
+        // → process_message — also carries hypergraph ops now; the byte-exact
+        // proto↔canonical round-trip is covered by
+        // `consensus_wire::tests::hypergraph_vertex_add_survives_bundle_round_trip`.
+        // We avoid it here only because its internal `commit_frame` would consume
+        // the dirty set before we can read the committed roots.)
+        let vadd_canon =
+            quil_execution::hypergraph_intrinsic::types::VertexAdd::from_proto(&proto_vadd)
+                .to_canonical_bytes()
+                .unwrap();
+        let bundle_bytes = quil_execution::message_envelope::CanonicalMessageBundle {
+            requests: vec![Some(
+                quil_execution::message_envelope::CanonicalMessageRequest::wrap(vadd_canon).unwrap(),
+            )],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap();
+
+        // 1. The op is ACCEPTED — it passes validation (structural proofs +
+        //    real Falcon write-key signature verify). This is a genuinely valid
+        //    write, not a stub.
+        mgr.process_message(1, &num_bigint::BigInt::from(0), &domain, &bundle_bytes)
+            .expect("a well-formed, signed VertexAdd must pass validation");
+
+        // 2. The write MATERIALIZED into the CRDT: the vertex is present and the
+        //    shard's live size grew.
+        let mut app = [0u8; 32];
+        app.copy_from_slice(&domain);
+        let loc = quil_hypergraph::addressing::Location {
+            app_address: app,
+            data_address: [0x22u8; 32],
+        };
+        assert!(
+            crdt.get_vertex_data(&loc).is_some(),
+            "vertex must be present in the CRDT after materialize"
+        );
+        assert!(
+            crdt.total_size() > size_before,
+            "shard live size must grow after a real write"
+        );
+
+        // 3. The committed state_roots the frame header advertises reflect the
+        //    write: the vertex-adds root (`state_roots[0]`) for this shard is
+        //    non-zero. This is the real write → materialize → state_roots chain —
+        //    the root the global reward audit reconstructs and PoRep's per-epoch
+        //    leaf re-registration re-encodes.
+        let roots_after = shard_roots(1);
+        assert!(
+            roots_after
+                .first()
+                .map(|r| r.iter().any(|b| *b != 0))
+                .unwrap_or(false),
+            "vertex-adds root (state_roots[0]) must be non-zero after a real write; got {roots_after:?}"
+        );
     }
 
     #[test]

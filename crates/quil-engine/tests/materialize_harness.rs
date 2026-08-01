@@ -109,7 +109,10 @@ impl MaterializeHarness {
         )
         .with_eviction_registry(registry.clone())
         .with_rocks_hg_store(hg_store.clone())
-        .with_shard_size_source(shard_size_source);
+        .with_shard_size_source(shard_size_source)
+        // Evictions are disabled fleet-wide by default; the harness turns the
+        // mutating kick path back on so the eviction-seam test can exercise it.
+        .with_evictions_enabled(true);
 
         Self {
             _rocks: rocks,
@@ -159,6 +162,46 @@ fn active_inactive_prover(prover_addr: &[u8; 32], filter: &[u8]) -> (Vec<u8>, Ve
         &100u64.to_be_bytes(),
     )
     .unwrap();
+    // Record the CURRENT epoch so `effective_status` reads Active (not
+    // ExpiredEpoch) at the eviction-activation test frame. Without this the
+    // epoch-aware gate (added with the ExpiredEpoch exemption) treats the
+    // stale-epoch alloc as expired → not an eviction candidate, so the test
+    // never reaches the kick path it exists to cover.
+    write_field(
+        &mut alloc,
+        "allocation:ProverAllocation",
+        "Epoch",
+        &quil_types::consensus::epoch_for_frame(GLOBAL_EVICTION_ACTIVATION_FRAME + 100).to_be_bytes(),
+    )
+    .unwrap();
+
+    (vertex_tree_to_blob(&prover), vertex_tree_to_blob(&alloc))
+}
+
+/// Build an Active prover whose allocation is FRESHLY active (last_active =
+/// `frame`, current epoch) on `filter` — a quorum filler so a shard clears
+/// `MIN_SHARD_CONSENSUS_PROVERS` without the filler itself ever becoming an
+/// eviction candidate.
+fn active_recent_prover(prover_addr: &[u8; 32], filter: &[u8], frame: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut prover = create_prover_vertex_tree(&vec![0xCDu8; 57], 0).unwrap();
+    write_field(&mut prover, "prover:Prover", "Status", &[STATUS_ACTIVE]).unwrap();
+
+    let mut alloc = create_allocation_vertex_tree(prover_addr, filter, 0).unwrap();
+    write_field(&mut alloc, "allocation:ProverAllocation", "Status", &[STATUS_ACTIVE]).unwrap();
+    write_field(
+        &mut alloc,
+        "allocation:ProverAllocation",
+        "LastActiveFrameNumber",
+        &frame.to_be_bytes(),
+    )
+    .unwrap();
+    write_field(
+        &mut alloc,
+        "allocation:ProverAllocation",
+        "Epoch",
+        &quil_types::consensus::epoch_for_frame(frame).to_be_bytes(),
+    )
+    .unwrap();
 
     (vertex_tree_to_blob(&prover), vertex_tree_to_blob(&alloc))
 }
@@ -188,10 +231,20 @@ fn materialize_evicts_inactive_prover_present_only_in_flat_store() {
     // Flat-keyspace only (CRDT tree never sees them) — the sync seam.
     h.seed_flat_vertex(&prover_addr, &prover_blob);
     h.seed_flat_vertex(&[0xA5u8; 32], &alloc_blob);
+
+    let frame = GLOBAL_EVICTION_ACTIVATION_FRAME + 100;
+    // Top the shard up to consensus quorum with fresh-active fillers, so the
+    // target isn't spared by the under-provisioned exemption (a shard below
+    // MIN_SHARD_CONSENSUS_PROVERS can't run consensus → no one is evicted).
+    for i in 0..(quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS - 1) as u8 {
+        let faddr = [0xB0u8 + i; 32];
+        let (fp, fa) = active_recent_prover(&faddr, &filter, frame);
+        h.seed_flat_vertex(&faddr, &fp);
+        h.seed_flat_vertex(&[0xC0u8 + i; 32], &fa);
+    }
     h.refresh_registry();
 
     // Sanity: the registry (from the flat store) sees the candidate.
-    let frame = GLOBAL_EVICTION_ACTIVATION_FRAME + 100;
     let halts: HashMap<Vec<u8>, u64> = HashMap::new();
     let pre = h.registry.find_eviction_candidates(frame, 360, &halts);
     assert!(
@@ -212,6 +265,134 @@ fn materialize_evicts_inactive_prover_present_only_in_flat_store() {
         "after materialize the prover must be kicked and gone from the candidate set \
          (this is the store-vs-CRDT seam that had no end-to-end coverage)"
     );
+}
+
+// =====================================================================
+// Two-node eviction convergence (the prover-root-mismatch class)
+// =====================================================================
+
+/// Seed one idle (long-inactive, current-epoch, effectively-Active) prover +
+/// its allocation on `filter` into a harness's flat keyspace, keyed by distinct
+/// prover/alloc address bytes. Returns the prover address.
+fn seed_idle_prover(
+    h: &MaterializeHarness,
+    prover_byte: u8,
+    alloc_byte: u8,
+    filter: &[u8],
+) -> Vec<u8> {
+    let paddr = [prover_byte; 32];
+    let (pb, ab) = active_inactive_prover(&paddr, filter);
+    h.seed_flat_vertex(&paddr, &pb);
+    h.seed_flat_vertex(&[alloc_byte; 32], &ab);
+    paddr.to_vec()
+}
+
+/// The global intrinsic (prover) shard root — the `prover_tree_commitment`
+/// two archives must agree on.
+fn prover_root(h: &MaterializeHarness) -> Vec<u8> {
+    let shard = ShardKey { l1: [0u8; 3], l2: [0xFFu8; 32] };
+    h.crdt.compute_shard_root("vertex", "adds", &shard)
+}
+
+/// TWO independent nodes with the SAME committed prover/allocation state but
+/// DIFFERENT per-node coverage-halt maps must produce the IDENTICAL prover root
+/// after eviction. This is the invariant behind the archive "prover root
+/// MISMATCH" reports: eviction used to consult each node's local
+/// `coverage_halt_durations` (a per-node streak counter), so two archives with
+/// different coverage streaks evicted different provers → divergent roots. The
+/// fix makes the decision census-authoritative (committed-state per-shard quorum
+/// exemption); the per-node coverage map is now observability-only.
+#[test]
+fn two_nodes_with_divergent_coverage_evict_identically() {
+    let node_a = MaterializeHarness::new(true, Arc::new(NoopInclusionProver));
+    let node_b = MaterializeHarness::new(true, Arc::new(NoopInclusionProver));
+
+    // Above-quorum shard X: MIN..+1 idle provers → evictable (the shard CAN run
+    // consensus, so its idle provers are genuinely inactive).
+    let filter_x = vec![0x33u8; 64];
+    // Under-quorum shard Y: 2 idle provers → exempt on BOTH via the census
+    // (2 < MIN_SHARD_CONSENSUS_PROVERS), regardless of any coverage-halt entry.
+    let filter_y = vec![0x44u8; 64];
+
+    let x_count = quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS as u8 + 1;
+    // Seed BOTH nodes with byte-identical committed state.
+    let seed_node = |node: &MaterializeHarness| -> Vec<Vec<u8>> {
+        let mut xs = Vec::new();
+        for i in 0..x_count {
+            xs.push(seed_idle_prover(node, 0x10 + i, 0x90 + i, &filter_x));
+        }
+        // Under-quorum shard Y: exactly 2 provers.
+        seed_idle_prover(node, 0x50, 0xD0, &filter_y);
+        seed_idle_prover(node, 0x51, 0xD1, &filter_y);
+        node.refresh_registry();
+        xs
+    };
+    let x_addrs = seed_node(&node_a);
+    let _ = seed_node(&node_b);
+
+    let frame = GLOBAL_EVICTION_ACTIVATION_FRAME + 100;
+
+    // Registry-level determinism: two independently-built registries on the same
+    // committed state produce the identical census-driven candidate set — exactly
+    // the shard-X provers (shard-Y is exempt: 2 < quorum). This is the input the
+    // materializer decision consumes (census-only, coverage-map-free).
+    let cand_a = node_a
+        .registry
+        .find_eviction_candidates(frame, 360, &HashMap::new());
+    let cand_b = node_b
+        .registry
+        .find_eviction_candidates(frame, 360, &HashMap::new());
+    assert_eq!(cand_a, cand_b, "independent nodes must agree on the candidate set");
+    assert_eq!(
+        cand_a.len(),
+        x_count as usize,
+        "exactly the above-quorum shard-X provers are candidates; shard-Y is exempt"
+    );
+    for xa in &x_addrs {
+        assert!(cand_a.contains(xa), "each shard-X prover is a candidate");
+    }
+
+    // DIVERGENT per-node coverage state — the crux. Node A saw no halts; node B's
+    // coverage monitor recorded a FULL halt on the under-quorum shard Y (u64::MAX,
+    // as it does for any shard below the halt threshold) PLUS a partial halt on X
+    // whose duration EXCEEDS the current inactivity window (which, under the old
+    // map-driven decision, would have zeroed X's inactivity and made node B evict
+    // NOTHING while node A evicted all of shard X → divergent roots). A realistic
+    // divergence: two archives with different local streak history.
+    node_a
+        .materializer
+        .set_coverage_halt_durations(HashMap::new());
+    let mut b_halts: HashMap<Vec<u8>, u64> = HashMap::new();
+    b_halts.insert(filter_y.clone(), u64::MAX); // Y fully halted per B
+    b_halts.insert(filter_x.clone(), u64::MAX); // X "halted" per B — worst case
+    node_b.materializer.set_coverage_halt_durations(b_halts);
+
+    // End-to-end: materialize the SAME frame on both nodes. The decision is now
+    // census-only, so each node's coverage map does NOT affect it — node B's
+    // full-halt-on-everything map must NOT stop it from evicting shard X. Assert
+    // the resulting prover roots are byte-identical.
+    node_a.materializer.materialize(&frame_at(frame)).expect("materialize A");
+    node_b.materializer.materialize(&frame_at(frame)).expect("materialize B");
+
+    let root_a = prover_root(&node_a);
+    let root_b = prover_root(&node_b);
+    assert!(!root_a.is_empty(), "eviction must have mutated the prover tree");
+    assert_eq!(
+        root_a, root_b,
+        "two archives with divergent coverage state must converge to the same prover root"
+    );
+
+    // Both nodes kicked the shard-X provers (gone from the candidate set) and
+    // spared the under-quorum shard-Y provers (never candidates).
+    for node in [&node_a, &node_b] {
+        let post = node
+            .registry
+            .find_eviction_candidates(frame, 360, &HashMap::new());
+        assert!(
+            post.is_empty(),
+            "post-eviction: shard-X kicked, shard-Y exempt → no remaining candidates"
+        );
+    }
 }
 
 // =====================================================================

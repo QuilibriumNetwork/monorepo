@@ -2135,32 +2135,57 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
         message: &[u8],
     ) -> Result<ProcessMessageResult> {
         let kind = crate::hypergraph_engine::peek_top_level_kind(message)?;
-        match kind {
-            crate::hypergraph_engine::MessageKindTopLevel::Bundle => {
-                let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        self.process_inner_op(
-                            frame_number,
-                            address,
-                            r.inner_type_prefix,
-                            &r.inner_bytes,
-                        )?;
+        // Process the message's op(s), accumulating writes into the
+        // HypergraphState changeset.
+        let result: Result<()> = (|| {
+            match kind {
+                crate::hypergraph_engine::MessageKindTopLevel::Bundle => {
+                    let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
+                    for req in &bundle.requests {
+                        if let Some(r) = req {
+                            self.process_inner_op(
+                                frame_number,
+                                address,
+                                r.inner_type_prefix,
+                                &r.inner_bytes,
+                            )?;
+                        }
                     }
                 }
-                Ok(ProcessMessageResult { messages: Vec::new(), state: Vec::new() })
+                crate::hypergraph_engine::MessageKindTopLevel::Request => {
+                    let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
+                    self.process_inner_op(
+                        frame_number,
+                        address,
+                        req.inner_type_prefix,
+                        &req.inner_bytes,
+                    )?;
+                }
             }
-            crate::hypergraph_engine::MessageKindTopLevel::Request => {
-                let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
-                self.process_inner_op(
-                    frame_number,
-                    address,
-                    req.inner_type_prefix,
-                    &req.inner_bytes,
-                )?;
-                Ok(ProcessMessageResult { messages: Vec::new(), state: Vec::new() })
+            Ok(())
+        })();
+
+        // Flush accepted writes to the CRDT (`state.commit()` → `crdt.add_vertex`
+        // / `remove_vertex` / `add_hyperedge` / `remove_hyperedge`), then clear
+        // the changeset. On ANY error, discard this message's partial changeset —
+        // mirrors GlobalExecutionEngine / TokenExecutionEngine's per-message
+        // commit/abort. Without this the hypergraph engine's writes (deploy
+        // metadata vertices AND vertex/hyperedge data) never reached the CRDT.
+        if let Some(state) = self.state.as_ref() {
+            match result {
+                Ok(()) => {
+                    state.commit()?;
+                    state.abort();
+                }
+                Err(e) => {
+                    state.abort();
+                    return Err(e);
+                }
             }
+        } else {
+            result?;
         }
+        Ok(ProcessMessageResult { messages: Vec::new(), state: Vec::new() })
     }
 
     fn prove(&self, _: &[u8], _: u64, message: &[u8]) -> Result<global::MessageRequest> {

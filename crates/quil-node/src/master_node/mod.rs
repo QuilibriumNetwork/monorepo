@@ -702,6 +702,74 @@ pub(crate) async fn start(
         info!("shard orchestration subscriber spawned");
     }
 
+    // Archive: subscribe to each active shard's per-shard gossip topics so the
+    // shard-frame firehose actually reaches this node. The message-loop already
+    // routes un-matched shard-frame traffic → `ArchiveAppShardIngest`, but only
+    // if the archive is MESHED on that shard's topic. The legacy `[0xFF; len]`
+    // catch-all relied on blossomsub's overlapping-bitmask (bloom-cover) mesh;
+    // under stock libp2p::gossipsub topics are EXACT-MATCH `IdentTopic`s, so the
+    // all-ones bitmask meshes with nobody. Subscribe per-shard instead (frame =
+    // ingest; consensus/prover/dispatch/cw = relay so the shard's provers —
+    // including separate-process cluster committee members — mesh through the
+    // archive). Re-scan periodically for new/split shards. `app_address == filter
+    // == shard_key l2` (app_engine.rs:1224), so the shard's 32-byte l2 is the
+    // topic seed.
+    if archive_mode {
+        let p2p_sub = p2p_handle.clone();
+        let reg_sub: Arc<dyn quil_types::consensus::ProverRegistry> =
+            prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>;
+        sup.spawn("archive-shard-topic-subscriber", move |cancel| async move {
+            let mut subscribed: std::collections::HashSet<Vec<u8>> =
+                std::collections::HashSet::new();
+            loop {
+                // Collect the EXACT per-shard filters the shard's provers publish
+                // on — `ProverAllocationInfo.confirmation_filter` IS the app
+                // engine's `filter` (`app_engine.rs:1224`), including the
+                // sub-shard prefix byte. The base shard_key l2 alone yields a
+                // DIFFERENT bloom topic (`get_bloom_filter`) and never meshes with
+                // the workers. Owned (no borrow held across the awaits below).
+                let mut filters: Vec<Vec<u8>> = Vec::new();
+                if let Ok(provers) = reg_sub.get_all_active_app_shard_provers() {
+                    for p in &provers {
+                        for a in &p.allocations {
+                            if !a.confirmation_filter.is_empty() {
+                                filters.push(a.confirmation_filter.clone());
+                            }
+                        }
+                    }
+                }
+                for f in filters {
+                    if subscribed.insert(f.clone()) {
+                        p2p_sub
+                            .subscribe(quil_engine::bitmasks::shard_frame_bitmask(&f))
+                            .await;
+                        p2p_sub
+                            .subscribe(quil_engine::bitmasks::shard_consensus_bitmask(&f))
+                            .await;
+                        p2p_sub
+                            .subscribe(quil_engine::bitmasks::shard_prover_bitmask(&f))
+                            .await;
+                        p2p_sub
+                            .subscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&f))
+                            .await;
+                        p2p_sub
+                            .subscribe(quil_engine::bitmasks::shard_cw_bitmask(&f))
+                            .await;
+                        info!(
+                            shard = %hex::encode(&f),
+                            "archive subscribed to per-shard gossip topics",
+                        );
+                    }
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    _ = cancel.cancelled() => return Ok(()),
+                }
+            }
+        });
+        info!("archive shard-topic subscriber spawned");
+    }
+
     // Commonware-simplex inbound router (P2c cutover). Shared, set post-spawn at
     // the archive-sync activation site when the committee is configured; unset
     // (the default) leaves the simplex path off.
@@ -747,6 +815,17 @@ pub(crate) async fn start(
             )
         };
 
+    // Broadcast channel for GlobalService::StreamGlobalMessages. Created here
+    // (before archive_sync + the recv loop) so the archive poller can tee
+    // GLOBAL_FRAME to cluster workers and the recv loop can feed GLOBAL_PEER_INFO;
+    // the gRPC server takes a clone later.
+    let global_msg_tx: tokio::sync::broadcast::Sender<
+        quil_types::proto::global::StreamGlobalMessagesResponse,
+    > = tokio::sync::broadcast::channel(
+        quil_rpc::global_service::GLOBAL_MESSAGE_BROADCAST_CAPACITY,
+    )
+    .0;
+
     archive_sync::spawn_all(&mut sup, archive_sync::ArchiveSyncArgs {
         mtls_seed,
         network,
@@ -791,18 +870,10 @@ pub(crate) async fn start(
             };
             base.join("cw-global-consensus")
         },
+        global_msg_tx: global_msg_tx.clone(),
     });
 
 
-    // Broadcast channel for GlobalService::StreamGlobalMessages.
-    // Construction here (before recv loop) so the recv loop can
-    // feed it; the gRPC server takes a clone later.
-    let global_msg_tx: tokio::sync::broadcast::Sender<
-        quil_types::proto::global::StreamGlobalMessagesResponse,
-    > = tokio::sync::broadcast::channel(
-        quil_rpc::global_service::GLOBAL_MESSAGE_BROADCAST_CAPACITY,
-    )
-    .0;
     // Archive-only: ingest full app-shard frames into the archive's CRDT
     // so it holds (and can serve via HyperSync) every shard's state.
     let archive_app_shard_ingest = if archive_mode {

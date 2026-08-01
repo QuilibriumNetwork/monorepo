@@ -35,62 +35,81 @@ pub struct ProdProverTreeSyncer {
 
 impl ProdProverTreeSyncer {
     /// Sync one SINGLE-shard tree (its `shard_id` is the app address) via the
-    /// efficient Merkle diff. For each of the four phases: discover the peer's
-    /// `(version, root)`, verify the vertex-adds root (phase 0) against
-    /// `expected_va_root` (the header root the caller pinned), then diff + apply
-    /// into the CRDT forest. Returns whether phase 0 converged to that root.
-    /// Phases 1–3 pin to the same generation but have no separately-advertised
-    /// header root, so they are pulled best-effort behind the phase-0 anchor.
-    async fn sync_single_shard(&self, shard_id: Vec<u8>, expected_va_root: &[u8]) -> Result<bool> {
+    /// efficient Merkle diff. `expected_roots` is the finalized header's
+    /// `state_roots` (audit #5): index `p` is the committed root of phase `p`
+    /// (0=vertex.adds, 1=vertex.removes, 2=hyperedge.adds, 3=hyperedge.removes).
+    /// For EACH phase we authenticate the peer's advertised root against that
+    /// committed root BEFORE pulling — an absent peer tree is the zero root, so
+    /// it must match a zero header root. Any divergence aborts the whole sync
+    /// (no partial, unauthenticated state is applied). Empty `expected_roots`
+    /// (or a missing entry) ⇒ TRUST the peer for that phase (bootstrap / initial
+    /// sync). Now that `state_roots` is deterministic + validated at consensus
+    /// (audit #3), phases 1–3 have real header anchors — previously they were
+    /// pulled best-effort behind phase 0, which let a peer serve divergent
+    /// removes/hyperedge state. Returns whether the sync converged.
+    async fn sync_single_shard(&self, shard_id: Vec<u8>, expected_roots: &[Vec<u8>]) -> Result<bool> {
         let mut client = ArchiveClient::connect_mtls(&self.master_stream_addr, &self.falcon_signing_key)
             .await
             .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
         let handle = tokio::runtime::Handle::current();
-        let mut va_converged = false;
         for phase in 0u32..4 {
+            // Header-committed root for this phase (empty ⇒ no anchor / trust).
+            let expected = expected_roots.get(phase as usize).cloned().unwrap_or_default();
             let head = client
                 .get_forest_head(shard_id.clone(), phase)
                 .await
                 .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))?;
-            let Some((v_s, root_s)) = head else {
-                continue; // peer has no tree for this phase (empty) — nothing to pull
-            };
-            if phase == 0 && root_s.as_slice() != expected_va_root {
-                warn!(
-                    peer = %hex::encode(&root_s),
-                    expected = %hex::encode(expected_va_root),
-                    "peer vertex-adds root != expected — not syncing this shard"
-                );
-                return Ok(false);
+            // PRE-pull anchor (audit #5): the peer's root for THIS phase must
+            // equal the header-committed root. An absent tree == the zero root.
+            if !expected.is_empty() {
+                let peer_root = head
+                    .as_ref()
+                    .map(|(_, r)| r.clone())
+                    .unwrap_or_else(|| vec![0u8; expected.len()]);
+                if peer_root.as_slice() != expected.as_slice() {
+                    warn!(
+                        phase,
+                        peer = %hex::encode(&peer_root),
+                        expected = %hex::encode(&expected),
+                        "peer phase root != header-committed root — not syncing this shard",
+                    );
+                    return Ok(false);
+                }
             }
+            let Some((v_s, _root_s)) = head else {
+                continue; // peer has no tree for this phase (matched the zero anchor)
+            };
             let got = crate::forest_sync::sync_one_phase(
                 &mut client, &handle, &self.crdt, &shard_id, phase, v_s,
             )
             .await?;
-            if phase == 0 {
-                va_converged = got.as_slice() == expected_va_root;
-                if !va_converged {
-                    warn!("post-sync vertex-adds root still differs from expected");
-                }
+            // POST-pull: the applied root must equal the anchor (belt-and-suspenders
+            // — the diff should land exactly on the pre-verified peer root).
+            if !expected.is_empty() && got.as_slice() != expected.as_slice() {
+                warn!(phase, "post-sync phase root still differs from the header-committed root");
+                return Ok(false);
             }
         }
-        Ok(va_converged)
+        // Every phase either had no anchor (trusted bootstrap) or matched.
+        Ok(true)
     }
 
-    /// Sync a SPLIT app (QUIL: 64 sub-shards). For each phase: fetch every
-    /// sub-shard's `(version, root)`; on phase 0, verify the whole set aggregates
-    /// to the header app root (`expected_va_root`) — one binding that
-    /// authenticates all 64 sub-shard roots at once (model B) — then diff + apply
-    /// each present sub-shard. Absent sub-shards contribute the empty root, so
-    /// the aggregate matches `commit_inner`. Returns whether phase 0 converged.
-    async fn sync_split_shard(&self, app: [u8; 32], expected_va_root: &[u8]) -> Result<bool> {
+    /// Sync a SPLIT app (QUIL: 64 sub-shards). `expected_roots` is the header's
+    /// `state_roots` (audit #5): index `p` is the AGGREGATE root of phase `p`
+    /// across the sub-shards. For EVERY phase we verify the fetched sub-shard set
+    /// aggregates to `expected_roots[p]` — one binding that authenticates all 64
+    /// sub-shard roots at once — BEFORE diffing + applying. Absent sub-shards
+    /// contribute the zero root, so the aggregate matches `commit_inner`. Any
+    /// phase whose aggregate or post-apply root diverges aborts the sync.
+    /// Previously only phase 0 was bound; phases 1–3 could be served divergent.
+    async fn sync_split_shard(&self, app: [u8; 32], expected_roots: &[Vec<u8>]) -> Result<bool> {
         let mut client = ArchiveClient::connect_mtls(&self.master_stream_addr, &self.falcon_signing_key)
             .await
             .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
         let handle = tokio::runtime::Handle::current();
         let sub_shards = self.crdt.app_sub_shards(&app);
-        let mut va_converged = false;
         for phase in 0u32..4 {
+            let expected = expected_roots.get(phase as usize).cloned().unwrap_or_default();
             // Fetch every sub-shard's head for this phase.
             let mut heads: Vec<(Vec<u8>, Vec<bool>, Option<(u64, [u8; 32])>)> =
                 Vec::with_capacity(sub_shards.len());
@@ -104,15 +123,16 @@ impl ProdProverTreeSyncer {
                 });
                 heads.push((shard_id.clone(), bits.clone(), h32));
             }
-            // Phase 0: the aggregate of all sub-shard roots must equal the trusted
-            // header app root, which authenticates every root before we pull it.
-            if phase == 0 {
+            // Anchor (audit #5): the aggregate of all sub-shard roots for THIS
+            // phase must equal the header-committed aggregate, authenticating
+            // every sub-shard root before we pull it. Empty ⇒ trust (bootstrap).
+            if !expected.is_empty() {
                 let sub_roots: Vec<(Vec<bool>, [u8; 32])> = heads
                     .iter()
                     .map(|(_, bits, h)| (bits.clone(), h.map(|(_, r)| r).unwrap_or([0u8; 32])))
                     .collect();
-                if !self.crdt.app_root_matches(&sub_roots, expected_va_root) {
-                    warn!("QUIL sub-shard roots do not aggregate to the expected app root — not syncing");
+                if !self.crdt.app_root_matches(&sub_roots, &expected) {
+                    warn!(phase, "QUIL sub-shard roots do not aggregate to the header root — not syncing");
                     return Ok(false);
                 }
             }
@@ -124,43 +144,41 @@ impl ProdProverTreeSyncer {
                 )
                 .await?;
                 if got != root_s {
-                    warn!(phase, "QUIL sub-shard post-sync root mismatch");
-                    if phase == 0 {
-                        return Ok(false);
-                    }
+                    warn!(phase, "QUIL sub-shard post-sync root mismatch — not syncing");
+                    return Ok(false);
                 }
             }
-            if phase == 0 {
-                va_converged = true;
-            }
         }
-        Ok(va_converged)
+        Ok(true)
     }
 }
 
 #[async_trait]
 impl ProverTreeSyncer for ProdProverTreeSyncer {
-    async fn sync_prover_tree(&self, expected_root: &[u8]) -> Result<bool> {
-        // The global prover shard is a single-shard app: L2 = [0xff; 32].
+    async fn sync_prover_tree(&self, expected_roots: &[Vec<u8>]) -> Result<bool> {
+        // The global prover shard is a single-shard app: L2 = [0xff; 32]. The
+        // global header now commits ALL FOUR prover-shard phase roots (audit #5
+        // flag-day): `expected_roots` = [prover_tree_commitment (phase 0),
+        // prover_tree_aux_roots (phases 1,2,3)], so every phase is authenticated.
         info!(addr = %self.master_stream_addr, "syncing global prover tree (forest diff)");
-        self.sync_single_shard(vec![0xffu8; 32], expected_root).await
+        self.sync_single_shard(vec![0xffu8; 32], expected_roots).await
     }
 
-    async fn sync_shard_tree(&self, filter: &[u8], expected_root: &[u8]) -> Result<bool> {
+    async fn sync_shard_tree(&self, filter: &[u8], expected_roots: &[Vec<u8>]) -> Result<bool> {
         let n = filter.len().min(32);
         let mut l2 = [0u8; 32];
         l2[..n].copy_from_slice(&filter[..n]);
         // QUIL splits 64-way: its state lives in sub-shard trees (app‖prefix),
-        // verified as a set via the aggregation binding.
+        // verified as a set via the aggregation binding (all 4 phases).
         if l2 == quil_execution::domains::QUIL_TOKEN {
             info!(addr = %self.master_stream_addr, "syncing QUIL app (forest diff, 64 sub-shards)");
-            return self.sync_split_shard(l2, expected_root).await;
+            return self.sync_split_shard(l2, expected_roots).await;
         }
         info!(
             addr = %self.master_stream_addr,
             filter = %hex::encode(&filter[..n]),
             "syncing app-shard tree (forest diff, single-shard)"
         );
-        self.sync_single_shard(l2.to_vec(), expected_root).await
+        self.sync_single_shard(l2.to_vec(), expected_roots).await
     }
 }

@@ -56,6 +56,13 @@ pub struct FrameMaterializer {
     last_materialized_frame: AtomicU64,
     /// Whether the local prover root matches the network.
     prover_root_synced: AtomicBool,
+    /// Whether a prover-root MISMATCH has been positively DETECTED and not since
+    /// cleared by a match. Distinct from `!prover_root_synced`, which is also
+    /// true on a fresh node that simply hasn't verified any root yet — using
+    /// that for recovery would make a healthy fresh archive sync spuriously.
+    /// Only the mismatch branch of `verify_prover_root` sets this; a match (or a
+    /// successful reconcile) clears it. The archive recovery loop gates on THIS.
+    prover_root_mismatch: AtomicBool,
     /// Frame number at which prover root was last verified.
     prover_root_verified_frame: AtomicU64,
     /// Whether a prover sync is currently in progress.
@@ -68,6 +75,16 @@ pub struct FrameMaterializer {
 
     /// Eviction grace period in frames.
     eviction_grace_frames: u64,
+
+    /// Master kill-switch for the state-MUTATING eviction step. When `false`
+    /// (the default) the materializer still computes + logs the would-be
+    /// eviction set every frame (so the explorer `/provers/eviction-risk`
+    /// view and the ramp logs keep working) but NEVER marks Status=4 /
+    /// KickFrameNumber — no prover is actually evicted. Eviction is
+    /// consensus-state-mutating, so this must be uniform across the fleet;
+    /// it defaults off everywhere (all production wiring goes through `new`)
+    /// and is only flipped on by tests that exercise the kick path.
+    evictions_enabled: bool,
 
     /// Concrete backing store for `refresh_from_store` — used after
     /// `commit_frame` to rebuild the prover-registry cache from the
@@ -158,11 +175,13 @@ impl FrameMaterializer {
             )),
             last_materialized_frame: AtomicU64::new(0),
             prover_root_synced: AtomicBool::new(false),
+            prover_root_mismatch: AtomicBool::new(false),
             prover_root_verified_frame: AtomicU64::new(0),
             prover_sync_in_progress: AtomicBool::new(false),
             _prover_address: prover_address,
             archive_mode,
             eviction_grace_frames: 360,
+            evictions_enabled: false,
             rocks_hg_store: None,
             eviction_registry: None,
             current_frame: None,
@@ -205,6 +224,14 @@ impl FrameMaterializer {
     /// shard-info provider, lifecycle, peer-info publisher).
     pub fn with_current_frame(mut self, current_frame: Arc<CurrentFrame>) -> Self {
         self.current_frame = Some(current_frame);
+        self
+    }
+
+    /// Enable the state-MUTATING eviction step (mark Status=4 + KickFrameNumber).
+    /// Off by default (see `evictions_enabled`) — evictions are currently
+    /// disabled fleet-wide; only tests that exercise the kick path flip this on.
+    pub fn with_evictions_enabled(mut self, enabled: bool) -> Self {
+        self.evictions_enabled = enabled;
         self
     }
 
@@ -280,14 +307,32 @@ impl FrameMaterializer {
         // hit its empty-root tolerance and never actually verified anything.)
         // Read-only: it neither commits nor publishes — the real state commit +
         // snapshot publish happen in the post-apply call at step 8.
-        let expected_root = &header.prover_tree_commitment;
-        let local_root = self.read_local_prover_root();
-        let prover_root_matched = self.verify_prover_root(
-            frame_number,
-            expected_root,
-            &local_root,
-            &header.prover,
-        );
+        //
+        // CATCH-UP GATE. Only cross-check at/near the LIVE head. During a large
+        // record-only backfill gap the startup re-materialize replays frames far
+        // below the record head; the cross-check there is meaningless (the forest
+        // is mid-replay) and actively harmful — its mismatch fires the reconcile,
+        // which pins the prover shard to the HEAD root NO straggler peer holds,
+        // shoving the shard AHEAD of the cursor (→ epoch-skew skips + diverging
+        // state) and adding a per-frame network round-trip that never converges:
+        // the ~20s/frame "restarting history" crawl. Below the head we skip the
+        // check (treat as matched) so the local replay runs at full speed and the
+        // shard tracks the cursor, letting it reach the head cleanly. At/near the
+        // head the check runs normally and can reconcile a genuine divergence.
+        let record_head = self
+            .clock_store
+            .get_latest_global_clock_frame()
+            .ok()
+            .and_then(|f| f.header.map(|h| h.frame_number))
+            .unwrap_or(frame_number);
+        const PROVER_ROOT_CHECK_MARGIN: u64 = 4;
+        let prover_root_matched = if frame_number + PROVER_ROOT_CHECK_MARGIN >= record_head {
+            let expected_root = &header.prover_tree_commitment;
+            let local_root = self.read_local_prover_root();
+            self.verify_prover_root(frame_number, expected_root, &local_root, &header.prover)
+        } else {
+            true
+        };
 
         // 3. Process frame requests through execution manager.
         //
@@ -737,13 +782,23 @@ impl FrameMaterializer {
                     .filter(|(_, &d)| d == u64::MAX)
                     .map(|(f, _)| hex::encode(f))
                     .collect();
-                let has_active_halt = !surviving.is_empty();
-                if has_active_halt {
-                    // A data-bearing shard is still halted — Go parity:
-                    // nobody is evicted while any real shard is
-                    // under-covered. Log the offenders so we can confirm
-                    // whether the size filter is actually clearing the
-                    // empty shards or the size source came back empty.
+                // Observability ONLY: the per-node coverage-halt view. This is
+                // NO LONGER a global suppression gate. Gating all eviction on
+                // this per-node map (`coverage_halt_durations`, a local streak
+                // counter) made two archives with different streaks evict
+                // different provers → divergent prover roots (the
+                // prover-root-mismatch class). The eviction DECISION is now
+                // census-authoritative: `find_eviction_candidates`'s per-shard
+                // consensus-quorum exemption (a shard below
+                // MIN_SHARD_CONSENSUS_PROVERS active provers, computed from
+                // committed registry state) deterministically protects provers
+                // on shards that can't run consensus — which subsumes the
+                // "don't evict while under-covered" intent, per-shard and
+                // node-independent. The `u64::MAX` coverage entries only ever
+                // occur for under-quorum shards, which the census already
+                // exempts, so dropping them from the decision changes no
+                // outcome except the divergence.
+                if !surviving.is_empty() {
                     let sample: Vec<&String> = surviving.iter().take(10).collect();
                     info!(
                         frame = frame_number,
@@ -751,10 +806,17 @@ impl FrameMaterializer {
                         surviving_max = surviving.len(),
                         sizes_loaded,
                         sizes_was_empty,
-                        suppressors = ?sample,
-                        "eviction suppressed by coverage halt (surviving_max>0 ⇒ these shards block; sizes_was_empty=true ⇒ size source returned nothing → size-blind)"
+                        coverage_halted = ?sample,
+                        "coverage-halt view (observability only; eviction decision is census-based)"
                     );
-                } else {
+                }
+                {
+                    // Census-only decision input: an EMPTY halt map, so the
+                    // decision depends solely on committed state + the per-shard
+                    // quorum census (deterministic across nodes). The per-node
+                    // `effective_halt` is retained above for the log only.
+                    let decision_halt: std::collections::HashMap<Vec<u8>, u64> =
+                        std::collections::HashMap::new();
                     // Compute the would-be eviction set every frame (read
                     // only) so it's observable (logs + explorer
                     // `/provers/eviction-risk`) even before eviction
@@ -762,7 +824,7 @@ impl FrameMaterializer {
                     let candidates = eviction_reg.find_eviction_candidates(
                         frame_number,
                         self.eviction_grace_frames,
-                        &effective_halt,
+                        &decision_halt,
                     );
                     // Unconditional: log the candidate count every frame, even
                     // zero. The gate is open here (no surviving u64::MAX), so a
@@ -774,10 +836,9 @@ impl FrameMaterializer {
                     info!(
                         frame = frame_number,
                         candidates = candidates.len(),
-                        halt_entries = effective_halt.len(),
-                        "eviction candidate scan"
+                        "eviction candidate scan (census-based)"
                     );
-                    if frame_number >= GLOBAL_EVICTION_ACTIVATION_FRAME {
+                    if self.evictions_enabled && frame_number >= GLOBAL_EVICTION_ACTIVATION_FRAME {
                         // Activated: actually mark Status=4 + KickFrameNumber.
                         let state = quil_execution::hypergraph_state::HypergraphState::new(
                             self.hypergraph.clone(),
@@ -785,7 +846,7 @@ impl FrameMaterializer {
                         match eviction_reg.evict_inactive_provers(
                             frame_number,
                             self.eviction_grace_frames,
-                            &effective_halt,
+                            &decision_halt,
                             &state,
                             // Flat-keyspace fallback for vertices the CRDT
                             // tree lacks (e.g. populated via hypergraph sync).
@@ -835,7 +896,7 @@ impl FrameMaterializer {
                                         let recheck = eviction_reg.find_eviction_candidates(
                                             frame_number,
                                             self.eviction_grace_frames,
-                                            &effective_halt,
+                                            &decision_halt,
                                         );
                                         let still_present = recheck
                                             .iter()
@@ -1016,6 +1077,7 @@ impl FrameMaterializer {
                 "prover root verified"
             );
             self.prover_root_synced.store(true, Ordering::Relaxed);
+            self.prover_root_mismatch.store(false, Ordering::Relaxed);
             self.prover_root_verified_frame.store(frame_number, Ordering::Relaxed);
             true
         } else {
@@ -1026,11 +1088,33 @@ impl FrameMaterializer {
                 "prover root MISMATCH — triggering sync"
             );
             self.prover_root_synced.store(false, Ordering::Relaxed);
+            self.prover_root_mismatch.store(true, Ordering::Relaxed);
             self.prover_root_verified_frame.store(0, Ordering::Relaxed);
             // Trigger async prover HyperSync
             self.trigger_prover_hypersync();
             false
         }
+    }
+
+    /// Mark the prover root as synced (or not) — called by the archive recovery
+    /// path (`is_prover_root_synced()` is the read side, defined below) after a
+    /// reconcile sync converges the local root to the network's, so the next
+    /// materialized frame doesn't immediately re-trigger recovery before
+    /// `verify_prover_root` runs again.
+    pub fn set_prover_root_synced(&self, synced: bool, frame_number: u64) {
+        self.prover_root_synced.store(synced, Ordering::Relaxed);
+        if synced {
+            self.prover_root_mismatch.store(false, Ordering::Relaxed);
+            self.prover_root_verified_frame.store(frame_number, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a prover-root mismatch has been positively detected and not yet
+    /// reconciled. The archive recovery loop gates its peer prover-tree sync on
+    /// this (NOT on `!is_prover_root_synced()`, which is also true on a fresh,
+    /// never-verified node → would sync spuriously). See `prover_root_mismatch`.
+    pub fn prover_root_mismatch_detected(&self) -> bool {
+        self.prover_root_mismatch.load(Ordering::Relaxed)
     }
 
     /// Trigger an asynchronous prover HyperSync to reconcile state.
@@ -1043,13 +1127,16 @@ impl FrameMaterializer {
             return;
         }
 
-        // The actual HyperSync is triggered from the node's main loop
-        // via the prover_root_synced flag. The main loop periodically
-        // checks this flag and initiates sync when false.
-        info!("prover root mismatch flagged — main loop will initiate sync");
+        // The actual reconcile runs in the archive-prover-tree-sync loop
+        // (master_node/archive_sync.rs), which polls `is_prover_root_synced()`
+        // and, when false, pulls the prover shard from a peer pinned to the QC'd
+        // `prover_tree_commitment`. Workers reconcile via their own syncer loop
+        // (worker_node.rs). This flag is the signal both consume.
+        info!("prover root mismatch flagged — sync loop will reconcile");
 
-        // Reset sync-in-progress after a reasonable timeout
-        // (the main loop is responsible for the actual sync)
+        // The reconcile is owned by those loops (which clear the flag on
+        // convergence), so release the in-progress latch immediately; it only
+        // dedups concurrent calls WITHIN this materializer.
         self.prover_sync_in_progress.store(false, Ordering::SeqCst);
     }
 
@@ -1377,20 +1464,25 @@ mod tests {
     fn verify_prover_root_empty_passes() {
         let synced = AtomicBool::new(false);
         let verified = AtomicU64::new(0);
+        let mismatch = AtomicBool::new(false);
 
         // Empty expected → pass
-        assert!(verify_root_logic(1, &[], &[0xAA; 64], &synced, &verified));
+        assert!(verify_root_logic(1, &[], &[0xAA; 64], &synced, &verified, &mismatch));
         // Empty local → pass
-        assert!(verify_root_logic(1, &[0xAA; 64], &[], &synced, &verified));
+        assert!(verify_root_logic(1, &[0xAA; 64], &[], &synced, &verified, &mismatch));
+        // Neither branch should flag a mismatch on an unverifiable (empty) root.
+        assert!(!mismatch.load(Ordering::Relaxed));
     }
 
     #[test]
     fn verify_prover_root_match() {
         let synced = AtomicBool::new(false);
         let verified = AtomicU64::new(0);
+        let mismatch = AtomicBool::new(false);
         let root = vec![0xBBu8; 64];
-        assert!(verify_root_logic(42, &root, &root, &synced, &verified));
+        assert!(verify_root_logic(42, &root, &root, &synced, &verified, &mismatch));
         assert!(synced.load(Ordering::Relaxed));
+        assert!(!mismatch.load(Ordering::Relaxed));
         assert_eq!(verified.load(Ordering::Relaxed), 42);
     }
 
@@ -1398,11 +1490,42 @@ mod tests {
     fn verify_prover_root_mismatch() {
         let synced = AtomicBool::new(true);
         let verified = AtomicU64::new(99);
+        let mismatch = AtomicBool::new(false);
         let expected = vec![0xAAu8; 64];
         let local = vec![0xBBu8; 64];
-        assert!(!verify_root_logic(10, &expected, &local, &synced, &verified));
+        assert!(!verify_root_logic(10, &expected, &local, &synced, &verified, &mismatch));
         assert!(!synced.load(Ordering::Relaxed));
+        assert!(mismatch.load(Ordering::Relaxed), "a mismatch must set the recovery flag");
         assert_eq!(verified.load(Ordering::Relaxed), 0);
+    }
+
+    /// The recovery flag must distinguish a FRESH archive (never verified) from a
+    /// DIVERGED one (verified, mismatched) — the archive sync loop gates peer
+    /// reconciliation on `prover_root_mismatch_detected()`, NOT `!synced`, so a
+    /// fresh node (synced=false but mismatch=false) does NOT sync spuriously,
+    /// while a diverged node does; a subsequent match clears the flag.
+    #[test]
+    fn prover_root_mismatch_flag_state_machine() {
+        let synced = AtomicBool::new(false);
+        let verified = AtomicU64::new(0);
+        let mismatch = AtomicBool::new(false);
+
+        // Fresh: no verification has run. Not synced, but NOT a detected
+        // mismatch → recovery must not fire.
+        assert!(!synced.load(Ordering::Relaxed));
+        assert!(!mismatch.load(Ordering::Relaxed), "fresh node is not a detected mismatch");
+
+        // Divergence detected → flag set.
+        let expected = vec![0x11u8; 64];
+        let local = vec![0x22u8; 64];
+        assert!(!verify_root_logic(500, &expected, &local, &synced, &verified, &mismatch));
+        assert!(mismatch.load(Ordering::Relaxed), "divergence sets the recovery flag");
+
+        // Reconcile then match → flag cleared, recovery stops.
+        assert!(verify_root_logic(501, &expected, &expected, &synced, &verified, &mismatch));
+        assert!(!mismatch.load(Ordering::Relaxed), "a match clears the recovery flag");
+        assert!(synced.load(Ordering::Relaxed));
+        assert_eq!(verified.load(Ordering::Relaxed), 501);
     }
 
     #[test]
@@ -1426,16 +1549,19 @@ mod tests {
         local: &[u8],
         synced: &AtomicBool,
         verified_frame: &AtomicU64,
+        mismatch: &AtomicBool,
     ) -> bool {
         if expected.is_empty() || local.is_empty() {
             return true;
         }
         if local == expected {
             synced.store(true, Ordering::Relaxed);
+            mismatch.store(false, Ordering::Relaxed);
             verified_frame.store(frame, Ordering::Relaxed);
             true
         } else {
             synced.store(false, Ordering::Relaxed);
+            mismatch.store(true, Ordering::Relaxed);
             verified_frame.store(0, Ordering::Relaxed);
             false
         }

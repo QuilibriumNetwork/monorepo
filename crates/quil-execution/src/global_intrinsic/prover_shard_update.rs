@@ -928,6 +928,7 @@ mod tests {
                 _: &quil_types::proto::global::GlobalFrameHeader,
                 _: &[Vec<u8>],
                 _: &[u8],
+                _: &[Vec<u8>],
                 _: &[u8],
                 _: &dyn quil_types::crypto::Signer,
                 _: i64,
@@ -1003,7 +1004,7 @@ mod tests {
         impl FrameProver for F {
             fn prove_frame_header(&self, _: &[u8], _: &[u8], _: &[u8], _: &[Vec<u8>], _: &[u8], _: i64, _: u32, _: u64, _: u64, _: &[u8], _: u64) -> Result<quil_types::proto::global::FrameHeader> { Err(QuilError::InvalidArgument("noop".into())) }
             fn verify_frame_header(&self, _: &quil_types::proto::global::FrameHeader) -> Result<Vec<u8>> { Ok(Vec::new()) }
-            fn prove_global_frame_header(&self, _: &quil_types::proto::global::GlobalFrameHeader, _: &[Vec<u8>], _: &[u8], _: &[u8], _: &dyn quil_types::crypto::Signer, _: i64, _: u32, _: u8) -> Result<quil_types::proto::global::GlobalFrameHeader> { Err(QuilError::InvalidArgument("noop".into())) }
+            fn prove_global_frame_header(&self, _: &quil_types::proto::global::GlobalFrameHeader, _: &[Vec<u8>], _: &[u8], _: &[Vec<u8>], _: &[u8], _: &dyn quil_types::crypto::Signer, _: i64, _: u32, _: u8) -> Result<quil_types::proto::global::GlobalFrameHeader> { Err(QuilError::InvalidArgument("noop".into())) }
             fn verify_global_frame_header(&self, _: &quil_types::proto::global::GlobalFrameHeader) -> Result<Vec<u8>> { Ok(Vec::new()) }
             fn calculate_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: u32) -> Result<Vec<u8>> { Ok(Vec::new()) }
             fn verify_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: &[&[u8]]) -> Result<bool> { Ok(true) }

@@ -230,6 +230,10 @@ pub trait FrameProver: Send + Sync {
         previous_frame: &crate::proto::global::GlobalFrameHeader,
         commitments: &[Vec<u8>],
         prover_root: &[u8],
+        // Prover shard phase 1/2/3 roots (vertex-removes, hyperedge-adds,
+        // hyperedge-removes), bound into the VDF challenge alongside
+        // `prover_root` (phase 0) and carried in `prover_tree_aux_roots`.
+        prover_aux_roots: &[Vec<u8>],
         request_root: &[u8],
         signer: &dyn Signer,
         timestamp: i64,

@@ -14,16 +14,28 @@ use quil_types::proto::global::{AppShardFrame, GlobalFrame, GlobalFrameHeader};
 pub struct GlobalFrameVerifier {
     frame_prover: Arc<dyn FrameProver>,
     bls_constructor: Option<Arc<dyn BlsConstructor>>,
+    /// Fixed global committee (genesis archives' Falcon pubkeys). When set, a
+    /// CW-finalized global frame carrying the simplex FINALIZATION cert (CWCT
+    /// magic in the header sig field) is verified against it — defense-in-depth
+    /// over the VDF, which is publicly computable. Empty ⇒ cert check skipped
+    /// (legacy / callers that don't know the committee).
+    global_committee: Vec<Vec<u8>>,
 }
 
 impl GlobalFrameVerifier {
     pub fn new(frame_prover: Arc<dyn FrameProver>) -> Self {
-        Self { frame_prover, bls_constructor: None }
+        Self { frame_prover, bls_constructor: None, global_committee: Vec::new() }
     }
 
     /// Create with BLS signature verification enabled.
     pub fn with_bls(frame_prover: Arc<dyn FrameProver>, bls_constructor: Arc<dyn BlsConstructor>) -> Self {
-        Self { frame_prover, bls_constructor: Some(bls_constructor) }
+        Self { frame_prover, bls_constructor: Some(bls_constructor), global_committee: Vec::new() }
+    }
+
+    /// Attach the fixed global committee so CW finalization certs are verified.
+    pub fn with_global_committee(mut self, committee: Vec<Vec<u8>>) -> Self {
+        self.global_committee = committee;
+        self
     }
 
     /// Decode raw bytes into a GlobalFrame.
@@ -55,6 +67,39 @@ impl GlobalFrameVerifier {
                     "frame VDF proof invalid"
                 );
                 return Ok(false);
+            }
+        }
+
+        // CW-finalized global frame: the header sig field carries the simplex
+        // FINALIZATION cert (CWCT magic) over Poseidon(output), signed by the
+        // fixed global committee (genesis archives). Verify it when we know the
+        // committee — this proves the committee finalized the frame, not just
+        // that someone solved the (publicly computable) VDF. No committee ⇒ skip
+        // (legacy behavior); a present-but-invalid cert is rejected.
+        if !self.global_committee.is_empty() {
+            if let Some(cert) = header
+                .public_key_signature_bls48581
+                .as_ref()
+                .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))
+            {
+                let output_digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+                    .unwrap_or_default();
+                if quil_cw_consensus::app_cert::verify_finalization(
+                    cert,
+                    &self.global_committee,
+                    b"global",
+                    output_digest,
+                )
+                .is_none()
+                {
+                    warn!(
+                        frame = header.frame_number,
+                        "global CW finalization cert verification failed",
+                    );
+                    return Ok(false);
+                }
+                debug!(frame = header.frame_number, "global CW finalization cert verified");
+                return Ok(true);
             }
         }
 
@@ -528,7 +573,45 @@ impl BlsAppFrameValidator {
                 "app shard frame missing BLS signature (post-genesis frames must be signed)".into(),
             ));
         }
-        if let Some(sig) = header.public_key_signature_bls48581.as_ref() {
+        // A commonware-simplex-finalized shard frame carries the simplex
+        // FINALIZATION certificate (magic-prefixed) in the sig field's
+        // `signature` bytes — NOT a header aggregate. Verify it against the shard
+        // committee over `poseidon(output)` (namespace `b"appshard" ++ address`),
+        // mirroring the global reward path (`prover_shard_update.rs`) and the
+        // finalize-side attach in `app_engine::handle_cw_finalized_frame`. This
+        // is how a follower / archive (non-committee member) accepts a CW frame.
+        let cw_cert: Option<&[u8]> = header
+            .public_key_signature_bls48581
+            .as_ref()
+            .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature));
+        if let Some(cert_bytes) = cw_cert {
+            let committee_frame = if header.global_frame_number > 0 {
+                header.global_frame_number
+            } else {
+                header.frame_number
+            };
+            let active = self
+                .prover_registry
+                .get_active_provers(&header.address, committee_frame)?;
+            let committee_pubkeys: Vec<Vec<u8>> =
+                active.iter().map(|p| p.public_key.clone()).collect();
+            let mut namespace = b"appshard".to_vec();
+            namespace.extend_from_slice(&header.address);
+            let output_digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+                .map_err(|e| QuilError::Crypto(format!("cw cert: poseidon(output): {e}")))?;
+            if quil_cw_consensus::app_cert::verify_finalization(
+                cert_bytes,
+                &committee_pubkeys,
+                &namespace,
+                output_digest,
+            )
+            .is_none()
+            {
+                return Err(QuilError::InvalidSignature(
+                    "app shard frame CW finalization cert verification failed".into(),
+                ));
+            }
+        } else if let Some(sig) = header.public_key_signature_bls48581.as_ref() {
             let Some(pk) = sig.public_key.as_ref() else {
                 return Err(QuilError::InvalidArgument(
                     "signature has no public key".into(),
@@ -538,7 +621,17 @@ impl BlsAppFrameValidator {
             let participant_indices: Vec<usize> =
                 quil_consensus::bitmask::set_bit_indices(&sig.bitmask).collect();
 
-            let active = self.prover_registry.get_active_provers(&header.address, header.frame_number)?;
+            // Committee epoch is GLOBAL-frame-defined — reconstruct it at the
+            // frame's stamped `global_frame_number` (the proposer's `anchor_gfn`),
+            // NOT the app-shard-local `frame_number` (unrelated to global). Using
+            // the app-shard counter here compared app-shard epochs to the
+            // proposer's global epoch → committee/index mismatch on verify.
+            let committee_frame = if header.global_frame_number > 0 {
+                header.global_frame_number
+            } else {
+                header.frame_number // genesis/legacy: no anchor, epoch 0 either way
+            };
+            let active = self.prover_registry.get_active_provers(&header.address, committee_frame)?;
 
             // Generate a throwaway key pair once — Go does this via
             // `blsConstructor.New()`. The throwaway signature bytes
@@ -1091,6 +1184,7 @@ mod tests {
             _: &quil_types::proto::global::GlobalFrameHeader,
             _: &[Vec<u8>],
             _: &[u8],
+            _: &[Vec<u8>],
             _: &[u8],
             _: &dyn quil_types::crypto::Signer,
             _: i64,

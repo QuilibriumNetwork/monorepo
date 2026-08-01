@@ -660,10 +660,9 @@ impl ThreadWorkerManager {
                                                     // tasks spawned by the inner consensus event loop.
                                                     // Sharing a task via `tokio::select!` here was making
                                                     // the engine's own select starve under load.
-                                                    let bls_signer = (deps.bls_signer_factory)();
-                                                    // TODO
+                                                    let signer_factory = deps.bls_signer_factory.clone();
                                                     let mut engine_handle = tokio::spawn(async move {
-                                                        engine.run(bls_signer).await;
+                                                        engine.run(signer_factory).await;
                                                     });
                                                     tokio::select! {
                                                         _ = ec.cancelled() => {

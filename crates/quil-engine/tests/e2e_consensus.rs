@@ -145,6 +145,7 @@ impl FrameProver for StubFrameProver {
         previous_frame: &gpb::GlobalFrameHeader,
         _commitments: &[Vec<u8>],
         prover_root: &[u8],
+        _prover_aux_roots: &[Vec<u8>],
         request_root: &[u8],
         signer: &dyn Signer,
         timestamp: i64,
@@ -709,9 +710,17 @@ impl AppShardHarness {
         // Spawn each worker's engine + its event drain.
         for (idx, pending) in pendings.into_iter().enumerate() {
             let engine = pending.engine;
-            let bls = pending.bls_signer;
+            // `run` now takes a signer FACTORY (for CW-activation retry); rebuild
+            // the signer from its key each call.
+            let sk = pending.bls_signer.private_key().to_vec();
+            let pk = pending.bls_signer.public_key().to_vec();
+            let factory: std::sync::Arc<
+                dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync,
+            > = std::sync::Arc::new(move || {
+                Box::new(quil_crypto::FalconSigner::from_bytes(&sk, &pk))
+            });
             tokio::spawn(async move {
-                engine.run(bls).await;
+                engine.run(factory).await;
             });
 
             let peer_handles: Vec<quil_engine::app_engine::AppEngineHandle> = all_handles
@@ -2974,9 +2983,16 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
         let (engine, handle) =
             quil_engine::app_engine::AppConsensusEngine::new(core_id, filter_bytes, deps, event_tx);
         let bls_signer = prover_for_spawn.signer_clone();
+        let sk = bls_signer.private_key().to_vec();
+        let pk = bls_signer.public_key().to_vec();
+        let factory: std::sync::Arc<
+            dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync,
+        > = std::sync::Arc::new(move || {
+            Box::new(quil_crypto::FalconSigner::from_bytes(&sk, &pk))
+        });
         let exit_log = event_log_clone.clone();
         let join = tokio::spawn(async move {
-            engine.run(bls_signer).await;
+            engine.run(factory).await;
         });
         // Sentinel: log if the engine task ever exits.
         tokio::spawn(async move {

@@ -185,6 +185,7 @@ impl FrameProver for WesolowskiFrameProver {
         previous_frame: &global::GlobalFrameHeader,
         commitments: &[Vec<u8>],
         prover_root: &[u8],
+        prover_aux_roots: &[Vec<u8>],
         request_root: &[u8],
         signer: &dyn quil_types::crypto::Signer,
         timestamp: i64,
@@ -213,6 +214,13 @@ impl FrameProver for WesolowskiFrameProver {
         }
         input.extend_from_slice(prover_root);
         input.extend_from_slice(request_root);
+        // Bind the prover shard's phases 1/2/3 (audit #5 flag-day): every root
+        // that the catch-up syncer will authenticate must be committed by the
+        // frame identity, or a peer could serve divergent removes/hyperedge
+        // state. Appended AFTER request_root; the verifier mirrors this exactly.
+        for aux in prover_aux_roots {
+            input.extend_from_slice(aux);
+        }
 
         let b: [u8; 32] = Sha3_256::digest(&input).into();
         let output = vdf::wesolowski_solve(self.int_size_bits, &b, difficulty);
@@ -264,6 +272,7 @@ impl FrameProver for WesolowskiFrameProver {
             requests_root: request_root.to_vec(),
             prover: signer.public_key().to_vec(),
             public_key_signature_bls48581: bls_sig,
+            prover_tree_aux_roots: prover_aux_roots.to_vec(),
         })
     }
 
@@ -295,6 +304,10 @@ impl FrameProver for WesolowskiFrameProver {
         }
         input.extend_from_slice(&header.prover_tree_commitment);
         input.extend_from_slice(&header.requests_root);
+        // Mirror the prove side: bind the prover shard's phases 1/2/3 (audit #5).
+        for aux in &header.prover_tree_aux_roots {
+            input.extend_from_slice(aux);
+        }
 
         let challenge = Sha3_256::digest(&input);
 
@@ -699,6 +712,66 @@ mod batch_tests {
         assert!(
             !fp.verify_frame_header_signature(&tampered[2], &bls, None).unwrap(),
             "individual rejects tampered"
+        );
+    }
+
+    /// Audit #5 flag-day: the prover shard's phase 1/2/3 roots
+    /// (`prover_tree_aux_roots`) must be BOUND into the global VDF challenge, so
+    /// a peer can't serve divergent removes/hyperedge state to a catch-up
+    /// syncer. Real prove → verify round-trip + tamper/strip detection.
+    #[test]
+    fn prover_aux_roots_bound_into_global_vdf_challenge() {
+        crate::init();
+        let bls = crate::FalconKeyConstructor;
+        let fp = WesolowskiFrameProver::new(2048);
+        let (signer, _pk) = BlsConstructor::new_key(&bls).unwrap();
+
+        let prev = global::GlobalFrameHeader {
+            frame_number: 41,
+            output: vec![7u8; 516],
+            ..Default::default()
+        };
+        let prover_root = vec![1u8; 32];
+        let aux = vec![vec![2u8; 32], vec![3u8; 32], vec![4u8; 32]];
+        let request_root = vec![5u8; 32];
+        let difficulty = 128u32;
+
+        let header = fp
+            .prove_global_frame_header(
+                &prev,
+                &[],
+                &prover_root,
+                &aux,
+                &request_root,
+                signer.as_ref(),
+                1234,
+                difficulty,
+                0,
+            )
+            .expect("prove");
+        assert_eq!(header.prover_tree_aux_roots, aux, "aux roots carried on header");
+
+        // Honest header: verify recomputes the identical challenge → OK.
+        assert!(
+            fp.verify_global_frame_header(&header).is_ok(),
+            "honest header must verify"
+        );
+
+        // Tamper an aux root → challenge differs → VDF verify must FAIL.
+        let mut tampered = header.clone();
+        tampered.prover_tree_aux_roots[1] = vec![0xAAu8; 32];
+        assert!(
+            fp.verify_global_frame_header(&tampered).is_err(),
+            "tampered aux root must fail verify"
+        );
+
+        // Strip the aux roots entirely → also FAILS (proves they are bound, not
+        // silently ignored on the verify side).
+        let mut stripped = header.clone();
+        stripped.prover_tree_aux_roots.clear();
+        assert!(
+            fp.verify_global_frame_header(&stripped).is_err(),
+            "stripped aux roots must fail verify"
         );
     }
 }

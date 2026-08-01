@@ -35,6 +35,11 @@ pub struct GlobalState {
     /// `verify_global_frame_header` recomputes the same challenge. Empty on
     /// nodes without a CRDT wired (tolerated).
     pub global_commitments: Vec<Vec<u8>>,
+    /// Prover shard phase 1/2/3 roots (audit #5), bound into the VDF challenge
+    /// alongside `prover_tree_commitment` (phase 0) and carried onto the rebuilt
+    /// header so a follower recomputes the identical challenge. Mirrors
+    /// `global_commitments`.
+    pub prover_tree_aux_roots: Vec<Vec<u8>>,
     pub requests_root: Vec<u8>,
     pub signature: Vec<u8>,
     /// Inbound message bundles attached to this proposal, decoded
@@ -85,6 +90,7 @@ impl GlobalState {
             prover,
             prover_tree_commitment,
             global_commitments: Vec::new(),
+            prover_tree_aux_roots: Vec::new(),
             requests_root,
             signature,
             messages: Vec::new(),
@@ -98,6 +104,13 @@ impl GlobalState {
     /// rebuilt header carries the identical bytes the challenge was hashed over.
     pub fn with_global_commitments(mut self, commitments: Vec<Vec<u8>>) -> Self {
         self.global_commitments = commitments;
+        self
+    }
+
+    /// Attach the prover shard's phase 1/2/3 roots (audit #5), bound into the
+    /// VDF challenge, so the rebuilt header carries the identical bytes.
+    pub fn with_prover_aux_roots(mut self, roots: Vec<Vec<u8>>) -> Self {
+        self.prover_tree_aux_roots = roots;
         self
     }
 
@@ -127,6 +140,7 @@ impl GlobalState {
             prover: h.prover.clone(),
             prover_tree_commitment: h.prover_tree_commitment.clone(),
             global_commitments: h.global_commitments.clone(),
+            prover_tree_aux_roots: h.prover_tree_aux_roots.clone(),
             requests_root: h.requests_root.clone(),
             signature: h
                 .public_key_signature_bls48581

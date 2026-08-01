@@ -9,9 +9,10 @@ use super::addressed_signature::AddressedSignature;
 use super::prover_filter_ops::{ProverLeave, ProverPause, ProverResume};
 use super::prover_join::ProverJoin;
 use super::prover_ops::{
-    ProverConfirm, ProverReject,
-    ProverUpdate,
+    ProverConfirm, ProverKick, ProverReject, ProverSeniorityMerge, ProverUpdate, ShardMerge,
+    ShardSplit,
 };
+use super::consensus_types::AltShardUpdate;
 use super::seniority_merge::SeniorityMerge;
 use super::frame_header::FrameHeader;
 use super::sig_with_pop::SignatureWithPop;
@@ -84,6 +85,154 @@ pub fn seniority_merge_to_proto(s: &SeniorityMerge) -> pb::SeniorityMerge {
         signature: s.signature.clone(),
         key_type: s.key_type,
         prover_public_key: s.prover_public_key.clone(),
+    }
+}
+
+// =====================================================================
+// ProverSeniorityMerge ↔ proto::ProverSeniorityMerge (the OUTER request,
+// 0x031A; its `merge_targets` are the inner SeniorityMerge records above).
+// =====================================================================
+
+pub fn prover_seniority_merge_from_proto(pb: &pb::ProverSeniorityMerge) -> ProverSeniorityMerge {
+    ProverSeniorityMerge {
+        frame_number: pb.frame_number,
+        public_key_signature_bls48581: pb
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(addressed_sig_from_proto),
+        merge_targets: pb.merge_targets.iter().map(seniority_merge_from_proto).collect(),
+    }
+}
+
+pub fn prover_seniority_merge_to_proto(s: &ProverSeniorityMerge) -> pb::ProverSeniorityMerge {
+    pb::ProverSeniorityMerge {
+        frame_number: s.frame_number,
+        public_key_signature_bls48581: s
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(addressed_sig_to_proto),
+        merge_targets: s.merge_targets.iter().map(seniority_merge_to_proto).collect(),
+    }
+}
+
+// =====================================================================
+// ProverKick ↔ proto::ProverKick (traversal_proof is a nested proto,
+// stored raw-prost in the canonical form).
+// =====================================================================
+
+pub fn prover_kick_from_proto(pb: &pb::ProverKick) -> ProverKick {
+    ProverKick {
+        frame_number: pb.frame_number,
+        kicked_prover_public_key: pb.kicked_prover_public_key.clone(),
+        conflicting_frame_1: pb.conflicting_frame_1.clone(),
+        conflicting_frame_2: pb.conflicting_frame_2.clone(),
+        commitment: pb.commitment.clone(),
+        proof: pb.proof.clone(),
+        traversal_proof: pb
+            .traversal_proof
+            .as_ref()
+            .map(prost::Message::encode_to_vec)
+            .unwrap_or_default(),
+    }
+}
+
+pub fn prover_kick_to_proto(k: &ProverKick) -> pb::ProverKick {
+    pb::ProverKick {
+        frame_number: k.frame_number,
+        kicked_prover_public_key: k.kicked_prover_public_key.clone(),
+        conflicting_frame_1: k.conflicting_frame_1.clone(),
+        conflicting_frame_2: k.conflicting_frame_2.clone(),
+        commitment: k.commitment.clone(),
+        proof: k.proof.clone(),
+        traversal_proof: if k.traversal_proof.is_empty() {
+            None
+        } else {
+            prost::Message::decode(k.traversal_proof.as_slice()).ok()
+        },
+    }
+}
+
+// =====================================================================
+// ShardSplit ↔ proto::ShardSplit
+// =====================================================================
+
+pub fn shard_split_from_proto(pb: &pb::ShardSplit) -> ShardSplit {
+    ShardSplit {
+        shard_address: pb.shard_address.clone(),
+        proposed_shards: pb.proposed_shards.clone(),
+        frame_number: pb.frame_number,
+        public_key_signature_bls48581: pb
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(addressed_sig_from_proto),
+    }
+}
+
+pub fn shard_split_to_proto(s: &ShardSplit) -> pb::ShardSplit {
+    pb::ShardSplit {
+        shard_address: s.shard_address.clone(),
+        proposed_shards: s.proposed_shards.clone(),
+        frame_number: s.frame_number,
+        public_key_signature_bls48581: s
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(addressed_sig_to_proto),
+    }
+}
+
+// =====================================================================
+// ShardMerge ↔ proto::ShardMerge
+// =====================================================================
+
+pub fn shard_merge_from_proto(pb: &pb::ShardMerge) -> ShardMerge {
+    ShardMerge {
+        shard_addresses: pb.shard_addresses.clone(),
+        parent_address: pb.parent_address.clone(),
+        frame_number: pb.frame_number,
+        public_key_signature_bls48581: pb
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(addressed_sig_from_proto),
+    }
+}
+
+pub fn shard_merge_to_proto(s: &ShardMerge) -> pb::ShardMerge {
+    pb::ShardMerge {
+        shard_addresses: s.shard_addresses.clone(),
+        parent_address: s.parent_address.clone(),
+        frame_number: s.frame_number,
+        public_key_signature_bls48581: s
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(addressed_sig_to_proto),
+    }
+}
+
+// =====================================================================
+// AltShardUpdate ↔ proto::AltShardUpdate (flat 1:1 field copy)
+// =====================================================================
+
+pub fn alt_shard_update_from_proto(p: &pb::AltShardUpdate) -> AltShardUpdate {
+    AltShardUpdate {
+        public_key: p.public_key.clone(),
+        frame_number: p.frame_number,
+        vertex_adds_root: p.vertex_adds_root.clone(),
+        vertex_removes_root: p.vertex_removes_root.clone(),
+        hyperedge_adds_root: p.hyperedge_adds_root.clone(),
+        hyperedge_removes_root: p.hyperedge_removes_root.clone(),
+        signature: p.signature.clone(),
+    }
+}
+
+pub fn alt_shard_update_to_proto(a: &AltShardUpdate) -> pb::AltShardUpdate {
+    pb::AltShardUpdate {
+        public_key: a.public_key.clone(),
+        frame_number: a.frame_number,
+        vertex_adds_root: a.vertex_adds_root.clone(),
+        vertex_removes_root: a.vertex_removes_root.clone(),
+        hyperedge_adds_root: a.hyperedge_adds_root.clone(),
+        hyperedge_removes_root: a.hyperedge_removes_root.clone(),
+        signature: a.signature.clone(),
     }
 }
 

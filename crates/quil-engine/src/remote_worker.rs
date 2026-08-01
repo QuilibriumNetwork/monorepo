@@ -41,6 +41,13 @@ struct RemoteWorkerState {
     channel: Option<Channel>,
     /// Whether the worker is reachable.
     connected: bool,
+    /// Whether a `start_consensus=true` Respawn is owed to this worker. Set when
+    /// the allocator asks to start consensus while the worker's channel is down
+    /// (a cluster worker that connects AFTER its alloc went Active). `connect_all`
+    /// re-issues the Respawn once the channel comes up. Without this the deferred
+    /// Respawn (remote_worker.rs "consensus not yet started"/"deferred") was lost
+    /// and the worker never activated.
+    wants_consensus: bool,
 }
 
 /// Manages workers running on remote machines via gRPC.
@@ -102,6 +109,7 @@ impl RemoteWorkerManager {
                 allocated: false,
                 channel: None,
                 connected: false,
+                wants_consensus: false,
             });
         }
 
@@ -138,25 +146,56 @@ impl RemoteWorkerManager {
         self.event_rx.lock().unwrap().take()
     }
 
-    /// Connect to all registered workers. Called during startup.
+    /// Connect to any registered workers that are NOT already connected. Safe to
+    /// poll on an interval: workers with a live channel are skipped (no redundant
+    /// reconnect / duplicate deferred-Respawn), so it only acts on the initial
+    /// connect or after a disconnect clears the channel.
     pub async fn connect_all(&self) {
         let endpoints: Vec<(u32, String)> = {
             let workers = self.workers.lock().unwrap();
             workers.values()
+                .filter(|w| w.channel.is_none())
                 .map(|w| (w.core_id, w.endpoint.clone()))
                 .collect()
         };
+        if endpoints.is_empty() {
+            return;
+        }
 
         for (core_id, endpoint) in endpoints {
             match connect_to_worker(&endpoint).await {
                 Ok(channel) => {
-                    let mut workers = self.workers.lock().unwrap();
-                    if let Some(w) = workers.get_mut(&core_id) {
-                        w.channel = Some(channel);
-                        w.connected = true;
-                    }
+                    let (owed_filter, chan) = {
+                        let mut workers = self.workers.lock().unwrap();
+                        if let Some(w) = workers.get_mut(&core_id) {
+                            w.channel = Some(channel.clone());
+                            w.connected = true;
+                            // If a start_consensus Respawn was deferred while the
+                            // channel was down, it's owed now.
+                            let owed = if w.wants_consensus && !w.filter.is_empty() {
+                                Some(w.filter.clone())
+                            } else {
+                                None
+                            };
+                            (owed, channel)
+                        } else {
+                            (None, channel)
+                        }
+                    };
                     info!(core_id, endpoint = %endpoint, "connected to remote worker");
                     let _ = self.event_tx.send(RemoteWorkerEvent::Connected { core_id }).await;
+                    // Re-issue the deferred Respawn now that the worker is up.
+                    if let Some(filter) = owed_filter {
+                        info!(core_id, filter = hex::encode(&filter), "re-issuing deferred Respawn on connect");
+                        let mut client =
+                            quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(chan);
+                        let req = tonic::Request::new(quil_types::proto::node::RespawnRequest {
+                            filter,
+                        });
+                        if let Err(e) = client.respawn(req).await {
+                            warn!(core_id, error = %e, "deferred Respawn failed");
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -250,6 +289,11 @@ impl WorkerManager for RemoteWorkerManager {
             let mut workers = self.workers.lock().unwrap();
             if let Some(w) = workers.get_mut(&core_id) {
                 w.filter = filter.to_vec();
+                // Remember whether consensus is owed, so `connect_all` can
+                // re-issue the Respawn if the worker connects later. A
+                // non-empty filter with start_consensus=false (Joining) clears
+                // it; an empty filter (idle) clears it too.
+                w.wants_consensus = start_consensus && !filter.is_empty();
                 w.channel.is_some()
             } else {
                 return Err(QuilError::InvalidArgument(

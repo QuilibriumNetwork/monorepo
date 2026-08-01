@@ -2,10 +2,13 @@
 //! canonical-bytes types in this module.
 
 use quil_types::error::Result;
+use quil_types::proto::keys as keys_pb;
 use quil_types::proto::token as pb;
 
 use super::config::{Authority, FeeBasisStruct, TokenConfiguration, TokenMintStrategy};
 use super::deploy::{TokenDeploy, TokenUpdate};
+use super::mint::{MintTransaction, MintTransactionInput, MintTransactionOutput};
+use super::pending::{PendingTransaction, PendingTransactionInput, PendingTransactionOutput};
 use super::transaction::{
     RecipientBundle, Transaction, TransactionInput, TransactionOutput,
 };
@@ -185,6 +188,33 @@ pub fn token_update_from_proto(p: &pb::TokenUpdate) -> Result<TokenUpdate> {
     })
 }
 
+pub fn token_update_to_proto(u: &TokenUpdate) -> Result<pb::TokenUpdate> {
+    let config = if !u.config.is_empty() {
+        Some(token_config_to_proto(
+            &TokenConfiguration::from_canonical_bytes(&u.config)?,
+        )?)
+    } else {
+        None
+    };
+    // The canonical field carries the RAW inner signature bytes (see
+    // `token_update_from_proto`); re-wrap it into the proto's inner
+    // `signature` field only, leaving pubkey/bitmask empty.
+    let public_key_signature_bls48581 = if u.public_key_signature_bls48581.is_empty() {
+        None
+    } else {
+        Some(keys_pb::Bls48581AggregateSignature {
+            signature: u.public_key_signature_bls48581.clone(),
+            public_key: None,
+            bitmask: Vec::new(),
+        })
+    };
+    Ok(pb::TokenUpdate {
+        config,
+        rdf_schema: u.rdf_schema.clone(),
+        public_key_signature_bls48581,
+    })
+}
+
 // =====================================================================
 // RecipientBundle
 // =====================================================================
@@ -252,7 +282,279 @@ pub fn transaction_from_proto(p: &pb::Transaction) -> Result<Transaction> {
         outputs,
         fees: p.fees.clone(),
         range_proof: p.range_proof.clone(),
-        traversal_proof: Vec::new(), // TraversalProof conversion is a follow-up
+        // TraversalProof is a nested proto stored raw-prost in canonical
+        // (same convention as ProverKick); re-encode it so the request
+        // round-trips faithfully through the materializer.
+        traversal_proof: p
+            .traversal_proof
+            .as_ref()
+            .map(prost::Message::encode_to_vec)
+            .unwrap_or_default(),
+    })
+}
+
+pub fn transaction_input_to_proto(i: &TransactionInput) -> pb::TransactionInput {
+    pb::TransactionInput {
+        commitment: i.commitment.clone(),
+        signature: i.signature.clone(),
+        proofs: i.proofs.clone(),
+    }
+}
+
+pub fn transaction_output_to_proto(o: &TransactionOutput) -> Result<pb::TransactionOutput> {
+    let recipient_output = if o.recipient_output.is_empty() {
+        None
+    } else {
+        Some(recipient_bundle_to_proto(&RecipientBundle::from_canonical_bytes(
+            &o.recipient_output,
+        )?))
+    };
+    Ok(pb::TransactionOutput {
+        frame_number: o.frame_number.clone(),
+        commitment: o.commitment.clone(),
+        recipient_output,
+    })
+}
+
+pub fn transaction_to_proto(t: &Transaction) -> Result<pb::Transaction> {
+    let inputs: Vec<pb::TransactionInput> = t
+        .inputs
+        .iter()
+        .map(|b| Ok(transaction_input_to_proto(&TransactionInput::from_canonical_bytes(b)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let outputs: Vec<pb::TransactionOutput> = t
+        .outputs
+        .iter()
+        .map(|b| transaction_output_to_proto(&TransactionOutput::from_canonical_bytes(b)?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(pb::Transaction {
+        domain: t.domain.clone(),
+        inputs,
+        outputs,
+        fees: t.fees.clone(),
+        range_proof: t.range_proof.clone(),
+        traversal_proof: if t.traversal_proof.is_empty() {
+            None
+        } else {
+            prost::Message::decode(t.traversal_proof.as_slice()).ok()
+        },
+    })
+}
+
+// =====================================================================
+// PendingTransaction / Input / Output
+// =====================================================================
+
+pub fn pending_transaction_input_from_proto(
+    p: &pb::PendingTransactionInput,
+) -> PendingTransactionInput {
+    PendingTransactionInput {
+        commitment: p.commitment.clone(),
+        signature: p.signature.clone(),
+        proofs: p.proofs.clone(),
+    }
+}
+
+pub fn pending_transaction_input_to_proto(
+    i: &PendingTransactionInput,
+) -> pb::PendingTransactionInput {
+    pb::PendingTransactionInput {
+        commitment: i.commitment.clone(),
+        signature: i.signature.clone(),
+        proofs: i.proofs.clone(),
+    }
+}
+
+pub fn pending_transaction_output_from_proto(
+    p: &pb::PendingTransactionOutput,
+) -> Result<PendingTransactionOutput> {
+    let to = match &p.to {
+        Some(r) => recipient_bundle_from_proto(r).to_canonical_bytes()?,
+        None => Vec::new(),
+    };
+    let refund = match &p.refund {
+        Some(r) => recipient_bundle_from_proto(r).to_canonical_bytes()?,
+        None => Vec::new(),
+    };
+    Ok(PendingTransactionOutput {
+        frame_number: p.frame_number.clone(),
+        commitment: p.commitment.clone(),
+        to,
+        refund,
+        expiration: p.expiration,
+    })
+}
+
+pub fn pending_transaction_output_to_proto(
+    o: &PendingTransactionOutput,
+) -> Result<pb::PendingTransactionOutput> {
+    let to = if o.to.is_empty() {
+        None
+    } else {
+        Some(recipient_bundle_to_proto(&RecipientBundle::from_canonical_bytes(&o.to)?))
+    };
+    let refund = if o.refund.is_empty() {
+        None
+    } else {
+        Some(recipient_bundle_to_proto(&RecipientBundle::from_canonical_bytes(&o.refund)?))
+    };
+    Ok(pb::PendingTransactionOutput {
+        frame_number: o.frame_number.clone(),
+        commitment: o.commitment.clone(),
+        to,
+        refund,
+        expiration: o.expiration,
+    })
+}
+
+pub fn pending_transaction_from_proto(p: &pb::PendingTransaction) -> Result<PendingTransaction> {
+    let inputs: Vec<Vec<u8>> = p
+        .inputs
+        .iter()
+        .map(|i| pending_transaction_input_from_proto(i).to_canonical_bytes())
+        .collect::<Result<Vec<_>>>()?;
+    let outputs: Vec<Vec<u8>> = p
+        .outputs
+        .iter()
+        .map(|o| pending_transaction_output_from_proto(o)?.to_canonical_bytes())
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PendingTransaction {
+        domain: p.domain.clone(),
+        inputs,
+        outputs,
+        fees: p.fees.clone(),
+        range_proof: p.range_proof.clone(),
+        traversal_proof: p
+            .traversal_proof
+            .as_ref()
+            .map(prost::Message::encode_to_vec)
+            .unwrap_or_default(),
+    })
+}
+
+pub fn pending_transaction_to_proto(t: &PendingTransaction) -> Result<pb::PendingTransaction> {
+    let inputs: Vec<pb::PendingTransactionInput> = t
+        .inputs
+        .iter()
+        .map(|b| {
+            Ok(pending_transaction_input_to_proto(
+                &PendingTransactionInput::from_canonical_bytes(b)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let outputs: Vec<pb::PendingTransactionOutput> = t
+        .outputs
+        .iter()
+        .map(|b| pending_transaction_output_to_proto(&PendingTransactionOutput::from_canonical_bytes(b)?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(pb::PendingTransaction {
+        domain: t.domain.clone(),
+        inputs,
+        outputs,
+        fees: t.fees.clone(),
+        range_proof: t.range_proof.clone(),
+        traversal_proof: if t.traversal_proof.is_empty() {
+            None
+        } else {
+            prost::Message::decode(t.traversal_proof.as_slice()).ok()
+        },
+    })
+}
+
+// =====================================================================
+// MintTransaction / Input / Output
+// =====================================================================
+
+pub fn mint_transaction_input_from_proto(p: &pb::MintTransactionInput) -> MintTransactionInput {
+    MintTransactionInput {
+        value: p.value.clone(),
+        commitment: p.commitment.clone(),
+        signature: p.signature.clone(),
+        proofs: p.proofs.clone(),
+        additional_reference: p.additional_reference.clone(),
+        additional_reference_key: p.additional_reference_key.clone(),
+    }
+}
+
+pub fn mint_transaction_input_to_proto(i: &MintTransactionInput) -> pb::MintTransactionInput {
+    pb::MintTransactionInput {
+        value: i.value.clone(),
+        commitment: i.commitment.clone(),
+        signature: i.signature.clone(),
+        proofs: i.proofs.clone(),
+        additional_reference: i.additional_reference.clone(),
+        additional_reference_key: i.additional_reference_key.clone(),
+    }
+}
+
+pub fn mint_transaction_output_from_proto(
+    p: &pb::MintTransactionOutput,
+) -> Result<MintTransactionOutput> {
+    let recipient_output = match &p.recipient_output {
+        Some(r) => recipient_bundle_from_proto(r).to_canonical_bytes()?,
+        None => Vec::new(),
+    };
+    Ok(MintTransactionOutput {
+        frame_number: p.frame_number.clone(),
+        commitment: p.commitment.clone(),
+        recipient_output,
+    })
+}
+
+pub fn mint_transaction_output_to_proto(
+    o: &MintTransactionOutput,
+) -> Result<pb::MintTransactionOutput> {
+    let recipient_output = if o.recipient_output.is_empty() {
+        None
+    } else {
+        Some(recipient_bundle_to_proto(&RecipientBundle::from_canonical_bytes(
+            &o.recipient_output,
+        )?))
+    };
+    Ok(pb::MintTransactionOutput {
+        frame_number: o.frame_number.clone(),
+        commitment: o.commitment.clone(),
+        recipient_output,
+    })
+}
+
+pub fn mint_transaction_from_proto(p: &pb::MintTransaction) -> Result<MintTransaction> {
+    let inputs: Vec<Vec<u8>> = p
+        .inputs
+        .iter()
+        .map(|i| mint_transaction_input_from_proto(i).to_canonical_bytes())
+        .collect::<Result<Vec<_>>>()?;
+    let outputs: Vec<Vec<u8>> = p
+        .outputs
+        .iter()
+        .map(|o| mint_transaction_output_from_proto(o)?.to_canonical_bytes())
+        .collect::<Result<Vec<_>>>()?;
+    Ok(MintTransaction {
+        domain: p.domain.clone(),
+        inputs,
+        outputs,
+        fees: p.fees.clone(),
+        range_proof: p.range_proof.clone(),
+    })
+}
+
+pub fn mint_transaction_to_proto(t: &MintTransaction) -> Result<pb::MintTransaction> {
+    let inputs: Vec<pb::MintTransactionInput> = t
+        .inputs
+        .iter()
+        .map(|b| Ok(mint_transaction_input_to_proto(&MintTransactionInput::from_canonical_bytes(b)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let outputs: Vec<pb::MintTransactionOutput> = t
+        .outputs
+        .iter()
+        .map(|b| mint_transaction_output_to_proto(&MintTransactionOutput::from_canonical_bytes(b)?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(pb::MintTransaction {
+        domain: t.domain.clone(),
+        inputs,
+        outputs,
+        fees: t.fees.clone(),
+        range_proof: t.range_proof.clone(),
     })
 }
 
