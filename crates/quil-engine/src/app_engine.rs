@@ -836,6 +836,16 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 frame_number,
                 rank,
                 &self.local_prover_address,
+                // Use the LOCALS that ride the wire via `AppShardState` (below),
+                // NOT `header.*` — the verifier recomputes from the reconstructed
+                // wire header, which carries these locals. (`header.*` from
+                // `prove_frame_header` can differ, e.g. fee_multiplier_vote.)
+                difficulty,
+                fee_multiplier_vote,
+                now_ms,
+                // Stamped above (before this call) and carried on the wire via
+                // `AppShardState.storage_attestation_root` — matches the verifier.
+                &header.storage_attestation_root,
             );
         }
 
@@ -1136,9 +1146,11 @@ pub struct AppConsensusEngine {
     /// Thread-safe mirror of `last_materialized_frame` for the CW proposal
     /// check, which runs on the simplex thread (audit #3). Bumped alongside the
     /// field via [`Self::set_materialized_frame`] wherever the materialized
-    /// shard state advances. Because it is only ever raised AFTER the state is
-    /// committed, it never OVER-reports, so the `state_roots` pre-state gate
-    /// abstains (signs) rather than false-nullifies when it lags.
+    /// shard state advances. Only ever raised AFTER the state is committed, so
+    /// it never OVER-reports. The `state_roots` pre-state gate is now FAIL-CLOSED:
+    /// a voter not exactly at N-1 nullifies (cannot validate the declared
+    /// pre-state) rather than signing blind — closing the frame-number-jump
+    /// bypass of audit #3. A lagging voter catches up via shard sync, then votes.
     shard_mat_frame: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Shared with the leader provider: requests this node collected for
     /// frames it proposed (proto `MessageBundle`s), keyed by frame
@@ -1618,7 +1630,22 @@ impl AppConsensusEngine {
                         Some(AppEngineMessage::CwIn { channel, from, data }) => {
                             if let Some(h) = self.cw_handle.as_ref() {
                                 if channel == crate::cw_app_seams::CW_APP_BLOCK_CHANNEL {
-                                    (h.ingest_block)(data);
+                                    // Authorize the block channel like channels 0/1/2
+                                    // (audit residual #1): require the sender key to
+                                    // resolve (the master resolves it from committee
+                                    // membership) before storing. Previously channel 3
+                                    // ingested any bytes, ignoring `from` — letting an
+                                    // unresolved peer feed/overwrite the block store
+                                    // (the block is still verified at `verify`, so this
+                                    // is authorization/DoS hardening, not a safety hole).
+                                    if quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&from).is_some() {
+                                        (h.ingest_block)(data);
+                                    } else {
+                                        tracing::debug!(
+                                            core_id = self.core_id,
+                                            "cw app block: unresolved sender key, dropping block",
+                                        );
+                                    }
                                 } else if (channel as usize) < h.inbound.len() {
                                     match quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&from) {
                                         Some(pk) => {
@@ -1988,20 +2015,36 @@ impl AppConsensusEngine {
                             if !req_ok {
                                 return false;
                             }
-                            // (b) Pre-state `state_roots` check (audit #3) — ONLY
-                            // when this node is EXACTLY at N-1 (materialized), so
-                            // the deterministic `compute_shard_root` pre-state
-                            // equals what an honest leader declared. A behind /
-                            // async-lagged member (mat < N-1) abstains here
-                            // (signs) rather than spuriously nullify; caught-up
-                            // peers gate the attack. Matches the leader's
-                            // construction: 4 phases in canonical order, empty →
-                            // zero root.
+                            // (b) Pre-state `state_roots` check (audit #3, +#3-bypass
+                            // fix). FAIL-CLOSED: a voter must be EXACTLY at N-1 to
+                            // validate the declared pre-state via the deterministic
+                            // `compute_shard_root`. Previously a voter not at N-1
+                            // (lagging, OR a leader that JUMPED `frame_number` so the
+                            // gate went false on every honest voter) fell through and
+                            // SIGNED unvalidatable roots — the audit-#3 bypass. Now it
+                            // NULLIFIES instead; a genuinely-lagging voter catches up
+                            // out-of-band (shard sync) and validates future frames, so
+                            // no forged root is ever signed. Matches the leader's
+                            // construction: 4 phases in canonical order, empty → zero.
                             let n = header.frame_number;
-                            if n > 0
-                                && shard_mat.load(std::sync::atomic::Ordering::Relaxed) + 1 == n
-                                && header.state_roots.len() == 4
-                            {
+                            if n > 0 {
+                                let mat =
+                                    shard_mat.load(std::sync::atomic::Ordering::Relaxed);
+                                if mat + 1 != n {
+                                    tracing::warn!(
+                                        frame = n, mat,
+                                        "cw app verify: not at N-1, cannot validate declared \
+                                         pre-state (frame-number jump or lag) — nullify",
+                                    );
+                                    return false;
+                                }
+                                if header.state_roots.len() != 4 {
+                                    tracing::warn!(
+                                        frame = n, roots = header.state_roots.len(),
+                                        "cw app verify: header.state_roots not 4 phases — nullify",
+                                    );
+                                    return false;
+                                }
                                 let zero =
                                     vec![0u8; if hg.has_forest() { 32 } else { 64 }];
                                 let phases = [
@@ -2214,6 +2257,17 @@ impl AppConsensusEngine {
 
         if frame_number <= self.last_materialized_frame || self.execution_engine.is_none() {
             // Already materialized (or nothing to apply); still (re)publish below.
+        } else if frame_number != self.last_materialized_frame + 1 {
+            // Leapfrog guard (audit Finding #4): a finalized frame more than one
+            // ahead of the cursor means intermediate frames are missing (e.g. a
+            // prior frame failed fatally). Materializing here would apply N+k on
+            // state missing N..N+k-1's mutations and permanently skip them. Refuse;
+            // the follower/shard-sync path fills the gap strictly (== last+1).
+            warn!(
+                core_id = self.core_id, frame = frame_number,
+                cursor = self.last_materialized_frame,
+                "cw-finalized frame ahead of cursor; deferring to catch-up (not skipping)",
+            );
         } else {
             let world_size = self
                 .hypergraph
@@ -2223,9 +2277,11 @@ impl AppConsensusEngine {
                     hg.total_size().to_u64().unwrap_or(0)
                 })
                 .unwrap_or(0);
-            let difficulty = self
-                .current_difficulty
-                .load(std::sync::atomic::Ordering::Relaxed);
+            // Use the CERTIFIED header difficulty (bound into the frame output),
+            // not this node's local `current_difficulty` — they can differ when
+            // materializing another leader's finalized frame, and the reward path
+            // must use the value the committee certified (audit hardening #2).
+            let difficulty = header.difficulty;
             match self
                 .materialize_offloaded(
                     frame.requests.clone(),
@@ -2242,8 +2298,10 @@ impl AppConsensusEngine {
                     debug!(core_id = self.core_id, frame = frame_number, processed, skipped,
                         "materialized cw-finalized shard frame");
                 }
+                // Cursor NOT advanced on error → the frame is retried on the next
+                // finalize/sync instead of being silently skipped (Finding #4).
                 Err(e) => warn!(core_id = self.core_id, frame = frame_number, error = %e,
-                    "cw-finalized materialize failed"),
+                    "cw-finalized materialize failed (cursor held; will retry)"),
             }
         }
 
@@ -2626,6 +2684,11 @@ impl AppConsensusEngine {
         };
 
         let fee_multiplier_vote = proto_header.fee_multiplier_vote;
+        // Capture the certified difficulty before `proto_header` is moved into
+        // the frame — materialize must use the value bound into the frame output,
+        // which can differ from `current_difficulty` if a difficulty adjustment
+        // landed between producing this header and materializing it (hardening #2).
+        let header_difficulty = proto_header.difficulty;
         let frame = quil_types::proto::global::AppShardFrame {
             header: Some(proto_header),
             requests: requests.clone(),
@@ -2635,7 +2698,17 @@ impl AppConsensusEngine {
         // Step 2: self-materialize into local shard state (idempotent).
         // Offloaded to the blocking pool so it doesn't HOL-block the
         // engine's runtime thread.
-        if frame_number > self.last_materialized_frame && self.execution_engine.is_some() {
+        if self.execution_engine.is_some()
+            && frame_number > self.last_materialized_frame
+            && frame_number != self.last_materialized_frame + 1
+        {
+            // Leapfrog guard (Finding #4): don't materialize past a gap.
+            warn!(
+                core_id = self.core_id, frame = frame_number,
+                cursor = self.last_materialized_frame,
+                "own shard frame ahead of cursor; deferring to catch-up (not skipping)",
+            );
+        } else if frame_number == self.last_materialized_frame + 1 && self.execution_engine.is_some() {
             let world_size = self
                 .hypergraph
                 .as_ref()
@@ -2644,9 +2717,7 @@ impl AppConsensusEngine {
                     hg.total_size().to_u64().unwrap_or(0)
                 })
                 .unwrap_or(0);
-            let difficulty = self
-                .current_difficulty
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let difficulty = header_difficulty;
             match self
                 .materialize_offloaded(
                     requests.clone(),
@@ -2666,8 +2737,9 @@ impl AppConsensusEngine {
                     debug!(core_id = self.core_id, frame = frame_number, processed, skipped,
                         "self-materialized own shard frame");
                 }
+                // Cursor held on error → retried on next finalize/sync (Finding #4).
                 Err(e) => warn!(core_id = self.core_id, frame = frame_number, error = %e,
-                    "self-materialize of own shard frame failed"),
+                    "self-materialize of own shard frame failed (cursor held; will retry)"),
             }
         }
 
@@ -2702,8 +2774,8 @@ impl AppConsensusEngine {
             };
             // Validate address + capture the fee vote (Copy) so we don't
             // hold a borrow of `frame.header` across the awaits below.
-            let fee_multiplier_vote = match frame.header.as_ref() {
-                Some(h) if h.address == self.app_address => h.fee_multiplier_vote,
+            let (fee_multiplier_vote, header_difficulty) = match frame.header.as_ref() {
+                Some(h) if h.address == self.app_address => (h.fee_multiplier_vote, h.difficulty),
                 _ => {
                     self.received_full_frames.remove(&next);
                     break;
@@ -2754,9 +2826,8 @@ impl AppConsensusEngine {
                     hg.total_size().to_u64().unwrap_or(0)
                 })
                 .unwrap_or(0);
-            let difficulty = self
-                .current_difficulty
-                .load(std::sync::atomic::Ordering::Relaxed);
+            // Certified difficulty from the received frame's header (hardening #2).
+            let difficulty = header_difficulty;
             match self
                 .materialize_offloaded(
                     frame.requests.clone(),
@@ -2903,12 +2974,25 @@ impl AppConsensusEngine {
         // materialize fails we DON'T seal: re-queue the parent so a later
         // attempt can retry, rather than committing an un-materialized
         // frame.
-        if header.frame_number > self.last_materialized_frame {
+        // Leapfrog guard (Finding #4): only materialize the immediate next frame.
+        // If the certified parent is more than one ahead of the cursor, seal the
+        // clock frame (the chain advances) but DON'T materialize past the gap —
+        // the strict follower/shard-sync path fills it (== last+1). Materializing
+        // N+k on state missing N..N+k-1 would silently skip their mutations.
+        if header.frame_number > self.last_materialized_frame + 1 {
+            warn!(
+                core_id = self.core_id, parent_rank, frame = header.frame_number,
+                cursor = self.last_materialized_frame,
+                "sealed parent ahead of cursor; sealing clock frame, deferring materialize to catch-up",
+            );
+        } else if header.frame_number == self.last_materialized_frame + 1 {
             // Scalars up front so no borrow of `self`/`frame` survives
             // into the result arms where we mutate
             // `self.last_materialized_frame` / `pending_certified_parents`.
             let frame_number = header.frame_number;
             let fee_multiplier_vote = header.fee_multiplier_vote;
+            // Certified difficulty from the sealed parent's header (hardening #2).
+            let header_difficulty = header.difficulty;
             if self.execution_engine.is_some() {
                 let world_size = self
                     .hypergraph
@@ -2918,9 +3002,7 @@ impl AppConsensusEngine {
                         hg.total_size().to_u64().unwrap_or(0)
                     })
                     .unwrap_or(0);
-                let difficulty = self
-                    .current_difficulty
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                let difficulty = header_difficulty;
                 // Offloaded to the blocking pool (off the engine task).
                 let result = self
                     .materialize_offloaded(
@@ -3375,11 +3457,19 @@ pub(crate) fn compute_requests_root(
         app_address.to_vec()
     };
 
-    // Build the per-message leaves once (identical for both schemes): the
-    // leaf key is SHA3-256(payload), the value the exec-lock output.
+    // Build the per-message leaves once (identical for both schemes). The leaf
+    // key is SHA3-256(index_be ‖ payload) — prefixing the canonical execution
+    // POSITION binds the commitment to request ORDER and MULTIPLICITY (audit
+    // Finding #2). A keyed JMT/VC tree is otherwise order-independent and
+    // collapses duplicate payloads, so a reordered body (e.g. two conflicting
+    // lattice spends `[A,B]` vs `[B,A]`) would share one certified `requests_root`
+    // yet execute to divergent state on different replicas. FLAG-DAY: changes the
+    // root → the deterministic frame output → the app-frame digest.
     let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(messages.len());
-    for payload in messages {
-        let hash: [u8; 32] = Sha3_256::digest(payload).into();
+    for (i, payload) in messages.iter().enumerate() {
+        let mut keyed = (i as u64).to_be_bytes().to_vec();
+        keyed.extend_from_slice(payload);
+        let hash: [u8; 32] = Sha3_256::digest(&keyed).into();
         let locked = exec
             .lock(frame_number, &addr_for_lock, payload)
             .unwrap_or_else(|_| Vec::new());

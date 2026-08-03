@@ -56,20 +56,43 @@ pub fn parse_address(hex_str: &str) -> anyhow::Result<LatticeAddress> {
     Ok(LatticeAddress { kem_pk, big_b })
 }
 
-/// Load the wallet's long-term lattice spend base `b`, generating + persisting
-/// it on first use (eta=1 so stealth `sk = offset + b` stays within ETA=2).
-pub fn load_or_create_b(config_dir: &std::path::Path, cols: usize) -> anyhow::Result<PolyVec> {
-    let path = config_dir.join("q-lattice-spend.key");
-    if path.exists() {
-        let hex_bytes = std::fs::read_to_string(&path)?;
-        let raw = hex::decode(hex_bytes.trim())?;
+/// The wallet's long-term lattice spend base `b` (eta=1, so stealth
+/// `sk = offset + b` stays within the membership norm bound ETA=2).
+///
+/// DERIVED deterministically from the wallet's encrypted `q-onion-key` keystore
+/// secret — it is NEVER written to disk. This replaces the first-cut plaintext
+/// `q-lattice-spend.key` file (a spend secret in the clear). Derivation is
+/// domain-separated so it can never collide with the stealth-offset derivation,
+/// and full-entropy (`hash_to_short_polyvec` expands the seed with SHA-256), so
+/// `b` retains the seed's entropy (a truncated PRG seed would have weakened it).
+///
+/// Backward-compat: if a legacy plaintext file still exists (a wallet from the
+/// first-cut), it is read (so coins made under that `b` remain spendable) with a
+/// loud deprecation warning; delete it once migrated.
+pub fn derive_spend_base(
+    config_dir: &std::path::Path,
+    onion_secret: &[u8],
+    cols: usize,
+) -> anyhow::Result<PolyVec> {
+    let legacy = config_dir.join("q-lattice-spend.key");
+    if legacy.exists() {
+        eprintln!(
+            "[WARN] using DEPRECATED plaintext lattice spend key {} — the spend base \
+             is now derived from the (encrypted) keystore; delete this file once your \
+             coins are migrated so no spend secret sits in the clear.",
+            legacy.display()
+        );
+        let raw = hex::decode(std::fs::read_to_string(&legacy)?.trim())?;
         return wire::decode_polyvec(&raw).map_err(|e| anyhow::anyhow!("decode b: {e:?}"));
     }
-    let mut prg = quil_lattice_ct::arith::SplitMix64::new(rand::random::<u64>());
-    let b = PolyVec::sample_short(cols, 1, &mut prg);
-    std::fs::write(&path, hex::encode(wire::encode_polyvec(&b)))?;
-    println!("Generated wallet lattice spend key at {}", path.display());
-    Ok(b)
+    // Domain-separated seed = SHA3-256("…/wallet-spend-base/v1" ‖ onion_secret),
+    // then a full-entropy short-vector expansion (eta=1).
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update(b"quil-lattice-ct/wallet-spend-base/v1");
+    h.update(onion_secret);
+    let seed = h.finalize();
+    Ok(quil_lattice_ct::stealth::hash_to_short_polyvec(&seed, cols))
 }
 
 /// The wallet's lattice keys + params, gathered once per command.
@@ -91,8 +114,6 @@ impl Wallet {
         let np = production_params();
         let mp = MembershipParams::production(1);
         let cols = mp.a_otk.cols;
-        let b = load_or_create_b(&tc.config_dir, cols)?;
-        let big_b = mp.a_otk.matvec(&b);
         let km = &tc.key_manager;
         let kem_sk = km
             .get_secret_key_bytes_by_id("q-onion-key")
@@ -100,6 +121,10 @@ impl Wallet {
         let kem_pk = km
             .get_public_key_bytes_by_id("q-onion-key")
             .map_err(|e| anyhow::anyhow!("q-onion-key public: {e}"))?;
+        // Derive the spend base from the (encrypted) keystore onion secret — no
+        // plaintext spend key on disk.
+        let b = derive_spend_base(&tc.config_dir, &kem_sk, cols)?;
+        let big_b = mp.a_otk.matvec(&b);
         let falcon_sk = km
             .get_secret_key_bytes_by_id("q-prover-key")
             .map_err(|e| anyhow::anyhow!("q-prover-key secret: {e}"))?;

@@ -237,14 +237,33 @@ impl GlobalProposer for AppSeamProposer {
                 // proposal can pair a legitimate header/root with a mismatched
                 // body. Reject before signing so no honest member certifies a
                 // body its declared (and soon certified) root does not cover.
-                if let Some(check) = self.requests_root_check.as_ref() {
-                    if !check(&frame) {
+                // audit residual #3: a wired check that FAILS is fail-closed
+                // (nullify). A committee member with NO check wired (missing
+                // execution engine / inclusion prover / hypergraph) cannot validate
+                // the body or pre-state — it votes blind. Production always wires the
+                // check; hard-nullifying the unwired case would break lightweight /
+                // relay committee members and the test harness, so we WARN loudly
+                // (was silent) so the misconfiguration is visible + alertable, but
+                // still sign. (Requiring state to vote is a committee-policy change.)
+                match self.requests_root_check.as_ref() {
+                    Some(check) => {
+                        if !check(&frame) {
+                            tracing::warn!(
+                                frame = header.frame_number,
+                                "cw app verify: requests_root/state-root check failed \
+                                 (body/pre-state does not match declared roots) — nullify",
+                            );
+                            return false;
+                        }
+                    }
+                    None => {
                         tracing::warn!(
                             frame = header.frame_number,
-                            "cw app verify: requests_root mismatch (carried body \
-                             does not match declared root) — nullify",
+                            "cw app verify: NO requests_root/state-root check wired \
+                             (stateless committee member voting WITHOUT validation) — \
+                             signing blind; wire execution engine + inclusion prover + \
+                             hypergraph to validate",
                         );
-                        return false;
                     }
                 }
                 self.block_meta

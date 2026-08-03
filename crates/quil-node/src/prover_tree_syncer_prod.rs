@@ -77,7 +77,28 @@ impl ProdProverTreeSyncer {
                 }
             }
             let Some((v_s, _root_s)) = head else {
-                continue; // peer has no tree for this phase (matched the zero anchor)
+                // Peer has no tree for this phase (matched the zero anchor). Verify
+                // our LOCAL tree is ALSO empty (audit residual #4): otherwise stale
+                // local data the header says shouldn't exist would survive the sync
+                // (the pull is skipped, so nothing overwrites it).
+                if !expected.is_empty() {
+                    if let Some(sk) = crate::forest_sync::app_shard_key(&shard_id) {
+                        let (s, p) = crate::forest_sync::phase_strs(phase);
+                        let mut local = self.crdt.compute_shard_root(s, p, &sk);
+                        if local.is_empty() {
+                            local = vec![0u8; expected.len()];
+                        }
+                        if local.as_slice() != expected.as_slice() {
+                            warn!(
+                                phase,
+                                "peer absent but LOCAL phase root != header-committed zero root \
+                                 (stale local data) — not syncing this shard",
+                            );
+                            return Ok(false);
+                        }
+                    }
+                }
+                continue;
             };
             let got = crate::forest_sync::sync_one_phase(
                 &mut client, &handle, &self.crdt, &shard_id, phase, v_s,

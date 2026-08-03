@@ -103,6 +103,7 @@ pub fn is_audited(rho_n: &[u8], id: &[u8], sample_num: u64, sample_den: u64) -> 
 /// `frame_number` at a higher rank after a timeout yields a DISTINCT identity —
 /// without it, the VDF-free output collides across re-proposals and the
 /// consensus forks tree rejects the second as a parent-level conflict.
+#[allow(clippy::too_many_arguments)]
 pub fn deterministic_app_frame_output(
     parent_selector: &[u8],
     requests_root: &[u8],
@@ -111,6 +112,19 @@ pub fn deterministic_app_frame_output(
     frame_number: u64,
     rank: u64,
     prover: &[u8],
+    // Header metadata that downstream code consumes (difficulty feeds
+    // reward/coverage accounting) but which used to sit OUTSIDE the certified
+    // output — freely substitutable on a certified frame (audit latent finding).
+    // Binding them here makes the finalize-time output-recompute reject any
+    // tampering. FLAG-DAY: changes the app-frame digest.
+    difficulty: u32,
+    fee_multiplier_vote: u64,
+    timestamp: i64,
+    // The proposer's storage-attestation root. Binding it here stops a
+    // finalize-time substitution from STRIPPING the attestation (emptying the
+    // root + body) under the same certified digest — which would silently drop
+    // storage-reward accounting (audit residual #2). FLAG-DAY.
+    storage_attestation_root: &[u8],
 ) -> Vec<u8> {
     let mut h = Sha3_256::new();
     h.update(DST_FRAME_OUTPUT);
@@ -129,6 +143,11 @@ pub fn deterministic_app_frame_output(
     h.update(rank.to_be_bytes());
     h.update((prover.len() as u32).to_be_bytes());
     h.update(prover);
+    h.update(difficulty.to_be_bytes());
+    h.update(fee_multiplier_vote.to_be_bytes());
+    h.update(timestamp.to_be_bytes());
+    h.update((storage_attestation_root.len() as u32).to_be_bytes());
+    h.update(storage_attestation_root);
     let digest = h.finalize();
     let mut out = vec![0u8; 516];
     out[..32].copy_from_slice(&digest);
@@ -1253,20 +1272,29 @@ mod tests {
         let srs = vec![vec![0x33u8; 64], vec![0x44u8; 64]];
         let rho = [0x55u8; 32];
         let prover = [0x66u8; 32];
-        let a = deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover);
+        let sar = [0x99u8; 32];
+        let a = deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar);
         // 516-byte layout: 32-byte digest then zeros (so poseidon(output) +
         // output[..516] parent derivations are unchanged downstream).
         assert_eq!(a.len(), 516);
         assert!(a[..32].iter().any(|&b| b != 0), "digest must be non-zero");
         assert!(a[32..].iter().all(|&b| b == 0), "tail must be zero-padded");
         // Deterministic.
-        assert_eq!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover));
+        assert_eq!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar));
         // Binds every input: a different beacon, frame, rank, or content changes it.
         let rho2 = [0x56u8; 32];
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho2, 7, 0, &prover));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 8, 0, &prover));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 1, &prover));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &[0x23u8; 64], &srs, &rho, 7, 0, &prover));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho2, 7, 0, &prover, 5, 3, 100, &sar));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 8, 0, &prover, 5, 3, 100, &sar));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 1, &prover, 5, 3, 100, &sar));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &[0x23u8; 64], &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar));
+        // Now-bound header metadata: difficulty, fee vote, timestamp, and the
+        // storage-attestation root each change it.
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 6, 3, 100, &sar));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 4, 100, &sar));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 101, &sar));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &[0x9Au8; 32]));
+        // Stripping the attestation (empty root) must change the output too.
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &[]));
     }
 
     #[test]

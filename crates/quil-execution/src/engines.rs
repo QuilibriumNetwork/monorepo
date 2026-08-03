@@ -570,6 +570,11 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     // cutover; retiring the decaf providers is a follow-up.)
                     use crate::token_intrinsic::lattice_ct;
                     let env = lattice_ct::decode_tx_envelope(inner_bytes)?;
+                    // Bound the consensus-opaque per-output memos + one-time keys
+                    // before they are stored verbatim in state (griefing/state-bloat
+                    // hardening #5).
+                    lattice_ct::check_memos_size(&env.output_memos)?;
+                    lattice_ct::check_otks_size(&env.output_otks)?;
                     let np = lattice_ct::production_params();
                     let is_quil = _address == &crate::domains::QUIL_TOKEN[..];
                     match lattice_ct::verify_envelope_and_derive_coins(
@@ -603,6 +608,10 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     // tree. All post-quantum — no decaf, no BLS.
                     use crate::token_intrinsic::lattice_ct;
                     let env = lattice_ct::decode_mint_envelope(inner_bytes)?;
+                    // Bound the consensus-opaque per-output memos + one-time keys
+                    // (hardening #5).
+                    lattice_ct::check_memos_size(&env.output_memos)?;
+                    lattice_ct::check_otks_size(&env.output_otks)?;
                     let np = lattice_ct::production_params();
                     let is_quil = _address == &crate::domains::QUIL_TOKEN[..];
                     // Reward-tree root for the cited frame (forest, 32 bytes).
@@ -627,7 +636,11 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             "lattice-mint: reward root not 32 bytes (forest reward tree required)".into(),
                         )
                     })?;
-                    match lattice_ct::verify_mint_envelope_and_derive(np, &reward_root, _address, &env)? {
+                    // DoS guard: a malformed mint proof must not panic the block
+                    // thread (consensus halt) — reject it instead (audit hardening).
+                    match lattice_ct::guard_verify(|| {
+                        lattice_ct::verify_mint_envelope_and_derive(np, &reward_root, _address, &env)
+                    })? {
                         Some((new_coins, decrements)) => {
                             let frame_bytes = _frame_number.to_be_bytes();
                             let result =
@@ -652,8 +665,15 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     // vertex (dual Falcon recipients + expiration). No coin yet.
                     use crate::token_intrinsic::lattice_ct;
                     let env = lattice_ct::decode_pending_create(inner_bytes)?;
+                    // Bound all consensus-opaque fields stored verbatim in the
+                    // escrow vertex before verify (griefing/state-bloat hardening #5).
+                    lattice_ct::check_escrow_memo_size(&env.memo)?;
+                    lattice_ct::check_memos_size(&env.change_memos)?;
+                    lattice_ct::check_otks_size(&env.change_otks)?;
+                    lattice_ct::check_recipient_key_size(&env.to_key)?;
+                    lattice_ct::check_recipient_key_size(&env.refund_key)?;
                     let np = lattice_ct::production_params();
-                    match lattice_ct::verify_lattice_pending_create(
+                    match lattice_ct::guard_verify(|| lattice_ct::verify_lattice_pending_create(
                         np,
                         state,
                         _address,
@@ -664,7 +684,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         &env.change_otks,
                         &env.balance_proof,
                         env.fee,
-                    )? {
+                    ))? {
                         Some((key_images, cv, change_coins)) => {
                             let frame_bytes = _frame_number.to_be_bytes();
                             let mut result = crate::token_intrinsic::materialize::materialize_lattice_pending(
@@ -693,6 +713,10 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     // party claims the escrow into a coin; the escrow is retired.
                     use crate::token_intrinsic::{lattice_ct, materialize, spent_check};
                     let env = lattice_ct::decode_pending_claim(inner_bytes)?;
+                    // Bound the consensus-opaque claimed-coin memo + one-time key
+                    // (hardening #5).
+                    lattice_ct::check_memo_size(&env.output_memo)?;
+                    lattice_ct::check_otk_size(&env.output_otk)?;
                     let np = lattice_ct::production_params();
 
                     // Read the escrow vertex and extract its fields.
@@ -734,10 +758,10 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         return Err(QuilError::InvalidArgument("lattice-pending: escrow already claimed".into()));
                     }
 
-                    match lattice_ct::verify_lattice_pending_claim(
+                    match lattice_ct::guard_verify(|| lattice_ct::verify_lattice_pending_claim(
                         np, _address, &cv, &recipient_key, env.is_to, &env.falcon_sig,
                         &env.output_commitment, &env.output_range_proof, &env.value_link_proof,
-                    )? {
+                    ))? {
                         Some(new_cv) => {
                             let frame_bytes = _frame_number.to_be_bytes();
                             let new_coins = vec![(env.output_otk.clone(), new_cv)];
@@ -768,6 +792,9 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     // entry is nullified. Ed448 survives only here.
                     use crate::token_intrinsic::{lattice_ct, materialize, spent_check};
                     let env = lattice_ct::decode_shield(inner_bytes)?;
+                    // Bound the consensus-opaque one-time key (hardening #5); the
+                    // shield envelope carries no memo.
+                    lattice_ct::check_otk_size(&env.output_otk)?;
                     let np = lattice_ct::production_params();
 
                     let blob = state
@@ -800,10 +827,10 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         return Err(QuilError::InvalidArgument("shield: coin already shielded".into()));
                     }
 
-                    match lattice_ct::verify_lattice_shield(
+                    match lattice_ct::guard_verify(|| lattice_ct::verify_lattice_shield(
                         np, _address, &owner_address, amount, &env.ed448_pubkey, &env.ed448_sig,
                         &env.output_commitment, &env.output_range_proof, &env.balance_proof,
-                    )? {
+                    ))? {
                         Some(cv) => {
                             let frame_bytes = _frame_number.to_be_bytes();
                             let new_coins = vec![(env.output_otk.clone(), cv)];
@@ -990,14 +1017,25 @@ impl ShardExecutionEngine for TokenExecutionEngine {
         // snapshot the changeset length before the call and truncate
         // back to it on `Err`. Errors stay non-fatal (logged, frame
         // continues) — that part of the original behavior is correct.
-        let run_one = |inner_bytes: &[u8], inner_tp: u32| {
+        let run_one = |inner_bytes: &[u8], inner_tp: u32| -> Result<()> {
             let savepoint = self.state.as_ref().map(|s| s.changeset_len());
             if let Err(e) = invoke_token(inner_bytes, inner_tp) {
-                eprintln!("[WARN] token invoke_step failed type=0x{:08x}: {}", inner_tp, e);
+                // INFRASTRUCTURE/TRANSIENT failures (Store/Io) are replica-local:
+                // swallowing one here would let this node skip an op another node
+                // applies → silent state divergence under the same certified
+                // digest (audit Finding #4). Propagate them so the outer
+                // materializer treats the frame as fatal (retry, don't advance).
+                // DETERMINISTIC failures (bad sig/semantics) fail identically on
+                // every replica, so they stay non-fatal: roll back + continue.
                 if let (Some(s), Some(sp)) = (self.state.as_ref(), savepoint) {
                     s.rollback_to(sp);
                 }
+                if matches!(e, QuilError::Store(_) | QuilError::Io(_)) {
+                    return Err(e);
+                }
+                eprintln!("[WARN] token invoke_step failed type=0x{:08x}: {}", inner_tp, e);
             }
+            Ok(())
         };
 
         // Persist the frame's accepted token writes into the CRDT. The
@@ -1007,7 +1045,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
         // trees via `crdt.commit(frame)`): the spent-set was effectively
         // empty on the next frame, making every spend replayable.
         // Mirrors GlobalExecutionEngine's per-message `state.commit()`.
-        let commit_state = || {
+        let commit_state = || -> Result<()> {
             if let Some(s) = self.state.as_ref() {
                 match s.commit() {
                     // Clear the committed changeset. The engine and its
@@ -1019,9 +1057,13 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     // (even same-frame, later messages) see it via the
                     // CRDT fallback in `HypergraphState::get`.
                     Ok(()) => s.abort(),
-                    Err(e) => eprintln!("[WARN] token state.commit failed: {}", e),
+                    // A commit failure is infrastructure (Store/Io): propagate
+                    // it as fatal so the frame is retried, not silently advanced
+                    // with the writes lost (audit Finding #4).
+                    Err(e) => return Err(e),
                 }
             }
+            Ok(())
         };
 
         match tp {
@@ -1029,16 +1071,16 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
                 for req in &bundle.requests {
                     if let Some(r) = req {
-                        run_one(&r.inner_bytes, r.inner_type_prefix);
+                        run_one(&r.inner_bytes, r.inner_type_prefix)?;
                     }
                 }
-                commit_state();
+                commit_state()?;
                 Ok(ProcessMessageResult { messages: Vec::new(), state: Vec::new() })
             }
             TYPE_MESSAGE_REQUEST => {
                 let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
-                run_one(&req.inner_bytes, req.inner_type_prefix);
-                commit_state();
+                run_one(&req.inner_bytes, req.inner_type_prefix)?;
+                commit_state()?;
                 Ok(ProcessMessageResult { messages: Vec::new(), state: Vec::new() })
             }
             _ => Err(QuilError::InvalidArgument("token: unsupported message type".into())),

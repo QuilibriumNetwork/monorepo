@@ -20,7 +20,7 @@ use quil_types::store::ShardKey;
 use tracing::warn;
 
 /// `(set, phase)` string pair — the blob keyspace keying, matching the CRDT.
-fn phase_strs(phase: u32) -> (&'static str, &'static str) {
+pub(crate) fn phase_strs(phase: u32) -> (&'static str, &'static str) {
     match phase {
         0 => ("vertex", "adds"),
         1 => ("vertex", "removes"),
@@ -32,7 +32,7 @@ fn phase_strs(phase: u32) -> (&'static str, &'static str) {
 /// The app ShardKey (blob-keyspace key) for a forest `shard_id` — its first 32
 /// bytes are the app address `l2` (whether it is the app itself for a
 /// single-shard app, or `app‖prefix` for a QUIL sub-shard).
-fn app_shard_key(shard_id: &[u8]) -> Option<ShardKey> {
+pub(crate) fn app_shard_key(shard_id: &[u8]) -> Option<ShardKey> {
     if shard_id.len() < 32 {
         return None;
     }
@@ -89,7 +89,18 @@ async fn fetch_changed_blobs(
             .await
             .map_err(|e| QuilError::Internal(format!("get_vertex_blob: {e}")))?
         else {
-            continue;
+            // FAIL, don't skip (audit residual #4): this leaf is in the diff the
+            // peer committed to in its authenticated root, so its blob MUST exist.
+            // Skipping left the tree with a correct root but MISSING data (later
+            // reads of this vertex return nothing). Abort so the caller retries /
+            // picks another peer rather than completing an incomplete sync.
+            return Err(QuilError::Internal(format!(
+                "peer did not serve blob for changed vertex {} (phase {}, ver {}) — \
+                 incomplete sync, aborting",
+                hex::encode(&vertex_id),
+                phase,
+                source_version
+            )));
         };
         // SECURITY: the served blob MUST hash to the committed leaf value
         // (`commitment ‖ size`), else a peer could serve data not bound to the

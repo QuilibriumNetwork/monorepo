@@ -226,8 +226,13 @@ impl GlobalLeaderProvider {
     fn compute_requests_root(&self, messages: &[Vec<u8>]) -> Vec<u8> {
         use sha3::{Digest as _, Sha3_256};
         let mut tree = quil_tries::VectorCommitmentTree::new();
-        for msg in messages {
-            let id: [u8; 32] = Sha3_256::digest(msg).into();
+        for (i, msg) in messages.iter().enumerate() {
+            // Key by SHA3(index_be ‖ msg) so the (order-independent, dup-collapsing)
+            // keyed tree commits request ORDER + MULTIPLICITY — the same fix as the
+            // app-shard `compute_requests_root` (audit Finding #2, global sibling).
+            let mut keyed = (i as u64).to_be_bytes().to_vec();
+            keyed.extend_from_slice(msg);
+            let id: [u8; 32] = Sha3_256::digest(&keyed).into();
             if let Err(e) = tree.insert(
                 &id,
                 msg,
@@ -917,6 +922,35 @@ mod tests {
         assert_ne!(empty, nonempty);
         // Deterministic for the same input.
         assert_eq!(empty, p.compute_requests_root(&[]));
+    }
+
+    /// Regression (audit Finding #2 / residual): the requests_root MUST bind
+    /// request ORDER and MULTIPLICITY. Before keying leaves by `SHA3(index‖msg)`,
+    /// a reordered or duplicated body produced the SAME root — a collision-free
+    /// consensus-divergence vector (e.g. two conflicting spends `[A,B]` vs `[B,A]`
+    /// share a certified root but execute differently).
+    #[test]
+    fn compute_requests_root_binds_order_and_multiplicity() {
+        let p = provider_with(Arc::new(TestProverRegistry::new()));
+        let a = vec![0x0Au8; 16];
+        let b = vec![0x0Bu8; 16];
+        // Order: [A,B] != [B,A].
+        assert_ne!(
+            p.compute_requests_root(&[a.clone(), b.clone()]),
+            p.compute_requests_root(&[b.clone(), a.clone()]),
+            "requests_root must bind request order",
+        );
+        // Multiplicity: [A] != [A,A].
+        assert_ne!(
+            p.compute_requests_root(&[a.clone()]),
+            p.compute_requests_root(&[a.clone(), a.clone()]),
+            "requests_root must bind request multiplicity",
+        );
+        // Still deterministic for the exact same ordered sequence.
+        assert_eq!(
+            p.compute_requests_root(&[a.clone(), b.clone()]),
+            p.compute_requests_root(&[a, b]),
+        );
     }
 
     /// Build a leader whose only non-default wiring is the hypergraph CRDT,

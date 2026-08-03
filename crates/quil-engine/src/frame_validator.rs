@@ -511,12 +511,12 @@ impl BlsAppFrameValidator {
             // identity basis) and require it to match the header. ρ_N is derived
             // from the anchored global frame's VDF output, resolved from our own
             // clock store (never trusting the wire).
-            let global_output = self
+            let global_anchor = self
                 .clock_store
                 .as_ref()
                 .and_then(|cs| cs.get_global_clock_frame(header.global_frame_number).ok())
-                .and_then(|gf| gf.header.map(|h| h.output));
-            let global_output = match global_output {
+                .and_then(|gf| gf.header.map(|h| (h.output, h.timestamp)));
+            let (global_output, global_timestamp) = match global_anchor {
                 Some(o) => o,
                 None => {
                     return Err(QuilError::Crypto(
@@ -536,11 +536,58 @@ impl BlsAppFrameValidator {
                 header.frame_number,
                 header.rank,
                 &header.prover,
+                header.difficulty,
+                header.fee_multiplier_vote,
+                header.timestamp,
+                &header.storage_attestation_root,
             );
             if expected != header.output {
                 return Err(QuilError::Crypto(
                     "storage frame: deterministic output does not match header".into(),
                 ));
+            }
+
+            // Timestamp sanity (hardening #3). Now that `timestamp` is bound into
+            // the deterministic output (fix C), a malicious leader can still stamp
+            // an arbitrary value and have the committee certify it unless voters
+            // reject out-of-range timestamps before signing.
+            //
+            // Two independent bounds:
+            //  * Future bound (wall clock, Bitcoin-style ±tolerance). The window
+            //    is far wider than any honest clock skew, so honest leaders never
+            //    trip it, and catch-up replay of already-finalized frames — whose
+            //    timestamps are in the PAST — always passes. A strict deterministic
+            //    verdict isn't required here (borderline-future frames don't occur
+            //    honestly), which is the standard approach for block timestamps.
+            //  * Backdating bound against the consensus-certified anchored global
+            //    frame, applied ONLY when that anchor carries a real timestamp.
+            //    This is deterministic (resolved from our own clock store) and is
+            //    skipped for timestampless genesis anchors (global frame with
+            //    timestamp 0), which otherwise have no meaningful time reference.
+            if header.timestamp <= 0 {
+                return Err(QuilError::InvalidArgument(
+                    "storage frame: non-positive timestamp".into(),
+                ));
+            }
+            const MAX_FUTURE_MS: i64 = 2 * 60 * 60 * 1000; // 2h ahead of wall clock
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if now_ms > 0 && header.timestamp > now_ms.saturating_add(MAX_FUTURE_MS) {
+                return Err(QuilError::InvalidArgument(format!(
+                    "storage frame: timestamp {} too far in the future (now {}, >{}ms)",
+                    header.timestamp, now_ms, MAX_FUTURE_MS,
+                )));
+            }
+            const MAX_BEHIND_MS: i64 = 60 * 60 * 1000; // 1h behind the anchor
+            if global_timestamp > 0
+                && header.timestamp < global_timestamp.saturating_sub(MAX_BEHIND_MS)
+            {
+                return Err(QuilError::InvalidArgument(format!(
+                    "storage frame: timestamp {} too far behind anchored global frame {} (>{}ms)",
+                    header.timestamp, global_timestamp, MAX_BEHIND_MS,
+                )));
             }
         } else if let Err(e) = self.frame_prover.verify_frame_header(header) {
             debug!(

@@ -1257,6 +1257,102 @@ pub fn split_output_memo(memo: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     Ok((kem, ring))
 }
 
+// ---------------------------------------------------------------------------
+// Consensus-opaque field size bounds (griefing / state-bloat hardening #5).
+//
+// Memos and recipient-key fields are NOT interpreted by verify — they are
+// stored VERBATIM in the coin/escrow vertex that every node persists forever.
+// The transaction fee is per-transaction (fixed), not per-byte, so without a
+// size bound one cheap tx (or escrow-create) can force the whole network to
+// store an arbitrarily large blob. These caps are far above any honest memo
+// (a real output memo = kem_ct ~1KB ‖ ring_memo, a few KB; an escrow memo is
+// two such halves) so they never reject a legitimate transaction, but they
+// bound the state a single fee buys. A violation is an `InvalidArgument` →
+// deterministic skip on every replica (never `Store`/`Io`), so it can't halt
+// the shard or diverge state.
+// ---------------------------------------------------------------------------
+
+/// Max bytes for a single consensus-opaque per-output/coin memo blob.
+pub const MAX_MEMO_BYTES: usize = 64 * 1024;
+/// Max bytes for the escrow memo (structurally two [`build_output_memo`]
+/// halves — one for `to`, one for `refund`).
+pub const MAX_ESCROW_MEMO_BYTES: usize = 2 * MAX_MEMO_BYTES;
+/// Max bytes for a consensus-opaque recipient key field (Falcon-512 pubkey =
+/// 897 B; generous headroom).
+pub const MAX_RECIPIENT_KEY_BYTES: usize = 4 * 1024;
+/// Max bytes for a consensus-opaque one-time key (`P`, a wire-encoded PolyVec)
+/// stored verbatim in the coin vertex. The canonical encoding at production
+/// params is 12316 B (a_otk rows=6, ring degree D=256, u64 coeffs) — measured,
+/// stable across ring sizes; this cap is ~2.6× that for safe headroom while
+/// still bounding the state a single fixed-fee output can force every node to
+/// store. (If the coin ring dimensions ever change, re-measure and revisit.)
+pub const MAX_OTK_BYTES: usize = 32 * 1024;
+
+/// Reject a single memo blob that exceeds [`MAX_MEMO_BYTES`].
+pub fn check_memo_size(memo: &[u8]) -> Result<()> {
+    if memo.len() > MAX_MEMO_BYTES {
+        return Err(QuilError::InvalidArgument(format!(
+            "lattice-ct: memo too large ({} > {} bytes)",
+            memo.len(),
+            MAX_MEMO_BYTES,
+        )));
+    }
+    Ok(())
+}
+
+/// Reject any memo in a per-output memo list that exceeds [`MAX_MEMO_BYTES`].
+pub fn check_memos_size(memos: &[Vec<u8>]) -> Result<()> {
+    for m in memos {
+        check_memo_size(m)?;
+    }
+    Ok(())
+}
+
+/// Reject an escrow memo that exceeds [`MAX_ESCROW_MEMO_BYTES`].
+pub fn check_escrow_memo_size(memo: &[u8]) -> Result<()> {
+    if memo.len() > MAX_ESCROW_MEMO_BYTES {
+        return Err(QuilError::InvalidArgument(format!(
+            "lattice-ct: escrow memo too large ({} > {} bytes)",
+            memo.len(),
+            MAX_ESCROW_MEMO_BYTES,
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a consensus-opaque recipient key that exceeds
+/// [`MAX_RECIPIENT_KEY_BYTES`].
+pub fn check_recipient_key_size(key: &[u8]) -> Result<()> {
+    if key.len() > MAX_RECIPIENT_KEY_BYTES {
+        return Err(QuilError::InvalidArgument(format!(
+            "lattice-ct: recipient key too large ({} > {} bytes)",
+            key.len(),
+            MAX_RECIPIENT_KEY_BYTES,
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a one-time key blob that exceeds [`MAX_OTK_BYTES`].
+pub fn check_otk_size(otk: &[u8]) -> Result<()> {
+    if otk.len() > MAX_OTK_BYTES {
+        return Err(QuilError::InvalidArgument(format!(
+            "lattice-ct: one-time key too large ({} > {} bytes)",
+            otk.len(),
+            MAX_OTK_BYTES,
+        )));
+    }
+    Ok(())
+}
+
+/// Reject any one-time key in a per-output list that exceeds [`MAX_OTK_BYTES`].
+pub fn check_otks_size(otks: &[Vec<u8>]) -> Result<()> {
+    for k in otks {
+        check_otk_size(k)?;
+    }
+    Ok(())
+}
+
 fn put_one(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(&(b.len() as u32).to_le_bytes());
     out.extend_from_slice(b);
@@ -1533,10 +1629,18 @@ pub fn verify_envelope_and_derive_coins(
     env: &TxEnvelope,
     include_fee: bool,
 ) -> Result<Option<(Vec<Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>)>> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        verify_envelope_and_derive_coins_inner(np, state, domain, env, include_fee)
-    }))
-    .unwrap_or_else(|_| {
+    guard_verify(|| verify_envelope_and_derive_coins_inner(np, state, domain, env, include_fee))
+}
+
+/// Run a lattice verifier under a panic guard. The lattice arithmetic asserts on
+/// module-dimension mismatches (e.g. a decoded polyvec of the wrong rank hitting
+/// `matvec`'s `assert_eq!`), so an adversarial mint/escrow/shield proof could
+/// otherwise PANIC the block-executing thread → consensus halt. The verifiers are
+/// read-only on `state`, so a caught panic simply rejects the message (never a
+/// halt, never a state change) — `AssertUnwindSafe` is sound for that reason.
+/// Use this to wrap EVERY lattice-CT verify entry point called from the engine.
+pub fn guard_verify<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
         Err(QuilError::InvalidArgument(
             "lattice-ct: verifier panicked on malformed proof (rejected)".into(),
         ))
@@ -3022,5 +3126,29 @@ mod tests {
         let ki1 = verify_input_signature(&np, &ring_b, &wire::encode_ring_sig(&s1), b"tx-A").unwrap().unwrap();
         let ki2 = verify_input_signature(&np, &ring_b, &wire::encode_ring_sig(&s2), b"tx-B").unwrap().unwrap();
         assert_eq!(ki1, ki2, "same spend key ⇒ same key image ⇒ double-spend caught");
+    }
+
+    #[test]
+    fn opaque_field_size_bounds_reject_bloat_accept_legit() {
+        // Legit-sized memos / keys pass (hardening #5).
+        assert!(check_memo_size(&vec![0u8; 8 * 1024]).is_ok());
+        assert!(check_memo_size(&vec![0u8; MAX_MEMO_BYTES]).is_ok());
+        assert!(check_memos_size(&[vec![0u8; 4096], vec![0u8; 4096]]).is_ok());
+        assert!(check_escrow_memo_size(&vec![0u8; 16 * 1024]).is_ok());
+        assert!(check_escrow_memo_size(&vec![0u8; MAX_ESCROW_MEMO_BYTES]).is_ok());
+        // Falcon-512 pubkey is 897 bytes — well under the cap.
+        assert!(check_recipient_key_size(&vec![0u8; 897]).is_ok());
+        // The canonical one-time key P encoding is 12316 bytes — under the cap.
+        assert!(check_otk_size(&vec![0u8; 12_316]).is_ok());
+        assert!(check_otk_size(&vec![0u8; MAX_OTK_BYTES]).is_ok());
+        assert!(check_otks_size(&[vec![0u8; 12_316], vec![0u8; 12_316]]).is_ok());
+
+        // Oversized blobs are rejected (state-bloat griefing).
+        assert!(check_memo_size(&vec![0u8; MAX_MEMO_BYTES + 1]).is_err());
+        assert!(check_memos_size(&[vec![0u8; 16], vec![0u8; MAX_MEMO_BYTES + 1]]).is_err());
+        assert!(check_escrow_memo_size(&vec![0u8; MAX_ESCROW_MEMO_BYTES + 1]).is_err());
+        assert!(check_recipient_key_size(&vec![0u8; MAX_RECIPIENT_KEY_BYTES + 1]).is_err());
+        assert!(check_otk_size(&vec![0u8; MAX_OTK_BYTES + 1]).is_err());
+        assert!(check_otks_size(&[vec![0u8; 16], vec![0u8; MAX_OTK_BYTES + 1]]).is_err());
     }
 }

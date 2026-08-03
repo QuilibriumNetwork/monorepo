@@ -169,6 +169,15 @@ pub struct WorkerOnlyNode {
     /// Cooldown frame to avoid sync-storms: after a sync attempt,
     /// skip further attempts until frame_number >= cooldown_until.
     sync_cooldown_until: std::sync::atomic::AtomicU64,
+    /// The prover-tree roots (phase 0 = `prover_tree_commitment`, phases
+    /// 1/2/3 = `prover_tree_aux_roots`) from the most recent global frame
+    /// header the worker has seen on the master stream. The periodic
+    /// background sync uses these as its anchor so it verifies the peer's
+    /// served tree against a consensus-certified root instead of blindly
+    /// trusting the peer (hardening #6). Empty until the first global frame
+    /// arrives — the periodic sync falls back to trust-the-peer only for
+    /// that initial window.
+    latest_prover_tree_anchor: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 impl WorkerOnlyNode {
@@ -213,6 +222,7 @@ impl WorkerOnlyNode {
             prover_tree_syncer: None,
             registry_refresh: None,
             sync_cooldown_until: std::sync::atomic::AtomicU64::new(0),
+            latest_prover_tree_anchor: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -326,7 +336,14 @@ impl WorkerOnlyNode {
                         _ = cancel.cancelled() => break,
                         _ = tick.tick() => {
                             if let Some(syncer) = this.prover_tree_syncer.as_ref() {
-                                match syncer.sync_prover_tree(&[]).await {
+                                // Anchor against the last-seen global frame header's
+                                // certified prover-tree roots (hardening #6). Empty
+                                // only before the first global frame arrives, in which
+                                // case we fall back to trust-the-peer for that window.
+                                let anchor = {
+                                    this.latest_prover_tree_anchor.lock().unwrap().clone()
+                                };
+                                match syncer.sync_prover_tree(&anchor).await {
                                     Ok(_) => this.refresh_registry(),
                                     Err(e) => tracing::debug!(error = %e, "periodic prover-tree sync failed"),
                                 }
@@ -752,6 +769,14 @@ impl WorkerOnlyNode {
         let expected = &header.prover_tree_commitment;
         if expected.is_empty() {
             return;
+        }
+        // Cache the certified prover-tree roots so the periodic background sync
+        // can anchor against them instead of trusting the peer (hardening #6).
+        {
+            let mut anchor = self.latest_prover_tree_anchor.lock().unwrap();
+            anchor.clear();
+            anchor.push(header.prover_tree_commitment.clone());
+            anchor.extend(header.prover_tree_aux_roots.iter().cloned());
         }
         // Compute local root from CRDT.
         let local_root = match self.hypergraph.as_ref() {
