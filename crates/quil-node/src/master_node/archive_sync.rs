@@ -495,6 +495,10 @@ async fn run_state_jump(
     // advances the cursor — enough to STOP replaying ancient pre-migration
     // history — and syncs its own assigned shards via the worker path.
     sync_all_shards: bool,
+    // Mainnet (network 0) declares the fixed 64-way QUIL grid before onboarding
+    // sync so produced roots match the network; testnet/devnet leaves QUIL
+    // single-shard (see `install_forest_for_sync`).
+    mainnet_quil_grid: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Option<u64> {
     let local_head = clock_store.get_latest_frame_number().unwrap_or(0);
@@ -557,7 +561,6 @@ async fn run_state_jump(
             warn!(%addr, target, "state-jump: peer head has no prover_tree_commitment anchor — skipping");
             continue;
         }
-        let prover_root = anchor.clone();
         info!(%addr, local_head, target, "state-jump: syncing FULL state pinned to frame N");
 
         // Onboarding: a fresh node boots on the ephemeral in-memory forest, so
@@ -566,62 +569,159 @@ async fn run_state_jump(
         // the persistent RocksDB forest + declare the QUIL partition BEFORE the
         // pulls so synced + produced state lands on disk consistently. No-op once
         // persistent (migrated node / prior jump).
-        if quil_forest_migrate::install_forest_for_sync(crdt.as_ref(), hg_store.as_ref()) {
+        if quil_forest_migrate::install_forest_for_sync(crdt.as_ref(), hg_store.as_ref(), mainnet_quil_grid) {
             info!("state-jump: installed persistent forest for onboarding sync");
         }
 
         // Prover tree — the global prover shard is a single-shard forest app
-        // (L2 = [0xff; 32]). Pull it (all phases) from the peer via the efficient
-        // Merkle diff. (`prover_root` / `anchor` are the peer's generation pin;
-        // the diff authenticates against the peer's own tree root.)
-        let _ = &prover_root;
-        if let Err(e) =
-            crate::forest_sync::pull_shard_from_peer(&addr, &seed, crdt.clone(), &[0xffu8; 32]).await
+        // (L2 = [0xff; 32]). VERIFY the synced vertex-adds root against the
+        // AUTHENTICATED `anchor` (`hdr.prover_tree_commitment` from the head N
+        // that already passed `frame_validate`), not just trust the peer's tree.
+        // A forged prover tree would otherwise be written to local state and the
+        // cursor advanced past it (suppressing re-materialization), poisoning
+        // seniority / committee membership / reward balances until the periodic
+        // verified reconcile. `sync_single_shard_verified` returns Ok(false) when
+        // the peer's root != anchor → try another peer (a partial/forged jump
+        // must NOT be committed).
+        match crate::forest_sync::sync_single_shard_verified(
+            &addr, &seed, crdt.clone(), &[0xffu8; 32], &anchor,
+        )
+        .await
         {
-            warn!(%addr, error = %e, "state-jump: prover tree sync failed — trying another peer");
-            continue;
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(%addr, target, "state-jump: peer prover-tree root != authenticated anchor — trying another peer");
+                continue;
+            }
+            Err(e) => {
+                warn!(%addr, error = %e, "state-jump: prover tree sync failed — trying another peer");
+                continue;
+            }
         }
 
         // Every app-shard forest tree. `range_app_shards` yields one `ShardInfo`
         // per sub-shard (a QUIL app has 64, each with its own `prefix`), which
         // maps directly to the forest sub-shard id `addr_path_shard_id(l2,
-        // prefix)`. Dedup by that id (QUIL sub-shards share an l1‖l2 shard_key
-        // but differ in prefix, so we must NOT dedup on shard_key).
+        // prefix)`.
+        //
+        // AUTHENTICATION: app-shard consensus is per-APP (its filter is the
+        // 32-byte L2), and the app-shard frame's `state_roots[0]` is the app's
+        // AGGREGATE vertex-adds root over ALL its sub-shards
+        // (`compute_shard_root` rolls the prefixes up — the SAME value the app
+        // header advertises and the CW pre-state gate checks at finalize). So we
+        // group sub-shards by app, pull every sub-shard, then recompute that
+        // aggregate root locally and cross-check it against the peer's attested
+        // app-shard frame. A torn/partial/forged app tree fails the check and we
+        // retry a fresh N on another peer.
+        //
+        // On mainnet the peer set is already the genesis-archive allowlist (see
+        // message_loop.rs "FAKE ARCHIVE" drop), so this binds the synced state to
+        // a canonical archive's signed frame header. Peers that serve no app
+        // frame (or a zero root) for an app are synced on trust — the app-shard
+        // CW fail-closed pre-state gate re-checks `state_roots[0]` on the next
+        // produced frame, so a bad jump self-corrects rather than persisting.
         let _ = &anchor;
         // Regulars skip the ALL-shards pull (see `sync_all_shards`): prover tree
         // + cursor advance is enough to stop them replaying ancient history.
         let mut shard_count = 0usize;
         if sync_all_shards {
             let shard_rows = shards_store.range_app_shards().unwrap_or_default();
-            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-            let mut aborted = false;
+            // app L2 -> (l1, [sub-shard forest ids]); dedup sub-shard ids (QUIL
+            // sub-shards share an l1‖l2 shard_key but differ in prefix).
+            let mut apps: std::collections::BTreeMap<[u8; 32], ([u8; 3], Vec<Vec<u8>>)> =
+                Default::default();
             for row in &shard_rows {
-                if cancel.is_cancelled() {
-                    return None;
-                }
                 if row.shard_key.len() < 35 {
                     continue;
                 }
+                let mut l1 = [0u8; 3];
+                l1.copy_from_slice(&row.shard_key[0..3]);
                 let mut l2 = [0u8; 32];
                 l2.copy_from_slice(&row.shard_key[3..35]);
                 let shard_id = quil_forest::Forest::addr_path_shard_id(&l2, &row.prefix);
-                if !seen.insert(shard_id.clone()) {
-                    continue;
+                let entry = apps.entry(l2).or_insert_with(|| (l1, Vec::new()));
+                if !entry.1.contains(&shard_id) {
+                    entry.1.push(shard_id);
                 }
-                if let Err(e) =
-                    crate::forest_sync::pull_shard_from_peer(&addr, &seed, crdt.clone(), &shard_id).await
-                {
-                    // A vertex-adds (anchor) failure means we didn't reach the peer's
-                    // generation for this shard — abort and retry a fresh N on another
-                    // peer (a partial jump must NOT be committed).
-                    warn!(
-                        %addr, error = %e,
-                        "state-jump: shard sync failed — aborting, retrying another peer",
-                    );
-                    aborted = true;
-                    break;
+            }
+            let mut aborted = false;
+            'apps: for (l2, (l1, shard_ids)) in &apps {
+                if cancel.is_cancelled() {
+                    return None;
                 }
-                shard_count += 1;
+                // 1. Pull every sub-shard tree of this app.
+                for shard_id in shard_ids {
+                    if cancel.is_cancelled() {
+                        return None;
+                    }
+                    if let Err(e) = crate::forest_sync::pull_shard_from_peer(
+                        &addr,
+                        &seed,
+                        crdt.clone(),
+                        shard_id,
+                    )
+                    .await
+                    {
+                        // A vertex-adds (anchor) failure means we didn't reach the
+                        // peer's generation for this shard — abort and retry a fresh
+                        // N on another peer (a partial jump must NOT be committed).
+                        warn!(
+                            %addr, error = %e,
+                            "state-jump: shard sync failed — aborting, retrying another peer",
+                        );
+                        aborted = true;
+                        break 'apps;
+                    }
+                    shard_count += 1;
+                }
+                // 2. Cross-check the synced app tree against the peer's attested
+                //    app-shard frame (filter == the 32-byte app L2). frame 0 == the
+                //    peer's latest frame on that filter; state_roots[0] is the
+                //    aggregate vertex-adds root.
+                let attested = match client.get_app_shard_frame(l2.to_vec(), 0).await {
+                    Ok(Some(f)) => f
+                        .header
+                        .and_then(|h| h.state_roots.into_iter().next()),
+                    Ok(None) => None,
+                    Err(e) => {
+                        debug!(%addr, error = %e, "state-jump: app-shard frame fetch failed — app synced on trust");
+                        None
+                    }
+                };
+                if let Some(root) = attested.filter(|r| r.iter().any(|b| *b != 0)) {
+                    // Local aggregate vertex-adds root over the freshly-synced
+                    // sub-shards, via the SAME accessor (`compute_shard_root`, which
+                    // rolls up `app_prefixes(l2)`) that produced the header and that
+                    // the app-shard CW pre-state gate re-checks at finalize. `l1` is
+                    // ignored by the accessor (it keys on l2), so its source is moot.
+                    let shard_key = quil_types::store::ShardKey { l1: *l1, l2: *l2 };
+                    let local = crdt.compute_shard_root("vertex", "adds", &shard_key);
+                    let local_nonzero = local.iter().any(|b| *b != 0);
+                    if local_nonzero && local != root {
+                        // Definitive: we synced real app state but it DISAGREES with
+                        // the peer's attested frame root — forged or torn. Retry a
+                        // fresh N on another peer (a bad jump must NOT be committed).
+                        warn!(
+                            %addr,
+                            app = %hex::encode(l2),
+                            peer = %hex::encode(&root),
+                            local = %hex::encode(&local),
+                            "state-jump: synced app tree root != peer's attested app-shard frame — aborting, retrying another peer",
+                        );
+                        aborted = true;
+                        break 'apps;
+                    } else if !local_nonzero {
+                        // Couldn't reproduce the aggregate locally (this app's
+                        // sub-shard prefixes may not be declared in the onboarding
+                        // forest yet) — can't authenticate, so sync on trust. The CW
+                        // fail-closed pre-state gate re-checks state_roots[0] on the
+                        // next produced frame, so a bad jump self-corrects.
+                        debug!(%addr, app = %hex::encode(l2), "state-jump: local app root empty — cannot authenticate, synced on trust");
+                    }
+                    // else (local_nonzero && local == root): app tree authenticated.
+                } else {
+                    debug!(%addr, app = %hex::encode(l2), "state-jump: no attested app-shard root — app synced on trust");
+                }
             }
             if aborted {
                 continue;
@@ -669,6 +769,9 @@ pub(crate) struct ArchiveSyncArgs {
     pub coverage_monitor: Arc<quil_engine::coverage::CoverageMonitor>,
     pub current_frame: Arc<quil_engine::current_frame::CurrentFrame>,
     pub last_global_head_frame: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared gossip-freshness signal; wired into the poller so it backs off
+    /// while the `GLOBAL_FRAME` mesh is carrying the head (non-archive only).
+    pub gossip_freshness: Arc<quil_rpc::GossipFreshness>,
     pub prover_pipeline: Arc<quil_engine::prover_pipeline::ProverPipeline>,
     pub file_key_manager: Arc<quil_keys::FileKeyManager>,
     pub frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
@@ -681,6 +784,9 @@ pub(crate) struct ArchiveSyncArgs {
     pub genesis_prover_addrs: std::collections::HashSet<Vec<u8>>,
     pub frame_materializer: Option<Arc<quil_engine::frame_materializer::FrameMaterializer>>,
     pub consensus_loopback_tx: tokio::sync::mpsc::Sender<quil_p2p::node::ReceivedMessage>,
+    /// GOSSIP publisher for finalized global frames (proposer-only), handed to the
+    /// CW global finalizer so regular nodes receive frames over gossip.
+    pub global_frame_publisher: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
     pub peer_id: quil_p2p::PeerId,
     pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
     /// commonware-simplex committee (`q-consensus-key` pubkeys, hex). Empty ⇒
@@ -729,6 +835,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         coverage_monitor,
         current_frame,
         last_global_head_frame,
+        gossip_freshness,
         prover_pipeline,
         file_key_manager,
         frame_prover,
@@ -738,6 +845,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         genesis_prover_addrs,
         frame_materializer,
         consensus_loopback_tx,
+        global_frame_publisher,
         peer_id,
         spawner,
         consensus_committee,
@@ -835,6 +943,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sj_pr = prover_registry.clone();
             let sj_crdt = crdt.clone();
             let sj_all_shards = archive_mode;
+            let sj_mainnet_quil_grid = network == 0;
             // DETACH (fire-and-forget) — NOT `sup.spawn`. The state-jump is a
             // one-shot task that RETURNS when done (jump complete or no-op); a
             // supervised task that exits is treated as a fatal
@@ -853,6 +962,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     sj_pr,
                     sj_crdt,
                     sj_all_shards,
+                    sj_mainnet_quil_grid,
                     tokio_util::sync::CancellationToken::new(),
                 )
                 .await
@@ -879,10 +989,19 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         let hg_for_poller = hg_store.clone();
         let crdt_for_poller = crdt.clone();
         let gmtx_for_poller = global_msg_tx.clone();
+        let fm_for_poller = frame_materializer.clone();
         let shards_store_for_poller: Arc<dyn quil_types::store::ShardsStore> =
             shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
         let archive_mode_poller = archive_mode;
+        // Non-archive nodes follow the chain over the `GLOBAL_FRAME` gossip mesh;
+        // hand the poller the freshness signal so it sources frames from the
+        // gossip-populated store and pauses its RPC head-poll while the mesh is
+        // current (archives keep polling — they need contiguous history that
+        // unordered gossip can't guarantee).
+        let poller_gossip_freshness =
+            if archive_mode { None } else { Some(gossip_freshness.clone()) };
         let poller_config = quil_rpc::ArchivePollerConfig {
+            gossip_freshness: poller_gossip_freshness,
             on_frame: Some(Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
                 let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
                 let frame_difficulty = frame.header.as_ref().map(|h| h.difficulty).unwrap_or(0);
@@ -920,6 +1039,20 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     );
                 }
 
+                // SINGLE-WRITER. The frame record is already persisted (the
+                // poller's `put_global_frame` above). Rather than process + commit
+                // + refresh state HERE — a SECOND writer that races the serial
+                // materializer and refreshes the shared prover-registry committee
+                // cache to a different frame (the epoch-boundary prover-root
+                // divergence) — just SIGNAL the materializer's single serial
+                // worker, which applies `[last+1..=frame_num]` in order from the
+                // stored records. Only when no worker is wired (poller-only node,
+                // or worker not yet up) do we fall back to inline processing.
+                let signaled = fm_for_poller
+                    .as_ref()
+                    .map(|fm| fm.enqueue_catchup(frame.clone(), frame_num))
+                    .unwrap_or(false);
+                if !signaled {
                 // Process frame messages through execution pipeline
                 match quil_engine::frame_processor::process_global_frame(
                     &exec_mgr_for_poller,
@@ -963,6 +1096,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         warn!(frame = frame_num, error = %e, "frame processing failed");
                     }
                 }
+                } // end inline-processing fallback (no serial materializer wired)
 
                 // Trigger worker allocation reconciliation. Skip in
                 // archive mode — archives don't run app-shard workers,
@@ -1133,6 +1267,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sync_em = exec_manager.clone();
             let sync_bls_pub = bls_pubkey.clone();
             let sync_pa = prover_address;
+            let sync_gfp = global_frame_publisher.clone();
             let sync_crdt = crdt.clone();
             let sync_shards_store = shards_store.clone();
             let sync_cov = coverage_monitor.clone();
@@ -1707,9 +1842,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         quil_types::proto::global::GlobalFrame,
                                         u64,
                                     )>();
+                                    // Let the archive poller signal this same serial worker
+                                    // (single-writer): the poller persists records + enqueues
+                                    // here instead of committing state itself.
+                                    m.set_catchup_sender(tx.clone());
                                     let cov_for_worker = sync_cov.clone();
                                     let mc_for_worker = sync_mc.clone();
                                     let pa_for_worker = sync_pa.to_vec();
+                                    let cs_for_worker = sync_cs.clone();
                                     // Handles for the leader-gated merge trigger's shard-inventory
                                     // assembly (filters + committed sizes + active counts). Use the
                                     // closure-local `sync_*` clones so the outer originals stay
@@ -1718,65 +1858,90 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     let shards_store_for_merge = sync_shards_store.clone();
                                     let registry_for_merge = sync_pr.clone();
                                     spawner.detach("global-materializer", async move {
-                                        while let Some((frame, frame_number)) = rx.recv().await {
+                                        while let Some((_frame, target)) = rx.recv().await {
                                             let m = m.clone();
                                             let cov = cov_for_worker.clone();
                                             let mc = mc_for_worker.clone();
                                             let pa = pa_for_worker.clone();
+                                            let cs = cs_for_worker.clone();
                                             let crdt_for_merge = crdt_for_merge.clone();
                                             let shards_store_for_merge = shards_store_for_merge.clone();
                                             let registry_for_merge = registry_for_merge.clone();
                                             let outcome = tokio::task::spawn_blocking(move || {
-                                                // Refresh halt durations right before
-                                                // materialize so the eviction step inside
-                                                // skips halted shards correctly.
-                                                let halts = cov.check(frame_number);
-                                                m.set_coverage_halt_durations(halts);
-                                                let res = match m.materialize(&frame) {
-                                                    Ok(result) => {
-                                                        // Consume the finalized frame's
-                                                        // bundles from the mempool so they
-                                                        // aren't re-proposed.
-                                                        if !result.finalized_bundles.is_empty() {
-                                                            mc.mark_finalized(&result.finalized_bundles);
-                                                        }
-                                                        Ok(())
+                                                // SINGLE-WRITER, IN-ORDER catch-up. Apply
+                                                // `[last+1..=target]` strictly in order, reading
+                                                // each frame from the CLOCK STORE — the source of
+                                                // truth persisted by BOTH the consensus finalize
+                                                // path and the archive poller. Because we only ever
+                                                // apply `last+1` (the in-order invariant: never
+                                                // build on roots we lack), the poller can be a pure
+                                                // fetcher that persists records + signals here,
+                                                // never a second state writer racing the committee
+                                                // cache. `target` is a hint (consensus frame # or
+                                                // poller head); the loop drains to whatever is
+                                                // durably stored. A not-yet-stored record just ends
+                                                // this pass — the next signal retries. Self-healing.
+                                                loop {
+                                                    let next = m.last_materialized_frame() + 1;
+                                                    if next > target {
+                                                        break Ok(());
                                                     }
-                                                    Err(e) => Err(e),
-                                                };
-                                                // Leader-gated shard-split rebalance trigger:
-                                                // only the producer of THIS frame proposes,
-                                                // matching Go's `frameProver` gate (exactly one
-                                                // proposer per frame, no duplicates). Publishes
-                                                // ShardSplitEligible events; the shard-
-                                                // orchestrator loop submits the op to the
-                                                // mempool. Runs after materialize so the
-                                                // registry reflects this frame's prover changes.
-                                                let producer = frame
-                                                    .header
-                                                    .as_ref()
-                                                    .map(|h| h.prover.clone())
-                                                    .unwrap_or_default();
-                                                if !producer.is_empty() && producer == pa {
-                                                    cov.propose_split_rebalance(frame_number);
-                                                    // Leader-gated MERGE trigger (16GiB-gated).
-                                                    // Assemble the current shard inventory
-                                                    // (filters + committed sizes + active counts)
-                                                    // and propose merges for under-covered
-                                                    // factor-2 sibling pairs that fit the gate.
-                                                    let inventory =
-                                                        quil_engine::coverage::build_shard_inventory(
-                                                            crdt_for_merge.clone(),
-                                                            shards_store_for_merge.clone(),
-                                                            registry_for_merge.as_ref(),
+                                                    let frame = match cs.get_global_frame(next) {
+                                                        Ok(f) => f,
+                                                        // Record for `next` not stored yet — stop
+                                                        // this pass (do NOT skip ahead → no hole).
+                                                        Err(_) => break Ok(()),
+                                                    };
+                                                    let frame_number = next;
+                                                    // Refresh halt durations right before
+                                                    // materialize so the eviction step inside
+                                                    // skips halted shards correctly.
+                                                    let halts = cov.check(frame_number);
+                                                    m.set_coverage_halt_durations(halts);
+                                                    match m.materialize(&frame) {
+                                                        Ok(result) => {
+                                                            // Consume the finalized frame's
+                                                            // bundles from the mempool so they
+                                                            // aren't re-proposed.
+                                                            if !result.finalized_bundles.is_empty() {
+                                                                mc.mark_finalized(&result.finalized_bundles);
+                                                            }
+                                                        }
+                                                        Err(e) => break Err(e),
+                                                    }
+                                                    // Leader-gated shard-split rebalance trigger:
+                                                    // only the producer of THIS frame proposes,
+                                                    // matching Go's `frameProver` gate (exactly one
+                                                    // proposer per frame, no duplicates). Publishes
+                                                    // ShardSplitEligible events; the shard-
+                                                    // orchestrator loop submits the op to the
+                                                    // mempool. Runs after materialize so the
+                                                    // registry reflects this frame's prover changes.
+                                                    let producer = frame
+                                                        .header
+                                                        .as_ref()
+                                                        .map(|h| h.prover.clone())
+                                                        .unwrap_or_default();
+                                                    if !producer.is_empty() && producer == pa {
+                                                        cov.propose_split_rebalance(frame_number);
+                                                        // Leader-gated MERGE trigger (16GiB-gated).
+                                                        // Assemble the current shard inventory
+                                                        // (filters + committed sizes + active counts)
+                                                        // and propose merges for under-covered
+                                                        // factor-2 sibling pairs that fit the gate.
+                                                        let inventory =
+                                                            quil_engine::coverage::build_shard_inventory(
+                                                                crdt_for_merge.clone(),
+                                                                shards_store_for_merge.clone(),
+                                                                registry_for_merge.as_ref(),
+                                                                frame_number,
+                                                            );
+                                                        cov.propose_merge_rebalance(
                                                             frame_number,
+                                                            &inventory,
                                                         );
-                                                    cov.propose_merge_rebalance(
-                                                        frame_number,
-                                                        &inventory,
-                                                    );
+                                                    }
                                                 }
-                                                res
                                             })
                                             .await;
                                             match outcome {
@@ -1800,7 +1965,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 Ok(Err(e)) => {
                                                     tracing::error!(
                                                         error = %e,
-                                                        frame = frame_number,
+                                                        target,
                                                         "frame materialize failed — stopping \
                                                          materializer to avoid a permanent state \
                                                          hole; restart to re-materialize from the \
@@ -1811,7 +1976,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 Err(e) => {
                                                     tracing::error!(
                                                         error = %e,
-                                                        frame = frame_number,
+                                                        target,
                                                         "materializer task panicked — stopping \
                                                          materializer to avoid a permanent state \
                                                          hole; restart to re-materialize from the \
@@ -2043,6 +2208,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 genesis_frame_number,
                                                 leader_timeout_secs: sync_consensus_leader_timeout_secs,
                                                 transport,
+                                                global_frame_publisher: sync_gfp.clone(),
+                                                local_prover_address: sync_pa.to_vec(),
                                                 resolve_peer,
                                                 storage_directory: sync_cw_storage_dir.clone(),
                                             };

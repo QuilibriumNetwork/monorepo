@@ -52,7 +52,9 @@ impl Path {
         let mut c = 0;
         expect(read_u32(data, &mut c)?, TYPE_PATH, "Path")?;
         let n = read_u32(data, &mut c)? as usize;
-        let mut indices = Vec::with_capacity(n);
+        // Cap pre-allocation against remaining bytes (each index is a u64 = 8
+        // bytes) so an attacker-chosen count can't drive an alloc-bomb.
+        let mut indices = Vec::with_capacity(n.min(data.len().saturating_sub(c) / 8));
         for _ in 0..n { indices.push(read_u64(data, &mut c)?); }
         Ok(Self { indices })
     }

@@ -56,6 +56,14 @@ pub struct WorkerNodeConfig {
     pub master_endpoint: String,
     /// This worker's gRPC listen address (for Respawn commands).
     pub listen_addr: String,
+    /// mTLS materials for the master↔worker (DataIpc) channel, derived from the
+    /// node's Falcon key (`quil_rpc::quil_tls::build_worker_channel_cert`) and
+    /// threaded in by the node layer. When all three are `Some`, the DataIpc
+    /// server REQUIRES a client cert chaining to `channel_tls_ca_pem` — so only a
+    /// master holding the node's key can connect. `None` (e.g. tests) = plaintext.
+    pub channel_tls_ca_pem: Option<String>,
+    pub channel_tls_leaf_pem: Option<String>,
+    pub channel_tls_key_pem: Option<String>,
     /// Parent process ID (for monitoring).
     pub parent_pid: Option<u32>,
     /// Whether app-shard consensus runs on commonware-simplex (CW) rather than
@@ -371,15 +379,40 @@ impl WorkerOnlyNode {
             .map_err(|e| QuilError::Internal(format!("bad listen addr: {}", e)))?;
 
         let server_cancel = self.cancel.clone();
-        // TODO
+        // mTLS the master↔worker (DataIpc) channel when the node layer supplied
+        // cert materials (cluster mode). The server then REQUIRES a client cert
+        // chaining to our CA — only a master holding the node's Falcon key can
+        // connect. `None` (tests / not wired) keeps the old plaintext behavior.
+        let channel_tls: Option<tonic::transport::ServerTlsConfig> = match (
+            self.config.channel_tls_ca_pem.clone(),
+            self.config.channel_tls_leaf_pem.clone(),
+            self.config.channel_tls_key_pem.clone(),
+        ) {
+            (Some(ca), Some(leaf), Some(key)) => Some(
+                tonic::transport::ServerTlsConfig::new()
+                    .identity(tonic::transport::Identity::from_pem(leaf, key))
+                    .client_ca_root(tonic::transport::Certificate::from_pem(ca)),
+            ),
+            _ => None,
+        };
         let server_handle = tokio::spawn(async move {
-            info!("DataIPC gRPC server starting on {}", listen_addr);
-            if let Err(e) = Server::builder()
+            info!("DataIPC gRPC server starting on {} (mtls={})", listen_addr, channel_tls.is_some());
+            let mut builder = Server::builder()
                 // Reap dead master connections (h2 PING) so a master that
                 // dies without FIN doesn't leave the stream fd behind.
                 .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
                 .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
-                .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+                .tcp_keepalive(Some(std::time::Duration::from_secs(60)));
+            if let Some(tls) = channel_tls {
+                match builder.tls_config(tls) {
+                    Ok(b) => builder = b,
+                    Err(e) => {
+                        error!(error = %e, "DataIPC gRPC TLS config invalid — server not started");
+                        return;
+                    }
+                }
+            }
+            if let Err(e) = builder
                 .add_service(
                     quil_types::proto::node::data_ipc_service_server::DataIpcServiceServer::new(
                         ipc_service,

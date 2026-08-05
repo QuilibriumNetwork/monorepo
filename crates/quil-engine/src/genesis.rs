@@ -1055,19 +1055,21 @@ pub fn initialize_testnet_genesis_state(
     quil_shard_key.extend_from_slice(&l1);
     quil_shard_key.extend_from_slice(&quil_token_domain[..]);
     {
+        // QUIL is a SINGLE shard at genesis (empty prefix = the whole app) and
+        // splits DYNAMICALLY like every other app as it grows — no fixed
+        // pre-split grid on testnet/devnet. (Mainnet keeps the fixed 64-way grid
+        // via `normalize_quil_token_grid` + `install_forest_boot`.)
         let txn = clock_store.new_transaction(false)?;
-        for path in 0u32..6 {
-            shards_store.put_app_shard(
-                txn.as_ref(),
-                &quil_types::store::ShardInfo {
-                    shard_key: quil_shard_key.clone(),
-                    prefix: vec![path],
-                    size: Vec::new(),
-                    data_shards: 0,
-                    commitment: Vec::new(),
-                },
-            )?;
-        }
+        shards_store.put_app_shard(
+            txn.as_ref(),
+            &quil_types::store::ShardInfo {
+                shard_key: quil_shard_key.clone(),
+                prefix: vec![],
+                size: Vec::new(),
+                data_shards: 0,
+                commitment: Vec::new(),
+            },
+        )?;
         txn.commit()?;
     }
 

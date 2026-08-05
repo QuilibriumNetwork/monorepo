@@ -230,18 +230,38 @@ pub struct ThreadWorkerManager {
 }
 
 impl ThreadWorkerManager {
+    /// Auto-size the worker pool to the available CPU cores (minus one for
+    /// the master). Equivalent to `new_with_count(0)`.
     pub fn new() -> Self {
+        Self::new_with_count(0)
+    }
+
+    /// Create a thread-worker manager with an explicit worker count.
+    ///
+    /// `configured` is `engine.data_worker_count` from config:
+    ///   * `> 0` → honor it exactly (the operator asked for N local workers);
+    ///     this is what makes a `dataWorkerCount: 1` localnet run a single
+    ///     worker instead of silently spinning up `cpu-1`.
+    ///   * `<= 0` (the default) → auto-size to `cpu_cores - 1` (the historical
+    ///     behavior; production configs that don't set the field are unchanged).
+    pub fn new_with_count(configured: i32) -> Self {
         let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-        let num_cores = if core_ids.len() > 1 {
+        let cpu_default = if core_ids.len() > 1 {
             (core_ids.len() - 1) as u32
         } else {
             0
+        };
+        let num_cores = if configured > 0 {
+            configured as u32
+        } else {
+            cpu_default
         };
 
         let (master_tx, master_rx) = mpsc::channel(256);
 
         info!(
             available_cores = core_ids.len(),
+            configured_worker_count = configured,
             worker_cores = num_cores,
             "thread worker manager initialized"
         );

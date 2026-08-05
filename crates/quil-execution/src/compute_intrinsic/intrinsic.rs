@@ -250,6 +250,22 @@ pub fn verify_code_execute(execute: &CodeExecute) -> Result<bool> {
         ));
     }
 
+    // Reject writes into SYSTEM-MANAGED domains. `materialize_code_execute`
+    // writes a vertex at the attacker-controlled `execute.domain`, and the
+    // zero-payer path below skips the signature entirely — without this, a
+    // permissionless CodeExecute could plant an attacker-controlled vertex into
+    // GLOBAL/COMPUTE/QUIL_TOKEN (e.g. a forged `prover:Prover` or coin vertex),
+    // usurping the intrinsics that own those namespaces. Mirrors the hypergraph
+    // engine's system-domain guard (`engines.rs`).
+    if execute.domain == crate::domains::GLOBAL
+        || execute.domain == crate::domains::COMPUTE
+        || execute.domain == crate::domains::QUIL_TOKEN
+    {
+        return Err(QuilError::InvalidArgument(
+            "verify: code execute into system-managed domain rejected".into(),
+        ));
+    }
+
     // Payment proof check.
     let payer = execute.proof_of_payment.first().map(Vec::as_slice).unwrap_or(&[]);
     if !payer.is_empty() && !is_zero_payer(payer) {

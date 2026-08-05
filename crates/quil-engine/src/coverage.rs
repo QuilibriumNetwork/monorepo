@@ -1288,6 +1288,7 @@ mod tests {
             leave_reject_frame_number: 0,
             last_active_frame_number: last_active,
             epoch: 0,
+            ring: 0,
             vertex_address: vec![],
         }
     }

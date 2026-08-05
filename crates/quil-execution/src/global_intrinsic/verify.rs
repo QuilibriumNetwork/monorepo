@@ -489,20 +489,30 @@ pub fn verify_prover_seniority_merge_spent_markers<F>(
 where
     F: FnMut(&[u8; 32]) -> Result<Option<Vec<u8>>>,
 {
+    // A merge target, once consumed, is spent FOREVER — by ANYONE, including the
+    // same prover. `merge_seniority` is ADDED to the prover's score
+    // (`materialize_seniority_merge`), and the aggregated targets add up (with
+    // overlapping-period scores collapsed to their max inside
+    // `GetAggregatedSeniority`), so allowing a prover to RE-SUBMIT its own merge
+    // would let it add the same seniority every frame without bound — a
+    // consensus-weight inflation. So reject on the mere EXISTENCE of either
+    // tombstone (a prior ProverJoin's `PROVER_JOIN_MERGE` or a prior
+    // ProverSeniorityMerge's `PROVER_SENIORITY_MERGE`), regardless of who stamped
+    // it. (A previous "allow same-prover re-use" relaxation here was the bug.)
     for mt in &op.merge_targets {
         let join_marker = super::materialize::spent_join_merge_address(&mt.prover_public_key)?;
         if lookup_tombstone(&join_marker)?.is_some() {
             return Err(QuilError::InvalidArgument(
-                "ProverSeniorityMerge verify: merge target already consumed by \
-                 a prior ProverJoin (PROVER_JOIN_MERGE tombstone)".into(),
+                "ProverSeniorityMerge verify: merge target already consumed \
+                 (PROVER_JOIN_MERGE tombstone)".into(),
             ));
         }
         let seniority_marker =
             super::materialize::spent_seniority_merge_address(&mt.prover_public_key)?;
         if lookup_tombstone(&seniority_marker)?.is_some() {
             return Err(QuilError::InvalidArgument(
-                "ProverSeniorityMerge verify: merge target already consumed by \
-                 a prior ProverSeniorityMerge (PROVER_SENIORITY_MERGE tombstone)".into(),
+                "ProverSeniorityMerge verify: merge target already consumed \
+                 (PROVER_SENIORITY_MERGE tombstone)".into(),
             ));
         }
     }
@@ -1120,6 +1130,57 @@ mod tests {
     use num_bigint::BigInt;
     use crate::global_schema::{TYPE_HASH_PROVER, TYPE_HASH_ALLOCATION};
     use super::super::addressed_signature::AddressedSignature;
+
+    /// A consumed merge target is spent FOREVER: the ONE-SHOT invariant. Since
+    /// `materialize_seniority_merge` ADDS the aggregated target seniority to the
+    /// prover's score, allowing a prover to re-submit its OWN merge would inflate
+    /// its consensus weight without bound. So the presence of EITHER tombstone
+    /// (same-prover, different-prover, or legacy/empty) blocks re-use.
+    #[test]
+    fn seniority_merge_spent_markers_reject_any_consumed_target() {
+        use crate::global_intrinsic::prover_ops::ProverSeniorityMerge;
+        use crate::global_intrinsic::seniority_merge::SeniorityMerge;
+
+        let self_addr = vec![0xAAu8; 32];
+        let other_addr = vec![0xBBu8; 32];
+        let make_op = || ProverSeniorityMerge {
+            frame_number: 5,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0u8; 666],
+                address: self_addr.clone(),
+            }),
+            merge_targets: vec![SeniorityMerge {
+                signature: vec![0u8; 666],
+                key_type: 0,
+                prover_public_key: vec![0x11u8; 32],
+            }],
+        };
+        let tombstone_of = |addr: &[u8]| -> Vec<u8> {
+            let t = crate::global_intrinsic::materialize::create_spent_merge_tree(addr).unwrap();
+            crate::prover_registry::vertex_tree_to_blob(&t)
+        };
+
+        // No tombstone → allowed.
+        assert!(verify_prover_seniority_merge_spent_markers(&make_op(), |_| Ok(None)).is_ok());
+        // Own (same-prover) tombstone → REJECTED. No re-submitting your own merge.
+        let self_blob = tombstone_of(&self_addr);
+        assert!(
+            verify_prover_seniority_merge_spent_markers(&make_op(), |_| Ok(Some(self_blob.clone())))
+                .is_err(),
+            "a consumed target must block re-use even by the SAME prover (no inflation)"
+        );
+        // Different-prover tombstone → rejected.
+        let other_blob = tombstone_of(&other_addr);
+        assert!(
+            verify_prover_seniority_merge_spent_markers(&make_op(), |_| Ok(Some(other_blob.clone())))
+                .is_err(),
+            "a DIFFERENT prover's tombstone must block the merge"
+        );
+        // Any present marker (even legacy/empty) means the target is consumed → rejected.
+        assert!(
+            verify_prover_seniority_merge_spent_markers(&make_op(), |_| Ok(Some(vec![]))).is_err()
+        );
+    }
 
     // Stub key manager that always accepts/rejects
     struct AcceptKeyManager;
@@ -1991,8 +2052,13 @@ mod tests {
     #[test]
     fn seniority_merge_spent_markers_rejects_consumed_target() {
         let op = sample_seniority_merge();
-        // Any tombstone present → reject.
-        let r = verify_prover_seniority_merge_spent_markers(&op, |_| Ok(Some(vec![0x01])));
+        // A consumed target → reject. One-shot: the mere existence of a tombstone
+        // blocks re-use (see `seniority_merge_spent_markers_reject_any_consumed_target`).
+        let other = crate::global_intrinsic::materialize::create_spent_merge_tree(&vec![0x77u8; 32])
+            .unwrap();
+        let other_blob = crate::prover_registry::vertex_tree_to_blob(&other);
+        let r =
+            verify_prover_seniority_merge_spent_markers(&op, |_| Ok(Some(other_blob.clone())));
         assert!(r.is_err());
     }
 }

@@ -17,7 +17,7 @@
 
 use once_cell::sync::Lazy;
 use prost::Message;
-use prost_reflect::{DescriptorPool, DynamicMessage, SerializeOptions};
+use prost_reflect::{DescriptorPool, DeserializeOptions, DynamicMessage, SerializeOptions};
 
 use crate::error::{QuilError, Result};
 
@@ -63,6 +63,31 @@ pub fn to_protojson<M: Message>(full_name: &str, msg: &M) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Deserialize protojson bytes into a prost message `M` — the inverse of
+/// [`to_protojson`]. Transcodes through the same [`DescriptorPool`]: parse the
+/// JSON into a [`DynamicMessage`] under the descriptor, re-encode to wire bytes,
+/// then decode into `M`.
+///
+/// Unknown fields are ignored (`deny_unknown_fields(false)`) so JSON carrying
+/// explorer-only extras (e.g. a `GlobalFrame` response's `requestOutcomes`)
+/// deserializes cleanly into the underlying proto.
+pub fn from_protojson<M: Message + Default>(full_name: &str, json: &[u8]) -> Result<M> {
+    let descriptor = POOL.get_message_by_name(full_name).ok_or_else(|| {
+        QuilError::Serialization(format!("protojson: unknown message type {full_name}"))
+    })?;
+    let options = DeserializeOptions::new().deny_unknown_fields(false);
+    let mut de = serde_json::Deserializer::from_slice(json);
+    let dynamic = DynamicMessage::deserialize_with_options(descriptor, &mut de, &options)
+        .map_err(|e| {
+            QuilError::Serialization(format!("protojson: deserialize {full_name}: {e}"))
+        })?;
+    de.end()
+        .map_err(|e| QuilError::Serialization(format!("protojson: trailing data {full_name}: {e}")))?;
+    let wire = dynamic.encode_to_vec();
+    M::decode(wire.as_slice())
+        .map_err(|e| QuilError::Serialization(format!("protojson: decode {full_name} into prost: {e}")))
+}
+
 /// Borrow the shared descriptor pool (useful for tests / introspection).
 pub fn descriptor_pool() -> &'static DescriptorPool {
     &POOL
@@ -72,6 +97,28 @@ pub fn descriptor_pool() -> &'static DescriptorPool {
 mod tests {
     use super::*;
     use crate::proto::global::{GlobalFrame, GlobalFrameHeader};
+
+    #[test]
+    fn from_protojson_roundtrips_and_ignores_unknown_fields() {
+        let frame = GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 699663,
+                rank: 3,
+                difficulty: 50000,
+                output: vec![9, 8, 7, 6, 5],
+                requests_root: vec![0xAB; 32],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = to_protojson(GLOBAL_FRAME, &frame).unwrap();
+        // Inject an explorer-only unknown field to prove it is ignored.
+        let mut v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        v["requestOutcomes"] = serde_json::json!([{"outcome": "ok"}]);
+        let json2 = serde_json::to_vec(&v).unwrap();
+        let back: GlobalFrame = from_protojson(GLOBAL_FRAME, &json2).unwrap();
+        assert_eq!(back, frame, "protojson round-trip must reproduce the frame");
+    }
 
     #[test]
     fn global_frame_matches_protojson_rules() {

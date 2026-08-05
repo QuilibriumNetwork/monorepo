@@ -41,7 +41,7 @@ rand = "0.8"
 ed448-rust = { path = "../ed448-rust" }
 vdf = { path = "../vdf" }
 metrics = "0.24"
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 libc = "0.2"
 http = "1"
 async-trait = "0.1"

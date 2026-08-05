@@ -341,10 +341,18 @@ pub fn install_forest_if_migrated(
 /// a wrong un-split root). Skips ONLY a store that carries un-migrated legacy
 /// state (committed frames but no forest) — that MUST run `--migrate-db` first.
 /// Idempotent: no-op if the forest is already persistent.
+/// `mainnet_quil_grid`: when true (mainnet, network 0), declare QUIL's fixed
+/// 64-way (`depth 1`) uniform split — the legacy topology the pebble→rocksdb
+/// migration and the committed mainnet state root depend on. When false
+/// (testnet/devnet), QUIL is left at the default single-shard partition and
+/// splits dynamically like every other app; declaring a split here would make
+/// genesis `commit(0)` aggregate over 64 sub-shards and fork against the
+/// single-shard shards-store registry.
 pub fn install_forest_boot(
     crdt: &quil_hypergraph::HypergraphCrdt,
     hg: &RocksHypergraphStore,
     store_is_fresh: bool,
+    mainnet_quil_grid: bool,
 ) -> bool {
     if crdt.forest_is_persistent() {
         return false;
@@ -354,7 +362,9 @@ pub fn install_forest_boot(
             hg.raw_db(),
             quil_store::FOREST_NAMESPACE.to_vec(),
         ));
-        crdt.set_shard_partition(quil_execution::domains::QUIL_TOKEN, 1);
+        if mainnet_quil_grid {
+            crdt.set_shard_partition(quil_execution::domains::QUIL_TOKEN, 1);
+        }
         true
     } else {
         false
@@ -375,9 +385,14 @@ pub fn install_forest_boot(
 /// prior sync) is left untouched. Unlike [`install_forest_if_migrated`] this does
 /// NOT gate on `has_forest_data()` — a syncing node is pulling authenticated
 /// state from peers and will fill the (initially empty) forest itself.
+/// `mainnet_quil_grid`: see [`install_forest_boot`]. Mainnet declares the fixed
+/// 64-way QUIL split so a syncing node computes the network-consistent app root;
+/// testnet/devnet leaves QUIL single-shard (its network is single-shard, so the
+/// default is already correct and a declared split would produce a wrong root).
 pub fn install_forest_for_sync(
     crdt: &quil_hypergraph::HypergraphCrdt,
     hg: &RocksHypergraphStore,
+    mainnet_quil_grid: bool,
 ) -> bool {
     if crdt.forest_is_persistent() {
         return false;
@@ -386,7 +401,9 @@ pub fn install_forest_for_sync(
         hg.raw_db(),
         quil_store::FOREST_NAMESPACE.to_vec(),
     ));
-    crdt.set_shard_partition(quil_execution::domains::QUIL_TOKEN, 1);
+    if mainnet_quil_grid {
+        crdt.set_shard_partition(quil_execution::domains::QUIL_TOKEN, 1);
+    }
     true
 }
 

@@ -93,8 +93,26 @@ pub(crate) async fn init(
     //
     // Archives also do a bulk subscribe to `[0xFF; 32]` (catches all
     // shard traffic via bloom overlap) for the app-frames queue.
+    // GLOBAL_FRAME is now subscribed by ALL nodes: the CW committee gossip-
+    // publishes each finalized global frame (see `GlobalSeamFinalizer`), so
+    // regular/non-committee nodes receive the chain head over gossip instead of
+    // RPC-polling archives (the archive poller stays as gap-fill / catch-up).
+    // GLOBAL_CONSENSUS/GLOBAL_PROVER + the bulk-shard subscribes remain archive-
+    // only — their bandwidth rationale (vote firehose, all-shard coverage) still
+    // holds and non-archives don't need them.
+    p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_FRAME.to_vec()).await;
+    // Mesh-level gate on GLOBAL_FRAME: shed wrong-type garbage and rate-limit
+    // per peer BEFORE delivery/forward, so a peer flooding the topic (the CPU-DoS
+    // vector — each frame otherwise forces a downstream VDF verify) is penalised
+    // by gossip scoring and its floods stop propagating. The authoritative
+    // genesis-prover + committee-cert + VDF checks still run in the recv loop.
+    p2p_handle
+        .register_global_frame_validator(
+            quil_engine::bitmasks::GLOBAL_FRAME.to_vec(),
+            quil_engine::consensus_wire::GLOBAL_FRAME_TYPE,
+        )
+        .await;
     if archive_mode {
-        p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_FRAME.to_vec()).await;
         p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec()).await;
         p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PROVER.to_vec()).await;
         // Bulk shard subscription — an all-ones bitmask bit-COVERS every
@@ -125,7 +143,7 @@ pub(crate) async fn init(
     if archive_mode {
         info!("subscribed to all global + bulk shard bitmasks (archive mode)");
     } else {
-        info!("subscribed to GLOBAL_PEER_INFO + GLOBAL_ALERT (non-archive)");
+        info!("subscribed to GLOBAL_FRAME + GLOBAL_PEER_INFO + GLOBAL_ALERT (non-archive)");
     }
 
     // Apply engine blacklist — deny connections from blacklisted peers.

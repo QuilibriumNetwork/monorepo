@@ -318,7 +318,13 @@ pub(crate) fn spawn_all(
     };
 
     let grpc_addr = if config.listen_grpc_multiaddr.is_empty() {
-        "0.0.0.0:8337".to_string()
+        // SECURITY: default to LOCALHOST, not 0.0.0.0. This NodeService exposes
+        // unauthenticated mutating RPCs (request_join, set_manually_managed, …) —
+        // its per-RPC no-auth assumes a local/trusted caller (as in Go, where an
+        // empty ListenGRPCMultiaddr leaves the server OFF). A world-open default
+        // bind turns it into a remotely-reachable control plane. Operators who
+        // need remote access set `listen_grpc_multiaddr` explicitly.
+        "127.0.0.1:8337".to_string()
     } else {
         let parts: Vec<&str> = config.listen_grpc_multiaddr
             .trim_start_matches('/')
@@ -327,7 +333,13 @@ pub(crate) fn spawn_all(
         if parts.len() >= 4 && parts[0] == "ip4" && parts[2] == "tcp" {
             format!("{}:{}", parts[1], parts[3])
         } else {
-            "0.0.0.0:8337".to_string()
+            // SECURITY: default to LOCALHOST, not 0.0.0.0. This NodeService exposes
+        // unauthenticated mutating RPCs (request_join, set_manually_managed, …) —
+        // its per-RPC no-auth assumes a local/trusted caller (as in Go, where an
+        // empty ListenGRPCMultiaddr leaves the server OFF). A world-open default
+        // bind turns it into a remotely-reachable control plane. Operators who
+        // need remote access set `listen_grpc_multiaddr` explicitly.
+        "127.0.0.1:8337".to_string()
         }
     };
 
@@ -416,6 +428,12 @@ pub(crate) fn spawn_all(
     // moving global consensus off gossip (app consensus is unaffected).
     let consensus_delivery: quil_rpc::global_service::ConsensusDeliveryHandler = {
         let tx = consensus_loopback_tx.clone();
+        // Per-peer rate limit on direct :8340 consensus injection. Any Ed448-authed
+        // peer (not just the committee) can call this; without a cap one peer can
+        // force sustained downstream cert/signature verification. Generous vs the
+        // real consensus cadence (a few vote/cert/block msgs per view).
+        let cw_rate: Arc<std::sync::Mutex<std::collections::HashMap<Vec<u8>, (u64, u32)>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         Arc::new(
             move |request: tonic::Request<quil_types::proto::global::SubmitGlobalConsensusRequest>| {
                 let auth = request
@@ -425,6 +443,27 @@ pub(crate) fn spawn_all(
                 let Some(auth) = auth else {
                     return Err("unauthenticated peer — global consensus delivery requires a valid Ed448 client cert".into());
                 };
+                {
+                    const MAX_CONSENSUS_MSGS_PER_SEC_PER_PEER: u32 = 256;
+                    let now_s = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if let Ok(mut map) = cw_rate.lock() {
+                        if map.len() > 4096 {
+                            map.clear();
+                        }
+                        let e = map.entry(auth.peer_id.to_bytes()).or_insert((now_s, 0));
+                        if e.0 == now_s {
+                            e.1 = e.1.saturating_add(1);
+                        } else {
+                            *e = (now_s, 1);
+                        }
+                        if e.1 > MAX_CONSENSUS_MSGS_PER_SEC_PER_PEER {
+                            return Err("global consensus delivery rate limited".into());
+                        }
+                    }
+                }
                 let req = request.into_inner();
                 // Accept the two legacy global-consensus topics AND the
                 // commonware-simplex CW channels (vote/cert/resolver/block), which

@@ -54,6 +54,17 @@ pub struct FrameMaterializer {
 
     /// Last materialized frame number (idempotency guard).
     last_materialized_frame: AtomicU64,
+    /// Signal channel into the single serial global-materializer worker: a
+    /// `(frame, target)` message tells the worker to catch up `[last+1..=target]`
+    /// in order from stored records. Fed by BOTH the CW-consensus finalize path
+    /// AND the archive poller — the poller thereby becomes a pure fetcher (it
+    /// persists frame records and signals here) instead of a SECOND state writer
+    /// that races the shared prover-registry committee cache. `None` until the
+    /// worker is wired (non-archive / pre-init); a `None` sender means the poller
+    /// falls back to its own inline processing (poller-only nodes).
+    catchup_tx: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedSender<(quil_types::proto::global::GlobalFrame, u64)>>,
+    >,
     /// Whether the local prover root matches the network.
     prover_root_synced: AtomicBool,
     /// Whether a prover-root MISMATCH has been positively DETECTED and not since
@@ -174,6 +185,7 @@ impl FrameMaterializer {
                 std::collections::HashMap::new(),
             )),
             last_materialized_frame: AtomicU64::new(0),
+            catchup_tx: std::sync::Mutex::new(None),
             prover_root_synced: AtomicBool::new(false),
             prover_root_mismatch: AtomicBool::new(false),
             prover_root_verified_frame: AtomicU64::new(0),
@@ -282,6 +294,29 @@ impl FrameMaterializer {
             });
         }
 
+        // IN-ORDER INVARIANT: a frame can only be applied when we already hold the
+        // roots it builds on — i.e. its parent (N-1) is materialized. Refuse to
+        // apply on top of a GAP (`frame_number > last + 1`): materializing ahead
+        // of the cursor would build on state we are NOT synced to and fork the
+        // prover root (a permanent hole — see the crash-hole warnings in this
+        // file and archive_sync). The caller must first catch up `[last+1..N]` in
+        // order from stored records (see the global-materializer consumer). This
+        // is self-healing: once the gap is filled, N is re-delivered and applied.
+        if frame_number > last + 1 {
+            debug!(
+                frame = frame_number,
+                last,
+                "refusing to materialize ahead of the cursor (gap) — catch-up required"
+            );
+            return Ok(MaterializeResult {
+                processed: 0,
+                skipped: 0,
+                prover_root_matched: true,
+                local_prover_root: Vec::new(),
+                finalized_bundles: Vec::new(),
+            });
+        }
+
         // Time the full materialization (verify + apply + commit) — records on
         // every real exit path (success or `?`-error) below the idempotency
         // skip. RAII so we don't have to thread the record call through each
@@ -293,6 +328,12 @@ impl FrameMaterializer {
             }
         }
         let _materialize_timer = MatTimer(std::time::Instant::now());
+
+        // (B) Serialize this ENTIRE materialize (pre-apply verify + apply +
+        // commit + root capture) against the prover-tree sync and any other
+        // forest writer. Nothing may advance the forest mid-materialize, so the
+        // verify below reads a stable N-1 forest and cannot fork the prover root.
+        let _forest_guard = self.hypergraph.lock_forest_writes();
 
         // 2. Compute local prover root and verify against frame.
         //
@@ -327,9 +368,24 @@ impl FrameMaterializer {
             .unwrap_or(frame_number);
         const PROVER_ROOT_CHECK_MARGIN: u64 = 4;
         let prover_root_matched = if frame_number + PROVER_ROOT_CHECK_MARGIN >= record_head {
-            let expected_root = &header.prover_tree_commitment;
-            let local_root = self.read_local_prover_root();
-            self.verify_prover_root(frame_number, expected_root, &local_root, &header.prover)
+            // The header's `prover_tree_commitment` is the PARENT (N-1)
+            // prover-shard root — the deterministic post-materialize-(N-1) value
+            // the leader binds in via `prover_root_at(N-1)`. Compare our OWN
+            // recorded N-1 root, which every node reproduces identically. This is
+            // NOT a live forest read: a live read races the async materializer /
+            // prover-sync forward to N (or beyond) and forks the check against the
+            // header's N-1 commitment — the prover-root-mismatch storm. Fall back
+            // to a live read only before N-1 has been recorded (fresh node).
+            let local_root = self
+                .hypergraph
+                .prover_root_at(frame_number.saturating_sub(1))
+                .unwrap_or_else(|| self.read_local_prover_root());
+            self.verify_prover_root(
+                frame_number,
+                &header.prover_tree_commitment,
+                &local_root,
+                &header.prover,
+            )
         } else {
             true
         };
@@ -948,6 +1004,19 @@ impl FrameMaterializer {
         // 9. Update state
         self.last_materialized_frame.store(frame_number, Ordering::SeqCst);
 
+        // Capture this frame's prover-shard root the moment materialization of
+        // it completes (forest reflects exactly `frame_number`). The verify for
+        // the NEXT frame reads `[frame_number]` from here rather than doing a live
+        // read that a concurrent materialize path can race forward.
+        {
+            let mroot = self.read_local_prover_root();
+            // Record this frame's deterministic post-state prover root so the
+            // leader can bind `prover_root_at(N)` as frame N+1's PARENT commitment
+            // and every follower can cross-check its own N-1 root — neither reading
+            // the racy live forest. Single source of truth, network-identical.
+            self.hypergraph.record_prover_root(frame_number, mroot);
+        }
+
         info!(
             frame = frame_number,
             processed,
@@ -1261,6 +1330,30 @@ impl FrameMaterializer {
     /// The last materialized frame number.
     pub fn last_materialized_frame(&self) -> u64 {
         self.last_materialized_frame.load(Ordering::SeqCst)
+    }
+
+    /// Wire the single serial global-materializer worker's signal sender (see
+    /// [`catchup_tx`](Self::catchup_tx)). Called once when the worker is spawned.
+    pub fn set_catchup_sender(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<(quil_types::proto::global::GlobalFrame, u64)>,
+    ) {
+        *self.catchup_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Signal the serial materializer to catch up `[last+1..=frame_number]` from
+    /// stored records. Returns `false` if no worker is wired (poller-only node) —
+    /// the caller then falls back to inline processing. The `frame` is a target
+    /// hint; the worker reads authoritative records from the store.
+    pub fn enqueue_catchup(
+        &self,
+        frame: quil_types::proto::global::GlobalFrame,
+        frame_number: u64,
+    ) -> bool {
+        match self.catchup_tx.lock().unwrap().as_ref() {
+            Some(tx) => tx.send((frame, frame_number)).is_ok(),
+            None => false,
+        }
     }
 
     /// Seed the in-memory `last_materialized_frame` cursor from the durable

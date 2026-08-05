@@ -165,6 +165,12 @@ pub struct ProverAllocationInfo {
     /// current epoch is read as [`EffectiveStatus::ExpiredEpoch`]. `0` is the
     /// genesis/grandfather sentinel.
     pub epoch: u64,
+    /// The reward-ring index this allocation is LOCKED into, computed at
+    /// confirmation (and recomputed only on a membership change — a higher prover
+    /// leaving/evicting shifts survivors up). Read during materialization instead
+    /// of re-sorting by live seniority, which is what keeps the prover-tree root
+    /// deterministic across nodes.
+    pub ring: u8,
     /// The 32-byte vertex address (last 32 bytes of the 64-byte
     /// hypergraph key).
     pub vertex_address: Vec<u8>,
@@ -735,6 +741,7 @@ mod epoch_tests {
             leave_reject_frame_number: 0,
             last_active_frame_number: 0,
             epoch,
+            ring: 0,
             vertex_address: Vec::new(),
         }
     }

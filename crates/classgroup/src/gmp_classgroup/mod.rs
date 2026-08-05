@@ -71,6 +71,15 @@ impl GmpClassGroup {
         (self.a, self.b)
     }
 
+    /// True if the form's `a` coefficient is zero — a DEGENERATE, invalid form
+    /// that a real proof never contains. Callers decoding untrusted proof bytes
+    /// must reject such a form BEFORE any arithmetic: `pow`/reduce divide by
+    /// `2·a` in raw GMP FFI, and `2·a == 0` is a C-level divide-by-zero (SIGFPE
+    /// abort) that `catch_unwind` cannot trap.
+    pub fn a_is_zero(&self) -> bool {
+        self.a == Mpz::from(0u64)
+    }
+
     fn inner_multiply(&mut self, rhs: &Self, ctx: &mut Ctx) {
         self.assert_valid();
         rhs.assert_valid();

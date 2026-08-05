@@ -1386,7 +1386,12 @@ fn take_u32(b: &[u8], p: &mut usize) -> Result<usize> {
 }
 fn take_vecs(b: &[u8], p: &mut usize) -> Result<Vec<Vec<u8>>> {
     let n = take_u32(b, p)?;
-    let mut v = Vec::with_capacity(n);
+    // Cap the pre-allocation against remaining bytes (each entry is a 4-byte
+    // length prefix + data) so an attacker-chosen count can't drive a multi-GB
+    // `Vec::with_capacity` → OOM/abort before the per-entry read runs. Hint only:
+    // the loop still bounds-checks each real entry, so legit envelopes are never
+    // rejected.
+    let mut v = Vec::with_capacity(n.min(b.len().saturating_sub(*p) / 4));
     for _ in 0..n {
         let len = take_u32(b, p)?;
         let e = *p + len;
@@ -1494,7 +1499,9 @@ pub fn decode_mint_envelope(b: &[u8]) -> Result<MintEnvelope> {
         u64::from_le_bytes(s.try_into().unwrap())
     };
     let n = take_u32(b, &mut p)?;
-    let mut inputs = Vec::with_capacity(n);
+    // Cap pre-allocation vs remaining bytes (each input has a u128 value +
+    // length-prefixed fields, ≥16 bytes) — attacker-count alloc-bomb guard.
+    let mut inputs = Vec::with_capacity(n.min(b.len().saturating_sub(p) / 16));
     for _ in 0..n {
         inputs.push(LatticeMintInput {
             value: take_u128(b, &mut p)?,

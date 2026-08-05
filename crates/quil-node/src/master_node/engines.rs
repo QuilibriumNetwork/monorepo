@@ -10,7 +10,7 @@ pub(crate) struct EngineHandles {
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
 }
 
-pub(crate) fn init_engines(storage: &StorageHandles) -> EngineHandles {
+pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandles {
     // ---------------------------------------------------------------
     // 3. Create execution engines with full crypto verification
     // ---------------------------------------------------------------
@@ -33,10 +33,14 @@ pub(crate) fn init_engines(storage: &StorageHandles) -> EngineHandles {
         .get_latest_frame_number()
         .map(|n| n == 0)
         .unwrap_or(true);
+    // Mainnet (network 0) uses the fixed 64-way QUIL grid (migration/state-root
+    // legacy); testnet/devnet treats QUIL like every other app — a single shard
+    // that splits dynamically.
     if quil_forest_migrate::install_forest_boot(
         crdt.as_ref(),
         storage.hg_store.as_ref(),
         store_is_fresh,
+        network == 0,
     ) {
         tracing::info!("Phase-3 JMT forest installed on global CRDT — state commits to the forest");
     }

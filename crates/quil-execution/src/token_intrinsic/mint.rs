@@ -1457,30 +1457,37 @@ pub fn parse_go_traversal_proof(data: &[u8]) -> Result<TraversalProof> {
     let proof_len = read_go_u32(mp_bytes, &mut mc)? as usize;
     let proof = read_go_bytes(mp_bytes, &mut mc, proof_len)?.to_vec();
 
-    // Subproofs
+    // Subproofs.
+    // Every `Vec::with_capacity` below is pre-sized from an attacker-controlled
+    // u32 count. Cap each hint against the remaining bytes (each entry needs at
+    // least a 4-byte length prefix, u64 elements 8 bytes) so a bogus count can't
+    // drive a multi-GB allocation → OOM/abort before the per-entry read even
+    // runs. `.min(..)` is a HINT cap only: the loop still reads and bounds-checks
+    // each real entry, so legit proofs are never rejected. (These hand-rolled
+    // `read_go_*` parsers never moved to the bounded `canonical_cursor` helpers.)
     let sp_count = read_go_u32(data, &mut c)? as usize;
-    let mut sub_proofs = Vec::with_capacity(sp_count);
+    let mut sub_proofs = Vec::with_capacity(sp_count.min(data.len().saturating_sub(c) / 4));
 
     for _ in 0..sp_count {
         let commits_count = read_go_u32(data, &mut c)? as usize;
-        let mut commits = Vec::with_capacity(commits_count);
+        let mut commits = Vec::with_capacity(commits_count.min(data.len().saturating_sub(c) / 4));
         for _ in 0..commits_count {
             let l = read_go_u32(data, &mut c)? as usize;
             commits.push(read_go_bytes(data, &mut c, l)?.to_vec());
         }
 
         let ys_count = read_go_u32(data, &mut c)? as usize;
-        let mut ys = Vec::with_capacity(ys_count);
+        let mut ys = Vec::with_capacity(ys_count.min(data.len().saturating_sub(c) / 4));
         for _ in 0..ys_count {
             let l = read_go_u32(data, &mut c)? as usize;
             ys.push(read_go_bytes(data, &mut c, l)?.to_vec());
         }
 
         let paths_count = read_go_u32(data, &mut c)? as usize;
-        let mut paths = Vec::with_capacity(paths_count);
+        let mut paths = Vec::with_capacity(paths_count.min(data.len().saturating_sub(c) / 4));
         for _ in 0..paths_count {
             let plen = read_go_u32(data, &mut c)? as usize;
-            let mut path = Vec::with_capacity(plen);
+            let mut path = Vec::with_capacity(plen.min(data.len().saturating_sub(c) / 8));
             for _ in 0..plen {
                 path.push(read_go_u64(data, &mut c)?);
             }

@@ -429,7 +429,11 @@ pub fn js_verify_ed448(public_key: &str, message: &str, signature: &str) -> Stri
   }
   
   let pub_bytes: [u8; 57] = key.try_into().unwrap();
-  let pub_key = ed448_rust::PublicKey::from(pub_bytes);
+  // `PublicKey::from` panics on a non-point key; fail with an error string.
+  let pub_key = match ed448_rust::PublicKey::try_from(&pub_bytes[..]) {
+    Ok(k) => k,
+    Err(_) => return "invalid public key".to_string(),
+  };
   let signature = pub_key.verify(&maybe_message.unwrap(), &maybe_signature.unwrap(), None);
   
   match signature {

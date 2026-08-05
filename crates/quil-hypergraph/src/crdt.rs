@@ -102,6 +102,27 @@ pub struct HypergraphCrdt {
     /// Monotonic JMT commit version (roots are content-addressed, so only
     /// monotonicity matters).
     forest_version: AtomicU64,
+    /// Coarse serialization for FOREST WRITES. Global-frame materialization
+    /// (a whole verify + apply + commit) and prover-tree SYNC both mutate the
+    /// forest; they must never interleave. Without this a sync — fired by a
+    /// prover-root mismatch — can advance the forest out from under a
+    /// materialize's pre-apply prover-root verify (which then reads state AHEAD
+    /// of N-1 and forks the root, firing another sync: a self-amplifying loop).
+    /// Both the materializer and the syncer hold this for their WHOLE operation,
+    /// enforcing the single-writer, monotonic forest invariant.
+    forest_write_lock: std::sync::Mutex<()>,
+    /// Deterministic per-frame global-prover-shard root: `frame N → the prover
+    /// vertex-adds root AFTER materializing frame N`. Written by the frame
+    /// materializer the instant it finishes frame N; read by BOTH the leader
+    /// (which binds `prover_root_at(N-1)` — the PARENT root — into frame N's
+    /// header) and the follower's pre-apply cross-check (which compares its own
+    /// `prover_root_at(N-1)`). This replaces reading the LIVE forest at proposal
+    /// time, which is RACY: the async materializer may or may not have advanced
+    /// the forest to frame N by the moment the leader proposes N, so a live read
+    /// lands on N-1 or N unpredictably and forks the commitment. All nodes
+    /// materialize a frame to the identical root, so this map is identical
+    /// network-wide. Bounded to the most recent frames.
+    prover_root_by_frame: RwLock<std::collections::BTreeMap<u64, Vec<u8>>>,
     /// The exact JMT version each `(shard, phase)` tree was last committed at.
     /// `get_with_proof`/`get_root_hash_option` need the precise version a tree
     /// was written at (they do not walk back to the latest ≤ v), and each
@@ -164,6 +185,8 @@ impl HypergraphCrdt {
             prover,
             forest: RwLock::new(Forest::in_memory()),
             forest_version: AtomicU64::new(0),
+            forest_write_lock: std::sync::Mutex::new(()),
+            prover_root_by_frame: RwLock::new(std::collections::BTreeMap::new()),
             phase_versions: RwLock::new(HashMap::new()),
             global_versions: RwLock::new(HashMap::new()),
             app_shard_prefixes: RwLock::new(HashMap::new()),
@@ -182,6 +205,17 @@ impl HypergraphCrdt {
     /// forest sharing the store's DB). Replaces the default in-memory forest.
     pub fn set_forest(&self, forest: Forest) {
         *self.forest.write().unwrap() = forest;
+    }
+
+    /// Acquire the coarse forest-write serialization guard. Held for the WHOLE
+    /// duration by the global-frame materializer (verify + apply + commit) and
+    /// by the prover-tree syncer (its forest apply), so the two never write the
+    /// forest concurrently. Poisoning is recovered (a panic mid-write is already
+    /// a stop-the-materializer condition upstream). See `forest_write_lock`.
+    pub fn lock_forest_writes(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.forest_write_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Always true now — the CRDT is forest-native. Retained for callers that
@@ -349,6 +383,35 @@ impl HypergraphCrdt {
     /// Borrow the legacy inclusion prover (ancillary KZG sub-tree callers).
     pub fn prover(&self) -> &Arc<dyn InclusionProver> {
         &self.prover
+    }
+
+    /// Record the deterministic global-prover-shard root produced by
+    /// materializing `frame` (post-state root). Called by the frame materializer
+    /// the instant frame `frame` finishes. Bounded to the most recent 256 frames.
+    /// See [`prover_root_by_frame`](Self::prover_root_by_frame).
+    pub fn record_prover_root(&self, frame: u64, root: Vec<u8>) {
+        if root.is_empty() {
+            return;
+        }
+        let mut map = self.prover_root_by_frame.write().unwrap();
+        map.insert(frame, root);
+        while map.len() > 256 {
+            let oldest = *map.keys().next().unwrap();
+            map.remove(&oldest);
+        }
+    }
+
+    /// The deterministic global-prover-shard root as of the END of `frame`
+    /// (post-materialization). `None` if that frame hasn't been recorded yet
+    /// (fresh node / pruned). The leader binds `prover_root_at(N-1)` into frame
+    /// N's header; the follower verifies against the same. See
+    /// [`prover_root_by_frame`](Self::prover_root_by_frame).
+    pub fn prover_root_at(&self, frame: u64) -> Option<Vec<u8>> {
+        self.prover_root_by_frame
+            .read()
+            .unwrap()
+            .get(&frame)
+            .cloned()
     }
 
     // ---- covered prefix -------------------------------------------------

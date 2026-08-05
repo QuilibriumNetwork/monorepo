@@ -415,6 +415,14 @@ pub fn wesolowski_verify_multi_sparse(
       let (y_bytes, pi_bytes) = blob.split_at(element_len);
       let y_i  = GmpClassGroup::from_bytes(y_bytes, disc.clone());
       let pi_i = GmpClassGroup::from_bytes(pi_bytes, disc.clone());
+      // Reject DEGENERATE (a==0) forms decoded from the attacker's proof blob
+      // BEFORE any arithmetic: `pow`/reduce divide by `2·a` in raw GMP FFI, and
+      // `2·a == 0` is a C-level divide-by-zero abort that `catch_unwind` cannot
+      // trap (the live residual of the prior class-group SIGABRT class on the
+      // multiproof frame-header verify path). A valid proof never has a==0.
+      if y_i.a_is_zero() || pi_i.a_is_zero() {
+          return false;
+      }
       let h_i = hash_to_exponent::<<GmpClassGroup as ClassGroup>::BigNum>(
           challenge,
           id_bytes.as_slice(),

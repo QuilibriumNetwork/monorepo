@@ -1129,6 +1129,71 @@ impl P2PHandle {
             .await;
     }
 
+    /// Mesh-level gate for the GLOBAL_FRAME topic. Runs in the gossip poll
+    /// thread BEFORE a message is delivered to the app recv loop or forwarded to
+    /// the mesh, so it must stay O(1): it does NOT decode the frame (frames can
+    /// be up to ~15 MiB) or verify the committee cert (that would move the
+    /// expensive work an attacker is trying to trigger into the swarm thread).
+    ///
+    /// It enforces two cheap invariants and reports `Reject` (which penalises the
+    /// sender's gossip score and stops propagation) when they fail:
+    ///   1. the message carries the canonical GLOBAL_FRAME type prefix, and
+    ///   2. no single peer exceeds `MAX_FRAMES_PER_SEC` frames in a 1s window.
+    ///
+    /// (1) sheds garbage floods; (2) caps a peer that floods unique (dedup-
+    /// evading) frames — the CPU-DoS vector where each frame otherwise forces a
+    /// VDF verify downstream. Legitimate gossip is head-only (~1 frame / 10s per
+    /// source), so the bound has ~80x headroom and never trips in normal flow.
+    /// The authoritative checks (genesis prover, committee finalization cert,
+    /// VDF) still run in the recv loop; this only bounds what reaches them.
+    pub async fn register_global_frame_validator(&self, bitmask: Vec<u8>, frame_type: u32) {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        // Per-source fixed-window counter. Bounded: the mesh has at most a few
+        // dozen peers; if it somehow grows past the cap we clear it wholesale
+        // (a coarse but O(1) reset that can only *reprieve* a flooder briefly).
+        const MAX_FRAMES_PER_SEC: u32 = 8;
+        const MAP_CAP: usize = 4096;
+        let counters: std::sync::Arc<Mutex<HashMap<PeerId, (u64, u32)>>> =
+            std::sync::Arc::new(Mutex::new(HashMap::new()));
+        let validator: Box<
+            dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync,
+        > = Box::new(move |peer, data| {
+            use crate::ValidationResult;
+            // (1) cheap shape/type check — legit frames are canonical-wire with
+            // the 4-byte type prefix; anything else on this topic is bogus.
+            if data.len() < 4
+                || u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4])) != frame_type
+            {
+                return ValidationResult::Reject;
+            }
+            // (2) per-peer rate limit.
+            let now_s = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if let Ok(mut map) = counters.lock() {
+                if map.len() > MAP_CAP {
+                    map.clear();
+                }
+                let entry = map.entry(*peer).or_insert((now_s, 0));
+                if entry.0 == now_s {
+                    entry.1 = entry.1.saturating_add(1);
+                } else {
+                    *entry = (now_s, 1);
+                }
+                if entry.1 > MAX_FRAMES_PER_SEC {
+                    return ValidationResult::Reject;
+                }
+            }
+            ValidationResult::Accept
+        });
+        let _ = self
+            .cmd_tx
+            .send(P2PCommand::RegisterValidator { bitmask, validator })
+            .await;
+    }
+
     pub async fn unsubscribe(&self, bitmask: Vec<u8>) {
         let _ = self.cmd_tx.send(P2PCommand::Unsubscribe(bitmask)).await;
     }

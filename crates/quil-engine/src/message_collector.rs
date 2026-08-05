@@ -74,12 +74,24 @@ impl FinalizedSet {
 enum AddOutcome {
     Added,
     Duplicate,
+    /// The per-rank count/byte cap is full — message rejected (not retained).
+    Full,
 }
+
+/// Per-rank caps. Without these an attacker floods DISTINCT payloads (vary one
+/// byte to defeat the SHA-256 dedup) at the current rank — each retained until
+/// the rank ages out — a memory-amplification DoS (submit paths accept up to
+/// 64 MiB/msg on :8340). A leader can only pack ~15 MiB into one proposal anyway,
+/// so retaining far more than that is pointless; these bound the buffer while
+/// staying well above any legitimate per-rank volume.
+const MAX_MESSAGES_PER_RANK: usize = 65_536;
+const MAX_BYTES_PER_RANK: usize = 64 * 1024 * 1024;
 
 /// Per-rank message buffer.
 struct RankBuffer {
     messages: Vec<CollectedMessage>,
     seen: HashSet<[u8; 32]>,
+    bytes: usize,
 }
 
 impl RankBuffer {
@@ -87,17 +99,23 @@ impl RankBuffer {
         Self {
             messages: Vec::new(),
             seen: HashSet::new(),
+            bytes: 0,
         }
     }
 
-    /// Add a message if not already seen. There is no per-frame cap on
-    /// global consensus, so the only rejection is exact-duplicate.
+    /// Add a message if not already seen and the rank isn't over its cap.
     fn add(&mut self, data: Vec<u8>) -> AddOutcome {
         let hash = sha256(&data);
         if self.seen.contains(&hash) {
             return AddOutcome::Duplicate;
         }
+        if self.messages.len() >= MAX_MESSAGES_PER_RANK
+            || self.bytes.saturating_add(data.len()) > MAX_BYTES_PER_RANK
+        {
+            return AddOutcome::Full;
+        }
         self.seen.insert(hash);
+        self.bytes += data.len();
         self.messages.push(CollectedMessage { data, hash });
         AddOutcome::Added
     }
@@ -285,6 +303,7 @@ impl MessageCollector {
         match buffer.add(data) {
             AddOutcome::Added => SubmitOutcome::Accepted,
             AddOutcome::Duplicate => SubmitOutcome::Duplicate,
+            AddOutcome::Full => SubmitOutcome::Filtered,
         }
     }
 
@@ -364,6 +383,7 @@ impl MessageCollector {
             for buf in buffers.values_mut() {
                 buf.messages.retain(|m| !hashes.contains(&m.hash));
                 buf.seen.retain(|h| !hashes.contains(h));
+                buf.bytes = buf.messages.iter().map(|m| m.data.len()).sum();
             }
             buffers.retain(|_, b| !b.messages.is_empty());
         }
@@ -395,6 +415,7 @@ impl MessageCollector {
         for buf in buffers.values_mut() {
             buf.messages.retain(|m| !hashes.contains(&m.hash));
             buf.seen.retain(|h| !hashes.contains(h));
+            buf.bytes = buf.messages.iter().map(|m| m.data.len()).sum();
         }
         buffers.retain(|_, b| !b.messages.is_empty());
     }

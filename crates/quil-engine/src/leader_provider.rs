@@ -99,31 +99,70 @@ impl GlobalLeaderProvider {
 
     /// Compute the `prover_tree_commitment` for the frame being proved:
     /// the global prover shard's (`L1=[0;3]`, `L2=[0xff;32]`) vertex-adds
-    /// forest root over the CURRENT committed state (which, at proposal
-    /// time, reflects the parent frame — the last one materialized on
-    /// finalization).
+    /// forest root of the PARENT frame (`frame_number - 1`) — the state the
+    /// new frame builds on, which every follower cross-checks in
+    /// `verify_prover_root`.
     ///
-    /// Reads the LIVE forest root via `compute_shard_root`, whose doc
-    /// contract is "the same value `commit_inner` puts in the header."
-    /// This deliberately does NOT go through `commit(frame_number)`: at
-    /// proposal time nothing is staged for the new frame and no root is
-    /// persisted at that frame number yet, so `commit()` (union of
-    /// pending + per-frame cached commits) would return an EMPTY set for
-    /// the global shard. The forest read is the authoritative
-    /// point-in-time root.
+    /// Reads the DETERMINISTIC recorded parent root via
+    /// [`prover_root_at`](quil_hypergraph::HypergraphCrdt::prover_root_at), NOT
+    /// the live forest. The live forest is RACY at proposal time: the async
+    /// materializer may or may not have already advanced it to `frame_number`,
+    /// so a live read lands on the parent OR self unpredictably and forks the
+    /// commitment across nodes (the prover-root-mismatch storm). The recorded
+    /// per-frame map is identical network-wide (all nodes materialize a frame to
+    /// the same root), so binding `prover_root_at(N-1)` is stable and every
+    /// follower reproduces it. Falls back to a live read only before the parent
+    /// has been recorded (bootstrap).
     ///
     /// Returns empty only when no CRDT is wired (unit tests) or the shard
     /// truly has no root — tolerated by the empty-root branch in
     /// `verify_prover_root`.
-    fn compute_prover_root(&self) -> Vec<u8> {
+    fn compute_prover_root(&self, frame_number: u64) -> Vec<u8> {
         let Some(hg) = self.hypergraph.as_ref() else {
             return Vec::new();
         };
-        let global_shard = quil_types::store::ShardKey {
-            l1: [0u8; 3],
-            l2: [0xffu8; 32],
-        };
-        let root = hg.compute_shard_root("vertex", "adds", &global_shard);
+        // Bind the PARENT (frame_number-1) prover-shard root: the deterministic
+        // post-materialize-(N-1) value recorded by the frame materializer, which
+        // every node reproduces identically. Do NOT read the LIVE forest here —
+        // it is RACY: the async materializer lags the (faster) produce path, so a
+        // live read lands on N-2/N-1 unpredictably and forks the commitment (the
+        // prover-root-mismatch storm).
+        //
+        // SERIAL/MONOTONIC GATE: the leader must not produce frame N until its
+        // materializer has recorded the parent (N-1) root. Produce outruns the
+        // async materializer by ~1-2 frames, so briefly BLOCK for the in-flight
+        // materialize(N-1) to record rather than reading the lagging forest.
+        // Bounded so a genuinely-behind materializer (deep catch-up) can't wedge
+        // proposing — past the deadline we fall back to a best-effort live read
+        // (tolerated by the empty/degenerate branch and `verify_prover_root`'s
+        // empty-root skip). Once produce paces to materialize, the wait is a
+        // single poll.
+        let parent = frame_number.saturating_sub(1);
+        let mut recorded = hg.prover_root_at(parent);
+        if recorded.is_none() && frame_number > 1 {
+            const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+            const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+            let deadline = std::time::Instant::now() + MAX_WAIT;
+            while recorded.is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(POLL);
+                recorded = hg.prover_root_at(parent);
+            }
+            if recorded.is_none() {
+                tracing::debug!(
+                    frame = frame_number,
+                    parent,
+                    "parent prover root not recorded before produce deadline; \
+                     using live-read fallback (materializer catching up)"
+                );
+            }
+        }
+        let root = recorded.unwrap_or_else(|| {
+            let global_shard = quil_types::store::ShardKey {
+                l1: [0u8; 3],
+                l2: [0xffu8; 32],
+            };
+            hg.compute_shard_root("vertex", "adds", &global_shard)
+        });
         // A real forest root is 32 bytes; reject the empty/degenerate case.
         if root.len() == 32 || root.len() >= 64 {
             root
@@ -224,30 +263,33 @@ impl GlobalLeaderProvider {
     /// failures are logged and skipped, matching Go's `if err != nil`
     /// soft-fail (a single bad bundle does not abort the whole frame).
     fn compute_requests_root(&self, messages: &[Vec<u8>]) -> Vec<u8> {
-        use sha3::{Digest as _, Sha3_256};
-        let mut tree = quil_tries::VectorCommitmentTree::new();
-        for (i, msg) in messages.iter().enumerate() {
-            // Key by SHA3(index_be ‖ msg) so the (order-independent, dup-collapsing)
-            // keyed tree commits request ORDER + MULTIPLICITY — the same fix as the
-            // app-shard `compute_requests_root` (audit Finding #2, global sibling).
-            let mut keyed = (i as u64).to_be_bytes().to_vec();
-            keyed.extend_from_slice(msg);
-            let id: [u8; 32] = Sha3_256::digest(&keyed).into();
-            if let Err(e) = tree.insert(
-                &id,
-                msg,
-                &[],
-                &num_bigint::BigInt::from(0),
-            ) {
-                tracing::warn!(
-                    error = %e,
-                    "failed to add global request to tree",
-                );
-                continue;
-            }
-        }
-        tree.commit(self.inclusion_prover.as_ref())
+        compute_global_requests_root(messages, self.inclusion_prover.as_ref())
     }
+}
+
+/// Compute a global frame's `requests_root` over its canonical request bytes.
+///
+/// Free function (shared by the producer in [`GlobalLeaderProvider`] and the
+/// receive-path verifier that binds a gossiped frame's body to its authenticated
+/// header). Keys each request by `SHA3(index_be ‖ msg)` so the commitment binds
+/// request ORDER + MULTIPLICITY. The `prover` MUST match the one the producer
+/// used (`quil_tries::ShaInclusionProver` in production) or the roots won't agree.
+pub fn compute_global_requests_root(
+    messages: &[Vec<u8>],
+    prover: &dyn quil_types::crypto::InclusionProver,
+) -> Vec<u8> {
+    use sha3::{Digest as _, Sha3_256};
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    for (i, msg) in messages.iter().enumerate() {
+        let mut keyed = (i as u64).to_be_bytes().to_vec();
+        keyed.extend_from_slice(msg);
+        let id: [u8; 32] = Sha3_256::digest(&keyed).into();
+        if let Err(e) = tree.insert(&id, msg, &[], &num_bigint::BigInt::from(0)) {
+            tracing::warn!(error = %e, "failed to add global request to tree");
+            continue;
+        }
+    }
+    tree.commit(prover)
 }
 
 impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
@@ -570,7 +612,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             .as_ref()
             .map(|hg| hg.global_commitments())
             .unwrap_or_default();
-        let prover_root: Vec<u8> = self.compute_prover_root();
+        let prover_root: Vec<u8> = self.compute_prover_root(frame_number);
         if prover_root.is_empty() {
             tracing::warn!(
                 frame = frame_number,
@@ -1015,7 +1057,7 @@ mod tests {
         );
 
         let provider = provider_with_crdt(Some(crdt.clone()));
-        let got = provider.compute_prover_root();
+        let got = provider.compute_prover_root(0);
 
         assert_eq!(
             got, expected,
@@ -1025,7 +1067,7 @@ mod tests {
         assert!(got.iter().any(|&b| b != 0), "global shard has data → non-zero root");
         assert_ne!(got, distractor, "must target the global shard, not another app shard");
         // Deterministic across re-proves of the same committed state.
-        assert_eq!(got, provider.compute_prover_root());
+        assert_eq!(got, provider.compute_prover_root(0));
     }
 
     /// No CRDT wired (unit-test / degraded node) → empty commitment, which
@@ -1033,6 +1075,6 @@ mod tests {
     #[test]
     fn compute_prover_root_empty_without_crdt() {
         let provider = provider_with_crdt(None);
-        assert!(provider.compute_prover_root().is_empty());
+        assert!(provider.compute_prover_root(0).is_empty());
     }
 }

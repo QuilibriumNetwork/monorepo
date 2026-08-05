@@ -142,7 +142,9 @@ impl ProverJoin {
 
         // merge_targets
         let mtc = read_u32(data, &mut cursor)?;
-        let mut merge_targets = Vec::with_capacity(mtc as usize);
+        // Cap pre-allocation against remaining bytes (alloc-bomb guard; hint only).
+        let mut merge_targets =
+            Vec::with_capacity((mtc as usize).min(data.len().saturating_sub(cursor) / 4));
         for _ in 0..mtc {
             let mtl = read_u32(data, &mut cursor)?;
             if mtl > MAX_MERGE_TARGET_LEN {

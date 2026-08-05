@@ -39,6 +39,9 @@ pub(crate) struct MessageLoopArgs {
     pub signer_registry: Arc<quil_p2p::SignerRegistry>,
     pub current_frame: Arc<quil_engine::current_frame::CurrentFrame>,
     pub last_global_head_frame: Arc<std::sync::atomic::AtomicU64>,
+    /// Stamped on every gossip-delivered `GLOBAL_FRAME` so the RPC poller can
+    /// back off while the mesh is carrying the head.
+    pub gossip_freshness: Arc<quil_rpc::GossipFreshness>,
     pub genesis_archive_peer_ids: std::collections::HashSet<Vec<u8>>,
     pub genesis_prover_addrs: std::collections::HashSet<Vec<u8>>,
     pub alert_pubkey: Vec<u8>,
@@ -83,6 +86,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         signer_registry: sr_for_recv,
         current_frame: cf_for_recv,
         last_global_head_frame: lhf_for_recv,
+        gossip_freshness: gossip_freshness_for_recv,
         genesis_archive_peer_ids: genesis_archive_peer_ids_for_recv,
         genesis_prover_addrs: genesis_prover_addrs_for_recv,
         alert_pubkey: alert_pubkey_for_recv,
@@ -591,6 +595,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                     "verified genesis archive peer"
                                                 );
                                             }
+                                            // Authenticated network-head hint for the poller's
+                                            // reconcile: this PeerInfo is signed and genesis-archive
+                                            // verified, so its advertised head lets the poller decide
+                                            // "am I behind?" without an RPC head-fetch.
+                                            gossip_freshness_for_recv
+                                                .note_network_head(info.last_global_head_frame);
                                             let mut first_addr: Option<String> = None;
                                             for reach in &info.reachability {
                                                 for ma in &reach.stream_multiaddrs {
@@ -652,6 +662,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                         // No-op once persistent.
                                                         if quil_forest_migrate::install_forest_for_sync(
                                                             crdt_for_bootstrap.as_ref(), store.as_ref(),
+                                                            network_for_recv == 0,
                                                         ) {
                                                             info!("prover-tree-bootstrap: installed persistent forest for onboarding sync");
                                                         }
@@ -788,6 +799,53 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             }
                                         }
 
+                                        // Frame-number sanity (cheap, pre-cert). Gossip is
+                                        // head-only, so a legit frame sits at ~the network head;
+                                        // one implausibly far beyond our head can only be a forged
+                                        // number aimed at poisoning the head atomic / gossip-head
+                                        // target. Shed it before the (Falcon) cert verify below. The
+                                        // margin is deliberately huge (~1M frames ≈ months) so a
+                                        // genuinely behind node still follows the real head; a node
+                                        // that far behind uses the state-jump path, not gossip.
+                                        {
+                                            const MAX_HEAD_LEAD: u64 = 1_000_000;
+                                            let head_now = lhf_for_recv
+                                                .load(std::sync::atomic::Ordering::Relaxed);
+                                            if frame_num > head_now.saturating_add(MAX_HEAD_LEAD) {
+                                                debug!(
+                                                    frame = frame_num,
+                                                    head = head_now,
+                                                    from = bs58::encode(&received.from).into_string(),
+                                                    "gossip global frame implausibly far ahead — dropping",
+                                                );
+                                                continue;
+                                            }
+                                        }
+
+                                        // UNTRUSTED SOURCE GATE. This frame came off the open
+                                        // GLOBAL_FRAME gossip mesh (any peer can publish), not the
+                                        // mTLS-authenticated archive poller. The VDF proof below is
+                                        // PUBLICLY COMPUTABLE — it authenticates nothing — and the
+                                        // genesis-prover check above is a public-address allowlist.
+                                        // So require a committee FINALIZATION cert (CWCT) that
+                                        // verifies against the fixed global committee: this proves
+                                        // the committee actually finalized the frame. Fails closed
+                                        // (no committee / no cert / bad cert ⇒ drop) and runs BEFORE
+                                        // the expensive VDF verify so forged frames are cheap to shed.
+                                        // Legit gossip + archive frames both carry this cert.
+                                        match frame.header.as_ref() {
+                                            Some(h) if frame_validator_for_recv
+                                                .verify_global_finalization_cert(h) => {}
+                                            _ => {
+                                                debug!(
+                                                    frame = frame_num,
+                                                    from = bs58::encode(&received.from).into_string(),
+                                                    "gossip global frame missing/invalid committee finalization cert — dropping",
+                                                );
+                                                continue;
+                                            }
+                                        }
+
                                         // Verify VDF proof before storing.
                                         // Wrap in catch_unwind — the classgroup can panic
                                         // on malformed VDF output from canonical decode bugs.
@@ -817,6 +875,69 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             }
                                         }
 
+                                        // BIND THE BODY TO THE AUTHENTICATED HEADER. The cert + VDF
+                                        // above authenticate the header (incl. `requests_root`), but
+                                        // `frame.requests` is a separate field. An attacker could keep
+                                        // a real frame's valid header+cert+VDF and swap in a different
+                                        // request set — each request is still intrinsic-validated on
+                                        // execution, but a receiver would compute a DIVERGENT state for
+                                        // this frame. Recompute the requests root from the carried body
+                                        // and require it to equal the authenticated `requests_root`.
+                                        // (The mTLS poller path trusts its source; this gate is for the
+                                        // untrusted gossip mesh.)
+                                        // Bound the work an attacker can force. Recomputing the
+                                        // requests root builds a commitment tree over every bundle and
+                                        // converts every request. A real header+cert can be REPLAYED
+                                        // with a maximally-large tampered body (a 16 MiB frame packs
+                                        // millions of minimal bundles) to burn seconds of CPU before
+                                        // the root mismatch is detected — the check is inherently
+                                        // build-then-compare. Shed oversized bodies here, cheaply
+                                        // (O(bundles) length reads, no tree work), before the recompute.
+                                        // Typical global frames are far under these caps; a rare genuinely
+                                        // huge frame simply isn't followed over gossip and is instead
+                                        // fetched by the RPC poller (which has no such cap and trusts its
+                                        // mTLS source), so correctness is preserved.
+                                        {
+                                            const MAX_GOSSIP_GLOBAL_BUNDLES: usize = 65_536;
+                                            const MAX_GOSSIP_GLOBAL_REQUESTS: usize = 65_536;
+                                            let total_requests: usize =
+                                                frame.requests.iter().map(|b| b.requests.len()).sum();
+                                            if frame.requests.len() > MAX_GOSSIP_GLOBAL_BUNDLES
+                                                || total_requests > MAX_GOSSIP_GLOBAL_REQUESTS
+                                            {
+                                                debug!(
+                                                    frame = frame_num,
+                                                    bundles = frame.requests.len(),
+                                                    requests = total_requests,
+                                                    from = bs58::encode(&received.from).into_string(),
+                                                    "gossip global frame body oversized — dropping (poller fetches if real)",
+                                                );
+                                                continue;
+                                            }
+                                        }
+
+                                        // Recompute runs on the ATTACKER-CONTROLLED body (before the
+                                        // match rejects a forgery), so contain any panic in the
+                                        // canonical-encoding / tree path exactly like the VDF verify
+                                        // above — a panic ⇒ treat as invalid ⇒ drop, never crash the
+                                        // recv loop.
+                                        let requests_root_ok = std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| match frame.header.as_ref() {
+                                                Some(h) => frame_validator_for_recv
+                                                    .verify_global_requests_root(h, &frame.requests),
+                                                None => false,
+                                            }),
+                                        )
+                                        .unwrap_or(false);
+                                        if !requests_root_ok {
+                                            debug!(
+                                                frame = frame_num,
+                                                from = bs58::encode(&received.from).into_string(),
+                                                "gossip global frame body does not match authenticated requests_root — dropping",
+                                            );
+                                            continue;
+                                        }
+
                                         match clock_store_recv.put_global_frame(&frame, None) {
                                             Ok(()) => {
                                                 frames_received += 1;
@@ -828,6 +949,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 // BlossomSub).
                                                 cf_for_recv.observe(frame_num);
                                                 lhf_for_recv.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
+                                                // Signal the RPC poller that gossip is delivering the
+                                                // head, so it backs off its redundant per-second fetch.
+                                                gossip_freshness_for_recv.stamp(frame_num);
 
                                                 // Frame execution dispatches on node mode:
                                                 //

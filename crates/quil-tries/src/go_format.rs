@@ -45,8 +45,18 @@ use crate::{TYPE_BRANCH, TYPE_LEAF, TYPE_NIL};
 /// `SerializeNonLazyTree` wire format.
 pub fn deserialize_go_tree(data: &[u8]) -> Result<Option<VectorCommitmentNode>> {
     let mut cursor = GoCursor::new(data);
-    cursor.read_node()
+    cursor.read_node(0)
 }
+
+/// Max branch-prefix length. Tree paths are ≤64 nibbles; 256 is generous
+/// headroom while rejecting a crafted u32 that would size a giant `Vec`.
+/// Mirrors `serialize.rs::MAX_TREE_PREFIX_LEN`.
+const MAX_GO_PREFIX_LEN: usize = 256;
+/// Max branch-nesting depth. Legit trees are ≤64 deep; 128 is headroom.
+/// Without this, a crafted deeply-nested go-tree blob (parsed from untrusted
+/// peer/tx bytes BEFORE any hash-binding check) overflows the stack.
+/// Mirrors `serialize.rs::MAX_DESERIALIZE_DEPTH`.
+const MAX_GO_DEPTH: usize = 128;
 
 /// Serialize a `VectorCommitmentTree` root node in Go's
 /// `SerializeNonLazyTree` wire format. The round trip is lossy in one
@@ -136,6 +146,14 @@ impl<'a> GoCursor<'a> {
 
     fn read_int_slice(&mut self) -> Result<Vec<i32>> {
         let len = self.read_u32_be()? as usize;
+        // Cap BEFORE `with_capacity`: an attacker u32 (~4.29B × 4B ≈ 17GB) would
+        // otherwise OOM/abort. A real prefix is a nibble path (≤64).
+        if len > MAX_GO_PREFIX_LEN {
+            return Err(QuilError::Serialization(format!(
+                "go_format: prefix length {} exceeds max {}",
+                len, MAX_GO_PREFIX_LEN
+            )));
+        }
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
             out.push(self.read_i32_be()?);
@@ -143,12 +161,20 @@ impl<'a> GoCursor<'a> {
         Ok(out)
     }
 
-    fn read_node(&mut self) -> Result<Option<VectorCommitmentNode>> {
+    fn read_node(&mut self, depth: usize) -> Result<Option<VectorCommitmentNode>> {
+        // Depth cap BEFORE recursing: a crafted deeply-nested blob would
+        // otherwise overflow the stack (this parses untrusted peer/tx bytes).
+        if depth > MAX_GO_DEPTH {
+            return Err(QuilError::Serialization(format!(
+                "go_format: nesting depth exceeds max {}",
+                MAX_GO_DEPTH
+            )));
+        }
         let tag = self.read_u8()?;
         match tag {
             TYPE_NIL => Ok(None),
             TYPE_LEAF => Ok(Some(VectorCommitmentNode::Leaf(self.read_leaf()?))),
-            TYPE_BRANCH => Ok(Some(VectorCommitmentNode::Branch(self.read_branch()?))),
+            TYPE_BRANCH => Ok(Some(VectorCommitmentNode::Branch(self.read_branch(depth)?))),
             other => Err(QuilError::Serialization(format!(
                 "go_format: unknown node tag {}",
                 other
@@ -171,12 +197,12 @@ impl<'a> GoCursor<'a> {
         })
     }
 
-    fn read_branch(&mut self) -> Result<BranchNode> {
+    fn read_branch(&mut self, depth: usize) -> Result<BranchNode> {
         let prefix = self.read_int_slice()?;
         let mut children: [Option<Box<VectorCommitmentNode>>; 64] =
             std::array::from_fn(|_| None);
         for slot in children.iter_mut() {
-            if let Some(child) = self.read_node()? {
+            if let Some(child) = self.read_node(depth + 1)? {
                 *slot = Some(Box::new(child));
             }
         }

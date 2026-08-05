@@ -109,9 +109,13 @@ impl Ed448Identity {
         if public_key.len() != 57 {
             return Ok(false);
         }
-        let mut pk_bytes = [0u8; 57];
-        pk_bytes.copy_from_slice(public_key);
-        let pk = ed448_rust::PublicKey::from(pk_bytes);
+        // Fallible decode: `PublicKey::from([u8;57])` panics on a non-point key,
+        // and this is a signature-verify entry reachable from untrusted bytes —
+        // a bad key must return `false`, not crash.
+        let pk = match ed448_rust::PublicKey::try_from(public_key) {
+            Ok(pk) => pk,
+            Err(_) => return Ok(false),
+        };
         Ok(pk.verify(message, signature, None).is_ok())
     }
 }

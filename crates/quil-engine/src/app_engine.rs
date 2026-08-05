@@ -705,6 +705,17 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // only non-anchored case is genesis / tests with no global chain
         // (`anchor_gfn == 0`), which keep the legacy app-shard VDF.
         let storage_active = anchor_gfn > 0;
+        // App-shard frames do NOT use a VDF at all. `prove_frame_header` no longer
+        // solves one; the header's `output` is the deterministic ρ_N-bound digest
+        // computed below (`deterministic_app_frame_output`). ρ_N binds freshness to
+        // the anchored GLOBAL VDF output; a genesis / no-global-anchor frame uses a
+        // ZERO-ANCHOR beacon (`derive_storage_beacon(0, ..)`) — still fully
+        // deterministic, just no ρ_N freshness (none exists pre-global-chain).
+        let rho_n = if storage_active {
+            quil_crypto::porep::derive_storage_beacon(anchor_gfn, &anchor_output)
+        } else {
+            quil_crypto::porep::derive_storage_beacon(0, &anchor_output)
+        };
         let mut header = self.frame_prover.prove_frame_header(
             &previous_frame_output,
             &self.filter,
@@ -719,7 +730,6 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             anchor_gfn,
         )?;
         if storage_active {
-            let rho_n = quil_crypto::porep::derive_storage_beacon(anchor_gfn, &anchor_output);
             // PROPOSER SELF-ATTESTATION (CW PoRep port). Legacy Jolteon assembled
             // the committee `StorageAttestation` from every member's per-vote
             // openings at QC time. Simplex votes carry no payload, so under CW the
@@ -824,30 +834,34 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                     }
                 }
             }
-            // Bind to the canonical-state fields that actually ride the wire
-            // (`AppShardState` below takes `requests_root`/`state_roots` from
-            // these locals, not from `header.*`), so the verifier — which
-            // recomputes from the wire header — derives the identical output.
-            header.output = quil_crypto::porep::deterministic_app_frame_output(
-                &header.parent_selector,
-                &requests_root,
-                &state_roots,
-                &rho_n,
-                frame_number,
-                rank,
-                &self.local_prover_address,
-                // Use the LOCALS that ride the wire via `AppShardState` (below),
-                // NOT `header.*` — the verifier recomputes from the reconstructed
-                // wire header, which carries these locals. (`header.*` from
-                // `prove_frame_header` can differ, e.g. fee_multiplier_vote.)
-                difficulty,
-                fee_multiplier_vote,
-                now_ms,
-                // Stamped above (before this call) and carried on the wire via
-                // `AppShardState.storage_attestation_root` — matches the verifier.
-                &header.storage_attestation_root,
-            );
         }
+
+        // ALWAYS set the app-shard frame output to the deterministic ρ_N-bound
+        // digest — for storage frames AND genesis (zero-anchor ρ_N). NO VDF.
+        // Bind to the canonical-state fields that actually ride the wire
+        // (`AppShardState` below takes `requests_root`/`state_roots` from these
+        // locals, not from `header.*`), so the verifier — which recomputes from
+        // the wire header — derives the identical output.
+        header.output = quil_crypto::porep::deterministic_app_frame_output(
+            &header.parent_selector,
+            &requests_root,
+            &state_roots,
+            &rho_n,
+            frame_number,
+            rank,
+            &self.local_prover_address,
+            // Use the LOCALS that ride the wire via `AppShardState` (below),
+            // NOT `header.*` — the verifier recomputes from the reconstructed
+            // wire header, which carries these locals. (`header.*` from
+            // `prove_frame_header` can differ, e.g. fee_multiplier_vote.)
+            difficulty,
+            fee_multiplier_vote,
+            now_ms,
+            // Stamped in the storage block above (empty for genesis) and carried
+            // on the wire via `AppShardState.storage_attestation_root` — matches
+            // the verifier.
+            &header.storage_attestation_root,
+        );
 
         let state = AppShardState::new(
             self.filter.clone(),

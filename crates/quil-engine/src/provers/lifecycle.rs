@@ -2059,6 +2059,7 @@ mod buckets_tests {
             leave_reject_frame_number: 0,
             last_active_frame_number: 0,
             epoch: 0,
+            ring: 0,
             vertex_address: Vec::new(),
         }
     }
@@ -2416,6 +2417,7 @@ mod proposal_loop_tests {
             // re-confirm cycle, so an Active alloc reads Active at any eval frame.
             epoch: u64::MAX,
             last_active_frame_number: 0,
+            ring: 0,
             vertex_address: vec![],
         }
     }
@@ -3215,6 +3217,7 @@ mod proposal_loop_tests {
             leave_reject_frame_number: 0,
             last_active_frame_number: 0,
             epoch: 0,
+            ring: 0,
             vertex_address: vec![],
         };
         let allocs = vec![

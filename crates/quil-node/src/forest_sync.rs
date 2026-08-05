@@ -135,6 +135,10 @@ pub async fn sync_one_phase(
     let c = crdt.clone();
     let sid = shard_id.to_vec();
     let (root, apply_version, changed) = tokio::task::spawn_blocking(move || {
+        // (B) Serialize the forest write against the global-frame materializer:
+        // hold the forest-write guard for the whole apply so a sync can never
+        // advance the forest out from under a materialize's pre-apply verify.
+        let _forest_guard = c.lock_forest_writes();
         c.sync_shard_phase_from(&remote, source_version, &sid, phase as usize)
     })
     .await

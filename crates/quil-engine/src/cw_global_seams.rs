@@ -235,6 +235,25 @@ impl GlobalProposer for GlobalSeamProposer {
         // Structural + VDF/BLS validation.
         match self.verifier.validate(&frame) {
             Ok(true) => {
+                // BIND THE BODY TO THE HEADER. The digest commits only
+                // `header.output` (which binds `requests_root` via the VDF
+                // challenge) — NOT the carried `frame.requests`. Two frames with
+                // the same header but different bodies share one digest, and the
+                // channel-3 BlockStore is overwrite + re-read at verify/finalize/
+                // broadcast time, so without this an attacker submits a valid
+                // header + tampered body under the agreed digest → the committee
+                // materializes a body inconsistent with the certified
+                // `requests_root` (state divergence / halt). Recompute + reject on
+                // mismatch, mirroring the app-shard seam (`app_engine`) and the
+                // gossip receive path.
+                if !self.verifier.verify_global_requests_root(header, &frame.requests) {
+                    tracing::warn!(
+                        view,
+                        frame = header.frame_number,
+                        "cw verify: request body does not match certified requests_root (nullify)"
+                    );
+                    return false;
+                }
                 self.block_meta.lock().unwrap().insert(digest, header.frame_number);
                 tracing::debug!(view, frame = header.frame_number, "cw verify: OK (vote)");
                 true
@@ -305,15 +324,44 @@ pub struct GlobalSeamFinalizer {
     mat_job_tx: tokio::sync::mpsc::UnboundedSender<(GlobalFrame, u64)>,
     /// Bump head atomics / CurrentFrame (node-supplied).
     head_hook: HeadHook,
+    /// Optional GOSSIP publisher for finalized global frames: non-blocking hand-off
+    /// (the node drains it and publishes on the `GLOBAL_FRAME` bitmask). This lets
+    /// NON-committee/regular nodes receive global frames over gossip instead of
+    /// RPC-polling archives. Only the PROPOSER of a frame publishes (gated on
+    /// `local_prover_address`) to avoid N-way committee duplication; gossip dedup
+    /// would absorb dupes anyway but the gate saves upstream bandwidth. `None`
+    /// disables (no p2p wired). The frame published carries the finalization cert
+    /// (attached above), so it is self-verifying to receivers.
+    global_frame_publisher: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    /// This node's 32-byte PROVER ADDRESS — the proposer gate for
+    /// `global_frame_publisher`. A finalized global frame header's `prover` field
+    /// is the proposer's 32-byte poseidon address (confirmed at runtime: it
+    /// rotates through the committee members' `prover_address`es), so the gate
+    /// compares against the address, NOT the 897-byte Falcon pubkey.
+    local_prover_address: Vec<u8>,
 }
+
+/// Gossip publish is skipped for a finalized frame whose encoding exceeds this —
+/// the p2p `MAX_MESSAGE_SIZE` is 16 MiB; stay safely under it (wire framing +
+/// bitmask overhead). Oversized (extreme full-coverage) frames fall back to the
+/// archive poller, which still fetches them by number.
+const MAX_GOSSIP_GLOBAL_FRAME: usize = 15 * 1024 * 1024;
 
 impl GlobalSeamFinalizer {
     pub fn new(
         clock_store: Arc<dyn ClockStore>,
         mat_job_tx: tokio::sync::mpsc::UnboundedSender<(GlobalFrame, u64)>,
         head_hook: HeadHook,
+        global_frame_publisher: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+        local_prover_address: Vec<u8>,
     ) -> Self {
-        Self { clock_store, mat_job_tx, head_hook }
+        Self {
+            clock_store,
+            mat_job_tx,
+            head_hook,
+            global_frame_publisher,
+            local_prover_address,
+        }
     }
 }
 
@@ -335,6 +383,20 @@ impl FrameFinalizer for GlobalSeamFinalizer {
     fn on_finalized(&self, _view: u64, _digest: Digest, bytes: Option<Vec<u8>>, cert: Option<Vec<u8>>) {
         let Some(bytes) = bytes else { return };
         let Ok(mut frame) = decode_global_frame(&bytes) else { return };
+        // Re-bind the body to the header at FINALIZE, not just at verify. The
+        // block bytes are re-read from the shared (overwrite-able) BlockStore by
+        // digest, so a body swapped in AFTER this node voted would otherwise be
+        // materialized. Recompute the requests root and drop on mismatch — the
+        // "post-verification body swap" guard the app-shard seam also has.
+        if let Some(h) = frame.header.as_ref() {
+            if !crate::frame_validator::global_frame_body_matches_requests_root(h, &frame.requests) {
+                tracing::warn!(
+                    frame = h.frame_number,
+                    "cw finalize: request body does not match certified requests_root — dropping"
+                );
+                return;
+            }
+        }
         // Attach the simplex FINALIZATION cert to the frame header so followers
         // can verify this CW-finalized global frame against the fixed global
         // committee (genesis archives) rather than trusting VDF + the archive
@@ -364,6 +426,30 @@ impl FrameFinalizer for GlobalSeamFinalizer {
             tracing::warn!(error = %e, "put finalized frame failed");
         }
         (self.head_hook)(frame_number, rank);
+
+        // GOSSIP the finalized (cert-attached) frame so regular/non-committee
+        // nodes receive it over the `GLOBAL_FRAME` topic instead of RPC-polling.
+        // Proposer-only (this node produced it) to avoid N-way committee dupes;
+        // size-gated (oversized frames fall back to the poller).
+        if let Some(publish) = self.global_frame_publisher.as_ref() {
+            let is_proposer = frame
+                .header
+                .as_ref()
+                .map(|h| !h.prover.is_empty() && h.prover == self.local_prover_address)
+                .unwrap_or(false);
+            if is_proposer {
+                match encode_global_frame(&frame) {
+                    Ok(encoded) if encoded.len() <= MAX_GOSSIP_GLOBAL_FRAME => publish(encoded),
+                    Ok(encoded) => tracing::debug!(
+                        frame = frame_number,
+                        bytes = encoded.len(),
+                        "finalized global frame exceeds gossip size — poller fallback"
+                    ),
+                    Err(e) => tracing::debug!(error = %e, "encode finalized frame for gossip failed"),
+                }
+            }
+        }
+
         let _ = self.mat_job_tx.send((frame, frame_number));
     }
 }
@@ -429,6 +515,11 @@ pub fn activate_global_consensus_cw(
     // path under the node's data dir so consensus resumes across restarts
     // instead of replaying from the migration head.
     storage_directory: std::path::PathBuf,
+    // GOSSIP publisher for finalized global frames (proposer-only), + this node's
+    // prover address for the proposer gate. `None` publisher disables gossip
+    // dissemination (regulars then rely on the RPC poller).
+    global_frame_publisher: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    local_prover_address: Vec<u8>,
 ) -> GlobalConsensusCwHandle {
     // Shared block store: `propose` inserts our own frame; the node inserts
     // peer-delivered frames via `ingest_block`; `verify`/`Relay`/`Reporter`
@@ -448,7 +539,13 @@ pub fn activate_global_consensus_cw(
     // frame number (block_meta is otherwise empty → prior_frame_number 0).
     proposer.note_frame(genesis_digest, genesis_frame_number);
     let sink = Arc::new(GlobalSeamSink::new(transport.clone(), peers.clone()));
-    let finalizer = Arc::new(GlobalSeamFinalizer::new(clock_store, mat_job_tx, head_hook));
+    let finalizer = Arc::new(GlobalSeamFinalizer::new(
+        clock_store,
+        mat_job_tx,
+        head_hook,
+        global_frame_publisher,
+        local_prover_address,
+    ));
 
     // Host the engine on its own runtime thread.
     let GlobalHostHandle { inbound, mut outbound } = spawn_global_host(

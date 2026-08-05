@@ -38,6 +38,10 @@ const FIRST_DOWN_CIRC_ID: u32 = 0x8000_0000;
 /// refused once this many circuits are live.
 const MAX_RELAY_CIRCUITS: usize = 1 << 16;
 
+/// Per-upstream-peer circuit cap, so one peer cannot monopolise the table and
+/// deny relay service to everyone else.
+const MAX_RELAY_CIRCUITS_PER_PEER: usize = 256;
+
 /// Circuit-table key: `(upstream_peer_id, upstream_circ_id)`.
 type UpKey = (Vec<u8>, CircuitId);
 
@@ -176,10 +180,22 @@ impl OnionRelay {
             return None;
         }
 
-        // DoS bound: refuse new circuits once the table is full.
-        if self.entries.lock().await.len() >= MAX_RELAY_CIRCUITS {
-            tracing::debug!("onion CREATE rejected: circuit table full");
-            return None;
+        // DoS bound: refuse new circuits once the table is full, AND cap the
+        // circuits any single upstream peer may hold. Without the per-peer cap
+        // one peer can register all `MAX_RELAY_CIRCUITS` (each a distinct
+        // attacker-chosen `circ_id`) and lock out every other peer's CREATEs —
+        // a network-wide relay denial from one peer.
+        {
+            let entries = self.entries.lock().await;
+            if entries.len() >= MAX_RELAY_CIRCUITS {
+                tracing::debug!("onion CREATE rejected: circuit table full");
+                return None;
+            }
+            let per_peer = entries.keys().filter(|(p, _)| p.as_slice() == src_peer).count();
+            if per_peer >= MAX_RELAY_CIRCUITS_PER_PEER {
+                tracing::debug!("onion CREATE rejected: per-peer circuit cap reached");
+                return None;
+            }
         }
 
         let onion_secret_key = self.onion_secret_key.read().unwrap().clone()?;

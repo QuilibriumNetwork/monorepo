@@ -17,7 +17,8 @@
 
 use ed25519_dalek::SigningKey;
 use rcgen::{
-    Certificate, CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS_ED25519,
+    date_time_ymd, BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    IsCa, KeyPair, SanType, SerialNumber, PKCS_ED25519,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -118,6 +119,100 @@ pub fn build_quil_tls_cert(falcon_signing_key: &[u8]) -> Result<QuilTlsCert, Qui
         cert_pem,
         key_pem: key_pem.to_string(),
         xsign_hex,
+    })
+}
+
+/// SAN / TLS domain name for the master↔worker channel cert. The master (client)
+/// sets this as the TLS domain so it matches the worker (server) leaf cert's SAN.
+pub const WORKER_CHANNEL_SAN: &str = "quil-worker";
+
+/// Deterministic mTLS materials for the master↔worker (cluster) channel.
+pub struct WorkerChannelTls {
+    /// The CA (trust anchor) both sides trust. PEM.
+    pub ca_cert_pem: String,
+    /// The end-entity (leaf) cert both sides PRESENT, signed by the CA. PEM.
+    pub leaf_cert_pem: String,
+    /// The leaf's private key. PEM.
+    pub leaf_key_pem: String,
+}
+
+fn dwc_seed(falcon_signing_key: &[u8], ctx: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(falcon_signing_key);
+    hasher.update(ctx);
+    let digest = hasher.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&digest[..32]);
+    seed
+}
+
+/// `(KeyPair, pkcs8_v2_der)` for a deterministic ed25519 key from `seed`.
+fn dwc_keypair(seed: &[u8; 32]) -> Result<(KeyPair, Vec<u8>), QuilTlsError> {
+    let ed_pub = SigningKey::from_bytes(seed).verifying_key().to_bytes();
+    let pkcs8 = ed25519_pkcs8_v2(seed, &ed_pub);
+    let kp = KeyPair::from_der(&pkcs8)
+        .map_err(|e| QuilTlsError::Rcgen(format!("KeyPair::from_der: {}", e)))?;
+    Ok((kp, pkcs8))
+}
+
+/// Build FULLY-DETERMINISTIC mTLS materials for the master↔worker channel from
+/// the node's Falcon key alone. The master and every worker process run the SAME
+/// node key, so each derives byte-identical CA + leaf: each trusts the CA and
+/// presents the CA-signed leaf. Only a process holding the node's Falcon key can
+/// complete the handshake, closing the previously plaintext/unauthenticated
+/// channel. Uses tonic-native mTLS (the xsign machinery isn't reused: `quil-engine`,
+/// which owns both endpoints, cannot depend on `quil-rpc` — that would cycle).
+///
+/// A CA + leaf (not one self-signed cert) is required: webpki rejects a single
+/// CA-marked cert used as BOTH trust anchor and end-entity (`CaUsedAsEndEntity`).
+/// Determinism needs fixed keys + serials + validity (rcgen otherwise varies).
+pub fn build_worker_channel_cert(
+    falcon_signing_key: &[u8],
+) -> Result<WorkerChannelTls, QuilTlsError> {
+    // CA (trust anchor).
+    let (ca_kp, _) = dwc_keypair(&dwc_seed(falcon_signing_key, b"quil-dwc-ca-v1"))?;
+    let mut ca_params = CertificateParams::default();
+    ca_params.alg = &PKCS_ED25519;
+    ca_params.key_pair = Some(ca_kp);
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params
+        .distinguished_name
+        .push(DnType::OrganizationName, "quil-worker-channel-ca");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    ca_params.serial_number = Some(SerialNumber::from(1u64));
+    ca_params.not_before = date_time_ymd(2020, 1, 1);
+    ca_params.not_after = date_time_ymd(2100, 1, 1);
+    let ca = Certificate::from_params(ca_params)
+        .map_err(|e| QuilTlsError::Rcgen(format!("ca from_params: {}", e)))?;
+    let ca_cert_pem = ca
+        .serialize_pem()
+        .map_err(|e| QuilTlsError::Rcgen(format!("ca serialize_pem: {}", e)))?;
+
+    // Leaf (identity), signed by the CA.
+    let (leaf_kp, leaf_pkcs8) = dwc_keypair(&dwc_seed(falcon_signing_key, b"quil-dwc-leaf-v1"))?;
+    let leaf_key_pem = pkcs8_der_to_pem("PRIVATE KEY", &leaf_pkcs8);
+    let mut leaf_params = CertificateParams::default();
+    leaf_params.alg = &PKCS_ED25519;
+    leaf_params.key_pair = Some(leaf_kp);
+    leaf_params.distinguished_name = DistinguishedName::new();
+    leaf_params
+        .distinguished_name
+        .push(DnType::OrganizationName, "quil-worker-channel");
+    leaf_params.subject_alt_names = vec![SanType::DnsName(WORKER_CHANNEL_SAN.to_string())];
+    leaf_params.is_ca = IsCa::ExplicitNoCa;
+    leaf_params.serial_number = Some(SerialNumber::from(2u64));
+    leaf_params.not_before = date_time_ymd(2020, 1, 1);
+    leaf_params.not_after = date_time_ymd(2100, 1, 1);
+    let leaf = Certificate::from_params(leaf_params)
+        .map_err(|e| QuilTlsError::Rcgen(format!("leaf from_params: {}", e)))?;
+    let leaf_cert_pem = leaf
+        .serialize_pem_with_signer(&ca)
+        .map_err(|e| QuilTlsError::Rcgen(format!("leaf serialize_pem_with_signer: {}", e)))?;
+
+    Ok(WorkerChannelTls {
+        ca_cert_pem,
+        leaf_cert_pem,
+        leaf_key_pem: leaf_key_pem.to_string(),
     })
 }
 
@@ -420,6 +515,88 @@ mod tests {
     fn falcon_signing_key() -> Vec<u8> {
         use quil_types::crypto::Signer as _;
         quil_crypto::FalconSigner::generate().private_key().to_vec()
+    }
+
+    #[test]
+    fn worker_channel_cert_is_deterministic() {
+        let k1 = falcon_signing_key();
+        let a = build_worker_channel_cert(&k1).unwrap();
+        let b = build_worker_channel_cert(&k1).unwrap();
+        assert_eq!(a.ca_cert_pem, b.ca_cert_pem, "same node key MUST yield a byte-identical CA (master and every worker derive it independently)");
+        assert_eq!(a.leaf_cert_pem, b.leaf_cert_pem);
+        assert_eq!(a.leaf_key_pem, b.leaf_key_pem);
+        let k2 = falcon_signing_key();
+        let c = build_worker_channel_cert(&k2).unwrap();
+        assert_ne!(a.ca_cert_pem, c.ca_cert_pem, "different node keys must yield different CAs");
+    }
+
+    /// Real in-process mTLS handshake (no cluster mode needed): a client bearing
+    /// the SAME node key is accepted; a client from a DIFFERENT node key is
+    /// rejected — i.e. only node-key holders can join the worker channel.
+    #[tokio::test]
+    async fn worker_channel_mtls_accepts_same_key_rejects_other() {
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+        let parse = |cert_pem: &str, key_pem: &str| {
+            let cert = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+                .next()
+                .unwrap()
+                .unwrap();
+            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+                .unwrap()
+                .unwrap();
+            (cert, key)
+        };
+
+        let node = falcon_signing_key();
+        let tls = build_worker_channel_cert(&node).unwrap();
+        let (ca, _) = parse(&tls.ca_cert_pem, &tls.leaf_key_pem);
+        let (leaf, leaf_key) = parse(&tls.leaf_cert_pem, &tls.leaf_key_pem);
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.clone()).unwrap();
+        let roots = Arc::new(roots);
+        let verifier = rustls::server::WebPkiClientVerifier::builder(roots.clone())
+            .build()
+            .unwrap();
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![leaf.clone()], leaf_key.clone_key())
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+
+        let make_client = |ccert: rustls::pki_types::CertificateDer<'static>,
+                           ckey: rustls::pki_types::PrivateKeyDer<'static>| {
+            let cfg = rustls::ClientConfig::builder()
+                .with_root_certificates((*roots).clone())
+                .with_client_auth_cert(vec![ccert], ckey)
+                .unwrap();
+            TlsConnector::from(Arc::new(cfg))
+        };
+        let sni = rustls::pki_types::ServerName::try_from(WORKER_CHANNEL_SAN).unwrap();
+
+        // Same node key → handshake succeeds both sides.
+        let (cio, sio) = tokio::io::duplex(16 * 1024);
+        let conn = make_client(leaf.clone(), leaf_key.clone_key());
+        let (sr, cr) = tokio::join!(acceptor.accept(sio), conn.connect(sni.clone(), cio));
+        assert!(
+            sr.is_ok() && cr.is_ok(),
+            "matching-key mTLS must succeed: server={:?} client={:?}",
+            sr.err(),
+            cr.err()
+        );
+
+        // Different node key → server REJECTS the client leaf (chains to a
+        // different CA, which the server does not trust).
+        let other = falcon_signing_key();
+        let otls = build_worker_channel_cert(&other).unwrap();
+        let (oleaf, oleaf_key) = parse(&otls.leaf_cert_pem, &otls.leaf_key_pem);
+        let (cio2, sio2) = tokio::io::duplex(16 * 1024);
+        let conn2 = make_client(oleaf, oleaf_key);
+        let (sr2, _cr2) = tokio::join!(acceptor.accept(sio2), conn2.connect(sni, cio2));
+        assert!(
+            sr2.is_err(),
+            "a client cert from a DIFFERENT node key must be rejected by the worker server",
+        );
     }
 
     fn cert_der_from_key(falcon_sk: &[u8]) -> Vec<u8> {

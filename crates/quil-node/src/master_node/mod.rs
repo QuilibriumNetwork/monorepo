@@ -69,13 +69,17 @@ pub(crate) async fn start(
     let hg_store = storage.hg_store.clone();
 
     // Normalize the QUIL-token shard grid to the single-nibble (64-shard)
-    // topology. Genesis seeds 64 directly, but a DB restored via the
-    // pebble->rocksdb migration carries the legacy 64x64 = 4096 grid; with a
-    // fresh prover tree those 4096 shards each start with zero coverage and
-    // the network can never escape the coverage halt. Idempotent: a no-op
-    // once the grid is already exactly 64 single-byte-prefix QUIL shards.
-    if let Err(e) = normalize_quil_token_grid(shards_store.as_ref(), clock_store.as_ref()) {
-        tracing::warn!(error = %e, "failed to normalize QUIL token shard grid");
+    // topology. MAINNET ONLY (network 0): a DB restored via the pebble->rocksdb
+    // migration carries the legacy 64x64 = 4096 grid; with a fresh prover tree
+    // those 4096 shards each start with zero coverage and the network can never
+    // escape the coverage halt. On testnet/devnet QUIL is a single shard that
+    // splits DYNAMICALLY like every other app, so forcing a fixed grid here
+    // would fight the split logic (collapsing legitimate splits on every
+    // restart) — skip it entirely.
+    if network == 0 {
+        if let Err(e) = normalize_quil_token_grid(shards_store.as_ref(), clock_store.as_ref()) {
+            tracing::warn!(error = %e, "failed to normalize QUIL token shard grid");
+        }
     }
 
     // Fresh-config peer key: on first run `config.p2p.peer_priv_key` is
@@ -118,7 +122,7 @@ pub(crate) async fn start(
             .map_err(|e| anyhow::anyhow!("load Falcon network identity key: {e}"))?
     };
 
-    let engines = engines::init_engines(&storage);
+    let engines = engines::init_engines(&storage, network);
     let inclusion_prover = engines.inclusion_prover.clone();
     let crdt = engines.crdt.clone();
     let exec_manager = engines.exec_manager.clone();
@@ -266,6 +270,11 @@ pub(crate) async fn start(
         );
     }
     let last_global_head_frame = Arc::new(std::sync::atomic::AtomicU64::new(initial_head_frame));
+    // Shared "gossip is carrying the global head" signal: stamped by the
+    // `GLOBAL_FRAME` receive path, read by the RPC poller so it backs off while
+    // gossip keeps the head fresh (regular nodes then follow the chain over the
+    // mesh instead of per-second RPC).
+    let gossip_freshness = quil_rpc::GossipFreshness::new();
 
     // Deferred worker-manager handle for per-worker reachability
     // advertisements. The PeerInfo broadcaster spawns here (before
@@ -815,6 +824,22 @@ pub(crate) async fn start(
             )
         };
 
+    // Bind the fixed global committee (genesis archives' Falcon pubkeys) into the
+    // receive-path frame validator so CW-finalized global frames arriving over
+    // GLOBAL_FRAME gossip are verified via their carried finalization cert (CWCT).
+    // Without the committee the validator can't detect the cert, falls through to
+    // the legacy BLS-aggregate path, and rejects every cert-bearing gossip frame
+    // as "BLS signature INVALID" — which is exactly why non-archives couldn't
+    // follow the chain over gossip. The poller's own verifier is already
+    // committee-bound (see archive_sync); this gives the gossip path parity.
+    let frame_validator = {
+        let committee: Vec<Vec<u8>> = consensus_committee
+            .iter()
+            .filter_map(|s| hex::decode(s).ok())
+            .collect();
+        frame_validator.with_global_committee(committee)
+    };
+
     // Broadcast channel for GlobalService::StreamGlobalMessages. Created here
     // (before archive_sync + the recv loop) so the archive poller can tee
     // GLOBAL_FRAME to cluster workers and the recv loop can feed GLOBAL_PEER_INFO;
@@ -825,6 +850,31 @@ pub(crate) async fn start(
         quil_rpc::global_service::GLOBAL_MESSAGE_BROADCAST_CAPACITY,
     )
     .0;
+
+    // GLOBAL_FRAME gossip publisher. The CW global finalizer (proposer-only)
+    // hands each finalized global frame here; this drain publishes it on the
+    // GLOBAL_FRAME topic so REGULAR / non-committee nodes get the chain head over
+    // gossip instead of RPC-polling archives (the poller stays as gap-fill).
+    // Non-blocking from the consensus finalize path: unbounded send → async
+    // publish. Wired only for CW committee members that actually finalize.
+    let global_frame_publisher: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>> = {
+        let (gf_tx, mut gf_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let gf_p2p = p2p_handle.clone();
+        detached_spawner.detach("global-frame-gossip-publish", async move {
+            while let Some(data) = gf_rx.recv().await {
+                if let Err(e) = gf_p2p
+                    .publish(quil_engine::bitmasks::GLOBAL_FRAME.to_vec(), data)
+                    .await
+                {
+                    tracing::debug!(error = %e, "global-frame gossip publish failed");
+                }
+            }
+            Ok(())
+        });
+        Some(std::sync::Arc::new(move |data: Vec<u8>| {
+            let _ = gf_tx.send(data);
+        }))
+    };
 
     archive_sync::spawn_all(&mut sup, archive_sync::ArchiveSyncArgs {
         mtls_seed,
@@ -843,6 +893,7 @@ pub(crate) async fn start(
         coverage_monitor: coverage_monitor.clone(),
         current_frame: current_frame.clone(),
         last_global_head_frame: last_global_head_frame.clone(),
+        gossip_freshness: gossip_freshness.clone(),
         prover_pipeline: prover_pipeline.clone(),
         file_key_manager: file_key_manager.clone(),
         frame_prover: frame_prover.clone(),
@@ -852,6 +903,7 @@ pub(crate) async fn start(
         genesis_prover_addrs: genesis_prover_addrs.clone(),
         frame_materializer: frame_materializer.clone(),
         consensus_loopback_tx: consensus_loopback_tx.clone(),
+        global_frame_publisher,
         peer_id,
         spawner: detached_spawner.clone(),
         consensus_committee,
@@ -928,6 +980,7 @@ pub(crate) async fn start(
         current_frame: current_frame.clone(),
         cw_router: cw_router.clone(),
         last_global_head_frame: last_global_head_frame.clone(),
+        gossip_freshness: gossip_freshness.clone(),
         genesis_archive_peer_ids: genesis_archive_peer_ids.clone(),
         genesis_prover_addrs: genesis_prover_addrs.clone(),
         alert_pubkey: hex::decode(&config.engine.alert_key).unwrap_or_default(),

@@ -44,10 +44,10 @@ use quil_types::error::{QuilError, Result};
 
 use super::frame_header::FrameHeader;
 use super::materialize::{
-    add_to_reward_balance, allocation_address, materialize_frame_header_activity, reward_address,
-    DEFAULT_SHARD_LEAVES, REWARD_UNITS, RING_GROUP_SIZE,
+    add_to_reward_balance, allocation_address, materialize_frame_header_activity,
+    prover_address_from_pubkey, reward_address, DEFAULT_SHARD_LEAVES, REWARD_UNITS, RING_GROUP_SIZE,
 };
-use crate::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+use crate::global_schema::{read_field, write_field, GLOBAL_INTRINSIC_ADDRESS};
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 use crate::prover_registry::{rebuild_vertex_tree_from_blob, vertex_tree_to_blob};
 
@@ -65,7 +65,6 @@ pub struct ShardUpdateContext {
     pub active_provers: Vec<ProverInfo>,
     pub participant_indices: Vec<usize>,
     pub participants_by_ring: HashMap<u8, Vec<usize>>,
-    pub ring_by_prover_address: HashMap<Vec<u8>, u8>,
     pub state_size: u64,
     pub shard_count: u64,
 }
@@ -311,17 +310,25 @@ pub fn build_shard_update_context(
 
     let participant_indices: Vec<usize> = participants_set.into_iter().collect();
 
-    // Compute ring assignments from all active provers.
-    let ring_by_prover_address =
-        compute_ring_assignments(&active_provers, &frame_header.address)?;
-
-    // Group participants by ring.
+    // Group participants by their LOCKED ring — the value STORED on each
+    // allocation at confirmation (and only recomputed on a membership change).
+    // We deliberately do NOT re-sort by live seniority here: that read the
+    // node-local, async-refreshed prover cache, whose per-frame-changing
+    // seniority made the sort node-dependent and forked the prover-tree root.
+    // The stored ring is committed state, identical on every node → deterministic.
     let mut participants_by_ring: HashMap<u8, Vec<usize>> = HashMap::new();
     for &idx in &participant_indices {
-        let addr = &active_provers[idx].address;
-        let ring = *ring_by_prover_address.get(addr).ok_or_else(|| {
-            QuilError::InvalidArgument("shard update: missing ring for participant".into())
-        })?;
+        let prover = &active_provers[idx];
+        let ring = prover
+            .allocations
+            .iter()
+            .find(|a| a.confirmation_filter == frame_header.address)
+            .map(|a| a.ring)
+            .ok_or_else(|| {
+                QuilError::InvalidArgument(
+                    "shard update: missing allocation/ring for participant".into(),
+                )
+            })?;
         participants_by_ring.entry(ring).or_default().push(idx);
     }
 
@@ -335,7 +342,6 @@ pub fn build_shard_update_context(
         active_provers,
         participant_indices,
         participants_by_ring,
-        ring_by_prover_address,
         state_size: shard_metadata.state_size,
         shard_count,
     })
@@ -453,6 +459,78 @@ pub fn validate_prover_shard_update(
 /// state size passed to the issuance calculator as `worldSize`.
 /// - `active_provers`, `participant_bitmask`, `shard_metadata`: the
 /// precomputed inputs (see `build_shard_update_context`).
+/// Recompute + persist the shard's per-allocation reward ring from the current
+/// active committee, using a STABLE ordering: `JoinFrameNumber` ascending, then
+/// address ascending — both IMMUTABLE committed fields. Rank → `ring =
+/// floor(rank / RING_GROUP_SIZE)`.
+///
+/// Because the ordering keys never change for a given prover, the assignment is
+/// byte-identical on every node and shifts ONLY when the active SET changes.
+/// Membership changes (join-confirm, leave-confirm, kick) are epoch-aligned
+/// (they take effect at the E+2 boundary via `effective_status`), so the ring is
+/// effectively frozen within an epoch and RECOMPACTED at a boundary — e.g. a
+/// ring-0 prover leaving shifts every survivor below it up one rank. This is the
+/// behaviour the `Ring` schema field documents, and deliberately does NOT sort
+/// by live seniority (whose per-frame drift is what forked the prover-tree root
+/// before the ring was stored).
+///
+/// The active SET is the caller's `active_provers` — the SAME
+/// `get_active_provers` result the frame-header attestation already trusts as
+/// consistent-with-committed across nodes, so it cannot fork. In-memory rings
+/// are patched so THIS frame's distribution uses the fresh values, and changed
+/// rings are written back to committed state (unchanged ones are skipped, so
+/// there is no version churn within an epoch).
+fn recompute_shard_rings(
+    state: &HypergraphState,
+    filter: &[u8],
+    active_provers: &mut [ProverInfo],
+    frame_number: u64,
+) -> Result<()> {
+    if active_provers.is_empty() {
+        return Ok(());
+    }
+    let join_frame = |p: &ProverInfo| -> u64 {
+        p.allocations
+            .iter()
+            .find(|a| a.confirmation_filter == filter)
+            .map(|a| a.join_frame_number)
+            .unwrap_or(0)
+    };
+    let mut order: Vec<usize> = (0..active_provers.len()).collect();
+    order.sort_by(|&i, &j| {
+        join_frame(&active_provers[i])
+            .cmp(&join_frame(&active_provers[j]))
+            .then_with(|| active_provers[i].address.cmp(&active_provers[j].address))
+    });
+
+    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+    let va_disc = vertex_adds_discriminator()?;
+    for (rank, &idx) in order.iter().enumerate() {
+        let ring = (rank as u64 / RING_GROUP_SIZE) as u8;
+        let pubkey = active_provers[idx].public_key.clone();
+        let Some(alloc) = active_provers[idx]
+            .allocations
+            .iter_mut()
+            .find(|a| a.confirmation_filter == filter)
+        else {
+            continue;
+        };
+        // Stable within the epoch: the set (hence the rank) is unchanged, so the
+        // cached ring already matches — nothing to write.
+        if alloc.ring == ring {
+            continue;
+        }
+        alloc.ring = ring; // fresh value for this frame's reward distribution
+        let alloc_addr = allocation_address(&pubkey, filter)?;
+        if let Some(blob) = state.get(domain, &alloc_addr, &va_disc)? {
+            let mut tree = rebuild_vertex_tree_from_blob(&blob);
+            write_field(&mut tree, "allocation:ProverAllocation", "Ring", &[ring])?;
+            state.set(domain, &alloc_addr, &va_disc, frame_number, vertex_tree_to_blob(&tree))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn materialize_prover_shard_update(
     frame_header: &FrameHeader,
     current_frame_number: u64,
@@ -461,10 +539,20 @@ pub fn materialize_prover_shard_update(
     _frame_prover: &Arc<dyn FrameProver>,
     reward_issuance: &Arc<dyn RewardIssuance>,
     world_state_size: u64,
-    active_provers: Vec<ProverInfo>,
+    mut active_provers: Vec<ProverInfo>,
     participant_bitmask: &[u8],
     shard_metadata: ShardMetadata,
 ) -> Result<()> {
+    // Epoch-aligned ring (re)assignment: recompute from the current active
+    // committee before rewards are distributed, recompacting on any membership
+    // change and persisting the result. See `recompute_shard_rings`.
+    recompute_shard_rings(
+        state,
+        &frame_header.address,
+        &mut active_provers,
+        current_frame_number,
+    )?;
+
     let ctx = build_shard_update_context(
         frame_header,
         active_provers,
@@ -552,7 +640,39 @@ fn apply_reward(
         _ => quil_tries::VectorCommitmentTree::new(),
     };
 
+    // Per-frame idempotency guard (mirrors `accrue_active_seniority`). Reward
+    // crediting is ADDITIVE and NOT nonce-protected like token spends, and the
+    // global frame is applied by TWO paths on an archive — the serial
+    // materializer AND the archive poller's `process_global_frame`. Without this
+    // guard the balance is credited once per path (and again on any
+    // re-materialize), and because the paths commit at different times the
+    // prover-tree root as-of-frame-N depends on interleaving → a timing-dependent
+    // fork across nodes. Gate on `LastRewardFrameNumber` so a frame credits at
+    // most once, deterministically, however many times it is applied.
+    // Presence-checked: a fresh reward vertex has NO `LastRewardFrameNumber`
+    // field, so it is creditable at any frame (including frame 0). Only once the
+    // field exists do we gate `frame_number <= last`. (A bare
+    // `read_..._u64`-defaults-to-0 gate would wrongly skip a first-ever credit at
+    // frame 0.)
+    let cls = "reward:ProverReward";
+    if let Some(bytes) = read_field(&reward_tree, cls, "LastRewardFrameNumber") {
+        let last_reward_frame = bytes
+            .get(..8)
+            .and_then(|s| s.try_into().ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0);
+        if frame_number <= last_reward_frame {
+            return Ok(());
+        }
+    }
+
     add_to_reward_balance(&mut reward_tree, share)?;
+    write_field(
+        &mut reward_tree,
+        cls,
+        "LastRewardFrameNumber",
+        &frame_number.to_be_bytes(),
+    )?;
 
     let blob = vertex_tree_to_blob(&reward_tree);
     state.set(domain, &reward_addr, &va_disc, frame_number, blob)?;
@@ -604,7 +724,81 @@ fn update_allocation_activity(
     materialize_frame_header_activity(&mut alloc_tree, frame_number)?;
 
     let blob = vertex_tree_to_blob(&alloc_tree);
-    state.set(domain, &alloc_addr, &va_disc, frame_number, blob)
+    state.set(domain, &alloc_addr, &va_disc, frame_number, blob)?;
+
+    // Accrue seniority for this active frame. Called for every participating
+    // prover in every ring each frame (right beside `apply_reward`), so an
+    // active prover gains `SENIORITY_PER_ACTIVE_FRAME` for every frame it is
+    // active. Idempotent per prover per frame (see `accrue_active_seniority`),
+    // so a multi-shard prover (one call per allocation) or a re-materialized
+    // frame accrues at most once.
+    accrue_active_seniority(state, &prover.public_key, frame_number)?;
+
+    Ok(())
+}
+
+/// Seniority a prover accrues for each frame it is active.
+pub const SENIORITY_PER_ACTIVE_FRAME: u64 = 10;
+
+/// Add `SENIORITY_PER_ACTIVE_FRAME` to a prover's `Seniority` for the current
+/// active frame, keyed for idempotency on a `LastSeniorityFrameNumber` field of
+/// the prover vertex.
+///
+/// Seniority is CONSENSUS state (it feeds the `Σseniority·2/3` voting threshold
+/// and the committed prover-tree root), so this mutation must be deterministic
+/// and applied identically on every node. It is:
+///   * per-prover / per-frame idempotent — `frame_number <= last` short-circuits,
+///     so multiple allocations of the same prover in one frame, and any
+///     re-materialization of a frame, accrue at most once;
+///   * gap-safe — a FIXED grant (not `10 * elapsed`), and it only fires on
+///     frames the prover is actually active (a participant in a shard update),
+///     so inactive frames contribute nothing;
+///   * monotonic — an out-of-order replay of an older frame is skipped.
+///
+/// FLAG-DAY: this changes the prover-tree state root over time (and adds the
+/// `LastSeniorityFrameNumber` field), so all nodes must run it together.
+fn accrue_active_seniority(
+    state: &HypergraphState,
+    public_key: &[u8],
+    frame_number: u64,
+) -> Result<()> {
+    let prover_addr = prover_address_from_pubkey(public_key)?;
+    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+    let va_disc = vertex_adds_discriminator()?;
+
+    // Only accrue for a prover that actually has a vertex (has joined).
+    let existing = match state.get(domain, &prover_addr, &va_disc)? {
+        Some(blob) if !blob.is_empty() => blob,
+        _ => return Ok(()),
+    };
+    let mut prover_tree = rebuild_vertex_tree_from_blob(&existing);
+    let cls = "prover:Prover";
+
+    let last = read_prover_u64(&prover_tree, cls, "LastSeniorityFrameNumber");
+    if frame_number <= last {
+        return Ok(()); // already accrued for this frame (idempotent)
+    }
+
+    let seniority = read_prover_u64(&prover_tree, cls, "Seniority");
+    let new_seniority = seniority.saturating_add(SENIORITY_PER_ACTIVE_FRAME);
+    write_field(&mut prover_tree, cls, "Seniority", &new_seniority.to_be_bytes())?;
+    write_field(
+        &mut prover_tree,
+        cls,
+        "LastSeniorityFrameNumber",
+        &frame_number.to_be_bytes(),
+    )?;
+
+    let blob = vertex_tree_to_blob(&prover_tree);
+    state.set(domain, &prover_addr, &va_disc, frame_number, blob)
+}
+
+/// Read an 8-byte big-endian u64 field from a vertex tree, defaulting to 0.
+fn read_prover_u64(tree: &quil_tries::VectorCommitmentTree, cls: &str, name: &str) -> u64 {
+    read_field(tree, cls, name)
+        .and_then(|b| b.get(..8).and_then(|s| s.try_into().ok()))
+        .map(u64::from_be_bytes)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -657,6 +851,7 @@ mod tests {
                 leave_reject_frame_number: 0,
                 last_active_frame_number: 0,
                 epoch: 0,
+                ring: 0,
                 vertex_address: vec![seed; 32],
             }],
             available_storage: 0,
@@ -711,6 +906,58 @@ mod tests {
             global_frame_number: 0,
             storage_attestation: Vec::new(),
         }
+    }
+
+    #[test]
+    fn accrue_active_seniority_is_fixed_10_per_frame_idempotent_and_monotonic() {
+        use crate::global_intrinsic::materialize::materialize_prover_join;
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        let prover = fake_prover(0x07, 1, 0, &filter); // initial seniority 0
+
+        // Seed the PROVER vertex (materialize_prover_join writes prover:Prover
+        // with the given seniority).
+        let output = materialize_prover_join(&prover.public_key, &[filter.clone()], 1, 0).unwrap();
+        let va_disc = vertex_adds_discriminator().unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS[..],
+                &output.prover_address,
+                &va_disc,
+                1,
+                vertex_tree_to_blob(&output.prover_tree),
+            )
+            .unwrap();
+
+        let read = |field: &str| -> u64 {
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], &output.prover_address, &va_disc)
+                .unwrap()
+                .unwrap();
+            read_prover_u64(&rebuild_vertex_tree_from_blob(&blob), "prover:Prover", field)
+        };
+
+        // First active frame → +10.
+        accrue_active_seniority(&state, &prover.public_key, 100).unwrap();
+        assert_eq!(read("Seniority"), 10);
+        assert_eq!(read("LastSeniorityFrameNumber"), 100);
+
+        // Same frame again (multi-shard prover / re-materialization) → idempotent.
+        accrue_active_seniority(&state, &prover.public_key, 100).unwrap();
+        assert_eq!(read("Seniority"), 10, "same-frame re-accrual must be a no-op");
+
+        // Next active frame → +10 more.
+        accrue_active_seniority(&state, &prover.public_key, 101).unwrap();
+        assert_eq!(read("Seniority"), 20);
+        assert_eq!(read("LastSeniorityFrameNumber"), 101);
+
+        // Out-of-order replay of an OLDER frame → monotonic skip.
+        accrue_active_seniority(&state, &prover.public_key, 50).unwrap();
+        assert_eq!(read("Seniority"), 20, "older-frame replay must not accrue");
+        assert_eq!(read("LastSeniorityFrameNumber"), 101);
+
+        // A prover with no vertex (never joined) is a silent no-op.
+        accrue_active_seniority(&state, &vec![0xEEu8; 585], 100).unwrap();
     }
 
     #[test]
@@ -834,18 +1081,27 @@ mod tests {
         let state = make_state();
         let filter = vec![0xAAu8; 32];
         let p = fake_prover(1, 1, 0, &filter);
-        apply_reward(&state, 50, &p, &BigInt::from(1000)).unwrap();
-        apply_reward(&state, 50, &p, &BigInt::from(500)).unwrap();
         let reward_addr = reward_address(&p.address).unwrap();
         let va_disc = vertex_adds_discriminator().unwrap();
-        let blob = state
-            .get(&GLOBAL_INTRINSIC_ADDRESS[..], &reward_addr, &va_disc)
-            .unwrap()
-            .unwrap();
-        let tree = rebuild_vertex_tree_from_blob(&blob);
-        let bal_bytes = read_field(&tree, "reward:ProverReward", "Balance").unwrap();
-        let bal = BigInt::from_bytes_be(num_bigint::Sign::Plus, &bal_bytes);
-        assert_eq!(bal, BigInt::from(1500));
+        let read_bal = || {
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], &reward_addr, &va_disc)
+                .unwrap()
+                .unwrap();
+            let tree = rebuild_vertex_tree_from_blob(&blob);
+            let bal_bytes = read_field(&tree, "reward:ProverReward", "Balance").unwrap();
+            BigInt::from_bytes_be(num_bigint::Sign::Plus, &bal_bytes)
+        };
+
+        // Credits accumulate ACROSS frames.
+        apply_reward(&state, 50, &p, &BigInt::from(1000)).unwrap();
+        apply_reward(&state, 51, &p, &BigInt::from(500)).unwrap();
+        assert_eq!(read_bal(), BigInt::from(1500));
+
+        // Per-frame IDEMPOTENT: a second credit at an already-credited frame
+        // (the double-processing case: materializer + archive poller) is a no-op.
+        apply_reward(&state, 51, &p, &BigInt::from(999)).unwrap();
+        assert_eq!(read_bal(), BigInt::from(1500), "reward must not double-credit a frame");
     }
 
     #[test]
@@ -1150,10 +1406,16 @@ mod tests {
         }
         let state = make_state();
         let filter = vec![0xAAu8; 32];
-        // 9 provers, ranks 0..8 → ring 0 (ranks 0-7) + ring 1 (rank 8). The
-        // rank order follows join_frame, so seed 9 (join_frame 9) is rank 8.
-        let provers: Vec<ProverInfo> =
+        // 9 provers, ranks 0..8 → ring 0 (ranks 0-7) + ring 1 (rank 8). Ring is
+        // now the STORED per-allocation value (set at confirmation); materialize
+        // reads it rather than re-sorting by seniority. Assign by rank here.
+        let mut provers: Vec<ProverInfo> =
             (1u8..=9).map(|s| fake_prover(s, s as u64, 0, &filter)).collect();
+        for (i, p) in provers.iter_mut().enumerate() {
+            if let Some(alloc) = p.allocations.iter_mut().find(|a| a.confirmation_filter == filter) {
+                alloc.ring = (i / RING_GROUP_SIZE as usize) as u8;
+            }
+        }
         for p in &provers {
             seed_alloc_blob(&state, p, &filter);
         }
@@ -1322,6 +1584,42 @@ mod tests {
         // Advancing to the next frame overwrites the single global key.
         crdt.commit_with_global_cursor(9, &key).unwrap();
         assert_eq!(clock.get_global_materialized_cursor(), Some(9));
+    }
+
+    /// `recompute_shard_rings` ranks by (join-frame, address) — a STABLE
+    /// immutable ordering — and RECOMPACTS when the active set shrinks: a ring-0
+    /// prover leaving shifts every survivor below it up one rank, so an ex-ring-1
+    /// prover can drop to ring 0.
+    #[test]
+    fn shard_rings_rank_by_join_frame_and_recompact_on_leave() {
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        let ring_of = |p: &ProverInfo| {
+            p.allocations.iter().find(|a| a.confirmation_filter == filter).unwrap().ring
+        };
+
+        // 10 active provers, join frames 10,20,…,100 (distinct, ascending by
+        // seed; addresses also ascend by seed) → ranks 0..9.
+        let mut provers: Vec<ProverInfo> =
+            (1u8..=10).map(|s| fake_prover(s, (s as u64) * 10, 0, &filter)).collect();
+        recompute_shard_rings(&state, &filter, &mut provers, 1000).unwrap();
+        // ranks 0..7 → ring 0; ranks 8,9 → ring 1 (RING_GROUP_SIZE = 8).
+        for p in &provers[..8] {
+            assert_eq!(ring_of(p), 0);
+        }
+        assert_eq!(ring_of(&provers[8]), 1);
+        assert_eq!(ring_of(&provers[9]), 1);
+
+        // The earliest joiner (rank 0, ring 0) leaves. Recompute over the 9
+        // survivors → ranks 0..8. The ex-rank-8 prover (seed 9) moves to rank 7
+        // → RECOMPACTS from ring 1 down to ring 0; only the last stays ring 1.
+        provers.remove(0);
+        recompute_shard_rings(&state, &filter, &mut provers, 1100).unwrap();
+        for p in &provers[..8] {
+            assert_eq!(ring_of(p), 0, "survivor recompacted to ring 0");
+        }
+        assert_eq!(ring_of(&provers[8]), 1);
+        assert_eq!(provers.iter().filter(|p| ring_of(p) == 1).count(), 1, "one ring-1 after leave");
     }
 
     /// THE critical test: frame N's reward-tree NODES must land durably in

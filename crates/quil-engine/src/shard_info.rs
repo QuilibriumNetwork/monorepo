@@ -871,6 +871,7 @@ mod tests {
                     // Confirmed for the current epoch (eval frame 2000 → epoch 2)
                     // so always-on epoch expiry doesn't read it as ExpiredEpoch.
                     epoch: 2,
+                    ring: 0,
                     vertex_address: vec![],
                 },
                 ProverAllocationInfo {
@@ -889,6 +890,7 @@ mod tests {
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
                     epoch: 0,
+                    ring: 0,
                     vertex_address: vec![],
                 },
                 // Joining but expired: proposed in epoch 0, never confirmed in
@@ -908,6 +910,7 @@ mod tests {
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
                     epoch: 0,
+                    ring: 0,
                     vertex_address: vec![],
                 },
             ],
@@ -1112,6 +1115,7 @@ mod tests {
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 100,
                     epoch: 0,
+                    ring: 0,
                     vertex_address: vec![],
                 }],
                 available_storage: 1 << 30,

@@ -430,6 +430,13 @@ impl TimeoutCertificate {
         let filter = read_bytes(data, &mut c)?;
         let rank = read_u64(data, &mut c)?;
         let count = read_u32(data, &mut c)? as usize;
+        // Allocation-bomb guard: each entry is a u64 (8 bytes), so a count above
+        // `remaining / 8` is impossible — reject before `Vec::with_capacity`.
+        if count > data.len().saturating_sub(c) / 8 {
+            return Err(QuilError::InvalidArgument(format!(
+                "TimeoutCertificate: latest_ranks count {} exceeds remaining bytes", count
+            )));
+        }
         let mut latest_ranks = Vec::with_capacity(count);
         for _ in 0..count { latest_ranks.push(read_u64(data, &mut c)?); }
         let qc_bytes = read_bytes(data, &mut c)?;
@@ -1206,6 +1213,16 @@ fn decode_frame_header(
 
     let commit_count = read_u32(data, &mut c)
         .map_err(|e| QuilError::InvalidArgument(format!("commit_count at {}/{}: {}", c, total, e)))? as usize;
+    // Bound the count against remaining bytes BEFORE pre-allocating: each entry
+    // is a length-prefixed blob (>= 4 bytes), so a claimed count larger than
+    // `remaining / 4` is impossible — reject it instead of letting an
+    // attacker-chosen u32 drive a huge `Vec::with_capacity` (a ~100GB alloc =
+    // OOM/abort from a tiny frame, reachable pre-auth on the gossip path).
+    if commit_count > data.len().saturating_sub(c) / 4 {
+        return Err(QuilError::InvalidArgument(format!(
+            "GlobalFrame: commit_count {} exceeds what remaining bytes can hold", commit_count
+        )));
+    }
     let mut global_commitments = Vec::with_capacity(commit_count);
     for i in 0..commit_count {
         global_commitments.push(read_bytes(data, &mut c)
@@ -1218,6 +1235,12 @@ fn decode_frame_header(
         .map_err(|e| QuilError::InvalidArgument(format!("requests_root at {}/{}: {}", c, total, e)))?;
     let aux_count = read_u32(data, &mut c)
         .map_err(|e| QuilError::InvalidArgument(format!("aux_root_count at {}/{}: {}", c, total, e)))? as usize;
+    // Same allocation-bomb guard as commit_count (entries are length-prefixed).
+    if aux_count > data.len().saturating_sub(c) / 4 {
+        return Err(QuilError::InvalidArgument(format!(
+            "GlobalFrame: aux_count {} exceeds what remaining bytes can hold", aux_count
+        )));
+    }
     let mut prover_tree_aux_roots = Vec::with_capacity(aux_count);
     for i in 0..aux_count {
         prover_tree_aux_roots.push(read_bytes(data, &mut c)
@@ -1272,6 +1295,39 @@ pub fn peek_consensus_type(data: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_decode_rejects_alloc_bomb_counts() {
+        // A tiny header claiming a huge commit_count/aux_count must be REJECTED
+        // by the remaining-bytes bound, not drive a ~100GB `Vec::with_capacity`
+        // (OOM/abort). Reachable pre-auth on the gossip decode path.
+        let build = |commit_count: u32, aux_count: u32| {
+            let mut b = Vec::new();
+            put_u32(&mut b, GLOBAL_FRAME_HEADER_TYPE);
+            b.extend_from_slice(&0u64.to_be_bytes()); // frame_number
+            b.extend_from_slice(&0u64.to_be_bytes()); // rank
+            b.extend_from_slice(&0i64.to_be_bytes()); // timestamp
+            put_u32(&mut b, 0); // difficulty
+            put_u32(&mut b, 0); // output (empty LP)
+            put_u32(&mut b, 0); // parent_selector (empty LP)
+            put_u32(&mut b, commit_count);
+            // For the aux-count case we need a valid (empty) commitments list +
+            // the intervening fields so the cursor reaches aux_count.
+            if commit_count == 0 {
+                put_u32(&mut b, 0); // prover_tree_commitment (empty LP)
+                put_u32(&mut b, 0); // requests_root (empty LP)
+                put_u32(&mut b, aux_count);
+            }
+            b
+        };
+        let r = decode_frame_header(&build(u32::MAX, 0));
+        assert!(r.is_err(), "huge commit_count must be rejected");
+        assert!(r.unwrap_err().to_string().contains("commit_count"));
+
+        let r = decode_frame_header(&build(0, u32::MAX));
+        assert!(r.is_err(), "huge aux_count must be rejected");
+        assert!(r.unwrap_err().to_string().contains("aux_count"));
+    }
 
     #[test]
     fn proposal_vote_roundtrip() {

@@ -25,9 +25,11 @@ use tonic::transport::{Channel, Endpoint};
 use tower::Service;
 use tracing::{debug, info};
 
+use quil_types::proto::global::app_shard_service_client::AppShardServiceClient;
 use quil_types::proto::global::global_service_client::GlobalServiceClient;
 use quil_types::proto::global::{
-    AppShardInfo, GetAppShardsRequest, GetForestHeadRequest, GetForestNodeRequest,
+    AppShardFrame, AppShardInfo, GetAppShardFrameRequest, GetAppShardsRequest,
+    GetForestHeadRequest, GetForestNodeRequest,
     GetForestPreimageRequest, GetForestValueRequest, GetGlobalFrameRequest,
     GetAppManifestRequest, GetGlobalProposalRequest, GetVertexBlobRequest, ResolveRootRequest,
     GlobalFrame, GlobalProposal, SubmitGlobalConsensusRequest, SubmitGlobalMessageRequest,
@@ -59,6 +61,10 @@ pub enum ArchiveClientError {
 #[derive(Clone)]
 pub struct ArchiveClient {
     inner: GlobalServiceClient<Channel>,
+    // AppShardService rides the SAME :8340 channel as GlobalService (both are
+    // registered on the peer server); used by the state-jump to fetch attested
+    // app-shard frames for onboarding root cross-checks.
+    app_shard: AppShardServiceClient<Channel>,
     endpoint: String,
 }
 
@@ -80,7 +86,10 @@ impl ArchiveClient {
             // global frames and app-shard size sets routinely exceed 4 MiB;
             // the default silently failed those RPCs. Matches the hypersync
             // client limits in `hypergraph_sync_probe`.
-            inner: GlobalServiceClient::new(channel)
+            inner: GlobalServiceClient::new(channel.clone())
+                .max_decoding_message_size(64 * 1024 * 1024)
+                .max_encoding_message_size(64 * 1024 * 1024),
+            app_shard: AppShardServiceClient::new(channel)
                 .max_decoding_message_size(64 * 1024 * 1024)
                 .max_encoding_message_size(64 * 1024 * 1024),
             endpoint: addr.to_string(),
@@ -147,7 +156,10 @@ impl ArchiveClient {
             // global frames and app-shard size sets routinely exceed 4 MiB;
             // the default silently failed those RPCs. Matches the hypersync
             // client limits in `hypergraph_sync_probe`.
-            inner: GlobalServiceClient::new(channel)
+            inner: GlobalServiceClient::new(channel.clone())
+                .max_decoding_message_size(64 * 1024 * 1024)
+                .max_encoding_message_size(64 * 1024 * 1024),
+            app_shard: AppShardServiceClient::new(channel)
                 .max_decoding_message_size(64 * 1024 * 1024)
                 .max_encoding_message_size(64 * 1024 * 1024),
             endpoint: addr.to_string(),
@@ -362,6 +374,25 @@ impl ArchiveClient {
             .await?
             .into_inner();
         resp.proposal.ok_or(ArchiveClientError::MissingField("proposal"))
+    }
+
+    /// Fetch a committed app-shard frame by its consensus `filter` (the app's
+    /// `L2 ‖ prefix` address; QUIL's per-app consensus uses the 32-byte L2).
+    /// `frame_number == 0` asks the peer for its LATEST frame on that filter.
+    /// The returned `FrameHeader.state_roots[0]` is the app's aggregate
+    /// vertex-adds root — the state-jump onboarding path cross-checks the
+    /// locally-synced app tree against it. `None` if the peer has no frame.
+    pub async fn get_app_shard_frame(
+        &mut self,
+        filter: Vec<u8>,
+        frame_number: u64,
+    ) -> Result<Option<AppShardFrame>, ArchiveClientError> {
+        let resp = self
+            .app_shard
+            .get_app_shard_frame(GetAppShardFrameRequest { filter, frame_number })
+            .await?
+            .into_inner();
+        Ok(resp.frame)
     }
 }
 

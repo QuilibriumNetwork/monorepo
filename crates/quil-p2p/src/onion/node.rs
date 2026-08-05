@@ -104,6 +104,12 @@ impl OnionNode {
         let relay_h = Arc::clone(&relay);
         let orig_h = Arc::clone(&originator);
         let out = Arc::clone(&transport);
+        // Bound concurrent per-cell processing. Without this, every inbound link
+        // cell spawns an unbounded tokio task (each CREATE runs sntrup761
+        // decap+encap), so one routing peer can exhaust scheduler/CPU/memory.
+        // Excess cells are dropped — the circuit's own retransmit/timeout copes.
+        const MAX_CONCURRENT_ONION_CELLS: usize = 256;
+        let cell_sem_h = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ONION_CELLS));
         transport.set_on_receive(Arc::new(move |src_peer: &[u8], circ_id: u32, cell: &[u8]| {
             let relay = Arc::clone(&relay_h);
             let orig = Arc::clone(&orig_h);
@@ -111,7 +117,12 @@ impl OnionNode {
             let exit = exit_handler.clone();
             let src = src_peer.to_vec();
             let cell = cell.to_vec();
+            let Ok(permit) = Arc::clone(&cell_sem_h).try_acquire_owned() else {
+                tracing::trace!("onion: inbound cell dropped — concurrency cap reached");
+                return;
+            };
             tokio::spawn(async move {
+                let _permit = permit;
                 match cell::parse_cell(&cell) {
                     // Someone opens a circuit hop through us.
                     Some((cell::CMD_CREATE, _)) => {

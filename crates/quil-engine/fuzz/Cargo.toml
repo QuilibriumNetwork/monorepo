@@ -1,0 +1,95 @@
+# cargo-fuzz harness for the untrusted-input frame/message DECODERS.
+#
+# These decode functions run on attacker-controlled bytes BEFORE any
+# authentication (gossip GLOBAL_FRAME decode) or before signature checks
+# (message submission), so a panic / integer-overflow / allocation-bomb here is
+# a remote DoS. See the F9 finding (unbounded `Vec::with_capacity` on an
+# attacker u32) — this harness guards against that whole class.
+#
+# Detached workspace (`[workspace]` below) so it never perturbs the root build;
+# the `[patch.crates-io]` block mirrors the root workspace (paths rebased two
+# levels up) because a detached workspace does not inherit the parent's patches
+# and the fuzzed crates require them.
+#
+# Run (needs nightly + FLINT for the crypto deps):
+#   cd crates/quil-engine
+#   FLINT_DIR=/Users/caheart/src/flint cargo +nightly fuzz run decode_global_frame
+[package]
+name = "quil-engine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+quil-engine = { path = ".." }
+quil-execution = { path = "../../quil-execution" }
+
+[workspace]
+
+[patch.crates-io]
+jmt = { path = "../../jmt" }
+libp2p-identity = { path = "../../libp2p-identity" }
+libp2p-autonat = { path = "../../libp2p-autonat" }
+libp2p-tls = { path = "../../libp2p-tls" }
+
+# Fuzz builds: keep debug assertions + overflow checks ON (catch integer
+# overflow / underflow), some debuginfo for good crash traces, no LTO for
+# faster iterate-rebuild.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+lto = false
+
+[[bin]]
+name = "decode_global_frame"
+path = "fuzz_targets/decode_global_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_message_bundle"
+path = "fuzz_targets/decode_message_bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canonical_message_bundle"
+path = "fuzz_targets/canonical_message_bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canonical_message_request"
+path = "fuzz_targets/canonical_message_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_execution_dag"
+path = "fuzz_targets/decode_execution_dag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_timeout_certificate"
+path = "fuzz_targets/decode_timeout_certificate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_prover_join"
+path = "fuzz_targets/decode_prover_join.rs"
+test = false
+doc = false
+bench = false

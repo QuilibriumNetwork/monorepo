@@ -204,10 +204,106 @@ pub type OnFrameCallback = Arc<dyn Fn(&GlobalFrame) + Send + Sync>;
 /// (e.g. a trusted/test caller).
 pub type FrameValidator = Arc<dyn Fn(&GlobalFrame) -> bool + Send + Sync>;
 
+/// Shared "gossip is delivering the head" signal, written by the gossip
+/// `GLOBAL_FRAME` receive path and read by the poller.
+///
+/// Once regular nodes subscribe to the `GLOBAL_FRAME` gossip topic, finalized
+/// frames arrive over the mesh — the same frames the RPC poller fetches. When
+/// gossip keeps the head current, the poller's per-second `GetGlobalFrame(0)`
+/// call is pure redundant RPC. This tracker lets the poller *back off* while
+/// gossip is fresh and resume polling (as a gap-filler) only when the mesh goes
+/// quiet, which is the whole point of the gossip-for-global-frames path.
+///
+/// Non-archive only: archives forward-fill contiguous history and cannot trust
+/// unordered/lossy gossip to fill gaps, so their poller ignores this signal.
+pub struct GossipFreshness {
+    base: Instant,
+    /// Millis-since-`base` of the last gossip-delivered frame; 0 = none yet.
+    last_millis: std::sync::atomic::AtomicU64,
+    /// Highest frame number seen over gossip.
+    last_frame: std::sync::atomic::AtomicU64,
+    /// Highest global head advertised by a signed, genesis-verified archive
+    /// PeerInfo. This is an AUTHENTICATED "network head" hint (PeerInfo is signed
+    /// by the archive) that lets the poller answer "am I behind?" for free — the
+    /// reconcile only re-pulls when an archive advertises a head above ours,
+    /// instead of fetching a full head frame over RPC every interval. 0 = none
+    /// seen yet (⇒ don't trust it; fall back to an RPC head-poll).
+    network_head: std::sync::atomic::AtomicU64,
+}
+
+impl GossipFreshness {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: Instant::now(),
+            last_millis: std::sync::atomic::AtomicU64::new(0),
+            last_frame: std::sync::atomic::AtomicU64::new(0),
+            network_head: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Record that a frame was just delivered over gossip. Called from the
+    /// `GLOBAL_FRAME` receive path after a successful store.
+    ///
+    /// Freshness tracks head ADVANCEMENT, not mere arrival: we only refresh the
+    /// timestamp when this frame raises the gossip head. Otherwise an attacker
+    /// re-broadcasting a single valid, already-finalized OLD frame could keep
+    /// `fresh_within` permanently true without the head moving — pinning the
+    /// poller in its gossip-paused branch and (combined with a stale
+    /// `network_head` under eclipse) suppressing the RPC reconcile indefinitely.
+    /// Tying freshness to advancement means a stalled/replayed head lets
+    /// `fresh_within` lapse after the window, and the poller falls back to RPC.
+    pub fn stamp(&self, frame_number: u64) {
+        let prev = self
+            .last_frame
+            .fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
+        if frame_number > prev {
+            // Store 1-based millis so a stamp at elapsed==0 is distinguishable
+            // from the "never stamped" sentinel (0).
+            self.last_millis.store(
+                (self.base.elapsed().as_millis() as u64).saturating_add(1),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Highest frame number ever delivered over gossip.
+    pub fn head(&self) -> u64 {
+        self.last_frame.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record a network head advertised by a signed, genesis-verified archive
+    /// PeerInfo. Called from the PeerInfo receive path.
+    pub fn note_network_head(&self, frame_number: u64) {
+        self.network_head
+            .fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Highest authenticated network head seen via archive PeerInfo (0 = none).
+    pub fn network_head(&self) -> u64 {
+        self.network_head.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// True if a gossip frame landed within the last `window`.
+    pub fn fresh_within(&self, window: Duration) -> bool {
+        let last = self.last_millis.load(std::sync::atomic::Ordering::Relaxed);
+        if last == 0 {
+            return false; // never stamped
+        }
+        let last = last - 1; // undo the 1-based offset from `stamp`
+        let now = self.base.elapsed().as_millis() as u64;
+        now.saturating_sub(last) < window.as_millis() as u64
+    }
+}
+
 /// Poller configuration. Defaults match Go's `pollFramesFromArchive`.
 pub struct ArchivePollerConfig {
     pub poll_interval: Duration,
     pub call_timeout: Duration,
+    /// When set (non-archive nodes), the poller skips its RPC head-fetch while
+    /// gossip is keeping the head fresh, polling only as a gap-filler when the
+    /// mesh goes quiet — plus a periodic reconcile poll as a safety net. `None`
+    /// (the default / archives) → always poll.
+    pub gossip_freshness: Option<Arc<GossipFreshness>>,
     /// Optional callback fired for each frame after storage.
     pub on_frame: Option<OnFrameCallback>,
     /// Optional genesis-prover + VDF/BLS gate applied to every frame
@@ -238,6 +334,7 @@ impl Default for ArchivePollerConfig {
         Self {
             poll_interval: Duration::from_secs(1),
             call_timeout: Duration::from_secs(30),
+            gossip_freshness: None,
             on_frame: None,
             frame_validator: None,
             forward_fill: false,
@@ -335,11 +432,116 @@ pub async fn run_archive_poller(
     let mut ticker = tokio::time::interval(config.poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Gossip-driven RPC reduction (wired on non-archive nodes only — the caller
+    // passes `gossip_freshness: Some` there and `None` for archives). While the
+    // `GLOBAL_FRAME` mesh keeps delivering the head, the receive path has
+    // already stored (and processed) each finalized frame, so the poller sources
+    // those frames from the LOCAL STORE instead of re-fetching them over RPC, and
+    // skips its `GetGlobalFrame(0)` head-poll entirely. It still fills genuine
+    // holes (frames gossip dropped) over RPC — contiguity is preserved for the
+    // ρ_N storage anchors — and forces a reconcile head-poll every
+    // `GOSSIP_RECONCILE_INTERVAL` so a silently-diverged node re-anchors. When
+    // gossip goes quiet for `GOSSIP_FRESH_WINDOW` (a few frame intervals) the
+    // poller resumes full RPC polling as the fallback.
+    const GOSSIP_FRESH_WINDOW: Duration = Duration::from_secs(30);
+    const GOSSIP_RECONCILE_INTERVAL: Duration = Duration::from_secs(120);
+    const GOSSIP_IDLE_BACKOFF: Duration = Duration::from_secs(5);
+    // Hard wall-clock bound on authenticated archive contact: even when gossip
+    // looks fresh AND PeerInfo says we're current, force a real RPC head-poll at
+    // least this often. Defense-in-depth so no combination of a stalled/replayed
+    // gossip head and a stale/withheld `network_head` (an eclipse) can suppress
+    // archive contact indefinitely — the poller re-verifies against the mTLS
+    // source on a fixed cadence regardless.
+    const HARD_RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
+    // Start "due" so the first tick always polls (establishes the endpoint and a
+    // baseline head before ceding to gossip).
+    let mut last_rpc_poll = tokio::time::Instant::now()
+        .checked_sub(GOSSIP_RECONCILE_INTERVAL)
+        .unwrap_or_else(tokio::time::Instant::now);
+    // Time of the last ACTUAL RPC head-poll (distinct from `last_rpc_poll`, which
+    // also resets when a reconcile is satisfied cheaply from PeerInfo).
+    let mut last_actual_rpc = tokio::time::Instant::now()
+        .checked_sub(HARD_RECONCILE_INTERVAL)
+        .unwrap_or_else(tokio::time::Instant::now);
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = ticker.tick() => {}
         }
+
+        // Gossip is carrying the head: drain the frames it already stored, over
+        // the local store (zero RPC), and only drop into the RPC path below if a
+        // hole is found or a reconcile is due. Checked before client acquisition
+        // so a fully-gossip-fed poller never even connects to :8340.
+        if let Some(gf) = config.gossip_freshness.clone() {
+            let reconcile_due = last_rpc_poll.elapsed() >= GOSSIP_RECONCILE_INTERVAL;
+            // Cheap, RPC-free "am I behind?" check. `network_head` is the highest
+            // head advertised by a signed, genesis-verified archive PeerInfo, so
+            // it authenticates the network height without fetching a full head
+            // frame. When it confirms we're not behind, a reconcile poll would
+            // only re-confirm what PeerInfo already told us — so satisfy the
+            // reconcile from PeerInfo instead of an RPC. Only when PeerInfo is
+            // unavailable (0) or shows an archive genuinely ahead do we spend the
+            // RPC. (Gossip going quiet is handled below — `fresh_within` fails and
+            // we fall through to a real poll, preserving the partition backstop.)
+            let net_head = gf.network_head();
+            let current_per_peerinfo = net_head > 0 && net_head <= last_frame;
+            // Hard bound overrides the cheap PeerInfo skip: guarantees periodic
+            // authenticated archive contact even under an eclipse.
+            let hard_due = last_actual_rpc.elapsed() >= HARD_RECONCILE_INTERVAL;
+            let reconcile_needs_rpc = (reconcile_due && !current_per_peerinfo) || hard_due;
+            if gf.fresh_within(GOSSIP_FRESH_WINDOW) && !reconcile_needs_rpc {
+                // If we hit the reconcile point but PeerInfo already confirms
+                // we're current, treat it as reconciled: reset the timer so we
+                // don't re-check every tick, and stay paused with no RPC.
+                if reconcile_due {
+                    last_rpc_poll = tokio::time::Instant::now();
+                }
+                let target = gf.head();
+                // Drain contiguous store-present frames (gossip delivered them);
+                // fire on_frame exactly as the RPC path would, just without the
+                // network round-trip.
+                let mut hole = false;
+                while last_frame < target {
+                    let next = last_frame + 1;
+                    match clock_store.get_global_frame(next) {
+                        Ok(frame) => {
+                            if let Some(ref cb) = config.on_frame {
+                                cb(&frame);
+                            }
+                            last_frame = next;
+                        }
+                        Err(_) => {
+                            // Gossip missed this frame — fall through to the RPC
+                            // path to fill the hole (last_frame sits just below it).
+                            hole = true;
+                            break;
+                        }
+                    }
+                }
+                if !hole {
+                    if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                        info!(
+                            local_frame = last_frame,
+                            gossip_head = target,
+                            "archive poller: gossip is carrying the head — RPC head-poll paused",
+                        );
+                        last_heartbeat = tokio::time::Instant::now();
+                    }
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(GOSSIP_IDLE_BACKOFF) => {}
+                    }
+                    continue;
+                }
+                // hole == true: fall through and let the RPC head-poll +
+                // forward-fill below fetch the missing frame(s).
+            }
+        }
+        last_rpc_poll = tokio::time::Instant::now();
+        // We're committing to an actual RPC head-poll below — reset the hard bound.
+        last_actual_rpc = tokio::time::Instant::now();
 
         // Acquire a working client.
         if current_client.is_none() {
@@ -464,6 +666,19 @@ pub async fn run_archive_poller(
             // its own distinct-endpoint tally.
             let mut failed_validation = false;
             for fn_ in (last_frame + 1)..new_number {
+                // Store-first (non-archive): if gossip already delivered this
+                // frame, use the local copy and skip the RPC. Only frames gossip
+                // missed cost a network fetch. Fire on_frame just as the RPC arm
+                // does, so processing is identical regardless of source.
+                if config.gossip_freshness.is_some() {
+                    if let Ok(frame) = clock_store.get_global_frame(fn_) {
+                        if let Some(ref cb) = config.on_frame {
+                            cb(&frame);
+                        }
+                        last_frame = fn_;
+                        continue;
+                    }
+                }
                 match tokio::time::timeout(
                     config.call_timeout,
                     client.get_global_frame(fn_),
@@ -849,5 +1064,47 @@ mod pool_tests {
         assert_eq!(cfg.call_timeout, Duration::from_secs(30));
         assert!(cfg.on_frame.is_none());
         assert!(!cfg.forward_fill);
+        // Gossip backoff is opt-in — off by default (archives, and any caller
+        // that doesn't wire it) so the poller always RPC-polls.
+        assert!(cfg.gossip_freshness.is_none());
+    }
+
+    #[test]
+    fn gossip_freshness_starts_stale_and_tracks_head() {
+        let gf = GossipFreshness::new();
+        // Never stamped → not fresh, head 0.
+        assert!(!gf.fresh_within(Duration::from_secs(30)));
+        assert_eq!(gf.head(), 0);
+
+        gf.stamp(41);
+        gf.stamp(42);
+        // Just stamped → fresh within any reasonable window.
+        assert!(gf.fresh_within(Duration::from_secs(30)));
+        // Head is the max seen; an out-of-order older stamp never regresses it.
+        assert_eq!(gf.head(), 42);
+        gf.stamp(7);
+        assert_eq!(gf.head(), 42);
+    }
+
+    #[test]
+    fn gossip_freshness_network_head_tracks_max_only() {
+        let gf = GossipFreshness::new();
+        assert_eq!(gf.network_head(), 0, "unset ⇒ 0 (poller falls back to RPC)");
+        gf.note_network_head(500);
+        gf.note_network_head(742);
+        assert_eq!(gf.network_head(), 742);
+        // An older/lower advertisement never regresses the head.
+        gf.note_network_head(100);
+        assert_eq!(gf.network_head(), 742);
+    }
+
+    #[test]
+    fn gossip_freshness_window_expires() {
+        let gf = GossipFreshness::new();
+        gf.stamp(100);
+        // A zero-length window is never satisfied by a stamp in the past.
+        assert!(!gf.fresh_within(Duration::from_millis(0)));
+        // A generous window is.
+        assert!(gf.fresh_within(Duration::from_secs(60)));
     }
 }

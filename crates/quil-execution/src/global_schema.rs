@@ -60,6 +60,11 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             FieldTag { name: "Seniority",        order: 3, size: 8,   rdf_type: RdfType::Uint },
             // order 4 — 8-byte big-endian u64.
             FieldTag { name: "KickFrameNumber",  order: 4, size: 8,   rdf_type: RdfType::Uint },
+            // order 5 — NEW (Rust-ahead seniority-accrual fork): the last frame
+            // this prover accrued active-seniority for. Idempotency key so a
+            // multi-shard prover (one call per allocation) or a re-materialized
+            // frame accrues `SENIORITY_PER_ACTIVE_FRAME` at most once per frame.
+            FieldTag { name: "LastSeniorityFrameNumber", order: 5, size: 8, rdf_type: RdfType::Uint },
         ],
     },
     ClassDef {
@@ -84,6 +89,18 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // epoch this allocation was last confirmed for. Data-shard
             // allocations are epoch-bound (see `EffectiveStatus::ExpiredEpoch`).
             FieldTag { name: "Epoch",                   order: 14, size: 8,  rdf_type: RdfType::Uint },
+            // order 15 — NEW (Rust-ahead ring-lock fork): the reward-ring index
+            // this allocation sits in (`2^(ring+1)` = the shard's reward divisor).
+            // Assigned by `prover_shard_update::recompute_shard_rings` from a
+            // STABLE ordering — `JoinFrameNumber` then address, both immutable —
+            // so `ring = floor(rank / RING_GROUP_SIZE)` is byte-identical on every
+            // node and changes ONLY when the active SET changes. Membership
+            // changes are epoch-aligned (join-confirm / leave-confirm / kick take
+            // effect at the E+2 boundary), so the ring is frozen within an epoch
+            // and RECOMPACTED at a boundary (a higher prover leaves → survivors
+            // shift up). Deliberately NOT sorted by live seniority, whose per-frame
+            // drift is what forked the prover-tree root before the ring was stored.
+            FieldTag { name: "Ring",                    order: 15, size: 1,  rdf_type: RdfType::Uint },
         ],
     },
     ClassDef {
@@ -93,6 +110,15 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             FieldTag { name: "DelegateAddress", order: 0, size: 32, rdf_type: RdfType::ByteArray },
             // order 1 — 32-byte big-endian u256 balance.
             FieldTag { name: "Balance",         order: 1, size: 32, rdf_type: RdfType::ByteArray },
+            // order 2 — last frame this reward was credited, the per-frame
+            // idempotency guard for `apply_reward` (mirrors prover:Prover's
+            // `LastSeniorityFrameNumber`). The global frame is applied by TWO
+            // paths on an archive — the serial materializer AND the archive
+            // poller's `process_global_frame` — and reward crediting is additive
+            // (not nonce-protected like token spends), so without this guard the
+            // balance is credited twice and the prover-tree root forks
+            // timing-dependently. FLAG-DAY: changes the reward vertex encoding.
+            FieldTag { name: "LastRewardFrameNumber", order: 2, size: 8, rdf_type: RdfType::Uint },
         ],
     },
     // NOTE: merge:SpentMerge is NOT in the Go GLOBAL_RDF_SCHEMA turtle.

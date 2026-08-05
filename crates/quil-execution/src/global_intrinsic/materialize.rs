@@ -894,7 +894,12 @@ pub fn materialize_seniority_merge(
         })
         .unwrap_or(0);
 
-    // Add merge seniority to existing
+    // ADDITIVE by design: the (overlapping-period-max-collapsed) aggregated
+    // seniority of the merge targets is added to the prover's existing score.
+    // The anti-inflation invariant is NOT here — it is the one-shot spent-merge
+    // gate in `verify::verify_prover_seniority_merge_spent_markers`, which rejects
+    // re-use of any already-consumed target (so the same merge can never be
+    // re-applied to add its seniority twice).
     let new_seniority = existing_seniority.saturating_add(merge_seniority);
 
     // Write updated seniority

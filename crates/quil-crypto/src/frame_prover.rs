@@ -5,6 +5,20 @@ use quil_types::crypto::{BlsConstructor, FrameProver};
 use quil_types::error::{QuilError, Result};
 use quil_types::proto::global;
 
+/// The last legacy (pre-2.1.0, BLS/KZG) global frame — the mainnet flag-day
+/// anchor the chain rewinds to. Global frames STRICTLY ABOVE this belong to the
+/// 2.1.0 commonware/Falcon/JMT chain and domain-separate their VDF challenge
+/// (see [`DOMAIN_2_1_0`]); at-or-below keep the legacy challenge for byte-exact
+/// verification of the migrated head. `669976` (the first 2.1.0 frame) matches
+/// `FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX`.
+const GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME: u64 = 669975;
+
+/// Version-domain prefix mixed into the 2.1.0 global-frame VDF challenge —
+/// `0x02 0x01 0x00` for v2.1.0. Prevents a pre-flag-day frame from being
+/// replayed as a 2.1.0 frame after the rewind (its output was solved against an
+/// un-prefixed challenge, so the 2.1.0 verify rejects it).
+const DOMAIN_2_1_0: [u8; 3] = [0x02, 0x01, 0x00];
+
 /// VDF-based frame prover using the Wesolowski VDF from the vdf crate.
 pub struct WesolowskiFrameProver {
     /// VDF integer size in bits (typically 2048).
@@ -98,8 +112,6 @@ impl FrameProver for WesolowskiFrameProver {
         storage_attestation_root: &[u8],
         global_frame_number: u64,
     ) -> Result<global::FrameHeader> {
-        use sha3::{Digest, Sha3_256};
-
         // parent = poseidon(previous_frame_output[:516]); zero on genesis.
         let parent: Vec<u8> = if previous_frame_output.len() >= 516 {
             crate::poseidon::hash_bytes_to_32(&previous_frame_output[..516])
@@ -109,25 +121,15 @@ impl FrameProver for WesolowskiFrameProver {
             vec![0u8; 32]
         };
 
-        let mut input = Vec::new();
-        input.extend_from_slice(address);
-        input.extend_from_slice(&frame_number.to_be_bytes());
-        input.extend_from_slice(&(timestamp as u64).to_be_bytes());
-        input.extend_from_slice(&difficulty.to_be_bytes());
-        input.extend_from_slice(&fee_multiplier_vote.to_be_bytes());
-        input.extend_from_slice(&parent);
-        input.extend_from_slice(requests_root);
-        for sr in state_roots {
-            input.extend_from_slice(sr);
-        }
-        input.extend_from_slice(prover);
-        // Storage-attestation binding: commit the attestation root and the
-        // global beacon anchor so neither can be altered after the VDF is solved.
-        input.extend_from_slice(storage_attestation_root);
-        input.extend_from_slice(&global_frame_number.to_be_bytes());
-
-        let challenge: [u8; 32] = Sha3_256::digest(&input).into();
-        let output = vdf::wesolowski_solve(self.int_size_bits, &challenge, difficulty);
+        // App-shard frames do NOT use a VDF. The caller (AppLeaderProvider) sets
+        // `header.output` to the deterministic ρ_N-bound digest
+        // (`porep::deterministic_app_frame_output`) for storage AND genesis frames,
+        // so producing a Wesolowski proof here was pure wasted CPU every round
+        // (it was solved and then overwritten). Leave `output` empty; the caller
+        // fills it. The remaining params (address/requests_root/state_roots/prover/
+        // storage_attestation_root/global_frame_number) are all bound into that
+        // deterministic digest by the caller, so nothing is lost.
+        let output: Vec<u8> = Vec::new();
 
         Ok(global::FrameHeader {
             address: address.to_vec(),
@@ -205,6 +207,16 @@ impl FrameProver for WesolowskiFrameProver {
         let new_frame_number = previous_frame.frame_number + 1;
 
         let mut input: Vec<u8> = Vec::new();
+        // Flag-day domain separation: frames ABOVE the last legacy frame belong
+        // to the 2.1.0 (commonware/Falcon/JMT) chain and mix `0x020100` into the
+        // VDF challenge. A pre-flag-day frame's `output` was solved against an
+        // un-prefixed challenge, so a 2.1.0 verifier rejects it here — which also
+        // separates the finalization signature for free, since the committee
+        // signs `Poseidon(output)` and the VDF is verified BEFORE the cert. This
+        // is the replay barrier across the rewind to the flag-day frame.
+        if new_frame_number > GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME {
+            input.extend_from_slice(&DOMAIN_2_1_0);
+        }
         input.extend_from_slice(&new_frame_number.to_be_bytes());
         input.extend_from_slice(&(timestamp as u64).to_be_bytes());
         input.extend_from_slice(&difficulty.to_be_bytes());
@@ -295,6 +307,12 @@ impl FrameProver for WesolowskiFrameProver {
         }
 
         let mut input = Vec::new();
+        // Mirror the prove side's flag-day domain separation (see
+        // `prove_global_frame_header`): 2.1.0 frames mix `0x020100` into the VDF
+        // challenge so a replayed pre-flag-day frame fails this verify.
+        if header.frame_number > GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME {
+            input.extend_from_slice(&DOMAIN_2_1_0);
+        }
         input.extend_from_slice(&header.frame_number.to_be_bytes());
         input.extend_from_slice(&(header.timestamp as u64).to_be_bytes());
         input.extend_from_slice(&header.difficulty.to_be_bytes());
@@ -482,7 +500,12 @@ impl FrameProver for WesolowskiFrameProver {
         let mp_count =
             u32::from_be_bytes(mp[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
-        let mut multiproofs: Vec<&[u8]> = Vec::with_capacity(mp_count);
+        // `mp_count` lives in the UNAUTHENTICATED signature tail (beyond the
+        // Falcon-verified prefix), so any relayer can inflate it. Each multiproof
+        // is a fixed 516 bytes — cap the pre-allocation against remaining bytes so
+        // a bogus count can't drive a multi-GB `Vec::with_capacity` → OOM/abort.
+        let mut multiproofs: Vec<&[u8]> =
+            Vec::with_capacity(mp_count.min(mp.len().saturating_sub(cursor) / 516));
         for _ in 0..mp_count {
             if cursor + 516 > mp.len() {
                 tracing::warn!(
@@ -776,6 +799,63 @@ mod batch_tests {
         assert!(
             fp.verify_global_frame_header(&stripped).is_err(),
             "stripped aux roots must fail verify"
+        );
+    }
+
+    /// Flag-day VDF domain separation: frames above the last legacy frame mix
+    /// `0x020100` into the challenge, so a pre-flag-day (un-prefixed) frame
+    /// cannot be replayed at a 2.1.0 height after the rewind. Honest frames on
+    /// both sides of the boundary still verify.
+    #[test]
+    fn global_vdf_challenge_domain_separated_above_flag_day() {
+        crate::init();
+        let bls = crate::FalconKeyConstructor;
+        let fp = WesolowskiFrameProver::new(2048);
+        let (signer, _pk) = BlsConstructor::new_key(&bls).unwrap();
+        let prove_at = |prev_n: u64| {
+            let prev = global::GlobalFrameHeader {
+                frame_number: prev_n,
+                output: vec![7u8; 516],
+                ..Default::default()
+            };
+            fp.prove_global_frame_header(
+                &prev,
+                &[],
+                &vec![1u8; 32],
+                &[],
+                &vec![5u8; 32],
+                signer.as_ref(),
+                1234,
+                128,
+                0,
+            )
+            .expect("prove")
+        };
+
+        // Legacy height (== flag day, NOT prefixed): honest round-trip verifies.
+        let legacy = prove_at(GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME - 1);
+        assert_eq!(legacy.frame_number, GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME);
+        assert!(
+            fp.verify_global_frame_header(&legacy).is_ok(),
+            "legacy (un-prefixed) frame must verify"
+        );
+
+        // 2.1.0 height (> flag day, prefixed): honest round-trip verifies.
+        let v210 = prove_at(GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME);
+        assert_eq!(v210.frame_number, GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME + 1);
+        assert!(
+            fp.verify_global_frame_header(&v210).is_ok(),
+            "2.1.0 (prefixed) frame must verify"
+        );
+
+        // Replay barrier: the legacy frame's output was solved against an
+        // un-prefixed challenge. Presenting it at a 2.1.0 height fails the
+        // domain-separated verify — a pre-rewind frame cannot be replayed.
+        let mut replay = legacy.clone();
+        replay.frame_number = GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME + 1;
+        assert!(
+            fp.verify_global_frame_header(&replay).is_err(),
+            "un-prefixed pre-flag-day output must NOT verify at a 2.1.0 height"
         );
     }
 }

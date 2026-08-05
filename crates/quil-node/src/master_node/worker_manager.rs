@@ -4,6 +4,8 @@ use tracing::{debug, info, warn};
 
 // Import KeyManager trait for get_signer
 use quil_keys::KeyManager as _;
+// ClockStore trait — mirror worker-finalized app-shard frames into the master store.
+use quil_types::store::ClockStore as _;
 
 use quil_lifecycle::Supervisor;
 
@@ -107,9 +109,21 @@ pub(crate) fn init(
                     .unwrap_or(8340)
             };
             let master_ep = format!("http://0.0.0.0:{}", master_port);
+            // Derive the master↔worker mTLS materials from the node's Falcon key
+            // (workers derive the identical cert from the same key). Cluster mode
+            // without this would be a plaintext, unauthenticated control channel.
+            let channel_tls_pem = file_key_manager
+                .get_private_key(quil_types::crypto::KeyType::Falcon512)
+                .ok()
+                .and_then(|sk| quil_rpc::quil_tls::build_worker_channel_cert(&sk).ok())
+                .map(|t| (t.ca_cert_pem, t.leaf_cert_pem, t.leaf_key_pem));
+            if channel_tls_pem.is_none() {
+                warn!("cluster mode: could not build worker-channel mTLS cert — worker channel will be UNAUTHENTICATED plaintext");
+            }
             let remote_mgr = Arc::new(quil_engine::remote_worker::RemoteWorkerManager::from_config(
                 &config.engine.data_worker_stream_multiaddrs,
                 master_ep,
+                channel_tls_pem,
             ));
             info!(
                 remote_workers = config.engine.data_worker_stream_multiaddrs.len(),
@@ -137,7 +151,12 @@ pub(crate) fn init(
             remote_mgr as Arc<dyn quil_engine::worker::WorkerManager>
         } else {
             // LOCAL MODE: core-pinned threads
-            let thread_mgr = Arc::new(quil_engine::thread_worker::ThreadWorkerManager::new());
+            // Honor an explicit `dataWorkerCount` in local thread mode (0/unset
+            // → auto-size to cpu-1). Without this the config field was ignored
+            // and every node ran cpu-1 workers regardless of what was requested.
+            let thread_mgr = Arc::new(quil_engine::thread_worker::ThreadWorkerManager::new_with_count(
+                config.engine.data_worker_count,
+            ));
             // Persistent worker registry — survives restarts so the
             // operator's `manually_managed` flag and the
             // worker→filter binding don't reset every reboot.
@@ -368,6 +387,11 @@ pub(crate) fn init(
                 let drain_halt = halt_state.clone();
                 let drain_spawner = spawner.clone();
                 let drain_transport_cell = prover_message_transport.clone();
+                // Master clock store — worker-finalized app-shard frames are mirrored
+                // here so `AppShardService` (and any master-side reader) can serve
+                // them. Workers commit into their OWN per-worker store, which the
+                // master-store-backed service otherwise can't see.
+                let drain_clock_store = clock_store.clone();
                 sup.run_until_cancelled("worker-master-drain", move |_token| async move {
                     loop {
                         let Some(event) = master_rx.recv().await else { break };
@@ -506,6 +530,26 @@ pub(crate) fn init(
                                         // to followers/archives.
                                         if drain_halt.any_halted() {
                                             continue;
+                                        }
+                                        // Mirror the finalized frame into the MASTER clock store
+                                        // so `AppShardService::get_app_shard_frame` (which reads
+                                        // the master store) serves real frames — the worker
+                                        // commits it only into its OWN per-worker store. Mirrors
+                                        // the engine's own commit (stage by selector =
+                                        // poseidon(header.output), so `get_latest_shard_clock_frame`
+                                        // resolves). Best-effort; failure never blocks the publish.
+                                        if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(&frame_data[..]) {
+                                            if let Some(header) = frame.header.as_ref() {
+                                                let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+                                                    .map(|h| h.to_vec())
+                                                    .unwrap_or_default();
+                                                if let Ok(txn) = drain_clock_store.new_transaction(false) {
+                                                    match drain_clock_store.stage_shard_clock_frame(&selector, &frame, txn.as_ref()) {
+                                                        Ok(()) => { let _ = txn.commit(); }
+                                                        Err(e) => warn!(core_id, filter = %hex::encode(&filter), error = %e, "mirror app-shard frame to master store failed"),
+                                                    }
+                                                }
+                                            }
                                         }
                                         let p2p = drain_p2p.clone();
                                         drain_spawner.detach("shard-full-frame-publish", async move {
@@ -740,12 +784,21 @@ pub(crate) fn init(
             Ok(ids) => ids.len() as u32,
             Err(_) => 0,
         };
-        // If no workers exist yet, create them for cores 1..N
+        // If no workers exist yet, create them for cores 1..N. Honor an explicit
+        // `dataWorkerCount` (>0); otherwise auto-size to `available_parallelism-1`
+        // (reserve core 0 for the master). Without honoring the config here, this
+        // loop would spawn cpu-1 worker threads even when the operator asked for
+        // a specific count (e.g. a single-worker localnet).
         if num_cores == 0 {
-            let total = std::thread::available_parallelism()
-                .map(|n| n.get() as u32)
-                .unwrap_or(4);
-            let worker_count = total.saturating_sub(1).max(1); // reserve core 0 for master
+            let worker_count = if config.engine.data_worker_count > 0 {
+                config.engine.data_worker_count as u32
+            } else {
+                std::thread::available_parallelism()
+                    .map(|n| n.get() as u32)
+                    .unwrap_or(4)
+                    .saturating_sub(1)
+                    .max(1) // reserve core 0 for master
+            };
             for core_id in 1..=worker_count {
                 if let Err(e) = worker_manager.allocate_worker(core_id, &[]) {
                     warn!(core_id, error = %e, "failed to pre-allocate idle worker");

@@ -1557,6 +1557,10 @@ fn decode_allocation(
         leave_reject_frame_number: read_u64_be(root, "allocation:ProverAllocation", "LeaveRejectFrameNumber"),
         last_active_frame_number: read_u64_be(root, "allocation:ProverAllocation", "LastActiveFrameNumber"),
         epoch: read_u64_be(root, "allocation:ProverAllocation", "Epoch"),
+        ring: read_bytes(root, "allocation:ProverAllocation", "Ring")
+            .first()
+            .copied()
+            .unwrap_or(0),
         vertex_address: vertex_key[32..64].to_vec(),
     };
     Some((prover_ref, alloc))

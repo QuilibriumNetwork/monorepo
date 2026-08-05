@@ -22,6 +22,34 @@ pub struct GlobalFrameVerifier {
     global_committee: Vec<Vec<u8>>,
 }
 
+/// True iff the request BODY hashes to the header's `requests_root`.
+///
+/// The header is authenticated (VDF binds `requests_root`; the finalization cert
+/// binds `output`), but `frame.requests` is a separate field an attacker can
+/// swap. Every path that ingests a global frame from an untrusted source — the
+/// gossip receiver, the CW consensus `verify`/`on_finalized` seams — MUST call
+/// this to bind the executed body to the certified header. Free function (no
+/// committee state needed) so the seams can reuse it without a verifier handle.
+/// Fails closed on any decode/length mismatch. Uses `ShaInclusionProver` — the
+/// prover the global producer commits with; it MUST match or roots won't agree.
+pub fn global_frame_body_matches_requests_root(
+    header: &GlobalFrameHeader,
+    requests: &[quil_types::proto::global::MessageBundle],
+) -> bool {
+    let canonical: Vec<Vec<u8>> = requests
+        .iter()
+        .filter_map(|b| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok())
+        .collect();
+    if canonical.len() != requests.len() {
+        return false;
+    }
+    let recomputed = crate::leader_provider::compute_global_requests_root(
+        &canonical,
+        &quil_tries::ShaInclusionProver,
+    );
+    recomputed == header.requests_root
+}
+
 impl GlobalFrameVerifier {
     pub fn new(frame_prover: Arc<dyn FrameProver>) -> Self {
         Self { frame_prover, bls_constructor: None, global_committee: Vec::new() }
@@ -36,6 +64,62 @@ impl GlobalFrameVerifier {
     pub fn with_global_committee(mut self, committee: Vec<Vec<u8>>) -> Self {
         self.global_committee = committee;
         self
+    }
+
+    /// Strict authentication for global frames arriving over the UNTRUSTED
+    /// gossip mesh. The frame MUST carry a simplex FINALIZATION cert (CWCT magic
+    /// in the header sig field) that verifies against the fixed global committee.
+    ///
+    /// This differs from [`Self::validate`], which trusts its mTLS-authenticated
+    /// poller/archive source and — for backward/bootstrap compatibility — accepts
+    /// a frame on its VDF alone when no cert is present. On the gossip path the
+    /// source is any mesh peer and the VDF is publicly computable, so VDF-only
+    /// acceptance would let an attacker who knows the public chain head forge a
+    /// frame and inject it into our state. This check FAILS CLOSED: no committee,
+    /// no cert, or an invalid cert ⇒ reject. Callers should run it BEFORE the
+    /// (more expensive) VDF verify so forged frames are dropped cheaply.
+    pub fn verify_global_finalization_cert(&self, header: &GlobalFrameHeader) -> bool {
+        if self.global_committee.is_empty() {
+            // A node that doesn't know the committee cannot authenticate a
+            // gossiped frame — refuse it and let the mTLS poller be the source.
+            return false;
+        }
+        let Some(cert) = header
+            .public_key_signature_bls48581
+            .as_ref()
+            .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))
+        else {
+            return false;
+        };
+        let output_digest =
+            quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap_or_default();
+        quil_cw_consensus::app_cert::verify_finalization(
+            cert,
+            &self.global_committee,
+            b"global",
+            output_digest,
+        )
+        .is_some()
+    }
+
+    /// Bind a global frame's request BODY to its authenticated header.
+    ///
+    /// The cert + VDF authenticate the header (including `requests_root`), but the
+    /// executed `frame.requests` list is a separate field. Without this check an
+    /// attacker could take a real frame's valid header+cert+VDF and swap in a
+    /// different (individually intrinsic-valid) request set, diverging a receiver's
+    /// state from the real chain. We recompute the root from the carried requests
+    /// and require it to equal the authenticated `header.requests_root`.
+    ///
+    /// Uses `ShaInclusionProver` — the prover the global producer commits with
+    /// (see `GlobalLeaderProvider::compute_requests_root`); it MUST match or the
+    /// roots won't agree. Fails closed on any decode/length mismatch.
+    pub fn verify_global_requests_root(
+        &self,
+        header: &GlobalFrameHeader,
+        requests: &[quil_types::proto::global::MessageBundle],
+    ) -> bool {
+        global_frame_body_matches_requests_root(header, requests)
     }
 
     /// Decode raw bytes into a GlobalFrame.
@@ -589,18 +673,31 @@ impl BlsAppFrameValidator {
                     header.timestamp, global_timestamp, MAX_BEHIND_MS,
                 )));
             }
-        } else if let Err(e) = self.frame_prover.verify_frame_header(header) {
-            debug!(
-                frame_number = header.frame_number,
-                address = %hex::encode(&header.address),
-                parent_selector = %hex::encode(&header.parent_selector),
-                error = %e,
-                "frame verification failed"
+        } else {
+            // Genesis / no global anchor. App-shard frames use NO VDF at all
+            // (removed): recompute the deterministic output with a ZERO-ANCHOR ρ_N
+            // (`derive_storage_beacon(0, &[])`, matching the producer) and require
+            // it to match the header — the same check as the storage branch above,
+            // minus the ρ_N global anchor which does not exist pre-global-chain.
+            let rho_n = quil_crypto::porep::derive_storage_beacon(0, &[]);
+            let expected = quil_crypto::porep::deterministic_app_frame_output(
+                &header.parent_selector,
+                &header.requests_root,
+                &header.state_roots,
+                &rho_n,
+                header.frame_number,
+                header.rank,
+                &header.prover,
+                header.difficulty,
+                header.fee_multiplier_vote,
+                header.timestamp,
+                &header.storage_attestation_root,
             );
-            return Err(QuilError::Crypto(format!(
-                "frame header verification: {}",
-                e
-            )));
+            if expected != header.output {
+                return Err(QuilError::Crypto(
+                    "genesis app-shard frame: deterministic output does not match header".into(),
+                ));
+            }
         }
 
         // 2. Aggregate-key check. Required for every post-genesis
@@ -1073,13 +1170,32 @@ mod tests {
             Arc::new(StubBls::default()),
             Arc::new(StubFrameProver::default()),
         );
-        let header = FrameHeader {
+        let mut header = FrameHeader {
             address: vec![0x01u8; 32],
             state_roots: vec![vec![0u8; 64]; 4],
             frame_number: 3,
             public_key_signature_bls48581: None,
             ..Default::default()
         };
+        // App-shard frames use NO VDF: the (genesis, global_frame_number==0)
+        // verify path recomputes the deterministic zero-anchor ρ_N output and
+        // requires it to match. Stamp the correct output so validation gets PAST
+        // the output check and reaches the BLS-signature requirement this test
+        // exercises. (Previously this hit the now-removed VDF branch.)
+        let rho_n = quil_crypto::porep::derive_storage_beacon(0, &[]);
+        header.output = quil_crypto::porep::deterministic_app_frame_output(
+            &header.parent_selector,
+            &header.requests_root,
+            &header.state_roots,
+            &rho_n,
+            header.frame_number,
+            header.rank,
+            &header.prover,
+            header.difficulty,
+            header.fee_multiplier_vote,
+            header.timestamp,
+            &header.storage_attestation_root,
+        );
         let frame = AppShardFrame {
             header: Some(header),
             requests: Vec::new(),
@@ -1147,6 +1263,101 @@ mod tests {
         // than panicking.
         let res = GlobalFrameVerifier::decode_frame(&[0xFFu8; 8]);
         assert!(res.is_err());
+    }
+
+    // ---- gossip untrusted-source cert gate (Finding 1) ----
+
+    #[test]
+    fn gossip_cert_gate_rejects_when_committee_empty() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        // No committee configured ⇒ cannot authenticate a gossiped frame ⇒
+        // must fail closed even if the frame otherwise looks fine.
+        let v = GlobalFrameVerifier::with_bls(
+            Arc::new(StubFrameProver::default()),
+            Arc::new(StubBls::default()),
+        );
+        let header = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            ..Default::default()
+        };
+        assert!(!v.verify_global_finalization_cert(&header));
+    }
+
+    #[test]
+    fn gossip_cert_gate_rejects_absent_and_garbage_cert() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        use quil_types::proto::keys::{Bls48581AggregateSignature, Bls48581g2PublicKey};
+        // Committee is set, so the ONLY thing standing between a forged frame and
+        // acceptance is a real cert. A frame with no sig, and a frame with a
+        // bogus (non-CWCT / unverifiable) sig, must both be rejected.
+        let v = GlobalFrameVerifier::with_bls(
+            Arc::new(StubFrameProver::default()),
+            Arc::new(StubBls::default()),
+        )
+        .with_global_committee(vec![vec![0x09u8; 897]]);
+
+        // (a) no signature field at all — the exact VDF-only forgery vector.
+        let no_sig = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            ..Default::default()
+        };
+        assert!(
+            !v.verify_global_finalization_cert(&no_sig),
+            "a frame with no committee cert must be rejected on the gossip path"
+        );
+
+        // (b) a signature field that is not a valid CWCT cert (random bytes).
+        let garbage_sig = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            public_key_signature_bls48581: Some(Bls48581AggregateSignature {
+                public_key: Some(Bls48581g2PublicKey { key_value: Vec::new() }),
+                signature: vec![0xAAu8; 128],
+                bitmask: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !v.verify_global_finalization_cert(&garbage_sig),
+            "a frame with a bogus/unverifiable cert must be rejected"
+        );
+    }
+
+    #[test]
+    fn requests_root_gate_binds_body_to_header() {
+        use quil_types::proto::global::{GlobalFrameHeader, MessageBundle};
+        let v = GlobalFrameVerifier::with_bls(
+            Arc::new(StubFrameProver::default()),
+            Arc::new(StubBls::default()),
+        );
+        // A header whose requests_root is the authentic root of an EMPTY body.
+        let empty_root = crate::leader_provider::compute_global_requests_root(
+            &[],
+            &quil_tries::ShaInclusionProver,
+        );
+        let header = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            requests_root: empty_root,
+            ..Default::default()
+        };
+        // Matching (empty) body ⇒ accept.
+        assert!(v.verify_global_requests_root(&header, &[]));
+        // A body swapped in under the SAME authenticated header ⇒ its root no
+        // longer matches ⇒ reject (this is the forgery we're closing).
+        let swapped = vec![MessageBundle::default()];
+        assert!(
+            !v.verify_global_requests_root(&header, &swapped),
+            "a body that doesn't hash to the authenticated requests_root must be rejected"
+        );
+        // A header claiming a bogus root with an empty body ⇒ reject.
+        let bad_header = GlobalFrameHeader {
+            requests_root: vec![0xEEu8; 32],
+            ..header.clone()
+        };
+        assert!(!v.verify_global_requests_root(&bad_header, &[]));
     }
 
     // ---- test stubs ----

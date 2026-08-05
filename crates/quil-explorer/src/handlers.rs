@@ -1883,6 +1883,7 @@ mod tests {
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
                     epoch: 0,
+                    ring: 0,
                     vertex_address: vec![],
                 },
                 ProverAllocationInfo {
@@ -1900,6 +1901,7 @@ mod tests {
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
                     epoch: 0,
+                    ring: 0,
                     vertex_address: vec![],
                 },
             ],
@@ -2003,6 +2005,7 @@ mod tests {
             epoch: quil_types::consensus::epoch_for_frame(
                 quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 100_000,
             ),
+            ring: 0,
             vertex_address: vec![],
         }
     }

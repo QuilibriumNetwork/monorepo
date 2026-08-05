@@ -78,7 +78,12 @@ pub(crate) async fn start(
         .and_then(|f| f.header.map(|h| h.frame_number))
         .map(|n| n == 0)
         .unwrap_or(true);
-    if quil_forest_migrate::install_forest_boot(crdt.as_ref(), hg_store.as_ref(), store_is_fresh) {
+    if quil_forest_migrate::install_forest_boot(
+        crdt.as_ref(),
+        hg_store.as_ref(),
+        store_is_fresh,
+        config.p2p.network == 0,
+    ) {
         tracing::info!("Phase-3 JMT forest installed — committing state to the forest");
     }
     // Same crypto setup as the master node — bulletproof is real;
@@ -213,10 +218,29 @@ pub(crate) async fn start(
         })
     });
 
+    // Worker-channel mTLS materials: derived deterministically from the node's
+    // Falcon key (the master derives the identical cert), so the DataIpc server
+    // requires a client cert from a master holding the node's key — closing the
+    // previously plaintext/unauthenticated control channel.
+    let (channel_tls_ca_pem, channel_tls_leaf_pem, channel_tls_key_pem) = match file_key_manager
+        .get_private_key(quil_types::crypto::KeyType::Falcon512)
+        .ok()
+        .and_then(|sk| quil_rpc::quil_tls::build_worker_channel_cert(&sk).ok())
+    {
+        Some(t) => (Some(t.ca_cert_pem), Some(t.leaf_cert_pem), Some(t.leaf_key_pem)),
+        None => {
+            warn!("could not build worker-channel mTLS cert — DataIpc server will be UNAUTHENTICATED plaintext");
+            (None, None, None)
+        }
+    };
+
     let worker_config = quil_engine::worker_node::WorkerNodeConfig {
         core_id,
         master_endpoint,
         listen_addr,
+        channel_tls_ca_pem,
+        channel_tls_leaf_pem,
+        channel_tls_key_pem,
         parent_pid: if parent_process > 0 { Some(parent_process) } else { None },
         channel_factory: Some(channel_factory),
         app_consensus_cw: config.engine.app_consensus_cw,

@@ -134,6 +134,12 @@ pub struct CwGlobalDeps {
     /// simplex leader timeout (seconds); 0 = engine default (30s).
     pub leader_timeout_secs: u64,
     pub transport: Arc<dyn GlobalConsensusTransport>,
+    /// GOSSIP publisher for finalized global frames (proposer-only) so regular
+    /// nodes get frames over gossip instead of RPC-polling. `None` = disabled.
+    pub global_frame_publisher: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    /// This node's 32-byte prover address — the proposer gate for the publisher
+    /// (a finalized global frame's `prover` field is the proposer's address).
+    pub local_prover_address: Vec<u8>,
     pub resolve_peer: PeerResolver,
     /// Persistent directory for the simplex journal. MUST be stable under the
     /// node's data dir so consensus resumes across restarts (the default is a
@@ -178,6 +184,8 @@ pub fn start_cw_global_consensus(deps: CwGlobalDeps) -> Option<CwInboundRouter> 
         deps.leader_timeout_secs,
         deps.transport,
         deps.storage_directory,
+        deps.global_frame_publisher,
+        deps.local_prover_address,
     );
 
     tracing::info!("commonware-simplex global consensus started");
