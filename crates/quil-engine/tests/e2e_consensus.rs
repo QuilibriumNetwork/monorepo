@@ -1294,6 +1294,31 @@ fn build_genesis_seed_hex(provers: &[TestProver]) -> String {
     hex::encode(blob)
 }
 
+/// Apply a frame as a node already synced to its PARENT.
+///
+/// The materializer enforces an in-order invariant: it refuses to apply a frame
+/// ahead of its cursor (`frame_number > last + 1`), since building on state we
+/// don't hold forks the prover root. These tests hand it a single frame at an
+/// arbitrary height, so seed the cursor to `N-1` first — exactly what production
+/// does via `seed_cursor` at startup / after a state jump.
+pub trait MaterializeSynced {
+    fn materialize_synced(
+        &self,
+        frame: &gpb::GlobalFrame,
+    ) -> QResult<quil_engine::frame_materializer::MaterializeResult>;
+}
+
+impl MaterializeSynced for quil_engine::frame_materializer::FrameMaterializer {
+    fn materialize_synced(
+        &self,
+        frame: &gpb::GlobalFrame,
+    ) -> QResult<quil_engine::frame_materializer::MaterializeResult> {
+        let n = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+        self.seed_cursor(n.saturating_sub(1));
+        self.materialize(frame)
+    }
+}
+
 /// Per-archive Tier-2 wiring: real production materializer + lifecycle
 /// + pipeline on top of an in-memory RocksHypergraphStore. Built from
 /// a shared genesis seed so every archive starts with the same prover
@@ -1712,7 +1737,7 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
 
     let result = archive
         .materializer
-        .materialize(&frame_to_materialize)
+        .materialize_synced(&frame_to_materialize)
         .expect("materialize frame with ProverJoin bundle");
     eprintln!(
         "materialize result: processed={} skipped={}",
@@ -1875,7 +1900,7 @@ async fn tier2_adversarial_forged_join_signature_rejected() {
     };
     let result = archive
         .materializer
-        .materialize(&frame)
+        .materialize_synced(&frame)
         .expect("materialize call should succeed (rejection happens per-request)");
     eprintln!(
         "tampered-bundle materialize: processed={} skipped={}",
@@ -1981,7 +2006,7 @@ async fn tier2_adversarial_premature_confirm_rejected() {
     let join_frame = build_global_frame_with_bundle(6, &join_bundles[0]);
     archive
         .materializer
-        .materialize(&join_frame)
+        .materialize_synced(&join_frame)
         .expect("materialize join");
     archive
         .prover_registry
@@ -2050,7 +2075,7 @@ async fn tier2_adversarial_premature_confirm_rejected() {
     };
     let result = archive
         .materializer
-        .materialize(&confirm_frame_proto)
+        .materialize_synced(&confirm_frame_proto)
         .expect("materialize call");
     eprintln!(
         "premature-confirm materialize: processed={} skipped={}",
@@ -2166,7 +2191,7 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
     let join_frame = build_global_frame_with_bundle(6, &join_bundles[0]);
     archive
         .materializer
-        .materialize(&join_frame)
+        .materialize_synced(&join_frame)
         .expect("materialize join");
     archive
         .prover_registry
@@ -2240,7 +2265,7 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
     };
     let result = archive
         .materializer
-        .materialize(&attack_frame)
+        .materialize_synced(&attack_frame)
         .expect("materialize call");
     eprintln!(
         "wrong-signer attack materialize: processed={} skipped={}",
@@ -2433,7 +2458,7 @@ async fn tier2_shard_coverage_reaches_archive_materializer() {
     // Hand the synthetic frame to the archive's real materializer.
     let result = archive
         .materializer
-        .materialize(&coverage_frame)
+        .materialize_synced(&coverage_frame)
         .expect("materialize coverage frame");
     eprintln!(
         "archive materialize result: processed={} skipped={}",
@@ -2708,7 +2733,7 @@ async fn self_coverage_composite_loopback() {
 
     let result = archive
         .materializer
-        .materialize(&coverage_frame)
+        .materialize_synced(&coverage_frame)
         .expect("materialize self-coverage frame");
     eprintln!(
         "self-coverage materialize: processed={} skipped={}",
@@ -2837,7 +2862,7 @@ async fn tier2_storage_audit_evicts_cheating_member() {
     let coverage_frame = build_global_frame_with_bundle(1001, &bundle);
     let result = archive
         .materializer
-        .materialize(&coverage_frame)
+        .materialize_synced(&coverage_frame)
         .expect("materialize reward proof with cheating attestation");
     assert!(
         result.processed >= 1,

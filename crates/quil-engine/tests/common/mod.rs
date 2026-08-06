@@ -984,6 +984,59 @@ pub fn build_genesis_seed_hex(provers: &[TestProver]) -> String {
     hex::encode(blob)
 }
 
+/// Fill an app-shard `FrameHeader`'s `output` with the deterministic digest the
+/// producer stamps.
+///
+/// App-shard frames carry no VDF — `AppLeaderProvider` sets `output` to
+/// `porep::deterministic_app_frame_output`, and the attestation verifier
+/// recomputes it. A genesis / no-global-anchor header (`global_frame_number ==
+/// 0`) binds the ZERO-ANCHOR ρ_N, since there is no global VDF output to bind
+/// freshness to. Synthetic headers must be stamped or they are (correctly)
+/// rejected as not matching their own digest.
+pub fn stamp_app_frame_output(
+    h: &mut quil_execution::global_intrinsic::frame_header::FrameHeader,
+) {
+    let rho_n = quil_crypto::porep::derive_storage_beacon(0, &[]);
+    h.output = quil_crypto::porep::deterministic_app_frame_output(
+        &h.parent_selector,
+        &h.requests_root,
+        &h.state_roots,
+        &rho_n,
+        h.frame_number,
+        h.rank,
+        &h.prover,
+        h.difficulty,
+        h.fee_multiplier_vote as u64,
+        h.timestamp,
+        &h.storage_attestation_root,
+    );
+}
+
+/// Apply a frame as a node already synced to its PARENT.
+///
+/// The materializer enforces an in-order invariant: it refuses to apply a frame
+/// ahead of its cursor (`frame_number > last + 1`), since building on state we
+/// don't hold forks the prover root. These tests hand it a single frame at an
+/// arbitrary height, so seed the cursor to `N-1` first — exactly what production
+/// does via `seed_cursor` at startup / after a state jump.
+pub trait MaterializeSynced {
+    fn materialize_synced(
+        &self,
+        frame: &gpb::GlobalFrame,
+    ) -> QResult<quil_engine::frame_materializer::MaterializeResult>;
+}
+
+impl MaterializeSynced for quil_engine::frame_materializer::FrameMaterializer {
+    fn materialize_synced(
+        &self,
+        frame: &gpb::GlobalFrame,
+    ) -> QResult<quil_engine::frame_materializer::MaterializeResult> {
+        let n = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+        self.seed_cursor(n.saturating_sub(1));
+        self.materialize(frame)
+    }
+}
+
 /// Per-archive Tier-2 wiring: real production materializer + lifecycle
 /// + pipeline on top of an in-memory RocksHypergraphStore. Built from
 /// a shared genesis seed so every archive starts with the same prover

@@ -216,6 +216,22 @@ fn frame_at(n: u64) -> GlobalFrame {
     }
 }
 
+/// Materialize `frame` as a node already synced to its PARENT.
+///
+/// The materializer enforces an in-order invariant: it refuses to apply a frame
+/// that sits ahead of its cursor (`frame_number > last + 1`), because building
+/// on state we don't hold forks the prover root. These harnesses jump straight
+/// to a high frame number, so seed the cursor to `N-1` first — exactly what
+/// production does via `seed_cursor` at startup / after a state jump.
+fn materialize_synced(
+    m: &FrameMaterializer,
+    frame: &GlobalFrame,
+) -> quil_types::error::Result<quil_engine::frame_materializer::MaterializeResult> {
+    let n = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+    m.seed_cursor(n.saturating_sub(1));
+    m.materialize(frame)
+}
+
 /// End-to-end: an inactive prover present only in the flat keyspace (the
 /// sync seam) is kicked when the materializer materializes a frame past the
 /// eviction activation — exercising find_eviction_candidates (registry) →
@@ -255,7 +271,7 @@ fn materialize_evicts_inactive_prover_present_only_in_flat_store() {
     // Materialize a frame past activation — the materializer's eviction step
     // runs, reads the vertex via the flat-store fallback, kicks it, commits,
     // and refreshes the registry.
-    h.materializer.materialize(&frame_at(frame)).expect("materialize");
+    materialize_synced(&h.materializer, &frame_at(frame)).expect("materialize");
 
     // The kicked prover must no longer be an eviction candidate (Status=4 →
     // dropped from the registry on refresh).
@@ -371,8 +387,8 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
     // census-only, so each node's coverage map does NOT affect it — node B's
     // full-halt-on-everything map must NOT stop it from evicting shard X. Assert
     // the resulting prover roots are byte-identical.
-    node_a.materializer.materialize(&frame_at(frame)).expect("materialize A");
-    node_b.materializer.materialize(&frame_at(frame)).expect("materialize B");
+    materialize_synced(&node_a.materializer, &frame_at(frame)).expect("materialize A");
+    materialize_synced(&node_b.materializer, &frame_at(frame)).expect("materialize B");
 
     let root_a = prover_root(&node_a);
     let root_b = prover_root(&node_b);

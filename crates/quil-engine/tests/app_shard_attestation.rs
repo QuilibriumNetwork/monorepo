@@ -64,6 +64,31 @@ fn app_address_from_filter(filter: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
+/// Stamp the frame `output` exactly as the producer does.
+///
+/// App-shard frames carry NO VDF: `prove_frame_header` leaves `output` empty and
+/// `AppLeaderProvider` fills it with the deterministic ρ_N-bound digest. These
+/// headers are genesis / no-global-anchor (`global_frame_number == 0`), so ρ_N is
+/// the ZERO-ANCHOR beacon — the same value the verifier recomputes. `rank` is
+/// passed separately because `prove_frame_header` returns `rank: 0` while the
+/// header that rides the wire (and gets voted on) carries the real rank.
+fn stamp_app_frame_output(proto: &mut quil_types::proto::global::FrameHeader, rank: u64) {
+    let rho_n = quil_crypto::porep::derive_storage_beacon(0, &[]);
+    proto.output = quil_crypto::porep::deterministic_app_frame_output(
+        &proto.parent_selector,
+        &proto.requests_root,
+        &proto.state_roots,
+        &rho_n,
+        proto.frame_number,
+        rank,
+        &proto.prover,
+        proto.difficulty,
+        proto.fee_multiplier_vote,
+        proto.timestamp,
+        &proto.storage_attestation_root,
+    );
+}
+
 /// Build a deterministic 32-byte filter for the test.
 fn test_filter() -> Vec<u8> {
     let mut f = vec![0u8; 32];
@@ -111,6 +136,7 @@ fn build_committee(
                 leave_reject_frame_number: 0,
                 last_active_frame_number: 0,
                 epoch: 0,
+                ring: 0,
                 vertex_address: Vec::new(),
             }],
             available_storage: 0,
@@ -177,11 +203,12 @@ fn build_and_verify_partial_with_filter(
     let rank: u64 = 42;
     let fee_multiplier_vote: u64 = 0;
 
-    let proto = frame_prover.prove_frame_header(
+    let mut proto = frame_prover.prove_frame_header(
         &[], &app_address, &requests_root, &state_roots,
         &prover_address, timestamp, difficulty, fee_multiplier_vote, frame_number,
         &[], 0,
     )?;
+    stamp_app_frame_output(&mut proto, rank);
 
     let identity = quil_crypto::poseidon::hash_bytes_to_32(&proto.output)?.to_vec();
     let vote_payload = make_vote_message(&app_address, rank, &identity);
@@ -321,7 +348,7 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
     let rank: u64 = 42;
     let fee_multiplier_vote: u64 = 0;
 
-    let proto = frame_prover.prove_frame_header(
+    let mut proto = frame_prover.prove_frame_header(
         &[],                              // previous_frame_output
         &app_address,                     // address — must match verifier
         &requests_root,
@@ -334,6 +361,7 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
         &[],
         0,
     )?;
+    stamp_app_frame_output(&mut proto, rank);
 
     // 3. Each signer produces a vote. The payload + domain must
     //    byte-exactly match what the verifier reconstructs.
@@ -492,7 +520,7 @@ fn signing_with_raw_filter_instead_of_app_address_must_fail_verify() {
     let frame_number: u64 = 1;
     let rank: u64 = 42;
 
-    let proto = frame_prover
+    let mut proto = frame_prover
         .prove_frame_header(
             &[],
             &app_address,
@@ -507,6 +535,7 @@ fn signing_with_raw_filter_instead_of_app_address_must_fail_verify() {
             0,
         )
         .unwrap();
+    stamp_app_frame_output(&mut proto, rank);
 
     let identity = quil_crypto::poseidon::hash_bytes_to_32(&proto.output)
         .unwrap()
