@@ -667,7 +667,20 @@ impl AppShardHarness {
         provers: Vec<TestProver>,
         registry: Arc<dyn ProverRegistry>,
     ) -> Self {
-        Self::build_inner(provers, registry, None)
+        Self::build_inner(provers, registry, None, false)
+    }
+
+    /// (P3) Build `n` workers driving the shard with commonware-simplex + Falcon
+    /// (`app_consensus_cw = true`). For `n == 1` the single committee member
+    /// self-proposes + self-finalizes (the `NoopAppTransport` in the engine has
+    /// no peers to reach); multi-worker CW needs the gossip transport wired.
+    pub fn build_cw(n: usize) -> Self {
+        assert!(n >= 1, "need at least one worker");
+        let provers: Vec<TestProver> = (0..n).map(|_| TestProver::generate()).collect();
+        let all_prover_infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
+        let registry =
+            Arc::new(TestProverRegistry::with_provers(all_prover_infos)) as Arc<dyn ProverRegistry>;
+        Self::build_inner(provers, registry, None, true)
     }
 
     /// Active-path PoRep variant: every worker gets a shared committed CRDT, an
@@ -681,13 +694,14 @@ impl AppShardHarness {
         registry: Arc<dyn ProverRegistry>,
         storage: StorageHarness,
     ) -> Self {
-        Self::build_inner(provers, registry, Some(storage))
+        Self::build_inner(provers, registry, Some(storage), false)
     }
 
     fn build_inner(
         provers: Vec<TestProver>,
         registry: Arc<dyn ProverRegistry>,
         storage: Option<StorageHarness>,
+        app_cw: bool,
     ) -> Self {
         let n = provers.len();
         assert!(n >= 1, "need at least one worker");
@@ -788,7 +802,7 @@ impl AppShardHarness {
                     Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
                 ),
                 kv_db: kv_db_dep,
-                app_consensus_cw: false,
+                app_consensus_cw: app_cw,
             db_config: quil_config::DbConfig { path: String::new(), worker_path_prefix: String::new(), worker_paths: vec![], ..Default::default() }, // ephemeral journal in tests
             };
 
@@ -817,6 +831,10 @@ impl AppShardHarness {
         // to broadcast to peers (= every worker except self).
         let all_handles: Vec<quil_engine::app_engine::AppEngineHandle> =
             workers.iter().map(|w| w.handle.clone()).collect();
+        // (P3) Each worker's committee Falcon pubkey, so the CW event drain can
+        // tag `CwIn.from` when routing `CwOut` to peers (in-memory transport).
+        let all_pubkeys: Vec<Vec<u8>> =
+            workers.iter().map(|w| w.prover.bls_pubkey.clone()).collect();
         let events_per_worker: Vec<Arc<Mutex<Vec<String>>>> =
             workers.iter().map(|w| w.events.clone()).collect();
         let full_frames_per_worker: Vec<Arc<Mutex<Vec<Vec<u8>>>>> =
@@ -843,6 +861,7 @@ impl AppShardHarness {
                 .filter(|(i, _)| *i != idx)
                 .map(|(_, h)| h.clone())
                 .collect();
+            let my_pubkey = all_pubkeys[idx].clone();
             let events_log = events_per_worker[idx].clone();
             let full_frames_log = full_frames_per_worker[idx].clone();
             let mut rx = pending.event_rx;
@@ -899,12 +918,17 @@ impl AppShardHarness {
                         E::ParentSealed { .. } => {
                             events_log.lock().push("ParentSealed".into());
                         }
-                        E::CwOut { .. } => {
-                            // Legacy (non-CW) app harness: the CW path
-                            // is disabled (`app_consensus_cw: false`),
-                            // so this event never fires. Present only
-                            // to keep the match exhaustive.
+                        E::CwOut { channel, bytes, .. } => {
                             events_log.lock().push("CwOut".into());
+                            // In-memory CW transport: deliver to every peer's
+                            // `CwIn`, tagged with this worker's committee key.
+                            for h in &peer_handles {
+                                h.send(quil_engine::app_engine::AppEngineMessage::CwIn {
+                                    channel: *channel,
+                                    from: my_pubkey.clone(),
+                                    data: bytes.clone(),
+                                });
+                            }
                         }
                     }
                 }
