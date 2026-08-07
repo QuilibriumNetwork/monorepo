@@ -131,53 +131,159 @@ pub struct LegacyMigrationSummary {
     pub total_amount: u128,
 }
 
-/// Archive-node bulk migration: scan every committed coin vertex of `domain`,
-/// decrypt each legacy verenc coin, write its compact transparent entry, and
-/// **remove the verenc original** (tombstone into the removes phase) so the coin
-/// is represented exactly once — no double-count in the forest and no
-/// double-spend via the legacy path. Non-legacy vertices are skipped. The
-/// decrypt + address derivation are deterministic ⇒ every node produces the
-/// same result ⇒ consensus-safe. Returns the count + total value moved. (Run
-/// once behind the migration flag; the caller commits the frame afterward.)
-pub fn migrate_all_legacy_coins(
-    state: &crate::hypergraph_state::HypergraphState,
-    domain: &[u8],
-) -> Result<LegacyMigrationSummary> {
-    // `vertex_key = domain(32) ‖ address(32)`; keep it to derive the origin and
-    // to tombstone the original.
-    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    state
-        .crdt()
-        .for_each_vertex_adds_blob(domain, &mut |key, blob| entries.push((key, blob)))?;
-    let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
-    let vr_disc = crate::hypergraph_state::vertex_removes_discriminator()?;
-    let mut summary = LegacyMigrationSummary::default();
-    for (vertex_key, blob) in entries {
-        // Defensive: a well-formed vertex key is `domain ‖ address` (64 bytes).
-        if vertex_key.len() < 64 {
-            continue;
-        }
-        let mut origin = [0u8; 32];
-        origin.copy_from_slice(&vertex_key[32..64]);
+/// The single store shard holding all of `domain`'s coin vertices — `l2` = the
+/// (padded) domain address (`shard_key_for_location`). All coins live under this
+/// one keyspace; the forest build later sub-shards them by address.
+pub fn coin_domain_shard(domain: &[u8]) -> quil_types::store::ShardKey {
+    let mut app = [0u8; 32];
+    let n = domain.len().min(32);
+    app[..n].copy_from_slice(&domain[..n]);
+    quil_hypergraph::addressing::shard_key_for_location(&quil_hypergraph::addressing::Location {
+        app_address: app,
+        data_address: [0u8; 32],
+    })
+}
 
-        let tree = VectorCommitmentTree {
-            root: quil_tries::deserialize_go_tree(&blob)
-                .map_err(|e| QuilError::Internal(format!("migrate: deserialize: {e}")))?,
-        };
-        if let Some((addr, amount, ttree)) = migrate_legacy_coin(domain, &tree, &origin)? {
+/// Archive-node bulk verenc→transparent migration, STREAMING (bounded memory):
+/// scans the coin keyspace in `chunk_size`-row snapshot chunks
+/// ([`stream_migrate_vertex_adds`](quil_store::RocksHypergraphStore::stream_migrate_vertex_adds),
+/// `rayon` per-coin transform), emitting `VertexWrite`s straight to the KV
+/// keyspace — NO `HypergraphState` changeset, NO per-coin KZG recompute — so peak
+/// memory is O(chunk) even at 100+ GB coin sets. Each legacy verenc coin becomes
+/// a transparent entry at its content address and the verenc original is
+/// PHYSICALLY DELETED from the adds phase. Deterministic ⇒ consensus-safe. The
+/// forest is rebuilt afterward (`quil_forest_migrate`); the caller records the
+/// conservation receipt. Returns the count + total value moved;
+/// `progress(scanned, migrated)` fires per chunk.
+pub fn migrate_all_legacy_coins(
+    store: &quil_store::RocksHypergraphStore,
+    domain: &[u8],
+    chunk_size: usize,
+    progress: &mut (dyn FnMut(usize, usize) + Send),
+) -> Result<LegacyMigrationSummary> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let shard = coin_domain_shard(domain);
+    let dom: Vec<u8> = domain[..domain.len().min(32)].to_vec();
+
+    // PARALLELISM across the 256 top-address-byte ranges: one snapshot iterator +
+    // transform + writer per range, fanned across the rayon pool so ALL cores
+    // stay busy. A single serial iterator was the throughput ceiling (the
+    // per-coin verenc decode is cheap and thread-safe; the bottleneck was the
+    // scan/write pipeline running on one core). Ranges are disjoint by address ⇒
+    // each coin is migrated exactly once. The transform is serial WITHIN a range
+    // (the range fan-out is the parallelism).
+    let scanned = AtomicUsize::new(0);
+    let migrated = AtomicUsize::new(0);
+    let total = Mutex::new(0u128);
+    let progress = Mutex::new(progress);
+
+    (0u8..=255u8).into_par_iter().try_for_each(|top| -> Result<()> {
+        // Sub-range key (after the shard prefix): domain(32) ‖ [top address byte].
+        let mut sub = Vec::with_capacity(dom.len() + 1);
+        sub.extend_from_slice(&dom);
+        sub.push(top);
+
+        store.migrate_vertex_adds_subrange(
+            &shard,
+            &sub,
+            chunk_size,
+            |chunk: &[(Vec<u8>, Vec<u8>)]| -> Result<(usize, Vec<quil_store::VertexWrite>)> {
+                let mut writes = Vec::with_capacity(chunk.len() * 2);
+                let mut m = 0usize;
+                let mut chunk_amount: u128 = 0;
+                for (vk, blob) in chunk {
+                    if let Some((amount, ws)) = migrate_one(domain, vk, blob)? {
+                        chunk_amount = chunk_amount.checked_add(amount).ok_or_else(|| {
+                            QuilError::InvalidArgument(
+                                "migrate: total legacy amount overflows u128".into(),
+                            )
+                        })?;
+                        m += 1;
+                        writes.extend(ws);
+                    }
+                }
+                // Fold this chunk's counts into the shared totals and report —
+                // PER CHUNK (across all ranges), so progress is live rather than
+                // only when a whole 760k-coin range finishes.
+                let sc = scanned.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
+                let mi = migrated.fetch_add(m, Ordering::Relaxed) + m;
+                {
+                    let mut t = total.lock().unwrap();
+                    *t = t.checked_add(chunk_amount).ok_or_else(|| {
+                        QuilError::InvalidArgument(
+                            "migrate: total legacy amount overflows u128".into(),
+                        )
+                    })?;
+                }
+                (*progress.lock().unwrap())(sc, mi);
+                Ok((m, writes))
+            },
+        )?;
+        Ok(())
+    })?;
+
+    let total_amount = *total.lock().unwrap();
+    Ok(LegacyMigrationSummary {
+        migrated: migrated.load(Ordering::Relaxed),
+        total_amount,
+    })
+}
+
+/// Transform ONE legacy verenc coin vertex: decode it, emit its transparent
+/// entry at the (unique) content address, and PHYSICALLY DELETE the verenc
+/// original from the adds phase (treated as if it never existed — the
+/// conservation receipt records Σ). Returns `None` for non-legacy vertices and
+/// the reserved metadata vertices (shadow-accumulator root, receipt). Mirrors
+/// [`rescale_one`]. Pure + deterministic ⇒ safe to fan out across `rayon`.
+fn migrate_one(
+    domain: &[u8],
+    vertex_key: &[u8],
+    blob: &[u8],
+) -> Result<Option<(u128, [quil_store::VertexWrite; 2])>> {
+    use super::shadow_accumulator::ACC_ROOT_ADDRESS;
+    if vertex_key.len() < 64 {
+        return Ok(None);
+    }
+    let addr = &vertex_key[32..64];
+    if addr == ACC_ROOT_ADDRESS.as_slice() || addr == MIGRATION_RECEIPT_ADDRESS.as_slice() {
+        return Ok(None);
+    }
+    let mut origin = [0u8; 32];
+    origin.copy_from_slice(&vertex_key[32..64]);
+    let tree = VectorCommitmentTree {
+        root: quil_tries::deserialize_go_tree(blob)
+            .map_err(|e| QuilError::Internal(format!("migrate: deserialize: {e}")))?,
+    };
+    match migrate_legacy_coin(domain, &tree, &origin)? {
+        Some((new_addr, amount, ttree)) => {
             let ser = quil_tries::serialize_go_tree(ttree.root.as_ref())
                 .map_err(|e| QuilError::Internal(format!("migrate: serialize: {e}")))?;
-            // REPLACE: tombstone the verenc original, then add the transparent
-            // entry at its (now unique) content address.
-            state.delete(domain, &origin, &vr_disc, 0)?;
-            state.set(domain, &addr, &va_disc, 0, ser)?;
-            summary.total_amount = summary.total_amount.checked_add(amount).ok_or_else(|| {
-                QuilError::InvalidArgument("migrate: total legacy amount overflows u128".into())
-            })?;
-            summary.migrated += 1;
+            // Put key = domain(32) ‖ new content address(32).
+            let mut add_key = Vec::with_capacity(64);
+            add_key.extend_from_slice(&vertex_key[..32]);
+            add_key.extend_from_slice(&new_addr);
+            Ok(Some((
+                amount,
+                [
+                    quil_store::VertexWrite::Put {
+                        set: "vertex",
+                        phase: "adds",
+                        vertex_key: add_key,
+                        blob: ser,
+                    },
+                    quil_store::VertexWrite::Delete {
+                        set: "vertex",
+                        phase: "adds",
+                        vertex_key: vertex_key.to_vec(),
+                    },
+                ],
+            )))
         }
+        None => Ok(None),
     }
-    Ok(summary)
 }
 
 /// Reserved vertex holding the coin-conservation receipt `count(u64 BE) ‖

@@ -115,6 +115,37 @@ pub fn quil_shards_for_app(app_address: &[u8; 32]) -> Vec<Vec<u32>> {
     }
 }
 
+/// Commit one sub-shard's ONE phase from its `(vertex_key, blob)` buffer, write
+/// the phase-tree head version, and (for the vertex-adds phase) fold the leaf
+/// count + live size into the app aggregates. Returns the phase root. Factored
+/// out so the streaming `convert_app` can flush a sub-shard the moment its
+/// contiguous run of vertices ends — without ever holding a second sub-shard.
+#[allow(clippy::too_many_arguments)]
+fn commit_subshard_phase(
+    forest: &Forest,
+    app_l2: &[u8; 32],
+    prefix: &[u32],
+    phase: Phase,
+    version: u64,
+    buffer: Vec<(Vec<u8>, Vec<u8>)>,
+    num_leaves: &mut u64,
+    total_size: &mut u128,
+) -> anyhow::Result<[u8; 32]> {
+    let leaves = per_vertex_phase_leaves(buffer)?;
+    if phase == Phase::VertexAdds {
+        *num_leaves += leaves.len() as u64;
+        *total_size += leaves.iter().map(|(_, v)| quil_forest::vertex_leaf_size(v)).sum::<u128>();
+    }
+    let shard_id = Forest::addr_path_shard_id(app_l2, prefix);
+    let root = forest
+        .commit_shard_phase_raw(&shard_id, phase, version, leaves)
+        .map_err(|e| anyhow::anyhow!("commit_shard_phase_raw: {e}"))?;
+    forest
+        .write_head_version(&shard_id, phase, version)
+        .map_err(|e| anyhow::anyhow!("write_head_version: {e}"))?;
+    Ok(root)
+}
+
 /// Convert one APP: read its vertices, split them into the app's shards by
 /// address (model B), commit each shard as a field-flattened tree keyed
 /// `addr_path_shard_id(app, prefix)`, and aggregate the shard commitments into
@@ -124,6 +155,16 @@ pub fn quil_shards_for_app(app_address: &[u8; 32]) -> Vec<Vec<u32>> {
 /// which is what keeps every node's app root identical. `num_leaves`/
 /// `total_size` are the app-wide sums (invariant to how the leaves shard).
 /// Returns `None` for an app with no state at all.
+///
+/// STREAMING (bounded memory): the legacy vertices are read one at a time in
+/// address order (`for_each_vertex_unversioned_ordered`), and because the
+/// address-path keys sort by `domain ‖ address`, a sub-shard's vertices (the top
+/// `bpl` address bits) arrive as one contiguous run. We buffer only the CURRENT
+/// sub-shard and commit it the instant the run ends — so peak memory is O(one
+/// sub-shard), NOT O(app). Roots are byte-identical to the old all-at-once path:
+/// `per_vertex_phase_leaves` is per-vertex and the JMT is content-addressed, so
+/// the same leaves under the same shard produce the same root regardless of how
+/// they were buffered. A 100+ GB QUIL coin set used to be loaded whole (OOM).
 pub fn convert_app(
     hg: &RocksHypergraphStore,
     forest: &Forest,
@@ -134,74 +175,174 @@ pub fn convert_app(
     // Canonical bit-path per shard (resolves the QUIL-vs-split-marker overload +
     // supports non-uniform splits), in the SAME order as `prefixes`.
     let bit_paths = canonical_shard_bit_paths(prefixes);
+    let n = prefixes.len();
 
-    // shard INDEX → the four phases' raw (vertex_key, blob) leaves. Route each
-    // vertex to its sub-shard by matching its data address against the canonical
-    // bit-paths (mirrors the running node's `commit_inner`); addresses outside the
-    // declared set fall back to shard 0 so no state is dropped.
-    let mut shard_blobs: Vec<[Vec<(Vec<u8>, Vec<u8>)>; 4]> =
-        (0..prefixes.len()).map(|_| Default::default()).collect();
-    for phase in PHASES {
-        let (set, ph) = phase_strs(phase);
-        for (vk, blob) in read_phase_vertex_blobs(hg, set, ph, app_shard_key)? {
-            let data: &[u8] = if vk.len() == 64 { &vk[32..] } else { &vk[..] };
-            let pi = quil_forest::address_shard_index(data, &bit_paths);
-            shard_blobs[pi][phase as usize].push((vk, blob));
-        }
+    // Per phase, per sub-shard: the committed phase root (None until committed).
+    let mut phase_roots: [Vec<Option<[u8; 32]>>; 4] = Default::default();
+    for p in 0..4 {
+        phase_roots[p] = vec![None; n];
     }
-
-    // Commit each shard (field-flattened) and collect, PER PHASE, its
-    // (bit-path → phase root). Aggregation is per-phase (then rolled up) to
-    // match the running node's `commit_inner` — so a membership proof chains
-    // leaf → shard phase root → app phase root. num_leaves/total_size mirror
-    // ShardMetadata (the vertex-adds phase), summed across shards.
-    let mut phase_shards: [Vec<(Vec<bool>, [u8; 32])>; 4] = Default::default();
     let mut num_leaves: u64 = 0;
     let mut total_size: u128 = 0;
-    let mut nonempty = 0usize;
-    for (i, prefix) in prefixes.iter().enumerate() {
-        let phase_blobs = std::mem::take(&mut shard_blobs[i]);
-        let mut phase_leaves: [Vec<(Vec<u8>, Vec<u8>)>; 4] = Default::default();
-        let mut shard_has_state = false;
-        for (blobs, phase) in phase_blobs.into_iter().zip(PHASES) {
-            let leaves = per_vertex_phase_leaves(blobs)?;
-            if !leaves.is_empty() {
-                shard_has_state = true;
+    // Which sub-shards carry any real (non-empty) state, for the "app has state"
+    // decision and the returned nonempty count.
+    let mut sub_has_state = vec![false; n];
+
+    for phase in PHASES {
+        let (set, ph) = phase_strs(phase);
+
+        // (a) v2 pass: bucket the MVCC v2 vertices by sub-shard, and record their
+        // keys so the (b) unversioned scan skips any it superseded. Bounded by the
+        // v2 count — nil on a fresh Go→rocks DB (v2 is written only by the live
+        // Rust commit AFTER migration), small on a re-run.
+        let mut v2_bufs: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); n];
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        hg.for_each_vertex_v2_max_version(set, ph, app_shard_key, |vk, blob| {
+            let data: &[u8] = if vk.len() == 64 { &vk[32..] } else { vk };
+            let si = quil_forest::address_shard_index(data, &bit_paths);
+            v2_bufs[si].push((vk.to_vec(), blob.to_vec()));
+            seen.insert(vk.to_vec());
+            Ok(())
+        })
+        .map_err(|e| anyhow::anyhow!("v2 scan {set}/{ph}: {e}"))?;
+        let had_v2 = !seen.is_empty();
+
+        // (b) unversioned pass: stream in address order, flushing one contiguous
+        // sub-shard at a time — combined with that sub-shard's v2 leaves.
+        let mut cur_sub: Option<usize> = None;
+        let mut buffer: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        let rows = hg.for_each_vertex_unversioned_ordered(
+            set,
+            ph,
+            app_shard_key,
+            |vk, blob| {
+                if seen.contains(vk) {
+                    return Ok(()); // superseded by a v2 rewrite
+                }
+                let data: &[u8] = if vk.len() == 64 { &vk[32..] } else { vk };
+                let si = quil_forest::address_shard_index(data, &bit_paths);
+                match cur_sub {
+                    Some(c) if c == si => buffer.push((vk.to_vec(), blob.to_vec())),
+                    Some(c) => {
+                        // Contiguity invariant: address-ordered keys ⇒ sub-shard
+                        // index is monotonically non-decreasing. A decrease means
+                        // the key layout assumption is wrong — fail LOUDLY rather
+                        // than silently produce a divergent root.
+                        if si < c {
+                            return Err(quil_types::error::QuilError::Store(format!(
+                                "forest migration: non-monotonic sub-shard {si} < {c}; \
+                                 vertex-key ordering assumption violated for phase {ph}"
+                            )));
+                        }
+                        let mut taken = std::mem::take(&mut buffer);
+                        taken.append(&mut v2_bufs[c]);
+                        let root = commit_subshard_phase(
+                            forest, &app_shard_key.l2, &prefixes[c], phase, version,
+                            taken, &mut num_leaves, &mut total_size,
+                        )
+                        .map_err(|e| quil_types::error::QuilError::Store(e.to_string()))?;
+                        phase_roots[phase as usize][c] = Some(root);
+                        sub_has_state[c] = true;
+                        cur_sub = Some(si);
+                        buffer.push((vk.to_vec(), blob.to_vec()));
+                    }
+                    None => {
+                        cur_sub = Some(si);
+                        buffer.push((vk.to_vec(), blob.to_vec()));
+                    }
+                }
+                Ok(())
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("stream {set}/{ph}: {e}"))?;
+
+        // Flush the final contiguous run (combined with its v2 leaves).
+        if let Some(c) = cur_sub {
+            let mut taken = std::mem::take(&mut buffer);
+            taken.append(&mut v2_bufs[c]);
+            let root = commit_subshard_phase(
+                forest, &app_shard_key.l2, &prefixes[c], phase, version,
+                taken, &mut num_leaves, &mut total_size,
+            )?;
+            phase_roots[phase as usize][c] = Some(root);
+            sub_has_state[c] = true;
+        }
+
+        // Sub-shards touched ONLY by v2 (no unversioned run reached them).
+        for si in 0..n {
+            if !v2_bufs[si].is_empty() {
+                let taken = std::mem::take(&mut v2_bufs[si]);
+                let root = commit_subshard_phase(
+                    forest, &app_shard_key.l2, &prefixes[si], phase, version,
+                    taken, &mut num_leaves, &mut total_size,
+                )?;
+                phase_roots[phase as usize][si] = Some(root);
+                sub_has_state[si] = true;
             }
-            if phase == Phase::VertexAdds {
-                num_leaves += leaves.len() as u64;
-                total_size += leaves.iter().map(|(_, v)| quil_forest::vertex_leaf_size(v)).sum::<u128>();
+        }
+
+        // Legacy whole-tree-blob fallback: a pre-per-vertex-commit shard keeps
+        // its leaves in a single serialized tree rather than the vertex keyspace,
+        // so BOTH keyspace scans find nothing. Load it (bounded — this format
+        // predates the large coin sets) and route + commit per sub-shard.
+        if rows == 0 && !had_v2 {
+            if let Some(blob) = hg
+                .load_tree_blob(set, ph, app_shard_key)
+                .map_err(|e| anyhow::anyhow!("load_tree_blob {set}/{ph}: {e}"))?
+            {
+                if let Some(root_node) = quil_tries::deserialize_tree(&blob)
+                    .map_err(|e| anyhow::anyhow!("deserialize_tree {set}/{ph}: {e}"))?
+                {
+                    let mut t = quil_tries::VectorCommitmentTree::new();
+                    t.root = Some(root_node);
+                    let mut buckets: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); n];
+                    for (vk, b) in t.leaves() {
+                        let data: &[u8] = if vk.len() == 64 { &vk[32..] } else { &vk[..] };
+                        let si = quil_forest::address_shard_index(data, &bit_paths);
+                        buckets[si].push((vk, b));
+                    }
+                    for (si, buf) in buckets.into_iter().enumerate() {
+                        if buf.is_empty() {
+                            continue;
+                        }
+                        let root = commit_subshard_phase(
+                            forest, &app_shard_key.l2, &prefixes[si], phase, version,
+                            buf, &mut num_leaves, &mut total_size,
+                        )?;
+                        phase_roots[phase as usize][si] = Some(root);
+                        sub_has_state[si] = true;
+                    }
+                }
             }
-            phase_leaves[phase as usize] = leaves;
         }
-        if shard_has_state {
-            nonempty += 1;
-        }
-        let shard_id = Forest::addr_path_shard_id(&app_shard_key.l2, prefix);
-        let roots = forest
-            .commit_shard_raw(&shard_id, version, phase_leaves)
-            .map_err(|e| anyhow::anyhow!("commit_shard_raw: {e}"))?;
-        // Mark each phase tree's head version so the running node's version-exact
-        // reads (commit_inner / membership / sync) can address the migrated tree
-        // after the live forest version advances past `version`.
-        for phase in PHASES {
-            forest
-                .write_head_version(&shard_id, phase, version)
-                .map_err(|e| anyhow::anyhow!("write_head_version: {e}"))?;
-        }
-        for p in 0..4 {
-            phase_shards[p].push((bit_paths[i].clone(), roots.phase_roots[p]));
+
+        // Commit the empty (never-touched) sub-shards for this phase so the
+        // aggregation is over the COMPLETE set (empty shard = empty-JMT root).
+        for si in 0..n {
+            if phase_roots[phase as usize][si].is_none() {
+                let root = commit_subshard_phase(
+                    forest, &app_shard_key.l2, &prefixes[si], phase, version,
+                    Vec::new(), &mut num_leaves, &mut total_size,
+                )?;
+                phase_roots[phase as usize][si] = Some(root);
+            }
         }
     }
 
+    let nonempty = sub_has_state.iter().filter(|&&b| b).count();
     if num_leaves == 0 && nonempty == 0 {
         return Ok(None);
     }
+
     // Aggregate the sub-shard roots into an app root PER PHASE, then roll the
     // four app phase roots up into the app commitment.
     let mut app_phase_roots = [[0u8; 32]; 4];
     for p in 0..4 {
-        app_phase_roots[p] = app_root_from_shard_paths(&phase_shards[p]);
+        let shards: Vec<(Vec<bool>, [u8; 32])> = (0..n)
+            .map(|si| (bit_paths[si].clone(), phase_roots[p][si].unwrap_or([0u8; 32])))
+            .collect();
+        app_phase_roots[p] = app_root_from_shard_paths(&shards);
     }
     let app_root = rollup_phase_roots(&app_phase_roots);
     Ok(Some((
@@ -541,6 +682,71 @@ mod tests {
                 &expected,
             )
             .expect("per-vertex leaf verifies against the vertex_adds root");
+    }
+
+    /// The streaming `convert_app` routes an app's vertices to the right
+    /// sub-shard from a SINGLE ordered pass (peak memory = one sub-shard, not the
+    /// whole app — the fix for the QUIL coin-set OOM), and each vertex proves
+    /// against ITS sub-shard's root. Three vertices in a QUIL-style 64-way split
+    /// land in sub-shards 0, 1, and 63 (by the top 6 address bits), arriving in
+    /// address order so the per-sub-shard flush stays monotonic.
+    #[test]
+    fn convert_app_streams_multi_subshard_and_routes_correctly() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let hg = RocksHypergraphStore::new(open_db(src.path()));
+        let forest = Forest::new(open_db(dst.path()));
+
+        let app_key = ShardKey { l2: [0xAAu8; 32], l1: [0u8; 3] };
+        // QUIL-style 64-way split.
+        let prefixes: Vec<Vec<u32>> = (0..64u32).map(|i| vec![i]).collect();
+
+        // vertex_key = domain(32) ‖ address(32); the top 6 address bits pick the
+        // sub-shard. 0x00→0, 0x04→1, 0xFC→63.
+        let domain = [0x11u8; 32];
+        let mk = |first: u8| -> ([u8; 32], Vec<u8>) {
+            let mut addr = [0u8; 32];
+            addr[0] = first;
+            let mut vk = domain.to_vec();
+            vk.extend_from_slice(&addr);
+            (addr, vk)
+        };
+        let type_key = vec![0xFFu8; 32];
+        let cases: [(u8, usize); 3] = [(0x00, 0), (0x04, 1), (0xFC, 63)];
+        for (first, _sub) in cases {
+            let (_addr, vk) = mk(first);
+            let blob = vertex_blob(&[(&type_key, b"x"), (&[first; 32], &[first])]);
+            hg.save_vertex_underlying("vertex", "adds", &app_key, &vk, &blob).unwrap();
+        }
+
+        let (entry, nonempty) = convert_app(&hg, &forest, &app_key, 0, &prefixes).unwrap().unwrap();
+        assert_eq!(entry.num_leaves, 3, "all three vertices counted");
+        assert_eq!(nonempty, 3, "three distinct sub-shards carry state");
+
+        // Each vertex proves against ITS sub-shard's vertex-adds root — i.e. it
+        // was routed to the correct sub-shard tree, not sub-shard 0.
+        for (first, sub) in cases {
+            let (addr, vk) = mk(first);
+            let blob = vertex_blob(&[(&type_key, b"x"), (&[first; 32], &[first])]);
+            let _ = &vk;
+            let shard_id = Forest::addr_path_shard_id(&app_key.l2, &[sub as u32]);
+            let expected = quil_tries::vertex_leaf_value(&blob).unwrap();
+            let (val, _proof) = forest
+                .shard_phase_get_with_proof_raw(&shard_id, Phase::VertexAdds, 0, &addr)
+                .unwrap();
+            assert_eq!(
+                val.as_deref(),
+                Some(&expected[..]),
+                "vertex 0x{first:02x} present under sub-shard {sub}",
+            );
+        }
+
+        // Deterministic: a second conversion into a fresh forest yields the same
+        // app root.
+        let dst2 = tempfile::tempdir().unwrap();
+        let forest2 = Forest::new(open_db(dst2.path()));
+        let (entry2, _) = convert_app(&hg, &forest2, &app_key, 0, &prefixes).unwrap().unwrap();
+        assert_eq!(entry.app_root, entry2.app_root, "app root is deterministic");
     }
 
     /// Seed one vertex (in vertex_adds) for `shard_addr` and register the

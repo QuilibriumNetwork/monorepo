@@ -203,6 +203,109 @@ impl RocksHypergraphStore {
         Ok(())
     }
 
+    /// Like [`stream_migrate_vertex_adds`](Self::stream_migrate_vertex_adds) but
+    /// scoped to the SUB-RANGE of a shard's vertex-adds keyspace whose key
+    /// (after the shard prefix) starts with `sub_prefix` — e.g. `domain ‖ [top]`
+    /// to select one top-address-byte slice. Takes its OWN point-in-time
+    /// snapshot. This is the unit of PARALLELISM for the coin migration: the
+    /// caller runs one call per disjoint range across a thread pool so all cores
+    /// stay busy (a single serial iterator was the throughput ceiling). Ranges
+    /// are disjoint by address, so each coin is processed exactly once; the
+    /// transparent puts other ranges make are skipped by the caller's transform.
+    /// `vertex_key` handed to `process_chunk` still strips only the SHARD prefix
+    /// (so it is `domain ‖ address`, identical to the non-ranged scan). Returns
+    /// `(scanned, migrated)`.
+    pub fn migrate_vertex_adds_subrange<F>(
+        &self,
+        shard: &quil_types::store::ShardKey,
+        sub_prefix: &[u8],
+        chunk_size: usize,
+        mut process_chunk: F,
+    ) -> Result<(usize, usize)>
+    where
+        F: FnMut(&[(Vec<u8>, Vec<u8>)]) -> Result<(usize, Vec<VertexWrite>)>,
+    {
+        let shard_prefix = hypergraph_vertex_data_prefix("vertex", "adds", shard);
+        let shard_prefix_len = shard_prefix.len();
+        let mut full_prefix = shard_prefix.clone();
+        full_prefix.extend_from_slice(sub_prefix);
+        let chunk_size = chunk_size.max(1);
+        let snapshot = self.db.snapshot();
+        let iter = snapshot
+            .iterator(rocksdb::IteratorMode::From(&full_prefix, rocksdb::Direction::Forward));
+        let mut chunk: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(chunk_size);
+        let mut scanned = 0usize;
+        let mut migrated = 0usize;
+
+        let mut flush = |chunk: &[(Vec<u8>, Vec<u8>)],
+                         migrated: &mut usize,
+                         process_chunk: &mut F|
+         -> Result<()> {
+            let (m, writes) = process_chunk(chunk)?;
+            *migrated += m;
+            if !writes.is_empty() {
+                let mut batch = rocksdb::WriteBatch::default();
+                for w in &writes {
+                    match w {
+                        VertexWrite::Put { set, phase, vertex_key, blob } => {
+                            let key = hypergraph_vertex_data_key(set, phase, shard, vertex_key);
+                            batch.put(&key, blob);
+                        }
+                        VertexWrite::Delete { set, phase, vertex_key } => {
+                            let key = hypergraph_vertex_data_key(set, phase, shard, vertex_key);
+                            batch.delete(&key);
+                        }
+                    }
+                }
+                self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))?;
+            }
+            Ok(())
+        };
+
+        for entry in iter {
+            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if !k.starts_with(&full_prefix) {
+                break;
+            }
+            if k.len() <= shard_prefix_len {
+                continue;
+            }
+            chunk.push((k[shard_prefix_len..].to_vec(), v.to_vec()));
+            if chunk.len() >= chunk_size {
+                scanned += chunk.len();
+                flush(&chunk, &mut migrated, &mut process_chunk)?;
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            scanned += chunk.len();
+            flush(&chunk, &mut migrated, &mut process_chunk)?;
+        }
+        Ok((scanned, migrated))
+    }
+
+    /// Direct (non-transactional) write of one vertex's underlying blob into the
+    /// unversioned keyspace — for the OFFLINE `--migrate-*` passes that write
+    /// straight to the KV (the identical bytes a commit persists), bypassing the
+    /// CRDT tree, since the forest is rebuilt afterward. Mirrors what
+    /// [`stream_migrate_vertex_adds`](Self::stream_migrate_vertex_adds)'s
+    /// `VertexWrite::Put` does, for the handful of reserved metadata vertices
+    /// (shadow-accumulator root, conservation receipt). NOT for the live path —
+    /// use [`save_vertex_underlying_txn`](Self::save_vertex_underlying_txn).
+    pub fn migrate_put_vertex_underlying(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        vertex_key: &[u8],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
+        self.db
+            .put(&key, bytes)
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
     /// Load one vertex's `underlying_data`, or `Ok(None)` if absent.
     pub fn load_vertex_underlying(
         &self,
@@ -294,6 +397,108 @@ impl RocksHypergraphStore {
                 continue;
             }
             callback(vertex_key, v.into_vec());
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Emit the max-version blob per vertex from the MVCC **v2** keyspace of one
+    /// `(set, phase, shard)`, via a fallible callback. Peak memory is O(number of
+    /// v2 vertices in this shard/phase) — a dedup `HashMap`, because variable-
+    /// length vertex keys let versions of different keys interleave. For the
+    /// `--migrate-db` forest build this is bounded in practice: a fresh Go→rocks
+    /// DB has NO v2 state (the v2 keyspace is written only by the live Rust CRDT
+    /// commit AFTER migration), and a re-run's v2 set is small. The companion
+    /// [`for_each_vertex_unversioned_ordered`] streams the (large) legacy set.
+    /// Emission order is unspecified (the caller buckets by sub-shard, so order
+    /// is irrelevant). Returns the vertex count.
+    pub fn for_each_vertex_v2_max_version<F>(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        mut callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        use std::collections::HashMap;
+        let v2_prefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix(
+            set_type, phase_type, shard_key,
+        );
+        let mut latest: HashMap<Vec<u8>, (u64, Vec<u8>)> = HashMap::new();
+        for entry in self
+            .db
+            .iterator(rocksdb::IteratorMode::From(&v2_prefix, rocksdb::Direction::Forward))
+        {
+            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if !k.starts_with(&v2_prefix) {
+                break;
+            }
+            if k.len() < v2_prefix.len() + 8 {
+                continue;
+            }
+            let vk = k[v2_prefix.len()..k.len() - 8].to_vec();
+            let ver = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
+            match latest.get_mut(&vk) {
+                Some((mv, mb)) if ver > *mv => {
+                    *mv = ver;
+                    *mb = v.into_vec();
+                }
+                Some(_) => {}
+                None => {
+                    latest.insert(vk, (ver, v.into_vec()));
+                }
+            }
+        }
+        let mut count = 0usize;
+        for (vk, (_ver, blob)) in latest {
+            callback(&vk, &blob)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Stream the UNVERSIONED (legacy, pre-forest) vertex blobs of one
+    /// `(set, phase, shard)` keyspace in KEY (address) order, one row at a time,
+    /// through a fallible callback. Peak store-side memory is O(1) — a raw
+    /// snapshot iterator with NO dedup map (unlike
+    /// [`for_each_vertex_underlying`], which accumulates the whole shard/phase in
+    /// a `HashMap` to reconcile the MVCC v2 keyspace).
+    ///
+    /// Correct for the `--migrate-db` forest build specifically: the legacy state
+    /// being converted lives entirely in the unversioned keyspace (the v2 keyspace
+    /// is written only by the LIVE forest AFTER migration), and the keys sort by
+    /// `vertex_key` — for the address-path forest, `domain(32) ‖ address(32)` — so
+    /// within one app the rows arrive in address order, letting the caller flush
+    /// one contiguous sub-shard at a time. `callback(vertex_key, blob)`. Returns
+    /// the row count (0 ⇒ this phase's leaves live in a legacy whole-tree blob;
+    /// the caller falls back to `load_tree_blob`).
+    pub fn for_each_vertex_unversioned_ordered<F>(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        mut callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        let prefix = crate::encoding::hypergraph_vertex_data_prefix(set_type, phase_type, shard_key);
+        let prefix_len = prefix.len();
+        let snapshot = self.db.snapshot();
+        let iter = snapshot
+            .iterator(rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward));
+        let mut count = 0usize;
+        for entry in iter {
+            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            if k.len() <= prefix_len {
+                continue;
+            }
+            callback(&k[prefix_len..], &v)?;
             count += 1;
         }
         Ok(count)

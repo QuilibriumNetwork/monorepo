@@ -14,12 +14,9 @@
 //! one-way **shielded** into a lattice private coin with its Ed448 signature.
 
 use std::path::Path;
-use std::sync::Arc;
 
-use quil_execution::hypergraph_state::HypergraphState;
 use quil_execution::token_intrinsic::legacy_migration::LegacyMigrationSummary;
 use quil_execution::token_intrinsic::{legacy_migration, shadow_accumulator};
-use quil_types::store::ClockStore;
 
 /// Migrate the DB at `target` (empty → `config.db.path`) in place: decrypt every
 /// legacy verenc coin of the QUIL token domain into a transparent entry (and
@@ -52,10 +49,12 @@ pub fn run_migrate_legacy(target: &Path, config: &quil_config::Config) -> anyhow
     Ok(())
 }
 
-/// Core legacy-coin conversion over an already-open DB handle. Decrypts every
-/// legacy verenc coin of the QUIL token domain into a transparent entry,
-/// **removes the verenc original** (tombstone), refreshes the lattice
-/// shadow-accumulator root, and commits both the state changeset and the CRDT.
+/// Core legacy-coin conversion over an already-open DB handle. STREAMS every
+/// legacy verenc coin of the QUIL token domain into a transparent entry and
+/// PHYSICALLY DELETES the verenc original — writing straight to the KV keyspace
+/// (no `HypergraphState`, no CRDT commit), so peak memory is O(chunk) even at
+/// 100+ GB coin sets. Then writes the (empty) shadow-accumulator root + the
+/// conservation receipt directly. The forest is rebuilt afterward.
 ///
 /// Returns `None` when the DB is already migrated (shadow root present — an
 /// idempotent no-op), else `Some(summary)`. Shared by `--migrate-legacy` and the
@@ -66,42 +65,73 @@ pub fn convert_legacy_coins_in_place(
     db: &quil_store::RocksDb,
 ) -> anyhow::Result<Option<LegacyMigrationSummary>> {
     let inner = db.inner();
-    let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(inner.clone()));
-    let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
-        Arc::new(quil_tries::ShaInclusionProver);
-    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
-        hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
-        inclusion_prover,
-    ));
-    let state = HypergraphState::new(crdt.clone());
-
+    let store = quil_store::RocksHypergraphStore::new(inner.clone());
     let domain = &quil_execution::domains::QUIL_TOKEN[..];
+    let shard = legacy_migration::coin_domain_shard(domain);
 
-    // Idempotency guard: a recorded shadow-accumulator root means the node has
-    // already been migrated (or is a fresh 2.1 DB with no legacy coins).
-    if shadow_accumulator::read_root(&state, domain)?.is_some() {
+    // Idempotency guard: the shadow-accumulator root vertex is written at the END
+    // of a successful migration, so its presence means "already migrated" (or a
+    // fresh 2.1 DB with no legacy coins). Read the KV directly — no CRDT.
+    let acc_vk = {
+        let mut k = domain.to_vec();
+        k.extend_from_slice(&shadow_accumulator::ACC_ROOT_ADDRESS);
+        k
+    };
+    if store
+        .load_vertex_underlying("vertex", "adds", &shard, &acc_vk)?
+        .is_some()
+    {
         return Ok(None);
     }
 
-    let summary = legacy_migration::migrate_all_legacy_coins(&state, domain)
-        .map_err(|e| anyhow::anyhow!("legacy migration failed: {e}"))?;
+    // STREAMING verenc→transparent conversion: writes go straight to the KV
+    // keyspace (no HypergraphState changeset, no per-coin KZG) so peak memory is
+    // O(chunk) even at 100+ GB coin sets. The forest is rebuilt afterward. A
+    // wall-clock-throttled line keeps a multi-hour run observable.
+    let started = std::time::Instant::now();
+    let mut last = started;
+    let mut first = true;
+    let mut progress = move |scanned: usize, migrated: usize| {
+        let now = std::time::Instant::now();
+        // Print the first line as soon as coins flow (so it's visibly alive),
+        // then every 15s.
+        if first || now.duration_since(last).as_secs() >= 15 {
+            first = false;
+            last = now;
+            let secs = now.duration_since(started).as_secs().max(1);
+            println!(
+                "  coins: scanned {scanned}, migrated {migrated} ({}/s, {secs}s elapsed)",
+                scanned as u64 / secs
+            );
+        }
+    };
+    let summary =
+        legacy_migration::migrate_all_legacy_coins(&store, domain, 4096, &mut progress)
+            .map_err(|e| anyhow::anyhow!("legacy coin migration failed: {e}"))?;
 
-    // Rebuild + record the lattice shadow root over the migrated set so shields
-    // can prove membership against it.
-    shadow_accumulator::refresh_root(&state, domain)
-        .map_err(|e| anyhow::anyhow!("shadow-root refresh failed: {e}"))?;
-    state.commit().map_err(|e| anyhow::anyhow!("state commit failed: {e}"))?;
+    // Write the (empty) lattice shadow-accumulator root DIRECTLY — a pre-2.1 DB
+    // has no shielded coins, so it's provably empty (no full-set scan). Written
+    // to the same unversioned keyspace the coins use, so the forest build picks
+    // it up as a normal leaf.
+    let acc_rec = shadow_accumulator::empty_root_record(domain)
+        .map_err(|e| anyhow::anyhow!("shadow accumulator: {e}"))?;
+    store.migrate_put_vertex_underlying("vertex", "adds", &shard, &acc_vk, &acc_rec)?;
 
-    let head_n = quil_store::RocksClockStore::new(inner)
-        .get_latest_global_clock_frame()
-        .ok()
-        .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
-        .unwrap_or(0);
-    crdt.commit(head_n)
-        .map_err(|e| anyhow::anyhow!("hypergraph commit failed: {e}"))?;
+    // Conservation receipt `(count u64 BE ‖ Σ u128 BE)` — the verenc originals are
+    // gone, so `--verify-db` reconciles `Σ transparent` against this instead.
+    let receipt_vk = {
+        let mut k = domain.to_vec();
+        k.extend_from_slice(&legacy_migration::MIGRATION_RECEIPT_ADDRESS);
+        k
+    };
+    let mut rec = Vec::with_capacity(24);
+    rec.extend_from_slice(&(summary.migrated as u64).to_be_bytes());
+    rec.extend_from_slice(&summary.total_amount.to_be_bytes());
+    store.migrate_put_vertex_underlying("vertex", "adds", &shard, &receipt_vk, &rec)?;
 
-    if let Some((depth, root)) = shadow_accumulator::read_root(&state, domain)? {
-        println!("shadow-accumulator root (depth {depth}) = {}", hex::encode(root));
-    }
+    println!(
+        "coin migration complete: {} coins, Σ = {} (shadow root + receipt written)",
+        summary.migrated, summary.total_amount
+    );
     Ok(Some(summary))
 }

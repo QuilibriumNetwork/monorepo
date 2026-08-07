@@ -318,6 +318,18 @@ pub fn write_root(state: &HypergraphState, domain: &[u8], acc: &CoinAccumulator)
     state.set(domain, &ACC_ROOT_ADDRESS, &disc, 0, rec)
 }
 
+/// The encoded `(depth ‖ root)` record for an EMPTY coin accumulator. A pre-2.1
+/// legacy DB holds NO shielded/lattice coins (shielding is a post-migration op),
+/// so its shadow-accumulator root is provably empty — the `--migrate-db` coin
+/// pass writes THIS directly instead of a full-set scan. Encapsulates the
+/// accumulator internals so the offline pass can persist the root without a
+/// `HypergraphState`.
+pub fn empty_root_record(domain: &[u8]) -> Result<Vec<u8>> {
+    let acc = build_from_coins(domain, std::iter::empty::<(Vec<u8>, Vec<u8>)>())?;
+    let (depth, root) = acc.root_with_depth();
+    Ok(encode_root_record(depth, &root))
+}
+
 /// Read the committed `(depth, root_bytes)` for a token, if present.
 pub fn read_root(state: &HypergraphState, domain: &[u8]) -> Result<Option<(usize, Vec<u8>)>> {
     let disc = vertex_adds_discriminator()?;
