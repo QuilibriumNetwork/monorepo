@@ -127,7 +127,7 @@ async fn tier2_joiner_lifecycle_emits_self_confirm_after_join() {
     let join_frame = build_global_frame_with_bundle(6, &join_bundles[0]);
     archive
         .materializer
-        .materialize(&join_frame)
+        .materialize_synced(&join_frame)
         .expect("materialize join");
     archive
         .prover_registry
@@ -355,7 +355,7 @@ async fn tier2_confirm_materializes_to_active_and_allocator_starts_worker() {
     let join_frame = build_global_frame_with_bundle(6, &join_bundles[0]);
     archive
         .materializer
-        .materialize(&join_frame)
+        .materialize_synced(&join_frame)
         .expect("materialize join");
     archive
         .prover_registry
@@ -424,7 +424,7 @@ async fn tier2_confirm_materializes_to_active_and_allocator_starts_worker() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             for bundle in &joiner_transport.drain_outbound() {
                 if let Ok(r) =
-                    archive.materializer.materialize(&build_global_frame_with_bundle(17, bundle))
+                    archive.materializer.materialize_synced(&build_global_frame_with_bundle(17, bundle))
                 {
                     confirm_result_processed += r.processed;
                     confirm_result_skipped += r.skipped;
@@ -581,7 +581,7 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
     let join_bundles = joiner_transport.drain_outbound();
     archive
         .materializer
-        .materialize(&build_global_frame_with_bundle(6, &join_bundles[0]))
+        .materialize_synced(&build_global_frame_with_bundle(6, &join_bundles[0]))
         .expect("materialize join");
     archive
         .prover_registry
@@ -635,7 +635,7 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
     for bundle in &joiner_transport.drain_outbound() {
         let _ = archive
             .materializer
-            .materialize(&build_global_frame_with_bundle(17, bundle));
+            .materialize_synced(&build_global_frame_with_bundle(17, bundle));
     }
     archive
         .prover_registry
@@ -680,7 +680,7 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
 
     let coverage_frame_number = 25u64; // some frame after confirm
 
-    let header = FrameHeader {
+    let mut header = FrameHeader {
         address: shard_address.clone(),
         frame_number: coverage_frame_number,
         rank: 0,
@@ -697,6 +697,9 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
         global_frame_number: 0,
         storage_attestation: Vec::new(),
     };
+    // No-global-anchor header ⇒ the attestation verifier recomputes the
+    // zero-anchor deterministic output, so stamp it like the producer does.
+    stamp_app_frame_output(&mut header);
     let header_bytes = header.to_canonical_bytes().expect("encode header");
 
     use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
@@ -753,7 +756,7 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
 
     let result = archive
         .materializer
-        .materialize(&coverage_global_frame)
+        .materialize_synced(&coverage_global_frame)
         .expect("materialize coverage");
     eprintln!(
         "coverage ingest: processed={} skipped={}",
@@ -890,7 +893,7 @@ async fn tier2_composite_end_to_end() {
     let join_frame = build_global_frame_with_bundle(6, &join_bundles[0]);
     archive
         .materializer
-        .materialize(&join_frame)
+        .materialize_synced(&join_frame)
         .expect("materialize join");
     archive
         .prover_registry
@@ -947,7 +950,7 @@ async fn tier2_composite_end_to_end() {
     for bundle in &joiner_transport.drain_outbound() {
         let _ = archive
             .materializer
-            .materialize(&build_global_frame_with_bundle(17, bundle));
+            .materialize_synced(&build_global_frame_with_bundle(17, bundle));
     }
     archive
         .prover_registry
@@ -1185,7 +1188,7 @@ async fn tier2_composite_end_to_end() {
     });
     let result = archive
         .materializer
-        .materialize(&coverage_frame)
+        .materialize_synced(&coverage_frame)
         .expect("materialize coverage frame");
     eprintln!(
         "coverage materialize: processed={} skipped={}",

@@ -69,10 +69,47 @@ pub struct ShardUpdateContext {
     pub shard_count: u64,
 }
 
+/// Recompute a genesis / no-global-anchor app-shard frame's output and require
+/// it to match the header.
+///
+/// App-shard frames carry NO VDF: the producer (`AppLeaderProvider`) stamps
+/// `porep::deterministic_app_frame_output` on every frame it makes. A frame
+/// anchored to a real global frame binds ρ_N to that anchor; a genesis /
+/// pre-global-chain frame (`global_frame_number == 0`) uses the ZERO-ANCHOR
+/// beacon, since there is no global VDF output to bind freshness to. This is the
+/// same check `quil_engine::frame_validator::BlsAppFrameValidator` runs on the
+/// no-anchor branch — it replaces the legacy Wesolowski verify, which can no
+/// longer succeed now that nothing solves a VDF for an app frame.
+fn verify_genesis_app_frame_output(frame_header: &FrameHeader) -> Result<()> {
+    let rho_n = quil_crypto::porep::derive_storage_beacon(0, &[]);
+    let expected = quil_crypto::porep::deterministic_app_frame_output(
+        &frame_header.parent_selector,
+        &frame_header.requests_root,
+        &frame_header.state_roots,
+        &rho_n,
+        frame_header.frame_number,
+        frame_header.rank,
+        &frame_header.prover,
+        frame_header.difficulty,
+        frame_header.fee_multiplier_vote as u64,
+        frame_header.timestamp,
+        &frame_header.storage_attestation_root,
+    );
+    if expected != frame_header.output {
+        return Err(QuilError::Crypto(
+            "frame header attestation: genesis app-shard frame output does not match \
+             the deterministic digest"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Verify a finalized shard FrameHeader's three-layer attestation:
-/// leader VDF, aggregate BLS over `make_vote_message(address, rank,
-/// poseidon(output))`, and per-participant VDF multi-proofs over
-/// `sha3(parent_selector)`. Returns the participant bitmask.
+/// leader proof-of-frame (deterministic output digest), aggregate BLS over
+/// `make_vote_message(address, rank, poseidon(output))`, and per-participant
+/// VDF multi-proofs over `sha3(parent_selector)`. Returns the participant
+/// bitmask.
 ///
 /// `active_provers` must be in the same order the consensus committee
 /// used at this rank — the bitmask indexes into this list.
@@ -90,35 +127,17 @@ pub fn verify_frame_header_attestation(
     if let Some(cert_bytes) =
         quil_cw_consensus::app_cert::unwrap_cert_from_header(&frame_header.public_key_signature_bls48581)
     {
-        // Proof-of-time over the header. Storage attestation is always-on: a
-        // frame anchored to a real global frame (`global_frame_number > 0`) is a
-        // storage frame whose `output` is the deterministic ρ_N-bound value
-        // (`deterministic_app_frame_output`, a SHA3 hash) — NOT a Wesolowski
-        // VDF. Only genesis/no-chain frames (== 0) carry the legacy app-shard
-        // VDF, so only they are VDF-verified (mirroring `frame_validator.rs`).
-        // For storage frames the output integrity is guaranteed instead by the CW
-        // finalization cert (which signs `poseidon(output)`, verified below
-        // against the committee) plus the ρ_N storage-attestation audit
-        // (`audit_storage_attestation`) the caller runs after this.
+        // Output integrity. A frame anchored to a real global frame
+        // (`global_frame_number > 0`) is a storage frame whose `output` is the
+        // deterministic ρ_N-bound value (`deterministic_app_frame_output`); its
+        // integrity comes from the CW finalization cert (which signs
+        // `poseidon(output)`, verified below against the committee) plus the ρ_N
+        // storage-attestation audit (`audit_storage_attestation`) the caller runs
+        // after this. A genesis/no-chain frame (== 0) has no anchor to audit
+        // against, so recompute its zero-anchor digest here (mirroring
+        // `frame_validator.rs`).
         if frame_header.global_frame_number == 0 {
-            let vdf_proto = quil_types::proto::global::FrameHeader {
-                address: frame_header.address.clone(),
-                frame_number: frame_header.frame_number,
-                rank: frame_header.rank,
-                timestamp: frame_header.timestamp,
-                difficulty: frame_header.difficulty,
-                output: frame_header.output.clone(),
-                parent_selector: frame_header.parent_selector.clone(),
-                requests_root: frame_header.requests_root.clone(),
-                state_roots: frame_header.state_roots.clone(),
-                prover: frame_header.prover.clone(),
-                fee_multiplier_vote: frame_header.fee_multiplier_vote as u64,
-                public_key_signature_bls48581: None,
-                storage_attestation_root: frame_header.storage_attestation_root.clone(),
-                global_frame_number: frame_header.global_frame_number,
-                storage_attestation: frame_header.storage_attestation.clone(),
-            };
-            frame_prover.verify_frame_header(&vdf_proto)?;
+            verify_genesis_app_frame_output(frame_header)?;
         }
 
         // Verify the finalization cert against the shard committee. Namespace =
@@ -199,12 +218,11 @@ pub fn verify_frame_header_attestation(
         storage_attestation: frame_header.storage_attestation.clone(),
     };
 
-    // Same storage-vs-legacy gate as the CW path above: a storage frame
-    // (`global_frame_number > 0`) carries a deterministic ρ_N-bound hash output,
-    // not a Wesolowski VDF, so `verify_frame_header` (→ `wesolowski_verify`) must
-    // not run on it. Legacy/genesis frames (== 0) keep the VDF check.
+    // Same gate as the CW path above: a storage frame (`global_frame_number > 0`)
+    // has its output covered by the attestation audit, while a genesis/no-anchor
+    // frame (== 0) is checked here against its deterministic zero-anchor digest.
     if frame_header.global_frame_number == 0 {
-        frame_prover.verify_frame_header(&proto)?;
+        verify_genesis_app_frame_output(frame_header)?;
     }
 
     let participant_ids: Vec<Vec<u8>> = {

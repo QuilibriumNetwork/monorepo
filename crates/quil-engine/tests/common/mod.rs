@@ -667,7 +667,20 @@ impl AppShardHarness {
         provers: Vec<TestProver>,
         registry: Arc<dyn ProverRegistry>,
     ) -> Self {
-        Self::build_inner(provers, registry, None)
+        Self::build_inner(provers, registry, None, false)
+    }
+
+    /// (P3) Build `n` workers driving the shard with commonware-simplex + Falcon
+    /// (`app_consensus_cw = true`). For `n == 1` the single committee member
+    /// self-proposes + self-finalizes (the `NoopAppTransport` in the engine has
+    /// no peers to reach); multi-worker CW needs the gossip transport wired.
+    pub fn build_cw(n: usize) -> Self {
+        assert!(n >= 1, "need at least one worker");
+        let provers: Vec<TestProver> = (0..n).map(|_| TestProver::generate()).collect();
+        let all_prover_infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
+        let registry =
+            Arc::new(TestProverRegistry::with_provers(all_prover_infos)) as Arc<dyn ProverRegistry>;
+        Self::build_inner(provers, registry, None, true)
     }
 
     /// Active-path PoRep variant: every worker gets a shared committed CRDT, an
@@ -681,13 +694,14 @@ impl AppShardHarness {
         registry: Arc<dyn ProverRegistry>,
         storage: StorageHarness,
     ) -> Self {
-        Self::build_inner(provers, registry, Some(storage))
+        Self::build_inner(provers, registry, Some(storage), false)
     }
 
     fn build_inner(
         provers: Vec<TestProver>,
         registry: Arc<dyn ProverRegistry>,
         storage: Option<StorageHarness>,
+        app_cw: bool,
     ) -> Self {
         let n = provers.len();
         assert!(n >= 1, "need at least one worker");
@@ -788,7 +802,7 @@ impl AppShardHarness {
                     Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
                 ),
                 kv_db: kv_db_dep,
-                app_consensus_cw: false,
+                app_consensus_cw: app_cw,
             db_config: quil_config::DbConfig { path: String::new(), worker_path_prefix: String::new(), worker_paths: vec![], ..Default::default() }, // ephemeral journal in tests
             };
 
@@ -817,6 +831,10 @@ impl AppShardHarness {
         // to broadcast to peers (= every worker except self).
         let all_handles: Vec<quil_engine::app_engine::AppEngineHandle> =
             workers.iter().map(|w| w.handle.clone()).collect();
+        // (P3) Each worker's committee Falcon pubkey, so the CW event drain can
+        // tag `CwIn.from` when routing `CwOut` to peers (in-memory transport).
+        let all_pubkeys: Vec<Vec<u8>> =
+            workers.iter().map(|w| w.prover.bls_pubkey.clone()).collect();
         let events_per_worker: Vec<Arc<Mutex<Vec<String>>>> =
             workers.iter().map(|w| w.events.clone()).collect();
         let full_frames_per_worker: Vec<Arc<Mutex<Vec<Vec<u8>>>>> =
@@ -843,6 +861,7 @@ impl AppShardHarness {
                 .filter(|(i, _)| *i != idx)
                 .map(|(_, h)| h.clone())
                 .collect();
+            let my_pubkey = all_pubkeys[idx].clone();
             let events_log = events_per_worker[idx].clone();
             let full_frames_log = full_frames_per_worker[idx].clone();
             let mut rx = pending.event_rx;
@@ -899,12 +918,17 @@ impl AppShardHarness {
                         E::ParentSealed { .. } => {
                             events_log.lock().push("ParentSealed".into());
                         }
-                        E::CwOut { .. } => {
-                            // Legacy (non-CW) app harness: the CW path
-                            // is disabled (`app_consensus_cw: false`),
-                            // so this event never fires. Present only
-                            // to keep the match exhaustive.
+                        E::CwOut { channel, bytes, .. } => {
                             events_log.lock().push("CwOut".into());
+                            // In-memory CW transport: deliver to every peer's
+                            // `CwIn`, tagged with this worker's committee key.
+                            for h in &peer_handles {
+                                h.send(quil_engine::app_engine::AppEngineMessage::CwIn {
+                                    channel: *channel,
+                                    from: my_pubkey.clone(),
+                                    data: bytes.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -982,6 +1006,59 @@ pub fn build_genesis_seed_hex(provers: &[TestProver]) -> String {
         blob.extend_from_slice(&p.bls_pubkey);
     }
     hex::encode(blob)
+}
+
+/// Fill an app-shard `FrameHeader`'s `output` with the deterministic digest the
+/// producer stamps.
+///
+/// App-shard frames carry no VDF — `AppLeaderProvider` sets `output` to
+/// `porep::deterministic_app_frame_output`, and the attestation verifier
+/// recomputes it. A genesis / no-global-anchor header (`global_frame_number ==
+/// 0`) binds the ZERO-ANCHOR ρ_N, since there is no global VDF output to bind
+/// freshness to. Synthetic headers must be stamped or they are (correctly)
+/// rejected as not matching their own digest.
+pub fn stamp_app_frame_output(
+    h: &mut quil_execution::global_intrinsic::frame_header::FrameHeader,
+) {
+    let rho_n = quil_crypto::porep::derive_storage_beacon(0, &[]);
+    h.output = quil_crypto::porep::deterministic_app_frame_output(
+        &h.parent_selector,
+        &h.requests_root,
+        &h.state_roots,
+        &rho_n,
+        h.frame_number,
+        h.rank,
+        &h.prover,
+        h.difficulty,
+        h.fee_multiplier_vote as u64,
+        h.timestamp,
+        &h.storage_attestation_root,
+    );
+}
+
+/// Apply a frame as a node already synced to its PARENT.
+///
+/// The materializer enforces an in-order invariant: it refuses to apply a frame
+/// ahead of its cursor (`frame_number > last + 1`), since building on state we
+/// don't hold forks the prover root. These tests hand it a single frame at an
+/// arbitrary height, so seed the cursor to `N-1` first — exactly what production
+/// does via `seed_cursor` at startup / after a state jump.
+pub trait MaterializeSynced {
+    fn materialize_synced(
+        &self,
+        frame: &gpb::GlobalFrame,
+    ) -> QResult<quil_engine::frame_materializer::MaterializeResult>;
+}
+
+impl MaterializeSynced for quil_engine::frame_materializer::FrameMaterializer {
+    fn materialize_synced(
+        &self,
+        frame: &gpb::GlobalFrame,
+    ) -> QResult<quil_engine::frame_materializer::MaterializeResult> {
+        let n = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+        self.seed_cursor(n.saturating_sub(1));
+        self.materialize(frame)
+    }
 }
 
 /// Per-archive Tier-2 wiring: real production materializer + lifecycle

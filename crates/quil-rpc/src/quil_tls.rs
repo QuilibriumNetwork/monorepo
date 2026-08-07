@@ -536,6 +536,11 @@ mod tests {
     #[tokio::test]
     async fn worker_channel_mtls_accepts_same_key_rejects_other() {
         use tokio_rustls::{TlsAcceptor, TlsConnector};
+        // Building a rustls config directly (rather than via
+        // `build_quil_server_tls_config`, which does this itself) needs the
+        // process-level provider installed first — rustls has no default when
+        // the crate is built with `default-features = false`.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let parse = |cert_pem: &str, key_pem: &str| {
             let cert = rustls_pemfile::certs(&mut cert_pem.as_bytes())
                 .next()
