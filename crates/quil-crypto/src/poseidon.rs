@@ -25,6 +25,23 @@ use quil_types::error::{QuilError, Result};
 const SPONGE_CHUNK_SIZE: usize = 31;
 const FRAME_SIZE: usize = 16;
 
+/// A single process-wide Poseidon instance.
+///
+/// `Poseidon::new()` parses the entire round-constant + MDS table from decimal
+/// STRING literals (`Fr::from_str`) and allocates it — tens of microseconds and
+/// a burst of allocations EVERY call. Constructing it per hash (as the callers
+/// used to) made Poseidon-heavy loops — e.g. `coin_content_address` over 195M
+/// migration coins — spend the bulk of their time re-parsing constants, and the
+/// allocation storm serialized every worker on the global allocator (so a
+/// parallel run was *slower* per core than a serial one). The table is immutable
+/// and `Poseidon::hash` takes `&self`, so one shared read-only instance is
+/// correct and contention-free. Identical constants ⇒ identical output ⇒
+/// consensus-neutral.
+fn shared_poseidon() -> &'static Poseidon {
+    static POSEIDON: std::sync::OnceLock<Poseidon> = std::sync::OnceLock::new();
+    POSEIDON.get_or_init(Poseidon::new)
+}
+
 /// Hash an arbitrary byte slice using iden3's Poseidon sponge and return
 /// the result as 32 big-endian bytes. Matches Go's
 /// `poseidon.HashBytes(msg).FillBytes(make([]byte, 32))`.
@@ -34,7 +51,7 @@ pub fn hash_bytes_to_32(msg: &[u8]) -> Result<[u8; 32]> {
     let mut hash: Option<Fr> = None;
     let mut k = 0usize;
 
-    let poseidon = Poseidon::new();
+    let poseidon = shared_poseidon();
 
     // Process complete 31-byte chunks first.
     let num_chunks = msg.len() / SPONGE_CHUNK_SIZE;
@@ -98,7 +115,7 @@ pub fn hash_elements(inputs: &[[u8; 32]]) -> Result<[u8; 32]> {
     for bytes in inputs {
         frs.push(fr_from_be_bytes(bytes)?);
     }
-    let poseidon = Poseidon::new();
+    let poseidon = shared_poseidon();
     let h = poseidon
         .hash(frs)
         .map_err(|e| QuilError::Crypto(format!("poseidon hash: {}", e)))?;
