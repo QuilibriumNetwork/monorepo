@@ -464,6 +464,11 @@ const STATE_JUMP_MAX_FRAME: u64 = 672_000;
 /// of head the poller catches up fine and a full-state snapshot isn't warranted.
 /// For non-archives this is the SOLE gate on when a jump fires.
 const STATE_JUMP_MIN_GAP: u64 = 1_000;
+/// Backoff between state-jump retry passes when the node IS far behind but no peer
+/// completed a jump this pass (empty/failing pool at boot, transient peer errors).
+/// Short enough to catch up quickly once a usable archive appears; long enough not
+/// to reconnect-storm the `:8340` path consensus shares.
+const STATE_JUMP_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Full-state "state jump" for a far-behind node (gap to head ≥
 /// [`STATE_JUMP_MIN_GAP`]): hypersync the prover tree + EVERY app-shard tree
@@ -499,21 +504,44 @@ async fn run_state_jump(
     // sync so produced roots match the network; testnet/devnet leaves QUIL
     // single-shard (see `install_forest_for_sync`).
     mainnet_quil_grid: bool,
+    // `true` (boot): a far-behind node MUST complete the jump before the poller
+    // starts — retry indefinitely (holding the startup barrier) rather than fall
+    // through to the poller and grind ancient history. `false` (runtime re-fire):
+    // one best-effort pass; on failure the caller forward-fills instead.
+    retry: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Option<u64> {
-    let local_head = clock_store.get_latest_frame_number().unwrap_or(0);
-    // Archive ceiling (see STATE_JUMP_MAX_FRAME): once an archive is current-era
-    // it must verify, not blind-trust a peer. Non-archives have no ceiling —
-    // whether they jump is decided per-peer purely by the gap to that peer's
-    // (validated) head (`STATE_JUMP_MIN_GAP` below).
-    if sync_all_shards && local_head >= STATE_JUMP_MAX_FRAME {
-        return None;
-    }
-    let endpoints = pool.get_all().await;
-    if endpoints.is_empty() {
-        return None;
-    }
-    for addr in endpoints {
+    // Retry loop. Each pass re-reads the local head + pool (PeerInfo may have
+    // added archives since) and tries every endpoint. The loop resolves to:
+    //   * Some(N)  — a jump completed (or, at boot, keeps retrying until one does);
+    //   * None     — we are NOT far behind any reachable peer (caught up / archive
+    //                ceiling), OR `retry == false` and this single pass found no
+    //                usable peer.
+    // Crucially it never returns None merely because the pool was momentarily
+    // empty/failing at boot — that was the bug that dropped far-behind nodes into
+    // the forward-fill grind.
+    loop {
+        // Wait for at least one endpoint (mirrors the poller) so we never no-op on
+        // an empty pool during early-boot PeerInfo discovery.
+        pool.wait_nonempty(&cancel).await;
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let local_head = clock_store.get_latest_frame_number().unwrap_or(0);
+        // Archive ceiling (see STATE_JUMP_MAX_FRAME): once an archive is current-era
+        // it must verify, not blind-trust a peer. Non-archives have no ceiling —
+        // whether they jump is decided per-peer purely by the gap to that peer's
+        // (validated) head (`STATE_JUMP_MIN_GAP` below).
+        if sync_all_shards && local_head >= STATE_JUMP_MAX_FRAME {
+            return None;
+        }
+        let endpoints = pool.get_all().await;
+        // Did we read a head from any peer this pass, and the max head among peers
+        // we would actually jump to (i.e. passing the archive ceiling policy)?
+        // These decide far-behind vs caught-up when no jump completes.
+        let mut reachable = false;
+        let mut best_jumpable = 0u64;
+        for addr in endpoints {
         if cancel.is_cancelled() {
             return None;
         }
@@ -534,15 +562,23 @@ async fn run_state_jump(
         if target == 0 {
             continue;
         }
+        // We successfully read a head from a peer this pass.
+        reachable = true;
         // Archives won't snapshot a current-era peer (see STATE_JUMP_MAX_FRAME);
-        // non-archives have no such ceiling.
+        // non-archives have no such ceiling. A ceiling-skipped peer is NOT a jump
+        // target, so it doesn't count toward `best_jumpable` (else an archive would
+        // retry forever against current-era peers it will never snapshot).
         if sync_all_shards && target >= STATE_JUMP_MAX_FRAME {
             continue;
         }
+        // Highest head among peers we WOULD jump to — the far-behind vs caught-up
+        // signal for the post-pass decision below.
+        best_jumpable = best_jumpable.max(target);
         // Within MIN_GAP of head → the verified poller catches up fine; don't
-        // snapshot. For non-archives this is the sole "should I jump" gate.
+        // snapshot THIS peer. (Another peer may still be far enough ahead, so try
+        // the rest rather than aborting the whole jump.)
         if target <= local_head.saturating_add(STATE_JUMP_MIN_GAP) {
-            return None;
+            continue;
         }
         if !frame_validate(&head) {
             debug!(%addr, target, "state-jump: peer head failed validation — trying another peer");
@@ -748,8 +784,34 @@ async fn run_state_jump(
             "state-jump complete — resuming near head (poller/consensus take over)"
         );
         return Some(target);
+        }
+
+        // No jump completed this pass. Decide caught-up vs retry:
+        //   * reachable && NOT far behind → we're within `STATE_JUMP_MIN_GAP` of
+        //     every reachable peer (caught up), or an archive whose only ahead
+        //     peers sit past the ceiling (best_jumpable == 0) → hand off to the
+        //     verified poller. Done.
+        //   * otherwise we ARE far behind, or we couldn't read a usable peer this
+        //     pass (empty/failing pool at early boot) → retry (boot) or give up to
+        //     the caller (runtime re-fire).
+        let far_behind = best_jumpable > local_head.saturating_add(STATE_JUMP_MIN_GAP);
+        if !far_behind && reachable {
+            return None;
+        }
+        if !retry {
+            return None;
+        }
+        warn!(
+            local_head,
+            best_jumpable,
+            reachable,
+            "state-jump: far behind (or no usable peer reached) but no jump completed this pass — retrying",
+        );
+        tokio::select! {
+            _ = cancel.cancelled() => return None,
+            _ = tokio::time::sleep(STATE_JUMP_RETRY_BACKOFF) => {}
+        }
     }
-    None
 }
 
 pub(crate) struct ArchiveSyncArgs {
@@ -963,6 +1025,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     sj_crdt,
                     sj_all_shards,
                     sj_mainnet_quil_grid,
+                    // Boot: hold the barrier and retry until the jump completes (or
+                    // we confirm we're caught up) — never drop a far-behind node
+                    // into the forward-fill grind because the pool was momentarily
+                    // empty/failing during PeerInfo discovery.
+                    true,
                     tokio_util::sync::CancellationToken::new(),
                 )
                 .await
@@ -1000,8 +1067,53 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         // unordered gossip can't guarantee).
         let poller_gossip_freshness =
             if archive_mode { None } else { Some(gossip_freshness.clone()) };
+        // Runtime far-behind rescue (non-archive only): if the poller falls a long
+        // way behind mid-run, it invokes this to snapshot-jump near head (one
+        // best-effort pass — `retry = false`) instead of forward-filling the whole
+        // gap. Archives keep verifying via the poller (no blind runtime jump), so
+        // the hook is `None` for them. Mirrors the boot state-jump's args.
+        let far_behind_jump: Option<quil_rpc::frame_sync::FarBehindJump> = if archive_mode {
+            None
+        } else {
+            let fb_pool = archive_pool.clone();
+            let fb_seed = seed.clone();
+            let fb_cs = clock_store.clone();
+            let fb_hg = hg_store.clone();
+            let fb_ss: Arc<dyn quil_types::store::ShardsStore> =
+                shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
+            let fb_fv = frame_validate.clone();
+            let fb_pr = prover_registry.clone();
+            let fb_crdt = crdt.clone();
+            let fb_mainnet = network == 0;
+            Some(Arc::new(move |_head: u64, cancel: tokio_util::sync::CancellationToken| {
+                let pool = fb_pool.clone();
+                let seed = fb_seed.clone();
+                let cs = fb_cs.clone();
+                let hg = fb_hg.clone();
+                let ss = fb_ss.clone();
+                let fv = fb_fv.clone();
+                let pr = fb_pr.clone();
+                let crdt = fb_crdt.clone();
+                Box::pin(async move {
+                    run_state_jump(
+                        pool, seed, cs, hg, ss, fv, pr, crdt,
+                        /*sync_all_shards*/ false,
+                        fb_mainnet,
+                        /*retry*/ false,
+                        // The poller's cancel — so `run_state_jump`'s internal
+                        // `wait_nonempty` is interrupted on node shutdown rather
+                        // than hanging this supervised task.
+                        cancel,
+                    )
+                    .await
+                }) as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Option<u64>> + Send>,
+                >
+            }) as quil_rpc::frame_sync::FarBehindJump)
+        };
         let poller_config = quil_rpc::ArchivePollerConfig {
             gossip_freshness: poller_gossip_freshness,
+            far_behind_jump,
             on_frame: Some(Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
                 let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
                 let frame_difficulty = frame.header.as_ref().map(|h| h.difficulty).unwrap_or(0);

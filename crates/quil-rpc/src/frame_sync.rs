@@ -175,8 +175,9 @@ impl ArchiveEndpointPool {
 
     /// Wait until at least one endpoint is available. Used at startup so the
     /// poller can block instead of spinning until PeerInfo discovery feeds
-    /// it.
-    async fn wait_nonempty(&self, cancel: &CancellationToken) {
+    /// it — and by the far-behind state-jump (in `quil-node`) so it never
+    /// no-ops on an empty pool during early-boot discovery.
+    pub async fn wait_nonempty(&self, cancel: &CancellationToken) {
         loop {
             if self.len().await > 0 {
                 return;
@@ -203,6 +204,27 @@ pub type OnFrameCallback = Arc<dyn Fn(&GlobalFrame) + Send + Sync>;
 /// stored and never fired to `on_frame`. `None` disables the gate
 /// (e.g. a trusted/test caller).
 pub type FrameValidator = Arc<dyn Fn(&GlobalFrame) -> bool + Send + Sync>;
+
+/// Async hook the poller invokes when a NON-ARCHIVE node finds itself far behind
+/// an endpoint's head at RUNTIME (gap ≥ [`STATE_JUMP_RUNTIME_GAP`]). The argument
+/// is the network head just observed; the hook runs a best-effort state-jump
+/// (hypersync to a recent target) and returns the synced frame number, or `None`
+/// if no jump completed. On `Some(n)` the poller fast-forwards `last_frame` to `n`
+/// instead of forward-filling (and re-materializing) the whole gap. Boot-time
+/// far-behind is handled separately by [`ArchivePollerConfig::startup_barrier`].
+pub type FarBehindJump = Arc<
+    dyn Fn(u64, CancellationToken) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u64>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Runtime far-behind threshold: when a non-archive poller sees an endpoint whose
+/// head is at least this many frames beyond the poller's `last_frame` MID-RUN, it
+/// invokes [`FarBehindJump`] to snapshot-jump near head rather than forward-fill
+/// the entire gap. Set comfortably above `STATE_JUMP_MIN_GAP` (the boot gate) so
+/// normal small lag never triggers a jump — and a jump lands near head, so the
+/// post-jump gap is small and cannot immediately re-trigger.
+pub const STATE_JUMP_RUNTIME_GAP: u64 = 2_000;
 
 /// Shared "gossip is delivering the head" signal, written by the gossip
 /// `GLOBAL_FRAME` receive path and read by the poller.
@@ -327,6 +349,12 @@ pub struct ArchivePollerConfig {
     /// has committed, or it would replay (re-materialize) frames the jump
     /// already synced. `None` = no wait.
     pub startup_barrier: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Optional runtime far-behind rescue (non-archive). When the poller falls
+    /// ≥ [`STATE_JUMP_RUNTIME_GAP`] behind an endpoint's head AFTER startup, it
+    /// invokes this hook to snapshot-jump near head instead of forward-filling
+    /// the whole gap. `None` (default / archives) → always forward-fill. See
+    /// [`FarBehindJump`].
+    pub far_behind_jump: Option<FarBehindJump>,
 }
 
 impl Default for ArchivePollerConfig {
@@ -339,6 +367,7 @@ impl Default for ArchivePollerConfig {
             frame_validator: None,
             forward_fill: false,
             startup_barrier: None,
+            far_behind_jump: None,
         }
     }
 }
@@ -642,6 +671,40 @@ pub async fn run_archive_poller(
         }
         // The endpoint is ahead — we're going to make progress this tick.
         no_progress = 0;
+
+        // 1b. Runtime far-behind rescue (non-archive): if we've fallen a long way
+        // behind the network head mid-run, snapshot-jump to a recent target
+        // instead of forward-filling (and re-materializing) the entire gap — the
+        // same rescue the startup barrier gives at boot. Without it a node that
+        // drops far behind at runtime (e.g. a long partition, or a restart onto a
+        // stale/legacy local head) grinds forward one frame at a time — across the
+        // pre-migration LEGACY range it can hit frames it can never validate and
+        // crawl a single frame per multi-archive stall. A successful jump advances
+        // the clock head + materialized cursor + registry, and lands near head, so
+        // the post-jump gap is small and this cannot immediately re-fire.
+        if let Some(ref jump) = config.far_behind_jump {
+            if config.gossip_freshness.is_some()
+                && new_number.saturating_sub(last_frame) >= STATE_JUMP_RUNTIME_GAP
+            {
+                info!(
+                    local_frame = last_frame,
+                    head = new_number,
+                    "archive poller: far behind at runtime — attempting state-jump",
+                );
+                if let Some(n) = jump(new_number, cancel.clone()).await {
+                    if n > last_frame {
+                        last_frame = n;
+                    }
+                    info!(target = n, "archive poller: runtime state-jump landed — resuming near head");
+                    continue;
+                }
+                warn!(
+                    local_frame = last_frame,
+                    head = new_number,
+                    "archive poller: runtime state-jump did not complete — forward-filling",
+                );
+            }
+        }
 
         // 2. Forward-fill any missed frames in (last_frame, new_number).
         //    Archive nodes need the full history; everyone else
