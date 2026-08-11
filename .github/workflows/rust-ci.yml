@@ -45,10 +45,8 @@ jobs:
           shared-key: rust-ci
           cache-on-failure: true
 
-      # channelwasm excluded: doesn't compile on native targets currently.
-      # Re-include once fixed.
       - name: cargo check --workspace
-        run: cargo check --workspace --locked --exclude channelwasm
+        run: cargo check --workspace --locked
 
   # -----------------------------------------------------------------
   # test — `cargo nextest run` against the whole workspace.
@@ -79,13 +77,11 @@ jobs:
         with:
           tool: nextest
 
-      # channelwasm excluded: see comment in build job above.
-      #
       # .nextest.toml gives the multi-node consensus e2e tests exclusive
       # scheduling slots so they aren't starved by parallel tests on the
       # 4-vCPU runner (it no longer skips any tests).
       - name: cargo nextest run --workspace
-        run: cargo nextest run --workspace --locked --no-fail-fast --exclude channelwasm --config-file .nextest.toml
+        run: cargo nextest run --workspace --locked --no-fail-fast --config-file .nextest.toml
 
   # ------------------------------------------------------------------
   # release-build — verify `node/build.sh` succeeds on every supported
