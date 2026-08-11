@@ -155,11 +155,22 @@ impl TokenCtx {
         println!("Loading node config...");
         let (node_config, config_dir) = ctx.load_node_config(&common.config)?;
 
+        // The Ed448 identity is kept ONLY for the legacy coin address
+        // (`poseidon(ed448 peerId)`, `legacy_address()` below). The peer id we
+        // DISPLAY is the current FALCON network identity — the Ed448 one is the
+        // pre-migration peer id and printing it is misleading.
         let identity = Ed448Identity::from_config_hex(&node_config.p2p.peer_priv_key)
             .map_err(|e| anyhow::anyhow!("derive peer id: {e}"))?;
-        println!("{}", identity.peer_id_base58());
 
         let key_manager = ctx.key_manager(&node_config, &config_dir)?;
+        match key_manager.get_public_key_bytes_by_id("q-prover-key") {
+            Ok(falcon_pub) => {
+                println!("{}", quil_p2p::peer_id_base58_from_falcon_pubkey(&falcon_pub));
+            }
+            // Fall back to the legacy Ed448 peer id only if the Falcon network key
+            // is absent (a pre-migration keystore).
+            Err(_) => println!("{}", identity.peer_id_base58()),
+        }
         let connect_opts = ctx.connect_opts(&node_config, common.public_rpc);
 
         Ok(Self {

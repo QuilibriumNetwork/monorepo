@@ -20,12 +20,55 @@ use quil_execution::hypergraph_intrinsic::{
     build_hyperedge_add_value, extract_hyperedge_id, hyperedge_add_domain_separator,
     hyperedge_add_signing_message, HYPEREDGE_ID_LEN,
 };
+use quil_keys::FileKeyManager;
 use quil_types::crypto::Signer;
 use quil_types::proto::global::{message_request::Request, MessageRequest};
 use quil_types::proto::hypergraph::HyperedgeAdd;
 
 use super::HypergraphCtx;
 use crate::vertex_write::{build_vertex_add, own_read_key};
+
+/// Build a signed `HyperedgeAdd` connecting `atoms` under `domain`, for the
+/// hyperedge whose id is `app ‖ data`. Builds the extrinsic tree and its
+/// SHA-Merkle commitment via the shared `build_hyperedge_add_value` (the node
+/// recomputes the same commit from `value`), then Falcon-signs
+/// `hyperedge_add_domain_separator(domain) ‖ hyperedge_add_signing_message(id, commit)`
+/// (empty context) with the `q-prover-key` write key — matching
+/// `verify_op_signature`.
+pub(crate) fn build_hyperedge_add(
+    key_manager: &FileKeyManager,
+    domain: &[u8],
+    app: &[u8; 32],
+    data: &[u8; 32],
+    atoms: &[[u8; HYPEREDGE_ID_LEN]],
+) -> anyhow::Result<HyperedgeAdd> {
+    // Value bytes (0x01‖app‖data‖tree) + the SHA-Merkle extrinsic commitment.
+    let (value, commit) = build_hyperedge_add_value(app, data, atoms)
+        .map_err(|e| anyhow::anyhow!("build hyperedge: {e}"))?;
+
+    // signed = separator ‖ (id ‖ commit); Falcon write key, empty context.
+    let id = extract_hyperedge_id(&value).map_err(|e| anyhow::anyhow!("hyperedge id: {e}"))?;
+    let separator = hyperedge_add_domain_separator(domain)
+        .map_err(|e| anyhow::anyhow!("hyperedge separator: {e}"))?;
+    let message = hyperedge_add_signing_message(&id, &commit)
+        .map_err(|e| anyhow::anyhow!("hyperedge signing message: {e}"))?;
+    let mut signed = Vec::with_capacity(separator.len() + message.len());
+    signed.extend_from_slice(&separator);
+    signed.extend_from_slice(&message);
+
+    let signer: Box<dyn Signer> = key_manager
+        .get_signer_by_id("q-prover-key")
+        .map_err(|e| anyhow::anyhow!("get write key (q-prover-key): {e}"))?;
+    let signature = signer
+        .sign_with_domain(&signed, &[])
+        .map_err(|e| anyhow::anyhow!("sign hyperedge add: {e}"))?;
+
+    Ok(HyperedgeAdd {
+        domain: domain.to_vec(),
+        value,
+        signature,
+    })
+}
 
 #[derive(Debug, Subcommand)]
 pub enum PutCommand {
@@ -129,33 +172,9 @@ async fn hyperedge(
         anyhow::bail!("at least one 64-byte atom address is required");
     }
 
-    // Value bytes (0x01‖app‖data‖tree) + the SHA-Merkle extrinsic commitment.
-    let (value, commit) = build_hyperedge_add_value(&app, &data, &atoms)
-        .map_err(|e| anyhow::anyhow!("build hyperedge: {e}"))?;
-
-    // signed = separator ‖ (id ‖ commit); Falcon write key, empty context.
-    let id = extract_hyperedge_id(&value).map_err(|e| anyhow::anyhow!("hyperedge id: {e}"))?;
-    let separator = hyperedge_add_domain_separator(&domain)
-        .map_err(|e| anyhow::anyhow!("hyperedge separator: {e}"))?;
-    let message = hyperedge_add_signing_message(&id, &commit)
-        .map_err(|e| anyhow::anyhow!("hyperedge signing message: {e}"))?;
-    let mut signed = Vec::with_capacity(separator.len() + message.len());
-    signed.extend_from_slice(&separator);
-    signed.extend_from_slice(&message);
-
-    let signer: Box<dyn Signer> = hc
-        .key_manager
-        .get_signer_by_id("q-prover-key")
-        .map_err(|e| anyhow::anyhow!("get write key (q-prover-key): {e}"))?;
-    let signature = signer
-        .sign_with_domain(&signed, &[])
-        .map_err(|e| anyhow::anyhow!("sign hyperedge add: {e}"))?;
-
-    let op = HyperedgeAdd {
-        domain: domain.clone(),
-        value,
-        signature,
-    };
+    let op = build_hyperedge_add(&hc.key_manager, &domain, &app, &data, &atoms)?;
+    // Full address (hyperedge id) for the confirmation line = app ‖ data.
+    let id = extract_hyperedge_id(&op.value).map_err(|e| anyhow::anyhow!("hyperedge id: {e}"))?;
 
     let mut client = hc.connect().await?;
     let request = MessageRequest {

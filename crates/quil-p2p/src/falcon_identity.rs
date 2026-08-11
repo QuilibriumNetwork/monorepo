@@ -59,6 +59,13 @@ pub fn peer_id_from_falcon_pubkey(public_key: &[u8]) -> Vec<u8> {
     multihash
 }
 
+/// The base58 (libp2p canonical) rendering of the Falcon peer id — the node's
+/// current network identity. Use this to DISPLAY the peer id (the Ed448 peer id
+/// is the legacy identity, kept only for legacy coin addressing).
+pub fn peer_id_base58_from_falcon_pubkey(public_key: &[u8]) -> String {
+    bs58::encode(peer_id_from_falcon_pubkey(public_key)).into_string()
+}
+
 /// Generate a fresh random Falcon-512 keypair and return its raw 1281-byte
 /// signing key. Feed this into `Keypair::falcon_from_bytes` (for the peer-id)
 /// and to the `:8340` PQNoise handshake (which keys on the same signing bytes).

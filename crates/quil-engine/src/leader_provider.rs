@@ -204,6 +204,25 @@ impl GlobalLeaderProvider {
         ]
         .iter()
         .map(|(s, p)| {
+            // The prover shard's HYPEREDGE-ADDS root is NOT committed. That
+            // phase holds only the denormalized prover→allocation index
+            // (`build_prover_allocation_hyperedge_blob`) — redundant with the
+            // phase-0 allocation VERTICES the prover registry actually reads
+            // (`prover_registry::refresh` walks vertices, never hyperedges), and
+            // consumed by no committee/verifier. Committing it required a LIVE
+            // forest read here (there is no materialized-N-1 anchor for aux
+            // phases, unlike `compute_prover_root`), which races the async
+            // materializer and yields a non-reproducible root: a peer serving
+            // its now-advanced live head fails the sync anchor-check forever
+            // (the phase-2 "peer phase root != header-committed root" storm).
+            // Emit an EMPTY root so the syncer treats it as "no anchor / trust"
+            // and skips the phase. Empty is VDF-bound like any other value and
+            // read straight from the header by verifiers, so this is
+            // rolling-upgrade safe. vertex/hyperedge REMOVES stay empty (zero
+            // root) in the prover shard, so they remain stable and are kept.
+            if *s == "hyperedge" && *p == "adds" {
+                return Vec::new();
+            }
             let r = hg.compute_shard_root(s, p, &global_shard);
             if r.len() == 32 || r.len() >= 64 {
                 r

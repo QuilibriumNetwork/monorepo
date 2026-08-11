@@ -25,7 +25,8 @@ pub use libp2p::identity::Keypair;
 pub use libp2p::PeerId;
 pub use ed448_identity::{peer_id_from_ed448_pubkey, Ed448Identity};
 pub use falcon_identity::{
-    falcon_identity_self_check, generate_falcon_signing_key, peer_id_from_falcon_pubkey,
+    falcon_identity_self_check, generate_falcon_signing_key, peer_id_base58_from_falcon_pubkey,
+    peer_id_from_falcon_pubkey,
 };
 pub use node::{P2PHandle, P2PNode, ReceivedMessage};
 pub use pqnoise_transport::{upgrade as pq_upgrade, PqNoiseError, PqOutput};

@@ -25,13 +25,14 @@ use crate::context::{Context, GlobalArgs};
 use crate::rpc::ConnectOpts;
 
 mod compute;
+pub(crate) mod compute_update;
 mod file;
 mod file_index;
 mod get;
 mod hypergraph;
-mod hypergraph_update;
+pub(crate) mod hypergraph_update;
 mod token;
-mod token_update;
+pub(crate) mod token_update;
 
 #[derive(Debug, Subcommand)]
 pub enum DeployCommand {
@@ -84,6 +85,14 @@ pub enum DeployCommand {
     /// Update a deployed hypergraph's config/schema (owner-signed).
     HypergraphUpdate {
         /// The hypergraph's 32-byte domain (hex or alias).
+        #[arg(short = 'd', long)]
+        domain: String,
+        /// Optional `rdf=<path>` for a schema evolution (omit for key rotation).
+        args: Vec<String>,
+    },
+    /// Update a deployed compute intrinsic's config/schema (owner-signed).
+    ComputeUpdate {
+        /// The compute domain's 32-byte address (hex or alias).
         #[arg(short = 'd', long)]
         domain: String,
         /// Optional `rdf=<path>` for a schema evolution (omit for key rotation).
@@ -200,6 +209,9 @@ pub async fn run(global: GlobalArgs, cmd: &DeployCommand) -> anyhow::Result<()> 
         DeployCommand::TokenUpdate { domain, args } => token_update::run(&dc, domain, args).await,
         DeployCommand::HypergraphUpdate { domain, args } => {
             hypergraph_update::run(&dc, domain, args).await
+        }
+        DeployCommand::ComputeUpdate { domain, args } => {
+            compute_update::run(&dc, domain, args).await
         }
     }
 }

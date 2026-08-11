@@ -10,12 +10,56 @@
 //! `rdf=<file>` (the node enforces the strict-superset evolution check).
 
 use quil_execution::hypergraph_intrinsic::HypergraphUpdate as CanonicalHypergraphUpdate;
+use quil_keys::FileKeyManager;
 use quil_types::crypto::Signer;
 use quil_types::proto::global::{message_request::Request, MessageRequest};
 use quil_types::proto::hypergraph::{HypergraphConfiguration, HypergraphUpdate};
 use quil_types::proto::keys::Bls48581AggregateSignature;
 
 use super::DeployCtx;
+
+/// Build a signed `HypergraphUpdate` for `domain`. The signed message is the
+/// canonical `HypergraphUpdate` with the signature cleared (via
+/// `to_canonical_bytes_without_signature`); the Falcon `q-prover-key` signs it
+/// under `domain ‖ "HYPERGRAPH_UPDATE"` — matching
+/// `hypergraph_intrinsic/auth.rs::verify_update_signature`.
+pub(crate) fn build_hypergraph_update(
+    key_manager: &FileKeyManager,
+    domain: &[u8],
+    cfg: HypergraphConfiguration,
+    rdf_schema: Vec<u8>,
+) -> anyhow::Result<HypergraphUpdate> {
+    // Signed message = canonical HypergraphUpdate with the signature cleared.
+    let unsigned = HypergraphUpdate {
+        config: Some(cfg.clone()),
+        rdf_schema: rdf_schema.clone(),
+        public_key_signature_bls48581: None,
+    };
+    let signed_message = CanonicalHypergraphUpdate::from_proto(&unsigned)
+        .map_err(|e| anyhow::anyhow!("canonicalize update: {e}"))?
+        .to_canonical_bytes_without_signature()
+        .map_err(|e| anyhow::anyhow!("canonical bytes: {e}"))?;
+
+    // Falcon owner signature under `domain ‖ "HYPERGRAPH_UPDATE"`.
+    let mut domain_sep = domain.to_vec();
+    domain_sep.extend_from_slice(b"HYPERGRAPH_UPDATE");
+    let signer: Box<dyn Signer> = key_manager
+        .get_signer_by_id("q-prover-key")
+        .map_err(|e| anyhow::anyhow!("get owner key (q-prover-key): {e}"))?;
+    let sig = signer
+        .sign_with_domain(&signed_message, &domain_sep)
+        .map_err(|e| anyhow::anyhow!("sign: {e}"))?;
+
+    Ok(HypergraphUpdate {
+        config: Some(cfg),
+        rdf_schema,
+        public_key_signature_bls48581: Some(Bls48581AggregateSignature {
+            signature: sig,
+            public_key: None,
+            bitmask: Vec::new(),
+        }),
+    })
+}
 
 pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::Result<()> {
     if domain_arg.is_empty() {
@@ -44,37 +88,7 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
         owner_public_key: keys.owner,
     };
 
-    // Signed message = canonical HypergraphUpdate with the signature cleared.
-    let unsigned = HypergraphUpdate {
-        config: Some(cfg.clone()),
-        rdf_schema: rdf_schema.clone(),
-        public_key_signature_bls48581: None,
-    };
-    let signed_message = CanonicalHypergraphUpdate::from_proto(&unsigned)
-        .map_err(|e| anyhow::anyhow!("canonicalize update: {e}"))?
-        .to_canonical_bytes_without_signature()
-        .map_err(|e| anyhow::anyhow!("canonical bytes: {e}"))?;
-
-    // Falcon owner signature under `domain ‖ "HYPERGRAPH_UPDATE"`.
-    let mut domain_sep = domain.clone();
-    domain_sep.extend_from_slice(b"HYPERGRAPH_UPDATE");
-    let signer: Box<dyn Signer> = dc
-        .key_manager
-        .get_signer_by_id("q-prover-key")
-        .map_err(|e| anyhow::anyhow!("get owner key (q-prover-key): {e}"))?;
-    let sig = signer
-        .sign_with_domain(&signed_message, &domain_sep)
-        .map_err(|e| anyhow::anyhow!("sign: {e}"))?;
-
-    let signed = HypergraphUpdate {
-        config: Some(cfg),
-        rdf_schema,
-        public_key_signature_bls48581: Some(Bls48581AggregateSignature {
-            signature: sig,
-            public_key: None,
-            bitmask: Vec::new(),
-        }),
-    };
+    let signed = build_hypergraph_update(&dc.key_manager, &domain, cfg, rdf_schema)?;
 
     let mut client = dc.connect().await?;
     let request = MessageRequest {

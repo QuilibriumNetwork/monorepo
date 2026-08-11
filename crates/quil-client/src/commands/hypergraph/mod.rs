@@ -17,8 +17,8 @@ use crate::context::{Context, GlobalArgs};
 use crate::rpc::ConnectOpts;
 
 mod get;
-mod put;
-mod remove;
+pub(crate) mod put;
+pub(crate) mod remove;
 
 #[derive(Debug, Subcommand)]
 pub enum HypergraphCommand {

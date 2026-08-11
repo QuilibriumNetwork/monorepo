@@ -747,19 +747,22 @@ impl WorkerOnlyNode {
     /// respawn can unsubscribe them.
     async fn subscribe_to_shard_bitmasks(&self, filter: &[u8]) {
         let Some(p2p) = self.worker_p2p.clone() else { return };
-        let mut bitmasks = vec![
+        let bitmasks = vec![
             crate::bitmasks::shard_frame_bitmask(filter),
             crate::bitmasks::shard_consensus_bitmask(filter),
             crate::bitmasks::shard_prover_bitmask(filter),
             crate::bitmasks::shard_dispatch_bitmask(filter),
+            // App-shard CW consensus rides its own per-shard topic. The app
+            // engine ALWAYS starts commonware-simplex (`app_engine::run` →
+            // `start_consensus_cw`, ungated — Jolteon is gone), so this
+            // subscription must be unconditional too: without it the worker
+            // publishes CW out (`CwOut` → `shard_cw_bitmask`) to a topic it
+            // never joined ("not subscribed to bitmask") AND never receives
+            // peers' votes/certs/blocks → its simplex engine can't reach
+            // quorum. Gating this on `config.app_consensus_cw` (default false,
+            // a vestige of the removed legacy path) was the bug.
+            crate::bitmasks::shard_cw_bitmask(filter),
         ];
-        // App-shard CW consensus rides its own per-shard topic; without this a
-        // cluster worker publishes CW out (`CwOut` → `shard_cw_bitmask`) but
-        // never receives peers' votes/certs/blocks → its simplex engine can't
-        // reach quorum. Subscribe only when CW is active for this worker.
-        if self.config.app_consensus_cw {
-            bitmasks.push(crate::bitmasks::shard_cw_bitmask(filter));
-        }
         for bm in &bitmasks {
             p2p.subscribe(bm.clone()).await;
         }

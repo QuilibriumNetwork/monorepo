@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use num_bigint::{BigInt, Sign};
 
 use quil_execution::token_intrinsic::conversions::token_update_from_proto;
+use quil_keys::FileKeyManager;
 use quil_types::crypto::Signer;
 use quil_types::proto::global::{message_request::Request, MessageRequest};
 use quil_types::proto::keys::Bls48581AggregateSignature;
@@ -20,6 +21,47 @@ use quil_types::proto::token::{
 };
 
 use super::DeployCtx;
+
+/// Build a signed `TokenUpdate` for `domain`. The signed message is the
+/// canonical `TokenUpdate` with the signature field cleared (the node re-encodes
+/// it the same way before verifying against the prior config's owner key); the
+/// Falcon `q-prover-key` signs it under `domain ‖ "TOKEN_UPDATE"`.
+pub(crate) fn build_token_update(
+    key_manager: &FileKeyManager,
+    domain: &[u8],
+    cfg: TokenConfiguration,
+) -> anyhow::Result<TokenUpdate> {
+    // Signed message = canonical TokenUpdate with an empty signature field.
+    let unsigned = TokenUpdate {
+        config: Some(cfg.clone()),
+        rdf_schema: Vec::new(),
+        public_key_signature_bls48581: None,
+    };
+    let signed_message = token_update_from_proto(&unsigned)
+        .map_err(|e| anyhow::anyhow!("canonicalize update: {e}"))?
+        .to_canonical_bytes()
+        .map_err(|e| anyhow::anyhow!("canonical bytes: {e}"))?;
+
+    // Falcon owner signature under `domain ‖ "TOKEN_UPDATE"`.
+    let mut domain_sep = domain.to_vec();
+    domain_sep.extend_from_slice(b"TOKEN_UPDATE");
+    let signer: Box<dyn Signer> = key_manager
+        .get_signer_by_id("q-prover-key")
+        .map_err(|e| anyhow::anyhow!("get owner key (q-prover-key): {e}"))?;
+    let sig = signer
+        .sign_with_domain(&signed_message, &domain_sep)
+        .map_err(|e| anyhow::anyhow!("sign: {e}"))?;
+
+    Ok(TokenUpdate {
+        config: Some(cfg),
+        rdf_schema: Vec::new(),
+        public_key_signature_bls48581: Some(Bls48581AggregateSignature {
+            signature: sig,
+            public_key: None,
+            bitmask: Vec::new(),
+        }),
+    })
+}
 
 const MINTABLE: u32 = 1 << 0;
 const BURNABLE: u32 = 1 << 1;
@@ -88,37 +130,7 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
         cfg.supply = parse_bigint_be(v)?;
     }
 
-    // Signed message = canonical TokenUpdate with an empty signature field.
-    let unsigned = TokenUpdate {
-        config: Some(cfg.clone()),
-        rdf_schema: Vec::new(),
-        public_key_signature_bls48581: None,
-    };
-    let signed_message = token_update_from_proto(&unsigned)
-        .map_err(|e| anyhow::anyhow!("canonicalize update: {e}"))?
-        .to_canonical_bytes()
-        .map_err(|e| anyhow::anyhow!("canonical bytes: {e}"))?;
-
-    // Falcon owner signature under `domain ‖ "TOKEN_UPDATE"`.
-    let mut domain_sep = domain.clone();
-    domain_sep.extend_from_slice(b"TOKEN_UPDATE");
-    let signer: Box<dyn Signer> = dc
-        .key_manager
-        .get_signer_by_id("q-prover-key")
-        .map_err(|e| anyhow::anyhow!("get owner key (q-prover-key): {e}"))?;
-    let sig = signer
-        .sign_with_domain(&signed_message, &domain_sep)
-        .map_err(|e| anyhow::anyhow!("sign: {e}"))?;
-
-    let signed = TokenUpdate {
-        config: Some(cfg),
-        rdf_schema: Vec::new(),
-        public_key_signature_bls48581: Some(Bls48581AggregateSignature {
-            signature: sig,
-            public_key: None,
-            bitmask: Vec::new(),
-        }),
-    };
+    let signed = build_token_update(&dc.key_manager, &domain, cfg)?;
 
     let mut client = dc.connect().await?;
     let request = MessageRequest {

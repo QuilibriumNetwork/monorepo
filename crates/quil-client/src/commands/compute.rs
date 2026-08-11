@@ -9,6 +9,7 @@
 use clap::{Args, Subcommand};
 use rand::RngCore;
 
+use quil_keys::FileKeyManager;
 use quil_types::crypto::Signer;
 use quil_types::proto::compute::{
     Application, CodeExecute, ExecuteOperation, ExecutionContext,
@@ -18,6 +19,32 @@ use quil_types::proto::global::{message_request::Request, MessageRequest};
 use crate::alias_store::{self, Store};
 use crate::context::{Context, GlobalArgs};
 use crate::rpc::ConnectOpts;
+
+/// Build a `CodeExecute` op for `domain` with the given operations. The
+/// proof-of-payment is a Falcon `q-prover-key` signature over `rendezvous`
+/// (FN-DSA context = `domain`), packaged as `[payer_pubkey, sig]` — exactly
+/// what the node's `verify_code_execute` checks.
+pub(crate) fn build_code_execute(
+    key_manager: &FileKeyManager,
+    domain: &[u8],
+    rendezvous: &[u8],
+    execute_operations: Vec<ExecuteOperation>,
+) -> anyhow::Result<CodeExecute> {
+    let signer: Box<dyn Signer> = key_manager
+        .get_signer_by_id("q-prover-key")
+        .map_err(|e| anyhow::anyhow!("get payer key (q-prover-key): {e}"))?;
+    let payer = signer.public_key().to_vec();
+    let payment_sig = signer
+        .sign_with_domain(rendezvous, domain)
+        .map_err(|e| anyhow::anyhow!("sign proof of payment: {e}"))?;
+
+    Ok(CodeExecute {
+        proof_of_payment: vec![payer, payment_sig],
+        domain: domain.to_vec(),
+        rendezvous: rendezvous.to_vec(),
+        execute_operations,
+    })
+}
 
 #[derive(Debug, Args)]
 pub struct ComputeArgs {
@@ -122,20 +149,7 @@ async fn execute(global: GlobalArgs, address: &str, rest: &[String]) -> anyhow::
     };
 
     // Falcon proof-of-payment: [payer_pubkey, sign(rendezvous, ctx=domain)].
-    let signer: Box<dyn Signer> = key_manager
-        .get_signer_by_id("q-prover-key")
-        .map_err(|e| anyhow::anyhow!("get payer key (q-prover-key): {e}"))?;
-    let payer = signer.public_key().to_vec();
-    let payment_sig = signer
-        .sign_with_domain(&rendezvous, &domain)
-        .map_err(|e| anyhow::anyhow!("sign proof of payment: {e}"))?;
-
-    let op = CodeExecute {
-        proof_of_payment: vec![payer, payment_sig],
-        domain: domain.clone(),
-        rendezvous: rendezvous.clone(),
-        execute_operations: vec![main_op],
-    };
+    let op = build_code_execute(&key_manager, &domain, &rendezvous, vec![main_op])?;
 
     let connect_opts = ConnectOpts {
         public_rpc: false,

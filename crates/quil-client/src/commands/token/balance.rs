@@ -47,6 +47,29 @@ pub async fn run(tc: &TokenCtx) -> anyhow::Result<()> {
         sum += BigInt::from_bytes_be(Sign::Plus, &p.raw_balance);
     }
 
+    // Claimable lattice escrows (pending transfers) addressed to this wallet —
+    // the "new" balance the legacy(Ed448) + view‖spend queries above miss. Same
+    // enumeration `token coins` uses; only escrows addressed TO this wallet count
+    // toward balance (refunds are contingent on non-claim + expiration).
+    if let Ok(w) = super::lattice::Wallet::load(tc) {
+        if let Ok(escrows) =
+            super::lattice::list_escrows(&mut client, &QUIL_TOKEN.to_vec()).await
+        {
+            for e in &escrows {
+                if e.to_key != w.falcon_pk {
+                    continue;
+                }
+                if let Some((amt, _)) =
+                    quil_execution::token_intrinsic::lattice_ct::open_escrow_memo(
+                        w.np, &w.kem_sk, &e.cv, &e.memo,
+                    )
+                {
+                    sum += BigInt::from(amt);
+                }
+            }
+        }
+    }
+
     let formatted = util::float_string_12(&sum, &util::conversion_factor());
     println!(
         "Total balance: {} QUIL (Account 0x{})",

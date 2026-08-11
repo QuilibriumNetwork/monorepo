@@ -276,8 +276,14 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
                 for req in &bundle.requests {
                     if let Some(r) = req {
                         if let Err(e) = invoke(&r.inner_bytes, r.inner_type_prefix) {
-                            eprintln!(
-                                "[WARN] global invoke_step failed for bundle request type=0x{:08x}: {}",
+                            // Invalid global-intrinsic ops (prover join/confirm/
+                            // leave/reject/pause/resume/update/kick) are an
+                            // expected, high-volume part of normal operation
+                            // (stale frame numbers, races, superseded lifecycle
+                            // ops) — log at debug, not warn. Other engines keep
+                            // their failures at warn.
+                            tracing::debug!(
+                                "global invoke_step failed for bundle request type=0x{:08x}: {}",
                                 r.inner_type_prefix, e
                             );
                         }
@@ -303,8 +309,11 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
             TYPE_MESSAGE_REQUEST => {
                 let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
                 if let Err(e) = invoke(&req.inner_bytes, req.inner_type_prefix) {
-                    eprintln!(
-                        "[WARN] global invoke_step failed for single request type=0x{:08x}: {}",
+                    // Invalid global-intrinsic ops are expected/high-volume; log
+                    // at debug (see the bundle path above). Other engines' op
+                    // failures stay at warn.
+                    tracing::debug!(
+                        "global invoke_step failed for single request type=0x{:08x}: {}",
                         req.inner_type_prefix, e
                     );
                 }

@@ -354,6 +354,15 @@ struct AppLeaderProvider {
     /// is a PROPOSER SELF-attestation (single member = the frame's prover), NOT
     /// the legacy multi-member committee attestation assembled from vote openings.
     frame_attestations: Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>>>,
+    /// Order-independent fingerprint of THIS CW instance's committee (the fixed
+    /// simplex validator set built at `start_consensus_cw`). The finalization
+    /// cert a proposed frame receives is signed by exactly this committee, but
+    /// every verifier reconstructs the committee from the frame's stamped
+    /// `global_frame_number`. If the active set moved since this instance was
+    /// built (epoch boundary, deferred activation, empty-committee floor), the
+    /// cert becomes unverifiable — so `prove_next_state` declines to propose
+    /// until the run loop rebuilds the instance. See `AppConsensusEngine::committee_fp`.
+    instance_committee_fp: [u8; 32],
 }
 
 /// Anchor to `latest − K`, not the bleeding-edge head: app-shard committees are
@@ -505,17 +514,41 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // Committee epoch is GLOBAL-frame-defined; read it at the anchor, NOT the
         // app-shard-local clock tip (unrelated to global). See `committee_anchor_gfn`.
         let committee_frame = anchor_gfn;
-        let active_count = self
+        let active = self
             .prover_registry
             .get_active_provers(&self.filter, committee_frame)
-            .map(|p| p.len())
-            .unwrap_or(0);
+            .unwrap_or_default();
+        let active_count = active.len();
         if (active_count as u64) < self.min_active_provers_for_propose {
             return Err(QuilError::NoVote(format!(
                 "shard has {} active prover(s); minimum {} required to propose",
                 active_count,
                 self.min_active_provers_for_propose,
             )));
+        }
+        // Epoch-straddle guard — prevents an UNVERIFIABLE finalization cert.
+        // The cert this frame will get is signed by THIS simplex instance's
+        // fixed committee. Every verifier instead reconstructs the committee
+        // from the frame's stamped `global_frame_number` (= `anchor_gfn` here) —
+        // i.e. the CURRENT active set at that anchor. If that set has moved
+        // since this instance was built (an epoch boundary crossed, a prover's
+        // deferred activation reached its epoch, or the empty-committee floor
+        // shifted), the cert is signed by a committee no verifier reconstructs
+        // and the frame is permanently unverifiable (the persistent
+        // "app shard frame CW finalization cert verification failed" storm).
+        // Decline to propose until the run loop's committee-change detection
+        // rebuilds the instance with the current set (≤ the 10s `cw_retry_timer`).
+        // NoVote (not Consensus) → the view nullifies without killing the loop.
+        let current_fp = AppConsensusEngine::committee_fp(
+            &active.iter().map(|p| p.public_key.clone()).collect::<Vec<_>>(),
+        );
+        if current_fp != self.instance_committee_fp {
+            return Err(QuilError::NoVote(
+                "active committee moved since the CW instance was built — declining \
+                 to propose until it rebuilds (prevents an unverifiable cross-committee \
+                 finalization cert)"
+                    .to_string(),
+            ));
         }
         // Get latest shard frame number
         let prior_frame_number = self.clock_store
@@ -1917,6 +1950,10 @@ impl AppConsensusEngine {
             frame_requests: self.frame_requests.clone(),
             kv_db: self.kv_db.clone(),
             frame_attestations: self.frame_attestations.clone(),
+            // Pin the committee this instance signs with, so the leader can
+            // refuse to propose frames whose verifier-reconstructed committee
+            // would no longer match (epoch-straddle guard).
+            instance_committee_fp: Self::committee_fp(&member_pubkeys),
         });
 
         // `.with_clock_store` is REQUIRED for storage-active frames: the validator

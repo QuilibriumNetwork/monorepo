@@ -3,9 +3,11 @@
 //!
 //! Lattice port of `client/cmd/token/split.go`: spend the one selected coin and
 //! create the requested self-outputs (plus a remainder coin so outputs sum
-//! exactly to the input, fee = 0). Amounts are raw base units (matching
-//! `token transfer`), not decimal QUIL. A coin is identified by the `address`
-//! shown by `token coins` (or its one-time key).
+//! exactly to the input, fee = 0). Explicit `<Amounts>` and `--part-amount` are
+//! **decimal QUIL** values (e.g. `1.5`, `0.02`), converted to base units via
+//! `util::conversion_factor()` (matching `token transfer` and the Go client). A
+//! coin is identified by the `address` shown by `token coins` (or its one-time
+//! key).
 
 use super::lattice::{
     address_to_otk, fetch_inputs, resolve_otk, scan_owned_coins, submit_spend, OutSpec, Wallet,
@@ -60,14 +62,18 @@ pub async fn run(
 
     // Compute the output amounts (which must sum to `total`).
     let out_amounts = if let Some(n) = parts {
-        split_into_parts(total, n, part_amount)?
+        // `--part-amount` is decimal QUIL; convert to base units first.
+        let part_units = match part_amount {
+            Some(a) => Some(crate::util::parse_quil_amount(a)?),
+            None => None,
+        };
+        split_into_parts(total, n, part_units)?
     } else {
         let mut amts: Vec<u128> = Vec::with_capacity(amounts.len());
         let mut sum: u128 = 0;
         for a in amounts {
-            let v: u128 = a
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid amount (expected base-unit integer): {a}"))?;
+            // Each explicit amount is decimal QUIL; convert to base units.
+            let v: u128 = crate::util::parse_quil_amount(a)?;
             if v == 0 {
                 anyhow::bail!("amount must be positive: {a}");
             }
@@ -109,16 +115,14 @@ pub async fn run(
     Ok(())
 }
 
-/// Amounts for `--parts N [--part-amount A]`. With an explicit part amount, N
-/// coins of A plus a remainder coin; otherwise N equal coins plus the leftover
-/// remainder (mirrors split.go's remainder coin).
-fn split_into_parts(total: u128, n: u32, part_amount: Option<&str>) -> anyhow::Result<Vec<u128>> {
+/// Amounts for `--parts N [--part-amount A]`. With an explicit part amount
+/// (already converted to base units), N coins of A plus a remainder coin;
+/// otherwise N equal coins plus the leftover remainder (mirrors split.go's
+/// remainder coin).
+fn split_into_parts(total: u128, n: u32, part_amount: Option<u128>) -> anyhow::Result<Vec<u128>> {
     let n = n as u128;
     match part_amount {
-        Some(a) => {
-            let per: u128 = a
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid --part-amount (base-unit integer): {a}"))?;
+        Some(per) => {
             if per == 0 {
                 anyhow::bail!("--part-amount must be positive");
             }
@@ -176,21 +180,22 @@ mod tests {
 
     #[test]
     fn part_amount_with_remainder() {
-        let amts = split_into_parts(1000, 2, Some("350")).unwrap();
+        // part amounts here are base units (decimal→base conversion happens in run()).
+        let amts = split_into_parts(1000, 2, Some(350)).unwrap();
         assert_eq!(amts, vec![350, 350, 300]);
         assert_conserves(1000, &amts);
     }
 
     #[test]
     fn part_amount_exact() {
-        let amts = split_into_parts(700, 2, Some("350")).unwrap();
+        let amts = split_into_parts(700, 2, Some(350)).unwrap();
         assert_eq!(amts, vec![350, 350]);
         assert_conserves(700, &amts);
     }
 
     #[test]
     fn rejects_overcommit_and_too_small() {
-        assert!(split_into_parts(500, 2, Some("300")).is_err()); // 600 > 500
+        assert!(split_into_parts(500, 2, Some(300)).is_err()); // 600 > 500
         assert!(split_into_parts(2, 3, None).is_err()); // base would be 0
     }
 }

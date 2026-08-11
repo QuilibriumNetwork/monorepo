@@ -107,7 +107,10 @@ pub(crate) fn handle_diagnostic_flags(
     }
 
     if args.peer_info {
-        let peer_id_b58 = {
+        // Legacy Ed448 peer id — the pre-migration network identity, retained
+        // only as the seniority root / legacy coin addressing. Shown as a
+        // clearly-labeled legacy line, NOT as the current "Peer ID".
+        let legacy_peer_id_b58 = {
             let pk_bytes = hex::decode(&config.p2p.peer_priv_key).unwrap_or_default();
             if pk_bytes.len() >= 57 {
                 let mut seed = [0u8; 57];
@@ -133,7 +136,12 @@ pub(crate) fn handle_diagnostic_flags(
             Box::new(bls_ctor),
         )?;
         let bls_pubkey = fkm.get_public_key(quil_types::crypto::KeyType::Falcon512)?;
+        // Current network identity — the FALCON q-prover-key peer id (matches
+        // --peer-id, --node-info, the prover-manage TUI, and GetNodeInfo RPC).
+        let peer_id_b58 =
+            bs58::encode(quil_p2p::peer_id_from_falcon_pubkey(&bls_pubkey)).into_string();
         println!("Peer ID: {}", peer_id_b58);
+        println!("Legacy Peer ID (Ed448): {}", legacy_peer_id_b58);
         println!("BLS Public Key Length: {} bytes", bls_pubkey.len());
         println!("Listen Multiaddr: {}", config.p2p.listen_multiaddr);
         return Ok(true);

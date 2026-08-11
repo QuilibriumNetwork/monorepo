@@ -18,3 +18,8 @@ pub mod util;
 pub mod vertex_write;
 
 pub mod commands;
+
+/// Acceptance tests: each request the client emits is run through the node's
+/// own signature/structure verification. See the module for scope.
+#[cfg(test)]
+mod request_acceptance_tests;
