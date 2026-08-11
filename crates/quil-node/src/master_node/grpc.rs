@@ -956,6 +956,11 @@ pub(crate) fn spawn_all(
         current_frame: Arc<quil_engine::current_frame::CurrentFrame>,
         key_store: Arc<dyn quil_types::store::KeyStore>,
         peer_info_lookup: Arc<dyn Fn(&[u8]) -> Vec<String> + Send + Sync>,
+        // The node's FALCON q-prover-key (1281 B) — the `:8340` PQNoise transport
+        // identity for the outbound shard-info dial. `ed448_seed` is the legacy
+        // Ed448 mTLS seed (57 B), kept only as a last-resort fallback: handing it
+        // to the Falcon transport fails to decode ("falcon feature not enabled").
+        falcon_signing_key: Option<Vec<u8>>,
         ed448_seed: Option<[u8; 57]>,
         archive_mode: bool,
         archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
@@ -998,7 +1003,19 @@ pub(crate) fn spawn_all(
                 Err(_) => true,
             };
             if !local_incomplete { return local_result; }
-            let Some(seed) = self.ed448_seed else { return local_result; };
+            // The :8340 transport decodes a FALCON signing key on both ends, so the
+            // outbound dial MUST present the node's Falcon q-prover-key (1281 B),
+            // NOT the legacy Ed448 seed (57 B) — the latter fails to decode as
+            // Falcon and the dial dies with "falcon keypair: ... feature not
+            // enabled". Fall back to the Ed448 seed only if the Falcon key is
+            // unavailable, matching the server side.
+            let Some(seed) = self
+                .falcon_signing_key
+                .clone()
+                .or_else(|| self.ed448_seed.map(|s| s.to_vec()))
+            else {
+                return local_result;
+            };
 
             use std::collections::HashMap;
             let key_store = self.key_store.clone();
@@ -1088,6 +1105,13 @@ pub(crate) fn spawn_all(
         current_frame: current_frame.clone(),
         key_store: key_store.clone() as Arc<dyn quil_types::store::KeyStore>,
         peer_info_lookup,
+        // Falcon transport identity for the outbound shard-info dial (gated by a
+        // transport identity being present, same as the onion dialer / server).
+        falcon_signing_key: if mtls_seed.is_some() {
+            file_key_manager.get_secret_key_bytes_by_id("q-prover-key").ok()
+        } else {
+            None
+        },
         ed448_seed: mtls_seed,
         archive_mode,
         archive_pool: archive_pool.clone(),

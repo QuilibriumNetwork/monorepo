@@ -78,6 +78,22 @@ pub fn run_migrate_db(target: &Path, config: &quil_config::Config) -> anyhow::Re
     for (idx, root) in &report.global_roots {
         println!("  global[{idx:#04x}] root = {}", hex::encode(root));
     }
+
+    // Seed the durable GLOBAL materialized cursor to the head the forest was
+    // built at. The migrated forest reflects state THROUGH `head_n`; without
+    // recording the cursor it stays at 0, and the in-order materializer then asks
+    // for frame 1 — which a mid-chain-migrated archive no longer holds — and
+    // stalls forever at the fork, freezing the prover root and every downstream
+    // frame. (The state-jump used to set this as a side effect, but archives stop
+    // state-jumping once head passes `STATE_JUMP_MAX_FRAME`.) Monotonic — a no-op
+    // if a higher cursor is already recorded.
+    if head_n > 0 {
+        clock
+            .put_global_materialized_cursor(head_n)
+            .map_err(|e| anyhow::anyhow!("seed materialized cursor: {e}"))?;
+        println!("materialized cursor seeded to head frame {head_n}");
+    }
+
     println!("=== migration complete ===");
     Ok(())
 }

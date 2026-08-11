@@ -97,6 +97,12 @@ pub struct FrameMaterializer {
     /// and is only flipped on by tests that exercise the kick path.
     evictions_enabled: bool,
 
+    /// MAINNET-ONLY 2.1.0.25 frozen-era recovery (see `FROZEN_ERA_RECOVERY_*`).
+    /// When true, frames in `[FROZEN_ERA_RECOVERY_START..FROZEN_ERA_RECOVERY_CUTOFF)`
+    /// are materialized as a deterministic no-op. Set only for `network == 0`;
+    /// off on localnet/testnet (and in tests), so those take the normal path.
+    frozen_era_recovery_enabled: bool,
+
     /// Concrete backing store for `refresh_from_store` — used after
     /// `commit_frame` to rebuild the prover-registry cache from the
     /// just-flushed RocksDB trees.
@@ -146,6 +152,27 @@ pub struct FrameMaterializer {
 /// consensus-state-mutating, so every archive shares this constant.
 pub const GLOBAL_EVICTION_ACTIVATION_FRAME: u64 = 674_570;
 
+// ── 2.1.0.25 frozen-era recovery (flag-day) ──────────────────────────────────
+// The archive fleet's materializers wedged at the fork (frame 669975): a fresh
+// `--migrate-db` never seeded the durable materialized cursor, so it sat at 0 and
+// the in-order materializer asked for frame 1 — which migrated archives no longer
+// hold — and silently stalled (`break Ok`). With the forest frozen at the fork
+// state, every leader proved on that state, so EVERY frame header from 669976 up
+// commits the frozen 669975 prover root. Re-materializing those frames by
+// EXECUTING their requests would evolve the forest and diverge from the committed
+// roots (prover-root mismatch → reconcile storm).
+//
+// Recovery: treat every request in `[FROZEN_ERA_RECOVERY_START ..
+// FROZEN_ERA_RECOVERY_CUTOFF)` as a deterministic no-op FAILURE — write one
+// `Failed` outcome per request, apply NO execution / reward / prune / eviction —
+// so the forest (and prover root) stays exactly at the committed frozen root, the
+// near-head prover-root check passes, and the cursor rolls forward out of the
+// wedge. Live execution resumes uniformly at/above the cutoff across the
+// coordinated fleet restart; provers re-join above it. The lower bound keeps
+// localnet/testnet (which never reach these heights) on the normal path.
+pub const FROZEN_ERA_RECOVERY_START: u64 = 669_976;
+pub const FROZEN_ERA_RECOVERY_CUTOFF: u64 = 677_000;
+
 /// Results from materializing a frame.
 #[derive(Debug)]
 pub struct MaterializeResult {
@@ -194,6 +221,7 @@ impl FrameMaterializer {
             archive_mode,
             eviction_grace_frames: 360,
             evictions_enabled: false,
+            frozen_era_recovery_enabled: false,
             rocks_hg_store: None,
             eviction_registry: None,
             current_frame: None,
@@ -242,6 +270,11 @@ impl FrameMaterializer {
     /// Enable the state-MUTATING eviction step (mark Status=4 + KickFrameNumber).
     /// Off by default (see `evictions_enabled`) — evictions are currently
     /// disabled fleet-wide; only tests that exercise the kick path flip this on.
+    pub fn with_frozen_era_recovery(mut self, enabled: bool) -> Self {
+        self.frozen_era_recovery_enabled = enabled;
+        self
+    }
+
     pub fn with_evictions_enabled(mut self, enabled: bool) -> Self {
         self.evictions_enabled = enabled;
         self
@@ -334,6 +367,80 @@ impl FrameMaterializer {
         // forest writer. Nothing may advance the forest mid-materialize, so the
         // verify below reads a stable N-1 forest and cannot fork the prover root.
         let _forest_guard = self.hypergraph.lock_forest_writes();
+
+        // ── 2.1.0.25 frozen-era recovery (see FROZEN_ERA_RECOVERY_* doc) ──
+        // Deterministic no-op for the frozen era: fail every request WITHOUT
+        // executing (no process_message → no reward/prune/eviction/state change),
+        // so the forest stays exactly at the frozen root the frame headers
+        // committed. Then advance the cursor so the materializer rolls out of the
+        // wedge. Held under the forest guard + timed like a normal materialize.
+        if self.frozen_era_recovery_enabled
+            && (FROZEN_ERA_RECOVERY_START..FROZEN_ERA_RECOVERY_CUTOFF).contains(&frame_number)
+        {
+            use quil_types::store::{RequestOutcome, RequestStatus};
+            let outcomes: Vec<RequestOutcome> = frame
+                .requests
+                .iter()
+                .map(|_| RequestOutcome {
+                    status: RequestStatus::Failed,
+                    error: "frozen-era recovery: request bypassed (pre-cutoff no-op)".into(),
+                })
+                .collect();
+            if !outcomes.is_empty() {
+                if let Err(e) = self
+                    .clock_store
+                    .put_global_clock_frame_outcomes(frame_number, &outcomes)
+                {
+                    warn!(frame = frame_number, error = %e, "frozen-era: persist outcomes failed");
+                }
+            }
+            // Flag-day progress signal: log the range boundaries + every 1000th
+            // frame so operators can watch the no-op roll through the frozen era
+            // (there is otherwise no per-frame materialize log on this path).
+            if frame_number == FROZEN_ERA_RECOVERY_START
+                || frame_number == FROZEN_ERA_RECOVERY_CUTOFF - 1
+                || frame_number % 1000 == 0
+            {
+                info!(
+                    frame = frame_number,
+                    requests = outcomes.len(),
+                    "frozen-era recovery: no-op-materialized frame (all requests failed, forest frozen)"
+                );
+            }
+            if let Some(cf) = &self.current_frame {
+                cf.materialize(frame_number);
+            }
+            // Record the (frozen) prover root for this frame so the produce-side
+            // STRICT GATE (`leader_provider::compute_prover_root` → `prover_root_at`)
+            // can resume producing once catch-up reaches head: the no-op leaves the
+            // forest at the committed frozen root, so that IS the correct
+            // end-of-frame-N root. Without this the recovered fleet would decline
+            // every proposal (parent never "materialized") and stay halted.
+            {
+                let global_shard =
+                    quil_types::store::ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+                let frozen_root =
+                    self.hypergraph.compute_shard_root("vertex", "adds", &global_shard);
+                self.hypergraph.record_prover_root(frame_number, frozen_root);
+            }
+            // Advance the durable cursor. No CRDT mutation was staged (no
+            // execution), so this only moves the cursor — the forest is untouched.
+            if let Err(e) = self
+                .execution_manager
+                .commit_frame_with_global_cursor(frame_number)
+            {
+                error!(frame = frame_number, error = %e, "frozen-era: cursor advance failed");
+                return Err(e);
+            }
+            self.last_materialized_frame.store(frame_number, Ordering::SeqCst);
+            return Ok(MaterializeResult {
+                processed: 0,
+                skipped: outcomes.len(),
+                prover_root_matched: true,
+                local_prover_root: Vec::new(),
+                finalized_bundles: Vec::new(),
+            });
+        }
 
         // 2. Compute local prover root and verify against frame.
         //
@@ -1330,6 +1437,65 @@ impl FrameMaterializer {
     /// The last materialized frame number.
     pub fn last_materialized_frame(&self) -> u64 {
         self.last_materialized_frame.load(Ordering::SeqCst)
+    }
+
+    /// Re-seed `prover_root_by_frame[last_materialized]` from the LIVE forest root.
+    ///
+    /// The per-frame prover-root map is IN-MEMORY and lost on restart. The boot
+    /// re-materialize records it for frames it re-runs, but when the durable cursor
+    /// is already AT head (no CRDT gap) nothing re-runs — leaving
+    /// `prover_root_at(cursor)` unrecorded, so the produce-side STRICT GATE
+    /// (`compute_prover_root` → `prover_root_at(N-1)`) can never build `cursor+1`
+    /// (the "parent N-1 not materialized" wedge at the head after a restart). The
+    /// forest reflects state through `last_materialized`, so `compute_shard_root`
+    /// IS that frame's recorded root — seed it. Call once at startup after seeding
+    /// the cursor. No-op at genesis.
+    pub fn record_current_prover_root(&self) {
+        let frame = self.last_materialized_frame.load(Ordering::SeqCst);
+        if frame == 0 {
+            return;
+        }
+        let _forest_guard = self.hypergraph.lock_forest_writes();
+        let global_shard = quil_types::store::ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+        let root = self.hypergraph.compute_shard_root("vertex", "adds", &global_shard);
+        self.hypergraph.record_prover_root(frame, root);
+    }
+
+    /// Advance the cursor past a MISSING frozen-era frame record (flag-day
+    /// recovery). Every frame in `[FROZEN_ERA_RECOVERY_START..CUTOFF)` is a no-op
+    /// that changes NO state, so a missing/unreadable record is harmless: skipping
+    /// it (advance cursor + record the frozen root, exactly like the no-op branch,
+    /// minus the per-request outcomes we don't have) yields the identical forest.
+    /// The in-order "no-hole" invariant does not apply because nothing is applied.
+    /// Used when a copied/partial archive lacks a frozen-era frame that no peer can
+    /// supply. Errors (leaving the caller to halt) if recovery is disabled or the
+    /// frame is outside the frozen range — a real hole there. Idempotent.
+    pub fn frozen_era_skip(&self, frame_number: u64) -> Result<()> {
+        if !self.frozen_era_recovery_enabled
+            || !(FROZEN_ERA_RECOVERY_START..FROZEN_ERA_RECOVERY_CUTOFF).contains(&frame_number)
+        {
+            return Err(QuilError::InvalidArgument(format!(
+                "frozen_era_skip({frame_number}): outside recovery range or disabled"
+            )));
+        }
+        if frame_number <= self.last_materialized_frame.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _forest_guard = self.hypergraph.lock_forest_writes();
+        if let Some(cf) = &self.current_frame {
+            cf.materialize(frame_number);
+        }
+        let global_shard = quil_types::store::ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+        let frozen_root = self.hypergraph.compute_shard_root("vertex", "adds", &global_shard);
+        self.hypergraph.record_prover_root(frame_number, frozen_root);
+        self.execution_manager
+            .commit_frame_with_global_cursor(frame_number)?;
+        self.last_materialized_frame.store(frame_number, Ordering::SeqCst);
+        warn!(
+            frame = frame_number,
+            "frozen-era recovery: SKIPPED missing frame record (no-op, cursor advanced)"
+        );
+        Ok(())
     }
 
     /// Wire the single serial global-materializer worker's signal sender (see

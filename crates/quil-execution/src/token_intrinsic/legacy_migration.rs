@@ -169,12 +169,12 @@ pub fn migrate_all_legacy_coins(
     let dom: Vec<u8> = domain[..domain.len().min(32)].to_vec();
 
     // PARALLELISM across the 256 top-address-byte ranges: one snapshot iterator +
-    // transform + writer per range, fanned across the rayon pool so ALL cores
-    // stay busy. A single serial iterator was the throughput ceiling (the
-    // per-coin verenc decode is cheap and thread-safe; the bottleneck was the
-    // scan/write pipeline running on one core). Ranges are disjoint by address ⇒
-    // each coin is migrated exactly once. The transform is serial WITHIN a range
-    // (the range fan-out is the parallelism).
+    // transform + writer per range, fanned across the rayon pool. A single scan
+    // is single-CORE-bound (the verenc decode dominates); fanning ranges out
+    // engages all cores. rayon caps live iterators at the pool size, so the DB
+    // sees ~cores concurrent readers, not 256. Ranges are disjoint by address ⇒
+    // each coin is migrated once; other ranges' transparent puts are skipped by
+    // `migrate_one`. Transform is serial WITHIN a range (fan-out is the parallelism).
     let scanned = AtomicUsize::new(0);
     let migrated = AtomicUsize::new(0);
     let total = Mutex::new(0u128);
@@ -205,9 +205,9 @@ pub fn migrate_all_legacy_coins(
                         writes.extend(ws);
                     }
                 }
-                // Fold this chunk's counts into the shared totals and report —
-                // PER CHUNK (across all ranges), so progress is live rather than
-                // only when a whole 760k-coin range finishes.
+                // Fold this chunk's counts into the shared totals and report PER
+                // CHUNK (across all ranges), so progress is live rather than only
+                // when a whole ~760k-coin range finishes.
                 let sc = scanned.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
                 let mi = migrated.fetch_add(m, Ordering::Relaxed) + m;
                 {
@@ -329,6 +329,108 @@ pub fn write_migration_receipt(
     rec.extend_from_slice(&total.to_be_bytes());
     let disc = crate::hypergraph_state::vertex_adds_discriminator()?;
     state.set(domain, &MIGRATION_RECEIPT_ADDRESS, &disc, 0, rec)
+}
+
+/// Read the coin-conservation receipt `(count, total)` straight from the RAW KV
+/// keyspace — the exact place [`migrate_all_legacy_coins`]'s caller writes it
+/// ([`quil_store::RocksHypergraphStore::migrate_put_vertex_underlying`]). The
+/// OFFLINE `--verify-db` / `--repair-receipt` passes hold a bare store and must
+/// read what was physically written, bypassing the versioned
+/// [`crate::hypergraph_state::HypergraphState`] view. `None` if no receipt vertex
+/// is present (a DB that predates receipt-writing).
+pub fn read_migration_receipt_raw(
+    store: &quil_store::RocksHypergraphStore,
+    domain: &[u8],
+) -> Result<Option<(u64, u128)>> {
+    let shard = coin_domain_shard(domain);
+    let mut vk = domain.to_vec();
+    vk.extend_from_slice(&MIGRATION_RECEIPT_ADDRESS);
+    match store.load_vertex_underlying("vertex", "adds", &shard, &vk)? {
+        Some(rec) if rec.len() >= 24 => {
+            let count = u64::from_be_bytes(rec[0..8].try_into().unwrap());
+            let total = u128::from_be_bytes(rec[8..24].try_into().unwrap());
+            Ok(Some((count, total)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Write the coin-conservation receipt directly to the RAW KV keyspace (matching
+/// the migration's `migrate_put_vertex_underlying` write). Used by
+/// `--repair-receipt` to overwrite a receipt that a RESTARTED migration recorded
+/// as only its final run's slice (see [`sum_transparent_coins`]).
+pub fn write_migration_receipt_raw(
+    store: &quil_store::RocksHypergraphStore,
+    domain: &[u8],
+    count: u64,
+    total: u128,
+) -> Result<()> {
+    let shard = coin_domain_shard(domain);
+    let mut vk = domain.to_vec();
+    vk.extend_from_slice(&MIGRATION_RECEIPT_ADDRESS);
+    let mut rec = Vec::with_capacity(24);
+    rec.extend_from_slice(&count.to_be_bytes());
+    rec.extend_from_slice(&total.to_be_bytes());
+    store.migrate_put_vertex_underlying("vertex", "adds", &shard, &vk, &rec)
+}
+
+/// Sum the migrated TRANSPARENT coin set: `(count, Σ amount)`.
+///
+/// This is the GROUND TRUTH of what the migration actually left in the DB —
+/// independent of the conservation receipt. A migration that was stopped and
+/// restarted UNDERCOUNTS in its receipt: it physically deletes each verenc
+/// original as it converts it, and every run's counters restart at 0, so coins
+/// converted by an earlier (interrupted) run are invisible to the final run's
+/// tally. The transparent set, by contrast, accumulates across all runs (puts are
+/// never deleted), so scanning it recovers the true totals.
+///
+/// Skips the reserved metadata vertices (shadow-accumulator root at `…FE`,
+/// receipt at `…FD`) by key — they are raw records, not coin trees. Every other
+/// vertex under the coin shard is a serialized coin tree and is counted iff its
+/// type leaf equals the transparent type hash.
+pub fn sum_transparent_coins(
+    store: &quil_store::RocksHypergraphStore,
+    domain: &[u8],
+) -> Result<(u64, u128)> {
+    use super::shadow_accumulator::ACC_ROOT_ADDRESS;
+    let th = transparent_type_hash(domain)?;
+    let shard = coin_domain_shard(domain);
+    let (mut count, mut total) = (0u64, 0u128);
+    let mut scan_err: Option<QuilError> = None;
+    store.for_each_vertex_underlying("vertex", "adds", &shard, |vk: Vec<u8>, blob: Vec<u8>| {
+        if scan_err.is_some() {
+            return;
+        }
+        // Skip the reserved metadata vertices (raw records, not coin trees).
+        if vk.len() >= 64 {
+            let addr = &vk[32..64];
+            if addr == ACC_ROOT_ADDRESS.as_slice() || addr == MIGRATION_RECEIPT_ADDRESS.as_slice() {
+                return;
+            }
+        }
+        let root = match quil_tries::deserialize_go_tree(&blob) {
+            Ok(r) => r,
+            Err(e) => {
+                scan_err = Some(QuilError::Internal(format!("transparent coin decode: {e}")));
+                return;
+            }
+        };
+        let tree = VectorCommitmentTree { root };
+        // Count only transparent coins (type leaf == transparent type hash).
+        if tree.get(&[0xFFu8; 32]).map(|t| t == th.as_slice()).unwrap_or(false) {
+            if let Some(a) = tree.get(&[1u8 << 2]) {
+                let mut b = [0u8; 16];
+                let n = a.len().min(16);
+                b[..n].copy_from_slice(&a[..n]);
+                total = total.wrapping_add(u128::from_le_bytes(b));
+                count += 1;
+            }
+        }
+    })?;
+    if let Some(e) = scan_err {
+        return Err(e);
+    }
+    Ok((count, total))
 }
 
 /// In-place CORRECTIVE pass for a DB migrated by the OLD byte-shifted decode

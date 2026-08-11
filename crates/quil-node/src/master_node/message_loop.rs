@@ -972,23 +972,17 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 //     predecessors — they're already past.
                                                 let frames_to_execute: Vec<(u64, quil_types::proto::global::GlobalFrame)> =
                                                 if archive_mode_recv {
-                                                    let mut out = Vec::new();
-                                                    loop {
-                                                        let next_num = last_executed_frame.saturating_add(1);
-                                                        match clock_store_recv.get_global_frame(next_num) {
-                                                            Ok(f) => out.push((next_num, f)),
-                                                            Err(_) => break,
-                                                        }
-                                                        last_executed_frame = next_num;
-                                                    }
-                                                    if frame_num > last_executed_frame {
-                                                        debug!(
-                                                            frame = frame_num,
-                                                            awaiting = last_executed_frame + 1,
-                                                            "archive: stored out-of-order frame, awaiting predecessor"
-                                                        );
-                                                    }
-                                                    out
+                                                    // Archives apply GLOBAL frame state ONLY through the
+                                                    // dedicated in-order materializer (frame_materializer +
+                                                    // the archive_sync consumer), which owns the durable
+                                                    // cursor and the frozen-era no-op gate. This gossip-
+                                                    // driven `process_global_frame_with_rewards` path is a
+                                                    // SECOND, ungated state applier: it double-applies
+                                                    // rewards/prover ops and — during the flag-day recovery —
+                                                    // executes frozen-era frames the materializer is
+                                                    // no-op'ing (the "invoke_step: prover/allocation not
+                                                    // found" storm). Never run it on archives.
+                                                    Vec::new()
                                                 } else if let Some(ref reel) = time_reel_for_recv {
                                                     if let Err(e) = reel.insert(Arc::new(frame.clone())) {
                                                         debug!(

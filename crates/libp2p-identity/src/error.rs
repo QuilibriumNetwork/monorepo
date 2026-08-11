@@ -32,6 +32,15 @@ pub struct DecodingError {
 }
 
 impl DecodingError {
+    /// A key blob was structurally invalid (wrong length / bad encoding) — NOT a
+    /// missing cargo feature. Use this when a `*::decode` returns `None`, so the
+    /// error names the real cause (e.g. a 57-byte Ed448 key fed to the Falcon
+    /// decoder) instead of the misleading "feature not enabled".
+    #[cfg(feature = "falcon")]
+    pub(crate) fn invalid_key(msg: String) -> Self {
+        Self { msg, source: None }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn missing_feature(feature_name: &'static str) -> Self {
         Self {

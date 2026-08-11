@@ -1542,14 +1542,52 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     if let Some(m) = frame_materializer.clone() {
                         let cs = sync_cs.clone();
                         let cov = sync_cov.clone();
+                        let hg = sync_hg.clone();
+                        // MAINNET-ONLY frozen-era recovery gate (see below).
+                        let seed_is_mainnet = network == 0;
                         let _ = tokio::task::spawn_blocking(move || {
-                            let durable_cursor =
+                            let mut durable_cursor =
                                 cs.get_global_materialized_cursor().unwrap_or(0);
                             let canonical_head = cs
                                 .get_latest_global_frame()
                                 .ok()
                                 .and_then(|f| f.header.map(|h| h.frame_number))
                                 .unwrap_or(0);
+                            // ── 2.1.0.25 frozen-era recovery: un-wedge migrated
+                            // archives whose cursor was never seeded (a fresh
+                            // --migrate-db leaves it at 0). If the cursor sits
+                            // below the fork, the node has fork-era records, AND
+                            // the cursor's successor record is missing (migrated
+                            // archives drop pre-fork history), the in-order
+                            // materializer would ask for frame 1 (absent) and
+                            // stall forever. Seed to the fork frame — the state
+                            // the migration forest is actually at — so
+                            // re-materialize resumes at the first frame the node
+                            // holds. Gated below the fork + on a missing successor
+                            // so localnet/testnet and full-history nodes are
+                            // untouched. Persisted so a re-restart is a no-op.
+                            const RECOVERY_FORK_FRAME: u64 = 669_975;
+                            // A MIGRATED node's forest is at the fork (669975), so
+                            // re-materializing anything below 669976 is wrong
+                            // regardless of which records are present. Key on
+                            // "migrated forest present + cursor below the fork" —
+                            // robust whether or not the successor record exists.
+                            if seed_is_mainnet
+                                && hg.has_forest_data()
+                                && durable_cursor < RECOVERY_FORK_FRAME
+                                && canonical_head >= RECOVERY_FORK_FRAME
+                            {
+                                info!(
+                                    old_cursor = durable_cursor,
+                                    seeded = RECOVERY_FORK_FRAME,
+                                    canonical_head,
+                                    "startup: migrated forest present but materialized cursor \
+                                     below the 2.1 fork — seeding to the fork frame \
+                                     (frozen-era recovery)"
+                                );
+                                let _ = cs.put_global_materialized_cursor(RECOVERY_FORK_FRAME);
+                                durable_cursor = RECOVERY_FORK_FRAME;
+                            }
                             m.seed_cursor(durable_cursor);
                             if canonical_head > durable_cursor {
                                 info!(
@@ -1563,6 +1601,24 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     let frame = match cs.get_global_frame(n) {
                                         Ok(f) => f,
                                         Err(e) => {
+                                            // A missing record inside the frozen era
+                                            // is harmless (the frame is a no-op that
+                                            // changes no state) and may be
+                                            // un-backfillable — every archive shares
+                                            // this copied DB. Skip it (advance the
+                                            // cursor) instead of stalling. Outside
+                                            // the range a hole is a real halt.
+                                            use quil_engine::frame_materializer::{
+                                                FROZEN_ERA_RECOVERY_CUTOFF,
+                                                FROZEN_ERA_RECOVERY_START,
+                                            };
+                                            if (FROZEN_ERA_RECOVERY_START
+                                                ..FROZEN_ERA_RECOVERY_CUTOFF)
+                                                .contains(&n)
+                                                && m.frozen_era_skip(n).is_ok()
+                                            {
+                                                continue;
+                                            }
                                             warn!(
                                                 frame = n,
                                                 error = %e,
@@ -1599,6 +1655,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                      no CRDT gap to re-materialize"
                                 );
                             }
+                            // Re-seed the in-memory prover-root map for the current
+                            // cursor. It's lost on restart; without this, a node whose
+                            // cursor is already at head records nothing and the strict
+                            // produce gate can never build cursor+1 ("parent N-1 not
+                            // materialized" wedge at the head). The forest IS at the
+                            // cursor, so its live root == that frame's recorded root.
+                            m.record_current_prover_root();
                         })
                         .await;
                     }
@@ -2000,9 +2063,27 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     }
                                                     let frame = match cs.get_global_frame(next) {
                                                         Ok(f) => f,
-                                                        // Record for `next` not stored yet — stop
-                                                        // this pass (do NOT skip ahead → no hole).
-                                                        Err(_) => break Ok(()),
+                                                        Err(_) => {
+                                                            // A missing FROZEN-ERA record is a no-op
+                                                            // and may be un-backfillable (shared
+                                                            // copied DB) — skip it (advance cursor)
+                                                            // rather than stall forever. Outside the
+                                                            // range, a not-yet-stored record just
+                                                            // ends this pass (do NOT skip → no hole);
+                                                            // the next signal retries. Self-healing.
+                                                            use quil_engine::frame_materializer::{
+                                                                FROZEN_ERA_RECOVERY_CUTOFF,
+                                                                FROZEN_ERA_RECOVERY_START,
+                                                            };
+                                                            if (FROZEN_ERA_RECOVERY_START
+                                                                ..FROZEN_ERA_RECOVERY_CUTOFF)
+                                                                .contains(&next)
+                                                                && m.frozen_era_skip(next).is_ok()
+                                                            {
+                                                                continue;
+                                                            }
+                                                            break Ok(());
+                                                        }
                                                     };
                                                     let frame_number = next;
                                                     // Refresh halt durations right before

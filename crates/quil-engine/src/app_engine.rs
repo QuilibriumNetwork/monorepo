@@ -322,6 +322,14 @@ struct AppLeaderProvider {
     /// test cluster still progresses. Plumbed from
     /// `config.p2p.network` in `worker_manager::init`.
     min_active_provers_for_propose: u64,
+    /// Shared mirror of the engine's `shard_mat_frame` (last materialized shard
+    /// frame). STRICT GATE: never propose frame N until this node has applied
+    /// N-1. A worker MAY skip old frames and catch up (state-jump / shard sync),
+    /// but once it produces it must be materialized to the parent — mirroring the
+    /// global `compute_prover_root` gate. Without this a lagging proposer emits a
+    /// stale-`state_roots` frame that voters (fail-closed at N-1) only reject
+    /// after the fact.
+    shard_mat_frame: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Requests this node collected per frame it proposed, decoded to
     /// proto `MessageBundle`s. The leader (writer) records the bundles
     /// it included when proving a frame; the engine (reader) retrieves
@@ -516,6 +524,25 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
             .unwrap_or(0);
         let frame_number = prior_frame_number + 1;
+
+        // STRICT GATE (mirrors the global `compute_prover_root`): never produce
+        // frame N until this node has MATERIALIZED the parent N-1. `state_roots`
+        // below reads the committed shard state and MUST equal N-1's — a lagging
+        // proposer would otherwise emit a stale root that voters (fail-closed at
+        // N-1) reject after the fact. Catching up is fine (skip old frames via
+        // shard sync); producing on unapplied state is not. `NoVote` = skip this
+        // round (not `Consensus`, which would kill the event loop); the node
+        // resumes proposing once its materializer reaches N-1.
+        if prior_frame_number > 0 {
+            let materialized =
+                self.shard_mat_frame.load(std::sync::atomic::Ordering::SeqCst);
+            if materialized < prior_frame_number {
+                return Err(QuilError::NoVote(format!(
+                    "cannot produce shard frame {frame_number}: parent {prior_frame_number} \
+                     not materialized (at {materialized}) — catching up",
+                )));
+            }
+        }
 
         // Collect pending messages (raw canonical bytes from the
         // dispatch bitmask), then decode each into a proto MessageBundle.
@@ -1886,6 +1913,7 @@ impl AppConsensusEngine {
             app_address: app_address.clone(),
             halted: self.halted.clone(),
             min_active_provers_for_propose: self.min_active_provers_for_propose,
+            shard_mat_frame: self.shard_mat_frame.clone(),
             frame_requests: self.frame_requests.clone(),
             kv_db: self.kv_db.clone(),
             frame_attestations: self.frame_attestations.clone(),

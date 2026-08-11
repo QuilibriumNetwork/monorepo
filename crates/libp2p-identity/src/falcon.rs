@@ -55,8 +55,14 @@ impl Keypair {
     /// Construct from raw encoded signing-key bytes (1281 bytes). The public
     /// key is recomputed from the signing key.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodingError> {
-        let sk = SigningKeyStandard::decode(bytes)
-            .ok_or_else(|| DecodingError::missing_feature("falcon"))?;
+        let sk = SigningKeyStandard::decode(bytes).ok_or_else(|| {
+            DecodingError::invalid_key(format!(
+                "invalid Falcon-512 signing key: expected {SIGNING_KEY_LEN} bytes, got {} \
+                 (a wrong-length blob here is usually a stale/non-Falcon network key — \
+                 e.g. an Ed448 key — NOT a disabled `falcon` feature)",
+                bytes.len()
+            ))
+        })?;
         let mut vrfy_key = vec![0u8; vrfy_key_size(sk.get_logn())];
         sk.to_verifying_key(&mut vrfy_key);
         Ok(Self {
@@ -101,8 +107,14 @@ impl PublicKey {
 
     /// Decode from raw bytes (897 bytes). Validates by decoding the key.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodingError> {
-        VerifyingKeyStandard::decode(bytes)
-            .ok_or_else(|| DecodingError::missing_feature("falcon"))?;
+        VerifyingKeyStandard::decode(bytes).ok_or_else(|| {
+            DecodingError::invalid_key(format!(
+                "invalid Falcon-512 public key: expected {PUBLIC_KEY_LEN} bytes, got {} \
+                 (a wrong-length blob here is usually a stale/non-Falcon key, NOT a \
+                 disabled `falcon` feature)",
+                bytes.len()
+            ))
+        })?;
         Ok(Self {
             bytes: bytes.to_vec(),
         })

@@ -287,6 +287,10 @@ pub(crate) fn init(
                 })
             })
             .with_current_frame(current_frame.clone())
+            // MAINNET-ONLY 2.1.0.25 frozen-era recovery: no-op-materialize the
+            // frozen range so the wedged fleet un-sticks deterministically. Off
+            // on localnet/testnet, which never reach these heights anyway.
+            .with_frozen_era_recovery(network == 0)
             // Same `frame_prover` Arc installed into the intrinsic above, so
             // the batch-preverified set the materializer records is the one
             // `verify_frame_header_signature` reads. BLS constructor is

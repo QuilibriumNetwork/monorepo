@@ -140,7 +140,7 @@ impl GlobalLeaderProvider {
         let parent = frame_number.saturating_sub(1);
         let mut recorded = hg.prover_root_at(parent);
         if recorded.is_none() && frame_number > 1 {
-            const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+            const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(5000);
             const POLL: std::time::Duration = std::time::Duration::from_millis(25);
             let deadline = std::time::Instant::now() + MAX_WAIT;
             while recorded.is_none() && std::time::Instant::now() < deadline {
@@ -148,14 +148,24 @@ impl GlobalLeaderProvider {
                 recorded = hg.prover_root_at(parent);
             }
             if recorded.is_none() {
-                tracing::debug!(
+                // STRICT GATE: never produce frame N on a stale root. We do NOT
+                // fall back to a live forest read — that stale read is exactly what
+                // let a fleet-wide materializer wedge keep producing frames on a
+                // FROZEN root (the whole chain advanced on unmaterialized state).
+                // Return empty so the caller DECLINES to propose (the view
+                // nullifies); this node resumes producing only once its materializer
+                // records the parent (N-1) root.
+                tracing::warn!(
                     frame = frame_number,
                     parent,
-                    "parent prover root not recorded before produce deadline; \
-                     using live-read fallback (materializer catching up)"
+                    "parent (N-1) prover root not materialized before deadline — \
+                     declining to produce (never build N on an unmaterialized N-1)"
                 );
+                return Vec::new();
             }
         }
+        // Genesis (frame ≤ 1) has no parent to materialize — read the live genesis
+        // forest. Every other frame is `recorded` by the strict gate above.
         let root = recorded.unwrap_or_else(|| {
             let global_shard = quil_types::store::ShardKey {
                 l1: [0u8; 3],
@@ -613,11 +623,22 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             .map(|hg| hg.global_commitments())
             .unwrap_or_default();
         let prover_root: Vec<u8> = self.compute_prover_root(frame_number);
+        if prover_root.is_empty() && frame_number > 1 {
+            // STRICT GATE (see compute_prover_root): the parent (N-1) prover root is
+            // not materialized, so we cannot bind a valid prover_tree_commitment.
+            // DECLINE — `propose` maps this Err to a nullified view — rather than
+            // producing on a stale/empty root. Never build N without materializing
+            // N-1. Resumes once the materializer catches the parent up.
+            return Err(QuilError::Consensus(format!(
+                "cannot produce frame {frame_number}: parent {} not materialized \
+                 (prover root unavailable)",
+                frame_number.saturating_sub(1)
+            )));
+        }
         if prover_root.is_empty() {
             tracing::warn!(
                 frame = frame_number,
-                "proving global frame with EMPTY prover_tree_commitment — \
-                 CRDT root unavailable (rewards/kick/sync anchoring degraded for this frame)",
+                "proving genesis global frame with EMPTY prover_tree_commitment",
             );
         }
         // Prover shard phases 1/2/3 roots (audit #5) — bound into the VDF

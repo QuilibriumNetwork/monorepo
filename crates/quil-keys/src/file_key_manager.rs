@@ -254,6 +254,25 @@ impl FileKeyManager {
                 // Post-quantum signing key. The `q-prover-key` is the node's
                 // single Falcon identity (proving + consensus), so it owns the
                 // type-keyed `signers[Falcon512]` slot.
+                //
+                // VALIDATE the bytes actually decode as an fn-dsa Falcon-512
+                // signing key (1281 B). `ensure_standard_keys` trusts the stored
+                // key_type LABEL, and `from_bytes` below just wraps the bytes — so
+                // a legacy/mis-migrated `q-prover-key` (labeled type-8 but holding
+                // wrong bytes, e.g. a pre-cutover BLS key) loads silently and only
+                // fails later at the :8340 PQNoise handshake with the MISLEADING
+                // "cargo feature `falcon` is not enabled". Surface the real cause +
+                // length LOUDLY at startup so it's diagnosable.
+                if quil_crypto::falcon_public_from_signing_key(&private_bytes).is_none() {
+                    tracing::error!(
+                        key_id = %stored.id,
+                        len = private_bytes.len(),
+                        "q-prover-key is labeled Falcon512 but its signing key does NOT decode as \
+                         fn-dsa Falcon-512 (expected 1281 bytes) — the :8340 PQNoise transport \
+                         WILL fail to connect. Restore the correct Falcon key, or delete this \
+                         q-prover-key entry to regenerate a fresh one (changes the node identity)."
+                    );
+                }
                 let signer =
                     quil_crypto::FalconSigner::from_bytes(&private_bytes, &public_bytes);
                 let mut signers = self.signers.write().unwrap();
@@ -490,10 +509,29 @@ impl FileKeyManager {
         Ok(())
     }
 
+    /// Whether the loaded key for a type-keyed slot is actually USABLE (decodes).
+    /// Falcon-512 only: the `:8340` transport decodes the `q-prover-key` via fn-dsa
+    /// `SigningKeyStandard`, so a labeled-but-invalid key (partial/legacy migration)
+    /// passes the `key_type` check yet fails at the handshake with the misleading
+    /// "falcon feature not enabled". Validate with the SAME decoder the transport
+    /// uses, so a working key ALWAYS passes — no false positives, healthy nodes and
+    /// archives are never rotated. Non-Falcon types are trusted by label (unchanged).
+    fn stored_key_is_usable(&self, expected_type: u8) -> bool {
+        if expected_type != 8 {
+            return true;
+        }
+        let signers = self.signers.read().unwrap();
+        match signers.get(&KeyType::Falcon512) {
+            Some(s) => quil_crypto::falcon_public_from_signing_key(s.private_key()).is_some(),
+            None => false,
+        }
+    }
+
     /// Ensure a single standard key exists with `expected_type`. Missing →
-    /// create via `create`. Present with the right type → no-op. Present with
-    /// the WRONG type → move the old entry to `<id>-legacy-<oldtype>`
-    /// (preserved, not deleted) and generate a fresh correct-type key.
+    /// create via `create`. Present with the right type AND usable → no-op.
+    /// Present with the WRONG type (or right type but undecodable bytes) → move the
+    /// old entry to `<id>-legacy-<oldtype>` (preserved, not deleted) and generate a
+    /// fresh correct-type key.
     fn ensure_key_type(
         &self,
         id: &str,
@@ -503,8 +541,23 @@ impl FileKeyManager {
         let existing = self.stored_keys.read().unwrap().get(id).cloned();
         match existing {
             None => create(self)?,
-            Some(k) if k.key_type == expected_type => {}
+            // Right type AND the bytes are actually USABLE. The usability check is
+            // Falcon-only (see `stored_key_is_usable`): a `q-prover-key` labeled
+            // type-8 but holding wrong bytes (a partial/legacy migration) would
+            // otherwise be kept and only fail later at the :8340 PQNoise handshake.
+            // A key that doesn't decode falls through to the wrong-type arm below,
+            // which preserves it as `-legacy` and regenerates a fresh one.
+            Some(k) if k.key_type == expected_type && self.stored_key_is_usable(expected_type) => {}
             Some(k) => {
+                if k.key_type == expected_type {
+                    tracing::warn!(
+                        id,
+                        key_type = expected_type,
+                        "existing key is labeled the correct type but its bytes do NOT decode \
+                         (stale/mis-migrated) — preserving it as -legacy and regenerating a fresh \
+                         key (this CHANGES the node identity)"
+                    );
+                }
                 let legacy_id = format!("{}-legacy-{}", id, key_type_name(k.key_type));
                 let mut legacy = k.clone();
                 legacy.id = legacy_id.clone();
