@@ -175,6 +175,25 @@ impl GlobalIntrinsic {
         self
     }
 
+    /// Install the shards store used by shard split/merge materialization.
+    /// Without it, `invoke_shard_split`/`invoke_shard_merge` validate but
+    /// record NO `PendingShardChange`, and `apply_due_shard_changes` no-ops —
+    /// so proposed splits "succeed" yet never take effect (the shard stays
+    /// overcrowded and provers re-propose every frame). Must be paired with
+    /// [`Self::with_shards_db`].
+    pub fn with_shards_store(mut self, shards_store: Arc<dyn ShardsStore>) -> Self {
+        self.shards_store = Some(shards_store);
+        self
+    }
+
+    /// Install the KvDb the shard-change records + topology flips are written
+    /// through. Must point at the SAME backing store as
+    /// [`Self::with_shards_store`]. Required for split/merge to persist.
+    pub fn with_shards_db(mut self, shards_db: Arc<dyn KvDb>) -> Self {
+        self.shards_db = Some(shards_db);
+        self
+    }
+
     /// Validate a canonical-bytes global op message. Decodes the
     /// message, dispatches by type prefix, and runs the per-op
     /// structural validation + signature verification (when prover
@@ -368,7 +387,7 @@ impl GlobalIntrinsic {
                 // and consensus would split between nodes that did vs
                 // did not run materialization.
                 if let Some(pt) = prover_tree {
-                    verify::verify_prover_join_not_kicked(pt)?;
+                    verify::verify_prover_join_not_kicked(pt, frame_number)?;
                 }
                 // Existing-allocation expiry gate. For each filter
                 // in the join, check the prover's current allocation:
@@ -1145,7 +1164,10 @@ impl GlobalIntrinsic {
                     .unwrap_or_default();
                 if kick_frame.len() == 8 {
                     let kf = u64::from_be_bytes(kick_frame.try_into().unwrap());
-                    if kf > 0 {
+                    // Spurious-kick amnesty (must mirror the validate-side gate in
+                    // `verify_prover_join_not_kicked` exactly): a kick before the
+                    // flag-day frame stops barring re-join once the chain reaches it.
+                    if materialize::kick_bars_rejoin(kf, frame_number) {
                         return Err(QuilError::InvalidArgument(
                             "invoke_step join: prover has been previously kicked".into(),
                         ));
@@ -2185,13 +2207,16 @@ impl GlobalIntrinsic {
     /// prover's address (frozen-committee, consensus-identical).
     /// - Merge: every ACTIVE prover on any child → the parent.
     ///
-    /// The active set is read from the SAME `prover_registry` the frame-header
-    /// attestation check already trusts at this point (so it's consistent with
-    /// committed state across nodes — otherwise attestation would already
-    /// fork). Leaving/joining allocations are NOT reassigned: a pending Leave
-    /// departs at E+2 by design, and joins to a frozen shard were rejected by
-    /// the join-freeze. When no `prover_registry` is installed (non-archive
-    /// fixtures), this is a no-op — the local grid still flips.
+    /// The active set is read DIRECTLY from committed hypergraph state via the
+    /// CRDT (`active_provers_on_filter_committed`), NOT from the async
+    /// `prover_registry` cache — so every node enumerates the identical prover
+    /// set for a given committed frame and the reassignment is a pure function
+    /// of that frame (the cache is refreshed on timing-dependent background
+    /// paths and could otherwise diverge → fork). Leaving/joining allocations
+    /// are NOT reassigned: a pending Leave departs at E+2 by design, and joins
+    /// to a frozen shard were rejected by the join-freeze. When no CRDT is
+    /// installed (non-archive fixtures) we fall back to the cache; when neither
+    /// is installed this is a no-op — the local grid still flips.
     fn reassign_shard_allocations(
         &self,
         state: &HypergraphState,
@@ -2199,42 +2224,56 @@ impl GlobalIntrinsic {
         change: &PendingShardChange,
         frame_number: u64,
     ) -> Result<()> {
-        let Some(pr) = self.prover_registry.as_ref() else {
+        let pr = self.prover_registry.as_ref();
+        // Proceed when EITHER committed-state (preferred) OR the cache is
+        // available; otherwise nothing to reassign.
+        if self.hypergraph.is_none() && pr.is_none() {
             return Ok(());
-        };
+        }
         let vr_disc = vertex_removes_discriminator()?;
         let ha_disc = hyperedge_adds_discriminator()?;
+
+        // Enumerate `(public_key, prover_address)` on `filter`: committed state
+        // via the CRDT when present (deterministic), else the async cache.
+        let enumerate = |filter: &[u8]| -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            if let Some(hg) = self.hypergraph.as_ref() {
+                Ok(crate::prover_registry::active_provers_on_filter_committed(
+                    hg, filter, frame_number,
+                ))
+            } else if let Some(pr) = pr {
+                let provers = pr.get_active_provers(filter, frame_number).map_err(|e| {
+                    QuilError::InvalidArgument(format!("reassign: get_active_provers failed: {e}"))
+                })?;
+                Ok(provers
+                    .into_iter()
+                    .map(|info| (info.public_key, info.address))
+                    .collect())
+            } else {
+                Ok(Vec::new())
+            }
+        };
 
         match change.kind {
             ShardChangeKind::Split => {
                 if change.children.is_empty() {
                     return Ok(());
                 }
-                let provers = pr.get_active_provers(&change.parent, frame_number).map_err(|e| {
-                    QuilError::InvalidArgument(format!(
-                        "reassign split: get_active_provers failed: {e}"
-                    ))
-                })?;
-                for info in &provers {
-                    let idx =
-                        reassignment::assign_child_index(&info.address, change.children.len());
+                let provers = enumerate(&change.parent)?;
+                for (public_key, address) in &provers {
+                    let idx = reassignment::assign_child_index(address, change.children.len());
                     let new_filter = &change.children[idx];
                     self.rekey_allocation(
-                        state, va_disc, &vr_disc, &ha_disc, &info.public_key, &info.address,
+                        state, va_disc, &vr_disc, &ha_disc, public_key, address,
                         &change.parent, new_filter, frame_number,
                     )?;
                 }
             }
             ShardChangeKind::Merge => {
                 for child in &change.children {
-                    let provers = pr.get_active_provers(child, frame_number).map_err(|e| {
-                        QuilError::InvalidArgument(format!(
-                            "reassign merge: get_active_provers failed: {e}"
-                        ))
-                    })?;
-                    for info in &provers {
+                    let provers = enumerate(child)?;
+                    for (public_key, address) in &provers {
                         self.rekey_allocation(
-                            state, va_disc, &vr_disc, &ha_disc, &info.public_key, &info.address,
+                            state, va_disc, &vr_disc, &ha_disc, public_key, address,
                             child, &change.parent, frame_number,
                         )?;
                     }

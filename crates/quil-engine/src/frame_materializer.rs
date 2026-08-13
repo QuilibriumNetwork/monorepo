@@ -874,6 +874,20 @@ impl FrameMaterializer {
         // reflected in the CRDT — which is the sole safe window given
         // `apply_reward` is additive with no per-frame idempotency
         // (re-running a committed frame would double-mint).
+        // Apply any epoch-aligned shard topology changes (split/merge) due at this
+        // frame ONCE per global frame, BEFORE the commit — so a staged split flips
+        // at its E+2 boundary even on frames carrying no app-shard FrameHeader. The
+        // in-`invoke_frame_header` call only fires when a header is materialized,
+        // which stalls in the field (header flow to the global chain pauses), so
+        // the flip was never triggered at the due frame. Its reassignment writes
+        // ride the same `commit_frame_with_global_cursor` batch below.
+        if let Err(e) = self
+            .execution_manager
+            .apply_global_due_shard_changes(frame_number)
+        {
+            error!(frame = frame_number, error = %e, "apply_due_shard_changes failed — aborting materialize");
+            return Err(e);
+        }
         if let Err(e) = self
             .execution_manager
             .commit_frame_with_global_cursor(frame_number)

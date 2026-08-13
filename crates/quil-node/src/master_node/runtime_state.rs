@@ -58,10 +58,32 @@ pub(crate) fn init(
     let prover_only_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let global_event_distributor: Arc<dyn quil_types::consensus::EventDistributor> =
         Arc::new(quil_engine::event_distributor::InMemoryEventDistributor::new());
+    // Coverage thresholds. Mainnet defaults (max_provers=32) never trip the
+    // shard-split rebalance trigger on a small localnet (a handful of provers),
+    // so splits can't be exercised locally. DEV/localnet ONLY: `QUIL_SPLIT_MAX_PROVERS`
+    // lowers the split trigger's `max_provers` so a shard with more Active provers
+    // than the override proposes a split (→ ShardSplitEligible → orchestrator op →
+    // PendingShardChange → epoch-aligned flip at E+2). Env-gated exactly like
+    // `QUIL_EPOCH_LENGTH_FRAMES` — mainnet never sets it, so mainnet is untouched.
+    let coverage_thresholds = {
+        let mut t = quil_engine::coverage::CoverageThresholds::mainnet();
+        if let Some(n) = std::env::var("QUIL_SPLIT_MAX_PROVERS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tracing::warn!(
+                max_provers = n,
+                "QUIL_SPLIT_MAX_PROVERS override active (dev/localnet only) — shards with more \
+                 than this many Active provers will propose a split"
+            );
+            t.max_provers = n;
+        }
+        t
+    };
     let coverage_monitor = Arc::new(quil_engine::coverage::CoverageMonitor::new(
         prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
         global_event_distributor.clone(),
-        quil_engine::coverage::CoverageThresholds::mainnet(),
+        coverage_thresholds,
         prover_only_flag.clone(),
     ));
 

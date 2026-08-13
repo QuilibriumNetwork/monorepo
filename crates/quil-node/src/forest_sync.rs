@@ -130,21 +130,36 @@ pub async fn sync_one_phase(
     shard_id: &[u8],
     phase: u32,
     source_version: u64,
+    // The peer's advertised root for this shard/phase (from `get_forest_head`).
+    // When it already equals our LOCAL root the trees are identical — the diff
+    // would return no changed leaves and fetch no blobs — so we skip the whole
+    // O(tree) diff walk (the caught-up steady state, which otherwise burns a
+    // full-tree diff every sync tick and, before this, held the forest lock while
+    // doing it). `None` (peer root unknown) always diffs.
+    remote_root: Option<[u8; 32]>,
 ) -> Result<[u8; 32]> {
+    // (#1) Cheap root-check short-circuit. `compute_shard_root` is a plain
+    // forest read (no recompute); when it matches the peer root there is nothing
+    // to sync — return it without touching the diff or the forest lock.
+    if let Some(rr) = remote_root {
+        if let Some(sk) = app_shard_key(shard_id) {
+            let (s, p) = phase_strs(phase);
+            if crdt.compute_shard_root(s, p, &sk).as_slice() == rr.as_slice() {
+                return Ok(rr);
+            }
+        }
+    }
     let remote = RemoteTreeReader::new(client.clone(), handle.clone(), shard_id.to_vec(), phase);
     let c = crdt.clone();
     let sid = shard_id.to_vec();
+    // The forest-write lock is taken INSIDE `sync_shard_phase_from`, around the
+    // apply only — the diff runs lock-free so it can't starve the materializer.
     let (root, apply_version, changed) = tokio::task::spawn_blocking(move || {
-        // (B) Serialize the forest write against the global-frame materializer:
-        // hold the forest-write guard for the whole apply so a sync can never
-        // advance the forest out from under a materialize's pre-apply verify.
-        let _forest_guard = c.lock_forest_writes();
         c.sync_shard_phase_from(&remote, source_version, &sid, phase as usize)
     })
     .await
     .map_err(|e| QuilError::Internal(format!("sync task join: {e}")))?
     .map_err(|e| QuilError::Internal(format!("sync apply: {e}")))?;
-    let _ = phase_strs(phase); // (blob keying lives in the CRDT; here for clarity)
     fetch_changed_blobs(client, crdt, shard_id, phase, source_version, apply_version, changed)
         .await?;
     Ok(root)
@@ -181,7 +196,8 @@ pub async fn sync_single_shard_verified(
             );
             return Ok(false);
         }
-        let got = sync_one_phase(&mut client, &handle, &crdt, shard_id, phase, v_s).await?;
+        let rr = <[u8; 32]>::try_from(root_s.as_slice()).ok();
+        let got = sync_one_phase(&mut client, &handle, &crdt, shard_id, phase, v_s, rr).await?;
         if phase == 0 {
             va_converged = expected_va_root.is_empty() || got.as_slice() == expected_va_root;
         }
@@ -209,8 +225,9 @@ pub async fn pull_shard_from_peer(
             .get_forest_head(shard_id.to_vec(), phase)
             .await
             .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))?;
-        let Some((v_s, _root_s)) = head else { continue };
-        match sync_one_phase(&mut client, &handle, &crdt, shard_id, phase, v_s).await {
+        let Some((v_s, root_s)) = head else { continue };
+        let rr = <[u8; 32]>::try_from(root_s.as_slice()).ok();
+        match sync_one_phase(&mut client, &handle, &crdt, shard_id, phase, v_s, rr).await {
             Ok(_) => synced += 1,
             Err(e) => {
                 if phase == 0 {

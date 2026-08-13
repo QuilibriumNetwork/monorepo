@@ -155,16 +155,45 @@ impl GlobalExecutionEngine {
         key_manager: Arc<dyn quil_types::crypto::KeyManager>,
         crdt: Arc<quil_hypergraph::HypergraphCrdt>,
         clock_store: Arc<dyn quil_types::store::ClockStore>,
+        shards_store: Option<Arc<dyn quil_types::store::ShardsStore>>,
+        shards_db: Option<Arc<dyn quil_types::store::KvDb>>,
     ) -> Self {
         let state = Arc::new(crate::hypergraph_state::HypergraphState::new(crdt.clone()));
-        let intrinsic = crate::global_intrinsic::intrinsic::GlobalIntrinsic::new(key_manager)
+        let mut intrinsic = crate::global_intrinsic::intrinsic::GlobalIntrinsic::new(key_manager)
             .with_clock_store(clock_store);
+        // Shard split/merge topology changes only persist/apply when BOTH the
+        // shards store and its KvDb are wired (see GlobalIntrinsic::with_shards_*).
+        if let Some(s) = shards_store {
+            intrinsic = intrinsic.with_shards_store(s);
+        }
+        if let Some(db) = shards_db {
+            intrinsic = intrinsic.with_shards_db(db);
+        }
         Self {
             inclusion_prover,
             intrinsic: Some(intrinsic),
             crdt: Some(crdt),
             state: Some(state),
         }
+    }
+
+    /// Apply epoch-aligned shard topology changes (split/merge) that have reached
+    /// their E+2 effective epoch, ONCE per global frame — decoupled from
+    /// `invoke_frame_header` so a staged `PendingShardChange` flips deterministically
+    /// at its boundary even when NO app-shard `FrameHeader` is materialized in the
+    /// frame. (Field failure mode: `apply_due_shard_changes` was reachable ONLY from
+    /// `invoke_frame_header`, so when app-shard header flow to the global chain
+    /// stalled, the flip never fired at the due frame and the split re-proposed
+    /// forever.) Writes go onto the frame's state changeset; `state.commit()` pushes
+    /// them into the in-memory CRDT trees exactly like `process_message`, so the
+    /// materializer's `commit_frame` flushes them durably. No-op when the
+    /// intrinsic/state is absent or nothing is due.
+    pub fn apply_due_shard_changes(&self, frame_number: u64) -> Result<()> {
+        if let (Some(ref intrinsic), Some(ref state)) = (&self.intrinsic, &self.state) {
+            intrinsic.apply_due_shard_changes(frame_number, state)?;
+            state.commit()?;
+        }
+        Ok(())
     }
 }
 

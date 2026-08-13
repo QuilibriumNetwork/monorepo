@@ -154,7 +154,11 @@ pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandl
     // resolver once the deploy materialization lands.
     let hypergraph_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
         Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
-    let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new(
+    // Wire the shard stores so the global intrinsic's shard split/merge ops
+    // actually record `PendingShardChange` and apply the topology flip at E+2.
+    // Without these, proposed splits validate + "succeed" but never take effect,
+    // so overcrowded shards stay overcrowded and provers re-propose every frame.
+    let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new_with_shards(
         inclusion_prover.clone(),
         key_manager.clone(),
         crdt.clone(),
@@ -162,6 +166,8 @@ pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandl
         clock_store_for_exec,
         hypergraph_resolver,
         true,
+        Some(storage.shards_store.clone()),
+        Some(storage.db_arc.clone() as Arc<dyn quil_types::store::KvDb>),
     ));
     info!("execution engines initialized with BLS48-581 + Ed448 signature verification");
 
@@ -275,4 +281,68 @@ pub(crate) fn refresh_crdt_shard_prefixes(
         crdt.set_app_shard_prefixes(app, prefixes);
     }
     app_count
+}
+
+/// Re-prime + eagerly commit the app-shard phase trees AFTER genesis bootstrap.
+///
+/// `init_engines` primes the CRDT from the shards store, but it runs BEFORE
+/// `bootstrap_genesis` — so any shard that genesis itself creates (e.g. the
+/// seeded QUIL shard under `QUIL_SEED_SHARD_DATA`, or the genesis-registered QUIL
+/// token sub-shards) is invisible at prime time (`range_app_shards()` is still
+/// empty → the earlier priming logged `shards:0`). The consequence is a
+/// CONSENSUS-BREAKING non-determinism: the seeded shard's committed vertex-adds
+/// root only materializes into the forest lazily during early-frame processing,
+/// so `compute_shard_root` returns ZERO at one moment and the real root moments
+/// later. The leader reads the stale-zero root at propose time while verifiers
+/// read the materialized non-zero root — every proposal is nullified and the
+/// app-shard CW churns views (leaking a 1MiB journal buffer per view).
+///
+/// Running the SAME prefix-population + phase-tree prime + eager `commit(0)` a
+/// second time here — now that genesis has registered the shard — makes
+/// `compute_shard_root` return the committed root deterministically from frame 1
+/// (mat=0) on every node, so leader and verifier agree. Idempotent: on stores
+/// with no genesis-created shards it's a cheap no-op (mirrors `init_engines`).
+pub(crate) fn reprime_after_genesis(
+    crdt: &quil_hypergraph::HypergraphCrdt,
+    shards_store: &dyn quil_types::store::ShardsStore,
+) {
+    // 1. Re-feed the (now-populated) shard-prefix sets so `commit_inner`
+    //    aggregates the seeded/registered sub-shards.
+    let apps = refresh_crdt_shard_prefixes(crdt, shards_store);
+    // 2. Ensure the lazy phase trees exist for every registered app shard so the
+    //    eager commit below materializes their roots (all 4 phases — remote
+    //    verifiers check commitments across every phase, not just vertex_adds).
+    let mut committed_apps: Vec<[u8; 32]> = Vec::new();
+    if let Ok(shards) = shards_store.range_app_shards() {
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for s in shards {
+            if s.shard_key.len() != 35 || !seen.insert(s.shard_key.clone()) {
+                continue;
+            }
+            let mut l1 = [0u8; 3];
+            l1.copy_from_slice(&s.shard_key[..3]);
+            let mut l2 = [0u8; 32];
+            l2.copy_from_slice(&s.shard_key[3..35]);
+            crdt.ensure_all_phase_trees(&quil_types::store::ShardKey { l1, l2 });
+            committed_apps.push(l2);
+        }
+    }
+    // 3. Seed the per-sub-shard live-size baseline for the genesis-created shards
+    //    (the seeded coins never passed through `add_vertex`, so the reward
+    //    `state_size` denominator would omit them without this).
+    if !committed_apps.is_empty() {
+        if let Err(e) = crdt.warm_sizes(&committed_apps) {
+            warn!(error = %e, "reprime_after_genesis: warm_sizes failed");
+        }
+    }
+    // 4. Eager commit so the seeded shard's committed phase roots are stable +
+    //    non-zero BEFORE the first frame is proposed/verified.
+    match crdt.commit(0) {
+        Ok(commits) => info!(
+            apps,
+            shards = commits.len(),
+            "reprimed app-shard phase trees after genesis (deterministic seeded roots)"
+        ),
+        Err(e) => warn!(error = %e, "reprime_after_genesis: eager commit failed"),
+    }
 }

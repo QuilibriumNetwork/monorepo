@@ -392,6 +392,33 @@ impl WorkerAllocator {
         // Get current worker assignments
         let workers = self.worker_manager.range_workers()?;
 
+        // FIX (split-parent rebind, local-only): after an epoch-aligned split
+        // rekeys this prover's allocation from a parent filter onto a child
+        // filter, a worker still pinned to the now-defunct parent can sit idle
+        // — the parent no longer has a live (Active) allocation, yet the live
+        // child allocation has no worker bound (the flapping/stale parent entry
+        // keeps the worker pinned instead of freeing it). Detect that here:
+        // there is an Active allocation on a filter NOT bound to any worker
+        // (the orphaned child). If so, any worker pinned to a filter with no
+        // resolvable (Active/Paused/Joining-in-grace/Leaving-in-grace)
+        // allocation — and not still inside its own pending-join window — is
+        // deallocated below so the fresh-assign path binds it to the child.
+        // This only re-pins LOCAL workers; it changes no consensus-visible state.
+        let bound_filters: std::collections::HashSet<Vec<u8>> = workers
+            .iter()
+            .filter(|w| !w.filter.is_empty())
+            .map(|w| w.filter.clone())
+            .collect();
+        let unassigned_active_exists = prover_info
+            .as_ref()
+            .map(|p| p.allocations.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .any(|a| {
+                a.status == ProverStatus::Active
+                    && !bound_filters.contains(&a.confirmation_filter)
+            });
+
         for worker in &workers {
             if worker.filter.is_empty() {
                 // Idle worker — but check for an expired pending-join
@@ -437,6 +464,40 @@ impl WorkerAllocator {
                         .set_pending_filter_frame(worker.core_id, 0);
                 }
                 continue;
+            }
+
+            // Split-parent rebind (see note above range_workers): free a worker
+            // stranded on a defunct parent so the orphaned child alloc can bind.
+            if unassigned_active_exists {
+                use quil_types::consensus::EffectiveStatus;
+                let f_resolvable = alloc_by_filter
+                    .get(&worker.filter)
+                    .map(|a| {
+                        matches!(
+                            a.effective_status(frame_number),
+                            EffectiveStatus::Active
+                                | EffectiveStatus::Paused
+                                | EffectiveStatus::Joining
+                                | EffectiveStatus::Leaving
+                        )
+                    })
+                    .unwrap_or(false);
+                // Protect a still-in-flight ProposeJoin (pending window not yet
+                // elapsed) so we don't cancel a legitimately pending bind.
+                let pending_in_flight = worker.pending_filter_frame > 0
+                    && frame_number
+                        <= worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES;
+                if !f_resolvable && !pending_in_flight {
+                    warn!(
+                        core_id = worker.core_id,
+                        stale_filter = hex::encode(&worker.filter),
+                        "worker pinned to a filter with no active allocation while an \
+                         active child allocation is unbound (likely split-parent) — \
+                         deallocating so the child rebinds"
+                    );
+                    self.worker_manager.deallocate_worker(worker.core_id)?;
+                    continue;
+                }
             }
 
             match alloc_by_filter.get(&worker.filter) {

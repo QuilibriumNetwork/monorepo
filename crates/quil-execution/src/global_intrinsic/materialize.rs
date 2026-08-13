@@ -17,6 +17,39 @@ pub const STATUS_PAUSED: u8 = 2;
 pub const STATUS_LEAVING: u8 = 3;
 pub const STATUS_KICKED: u8 = 4;
 
+/// Flag-day frame for the spurious-kick amnesty (seniority restoration).
+///
+/// A batch of honest, active app-shard provers was spuriously KICKED at epoch
+/// boundaries by an anchor-lagged storage audit (fixed upstream via 3-slot
+/// leaf-root registration), which set Status=4 + KickFrameNumber AND zeroed
+/// Seniority with no restore path. A kick only *permanently* disqualifies a
+/// prover at the two re-join bars (`verify_prover_join_not_kicked` + the
+/// materialize-side check); `decode_prover` dropping the vertex is transient (a
+/// re-join overwrites it). So we simply stop those bars from honoring a kick
+/// recorded BEFORE this frame, once the chain reaches it: the victim re-joins
+/// with their own key → fresh Active vertex → Status recovers via the normal
+/// lifecycle, and a seniority re-merge (allowed when Seniority==0, see
+/// [`crate::global_intrinsic::verify`]) restores the value `0 + X = X`.
+///
+/// Gating on BOTH `kick_frame_number < FRAME` and `current_frame >= FRAME`
+/// makes the switch deterministic across nodes at exactly this frame (a node
+/// that upgraded early must NOT forgive kicks before the chain arrives here, or
+/// it would fork). Kicks at/after this frame are never forgiven.
+pub const KICK_AMNESTY_FRAME: u64 = 695_000;
+
+/// Whether a prior `kick_frame_number` still bars a prover from re-joining /
+/// counting at `current_frame`. `0` means "never kicked" (e.g. a voluntary
+/// leave records no KickFrameNumber). A pre-amnesty kick is forgiven only once
+/// the chain has reached [`KICK_AMNESTY_FRAME`]; every other non-zero kick bars.
+pub fn kick_bars_rejoin(kick_frame_number: u64, current_frame: u64) -> bool {
+    if kick_frame_number == 0 {
+        return false;
+    }
+    let forgiven =
+        kick_frame_number < KICK_AMNESTY_FRAME && current_frame >= KICK_AMNESTY_FRAME;
+    !forgiven
+}
+
 /// Protocol-level halt-risk threshold. A shard with `Active` prover
 /// count at or below this value is classified as halt-risk by the
 /// coverage monitor and the proposer's auto-allocation logic.
@@ -615,9 +648,16 @@ pub fn upsert_leaf_root_registration(
 ) -> Result<quil_tries::VectorCommitmentTree> {
     let cls = "leafroot:LeafRootRegistration";
 
-    // Gather the existing slots (current + next, whichever are present).
+    // Gather the existing slots (prev + current + next, whichever are present).
     let mut slots: Vec<(u64, Vec<u8>, u64)> = Vec::new();
     if let Some(t) = existing {
+        if let Some(e) = read_u64_field(t, cls, "PrevEpoch") {
+            slots.push((
+                e,
+                read_field(t, cls, "PrevLeafRoot").unwrap_or_default(),
+                read_u64_field(t, cls, "PrevNumBlocks").unwrap_or(0),
+            ));
+        }
         if let Some(e) = read_u64_field(t, cls, "Epoch") {
             slots.push((
                 e,
@@ -636,10 +676,14 @@ pub fn upsert_leaf_root_registration(
     // Merge the new registration: same-epoch overwrites, else add.
     slots.retain(|(e, _, _)| *e != new_epoch);
     slots.push((new_epoch, new_leaf_root.to_vec(), new_num_blocks));
-    // Keep the two highest epochs (drop the lowest if 3+), epoch-sorted ascending
-    // so the vertex bytes are deterministic across nodes.
+    // Keep the THREE highest epochs (drop the lowest if 4+), epoch-sorted
+    // ascending so the vertex bytes are deterministic across nodes. The third
+    // (oldest retained) epoch covers the anchor-lagged storage audit window: an
+    // opening produced ~K frames before the audit is still anchored to the
+    // previous epoch just after a boundary, and a two-slot vertex would have
+    // already evicted it → spurious kick + seniority-zero. See the schema note.
     slots.sort_by_key(|(e, _, _)| *e);
-    while slots.len() > 2 {
+    while slots.len() > 3 {
         slots.remove(0);
     }
 
@@ -649,17 +693,27 @@ pub fn upsert_leaf_root_registration(
     write_field(&mut tree, cls, "ShardFilter", shard_filter)?;
     write_field(&mut tree, cls, "Prefix", &pack_prefix(prefix))?;
     write_field(&mut tree, cls, "RegistrationFrameNumber", &frame_number.to_be_bytes())?;
-    // Lower epoch → current slot.
-    if let Some((e, lr, nb)) = slots.first() {
+    // Assign from the top: highest epoch → next slot, the one below → current
+    // slot, the one below that → prev slot. This keeps the historical layouts
+    // byte-identical (1 slot ⇒ `Epoch` only; 2 slots ⇒ `Epoch`+`NextEpoch`) and
+    // only writes the `Prev*` fields once a third, older epoch is retained.
+    let cur_idx = slots.len().saturating_sub(2); // len1→0, len2→0, len3→1
+    if let Some((e, lr, nb)) = slots.get(cur_idx) {
         write_field(&mut tree, cls, "Epoch", &e.to_be_bytes())?;
         write_field(&mut tree, cls, "LeafRoot", lr)?;
         write_field(&mut tree, cls, "NumBlocks", &nb.to_be_bytes())?;
     }
-    // Higher epoch → next slot (only when two slots are present).
-    if let Some((e, lr, nb)) = slots.get(1) {
+    if let Some((e, lr, nb)) = slots.get(cur_idx + 1) {
         write_field(&mut tree, cls, "NextEpoch", &e.to_be_bytes())?;
         write_field(&mut tree, cls, "NextLeafRoot", lr)?;
         write_field(&mut tree, cls, "NextNumBlocks", &nb.to_be_bytes())?;
+    }
+    if cur_idx >= 1 {
+        if let Some((e, lr, nb)) = slots.get(cur_idx - 1) {
+            write_field(&mut tree, cls, "PrevEpoch", &e.to_be_bytes())?;
+            write_field(&mut tree, cls, "PrevLeafRoot", lr)?;
+            write_field(&mut tree, cls, "PrevNumBlocks", &nb.to_be_bytes())?;
+        }
     }
     Ok(tree)
 }
@@ -683,6 +737,14 @@ pub fn leaf_root_registration_for_epoch(
         return Some((
             read_field(tree, cls, "NextLeafRoot")?,
             read_u64_field(tree, cls, "NextNumBlocks").unwrap_or(0),
+        ));
+    }
+    // Prev slot: retained for the anchor-lagged audit window so a member is not
+    // spuriously kicked for an opening still anchored to the just-departed epoch.
+    if read_u64_field(tree, cls, "PrevEpoch") == Some(active_epoch) {
+        return Some((
+            read_field(tree, cls, "PrevLeafRoot")?,
+            read_u64_field(tree, cls, "PrevNumBlocks").unwrap_or(0),
         ));
     }
     None
@@ -1091,7 +1153,7 @@ mod tests {
     use crate::global_schema::{write_type, read_type, TYPE_HASH_ALLOCATION};
 
     #[test]
-    fn two_slot_registration_keeps_highest_two_and_lookup_matches_by_epoch() {
+    fn three_slot_registration_keeps_highest_three_and_lookup_matches_by_epoch() {
         let member = [0x5Au8; 32];
         let filter = vec![0x44u8; 32];
         let prefix: Vec<u32> = vec![3, 9];
@@ -1120,17 +1182,34 @@ mod tests {
         assert_eq!(leaf_root_registration_for_epoch(&t2, 6), Some((vec![0x06u8; 74], 61)));
         assert_eq!(leaf_root_registration_for_epoch(&t2, 4), None);
 
-        // Roll forward to epoch 7 → drops the lowest (5), keeps {6,7}.
+        // Roll forward to epoch 7 → keeps {5,6,7}: prev=5, current=6, next=7.
+        // The previous epoch (5) is RETAINED (three-slot) so the anchor-lagged
+        // audit can still find it just after the boundary.
         let t3 = mk(Some(&t2), 7, 0x07);
+        assert_eq!(read_u64_field(&t3, "leafroot:LeafRootRegistration", "PrevEpoch"), Some(5));
         assert_eq!(read_u64_field(&t3, "leafroot:LeafRootRegistration", "Epoch"), Some(6));
         assert_eq!(read_u64_field(&t3, "leafroot:LeafRootRegistration", "NextEpoch"), Some(7));
-        assert_eq!(leaf_root_registration_for_epoch(&t3, 5), None, "stale slot dropped");
+        assert_eq!(
+            leaf_root_registration_for_epoch(&t3, 5),
+            Some((vec![0x05u8; 74], 51)),
+            "previous epoch retained for the anchor-lagged audit window",
+        );
+        assert_eq!(leaf_root_registration_for_epoch(&t3, 6), Some((vec![0x06u8; 74], 61)));
         assert_eq!(leaf_root_registration_for_epoch(&t3, 7), Some((vec![0x07u8; 74], 71)));
 
-        // Same-epoch re-register overwrites that slot's value (no third slot).
-        let t4 = mk(Some(&t3), 7, 0xF7);
-        assert_eq!(leaf_root_registration_for_epoch(&t4, 7), Some((vec![0xF7u8; 74], 71)));
-        assert_eq!(read_u64_field(&t4, "leafroot:LeafRootRegistration", "Epoch"), Some(6));
+        // Roll forward to epoch 8 → NOW the oldest (5) drops, keeps {6,7,8}.
+        // By this point (two epochs later) the audit anchor is well past epoch 5.
+        let t4 = mk(Some(&t3), 8, 0x08);
+        assert_eq!(read_u64_field(&t4, "leafroot:LeafRootRegistration", "PrevEpoch"), Some(6));
+        assert_eq!(read_u64_field(&t4, "leafroot:LeafRootRegistration", "Epoch"), Some(7));
+        assert_eq!(read_u64_field(&t4, "leafroot:LeafRootRegistration", "NextEpoch"), Some(8));
+        assert_eq!(leaf_root_registration_for_epoch(&t4, 5), None, "two-epochs-old slot dropped");
+        assert_eq!(leaf_root_registration_for_epoch(&t4, 8), Some((vec![0x08u8; 74], 81)));
+
+        // Same-epoch re-register overwrites that slot's value (still three slots).
+        let t5 = mk(Some(&t4), 8, 0xF8);
+        assert_eq!(leaf_root_registration_for_epoch(&t5, 8), Some((vec![0xF8u8; 74], 81)));
+        assert_eq!(read_u64_field(&t5, "leafroot:LeafRootRegistration", "Epoch"), Some(7));
     }
 
     #[test]

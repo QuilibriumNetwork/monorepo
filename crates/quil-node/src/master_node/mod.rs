@@ -127,6 +127,13 @@ pub(crate) async fn start(
     let crdt = engines.crdt.clone();
     let exec_manager = engines.exec_manager.clone();
     engines::bootstrap_genesis(network, config, &storage, &engines, &bls_pubkey)?;
+    // Genesis may CREATE shards (seeded QUIL data, registered token sub-shards)
+    // that `init_engines` primed before they existed. Re-prime + eagerly commit
+    // now so their committed phase roots are deterministic from frame 1 — else
+    // the seeded shard root materializes lazily/non-deterministically and the
+    // app-shard leader proposes a stale-zero `state_roots` that verifiers reject
+    // (view-churn + journal memory leak). See `reprime_after_genesis`.
+    engines::reprime_after_genesis(crdt.as_ref(), storage.shards_store.as_ref());
 
     // One-time corrective restore of the global-committee provers' Seniority.
     // The re-bootstrapped mainnet left the genesis archive provers at
@@ -649,6 +656,12 @@ pub(crate) async fn start(
         replica_store: Some(quil_store::replica_store::ReplicaStore::new(
             db_arc.clone() as Arc<dyn quil_types::store::KvDb>,
         )),
+        // Loopback deps so a frame PRODUCER (which runs the coverage orchestrator)
+        // includes its OWN ShardSplit/ShardMerge ops even when the remote publish
+        // has no acceptor — single-archive localnet, or any moment with no other
+        // archive reachable. Same collector + rank the gRPC/gossip ingest uses.
+        local_message_collector: Some(message_collector.clone()),
+        current_frame: Some(current_frame.clone()),
     });
 
     // Shard orchestration subscriber: watches for ShardSplitEligible /

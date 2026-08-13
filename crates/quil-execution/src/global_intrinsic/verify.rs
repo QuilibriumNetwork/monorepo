@@ -531,6 +531,7 @@ where
 /// validators that did and did not run materialize.
 pub fn verify_prover_join_not_kicked(
     prover_tree: &quil_tries::VectorCommitmentTree,
+    current_frame: u64,
 ) -> Result<()> {
     let kf_bytes =
         read_field(prover_tree, "allocation:ProverAllocation", "KickFrameNumber")
@@ -542,7 +543,9 @@ pub fn verify_prover_join_not_kicked(
         return Ok(());
     }
     let kf = u64::from_be_bytes(kf_bytes.try_into().unwrap());
-    if kf != 0 {
+    // Spurious-kick amnesty: a kick recorded before the flag-day frame no longer
+    // bars re-join once the chain reaches it (see `materialize::KICK_AMNESTY_FRAME`).
+    if super::materialize::kick_bars_rejoin(kf, current_frame) {
         return Err(QuilError::InvalidArgument(format!(
             "ProverJoin verify: prover has been previously kicked \
              (KickFrameNumber={})",
@@ -1936,7 +1939,7 @@ mod tests {
     #[test]
     fn join_not_kicked_passes_when_no_kick_field() {
         let prover_tree = make_prover_tree();
-        assert!(verify_prover_join_not_kicked(&prover_tree).is_ok());
+        assert!(verify_prover_join_not_kicked(&prover_tree, 1000).is_ok());
     }
 
     #[test]
@@ -1945,7 +1948,8 @@ mod tests {
         // KickFrameNumber on prover:Prover at its schema key.
         let kf_key = crate::global_schema::field_key("prover:Prover", "KickFrameNumber").unwrap();
         prover_tree.insert(&kf_key, &500u64.to_be_bytes(), &[], &BigInt::from(8)).unwrap();
-        assert!(verify_prover_join_not_kicked(&prover_tree).is_err());
+        // Before the amnesty frame, a kick still bars re-join.
+        assert!(verify_prover_join_not_kicked(&prover_tree, 1000).is_err());
     }
 
     #[test]
@@ -1953,7 +1957,28 @@ mod tests {
         let mut prover_tree = make_prover_tree();
         let kf_key = crate::global_schema::field_key("prover:Prover", "KickFrameNumber").unwrap();
         prover_tree.insert(&kf_key, &0u64.to_be_bytes(), &[], &BigInt::from(8)).unwrap();
-        assert!(verify_prover_join_not_kicked(&prover_tree).is_ok());
+        assert!(verify_prover_join_not_kicked(&prover_tree, 1000).is_ok());
+    }
+
+    #[test]
+    fn join_not_kicked_amnesty_forgives_pre_flag_day_kick() {
+        use crate::global_intrinsic::materialize::KICK_AMNESTY_FRAME;
+        let mut prover_tree = make_prover_tree();
+        let kf_key = crate::global_schema::field_key("prover:Prover", "KickFrameNumber").unwrap();
+        // A kick BEFORE the amnesty frame.
+        prover_tree
+            .insert(&kf_key, &(KICK_AMNESTY_FRAME - 100).to_be_bytes(), &[], &BigInt::from(8))
+            .unwrap();
+        // Still barred while the chain is before the amnesty frame …
+        assert!(verify_prover_join_not_kicked(&prover_tree, KICK_AMNESTY_FRAME - 1).is_err());
+        // … forgiven once the chain reaches it.
+        assert!(verify_prover_join_not_kicked(&prover_tree, KICK_AMNESTY_FRAME).is_ok());
+
+        // A kick AT/AFTER the amnesty frame is never forgiven.
+        prover_tree
+            .insert(&kf_key, &(KICK_AMNESTY_FRAME + 50).to_be_bytes(), &[], &BigInt::from(8))
+            .unwrap();
+        assert!(verify_prover_join_not_kicked(&prover_tree, KICK_AMNESTY_FRAME + 1000).is_err());
     }
 
     // -----------------------------------------------------------------

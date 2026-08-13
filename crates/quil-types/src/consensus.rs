@@ -528,6 +528,7 @@ pub trait ProverRegistry: Send + Sync {
         &self,
         _member: &[u8],
         _leaf_id: &[u8],
+        _epoch: u64,
     ) -> Result<Option<(Vec<u8>, u64, u64)>> {
         Ok(None)
     }

@@ -41,6 +41,40 @@ impl ExecutionEngineManager {
         >,
         include_global: bool,
     ) -> Self {
+        Self::new_with_shards(
+            inclusion_prover,
+            key_manager,
+            crdt,
+            circuit_compiler,
+            clock_store,
+            hypergraph_config_resolver,
+            include_global,
+            None,
+            None,
+        )
+    }
+
+    /// Like [`Self::new`], but wires the global intrinsic's shard stores so
+    /// shard split/merge topology changes actually record (`PendingShardChange`)
+    /// and apply at the E+2 boundary. The GLOBAL materialization path
+    /// (master/archive, `include_global = true`) MUST use this — otherwise
+    /// proposed splits validate + "succeed" but never take effect. App-shard-only
+    /// managers (workers) can keep using [`Self::new`] (they never process the
+    /// global-intrinsic split/merge ops).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_shards(
+        inclusion_prover: Arc<dyn InclusionProver>,
+        key_manager: Arc<dyn quil_types::crypto::KeyManager>,
+        crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+        circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler>,
+        clock_store: Arc<dyn quil_types::store::ClockStore>,
+        hypergraph_config_resolver: Arc<
+            dyn crate::hypergraph_intrinsic::HypergraphConfigResolver,
+        >,
+        include_global: bool,
+        shards_store: Option<Arc<dyn quil_types::store::ShardsStore>>,
+        shards_db: Option<Arc<dyn quil_types::store::KvDb>>,
+    ) -> Self {
         let mut engines: HashMap<String, Box<dyn ShardExecutionEngine>> = HashMap::new();
 
         if include_global {
@@ -51,6 +85,8 @@ impl ExecutionEngineManager {
                     key_manager.clone(),
                     crdt.clone(),
                     clock_store.clone(),
+                    shards_store,
+                    shards_db,
                 )),
             );
         }
@@ -140,6 +176,27 @@ impl ExecutionEngineManager {
         crate::metrics::observe_execution_duration("crdt", "commit", start.elapsed().as_secs_f64());
         res?;
         Ok(())
+    }
+
+    /// Apply epoch-aligned shard topology changes (split/merge) due at this GLOBAL
+    /// frame, once per frame — decoupled from `invoke_frame_header` so a staged
+    /// `PendingShardChange` flips at its E+2 boundary regardless of whether an
+    /// app-shard `FrameHeader` is materialized in the frame. GLOBAL-ONLY; a no-op
+    /// on app-shard-only managers (no "global" engine). MUST be called after the
+    /// frame's messages are processed and BEFORE `commit_frame_with_global_cursor`,
+    /// so the reassignment writes ride the same commit batch.
+    pub fn apply_global_due_shard_changes(&self, frame_number: u64) -> Result<()> {
+        let mut engines = self.engines.write().unwrap();
+        let Some(engine) = engines.get_mut("global") else {
+            return Ok(());
+        };
+        let Some(any) = engine.as_any_mut() else {
+            return Ok(());
+        };
+        let Some(global) = any.downcast_mut::<GlobalExecutionEngine>() else {
+            return Ok(());
+        };
+        global.apply_due_shard_changes(frame_number)
     }
 
     /// Get an engine by name.

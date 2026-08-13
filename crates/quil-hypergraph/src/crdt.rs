@@ -615,6 +615,21 @@ impl HypergraphCrdt {
         self.store.for_each_vertex_underlying("vertex", "adds", &shard, cb)
     }
 
+    /// Enumerate committed `(vertex_key, blob)` for an EXPLICIT shard/phase —
+    /// used to read the global prover shard ({l1:[0;3], l2:[0xff;32]}) whose
+    /// L1 is not derivable from a domain. Reads the committed underlying store
+    /// (identical across nodes at a given committed height), so callers get a
+    /// deterministic snapshot for consensus-critical enumeration.
+    pub fn for_each_vertex_underlying_shard(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard: &ShardKey,
+        cb: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+    ) -> Result<usize> {
+        self.store.for_each_vertex_underlying(set_type, phase_type, shard, cb)
+    }
+
     // ---- commit ---------------------------------------------------------
 
     pub fn commit(&self, frame_number: u64) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
@@ -1253,10 +1268,15 @@ impl HypergraphCrdt {
     /// doesn't collide with live `commit_inner` versions). Returns the new root
     /// for the caller to verify against the trusted target.
     ///
-    /// The diff walk (remote reads) runs WITHOUT the commit lock — JMT reads are
-    /// version-exact, so it stays consistent even if a live commit advances the
-    /// tree; only the apply takes the lock. For a catch-up node a concurrent
-    /// local commit to the same shard is caught by the caller's root check.
+    /// The diff walk (remote reads) runs LOCK-FREE — it takes neither
+    /// `forest_write_lock` nor `commit_lock`. JMT reads are version-exact, so the
+    /// diff stays consistent even if the materializer advances the tree mid-walk;
+    /// only the apply takes the locks (forest_write_lock THEN commit_lock, the
+    /// same order the materializer uses). Because the diff is lock-free, the
+    /// version it read (`v_t`) is revalidated under the write lock before the
+    /// apply: if a commit advanced this phase in between, the diff's leaves are
+    /// stale and the apply is aborted for the caller to retry — so an expensive
+    /// full-tree diff can never block the global-frame materializer.
     pub fn sync_shard_phase_from<S: quil_forest::TreeReader>(
         &self,
         source: &S,
@@ -1267,12 +1287,17 @@ impl HypergraphCrdt {
         if phase_idx >= 4 {
             return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
         }
-        let leaves = {
+        // Lock-free diff (no forest_write_lock, no commit_lock). Capture the
+        // version it read (`v_t_opt`) so we can revalidate it under the write lock
+        // before applying.
+        let (v_t_opt, leaves) = {
             let forest = self.forest.read().unwrap();
-            let v_t = self.resolve_phase_version_with(&forest, shard_id, phase_idx).unwrap_or(0);
+            let v_t_opt = self.resolve_phase_version_with(&forest, shard_id, phase_idx);
             let target = forest.shard_phase_reader(shard_id, PHASES[phase_idx]);
-            quil_forest::diff_leaves(source, source_version, &target, v_t)
-                .map_err(|e| QuilError::Internal(format!("diff_leaves: {e}")))?
+            let leaves =
+                quil_forest::diff_leaves(source, source_version, &target, v_t_opt.unwrap_or(0))
+                    .map_err(|e| QuilError::Internal(format!("diff_leaves: {e}")))?;
+            (v_t_opt, leaves)
         };
         // The changed leaves as `(key_hash, leaf_value)` pairs. Under the
         // per-vertex-subtree model the raw-key `key_hash` IS the vertex's 32-byte
@@ -1282,14 +1307,29 @@ impl HypergraphCrdt {
         // `leaf_value` (a peer cannot serve data not matching the commitment).
         let changed: Vec<([u8; 32], Vec<u8>)> =
             leaves.iter().map(|(k, v)| (k.0, v.clone())).collect();
+        // Take the forest-write lock ONLY around the apply — the diff above ran
+        // lock-free, so an O(tree) diff no longer starves the global-frame
+        // materializer (which holds `forest_write_lock` across its whole
+        // verify+apply). Lock order matches the materializer: forest_write_lock
+        // BEFORE commit_lock.
+        let _forest_guard = self.forest_write_lock.lock().unwrap();
         let _guard = self.commit_lock.lock().unwrap();
         let forest = self.forest.read().unwrap();
+        // Revalidate the version the lock-free diff read against. If a commit
+        // advanced this phase between the diff and here, `leaves` is stale
+        // (computed against `v_t_opt`) and applying it would build a divergent
+        // version — abort so the caller re-diffs against the new head. (Under the
+        // old whole-sync forest lock this couldn't happen; the diff is now
+        // lock-free, so the guard moves here.)
+        let cur_opt = self.resolve_phase_version_with(&forest, shard_id, phase_idx);
+        if cur_opt != v_t_opt {
+            return Err(QuilError::Internal(format!(
+                "sync phase {phase_idx} advanced {v_t_opt:?}→{cur_opt:?} during diff — retry"
+            )));
+        }
         // Per-tree contiguous version (JMT builds on `version - 1`), same as
         // `commit_one_shard_phase`.
-        let ver = self
-            .resolve_phase_version_with(&forest, shard_id, phase_idx)
-            .map(|v| v + 1)
-            .unwrap_or(0);
+        let ver = cur_opt.map(|v| v + 1).unwrap_or(0);
         let (root, puts) = forest
             .apply_synced_shard_phase(shard_id, PHASES[phase_idx], ver, leaves)
             .map_err(|e| QuilError::Internal(format!("apply synced shard: {e}")))?;

@@ -27,6 +27,8 @@ use quil_types::error::{QuilError, Result};
 use crate::provers::lifecycle::{LifecycleAction, ProverLifecycle};
 use crate::worker::WorkerManager;
 use crate::prover_message_transport::ProverMessageTransport;
+use crate::message_collector::{MessageCollector, SubmitOutcome};
+use crate::current_frame::CurrentFrame;
 
 /// End-to-end submission pipeline for prover lifecycle actions.
 ///
@@ -71,6 +73,18 @@ pub struct ProverPipeline {
     /// (keyed by `(epoch, leaf_id)`), so the per-frame producer can later
     /// answer openings. `None` disables the hook.
     pub replica_store: Option<quil_store::replica_store::ReplicaStore>,
+    /// Local global-message collector, for LOOPBACK of ops this node generates
+    /// for ITSELF (ShardSplit/ShardMerge from the coverage orchestrator, which
+    /// runs on the frame producer). A producer must include its own generated op
+    /// in the frame it builds; the network publish only reaches OTHER nodes, so
+    /// on a single-archive network (no other archive to accept, gossipsub won't
+    /// self-loopback) the op would otherwise never land. Loop it into the same
+    /// collector the gRPC/gossip ingest feeds. `None` disables loopback (tests).
+    pub local_message_collector: Option<Arc<MessageCollector>>,
+    /// Current-frame tracker, used to tag looped-back ops with the CONSENSUS RANK
+    /// (`effective_rank()`) exactly as the gRPC ingest does (grpc.rs:400) so the
+    /// leader's `collect_for_rank` picks them up. `None` disables loopback.
+    pub current_frame: Option<Arc<CurrentFrame>>,
 }
 
 /// Hard ceiling on lifecycle submissions that do NOT perform VDF
@@ -603,7 +617,7 @@ impl ProverPipeline {
             "submitting ShardSplit"
         );
         crate::metrics::inc_shard_splits_submitted();
-        self.publish_prover_message(bytes).await
+        self.publish_prover_message_local_first(bytes).await
     }
 
     /// Submit a `ShardMerge` proposal for the given shard list →
@@ -639,7 +653,7 @@ impl ProverPipeline {
             "submitting ShardMerge"
         );
         crate::metrics::inc_shard_merges_submitted();
-        self.publish_prover_message(bytes).await
+        self.publish_prover_message_local_first(bytes).await
     }
 
     /// Submit a `ProverSeniorityMerge` to raise on-chain seniority.
@@ -737,7 +751,7 @@ impl ProverPipeline {
     /// configured transport. The transport is responsible for the
     /// gRPC fan-out + pubsub publish (production) or in-memory
     /// broadcast (tests).
-    async fn publish_prover_message(&self, inner_bytes: Vec<u8>) -> Result<()> {
+    fn build_prover_bundle(&self, inner_bytes: Vec<u8>) -> Result<Vec<u8>> {
         let req = CanonicalMessageRequest::wrap(inner_bytes)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -747,7 +761,46 @@ impl ProverPipeline {
             requests: vec![Some(req)],
             timestamp: now_ms,
         };
-        let bundle_bytes = bundle.to_canonical_bytes()?;
+        bundle.to_canonical_bytes()
+    }
+
+    async fn publish_prover_message(&self, inner_bytes: Vec<u8>) -> Result<()> {
+        let bundle_bytes = self.build_prover_bundle(inner_bytes)?;
         self.transport.publish_prover_bundle(bundle_bytes).await
+    }
+
+    /// Loop a self-generated op into the LOCAL mempool (the same collector the
+    /// gRPC/gossip ingest feeds), tagged with the current consensus rank exactly
+    /// like the gRPC ingest (grpc.rs:400). Returns true if the op is now in the
+    /// local mempool (freshly Accepted, or already present as a Duplicate).
+    fn loopback_to_local_mempool(&self, bundle_bytes: &[u8]) -> bool {
+        match (&self.local_message_collector, &self.current_frame) {
+            (Some(mc), Some(cf)) => matches!(
+                mc.add_message_outcome(cf.effective_rank(), bundle_bytes.to_vec()),
+                SubmitOutcome::Accepted | SubmitOutcome::Duplicate
+            ),
+            _ => false,
+        }
+    }
+
+    /// Publish a self-generated op LOCAL-FIRST: add it to this node's own mempool
+    /// (so a frame PRODUCER includes its own op) AND best-effort publish to remote
+    /// paths. Succeeds if EITHER path delivered — so a single-archive producer
+    /// (where the remote publish has no acceptor and gossipsub won't self-loop)
+    /// still submits its op instead of failing with "no archive accepted". Used
+    /// for ShardSplit/ShardMerge, which the coverage orchestrator generates on
+    /// the frame producer itself.
+    async fn publish_prover_message_local_first(&self, inner_bytes: Vec<u8>) -> Result<()> {
+        let bundle_bytes = self.build_prover_bundle(inner_bytes)?;
+        let looped = self.loopback_to_local_mempool(&bundle_bytes);
+        let published = self.transport.publish_prover_bundle(bundle_bytes).await;
+        if looped || published.is_ok() {
+            if looped {
+                debug!("prover op looped back into local mempool (producer self-inclusion)");
+            }
+            Ok(())
+        } else {
+            published
+        }
     }
 }

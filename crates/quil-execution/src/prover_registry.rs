@@ -73,7 +73,7 @@ pub struct InMemoryProverRegistry {
     /// (member_address, leaf_id) → registered leaf-root record. `leaf_id` is
     /// `leaf_id_bytes(shard_filter, prefix)`. Populated from
     /// `leafroot:LeafRootRegistration` vertices written by ProverConfirm.
-    leaf_root_cache: HashMap<(Vec<u8>, Vec<u8>), LeafRootRecord>,
+    leaf_root_cache: HashMap<(Vec<u8>, Vec<u8>, u64), LeafRootRecord>,
     /// confirmation_filter → sorted list of prover addresses with at
     /// least one allocation under that filter. Sorted lexicographically
     /// by address bytes.
@@ -131,9 +131,14 @@ impl InMemoryProverRegistry {
     /// The registered leaf-root record for `(member, leaf_id)`, or `None`.
     /// `leaf_id` = `leaf_id_bytes(shard_filter, prefix)`. Used by the storage
     /// attestation verifier to cross-check an opening's claimed `leaf_root`.
-    pub fn get_leaf_root(&self, member: &[u8], leaf_id: &[u8]) -> Option<&LeafRootRecord> {
+    pub fn get_leaf_root(
+        &self,
+        member: &[u8],
+        leaf_id: &[u8],
+        epoch: u64,
+    ) -> Option<&LeafRootRecord> {
         self.leaf_root_cache
-            .get(&(member.to_vec(), leaf_id.to_vec()))
+            .get(&(member.to_vec(), leaf_id.to_vec(), epoch))
     }
 
     /// Total registered leaf roots across all members (diagnostics).
@@ -861,9 +866,14 @@ impl SharedProverRegistry {
     /// The registered leaf-root record for `(member, leaf_id)`, cloned out from
     /// under the lock. `leaf_id = leaf_id_bytes(shard_filter, prefix)`. Used by
     /// the storage attestation verifier to cross-check an opening's leaf root.
-    pub fn get_leaf_root(&self, member: &[u8], leaf_id: &[u8]) -> Option<LeafRootRecord> {
+    pub fn get_leaf_root(
+        &self,
+        member: &[u8],
+        leaf_id: &[u8],
+        epoch: u64,
+    ) -> Option<LeafRootRecord> {
         let guard = self.inner.read().ok()?;
-        guard.get_leaf_root(member, leaf_id).cloned()
+        guard.get_leaf_root(member, leaf_id, epoch).cloned()
     }
 
     /// Find inactive provers AND apply the kick mutations (Status=4,
@@ -1335,13 +1345,14 @@ impl ProverRegistryTrait for SharedProverRegistry {
         &self,
         member: &[u8],
         leaf_id: &[u8],
+        epoch: u64,
     ) -> QuilResult<Option<(Vec<u8>, u64, u64)>> {
         let guard = self
             .inner
             .read()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
         Ok(guard
-            .get_leaf_root(member, leaf_id)
+            .get_leaf_root(member, leaf_id, epoch)
             .map(|r| (r.leaf_root.clone(), r.num_blocks, r.epoch)))
     }
 
@@ -1566,12 +1577,90 @@ fn decode_allocation(
     Some((prover_ref, alloc))
 }
 
+/// Deterministically enumerate provers whose ACTIVE allocation is on `filter`,
+/// read DIRECTLY from committed state via the CRDT (not the async cache), for the
+/// epoch-aligned split/merge reassignment which MUST be a pure function of the
+/// committed frame. Returns (public_key, prover_address) per matching prover,
+/// sorted by address for a stable order. Mirrors `get_active_provers`' intent
+/// (raw-Active only; Leaving/Joining are intentionally not reassigned).
+pub fn active_provers_on_filter_committed(
+    hg: &quil_hypergraph::HypergraphCrdt,
+    filter: &[u8],
+    frame_number: u64,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let shard = ShardKey {
+        l1: [0u8; 3],
+        l2: [0xffu8; 32],
+    };
+
+    // Single destructive pass over the committed global prover shard,
+    // collecting both prover pubkeys (by address) and allocations.
+    let mut addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let mut allocations: Vec<(Vec<u8>, ProverAllocationInfo)> = Vec::new();
+
+    let mut cb = |vk: Vec<u8>, data: Vec<u8>| {
+        if vk.len() != 64 {
+            return;
+        }
+        let root = match deserialize_go_tree(&data) {
+            Ok(Some(r)) => r,
+            _ => return,
+        };
+        let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+            return;
+        };
+        if type_hash == TYPE_HASH_ALLOCATION {
+            if let Some((prover_ref, alloc)) = decode_allocation(&vk, &root) {
+                allocations.push((prover_ref, alloc));
+            }
+            return;
+        }
+        if let Some("prover:Prover") = class_for_type_hash(&type_hash) {
+            if let Some(info) = decode_prover(&vk, &root) {
+                addr_to_pubkey.insert(info.address.clone(), info.public_key);
+            }
+        }
+    };
+    let _ = hg.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut cb);
+
+    // Match `get_active_provers`' committee eligibility (effective_status via
+    // `committee_eligible`) — NOT raw `status == Active` — with the same
+    // strict→lenient fallback, so the reassignment moves EXACTLY the provers the
+    // rest of consensus considers on `filter`. A raw-Active check strands
+    // epoch-boundary re-confirmers (effective-Active but not raw-Active), which
+    // is precisely the "2 of 4 not moved" bug: the split flips at an epoch
+    // boundary where some members are mid-re-confirm.
+    let collect = |lenient: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut v: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (prover_ref, alloc) in &allocations {
+            if alloc.confirmation_filter != filter
+                || !committee_eligible(alloc, frame_number, lenient)
+            {
+                continue;
+            }
+            if let Some(pubkey) = addr_to_pubkey.get(prover_ref) {
+                v.push((pubkey.clone(), prover_ref.clone()));
+            }
+        }
+        v
+    };
+    // Strict first; fall back to the lenient (empty-committee) floor for a
+    // non-empty (app-shard) filter, exactly as `get_active_provers` does.
+    let mut out = collect(false);
+    if out.is_empty() && !filter.is_empty() {
+        out = collect(true);
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out.dedup_by(|a, b| a.1 == b.1);
+    out
+}
+
 /// Decode a `leafroot:LeafRootRegistration` vertex into
 /// `((member, leaf_id), record)`. `leaf_id = leaf_id_bytes(shard_filter,
 /// prefix)`. Returns `None` if required fields are missing.
 fn decode_leaf_root(
     root: &VectorCommitmentNode,
-) -> Option<((Vec<u8>, Vec<u8>), LeafRootRecord)> {
+) -> Option<((Vec<u8>, Vec<u8>, u64), LeafRootRecord)> {
     let cls = "leafroot:LeafRootRegistration";
     let member = read_bytes(root, cls, "Member");
     let shard_filter = read_bytes(root, cls, "ShardFilter");
@@ -1582,12 +1671,13 @@ fn decode_leaf_root(
     let prefix_bytes = read_bytes(root, cls, "Prefix");
     let prefix = crate::global_intrinsic::materialize::unpack_prefix(&prefix_bytes);
     let leaf_id = crate::global_intrinsic::leaf_id_bytes(&shard_filter, &prefix);
+    let epoch = read_u64_be(root, cls, "Epoch");
     let rec = LeafRootRecord {
         leaf_root,
         num_blocks: read_u64_be(root, cls, "NumBlocks"),
-        epoch: read_u64_be(root, cls, "Epoch"),
+        epoch,
     };
-    Some(((member, leaf_id), rec))
+    Some(((member, leaf_id, epoch), rec))
 }
 
 // =====================================================================
@@ -1648,7 +1738,8 @@ mod tests {
         let blob = vertex_tree_to_blob(&tree);
         let root = deserialize_go_tree(&blob).unwrap().unwrap();
 
-        let ((m, leaf_id), rec) = super::decode_leaf_root(&root).expect("decode");
+        let ((m, leaf_id, ep), rec) = super::decode_leaf_root(&root).expect("decode");
+        assert_eq!(ep, 19);
         assert_eq!(m, member.to_vec());
         assert_eq!(
             leaf_id,
@@ -1676,12 +1767,14 @@ mod tests {
             reg.leaf_root_cache.insert(key, recd);
         }
         let leaf_id = crate::global_intrinsic::leaf_id_bytes(&filter, &prefix);
-        let got = reg.get_leaf_root(&member, &leaf_id).expect("cached");
+        let got = reg.get_leaf_root(&member, &leaf_id, 5).expect("cached");
         assert_eq!(got.leaf_root, vec![0x22; 74]);
         assert_eq!(got.epoch, 5);
         assert_eq!(reg.leaf_root_count(), 1);
         // Unknown member/leaf → None.
-        assert!(reg.get_leaf_root(&[0u8; 32], &leaf_id).is_none());
+        assert!(reg.get_leaf_root(&[0u8; 32], &leaf_id, 5).is_none());
+        // Right member/leaf but wrong epoch → None (per-epoch keying).
+        assert!(reg.get_leaf_root(&member, &leaf_id, 6).is_none());
     }
 
     fn type_hash_leaf(class: &str) -> LeafNode {
@@ -1844,10 +1937,10 @@ mod tests {
         shared.refresh_from_store(&store);
 
         let leaf_id = leaf_id_bytes(&filter, &prefix);
-        let got = shared.get_leaf_root(&member, &leaf_id).expect("registered");
+        let got = shared.get_leaf_root(&member, &leaf_id, epoch).expect("registered");
         assert_eq!(got, LeafRootRecord { leaf_root, num_blocks, epoch });
         // Unknown leaf → None.
-        assert!(shared.get_leaf_root(&member, b"nope").is_none());
+        assert!(shared.get_leaf_root(&member, b"nope", epoch).is_none());
     }
 
     #[test]

@@ -76,7 +76,7 @@ impl ProdProverTreeSyncer {
                     return Ok(false);
                 }
             }
-            let Some((v_s, _root_s)) = head else {
+            let Some((v_s, root_s)) = head else {
                 // Peer has no tree for this phase (matched the zero anchor). Verify
                 // our LOCAL tree is ALSO empty (audit residual #4): otherwise stale
                 // local data the header says shouldn't exist would survive the sync
@@ -100,8 +100,9 @@ impl ProdProverTreeSyncer {
                 }
                 continue;
             };
+            let rr = <[u8; 32]>::try_from(root_s.as_slice()).ok();
             let got = crate::forest_sync::sync_one_phase(
-                &mut client, &handle, &self.crdt, &shard_id, phase, v_s,
+                &mut client, &handle, &self.crdt, &shard_id, phase, v_s, rr,
             )
             .await?;
             // POST-pull: the applied root must equal the anchor (belt-and-suspenders
@@ -161,7 +162,7 @@ impl ProdProverTreeSyncer {
             for (shard_id, _, head) in &heads {
                 let Some((v_s, root_s)) = *head else { continue };
                 let got = crate::forest_sync::sync_one_phase(
-                    &mut client, &handle, &self.crdt, shard_id, phase, v_s,
+                    &mut client, &handle, &self.crdt, shard_id, phase, v_s, Some(root_s),
                 )
                 .await?;
                 if got != root_s {
@@ -172,6 +173,32 @@ impl ProdProverTreeSyncer {
         }
         Ok(true)
     }
+
+    /// (#3) True when every phase's LOCAL root already equals the header anchor's
+    /// — the node is caught up and a sync would pull nothing, so the whole cycle
+    /// (gRPC connect + per-phase head round-trips + diff) can be skipped. Requires
+    /// a FULL 4-phase anchor with no empty entry; a bootstrap / partial anchor
+    /// returns false so the sync proceeds and trusts the peer. `compute_shard_root`
+    /// is a plain forest read and aggregates sub-shards, so this works for both a
+    /// single-shard app and a QUIL split.
+    fn caught_up_to_anchor(&self, l2: &[u8; 32], expected_roots: &[Vec<u8>]) -> bool {
+        if expected_roots.len() < 4 || expected_roots.iter().any(|r| r.is_empty()) {
+            return false;
+        }
+        let Some(sk) = crate::forest_sync::app_shard_key(l2) else { return false };
+        for phase in 0u32..4 {
+            let (s, p) = crate::forest_sync::phase_strs(phase);
+            let mut local = self.crdt.compute_shard_root(s, p, &sk);
+            if local.is_empty() {
+                // An empty local tree is the zero root of the anchor's width.
+                local = vec![0u8; expected_roots[phase as usize].len()];
+            }
+            if local.as_slice() != expected_roots[phase as usize].as_slice() {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[async_trait]
@@ -181,6 +208,12 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
         // global header now commits ALL FOUR prover-shard phase roots (audit #5
         // flag-day): `expected_roots` = [prover_tree_commitment (phase 0),
         // prover_tree_aux_roots (phases 1,2,3)], so every phase is authenticated.
+        // (#3) Skip the whole sync when already caught up to the committed anchor
+        // — the periodic cadence would otherwise re-diff the entire prover tree
+        // every tick on a node that keeps it current via its own materializer.
+        if self.caught_up_to_anchor(&[0xffu8; 32], expected_roots) {
+            return Ok(true);
+        }
         info!(addr = %self.master_stream_addr, "syncing global prover tree (forest diff)");
         self.sync_single_shard(vec![0xffu8; 32], expected_roots).await
     }
@@ -189,6 +222,10 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
         let n = filter.len().min(32);
         let mut l2 = [0u8; 32];
         l2[..n].copy_from_slice(&filter[..n]);
+        // (#3) Skip when already caught up (works for single-shard and QUIL split).
+        if self.caught_up_to_anchor(&l2, expected_roots) {
+            return Ok(true);
+        }
         // QUIL splits 64-way: its state lives in sub-shard trees (app‖prefix),
         // verified as a set via the aggregation binding (all 4 phases).
         if l2 == quil_execution::domains::QUIL_TOKEN {

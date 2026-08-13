@@ -550,6 +550,40 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                     .to_string(),
             ));
         }
+        // Effective-Active proposing gate (storage frames only). A prover that is
+        // NOT yet effective-`Active` for THIS shard at the frame's epoch (freshly
+        // joined + still inside its deferred-activation epoch, or admitted only by
+        // the empty-committee floor) has no storage leaf-root registration for the
+        // CURRENT epoch — its confirm registers "encode-ahead" for the NEXT epoch.
+        // Proposing a storage frame now produces an attestation whose leaf roots are
+        // for a future epoch, so no verifier matches it and the finalized frame is
+        // dropped ("app shard frame storage attestation rejected") — the shard
+        // stalls. Decline until this prover is Active for the epoch it would anchor
+        // to. Consensus stays live (the floor keeps the committee non-empty) but
+        // never mints an unverifiable storage frame.
+        if anchor_gfn > 0 {
+            let eff_active = self
+                .prover_registry
+                .get_prover_info(&self.local_prover_address)
+                .ok()
+                .flatten()
+                .map(|info| {
+                    info.allocations.iter().any(|a| {
+                        a.confirmation_filter == self.filter
+                            && a.effective_status(anchor_gfn)
+                                == quil_types::consensus::EffectiveStatus::Active
+                    })
+                })
+                .unwrap_or(false);
+            if !eff_active {
+                return Err(QuilError::NoVote(
+                    "local prover not effective-Active for this shard at the frame's \
+                     epoch — declining to propose (storage attestation would have no \
+                     current-epoch leaf roots)"
+                        .to_string(),
+                ));
+            }
+        }
         // Get latest shard frame number
         let prior_frame_number = self.clock_store
             .get_latest_shard_clock_frame(&self.filter)
@@ -1526,6 +1560,57 @@ impl AppConsensusEngine {
             .store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Persist a certified shard frame as the shard clock head so the next
+    /// `prove_next_state` (which reads `get_latest_shard_clock_frame`) chains on
+    /// it. MUST be called by EVERY path that advances the materialized cursor —
+    /// not only the CW-finalize handler, but also the leader self-materialize and
+    /// the follower catch-up drain. Otherwise a node that materializes a frame
+    /// OUTSIDE its own finalize handler (e.g. draining `received_full_frames`
+    /// after a frame-sync) advances `mat` while the clock head stalls, and the
+    /// (co-located, in cluster mode separate-process) proposer then reads the
+    /// stale clock and RE-PROPOSES the already-materialized frame N — which every
+    /// voter nullifies (`mat+1 != N`), producing a view-churn storm that never
+    /// makes progress. Keeping clock-head == mat on every path removes that whole
+    /// divergence class. Idempotent + monotonic: `commit_shard_clock_frame` only
+    /// bumps the latest-index pointer when `frame_number` exceeds the current
+    /// head (clock.rs:1152), so re-committing or filling a gap below the head can
+    /// never regress it.
+    fn commit_shard_clock_head(
+        &self,
+        frame: &quil_types::proto::global::AppShardFrame,
+        frame_number: u64,
+    ) {
+        let Some(header) = frame.header.as_ref() else {
+            return;
+        };
+        let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+            .map(|h| h.to_vec())
+            .unwrap_or_default();
+        if let Ok(txn) = self.clock_store.new_transaction(false) {
+            if let Err(e) =
+                self.clock_store
+                    .stage_shard_clock_frame(&selector, frame, txn.as_ref())
+            {
+                warn!(core_id = self.core_id, frame = frame_number, error = %e, "stage shard clock head failed");
+            } else {
+                let _ = txn.commit();
+            }
+        }
+        if let Ok(txn) = self.clock_store.new_transaction(false) {
+            if let Err(e) = self.clock_store.commit_shard_clock_frame(
+                &self.filter,
+                frame_number,
+                &selector,
+                txn.as_ref(),
+                false,
+            ) {
+                warn!(core_id = self.core_id, frame = frame_number, error = %e, "commit shard clock head failed");
+            } else {
+                let _ = txn.commit();
+            }
+        }
+    }
+
     async fn reconcile_with_sync(&mut self, synced_to_frame: u64) {
         if synced_to_frame <= self.last_materialized_frame {
             return;
@@ -1623,6 +1708,42 @@ impl AppConsensusEngine {
                     let _ = kv.delete(&quil_store::encoding::consensus_liveness_key(&self.filter));
                     let _ = kv.delete(&quil_store::encoding::consensus_state_key(&self.filter));
                 }
+            }
+        }
+
+        // ONE-TIME startup sync of the covered shard's committed data from the
+        // storage source (the master's genesis-seeded/forest-filled hypergraph)
+        // into this worker's OWN crdt, BEFORE consensus can propose or verify.
+        // Per-worker stores start empty; the seeded genesis coins live only in
+        // the master store. The storage-attestation path (`prove_next_state`)
+        // syncs them lazily, but that runs AFTER `state_roots` is computed, so the
+        // first proposal reads an un-synced (zero) pre-state root while later
+        // verifiers read the synced (non-zero) root → every proposal is nullified
+        // (state_roots mismatch) and the app-shard CW churns views + leaks journal
+        // buffers. Syncing here makes the own crdt's committed root deterministic
+        // from frame 1 (mat=0) on every node, so leader and verifier agree. No-op
+        // for archives/tests (no separate source) and for empty shards (copied=0).
+        if let (Some(source), Some(own_crdt)) =
+            (self.storage_source_hypergraph.as_ref(), self.hypergraph.as_ref())
+        {
+            let app_addr = self.filter[..self.filter.len().min(32)].to_vec();
+            match crate::app_shard_metadata::sync_app_shard_to_own_crdt(
+                source.as_ref(),
+                own_crdt.as_ref(),
+                &app_addr,
+                0,
+            ) {
+                Ok(n) if n > 0 => info!(
+                    core_id = self.core_id,
+                    copied = n,
+                    "startup: synced app-shard seed data into own crdt (deterministic pre-state)"
+                ),
+                Err(e) => warn!(
+                    core_id = self.core_id,
+                    error = %e,
+                    "startup app-shard sync into own crdt failed"
+                ),
+                _ => {}
             }
         }
 
@@ -2920,6 +3041,12 @@ impl AppConsensusEngine {
                 Ok((processed, skipped)) => {
                     self.set_materialized_frame(next);
                     self.persist_materialized_cursor(next);
+                    // Advance the clock head in lockstep with the cursor. This is
+                    // the critical case: a follower drains finalized frames it
+                    // received via frame-sync WITHOUT running its own finalize
+                    // handler for them, so nothing else writes the clock head —
+                    // leaving mat > clock and triggering a re-propose/nullify storm.
+                    self.commit_shard_clock_head(&frame, next);
                     self.received_full_frames.remove(&next);
                     self.materialize_failures.remove(&next);
                     debug!(core_id = self.core_id, frame = next, processed, skipped,

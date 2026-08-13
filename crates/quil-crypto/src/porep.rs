@@ -360,13 +360,13 @@ pub fn verify_frame_storage_attestation_registered<F>(
     lookup: F,
 ) -> bool
 where
-    F: Fn(&[u8], &[u8]) -> Option<(Vec<u8>, u64, u64)>,
+    F: Fn(&[u8], &[u8], u64) -> Option<(Vec<u8>, u64, u64)>,
 {
     for o in &attestation.openings {
         if o.epoch != active_epoch {
             return false;
         }
-        match lookup(&o.member_id, &o.shard_id) {
+        match lookup(&o.member_id, &o.shard_id, o.epoch) {
             Some((reg_root, reg_blocks, reg_epoch)) => {
                 if reg_epoch != active_epoch
                     || reg_root != o.leaf_root
@@ -1178,7 +1178,7 @@ mod tests {
         let params = crate::sdr::SdrParams::default();
 
         let mut openings = Vec::new();
-        let mut reg: HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)> = HashMap::new();
+        let mut reg: HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)> = HashMap::new();
         for (m, id) in [b"m0".as_slice(), b"m1"].iter().enumerate() {
             // Opaque per-member leaf id (the engine sets this to
             // leaf_id_bytes(filter, prefix); crypto treats it as bytes).
@@ -1193,7 +1193,7 @@ mod tests {
                 &leaf_data, id, &leaf_id, epoch, poly_size, &params,
             );
             reg.insert(
-                (id.to_vec(), leaf_id.clone()),
+                (id.to_vec(), leaf_id.clone(), epoch),
                 (leaf.root.clone(), leaf.block_commitments().len() as u64, epoch),
             );
             for q in 0..2u32 {
@@ -1205,7 +1205,7 @@ mod tests {
 
         let (attestation, root) =
             build_frame_storage_attestation(&openings, frame, &rho_n, &bitmask, poly_size);
-        let good = |m: &[u8], l: &[u8]| reg.get(&(m.to_vec(), l.to_vec())).cloned();
+        let good = |m: &[u8], l: &[u8], e: u64| reg.get(&(m.to_vec(), l.to_vec(), e)).cloned();
         assert!(
             verify_frame_storage_attestation_registered(
                 &root, &attestation, frame, &rho_n, &bitmask, poly_size, epoch, good,
@@ -1229,14 +1229,14 @@ mod tests {
             build_frame_storage_attestation(&openings, frame, &rho_n, &bitmask, poly_size);
 
         // Registry map: (member_id, shard_id=leaf_id) → (leaf_root, num_blocks, epoch).
-        let mut reg: HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)> = HashMap::new();
+        let mut reg: HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)> = HashMap::new();
         for o in &openings {
             reg.insert(
-                (o.member_id.clone(), o.shard_id.clone()),
+                (o.member_id.clone(), o.shard_id.clone(), o.epoch),
                 (o.leaf_root.clone(), o.num_blocks, o.epoch),
             );
         }
-        let good = |m: &[u8], l: &[u8]| reg.get(&(m.to_vec(), l.to_vec())).cloned();
+        let good = |m: &[u8], l: &[u8], e: u64| reg.get(&(m.to_vec(), l.to_vec(), e)).cloned();
 
         // Honest: registered, current epoch, matching roots → accept.
         assert!(verify_frame_storage_attestation_registered(
@@ -1246,19 +1246,19 @@ mod tests {
         // Unregistered leaf (lookup always None) → reject.
         assert!(!verify_frame_storage_attestation_registered(
             &root, &attestation, frame, &rho_n, &bitmask, poly_size, active_epoch,
-            |_m: &[u8], _l: &[u8]| None,
+            |_m: &[u8], _l: &[u8], _e: u64| None,
         ));
 
         // Stale epoch (active epoch advanced; opening still at EPOCH) → reject.
         assert!(!verify_frame_storage_attestation_registered(
             &root, &attestation, frame, &rho_n, &bitmask, poly_size, active_epoch + 1,
-            |m: &[u8], l: &[u8]| reg.get(&(m.to_vec(), l.to_vec())).cloned(),
+            |m: &[u8], l: &[u8], e: u64| reg.get(&(m.to_vec(), l.to_vec(), e)).cloned(),
         ));
 
         // Registered leaf_root differs from the opening's → reject (junk-leaf swap).
-        let wrong = |m: &[u8], l: &[u8]| {
-            reg.get(&(m.to_vec(), l.to_vec()))
-                .map(|(_r, b, e)| (vec![0u8; 74], *b, *e))
+        let wrong = |m: &[u8], l: &[u8], e: u64| {
+            reg.get(&(m.to_vec(), l.to_vec(), e))
+                .map(|(_r, b, ep)| (vec![0u8; 74], *b, *ep))
         };
         assert!(!verify_frame_storage_attestation_registered(
             &root, &attestation, frame, &rho_n, &bitmask, poly_size, active_epoch, wrong,

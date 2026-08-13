@@ -40,7 +40,7 @@ pub struct TestProverRegistry {
     /// the frame validator's registered-leaf cross-check on storage attestations
     /// can pass. See [`Self::register_leaf_root`] / [`ProverRegistry::get_leaf_root`].
     #[allow(clippy::type_complexity)]
-    leaf_roots: Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)>>,
+    leaf_roots: Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)>>,
 }
 
 impl Default for TestProverRegistry {
@@ -71,7 +71,7 @@ impl TestProverRegistry {
         epoch: u64,
     ) {
         self.leaf_roots.lock().unwrap().insert(
-            (member.to_vec(), leaf_id.to_vec()),
+            (member.to_vec(), leaf_id.to_vec(), epoch),
             (leaf_root, num_blocks, epoch),
         );
     }
@@ -123,12 +123,13 @@ impl ProverRegistry for TestProverRegistry {
         &self,
         member: &[u8],
         leaf_id: &[u8],
+        epoch: u64,
     ) -> Result<Option<(Vec<u8>, u64, u64)>> {
         Ok(self
             .leaf_roots
             .lock()
             .unwrap()
-            .get(&(member.to_vec(), leaf_id.to_vec()))
+            .get(&(member.to_vec(), leaf_id.to_vec(), epoch))
             .cloned())
     }
 

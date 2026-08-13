@@ -543,10 +543,24 @@ pub(crate) fn init(
                                                 let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
                                                     .map(|h| h.to_vec())
                                                     .unwrap_or_default();
+                                                let frame_number = header.frame_number;
                                                 if let Ok(txn) = drain_clock_store.new_transaction(false) {
                                                     match drain_clock_store.stage_shard_clock_frame(&selector, &frame, txn.as_ref()) {
                                                         Ok(()) => { let _ = txn.commit(); }
                                                         Err(e) => warn!(core_id, filter = %hex::encode(&filter), error = %e, "mirror app-shard frame to master store failed"),
+                                                    }
+                                                }
+                                                // Commit the latest-index pointer too: staging alone
+                                                // writes the staged key only, so `get_latest_shard_clock_frame`
+                                                // (which reads the canonical key via the latest index) would
+                                                // NOT resolve to this frame — the master's serving head +
+                                                // co-located proposer would stay stuck on the prior frame and
+                                                // re-propose it. Monotonic (clock.rs:1152), so safe to re-run.
+                                                if let Ok(txn) = drain_clock_store.new_transaction(false) {
+                                                    if let Err(e) = drain_clock_store.commit_shard_clock_frame(&filter, frame_number, &selector, txn.as_ref(), false) {
+                                                        warn!(core_id, filter = %hex::encode(&filter), error = %e, "commit mirrored app-shard frame head failed");
+                                                    } else {
+                                                        let _ = txn.commit();
                                                     }
                                                 }
                                             }

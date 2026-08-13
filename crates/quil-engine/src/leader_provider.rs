@@ -140,9 +140,21 @@ impl GlobalLeaderProvider {
         let parent = frame_number.saturating_sub(1);
         let mut recorded = hg.prover_root_at(parent);
         if recorded.is_none() && frame_number > 1 {
-            const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(5000);
+            // How long the leader blocks for the in-flight materialize(N-1) to
+            // record before declining (view nullifies). Env-tunable so nodes on
+            // slower hardware — where the materialize commit occasionally throttles
+            // on a RocksDB write-stall despite the compaction tuning in
+            // `RocksDb::open` — can absorb residual jitter within their view budget
+            // instead of missing the proposal. Keep it below the CW leader timeout
+            // so a genuinely-wedged materializer still yields the view rather than
+            // holding it to the end.
+            let max_wait_ms: u64 = std::env::var("QUIL_MATERIALIZE_WAIT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5000);
+            let max_wait = std::time::Duration::from_millis(max_wait_ms);
             const POLL: std::time::Duration = std::time::Duration::from_millis(25);
-            let deadline = std::time::Instant::now() + MAX_WAIT;
+            let deadline = std::time::Instant::now() + max_wait;
             while recorded.is_none() && std::time::Instant::now() < deadline {
                 std::thread::sleep(POLL);
                 recorded = hg.prover_root_at(parent);

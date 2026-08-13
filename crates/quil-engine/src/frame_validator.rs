@@ -898,8 +898,8 @@ impl BlsAppFrameValidator {
                 // consensus opening domain.
                 quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
                 active_epoch,
-                |member: &[u8], leaf_id: &[u8]| {
-                    registry.get_leaf_root(member, leaf_id).ok().flatten()
+                |member: &[u8], leaf_id: &[u8], epoch: u64| {
+                    registry.get_leaf_root(member, leaf_id, epoch).ok().flatten()
                 },
             );
             if !ok {

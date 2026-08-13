@@ -110,6 +110,32 @@ impl RocksDb {
         opts.set_level_zero_slowdown_writes_trigger(16);
         opts.set_level_zero_stop_writes_trigger(32);
 
+        // WRITE-STALL AVOIDANCE. The per-frame materialize commit is a synchronous
+        // `db.write` (memtable + WAL). Normally fast, but RocksDB THROTTLES writes
+        // once L0 files pile up faster than compaction drains them (the
+        // slowdown/stop triggers above) or once all memtables are full awaiting a
+        // flush. On slower machines compaction can't keep up under bursty frame
+        // commits, so `db.write` blocks — surfacing as transient, payload-agnostic
+        // "parent (N-1) prover root not materialized before deadline" proposer
+        // misses (materialization lag). Give background flush+compaction enough
+        // threads to keep up, plus extra memtable headroom to absorb bursts.
+        // Threads scale with cores (compaction is the bottleneck on weak HW);
+        // env-overridable for constrained nodes.
+        let bg_threads: i32 = std::env::var("QUIL_ROCKSDB_BG_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| (n.get() as i32).clamp(2, 8))
+                    .unwrap_or(4)
+            });
+        opts.increase_parallelism(bg_threads);
+        opts.set_max_background_jobs(bg_threads);
+        // More memtables in flight (default 2) so a flush stall doesn't immediately
+        // block writes; the commit can keep filling a fresh buffer while older ones
+        // flush in the background.
+        opts.set_max_write_buffer_number(4);
+
         // LZ4 compression: ~50% size reduction at ~5% CPU cost.
         // RocksDB's default is Snappy (worse ratio); LZ4 is the
         // standard pick for write-heavy workloads.
