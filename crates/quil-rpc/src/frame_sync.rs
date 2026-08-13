@@ -372,6 +372,29 @@ impl Default for ArchivePollerConfig {
     }
 }
 
+/// The single fetch surface [`run_archive_poller`] needs from its remote
+/// source: `GetGlobalFrame(n)`, with `0` meaning "latest head". Extracted
+/// from [`ArchiveClient`] so tests can inject an in-process fake source and
+/// drive the poller loop deterministically (see the `forward_fill_repro`
+/// tests); production goes through the impl below over the real mTLS client.
+#[tonic::async_trait]
+pub trait PollerFrameSource: Send {
+    async fn get_global_frame(
+        &mut self,
+        frame_number: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError>;
+}
+
+#[tonic::async_trait]
+impl PollerFrameSource for ArchiveClient {
+    async fn get_global_frame(
+        &mut self,
+        frame_number: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError> {
+        ArchiveClient::get_global_frame(self, frame_number).await
+    }
+}
+
 /// Long-running task that polls a chosen archive endpoint for the current
 /// head, and forward-fills any gap from the previously seen head. The
 /// returned future runs until `cancel` fires; callers register it with
@@ -380,9 +403,31 @@ pub async fn run_archive_poller(
     pool: Arc<ArchiveEndpointPool>,
     clock_store: Arc<RocksClockStore>,
     falcon_signing_key: Vec<u8>,
-    mut config: ArchivePollerConfig,
+    config: ArchivePollerConfig,
     cancel: CancellationToken,
 ) {
+    run_archive_poller_with_connector(pool, clock_store, config, cancel, move |addr: String| {
+        let key = falcon_signing_key.clone();
+        async move { ArchiveClient::connect_mtls(&addr, &key).await }
+    })
+    .await
+}
+
+/// Generic core of [`run_archive_poller`]: identical loop, with the remote
+/// source injectable via `connect` (production passes a closure over
+/// `ArchiveClient::connect_mtls`; tests pass an in-process fake). Kept
+/// crate-private — the mTLS wrapper above is the public entry point.
+pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
+    pool: Arc<ArchiveEndpointPool>,
+    clock_store: Arc<RocksClockStore>,
+    mut config: ArchivePollerConfig,
+    cancel: CancellationToken,
+    connect: C,
+) where
+    S: PollerFrameSource,
+    C: Fn(String) -> F,
+    F: std::future::Future<Output = Result<S, ArchiveClientError>>,
+{
     info!("archive frame poller started");
     pool.wait_nonempty(&cancel).await;
     if cancel.is_cancelled() {
@@ -402,7 +447,7 @@ pub async fn run_archive_poller(
     // Reuse a single client for as long as it works AND it keeps us moving
     // forward. Switch endpoints on an RPC failure OR when an endpoint stops
     // being ahead of us (see the no-progress handling below).
-    let mut current_client: Option<(String, ArchiveClient)> = None;
+    let mut current_client: Option<(String, S)> = None;
     // Use the local store's latest as our starting "last seen", so a
     // restart doesn't re-fetch frames we already have.
     let mut last_frame: u64 = clock_store.get_latest_frame_number().unwrap_or(0);
@@ -575,7 +620,7 @@ pub async fn run_archive_poller(
         // Acquire a working client.
         if current_client.is_none() {
             if let Some(addr) = pool.next().await {
-                match ArchiveClient::connect_mtls(&addr, &falcon_signing_key).await {
+                match connect(addr.clone()).await {
                     Ok(c) => {
                         info!(%addr, "archive poller connected");
                         current_client = Some((addr, c));
@@ -1169,5 +1214,254 @@ mod pool_tests {
         assert!(!gf.fresh_within(Duration::from_millis(0)));
         // A generous window is.
         assert!(gf.fresh_within(Duration::from_secs(60)));
+    }
+}
+
+/// In-process repro for the poller's empty-store forward-fill hole.
+///
+/// Observed live in the devnet partition harness: an archive isolated while
+/// frames 1..k finalize comes back, polls a head N, and permanently serves
+/// NotFound for the missed frames — its serial materializer wedges below the
+/// registrations it needs. Mechanism: the forward-fill guard
+/// (`config.forward_fill && last_frame > 0 && …`) treats an empty store
+/// (`last_frame == 0`, every fresh boot) as "nothing to fill", so the first
+/// successful head poll stores ONLY the head and latches `last_frame` past
+/// the hole. No runtime path revisits frames below the cursor (the
+/// record-gap scan runs at bootstrap only), so the hole is permanent.
+///
+/// NOT archive-specific: `forward_fill: true` is set for EVERY node role
+/// (see `master_node/archive_sync.rs` — regulars need contiguity too, their
+/// app-shard storage attestations anchor ρ_N to an exact global frame that
+/// must be present locally). Regular nodes merely shrink the window: gossip
+/// stores frames independently and a far-behind boot state-jumps, but a
+/// client whose store is empty at its first head poll while gossip missed
+/// the early frames (boot-time partition, mesh forming late, gossip drops)
+/// hits the identical skip — and its materializer/ρ_N anchors wedge the
+/// same way.
+///
+/// The two RED tests are the repro — they FAIL on this branch and are meant
+/// to be attached to a bug report:
+/// - `empty_store_first_head_poll_must_backfill_full_history` (archive
+///   mode: `gossip_freshness: None`)
+/// - `client_mode_empty_store_hits_the_same_skip` (regular-node mode:
+///   `gossip_freshness: Some`, mesh quiet — the client boot race)
+/// `seeded_store_gap_is_forward_filled` is the passing contrast: the same
+/// gap above a NON-empty cursor is filled, showing the inconsistency.
+#[cfg(test)]
+mod forward_fill_repro {
+    use super::*;
+    use std::collections::BTreeMap;
+    use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+
+    /// Minimal frame that satisfies `RocksClockStore::put_global_frame`
+    /// (header present; requests empty).
+    fn mk_frame(n: u64) -> GlobalFrame {
+        GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: n,
+                output: vec![n as u8; 32],
+                ..Default::default()
+            }),
+            requests: vec![],
+        }
+    }
+
+    /// In-process archive: serves `0` as "latest" and exact frame numbers
+    /// otherwise, with a real gRPC `NotFound` status for absent frames so the
+    /// poller's NotFound-detection paths behave as in production.
+    #[derive(Clone)]
+    struct FakeArchive {
+        frames: Arc<std::sync::Mutex<BTreeMap<u64, GlobalFrame>>>,
+    }
+
+    impl FakeArchive {
+        fn serving(range: std::ops::RangeInclusive<u64>) -> Self {
+            let frames = range.map(|n| (n, mk_frame(n))).collect();
+            Self { frames: Arc::new(std::sync::Mutex::new(frames)) }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl PollerFrameSource for FakeArchive {
+        async fn get_global_frame(
+            &mut self,
+            frame_number: u64,
+        ) -> Result<GlobalFrame, ArchiveClientError> {
+            let frames = self.frames.lock().unwrap();
+            let found = if frame_number == 0 {
+                frames.values().next_back().cloned()
+            } else {
+                frames.get(&frame_number).cloned()
+            };
+            found.ok_or_else(|| {
+                ArchiveClientError::Rpc(tonic::Status::not_found(format!(
+                    "frame {frame_number} not found"
+                )))
+            })
+        }
+    }
+
+    struct Rig {
+        _tmp: tempfile::TempDir,
+        store: Arc<RocksClockStore>,
+        seen: Arc<std::sync::Mutex<Vec<u64>>>,
+        cancel: CancellationToken,
+        poller: tokio::task::JoinHandle<()>,
+    }
+
+    /// Spawn the real poller loop (forward_fill on — every node role runs
+    /// with it, see the module comment) against `fake`, over a fresh Rocks
+    /// store optionally pre-seeded with frames. `gossip` selects the role:
+    /// `None` = archive mode (always RPC-polls); `Some` = regular-node mode
+    /// (the poller consults the freshness signal first — an unstamped signal
+    /// models a client whose gossip mesh has delivered nothing, so it falls
+    /// through to the same RPC head-poll + forward-fill path).
+    async fn spawn_poller(
+        fake: FakeArchive,
+        seed_frames: &[u64],
+        gossip: Option<Arc<GossipFreshness>>,
+    ) -> Rig {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = quil_store::RocksDb::open(tmp.path()).unwrap();
+        let store = Arc::new(RocksClockStore::new(db.inner()));
+        for n in seed_frames {
+            store.put_global_frame(&mk_frame(*n), None).unwrap();
+        }
+
+        let pool = Arc::new(ArchiveEndpointPool::new(Duration::from_secs(60)));
+        pool.add("fake-archive:8340".into()).await;
+
+        let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let seen_cb = seen.clone();
+        let config = ArchivePollerConfig {
+            poll_interval: Duration::from_millis(20),
+            call_timeout: Duration::from_secs(1),
+            forward_fill: true,
+            gossip_freshness: gossip,
+            on_frame: Some(Arc::new(move |f: &GlobalFrame| {
+                if let Some(h) = f.header.as_ref() {
+                    seen_cb.lock().unwrap().push(h.frame_number);
+                }
+            })),
+            ..Default::default()
+        };
+
+        let cancel = CancellationToken::new();
+        let poller = tokio::spawn(run_archive_poller_with_connector(
+            pool,
+            store.clone(),
+            config,
+            cancel.clone(),
+            move |_addr: String| {
+                let f = fake.clone();
+                async move { Ok::<_, ArchiveClientError>(f) }
+            },
+        ));
+        Rig { _tmp: tmp, store, seen, cancel, poller }
+    }
+
+    /// Wait (bounded) until the store's latest-frame cursor reaches `head`,
+    /// then stop the poller. Returns whether the head was reached at all.
+    async fn await_head_then_stop(rig: &Rig, head: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut reached = false;
+        while tokio::time::Instant::now() < deadline {
+            if rig.store.get_latest_frame_number() == Some(head) {
+                reached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        rig.cancel.cancel();
+        reached
+    }
+
+    /// REPRO (fails on this branch): a poller booted on an EMPTY store must
+    /// backfill the full history below the first head it sees — an archive
+    /// needs frames 1..head, and the materializer requires contiguity.
+    /// Instead, the `last_frame > 0` arm of the forward-fill guard skips the
+    /// fill, only the head frame is stored, and the hole below it is
+    /// permanent (nothing revisits frames under the cursor at runtime).
+    #[tokio::test]
+    async fn empty_store_first_head_poll_must_backfill_full_history() {
+        let rig = spawn_poller(FakeArchive::serving(1..=5), &[], None).await;
+        assert!(
+            await_head_then_stop(&rig, 5).await,
+            "poller never even reached the head — setup problem, not the repro"
+        );
+        rig.poller.abort();
+
+        let missing: Vec<u64> = (1..=5)
+            .filter(|n| rig.store.get_global_frame(*n).is_err())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "frames {missing:?} were permanently skipped: the forward-fill guard \
+             (`config.forward_fill && last_frame > 0 && …`) treats an empty store \
+             (last_frame == 0) as nothing-to-fill, so the first successful head poll \
+             stores only the head and latches the cursor past the hole; no runtime \
+             path revisits frames below the cursor (the record-gap scan is \
+             bootstrap-only), so a serial materializer wedges here forever. \
+             on_frame saw {:?}, want [1, 2, 3, 4, 5]",
+            rig.seen.lock().unwrap(),
+        );
+    }
+
+    /// REPRO (fails on this branch), regular-node flavor: `forward_fill` is
+    /// on for regulars too (their ρ_N storage-attestation anchors need exact
+    /// global frames locally), and a client can reach its first head poll
+    /// with an empty store while gossip missed the early frames — a
+    /// boot-time partition or a late-forming mesh (devnet run 1's archive-4
+    /// race, on a client). The unstamped freshness signal models the quiet
+    /// mesh; the poller falls through to the identical RPC path and the
+    /// identical guard skips the identical fill.
+    #[tokio::test]
+    async fn client_mode_empty_store_hits_the_same_skip() {
+        let rig = spawn_poller(FakeArchive::serving(1..=5), &[], Some(GossipFreshness::new()))
+            .await;
+        assert!(
+            await_head_then_stop(&rig, 5).await,
+            "poller never even reached the head — setup problem, not the repro"
+        );
+        rig.poller.abort();
+
+        let missing: Vec<u64> = (1..=5)
+            .filter(|n| rig.store.get_global_frame(*n).is_err())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "frames {missing:?} were permanently skipped in REGULAR-NODE mode: the \
+             empty-store forward-fill guard is role-independent, so a client that \
+             boots into a quiet gossip mesh latches onto the first polled head and \
+             never backfills — its serial materializer and ρ_N anchor lookups then \
+             wedge exactly like an archive's. on_frame saw {:?}, want [1, 2, 3, 4, 5]",
+            rig.seen.lock().unwrap(),
+        );
+    }
+
+    /// Contrast (passes): the SAME gap above a non-empty cursor IS forward-
+    /// filled — store holds frame 1, head jumps to 5, frames 2..4 get
+    /// fetched, stored, and fired in order. Shows the empty-store case is an
+    /// inconsistency in the guard, not a designed limitation of the loop.
+    #[tokio::test]
+    async fn seeded_store_gap_is_forward_filled() {
+        let rig = spawn_poller(FakeArchive::serving(1..=5), &[1], None).await;
+        assert!(
+            await_head_then_stop(&rig, 5).await,
+            "poller did not fill the gap and reach head 5"
+        );
+        rig.poller.abort();
+
+        for n in 1..=5u64 {
+            assert!(
+                rig.store.get_global_frame(n).is_ok(),
+                "frame {n} missing after forward-fill from a seeded cursor"
+            );
+        }
+        assert_eq!(
+            *rig.seen.lock().unwrap(),
+            vec![2, 3, 4, 5],
+            "forward-fill must fire on_frame for each filled frame, then the head"
+        );
     }
 }
