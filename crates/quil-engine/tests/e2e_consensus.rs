@@ -182,7 +182,43 @@ async fn worker_active_storage_attestation() {
         .try_init();
 
     let provers: Vec<TestProver> = (0..4).map(|_| TestProver::generate()).collect();
-    let infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
+    // Every member needs an effective-`Active` allocation on the harness shard
+    // filter (`[0x55;32]`, matching `build_inner`) for the epoch the frames
+    // anchor to. `AppLeaderProvider::propose` declines to propose a STORAGE
+    // frame unless the local prover is effective-Active for that shard/epoch —
+    // otherwise the attestation's leaf roots would be for a future epoch and no
+    // verifier could match them. `to_prover_info` alone leaves `allocations`
+    // empty, which reads as "not on this shard" and stalls the shard.
+    let alloc_epoch = quil_types::consensus::epoch_for_frame(1000);
+    let infos: Vec<_> = provers
+        .iter()
+        .map(|p| {
+            let mut info = p.to_prover_info(1);
+            info.allocations = vec![quil_types::consensus::ProverAllocationInfo {
+                status: quil_types::consensus::ProverStatus::Active,
+                confirmation_filter: vec![0x55; 32],
+                rejection_filter: Vec::new(),
+                join_frame_number: 0,
+                leave_frame_number: 0,
+                pause_frame_number: 0,
+                resume_frame_number: 0,
+                kick_frame_number: 0,
+                // Zero keeps this off the deferred-activation path (genesis /
+                // test fixture), so the allocation is Active immediately.
+                join_confirm_frame_number: 0,
+                join_reject_frame_number: 0,
+                leave_confirm_frame_number: 0,
+                leave_reject_frame_number: 0,
+                last_active_frame_number: 0,
+                // `epoch >= current_epoch` is the re-confirm obligation; anything
+                // older reads as `ExpiredEpoch`.
+                epoch: alloc_epoch,
+                ring: 0,
+                vertex_address: Vec::new(),
+            }];
+            info
+        })
+        .collect();
     let registry = Arc::new(TestProverRegistry::with_provers(infos));
 
     // `seeded` lowers `storage_activation_frame()` to 1000 and builds the
@@ -584,6 +620,10 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
             as Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport>,
         hypergraph: None,
         replica_store: None,
+        // The joiner only emits ProverJoin over the test transport; it never
+        // produces frames, so there is nothing to loop back to itself.
+        local_message_collector: None,
+        current_frame: None,
     });
 
     // 5. Pick a filter that exists in shards_store. Genesis seeds

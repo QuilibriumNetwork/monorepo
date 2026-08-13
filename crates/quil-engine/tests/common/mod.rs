@@ -1291,6 +1291,10 @@ pub fn build_tier2_archive_rig_with_key_manager(
         transport: transport.clone() as Arc<dyn ProverMessageTransport>,
         hypergraph: None,
         replica_store: None,
+        // No self-loopback in the rig: this pipeline has no ingest-side
+        // MessageCollector, so generated ops go out via the test transport only.
+        local_message_collector: None,
+        current_frame: None,
     });
 
     let _ = all_provers; // unused in this builder — kept for API symmetry
@@ -1387,6 +1391,10 @@ pub fn build_test_pipeline_with_registry(
         transport: transport as Arc<dyn ProverMessageTransport>,
         hypergraph: None,
         replica_store: None,
+        // No self-loopback in the rig: this pipeline has no ingest-side
+        // MessageCollector, so generated ops go out via the test transport only.
+        local_message_collector: None,
+        current_frame: None,
     });
     TestPipelineRig {
         pipeline,
