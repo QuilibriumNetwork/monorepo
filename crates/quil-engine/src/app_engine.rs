@@ -80,7 +80,11 @@ pub enum AppEngineMessage {
     /// aggregate in the header). `cert` is the serialized simplex finalization
     /// certificate, attached to the reward-coverage bundle for global-level
     /// verification.
-    CwFinalizedFrame { frame: Vec<u8>, cert: Vec<u8> },
+    CwFinalizedFrame {
+        frame: Vec<u8>,
+        cert: Vec<u8>,
+        locally_verified: bool,
+    },
     /// (P3) An inbound commonware-simplex message from a committee peer, demuxed
     /// from `shard_cw_bitmask` gossip. `channel` = CW channel id; `from` = the
     /// sender's committee Falcon public-key bytes (resolved by the master from
@@ -1819,8 +1823,13 @@ impl AppConsensusEngine {
                         Some(AppEngineMessage::ShardSyncCompleted { synced_to_frame }) => {
                             self.reconcile_with_sync(synced_to_frame).await;
                         }
-                        Some(AppEngineMessage::CwFinalizedFrame { frame, cert }) => {
-                            self.handle_cw_finalized_frame(&frame, &cert).await;
+                        Some(AppEngineMessage::CwFinalizedFrame {
+                            frame,
+                            cert,
+                            locally_verified,
+                        }) => {
+                            self.handle_cw_finalized_frame(&frame, &cert, locally_verified)
+                                .await;
                         }
                         Some(AppEngineMessage::CwIn { channel, from, data }) => {
                             if let Some(h) = self.cw_handle.as_ref() {
@@ -2122,10 +2131,14 @@ impl AppConsensusEngine {
         // `handle_cw_finalized_frame` materializes it on `&mut self`.
         let on_finalized: crate::cw_app_seams::AppFinalizedSink = {
             let msg_tx = self.self_msg_tx.clone();
-            Arc::new(move |frame, cert| {
+            Arc::new(move |frame, cert, locally_verified| {
                 let mut buf = Vec::new();
                 if prost::Message::encode(&frame, &mut buf).is_ok() {
-                    let _ = msg_tx.try_send(AppEngineMessage::CwFinalizedFrame { frame: buf, cert });
+                    let _ = msg_tx.try_send(AppEngineMessage::CwFinalizedFrame {
+                        frame: buf,
+                        cert,
+                        locally_verified,
+                    });
                 }
             })
         };
@@ -2317,7 +2330,12 @@ impl AppConsensusEngine {
     /// self-materialize half of [`distribute_and_materialize_own_frame`]: apply
     /// the requests, advance + persist the durable cursor, and publish the full
     /// frame for followers/archives on `shard_frame_bitmask`.
-    async fn handle_cw_finalized_frame(&mut self, data: &[u8], cert: &[u8]) {
+    async fn handle_cw_finalized_frame(
+        &mut self,
+        data: &[u8],
+        cert: &[u8],
+        locally_verified: bool,
+    ) {
         let mut frame: quil_types::proto::global::AppShardFrame = match prost::Message::decode(data) {
             Ok(f) => f,
             Err(e) => {
@@ -2325,78 +2343,64 @@ impl AppConsensusEngine {
                 return;
             }
         };
-        // SECURITY — post-verification substitution defense (audit Finding #1).
-        // These finalized `data` bytes are a FRESH read of the mutable
-        // `BlockStore` (the reporter re-reads by digest at finalize), so they
-        // can differ from the bytes the committee actually verified at proposal
-        // time: the store is last-writer-wins and the block channel (3) has no
-        // committee admission. A substitution keeps the certified
-        // `Poseidon(output)` digest (so the finalization cert still verifies)
-        // while changing every other header field and the body. Re-run PROPOSAL
-        // validation here before anything touches the clock store or
-        // materializer: it RECOMPUTES the deterministic output from the declared
-        // fields (parent_selector, requests_root, state_roots, ρ_N, frame_number,
-        // rank, prover) and rejects any frame whose fields don't reproduce
-        // `header.output`. Honest frames (same bytes as verified) pass; a
-        // substituted/internally-inconsistent header is dropped. (Validate the
-        // PRISTINE frame, before the cert is attached below.)
-        if let Some(v) = self.app_frame_validator.as_ref() {
-            match validate_app_frame_panic_safe(v, &frame, /* proposal */ true) {
-                Ok(true) => {}
-                other => {
+        // A locally verified value is the exact byte sequence the BlockStore
+        // sealed when this node's application validator accepted it. Do not
+        // repeat proposal validation for that value: storage attestations and
+        // global-frame anchors come from mutable local state, so the same frame
+        // can fail later even though this node already voted for it.
+        //
+        // A replica may instead learn a finalization certificate without first
+        // verifying the block locally (for example during replay/catch-up). Such
+        // unsealed bytes still take the defensive validation path before being
+        // persisted or materialized.
+        if !locally_verified {
+            if let Some(v) = self.app_frame_validator.as_ref() {
+                match validate_app_frame_panic_safe(v, &frame, /* proposal */ true) {
+                    Ok(true) => {}
+                    other => {
+                        warn!(
+                            core_id = self.core_id,
+                            result = ?other,
+                            "cw finalized frame: unverified bytes failed validation — dropping",
+                        );
+                        return;
+                    }
+                }
+            }
+            if let (Some(exec), Some(header)) =
+                (self.execution_engine.as_ref(), frame.header.as_ref())
+            {
+                let canonical: Vec<Vec<u8>> = frame
+                    .requests
+                    .iter()
+                    .filter_map(|b| {
+                        crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok()
+                    })
+                    .collect();
+                let use_forest = self
+                    .hypergraph
+                    .as_ref()
+                    .map(|h| h.has_forest())
+                    .unwrap_or(false);
+                let ok = canonical.len() == frame.requests.len()
+                    && compute_requests_root(
+                        &canonical,
+                        &self.app_address,
+                        header.frame_number,
+                        Some(exec.as_ref()),
+                        self.inclusion_prover.as_deref(),
+                        use_forest,
+                    )
+                    .map(|r| r == header.requests_root)
+                    .unwrap_or(false);
+                if !ok {
                     warn!(
                         core_id = self.core_id,
-                        result = ?other,
-                        "cw finalized frame: failed re-validation (post-verification \
-                         substitution or inconsistent header) — dropping",
+                        frame = header.frame_number,
+                        "cw finalized frame: unverified body does not match requests_root — dropping",
                     );
                     return;
                 }
-            }
-        }
-        // SECURITY — body-root cross-check (audit Finding #2, and the body-swap
-        // case of #1). The re-validation above binds the DECLARED `requests_root`
-        // through output recomputation, but not the carried body; a finalize-time
-        // BlockStore overwrite can keep the whole header (hence the certified
-        // digest) while swapping `frame.requests`. Recompute the body root from
-        // the carried requests and DROP on mismatch, so no CW replica ever
-        // materializes a body its certified root does not cover. (Dropping a
-        // substituted body stalls at worst — recoverable via catch-up — whereas
-        // materializing it would be an unrecoverable state divergence.)
-        if let (Some(exec), Some(header)) =
-            (self.execution_engine.as_ref(), frame.header.as_ref())
-        {
-            let canonical: Vec<Vec<u8>> = frame
-                .requests
-                .iter()
-                .filter_map(|b| {
-                    crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok()
-                })
-                .collect();
-            let use_forest = self
-                .hypergraph
-                .as_ref()
-                .map(|h| h.has_forest())
-                .unwrap_or(false);
-            let ok = canonical.len() == frame.requests.len()
-                && compute_requests_root(
-                    &canonical,
-                    &self.app_address,
-                    header.frame_number,
-                    Some(exec.as_ref()),
-                    self.inclusion_prover.as_deref(),
-                    use_forest,
-                )
-                .map(|r| r == header.requests_root)
-                .unwrap_or(false);
-            if !ok {
-                warn!(
-                    core_id = self.core_id,
-                    frame = header.frame_number,
-                    "cw finalized frame: requests_root mismatch (carried body does not \
-                     match the certified root) — dropping (post-verification body swap)",
-                );
-                return;
             }
         }
         // Attach the simplex FINALIZATION cert to the frame header so every
@@ -3881,6 +3885,152 @@ fn validate_app_frame_panic_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quil_types::crypto::Signer as _;
+
+    /// Regression for #589. Proposal validation may depend on mutable local
+    /// state (here, availability of the anchored global frame). Once Simplex
+    /// has accepted and finalized the proposal, a replica must apply the sealed
+    /// bytes it already validated instead of rerunning that stateful gate.
+    #[tokio::test]
+    async fn cw_finalization_does_not_repeat_stateful_proposal_validation() {
+        let filter = vec![0x59; 32];
+        let shard_store = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let voting_anchor_store = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let lagging_anchor_store = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let global_output = vec![0xA5; 516];
+        voting_anchor_store.seed_frame(quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader {
+                frame_number: 5,
+                output: global_output.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_millis() as i64;
+        let parent_selector = vec![0u8; 32];
+        let requests_root = Vec::new();
+        let state_roots = vec![vec![0u8; 32]; 4];
+        let prover = vec![0x33; 32];
+        let rho_n = quil_crypto::porep::derive_storage_beacon(5, &global_output);
+        let output = quil_crypto::porep::deterministic_app_frame_output(
+            &parent_selector,
+            &requests_root,
+            &state_roots,
+            &rho_n,
+            1,
+            1,
+            &prover,
+            1,
+            1,
+            timestamp,
+            &[],
+        );
+        let frame = quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                address: filter.clone(),
+                frame_number: 1,
+                rank: 1,
+                timestamp,
+                difficulty: 1,
+                output,
+                parent_selector,
+                requests_root,
+                state_roots,
+                prover,
+                fee_multiplier_vote: 1,
+                global_frame_number: 5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let registry = Arc::new(crate::test_support::TestProverRegistry::default());
+        let frame_prover = Arc::new(quil_crypto::WesolowskiFrameProver::new(2048));
+        let voting_validator = BlsAppFrameValidator::new(
+            registry.clone(),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            frame_prover.clone(),
+        )
+        .with_clock_store(voting_anchor_store);
+        assert!(
+            voting_validator
+                .validate_proposal(&frame)
+                .expect("proposal is valid while its global anchor is available"),
+            "the regression frame must pass the committee's vote-time gate"
+        );
+
+        let signer = quil_crypto::FalconSigner::generate();
+        let deps = AppEngineDeps {
+            clock_store: shard_store.clone(),
+            global_anchor_store: None,
+            prover_registry: registry.clone(),
+            frame_prover: frame_prover.clone(),
+            message_collector: Arc::new(MessageCollector::new()),
+            fee_manager: Arc::new(crate::InMemoryDynamicFeeManager::new(32)),
+            local_prover_address: vec![0x44; 32],
+            local_bls_pubkey: signer.public_key().to_vec(),
+            bls_signer: Box::new(signer),
+            reward_greedy: false,
+            min_active_provers_for_propose: 1,
+            coverage_publish: None,
+            hypergraph: None,
+            storage_source_hypergraph: None,
+            execution_engine: None,
+            inclusion_prover: None,
+            kv_db: None,
+            app_consensus_cw: true,
+            db_config: quil_config::DbConfig::default(),
+        };
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (mut engine, _handle) = AppConsensusEngine::new(1, filter.clone(), deps, event_tx);
+        // Model finalize-time local-state drift: the same validator can no
+        // longer resolve rho_N because this replica's global store is behind.
+        engine.app_frame_validator = Some(Arc::new(
+            BlsAppFrameValidator::new(
+                registry,
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                frame_prover,
+            )
+            .with_clock_store(lagging_anchor_store),
+        ));
+
+        let encoded = prost::Message::encode_to_vec(&frame);
+
+        // A certificate-only replica must not blindly trust block bytes it did
+        // not validate. Its lagging anchor makes this defensive path reject.
+        engine
+            .handle_cw_finalized_frame(&encoded, &[], false)
+            .await;
+        assert!(shard_store.get_latest_shard_clock_frame(&filter).is_err());
+        assert!(event_rx.try_recv().is_err());
+
+        // The exact bytes sealed when this replica voted remain finalizable
+        // even though the mutable anchor state has since fallen behind.
+        engine
+            .handle_cw_finalized_frame(&encoded, &[], true)
+            .await;
+
+        assert_eq!(
+            shard_store
+                .get_latest_shard_clock_frame(&filter)
+                .expect("committee-finalized frame must be persisted")
+                .header
+                .expect("persisted frame has a header")
+                .frame_number,
+            1
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AppEngineEvent::FullFrameProduced {
+                frame_number: 1,
+                ..
+            })
+        ));
+    }
 
     /// Go parity (`app_consensus_engine.go:718`): core 0 → `db.path`; worker
     /// core N → `worker_paths[N-1]` else `worker_path_prefix` (`%d`→N); empty

@@ -68,7 +68,14 @@ struct SignalFinalizer {
 }
 impl FrameFinalizer for SignalFinalizer {
     fn on_notarized(&self, _v: u64, _d: Sha256Digest, _b: Option<Vec<u8>>) {}
-    fn on_finalized(&self, view: u64, _d: Sha256Digest, _b: Option<Vec<u8>>, _c: Option<Vec<u8>>) {
+    fn on_finalized(
+        &self,
+        view: u64,
+        _d: Sha256Digest,
+        _b: Option<Vec<u8>>,
+        _c: Option<Vec<u8>>,
+        _locally_verified: bool,
+    ) {
         let _ = self.tx.send_lossy(view);
     }
 }
