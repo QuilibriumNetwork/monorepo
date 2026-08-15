@@ -386,14 +386,19 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         }
     }
 
-    fn on_finalized(&self, _view: u64, _digest: Digest, bytes: Option<Vec<u8>>, cert: Option<Vec<u8>>) {
+    fn on_finalized(
+        &self,
+        _view: u64,
+        _digest: Digest,
+        bytes: Option<Vec<u8>>,
+        cert: Option<Vec<u8>>,
+        _locally_verified: bool,
+    ) {
         let Some(bytes) = bytes else { return };
         let Ok(mut frame) = decode_global_frame(&bytes) else { return };
         // Re-bind the body to the header at FINALIZE, not just at verify. The
-        // block bytes are re-read from the shared (overwrite-able) BlockStore by
-        // digest, so a body swapped in AFTER this node voted would otherwise be
-        // materialized. Recompute the requests root and drop on mismatch — the
-        // "post-verification body swap" guard the app-shard seam also has.
+        // Certificate-only replicas may not have locally verified these bytes,
+        // so retain this context-free body check at the persistence boundary.
         if let Some(h) = frame.header.as_ref() {
             if !crate::frame_validator::global_frame_body_matches_requests_root(h, &frame.requests) {
                 tracing::warn!(

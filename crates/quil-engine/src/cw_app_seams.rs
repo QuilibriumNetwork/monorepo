@@ -53,8 +53,9 @@ pub type AppFrameSink = Arc<dyn Fn(AppShardFrame) + Send + Sync>;
 
 /// Like [`AppFrameSink`] but also carries the serialized simplex finalization
 /// certificate (proposal + Falcon quorum cert), so the engine can attach it to
-/// the reward-coverage bundle for global-level verification.
-pub type AppFinalizedSink = Arc<dyn Fn(AppShardFrame, Vec<u8>) + Send + Sync>;
+/// the reward-coverage bundle for global-level verification. The boolean marks
+/// whether this exact frame was locally validated and sealed before finalization.
+pub type AppFinalizedSink = Arc<dyn Fn(AppShardFrame, Vec<u8>, bool) + Send + Sync>;
 
 /// Build the full `AppShardFrame` from a produced consensus state + the leader's
 /// recorded request bundles. Mirrors the finalized-frame rebuild at
@@ -415,10 +416,17 @@ impl FrameFinalizer for AppSeamFinalizer {
         (self.on_notarized)(frame);
     }
 
-    fn on_finalized(&self, _view: u64, _digest: Digest, bytes: Option<Vec<u8>>, cert: Option<Vec<u8>>) {
+    fn on_finalized(
+        &self,
+        _view: u64,
+        _digest: Digest,
+        bytes: Option<Vec<u8>>,
+        cert: Option<Vec<u8>>,
+        locally_verified: bool,
+    ) {
         let Some(bytes) = bytes else { return };
         let Some(frame) = decode_app_frame(&bytes) else { return };
-        (self.on_finalized)(frame, cert.unwrap_or_default());
+        (self.on_finalized)(frame, cert.unwrap_or_default(), locally_verified);
     }
 }
 

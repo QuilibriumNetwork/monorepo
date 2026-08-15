@@ -56,24 +56,82 @@ pub fn digest_to_identity(digest: &Digest) -> [u8; 32] {
     digest.0
 }
 
-/// Shared digest → frame-bytes store. `Automaton::propose` inserts the frame it
-/// built; `Relay` reads it to ship; `verify`/`Reporter` read it to validate /
-/// commit. Frames arriving from peers (over `FrameSink`'s transport) are also
-/// inserted here by the node's inbound path.
+/// Shared digest → frame-bytes store. `Automaton::propose` seals the frame it
+/// built; successful `verify` seals the exact peer bytes the application
+/// accepted. Frames arriving from peers remain replaceable candidates until
+/// application validation succeeds.
 #[derive(Clone, Default)]
 pub struct BlockStore {
-    inner: Arc<Mutex<HashMap<Digest, Vec<u8>>>>,
+    inner: Arc<Mutex<HashMap<Digest, StoredBlock>>>,
+}
+
+#[derive(Clone)]
+struct StoredBlock {
+    bytes: Vec<u8>,
+    verified: bool,
 }
 
 impl BlockStore {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Insert an unverified block candidate. Candidates may be replaced until
+    /// one exact byte sequence passes application validation and is sealed.
+    /// Once sealed, peer ingress cannot substitute different bytes for the
+    /// consensus digest that was actually verified.
     pub fn put(&self, digest: Digest, bytes: Vec<u8>) {
-        self.inner.lock().insert(digest, bytes);
+        let mut inner = self.inner.lock();
+        match inner.get_mut(&digest) {
+            Some(stored) if stored.verified => {}
+            Some(stored) => stored.bytes = bytes,
+            None => {
+                inner.insert(
+                    digest,
+                    StoredBlock {
+                        bytes,
+                        verified: false,
+                    },
+                );
+            }
+        }
     }
     pub fn get(&self, digest: &Digest) -> Option<Vec<u8>> {
-        self.inner.lock().get(digest).cloned()
+        self.inner
+            .lock()
+            .get(digest)
+            .map(|stored| stored.bytes.clone())
+    }
+
+    /// Seal the exact bytes that passed application validation. This is atomic
+    /// with respect to peer ingress: even if another candidate arrived between
+    /// `get` and validation, the validated bytes become the immutable value.
+    pub fn seal(&self, digest: Digest, bytes: Vec<u8>) {
+        let mut inner = self.inner.lock();
+        if inner
+            .get(&digest)
+            .map(|stored| stored.verified)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        inner.insert(
+            digest,
+            StoredBlock {
+                bytes,
+                verified: true,
+            },
+        );
+    }
+
+    /// Return the current bytes together with whether this node's application
+    /// validator accepted and sealed this exact value. A replica can learn a
+    /// finalization certificate before locally verifying its block, so the
+    /// reporter must preserve that distinction for the finalizer.
+    pub fn get_with_verification(&self, digest: &Digest) -> Option<(Vec<u8>, bool)> {
+        self.inner
+            .lock()
+            .get(digest)
+            .map(|stored| (stored.bytes.clone(), stored.verified))
     }
 }
 
@@ -126,7 +184,16 @@ pub trait FrameFinalizer: Send + Sync + 'static {
     /// Falcon quorum cert) — carried so the finalizer can attach it to a coverage
     /// bundle for off-chain / global-level verification (reward
     /// attribution). `None` if the reporter couldn't recover it.
-    fn on_finalized(&self, view: u64, digest: Digest, bytes: Option<Vec<u8>>, cert: Option<Vec<u8>>);
+    /// `locally_verified` is true only when the reported bytes are the immutable
+    /// value this node's application verifier accepted (or built locally).
+    fn on_finalized(
+        &self,
+        view: u64,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+        cert: Option<Vec<u8>>,
+        locally_verified: bool,
+    );
     /// A proposer equivocated (double-propose/finalize). Drives a ProverKick.
     fn on_equivocation(&self, _view: u64) {}
 }
@@ -177,7 +244,9 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
         let store = self.store.clone();
         self.context.child("propose").spawn(move |_| async move {
             if let Some((digest, bytes)) = proposer.propose(view, parent) {
-                store.put(digest, bytes);
+                // Locally-produced bytes came directly from the application
+                // proposer and are the value Simplex is about to certify.
+                store.seal(digest, bytes);
                 let _ = tx.send(digest);
             }
             // else: drop tx → receiver cancelled → simplex nullifies the view.
@@ -211,7 +280,13 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
                 bytes = store.get(&payload);
                 waited += 1;
             }
+            let verified_bytes = bytes.clone();
             let ok = proposer.verify(view, parent, payload, bytes);
+            if ok {
+                if let Some(bytes) = verified_bytes {
+                    store.seal(payload, bytes);
+                }
+            }
             let _ = tx.send(ok);
         });
         rx
@@ -305,12 +380,16 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
             Activity::Finalization(f) => {
                 let digest = f.proposal.payload;
                 let view: u64 = f.proposal.round.view().get();
-                let bytes = self.store.get(&digest);
+                let (bytes, locally_verified) = self
+                    .store
+                    .get_with_verification(&digest)
+                    .map_or((None, false), |(bytes, verified)| (Some(bytes), verified));
                 // Serialize the finalization certificate (proposal + Falcon
                 // quorum cert) so the finalizer can carry it into a coverage
                 // bundle for global-level reward verification.
                 let cert = Some(crate::app_cert::encode_finalization(&f));
-                self.finalizer.on_finalized(view, digest, bytes, cert);
+                self.finalizer
+                    .on_finalized(view, digest, bytes, cert, locally_verified);
             }
             Activity::ConflictingNotarize(_)
             | Activity::ConflictingFinalize(_)
@@ -322,5 +401,58 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
             _ => {}
         }
         Feedback::Ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest(byte: u8) -> Digest {
+        digest_from_identity([byte; 32])
+    }
+
+    #[test]
+    fn unverified_candidates_are_distinguished_from_verified_blocks() {
+        let store = BlockStore::new();
+        let block = digest(1);
+
+        store.put(block, b"candidate".to_vec());
+
+        assert_eq!(store.get(&block), Some(b"candidate".to_vec()));
+        assert_eq!(
+            store.get_with_verification(&block),
+            Some((b"candidate".to_vec(), false))
+        );
+    }
+
+    #[test]
+    fn verified_bytes_cannot_be_substituted() {
+        let store = BlockStore::new();
+        let block = digest(2);
+        let verified = b"committee-validated bytes".to_vec();
+
+        store.put(block, verified.clone());
+        store.seal(block, verified.clone());
+        store.put(block, b"same digest, substituted body".to_vec());
+
+        assert_eq!(store.get(&block), Some(verified.clone()));
+        assert_eq!(store.get_with_verification(&block), Some((verified, true)));
+    }
+
+    #[test]
+    fn sealing_uses_the_bytes_that_were_validated() {
+        let store = BlockStore::new();
+        let block = digest(3);
+        let validated = b"validated candidate".to_vec();
+
+        store.put(block, validated.clone());
+        // Model peer ingress racing between Automaton's read and the end of
+        // application validation. `seal` must restore and freeze the clone that
+        // was actually checked, not whichever candidate is currently stored.
+        store.put(block, b"racing replacement".to_vec());
+        store.seal(block, validated.clone());
+
+        assert_eq!(store.get_with_verification(&block), Some((validated, true)));
     }
 }
