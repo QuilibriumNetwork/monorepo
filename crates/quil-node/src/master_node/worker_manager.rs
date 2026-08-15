@@ -49,6 +49,65 @@ pub(crate) struct WorkerManagerArgs {
     pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
 }
 
+/// Build the hypergraph state owned by one in-process worker.
+///
+/// Thread workers use a dedicated RocksDB, just like standalone workers.  A
+/// brand-new worker must therefore install the namespaced Rocks forest before
+/// its first materialization.  Leaving the CRDT's default in-memory forest in
+/// place persists the vertex blobs and materialized cursor but loses the
+/// commitment nodes on restart.
+fn build_thread_worker_hypergraph(
+    db: &Arc<quil_store::RocksDb>,
+    inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
+    mainnet_quil_grid: bool,
+) -> Arc<quil_hypergraph::HypergraphCrdt> {
+    let raw_db = db.inner();
+    let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(raw_db.clone()));
+    let store_has_no_materialized_state = {
+        let has_prefix = |prefix: &[u8]| {
+            let mut it = raw_db.raw_iterator();
+            it.seek(prefix);
+            it.valid()
+                && it
+                    .key()
+                    .map(|key| key.starts_with(prefix))
+                    .unwrap_or(false)
+        };
+        let has_hypergraph_state = has_prefix(&[quil_store::encoding::HYPERGRAPH_SHARD]);
+        let has_app_cursor = has_prefix(&[
+            quil_store::encoding::CONSENSUS,
+            quil_store::encoding::CONSENSUS_MATERIALIZED_CURSOR,
+        ]);
+        let has_global_cursor = has_prefix(&[
+            quil_store::encoding::CONSENSUS,
+            quil_store::encoding::CONSENSUS_GLOBAL_MATERIALIZED_CURSOR,
+        ]);
+
+        // RocksDb::open writes a schema marker, and Simplex may persist
+        // liveness/consensus metadata before the first app write.  Neither
+        // means a state forest already exists.  Only durable materialized
+        // state makes installing an empty forest unsafe.
+        !(has_hypergraph_state || has_app_cursor || has_global_cursor)
+    };
+    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+        hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+        inclusion_prover,
+    ));
+
+    if quil_forest_migrate::install_forest_boot(
+        crdt.as_ref(),
+        hg_store.as_ref(),
+        store_has_no_materialized_state,
+        mainnet_quil_grid,
+    ) {
+        tracing::info!(
+            "Phase-3 JMT forest installed on thread-worker CRDT — state commitments are persistent"
+        );
+    }
+
+    crdt
+}
+
 pub(crate) fn init(
     sup: &mut Supervisor<anyhow::Error>,
     args: WorkerManagerArgs,
@@ -239,6 +298,7 @@ pub(crate) fn init(
             let worker_db_base = config.db.path.clone();
             let worker_paths_cfg = config.db.worker_paths.clone();
             let worker_path_prefix_cfg = config.db.worker_path_prefix.clone();
+            let mainnet_quil_grid = config.p2p.network == 0;
             let worker_state_builder: Arc<
                 dyn Fn(u32) -> std::result::Result<
                     quil_engine::thread_worker::WorkerOwnedDeps,
@@ -273,24 +333,13 @@ pub(crate) fn init(
                 let clock_store: Arc<dyn quil_types::store::ClockStore> = Arc::new(
                     quil_store::RocksClockStore::new(db_arc.inner()),
                 );
-                let hg_store_concrete =
-                    Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
-                let hg_store: Arc<dyn quil_types::store::HypergraphStore> =
-                    hg_store_concrete.clone();
                 let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
                     Arc::new(quil_tries::ShaInclusionProver);
-                let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
-                    hg_store,
+                let crdt = build_thread_worker_hypergraph(
+                    &db_arc,
                     inclusion_prover.clone(),
-                ));
-                // Phase-3: migrated DB → commit this worker shard's state to
-                // the JMT forest. No-op on a non-migrated DB.
-                if quil_forest_migrate::install_forest_if_migrated(
-                    crdt.as_ref(),
-                    hg_store_concrete.as_ref(),
-                ) {
-                    tracing::info!("Phase-3 JMT forest installed on worker-manager CRDT");
-                }
+                    mainnet_quil_grid,
+                );
                 // Workers don't sign or verify identities — a default
                 // key manager satisfies the execution engine's
                 // `KeyManager` requirement for state materialization.
@@ -867,4 +916,77 @@ pub(crate) fn init(
     let _ = pi_worker_manager.set(worker_manager.clone());
 
     worker_manager
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_thread_worker_forest_survives_restart_and_extends_prior_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_location = quil_hypergraph::Location {
+            app_address: [0x2a; 32],
+            data_address: [0x07; 32],
+        };
+        let shard_key = quil_hypergraph::shard_key_for_location(&first_location);
+
+        let first_root = {
+            let db = Arc::new(quil_store::RocksDb::open(dir.path()).unwrap());
+            // Rocks migrations and Simplex metadata may exist before the first
+            // materialized frame; neither should disqualify a fresh worker from
+            // installing its persistent forest.
+            db.inner()
+                .put(
+                    [
+                        quil_store::encoding::CONSENSUS,
+                        quil_store::encoding::CONSENSUS_STATE,
+                        0x42,
+                    ],
+                    b"pre-materialization metadata",
+                )
+                .unwrap();
+            let crdt = build_thread_worker_hypergraph(
+                &db,
+                Arc::new(quil_tries::ShaInclusionProver),
+                false,
+            );
+            assert!(
+                crdt.forest_is_persistent(),
+                "fresh worker must not use Forest::in_memory"
+            );
+
+            crdt.add_vertex(&first_location, b"persisted worker state")
+                .unwrap();
+            let roots = crdt.commit(1).unwrap();
+            let root = roots[&shard_key][0].clone();
+            assert!(root.iter().any(|byte| *byte != 0));
+            root
+        };
+
+        // Drop every handle above, then reopen the exact worker database.  The
+        // commitment root must come from RocksDB rather than process memory.
+        let db = Arc::new(quil_store::RocksDb::open(dir.path()).unwrap());
+        let crdt =
+            build_thread_worker_hypergraph(&db, Arc::new(quil_tries::ShaInclusionProver), false);
+        assert!(crdt.forest_is_persistent());
+        assert_eq!(
+            crdt.compute_shard_root("vertex", "adds", &shard_key),
+            first_root,
+            "restarted worker must recover the previously advertised state root"
+        );
+
+        // Extending the state after restart must build on the restored tree,
+        // not an empty forest that merely happens to be persistent now.
+        crdt.add_vertex(
+            &quil_hypergraph::Location {
+                app_address: first_location.app_address,
+                data_address: [0x08; 32],
+            },
+            b"state added after restart",
+        )
+        .unwrap();
+        let second_root = crdt.commit(2).unwrap()[&shard_key][0].clone();
+        assert_ne!(second_root, first_root);
+    }
 }
