@@ -397,6 +397,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // the fixture sets the deprecated `filter` explicitly
     fn proto_to_canonical_confirm_matches_handcrafted() {
         use quil_types::proto::global as pb;
         use quil_types::proto::keys as keys_pb;
