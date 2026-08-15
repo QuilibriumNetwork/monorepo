@@ -398,7 +398,6 @@ impl GlobalTimeReel {
         {
             let old_head_frame = inner.nodes.get(&head_id).map(|n| n.frame.clone());
             inner.head = Some(new_node_id.to_string());
-            let _frame = inner.nodes.get(new_node_id).unwrap().frame.clone();
             self.send_head_event(inner, new_node_id, old_head_frame);
             return;
         }

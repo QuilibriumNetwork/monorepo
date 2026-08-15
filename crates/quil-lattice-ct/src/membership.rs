@@ -805,12 +805,13 @@ fn prove_combined(
     m: &[Poly],
     r: &PolyVec,
     lmat: &PolyMatrix,
-    tvec: &PolyVec,
     mu: &[u8],
     seed: u64,
 ) -> Option<CombinedOpening> {
     let m_l = stack_rows(&ck.a1, &lmat.matmul(&ck.a2));
-    let _d_l = c.t1.concat(&lmat.matvec(&c.t2).sub(tvec));
+    // `d_l` is not built here, and the target vector is not a parameter: the
+    // prover only ever needs `m_l·y`, while `d_l = (C.t1, L·C.t2 − t)` is
+    // public and the verifier reconstructs it in `verify_combined_ml`.
     let rhos = derive_ring_rhos(c, N_PROJ, m.len(), mu);
     let rho_a2: Vec<PolyVec> = rhos.iter().map(|r| ring_wrow(r, &ck.a2)).collect();
     let proj: Vec<Poly> = rhos.iter().map(|r| ring_wsum(r, m)).collect();
@@ -944,8 +945,8 @@ pub fn prove_membership(
     // (k ring-projections) under ONE Fiat-Shamir challenge ⇒ single-τ extraction
     // (H_B M-SIS floor ~2^141 at β≈q, estimator-confirmed ≥128-bit) — the
     // tight-LNP shared-challenge design.
-    let (lmat, tvec) = build_relation(params, &lay, root, &key_image);
-    let combined = prove_combined(&ck, &commitment, &m, &r, &lmat, &tvec, mu, seed ^ 0x11)?;
+    let (lmat, _) = build_relation(params, &lay, root, &key_image);
+    let combined = prove_combined(&ck, &commitment, &m, &r, &lmat, mu, seed ^ 0x11)?;
 
     // Chaining: one vectorized product-is-zero proof per level (κ components
     // aggregated), with left/right/u_{ℓ-1} all DERIVED as selections of the limbs.
@@ -1234,8 +1235,8 @@ pub fn prove_spend(
     let r = PolyVec::sample_short(LAMBDA, crate::module::ETA, &mut prg);
     let commitment = ck.commit(&PolyVec(m.clone()), &r);
 
-    let (lmat, tvec) = build_spend_relation(params, vlink, &lay, root, &key_image, &c_prime);
-    let combined = prove_combined(&ck, &commitment, &m, &r, &lmat, &tvec, mu, seed ^ 0x11)?;
+    let (lmat, _) = build_spend_relation(params, vlink, &lay, root, &key_image, &c_prime);
+    let combined = prove_combined(&ck, &commitment, &m, &r, &lmat, mu, seed ^ 0x11)?;
 
     // Chaining (identical to membership — value-link columns are not referenced).
     let pz = ProdZeroParams::production();

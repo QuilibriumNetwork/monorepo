@@ -177,7 +177,6 @@ pub fn prove_range(
     if v >= (1u128 << key.n_bits) {
         return None;
     }
-    let _q = params.q;
     // Fresh short (ternary) randomness for the bit-vector commitment.
     let mut prg = SplitMix64::new(seed ^ 0xB175);
     let r_b: Vec<i128> = (0..key.m()).map(|_| (prg.next_u64() % 3) as i128 - 1).collect();
