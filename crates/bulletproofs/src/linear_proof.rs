@@ -326,8 +326,8 @@ impl LinearProof {
             buf.extend_from_slice(r.as_bytes());
         }
         buf.extend_from_slice(self.S.as_bytes());
-        buf.extend_from_slice(self.a.as_bytes());
-        buf.extend_from_slice(self.r.as_bytes());
+        buf.extend_from_slice(&self.a.to_bytes());
+        buf.extend_from_slice(&self.r.to_bytes());
         buf
     }
 
@@ -339,16 +339,20 @@ impl LinearProof {
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn to_bytes_iter(&self) -> impl Iterator<Item = u8> + '_ {
-        self.L_vec
-            .iter()
-            .zip(self.R_vec.iter())
-            .flat_map(|(l, r)| l.as_bytes().iter().chain(r.as_bytes()))
-            .chain(self.S.as_bytes())
-            .chain(self.a.as_bytes())
-            .chain(&[0u8])
-            .chain(self.r.as_bytes())
-            .chain(&[0u8])
-            .copied()
+        // Built eagerly, like `InnerProductProof::to_bytes_iter`. The previous
+        // lazy chain called `Scalar::as_bytes()` twice, and both slices pointed
+        // at the same process-wide buffer, so `a` was serialized as `r`.
+        let mut bytes = Vec::with_capacity(self.serialized_size() + 2);
+        for (l, r) in self.L_vec.iter().zip(self.R_vec.iter()) {
+            bytes.extend_from_slice(l.as_bytes());
+            bytes.extend_from_slice(r.as_bytes());
+        }
+        bytes.extend_from_slice(self.S.as_bytes());
+        bytes.extend_from_slice(&self.a.to_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&self.r.to_bytes());
+        bytes.push(0);
+        bytes.into_iter()
     }
 
     /// Deserializes the proof from a byte slice.
