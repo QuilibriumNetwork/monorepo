@@ -31,3 +31,10 @@ insecure-rng = []
 [target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
 version = "0.2"
 features = ["js"]
+
+# Vendored upstream code: lints are allowed at the crate level rather than
+# fixed in place, so this tree stays byte-comparable with https://github.com/0xCarbon/DKLs23 and
+# re-vendoring does not have to re-apply a cleanup patch. Only the cosmetic
+# lints below are silenced; soundness lints are deliberately left enabled.
+[lints.rust]
+unused_imports = "allow"

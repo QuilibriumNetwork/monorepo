@@ -35,3 +35,22 @@ criterion = ">=0.2"
 name = "classgroup-bench"
 harness = false
 path = "bench/bench.rs"
+
+# Vendored upstream code: lints are allowed at the crate level rather than
+# fixed in place, so this tree stays byte-comparable with https://github.com/poanetwork/vdf and
+# re-vendoring does not have to re-apply a cleanup patch. Only the cosmetic
+# lints below are silenced; soundness lints are deliberately left enabled.
+#
+# `deprecated` covers build.rs's two `cc::Build::static_flag` calls. It does NOT
+# reach src/gmp/, which opens with `#![warn(deprecated)]` — an in-source
+# attribute wins over the level this table passes on the command line. The eight
+# warnings that survive there are the `mem::uninitialized` calls, deliberately
+# left visible with the crate's other FFI soundness issues.
+[lints.rust]
+bare_trait_objects = "allow"
+dead_code = "allow"
+deprecated = "allow"
+noop_method_call = "allow"
+non_fmt_panics = "allow"
+unexpected_cfgs = "allow"
+unused_variables = "allow"
