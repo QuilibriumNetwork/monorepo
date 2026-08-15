@@ -32,15 +32,12 @@ pub mod hash512;
 pub mod sha3;
 
 use std::error::Error;
-use std::fs;
 use bls48581::big;
 use bls48581::ecp;
 use bls48581::ecp::ECP;
 use bls48581::ecp8;
-use bls48581::mpin256::SHA512;
 use bls48581::rom;
 use bls48581::pair8;
-use ::rand::rngs;
 use ::rand::RngCore;
 
 uniffi::include_scaffolding!("lib");
@@ -54,7 +51,7 @@ fn recurse_fft(
     fft_width: u64,
     inverse: bool,
 ) {
-  let M = &big::BIG::new_ints(&rom::CURVE_ORDER);
+  let _M = &big::BIG::new_ints(&rom::CURVE_ORDER);
   let roots = if inverse {
     &bls::singleton().ReverseRootsOfUnityBLS48581[&fft_width]
   } else {
@@ -1470,17 +1467,17 @@ pub fn prove_multiple(
 
     // 1. Fiat–Shamir challenge  ρ
     let mut fs_input = Vec::<u8>::new();
-    for (i, c) in commits.iter().enumerate() {
+    for (_i, c) in commits.iter().enumerate() {
         let mut tmp = [0u8; 74];
         c.tobytes(&mut tmp, true);
         fs_input.extend_from_slice(&tmp);
     }
-    for (i, s) in y.iter().enumerate() {
+    for (_i, s) in y.iter().enumerate() {
         let mut tmp = [0u8; 73];
         s.tobytes(&mut tmp);
         fs_input.extend_from_slice(&tmp);
     }
-    for (i, &idx) in indices.iter().enumerate() { 
+    for (_i, &idx) in indices.iter().enumerate() { 
         fs_input.extend_from_slice(&idx.to_le_bytes()); 
     }
     let rho = hash_to_scalar(&fs_input);
@@ -1536,12 +1533,12 @@ pub fn prove_multiple(
 
     // 5. Compute h(x) =  Σ ρᶦ · (fᵢ(X))/(t − zᵢ)
     let mut acc_pow = big::BIG::new_int(1);
-    for ((index, blob), (&idx, y_i)) in polys.iter().enumerate().zip(indices.iter().zip(y.iter())) {
+    for ((index, _blob), (&idx, _y_i)) in polys.iter().enumerate().zip(indices.iter().zip(y.iter())) {
         let mut coeffs = f_evals[index].clone();
         let z_i = bls::singleton().RootsOfUnityBLS48581[&poly_size][idx as usize].clone();
         let mut den = big::BIG::modadd(&t, &big::BIG::modneg(&z_i, &modulus), &modulus);
         den.invmodp(&modulus);
-        for (i, dst) in coeffs.iter_mut().enumerate() {
+        for (_i, dst) in coeffs.iter_mut().enumerate() {
           *dst = big::BIG::modmul(dst, &acc_pow, &modulus);
           *dst = big::BIG::modmul(dst, &den, &modulus);
         }
@@ -1557,7 +1554,7 @@ pub fn prove_multiple(
       &bls::singleton().CeremonyBLS48581G1[..(hx.len())],
       &hx,
     ).unwrap();
-    let mut g2x: Vec<big::BIG> = hx.iter().zip(qx).map(|(h, q)| big::BIG::modadd(h, &big::BIG::modneg(&q, &modulus), &modulus)).collect();
+    let g2x: Vec<big::BIG> = hx.iter().zip(qx).map(|(h, q)| big::BIG::modadd(h, &big::BIG::modneg(&q, &modulus), &modulus)).collect();
 
     let mut c_h_bytes = [0u8; 74];
     c_h.tobytes(&mut c_h_bytes, true);
@@ -1614,21 +1611,21 @@ pub fn verify_multiple(
 
     let mut c_points: Vec<ecp::ECP> = Vec::with_capacity(m); // Cᵢ
     let mut y_scalars: Vec<big::BIG> = Vec::with_capacity(m); // yᵢ
-    for (i, (c_bytes, y_b)) in commits.iter().zip(y_bytes).enumerate() {
+    for (_i, (c_bytes, y_b)) in commits.iter().zip(y_bytes).enumerate() {
         c_points.push(ecp::ECP::frombytes(&c_bytes));
         y_scalars.push(big::BIG::frombytes(&y_b));
     }
 
     // 1. Re‑derive ρ
     let mut fs_input = Vec::<u8>::new();
-    for (i, b) in commits.iter().enumerate() {
+    for (_i, b) in commits.iter().enumerate() {
       fs_input.extend_from_slice(b);
     }
-    for (i, b) in y_bytes.iter().enumerate() {
+    for (_i, b) in y_bytes.iter().enumerate() {
       fs_input.extend_from_slice(&[0u8;9]);
       fs_input.extend_from_slice(b);
     }
-    for (i, &idx) in indices.iter().enumerate() { 
+    for (_i, &idx) in indices.iter().enumerate() { 
       fs_input.extend_from_slice(&idx.to_le_bytes()); 
     }
     
@@ -1642,7 +1639,7 @@ pub fn verify_multiple(
     let mut acc_pow = big::BIG::new_int(1);
     let mut y = big::BIG::new();
     
-    for ((c_i, y_i), &idx) in c_points.iter().zip(y_scalars.iter()).zip(indices) {
+    for ((_c_i, y_i), &idx) in c_points.iter().zip(y_scalars.iter()).zip(indices) {
         let z_i = bls::singleton().RootsOfUnityBLS48581[&poly_size][idx as usize].clone();
         
         let mut denom = big::BIG::modadd(&t, &big::BIG::modneg(&z_i, &modulus), &modulus);

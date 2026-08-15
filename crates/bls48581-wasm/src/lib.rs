@@ -1,7 +1,7 @@
 use wasm_bindgen::prelude::*;
 use bls48581::{
     init, commit_raw, prove_raw, verify_raw, bls_keygen, bls_sign, bls_verify, bls_aggregate,
-    prove_multiple, verify_multiple, Multiproof, BlsKeygenOutput, BlsAggregateOutput,
+    prove_multiple, verify_multiple,
     bls_scalar_random, bls_scalar_mul, bls_scalar_add, bls_scalar_sub, bls_scalar_neg,
     bls_scalar_inv, bls_scalar_from_u64, bls_scalar_to_g1, bls_g1_add,
     bls_scalar_to_g8, bls_g8_add,

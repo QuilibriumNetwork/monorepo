@@ -1,4 +1,4 @@
-use ferret::{NetIO, FerretCOT, BlockArray, ALICE, BOB};
+use ferret::{NetIO, FerretCOT, BlockArray, ALICE};
 use std::env;
 
 fn main() {
