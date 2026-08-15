@@ -126,6 +126,46 @@ fn decode_app_frame(bytes: &[u8]) -> Option<AppShardFrame> {
     <AppShardFrame as prost::Message>::decode(bytes).ok()
 }
 
+/// Feed a peer-delivered block into the shared [`BlockStore`] so `verify` finds
+/// the bytes behind a proposed digest. Drops malformed bytes; idempotent.
+///
+/// SECURITY — this path is UNVALIDATED. The node authorizes the sender only far
+/// enough to resolve a peer key (`app_engine`'s `CwIn` handler), and nothing
+/// here checks the frame: the VDF, the roots, and the parent linkage are all
+/// `verify`'s job. Critically, the consensus digest is `Poseidon(header.output)`
+/// and does NOT commit to `header.frame_number`, so a peer can pair any real
+/// frame's `output` with any height it likes and have it land on the honest
+/// frame's digest.
+///
+/// So this function stores bytes and NOTHING else — it must never record
+/// digest→frame_number. `propose` reads that index for the height it builds on;
+/// today the app leader provider treats that height as advisory (it resolves its
+/// parent from the shard clock store) and `verify` no longer derives anything
+/// from it, so a forged entry currently has no reachable consumer here. The
+/// global twin is not so lucky — the same primitive halts the global chain
+/// outright (see `cw_global_seams::ingest_global_block`) — and the app seam has
+/// already carried a height-derived `verify` gate once. Keeping the index
+/// unreachable from unvalidated input makes the property structural instead of a
+/// standing invariant for every future reader of `block_meta`.
+///
+/// The block bytes themselves are safe to accept here: [`BlockStore`] seals the
+/// exact bytes that pass `verify`, after which ingress cannot substitute a
+/// different body under the same digest.
+pub(crate) fn ingest_app_block(store: &BlockStore, bytes: Vec<u8>) {
+    let Some(frame) = decode_app_frame(&bytes) else {
+        tracing::debug!("cw app block ingress: undecodable frame, dropping");
+        return;
+    };
+    let Some(header) = frame.header.as_ref() else { return };
+    let Some(digest) = app_frame_digest(&frame) else { return };
+    let claimed_frame_number = header.frame_number;
+    store.put(digest, bytes);
+    tracing::debug!(
+        claimed_frame = claimed_frame_number,
+        "cw app block ingress: stored peer frame (height unverified)",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Proposer (GlobalProposer seam)
 // ---------------------------------------------------------------------------
@@ -159,7 +199,8 @@ pub struct AppSeamProposer {
     assemble: AppFrameAssembler,
     filter: Vec<u8>,
     /// digest → frame_number (resolves the parent frame number from the simplex
-    /// parent digest, which carries only the identity).
+    /// parent digest, which carries only the identity). VALIDATED WRITES ONLY —
+    /// see [`ingest_app_block`] and [`AppSeamProposer::note_frame`].
     block_meta: Arc<Mutex<HashMap<Digest, u64>>>,
     /// Body-root cross-check (audit Finding #2); see [`AppRequestsRootCheck`].
     requests_root_check: Option<AppRequestsRootCheck>,
@@ -183,11 +224,15 @@ impl AppSeamProposer {
         }
     }
 
-    /// Record digest → frame_number (used by inbound-block ingestion so a synced
-    /// parent resolves its number).
+    /// Record digest → frame_number for a block whose bytes this node has
+    /// VALIDATED (built in `propose`, accepted in `verify`) or that it read from
+    /// its own committed store (the activation seed). Never call this with a
+    /// height learned from a peer — that is the poisoning primitive documented
+    /// on [`ingest_app_block`].
     pub fn note_frame(&self, digest: Digest, frame_number: u64) {
         self.block_meta.lock().unwrap().insert(digest, frame_number);
     }
+
 }
 
 impl GlobalProposer for AppSeamProposer {
@@ -203,10 +248,29 @@ impl GlobalProposer for AppSeamProposer {
 
         // App shards resolve their parent from the shard clock store internally,
         // so `prior_frame_number` is advisory; `prior_state_id` is the identity.
-        let state = self
-            .leader_provider
-            .prove_next_state(view, &self.filter, prior_frame_number, &prior_state_id)
-            .ok()?;
+        let state = match self.leader_provider.prove_next_state(
+            view,
+            &self.filter,
+            prior_frame_number,
+            &prior_state_id,
+        ) {
+            Ok(state) => state,
+            Err(e) => {
+                // Surface WHY (mirrors the global seam). Swallowing this is how a
+                // shard halt becomes invisible: the leader nullifies its own view
+                // with no on-disk signal, and across all leaders the shard spins
+                // through views producing nothing.
+                tracing::warn!(
+                    view,
+                    prior_frame_number,
+                    parent = %hex::encode(&prior_state_id),
+                    error = %e,
+                    "cw app propose: prove_next_state failed — cannot build a proposal \
+                     (view nullifies)",
+                );
+                return None;
+            }
+        };
 
         // The engine assembles the FULL frame (header + recorded requests).
         let frame = (self.assemble)(&state)?;
@@ -407,9 +471,10 @@ pub fn build_app_committee(
 pub struct AppConsensusCwHandle {
     pub inbound:
         [tokio::sync::mpsc::UnboundedSender<quil_cw_consensus::p2p_bridge::Message<FalconPublicKey>>; 3],
-    /// Feed a peer-delivered app frame's bytes into the engine's `BlockStore`
-    /// (so `verify` finds the block behind a proposed digest) and record its
-    /// digest→frame_number. Idempotent; drops malformed bytes.
+    /// Feed a peer-delivered app frame's bytes into the engine's `BlockStore`,
+    /// so `verify` finds the block behind a proposed digest. Stores bytes only —
+    /// nothing a peer claims about a frame's height is recorded. Idempotent;
+    /// drops malformed bytes. See [`ingest_app_block`].
     pub ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
     /// Cooperative shutdown flag for the simplex host thread. Set it to stop this
     /// instance (the engine drops + the runtime thread returns) — used to REBUILD
@@ -484,23 +549,12 @@ pub fn activate_app_consensus_cw(
         }
     });
 
-    // Block ingress: decode a peer app frame, compute identity digest, store it,
-    // and note digest→frame_number for parent resolution.
+    // Block ingress: decode a peer app frame, compute its identity digest, and
+    // store the bytes so `verify` can find them. Deliberately has NO handle on
+    // the proposer's digest→frame-number index — see [`ingest_app_block`].
     let ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync> = {
         let store = store.clone();
-        let proposer = proposer.clone();
-        Arc::new(move |bytes: Vec<u8>| {
-            let Some(frame) = decode_app_frame(&bytes) else {
-                tracing::debug!("cw app block ingress: undecodable frame, dropping");
-                return;
-            };
-            let Some(header) = frame.header.as_ref() else { return };
-            let Some(digest) = app_frame_digest(&frame) else { return };
-            let frame_number = header.frame_number;
-            store.put(digest, bytes);
-            proposer.note_frame(digest, frame_number);
-            tracing::debug!(frame = frame_number, "cw app block ingress: stored peer frame");
-        })
+        Arc::new(move |bytes: Vec<u8>| ingest_app_block(&store, bytes))
     };
 
     AppConsensusCwHandle { inbound, ingest_block, shutdown }
@@ -547,5 +601,84 @@ mod tests {
             &app_a,
         )
         .is_none());
+    }
+    /// An app frame carrying `output` at `frame_number`. Only the fields the
+    /// digest and the parent checks read are meaningful.
+    fn test_frame(filter: &[u8], frame_number: u64, output: &[u8]) -> AppShardFrame {
+        AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                address: filter.to_vec(),
+                frame_number,
+                output: output.to_vec(),
+                ..Default::default()
+            }),
+            requests: vec![],
+            storage_attestation: None,
+        }
+    }
+
+    /// The attack behind the #593 review comments, at the unit level: the
+    /// consensus digest is `Poseidon(output)` and does not commit to
+    /// `frame_number`, so a peer can gossip a real frame's `output` under a
+    /// forged height and land on the honest frame's digest. Ingress must not be
+    /// able to move the height that `propose`/`verify` then trust.
+    #[test]
+    fn peer_ingress_cannot_forge_the_parent_height() {
+        let filter = vec![0x55u8; 32];
+        let honest = test_frame(&filter, 7, b"honest-output");
+        let digest = app_frame_digest(&honest).expect("frame digests");
+
+        // What `verify` records once the honest parent passes validation.
+        let meta: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
+        meta.lock().unwrap().insert(digest, 7);
+
+        let store = BlockStore::new();
+        ingest_app_block(&store, encode_app_frame(&honest));
+
+        // Attacker: identical `output` (→ identical digest), forged height.
+        let mut forged = honest.clone();
+        forged.header.as_mut().unwrap().frame_number = u64::MAX / 2;
+        assert_eq!(
+            app_frame_digest(&forged),
+            Some(digest),
+            "the forgery must collide with the honest digest or it models nothing",
+        );
+        ingest_app_block(&store, encode_app_frame(&forged));
+
+        assert_eq!(
+            meta.lock().unwrap().get(&digest).copied(),
+            Some(7),
+            "unvalidated peer ingress moved the parent height",
+        );
+
+        // Delivery still works, and the sealed bytes are immutable afterwards.
+        let honest_bytes = encode_app_frame(&honest);
+        store.seal(digest, honest_bytes.clone());
+        ingest_app_block(&store, encode_app_frame(&forged));
+        assert_eq!(store.get(&digest), Some(honest_bytes));
+    }
+
+    /// The hardening must not cost block delivery: `verify` reads the proposed
+    /// block out of the store, so ingress still has to put bytes there.
+    #[test]
+    fn peer_ingress_still_delivers_block_bytes() {
+        let filter = vec![0x55u8; 32];
+        let frame = test_frame(&filter, 3, b"delivered-output");
+        let digest = app_frame_digest(&frame).expect("frame digests");
+        let bytes = encode_app_frame(&frame);
+
+        let store = BlockStore::new();
+        ingest_app_block(&store, bytes.clone());
+        assert_eq!(store.get(&digest), Some(bytes.clone()));
+
+        // Once the exact bytes pass validation they are sealed, and later
+        // ingress cannot substitute a different body under the same digest.
+        store.seal(digest, bytes.clone());
+        let mut swapped = frame.clone();
+        swapped.header.as_mut().unwrap().frame_number = 999;
+        ingest_app_block(&store, encode_app_frame(&swapped));
+        assert_eq!(store.get(&digest), Some(bytes));
+
+        ingest_app_block(&store, b"not a frame".to_vec());
     }
 }

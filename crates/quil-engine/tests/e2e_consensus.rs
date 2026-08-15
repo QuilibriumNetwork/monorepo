@@ -148,6 +148,350 @@ async fn app_consensus_cw_multi_prover_finalizes() {
     );
 }
 
+// ===================================================================
+// Global-consensus CW rig — the global twin of the app-seam ingress hardening.
+//
+// `activate_global_consensus_cw` is only wired inside `quil-node`, so there is
+// no harness for it. It is fully stub-able though: a single-member committee
+// self-finalizes (quorum 1) with a no-op transport, so the whole global seam can
+// be driven in-process and attacked through its real public ingress.
+// ===================================================================
+
+/// A CW transport that plays the attacker.
+///
+/// A single-member committee is its own quorum and `Automaton::propose` seals
+/// the bytes it just built, so nothing actually has to travel — but the leader
+/// still ships every proposal's frame bytes on the block channel, and that
+/// broadcast is precisely what a network peer sees. So this transport watches
+/// channel 3 and immediately gossips the frame back with a forged height.
+///
+/// Tapping the broadcast is what makes the attack faithful. The forgery lands
+/// while the frame it targets is still the Simplex parent — the leader has not
+/// yet built (VDF-proved, in production) the frame above it. An attacker keyed
+/// off FINALIZATION instead would always be about two views late, poisoning a
+/// parent consensus had already moved past, and would prove nothing.
+struct ForgingGlobalTransport {
+    /// Set once `activate_global_consensus_cw` hands back the real ingress.
+    ingest: Mutex<Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>>,
+    forged: std::sync::atomic::AtomicUsize,
+}
+
+impl ForgingGlobalTransport {
+    fn new() -> Self {
+        Self {
+            ingest: Mutex::new(None),
+            forged: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn arm(&self, ingest: Arc<dyn Fn(Vec<u8>) + Send + Sync>) {
+        *self.ingest.lock() = Some(ingest);
+    }
+
+    fn forged(&self) -> usize {
+        self.forged.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl quil_engine::cw_global_seams::GlobalConsensusTransport for ForgingGlobalTransport {
+    fn deliver(
+        &self,
+        channel: u64,
+        _recipients: Vec<quil_cw_consensus::falcon_base::FalconPublicKey>,
+        bytes: Vec<u8>,
+    ) {
+        if channel != quil_engine::cw_global_seams::CW_BLOCK_CHANNEL {
+            return;
+        }
+        // Clone the handle out before calling — never hold this lock across the
+        // ingress, which takes the BlockStore's.
+        let ingest = self.ingest.lock().clone();
+        let Some(ingest) = ingest else { return };
+        let Ok(mut frame) = quil_engine::consensus_wire::decode_global_frame(&bytes) else {
+            return;
+        };
+        let Some(header) = frame.header.as_mut() else { return };
+        // Same `output` → same consensus digest. The digest is
+        // `Poseidon(header.output)` and commits to nothing else, so this forgery
+        // lands on the very entry Simplex hands the seam as the parent.
+        header.frame_number += 1_000_000;
+        let Ok(forged) = quil_engine::consensus_wire::encode_global_frame(&frame) else {
+            return;
+        };
+        ingest(forged);
+        self.forged
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A `LeaderProvider<GlobalState>` that models the one property this attack
+/// turns on: the real provider is TOLD the parent's height and looks the parent
+/// frame up at it, so a height that doesn't belong to the parent identity is an
+/// error ("needs sync"), not a frame built somewhere else. Everything else is
+/// the minimum needed to produce a chain the stub verifier accepts.
+struct HeightCheckedGlobalLeaderProvider {
+    prover: Vec<u8>,
+    requests_root: Vec<u8>,
+    /// frame identity (`Poseidon(output)`) → the height that identity actually is.
+    heights: Mutex<std::collections::HashMap<Vec<u8>, u64>>,
+}
+
+impl quil_consensus::leader_provider::LeaderProvider<quil_engine::consensus_types::GlobalState>
+    for HeightCheckedGlobalLeaderProvider
+{
+    fn get_next_leaders(
+        &self,
+        _prior: Option<&quil_consensus::models::State<quil_engine::consensus_types::GlobalState>>,
+    ) -> quil_types::error::Result<Vec<quil_consensus::models::Identity>> {
+        Ok(vec![self.prover.clone()])
+    }
+
+    fn prove_next_state(
+        &self,
+        rank: u64,
+        _filter: &[u8],
+        prior_frame_number: u64,
+        prior_state: &quil_consensus::models::Identity,
+    ) -> quil_types::error::Result<
+        quil_consensus::models::State<quil_engine::consensus_types::GlobalState>,
+    > {
+        match self.heights.lock().get(prior_state.as_slice()).copied() {
+            Some(actual) if actual == prior_frame_number => {}
+            Some(actual) => {
+                return Err(quil_types::error::QuilError::NotFound(format!(
+                    "needs sync: consensus parent is frame {actual}, told {prior_frame_number}"
+                )))
+            }
+            None => {
+                return Err(quil_types::error::QuilError::NotFound(format!(
+                    "frame {prior_frame_number} not found"
+                )))
+            }
+        }
+
+        // Output must be unique per (frame, rank, parent) — the frame identity
+        // IS the consensus digest, so colliding outputs collapse the chain.
+        let frame_number = prior_frame_number + 1;
+        let mut seed = Vec::with_capacity(48);
+        seed.extend_from_slice(&frame_number.to_be_bytes());
+        seed.extend_from_slice(&rank.to_be_bytes());
+        seed.extend_from_slice(prior_state);
+        let h = quil_crypto::poseidon::hash_bytes_to_32(&seed).expect("poseidon hashes");
+        let mut output = vec![0u8; 516];
+        output[..32].copy_from_slice(&h);
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_millis() as i64;
+        let header = gpb::GlobalFrameHeader {
+            frame_number,
+            rank,
+            timestamp,
+            difficulty: 1,
+            output,
+            parent_selector: prior_state.to_vec(),
+            prover: self.prover.clone(),
+            requests_root: self.requests_root.clone(),
+            ..Default::default()
+        };
+        let identity = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+            .expect("poseidon hashes")
+            .to_vec();
+        self.heights.lock().insert(identity.clone(), frame_number);
+
+        Ok(quil_consensus::models::State {
+            rank,
+            identifier: identity,
+            proposer_id: self.prover.clone(),
+            parent_qc_identity: prior_state.to_vec(),
+            parent_qc_rank: rank.saturating_sub(1),
+            parent_quorum_certificate: None,
+            timestamp: timestamp as u64,
+            state: quil_engine::consensus_types::GlobalState::from_header(&header),
+        })
+    }
+}
+
+/// The global twin of `app_consensus_cw_survives_forged_parent_height_gossip`,
+/// driven through the real public ingress `GlobalConsensusCwHandle::ingest_block`.
+///
+/// The global block channel is worse off than the app one: `CwInboundRouter`
+/// forwards channel 3 with no sender check at all, so these bytes need not come
+/// from a peer the node has ever authenticated. And as on the app side the
+/// consensus digest is `Poseidon(header.output)`, which does not commit to
+/// `header.frame_number` — so a forged height lands on the honest frame's digest.
+///
+/// If ingress reached the seam's digest→frame-number index, every view this node
+/// leads would ask the leader provider to build on a height the consensus parent
+/// does not have. That is an index HIT, so the restart fallback (which only
+/// covers a miss) never fires, and the proposal fails on every view: the chain
+/// stops. Here one node IS the committee, so "every view this node leads" is
+/// every view — the chain must keep finalizing anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_consensus_cw_survives_forged_parent_height_gossip() {
+    use quil_types::crypto::Signer as _;
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    // One member ⇒ quorum 1 ⇒ this node finalizes its own proposals.
+    let signer = quil_crypto::FalconSigner::generate();
+    let public_key = signer.public_key().to_vec();
+    let private_key = signer.private_key().to_vec();
+    let committee = quil_cw_consensus::committee::build_global_committee(
+        &[public_key.clone()],
+        &private_key,
+        &public_key,
+        b"global",
+    )
+    .expect("single-member global committee builds");
+    let prover_address = quil_crypto::poseidon::hash_bytes_to_32(&public_key)
+        .expect("poseidon hashes")
+        .to_vec();
+
+    // Empty request body — the seam's `verify` and the finalizer both recompute
+    // this root from the carried requests and reject a mismatch.
+    let requests_root = quil_engine::leader_provider::compute_global_requests_root(
+        &[],
+        &quil_tries::ShaInclusionProver,
+    );
+
+    // Genesis: the frame the first proposal extends, and the floor Simplex is
+    // handed as its parent digest.
+    let genesis_output = {
+        let mut out = vec![0u8; 516];
+        out[..32].copy_from_slice(
+            &quil_crypto::poseidon::hash_bytes_to_32(b"cw-global-attack-genesis")
+                .expect("poseidon hashes"),
+        );
+        out
+    };
+    let genesis_identity = quil_crypto::poseidon::hash_bytes_to_32(&genesis_output)
+        .expect("poseidon hashes");
+    let genesis_digest = quil_cw_consensus::adapters::digest_from_identity(genesis_identity);
+    let genesis = gpb::GlobalFrame {
+        header: Some(gpb::GlobalFrameHeader {
+            frame_number: 0,
+            output: genesis_output,
+            requests_root: requests_root.clone(),
+            prover: prover_address.clone(),
+            ..Default::default()
+        }),
+        requests: vec![],
+    };
+
+    let clock_store = Arc::new(InMemoryClockStore::new());
+    clock_store.seed_frame(genesis.clone());
+
+    let leader_provider = Arc::new(HeightCheckedGlobalLeaderProvider {
+        prover: prover_address.clone(),
+        requests_root,
+        heights: Mutex::new(std::collections::HashMap::from([(
+            genesis_identity.to_vec(),
+            0u64,
+        )])),
+    });
+    let verifier = Arc::new(quil_engine::frame_validator::GlobalFrameVerifier::new(
+        Arc::new(StubFrameProver),
+    ));
+
+    let (mat_job_tx, mut mat_job_rx) = mpsc::unbounded_channel::<(gpb::GlobalFrame, u64)>();
+    let storage_directory = std::env::temp_dir().join(format!(
+        "cw-global-attack-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_nanos(),
+    ));
+
+    let transport = Arc::new(ForgingGlobalTransport::new());
+    let handle = quil_engine::cw_global_seams::activate_global_consensus_cw(
+        committee.scheme,
+        committee.peers,
+        leader_provider,
+        verifier,
+        clock_store.clone(),
+        mat_job_tx,
+        Arc::new(|_, _| {}),
+        vec![0u8; 32],
+        0, // epoch
+        genesis_digest,
+        0, // genesis frame number
+        5, // leader_timeout_secs — the stub proposer is instant
+        transport.clone(),
+        storage_directory.clone(),
+        None, // no gossip publisher
+        prover_address,
+    );
+    // Arm the attacker with the real public ingress. The engine is still opening
+    // its simplex journal at this point, so the first proposal is attacked too.
+    transport.arm(handle.ingest_block.clone());
+
+    let mut finalized: Vec<gpb::GlobalFrame> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while finalized.len() < 4 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, mat_job_rx.recv()).await {
+            Ok(Some((frame, _))) => finalized.push(frame),
+            // Channel closed (engine gone) or the deadline expired.
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let forged_count = transport.forged();
+    let _ = std::fs::remove_dir_all(&storage_directory);
+
+    assert_eq!(
+        finalized.len(),
+        4,
+        "global CW consensus stopped finalizing under forged parent-height gossip \
+         (finalized {} frame(s), {forged_count} forgeries delivered) — unvalidated \
+         channel-3 ingress poisoned the digest→frame-number index `propose` builds on",
+        finalized.len(),
+    );
+    assert!(
+        forged_count > 0,
+        "the attacker never gossiped a forgery — the chain went unattacked",
+    );
+
+    let headers = finalized
+        .iter()
+        .map(|frame| frame.header.as_ref().expect("finalized frame has a header"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        headers.iter().map(|h| h.frame_number).collect::<std::collections::HashSet<_>>().len(),
+        headers.len(),
+        "finalized duplicate global frame numbers",
+    );
+    for pair in headers.windows(2) {
+        let (parent, child) = (pair[0], pair[1]);
+        assert_eq!(
+            child.frame_number,
+            parent.frame_number + 1,
+            "finalized global chain contains a height gap under attack",
+        );
+        let parent_identity = quil_crypto::poseidon::hash_bytes_to_32(&parent.output)
+            .expect("parent output hashes")
+            .to_vec();
+        assert_eq!(
+            child.parent_selector, parent_identity,
+            "finalized global frame does not extend its predecessor under attack",
+        );
+        assert!(
+            child.frame_number < 1_000_000,
+            "a forged height reached the finalized global chain",
+        );
+    }
+}
 /// Active PoRep path end-to-end through the live consensus harness.
 ///
 /// Each of the 4 workers gets a shared committed CRDT (vertices under the

@@ -98,6 +98,41 @@ fn frame_digest(header: &GlobalFrameHeader) -> Option<Digest> {
     Some(digest_from_identity(id))
 }
 
+/// Feed a peer-delivered frame into the shared [`BlockStore`] so `verify` finds
+/// the bytes behind a proposed digest. Drops malformed bytes; idempotent.
+///
+/// SECURITY — this path is UNVALIDATED, and on the global chain it is not even
+/// sender-attributed (`CwInboundRouter::route` forwards channel 3 without
+/// resolving the peer). The consensus digest is `Poseidon(header.output)` and
+/// does NOT commit to `header.frame_number`, so any peer can pair a real frame's
+/// `output` with an arbitrary height and land it on that frame's digest.
+///
+/// So this function stores bytes and NOTHING else. It must never record
+/// digest→frame_number: `propose` builds the next frame at the height that index
+/// reports for the Simplex parent, and a forged entry makes `prove_next_state`
+/// fail on every view this node leads — with no fallback, because a poisoned
+/// entry is a HIT, not the miss the clock-store fallback below covers. The block
+/// bytes themselves are safe to accept: [`BlockStore`] seals the exact bytes that
+/// pass `verify`, after which ingress cannot substitute a different body.
+///
+/// Mirrors `cw_app_seams::ingest_app_block`, where the same primitive halts a
+/// shard outright (the app seam also derives the child's expected height and
+/// parent linkage from this index).
+pub(crate) fn ingest_global_block(store: &BlockStore, bytes: Vec<u8>) {
+    let Ok(frame) = decode_global_frame(&bytes) else {
+        tracing::debug!("cw block ingress: undecodable frame, dropping");
+        return;
+    };
+    let Some(header) = frame.header.as_ref() else { return };
+    let Some(digest) = frame_digest(header) else { return };
+    let claimed_frame_number = header.frame_number;
+    store.put(digest, bytes);
+    tracing::debug!(
+        claimed_frame = claimed_frame_number,
+        "cw block ingress: stored peer frame (height unverified)",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // GlobalProposer
 // ---------------------------------------------------------------------------
@@ -552,8 +587,9 @@ pub trait GlobalConsensusTransport: Send + Sync + 'static {
 pub struct GlobalConsensusCwHandle {
     pub inbound: [tokio::sync::mpsc::UnboundedSender<quil_cw_consensus::p2p_bridge::Message<FalconPublicKey>>; 3],
     /// Feed a peer-delivered frame's canonical bytes into the engine's
-    /// `BlockStore` (so `verify` finds the block behind a proposed digest) and
-    /// record its digest→frame_number mapping. Idempotent; drops malformed bytes.
+    /// `BlockStore`, so `verify` finds the block behind a proposed digest. Stores
+    /// bytes only — nothing a peer claims about a frame's height is recorded.
+    /// Idempotent; drops malformed bytes. See [`ingest_global_block`].
     pub ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
 }
 
@@ -643,24 +679,70 @@ pub fn activate_global_consensus_cw(
         }
     });
 
-    // Block ingress: decode a peer frame, compute its identity digest, insert
-    // into the store, and note digest→frame_number for parent resolution.
+    // Block ingress: decode a peer frame, compute its identity digest, and store
+    // the bytes. Deliberately has NO handle on the proposer's digest→frame-number
+    // index — see [`ingest_global_block`].
     let ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync> = {
         let store = store.clone();
-        let proposer = proposer.clone();
-        Arc::new(move |bytes: Vec<u8>| {
-            let Ok(frame) = decode_global_frame(&bytes) else {
-                tracing::debug!("cw block ingress: undecodable frame, dropping");
-                return;
-            };
-            let Some(header) = frame.header.as_ref() else { return };
-            let Some(digest) = frame_digest(header) else { return };
-            let frame_number = header.frame_number;
-            store.put(digest, bytes);
-            proposer.note_frame(digest, frame_number);
-            tracing::debug!(frame = frame_number, "cw block ingress: stored peer frame");
-        })
+        Arc::new(move |bytes: Vec<u8>| ingest_global_block(&store, bytes))
     };
 
     GlobalConsensusCwHandle { inbound, ingest_block }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_frame(frame_number: u64, output: &[u8]) -> GlobalFrame {
+        GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number,
+                output: output.to_vec(),
+                ..Default::default()
+            }),
+            requests: vec![],
+        }
+    }
+
+    /// The global twin of `cw_app_seams::peer_ingress_cannot_forge_the_parent_height`.
+    /// Channel 3 is not even sender-attributed here, and the digest is
+    /// `Poseidon(output)` — which does not commit to `frame_number` — so peer
+    /// ingress must not be able to move the height `propose` builds on. A forged
+    /// entry would be an index HIT, so the restart fallback would not cover it:
+    /// every view this node leads would nullify.
+    #[test]
+    fn peer_ingress_cannot_forge_the_parent_height() {
+        let honest = test_frame(41, b"honest-global-output");
+        let digest = frame_digest(honest.header.as_ref().unwrap()).expect("frame digests");
+
+        // What `propose`/`verify` record once the bytes are validated.
+        let meta: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
+        meta.lock().unwrap().insert(digest, 41);
+
+        let store = BlockStore::new();
+        let honest_bytes = encode_global_frame(&honest).expect("frame encodes");
+        ingest_global_block(&store, honest_bytes.clone());
+        assert_eq!(store.get(&digest), Some(honest_bytes.clone()));
+
+        // Attacker: identical `output` (→ identical digest), forged height.
+        let mut forged = honest.clone();
+        forged.header.as_mut().unwrap().frame_number = u64::MAX / 2;
+        assert_eq!(
+            frame_digest(forged.header.as_ref().unwrap()),
+            Some(digest),
+            "the forgery must collide with the honest digest or it models nothing",
+        );
+        ingest_global_block(&store, encode_global_frame(&forged).expect("frame encodes"));
+
+        assert_eq!(
+            meta.lock().unwrap().get(&digest).copied(),
+            Some(41),
+            "unvalidated peer ingress moved the parent height",
+        );
+        // Delivery still works, and the sealed bytes are immutable afterwards.
+        store.seal(digest, honest_bytes.clone());
+        ingest_global_block(&store, encode_global_frame(&forged).expect("frame encodes"));
+        assert_eq!(store.get(&digest), Some(honest_bytes));
+    }
 }
