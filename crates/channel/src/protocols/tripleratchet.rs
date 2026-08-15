@@ -956,7 +956,12 @@ impl TripleRatchetParticipant {
           },
           Err(_) if receiving_header_key == self.current_header_key => {
               if self.async_dkg_ratchet && self.async_dkg_pubkey.is_some() {
-                  let _receiving_group_key = Some(self.dkg_ratchet.public_key().to_bytes().to_vec());
+                  // This only derives the header key to *try* the decrypt; the
+                  // matching state update (`receiving_group_key`, `root_key`,
+                  // `current_header_key`, `next_header_key`) is performed by
+                  // `advance_and_decrypt` when we return
+                  // `should_advance_dkg_ratchet = true` below. Do not assign
+                  // `self.receiving_group_key` here as well.
                   let sess = Sha512::digest(&self.dkg_ratchet.public_key_bytes());
                   let hkdf = Hkdf::<Sha512>::new(
                       Some(&sess),
