@@ -79,10 +79,6 @@ fn main() {
         cc::Build::new()
             .cpp(true)
             .file("src/vdf.cpp")
-            // Vendored upstream C++: `sgn` in fast_reduce() and `f_` in
-            // gmp_nudupl() are unused. Silenced here rather than edited so
-            // src/vdf.cpp stays byte-identical to upstream.
-            .flag("-Wno-unused-variable")
             .flag(&inc_gmp)
             .flag(&inc_flint)
             .flag(&inc_mpfr)
@@ -102,10 +98,6 @@ fn main() {
         cc::Build::new()
             .cpp(true)
             .file("src/vdf.cpp")
-            // Vendored upstream C++: `sgn` in fast_reduce() and `f_` in
-            // gmp_nudupl() are unused. Silenced here rather than edited so
-            // src/vdf.cpp stays byte-identical to upstream.
-            .flag("-Wno-unused-variable")
             .static_flag(true)
             .flag("-lflint")
             .flag("-lmpfr")
@@ -124,10 +116,6 @@ fn main() {
         cc::Build::new()
             .cpp(true)
             .file("src/vdf.cpp")
-            // Vendored upstream C++: `sgn` in fast_reduce() and `f_` in
-            // gmp_nudupl() are unused. Silenced here rather than edited so
-            // src/vdf.cpp stays byte-identical to upstream.
-            .flag("-Wno-unused-variable")
             .static_flag(true)
             .flag("-lflint")
             .flag("-lmpfr")
