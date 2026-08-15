@@ -502,6 +502,11 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
     // it — a recently-produced frame that's briefly unavailable is served by
     // its producer within a few frames, so a large lag means "permanent".
     const UNFILLABLE_HEAD_MARGIN: u64 = 16;
+    // Most frames a single tick will forward-fill before yielding back to the
+    // loop (and its cancellation check). Well above the achievable rate — each
+    // frame is a serial round-trip — so this bounds worst-case tick duration
+    // without throttling catch-up.
+    const MAX_FORWARD_FILL_PER_TICK: u64 = 512;
 
     let mut ticker = tokio::time::interval(config.poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -754,7 +759,32 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
         // 2. Forward-fill any missed frames in (last_frame, new_number).
         //    Archive nodes need the full history; everyone else
         //    just wants to start from the current head.
-        if config.forward_fill && last_frame > 0 && new_number > last_frame + 1 {
+        //
+        // An EMPTY store (`last_frame == 0`) is a gap like any other, and used
+        // to be excluded here by a `last_frame > 0` arm. That treated every
+        // fresh boot as "nothing to fill": the first successful head poll
+        // stored ONLY the head and latched the cursor past everything below it,
+        // and nothing revisits frames under the cursor at runtime (the
+        // record-gap scan runs at bootstrap only), so the hole was permanent.
+        // It is not archive-specific — `forward_fill` is set for every node
+        // role, because regulars need contiguity too (their app-shard storage
+        // attestations anchor ρ_N to an exact global frame that must be present
+        // locally). Regulars merely have a smaller window to hit it in: the
+        // runtime far-behind rescue above tries a state-jump first, and only a
+        // node whose jump does not complete crawls up from genesis here.
+        if config.forward_fill && new_number > last_frame + 1 {
+            // Bound the span filled per tick. Dropping the guard above means a
+            // fresh archive at mainnet height would otherwise attempt a single
+            // genesis-to-head crawl inside ONE tick — an unbounded loop with no
+            // cancellation check in it. Filling a bounded chunk and resuming on
+            // the next tick keeps the loop responsive to `cancel` and bounds the
+            // work per iteration, at no throughput cost: each frame is a
+            // round-trip, so the real fill rate is far below this ceiling.
+            let fill_end = new_number.min(
+                last_frame
+                    .saturating_add(1)
+                    .saturating_add(MAX_FORWARD_FILL_PER_TICK),
+            );
             // Track partial progress: every frame we successfully store
             // advances `last_frame`, so a failure midway does NOT throw
             // away the frames we already pulled. The previous design left
@@ -773,7 +803,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
             // opposed to NotFound / transport). Counts toward the same skip via
             // its own distinct-endpoint tally.
             let mut failed_validation = false;
-            for fn_ in (last_frame + 1)..new_number {
+            for fn_ in (last_frame + 1)..fill_end {
                 // Store-first (non-archive): if gossip already delivered this
                 // frame, use the local copy and skip the RPC. Only frames gossip
                 // missed cost a network fetch. Fire on_frame just as the RPC arm
@@ -908,6 +938,18 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                 }
+                continue;
+            }
+            if fill_end < new_number {
+                // Chunk done but the gap is still open. Do NOT fall through to
+                // head processing: storing the head here would latch the cursor
+                // past the frames we have not fetched yet — the very skip this
+                // fill exists to prevent. Resume from `last_frame` next tick.
+                debug!(
+                    local_frame = last_frame,
+                    head = new_number,
+                    "catchup: filled a bounded chunk — resuming below head next tick"
+                );
                 continue;
             }
         }
@@ -1321,6 +1363,17 @@ mod forward_fill_repro {
         seed_frames: &[u64],
         gossip: Option<Arc<GossipFreshness>>,
     ) -> Rig {
+        spawn_poller_with_jump(fake, seed_frames, gossip, None).await
+    }
+
+    /// As `spawn_poller`, but able to wire the runtime far-behind rescue hook —
+    /// the branch that decides whether a regular node state-jumps or crawls.
+    async fn spawn_poller_with_jump(
+        fake: FakeArchive,
+        seed_frames: &[u64],
+        gossip: Option<Arc<GossipFreshness>>,
+        far_behind_jump: Option<FarBehindJump>,
+    ) -> Rig {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = quil_store::RocksDb::open(tmp.path()).unwrap();
         let store = Arc::new(RocksClockStore::new(db.inner()));
@@ -1338,6 +1391,7 @@ mod forward_fill_repro {
             call_timeout: Duration::from_secs(1),
             forward_fill: true,
             gossip_freshness: gossip,
+            far_behind_jump,
             on_frame: Some(Arc::new(move |f: &GlobalFrame| {
                 if let Some(h) = f.header.as_ref() {
                     seen_cb.lock().unwrap().push(h.frame_number);
@@ -1462,6 +1516,106 @@ mod forward_fill_repro {
             *rig.seen.lock().unwrap(),
             vec![2, 3, 4, 5],
             "forward-fill must fire on_frame for each filled frame, then the head"
+        );
+    }
+
+    /// Coverage for the bounded fill that replaced the `last_frame > 0` guard:
+    /// a gap wider than `MAX_FORWARD_FILL_PER_TICK` (512) must still close
+    /// contiguously, just across several ticks.
+    ///
+    /// The interesting case is the tick boundary. A chunk that ends below the
+    /// head must NOT fall through to head processing — storing the head there
+    /// would latch the cursor past the unfetched remainder and reintroduce
+    /// exactly the permanent hole this fix removes. So the head is stored only
+    /// on the tick that closes the gap, and the result is dense from 1 to head.
+    #[tokio::test]
+    async fn gap_wider_than_one_chunk_fills_contiguously_across_ticks() {
+        const HEAD: u64 = 600; // > MAX_FORWARD_FILL_PER_TICK
+        let rig = spawn_poller(FakeArchive::serving(1..=HEAD), &[], None).await;
+        assert!(
+            await_head_then_stop(&rig, HEAD).await,
+            "poller did not reach head {HEAD} across multiple fill chunks"
+        );
+        rig.poller.abort();
+
+        let missing: Vec<u64> = (1..=HEAD)
+            .filter(|n| rig.store.get_global_frame(*n).is_err())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "frames {missing:?} missing — a bounded chunk must resume below the head, \
+             never latch the cursor past the frames it has not fetched yet",
+        );
+        assert_eq!(
+            *rig.seen.lock().unwrap(),
+            (1..=HEAD).collect::<Vec<u64>>(),
+            "on_frame must fire once per frame, in order, across the chunk boundary",
+        );
+    }
+
+    /// The regular-node escape hatch, and the reason removing the
+    /// `last_frame > 0` guard is acceptable for non-archives.
+    ///
+    /// Filling from an empty store means the head is stored only once the gap
+    /// closes, so a node far from head would climb to it one frame at a time.
+    /// Regulars must not: the runtime far-behind rescue fires FIRST (empty store
+    /// ⇒ the gap is the whole chain, so it clears `STATE_JUMP_RUNTIME_GAP`),
+    /// state-jumps near head, and the poller resumes from there. Only a regular
+    /// whose jump does not complete crawls up from genesis.
+    ///
+    /// Archives are deliberately excluded from this path (`far_behind_jump` is
+    /// `None` for them in `archive_sync.rs`) — they need the full history, so
+    /// crawling is the correct behaviour there.
+    #[tokio::test]
+    async fn regular_node_far_behind_state_jumps_instead_of_crawling_from_genesis() {
+        const HEAD: u64 = STATE_JUMP_RUNTIME_GAP + 500; // far enough to trigger
+        const JUMP_TO: u64 = HEAD - 100;
+
+        let jumped: Arc<std::sync::Mutex<Vec<u64>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jump_log = jumped.clone();
+        let jump: FarBehindJump = Arc::new(move |head: u64, _cancel: CancellationToken| {
+            jump_log.lock().unwrap().push(head);
+            Box::pin(async move { Some(JUMP_TO) })
+        });
+
+        let rig = spawn_poller_with_jump(
+            FakeArchive::serving(1..=HEAD),
+            &[],
+            Some(GossipFreshness::new()),
+            Some(jump),
+        )
+        .await;
+        assert!(
+            await_head_then_stop(&rig, HEAD).await,
+            "poller never reached head {HEAD} after the state-jump"
+        );
+        rig.poller.abort();
+
+        assert!(
+            !jumped.lock().unwrap().is_empty(),
+            "the far-behind rescue never fired — an empty store is the whole chain \
+             behind, so a regular node must state-jump rather than crawl",
+        );
+        // The jump landed at JUMP_TO, so the poller fills only above it. Nothing
+        // below may have been fetched: that crawl is exactly what the rescue exists
+        // to avoid.
+        let crawled: Vec<u64> = (1..=JUMP_TO)
+            .filter(|n| rig.store.get_global_frame(*n).is_ok())
+            .collect();
+        assert!(
+            crawled.is_empty(),
+            "frames {crawled:?} were fetched below the state-jump target — the \
+             poller crawled from genesis instead of resuming at the jump",
+        );
+        // Above the jump it still forward-fills contiguously to the head.
+        let missing: Vec<u64> = (JUMP_TO + 1..=HEAD)
+            .filter(|n| rig.store.get_global_frame(*n).is_err())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "frames {missing:?} missing above the jump target — the post-jump gap \
+             must still be forward-filled",
         );
     }
 }
