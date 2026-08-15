@@ -214,7 +214,13 @@ impl GlobalProposer for GlobalSeamProposer {
         Some((digest, bytes))
     }
 
-    fn verify(&self, view: u64, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
+    fn verify(
+        &self,
+        view: u64,
+        _parent_digest: Digest,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> bool {
         let Some(bytes) = bytes else {
             // Block not yet delivered — nullify rather than vote blind.
             tracing::warn!(view, "cw verify: block not delivered (nullify)");
