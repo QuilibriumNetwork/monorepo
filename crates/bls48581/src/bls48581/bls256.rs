@@ -27,6 +27,7 @@ use crate::bls48581::fp16::FP16;
 use crate::bls48581::pair8;
 use crate::bls48581::rom;
 use crate::hmac;
+use std::sync::OnceLock;
 
 /* Boneh-Lynn-Shacham signature 256-bit API Functions */
 
@@ -37,7 +38,10 @@ pub const BLS_FAIL: isize = -1;
 
 // NOTE this must be accessed in unsafe mode.
 // But it is just written to once at start-up, so actually safe.
-static mut G2_TAB: [FP16; ecp::G2_TABLE] = [FP16::new(); ecp::G2_TABLE];
+/// Precomputed pairing table for the G2 generator. Filled exactly once by
+/// `init()`; every reader below goes through `expect`, so a missing `init()`
+/// is a loud panic rather than a silently zeroed table.
+static G2_TAB: OnceLock<[FP16; ecp::G2_TABLE]> = OnceLock::new();
 
 fn ceil(a: usize,b: usize) -> usize {
     (a-1)/b+1
@@ -85,9 +89,9 @@ pub fn init() -> isize {
     if g.is_infinity() {
         return BLS_FAIL;
     }
-    unsafe {
-        pair8::precomp(&mut G2_TAB, &g);
-    }
+    let mut tab = [FP16::new(); ecp::G2_TABLE];
+    pair8::precomp(&mut tab, &g);
+    let _ = G2_TAB.set(tab);
     BLS_OK
 }
 
@@ -152,9 +156,11 @@ pub fn core_verify(sig: &[u8], m: &[u8], w: &[u8]) -> isize {
     // Use new multi-pairing mechanism
     let mut r = pair8::initmp();
     //    pair8::another(&mut r,&g,&d);
-    unsafe {
-        pair8::another_pc(&mut r, &G2_TAB, &d);
-    }
+    pair8::another_pc(
+        &mut r,
+        G2_TAB.get().expect("bls256::init() must run before verification"),
+        &d,
+    );
     pair8::another(&mut r, &pk, &hm);
     let mut v = pair8::miller(&mut r);
 
@@ -194,9 +200,11 @@ pub fn core_msig_verify(sig: &[u8], ms: &Vec<Vec<u8>>, ws: &Vec<Vec<u8>>) -> isi
     // Use new multi-pairing mechanism
     let mut r = pair8::initmp();
     //    pair8::another(&mut r,&g,&d);
-    unsafe {
-        pair8::another_pc(&mut r, &G2_TAB, &d);
-    }
+    pair8::another_pc(
+        &mut r,
+        G2_TAB.get().expect("bls256::init() must run before verification"),
+        &d,
+    );
     for (pk, hm) in pks.iter().zip(hms) {
       pair8::another(&mut r, &pk, &hm);
     }

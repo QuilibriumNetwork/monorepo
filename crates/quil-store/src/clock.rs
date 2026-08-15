@@ -1113,7 +1113,7 @@ impl store::ClockStore for RocksClockStore {
         // Go's GetShardClockFrame already accepts a non-pointer value
         // at the canonical key (the `else` branch at clock.go:1290).
         let staged_key = encoding::clock_shard_staged_key(selector, frame_number);
-        let mut have_frame = false;
+        let have_frame;
         if let Some(staged_bytes) = self
             .db
             .get(&staged_key)
