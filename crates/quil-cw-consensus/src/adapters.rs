@@ -93,10 +93,18 @@ pub trait GlobalProposer: Send + Sync + 'static {
     /// out and nullifies the view (mirrors the existing leader-can't-build SKIP).
     fn propose(&self, view: u64, parent_digest: Digest) -> Option<(Digest, Vec<u8>)>;
 
-    /// Validate a proposed frame `digest` for `view`. `bytes` is the frame body
-    /// if already delivered (via `FrameSink`), else `None` (not yet arrived →
-    /// return `false` so the view nullifies rather than votes blind).
-    fn verify(&self, view: u64, digest: Digest, bytes: Option<Vec<u8>>) -> bool;
+    /// Validate a proposed frame `digest` for `view` as a child of
+    /// `parent_digest`. `bytes` is the frame body if already delivered (via
+    /// `FrameSink`), else `None` (not yet arrived → return `false` so the view
+    /// nullifies rather than votes blind). Passing the consensus parent lets
+    /// application seams enforce height + parent linkage before voting.
+    fn verify(
+        &self,
+        view: u64,
+        parent_digest: Digest,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> bool;
 }
 
 /// Ships frame bytes to peers — the `Relay` behind consensus. In the node this
@@ -184,6 +192,7 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
     ) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
         let view: u64 = context.view().get();
+        let parent = context.parent.1;
         let proposer = self.proposer.clone();
         let store = self.store.clone();
         self.context.child("verify").spawn(move |ctx| async move {
@@ -202,7 +211,7 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
                 bytes = store.get(&payload);
                 waited += 1;
             }
-            let ok = proposer.verify(view, payload, bytes);
+            let ok = proposer.verify(view, parent, payload, bytes);
             let _ = tx.send(ok);
         });
         rx

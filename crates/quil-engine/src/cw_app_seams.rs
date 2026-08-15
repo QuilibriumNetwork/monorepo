@@ -64,7 +64,7 @@ pub type AppFinalizedSink = Arc<dyn Fn(AppShardFrame, Vec<u8>) + Send + Sync>;
 /// require one — so `public_key_signature_bls48581` is left `None`.
 ///
 /// This is the pure core of the engine-supplied `AppFrameAssembler`: the engine's
-/// closure reads `frame_requests[state.frame_number]` and calls this.
+/// closure reads `frame_requests[(state.frame_number, state.rank)]` and calls this.
 pub fn app_frame_from_state(
     state: &State<AppShardState>,
     requests: Vec<quil_types::proto::global::MessageBundle>,
@@ -121,6 +121,30 @@ fn encode_app_frame(frame: &AppShardFrame) -> Vec<u8> {
 
 fn decode_app_frame(bytes: &[u8]) -> Option<AppShardFrame> {
     <AppShardFrame as prost::Message>::decode(bytes).ok()
+}
+
+/// Bind an app block's wire header to the Simplex proposal context before an
+/// honest replica votes. Header validation alone cannot see the consensus
+/// parent, so this link check lives at the seam where both are available.
+fn app_header_extends_simplex_parent(
+    header: &quil_types::proto::global::FrameHeader,
+    filter: &[u8],
+    view: u64,
+    parent_frame_number: u64,
+    parent_digest: &Digest,
+) -> bool {
+    let Some(expected_frame_number) = parent_frame_number.checked_add(1) else {
+        return false;
+    };
+    let expected_parent = if parent_frame_number == 0 {
+        vec![0u8; 32]
+    } else {
+        digest_to_identity(parent_digest).to_vec()
+    };
+    header.address == filter
+        && header.rank == view
+        && header.frame_number == expected_frame_number
+        && header.parent_selector == expected_parent
 }
 
 // ---------------------------------------------------------------------------
@@ -187,16 +211,27 @@ impl AppSeamProposer {
 impl GlobalProposer for AppSeamProposer {
     fn propose(&self, view: u64, parent_digest: Digest) -> Option<(Digest, Vec<u8>)> {
         let prior_state_id: Vec<u8> = digest_to_identity(&parent_digest).to_vec();
-        let prior_frame_number = self
+        let prior_frame_number = match self
             .block_meta
             .lock()
             .unwrap()
             .get(&parent_digest)
             .copied()
-            .unwrap_or(0);
+        {
+            Some(frame_number) => frame_number,
+            None => {
+                tracing::warn!(
+                    view,
+                    parent = %hex::encode(&prior_state_id),
+                    "cw app propose: consensus parent metadata unavailable — nullify",
+                );
+                return None;
+            }
+        };
 
-        // App shards resolve their parent from the shard clock store internally,
-        // so `prior_frame_number` is advisory; `prior_state_id` is the identity.
+        // Both values come from the Simplex-selected parent. The leader provider
+        // resolves and validates that exact canonical/materialized frame rather
+        // than substituting its local latest head.
         let state = self
             .leader_provider
             .prove_next_state(view, &self.filter, prior_frame_number, &prior_state_id)
@@ -212,7 +247,13 @@ impl GlobalProposer for AppSeamProposer {
         Some((digest, bytes))
     }
 
-    fn verify(&self, _view: u64, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
+    fn verify(
+        &self,
+        view: u64,
+        parent_digest: Digest,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> bool {
         let Some(bytes) = bytes else {
             tracing::warn!("cw app verify: block not delivered (nullify)");
             return false;
@@ -226,6 +267,38 @@ impl GlobalProposer for AppSeamProposer {
         };
         if app_frame_digest(&frame) != Some(digest) {
             tracing::warn!(frame = header.frame_number, "cw app verify: digest mismatch");
+            return false;
+        }
+        let parent_frame_number = match self
+            .block_meta
+            .lock()
+            .unwrap()
+            .get(&parent_digest)
+            .copied()
+        {
+            Some(frame_number) => frame_number,
+            None => {
+                tracing::warn!(
+                    view,
+                    parent = %hex::encode(digest_to_identity(&parent_digest)),
+                    "cw app verify: consensus parent metadata unavailable — nullify",
+                );
+                return false;
+            }
+        };
+        if !app_header_extends_simplex_parent(
+            header,
+            &self.filter,
+            view,
+            parent_frame_number,
+            &parent_digest,
+        ) {
+            tracing::warn!(
+                view,
+                frame = header.frame_number,
+                parent_frame = parent_frame_number,
+                "cw app verify: shard/rank/height/parent does not match Simplex context — nullify",
+            );
             return false;
         }
         // Proposal-mode validation: VDF + structure, no committee QC required yet.
@@ -534,5 +607,32 @@ mod tests {
             &app_a,
         )
         .is_none());
+    }
+
+    #[test]
+    fn app_header_must_extend_simplex_parent() {
+        let filter = vec![0xAA; 32];
+        let parent = digest_from_identity([0x11; 32]);
+        let valid = quil_types::proto::global::FrameHeader {
+            address: filter.clone(),
+            frame_number: 8,
+            rank: 42,
+            parent_selector: digest_to_identity(&parent).to_vec(),
+            ..Default::default()
+        };
+        assert!(app_header_extends_simplex_parent(&valid, &filter, 42, 7, &parent));
+
+        let mut wrong = valid.clone();
+        wrong.frame_number = 7;
+        assert!(!app_header_extends_simplex_parent(&wrong, &filter, 42, 7, &parent));
+        let mut wrong = valid.clone();
+        wrong.parent_selector = vec![0x22; 32];
+        assert!(!app_header_extends_simplex_parent(&wrong, &filter, 42, 7, &parent));
+        let mut wrong = valid.clone();
+        wrong.rank = 43;
+        assert!(!app_header_extends_simplex_parent(&wrong, &filter, 42, 7, &parent));
+        let mut wrong = valid;
+        wrong.address = vec![0xBB; 32];
+        assert!(!app_header_extends_simplex_parent(&wrong, &filter, 42, 7, &parent));
     }
 }
