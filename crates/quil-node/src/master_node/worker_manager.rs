@@ -4,9 +4,6 @@ use tracing::{debug, info, warn};
 
 // Import KeyManager trait for get_signer
 use quil_keys::KeyManager as _;
-// ClockStore trait — mirror worker-finalized app-shard frames into the master store.
-use quil_types::store::ClockStore as _;
-
 use quil_lifecycle::Supervisor;
 
 pub(crate) struct WorkerManagerArgs {
@@ -29,6 +26,7 @@ pub(crate) struct WorkerManagerArgs {
     pub shard_engines: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
     >>,
+    pub app_shard_frame_router: Arc<super::app_shard_router::AppShardFrameRouter>,
     pub remote_worker_manager_for_halt:
         Arc<std::sync::OnceLock<Arc<quil_engine::remote_worker::RemoteWorkerManager>>>,
     pub pi_worker_manager: Arc<std::sync::OnceLock<Arc<dyn quil_engine::worker::WorkerManager>>>,
@@ -130,6 +128,7 @@ pub(crate) fn init(
         prover_address,
         bls_pubkey,
         shard_engines,
+        app_shard_frame_router,
         remote_worker_manager_for_halt,
         pi_worker_manager,
         prover_message_transport,
@@ -191,6 +190,7 @@ pub(crate) fn init(
             // Publish to the halt broadcaster spawned above so it can
             // SetHalted across standalone workers when coverage halts.
             let _ = remote_worker_manager_for_halt.set(remote_mgr.clone());
+            app_shard_frame_router.set_remote(remote_mgr.clone());
             // Establish (and maintain) the gRPC channels to the remote workers.
             // `connect_all` was previously never called — cluster workers
             // registered but the master never connected, so the Respawn stayed
@@ -436,11 +436,7 @@ pub(crate) fn init(
                 let drain_halt = halt_state.clone();
                 let drain_spawner = spawner.clone();
                 let drain_transport_cell = prover_message_transport.clone();
-                // Master clock store — worker-finalized app-shard frames are mirrored
-                // here so `AppShardService` (and any master-side reader) can serve
-                // them. Workers commit into their OWN per-worker store, which the
-                // master-store-backed service otherwise can't see.
-                let drain_clock_store = clock_store.clone();
+                let drain_app_shard_router = app_shard_frame_router.clone();
                 sup.run_until_cancelled("worker-master-drain", move |_token| async move {
                     loop {
                         let Some(event) = master_rx.recv().await else { break };
@@ -580,40 +576,6 @@ pub(crate) fn init(
                                         if drain_halt.any_halted() {
                                             continue;
                                         }
-                                        // Mirror the finalized frame into the MASTER clock store
-                                        // so `AppShardService::get_app_shard_frame` (which reads
-                                        // the master store) serves real frames — the worker
-                                        // commits it only into its OWN per-worker store. Mirrors
-                                        // the engine's own commit (stage by selector =
-                                        // poseidon(header.output), so `get_latest_shard_clock_frame`
-                                        // resolves). Best-effort; failure never blocks the publish.
-                                        if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(&frame_data[..]) {
-                                            if let Some(header) = frame.header.as_ref() {
-                                                let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
-                                                    .map(|h| h.to_vec())
-                                                    .unwrap_or_default();
-                                                let frame_number = header.frame_number;
-                                                if let Ok(txn) = drain_clock_store.new_transaction(false) {
-                                                    match drain_clock_store.stage_shard_clock_frame(&selector, &frame, txn.as_ref()) {
-                                                        Ok(()) => { let _ = txn.commit(); }
-                                                        Err(e) => warn!(core_id, filter = %hex::encode(&filter), error = %e, "mirror app-shard frame to master store failed"),
-                                                    }
-                                                }
-                                                // Commit the latest-index pointer too: staging alone
-                                                // writes the staged key only, so `get_latest_shard_clock_frame`
-                                                // (which reads the canonical key via the latest index) would
-                                                // NOT resolve to this frame — the master's serving head +
-                                                // co-located proposer would stay stuck on the prior frame and
-                                                // re-propose it. Monotonic (clock.rs:1152), so safe to re-run.
-                                                if let Ok(txn) = drain_clock_store.new_transaction(false) {
-                                                    if let Err(e) = drain_clock_store.commit_shard_clock_frame(&filter, frame_number, &selector, txn.as_ref(), false) {
-                                                        warn!(core_id, filter = %hex::encode(&filter), error = %e, "commit mirrored app-shard frame head failed");
-                                                    } else {
-                                                        let _ = txn.commit();
-                                                    }
-                                                }
-                                            }
-                                        }
                                         let p2p = drain_p2p.clone();
                                         drain_spawner.detach("shard-full-frame-publish", async move {
                                             if let Err(e) = p2p
@@ -693,7 +655,13 @@ pub(crate) fn init(
                                             Ok(())
                                         });
                                     }
-                                    WorkerToMaster::ShardActivated { core_id, filter, handle } => {
+                                    WorkerToMaster::ShardActivated {
+                                        core_id,
+                                        generation,
+                                        filter,
+                                        handle,
+                                        clock_store,
+                                    } => {
                                         // Push the current halt state to the
                                         // freshly-activated engine before
                                         // registering it. Without this the
@@ -709,44 +677,61 @@ pub(crate) fn init(
                                             let mut map = drain_shard_engines.write();
                                             map.insert(filter.clone(), handle);
                                         }
+                                        drain_app_shard_router.register_local(
+                                            core_id,
+                                            generation,
+                                            filter.clone(),
+                                            clock_store,
+                                        );
                                         // Subscribe BlossomSub to the four
                                         // per-shard bitmasks. Without these
                                         // subscriptions our mesh peers won't
                                         // forward shard traffic to us, so
                                         // peer votes / proposals / frames /
                                         // dispatches never reach the engine.
-                                        let p2p = drain_p2p.clone();
-                                        let filter_for_sub = filter.clone();
-                                        drain_spawner.detach("shard-subscribe", async move {
-                                            p2p.subscribe(quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub)).await;
-                                            p2p.subscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub)).await;
-                                            p2p.subscribe(quil_engine::bitmasks::shard_prover_bitmask(&filter_for_sub)).await;
-                                            p2p.subscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&filter_for_sub)).await;
-                                            // (P3) Subscribe the shard's commonware-simplex topic so
-                                            // committee peers' votes/certs/blocks reach this engine.
-                                            p2p.subscribe(quil_engine::bitmasks::shard_cw_bitmask(&filter_for_sub)).await;
-                                            Ok(())
-                                        });
+                                        // Keep subscription transitions ordered with activation
+                                        // events. Detached subscribe/unsubscribe tasks can land in
+                                        // reverse order during a fast respawn.
+                                        drain_p2p.subscribe(quil_engine::bitmasks::shard_frame_bitmask(&filter)).await;
+                                        drain_p2p.subscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter)).await;
+                                        drain_p2p.subscribe(quil_engine::bitmasks::shard_prover_bitmask(&filter)).await;
+                                        drain_p2p.subscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&filter)).await;
+                                        // (P3) Subscribe the shard's commonware-simplex topic so
+                                        // committee peers' votes/certs/blocks reach this engine.
+                                        drain_p2p.subscribe(quil_engine::bitmasks::shard_cw_bitmask(&filter)).await;
                                         info!(
                                             core_id,
                                             filter = %hex::encode(&filter),
                                             "registered shard engine + subscribed per-shard bitmasks"
                                         );
                                     }
-                                    WorkerToMaster::ShardDeactivated { core_id, filter } => {
+                                    WorkerToMaster::ShardDeactivated {
+                                        core_id,
+                                        generation,
+                                        filter,
+                                    } => {
+                                        if !drain_app_shard_router.unregister_local(
+                                            core_id,
+                                            generation,
+                                            &filter,
+                                        ) {
+                                            debug!(
+                                                core_id,
+                                                generation,
+                                                filter = %hex::encode(&filter),
+                                                "ignored stale shard deactivation"
+                                            );
+                                            continue;
+                                        }
                                         {
                                             let mut map = drain_shard_engines.write();
                                             map.remove(&filter);
                                         }
-                                        let p2p = drain_p2p.clone();
-                                        let filter_for_sub = filter.clone();
-                                        drain_spawner.detach("shard-unsubscribe", async move {
-                                            p2p.unsubscribe(quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub)).await;
-                                            p2p.unsubscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub)).await;
-                                            p2p.unsubscribe(quil_engine::bitmasks::shard_prover_bitmask(&filter_for_sub)).await;
-                                            p2p.unsubscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&filter_for_sub)).await;
-                                            Ok(())
-                                        });
+                                        drain_p2p.unsubscribe(quil_engine::bitmasks::shard_frame_bitmask(&filter)).await;
+                                        drain_p2p.unsubscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter)).await;
+                                        drain_p2p.unsubscribe(quil_engine::bitmasks::shard_prover_bitmask(&filter)).await;
+                                        drain_p2p.unsubscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&filter)).await;
+                                        drain_p2p.unsubscribe(quil_engine::bitmasks::shard_cw_bitmask(&filter)).await;
                                         info!(
                                             core_id,
                                             filter = %hex::encode(&filter),

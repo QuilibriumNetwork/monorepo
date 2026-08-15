@@ -106,7 +106,6 @@ pub fn app_frame_from_state(
         storage_attestation,
     }
 }
-
 /// Frame identity (`Poseidon(output)[..32]`) as the consensus digest — identical
 /// scheme to global (`AppShardState`/`GlobalFrame` share `compute_output_identity`).
 fn app_frame_digest(frame: &AppShardFrame) -> Option<Digest> {
@@ -477,6 +476,16 @@ pub struct AppConsensusCwHandle {
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
+impl Drop for AppConsensusCwHandle {
+    fn drop(&mut self) {
+        // The commonware host runs independently of the app engine's tokio
+        // task. Ensure aborting/dropping that engine cannot leave an old-shard
+        // consensus host alive after reassignment or deallocation.
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Assemble + start the simplex-backed app-shard consensus for one shard.
 /// Must be called from within the node's tokio runtime (spawns the outbound
 /// drain there); the engine runs on its own runtime thread.
@@ -570,6 +579,22 @@ pub fn activate_app_consensus_cw(
 mod tests {
     use super::*;
     use quil_types::crypto::Signer as _;
+
+    #[test]
+    fn dropping_consensus_handle_requests_host_shutdown() {
+        let (a, _arx) = tokio::sync::mpsc::unbounded_channel();
+        let (b, _brx) = tokio::sync::mpsc::unbounded_channel();
+        let (c, _crx) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let _handle = AppConsensusCwHandle {
+                inbound: [a, b, c],
+                ingest_block: Arc::new(|_| {}),
+                shutdown: shutdown.clone(),
+            };
+        }
+        assert!(shutdown.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[test]
     fn app_committee_builds_and_scopes_by_shard() {

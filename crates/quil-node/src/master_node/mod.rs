@@ -5,6 +5,7 @@ use tracing::{debug, info, warn};
 use quil_lifecycle::{ShutdownReason, Supervisor};
 
 pub(crate) mod allocator_and_lifecycle;
+pub(crate) mod app_shard_router;
 pub(crate) mod archive_sync;
 pub(crate) mod engines;
 pub(crate) mod frame_pipeline;
@@ -251,6 +252,11 @@ pub(crate) async fn start(
     let shard_engines: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
     >> = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    let app_shard_frame_router = Arc::new(app_shard_router::AppShardFrameRouter::new(
+        archive_mode.then(|| {
+            clock_store.clone() as Arc<dyn quil_types::store::ClockStore>
+        }),
+    ));
     // SignerRegistry — populated from inbound KeyRegistry broadcasts
     // on GLOBAL_PEER_INFO. Consumed by consensus message verification
     // (BLS signatures from peers whose identity↔prover binding we've
@@ -357,6 +363,7 @@ pub(crate) async fn start(
             prover_address,
             bls_pubkey: bls_pubkey.clone(),
             shard_engines: shard_engines.clone(),
+            app_shard_frame_router: app_shard_frame_router.clone(),
             remote_worker_manager_for_halt: remote_worker_manager_for_halt.clone(),
             pi_worker_manager: pi_worker_manager.clone(),
             prover_message_transport: prover_message_transport_cell.clone(),
@@ -1033,6 +1040,7 @@ pub(crate) async fn start(
         signer_registry: signer_registry.clone(),
         prover_pipeline: prover_pipeline.clone(),
         worker_manager: worker_manager.clone(),
+        app_shard_frame_provider: app_shard_frame_router.clone(),
         inclusion_prover: inclusion_prover.clone(),
         peer_id,
         p2p_handle: p2p_handle.clone(),

@@ -88,7 +88,6 @@ pub struct WorkerNodeConfig {
     /// DataIPC; used in tests and during master-less bring-up).
     pub channel_factory: Option<MasterChannelFactory>,
 }
-
 /// Publish-side hook for the standalone worker's outbound traffic.
 /// Today this is wired to the master's PubSubProxy; once each worker
 /// runs its own libp2p instance with a synthetic peer key (per
@@ -127,6 +126,12 @@ pub struct WorkerOnlyNode {
     inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
     /// Current engine handle (set after Respawn).
     engine_handle: std::sync::Mutex<Option<AppEngineHandle>>,
+    /// Top-level engine task. Aborting it is the standalone-worker equivalent
+    /// of cancelling a thread worker's per-engine cancellation token.
+    engine_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Filter served by this worker's AppShardService. Cleared before an
+    /// engine swap and set only after the replacement engine is installed.
+    active_filter: Arc<std::sync::Mutex<Vec<u8>>>,
     /// Channel for engine events back to the master stream.
     engine_event_tx: mpsc::UnboundedSender<crate::app_engine::AppEngineEvent>,
     /// Optional receiver for engine events — consumed by the
@@ -220,6 +225,8 @@ impl WorkerOnlyNode {
             execution_engine: None,
             inclusion_prover: None,
             engine_handle: std::sync::Mutex::new(None),
+            engine_task: std::sync::Mutex::new(None),
+            active_filter: Arc::new(std::sync::Mutex::new(Vec::new())),
             engine_event_tx,
             engine_event_rx: std::sync::Mutex::new(Some(engine_event_rx)),
             publish_fn: None,
@@ -375,6 +382,10 @@ impl WorkerOnlyNode {
         let ipc_service = DataIpcServiceImpl {
             worker: self.clone(),
         };
+        let app_shard_service = WorkerAppShardServiceImpl {
+            clock_store: self.clock_store.clone(),
+            active_filter: self.active_filter.clone(),
+        };
         let listen_addr = self.config.listen_addr.parse()
             .map_err(|e| QuilError::Internal(format!("bad listen addr: {}", e)))?;
 
@@ -417,6 +428,13 @@ impl WorkerOnlyNode {
                     quil_types::proto::node::data_ipc_service_server::DataIpcServiceServer::new(
                         ipc_service,
                     ),
+                )
+                .add_service(
+                    quil_types::proto::global::app_shard_service_server::AppShardServiceServer::new(
+                        app_shard_service,
+                    )
+                    .max_decoding_message_size(64 * 1024 * 1024)
+                    .max_encoding_message_size(64 * 1024 * 1024),
                 )
                 .serve_with_shutdown(listen_addr, server_cancel.cancelled())
                 .await
@@ -628,9 +646,16 @@ impl WorkerOnlyNode {
 
         // Stop existing engine and drop subscriptions for the
         // outgoing filter.
+        let old_task = self.engine_task.lock().unwrap().take();
         {
             let mut handle = self.engine_handle.lock().unwrap();
             *handle = None;
+        }
+        self.active_filter.lock().unwrap().clear();
+        if let Some(task) = old_task {
+            task.abort();
+            let _ = task.await;
+            info!(core_id, "outgoing app engine stopped");
         }
         self.unsubscribe_active_shards().await;
 
@@ -713,26 +738,24 @@ impl WorkerOnlyNode {
             },
         };
 
-        let (engine, handle) = AppConsensusEngine::new(
-            core_id,
-            filter.clone(),
-            deps,
-            self.engine_event_tx.clone(),
-        );
+        let (engine, handle) =
+            AppConsensusEngine::new(core_id, filter.clone(), deps, self.engine_event_tx.clone());
 
         // Store handle for message routing
         {
             let mut h = self.engine_handle.lock().unwrap();
             *h = Some(handle);
         }
+        *self.active_filter.lock().unwrap() = filter.clone();
 
         // Run engine in background. Pass the signer FACTORY so the engine can
         // retry starting CW (obtaining a fresh signer each attempt) until its
         // committee is buildable.
         let signer_factory = self.bls_signer_factory.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             engine.run(signer_factory).await;
         });
+        *self.engine_task.lock().unwrap() = Some(task);
 
         // Subscribe to per-shard bitmasks on the worker's own p2p so
         // peer-published shard traffic flows in. No-op when running in
@@ -1095,6 +1118,82 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
             .store(halted, std::sync::atomic::Ordering::Relaxed);
         Ok(tonic::Response::new(
             quil_types::proto::node::SetHaltedResponse {},
+        ))
+    }
+}
+
+// =====================================================================
+// AppShardService — direct reads from this standalone worker's store
+// =====================================================================
+
+struct WorkerAppShardServiceImpl {
+    clock_store: Arc<dyn ClockStore>,
+    active_filter: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+#[tonic::async_trait]
+impl quil_types::proto::global::app_shard_service_server::AppShardService
+    for WorkerAppShardServiceImpl
+{
+    async fn get_app_shard_frame(
+        &self,
+        request: tonic::Request<quil_types::proto::global::GetAppShardFrameRequest>,
+    ) -> std::result::Result<
+        tonic::Response<quil_types::proto::global::AppShardFrameResponse>,
+        tonic::Status,
+    > {
+        let req = request.into_inner();
+        if req.filter.is_empty() {
+            return Err(tonic::Status::invalid_argument("filter required"));
+        }
+        if *self.active_filter.lock().unwrap() != req.filter {
+            return Ok(tonic::Response::new(
+                quil_types::proto::global::AppShardFrameResponse {
+                    frame: None,
+                    proof: Vec::new(),
+                },
+            ));
+        }
+
+        let clock_store = self.clock_store.clone();
+        let filter = req.filter;
+        let frame_number = req.frame_number;
+        let result = tokio::task::spawn_blocking(move || {
+            if frame_number == 0 {
+                clock_store.get_latest_shard_clock_frame(&filter)
+            } else {
+                clock_store.get_shard_clock_frame(&filter, frame_number, false)
+            }
+        })
+        .await
+        .map_err(|e| tonic::Status::internal(format!("worker frame read task failed: {e}")))?;
+
+        let frame = match result {
+            Ok(frame) => Some(frame),
+            Err(QuilError::NotFound(_)) => None,
+            Err(e) => {
+                return Err(tonic::Status::internal(format!(
+                    "worker app-shard frame read failed: {e}"
+                )))
+            }
+        };
+        Ok(tonic::Response::new(
+            quil_types::proto::global::AppShardFrameResponse {
+                frame,
+                proof: Vec::new(),
+            },
+        ))
+    }
+
+    async fn get_app_shard_proposal(
+        &self,
+        _request: tonic::Request<quil_types::proto::global::GetAppShardProposalRequest>,
+    ) -> std::result::Result<
+        tonic::Response<quil_types::proto::global::AppShardProposalResponse>,
+        tonic::Status,
+    > {
+        Ok(tonic::Response::new(
+            quil_types::proto::global::AppShardProposalResponse { proposal: None },
         ))
     }
 }
@@ -1476,5 +1575,67 @@ mod tests {
         // the misconfig in logs.
         let c = config_with_stream("not-a-multiaddr");
         assert_eq!(master_grpc_endpoint(&c), "http://127.0.0.1:8340");
+    }
+
+    fn app_shard_store(
+        filter: &[u8],
+        frame_number: u64,
+    ) -> Arc<quil_store::testing::InMemoryClockStore> {
+        let store = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let mut header = quil_types::proto::global::FrameHeader::default();
+        header.address = filter.to_vec();
+        header.frame_number = frame_number;
+        let frame = quil_types::proto::global::AppShardFrame {
+            header: Some(header),
+            requests: Vec::new(),
+            ..Default::default()
+        };
+        let selector = vec![7; 32];
+        let txn = store.new_transaction(false).unwrap();
+        store
+            .stage_shard_clock_frame(&selector, &frame, txn.as_ref())
+            .unwrap();
+        store
+            .commit_shard_clock_frame(filter, frame_number, &selector, txn.as_ref(), false)
+            .unwrap();
+        txn.commit().unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn app_shard_service_reads_only_the_active_filter() {
+        use quil_types::proto::global::app_shard_service_server::AppShardService;
+
+        let filter = b"active-shard".to_vec();
+        let service = WorkerAppShardServiceImpl {
+            clock_store: app_shard_store(&filter, 31),
+            active_filter: Arc::new(std::sync::Mutex::new(filter.clone())),
+        };
+
+        let latest = service
+            .get_app_shard_frame(tonic::Request::new(
+                quil_types::proto::global::GetAppShardFrameRequest {
+                    filter: filter.clone(),
+                    frame_number: 0,
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .frame
+            .unwrap();
+        assert_eq!(latest.header.unwrap().frame_number, 31);
+
+        let inactive = service
+            .get_app_shard_frame(tonic::Request::new(
+                quil_types::proto::global::GetAppShardFrameRequest {
+                    filter: b"old-shard".to_vec(),
+                    frame_number: 31,
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(inactive.frame.is_none());
     }
 }

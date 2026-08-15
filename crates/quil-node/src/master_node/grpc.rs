@@ -22,6 +22,8 @@ pub(crate) struct GrpcArgs {
     pub signer_registry: Arc<quil_p2p::SignerRegistry>,
     pub prover_pipeline: Arc<quil_engine::prover_pipeline::ProverPipeline>,
     pub worker_manager: Arc<dyn quil_engine::worker::WorkerManager>,
+    pub app_shard_frame_provider:
+        Arc<dyn quil_rpc::stub_services::AppShardFrameProvider>,
     pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
     pub peer_id: quil_p2p::PeerId,
     pub p2p_handle: quil_p2p::node::P2PHandle,
@@ -258,6 +260,7 @@ pub(crate) fn spawn_all(
         signer_registry,
         prover_pipeline,
         worker_manager,
+        app_shard_frame_provider,
         inclusion_prover,
         peer_id,
         p2p_handle,
@@ -1162,8 +1165,12 @@ pub(crate) fn spawn_all(
         );
         let app_shard_service = tonic::service::interceptor::InterceptedService::new(
             quil_types::proto::global::app_shard_service_server::AppShardServiceServer::new(
-                quil_rpc::stub_services::AppShardRpcServer::new(clock_store.clone() as Arc<dyn quil_types::store::ClockStore>),
-            ),
+                quil_rpc::stub_services::AppShardRpcServer::with_provider(
+                    app_shard_frame_provider.clone(),
+                ),
+            )
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024),
             quil_rpc::peer_auth_middleware::peer_auth_interceptor,
         );
         let key_registry_service = tonic::service::interceptor::InterceptedService::new(

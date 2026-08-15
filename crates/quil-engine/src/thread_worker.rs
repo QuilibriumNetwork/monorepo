@@ -45,7 +45,6 @@ pub enum MasterToWorker {
 }
 
 /// Message from worker to master.
-#[derive(Debug)]
 pub enum WorkerToMaster {
     /// Worker has completed a respawn and is ready.
     Ready { core_id: u32 },
@@ -108,8 +107,10 @@ pub enum WorkerToMaster {
     /// per-shard frame/consensus/prover/dispatch bitmasks.
     ShardActivated {
         core_id: u32,
+        generation: u64,
         filter: Vec<u8>,
         handle: crate::app_engine::AppEngineHandle,
+        clock_store: Arc<dyn quil_types::store::ClockStore>,
     },
     /// A shard worker has torn down its `AppConsensusEngine` for
     /// `filter`. Master removes the registry entry and unsubscribes
@@ -117,8 +118,15 @@ pub enum WorkerToMaster {
     /// shard messages once we leave it).
     ShardDeactivated {
         core_id: u32,
+        generation: u64,
         filter: Vec<u8>,
     },
+}
+
+impl std::fmt::Debug for WorkerToMaster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerToMaster").finish_non_exhaustive()
+    }
 }
 
 /// State of a single worker thread.
@@ -404,6 +412,7 @@ impl ThreadWorkerManager {
                 rt.block_on(async move {
                     let mut current_filter: Vec<u8> = Vec::new();
                     let mut engine_cancel: Option<tokio_util::sync::CancellationToken> = None;
+                    let mut engine_generation = 0u64;
 
                     // Per-worker memory tick. Each worker owns its own RocksDB
                     // (block cache + memtables + table readers) in this thread,
@@ -469,6 +478,8 @@ impl ThreadWorkerManager {
                                                 "worker assigned to shard"
                                             );
                                             current_filter = filter.clone();
+                                            engine_generation = engine_generation.wrapping_add(1);
+                                            let generation = engine_generation;
 
                                             // Compute app address from filter
                                             let _app_address = quil_crypto::poseidon::hash_bytes_to_32(&filter)
@@ -493,6 +504,7 @@ impl ThreadWorkerManager {
                                                         .as_ref()
                                                         .map(|o| o.clock_store.clone())
                                                         .unwrap_or_else(|| deps.clock_store.clone());
+                                                    let route_clock_store = clock_store.clone();
                                                     let hypergraph = owned
                                                         .as_ref()
                                                         .map(|o| Some(o.hypergraph.clone()))
@@ -562,8 +574,10 @@ impl ThreadWorkerManager {
                                                     let _ = master_tx_clone.send(
                                                         WorkerToMaster::ShardActivated {
                                                             core_id,
+                                                            generation,
                                                             filter: filter_clone.clone(),
                                                             handle: app_handle.clone(),
+                                                            clock_store: route_clock_store,
                                                         }
                                                     ).await;
 
@@ -698,6 +712,7 @@ impl ThreadWorkerManager {
                                                     let _ = master_tx_clone.send(
                                                         WorkerToMaster::ShardDeactivated {
                                                             core_id,
+                                                            generation,
                                                             filter: filter_clone.clone(),
                                                         }
                                                     ).await;
