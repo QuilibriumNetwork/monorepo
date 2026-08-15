@@ -1571,6 +1571,9 @@ impl FrameMaterializer {
     }
 
     /// Check if there's an active coverage halt on any shard.
+    // Callers inspect `coverage_halt_durations` per shard instead of asking
+    // the any-shard question.
+    #[allow(dead_code)]
     fn has_active_coverage_halt(&self) -> bool {
         let durations = self.coverage_halt_durations.lock().unwrap();
         durations.values().any(|&d| d == u64::MAX)

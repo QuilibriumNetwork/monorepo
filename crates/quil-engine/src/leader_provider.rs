@@ -35,6 +35,9 @@ pub struct GlobalLeaderProvider {
     /// This node's prover address (32-byte Poseidon hash of BLS pubkey).
     local_prover_address: Vec<u8>,
     /// This node's BLS48-581 public key (585 bytes).
+    /// Held for parity with Go's provider struct; signing goes through
+    /// `signer` and identity comparisons use `local_prover_address`.
+    #[allow(dead_code)]
     local_public_key: Vec<u8>,
     /// BLS48-581 signer used by `ProveGlobalFrameHeader` to sign the
     /// (challenge || output) payload under the "global" domain. Mirrors
@@ -273,6 +276,9 @@ impl GlobalLeaderProvider {
     /// which returns `models.Identity(g.Selector)` — i.e. the Selector
     /// bytes interpreted as the identity directly (Go strings are byte
     /// sequences).
+    // Mirror kept alongside `frame_identity`; call sites use the selector
+    // bytes directly.
+    #[allow(dead_code)]
     fn qc_identity(
         qc: &quil_types::proto::global::QuorumCertificate,
     ) -> Identity {

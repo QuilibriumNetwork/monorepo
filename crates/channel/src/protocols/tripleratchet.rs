@@ -21,6 +21,9 @@ use super::x3dh::{receiver_x3dh, sender_x3dh};
 const TRIPLE_RATCHET_PROTOCOL_VERSION: u16 = 1;
 const TRIPLE_RATCHET_PROTOCOL: u16 = 2 << 8 + TRIPLE_RATCHET_PROTOCOL_VERSION;
 
+// Round tracking is carried by the embedded Feldman state machine
+// (`FeldmanRound`); this mirror of it is not consulted.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq)]
 enum TripleRatchetRound {
     Uninitialized,
@@ -427,6 +430,8 @@ impl TripleRatchetParticipant {
         })
     }
 
+    // Accessor for embedders that need the peer ordering used by the DKG.
+    #[allow(dead_code)]
     pub fn get_peer_id_map(&self) -> HashMap<Vec<u8>, usize> {
         return self.peer_id_map.clone();
     }

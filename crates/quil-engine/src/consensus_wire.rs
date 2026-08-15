@@ -1176,7 +1176,10 @@ fn proto_message_request_to_canonical(
             .to_canonical_bytes()
             .ok()?,
         // Any genuinely unported variant is dropped (symmetric with the
-        // `_ => None` in `canonical_request_to_proto`).
+        // `_ => None` in `canonical_request_to_proto`). Every variant is
+        // ported right now, so this arm is unreachable — it is kept so that
+        // regenerating the protos adds a variant without breaking the build.
+        #[allow(unreachable_patterns)]
         _ => return None,
     };
 

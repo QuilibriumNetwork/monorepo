@@ -466,13 +466,6 @@ pub fn prover_update_to_proto(u: &ProverUpdate) -> pb::ProverUpdate {
 mod tests {
     use super::*;
 
-    fn sample_addr_sig() -> AddressedSignature {
-        AddressedSignature {
-            signature: vec![0xAAu8; 666],
-            address: vec![0xBBu8; 32],
-        }
-    }
-
     fn sample_pb_addr_sig() -> keys_pb::Bls48581AddressedSignature {
         keys_pb::Bls48581AddressedSignature {
             signature: vec![0xAAu8; 666],
