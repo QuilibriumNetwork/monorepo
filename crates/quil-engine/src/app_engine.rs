@@ -72,9 +72,13 @@ pub enum AppEngineMessage {
     /// could be re-applied on top of the already-synced tree.
     ShardSyncCompleted { synced_to_frame: u64 },
     /// (P3 / commonware-simplex) A frame this shard's simplex engine FINALIZED
-    /// (prost-encoded `AppShardFrame`). Routed from `AppSeamFinalizer::on_finalized`
-    /// (which runs on the simplex engine thread) into the engine run loop so it
-    /// materializes on the worker's `&mut self`. Trusted — simplex already
+    /// (prost-encoded `AppShardFrame`), injected into the engine run loop so it
+    /// materializes on the worker's `&mut self`. The simplex thread's own
+    /// `AppSeamFinalizer::on_finalized` does NOT travel this bounded queue — it
+    /// uses the dedicated unbounded `cw_finalized_tx`, so a full inbound queue
+    /// can never drop a certified frame; this variant is the out-of-band
+    /// injection path for callers holding an `AppEngineHandle`. Trusted — simplex
+    /// already
     /// certified it via quorum — so it SKIPS the BLS-quorum-signature check that
     /// `Frame` requires (a CW frame carries a Falcon certificate, not a BLS
     /// aggregate in the header). `cert` is the serialized simplex finalization
@@ -1353,8 +1357,12 @@ pub struct AppConsensusEngine {
     /// Lossless, ordered handoff from the dedicated Simplex runtime thread to
     /// this engine's finalization handler. Finalizations are safety-critical and
     /// must not compete for capacity with the best-effort inbound message queue.
-    cw_finalized_tx: mpsc::UnboundedSender<(Vec<u8>, Vec<u8>)>,
-    cw_finalized_rx: Option<mpsc::UnboundedReceiver<(Vec<u8>, Vec<u8>)>>,
+    /// Payload: `(encoded AppShardFrame, finalization cert, locally_verified)`.
+    /// `locally_verified` marks the bytes this replica's own application
+    /// validator sealed at proposal time, so the finalize handler can skip
+    /// re-validating them against since-drifted local state.
+    cw_finalized_tx: mpsc::UnboundedSender<(Vec<u8>, Vec<u8>, bool)>,
+    cw_finalized_rx: Option<mpsc::UnboundedReceiver<(Vec<u8>, Vec<u8>, bool)>>,
 
     /// Atomic publish slot for engine sizes. Updated each event-loop
     /// iteration so external memory snapshots can read internal
@@ -1813,8 +1821,8 @@ impl AppConsensusEngine {
                 biased;
 
                 finalized = cw_finalized_rx.recv() => {
-                    if let Some((frame, cert)) = finalized {
-                        self.handle_cw_finalized_frame(&frame, &cert).await;
+                    if let Some((frame, cert, locally_verified)) = finalized {
+                        self.handle_cw_finalized_frame(&frame, &cert, locally_verified).await;
                     }
                 }
 
@@ -2167,14 +2175,11 @@ impl AppConsensusEngine {
         // drop the certified parent while Simplex advances to its child, leaving
         // the worker permanently unable to materialize the selected parent.
         let on_finalized: crate::cw_app_seams::AppFinalizedSink = {
+            let finalized_tx = self.cw_finalized_tx.clone();
             Arc::new(move |frame, cert, locally_verified| {
                 let mut buf = Vec::new();
                 if prost::Message::encode(&frame, &mut buf).is_ok() {
-                    let _ = msg_tx.try_send(AppEngineMessage::CwFinalizedFrame {
-                        frame: buf,
-                        cert,
-                        locally_verified,
-                    });
+                    let _ = finalized_tx.send((buf, cert, locally_verified));
                 }
             })
         };
@@ -4386,7 +4391,7 @@ mod tests {
         let mut gap = test_shard_frame(&filter, 9, 0x09);
         gap.header.as_mut().expect("gap frame header").parent_selector = parent_identity.clone();
         engine
-            .handle_cw_finalized_frame(&prost::Message::encode_to_vec(&gap), &[])
+            .handle_cw_finalized_frame(&prost::Message::encode_to_vec(&gap), &[], true)
             .await;
         assert!(event_rx.try_recv().is_err(), "gap finalization must not publish");
         assert_eq!(coverage_count.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -4405,7 +4410,7 @@ mod tests {
         wrong_parent.header.as_mut().expect("wrong-parent frame header").parent_selector =
             vec![0xFF; 32];
         engine
-            .handle_cw_finalized_frame(&prost::Message::encode_to_vec(&wrong_parent), &[])
+            .handle_cw_finalized_frame(&prost::Message::encode_to_vec(&wrong_parent), &[], true)
             .await;
         assert!(
             event_rx.try_recv().is_err(),
@@ -4425,7 +4430,7 @@ mod tests {
         let mut frame = test_shard_frame(&filter, 8, 0x08);
         frame.header.as_mut().expect("frame header").parent_selector = parent_identity;
         let encoded = prost::Message::encode_to_vec(&frame);
-        engine.handle_cw_finalized_frame(&encoded, &[]).await;
+        engine.handle_cw_finalized_frame(&encoded, &[], true).await;
 
         let first_events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
         assert_eq!(
@@ -4455,7 +4460,7 @@ mod tests {
             vec![0x08; 516]
         );
 
-        engine.handle_cw_finalized_frame(&encoded, &[]).await;
+        engine.handle_cw_finalized_frame(&encoded, &[], true).await;
         assert!(
             event_rx.try_recv().is_err(),
             "identical finalization replay must not republish"
@@ -4469,7 +4474,7 @@ mod tests {
         let mut conflicting = frame;
         conflicting.header.as_mut().expect("conflicting frame header").output = vec![0xF8; 516];
         engine
-            .handle_cw_finalized_frame(&prost::Message::encode_to_vec(&conflicting), &[])
+            .handle_cw_finalized_frame(&prost::Message::encode_to_vec(&conflicting), &[], true)
             .await;
         assert!(
             event_rx.try_recv().is_err(),
