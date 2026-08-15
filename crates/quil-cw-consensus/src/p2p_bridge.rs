@@ -20,7 +20,7 @@ use std::time::SystemTime;
 use bytes::Buf as _;
 use commonware_actor::{Feedback, Unreliable};
 use commonware_cryptography::PublicKey;
-use commonware_p2p::{CheckedSender, LimitedSender, Receiver, Recipients, Sender};
+use commonware_p2p::{CheckedSender, LimitedSender, Receiver, Recipients};
 pub use commonware_p2p::Message;
 use commonware_runtime::{IoBuf, IoBufs};
 use tokio::sync::mpsc;
@@ -184,6 +184,9 @@ impl<P: PublicKey> commonware_p2p::Blocker for NoopBlocker<P> {
 mod tests {
     use super::*;
     use crate::falcon_base::{FalconPrivateKey, FalconPublicKey};
+    // Only the tests call `ChannelSender::send` through the trait; the module
+    // itself implements it, so the import belongs here rather than at the top.
+    use commonware_p2p::Sender as _;
     use commonware_cryptography::Signer as _;
     use commonware_math::algebra::Random;
 

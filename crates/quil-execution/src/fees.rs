@@ -500,7 +500,7 @@ mod tests {
             vertex_add_request(),
             vertex_add_request(),
         ]);
-        let mut queue = collect_bundle_fees(&b, &p);
+        let queue = collect_bundle_fees(&b, &p);
         assert_eq!(queue.len(), 3);
         let n = count_fee_consumers(&b, &p);
         // 2 transactions (producers that also consume) + 3 vertex-adds = 5

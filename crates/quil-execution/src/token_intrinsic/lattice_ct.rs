@@ -39,14 +39,13 @@
 use quil_lattice_ct::limb_balance::{
     limbs_of, prove_limb_balance_bound, verify_limb_balance, LimbBalanceProof,
 };
-use quil_lattice_ct::linear_rq::verify_linear_rq;
 use quil_lattice_ct::membership::{verify_membership, verify_spend, MembershipParams};
 use quil_lattice_ct::value_link::{ValueLinkParams, VALUE_LIMBS};
 use quil_lattice_ct::module::{PolyMatrix, PolyVec, RingCommitKey, RingCommitment, ETA};
-use quil_lattice_ct::range_rq::{verify_range_rq, RingRangeKey};
+use quil_lattice_ct::range_rq::RingRangeKey;
 use quil_lattice_ct::ring_rq::{verify as ring_verify, RingSigKeyRq};
 use quil_lattice_ct::rq::Poly;
-use quil_lattice_ct::sigma_rq::{verify_ring_opening, RingOpeningProof, RingSigmaParams};
+use quil_lattice_ct::sigma_rq::{verify_ring_opening, RingSigmaParams};
 use quil_lattice_ct::wire;
 use quil_types::error::{QuilError, Result};
 
@@ -2315,8 +2314,6 @@ mod tests {
     use super::*;
     use quil_lattice_ct::sigma_rq::prove_ring_opening;
     use quil_lattice_ct::arith::SplitMix64;
-    use quil_lattice_ct::linear_rq::prove_linear_rq;
-    use quil_lattice_ct::range_rq::prove_range_rq;
     use quil_lattice_ct::ring_rq::sign as ring_sign;
 
     #[test]
@@ -2403,7 +2400,7 @@ mod tests {
             app.copy_from_slice(domain);
             shard_key_for_location(&Location { app_address: app, data_address: [0u8; 32] })
         };
-        let mut insert = |p_b: &[u8], cv_b: &[u8], memo: &[u8], tag: u8| {
+        let insert = |p_b: &[u8], cv_b: &[u8], memo: &[u8], tag: u8| {
             let tree = create_lattice_coin_vertex_tree(&[0, 0, 0, 1], p_b, cv_b, memo, &th).unwrap();
             let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
             let mut addr = quil_crypto::poseidon::hash_bytes_to_32(&blob).unwrap();
@@ -3280,8 +3277,6 @@ mod tests {
     #[test]
     fn legacy_shield_verifies_and_rejects_wrong_owner() {
         use ed448_rust::{PrivateKey, PublicKey};
-        use quil_lattice_ct::linear_rq::prove_linear_rq;
-        use quil_lattice_ct::range_rq::prove_range_rq;
 
         let np = NetworkParams::with_bits(16);
         let vkey = np.value_key();
@@ -3641,9 +3636,7 @@ mod tests {
         use super::super::shadow_accumulator;
         use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
         use quil_lattice_ct::accumulator::ACC_NODE_RANK;
-        use quil_lattice_ct::linear_rq::prove_linear_rq;
         use quil_lattice_ct::membership::{prove_spend, MembershipParams};
-        use quil_lattice_ct::range_rq::prove_range_rq;
         use quil_lattice_ct::wire;
         use std::sync::Arc;
 

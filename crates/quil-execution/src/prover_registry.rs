@@ -1997,7 +1997,7 @@ mod tests {
     use super::*;
     use crate::global_schema::{TYPE_HASH_PROVER, TYPE_HASH_REWARD};
     use num_bigint::BigInt;
-    use quil_tries::{serialize_go_tree, LeafNode, VectorCommitmentNode, VectorCommitmentTree};
+    use quil_tries::{serialize_go_tree, LeafNode, VectorCommitmentTree};
 
     fn make_vertex_key(address_byte: u8) -> Vec<u8> {
         // 32-byte domain (global intrinsic) + 32-byte address.
@@ -2612,7 +2612,7 @@ mod tests {
         let filter_normal = vec![0x11u8; 64];
         let filter_halted = vec![0x22u8; 64];
 
-        let mk_prover = |addr: [u8; 32]| {
+        let mk_prover = |_addr: [u8; 32]| {
             build_sub_tree(vec![
                 type_hash_leaf("prover:Prover"),
                 field_leaf("prover:Prover", "PublicKey", vec![0xCD; 57]),
@@ -2898,7 +2898,7 @@ mod tests {
         let prover_a = [0xA1u8; 32];
         let prover_b = [0xA2u8; 32];
 
-        let mk_prover = |addr: [u8; 32]| {
+        let mk_prover = |_addr: [u8; 32]| {
             build_sub_tree(vec![
                 type_hash_leaf("prover:Prover"),
                 field_leaf("prover:Prover", "PublicKey", vec![0xAA; 57]),

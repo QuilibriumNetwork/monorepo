@@ -87,7 +87,6 @@ pub(crate) fn load_committed_or_tip_candidate(
     clock_store: &dyn quil_types::store::ClockStore,
     n: u64,
 ) -> Result<quil_types::proto::global::GlobalFrame, String> {
-    use quil_types::store::ClockStore;
     if let Ok(f) = clock_store.get_global_clock_frame(n) {
         return Ok(f);
     }
@@ -134,7 +133,6 @@ pub(crate) fn reconstruct_local_proposal(
     clock_store: &dyn quil_types::store::ClockStore,
     n: u64,
 ) -> Result<quil_types::proto::global::GlobalProposal, String> {
-    use quil_types::store::ClockStore;
     let frame = load_committed_or_tip_candidate(clock_store, n)?;
     if n == 0 {
         return Ok(quil_types::proto::global::GlobalProposal {

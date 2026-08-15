@@ -1512,8 +1512,7 @@ pub const REWARD_UNITS: u64 = 8_000_000_000;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use num_bigint::BigInt;
-    use crate::global_schema::{write_type, read_type, TYPE_HASH_ALLOCATION};
+    use crate::global_schema::{write_type, read_type};
 
     #[test]
     fn three_slot_registration_keeps_highest_three_and_lookup_matches_by_epoch() {

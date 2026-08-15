@@ -22,7 +22,7 @@ use num_bigint::BigInt;
 use num_traits::{One, Zero};
 
 use quil_types::consensus::{
-    ProverInfo, ProverRegistry, ProverStatus, ShardDetail,
+    ProverInfo, ProverRegistry, ShardDetail,
 };
 use quil_types::error::Result;
 use quil_types::store::{ShardInfo, ShardsStore};
@@ -1257,7 +1257,7 @@ mod tests {
         crdt.add_vertex(&loc_a, b"data-a").unwrap();
 
         // Persist three shard entries — only the first has trie data.
-        let mut shard_key = |a: &[u8; 32]| {
+        let shard_key = |a: &[u8; 32]| {
             let typed = quil_hypergraph::addressing::shard_key_for_location(&Location {
                 app_address: *a,
                 data_address: [0u8; 32],

@@ -86,13 +86,9 @@ use crate::accumulator::{
 use crate::arith::SplitMix64;
 use crate::module::{PolyMatrix, PolyVec, RingCommitKey, RingCommitment};
 use crate::params::{CHALLENGE_WEIGHT_TAU, LWE_RANK_LAMBDA};
-use crate::ring_rq::{relation_prove, relation_verify};
 use crate::rq::Poly;
-use crate::shortness::{
-    prove_message_short, verify_message_short, verify_message_short_collect, ElementOpening,
-    ShortnessParams,
-};
-use crate::sigma_rq::{RingOpeningProof, RingSigmaParams};
+use crate::shortness::ElementOpening;
+use crate::sigma_rq::RingSigmaParams;
 
 // ── Product-is-zero proof ───────────────────────────────────────────────────
 
@@ -814,7 +810,7 @@ fn prove_combined(
     seed: u64,
 ) -> Option<CombinedOpening> {
     let m_l = stack_rows(&ck.a1, &lmat.matmul(&ck.a2));
-    let d_l = c.t1.concat(&lmat.matvec(&c.t2).sub(tvec));
+    let _d_l = c.t1.concat(&lmat.matvec(&c.t2).sub(tvec));
     let rhos = derive_ring_rhos(c, N_PROJ, m.len(), mu);
     let rho_a2: Vec<PolyVec> = rhos.iter().map(|r| ring_wrow(r, &ck.a2)).collect();
     let proj: Vec<Poly> = rhos.iter().map(|r| ring_wsum(r, m)).collect();

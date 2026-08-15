@@ -526,7 +526,7 @@ pub fn new_mux(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::circuit::{IOArg, IOExt};
+    use crate::circuit::IOArg;
     use crate::types::Type;
     use num_bigint::BigInt;
 

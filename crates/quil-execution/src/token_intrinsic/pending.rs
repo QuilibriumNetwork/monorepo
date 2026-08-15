@@ -202,7 +202,6 @@ pub(crate) fn decrypt_single_verenc(bytes: &[u8], decryption_key: &[u8]) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_types::crypto::{DecafAgreement, Multiproof, RangeProofResult};
 
 
     // --- Helpers to build valid test fixtures ---

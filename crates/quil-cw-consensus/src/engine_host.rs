@@ -20,7 +20,7 @@ use commonware_cryptography::Sha256;
 use commonware_p2p::Blocker;
 use commonware_parallel::Sequential;
 use commonware_runtime::buffer::paged::CacheRef;
-use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage, Supervisor as _};
+use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
 use commonware_utils::{NZUsize, NZU16};
 
 use crate::adapters::{

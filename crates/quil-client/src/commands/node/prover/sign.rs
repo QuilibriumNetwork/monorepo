@@ -88,9 +88,9 @@ pub fn update_sig(km: &FileKeyManager, delegate_address: &[u8]) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_crypto::{DefaultKeyManager, FalconKeyConstructor};
+    use quil_crypto::FalconKeyConstructor;
     use quil_keys::FileKeyManager;
-    use quil_types::crypto::{KeyManager, KeyType};
+    use quil_types::crypto::KeyType;
 
     fn km_with_prover_key() -> (FileKeyManager, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

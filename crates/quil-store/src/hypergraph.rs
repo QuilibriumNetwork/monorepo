@@ -285,7 +285,7 @@ impl RocksHypergraphStore {
         let mut scanned = 0usize;
         let mut migrated = 0usize;
 
-        let mut flush = |chunk: &[(Vec<u8>, Vec<u8>)],
+        let flush = |chunk: &[(Vec<u8>, Vec<u8>)],
                          migrated: &mut usize,
                          process_chunk: &mut F|
          -> Result<()> {
@@ -648,7 +648,7 @@ impl RocksHypergraphStore {
 
         // Apply one chunk: run the (possibly parallel) transform, then commit its
         // writes in a single batch. Kept as a closure so the tail chunk reuses it.
-        let mut flush = |chunk: &[(Vec<u8>, Vec<u8>)],
+        let flush = |chunk: &[(Vec<u8>, Vec<u8>)],
                          migrated: &mut usize,
                          process_chunk: &mut F|
          -> Result<()> {

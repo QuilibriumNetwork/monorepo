@@ -297,7 +297,7 @@ mod tests {
     use super::*;
     use quil_hypergraph::testing::MemStore;
     use quil_types::crypto::{InclusionProver, NoopInclusionProver};
-    use quil_types::proto::global::{GlobalFrameHeader, MessageBundle, MessageRequest};
+    use quil_types::proto::global::{GlobalFrameHeader, MessageBundle};
     use std::sync::Arc;
 
     fn mgr() -> ExecutionEngineManager {
