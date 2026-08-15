@@ -19,6 +19,7 @@
 mod common;
 use common::*;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -146,6 +147,55 @@ async fn app_consensus_cw_multi_prover_finalizes() {
         "app CW chain did not advance past genesis (frame_number = {})",
         header.frame_number
     );
+}
+
+/// Regression for #591: adjacent Simplex views may begin before the previous
+/// view's finalization callback reaches the app engine. Every worker must still
+/// observe one strictly connected, monotonically numbered finalized chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn app_consensus_cw_multi_prover_has_no_duplicate_frame_numbers() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let harness = AppShardHarness::build_cw(3);
+    let frames = harness
+        .wait_for_full_frames_from_one_worker(4, std::time::Duration::from_secs(90))
+        .await
+        .expect("one 3-prover app CW replica should finalize four frames within 90s");
+    let headers = frames
+        .iter()
+        .map(|frame| frame.header.as_ref().expect("finalized frame has a header"))
+        .collect::<Vec<_>>();
+
+    let outputs = headers.iter().map(|header| &header.output).collect::<HashSet<_>>();
+    let numbers = headers
+        .iter()
+        .map(|header| header.frame_number)
+        .collect::<HashSet<_>>();
+    assert_eq!(outputs.len(), headers.len(), "finalized duplicate frame identities");
+    assert_eq!(numbers.len(), headers.len(), "finalized duplicate frame numbers");
+
+    for pair in headers.windows(2) {
+        let parent = pair[0];
+        let child = pair[1];
+        assert_eq!(
+            child.frame_number,
+            parent.frame_number + 1,
+            "finalized app chain contains a height gap",
+        );
+        let parent_identity = quil_crypto::poseidon::hash_bytes_to_32(&parent.output)
+            .expect("parent output hashes")
+            .to_vec();
+        assert_eq!(
+            child.parent_selector, parent_identity,
+            "finalized app frame does not extend its predecessor",
+        );
+    }
 }
 
 /// Active PoRep path end-to-end through the live consensus harness.

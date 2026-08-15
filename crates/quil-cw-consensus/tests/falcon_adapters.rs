@@ -50,7 +50,13 @@ impl GlobalProposer for TestProposer {
         let digest = h.finalize();
         Some((digest, digest.as_ref().to_vec()))
     }
-    fn verify(&self, _view: u64, _digest: Sha256Digest, bytes: Option<Vec<u8>>) -> bool {
+    fn verify(
+        &self,
+        _view: u64,
+        _parent_digest: Sha256Digest,
+        _digest: Sha256Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> bool {
         // With a shared store the block is always present; a real verifier runs
         // frame validation here.
         bytes.is_some()

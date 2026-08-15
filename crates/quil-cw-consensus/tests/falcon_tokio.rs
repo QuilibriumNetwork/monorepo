@@ -35,7 +35,13 @@ impl GlobalProposer for TestProposer {
         let digest = h.finalize();
         Some((digest, digest.as_ref().to_vec()))
     }
-    fn verify(&self, _v: u64, _d: Sha256Digest, bytes: Option<Vec<u8>>) -> bool {
+    fn verify(
+        &self,
+        _v: u64,
+        _parent_digest: Sha256Digest,
+        _d: Sha256Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> bool {
         bytes.is_some()
     }
 }
