@@ -214,13 +214,7 @@ impl GlobalProposer for GlobalSeamProposer {
         Some((digest, bytes))
     }
 
-    fn verify(
-        &self,
-        view: u64,
-        _parent_digest: Digest,
-        digest: Digest,
-        bytes: Option<Vec<u8>>,
-    ) -> bool {
+    fn verify(&self, view: u64, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
         let Some(bytes) = bytes else {
             // Block not yet delivered — nullify rather than vote blind.
             tracing::warn!(view, "cw verify: block not delivered (nullify)");
@@ -394,11 +388,16 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         cert: Option<Vec<u8>>,
         _locally_verified: bool,
     ) {
+        // Certificate-only replicas may not have locally verified these bytes,
+        // so retain the context-free body re-bind check below at the persistence
+        // boundary regardless of `_locally_verified`.
         let Some(bytes) = bytes else { return };
         let Ok(mut frame) = decode_global_frame(&bytes) else { return };
         // Re-bind the body to the header at FINALIZE, not just at verify. The
-        // Certificate-only replicas may not have locally verified these bytes,
-        // so retain this context-free body check at the persistence boundary.
+        // block bytes are re-read from the shared (overwrite-able) BlockStore by
+        // digest, so a body swapped in AFTER this node voted would otherwise be
+        // materialized. Recompute the requests root and drop on mismatch — the
+        // "post-verification body swap" guard the app-shard seam also has.
         if let Some(h) = frame.header.as_ref() {
             if !crate::frame_validator::global_frame_body_matches_requests_root(h, &frame.requests) {
                 tracing::warn!(

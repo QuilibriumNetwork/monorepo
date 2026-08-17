@@ -651,10 +651,7 @@ fn compute_shard_sizes(state: &ExplorerState) -> HashMap<String, (BigInt, u64)> 
             None => (shard.size.clone(), shard.data_shards),
         };
         let l2 = &shard.shard_key[shard.shard_key.len() - 32..];
-        let mut filter = l2.to_vec();
-        for p in &shard.prefix {
-            filter.push(*p as u8);
-        }
+        let filter = quil_forest::shard_prefix_to_filter(l2, &shard.prefix);
         let size = BigInt::from_bytes_be(Sign::Plus, &size_be);
         result.insert(hex::encode(&filter), (size, data_shards));
     }
@@ -953,10 +950,7 @@ fn current_halts(state: &ExplorerState, frame: u64) -> HashMap<Vec<u8>, u64> {
         let mut has_data: HashMap<Vec<u8>, bool> = HashMap::new();
         for s in shards {
             let l2_start = if s.shard_key.len() >= 3 { 3 } else { 0 };
-            let mut filter = s.shard_key[l2_start..].to_vec();
-            for p in &s.prefix {
-                filter.push(*p as u8);
-            }
+            let filter = quil_forest::shard_prefix_to_filter(&s.shard_key[l2_start..], &s.prefix);
             if filter.is_empty() {
                 continue;
             }

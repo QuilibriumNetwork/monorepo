@@ -22,7 +22,8 @@ use quil_types::error::{QuilError, Result};
 
 /// Syncs from a fixed endpoint (typically the master's stream port).
 pub struct ProdProverTreeSyncer {
-    /// `host:port` of the master's peer gRPC listener.
+    /// `host:port` of the master's peer gRPC listener. Used when `archive_pool`
+    /// is absent or empty (the multi-process worker path, which dials its master).
     pub master_stream_addr: String,
     /// Worker's HypergraphStore (the forest shares its RocksDB).
     pub hg_store: Arc<quil_store::RocksHypergraphStore>,
@@ -31,9 +32,27 @@ pub struct ProdProverTreeSyncer {
     pub falcon_signing_key: Vec<u8>,
     /// The live CRDT — sync applies into ITS forest at coordinated versions.
     pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    /// When set, resolve a live ARCHIVE endpoint per sync attempt (round-robin,
+    /// failure-blacklisting) instead of the fixed `master_stream_addr`. Used by
+    /// thread-mode workers doing the step-4 app-shard catch-up: they dial an
+    /// archive directly (the master only serves the global tree, not app-shard
+    /// leaves), and the pool tolerates an empty-at-build / dead-archive state.
+    pub archive_pool: Option<Arc<quil_rpc::ArchiveEndpointPool>>,
 }
 
 impl ProdProverTreeSyncer {
+    /// The endpoint to dial for the next sync: a live archive from the pool when
+    /// wired (falling back to `master_stream_addr` if the pool is empty), else
+    /// the fixed `master_stream_addr`.
+    async fn resolve_addr(&self) -> String {
+        if let Some(pool) = self.archive_pool.as_ref() {
+            if let Some(ep) = pool.next().await {
+                return ep;
+            }
+        }
+        self.master_stream_addr.clone()
+    }
+
     /// Sync one SINGLE-shard tree (its `shard_id` is the app address) via the
     /// efficient Merkle diff. `expected_roots` is the finalized header's
     /// `state_roots` (audit #5): index `p` is the committed root of phase `p`
@@ -48,7 +67,7 @@ impl ProdProverTreeSyncer {
     /// pulled best-effort behind phase 0, which let a peer serve divergent
     /// removes/hyperedge state. Returns whether the sync converged.
     async fn sync_single_shard(&self, shard_id: Vec<u8>, expected_roots: &[Vec<u8>]) -> Result<bool> {
-        let mut client = ArchiveClient::connect_mtls(&self.master_stream_addr, &self.falcon_signing_key)
+        let mut client = ArchiveClient::connect_mtls(&self.resolve_addr().await, &self.falcon_signing_key)
             .await
             .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
         let handle = tokio::runtime::Handle::current();
@@ -125,7 +144,7 @@ impl ProdProverTreeSyncer {
     /// phase whose aggregate or post-apply root diverges aborts the sync.
     /// Previously only phase 0 was bound; phases 1–3 could be served divergent.
     async fn sync_split_shard(&self, app: [u8; 32], expected_roots: &[Vec<u8>]) -> Result<bool> {
-        let mut client = ArchiveClient::connect_mtls(&self.master_stream_addr, &self.falcon_signing_key)
+        let mut client = ArchiveClient::connect_mtls(&self.resolve_addr().await, &self.falcon_signing_key)
             .await
             .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
         let handle = tokio::runtime::Handle::current();
@@ -170,6 +189,59 @@ impl ProdProverTreeSyncer {
                     return Ok(false);
                 }
             }
+        }
+        Ok(true)
+    }
+
+    /// UNIFIED shard-prover subtree-range sync: catch up ONLY the covered shard's
+    /// subtree of the app tree — never the whole app. `prefix_bytes` are the
+    /// shard's `ShardInfo.prefix` bytes (`filter[32..]`); `expected_roots[phase]`
+    /// is the header's app-phase root, which we pin the peer's app tree to and
+    /// authenticate the pulled subtree against (the descent co-path). Each phase's
+    /// pulled leaves reconstruct a local subtree whose root the CRDT verifies
+    /// equals the authenticated source subtree root.
+    async fn sync_shard_subtree(
+        &self,
+        app: [u8; 32],
+        prefix_bytes: &[u8],
+        expected_roots: &[Vec<u8>],
+    ) -> Result<bool> {
+        let prefix: Vec<u32> = prefix_bytes.iter().map(|b| *b as u32).collect();
+        let bits = self.crdt.canonical_bits_for_prefix(&app, &prefix);
+        let mut client = ArchiveClient::connect_mtls(&self.resolve_addr().await, &self.falcon_signing_key)
+            .await
+            .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
+        let handle = tokio::runtime::Handle::current();
+        for phase in 0u32..4 {
+            let expected = expected_roots.get(phase as usize).cloned().unwrap_or_default();
+            let head = client
+                .get_forest_head(app.to_vec(), phase)
+                .await
+                .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))?;
+            let Some((v_s, root_s)) = head else {
+                // Peer has no app tree for this phase → must match the zero anchor.
+                if !expected.is_empty() && expected.iter().any(|b| *b != 0) {
+                    warn!(phase, "peer absent but header app root non-empty — not syncing subtree");
+                    return Ok(false);
+                }
+                continue;
+            };
+            // Pin: the peer's advertised APP root must equal the header app root
+            // for this phase (audit #5). Empty ⇒ trust (bootstrap).
+            if !expected.is_empty() && root_s.as_slice() != expected.as_slice() {
+                warn!(phase, "peer app root != header-committed root — not syncing subtree");
+                return Ok(false);
+            }
+            let pinned = if expected.is_empty() {
+                None
+            } else {
+                <[u8; 32]>::try_from(expected.as_slice()).ok()
+            };
+            // Pull ONLY this shard's subtree, authenticated against the app root.
+            crate::forest_sync::sync_subtree_one_phase(
+                &mut client, &handle, &self.crdt, &app, phase, v_s, bits.clone(), pinned,
+            )
+            .await?;
         }
         Ok(true)
     }
@@ -225,6 +297,29 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
         // (#3) Skip when already caught up (works for single-shard and QUIL split).
         if self.caught_up_to_anchor(&l2, expected_roots) {
             return Ok(true);
+        }
+        // UNIFIED mode: EVERY app is ONE L3 tree keyed by `l2`, and its four phase
+        // roots ARE the header `state_roots`. A shard prover covering a specific
+        // prefix (`filter = app ‖ prefix`) pulls ONLY its subtree — authenticated
+        // against the header app root via the descent co-path — so it never stores
+        // the whole app. A whole-app sync (no prefix, e.g. an archive) diffs the
+        // one tree directly.
+        if self.crdt.unified_tree() {
+            let prefix_bytes: Vec<u8> = if filter.len() > 32 { filter[32..].to_vec() } else { Vec::new() };
+            if prefix_bytes.is_empty() {
+                info!(
+                    addr = %self.master_stream_addr,
+                    filter = %hex::encode(&filter[..n]),
+                    "syncing app tree (unified, whole tree)"
+                );
+                return self.sync_single_shard(l2.to_vec(), expected_roots).await;
+            }
+            info!(
+                addr = %self.master_stream_addr,
+                filter = %hex::encode(&filter[..n]),
+                "syncing shard subtree (unified, range diff — only this prefix)"
+            );
+            return self.sync_shard_subtree(l2, &prefix_bytes, expected_roots).await;
         }
         // QUIL splits 64-way: its state lives in sub-shard trees (app‖prefix),
         // verified as a set via the aggregation binding (all 4 phases).

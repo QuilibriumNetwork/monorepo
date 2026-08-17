@@ -30,7 +30,8 @@ mod walk;
 pub use walk::{
     convert_app, convert_db, convert_shard, install_forest_boot, install_forest_for_sync,
     install_forest_if_migrated, quil_shards_for_app, run_conversion, run_conversion_in_place,
-    run_conversion_in_place_with_shards, shards_for_app_from_store, ConvertReport, ShardConversion,
+    run_conversion_in_place_with_shards, run_unified_consolidation_in_place,
+    shards_for_app_from_store, ConvertReport, ShardConversion,
 };
 
 /// Flatten one legacy per-vertex blob into the forest's flat Level-3 leaves.

@@ -40,8 +40,11 @@ mod check_submit;
 mod fork_ladder;
 mod verify_migration;
 mod forest_migration;
+mod dry_run_reset;
+mod unified_consolidation;
 mod legacy_migration;
 mod coin_rescale;
+mod coin_receipt_repair;
 
 mod master_node;
 
@@ -99,6 +102,18 @@ struct Args {
     #[arg(long)]
     migrate_db: Option<PathBuf>,
 
+    /// OFFLINE dry-run of the unified split reset against a snapshot DB (the given
+    /// path, or config.db.path). Reports the BEFORE grid + prover state, runs the
+    /// flag-day reset (QUIL grid → genesis + prover-tree wipe/rebuild), reports the
+    /// AFTER state, then exits. Destructive on the DB — point it at a COPY of a
+    /// mainnet snapshot. Never connects to the network.
+    #[arg(long)]
+    dry_run_reset: Option<PathBuf>,
+
+    /// The simulated cutover frame for `--dry-run-reset` (0 ⇒ head + 1).
+    #[arg(long, default_value_t = 0)]
+    dry_run_reset_frame: u64,
+
     /// Archive-only: convert pre-2.1 verenc coins in the DB (config.db.path, or
     /// the given path) into compact transparent public token entries and refresh
     /// the lattice shadow-accumulator root, then exit. Deterministic and
@@ -113,6 +128,15 @@ struct Args {
     /// uniformly inflated. Empty path uses config.db.path. Run once.
     #[arg(long)]
     fix_coin_scale: Option<PathBuf>,
+
+    /// Archive-only: recompute the coin-conservation receipt from the migrated
+    /// TRANSPARENT coin set and rewrite it, then exit. Use when a legacy
+    /// migration was STOPPED AND RESTARTED: the receipt then records only the
+    /// final run's slice (the state is complete, but `--verify-db`'s conservation
+    /// check would flag the undercount). Read-mostly — only the receipt vertex is
+    /// written; refuses to shrink a receipt. Empty path uses config.db.path.
+    #[arg(long)]
+    repair_receipt: Option<PathBuf>,
 
     /// Diagnose the consensus bootstrap root: replay the latest-QC
     /// candidate-frame lookup and report whether the forks-root identity
@@ -620,6 +644,21 @@ async fn main() -> anyhow::Result<ExitCode> {
         };
     }
 
+    if let Some(ref snapshot_path) = args.dry_run_reset {
+        return match dry_run_reset::run_dry_run_reset(
+            snapshot_path,
+            &config,
+            args.network,
+            args.dry_run_reset_frame,
+        ) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
     if let Some(ref dest_path) = args.migrate_legacy {
         return match legacy_migration::run_migrate_legacy(dest_path, &config) {
             Ok(()) => Ok(ExitCode::SUCCESS),
@@ -632,6 +671,16 @@ async fn main() -> anyhow::Result<ExitCode> {
 
     if let Some(ref target_path) = args.fix_coin_scale {
         return match coin_rescale::run_fix_coin_scale(target_path, &config) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref target_path) = args.repair_receipt {
+        return match coin_receipt_repair::run_repair_receipt(target_path, &config) {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");

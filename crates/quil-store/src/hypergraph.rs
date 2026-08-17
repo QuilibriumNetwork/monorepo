@@ -45,6 +45,24 @@ fn byte_phase_str(b: u8) -> Option<&'static str> {
     }
 }
 
+/// Exclusive upper bound for a `delete_range` that covers every key beginning
+/// with `prefix`: increment the last byte that is `< 0xFF`, dropping any
+/// trailing `0xFF` bytes. `None` if `prefix` is empty or all `0xFF` (no bound —
+/// caller must skip the range delete rather than wipe to the end of the DB).
+fn prefix_range_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut u = prefix.to_vec();
+    while matches!(u.last(), Some(&0xff)) {
+        u.pop();
+    }
+    match u.last_mut() {
+        Some(b) => {
+            *b += 1;
+            Some(u)
+        }
+        None => None,
+    }
+}
+
 impl RocksHypergraphStore {
     pub fn new(db: Arc<rocksdb::DB>) -> Self {
         Self { db }
@@ -58,6 +76,8 @@ impl RocksHypergraphStore {
     pub fn raw_db(&self) -> Arc<rocksdb::DB> {
         self.db.clone()
     }
+
+    // (helper `prefix_range_upper_bound` is a free function below the impl)
 
     /// Whether this DB already contains Phase-3 forest data (any key under
     /// [`FOREST_NAMESPACE`]). The runtime uses this to gate the forest
@@ -82,6 +102,34 @@ impl RocksHypergraphStore {
         *upper.last_mut().unwrap() += 1; // 0xF7 -> 0xF8
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(&lower, &upper);
+        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+    }
+
+    /// Delete a single shard's UNDERLYING vertex-blob keyspace — both the V1
+    /// (`0x30`) and V2/MVCC (`0x31`) ranges, across all four phases. The store
+    /// half of the shard-scoped prover-tree reset: the forest trees are wiped
+    /// separately (`Forest::reset_shard_phase_trees`), and this clears the flat
+    /// blob cache the prover registry reads (`for_each_vertex_underlying`) so a
+    /// rebuild can't resurrect the old records. Scoped to `shard` only; leaves
+    /// every other shard untouched.
+    pub fn clear_shard_underlying(&self, shard: &quil_types::store::ShardKey) -> Result<()> {
+        let combos = [
+            ("vertex", "adds"),
+            ("vertex", "removes"),
+            ("hyperedge", "adds"),
+            ("hyperedge", "removes"),
+        ];
+        let mut batch = rocksdb::WriteBatch::default();
+        for (set, phase) in combos {
+            for lower in [
+                crate::encoding::hypergraph_vertex_data_prefix(set, phase, shard),
+                crate::encoding::hypergraph_vertex_data_v2_shard_prefix(set, phase, shard),
+            ] {
+                if let Some(upper) = prefix_range_upper_bound(&lower) {
+                    batch.delete_range(&lower, &upper);
+                }
+            }
+        }
         self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
     }
 

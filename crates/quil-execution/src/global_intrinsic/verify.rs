@@ -927,19 +927,38 @@ pub fn verify_shard_split(
             op.proposed_shards.len()
         )));
     }
+    // Deep-bifurcation: post-cutover proposals encode children as bit-path
+    // FILTERS (`app ‖ bit_len ‖ packed`, variable length), validated as
+    // bit-prefix extensions of the parent — NOT the legacy byte-suffix children
+    // (exactly parent_len+1/+2, a byte prefix). The proposal frame decides the
+    // format, matching `materialize_shard_split`'s gate at the same frame.
+    let bit_path_mode = op.frame_number >= super::materialize::unified_tree_cutover_frame();
     let parent_len = op.shard_address.len();
     for shard in &op.proposed_shards {
-        if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
-            return Err(QuilError::InvalidArgument(format!(
-                "shard split: proposed shard length {} invalid for parent length {}",
-                shard.len(),
-                parent_len
-            )));
-        }
-        if !shard.starts_with(&op.shard_address) {
-            return Err(QuilError::InvalidArgument(
-                "shard split: proposed shard must share parent prefix".into(),
-            ));
+        if bit_path_mode {
+            if !quil_forest::shard_filter_extends(shard, &op.shard_address, 32) {
+                return Err(QuilError::InvalidArgument(
+                    "shard split: bit-path child must extend parent bit-path".into(),
+                ));
+            }
+            if quil_forest::decode_shard_bit_path(shard, 32).is_none() {
+                return Err(QuilError::InvalidArgument(
+                    "shard split: malformed bit-path child filter".into(),
+                ));
+            }
+        } else {
+            if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
+                return Err(QuilError::InvalidArgument(format!(
+                    "shard split: proposed shard length {} invalid for parent length {}",
+                    shard.len(),
+                    parent_len
+                )));
+            }
+            if !shard.starts_with(&op.shard_address) {
+                return Err(QuilError::InvalidArgument(
+                    "shard split: proposed shard must share parent prefix".into(),
+                ));
+            }
         }
     }
 
@@ -988,19 +1007,38 @@ pub fn verify_shard_merge(
             op.shard_addresses.len()
         )));
     }
+    // Deep-bifurcation (parity with `verify_shard_split`): post-cutover the
+    // merged children are variable-length bit-path FILTERS validated as bit-prefix
+    // extensions of the parent — NOT the legacy parent_len+1/+2 byte suffixes. The
+    // proposal frame decides the format. The parent may be the bare app root or a
+    // bit-path filter; `shard_filter_extends` handles both.
+    let bit_path_mode = op.frame_number >= super::materialize::unified_tree_cutover_frame();
     let parent_len = op.parent_address.len();
     for shard in &op.shard_addresses {
-        if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
-            return Err(QuilError::InvalidArgument(format!(
-                "shard merge: child shard length {} invalid for parent length {}",
-                shard.len(),
-                parent_len
-            )));
-        }
-        if !shard.starts_with(&op.parent_address) {
-            return Err(QuilError::InvalidArgument(
-                "shard merge: child shard must share parent prefix".into(),
-            ));
+        if bit_path_mode {
+            if !quil_forest::shard_filter_extends(shard, &op.parent_address, 32) {
+                return Err(QuilError::InvalidArgument(
+                    "shard merge: bit-path child must extend parent bit-path".into(),
+                ));
+            }
+            if quil_forest::decode_shard_bit_path(shard, 32).is_none() {
+                return Err(QuilError::InvalidArgument(
+                    "shard merge: malformed bit-path child filter".into(),
+                ));
+            }
+        } else {
+            if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
+                return Err(QuilError::InvalidArgument(format!(
+                    "shard merge: child shard length {} invalid for parent length {}",
+                    shard.len(),
+                    parent_len
+                )));
+            }
+            if !shard.starts_with(&op.parent_address) {
+                return Err(QuilError::InvalidArgument(
+                    "shard merge: child shard must share parent prefix".into(),
+                ));
+            }
         }
     }
 
@@ -1815,6 +1853,38 @@ mod tests {
         assert!(!verify_shard_split(&sample_split(), &prover_tree, &RejectKeyManager).unwrap());
     }
 
+    /// Deep-bifurcation: post-cutover (`frame_number >= cutover`) the children are
+    /// variable-length bit-path FILTERS (`app ‖ bit_len ‖ packed`), NOT the legacy
+    /// parent_len+1/+2 byte suffixes — validated as bit-prefix extensions. The
+    /// parent here is the BARE 32-byte app address (the root shard). Both the
+    /// byte-length wall and the bare-app-root parent were bugs that silently
+    /// rejected real deep splits at this validation wall.
+    #[test]
+    fn shard_split_bit_path_mode_accepts_deep_children_under_bare_app_root() {
+        use quil_forest::encode_shard_bit_path;
+        let prover_tree = make_prover_tree();
+        let app = [0x01u8; 32]; // == sample_split shard_address (the signer/app)
+        // A 4-bit descent past the immediate bit: children branch at bit 3.
+        let c0 = encode_shard_bit_path(&app, &[false, false, false, false]);
+        let c1 = encode_shard_bit_path(&app, &[false, false, false, true]);
+        let mut op = sample_split();
+        op.frame_number = 700_000; // >= UNIFIED_TREE_CUTOVER_FRAME (698_000)
+        op.shard_address = app.to_vec(); // bare app root (empty bit-path parent)
+        op.proposed_shards = vec![c0, c1];
+        assert!(
+            verify_shard_split(&op, &prover_tree, &AcceptKeyManager).unwrap(),
+            "deep bit-path children under the bare-app root must pass validation"
+        );
+
+        // A child under a DIFFERENT app does not extend the parent → rejected.
+        let mut bad = op.clone();
+        bad.proposed_shards = vec![
+            encode_shard_bit_path(&app, &[true]),
+            encode_shard_bit_path(&[0x09u8; 32], &[false]),
+        ];
+        assert!(verify_shard_split(&bad, &prover_tree, &AcceptKeyManager).is_err());
+    }
+
     fn sample_merge() -> ShardMerge {
         ShardMerge {
             shard_addresses: vec![vec![0x01u8; 33], vec![0x01u8; 33]],
@@ -1848,6 +1918,36 @@ mod tests {
         op.public_key_signature_bls48581.as_mut().unwrap().address = vec![0x77u8; 32];
         // poseidon(pubkey) != sig.address → Ok(false).
         assert!(!verify_shard_merge(&op, &prover_tree, &AcceptKeyManager).unwrap());
+    }
+
+    /// Deep-bifurcation (parity with the split): post-cutover the merged children
+    /// are bit-path FILTERS validated as bit-prefix extensions of the parent —
+    /// NOT the legacy parent_len+1/+2 byte suffixes. The parent here is a deep
+    /// bit-path filter (merging [0,0,0,0]/[0,0,0,1] back into [0,0,0]).
+    #[test]
+    fn shard_merge_bit_path_mode_accepts_deep_children() {
+        use quil_forest::encode_shard_bit_path;
+        let prover_tree = make_prover_tree();
+        let app = [0x01u8; 32];
+        let mut op = sample_merge();
+        op.frame_number = 700_000; // >= cutover
+        op.parent_address = encode_shard_bit_path(&app, &[false, false, false]);
+        op.shard_addresses = vec![
+            encode_shard_bit_path(&app, &[false, false, false, false]),
+            encode_shard_bit_path(&app, &[false, false, false, true]),
+        ];
+        assert!(
+            verify_shard_merge(&op, &prover_tree, &AcceptKeyManager).unwrap(),
+            "deep bit-path children merging into their parent branch must validate"
+        );
+
+        // A child that does NOT extend the parent branch is rejected.
+        let mut bad = op.clone();
+        bad.shard_addresses = vec![
+            encode_shard_bit_path(&app, &[false, false, false, false]),
+            encode_shard_bit_path(&app, &[true, false, false, false]), // wrong branch
+        ];
+        assert!(verify_shard_merge(&bad, &prover_tree, &AcceptKeyManager).is_err());
     }
 
     fn sample_seniority_merge() -> ProverSeniorityMerge {

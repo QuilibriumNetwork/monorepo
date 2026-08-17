@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use jmt::storage::{LeafNode, Node, NodeBatch, NodeKey, TreeReader, TreeUpdateBatch, TreeWriter};
+use jmt::storage::{
+    LeafNode, NibblePath, Node, NodeBatch, NodeKey, TreeReader, TreeUpdateBatch, TreeWriter,
+};
 use jmt::{KeyHash, OwnedValue, Sha256Jmt, Version};
 use sha2::{Digest, Sha256};
 
@@ -24,6 +26,21 @@ use crate::{commit_pruning, ForestStore, MemTreeStore, RocksTreeStore, TreeId};
 pub enum TreeStore {
     Rocks(RocksTreeStore),
     Mem(Arc<MemTreeStore>),
+}
+
+impl TreeStore {
+    /// Wipe this tree back to empty (all nodes/values/stale/preimages/head).
+    /// Used by the shard-scoped prover-tree reset; the next commit rebuilds
+    /// from version 0.
+    pub fn clear(&self) -> Result<()> {
+        match self {
+            TreeStore::Rocks(s) => s.clear(),
+            TreeStore::Mem(s) => {
+                s.clear();
+                Ok(())
+            }
+        }
+    }
 }
 
 impl TreeReader for TreeStore {
@@ -121,6 +138,47 @@ pub fn rollup_phase_roots(phase_roots: &[[u8; 32]; 4]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// MSB-first `bits` (1..=4 of them) → a nibble value 0..15. Used by
+/// [`Forest::app_subtree_root`] to turn a shard's canonical bit-path into the
+/// nibble to descend / the sub-nibble range to select.
+fn bits_to_nibble(bits: &[bool]) -> u8 {
+    let mut v = 0u8;
+    for &b in bits {
+        v = (v << 1) | (b as u8);
+    }
+    v
+}
+
+/// A single-leaf subtree's commitment for [`Forest::app_subtree_root`]: the
+/// leaf hash iff the leaf's (raw-key) address carries `bit_path` as a leading
+/// bit-prefix, else the all-zero placeholder (the leaf lives in a sibling
+/// subtree). Mirrors `addr_has_bit_prefix` over the leaf's key bytes.
+fn leaf_if_under(leaf: &LeafNode, bit_path: &[bool]) -> [u8; 32] {
+    let key = leaf.key_hash().0;
+    let under = bit_path.iter().enumerate().all(|(i, &want)| {
+        let byte = i / 8;
+        let bit = 7 - (i % 8);
+        key.get(byte).map(|b| (b >> bit) & 1 == 1).unwrap_or(false) == want
+    });
+    if under {
+        leaf.hash::<Sha256>()
+    } else {
+        [0u8; 32]
+    }
+}
+
+/// Count counterpart of [`leaf_if_under`]: `1` iff the single leaf's address
+/// carries `bit_path`, else `0`.
+fn leaf_count_if_under(leaf: &LeafNode, bit_path: &[bool]) -> u64 {
+    let key = leaf.key_hash().0;
+    let under = bit_path.iter().enumerate().all(|(i, &want)| {
+        let byte = i / 8;
+        let bit = 7 - (i % 8);
+        key.get(byte).map(|b| (b >> bit) & 1 == 1).unwrap_or(false) == want
+    });
+    under as u64
+}
+
 /// A shard's committed state after one frame: the four phase roots (the
 /// header `state_roots`) and their rollup (the app-level commitment).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,6 +258,20 @@ impl Forest {
 
     /// Commit one shard/phase tree at `version`, returning its 32-byte root.
     /// Overwritten nodes are indexed for pruning.
+    /// Wipe ALL FOUR phase trees of a shard back to empty — the forest half of
+    /// the shard-scoped prover-tree reset. After this the shard's trees hold
+    /// nothing; the caller rebuilds them by committing the desired leaves at
+    /// version 0 (the head-version marker is wiped too, so `resolve_phase_version`
+    /// reports "never committed" and the next commit starts fresh). Does NOT
+    /// touch any other shard or the underlying vertex-blob keyspace (the caller
+    /// clears that separately). Idempotent.
+    pub fn reset_shard_phase_trees(&self, shard_id: &[u8]) -> Result<()> {
+        for phase in PHASES {
+            self.store(&TreeId::shard_phase(shard_id, phase)).clear()?;
+        }
+        Ok(())
+    }
+
     pub fn commit_shard_phase(
         &self,
         shard_id: &[u8],
@@ -586,6 +658,204 @@ impl Forest {
         Ok(tree.get_root_hash_option(version)?.map(|r| r.0))
     }
 
+    /// UNIFIED-APP-TREE per-shard commitment: the subtree root, at `version`, of
+    /// the app's ONE L3 phase tree (keyed by `app_address`, all shards' leaves
+    /// positioned by raw address) at a shard's `bit_path` — the shard's canonical
+    /// bit-prefix from [`crate::prefix_to_bits`] / [`crate::canonical_shard_bit_paths`].
+    ///
+    /// This REPLACES the separate-per-shard-tree + [`crate::app_root_from_shard_paths`]
+    /// rollup: a shard is the in-place subtree at its prefix, so its commitment is
+    /// a READ, and the app root (`bit_path == []`) is the JMT root over ALL shards
+    /// natively — no `hash_pair` aggregation (see
+    /// `crates/quil-execution/UNIFIED_APP_TREE_DESIGN.md` §3/§4).
+    ///
+    /// Handles the real cases: nibble-aligned prefix (the subtree root is the node
+    /// hash at that path); non-nibble-aligned (the 64-way / top-6-bit boundary — a
+    /// width-`16>>rem` sub-range of the containing internal node via
+    /// [`jmt::node_type::InternalNode::subtree_hash`]); a single-leaf subtree
+    /// (compression — the leaf IS the subtree iff its address carries the prefix);
+    /// and an empty subtree (→ all-zero placeholder, matching
+    /// `app_root_from_shard_paths`' absent-sibling convention).
+    ///
+    /// `version` MUST be the app tree's exact committed version for the phase (as
+    /// the CRDT resolves via `resolve_phase_version`), matching [`crate::sync`].
+    pub fn app_subtree_root(
+        &self,
+        app_address: &[u8],
+        phase: Phase,
+        version: u64,
+        bit_path: &[bool],
+    ) -> Result<[u8; 32]> {
+        let store = self.store(&TreeId::shard_phase(app_address, phase));
+        // Empty tree → placeholder; empty path → whole app-phase root.
+        let root_hash = match Sha256Jmt::new(&store).get_root_hash_option(version)? {
+            Some(r) => r.0,
+            None => return Ok([0u8; 32]),
+        };
+        if bit_path.is_empty() {
+            return Ok(root_hash);
+        }
+        let full = bit_path.len() / 4; // whole nibbles to descend
+        let rem = bit_path.len() % 4; // trailing sub-nibble bits (1..=3)
+
+        let mut cur_key = NodeKey::new(version, NibblePath::new(vec![]));
+        let mut cur_node = match store.get_node_option(&cur_key)? {
+            Some(n) => n,
+            None => return Ok([0u8; 32]),
+        };
+
+        // Descend `full` whole nibbles.
+        for i in 0..full {
+            let nib_val = bits_to_nibble(&bit_path[i * 4..i * 4 + 4]);
+            let int = match cur_node {
+                // The subtree collapsed to a single leaf ABOVE our target depth:
+                // it's the shard's subtree iff the leaf address carries `bit_path`.
+                Node::Leaf(leaf) => return Ok(leaf_if_under(&leaf, bit_path)),
+                Node::Null => return Ok([0u8; 32]),
+                Node::Internal(int) => int,
+            };
+            // Find the child at `nib_val` (its Nibble + version) without
+            // constructing a Nibble; drop the borrow before re-reading.
+            let child = int
+                .children_sorted()
+                .find(|(nibble, _)| nibble.as_usize() as u8 == nib_val)
+                .map(|(nibble, c)| (nibble, c.version));
+            let (nibble, cver) = match child {
+                Some(x) => x,
+                None => return Ok([0u8; 32]), // empty subtree under this prefix
+            };
+            cur_key = cur_key.gen_child_node_key(cver, nibble);
+            cur_node = match store.get_node_option(&cur_key)? {
+                Some(n) => n,
+                None => return Ok([0u8; 32]),
+            };
+        }
+
+        // At the whole-nibble prefix node. Nibble-aligned ⇒ the node hash IS the
+        // subtree root; sub-nibble ⇒ a width-(16>>rem) sub-range of it.
+        Ok(match cur_node {
+            Node::Null => [0u8; 32],
+            Node::Leaf(leaf) => leaf_if_under(&leaf, bit_path),
+            Node::Internal(int) => {
+                if rem == 0 {
+                    int.hash::<Sha256>()
+                } else {
+                    let top = bits_to_nibble(&bit_path[full * 4..]); // MSB-first, `rem` bits
+                    let width = 16u8 >> rem;
+                    let start = top << (4 - rem);
+                    int.subtree_hash::<Sha256>(start, width)
+                }
+            }
+        })
+    }
+
+    /// The number of leaves under `bit_path` in the app's phase tree — the COUNT
+    /// counterpart of [`Self::app_subtree_root`], via jmt's per-`Child`
+    /// `leaf_count` metadata ([`jmt::node_type::InternalNode::subtree_leaf_count`]).
+    /// `bit_path == []` is the whole-tree leaf count. Used by the split decision
+    /// (`UNIFIED_APP_TREE_DESIGN` §6.1) to test whether a candidate child is
+    /// data-bearing.
+    pub fn app_subtree_leaf_count(
+        &self,
+        app_address: &[u8],
+        phase: Phase,
+        version: u64,
+        bit_path: &[bool],
+    ) -> Result<u64> {
+        let store = self.store(&TreeId::shard_phase(app_address, phase));
+        let mut cur_key = NodeKey::new(version, NibblePath::new(vec![]));
+        let mut cur_node = match store.get_node_option(&cur_key)? {
+            Some(n) => n,
+            None => return Ok(0), // empty tree
+        };
+        if bit_path.is_empty() {
+            return Ok(match cur_node {
+                Node::Internal(int) => int.leaf_count() as u64,
+                Node::Leaf(_) => 1,
+                Node::Null => 0,
+            });
+        }
+        let full = bit_path.len() / 4;
+        let rem = bit_path.len() % 4;
+        for i in 0..full {
+            let nib_val = bits_to_nibble(&bit_path[i * 4..i * 4 + 4]);
+            let int = match cur_node {
+                Node::Leaf(leaf) => return Ok(leaf_count_if_under(&leaf, bit_path)),
+                Node::Null => return Ok(0),
+                Node::Internal(int) => int,
+            };
+            let child = int
+                .children_sorted()
+                .find(|(nibble, _)| nibble.as_usize() as u8 == nib_val)
+                .map(|(nibble, c)| (nibble, c.version));
+            let (nibble, cver) = match child {
+                Some(x) => x,
+                None => return Ok(0),
+            };
+            cur_key = cur_key.gen_child_node_key(cver, nibble);
+            cur_node = match store.get_node_option(&cur_key)? {
+                Some(n) => n,
+                None => return Ok(0),
+            };
+        }
+        Ok(match cur_node {
+            Node::Null => 0,
+            Node::Leaf(leaf) => leaf_count_if_under(&leaf, bit_path),
+            Node::Internal(int) => {
+                if rem == 0 {
+                    int.leaf_count() as u64
+                } else {
+                    let top = bits_to_nibble(&bit_path[full * 4..]);
+                    let width = 16u8 >> rem;
+                    let start = top << (4 - rem);
+                    int.subtree_leaf_count(start, width) as u64
+                }
+            }
+        })
+    }
+
+    /// Find the MEANINGFUL split point for a shard: descend its subtree bit-by-bit
+    /// from `shard_bits` to the SHALLOWEST bit where the data divides into TWO
+    /// non-empty halves, and return the two child bit-paths (`shard_bits ++ …0`,
+    /// `shard_bits ++ …1`). This is `UNIFIED_APP_TREE_DESIGN` §6.1's descend-to-
+    /// bifurcation + empty-split guard in one: the split cuts where the data
+    /// actually branches (not the immediate bit, which may leave a child empty),
+    /// and returns `None` when the shard is unsplittable — fewer than 2 leaves, or
+    /// data so clustered no bifurcation appears within `max_extra_bits`.
+    ///
+    /// Both returned children are guaranteed non-empty, so a split at these
+    /// prefixes never produces an empty child. `max_extra_bits` bounds the descent
+    /// (a shard prefix + this many bits); keep it modest (the split cost is O(bits)).
+    pub fn first_split_bifurcation(
+        &self,
+        app_address: &[u8],
+        phase: Phase,
+        version: u64,
+        shard_bits: &[bool],
+        max_extra_bits: usize,
+    ) -> Result<Option<Vec<Vec<bool>>>> {
+        // Empty-split guard: a shard with <2 leaves can't split meaningfully.
+        if self.app_subtree_leaf_count(app_address, phase, version, shard_bits)? < 2 {
+            return Ok(None);
+        }
+        let mut prefix = shard_bits.to_vec();
+        for _ in 0..max_extra_bits {
+            let mut p0 = prefix.clone();
+            p0.push(false);
+            let mut p1 = prefix.clone();
+            p1.push(true);
+            let c0 = self.app_subtree_leaf_count(app_address, phase, version, &p0)?;
+            let c1 = self.app_subtree_leaf_count(app_address, phase, version, &p1)?;
+            match (c0 > 0, c1 > 0) {
+                (true, true) => return Ok(Some(vec![p0, p1])), // bifurcation: both non-empty
+                (true, false) => prefix = p0,                  // all data on the 0 side — descend
+                (false, true) => prefix = p1,                  // all data on the 1 side — descend
+                (false, false) => return Ok(None),             // unreachable (count>=2 above)
+            }
+        }
+        Ok(None) // no bifurcation within the bit budget — data too clustered to split
+    }
+
     /// Authenticated read of one leaf in a shard/phase tree at `version`:
     /// returns the value (if present) alongside a proof that verifies against
     /// that phase's root.
@@ -814,6 +1084,203 @@ impl Forest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase-2 unified tree: `app_subtree_root` reads per-shard commitments as
+    /// in-place subtrees of the ONE app tree — nibble-aligned, non-nibble-aligned
+    /// (6-bit), and empty — and the empty path is the JMT root over ALL shards.
+    /// §6.1 descend-to-bifurcation + empty-split guard: the split cuts where the
+    /// data actually branches (both children non-empty), skips uniform prefix
+    /// bits, and refuses to split an un-splittable shard.
+    #[test]
+    fn first_split_bifurcation_finds_the_real_branch() {
+        let forest = Forest::in_memory();
+        let app = b"quil-app-address-0123456789abcd!".to_vec();
+        let phase = Phase::VertexAdds;
+        let key = |b0: u8, b1: u8, tag: u8| -> Vec<u8> {
+            let mut k = vec![0u8; 32];
+            k[0] = b0;
+            k[1] = b1;
+            k[31] = tag;
+            k
+        };
+
+        // All leaves share the top 3 bits (0x00 / 0x10 → 0b000...), so the data
+        // does NOT divide at bit 0/1/2 — only DEEPER. A naive immediate split
+        // would leave a child empty; the bifurcation finder must descend.
+        //   0x00.. (0b0000_0000)  and  0x10.. (0b0001_0000)  → first differ at bit 3.
+        let leaves = vec![
+            (key(0x00, 0x00, 1), vec![0xCC, 1]),
+            (key(0x00, 0x11, 2), vec![0xCC, 2]),
+            (key(0x10, 0x00, 3), vec![0xDD, 3]),
+            (key(0x10, 0x22, 4), vec![0xDD, 4]),
+        ];
+        forest.commit_shard_phase_raw(&app, phase, 0, leaves).unwrap();
+
+        // Whole app (shard_bits = []): the branch is at bit 3 (top 3 bits uniform).
+        let children = forest
+            .first_split_bifurcation(&app, phase, 0, &[], 16)
+            .unwrap()
+            .expect("app has 4 leaves that branch → a bifurcation exists");
+        assert_eq!(children.len(), 2, "binary bifurcation");
+        // Both children are non-empty (the empty-split guarantee).
+        for c in &children {
+            assert!(
+                forest.app_subtree_leaf_count(&app, phase, 0, c).unwrap() >= 1,
+                "each child of the bifurcation is data-bearing: {c:?}"
+            );
+        }
+        // The branch is at bit 3: children are [0,0,0,0] and [0,0,0,1] (bits 0-2
+        // uniform-false, diverging at bit 3), each holding 2 leaves.
+        assert_eq!(children[0], vec![false, false, false, false]);
+        assert_eq!(children[1], vec![false, false, false, true]);
+        assert_eq!(forest.app_subtree_leaf_count(&app, phase, 0, &children[0]).unwrap(), 2);
+        assert_eq!(forest.app_subtree_leaf_count(&app, phase, 0, &children[1]).unwrap(), 2);
+
+        // Empty-split guard: a shard with a single leaf is unsplittable → None.
+        let single = Forest::in_memory();
+        single.commit_shard_phase_raw(&app, phase, 0, vec![(key(0x00, 0x00, 1), vec![0xAB])]).unwrap();
+        assert_eq!(single.app_subtree_leaf_count(&app, phase, 0, &[]).unwrap(), 1);
+        assert!(
+            single.first_split_bifurcation(&app, phase, 0, &[], 16).unwrap().is_none(),
+            "empty-split guard: a single-leaf shard does not split"
+        );
+        // An empty shard is likewise unsplittable.
+        assert!(
+            single.first_split_bifurcation(&app, phase, 0, &[true], 16).unwrap().is_none(),
+            "empty-split guard: an empty shard does not split"
+        );
+    }
+
+    #[test]
+    fn app_subtree_root_reads_unified_shard_commitments() {
+        use jmt::storage::{Node, NodeKey, NibblePath, TreeReader};
+        use sha2::Sha256;
+
+        let forest = Forest::in_memory();
+        let app = b"quil-app-address-0123456789abcd!".to_vec(); // 32B
+        let phase = Phase::VertexAdds;
+
+        // Spike #2's layout, but committed THROUGH the Forest into ONE app tree:
+        // 8 leaves under 1st-nibble 0 (byte0 0x00..0x07) + one under nibble 8
+        // (0x80) so the app-tree root is a real internal node.
+        let key = |b0: u8| -> Vec<u8> {
+            let mut k = vec![0u8; 32];
+            k[0] = b0;
+            k[31] = b0;
+            k
+        };
+        let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for b in 0u8..8 {
+            leaves.push((key(b), vec![0xCC, b]));
+        }
+        leaves.push((key(0x80), vec![0xDD, 0]));
+        let app_root = forest.commit_shard_phase_raw(&app, phase, 0, leaves).unwrap();
+
+        // (1) Empty path ⇒ the whole app-phase root (JMT root over ALL shards).
+        assert_eq!(forest.app_subtree_root(&app, phase, 0, &[]).unwrap(), app_root);
+
+        // (2) The two 6-bit shards X=000000, Y=000001 read as distinct, non-empty
+        //     subtree roots via the non-nibble-aligned descent.
+        let bits_x = crate::prefix_to_bits(&[0u32], 6);
+        let bits_y = crate::prefix_to_bits(&[1u32], 6);
+        let sx = forest.app_subtree_root(&app, phase, 0, &bits_x).unwrap();
+        let sy = forest.app_subtree_root(&app, phase, 0, &bits_y).unwrap();
+        assert_ne!(sx, sy);
+        assert_ne!(sx, [0u8; 32]);
+        assert_ne!(sy, [0u8; 32]);
+
+        // (2b) Cross-check against the manual spike-#2 descent: they MUST equal
+        //      the width-4 sub-ranges of the 2nd-nibble internal node.
+        let store = forest.shard_phase_reader(&app, phase);
+        let root_key = NodeKey::new(0, NibblePath::new(vec![]));
+        let root_int = match store.get_node_option(&root_key).unwrap().unwrap() {
+            Node::Internal(n) => n,
+            o => panic!("root not internal: {o:?}"),
+        };
+        let (nib0, ver0) = root_int
+            .children_sorted()
+            .map(|(n, c)| (n, c.version))
+            .next()
+            .unwrap();
+        let n2 = match store
+            .get_node_option(&root_key.gen_child_node_key(ver0, nib0))
+            .unwrap()
+            .unwrap()
+        {
+            Node::Internal(n) => n,
+            o => panic!("2nd-nibble not internal: {o:?}"),
+        };
+        assert_eq!(sx, n2.subtree_hash::<Sha256>(0, 4), "shard X == subtree [0,4)");
+        assert_eq!(sy, n2.subtree_hash::<Sha256>(4, 4), "shard Y == subtree [4,8)");
+
+        // (3) Nibble-aligned 4-bit prefix (1st-nibble 0) == the 2nd-nibble node
+        //     hash — the child the root commits to.
+        let n0 = forest.app_subtree_root(&app, phase, 0, &[false; 4]).unwrap();
+        assert_eq!(n0, n2.hash::<Sha256>(), "nibble-aligned shard == node hash");
+
+        // (4) Empty shard (6-bit prefix 111111 = 63, no data) → placeholder.
+        let bits_empty = crate::prefix_to_bits(&[63u32], 6);
+        assert_eq!(
+            forest.app_subtree_root(&app, phase, 0, &bits_empty).unwrap(),
+            [0u8; 32],
+            "empty shard → all-zero placeholder"
+        );
+    }
+
+    /// CRUX of shard-prover subtree-range sync: a PARTIAL app tree holding only
+    /// ONE shard's leaves yields the SAME `app_subtree_root(P)` as the FULL app
+    /// tree — because the node at P depends only on the leaves under P, which a
+    /// shard prover holds in full. This is what lets a prover store just its
+    /// subtree yet compute a shard commitment that composes to the global app
+    /// root (authenticated by the descent co-path). Covers both the nibble-
+    /// aligned and the non-nibble-aligned (6-bit) cases.
+    #[test]
+    fn partial_app_tree_reproduces_full_subtree_root() {
+        use crate::prefix_to_bits;
+
+        let app = b"quil-app-address-0123456789abcd!".to_vec();
+        let phase = Phase::VertexAdds;
+        let key = |b0: u8, tag: u8| -> Vec<u8> {
+            let mut k = vec![0u8; 32];
+            k[0] = b0;
+            k[31] = tag;
+            k
+        };
+
+        // FULL tree: shard X (top-6-bits 0 → byte0 0x00..0x03) has 3 leaves;
+        // OTHER shards have data too (byte0 0x40, 0x80, 0xFC).
+        let full = Forest::in_memory();
+        let mut full_leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (b0, tag) in [(0x00u8, 1u8), (0x01, 2), (0x03, 3)] {
+            full_leaves.push((key(b0, tag), vec![0xCC, b0]));
+        }
+        for b0 in [0x40u8, 0x80, 0xFC] {
+            full_leaves.push((key(b0, b0), vec![0xDD, b0]));
+        }
+        full.commit_shard_phase_raw(&app, phase, 0, full_leaves).unwrap();
+
+        // PARTIAL tree: ONLY shard X's 3 leaves.
+        let partial = Forest::in_memory();
+        let x_leaves: Vec<(Vec<u8>, Vec<u8>)> = [(0x00u8, 1u8), (0x01, 2), (0x03, 3)]
+            .iter()
+            .map(|(b0, tag)| (key(*b0, *tag), vec![0xCC, *b0]))
+            .collect();
+        partial.commit_shard_phase_raw(&app, phase, 0, x_leaves).unwrap();
+
+        // Shard X's 6-bit and nibble-aligned commitments must match across the
+        // full and partial trees.
+        let bits_6 = prefix_to_bits(&[0u32], 6); // top-6-bits 000000
+        let bits_nib = vec![false; 4]; // 1st nibble 0 (nibble-aligned)
+        for bits in [bits_6, bits_nib] {
+            let full_root = full.app_subtree_root(&app, phase, 0, &bits).unwrap();
+            let partial_root = partial.app_subtree_root(&app, phase, 0, &bits).unwrap();
+            assert_eq!(
+                full_root, partial_root,
+                "partial tree must reproduce the full subtree root for bits {bits:?}"
+            );
+            assert_ne!(full_root, [0u8; 32], "shard X is populated");
+        }
+    }
 
     #[test]
     fn address_path_app_shards_commit_and_leaf_proves_against_app_root() {

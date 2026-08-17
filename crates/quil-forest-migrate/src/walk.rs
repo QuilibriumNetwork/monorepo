@@ -620,6 +620,74 @@ pub fn run_conversion_in_place_with_shards(
     convert_db(hg, &forest, version, head_frame, shards_for_app_from_store(shards_store))
 }
 
+/// UNIFIED-APP-TREE consolidation (the Phase-2 `UNIFIED_APP_TREE_DESIGN.md` §9
+/// cutover, run in place). For every SPLIT app — one with a real sub-shard
+/// partition, not a single shard — rebuild its ONE app tree
+/// (`TreeId::shard_phase(app, phase)`) from the app's vertices via
+/// [`convert_app`] with a SINGLE EMPTY prefix: all leaves land in the app tree,
+/// raw-key positioned, so a shard becomes the in-place subtree at its prefix.
+///
+/// The unified app root produced here is byte-identical to what `commit_inner`
+/// emits in unified mode (same leaves, content-addressed JMT). Single-shard apps
+/// are ALREADY their own app tree (the live path keys them by `app.l2`), so they
+/// are SKIPPED — rebuilding would collide with their live version. This does NOT
+/// touch L1: `commit_inner` rebuilds each app's L1 leaf with the unified root the
+/// first time it commits that app at/after the cutover frame.
+///
+/// The CALLER guards idempotency (a persisted marker) and the flag-day gate — this
+/// routine unconditionally rebuilds the split apps it finds. Returns the count of
+/// apps consolidated. `version` should be `0` (the app trees are fresh keyspace;
+/// live commits then continue from the written head version).
+pub fn run_unified_consolidation_in_place(
+    hg: &RocksHypergraphStore,
+    shards_store: &dyn quil_types::store::ShardsStore,
+    version: u64,
+    head_frame: u64,
+) -> anyhow::Result<usize> {
+    let forest = Forest::with_namespace(hg.raw_db(), quil_store::FOREST_NAMESPACE.to_vec());
+    let shards_for_app = shards_for_app_from_store(shards_store);
+
+    // Enumerate every app that carries state (the same union `convert_db` uses:
+    // the all-time split sub-shard index ∪ a lookback window of shard commits).
+    const LOOKBACK: u64 = 128;
+    let mut shard_keys: std::collections::HashSet<ShardKey> = std::collections::HashSet::new();
+    for addr in HypergraphStore::range_alt_shard_addresses(hg)
+        .map_err(|e| anyhow::anyhow!("range_alt_shard_addresses: {e}"))?
+    {
+        if addr.len() >= 32 {
+            let mut l2 = [0u8; 32];
+            l2.copy_from_slice(&addr[..32]);
+            shard_keys.insert(ShardKey { l2, l1: get_bloom_filter_indices(&addr, 256, 3) });
+        }
+    }
+    let lo = head_frame.saturating_sub(LOOKBACK);
+    for fno in lo..=head_frame {
+        for sk in HypergraphStore::get_root_commits(hg, fno)
+            .map_err(|e| anyhow::anyhow!("get_root_commits({fno}): {e}"))?
+            .into_keys()
+        {
+            shard_keys.insert(sk);
+        }
+    }
+
+    let mut consolidated = 0usize;
+    for shard_key in &shard_keys {
+        let prefixes = shards_for_app(&shard_key.l2);
+        // Split iff there's more than one shard OR a single non-empty prefix.
+        // A single empty prefix is an unsplit app → already its own app tree.
+        let is_split = prefixes.len() > 1 || prefixes.iter().any(|p| !p.is_empty());
+        if !is_split {
+            continue;
+        }
+        // Rebuild the app's ONE tree: empty prefix ⇒ every vertex routes to the
+        // app.l2 tree. `convert_app` writes the per-phase head versions.
+        if convert_app(hg, &forest, shard_key, version, &[Vec::new()])?.is_some() {
+            consolidated += 1;
+        }
+    }
+    Ok(consolidated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +750,81 @@ mod tests {
                 &expected,
             )
             .expect("per-vertex leaf verifies against the vertex_adds root");
+    }
+
+    /// Phase-2 §9 consolidation: rebuilding a SPLIT app with a single empty
+    /// prefix yields ONE app tree whose root IS the JMT root (native, no
+    /// `app_root_from_shard_paths` rollup) — byte-identical to unified
+    /// `commit_inner` — differing from the legacy 64-way rollup (the fork), with
+    /// every vertex proving directly against the app root (shard = subtree).
+    #[test]
+    fn unified_consolidation_builds_one_app_tree_matching_the_jmt_root() {
+        use quil_execution::domains::QUIL_TOKEN;
+
+        let src = tempfile::tempdir().unwrap();
+        let dst_legacy = tempfile::tempdir().unwrap();
+        let dst_unified = tempfile::tempdir().unwrap();
+        let hg = RocksHypergraphStore::new(open_db(src.path()));
+        let app_key = ShardKey { l2: QUIL_TOKEN, l1: [0u8; 3] };
+        let type_key = vec![0xFFu8; 32];
+
+        // 3 vertices in QUIL sub-shards 0, 1, 63 (by the top-6 address bits).
+        for (b0, tag) in [(0x00u8, 0xA1u8), (0x04, 0xB2), (0xFC, 0xC3)] {
+            let mut data_addr = [0u8; 32];
+            data_addr[0] = b0;
+            data_addr[31] = tag;
+            let mut vk = QUIL_TOKEN.to_vec();
+            vk.extend_from_slice(&data_addr);
+            let blob = vertex_blob(&[(&type_key, b"token:Coin")]);
+            hg.save_vertex_underlying("vertex", "adds", &app_key, &vk, &blob).unwrap();
+        }
+
+        // Legacy: 64-way split → per-sub-shard trees + hash_pair rollup.
+        let forest_legacy = Forest::new(open_db(dst_legacy.path()));
+        let (legacy, _) = convert_app(&hg, &forest_legacy, &app_key, 0, &quil_shards_for_app(&QUIL_TOKEN))
+            .unwrap()
+            .unwrap();
+
+        // Unified consolidation: SINGLE empty prefix → ONE app tree.
+        let forest_unified = Forest::new(open_db(dst_unified.path()));
+        let (unified, nonempty) =
+            convert_app(&hg, &forest_unified, &app_key, 0, &[Vec::new()]).unwrap().unwrap();
+
+        // The unified commitment IS the rollup of the ONE app tree's four native
+        // phase JMT roots (no per-sub-shard `app_root_from_shard_paths`).
+        let mut phase_roots = [[0u8; 32]; 4];
+        for (i, ph) in PHASES.iter().enumerate() {
+            phase_roots[i] =
+                forest_unified.app_subtree_root(&QUIL_TOKEN, *ph, 0, &[]).unwrap();
+        }
+        assert_eq!(
+            unified.app_root,
+            rollup_phase_roots(&phase_roots),
+            "unified commitment == rollup of the app tree's phase roots"
+        );
+        let jmt_root = phase_roots[Phase::VertexAdds as usize]; // for the leaf proof below
+        assert_eq!(unified.num_leaves, 3, "all 3 vertices in the one app tree");
+        assert_eq!(nonempty, 1, "one non-empty shard = the whole app");
+        assert_ne!(unified.app_root, legacy.app_root, "unified != legacy rollup (the fork)");
+        assert_eq!(unified.num_leaves, legacy.num_leaves, "same leaves, invariant to sharding");
+
+        // A vertex proves DIRECTLY against the unified app root (shard=subtree).
+        let mut probe = [0u8; 32];
+        probe[0] = 0xFC;
+        probe[31] = 0xC3;
+        let expected =
+            quil_tries::vertex_leaf_value(&vertex_blob(&[(&type_key, b"token:Coin")])).unwrap();
+        let (val, proof) = forest_unified
+            .shard_phase_get_with_proof_raw(&QUIL_TOKEN, Phase::VertexAdds, 0, &probe)
+            .unwrap();
+        assert_eq!(val.as_deref(), Some(&expected[..]));
+        proof
+            .verify_existence(
+                jmt::RootHash(jmt_root),
+                quil_forest::shard_path_key_hash(&probe),
+                &expected,
+            )
+            .expect("leaf verifies against the unified app root");
     }
 
     /// The streaming `convert_app` routes an app's vertices to the right

@@ -187,6 +187,28 @@ impl InMemoryProverRegistry {
             }
         }
 
+        // Subtract removals. `remove_vertex` tombstones a vertex in the "removes"
+        // phase but LEAVES its "adds" blob intact (see
+        // `HypergraphCrdt::remove_vertex`), so an adds-only walk resurrects any
+        // vertex that was DELETED from committed state — e.g. the non-archive
+        // prover records the unified split reset drops. Without this exclusion the
+        // registry keeps reporting a dropped allocation as Active, so the
+        // lifecycle never notices it's gone and never re-joins (the app-shard then
+        // fails its storage attestation against committed state). Exclude any vk
+        // present in "removes" so the cache reflects committed `adds ∧ ¬removes`,
+        // matching the CRDT's own scan and the authoritative committed reads.
+        // A no-op except after a real deletion — removes is empty on the prover
+        // shard in steady state (leaves/kicks flip Status in place, they don't
+        // delete).
+        let mut removed_vks: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
+        let _ = hg_store.for_each_vertex_underlying("vertex", "removes", &shard, |vk, _data| {
+            removed_vks.insert(vk);
+        });
+        if !removed_vks.is_empty() {
+            leaves.retain(|(vk, _)| !removed_vks.contains(vk));
+        }
+
         // Two-pass walk: first collect provers, then collect allocations.
         // The iterator order is arbitrary, so if we did it in one pass
         // we'd need to synthesize stubs when an allocation arrives
@@ -1655,6 +1677,65 @@ pub fn active_provers_on_filter_committed(
     out
 }
 
+/// Enumerate EVERY registered prover on the global prover shard from COMMITTED
+/// state, returning `(prover_address, public_key, confirmation_filters)` — one
+/// entry per `prover:Prover` vertex, with every `allocation:ProverAllocation`
+/// filter that references it (global + each app sub-shard). Deterministic (a
+/// single committed-state pass, address-sorted), so every node computes the
+/// identical set for a given frame. Used by the unified-tree reset to DROP
+/// non-archive records without depending on the timing-sensitive async cache.
+pub fn all_provers_with_allocations_committed(
+    hg: &quil_hypergraph::HypergraphCrdt,
+) -> Vec<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>)> {
+    let shard = ShardKey {
+        l1: [0u8; 3],
+        l2: [0xffu8; 32],
+    };
+    let mut addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    // prover_address -> every confirmation_filter it is allocated on.
+    let mut alloc_filters: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+
+    let mut cb = |vk: Vec<u8>, data: Vec<u8>| {
+        if vk.len() != 64 {
+            return;
+        }
+        let root = match deserialize_go_tree(&data) {
+            Ok(Some(r)) => r,
+            _ => return,
+        };
+        let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+            return;
+        };
+        if type_hash == TYPE_HASH_ALLOCATION {
+            if let Some((prover_ref, alloc)) = decode_allocation(&vk, &root) {
+                alloc_filters
+                    .entry(prover_ref)
+                    .or_default()
+                    .push(alloc.confirmation_filter);
+            }
+            return;
+        }
+        if let Some("prover:Prover") = class_for_type_hash(&type_hash) {
+            if let Some(info) = decode_prover(&vk, &root) {
+                addr_to_pubkey.insert(info.address.clone(), info.public_key);
+            }
+        }
+    };
+    let _ = hg.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut cb);
+
+    let mut out: Vec<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>)> = addr_to_pubkey
+        .into_iter()
+        .map(|(addr, pubkey)| {
+            let mut filters = alloc_filters.remove(&addr).unwrap_or_default();
+            filters.sort();
+            filters.dedup();
+            (addr, pubkey, filters)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Decode a `leafroot:LeafRootRegistration` vertex into
 /// `((member, leaf_id), record)`. `leaf_id = leaf_id_bytes(shard_filter,
 /// prefix)`. Returns `None` if required fields are missing.
@@ -2061,6 +2142,97 @@ mod tests {
         // Active-filter query too.
         let active = reg.get_active_provers(&filter, 0);
         assert_eq!(active.len(), 1);
+    }
+
+    /// `all_provers_with_allocations_committed` (the unified-tree reset's
+    /// enumeration) must surface every prover with EVERY confirmation filter it
+    /// holds, keyed by its real address — and each allocation must live at
+    /// `allocation_address(pubkey, filter)`, so the reset's drop (which recomputes
+    /// that address) targets exactly the seeded vertices. Seeds provers at their
+    /// REAL poseidon addresses, the on-chain layout the reset assumes.
+    #[test]
+    fn all_provers_with_allocations_enumerates_real_addresses_and_filters() {
+        use crate::global_intrinsic::materialize::{allocation_address, prover_address_from_pubkey};
+        use quil_hypergraph::HypergraphCrdt;
+        use quil_types::crypto::NoopInclusionProver;
+
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let quil = crate::domains::QUIL_TOKEN;
+        let mk_filter = |suffix: u8| {
+            let mut f = quil.to_vec();
+            f.push(suffix);
+            f
+        };
+
+        // Seed a prover at prover_address_from_pubkey(pk) with an allocation at
+        // allocation_address(pk, filter) for each filter. Returns the address.
+        let seed = |pk: &[u8], filters: &[Vec<u8>]| -> Vec<u8> {
+            let paddr = prover_address_from_pubkey(pk).unwrap();
+            let prover = build_sub_tree(vec![
+                type_hash_leaf("prover:Prover"),
+                field_leaf("prover:Prover", "PublicKey", pk.to_vec()),
+                field_leaf("prover:Prover", "Status", vec![1u8]),
+                field_leaf("prover:Prover", "AvailableStorage", 0u64.to_be_bytes().to_vec()),
+                field_leaf("prover:Prover", "Seniority", 0u64.to_be_bytes().to_vec()),
+                field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
+            ]);
+            let mut pvk = vec![0xFFu8; 32];
+            pvk.extend_from_slice(&paddr);
+            store
+                .save_vertex_underlying("vertex", "adds", &shard, &pvk, &prover)
+                .unwrap();
+            for filter in filters {
+                let aaddr = allocation_address(pk, filter).unwrap();
+                let alloc = build_sub_tree(vec![
+                    type_hash_leaf("allocation:ProverAllocation"),
+                    field_leaf("allocation:ProverAllocation", "Prover", paddr.to_vec()),
+                    field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+                    field_leaf(
+                        "allocation:ProverAllocation",
+                        "ConfirmationFilter",
+                        filter.clone(),
+                    ),
+                ]);
+                let mut avk = vec![0xFFu8; 32];
+                avk.extend_from_slice(&aaddr);
+                store
+                    .save_vertex_underlying("vertex", "adds", &shard, &avk, &alloc)
+                    .unwrap();
+            }
+            paddr.to_vec()
+        };
+
+        let pk_a = vec![0xA1u8; 57];
+        let pk_b = vec![0xB2u8; 57];
+        let fa = vec![mk_filter(0x00), mk_filter(0x01)]; // two sub-shards
+        let fb = vec![mk_filter(0x02)];
+        let addr_a = seed(&pk_a, &fa);
+        let addr_b = seed(&pk_b, &fb);
+
+        let crdt = HypergraphCrdt::new(
+            store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+            Arc::new(NoopInclusionProver),
+        );
+        let by_addr: HashMap<Vec<u8>, (Vec<u8>, Vec<Vec<u8>>)> =
+            all_provers_with_allocations_committed(&crdt)
+                .into_iter()
+                .map(|(a, p, f)| (a, (p, f)))
+                .collect();
+
+        assert_eq!(by_addr.len(), 2, "both provers enumerated");
+        let (pa, mut fa_got) = by_addr.get(&addr_a).cloned().expect("prover A present");
+        fa_got.sort();
+        let mut fa_want = fa.clone();
+        fa_want.sort();
+        assert_eq!(pa, pk_a, "A pubkey recovered");
+        assert_eq!(fa_got, fa_want, "A carries BOTH sub-shard filters");
+        let (pb, fb_got) = by_addr.get(&addr_b).cloned().expect("prover B present");
+        assert_eq!(pb, pk_b, "B pubkey recovered");
+        assert_eq!(fb_got, fb, "B carries its single filter");
+        // Enumerating A's filter fa[0] proves the allocation seeded at
+        // allocation_address(pk_a, fa[0]) was read — i.e. the reset's drop, which
+        // recomputes that same address, targets exactly the vertex that exists.
     }
 
     #[test]

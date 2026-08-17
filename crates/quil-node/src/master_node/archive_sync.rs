@@ -817,6 +817,10 @@ async fn run_state_jump(
 pub(crate) struct ArchiveSyncArgs {
     pub mtls_seed: Option<[u8; 57]>,
     pub network: u8,
+    /// Testnet/localnet genesis seed (concatenated Falcon prover keys) — used by
+    /// the at-cutover prover-tree reset on regular nodes to re-seed the genesis
+    /// committee locally (deterministic, so no dependence on syncing the wipe).
+    pub genesis_seed: String,
     pub archive_mode: bool,
     pub archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
     pub clock_store: Arc<quil_store::RocksClockStore>,
@@ -883,6 +887,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
     let ArchiveSyncArgs {
         mtls_seed,
         network,
+        genesis_seed: _genesis_seed,
         archive_mode,
         archive_pool,
         clock_store,
@@ -1189,6 +1194,37 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         // trees and the registry refresh below sees
                         // no new ProverJoin/Confirm/Leave writes.
                         if applied > 0 {
+                            // Flip to the unified app-tree commitment at exactly
+                            // the cutover frame, BEFORE this frame commits.
+                            crate::unified_consolidation::gate_unified_at_frame(
+                                crdt_for_poller.as_ref(),
+                                &hg_for_poller,
+                                shards_store_for_poller.as_ref(),
+                                frame_num,
+                            );
+                            // (The at-cutover prover-tree reset for regulars runs in
+                            // the gossip apply path — `message_loop.rs` — where they
+                            // apply frames FIRST/in-order; here `applied` is already 0
+                            // so this poller path never carries the cutover frame.)
+                            // Apply any epoch-aligned shard split/merge due at this
+                            // frame BEFORE committing, so the reassignment writes ride
+                            // the same commit and the shards store reflects the new
+                            // topology. On the ARCHIVE this runs in the FrameMaterializer;
+                            // regular nodes have no materializer (it's archive-only) and
+                            // otherwise NEVER apply splits locally — their shards_store
+                            // stays single-shard, so `refresh_crdt_shard_prefixes` never
+                            // sees the leaves, `app_prefixes`/size-buckets/compute_shard_root
+                            // go stale, and provers churn (proposing to leave the
+                            // data-bearing leaf they read as size 0). The global intrinsic
+                            // here has shards_store+shards_db wired (init_engines), so this
+                            // records + applies deterministically, converging the reg to the
+                            // archive's committed topology. (No-op when nothing is due.)
+                            if let Err(e) =
+                                exec_mgr_for_poller.apply_global_due_shard_changes(frame_num)
+                            {
+                                warn!(error = %e, frame = frame_num,
+                                    "apply_due_shard_changes (inline) failed");
+                            }
                             if let Err(e) = exec_mgr_for_poller.commit_frame(frame_num) {
                                 warn!(error = %e, frame = frame_num, "hypergraph commit failed");
                             }
@@ -1283,9 +1319,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     if bytes == 0 {
                                         continue;
                                     }
-                                    // Reconstruct the `bp` filter the
-                                    // proposer keys on: L2[32] +
-                                    // prefix bytes.
+                                    // Reconstruct the `bp` filter the proposer keys
+                                    // on (canonical, sentinel-aware).
                                     let l2 = if s.shard_key.len() >= 35 {
                                         &s.shard_key[3..35]
                                     } else if s.shard_key.len() > 3 {
@@ -1293,10 +1328,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     } else {
                                         &s.shard_key[..]
                                     };
-                                    let mut bp = l2.to_vec();
-                                    for &p in &entry.prefix {
-                                        bp.push(p as u8);
-                                    }
+                                    let bp = quil_forest::shard_prefix_to_filter(l2, &entry.prefix);
                                     sizes_by_filter.insert(bp, bytes);
                                 }
                             }
@@ -2721,11 +2753,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     std::collections::HashSet::with_capacity(rows.len());
                                 for r in &rows {
                                     if r.shard_key.len() >= 35 {
-                                        let mut addr = r.shard_key[3..35].to_vec();
-                                        for &p in &r.prefix {
-                                            addr.push(p as u8);
-                                        }
-                                        valid.insert(addr);
+                                        // Canonical, sentinel-aware — else deep-shard
+                                        // frames' bit-path addresses get rejected.
+                                        valid.insert(quil_forest::shard_prefix_to_filter(
+                                            &r.shard_key[3..35],
+                                            &r.prefix,
+                                        ));
                                     }
                                 }
                                 if !valid.is_empty() {

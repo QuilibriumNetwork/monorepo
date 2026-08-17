@@ -107,6 +107,22 @@ pub struct FrameMaterializer {
     /// `commit_frame` to rebuild the prover-registry cache from the
     /// just-flushed RocksDB trees.
     rocks_hg_store: Option<Arc<quil_store::RocksHypergraphStore>>,
+    /// (B/#2) At-cutover consolidation hook `Fn(frame) -> ok`. Run on THIS
+    /// materializer's CRDT store at the cutover frame BEFORE flipping to unified,
+    /// to fold every split app's per-sub-shard trees into its app.l2 tree from
+    /// current committed vertices — so a split/commit in the `[boot, cutover)`
+    /// window is reflected (boot-only consolidation goes stale). Built by the node
+    /// (archive hg + shards store → `run_unified_consolidation_in_place`). `None`
+    /// (tests) flips without consolidating.
+    unified_cutover_consolidate: Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
+    /// At-cutover PROVER-TREE reset hook `Fn(frame) -> ok`. Runs on the archive's
+    /// CRDT + store at the cutover frame alongside the unified flip: wipes the
+    /// global prover shard (vertex + hyperedge trees + blob keyspace) and rebuilds
+    /// it from the genesis committee (`reset_prover_tree_to_genesis`), so provers
+    /// stranded on alias sub-shards are cleared and re-join onto the reset grid.
+    /// Built by the node (archive hg + rocks store + network genesis committee).
+    /// `None` (tests / non-archives) leaves the prover tree untouched.
+    prover_tree_reset: Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
     /// Concrete `SharedProverRegistry` reference for the mutating
     /// `evict_inactive_provers` path. When set, archive
     /// nodes apply Status=4 + KickFrameNumber to evicted prover and
@@ -223,6 +239,8 @@ impl FrameMaterializer {
             evictions_enabled: false,
             frozen_era_recovery_enabled: false,
             rocks_hg_store: None,
+            unified_cutover_consolidate: None,
+            prover_tree_reset: None,
             eviction_registry: None,
             current_frame: None,
             frame_prover: None,
@@ -304,6 +322,24 @@ impl FrameMaterializer {
         self
     }
 
+    /// Wire the at-cutover consolidation hook (see `unified_cutover_consolidate`).
+    pub fn with_unified_cutover_consolidate(
+        mut self,
+        hook: Arc<dyn Fn(u64) -> bool + Send + Sync>,
+    ) -> Self {
+        self.unified_cutover_consolidate = Some(hook);
+        self
+    }
+
+    /// Wire the at-cutover prover-tree reset hook (see `prover_tree_reset`).
+    pub fn with_prover_tree_reset(
+        mut self,
+        hook: Arc<dyn Fn(u64) -> bool + Send + Sync>,
+    ) -> Self {
+        self.prover_tree_reset = Some(hook);
+        self
+    }
+
     /// Materialize a finalized global frame — apply all its transactions
     /// to local state.
     pub fn materialize(
@@ -313,6 +349,46 @@ impl FrameMaterializer {
         let header = frame.header.as_ref()
             .ok_or_else(|| QuilError::InvalidArgument("frame has no header".into()))?;
         let frame_number = header.frame_number;
+
+        // UNIFIED_APP_TREE cutover: flip to the unified commitment at exactly the
+        // cutover frame, BEFORE this frame's state commits. Deterministic across
+        // nodes (pure fn of `frame_number`), so every node switches at the same
+        // height. (B/#2) Consolidate AT the cutover frame first — folding every
+        // split app's per-sub-shard trees into its app.l2 tree from current
+        // committed vertices — so a split/commit in the [boot, cutover) window is
+        // reflected (a boot-only app tree goes stale). If it fails, defer the flip.
+        if frame_number
+            >= quil_execution::global_intrinsic::materialize::unified_tree_cutover_frame()
+            && !self.hypergraph.unified_tree()
+        {
+            let ok = self
+                .unified_cutover_consolidate
+                .as_ref()
+                .map(|h| h(frame_number))
+                .unwrap_or(true);
+            // Prover-tree reset rides the same flag day: wipe the global prover
+            // shard + rebuild from the genesis committee, so provers stranded on
+            // alias sub-shards are cleared and re-join. Committed here (before this
+            // frame materializes), so the reset lands in the cutover frame's
+            // recorded prover root and propagates to syncing nodes. `None` (tests /
+            // non-archives) is a no-op.
+            let reset_ok = self
+                .prover_tree_reset
+                .as_ref()
+                .map(|h| h(frame_number))
+                .unwrap_or(true);
+            if ok && reset_ok {
+                self.hypergraph.set_unified_tree(true);
+                info!(frame = frame_number, "unified app-tree commitment ACTIVATED at cutover");
+            } else {
+                error!(
+                    frame = frame_number,
+                    consolidate_ok = ok,
+                    reset_ok,
+                    "unified cutover step FAILED — deferring flip this frame"
+                );
+            }
+        }
 
         // 1. Idempotency check
         let last = self.last_materialized_frame.load(Ordering::SeqCst);
@@ -361,12 +437,22 @@ impl FrameMaterializer {
             }
         }
         let _materialize_timer = MatTimer(std::time::Instant::now());
+        // Opt-in per-stage materialize timing (set QUIL_MAT_STAGE_TIMING=1 on one
+        // archive to capture where the per-frame floor goes). `mat_start` brackets
+        // the whole function; each stage logs its CUMULATIVE elapsed so per-stage
+        // deltas are the differences between consecutive lines.
+        let mat_stage_timing = std::env::var("QUIL_MAT_STAGE_TIMING").is_ok();
+        let mat_start = std::time::Instant::now();
 
         // (B) Serialize this ENTIRE materialize (pre-apply verify + apply +
         // commit + root capture) against the prover-tree sync and any other
         // forest writer. Nothing may advance the forest mid-materialize, so the
         // verify below reads a stable N-1 forest and cannot fork the prover root.
         let _forest_guard = self.hypergraph.lock_forest_writes();
+        if mat_stage_timing {
+            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: forest lock acquired (this delta = lock-wait)");
+        }
 
         // ── 2.1.0.25 frozen-era recovery (see FROZEN_ERA_RECOVERY_* doc) ──
         // Deterministic no-op for the frozen era: fail every request WITHOUT
@@ -888,12 +974,20 @@ impl FrameMaterializer {
             error!(frame = frame_number, error = %e, "apply_due_shard_changes failed — aborting materialize");
             return Err(e);
         }
+        if mat_stage_timing {
+            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: process_message + apply_due done (delta from lock = request/apply work)");
+        }
         if let Err(e) = self
             .execution_manager
             .commit_frame_with_global_cursor(frame_number)
         {
             error!(frame = frame_number, error = %e, "CRDT commit_frame failed — aborting materialize");
             return Err(e);
+        }
+        if mat_stage_timing {
+            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: commit_frame_with_global_cursor done (delta = the main CRDT commit)");
         }
         if let (Some(eviction_reg), Some(rocks_store)) =
             (self.eviction_registry.as_ref(), self.rocks_hg_store.as_ref())
@@ -1118,9 +1212,17 @@ impl FrameMaterializer {
         if let Err(e) = self.persist_alt_shard_updates(frame_number, frame) {
             warn!(frame = frame_number, error = %e, "persist alt shard updates failed");
         }
+        if mat_stage_timing {
+            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: eviction + persist_alt done (delta = eviction scan + alt-shard)");
+        }
 
         // 8. Compute post-materialization prover root
         let post_root = self.compute_local_prover_root(frame_number + 1);
+        if mat_stage_timing {
+            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: compute_local_prover_root done (delta = the SECOND full commit(N+1))");
+        }
 
         // 9. Update state
         self.last_materialized_frame.store(frame_number, Ordering::SeqCst);

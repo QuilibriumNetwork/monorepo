@@ -61,7 +61,10 @@ pub struct CoverageThresholds {
     pub halt_threshold: u64,
     /// Minimum total provers for normal operation (from config).
     pub min_provers: u64,
-    /// Maximum provers before split should be considered.
+    /// Maximum provers before a split is considered (the split TRIGGER). A shard
+    /// splits only when `active > max_provers` AND its leaves can divide further
+    /// (§6.1 — the divisibility guard bounds depth to where data diverges, giving
+    /// convergence; there is NO separate data-count threshold).
     pub max_provers: u64,
     /// Streak length at which an initial halt is confirmed.
     pub halt_grace_frames: u64,
@@ -411,12 +414,47 @@ pub struct CoverageMonitor {
     /// zero-prover-but-non-zero-size shards (the address-creation
     /// failure mode).
     shard_inventory_provider: Option<ShardInventoryProvider>,
+    /// Optional EMPTY-SPLIT GUARD (`UNIFIED_APP_TREE_DESIGN` §6.1): given a shard
+    /// `(filter, factor)`, returns the leaf count of each of the `factor` proposed
+    /// children under the unified app tree. A split is only proposed when ≥2 of
+    /// those children are DATA-BEARING — otherwise the split would create an
+    /// empty child (meaningless; on the legacy separate-tree model it also
+    /// orphaned data). Wired by the node to
+    /// `HypergraphCrdt::unified_subtree_leaf_count` (unified only); unset ⇒ no
+    /// guard (legacy behavior). Interior-mutable because the monitor is
+    /// `Arc`-wrapped before the CRDT exists.
+    split_feasibility: std::sync::RwLock<Option<SplitFeasibilityProvider>>,
+    /// Deep-bifurcation (§6.1 encoding rework) split PROPOSER. Given a shard
+    /// filter, returns the child bit-path FILTERS of the shallowest real branch
+    /// (`HypergraphCrdt::propose_split_children` → `first_split_bifurcation`),
+    /// descending past any uniform run so BOTH children are data-bearing — or
+    /// `None` (the empty-split guard, or an unsplittable single-leaf shard).
+    /// Wired by the node ONLY under the unified app tree; unset ⇒ the legacy
+    /// immediate-bit `compute_proposed_shards` byte-suffix children. Interior-
+    /// mutable for the same reason as `split_feasibility`.
+    split_proposer: std::sync::RwLock<Option<SplitProposalProvider>>,
+    /// Deep-bifurcation: reports whether the unified app tree is active RIGHT NOW
+    /// (the node wires `move || crdt.unified_tree()`, checked dynamically since it
+    /// flips at the cutover frame — not at wiring time). Gates `propose_merge_
+    /// rebalance`'s sibling identification: bit-path filters (`parent = drop the
+    /// last BIT`) under unified, byte-suffix (`drop the last BYTE`, `0x00`/`0x80`)
+    /// otherwise. Unset ⇒ legacy. Parity with the split proposer's dynamic check.
+    unified_provider: std::sync::RwLock<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
     /// Per-shard frame of the last split/merge proposal we emitted, so a
     /// hot/cold shard isn't re-proposed every frame while the previous
     /// proposal is still working through consensus + materialize. Mirrors
     /// Go's `shard_rebalancer` cooldown.
     last_rebalance_frame: Mutex<std::collections::HashMap<Vec<u8>, u64>>,
 }
+
+/// See [`CoverageMonitor::split_feasibility`]: `(filter, factor) →` per-child
+/// leaf counts (length `factor`).
+pub type SplitFeasibilityProvider = Arc<dyn Fn(&[u8], u8) -> Vec<u64> + Send + Sync>;
+
+/// See [`CoverageMonitor::split_proposer`]: `filter →` the deep-bifurcation
+/// child bit-path FILTERS (length 2), or `None` when the shard can't be split
+/// into two data-bearing halves (the empty-split guard / single leaf).
+pub type SplitProposalProvider = Arc<dyn Fn(&[u8]) -> Option<Vec<Vec<u8>>> + Send + Sync>;
 
 /// Frames to wait before re-proposing a split/merge for the same shard.
 const REBALANCE_COOLDOWN_FRAMES: u64 = 30;
@@ -464,10 +502,8 @@ pub fn build_shard_inventory(
             } else {
                 &s.shard_key[..]
             };
-            let mut filter = l2.to_vec();
-            for &p in &entry.prefix {
-                filter.push(p as u8);
-            }
+            // Canonical prefix → filter (sentinel-aware; see shard_prefix_to_filter).
+            let filter = quil_forest::shard_prefix_to_filter(l2, &entry.prefix);
             let active = prover_registry
                 .get_active_provers(&filter, frame_number)
                 .map(|v| v.len() as u64)
@@ -505,6 +541,9 @@ impl CoverageMonitor {
             last_checked_frame: AtomicU64::new(0),
             emitted_halted: Mutex::new(std::collections::HashSet::new()),
             shard_inventory_provider: None,
+            split_feasibility: std::sync::RwLock::new(None),
+            split_proposer: std::sync::RwLock::new(None),
+            unified_provider: std::sync::RwLock::new(None),
             last_rebalance_frame: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -512,6 +551,38 @@ impl CoverageMonitor {
     /// Configured thresholds (halt threshold, min/max provers, grace frames).
     pub fn thresholds(&self) -> CoverageThresholds {
         self.thresholds
+    }
+
+    /// Install the §6.1 empty-split guard provider (see
+    /// [`Self::split_feasibility`]). The node wires this to the unified app tree;
+    /// without it, splits are proposed unconditionally (legacy). `&self` +
+    /// interior mutability so it can be set through the `Arc` once the CRDT exists.
+    pub fn set_split_feasibility_provider(&self, provider: SplitFeasibilityProvider) {
+        *self.split_feasibility.write().unwrap() = Some(provider);
+    }
+
+    /// Install the deep-bifurcation split proposer (see [`Self::split_proposer`]).
+    /// Wired by the node ONLY under the unified app tree; without it,
+    /// `propose_split_rebalance` emits legacy immediate-bit byte-suffix children.
+    pub fn set_split_proposer(&self, provider: SplitProposalProvider) {
+        *self.split_proposer.write().unwrap() = Some(provider);
+    }
+
+    /// Install the unified-tree state provider (see [`Self::unified_provider`]).
+    /// The node wires `move || crdt.unified_tree()`; `propose_merge_rebalance`
+    /// calls it each frame to pick bit-path vs byte-suffix sibling identification.
+    pub fn set_unified_provider(&self, provider: Arc<dyn Fn() -> bool + Send + Sync>) {
+        *self.unified_provider.write().unwrap() = Some(provider);
+    }
+
+    /// Whether the unified app tree is active right now (deep-bifurcation mode).
+    fn is_unified(&self) -> bool {
+        self.unified_provider
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|p| p())
+            .unwrap_or(false)
     }
 
     /// Install a [`ShardInventoryProvider`] so per-frame `check` sees
@@ -824,9 +895,6 @@ impl CoverageMonitor {
                 .get(&ProverStatus::Active)
                 .copied()
                 .unwrap_or(0) as u64;
-            if active <= self.thresholds.max_provers {
-                continue;
-            }
             // Per-shard cooldown so we don't re-propose every frame while
             // the previous split works through consensus + materialize.
             if last
@@ -835,11 +903,78 @@ impl CoverageMonitor {
             {
                 continue;
             }
-            let factor = crate::shard_rebalancer::split_factor(active);
-            let proposed = crate::shard_rebalancer::compute_proposed_shards(filter, factor);
-            if proposed.len() < 2 {
-                continue;
+            // §6.1: a shard splits ONLY when BOTH hold — (1) it is OVER-CROWDED
+            // (`active > max_provers`, the trigger), AND (2) its leaves CAN BE
+            // DIVIDED FURTHER (≥2 non-empty children). Prover-count alone is not
+            // enough: splitting a shard whose data can't divide (the skewed [7,0]
+            // case) just makes an empty child and never reduces load. Divisibility
+            // (2) is enforced below by the empty-split guard / the deep proposer
+            // returning `None`, so it also BOUNDS the split depth to where the data
+            // actually diverges → convergence even under surplus workers. The data
+            // condition is "can it split", NOT "is it big" — there is no data-count
+            // threshold.
+            let provider = self.split_feasibility.read().unwrap().clone();
+            if active <= self.thresholds.max_provers {
+                continue; // (1) not over-crowded → no split
             }
+            let factor = crate::shard_rebalancer::split_factor(active);
+            // Per-child leaf counts for the divisibility / empty-split guard below.
+            let counts = provider.as_ref().map(|p| p(filter, factor));
+            tracing::debug!(
+                filter = hex::encode(filter),
+                active,
+                factor,
+                ?counts,
+                "split-trigger check (over-crowded; divisibility guard next)",
+            );
+            // Deep-bifurcation (§6.1 encoding rework): under the unified app tree
+            // the PROPOSER descends past any uniform bit run to the shallowest
+            // REAL branch and emits variable-depth bit-path child FILTERS — so a
+            // skewed shard (the localnet `[7,0]` case) splits at the branch where
+            // the data actually diverges instead of cutting at the immediate bit
+            // and orphaning a child. Its `None` IS the empty-split guard (no two
+            // data-bearing halves / single leaf). Absent (legacy tree) ⇒ the
+            // immediate-bit byte-suffix children + the counts-based guard below.
+            let deep_proposer = self.split_proposer.read().unwrap().clone();
+            let proposed = if let Some(propose) = deep_proposer.as_ref() {
+                match propose(filter) {
+                    Some(children) if children.len() >= 2 => children,
+                    _ => {
+                        tracing::debug!(
+                            filter = hex::encode(filter),
+                            "skipping split — no two data-bearing halves (deep-bifurcation guard)",
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                let proposed = crate::shard_rebalancer::compute_proposed_shards(filter, factor);
+                if proposed.len() < 2 {
+                    continue;
+                }
+                // §6.1 EMPTY-SPLIT GUARD: only propose when the split actually
+                // divides the data — ≥2 of the proposed children are data-bearing.
+                // Skips the meaningless "one child gets everything, the sibling is
+                // empty" split (which on the legacy tree also orphaned data). Only
+                // active when the provider is wired; absent ⇒ propose unconditionally.
+                if let Some(c) = counts.as_ref() {
+                    if c.iter().filter(|&&x| x > 0).count() < 2 {
+                        tracing::debug!(
+                            filter = hex::encode(filter),
+                            factor,
+                            ?c,
+                            "skipping split — data does not divide across children (empty-split guard)",
+                        );
+                        continue;
+                    }
+                }
+                proposed
+            };
+            // Deep-bifurcation observability: log each proposed child filter so a
+            // DEEP bit-path (app ‖ bit_len ‖ packed, depth > 1) is visible — proof
+            // the proposer descended past uniform bits instead of cutting at the
+            // immediate bit (which the legacy byte-suffix form could only ever do).
+            let child_hex: Vec<String> = proposed.iter().map(hex::encode).collect();
             self.event_distributor.publish(ControlEvent {
                 event_type: ControlEventType::ShardSplitEligible,
                 data: ControlEventData::ShardSplit {
@@ -853,6 +988,7 @@ impl CoverageMonitor {
                 active,
                 factor,
                 frame = frame_number,
+                children = ?child_hex,
                 "shard eligible for split — proposing"
             );
         }
@@ -885,6 +1021,79 @@ impl CoverageMonitor {
     /// `materialize_shard_merge` supports (merge-to-root). Factor-4/8 and
     /// deeper groups are skipped: a partial-group merge would leave coverage
     /// holes, so a clean two-child `{0x00,0x80}` group is required.
+    /// This shard's clean factor-2 merge group: `(parent_filter, low_child,
+    /// high_child)`, or `None` when `f` isn't a mergeable factor-2 child (the
+    /// root, wrong suffix, or the two clean siblings don't both exist in
+    /// `by_filter`).
+    ///
+    /// - **Deep-bifurcation (unified):** `f` is a bit-path filter
+    ///   (`app ‖ bit_len ‖ packed`). The parent is `bits` with the LAST bit
+    ///   dropped; the siblings are `parent_bits‖0` / `parent_bits‖1` (re-encoded).
+    ///   The parent filter is the BARE app address when `parent_bits` is empty
+    ///   (merge-to-root), else the encoded parent — matching `verify_shard_merge` /
+    ///   `materialize_shard_merge`'s `bit_path_mode`.
+    /// - **Legacy (byte-suffix):** parent = drop the last BYTE; siblings
+    ///   `parent‖0x00` / `parent‖0x80`; requires EXACTLY two children under the
+    ///   parent (a `0x40`/`0xC0` ⇒ a factor-4/8 group we don't partial-merge).
+    fn merge_sibling_group(
+        &self,
+        f: &[u8],
+        by_filter: &std::collections::HashMap<&[u8], &ShardCoverageEntry>,
+    ) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        if self.is_unified() {
+            let (app, bits) = quil_forest::decode_shard_bit_path(f, 32)?;
+            if bits.is_empty() {
+                return None; // the root has no parent to merge into
+            }
+            // Merge the two immediate bit-siblings `B‖0`/`B‖1` back into the branch
+            // `B` = drop-last-bit. Under Option A (prefix-free spine) `B` is a valid
+            // leaf after merge — the retained spine keeps completeness around it —
+            // and `materialize_shard_merge` re-registers `B`. (Bare app when the
+            // branch is empty, i.e. a 1-bit split of the root.)
+            let branch = &bits[..bits.len() - 1];
+            let mut lo = branch.to_vec();
+            lo.push(false);
+            let mut hi = branch.to_vec();
+            hi.push(true);
+            let c0 = quil_forest::encode_shard_bit_path(&app, &lo);
+            let c1 = quil_forest::encode_shard_bit_path(&app, &hi);
+            if !by_filter.contains_key(c0.as_slice()) || !by_filter.contains_key(c1.as_slice()) {
+                return None; // both clean siblings must exist
+            }
+            let parent = if branch.is_empty() {
+                app // bare app = the root shard (empty bit-path)
+            } else {
+                quil_forest::encode_shard_bit_path(&app, branch)
+            };
+            Some((parent, c0, c1))
+        } else {
+            if f.len() < 33 || f.len() > 64 {
+                return None;
+            }
+            let suffix = *f.last().unwrap();
+            if suffix != 0x00 && suffix != 0x80 {
+                return None;
+            }
+            let parent = f[..f.len() - 1].to_vec();
+            let child_len = parent.len() + 1;
+            let child_count = by_filter
+                .keys()
+                .filter(|k| k.len() == child_len && k.starts_with(parent.as_slice()))
+                .count();
+            if child_count != 2 {
+                return None;
+            }
+            let mut c0 = parent.clone();
+            c0.push(0x00);
+            let mut c1 = parent.clone();
+            c1.push(0x80);
+            if !by_filter.contains_key(c0.as_slice()) || !by_filter.contains_key(c1.as_slice()) {
+                return None;
+            }
+            Some((parent, c0, c1))
+        }
+    }
+
     pub fn propose_merge_rebalance(
         &self,
         frame_number: u64,
@@ -898,49 +1107,29 @@ impl CoverageMonitor {
 
         for entry in inventory {
             let f = &entry.filter;
-            // A factor-2 split child at ANY depth: parent (32-63 bytes) plus one
-            // 0x00/0x80 split byte. Parent = drop the last byte. (The genesis
-            // QUIL shards are 33-byte filters, so their children are 34-byte and
-            // merge to a 33-byte parent — not just the 32-byte root.)
-            if f.len() < 33 || f.len() > 64 {
+            // Identify this shard's clean factor-2 merge group: the parent filter
+            // and its two sibling children. Bit-path `parent = drop last BIT`
+            // (unified) vs byte-suffix `drop last BYTE`, `{0x00,0x80}` (legacy).
+            let Some((parent, c0, c1)) = self.merge_sibling_group(f, &by_filter) else {
                 continue;
-            }
-            let suffix = *f.last().unwrap();
-            if suffix != 0x00 && suffix != 0x80 {
-                continue;
-            }
-            let parent = f[..f.len() - 1].to_vec();
+            };
             if emitted.contains(&parent) {
                 continue;
             }
-
-            // Require a clean factor-2 split: exactly the two {0x00,0x80}
-            // children exist under P (any 0x40/0xC0/… ⇒ a factor-4/8 group,
-            // which we don't partial-merge).
-            let child_len = parent.len() + 1;
-            let child_count = inventory
-                .iter()
-                .filter(|e| e.filter.len() == child_len && e.filter.starts_with(&parent))
-                .count();
-            if child_count != 2 {
-                continue;
-            }
-            let c0 = {
-                let mut c = parent.clone();
-                c.push(0x00);
-                c
-            };
-            let c1 = {
-                let mut c = parent.clone();
-                c.push(0x80);
-                c
-            };
             let (Some(e0), Some(e1)) =
                 (by_filter.get(c0.as_slice()), by_filter.get(c1.as_slice()))
             else {
                 continue;
             };
 
+            // Deep-bifurcation: two EMPTY siblings are latent prefix-free-spine
+            // placeholders — leave them (don't churn a merge on shards with no data
+            // to consolidate). Mirrors the halt-risk / split-proposer `size == 0`
+            // exclusion: empty shards are not viable for proposal logic until data
+            // lands. A pair with data on either side still merges under the gates.
+            if e0.size == 0 && e1.size == 0 {
+                continue;
+            }
             // TRIGGER: both halves starved.
             if e0.active_count >= self.thresholds.min_provers
                 || e1.active_count >= self.thresholds.min_provers
@@ -1633,6 +1822,158 @@ mod tests {
         assert_eq!(dist.0.lock().unwrap().len(), 2, "should re-emit after cooldown");
     }
 
+    /// §6.1 empty-split guard: a shard over the trigger is NOT split when the
+    /// split would put all data on one child (the sibling empty); it IS split
+    /// once the data divides across children.
+    #[test]
+    fn empty_split_guard_suppresses_one_sided_split() {
+        let mut filter = vec![0x11u8; 32];
+        filter.push(0x05);
+        let registry: Arc<dyn quil_types::consensus::ProverRegistry> =
+            Arc::new(HotShardRegistry { filter: filter.clone(), active: 40 });
+        let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
+        let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
+        let monitor = CoverageMonitor::new(
+            registry,
+            dist_arc,
+            CoverageThresholds::mainnet(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        // One-sided: all data on child 0, sibling empty → guard suppresses.
+        monitor.set_split_feasibility_provider(Arc::new(|_f: &[u8], factor: u8| {
+            let mut v = vec![0u64; factor as usize];
+            v[0] = 100;
+            v
+        }));
+        monitor.propose_split_rebalance(1000);
+        assert_eq!(
+            dist.0.lock().unwrap().len(),
+            0,
+            "empty-split guard must suppress a one-sided split"
+        );
+
+        // Data divides across children → the split is proposed (no cooldown was
+        // recorded, since the guard `continue`d before the cooldown insert).
+        monitor.set_split_feasibility_provider(Arc::new(|_f: &[u8], factor: u8| {
+            vec![50u64; factor as usize]
+        }));
+        monitor.propose_split_rebalance(2000);
+        assert_eq!(
+            dist.0.lock().unwrap().len(),
+            1,
+            "a data-dividing split IS proposed"
+        );
+    }
+
+    /// §6.1 split fires ONLY when BOTH hold: (1) OVER-CROWDED (`active >
+    /// max_provers`) AND (2) the leaves CAN DIVIDE (≥2 non-empty children). Not
+    /// over-crowded ⇒ never splits (even if divisible); over-crowded but
+    /// INDIVISIBLE (the skewed `[10,0]` case) ⇒ deferred by the empty-split guard.
+    #[test]
+    fn split_requires_both_overcrowded_and_divisible() {
+        let filter = {
+            let mut f = vec![0x11u8; 32];
+            f.push(0x05);
+            f
+        };
+        // (active provers, per-child leaf counts) → number of split events.
+        let round = |active: u32, counts: Vec<u64>| -> usize {
+            let registry: Arc<dyn quil_types::consensus::ProverRegistry> =
+                Arc::new(HotShardRegistry { filter: filter.clone(), active });
+            let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
+            let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
+            let monitor = CoverageMonitor::new(
+                registry,
+                dist_arc,
+                CoverageThresholds::mainnet(), // max_provers = 32
+                Arc::new(AtomicBool::new(false)),
+            );
+            monitor.set_split_feasibility_provider(Arc::new(move |_f: &[u8], factor: u8| {
+                let mut v = counts.clone();
+                v.resize(factor as usize, 0); // pad/truncate to the split factor
+                v
+            }));
+            monitor.propose_split_rebalance(1000);
+            let n = dist.0.lock().unwrap().len();
+            n
+        };
+
+        // (1) NOT over-crowded (20 ≤ 32), even though divisible → NO split.
+        assert_eq!(round(20, vec![5, 5]), 0, "not over-crowded → no split even if divisible");
+        // (2) Over-crowded (40 > 32) but INDIVISIBLE (all data on one side) → NO
+        // split (the divisibility precondition fails; the guard defers).
+        assert_eq!(round(40, vec![10, 0]), 0, "over-crowded but indivisible → deferred");
+        // BOTH: over-crowded AND divisible → split.
+        assert_eq!(round(40, vec![5, 5]), 1, "over-crowded AND divisible → split");
+    }
+
+    /// Deep-bifurcation (§6.1 encoding rework): when a `split_proposer` is wired
+    /// (unified app tree) the proposal emits ITS variable-depth bit-path children
+    /// verbatim — NOT `compute_proposed_shards`' immediate-bit byte-suffix ones —
+    /// and the proposer's `None` supersedes the counts guard (suppresses).
+    #[test]
+    fn deep_bifurcation_proposer_children_and_none_guard() {
+        use quil_types::consensus::ControlEventData;
+        let mut filter = vec![0x11u8; 32];
+        filter.push(0x05);
+        let registry: Arc<dyn quil_types::consensus::ProverRegistry> =
+            Arc::new(HotShardRegistry { filter: filter.clone(), active: 40 });
+        let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
+        let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
+        // Prover-count trigger (active 40 > mainnet max 32); no data trigger.
+        let monitor = CoverageMonitor::new(
+            registry,
+            dist_arc,
+            CoverageThresholds::mainnet(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        // Proposer returns two DEEP bit-path child filters (a byte-suffix cut
+        // could never produce a 40- and 41-byte pair) → emitted verbatim.
+        let c0 = vec![0xAAu8; 40];
+        let c1 = vec![0xBBu8; 41];
+        let (p0, p1) = (c0.clone(), c1.clone());
+        monitor.set_split_proposer(Arc::new(move |_f: &[u8]| Some(vec![p0.clone(), p1.clone()])));
+        monitor.propose_split_rebalance(1000);
+        {
+            let events = dist.0.lock().unwrap();
+            assert_eq!(events.len(), 1, "proposer path emits the split");
+            match &events[0].data {
+                ControlEventData::ShardSplit { proposed, .. } => {
+                    assert_eq!(
+                        proposed,
+                        &vec![c0.clone(), c1.clone()],
+                        "emitted children are the proposer's bit-path filters, not byte-suffix",
+                    );
+                }
+                _ => panic!("wrong event data"),
+            }
+        }
+
+        // A fresh over-threshold shard whose proposer returns None (no two
+        // data-bearing halves) → the split is suppressed by the guard.
+        let mut filter2 = vec![0x22u8; 32];
+        filter2.push(0x07);
+        let registry2: Arc<dyn quil_types::consensus::ProverRegistry> =
+            Arc::new(HotShardRegistry { filter: filter2.clone(), active: 40 });
+        let dist2 = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
+        let dist2_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist2.clone();
+        let monitor2 = CoverageMonitor::new(
+            registry2,
+            dist2_arc,
+            CoverageThresholds::mainnet(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        monitor2.set_split_proposer(Arc::new(|_f: &[u8]| None));
+        monitor2.propose_split_rebalance(1000);
+        assert_eq!(
+            dist2.0.lock().unwrap().len(),
+            0,
+            "proposer None → deep-bifurcation guard suppresses the split",
+        );
+    }
+
     /// Verifies the inventory-provider path actually catches the
     /// "zero provers, non-zero size" case the registry-summary path
     /// misses. With registry summary empty, the only way the
@@ -1778,6 +2119,58 @@ mod tests {
         let (filters, p) = &events[0];
         assert_eq!(p, &parent, "33-byte parent");
         assert_eq!(filters, &vec![child(&parent, 0x00), child(&parent, 0x80)]);
+    }
+
+    /// Deep-bifurcation merge proposer: under the unified provider, siblings are
+    /// bit-path FILTERS and the parent is the BRANCH (drop the last bit) — under
+    /// Option A the branch is a valid leaf after merge (the retained prefix-free
+    /// spine keeps completeness around it) and `materialize_shard_merge` re-registers
+    /// it. Two EMPTY siblings are latent spine placeholders → no merge; a lone
+    /// sibling → no merge (both required).
+    #[test]
+    fn merge_bit_path_siblings_propose_parent_with_last_bit_dropped() {
+        use quil_forest::encode_shard_bit_path;
+        let app = [0xAAu8; 32];
+
+        // Deep pair [0,0,0,0]/[0,0,0,1] → the branch [0,0,0] (drop last bit).
+        let (monitor, dist) = build_merge_monitor();
+        monitor.set_unified_provider(Arc::new(|| true));
+        let c0 = encode_shard_bit_path(&app, &[false, false, false, false]);
+        let c1 = encode_shard_bit_path(&app, &[false, false, false, true]);
+        let inv = vec![entry(c0.clone(), 1 << 30, 2), entry(c1.clone(), 1 << 30, 3)];
+        monitor.propose_merge_rebalance(100, &inv);
+        let events = merge_events(&dist);
+        assert_eq!(events.len(), 1, "deep bit-path merge fires");
+        let (filters, parent) = &events[0];
+        assert_eq!(parent, &encode_shard_bit_path(&app, &[false, false, false]), "parent = branch (drop last bit)");
+        assert_eq!(filters, &vec![c0, c1]);
+
+        // Two EMPTY siblings (size 0) are latent spine placeholders → NOT merged.
+        let (monitor_e, dist_e) = build_merge_monitor();
+        monitor_e.set_unified_provider(Arc::new(|| true));
+        let e0 = encode_shard_bit_path(&app, &[false, false, false, false]);
+        let e1 = encode_shard_bit_path(&app, &[false, false, false, true]);
+        monitor_e.propose_merge_rebalance(100, &[entry(e0, 0, 0), entry(e1, 0, 0)]);
+        assert_eq!(merge_events(&dist_e).len(), 0, "two empty siblings are not merged");
+
+        // Merge-to-root: [0]/[1] → parent = the BARE app address (root shard).
+        let (monitor2, dist2) = build_merge_monitor();
+        monitor2.set_unified_provider(Arc::new(|| true));
+        let r0 = encode_shard_bit_path(&app, &[false]);
+        let r1 = encode_shard_bit_path(&app, &[true]);
+        let inv2 = vec![entry(r0.clone(), 1 << 30, 2), entry(r1.clone(), 1 << 30, 3)];
+        monitor2.propose_merge_rebalance(100, &inv2);
+        let ev2 = merge_events(&dist2);
+        assert_eq!(ev2.len(), 1, "merge-to-root fires");
+        assert_eq!(ev2[0].1, app.to_vec(), "parent = bare app root");
+        assert_eq!(ev2[0].0, vec![r0, r1]);
+
+        // A lone deep sibling (no partner in the inventory) → no merge.
+        let (monitor3, dist3) = build_merge_monitor();
+        monitor3.set_unified_provider(Arc::new(|| true));
+        let lone = encode_shard_bit_path(&app, &[false, false, false, false]);
+        monitor3.propose_merge_rebalance(100, &[entry(lone, 1 << 30, 2)]);
+        assert_eq!(merge_events(&dist3).len(), 0, "lone sibling does not merge");
     }
 
     #[test]

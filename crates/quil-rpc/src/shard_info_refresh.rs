@@ -217,20 +217,17 @@ async fn try_one_endpoint(
     Ok(out)
 }
 
-/// Build the wire filter from `(shard_key, prefix)` using the
-/// L2 || prefix.byte() encoding. Matches the lifecycle's local
-/// shards-store consumer.
+/// Build the wire filter from `(shard_key, prefix)` — the canonical,
+/// sentinel-aware encoding (`quil_forest::shard_prefix_to_filter`). A deep-
+/// bifurcation shard rides a SENTINEL prefix (`[0xFFFF_FFFF, …]`) that becomes
+/// the encoded bit-path filter (`app ‖ bit_len ‖ packed`); a raw `p as u8` on the
+/// sentinel garbles it, so the size map would key deep shards under junk filters.
 fn build_filter(shard_key: &[u8], prefix: &[u32]) -> Option<Vec<u8>> {
     if shard_key.len() < 35 {
         return None;
     }
     // L1 = bytes 0..3, L2 = bytes 3..35.
-    let l2 = &shard_key[3..35];
-    let mut filter = l2.to_vec();
-    for p in prefix {
-        filter.push((*p & 0xFF) as u8);
-    }
-    Some(filter)
+    Some(quil_forest::shard_prefix_to_filter(&shard_key[3..35], prefix))
 }
 
 /// Parse an `AppShardInfo.size` BigInt byte string into a `u64`.

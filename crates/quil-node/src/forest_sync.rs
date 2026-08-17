@@ -165,6 +165,43 @@ pub async fn sync_one_phase(
     Ok(root)
 }
 
+/// UNIFIED shard-prover subtree-range sync of ONE phase: pull only the leaves
+/// under `bit_path` (this prover's shard prefix) from the peer's APP tree
+/// (`shard_id = app`), authenticated against `pinned_app_root` (the trusted
+/// header app root), and apply to the local app tree. Returns the local subtree
+/// root (shard commitment). This is the per-shard counterpart of
+/// [`sync_one_phase`] — a shard prover NEVER pulls the whole app.
+#[allow(clippy::too_many_arguments)]
+pub async fn sync_subtree_one_phase(
+    client: &mut ArchiveClient,
+    handle: &tokio::runtime::Handle,
+    crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+    app: &[u8],
+    phase: u32,
+    source_version: u64,
+    bit_path: Vec<bool>,
+    pinned_app_root: Option<[u8; 32]>,
+) -> Result<[u8; 32]> {
+    let remote = RemoteTreeReader::new(client.clone(), handle.clone(), app.to_vec(), phase);
+    let c = crdt.clone();
+    let app_v = app.to_vec();
+    let (root, apply_version, changed) = tokio::task::spawn_blocking(move || {
+        c.sync_shard_subtree_phase_from(
+            &remote,
+            source_version,
+            &app_v,
+            phase as usize,
+            &bit_path,
+            pinned_app_root,
+        )
+    })
+    .await
+    .map_err(|e| QuilError::Internal(format!("subtree sync task join: {e}")))?
+    .map_err(|e| QuilError::Internal(format!("subtree sync apply: {e}")))?;
+    fetch_changed_blobs(client, crdt, app, phase, source_version, apply_version, changed).await?;
+    Ok(root)
+}
+
 /// Sync a SINGLE-shard forest tree (all four phases + blobs) from `addr`,
 /// verifying the vertex-adds (phase 0) root against `expected_va_root` when it
 /// is non-empty (empty ⇒ trust the peer's latest snapshot, e.g. bootstrap).

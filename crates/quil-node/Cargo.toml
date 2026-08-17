@@ -94,4 +94,3 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 [dev-dependencies]
 tempfile = "3"
 flate2 = "1"
-quil-store = { path = "../quil-store", features = ["test-utils"] }

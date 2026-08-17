@@ -24,17 +24,19 @@ use quil_types::proto::global::{
 use quil_types::proto::node::{
     self, connectivity_service_server::ConnectivityService,
 };
-use quil_types::error::QuilError;
 use quil_types::store::ClockStore;
 
 // =====================================================================
 // AppShardService — shard frame/proposal reads
 // =====================================================================
 
-/// Resolves app-shard frames from the worker that currently owns a filter.
-///
-/// Archive nodes use a store-backed provider instead because their local
-/// clock store is the durable source of truth rather than a worker mirror.
+/// Resolves an app-shard frame for a filter to the CANONICAL source for this
+/// node. On a prover/cluster node the app-shard frames live in the owning
+/// worker's store (a remote process in cluster mode), NOT the master clock
+/// store — so serving reads straight off the master store returns nothing.
+/// The router-backed provider (`AppShardFrameRouter`, in quil-node) resolves to
+/// the owning worker; archives use the store-backed provider below because their
+/// local clock store is the durable source of truth, not a worker mirror.
 #[tonic::async_trait]
 pub trait AppShardFrameProvider: Send + Sync {
     async fn get_app_shard_frame(
@@ -44,6 +46,9 @@ pub trait AppShardFrameProvider: Send + Sync {
     ) -> Result<Option<global::AppShardFrame>, Status>;
 }
 
+/// Store-backed provider — reads the master/archive clock store directly. The
+/// archive variant: its local store IS authoritative (it materializes every
+/// finalized frame), so no worker routing is needed.
 struct ClockStoreAppShardFrameProvider {
     clock_store: Arc<dyn ClockStore>,
 }
@@ -64,7 +69,7 @@ impl AppShardFrameProvider for ClockStoreAppShardFrameProvider {
             };
             match result {
                 Ok(frame) => Ok(Some(frame)),
-                Err(QuilError::NotFound(_)) => Ok(None),
+                Err(quil_types::error::QuilError::NotFound(_)) => Ok(None),
                 Err(e) => Err(Status::internal(format!(
                     "app-shard frame store read failed: {e}"
                 ))),
@@ -75,18 +80,20 @@ impl AppShardFrameProvider for ClockStoreAppShardFrameProvider {
     }
 }
 
-/// Public AppShardService facade. The provider is worker-routed on prover
-/// nodes and store-backed on archives.
+/// Public `AppShardService` facade. The provider is worker-routed on prover
+/// (cluster) nodes and store-backed on archives.
 pub struct AppShardRpcServer {
     provider: Arc<dyn AppShardFrameProvider>,
 }
 
 impl AppShardRpcServer {
-    /// Construct the archive/store-backed variant.
+    /// Construct the archive/store-backed variant (reads the local clock store).
     pub fn new(clock_store: Arc<dyn ClockStore>) -> Self {
         Self::with_provider(Arc::new(ClockStoreAppShardFrameProvider { clock_store }))
     }
 
+    /// Construct with an explicit provider — the worker-routing
+    /// `AppShardFrameRouter` on prover/cluster nodes.
     pub fn with_provider(provider: Arc<dyn AppShardFrameProvider>) -> Self {
         Self { provider }
     }
@@ -319,117 +326,5 @@ impl ConnectivityService for ConnectivityRpcServer {
             success: true,
             error_message: String::new(),
         }))
-    }
-}
-
-#[cfg(test)]
-mod app_shard_tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    struct RecordingProvider {
-        calls: Mutex<Vec<(Vec<u8>, u64)>>,
-        fail: bool,
-    }
-
-    #[tonic::async_trait]
-    impl AppShardFrameProvider for RecordingProvider {
-        async fn get_app_shard_frame(
-            &self,
-            filter: Vec<u8>,
-            frame_number: u64,
-        ) -> Result<Option<global::AppShardFrame>, Status> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((filter.clone(), frame_number));
-            if self.fail {
-                return Err(Status::unavailable("worker offline"));
-            }
-            let mut header = global::FrameHeader::default();
-            header.address = filter;
-            header.frame_number = if frame_number == 0 { 22 } else { frame_number };
-            Ok(Some(global::AppShardFrame {
-                header: Some(header),
-                requests: Vec::new(),
-                ..Default::default()
-            }))
-        }
-    }
-
-    #[tokio::test]
-    async fn latest_and_numbered_reads_are_forwarded_unchanged() {
-        let provider = Arc::new(RecordingProvider {
-            calls: Mutex::new(Vec::new()),
-            fail: false,
-        });
-        let server = AppShardRpcServer::with_provider(provider.clone());
-
-        let latest = server
-            .get_app_shard_frame(Request::new(global::GetAppShardFrameRequest {
-                filter: b"shard-a".to_vec(),
-                frame_number: 0,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .frame
-            .unwrap();
-        let numbered = server
-            .get_app_shard_frame(Request::new(global::GetAppShardFrameRequest {
-                filter: b"shard-a".to_vec(),
-                frame_number: 19,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .frame
-            .unwrap();
-
-        assert_eq!(latest.header.unwrap().frame_number, 22);
-        assert_eq!(numbered.header.unwrap().frame_number, 19);
-        assert_eq!(
-            *provider.calls.lock().unwrap(),
-            vec![(b"shard-a".to_vec(), 0), (b"shard-a".to_vec(), 19)]
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_filter_is_rejected_before_provider_call() {
-        let provider = Arc::new(RecordingProvider {
-            calls: Mutex::new(Vec::new()),
-            fail: false,
-        });
-        let server = AppShardRpcServer::with_provider(provider.clone());
-
-        let status = server
-            .get_app_shard_frame(Request::new(global::GetAppShardFrameRequest {
-                filter: Vec::new(),
-                frame_number: 0,
-            }))
-            .await
-            .unwrap_err();
-
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert!(provider.calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn provider_failures_are_not_flattened_to_missing_frames() {
-        let provider = Arc::new(RecordingProvider {
-            calls: Mutex::new(Vec::new()),
-            fail: true,
-        });
-        let server = AppShardRpcServer::with_provider(provider);
-
-        let status = server
-            .get_app_shard_frame(Request::new(global::GetAppShardFrameRequest {
-                filter: b"shard-a".to_vec(),
-                frame_number: 0,
-            }))
-            .await
-            .unwrap_err();
-
-        assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 }

@@ -804,6 +804,7 @@ impl AppShardHarness {
                 kv_db: kv_db_dep,
                 app_consensus_cw: app_cw,
             db_config: quil_config::DbConfig { path: String::new(), worker_path_prefix: String::new(), worker_paths: vec![], ..Default::default() }, // ephemeral journal in tests
+            unified_cutover_hook: None,
             };
 
             let (engine, handle) = quil_engine::app_engine::AppConsensusEngine::new(
@@ -966,42 +967,6 @@ impl AppShardHarness {
             for w in &self.workers {
                 if let Some(bytes) = w.full_frames.lock().first().cloned() {
                     return gpb::AppShardFrame::decode(bytes.as_slice()).ok();
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        None
-    }
-
-    /// Wait until one worker has observed `count` finalized shard frames, then
-    /// decode that worker's first `count` frames. Keeping frames from one worker
-    /// avoids counting one committee finalization once per replica when checking
-    /// chain continuity and frame-number uniqueness.
-    pub async fn wait_for_full_frames_from_one_worker(
-        &self,
-        count: usize,
-        timeout: std::time::Duration,
-    ) -> Option<Vec<gpb::AppShardFrame>> {
-        use prost::Message;
-
-        assert!(count > 0, "need at least one finalized frame");
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            for worker in &self.workers {
-                let captured = {
-                    let frames = worker.full_frames.lock();
-                    (frames.len() >= count)
-                        .then(|| frames.iter().take(count).cloned().collect::<Vec<_>>())
-                };
-                let Some(captured) = captured else {
-                    continue;
-                };
-                let decoded = captured
-                    .iter()
-                    .map(|bytes| gpb::AppShardFrame::decode(bytes.as_slice()).ok())
-                    .collect::<Option<Vec<_>>>();
-                if decoded.is_some() {
-                    return decoded;
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1327,10 +1292,6 @@ pub fn build_tier2_archive_rig_with_key_manager(
         transport: transport.clone() as Arc<dyn ProverMessageTransport>,
         hypergraph: None,
         replica_store: None,
-        // No self-loopback in the rig: this pipeline has no ingest-side
-        // MessageCollector, so generated ops go out via the test transport only.
-        local_message_collector: None,
-        current_frame: None,
     });
 
     let _ = all_provers; // unused in this builder — kept for API symmetry
@@ -1427,10 +1388,6 @@ pub fn build_test_pipeline_with_registry(
         transport: transport as Arc<dyn ProverMessageTransport>,
         hypergraph: None,
         replica_store: None,
-        // No self-loopback in the rig: this pipeline has no ingest-side
-        // MessageCollector, so generated ops go out via the test transport only.
-        local_message_collector: None,
-        current_frame: None,
     });
     TestPipelineRig {
         pipeline,

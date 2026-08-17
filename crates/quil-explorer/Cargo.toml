@@ -7,6 +7,7 @@ description = "In-process read-only explorer REST API over the node's live store
 
 [dependencies]
 quil-types = { path = "../quil-types" }
+quil-forest = { path = "../quil-forest" }
 quil-hypergraph = { path = "../quil-hypergraph" }
 quil-execution = { path = "../quil-execution" }
 quil-tries = { path = "../quil-tries" }

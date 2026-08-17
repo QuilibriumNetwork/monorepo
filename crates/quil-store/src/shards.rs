@@ -40,6 +40,22 @@ fn app_shard_key(shard_key: &[u8], prefix: &[u32]) -> Vec<u8> {
     key
 }
 
+/// The lexicographic successor of `key` as a byte-prefix upper bound: increment
+/// the last byte `< 0xFF`, dropping any trailing `0xFF`s. `None` (unbounded) when
+/// `key` is all `0xFF`. Used to range-scan every key starting with `key`
+/// regardless of what follows — including the `0xFF…` sentinel bit-path prefixes.
+fn prefix_byte_successor(key: &[u8]) -> Option<Vec<u8>> {
+    let mut out = key.to_vec();
+    while let Some(last) = out.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return Some(out);
+        }
+        out.pop();
+    }
+    None
+}
+
 /// Decode a value blob into a `Vec<u32>` of big-endian u32s.
 ///
 /// The Go code handles values whose length is not a multiple of 4 by
@@ -156,14 +172,21 @@ impl ShardsStore for RocksShardsStore {
     }
 
     fn get_app_shards(&self, shard_key: &[u8], prefix: &[u32]) -> Result<Vec<ShardInfo>> {
+        // Scan every key whose byte prefix is `app_shard_key(shard_key, prefix)`
+        // — i.e. all shards under `prefix`. The upper bound is the lexicographic
+        // successor of that byte prefix, NOT `prefix ‖ 0xffff`: a deep-bifurcation
+        // shard rides a SENTINEL prefix (`0xFFFF_FFFF, …`) whose big-endian u32
+        // encoding (`FF FF FF FF …`) sorts ABOVE `0xffff` (`00 00 FF FF`), so the
+        // old bound silently excluded every deep shard. The successor bound
+        // includes them and is identical for legacy (small-valued) prefixes.
         let lower = app_shard_key(shard_key, prefix);
-        let mut end_prefix = prefix.to_vec();
-        end_prefix.push(0xffff);
-        let upper = app_shard_key(shard_key, &end_prefix);
+        let upper = prefix_byte_successor(&lower);
 
         let mut read_opts = rocksdb::ReadOptions::default();
         read_opts.set_iterate_lower_bound(lower);
-        read_opts.set_iterate_upper_bound(upper);
+        if let Some(u) = upper {
+            read_opts.set_iterate_upper_bound(u);
+        }
 
         let iter = self
             .db
@@ -309,6 +332,56 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].shard_key, shard_key);
         assert_eq!(results[0].prefix, prefix);
+    }
+
+    /// Deep-bifurcation: a shard's prefix can be a SENTINEL bit-path
+    /// (`[0xFFFF_FFFF, b0, …]`). Its big-endian u32 encoding (`FF FF FF FF …`)
+    /// sorts ABOVE the old `prefix ‖ 0xffff` upper bound, so it USED to be
+    /// silently excluded from `get_app_shards(_, &[])`. The byte-successor bound
+    /// must now enumerate it alongside legacy shards.
+    #[test]
+    fn get_app_shards_enumerates_sentinel_bit_path_prefixes() {
+        let (db, store) = test_db();
+        let shard_key = make_shard_key();
+        let legacy = ShardInfo {
+            shard_key: shard_key.clone(),
+            prefix: vec![5u32],
+            size: Vec::new(),
+            data_shards: 0,
+            commitment: Vec::new(),
+        };
+        // Two deep sentinel shards (bits [0,0,0] / [0,0,1]).
+        let deep0 = ShardInfo {
+            shard_key: shard_key.clone(),
+            prefix: vec![0xFFFF_FFFFu32, 0, 0, 0],
+            size: Vec::new(),
+            data_shards: 0,
+            commitment: Vec::new(),
+        };
+        let deep1 = ShardInfo {
+            shard_key: shard_key.clone(),
+            prefix: vec![0xFFFF_FFFFu32, 0, 0, 1],
+            size: Vec::new(),
+            data_shards: 0,
+            commitment: Vec::new(),
+        };
+
+        let txn = db.new_batch(false).expect("new batch");
+        store.put_app_shard(txn.as_ref(), &legacy).expect("put legacy");
+        store.put_app_shard(txn.as_ref(), &deep0).expect("put deep0");
+        store.put_app_shard(txn.as_ref(), &deep1).expect("put deep1");
+        txn.commit().expect("commit");
+
+        let mut got: Vec<Vec<u32>> = store
+            .get_app_shards(&shard_key, &[])
+            .expect("get app shards")
+            .into_iter()
+            .map(|s| s.prefix)
+            .collect();
+        got.sort();
+        let mut want = vec![vec![5u32], vec![0xFFFF_FFFFu32, 0, 0, 0], vec![0xFFFF_FFFFu32, 0, 0, 1]];
+        want.sort();
+        assert_eq!(got, want, "sentinel bit-path shards must be enumerated too");
     }
 
     #[test]

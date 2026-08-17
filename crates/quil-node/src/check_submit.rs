@@ -149,14 +149,12 @@ pub async fn run_check_submit(
             print_error_chain(&e);
             anyhow::anyhow!("get_app_shards(specific) failed: {e}")
         })?;
-    // Wire filter = L2(shard_key[3..35]) || (prefix elem as low byte)*.
+    // Wire filter = canonical prefix → filter (sentinel-aware; a deep shard's
+    // filter is `app ‖ bit_len ‖ packed`, NOT L2 ‖ prefix-low-bytes).
     let filter = infos
         .iter()
         .filter_map(|info| {
-            let mut f = shard_key[3..35].to_vec();
-            for p in &info.prefix {
-                f.push((*p & 0xFF) as u8);
-            }
+            let f = quil_forest::shard_prefix_to_filter(&shard_key[3..35], &info.prefix);
             (1..=64).contains(&f.len()).then_some(f)
         })
         .next()

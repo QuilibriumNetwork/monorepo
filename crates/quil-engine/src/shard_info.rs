@@ -309,10 +309,9 @@ where
             } else {
                 &shard_key[..]
             };
-            let mut bp = l2.to_vec();
-            for &p in &shard.prefix {
-                bp.push(p as u8);
-            }
+            // Canonical prefix → filter (sentinel-aware) so `allocated_filters` /
+            // `get_provers` match a deep shard's real ConfirmationFilter.
+            let bp = quil_forest::shard_prefix_to_filter(l2, &shard.prefix);
 
             let is_alloc = allocated_filters.contains(&bp);
 

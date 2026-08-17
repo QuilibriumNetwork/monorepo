@@ -45,6 +45,7 @@ pub enum MasterToWorker {
 }
 
 /// Message from worker to master.
+#[derive(Debug)]
 pub enum WorkerToMaster {
     /// Worker has completed a respawn and is ready.
     Ready { core_id: u32 },
@@ -107,10 +108,8 @@ pub enum WorkerToMaster {
     /// per-shard frame/consensus/prover/dispatch bitmasks.
     ShardActivated {
         core_id: u32,
-        generation: u64,
         filter: Vec<u8>,
         handle: crate::app_engine::AppEngineHandle,
-        clock_store: Arc<dyn quil_types::store::ClockStore>,
     },
     /// A shard worker has torn down its `AppConsensusEngine` for
     /// `filter`. Master removes the registry entry and unsubscribes
@@ -118,15 +117,8 @@ pub enum WorkerToMaster {
     /// shard messages once we leave it).
     ShardDeactivated {
         core_id: u32,
-        generation: u64,
         filter: Vec<u8>,
     },
-}
-
-impl std::fmt::Debug for WorkerToMaster {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkerToMaster").finish_non_exhaustive()
-    }
 }
 
 /// State of a single worker thread.
@@ -217,6 +209,19 @@ pub struct WorkerOwnedDeps {
     /// expose a KV handle leave this `None` and the engine falls
     /// back to the in-memory consensus stub.
     pub kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
+    /// Archive-direct shard-tree syncer bound to THIS worker's CRDT/store.
+    /// Handles the step-4 app-shard catch-up (`AncestorSyncRequested`) when the
+    /// worker falls far enough behind that gossip can't fill the gap — it pulls
+    /// the shard subtree from an archive and the engine fast-forwards its cursor.
+    /// `None` in shared-state mode (or when no archive/key is wired), where the
+    /// event is simply skipped. Mirrors the `worker_node.rs` (multi-process) path.
+    pub shard_syncer:
+        Option<Arc<dyn crate::prover_tree_syncer::ProverTreeSyncer>>,
+    /// (B) Unified-cutover consolidation hook bound to THIS worker's CRDT/store
+    /// (see `AppEngineDeps::unified_cutover_hook`). Built by the node
+    /// (`worker_state_builder`); `None` skips consolidation (still flips).
+    pub unified_cutover_hook:
+        Option<Arc<dyn Fn(&[u8], u64) -> bool + Send + Sync>>,
 }
 
 /// Thread-based worker manager. Core 0 is reserved for the master;
@@ -412,7 +417,6 @@ impl ThreadWorkerManager {
                 rt.block_on(async move {
                     let mut current_filter: Vec<u8> = Vec::new();
                     let mut engine_cancel: Option<tokio_util::sync::CancellationToken> = None;
-                    let mut engine_generation = 0u64;
 
                     // Per-worker memory tick. Each worker owns its own RocksDB
                     // (block cache + memtables + table readers) in this thread,
@@ -478,8 +482,6 @@ impl ThreadWorkerManager {
                                                 "worker assigned to shard"
                                             );
                                             current_filter = filter.clone();
-                                            engine_generation = engine_generation.wrapping_add(1);
-                                            let generation = engine_generation;
 
                                             // Compute app address from filter
                                             let _app_address = quil_crypto::poseidon::hash_bytes_to_32(&filter)
@@ -504,7 +506,6 @@ impl ThreadWorkerManager {
                                                         .as_ref()
                                                         .map(|o| o.clock_store.clone())
                                                         .unwrap_or_else(|| deps.clock_store.clone());
-                                                    let route_clock_store = clock_store.clone();
                                                     let hypergraph = owned
                                                         .as_ref()
                                                         .map(|o| Some(o.hypergraph.clone()))
@@ -559,6 +560,11 @@ impl ThreadWorkerManager {
                                                         kv_db,
                                                         app_consensus_cw: deps.app_consensus_cw,
                                                         db_config: deps.db_config.clone(),
+                                                        // (B) per-worker consolidation hook (bound to this
+                                                        // worker's CRDT/store by worker_state_builder).
+                                                        unified_cutover_hook: owned
+                                                            .as_ref()
+                                                            .and_then(|o| o.unified_cutover_hook.clone()),
                                                     };
                                                     let (engine, app_handle) = crate::app_engine::AppConsensusEngine::new(
                                                         core_id,
@@ -574,10 +580,8 @@ impl ThreadWorkerManager {
                                                     let _ = master_tx_clone.send(
                                                         WorkerToMaster::ShardActivated {
                                                             core_id,
-                                                            generation,
                                                             filter: filter_clone.clone(),
                                                             handle: app_handle.clone(),
-                                                            clock_store: route_clock_store,
                                                         }
                                                     ).await;
 
@@ -592,7 +596,16 @@ impl ThreadWorkerManager {
                                                     let master_tx_events = master_tx_clone.clone();
                                                     let loopback_handle = app_handle.clone();
                                                     let _filter_for_events = filter_clone.clone();
-                                                    // TODO
+                                                    // Step-4 app-shard catch-up (AncestorSyncRequested): the
+                                                    // per-worker archive-direct syncer + this shard's clock store
+                                                    // (for the finalized-header pin), and a single-in-flight guard.
+                                                    let sync_syncer =
+                                                        owned.as_ref().and_then(|o| o.shard_syncer.clone());
+                                                    let sync_clock =
+                                                        owned.as_ref().map(|o| o.clock_store.clone());
+                                                    let sync_in_progress = std::sync::Arc::new(
+                                                        std::sync::atomic::AtomicBool::new(false),
+                                                    );
                                                     tokio::spawn(async move {
                                                         while let Some(event) = event_rx.recv().await {
                                                             match event {
@@ -678,11 +691,67 @@ impl ThreadWorkerManager {
                                                                         }
                                                                     ).await;
                                                                 }
+                                                                crate::app_engine::AppEngineEvent::AncestorSyncRequested { filter, .. } => {
+                                                                    // Step-4 app-shard catch-up. The engine hit a
+                                                                    // frame gap gossip can't fill (deeply behind).
+                                                                    // Pull the shard's forest subtree from an archive
+                                                                    // (pinned to the latest finalized header's
+                                                                    // state_roots), then loopback ShardSyncCompleted
+                                                                    // so the engine fast-forwards its materialized
+                                                                    // cursor. Mirrors worker_node.rs; before this,
+                                                                    // thread-mode workers dropped the event and a
+                                                                    // deeply-behind node wedged permanently.
+                                                                    let (Some(syncer), Some(clock)) =
+                                                                        (sync_syncer.clone(), sync_clock.clone())
+                                                                    else {
+                                                                        // Shared-state mode / no syncer wired.
+                                                                        debug!(core_id, "AncestorSyncRequested: no shard syncer wired — skipping");
+                                                                        continue;
+                                                                    };
+                                                                    // One in-flight sync per worker.
+                                                                    if sync_in_progress.swap(
+                                                                        true,
+                                                                        std::sync::atomic::Ordering::SeqCst,
+                                                                    ) {
+                                                                        continue;
+                                                                    }
+                                                                    // Pin ALL FOUR phases to the latest finalized
+                                                                    // header's state_roots (audit #5). Those roots
+                                                                    // are the PRE-materialization state of frame L =
+                                                                    // POST of L-1, so a converged sync brings the
+                                                                    // tree to L-1.
+                                                                    let latest = clock
+                                                                        .get_latest_shard_clock_frame(&filter)
+                                                                        .ok()
+                                                                        .and_then(|f| f.header)
+                                                                        .map(|h| (h.frame_number, h.state_roots));
+                                                                    let (pinned_frame, expected_roots) = match latest {
+                                                                        Some((n, r)) => (n, r),
+                                                                        None => {
+                                                                            sync_in_progress.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                            continue;
+                                                                        }
+                                                                    };
+                                                                    let synced_to_frame = pinned_frame.saturating_sub(1);
+                                                                    let lb = loopback_handle.clone();
+                                                                    let flag = sync_in_progress.clone();
+                                                                    let f = filter.clone();
+                                                                    tokio::spawn(async move {
+                                                                        match syncer.sync_shard_tree(&f, &expected_roots).await {
+                                                                            Ok(true) => {
+                                                                                tracing::info!(filter = %hex::encode(&f), synced_to_frame, "app-shard catch-up sync converged");
+                                                                                lb.send(crate::app_engine::AppEngineMessage::ShardSyncCompleted { synced_to_frame });
+                                                                            }
+                                                                            Ok(false) => tracing::warn!(filter = %hex::encode(&f), "app-shard catch-up sync did not converge"),
+                                                                            Err(e) => tracing::warn!(filter = %hex::encode(&f), error = %e, "app-shard catch-up sync failed"),
+                                                                        }
+                                                                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                    });
+                                                                }
                                                                 _ => {
-                                                                    // Equivocation/Halted/AncestorSyncRequested/
-                                                                    // ParentSealed — informational; engine handles
-                                                                    // them internally or they require no master
-                                                                    // mediation in local mode.
+                                                                    // Equivocation/Halted/ParentSealed —
+                                                                    // informational; engine handles them internally
+                                                                    // or they require no master mediation in local mode.
                                                                     debug!(core_id, "engine event: {:?}", event);
                                                                 }
                                                             }
@@ -712,7 +781,6 @@ impl ThreadWorkerManager {
                                                     let _ = master_tx_clone.send(
                                                         WorkerToMaster::ShardDeactivated {
                                                             core_id,
-                                                            generation,
                                                             filter: filter_clone.clone(),
                                                         }
                                                     ).await;

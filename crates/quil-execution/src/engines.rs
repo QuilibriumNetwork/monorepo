@@ -130,6 +130,26 @@ impl GlobalExecutionEngine {
         }
     }
 
+    /// Install the config the unified-tree split reset needs at the flag day: the
+    /// archive KEEP-set (records that survive the drop) and the network's QUIL
+    /// genesis shard-prefix set (the grid is rebuilt to it). See
+    /// [`crate::global_intrinsic::intrinsic::GlobalIntrinsic::maybe_apply_split_reset`].
+    /// Archive-materializing nodes only; without it the reset no-ops and the node
+    /// syncs the post-reset state.
+    pub fn install_split_reset_config(
+        &mut self,
+        archive_prover_addresses: Arc<std::collections::HashSet<Vec<u8>>>,
+        reset_genesis_prefixes: Arc<Vec<Vec<u32>>>,
+    ) {
+        if let Some(intrinsic) = self.intrinsic.take() {
+            self.intrinsic = Some(
+                intrinsic
+                    .with_archive_prover_addresses(archive_prover_addresses)
+                    .with_reset_genesis_prefixes(reset_genesis_prefixes),
+            );
+        }
+    }
+
     /// Install only the `frame_prover` on the intrinsic. This is the
     /// minimum needed to verify frame-header attestations
     /// (`verify_frame_header_signature` in `GlobalIntrinsic::validate`);
@@ -191,6 +211,12 @@ impl GlobalExecutionEngine {
     pub fn apply_due_shard_changes(&self, frame_number: u64) -> Result<()> {
         if let (Some(ref intrinsic), Some(ref state)) = (&self.intrinsic, &self.state) {
             intrinsic.apply_due_shard_changes(frame_number, state)?;
+            // The one-time unified-tree split reset rides the SAME per-frame,
+            // pre-commit hook so its prover-record deletes land in the cutover
+            // frame's commit batch. Runs AFTER apply_due so its deletes win over
+            // any reassignment written this frame; a no-op except at the cutover
+            // frame on a materializing archive.
+            intrinsic.maybe_apply_split_reset(frame_number, state)?;
             state.commit()?;
         }
         Ok(())

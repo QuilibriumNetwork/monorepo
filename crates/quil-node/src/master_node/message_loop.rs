@@ -46,6 +46,11 @@ pub(crate) struct MessageLoopArgs {
     pub genesis_prover_addrs: std::collections::HashSet<Vec<u8>>,
     pub alert_pubkey: Vec<u8>,
     pub network: u8,
+    /// CRDT + genesis seed for the at-cutover prover-tree reset on regular nodes
+    /// (they apply frames here, not in the archive materializer). Deterministic:
+    /// every node rebuilds the identical prover tree from the genesis committee.
+    pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    pub genesis_seed: String,
     pub archive_mode: bool,
     pub prover_lifecycle: Arc<quil_engine::provers::lifecycle::ProverLifecycle>,
     pub prover_registry: Arc<quil_execution::SharedProverRegistry>,
@@ -91,6 +96,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         genesis_prover_addrs: genesis_prover_addrs_for_recv,
         alert_pubkey: alert_pubkey_for_recv,
         network: network_for_recv,
+        crdt: crdt_for_recv,
+        genesis_seed: genesis_seed_for_recv,
         archive_mode: archive_mode_recv,
         prover_lifecycle: pl_for_recv,
         prover_registry: pr_for_recv,
@@ -1036,6 +1043,33 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 };
 
                                                 for (exec_num, exec_frame) in frames_to_execute {
+                                                    // At-cutover prover-tree reset on regular nodes — run
+                                                    // LOCALLY, BEFORE processing the cutover frame, exactly as
+                                                    // the archive materializer does (which resets before it
+                                                    // materializes the frame). The reset is a deterministic pure
+                                                    // function of (cutover frame, genesis committee), so every
+                                                    // node rebuilds the identical prover tree from empty — the
+                                                    // forest JMT is put-only, so a wipe can't propagate through
+                                                    // incremental sync. Running it here converges regulars
+                                                    // immediately instead of via the slow mismatch-recovery
+                                                    // full re-pull. `== cutover` fires exactly once (in-order
+                                                    // gossip application), matching the archive's reset frame.
+                                                    if !archive_mode_recv
+                                                        && exec_num
+                                                            == quil_execution::global_intrinsic::materialize::unified_tree_cutover_frame()
+                                                    {
+                                                        match quil_engine::genesis::reset_prover_tree_to_genesis(
+                                                            &crdt_for_recv,
+                                                            &hg_store_for_recv,
+                                                            exec_num,
+                                                            network_for_recv,
+                                                            &genesis_seed_for_recv,
+                                                            &[],
+                                                        ) {
+                                                            Ok(n) => info!(seeded = n, frame = exec_num, "regular at-cutover prover-tree reset complete"),
+                                                            Err(e) => warn!(error = %e, frame = exec_num, "regular at-cutover prover-tree reset FAILED"),
+                                                        }
+                                                    }
                                                     match quil_engine::frame_processor::process_global_frame_with_rewards(
                                                         &exec_mgr_for_recv,
                                                         &exec_frame,
@@ -1265,6 +1299,34 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                     }
                                 }
                                 if !routed {
+                                    // CLUSTER MASTER: a full app-shard frame the master received
+                                    // via `shard_frame_bitmask` gossip for a filter its REMOTE
+                                    // workers cover — no local engine handle, and (on a prover)
+                                    // no archive ingest. Mirror it into the master clock store so
+                                    // the store-backed `AppShardService::get_app_shard_frame`
+                                    // serves it; without this, cluster reads hit an empty master
+                                    // store (thread-mode/local frames are mirrored by the worker
+                                    // drain, archive frames by `archive_ingest` below). The
+                                    // filter is the frame header's `address`; the bitmask check
+                                    // confirms this really is a shard-frame message for it (and
+                                    // that non-frame mesh traffic is skipped).
+                                    if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(
+                                        &received.data[..],
+                                    ) {
+                                        if let Some(addr) =
+                                            frame.header.as_ref().map(|h| h.address.clone())
+                                        {
+                                            if !addr.is_empty()
+                                                && bm == quil_engine::bitmasks::shard_frame_bitmask(&addr).as_slice()
+                                            {
+                                                super::worker_manager::mirror_shard_frame_to_clock_store(
+                                                    clock_store_recv.as_ref(),
+                                                    &addr,
+                                                    &received.data,
+                                                );
+                                            }
+                                        }
+                                    }
                                     // Non-shard traffic (e.g. mesh relay) — no local
                                     // handler. On an archive (no local shard engines),
                                     // un-routed shard-frame traffic lands here: feed it to

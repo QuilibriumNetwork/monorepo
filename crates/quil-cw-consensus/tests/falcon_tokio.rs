@@ -35,13 +35,7 @@ impl GlobalProposer for TestProposer {
         let digest = h.finalize();
         Some((digest, digest.as_ref().to_vec()))
     }
-    fn verify(
-        &self,
-        _v: u64,
-        _parent_digest: Sha256Digest,
-        _d: Sha256Digest,
-        bytes: Option<Vec<u8>>,
-    ) -> bool {
+    fn verify(&self, _v: u64, _d: Sha256Digest, bytes: Option<Vec<u8>>) -> bool {
         bytes.is_some()
     }
 }
@@ -56,14 +50,7 @@ struct SignalFinalizer {
 }
 impl FrameFinalizer for SignalFinalizer {
     fn on_notarized(&self, _v: u64, _d: Sha256Digest, _b: Option<Vec<u8>>) {}
-    fn on_finalized(
-        &self,
-        view: u64,
-        _d: Sha256Digest,
-        _b: Option<Vec<u8>>,
-        _c: Option<Vec<u8>>,
-        _locally_verified: bool,
-    ) {
+    fn on_finalized(&self, view: u64, _d: Sha256Digest, _b: Option<Vec<u8>>, _c: Option<Vec<u8>>, _lv: bool) {
         let _ = self.tx.send(view);
     }
 }

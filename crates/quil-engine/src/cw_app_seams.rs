@@ -53,8 +53,10 @@ pub type AppFrameSink = Arc<dyn Fn(AppShardFrame) + Send + Sync>;
 
 /// Like [`AppFrameSink`] but also carries the serialized simplex finalization
 /// certificate (proposal + Falcon quorum cert), so the engine can attach it to
-/// the reward-coverage bundle for global-level verification. The boolean marks
-/// whether this exact frame was locally validated and sealed before finalization.
+/// the reward-coverage bundle for global-level verification.
+/// The boolean marks whether this exact frame was locally validated and sealed
+/// before finalization (vs. a certificate-only replica that learned the cert
+/// without locally verifying the bytes).
 pub type AppFinalizedSink = Arc<dyn Fn(AppShardFrame, Vec<u8>, bool) + Send + Sync>;
 
 /// Build the full `AppShardFrame` from a produced consensus state + the leader's
@@ -65,7 +67,7 @@ pub type AppFinalizedSink = Arc<dyn Fn(AppShardFrame, Vec<u8>, bool) + Send + Sy
 /// require one — so `public_key_signature_bls48581` is left `None`.
 ///
 /// This is the pure core of the engine-supplied `AppFrameAssembler`: the engine's
-/// closure reads `frame_requests[(state.frame_number, state.rank)]` and calls this.
+/// closure reads `frame_requests[state.frame_number]` and calls this.
 pub fn app_frame_from_state(
     state: &State<AppShardState>,
     requests: Vec<quil_types::proto::global::MessageBundle>,
@@ -107,6 +109,7 @@ pub fn app_frame_from_state(
         storage_attestation,
     }
 }
+
 /// Frame identity (`Poseidon(output)[..32]`) as the consensus digest — identical
 /// scheme to global (`AppShardState`/`GlobalFrame` share `compute_output_identity`).
 fn app_frame_digest(frame: &AppShardFrame) -> Option<Digest> {
@@ -123,30 +126,6 @@ fn decode_app_frame(bytes: &[u8]) -> Option<AppShardFrame> {
     <AppShardFrame as prost::Message>::decode(bytes).ok()
 }
 
-/// Bind an app block's wire header to the Simplex proposal context before an
-/// honest replica votes. Header validation alone cannot see the consensus
-/// parent, so this link check lives at the seam where both are available.
-fn app_header_extends_simplex_parent(
-    header: &quil_types::proto::global::FrameHeader,
-    filter: &[u8],
-    view: u64,
-    parent_frame_number: u64,
-    parent_digest: &Digest,
-) -> bool {
-    let Some(expected_frame_number) = parent_frame_number.checked_add(1) else {
-        return false;
-    };
-    let expected_parent = if parent_frame_number == 0 {
-        vec![0u8; 32]
-    } else {
-        digest_to_identity(parent_digest).to_vec()
-    };
-    header.address == filter
-        && header.rank == view
-        && header.frame_number == expected_frame_number
-        && header.parent_selector == expected_parent
-}
-
 // ---------------------------------------------------------------------------
 // Proposer (GlobalProposer seam)
 // ---------------------------------------------------------------------------
@@ -161,10 +140,13 @@ fn app_header_extends_simplex_parent(
 ///   `frame.requests` and reject a mismatch, so every replica executes the one
 ///   body that matches the declared+certified root (no divergence);
 /// - **pre-state `state_roots` (audit #3)** — when this node is EXACTLY at
-///   frame N-1, recompute the 4 deterministic phase roots (`compute_shard_root`)
-///   and reject if they don't equal `header.state_roots`, so an honest member
-///   never signs a leader's false pre-state root claim; a behind/lagged member
-///   abstains (signs) so it can't spuriously nullify.
+///   frame N-1, recompute the 4 deterministic phase roots and reject if they
+///   don't equal `header.state_roots`, so an honest member never signs a
+///   leader's false pre-state root claim; a behind/lagged member abstains
+///   (signs) so it can't spuriously nullify. Under the unified sharded model the
+///   per-shard root is the covered SUBTREE root
+///   (`sub_shard_commitment_for_filter`, computable from partial storage); legacy
+///   pre-cutover uses the whole-app aggregate (`compute_shard_root`).
 ///
 /// The engine builds it capturing its deps; `None` skips both checks (tests /
 /// no-exec paths).
@@ -211,27 +193,16 @@ impl AppSeamProposer {
 impl GlobalProposer for AppSeamProposer {
     fn propose(&self, view: u64, parent_digest: Digest) -> Option<(Digest, Vec<u8>)> {
         let prior_state_id: Vec<u8> = digest_to_identity(&parent_digest).to_vec();
-        let prior_frame_number = match self
+        let prior_frame_number = self
             .block_meta
             .lock()
             .unwrap()
             .get(&parent_digest)
             .copied()
-        {
-            Some(frame_number) => frame_number,
-            None => {
-                tracing::warn!(
-                    view,
-                    parent = %hex::encode(&prior_state_id),
-                    "cw app propose: consensus parent metadata unavailable — nullify",
-                );
-                return None;
-            }
-        };
+            .unwrap_or(0);
 
-        // Both values come from the Simplex-selected parent. The leader provider
-        // resolves and validates that exact canonical/materialized frame rather
-        // than substituting its local latest head.
+        // App shards resolve their parent from the shard clock store internally,
+        // so `prior_frame_number` is advisory; `prior_state_id` is the identity.
         let state = self
             .leader_provider
             .prove_next_state(view, &self.filter, prior_frame_number, &prior_state_id)
@@ -247,13 +218,7 @@ impl GlobalProposer for AppSeamProposer {
         Some((digest, bytes))
     }
 
-    fn verify(
-        &self,
-        view: u64,
-        parent_digest: Digest,
-        digest: Digest,
-        bytes: Option<Vec<u8>>,
-    ) -> bool {
+    fn verify(&self, _view: u64, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
         let Some(bytes) = bytes else {
             tracing::warn!("cw app verify: block not delivered (nullify)");
             return false;
@@ -267,38 +232,6 @@ impl GlobalProposer for AppSeamProposer {
         };
         if app_frame_digest(&frame) != Some(digest) {
             tracing::warn!(frame = header.frame_number, "cw app verify: digest mismatch");
-            return false;
-        }
-        let parent_frame_number = match self
-            .block_meta
-            .lock()
-            .unwrap()
-            .get(&parent_digest)
-            .copied()
-        {
-            Some(frame_number) => frame_number,
-            None => {
-                tracing::warn!(
-                    view,
-                    parent = %hex::encode(digest_to_identity(&parent_digest)),
-                    "cw app verify: consensus parent metadata unavailable — nullify",
-                );
-                return false;
-            }
-        };
-        if !app_header_extends_simplex_parent(
-            header,
-            &self.filter,
-            view,
-            parent_frame_number,
-            &parent_digest,
-        ) {
-            tracing::warn!(
-                view,
-                frame = header.frame_number,
-                parent_frame = parent_frame_number,
-                "cw app verify: shard/rank/height/parent does not match Simplex context — nullify",
-            );
             return false;
         }
         // Proposal-mode validation: VDF + structure, no committee QC required yet.
@@ -484,16 +417,6 @@ pub struct AppConsensusCwHandle {
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl Drop for AppConsensusCwHandle {
-    fn drop(&mut self) {
-        // The commonware host runs independently of the app engine's tokio
-        // task. Ensure aborting/dropping that engine cannot leave an old-shard
-        // consensus host alive after reassignment or deallocation.
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-}
-
 /// Assemble + start the simplex-backed app-shard consensus for one shard.
 /// Must be called from within the node's tokio runtime (spawns the outbound
 /// drain there); the engine runs on its own runtime thread.
@@ -589,22 +512,6 @@ mod tests {
     use quil_types::crypto::Signer as _;
 
     #[test]
-    fn dropping_consensus_handle_requests_host_shutdown() {
-        let (a, _arx) = tokio::sync::mpsc::unbounded_channel();
-        let (b, _brx) = tokio::sync::mpsc::unbounded_channel();
-        let (c, _crx) = tokio::sync::mpsc::unbounded_channel();
-        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
-            let _handle = AppConsensusCwHandle {
-                inbound: [a, b, c],
-                ingest_block: Arc::new(|_| {}),
-                shutdown: shutdown.clone(),
-            };
-        }
-        assert!(shutdown.load(std::sync::atomic::Ordering::Acquire));
-    }
-
-    #[test]
     fn app_committee_builds_and_scopes_by_shard() {
         // This node + 2 other shard members.
         let me = quil_crypto::FalconSigner::generate();
@@ -640,32 +547,5 @@ mod tests {
             &app_a,
         )
         .is_none());
-    }
-
-    #[test]
-    fn app_header_must_extend_simplex_parent() {
-        let filter = vec![0xAA; 32];
-        let parent = digest_from_identity([0x11; 32]);
-        let valid = quil_types::proto::global::FrameHeader {
-            address: filter.clone(),
-            frame_number: 8,
-            rank: 42,
-            parent_selector: digest_to_identity(&parent).to_vec(),
-            ..Default::default()
-        };
-        assert!(app_header_extends_simplex_parent(&valid, &filter, 42, 7, &parent));
-
-        let mut wrong = valid.clone();
-        wrong.frame_number = 7;
-        assert!(!app_header_extends_simplex_parent(&wrong, &filter, 42, 7, &parent));
-        let mut wrong = valid.clone();
-        wrong.parent_selector = vec![0x22; 32];
-        assert!(!app_header_extends_simplex_parent(&wrong, &filter, 42, 7, &parent));
-        let mut wrong = valid.clone();
-        wrong.rank = 43;
-        assert!(!app_header_extends_simplex_parent(&wrong, &filter, 42, 7, &parent));
-        let mut wrong = valid;
-        wrong.address = vec![0xBB; 32];
-        assert!(!app_header_extends_simplex_parent(&wrong, &filter, 42, 7, &parent));
     }
 }

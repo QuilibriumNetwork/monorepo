@@ -111,6 +111,24 @@ pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandl
             info!(apps = committed_apps.len(), "seeded per-sub-shard live-size baseline");
         }
     }
+
+    // UNIFIED_APP_TREE cutover: run the one-time split→app-tree consolidation (a
+    // no-op after the first boot, via a persisted marker) and set the CRDT's
+    // unified-tree flag from the head frame. The per-frame flip at exactly
+    // `UNIFIED_TREE_CUTOVER_FRAME` is handled by `gate_unified_at_frame` on the
+    // commit paths; this boot call gets a node that starts up already past the
+    // cutover into unified mode immediately.
+    // DEV: `QUIL_DISABLE_UNIFIED=1` skips the boot consolidation entirely (used to
+    // A/B a fully-inert baseline — pair with a high cutover so the per-frame flip
+    // never fires either).
+    if std::env::var("QUIL_DISABLE_UNIFIED").is_err() {
+        crate::unified_consolidation::boot_consolidate_and_gate(
+            &storage.hg_store,
+            storage.shards_store.as_ref(),
+            storage.clock_store.as_ref(),
+            crdt.as_ref(),
+        );
+    }
     // Eagerly run one commit at startup so the per-shard tree blob
     // lands at `[0x2F, vertex, adds, {l1=[0;3], l2=[0xff;32]}]`
     // before any sync probe arrives. Without an eager commit the
@@ -278,7 +296,34 @@ pub(crate) fn refresh_crdt_shard_prefixes(
     }
     let app_count = by_app.len();
     for (app, prefixes) in by_app {
-        crdt.set_app_shard_prefixes(app, prefixes);
+        // A `true` return means the app's registered shard set just TRANSITIONED
+        // (a split/merge landed this frame) — re-partition its size buckets so the
+        // pre-split data (stranded in the now-removed parent bucket) is re-attributed
+        // to the new leaves. Without this a freshly-created deep-split leaf reads
+        // size 0 and provers churn, proposing to "leave" the data-bearing child.
+        // Deterministic: every node sees the change at the same frame (the shards
+        // store is written at the E+2 flip on all nodes) and rescans identical
+        // committed state.
+        // NOTE: this only fires where `app_prefixes` actually TRANSITIONS — which
+        // today means nodes that run `apply_due_shard_changes` into their local
+        // shards_store (archives, via the FrameMaterializer). Regular nodes don't
+        // apply splits locally (no materializer), so their shards_store stays
+        // single-shard and this stays inert on them until that gap is closed —
+        // see the size-bucket note in shard_data_migration_design.
+        if crdt.set_app_shard_prefixes(app, prefixes) {
+            if let Err(e) = crdt.rebucket_app(&app) {
+                warn!(
+                    app = %hex::encode(app),
+                    error = %e,
+                    "refresh_crdt_shard_prefixes: rebucket_app failed after shard-set change"
+                );
+            } else {
+                info!(
+                    app = %hex::encode(app),
+                    "shard set changed (split/merge) — re-partitioned size buckets"
+                );
+            }
+        }
     }
     app_count
 }

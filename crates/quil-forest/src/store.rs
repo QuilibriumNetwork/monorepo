@@ -56,6 +56,16 @@ pub struct MemTreeStore {
     stale: RwLock<BTreeMap<(Version, NodeKey), ()>>,
 }
 
+impl MemTreeStore {
+    /// Wipe the whole tree back to empty (the in-memory analogue of
+    /// [`RocksTreeStore::clear`]). Used by the shard-scoped prover-tree reset.
+    pub fn clear(&self) {
+        self.nodes.write().unwrap().clear();
+        self.values.write().unwrap().clear();
+        self.stale.write().unwrap().clear();
+    }
+}
+
 impl TreeReader for MemTreeStore {
     fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {
         Ok(self.nodes.read().unwrap().get(node_key).cloned())
@@ -223,6 +233,35 @@ impl RocksTreeStore {
     pub fn put_preimage(&self, raw_key: &[u8]) -> Result<()> {
         let (k, v) = self.preimage_put(raw_key);
         self.db.put(k, v)?;
+        Ok(())
+    }
+
+    /// Delete EVERY key of this tree — nodes, values, stale index, preimages,
+    /// and the head-version marker all live under `self.prefix`, so a single
+    /// range delete wipes the tree back to empty (next commit rebuilds from
+    /// version 0). Used by the shard-scoped prover-tree reset. NOT for pruning
+    /// (which keeps the live version) — this discards the whole tree.
+    pub fn clear(&self) -> Result<()> {
+        let lower = self.prefix.clone();
+        // Exclusive upper bound covering all `prefix`-prefixed keys: increment
+        // the last byte < 0xFF, dropping trailing 0xFF bytes. `prefix` starts
+        // with the non-0xFF tree-level byte, so an upper bound always exists.
+        let upper = {
+            let mut u = self.prefix.clone();
+            while matches!(u.last(), Some(&0xff)) {
+                u.pop();
+            }
+            match u.last_mut() {
+                Some(b) => {
+                    *b += 1;
+                    u
+                }
+                None => return Ok(()), // empty prefix — nothing scoped to clear
+            }
+        };
+        let mut wb = rocksdb::WriteBatch::default();
+        wb.delete_range(&lower, &upper);
+        self.db.write(wb)?;
         Ok(())
     }
 

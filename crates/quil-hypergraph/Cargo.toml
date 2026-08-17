@@ -45,3 +45,7 @@ required-features = ["test-utils"]
 [[test]]
 name = "prover_tree_sync"
 required-features = ["test-utils"]
+
+[[test]]
+name = "unified_tree_commit"
+required-features = ["test-utils"]

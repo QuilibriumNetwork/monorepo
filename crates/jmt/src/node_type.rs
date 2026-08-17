@@ -458,6 +458,44 @@ impl InternalNode {
         )
     }
 
+    /// Root hash of the child sub-range `[start, start+width)` of this internal
+    /// node — i.e. the commitment of a BIT-prefix subtree that lives *inside*
+    /// this nibble (e.g. a 64-way / top-6-bit shard boundary is a width-4 range
+    /// within the 2nd nibble). `[start=0, width=16)` reproduces [`Self::hash`].
+    /// `width` must be a power of two dividing 16 and `start` a multiple of it.
+    /// Used by the unified-app-tree shard model to give non-nibble-aligned shard
+    /// prefixes a well-defined commitment that composes to the node/app root.
+    pub fn subtree_hash<H: SimpleHasher>(&self, start: u8, width: u8) -> [u8; 32] {
+        self.merkle_hash::<H>(start, width, self.generate_bitmaps())
+    }
+
+    /// Total leaf count under the child sub-range `[start, start+width)` — the
+    /// COUNT half of the unified-app-tree Merkle-sum (see
+    /// `crates/quil-execution/UNIFIED_APP_TREE_DESIGN.md` §5/§6.1). Uses the
+    /// per-[`Child`] `leaf_count` metadata jmt already maintains — no tree walk,
+    /// no node-format change. `[start=0, width=16)` reproduces
+    /// [`Self::leaf_count`]. Same range constraints as [`Self::subtree_hash`]:
+    /// `width` a power of two dividing 16, `start` a multiple of `width`.
+    ///
+    /// This gives a prospective shard (a bit-prefix subtree, e.g. a 64-way /
+    /// top-6-bit boundary = width-4 range within a nibble) its data-bearing leaf
+    /// count, for the DATA-based split trigger and the ≥2-non-empty-children
+    /// guard: a split at this node is meaningful iff at least two of the
+    /// candidate child sub-ranges have a non-zero `subtree_leaf_count`.
+    pub fn subtree_leaf_count(&self, start: u8, width: u8) -> usize {
+        assert!(start < 16 && width.count_ones() == 1 && start % width == 0);
+        assert!(width <= 16 && (start + width) <= 16);
+        let (lo, hi) = (start, start + width);
+        self.children
+            .iter()
+            .filter(|(nibble, _)| {
+                let i = u8::from(*nibble);
+                i >= lo && i < hi
+            })
+            .map(|(_, child)| child.leaf_count())
+            .sum()
+    }
+
     pub fn children_sorted(&self) -> impl Iterator<Item = (Nibble, &Child)> {
         // Previously this used `.sorted_by_key()` directly on the iterator but this does not appear
         // to be available in itertools (it does not seem to ever have existed???) for unknown

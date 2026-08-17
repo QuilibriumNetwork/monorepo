@@ -254,6 +254,69 @@ pub(crate) fn init(
             )
             .with_eviction_registry(prover_registry.clone())
             .with_rocks_hg_store(hg_store.clone())
+            // (B/#2) At-cutover consolidation on the archive's CRDT store: fold
+            // every split app's per-sub-shard trees into its app.l2 tree from
+            // current committed vertices before the unified flip, so a split in
+            // the [boot, cutover) window is reflected. Deterministic (same frame,
+            // same committed state on every archive).
+            .with_unified_cutover_consolidate({
+                let hg = hg_store.clone();
+                let ss = shards_store.clone();
+                std::sync::Arc::new(move |frame: u64| -> bool {
+                    match quil_forest_migrate::run_unified_consolidation_in_place(
+                        hg.as_ref(),
+                        ss.as_ref(),
+                        0,
+                        frame,
+                    ) {
+                        Ok(n) => {
+                            tracing::info!(
+                                apps = n,
+                                frame,
+                                "archive at-cutover unified consolidation complete"
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                frame,
+                                "archive at-cutover unified consolidation FAILED"
+                            );
+                            false
+                        }
+                    }
+                })
+            })
+            // Prover-tree reset rides the same cutover flag day (archive only):
+            // wipe the global prover shard + rebuild from the network's genesis
+            // committee, so provers stranded on alias sub-shards are cleared and
+            // re-join onto the reset grid. The committee is resolved once
+            // (network-aware); the reset is deterministic across archives.
+            .with_prover_tree_reset({
+                let hg = crdt.clone();
+                let store = hg_store.clone();
+                let net = network;
+                let seed = config.engine.genesis_seed.clone();
+                // The local Falcon prover pubkey is only consulted by the testnet
+                // EMPTY-seed single-prover fallback; mainnet uses the embedded
+                // genesis and a seeded testnet/localnet uses the seed keys, so `&[]`
+                // suffices here.
+                std::sync::Arc::new(move |frame: u64| -> bool {
+                    match quil_engine::genesis::reset_prover_tree_to_genesis(
+                        &hg, store.as_ref(), frame, net, &seed, &[],
+                    ) {
+                        Ok(n) => {
+                            tracing::info!(seeded = n, frame, "archive at-cutover prover-tree reset complete");
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, frame, "archive at-cutover prover-tree reset FAILED");
+                            false
+                        }
+                    }
+                })
+            })
             // Deterministic per-shard data-size source for the eviction
             // halt gate: enumerate committed shards from the shards store
             // and key by `confirmation_filter` = L2(32) ++ prefix-byte
@@ -270,10 +333,11 @@ pub(crate) fn init(
                     if let Ok(shards) = ss.range_app_shards() {
                         for s in shards {
                             let l2_start = if s.shard_key.len() >= 3 { 3 } else { 0 };
-                            let mut filter = s.shard_key[l2_start..].to_vec();
-                            for p in &s.prefix {
-                                filter.push(*p as u8);
-                            }
+                            // Canonical prefix → filter (sentinel-aware).
+                            let filter = quil_forest::shard_prefix_to_filter(
+                                &s.shard_key[l2_start..],
+                                &s.prefix,
+                            );
                             if filter.is_empty() {
                                 continue;
                             }

@@ -468,6 +468,221 @@ fn binary_split_marker_prefixes_commit_deterministically() {
     );
 }
 
+/// EVALUATION (mainnet KZG-era cascade repair): reproduce the non-prefix-free
+/// legacy grid observed on mainnet — a depth-1 DATA shard `[0]` coexisting with a
+/// deep EMPTY descendant `[0,0,0,0,0,0]` on its all-zeros sub-branch, plus a data
+/// sibling `[1]`. Establishes how the unified sharded model behaves on this state
+/// the unification must tolerate:
+///  (1) LEGACY whole-app aggregate (`compute_shard_root` → `app_root_from_shard_paths`,
+///      documented "MUST be prefix-free") — does it survive or panic?
+///  (2) UNIFIED per-shard subtree commitments (`sub_shard_commitment_for_filter`) —
+///      the data shard carries its data, the deep empty descendant commits the
+///      ZERO root, and the overlap is a view/sub-view, not a conflict.
+///  (3) ROUTING (`address_shard_index`, first-match) puts an under-`[0]`-not-deep
+///      address on the DATA shard, so the deep descendant genuinely stays empty.
+#[test]
+fn nonprefixfree_cascade_grid_evaluation() {
+    use quil_types::store::ShardKey;
+    let app = [0xCDu8; 32];
+    let sk = ShardKey { l1: [0u8; 3], l2: app };
+    // Several leaves under `[0]` (top-6-bits 000000) but NONE under the deep
+    // 36-zero path (byte 1 non-zero breaks the zero run at bit 8) — realistic: a
+    // mainnet data shard has millions of leaves, so its deep all-zeros descendant
+    // is genuinely empty (avoids JMT single-leaf compression, where one leaf would
+    // make the descendant inherit the parent's root).
+    let under0 = |b1: u8, b2: u8| Location {
+        app_address: app,
+        data_address: { let mut a = [0u8; 32]; a[1] = b1; a[2] = b2; a },
+    };
+    // Under `[1]` (top-6-bits 000001): byte0 0x04 = 0b0000_0100.
+    let d1 = Location { app_address: app, data_address: { let mut a=[0u8;32]; a[0]=0x04; a[1]=0xAB; a } };
+    // NON-prefix-free set: [0] ⊂ [0,0,0,0,0,0].
+    let nonpf = vec![vec![0u32], vec![1u32], vec![0u32, 0, 0, 0, 0, 0]];
+
+    // (1) LEGACY aggregate on the non-prefix-free grid — panic or survive?
+    let legacy = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let c = fresh_crdt();
+        c.set_app_shard_prefixes(app, nonpf.clone());
+        c.add_vertex(&under0(0xFF, 0x11), b"a").unwrap();
+        c.add_vertex(&under0(0xFE, 0x22), b"b").unwrap();
+        c.add_vertex(&d1, b"data1").unwrap();
+        c.commit(1).unwrap();
+        c.compute_shard_root("vertex", "adds", &sk)
+    }));
+    eprintln!(
+        "[eval] LEGACY whole-app aggregate on non-prefix-free grid: {}",
+        if legacy.is_ok() { "SURVIVED (no panic)" } else { "PANICKED (app_root_from_shard_paths requires prefix-free)" }
+    );
+    // KEY FINDING: the legacy whole-app aggregate cannot run on this grid.
+    assert!(legacy.is_err(),
+        "legacy app_root_from_shard_paths must PANIC on a non-prefix-free set (documents the flip requirement)");
+
+    // (2) UNIFIED per-subtree commitments on the SAME non-prefix-free grid.
+    let c = fresh_crdt();
+    c.set_app_shard_prefixes(app, nonpf.clone());
+    c.set_unified_tree(true);
+    c.add_vertex(&under0(0xFF, 0x11), b"a").unwrap();
+    c.add_vertex(&under0(0xFE, 0x22), b"b").unwrap();
+    c.add_vertex(&under0(0xF0, 0x33), b"c").unwrap();
+    c.add_vertex(&d1, b"data1").unwrap();
+    c.commit(1).unwrap();
+
+    let filt = |suffix: &[u8]| { let mut f = app.to_vec(); f.extend_from_slice(suffix); f };
+    let root0 = c.sub_shard_commitment_for_filter("vertex", "adds", &filt(&[0x00]));
+    let root1 = c.sub_shard_commitment_for_filter("vertex", "adds", &filt(&[0x01]));
+    let root_deep = c.sub_shard_commitment_for_filter("vertex", "adds", &filt(&[0, 0, 0, 0, 0, 0]));
+    let zero = vec![0u8; 32];
+    eprintln!(
+        "[eval] UNIFIED non-pf: [0] nonzero={}, [1] nonzero={}, deep==[0]? {}",
+        root0 != zero, root1 != zero, root_deep == root0
+    );
+
+    // KEY FINDING (2): `canonical_shard_bit_paths` collapses the non-prefix-free
+    // continuation. Tracing [[0],[1],[0,0,0,0,0,0]]: at depth 0 both `[0]` and
+    // `[0,0,0,0,0,0]` take bit `false`; at depth 1 `[0]` TERMINATES, leaving
+    // `[0,0,0,0,0,0]` alone in the branch → width-0 levels push no further bits.
+    // So the deep descendant resolves to the SAME bit-path `[false]` as `[0]`:
+    // it is an ALIAS of the data shard, NOT a distinct empty subtree.
+    assert_ne!(root0, zero, "data shard [0] carries its data under unified");
+    assert_ne!(root1, zero, "data shard [1] carries its data under unified");
+    assert_eq!(root_deep, root0,
+        "deep descendant ALIASES [0]'s subtree root (bit-path collapse) — a prover on the \
+         empty deep shard would be asked to commit [0]'s data root it does not hold");
+    assert_ne!(root0, root1, "distinct data shards still commit distinct roots");
+
+    // (3) ROUTING consequence: `address_shard_index` is FIRST-MATCH over the
+    // canonical bit-paths. `[0]` and the deep alias share bit-path `[false]`, and
+    // `[0]` appears first, so EVERY address that would fall under the alias is
+    // shadowed onto `[0]`. No new data ever routes to the deep shard — good, it
+    // stays empty — but its commitment still aliases `[0]` (finding 2).
+    let bit_paths = quil_forest::canonical_shard_bit_paths(&nonpf);
+    eprintln!("[eval] canonical bit-paths of non-pf grid: {:?}", bit_paths);
+    assert_eq!(bit_paths[0], bit_paths[2], "[0] and its deep descendant collapse to one bit-path");
+    let addr_under0 = { let mut a = [0u8; 32]; a[1] = 0xFF; a };
+    assert_eq!(quil_forest::address_shard_index(&addr_under0, &bit_paths), 0,
+        "first-match routes the address to [0], never to the aliased deep shard (index 2)");
+
+    // (4) THE RESET TARGET: rebuilding the QUIL grid to the 64-way genesis set
+    // (`[0]..[63]`, what `maybe_apply_split_reset` writes) is prefix-free by
+    // construction — the aliasing AND the legacy-aggregate panic are both gone,
+    // and the pre-existing data is preserved (routes to, and commits under, its
+    // genesis shard). This is the offline analogue of the flag-day reset.
+    let genesis64: Vec<Vec<u32>> = (0..64u32).map(|i| vec![i]).collect();
+    let legacy_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let c = fresh_crdt();
+        c.set_app_shard_prefixes(app, genesis64.clone());
+        // Data that lived under the cascade `[0]` (top byte 0x00 ⇒ genesis index 0).
+        c.add_vertex(&under0(0xFF, 0x11), b"a").unwrap();
+        c.add_vertex(&under0(0xFE, 0x22), b"b").unwrap();
+        c.add_vertex(&d1, b"data1").unwrap(); // top byte 0x04 ⇒ genesis index 1
+        c.commit(1).unwrap();
+        c.compute_shard_root("vertex", "adds", &sk)
+    }));
+    eprintln!(
+        "[eval] RESET-to-genesis-64 legacy aggregate: {}",
+        if legacy_ok.is_ok() { "SURVIVED" } else { "still PANICS" }
+    );
+    assert!(legacy_ok.is_ok(),
+        "the 64-way genesis grid is prefix-free — the legacy aggregate accepts it, no panic");
+
+    // Prefix-free: 64 distinct 6-bit paths, all depth 6, no shard a prefix of
+    // another (so nothing aliases and address routing is unambiguous).
+    let gbits = quil_forest::canonical_shard_bit_paths(&genesis64);
+    assert_eq!(gbits.len(), 64);
+    let mut seen = std::collections::HashSet::new();
+    for b in &gbits {
+        assert_eq!(b.len(), 6, "every genesis shard sits at depth 6");
+        assert!(seen.insert(b.clone()), "genesis bit-paths are all distinct");
+    }
+    // Data preserved: under the reset grid the data that was in cascade `[0]`
+    // routes to genesis index 0 and commits a non-zero subtree root there.
+    let c = fresh_crdt();
+    c.set_app_shard_prefixes(app, genesis64.clone());
+    c.set_unified_tree(true);
+    c.add_vertex(&under0(0xFF, 0x11), b"a").unwrap();
+    c.add_vertex(&under0(0xFE, 0x22), b"b").unwrap();
+    c.add_vertex(&d1, b"data1").unwrap();
+    c.commit(1).unwrap();
+    assert_eq!(quil_forest::address_shard_index(&under0(0xFF, 0x11).data_address, &gbits), 0,
+        "cascade-[0] data routes to genesis shard 0 after reset");
+    let g0 = c.sub_shard_commitment_for_filter("vertex", "adds", &filt(&[0x00]));
+    assert_ne!(g0, zero, "genesis shard 0 carries the preserved data under unified");
+}
+
+/// `rebucket_app` re-partitions the per-sub-shard size buckets after a shard-set
+/// change so a newly-created child reflects the PRE-EXISTING data that routes to
+/// it — instead of reading 0. This is the deep-split convergence fix: the
+/// incremental `bump_meta` only routes NEW writes, so without a re-bucket the
+/// pre-split data stays stranded in the removed parent bucket and the child leaf
+/// looks empty (provers churn, proposing to "leave" the data-bearing shard).
+/// Conservation: the app TOTAL is unchanged; only per-sub-shard attribution moves.
+#[test]
+fn rebucket_app_repartitions_size_after_split() {
+    use num_bigint::BigInt;
+    let app = [0xCDu8; 32];
+    let mk = |d0: u8| {
+        let mut a = [0u8; 32];
+        a[0] = d0;
+        Location { app_address: app, data_address: a }
+    };
+    // data[0] top bit 0 → child [0]; top bit 1 → child [128].
+    let (v_lo, v_hi) = (mk(0x00), mk(0x80));
+
+    let crdt = fresh_crdt();
+    // Register the app as a single shard first (mirrors genesis), so the later
+    // split is a genuine Some(old)→Some(new) TRANSITION, not first-sight.
+    assert!(
+        !crdt.set_app_shard_prefixes(app, vec![Vec::new()]),
+        "first-sight registration is not a transition"
+    );
+    // Single-shard app (empty prefix): both vertices land in the ONE
+    // whole-app bucket — mirroring data written before a shard ever split.
+    crdt.add_vertex(&v_lo, b"aaaa").unwrap(); // 4 bytes
+    crdt.add_vertex(&v_hi, b"bbbbbb").unwrap(); // 6 bytes
+    crdt.commit(1).unwrap();
+
+    let total_before = crdt.total_size();
+    assert_eq!(total_before, BigInt::from(10), "app total = 4 + 6");
+
+    let lo_filter = {
+        let mut f = app.to_vec();
+        f.push(0x00);
+        f
+    };
+    let hi_filter = {
+        let mut f = app.to_vec();
+        f.push(0x80);
+        f
+    };
+    // Pre-split the child buckets don't exist (single-shard app).
+    assert!(
+        crdt.sub_shard_metadata_for_filter(&lo_filter).is_none(),
+        "pre-split: child [0] bucket empty"
+    );
+
+    // Split into [0]/[128]; the setter reports the transition, then re-partition.
+    assert!(
+        crdt.set_app_shard_prefixes(app, vec![vec![0], vec![128]]),
+        "prefix-set transition detected"
+    );
+    crdt.rebucket_app(&app).unwrap();
+
+    // Conservation: total unchanged, but each child now reflects its own data.
+    assert_eq!(
+        crdt.total_size(),
+        total_before,
+        "rebucket preserves the app total"
+    );
+    let lo = crdt
+        .sub_shard_metadata_for_filter(&lo_filter)
+        .expect("child [0] now sized");
+    let hi = crdt
+        .sub_shard_metadata_for_filter(&hi_filter)
+        .expect("child [128] now sized");
+    assert_eq!(lo.size, BigInt::from(4), "child [0] holds v_lo's 4 bytes");
+    assert_eq!(hi.size, BigInt::from(6), "child [128] holds v_hi's 6 bytes");
+}
+
 /// Full membership chain for a binary-split app: a vertex in the `0x80` sub-shard
 /// proves against that sub-shard root, and the co-path binds it to the aggregated
 /// app root — verifying the marker-byte prefix path end to end.

@@ -59,7 +59,9 @@ pub fn digest_to_identity(digest: &Digest) -> [u8; 32] {
 /// Shared digest → frame-bytes store. `Automaton::propose` seals the frame it
 /// built; successful `verify` seals the exact peer bytes the application
 /// accepted. Frames arriving from peers remain replaceable candidates until
-/// application validation succeeds.
+/// application validation succeeds — so a re-proposed/unverified block at a
+/// finalized digest can no longer overwrite the finalized frame (the
+/// "preserve finalized app shard frames" fix).
 #[derive(Clone, Default)]
 pub struct BlockStore {
     inner: Arc<Mutex<HashMap<Digest, StoredBlock>>>,
@@ -96,22 +98,15 @@ impl BlockStore {
         }
     }
     pub fn get(&self, digest: &Digest) -> Option<Vec<u8>> {
-        self.inner
-            .lock()
-            .get(digest)
-            .map(|stored| stored.bytes.clone())
+        self.inner.lock().get(digest).map(|stored| stored.bytes.clone())
     }
 
-    /// Seal the exact bytes that passed application validation. This is atomic
-    /// with respect to peer ingress: even if another candidate arrived between
-    /// `get` and validation, the validated bytes become the immutable value.
+    /// Seal the exact bytes that passed application validation (or were built
+    /// locally). Idempotent: once a digest is sealed, a later `seal`/`put`
+    /// cannot substitute different bytes for it.
     pub fn seal(&self, digest: Digest, bytes: Vec<u8>) {
         let mut inner = self.inner.lock();
-        if inner
-            .get(&digest)
-            .map(|stored| stored.verified)
-            .unwrap_or(false)
-        {
+        if inner.get(&digest).map(|stored| stored.verified).unwrap_or(false) {
             return;
         }
         inner.insert(
@@ -151,18 +146,10 @@ pub trait GlobalProposer: Send + Sync + 'static {
     /// out and nullifies the view (mirrors the existing leader-can't-build SKIP).
     fn propose(&self, view: u64, parent_digest: Digest) -> Option<(Digest, Vec<u8>)>;
 
-    /// Validate a proposed frame `digest` for `view` as a child of
-    /// `parent_digest`. `bytes` is the frame body if already delivered (via
-    /// `FrameSink`), else `None` (not yet arrived → return `false` so the view
-    /// nullifies rather than votes blind). Passing the consensus parent lets
-    /// application seams enforce height + parent linkage before voting.
-    fn verify(
-        &self,
-        view: u64,
-        parent_digest: Digest,
-        digest: Digest,
-        bytes: Option<Vec<u8>>,
-    ) -> bool;
+    /// Validate a proposed frame `digest` for `view`. `bytes` is the frame body
+    /// if already delivered (via `FrameSink`), else `None` (not yet arrived →
+    /// return `false` so the view nullifies rather than votes blind).
+    fn verify(&self, view: u64, digest: Digest, bytes: Option<Vec<u8>>) -> bool;
 }
 
 /// Ships frame bytes to peers — the `Relay` behind consensus. In the node this
@@ -185,7 +172,9 @@ pub trait FrameFinalizer: Send + Sync + 'static {
     /// bundle for off-chain / global-level verification (reward
     /// attribution). `None` if the reporter couldn't recover it.
     /// `locally_verified` is true only when the reported bytes are the immutable
-    /// value this node's application verifier accepted (or built locally).
+    /// value this node's application verifier accepted (or built locally) — a
+    /// replica can learn a finalization certificate before locally verifying its
+    /// block, and the finalizer must preserve that distinction.
     fn on_finalized(
         &self,
         view: u64,
@@ -245,7 +234,8 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
         self.context.child("propose").spawn(move |_| async move {
             if let Some((digest, bytes)) = proposer.propose(view, parent) {
                 // Locally-produced bytes came directly from the application
-                // proposer and are the value Simplex is about to certify.
+                // proposer and are the value Simplex is about to certify — seal
+                // them so peer ingress can't substitute a different body later.
                 store.seal(digest, bytes);
                 let _ = tx.send(digest);
             }
@@ -261,7 +251,6 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
     ) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
         let view: u64 = context.view().get();
-        let parent = context.parent.1;
         let proposer = self.proposer.clone();
         let store = self.store.clone();
         self.context.child("verify").spawn(move |ctx| async move {
@@ -281,7 +270,9 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
                 waited += 1;
             }
             let verified_bytes = bytes.clone();
-            let ok = proposer.verify(view, parent, payload, bytes);
+            let ok = proposer.verify(view, payload, bytes);
+            // On success, seal the EXACT bytes the application validated, so a
+            // racing peer candidate at the same digest can't replace them.
             if ok {
                 if let Some(bytes) = verified_bytes {
                     store.seal(payload, bytes);
@@ -380,6 +371,10 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
             Activity::Finalization(f) => {
                 let digest = f.proposal.payload;
                 let view: u64 = f.proposal.round.view().get();
+                // Distinguish "we sealed the exact validated/built bytes" from
+                // "we only learned the finalization cert" (bytes present but
+                // never locally verified) — the finalizer needs it to decide
+                // whether to trust the local bytes or re-fetch.
                 let (bytes, locally_verified) = self
                     .store
                     .get_with_verification(&digest)
@@ -405,7 +400,7 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
 }
 
 #[cfg(test)]
-mod tests {
+mod block_store_seal_tests {
     use super::*;
 
     fn digest(byte: u8) -> Digest {
@@ -416,9 +411,7 @@ mod tests {
     fn unverified_candidates_are_distinguished_from_verified_blocks() {
         let store = BlockStore::new();
         let block = digest(1);
-
         store.put(block, b"candidate".to_vec());
-
         assert_eq!(store.get(&block), Some(b"candidate".to_vec()));
         assert_eq!(
             store.get_with_verification(&block),
@@ -431,11 +424,10 @@ mod tests {
         let store = BlockStore::new();
         let block = digest(2);
         let verified = b"committee-validated bytes".to_vec();
-
         store.put(block, verified.clone());
         store.seal(block, verified.clone());
+        // A later peer `put` at the same digest must NOT overwrite the sealed value.
         store.put(block, b"same digest, substituted body".to_vec());
-
         assert_eq!(store.get(&block), Some(verified.clone()));
         assert_eq!(store.get_with_verification(&block), Some((verified, true)));
     }
@@ -445,14 +437,12 @@ mod tests {
         let store = BlockStore::new();
         let block = digest(3);
         let validated = b"validated candidate".to_vec();
-
         store.put(block, validated.clone());
-        // Model peer ingress racing between Automaton's read and the end of
-        // application validation. `seal` must restore and freeze the clone that
-        // was actually checked, not whichever candidate is currently stored.
+        // Model peer ingress racing between the Automaton's read and the end of
+        // application validation: `seal` freezes the clone that was actually
+        // checked, not whichever candidate is currently stored.
         store.put(block, b"racing replacement".to_vec());
         store.seal(block, validated.clone());
-
         assert_eq!(store.get_with_verification(&block), Some((validated, true)));
     }
 }

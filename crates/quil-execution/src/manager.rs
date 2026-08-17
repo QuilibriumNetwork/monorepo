@@ -276,6 +276,28 @@ impl ExecutionEngineManager {
         Ok(())
     }
 
+    /// Install the split-reset config (archive KEEP-set + network QUIL genesis
+    /// prefix set) on the global engine's intrinsic, used by the unified-tree
+    /// split reset at the flag day. GLOBAL-ONLY; a no-op without a "global" engine.
+    pub fn install_global_split_reset_config(
+        &self,
+        archive_prover_addresses: Arc<std::collections::HashSet<Vec<u8>>>,
+        reset_genesis_prefixes: Arc<Vec<Vec<u32>>>,
+    ) -> Result<()> {
+        let mut engines = self.engines.write().unwrap();
+        let Some(engine) = engines.get_mut("global") else {
+            return Ok(());
+        };
+        let Some(any) = engine.as_any_mut() else {
+            return Ok(());
+        };
+        let Some(global) = any.downcast_mut::<GlobalExecutionEngine>() else {
+            return Ok(());
+        };
+        global.install_split_reset_config(archive_prover_addresses, reset_genesis_prefixes);
+        Ok(())
+    }
+
     /// Get all supported capabilities across all engines.
     pub fn get_supported_capabilities(&self) -> Vec<node::Capability> {
         let engines = self.engines.read().unwrap();

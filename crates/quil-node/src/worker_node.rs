@@ -305,6 +305,9 @@ pub(crate) async fn start(
                     hg_store: hg_store.clone(),
                     falcon_signing_key: falcon_sk,
                     crdt: crdt.clone(),
+                    // Multi-process worker dials its MASTER (which relays); no
+                    // archive pool — it uses the fixed master_stream_addr above.
+                    archive_pool: None,
                 });
             worker_node = worker_node.with_prover_tree_syncer(syncer);
         }

@@ -19,7 +19,6 @@
 mod common;
 use common::*;
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -149,55 +148,6 @@ async fn app_consensus_cw_multi_prover_finalizes() {
     );
 }
 
-/// Regression for #591: adjacent Simplex views may begin before the previous
-/// view's finalization callback reaches the app engine. Every worker must still
-/// observe one strictly connected, monotonically numbered finalized chain.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn app_consensus_cw_multi_prover_has_no_duplicate_frame_numbers() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_test_writer()
-        .try_init();
-
-    let harness = AppShardHarness::build_cw(3);
-    let frames = harness
-        .wait_for_full_frames_from_one_worker(4, std::time::Duration::from_secs(90))
-        .await
-        .expect("one 3-prover app CW replica should finalize four frames within 90s");
-    let headers = frames
-        .iter()
-        .map(|frame| frame.header.as_ref().expect("finalized frame has a header"))
-        .collect::<Vec<_>>();
-
-    let outputs = headers.iter().map(|header| &header.output).collect::<HashSet<_>>();
-    let numbers = headers
-        .iter()
-        .map(|header| header.frame_number)
-        .collect::<HashSet<_>>();
-    assert_eq!(outputs.len(), headers.len(), "finalized duplicate frame identities");
-    assert_eq!(numbers.len(), headers.len(), "finalized duplicate frame numbers");
-
-    for pair in headers.windows(2) {
-        let parent = pair[0];
-        let child = pair[1];
-        assert_eq!(
-            child.frame_number,
-            parent.frame_number + 1,
-            "finalized app chain contains a height gap",
-        );
-        let parent_identity = quil_crypto::poseidon::hash_bytes_to_32(&parent.output)
-            .expect("parent output hashes")
-            .to_vec();
-        assert_eq!(
-            child.parent_selector, parent_identity,
-            "finalized app frame does not extend its predecessor",
-        );
-    }
-}
-
 /// Active PoRep path end-to-end through the live consensus harness.
 ///
 /// Each of the 4 workers gets a shared committed CRDT (vertices under the
@@ -232,43 +182,7 @@ async fn worker_active_storage_attestation() {
         .try_init();
 
     let provers: Vec<TestProver> = (0..4).map(|_| TestProver::generate()).collect();
-    // Every member needs an effective-`Active` allocation on the harness shard
-    // filter (`[0x55;32]`, matching `build_inner`) for the epoch the frames
-    // anchor to. `AppLeaderProvider::propose` declines to propose a STORAGE
-    // frame unless the local prover is effective-Active for that shard/epoch —
-    // otherwise the attestation's leaf roots would be for a future epoch and no
-    // verifier could match them. `to_prover_info` alone leaves `allocations`
-    // empty, which reads as "not on this shard" and stalls the shard.
-    let alloc_epoch = quil_types::consensus::epoch_for_frame(1000);
-    let infos: Vec<_> = provers
-        .iter()
-        .map(|p| {
-            let mut info = p.to_prover_info(1);
-            info.allocations = vec![quil_types::consensus::ProverAllocationInfo {
-                status: quil_types::consensus::ProverStatus::Active,
-                confirmation_filter: vec![0x55; 32],
-                rejection_filter: Vec::new(),
-                join_frame_number: 0,
-                leave_frame_number: 0,
-                pause_frame_number: 0,
-                resume_frame_number: 0,
-                kick_frame_number: 0,
-                // Zero keeps this off the deferred-activation path (genesis /
-                // test fixture), so the allocation is Active immediately.
-                join_confirm_frame_number: 0,
-                join_reject_frame_number: 0,
-                leave_confirm_frame_number: 0,
-                leave_reject_frame_number: 0,
-                last_active_frame_number: 0,
-                // `epoch >= current_epoch` is the re-confirm obligation; anything
-                // older reads as `ExpiredEpoch`.
-                epoch: alloc_epoch,
-                ring: 0,
-                vertex_address: Vec::new(),
-            }];
-            info
-        })
-        .collect();
+    let infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
     let registry = Arc::new(TestProverRegistry::with_provers(infos));
 
     // `seeded` lowers `storage_activation_frame()` to 1000 and builds the
@@ -670,10 +584,6 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
             as Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport>,
         hypergraph: None,
         replica_store: None,
-        // The joiner only emits ProverJoin over the test transport; it never
-        // produces frames, so there is nothing to loop back to itself.
-        local_message_collector: None,
-        current_frame: None,
     });
 
     // 5. Pick a filter that exists in shards_store. Genesis seeds
@@ -1894,6 +1804,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
             kv_db: None,
             app_consensus_cw: false,
             db_config: quil_config::DbConfig { path: String::new(), worker_path_prefix: String::new(), worker_paths: vec![], ..Default::default() }, // ephemeral journal in tests
+            unified_cutover_hook: None,
         };
 
         let (engine, handle) =

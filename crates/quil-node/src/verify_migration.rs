@@ -69,6 +69,7 @@ pub fn run_verify_db(db_path: &Path, config: &quil_config::Config) -> anyhow::Re
     let mut run = |name: &str, f: &mut dyn FnMut() -> anyhow::Result<Outcome>| {
         match f() {
             Ok(Outcome::Pass(detail)) => println!("  [PASS] {name:<32} {detail}"),
+            Ok(Outcome::Warn(detail)) => println!("  [WARN] {name:<32} {detail}"),
             Ok(Outcome::Skip(reason)) => println!("  [SKIP] {name:<32} ({reason})"),
             Err(e) => {
                 failures += 1;
@@ -213,77 +214,50 @@ pub fn run_verify_db(db_path: &Path, config: &quil_config::Config) -> anyhow::Re
         }
     });
 
-    // ---- 1c. Coin conservation: verenc → transparent preserved value 1:1 ----
-    // The migration removes each verenc original (tombstone) and writes one
-    // transparent entry. Recompute both sides from the domain's vertex-adds set
-    // (the tombstoned verenc blobs are still readable there) and require
-    // Σ verenc == Σ transparent AND equal counts — i.e. no value lost to
-    // address collisions and no coin double-counted.
+    // ---- 1c. Coin conservation: transparent set reconciled against the receipt.
+    // The migration PHYSICALLY DELETES each verenc original (it "never existed")
+    // and writes one transparent entry, recording `(count, Σ)` in a conservation
+    // receipt — so the verenc side can no longer be re-summed. We sum the actual
+    // transparent set (ground truth) and reconcile it against the receipt:
+    //   - exact match           → conserved (single clean run).
+    //   - transparent ≥ receipt  → the receipt UNDERCOUNTS. This is the signature
+    //     of a RESTARTED migration: counters reset per run and earlier runs'
+    //     coins were physically deleted, so the final run's receipt covers only
+    //     its own slice. Per-chunk writes are atomic ⇒ no value lost; the
+    //     transparent totals are authoritative. WARN (not fail) + point at
+    //     `--repair-receipt`.
+    //   - transparent < receipt  → coins are MISSING (deleted without a
+    //     transparent replacement). FAIL.
     run("coin conservation (QUIL)", &mut || {
         use quil_execution::token_intrinsic::legacy_migration::{
-            decode_legacy_verenc_coin, transparent_type_hash,
+            read_migration_receipt_raw, sum_transparent_coins,
         };
         let domain = &quil_execution::domains::QUIL_TOKEN[..];
-        let th = transparent_type_hash(domain).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let crdt = quil_hypergraph::HypergraphCrdt::new(
-            hg_store.clone() as Arc<dyn HypergraphStore>,
-            Arc::new(quil_tries::ShaInclusionProver),
-        );
-        let (mut sum_in, mut sum_out) = (0u128, 0u128);
-        let (mut cnt_in, mut cnt_out) = (0usize, 0usize);
-        let mut scan_err: Option<String> = None;
-        crdt.for_each_vertex_adds_blob(domain, &mut |_k, blob| {
-            if scan_err.is_some() {
-                return;
-            }
-            let root = match quil_tries::deserialize_go_tree(&blob) {
-                Ok(r) => r,
-                Err(e) => {
-                    scan_err = Some(format!("coin blob decode: {e}"));
-                    return;
-                }
-            };
-            let tree = quil_tries::VectorCommitmentTree { root };
-            // Transparent coin? (type leaf equals the transparent type hash.)
-            if tree.get(&[0xFFu8; 32]).map(|t| t == th.as_slice()).unwrap_or(false) {
-                if let Some(a) = tree.get(&[1u8 << 2]) {
-                    let mut b = [0u8; 16];
-                    let n = a.len().min(16);
-                    b[..n].copy_from_slice(&a[..n]);
-                    sum_out = sum_out.wrapping_add(u128::from_le_bytes(b));
-                    cnt_out += 1;
-                }
-                return;
-            }
-            // Legacy verenc coin? (decodes to an amount.)
-            match decode_legacy_verenc_coin(&tree) {
-                Ok(Some(coin)) => {
-                    sum_in = sum_in.wrapping_add(coin.amount);
-                    cnt_in += 1;
-                }
-                Ok(None) => {}
-                Err(e) => scan_err = Some(format!("verenc decrypt: {e}")),
-            }
-        })
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if let Some(e) = scan_err {
-            anyhow::bail!("{e}");
+        let (cnt, sum) =
+            sum_transparent_coins(&hg_store, domain).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if cnt == 0 {
+            return Ok(Outcome::Skip("no transparent coins".into()));
         }
-        if cnt_in == 0 && cnt_out == 0 {
-            return Ok(Outcome::Skip("no legacy/transparent coins".into()));
+        match read_migration_receipt_raw(&hg_store, domain).map_err(|e| anyhow::anyhow!("{e}"))? {
+            None => Ok(Outcome::Warn(format!(
+                "{cnt} transparent coins, Σ={sum} — NO receipt present (pre-receipt migration); \
+                 cannot cross-check. Run --repair-receipt to record one from this set."
+            ))),
+            Some((rc, rs)) if cnt == rc && sum == rs => Ok(Outcome::Pass(format!(
+                "{cnt} coins, Σ={sum} conserved (matches receipt)"
+            ))),
+            Some((rc, rs)) if cnt >= rc && sum >= rs => Ok(Outcome::Warn(format!(
+                "{cnt} transparent coins (Σ={sum}) EXCEED the receipt ({rc} coins, Σ={rs}) — the \
+                 receipt records only a restarted migration's FINAL run. Atomic per-chunk writes \
+                 mean no value was lost; the transparent totals above are ground truth. Run \
+                 --repair-receipt to rewrite the receipt to match."
+            ))),
+            Some((rc, rs)) => anyhow::bail!(
+                "transparent set ({cnt} coins, Σ={sum}) is LESS than the receipt \
+                 ({rc} coins, Σ={rs}) — coins are MISSING (deleted without a transparent \
+                 replacement)."
+            ),
         }
-        if cnt_in != cnt_out {
-            anyhow::bail!(
-                "coin COUNT mismatch: {cnt_in} verenc vs {cnt_out} transparent \
-                 (coins lost or duplicated)"
-            );
-        }
-        if sum_in != sum_out {
-            anyhow::bail!("coin VALUE mismatch: verenc Σ={sum_in} vs transparent Σ={sum_out}");
-        }
-        Ok(Outcome::Pass(format!(
-            "{cnt_out} coins, Σ={sum_out} conserved (verenc→transparent)"
-        )))
     });
 
     // ---- 2. Frame acceptance (VDF + committee-bound BLS) ----
@@ -415,6 +389,9 @@ pub fn run_verify_db(db_path: &Path, config: &quil_config::Config) -> anyhow::Re
 
 enum Outcome {
     Pass(String),
+    /// Non-failing advisory: the category is self-consistent but something worth
+    /// flagging (e.g. a receipt that undercounts because the migration restarted).
+    Warn(String),
     Skip(String),
 }
 

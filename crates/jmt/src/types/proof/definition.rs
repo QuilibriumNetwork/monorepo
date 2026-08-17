@@ -88,6 +88,24 @@ impl<H: SimpleHasher> SparseMerkleProof<H> {
         self.leaf.clone()
     }
 
+    /// Unified-app-tree support: the sibling hashes on the leaf→root path
+    /// (leaf-adjacent first), the leaf's own hash, and the internal-node combine
+    /// jmt folds with. Together these let a verifier replay the authentication
+    /// path itself and observe intermediate (shard subtree) commitments — the
+    /// basis for shard-scoped proofs when a shard is a prefix-subtree of one
+    /// per-app tree. Fold order mirrors [`Self::verify`].
+    pub fn sibling_hashes(&self) -> Vec<[u8; 32]> {
+        self.siblings.iter().map(|s| s.hash::<H>()).collect()
+    }
+    /// The leaf's own node hash (start of the fold), if this is an inclusion proof.
+    pub fn leaf_node_hash(&self) -> Option<[u8; 32]> {
+        self.leaf.as_ref().map(|l| l.hash::<H>())
+    }
+    /// The domain-separated internal-node combine `H(left, right)` jmt uses.
+    pub fn combine(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+        SparseMerkleInternalNode::new(left, right).hash::<H>()
+    }
+
     /// Returns the list of siblings in this proof.
     pub(crate) fn siblings(&self) -> &[SparseMerkleNode] {
         &self.siblings

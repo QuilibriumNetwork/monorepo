@@ -130,7 +130,7 @@ impl ArchiveEndpointPool {
     /// dead archive can be retried without waiting for PeerInfo
     /// re-discovery. With a zero TTL every entry is immediately eligible,
     /// so a failed endpoint returns to rotation on the next call.
-    pub(crate) async fn next(&self) -> Option<String> {
+    pub async fn next(&self) -> Option<String> {
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
         let expired: Vec<String> = inner

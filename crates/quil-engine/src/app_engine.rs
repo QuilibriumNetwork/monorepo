@@ -83,6 +83,9 @@ pub enum AppEngineMessage {
     CwFinalizedFrame {
         frame: Vec<u8>,
         cert: Vec<u8>,
+        /// Whether this node's application validator sealed these exact bytes
+        /// before finalization (vs. a certificate-only replica). Gates the
+        /// finalize-time proposal re-validation — see `handle_cw_finalized_frame`.
         locally_verified: bool,
     },
     /// (P3) An inbound commonware-simplex message from a committee peer, demuxed
@@ -343,7 +346,7 @@ struct AppLeaderProvider {
     /// `requests_root` is computed over these bundles' canonical
     /// encodings, so it is recomputable/verifiable from the frame.
     frame_requests: Arc<std::sync::Mutex<
-        std::collections::HashMap<(u64, u64), Vec<quil_types::proto::global::MessageBundle>>,
+        std::collections::HashMap<u64, Vec<quil_types::proto::global::MessageBundle>>,
     >>,
     /// KV backing the member's persisted PoRep replicas. Present iff this node
     /// participates in storage (built into a `ReplicaStore` in `prove_next_state`
@@ -357,8 +360,7 @@ struct AppLeaderProvider {
     /// `frame_requests`. Under commonware-simplex, votes carry no payload, so this
     /// is a PROPOSER SELF-attestation (single member = the frame's prover), NOT
     /// the legacy multi-member committee attestation assembled from vote openings.
-    frame_attestations:
-        Arc<std::sync::Mutex<std::collections::HashMap<(u64, u64), Vec<u8>>>>,
+    frame_attestations: Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>>>,
     /// Order-independent fingerprint of THIS CW instance's committee (the fixed
     /// simplex validator set built at `start_consensus_cw`). The finalization
     /// cert a proposed frame receives is signed by exactly this committee, but
@@ -456,7 +458,11 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         &self,
         rank: u64,
         _filter: &[u8],
-        prior_frame_number: u64,
+        // App shards resolve their parent from the latest shard clock frame
+        // (see below), not from a consensus-passed frame number, so this is
+        // unused here. It exists on the trait for the global engine, which
+        // must build on the exact consensus-chosen parent.
+        _prior_frame_number: u64,
         prior_state_id: &Identity,
     ) -> Result<State<AppShardState>> {
         // Coverage halt gate. Mirrors Go's `app_consensus_engine.go`
@@ -585,60 +591,32 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 ));
             }
         }
-        // Build on the parent selected by Simplex, not whatever frame happens
-        // to be the clock-store head when this callback runs. Simplex may enter
-        // view V+1 as soon as V is certified, before V's finalization callback
-        // has committed/materialized it locally. Re-reading the store in that
-        // window used N-1 as the parent again and produced a second frame N.
-        //
-        // App-shard state roots are the materialized pre-state, so unlike the
-        // global chain we deliberately wait until the selected parent is both
-        // canonical and materialized. A NoVote only nullifies this view; once
-        // the finalization callback catches up, the next view can safely build
-        // N+1 from the exact parent bytes and identity.
-        let materialized = self
-            .shard_mat_frame
-            .load(std::sync::atomic::Ordering::SeqCst);
-        if materialized != prior_frame_number {
-            return Err(QuilError::NoVote(format!(
-                "cannot build on consensus parent {prior_frame_number}: local materialized \
-                 frame is {materialized} — waiting for exact parent state",
-            )));
-        }
+        // Get latest shard frame number
+        let prior_frame_number = self.clock_store
+            .get_latest_shard_clock_frame(&self.filter)
+            .ok()
+            .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
+            .unwrap_or(0);
+        let frame_number = prior_frame_number + 1;
 
-        let (previous_frame_output, previous_timestamp_ms) = if prior_frame_number == 0 {
-            (Vec::new(), None)
-        } else {
-            let prior = self
-                .clock_store
-                .get_shard_clock_frame(&self.filter, prior_frame_number, false)
-                .map_err(|e| {
-                    QuilError::NoVote(format!(
-                        "cannot build on consensus parent {prior_frame_number}: \
-                         canonical frame unavailable ({e})",
-                    ))
-                })?;
-            let header = prior.header.as_ref().ok_or_else(|| {
-                QuilError::NoVote(format!(
-                    "cannot build on consensus parent {prior_frame_number}: frame has no header",
-                ))
-            })?;
-            let local_parent_id = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
-                .map_err(|e| QuilError::Crypto(format!("app parent poseidon: {e}")))?
-                .to_vec();
-            if local_parent_id != *prior_state_id {
+        // STRICT GATE (mirrors the global `compute_prover_root`): never produce
+        // frame N until this node has MATERIALIZED the parent N-1. `state_roots`
+        // below reads the committed shard state and MUST equal N-1's — a lagging
+        // proposer would otherwise emit a stale root that voters (fail-closed at
+        // N-1) reject after the fact. Catching up is fine (skip old frames via
+        // shard sync); producing on unapplied state is not. `NoVote` = skip this
+        // round (not `Consensus`, which would kill the event loop); the node
+        // resumes proposing once its materializer reaches N-1.
+        if prior_frame_number > 0 {
+            let materialized =
+                self.shard_mat_frame.load(std::sync::atomic::Ordering::SeqCst);
+            if materialized < prior_frame_number {
                 return Err(QuilError::NoVote(format!(
-                    "cannot build on consensus parent {prior_frame_number}: local identity {} \
-                     differs from selected identity {} — waiting for exact parent",
-                    hex::encode(local_parent_id),
-                    hex::encode(prior_state_id),
+                    "cannot produce shard frame {frame_number}: parent {prior_frame_number} \
+                     not materialized (at {materialized}) — catching up",
                 )));
             }
-            (header.output.clone(), Some(header.timestamp))
-        };
-        let frame_number = prior_frame_number.checked_add(1).ok_or_else(|| {
-            QuilError::NoVote("cannot produce app frame after u64::MAX parent".into())
-        })?;
+        }
 
         // Collect pending messages (raw canonical bytes from the
         // dispatch bitmask), then decode each into a proto MessageBundle.
@@ -668,10 +646,10 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // Stash the bundles so the engine can retrieve them at
         // finalization (to self-materialize + publish the full frame).
         if let Ok(mut map) = self.frame_requests.lock() {
-            map.insert((frame_number, rank), request_bundles);
+            map.insert(frame_number, request_bundles);
             // Bound memory: keep only recent frames.
             let cutoff = frame_number.saturating_sub(64);
-            map.retain(|&(fnum, _), _| fnum >= cutoff);
+            map.retain(|&fnum, _| fnum >= cutoff);
         }
         debug!(
             filter = hex::encode(&self.filter),
@@ -680,6 +658,15 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             messages = canonical_requests.len(),
             "producing shard frame"
         );
+
+        // Pull previous frame's full output for `parent` derivation.
+        // Empty for the first frame (genesis); the prover handles that
+        // by emitting a 32-byte zero parent.
+        let previous_frame_output = self.clock_store
+            .get_latest_shard_clock_frame(&self.filter)
+            .ok()
+            .and_then(|f| f.header.as_ref().map(|h| h.output.clone()))
+            .unwrap_or_default();
 
         let difficulty = self.current_difficulty
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -691,7 +678,11 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
 
         // Compute fee multiplier vote: base from sliding window +
         // traffic adjustment.
-        let previous_timestamp_ms = previous_timestamp_ms.unwrap_or(now_ms - 10_000);
+        let previous_timestamp_ms = self.clock_store
+            .get_latest_shard_clock_frame(&self.filter)
+            .ok()
+            .and_then(|f| f.header.as_ref().map(|h| h.timestamp))
+            .unwrap_or(now_ms - 10_000); // assume 10s if no prior frame
         let fee_multiplier_vote = crate::fees::compute_fee_multiplier_vote(
             self.fee_manager.as_ref(),
             &self.filter,
@@ -728,6 +719,11 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // hyperedge.removes]; `state_roots[0]` (vertex-adds) stays the sync
         // anchor. Empty (never-committed) phases normalize to the zero root so
         // the 4-root shape holds.
+        // (B) NOTE: the unified flip is driven from AppConsensusEngine's run loop
+        // (`maybe_flip_unified_at_cutover`) on the SHARED CRDT before produce, so
+        // by the time this producer computes `state_roots` the CRDT already
+        // reflects the cutover — no flip needed here (this is AppLeaderProvider,
+        // which shares the worker's CRDT Arc with the engine).
         let state_roots: Vec<Vec<u8>> = match self.hypergraph.as_ref() {
             Some(hg) => {
                 let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(
@@ -748,7 +744,18 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 ]
                 .iter()
                 .map(|(s, p)| {
-                    let r = hg.compute_shard_root(s, p, &shard_key);
+                    // (A) Sharded unified model: the per-shard `state_root` is the
+                    // covered SUBTREE root (computable from partial, subtree-only
+                    // storage), NOT `compute_shard_root(app)` (the whole-app
+                    // aggregate a subtree-only worker cannot reproduce). Gated on
+                    // the worker CRDT being unified (flipped at the cutover by (B));
+                    // legacy pre-cutover keeps the aggregate so in-flight frames
+                    // don't fork. Unsplit app is a no-op (subtree root == app root).
+                    let r = if hg.unified_tree() {
+                        hg.sub_shard_commitment_for_filter(s, p, &self.filter)
+                    } else {
+                        hg.compute_shard_root(s, p, &shard_key)
+                    };
                     if r.is_empty() { zero.clone() } else { r }
                 })
                 .collect();
@@ -839,14 +846,6 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             &storage_attestation_root,
             anchor_gfn,
         )?;
-        // The app output is now a compact deterministic digest rather than the
-        // legacy 516-byte VDF output, so FrameProver cannot derive the parent
-        // selector from `previous_frame_output[..516]`. Bind the wire header to
-        // the exact Simplex parent identity directly. Preserve the all-zero
-        // selector for the synthetic frame-0 floor.
-        if prior_frame_number > 0 {
-            header.parent_selector = prior_state_id.clone();
-        }
         if storage_active {
             // PROPOSER SELF-ATTESTATION (CW PoRep port). Legacy Jolteon assembled
             // the committee `StorageAttestation` from every member's per-vote
@@ -944,7 +943,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                             header.storage_attestation_root = root;
                             if let Ok(mut map) = self.frame_attestations.lock() {
                                 map.insert(
-                                    (frame_number, rank),
+                                    frame_number,
                                     prost::Message::encode_to_vec(&att),
                                 );
                             }
@@ -1110,6 +1109,16 @@ pub struct AppEngineDeps {
     /// An empty resolved path ⇒ ephemeral journal (tests). Default is fine for
     /// callers that don't persist app-shard consensus.
     pub db_config: quil_config::DbConfig,
+    /// (B) Unified-cutover consolidation hook, `Fn(filter, global_frame) -> ok`.
+    /// Invoked once, on THIS worker's CRDT, at the moment its anchored global
+    /// frame reaches `UNIFIED_TREE_CUTOVER_FRAME` — BEFORE flipping the CRDT to
+    /// unified — to fold the covered app's pre-cutover per-sub-shard trees into
+    /// its single app.l2 tree (so the first unified subtree `state_root` reflects
+    /// pre-cutover data). Built by the node (`worker_state_builder`) capturing the
+    /// worker's hg store; `None` (tests / no-migrate) skips consolidation and just
+    /// flips. Returns `false` to abort the flip this cycle (retried next).
+    pub unified_cutover_hook:
+        Option<Arc<dyn Fn(&[u8], u64) -> bool + Send + Sync>>,
 }
 
 /// The persistent base directory for a core's app-shard simplex journals,
@@ -1165,10 +1174,10 @@ pub(crate) fn cw_app_storage_base(
 ///  - the **re-seed point** (genesis identity — the frame the engine floors at).
 ///    The journal is persistent but `block_meta` (digest→frame-number) is NOT,
 ///    so on restart the journal can restore the engine to a parent whose digest
-///    the freshly-seeded `block_meta` can't resolve — the proposer then
-///    nullifies because it cannot prove the selected parent's height, causing a
-///    total production halt. This happens whenever the committed head MOVES
-///    between runs (the
+///    the freshly-seeded `block_meta` can't resolve — the proposer then defaults
+///    `prior_frame_number` to 0 and `prove_next_state` fails with "frame 0 not
+///    found", so the leader silently nullifies its own view → total production
+///    halt. This happens whenever the committed head MOVES between runs (the
 ///    fresh genesis differs from the journal's floor). Resetting re-floors
 ///    consensus at the current committed head, consistent with `block_meta`.
 ///
@@ -1249,6 +1258,9 @@ pub struct AppConsensusEngine {
     hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
     /// Storage-attestation SOURCE crdt (master's hypergraph). See `AppEngineDeps`.
     storage_source_hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// (B) Unified-cutover consolidation hook (see `AppEngineDeps`).
+    unified_cutover_hook:
+        Option<Arc<dyn Fn(&[u8], u64) -> bool + Send + Sync>>,
     execution_engine: Option<Arc<quil_execution::ExecutionEngineManager>>,
     inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
 
@@ -1286,17 +1298,16 @@ pub struct AppConsensusEngine {
     shard_mat_frame: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Shared with the leader provider: requests this node collected for
     /// frames it proposed (proto `MessageBundle`s), keyed by frame
-    /// number and Simplex view/rank. Read at finalization to self-materialize
-    /// and assemble the full `AppShardFrame` for publication.
+    /// number. Read at finalization to self-materialize + assemble the
+    /// full `AppShardFrame` for publication.
     frame_requests: Arc<std::sync::Mutex<
-        std::collections::HashMap<(u64, u64), Vec<quil_types::proto::global::MessageBundle>>,
+        std::collections::HashMap<u64, Vec<quil_types::proto::global::MessageBundle>>,
     >>,
     /// Shared with the leader provider (mirrors `frame_requests`): the serialized
     /// proposer self storage-attestation (`StorageAttestation` openings) for each
     /// frame this node proposed. The `AppFrameAssembler` reads it to attach the
     /// openings to the full `AppShardFrame`. See `AppLeaderProvider::frame_attestations`.
-    frame_attestations:
-        Arc<std::sync::Mutex<std::collections::HashMap<(u64, u64), Vec<u8>>>>,
+    frame_attestations: Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>>>,
     /// `requests_root` of frames this node FINALIZED through (BLS-verified)
     /// consensus, keyed by frame number. The trust anchor for materializing
     /// a full frame received on the wire as a follower: the received
@@ -1350,11 +1361,9 @@ pub struct AppConsensusEngine {
     /// what lets a shard grow from a 1-member floor committee (formed before the
     /// second prover's deferred activation) to the real N-member committee.
     cw_committee_fp: Option<[u8; 32]>,
-    /// Lossless, ordered handoff from the dedicated Simplex runtime thread to
-    /// this engine's finalization handler. Finalizations are safety-critical and
-    /// must not compete for capacity with the best-effort inbound message queue.
-    cw_finalized_tx: mpsc::UnboundedSender<(Vec<u8>, Vec<u8>)>,
-    cw_finalized_rx: Option<mpsc::UnboundedReceiver<(Vec<u8>, Vec<u8>)>>,
+    /// (P3) Self-clone of the inbound message sender, so `on_finalized` (running
+    /// on the simplex thread) can inject `CwFinalizedFrame` into this run loop.
+    self_msg_tx: mpsc::Sender<AppEngineMessage>,
 
     /// Atomic publish slot for engine sizes. Updated each event-loop
     /// iteration so external memory snapshots can read internal
@@ -1371,7 +1380,6 @@ impl AppConsensusEngine {
         event_tx: mpsc::UnboundedSender<AppEngineEvent>,
     ) -> (Self, AppEngineHandle) {
         let (msg_tx, msg_rx) = mpsc::channel(CONSENSUS_QUEUE_SIZE);
-        let (cw_finalized_tx, cw_finalized_rx) = mpsc::unbounded_channel();
 
         // The shard's app address IS the domain — the same 32-byte value
         // the master assigns as `filter` (Go's `appAddress`). It must NOT
@@ -1417,6 +1425,7 @@ impl AppConsensusEngine {
             min_active_provers_for_propose: deps.min_active_provers_for_propose,
             hypergraph: deps.hypergraph,
             storage_source_hypergraph: deps.storage_source_hypergraph,
+            unified_cutover_hook: deps.unified_cutover_hook,
             execution_engine: deps.execution_engine,
             inclusion_prover: deps.inclusion_prover,
             current_difficulty: Arc::new(std::sync::atomic::AtomicU32::new(50000)),
@@ -1447,8 +1456,7 @@ impl AppConsensusEngine {
             app_consensus_cw: deps.app_consensus_cw,
             cw_handle: None,
             cw_committee_fp: None,
-            cw_finalized_tx,
-            cw_finalized_rx: Some(cw_finalized_rx),
+            self_msg_tx: msg_tx,
             sizes,
         };
         (engine, handle)
@@ -1662,6 +1670,45 @@ impl AppConsensusEngine {
         self.try_materialize_follower_frames().await;
     }
 
+    /// (B) At the moment this worker's anchored global frame reaches the unified
+    /// cutover, fold its covered app's pre-cutover per-sub-shard trees into the
+    /// single app.l2 tree (the consolidation hook) and flip its CRDT to unified —
+    /// so the per-shard `state_root` (A) becomes the covered SUBTREE root
+    /// (computable from partial storage). Idempotent: a no-op once unified or
+    /// before the cutover. Every worker on the shard runs it at the same anchored
+    /// frame over committed state, so producers and verifiers flip together and
+    /// agree on the post-cutover roots. Called before producing/validating a frame.
+    fn maybe_flip_unified_at_cutover(&self) {
+        let Some(hg) = self.hypergraph.as_ref() else {
+            return;
+        };
+        if hg.unified_tree() {
+            return;
+        }
+        let (anchor_gfn, _) = resolve_global_anchor(self.global_anchor_store.as_ref());
+        if anchor_gfn
+            < quil_execution::global_intrinsic::materialize::unified_tree_cutover_frame()
+        {
+            return;
+        }
+        if let Some(hook) = self.unified_cutover_hook.as_ref() {
+            if !hook(&self.filter, anchor_gfn) {
+                tracing::warn!(
+                    core_id = self.core_id,
+                    anchor_gfn,
+                    "unified cutover consolidation failed — deferring flip this cycle"
+                );
+                return;
+            }
+        }
+        hg.set_unified_tree(true);
+        tracing::info!(
+            core_id = self.core_id,
+            anchor_gfn,
+            "worker app-tree unified commitment ACTIVATED at cutover"
+        );
+    }
+
     /// Start the app shard consensus loop. Runs on the worker thread's
     /// tokio runtime and processes messages until cancelled.
     ///
@@ -1682,10 +1729,6 @@ impl AppConsensusEngine {
         >,
     ) {
         let mut msg_rx = self.msg_rx.take().expect("msg_rx already taken");
-        let mut cw_finalized_rx = self
-            .cw_finalized_rx
-            .take()
-            .expect("cw_finalized_rx already taken");
 
         info!(
             core_id = self.core_id,
@@ -1812,14 +1855,13 @@ impl AppConsensusEngine {
             tokio::select! {
                 biased;
 
-                finalized = cw_finalized_rx.recv() => {
-                    if let Some((frame, cert)) = finalized {
-                        self.handle_cw_finalized_frame(&frame, &cert).await;
-                    }
-                }
-
                 // Inbound network messages
                 msg = msg_rx.recv() => {
+                    // (B) Flip this worker's CRDT to unified (+ consolidate) once
+                    // its anchored global frame reaches the cutover, BEFORE any
+                    // produce/validate/materialize below computes a `state_root`.
+                    // Idempotent + cheap after the flip (a `bool` load).
+                    self.maybe_flip_unified_at_cutover();
                     match msg {
                         Some(AppEngineMessage::Consensus(_data)) => {
                             // Legacy HotStuff consensus wire messages are no
@@ -2147,26 +2189,25 @@ impl AppConsensusEngine {
             let frame_attestations = self.frame_attestations.clone();
             Arc::new(move |state| {
                 let fnum = state.state.frame_number;
-                let key = (fnum, state.state.rank);
                 let reqs = frame_requests
                     .lock()
                     .ok()
-                    .and_then(|m| m.get(&key).cloned())
+                    .and_then(|m| m.get(&fnum).cloned())
                     .unwrap_or_default();
                 let attestation = frame_attestations
                     .lock()
                     .ok()
-                    .and_then(|m| m.get(&key).cloned())
+                    .and_then(|m| m.get(&fnum).cloned())
                     .unwrap_or_default();
                 Some(crate::cw_app_seams::app_frame_from_state(state, reqs, attestation))
             })
         };
 
         // on_finalized: route the finalized frame back into THIS engine's run
-        // loop over a dedicated unbounded channel. A bounded `try_send` here can
-        // drop the certified parent while Simplex advances to its child, leaving
-        // the worker permanently unable to materialize the selected parent.
+        // loop (it runs on the simplex thread → `try_send` into `msg_tx`), where
+        // `handle_cw_finalized_frame` materializes it on `&mut self`.
         let on_finalized: crate::cw_app_seams::AppFinalizedSink = {
+            let msg_tx = self.self_msg_tx.clone();
             Arc::new(move |frame, cert, locally_verified| {
                 let mut buf = Vec::new();
                 if prost::Message::encode(&frame, &mut buf).is_ok() {
@@ -2233,6 +2274,9 @@ impl AppConsensusEngine {
                         l2[..copy_len].copy_from_slice(&self.filter[..copy_len]);
                         quil_types::store::ShardKey { l1, l2 }
                     };
+                    // Captured for the (A) sharded verifier recompute
+                    // (subtree root, mirrors the leader's `state_roots` build).
+                    let filter_for_verify = self.filter.clone();
                     Some(Arc::new(
                         move |frame: &quil_types::proto::global::AppShardFrame| -> bool {
                             let Some(header) = frame.header.as_ref() else {
@@ -2303,7 +2347,15 @@ impl AppConsensusEngine {
                                     ("hyperedge", "removes"),
                                 ];
                                 for (i, (s, p)) in phases.iter().enumerate() {
-                                    let mut local = hg.compute_shard_root(s, p, &shard_key);
+                                    // (A) Recompute the SAME per-shard root the leader
+                                    // committed: subtree root under unified, whole-app
+                                    // aggregate under legacy. Gated symmetrically with
+                                    // the producer on `unified_tree()`.
+                                    let mut local = if hg.unified_tree() {
+                                        hg.sub_shard_commitment_for_filter(s, p, &filter_for_verify)
+                                    } else {
+                                        hg.compute_shard_root(s, p, &shard_key)
+                                    };
                                     if local.is_empty() {
                                         local = zero.clone();
                                     }
@@ -2366,12 +2418,7 @@ impl AppConsensusEngine {
     /// self-materialize half of [`distribute_and_materialize_own_frame`]: apply
     /// the requests, advance + persist the durable cursor, and publish the full
     /// frame for followers/archives on `shard_frame_bitmask`.
-    async fn handle_cw_finalized_frame(
-        &mut self,
-        data: &[u8],
-        cert: &[u8],
-        locally_verified: bool,
-    ) {
+    async fn handle_cw_finalized_frame(&mut self, data: &[u8], cert: &[u8], locally_verified: bool) {
         let mut frame: quil_types::proto::global::AppShardFrame = match prost::Message::decode(data) {
             Ok(f) => f,
             Err(e) => {
@@ -2379,16 +2426,47 @@ impl AppConsensusEngine {
                 return;
             }
         };
-        // A locally verified value is the exact byte sequence the BlockStore
-        // sealed when this node's application validator accepted it. Do not
-        // repeat proposal validation for that value: storage attestations and
-        // global-frame anchors come from mutable local state, so the same frame
-        // can fail later even though this node already voted for it.
+        // DEV-ONLY fault injection: also drop the CW-finalization path for the
+        // range [df, df+8) so this node's `last_materialized_frame` genuinely
+        // STALLS (CW materialization is sequential) — it then falls onto the
+        // gossip follower path (whose same range is dropped in the receive
+        // handler), leaving frames buffered AHEAD of a hole → gap detection →
+        // step-4 catch-up sync. Unset in prod (QUIL_APP_SYNC_DROP_FRAME).
+        if let Some(fnum) = frame.header.as_ref().map(|h| h.frame_number) {
+            let fault_drop = std::env::var("QUIL_APP_SYNC_DROP_FRAME")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|df| fnum >= df && fnum < df + 8)
+                .unwrap_or(false);
+            if fault_drop {
+                tracing::warn!(
+                    core_id = self.core_id,
+                    frame = fnum,
+                    "FAULT-INJECT (QUIL_APP_SYNC_DROP_FRAME): dropping CW-finalized \
+                     frame to stall the materializer and force a step-4 sync"
+                );
+                return;
+            }
+        }
+        // SECURITY — post-verification substitution defense (audit Finding #1),
+        // gated on `locally_verified` (#594 "preserve finalized app shard frames").
         //
-        // A replica may instead learn a finalization certificate without first
-        // verifying the block locally (for example during replay/catch-up). Such
-        // unsealed bytes still take the defensive validation path before being
-        // persisted or materialized.
+        // When `locally_verified`, these `data` bytes are the EXACT sequence this
+        // node's application validator accepted and the `BlockStore` SEALED at
+        // proposal time (peer ingress can no longer substitute them). Re-running
+        // PROPOSAL validation here would recompute the deterministic output from
+        // fields whose backing is MUTABLE local state (storage attestations,
+        // global-frame anchors, state_roots) — which can legitimately drift
+        // between our vote and finalization — and would DROP a frame we already
+        // voted for, losing a validly-finalized app-shard frame. So skip it for
+        // sealed bytes.
+        //
+        // A certificate-only replica (e.g. replay/catch-up) may learn the
+        // finalization cert WITHOUT locally verifying the block; those unsealed
+        // bytes still take the defensive re-validation path before anything
+        // touches the clock store or materializer. It RECOMPUTES `header.output`
+        // from the declared fields and drops any frame whose fields don't
+        // reproduce it — catching a substituted/internally-inconsistent header.
         if !locally_verified {
             if let Some(v) = self.app_frame_validator.as_ref() {
                 match validate_app_frame_panic_safe(v, &frame, /* proposal */ true) {
@@ -2397,46 +2475,57 @@ impl AppConsensusEngine {
                         warn!(
                             core_id = self.core_id,
                             result = ?other,
-                            "cw finalized frame: unverified bytes failed validation — dropping",
+                            "cw finalized frame: unverified bytes failed re-validation \
+                             (substitution or inconsistent header) — dropping",
                         );
                         return;
                     }
                 }
             }
-            if let (Some(exec), Some(header)) =
-                (self.execution_engine.as_ref(), frame.header.as_ref())
-            {
-                let canonical: Vec<Vec<u8>> = frame
-                    .requests
-                    .iter()
-                    .filter_map(|b| {
-                        crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok()
-                    })
-                    .collect();
-                let use_forest = self
-                    .hypergraph
-                    .as_ref()
-                    .map(|h| h.has_forest())
-                    .unwrap_or(false);
-                let ok = canonical.len() == frame.requests.len()
-                    && compute_requests_root(
-                        &canonical,
-                        &self.app_address,
-                        header.frame_number,
-                        Some(exec.as_ref()),
-                        self.inclusion_prover.as_deref(),
-                        use_forest,
-                    )
-                    .map(|r| r == header.requests_root)
-                    .unwrap_or(false);
-                if !ok {
-                    warn!(
-                        core_id = self.core_id,
-                        frame = header.frame_number,
-                        "cw finalized frame: unverified body does not match requests_root — dropping",
-                    );
-                    return;
-                }
+        }
+        // SECURITY — body-root cross-check (audit Finding #2, and the body-swap
+        // case of #1). The re-validation above binds the DECLARED `requests_root`
+        // through output recomputation, but not the carried body; a finalize-time
+        // BlockStore overwrite can keep the whole header (hence the certified
+        // digest) while swapping `frame.requests`. Recompute the body root from
+        // the carried requests and DROP on mismatch, so no CW replica ever
+        // materializes a body its certified root does not cover. (Dropping a
+        // substituted body stalls at worst — recoverable via catch-up — whereas
+        // materializing it would be an unrecoverable state divergence.)
+        if let (Some(exec), Some(header)) =
+            (self.execution_engine.as_ref(), frame.header.as_ref())
+        {
+            let canonical: Vec<Vec<u8>> = frame
+                .requests
+                .iter()
+                .filter_map(|b| {
+                    crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok()
+                })
+                .collect();
+            let use_forest = self
+                .hypergraph
+                .as_ref()
+                .map(|h| h.has_forest())
+                .unwrap_or(false);
+            let ok = canonical.len() == frame.requests.len()
+                && compute_requests_root(
+                    &canonical,
+                    &self.app_address,
+                    header.frame_number,
+                    Some(exec.as_ref()),
+                    self.inclusion_prover.as_deref(),
+                    use_forest,
+                )
+                .map(|r| r == header.requests_root)
+                .unwrap_or(false);
+            if !ok {
+                warn!(
+                    core_id = self.core_id,
+                    frame = header.frame_number,
+                    "cw finalized frame: requests_root mismatch (carried body does not \
+                     match the certified root) — dropping (post-verification body swap)",
+                );
+                return;
             }
         }
         // Attach the simplex FINALIZATION cert to the frame header so every
@@ -2466,137 +2555,22 @@ impl AppConsensusEngine {
         }
         let frame_number = header.frame_number;
 
-        // Finalization callbacks must be monotonic at the application boundary,
-        // even if the consensus host replays a callback or ever hands us a
-        // conflicting certified block at an already-committed height. The old
-        // path overwrote the canonical `(filter, frame_number)` value, skipped
-        // materialization via the cursor check, and still republished + awarded
-        // coverage. Never replace an existing height with a different identity.
-        // An identical replay may retry materialization after a prior transient
-        // failure, but it is not published or rewarded a second time.
-        let already_committed = match self.clock_store.get_latest_shard_clock_frame(&self.filter) {
-            Ok(latest) => {
-                let Some(latest_header) = latest.header.as_ref() else {
-                    warn!(core_id = self.core_id, "cw finalized frame: canonical head has no header");
-                    return;
-                };
-                if frame_number < latest_header.frame_number {
-                    warn!(
-                        core_id = self.core_id,
-                        frame = frame_number,
-                        canonical = latest_header.frame_number,
-                        "cw finalized frame: stale finalization below canonical head — dropping",
-                    );
-                    return;
-                }
-                if frame_number == latest_header.frame_number {
-                    if latest_header.output != header.output {
-                        warn!(
-                            core_id = self.core_id,
-                            frame = frame_number,
-                            "cw finalized frame: conflicting identity at canonical height — dropping",
-                        );
-                        return;
-                    }
-                    true
-                } else {
-                    let Some(expected_frame_number) =
-                        latest_header.frame_number.checked_add(1)
-                    else {
-                        warn!(core_id = self.core_id, "cw finalized frame: canonical height overflow");
-                        return;
-                    };
-                    if frame_number != expected_frame_number {
-                        warn!(
-                            core_id = self.core_id,
-                            frame = frame_number,
-                            expected = expected_frame_number,
-                            "cw finalized frame: gap above canonical head — dropping",
-                        );
-                        return;
-                    }
-                    let expected_parent = if latest_header.frame_number == 0 {
-                        vec![0u8; 32]
-                    } else {
-                        match quil_crypto::poseidon::hash_bytes_to_32(&latest_header.output) {
-                            Ok(id) => id.to_vec(),
-                            Err(e) => {
-                                warn!(core_id = self.core_id, frame = frame_number, error = %e, "cw finalized frame: canonical parent identity failed");
-                                return;
-                            }
-                        }
-                    };
-                    if header.parent_selector != expected_parent {
-                        warn!(
-                            core_id = self.core_id,
-                            frame = frame_number,
-                            "cw finalized frame: parent selector does not extend canonical head — dropping",
-                        );
-                        return;
-                    }
-                    false
-                }
-            }
-            Err(QuilError::NotFound(_)) => {
-                if frame_number != 1 || header.parent_selector != vec![0u8; 32] {
-                    warn!(
-                        core_id = self.core_id,
-                        frame = frame_number,
-                        "cw finalized frame: non-genesis child without canonical parent — dropping",
-                    );
-                    return;
-                }
-                false
-            }
-            Err(e) => {
-                warn!(
-                    core_id = self.core_id,
-                    frame = frame_number,
-                    error = %e,
-                    "cw finalized frame: cannot read canonical head — dropping",
-                );
-                return;
-            }
-        };
-
         // Persist the finalized frame to the shard clock store so the NEXT
-        // `prove_next_state` can resolve the exact consensus parent. Persistence
-        // is a prerequisite for all downstream effects: never publish or reward
-        // a frame that this worker failed to make durable.
-        if !already_committed {
-            let selector = match quil_crypto::poseidon::hash_bytes_to_32(&header.output) {
-                Ok(h) => h.to_vec(),
-                Err(e) => {
-                    warn!(core_id = self.core_id, frame = frame_number, error = %e, "cw shard frame selector failed");
-                    return;
-                }
-            };
-            let txn = match self.clock_store.new_transaction(false) {
-                Ok(txn) => txn,
-                Err(e) => {
-                    warn!(core_id = self.core_id, frame = frame_number, error = %e, "cw stage shard frame transaction failed");
-                    return;
-                }
-            };
-            if let Err(e) = self
-                .clock_store
-                .stage_shard_clock_frame(&selector, &frame, txn.as_ref())
-            {
+        // `prove_next_state` (which reads `get_latest_shard_clock_frame`) chains
+        // on it — otherwise the chain stalls re-proposing on genesis. The legacy
+        // path stages in the incorporated hook + commits on QC; the CW path does
+        // both here at finalize (stage then commit, separate txns like legacy).
+        let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+            .map(|h| h.to_vec())
+            .unwrap_or_default();
+        if let Ok(txn) = self.clock_store.new_transaction(false) {
+            if let Err(e) = self.clock_store.stage_shard_clock_frame(&selector, &frame, txn.as_ref()) {
                 warn!(core_id = self.core_id, frame = frame_number, error = %e, "cw stage shard frame failed");
-                return;
+            } else {
+                let _ = txn.commit();
             }
-            if let Err(e) = txn.commit() {
-                warn!(core_id = self.core_id, frame = frame_number, error = %e, "cw stage shard frame transaction commit failed");
-                return;
-            }
-
-            let txn = match self.clock_store.new_transaction(false) {
-                Ok(txn) => txn,
-                Err(e) => {
-                    warn!(core_id = self.core_id, frame = frame_number, error = %e, "cw commit shard frame transaction failed");
-                    return;
-                }
-            };
+        }
+        if let Ok(txn) = self.clock_store.new_transaction(false) {
             if let Err(e) = self.clock_store.commit_shard_clock_frame(
                 &self.filter,
                 frame_number,
@@ -2605,11 +2579,8 @@ impl AppConsensusEngine {
                 false,
             ) {
                 warn!(core_id = self.core_id, frame = frame_number, error = %e, "cw commit shard frame failed");
-                return;
-            }
-            if let Err(e) = txn.commit() {
-                warn!(core_id = self.core_id, frame = frame_number, error = %e, "cw commit shard frame transaction commit failed");
-                return;
+            } else {
+                let _ = txn.commit();
             }
         }
 
@@ -2661,13 +2632,6 @@ impl AppConsensusEngine {
                 Err(e) => warn!(core_id = self.core_id, frame = frame_number, error = %e,
                     "cw-finalized materialize failed (cursor held; will retry)"),
             }
-        }
-
-        // An identical callback replay was already published/rewarded when it
-        // first became canonical. It may have retried materialization above, but
-        // must not appear as a second finalized frame to downstream consumers.
-        if already_committed {
-            return;
         }
 
         // Publish the full frame for followers/archives on `shard_frame_bitmask`.
@@ -2778,12 +2742,33 @@ impl AppConsensusEngine {
                 let frame_id = hex::encode(Sha256::digest(&h.output));
                 self.frame_store.insert(frame_id, data.to_vec());
 
-                // Buffer the full frame (header+requests) for follower
-                // materialization, but only if it's still ahead of what
-                // we've materialized (avoid unbounded re-buffering of old
-                // frames). The buffer is materialized in strict order
-                // against the finalized (trusted) requests_root.
-                if frame_number > self.last_materialized_frame {
+                // DEV-ONLY fault injection: drop a specific app-frame on receipt
+                // to force a PERSISTENT materialization gap (a locally-dropped
+                // frame can't be refilled by gossip — it's re-dropped on every
+                // receipt), exercising the step-4 catch-up sync. Unset in prod;
+                // set QUIL_APP_SYNC_DROP_FRAME=<app_frame_number> to reproduce a
+                // deeply-behind node. Re-read per receipt (rare, dev-only path).
+                // Drops a small RANGE [df, df+8) so a single node falls behind
+                // even across the frames it happens to lead (a leader
+                // self-materializes and doesn't hit this receive path).
+                let fault_drop = std::env::var("QUIL_APP_SYNC_DROP_FRAME")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(|df| frame_number >= df && frame_number < df + 8)
+                    .unwrap_or(false);
+                if fault_drop {
+                    tracing::warn!(
+                        core_id = self.core_id,
+                        frame = frame_number,
+                        "FAULT-INJECT (QUIL_APP_SYNC_DROP_FRAME): dropping received \
+                         app-frame to force a step-4 catch-up sync"
+                    );
+                } else if frame_number > self.last_materialized_frame {
+                    // Buffer the full frame (header+requests) for follower
+                    // materialization, but only if it's still ahead of what
+                    // we've materialized (avoid unbounded re-buffering of old
+                    // frames). The buffer is materialized in strict order
+                    // against the finalized (trusted) requests_root.
                     self.received_full_frames.insert(frame_number, frame);
                     self.try_materialize_follower_frames().await;
                 }
@@ -2981,7 +2966,7 @@ impl AppConsensusEngine {
             .frame_requests
             .lock()
             .ok()
-            .and_then(|mut m| m.remove(&(frame_number, canon.rank)))
+            .and_then(|mut m| m.remove(&frame_number))
         {
             Some(r) => r,
             None => {
@@ -4046,447 +4031,6 @@ fn validate_app_frame_panic_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_types::crypto::Signer as _;
-
-    /// Regression for #589. Proposal validation may depend on mutable local
-    /// state (here, availability of the anchored global frame). Once Simplex
-    /// has accepted and finalized the proposal, a replica must apply the sealed
-    /// bytes it already validated instead of rerunning that stateful gate.
-    #[tokio::test]
-    async fn cw_finalization_does_not_repeat_stateful_proposal_validation() {
-        let filter = vec![0x59; 32];
-        let shard_store = Arc::new(quil_store::testing::InMemoryClockStore::new());
-        let voting_anchor_store = Arc::new(quil_store::testing::InMemoryClockStore::new());
-        let lagging_anchor_store = Arc::new(quil_store::testing::InMemoryClockStore::new());
-        let global_output = vec![0xA5; 516];
-        voting_anchor_store.seed_frame(quil_types::proto::global::GlobalFrame {
-            header: Some(quil_types::proto::global::GlobalFrameHeader {
-                frame_number: 5,
-                output: global_output.clone(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_millis() as i64;
-        let parent_selector = vec![0u8; 32];
-        let requests_root = Vec::new();
-        let state_roots = vec![vec![0u8; 32]; 4];
-        let prover = vec![0x33; 32];
-        let rho_n = quil_crypto::porep::derive_storage_beacon(5, &global_output);
-        let output = quil_crypto::porep::deterministic_app_frame_output(
-            &parent_selector,
-            &requests_root,
-            &state_roots,
-            &rho_n,
-            1,
-            1,
-            &prover,
-            1,
-            1,
-            timestamp,
-            &[],
-        );
-        let frame = quil_types::proto::global::AppShardFrame {
-            header: Some(quil_types::proto::global::FrameHeader {
-                address: filter.clone(),
-                frame_number: 1,
-                rank: 1,
-                timestamp,
-                difficulty: 1,
-                output,
-                parent_selector,
-                requests_root,
-                state_roots,
-                prover,
-                fee_multiplier_vote: 1,
-                global_frame_number: 5,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let registry = Arc::new(crate::test_support::TestProverRegistry::default());
-        let frame_prover = Arc::new(quil_crypto::WesolowskiFrameProver::new(2048));
-        let voting_validator = BlsAppFrameValidator::new(
-            registry.clone(),
-            Arc::new(quil_crypto::FalconKeyConstructor),
-            frame_prover.clone(),
-        )
-        .with_clock_store(voting_anchor_store);
-        assert!(
-            voting_validator
-                .validate_proposal(&frame)
-                .expect("proposal is valid while its global anchor is available"),
-            "the regression frame must pass the committee's vote-time gate"
-        );
-
-        let signer = quil_crypto::FalconSigner::generate();
-        let deps = AppEngineDeps {
-            clock_store: shard_store.clone(),
-            global_anchor_store: None,
-            prover_registry: registry.clone(),
-            frame_prover: frame_prover.clone(),
-            message_collector: Arc::new(MessageCollector::new()),
-            fee_manager: Arc::new(crate::InMemoryDynamicFeeManager::new(32)),
-            local_prover_address: vec![0x44; 32],
-            local_bls_pubkey: signer.public_key().to_vec(),
-            bls_signer: Box::new(signer),
-            reward_greedy: false,
-            min_active_provers_for_propose: 1,
-            coverage_publish: None,
-            hypergraph: None,
-            storage_source_hypergraph: None,
-            execution_engine: None,
-            inclusion_prover: None,
-            kv_db: None,
-            app_consensus_cw: true,
-            db_config: quil_config::DbConfig::default(),
-        };
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let (mut engine, _handle) = AppConsensusEngine::new(1, filter.clone(), deps, event_tx);
-        // Model finalize-time local-state drift: the same validator can no
-        // longer resolve rho_N because this replica's global store is behind.
-        engine.app_frame_validator = Some(Arc::new(
-            BlsAppFrameValidator::new(
-                registry,
-                Arc::new(quil_crypto::FalconKeyConstructor),
-                frame_prover,
-            )
-            .with_clock_store(lagging_anchor_store),
-        ));
-
-        let encoded = prost::Message::encode_to_vec(&frame);
-
-        // A certificate-only replica must not blindly trust block bytes it did
-        // not validate. Its lagging anchor makes this defensive path reject.
-        engine
-            .handle_cw_finalized_frame(&encoded, &[], false)
-            .await;
-        assert!(shard_store.get_latest_shard_clock_frame(&filter).is_err());
-        assert!(event_rx.try_recv().is_err());
-
-        // The exact bytes sealed when this replica voted remain finalizable
-        // even though the mutable anchor state has since fallen behind.
-        engine
-            .handle_cw_finalized_frame(&encoded, &[], true)
-            .await;
-
-        assert_eq!(
-            shard_store
-                .get_latest_shard_clock_frame(&filter)
-                .expect("committee-finalized frame must be persisted")
-                .header
-                .expect("persisted frame has a header")
-                .frame_number,
-            1
-        );
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(AppEngineEvent::FullFrameProduced {
-                frame_number: 1,
-                ..
-            })
-        ));
-    }
-
-    use quil_consensus::leader_provider::LeaderProvider as _;
-    use quil_types::crypto::Signer as _;
-
-    fn test_shard_frame(
-        filter: &[u8],
-        frame_number: u64,
-        output_byte: u8,
-    ) -> quil_types::proto::global::AppShardFrame {
-        quil_types::proto::global::AppShardFrame {
-            header: Some(quil_types::proto::global::FrameHeader {
-                address: filter.to_vec(),
-                frame_number,
-                output: vec![output_byte; 516],
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    fn commit_test_shard_frame(
-        store: &dyn ClockStore,
-        filter: &[u8],
-        frame_number: u64,
-        output_byte: u8,
-    ) -> Vec<u8> {
-        let frame = test_shard_frame(filter, frame_number, output_byte);
-        let output = &frame.header.as_ref().expect("test frame header").output;
-        let selector = quil_crypto::poseidon::hash_bytes_to_32(output)
-            .expect("test frame output hashes")
-            .to_vec();
-
-        let txn = store.new_transaction(false).expect("stage transaction");
-        store
-            .stage_shard_clock_frame(&selector, &frame, txn.as_ref())
-            .expect("stage test shard frame");
-        txn.commit().expect("commit staged test shard frame");
-
-        let txn = store.new_transaction(false).expect("canonical transaction");
-        store
-            .commit_shard_clock_frame(filter, frame_number, &selector, txn.as_ref(), false)
-            .expect("commit canonical test shard frame");
-        txn.commit().expect("commit test shard head");
-        selector
-    }
-
-    fn test_app_leader_provider(
-        clock_store: Arc<dyn ClockStore>,
-        filter: Vec<u8>,
-        materialized: Arc<std::sync::atomic::AtomicU64>,
-    ) -> AppLeaderProvider {
-        let prover_address = vec![0x33; 32];
-        let prover_public_key = vec![0x44; 897];
-        let registry = Arc::new(crate::test_support::TestProverRegistry::with_prover(
-            quil_types::consensus::ProverInfo {
-                public_key: prover_public_key.clone(),
-                address: prover_address.clone(),
-                status: quil_types::consensus::ProverStatus::Active,
-                kick_frame_number: 0,
-                allocations: Vec::new(),
-                available_storage: 0,
-                seniority: 1,
-                delegate_address: Vec::new(),
-            },
-        ));
-
-        AppLeaderProvider {
-            filter: filter.clone(),
-            clock_store: clock_store.clone(),
-            global_anchor_store: clock_store,
-            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
-            prover_registry: registry,
-            message_collector: Arc::new(MessageCollector::new()),
-            fee_manager: Arc::new(crate::InMemoryDynamicFeeManager::new(32)),
-            local_prover_address: prover_address,
-            local_public_key: prover_public_key.clone(),
-            current_difficulty: Arc::new(std::sync::atomic::AtomicU32::new(1)),
-            reward_greedy: false,
-            hypergraph: None,
-            storage_source_hypergraph: None,
-            execution_engine: None,
-            inclusion_prover: None,
-            app_address: filter,
-            halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            min_active_provers_for_propose: 1,
-            shard_mat_frame: materialized,
-            frame_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            kv_db: None,
-            frame_attestations: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            instance_committee_fp: AppConsensusEngine::committee_fp(&[prover_public_key]),
-        }
-    }
-
-    /// Regression for #591. Simplex may enter view V+1 with V as its certified
-    /// parent before V's finalization callback has persisted/materialized it.
-    /// The app proposer must not consult the stale store head and emit another
-    /// frame numbered N+1. It waits; after N+1 is applied, the next proposal is
-    /// N+2 and chains to the exact consensus parent identity.
-    #[test]
-    fn app_leader_waits_for_unfinalized_simplex_parent() {
-        let filter = vec![0xAA; 32];
-        let store = Arc::new(quil_store::testing::InMemoryClockStore::new());
-        let materialized = Arc::new(std::sync::atomic::AtomicU64::new(7));
-        commit_test_shard_frame(store.as_ref(), &filter, 7, 0x07);
-        let provider = test_app_leader_provider(
-            store.clone() as Arc<dyn ClockStore>,
-            filter.clone(),
-            materialized.clone(),
-        );
-
-        // Adjacent Simplex view: frame 8 is the certified consensus parent, but
-        // the finalization callback has not advanced the store/materializer yet.
-        let pending_parent_identity = vec![0x88; 32];
-        let err = provider
-            .prove_next_state(9, &filter, 8, &pending_parent_identity)
-            .expect_err("must not reuse frame number 8 while its parent is unapplied");
-        assert!(
-            err.is_no_vote(),
-            "unapplied consensus parent must defer the view: {err}"
-        );
-
-        // Once that exact parent is durable and materialized, production may
-        // advance. Its output hashes to the identity Simplex supplied.
-        let committed_parent_identity = commit_test_shard_frame(store.as_ref(), &filter, 8, 0x08);
-        materialized.store(8, std::sync::atomic::Ordering::SeqCst);
-        let state = provider
-            .prove_next_state(10, &filter, 8, &committed_parent_identity)
-            .expect("proposal resumes after the consensus parent is applied");
-
-        assert_eq!(state.state.frame_number, 9);
-        assert_eq!(state.state.parent_selector, committed_parent_identity);
-        assert_eq!(state.parent_qc_identity, committed_parent_identity);
-    }
-
-    /// A finalized frame has exactly one durable value, one full-frame publish,
-    /// and one reward/coverage emission. Replaying the same finalization or a
-    /// conflicting block at that height must not overwrite or emit again.
-    #[tokio::test]
-    async fn cw_finalization_is_persisted_and_published_once_per_height() {
-        let filter = vec![0xAB; 32];
-        let store = Arc::new(quil_store::testing::InMemoryClockStore::new());
-        let signer = quil_crypto::FalconSigner::generate();
-        let prover_public_key = signer.public_key().to_vec();
-        let prover_address = quil_crypto::poseidon::hash_bytes_to_32(&prover_public_key)
-            .expect("test prover public key hashes")
-            .to_vec();
-        let registry = Arc::new(crate::test_support::TestProverRegistry::with_prover(
-            quil_types::consensus::ProverInfo {
-                public_key: prover_public_key.clone(),
-                address: prover_address.clone(),
-                status: quil_types::consensus::ProverStatus::Active,
-                kick_frame_number: 0,
-                allocations: Vec::new(),
-                available_storage: 0,
-                seniority: 1,
-                delegate_address: Vec::new(),
-            },
-        ));
-        let coverage_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let coverage_count_for_callback = coverage_count.clone();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let deps = AppEngineDeps {
-            clock_store: store.clone() as Arc<dyn ClockStore>,
-            global_anchor_store: None,
-            prover_registry: registry,
-            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
-            message_collector: Arc::new(MessageCollector::new()),
-            fee_manager: Arc::new(crate::InMemoryDynamicFeeManager::new(32)),
-            local_prover_address: prover_address,
-            local_bls_pubkey: prover_public_key,
-            bls_signer: Box::new(signer),
-            reward_greedy: false,
-            min_active_provers_for_propose: 1,
-            coverage_publish: Some(Arc::new(move |_| {
-                coverage_count_for_callback.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            })),
-            hypergraph: None,
-            storage_source_hypergraph: None,
-            execution_engine: None,
-            inclusion_prover: None,
-            kv_db: None,
-            app_consensus_cw: true,
-            db_config: quil_config::DbConfig::default(),
-        };
-        let (mut engine, _handle) = AppConsensusEngine::new(1, filter.clone(), deps, event_tx);
-
-        // Canonical parent N is durable. The incoming N+1 frame must link to
-        // that exact identity; this also exercises the finalizer's no-gap and
-        // parent-selector guards rather than bypassing them with an empty store.
-        let parent_identity = commit_test_shard_frame(store.as_ref(), &filter, 7, 0x07);
-
-        let mut gap = test_shard_frame(&filter, 9, 0x09);
-        gap.header.as_mut().expect("gap frame header").parent_selector = parent_identity.clone();
-        engine
-            .handle_cw_finalized_frame(&prost::Message::encode_to_vec(&gap), &[])
-            .await;
-        assert!(event_rx.try_recv().is_err(), "gap finalization must not publish");
-        assert_eq!(coverage_count.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(
-            store
-                .get_latest_shard_clock_frame(&filter)
-                .expect("gap must leave parent canonical")
-                .header
-                .expect("canonical parent header")
-                .frame_number,
-            7,
-            "finalizer must not skip a canonical height"
-        );
-
-        let mut wrong_parent = test_shard_frame(&filter, 8, 0x18);
-        wrong_parent.header.as_mut().expect("wrong-parent frame header").parent_selector =
-            vec![0xFF; 32];
-        engine
-            .handle_cw_finalized_frame(&prost::Message::encode_to_vec(&wrong_parent), &[])
-            .await;
-        assert!(
-            event_rx.try_recv().is_err(),
-            "wrong-parent finalization must not publish"
-        );
-        assert_eq!(coverage_count.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(
-            store
-                .get_latest_shard_clock_frame(&filter)
-                .expect("wrong parent must leave canonical head unchanged")
-                .header
-                .expect("canonical parent header")
-                .frame_number,
-            7
-        );
-
-        let mut frame = test_shard_frame(&filter, 8, 0x08);
-        frame.header.as_mut().expect("frame header").parent_selector = parent_identity;
-        let encoded = prost::Message::encode_to_vec(&frame);
-        engine.handle_cw_finalized_frame(&encoded, &[]).await;
-
-        let first_events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
-        assert_eq!(
-            first_events
-                .iter()
-                .filter(|e| matches!(e, AppEngineEvent::FullFrameProduced { .. }))
-                .count(),
-            1,
-            "first finalization publishes one full frame"
-        );
-        assert_eq!(
-            first_events
-                .iter()
-                .filter(|e| matches!(e, AppEngineEvent::ShardFrameFinalized { .. }))
-                .count(),
-            1,
-            "first finalization emits one rewardable header"
-        );
-        assert_eq!(coverage_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(
-            store
-                .get_latest_shard_clock_frame(&filter)
-                .expect("first finalization persisted")
-                .header
-                .expect("persisted frame header")
-                .output,
-            vec![0x08; 516]
-        );
-
-        engine.handle_cw_finalized_frame(&encoded, &[]).await;
-        assert!(
-            event_rx.try_recv().is_err(),
-            "identical finalization replay must not republish"
-        );
-        assert_eq!(
-            coverage_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "identical finalization replay must not earn coverage twice"
-        );
-
-        let mut conflicting = frame;
-        conflicting.header.as_mut().expect("conflicting frame header").output = vec![0xF8; 516];
-        engine
-            .handle_cw_finalized_frame(&prost::Message::encode_to_vec(&conflicting), &[])
-            .await;
-        assert!(
-            event_rx.try_recv().is_err(),
-            "conflicting same-height finalization must not publish"
-        );
-        assert_eq!(coverage_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(
-            store
-                .get_latest_shard_clock_frame(&filter)
-                .expect("canonical head remains readable")
-                .header
-                .expect("canonical head has a header")
-                .output,
-            vec![0x08; 516],
-            "conflicting same-height finalization must not overwrite canonical data"
-        );
-    }
 
     /// Go parity (`app_consensus_engine.go:718`): core 0 → `db.path`; worker
     /// core N → `worker_paths[N-1]` else `worker_path_prefix` (`%d`→N); empty

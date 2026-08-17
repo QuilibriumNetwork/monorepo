@@ -5,7 +5,6 @@ use tracing::{debug, info, warn};
 use quil_lifecycle::{ShutdownReason, Supervisor};
 
 pub(crate) mod allocator_and_lifecycle;
-pub(crate) mod app_shard_router;
 pub(crate) mod archive_sync;
 pub(crate) mod engines;
 pub(crate) mod frame_pipeline;
@@ -252,11 +251,6 @@ pub(crate) async fn start(
     let shard_engines: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
     >> = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
-    let app_shard_frame_router = Arc::new(app_shard_router::AppShardFrameRouter::new(
-        archive_mode.then(|| {
-            clock_store.clone() as Arc<dyn quil_types::store::ClockStore>
-        }),
-    ));
     // SignerRegistry — populated from inbound KeyRegistry broadcasts
     // on GLOBAL_PEER_INFO. Consumed by consensus message verification
     // (BLS signatures from peers whose identity↔prover binding we've
@@ -332,6 +326,77 @@ pub(crate) async fn start(
         remote_worker_manager_for_halt,
     } = runtime_state::init(&mut sup, hg_store.clone(), shard_engines.clone());
 
+    // §6.1 EMPTY-SPLIT GUARD: give the coverage monitor a data-bearing test for a
+    // shard's proposed children, read from the unified app tree. A split is only
+    // proposed when the data actually divides (≥2 non-empty children). Under
+    // legacy mode the app tree isn't the source of truth, so it returns
+    // all-non-empty (guard passes → unchanged behavior).
+    {
+        let crdt_fb = crdt.clone();
+        coverage_monitor.set_split_feasibility_provider(std::sync::Arc::new(
+            move |filter: &[u8], factor: u8| -> Vec<u64> {
+                if !crdt_fb.unified_tree() || filter.len() < 32 || factor == 0 {
+                    return vec![1u64; factor.max(1) as usize];
+                }
+                let mut app = [0u8; 32];
+                app.copy_from_slice(&filter[..32]);
+                let parent_prefix: Vec<u32> = filter[32..].iter().map(|b| *b as u32).collect();
+                let parent_bits = crdt_fb.canonical_bits_for_prefix(&app, &parent_prefix);
+                let bits_per = (factor as u32).trailing_zeros() as usize; // log2(factor)
+                (0..factor as usize)
+                    .map(|i| {
+                        let mut child_bits = parent_bits.clone();
+                        for b in (0..bits_per).rev() {
+                            child_bits.push((i >> b) & 1 == 1);
+                        }
+                        crdt_fb.unified_subtree_leaf_count("vertex", "adds", &app, &child_bits)
+                    })
+                    .collect()
+            },
+        ));
+    }
+
+    // Deep-bifurcation (§6.1 encoding rework): give the coverage monitor a split
+    // PROPOSER that descends to the shallowest REAL branch and emits variable-
+    // depth bit-path child FILTERS (`propose_split_children` → `first_split_
+    // bifurcation`). Under the unified app tree only — legacy stays on the
+    // immediate-bit byte-suffix `compute_proposed_shards`. Gated on
+    // `unified_tree()`, so it activates at the same cutover as the tree fork.
+    {
+        let crdt_pr = crdt.clone();
+        coverage_monitor.set_split_proposer(std::sync::Arc::new(
+            move |filter: &[u8]| -> Option<Vec<Vec<u8>>> {
+                if !crdt_pr.unified_tree() || filter.len() < 32 {
+                    return None;
+                }
+                let mut app = [0u8; 32];
+                app.copy_from_slice(&filter[..32]);
+                // Parent shard bit-path: a deep (sentinel) shard's filter is
+                // already a bit-path filter (`app ‖ bit_len ‖ packed`); a legacy
+                // filter is `app ‖ byte-suffix` → derive via canonical bits.
+                let parent_bits =
+                    if let Some((_, bits)) = quil_forest::decode_shard_bit_path(filter, 32) {
+                        bits
+                    } else {
+                        let parent_prefix: Vec<u32> =
+                            filter[32..].iter().map(|b| *b as u32).collect();
+                        crdt_pr.canonical_bits_for_prefix(&app, &parent_prefix)
+                    };
+                // Descend up to 16 extra bits past any uniform run to the branch.
+                crdt_pr.propose_split_children("vertex", "adds", &app, &parent_bits, 16)
+            },
+        ));
+    }
+
+    // Deep-bifurcation: tell the coverage monitor whether the unified app tree is
+    // active (checked each frame — it flips at the cutover, not at wiring time) so
+    // `propose_merge_rebalance` identifies bit-path siblings (parent = drop the
+    // last BIT, merge-to-root at the bare app) instead of byte-suffix ones.
+    {
+        let crdt_um = crdt.clone();
+        coverage_monitor.set_unified_provider(std::sync::Arc::new(move || crdt_um.unified_tree()));
+    }
+
     // Lazy cell holding the prover-message transport. The transport
     // itself is constructed later (it depends on the archive pool and
     // mtls seed which are resolved further down), but worker_manager
@@ -342,6 +407,21 @@ pub(crate) async fn start(
             Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport>,
         >,
     > = Arc::new(std::sync::OnceLock::new());
+
+    // Archive endpoint pool — created HERE (before worker_manager) and shared as
+    // one Arc: thread-mode workers resolve a live archive from it per step-4
+    // app-shard catch-up sync. Starts empty; the pre-seed + PeerInfo discovery
+    // below fill this same Arc, so a call-time `next()` sees the endpoints.
+    let blacklist_ttl = match config.engine.archive_blacklist_ttl_secs {
+        -1 => std::time::Duration::ZERO,
+        n if n < 0 => anyhow::bail!(
+            "engine.archiveBlacklistTtl must be -1 (disabled), 0 (default), or a \
+             positive number of seconds; got {n}"
+        ),
+        n => std::time::Duration::from_secs(n as u64),
+    };
+    let archive_pool =
+        std::sync::Arc::new(quil_rpc::ArchiveEndpointPool::new(blacklist_ttl));
 
     let worker_manager: Arc<dyn quil_engine::worker::WorkerManager> = worker_manager::init(
         &mut sup,
@@ -363,10 +443,10 @@ pub(crate) async fn start(
             prover_address,
             bls_pubkey: bls_pubkey.clone(),
             shard_engines: shard_engines.clone(),
-            app_shard_frame_router: app_shard_frame_router.clone(),
             remote_worker_manager_for_halt: remote_worker_manager_for_halt.clone(),
             pi_worker_manager: pi_worker_manager.clone(),
             prover_message_transport: prover_message_transport_cell.clone(),
+            archive_pool: archive_pool.clone(),
             spawner: detached_spawner.clone(),
         },
     );
@@ -433,16 +513,8 @@ pub(crate) async fn start(
     // partition recovery is instantaneous); `0` was already coerced to the
     // default by `EngineConfig::apply_defaults`. Any other negative value is
     // a config mistake, not a second way to spell "disabled".
-    let blacklist_ttl = match config.engine.archive_blacklist_ttl_secs {
-        -1 => std::time::Duration::ZERO,
-        n if n < 0 => anyhow::bail!(
-            "engine.archiveBlacklistTtl must be -1 (disabled), 0 (default), or a \
-             positive number of seconds; got {n}"
-        ),
-        n => std::time::Duration::from_secs(n as u64),
-    };
-    let archive_pool =
-        std::sync::Arc::new(quil_rpc::ArchiveEndpointPool::new(blacklist_ttl));
+    // `archive_pool` + `blacklist_ttl` are created earlier (before worker_manager)
+    // so the pool Arc can be shared with thread-mode workers' step-4 syncer.
 
     // Pre-seed the archive pool. Precedence matches the Go node
     // (`node/main.go:737-741`):
@@ -568,6 +640,25 @@ pub(crate) async fn start(
         genesis_provers = genesis_prover_addrs.len(),
         "loaded genesis peer data for validation"
     );
+
+    // Hand the split-reset config to the global intrinsic so the unified-tree
+    // reset (flag day) can deterministically rebuild the QUIL grid + drop every
+    // NON-archive prover record. The genesis prefix set is network-specific:
+    // mainnet QUIL is a 64-way pre-split ([0]..[63]); testnet/localnet is a single
+    // shard ([]) — mirroring `quil_engine::genesis`. GLOBAL-only + a no-op on
+    // nodes without a global engine; archives that materialize the cutover frame
+    // use it, others sync the post-reset state.
+    let reset_genesis_prefixes: Vec<Vec<u32>> = if network == 0 {
+        (0..64u32).map(|i| vec![i]).collect()
+    } else {
+        vec![vec![]]
+    };
+    if let Err(e) = exec_manager.install_global_split_reset_config(
+        std::sync::Arc::new(genesis_prover_addrs.clone()),
+        std::sync::Arc::new(reset_genesis_prefixes),
+    ) {
+        warn!(error = %e, "failed to install split-reset config for unified split reset");
+    }
 
     // Assemble the multisig Ed448 seed set for seniority merge helpers.
     // Always includes our local peer-private key seed; extra seeds are
@@ -743,7 +834,16 @@ pub(crate) async fn start(
     // archive). Re-scan periodically for new/split shards. `app_address == filter
     // == shard_key l2` (app_engine.rs:1224), so the shard's 32-byte l2 is the
     // topic seed.
-    if archive_mode {
+    // A CLUSTER MASTER (remote workers via `data_worker_stream_multiaddrs`) must
+    // also mesh on its shards' frame topics: its app-shard frames are finalized in
+    // SEPARATE worker processes and only reach the master over `shard_frame_bitmask`
+    // gossip, where the recv loop mirrors them into the master clock store so the
+    // store-backed `AppShardService` can serve reads (see
+    // `worker_manager::mirror_shard_frame_to_clock_store`). Without the mesh, the
+    // frames never arrive and cluster reads return empty. Thread-mode masters don't
+    // need this (workers share the process + mirror in-band via the drain).
+    let cluster_mode = !config.engine.data_worker_stream_multiaddrs.is_empty();
+    if archive_mode || cluster_mode {
         let p2p_sub = p2p_handle.clone();
         let reg_sub: Arc<dyn quil_types::consensus::ProverRegistry> =
             prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>;
@@ -899,6 +999,7 @@ pub(crate) async fn start(
     archive_sync::spawn_all(&mut sup, archive_sync::ArchiveSyncArgs {
         mtls_seed,
         network,
+        genesis_seed: config.engine.genesis_seed.clone(),
         archive_mode,
         archive_pool: archive_pool.clone(),
         clock_store: clock_store.clone(),
@@ -980,6 +1081,8 @@ pub(crate) async fn start(
     message_loop::spawn(&mut sup, message_loop::MessageLoopArgs {
         clock_store: clock_store.clone(),
         exec_manager: exec_manager.clone(),
+        crdt: crdt.clone(),
+        genesis_seed: config.engine.genesis_seed.clone(),
         msg_rx,
         consensus_loopback_rx,
         global_msg_tx: global_msg_tx.clone(),
@@ -1040,7 +1143,6 @@ pub(crate) async fn start(
         signer_registry: signer_registry.clone(),
         prover_pipeline: prover_pipeline.clone(),
         worker_manager: worker_manager.clone(),
-        app_shard_frame_provider: app_shard_frame_router.clone(),
         inclusion_prover: inclusion_prover.clone(),
         peer_id,
         p2p_handle: p2p_handle.clone(),

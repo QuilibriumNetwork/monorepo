@@ -178,6 +178,40 @@ mod tests {
         assert_eq!(assign_child_index(&[], 4), 0);
     }
 
+    /// Why the split reassignment round-robins (post-cutover) instead of using
+    /// `assign_child_index`: for a SMALL committee whose addresses cluster on one
+    /// side of the split bit, `assign_child_index` sends everyone to the same
+    /// child and leaves the sibling permanently uncovered (the localnet
+    /// "child …80 never covered" artifact). Deterministic round-robin over the
+    /// address-sorted provers covers every child.
+    #[test]
+    fn round_robin_covers_children_where_assign_child_index_leaves_a_gap() {
+        // 4 provers, all with address byte < 0x80 → all hash to child 0.
+        let addrs: Vec<[u8; 32]> = [0x10u8, 0x20, 0x30, 0x40]
+            .iter()
+            .map(|&b| {
+                let mut a = [0u8; 32];
+                a[0] = b;
+                a
+            })
+            .collect();
+        let k = 2usize;
+
+        let mut hashed = vec![0usize; k];
+        for a in &addrs {
+            hashed[assign_child_index(a, k)] += 1;
+        }
+        assert_eq!(hashed, vec![4, 0], "assign_child_index leaves child 1 EMPTY for clustered small-N");
+
+        // Round-robin over the sorted provers (what reassign_shard_allocations
+        // does at/after the cutover) covers both children.
+        let mut rr = vec![0usize; k];
+        for i in 0..addrs.len() {
+            rr[i % k] += 1;
+        }
+        assert_eq!(rr, vec![2, 2], "round-robin covers both children evenly");
+    }
+
     // ---- rewrite_allocation_filter ------------------------------------
 
     fn make_alloc_blob(prover_addr: &[u8; 32], filter: &[u8]) -> Vec<u8> {

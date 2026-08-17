@@ -625,6 +625,81 @@ pub fn restore_global_prover_seniority(
     Ok(fixed)
 }
 
+/// Flag-day RESET of the global prover tree, riding the unified-tree cutover.
+/// The deep-split machinery left the prover tree carrying provers stranded on
+/// alias sub-shards; rather than surgically remove them (the forest JMT is
+/// put-only, so a per-vertex remove can't shrink it AND leaves the committed
+/// adds root unchanged, so it never reaches syncing nodes), this WIPES the whole
+/// global prover shard — BOTH the vertex and hyperedge phase trees plus the flat
+/// blob keyspace the registry reads — and REBUILDS it from the genesis committee.
+///
+/// The rebuild reuses the SAME established seeders that create the on-chain
+/// provers, so the vertices land at their exact addresses (`poseidon` of the
+/// FALCON prover key — the network identity under the Falcon migration; the
+/// genesis `archive_peers` values ARE those Falcon keys, fed to
+/// `peer_id_from_falcon_pubkey` in [`genesis_archive_peers`]):
+/// - **mainnet**: [`restore_global_prover_seniority`] (its from-empty "seed
+///   missing" branch reinstalls the beacon + archives) + [`remove_offline_global_prover`]
+///   (kicks the permanently-removed archive → 5-member active committee);
+/// - **testnet/localnet**: the seed-resolved Falcon provers
+///   ([`resolve_testnet_prover_keys`], 897-byte keys) at the testnet genesis
+///   seniority (1000, matching [`initialize_testnet_genesis_state`]).
+///
+/// Deterministic (fixed prover set + values, frame-independent vertex data) so
+/// every archive converges on the byte-identical prover-tree root, and the root
+/// CHANGES (the whole shard is rebuilt), so it lands in the cutover frame's
+/// `prover_tree_commitment` and propagates to syncing nodes — which is what makes
+/// the stranded provers re-join onto the reset grid. Archive-only (materializing
+/// nodes); regulars sync the post-reset tree. The seeders commit into the CRDT at
+/// `frame_number`. Returns the number of provers seeded.
+pub fn reset_prover_tree_to_genesis(
+    hypergraph: &Arc<HypergraphCrdt>,
+    rocks_store: &quil_store::RocksHypergraphStore,
+    frame_number: u64,
+    network: u8,
+    genesis_seed: &str,
+    local_prover_pubkey: &[u8],
+) -> Result<usize> {
+    use quil_types::store::ShardKey;
+    // The global intrinsic prover shard: l2 = 0xff*32 (the id the CRDT commits it
+    // under, `&shard.l2`).
+    let prover_l2 = [0xffu8; 32];
+    let shard = ShardKey { l1: [0u8; 3], l2: prover_l2 };
+
+    // 1. WIPE — forest phase trees (vertex adds/removes + hyperedge adds/removes)
+    //    and the underlying blob keyspace, so the rebuild starts from empty and
+    //    nothing (tree node or flat blob) resurrects a dropped record.
+    hypergraph.reset_shard_forest_trees(&prover_l2)?;
+    rocks_store.clear_shard_underlying(&shard)?;
+
+    // 2. REBUILD via the established genesis seeders (Falcon-keyed, exact addresses).
+    let seeded = if network == 0 {
+        // From-empty, `restore_global_prover_seniority` seeds every genesis prover
+        // (beacon + archives) at `MAINNET_BEACON_SENIORITY`; both this and the
+        // removed-prover kick commit internally.
+        let n = restore_global_prover_seniority(hypergraph, frame_number)?;
+        remove_offline_global_prover(hypergraph, frame_number)?;
+        n
+    } else {
+        let keys = resolve_testnet_prover_keys(network, genesis_seed, local_prover_pubkey)?;
+        let state = HypergraphState::new(hypergraph.clone());
+        for pubkey in &keys {
+            add_prover_on_filter(&state, pubkey, 1000, frame_number, &[])?;
+        }
+        state.commit()?;
+        hypergraph.commit(frame_number)?;
+        keys.len()
+    };
+
+    info!(
+        seeded,
+        frame = frame_number,
+        network,
+        "reset_prover_tree_to_genesis: global prover tree wiped + rebuilt from genesis committee"
+    );
+    Ok(seeded)
+}
+
 /// Peer ID of the genesis archive prover being permanently removed from the
 /// global committee (offline; its slot would otherwise keep the committee at
 /// 6 members and its rank turns would always time out). Removing it leaves a
