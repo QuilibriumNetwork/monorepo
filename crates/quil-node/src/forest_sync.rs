@@ -227,6 +227,7 @@ pub async fn sync_single_shard_verified(
         let Some((v_s, root_s)) = head else { continue };
         if phase == 0 && !expected_va_root.is_empty() && root_s.as_slice() != expected_va_root {
             warn!(
+                addr = %addr,
                 peer = %hex::encode(&root_s),
                 expected = %hex::encode(expected_va_root),
                 "peer vertex-adds root != expected — not syncing",
@@ -270,7 +271,7 @@ pub async fn pull_shard_from_peer(
                 if phase == 0 {
                     return Err(e);
                 }
-                warn!(phase, error = %e, "forest sync: non-anchor phase failed (best-effort)");
+                warn!(addr = %addr, phase, error = %e, "forest sync: non-anchor phase failed (best-effort)");
             }
         }
     }
