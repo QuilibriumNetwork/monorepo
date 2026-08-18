@@ -182,7 +182,39 @@ async fn worker_active_storage_attestation() {
         .try_init();
 
     let provers: Vec<TestProver> = (0..4).map(|_| TestProver::generate()).collect();
-    let infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
+    // Every member needs an Active allocation on THIS shard's filter, confirmed
+    // for the epoch the frame anchors to. `prove_next_state`'s effective-Active
+    // gate (app_engine.rs) refuses to propose a storage frame unless the local
+    // prover holds one — a prover admitted to the committee without it would mint
+    // an attestation whose leaf roots are for a future epoch. `to_prover_info`
+    // leaves `allocations` empty, which is fine for the legacy path
+    // (`anchor_gfn == 0` skips the gate) but not here: `StorageHarness::seeded`
+    // anchors at global frame 1000.
+    let infos: Vec<_> = provers
+        .iter()
+        .map(|p| {
+            let mut info = p.to_prover_info(1);
+            info.allocations = vec![quil_types::consensus::ProverAllocationInfo {
+                status: quil_types::consensus::ProverStatus::Active,
+                confirmation_filter: vec![0x55; 32],
+                rejection_filter: Vec::new(),
+                join_frame_number: 0,
+                leave_frame_number: 0,
+                pause_frame_number: 0,
+                resume_frame_number: 0,
+                kick_frame_number: 0,
+                join_confirm_frame_number: 0,
+                join_reject_frame_number: 0,
+                leave_confirm_frame_number: 0,
+                leave_reject_frame_number: 0,
+                last_active_frame_number: 1000,
+                epoch: quil_types::consensus::epoch_for_frame(1000),
+                ring: 0,
+                vertex_address: Vec::new(),
+            }];
+            info
+        })
+        .collect();
     let registry = Arc::new(TestProverRegistry::with_provers(infos));
 
     // `seeded` lowers `storage_activation_frame()` to 1000 and builds the
