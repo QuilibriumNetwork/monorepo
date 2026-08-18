@@ -584,6 +584,8 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
             as Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport>,
         hypergraph: None,
         replica_store: None,
+        local_message_collector: None,
+        current_frame: None,
     });
 
     // 5. Pick a filter that exists in shards_store. Genesis seeds
