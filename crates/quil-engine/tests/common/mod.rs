@@ -1292,6 +1292,8 @@ pub fn build_tier2_archive_rig_with_key_manager(
         transport: transport.clone() as Arc<dyn ProverMessageTransport>,
         hypergraph: None,
         replica_store: None,
+        local_message_collector: None,
+        current_frame: None,
     });
 
     let _ = all_provers; // unused in this builder — kept for API symmetry
@@ -1388,6 +1390,8 @@ pub fn build_test_pipeline_with_registry(
         transport: transport as Arc<dyn ProverMessageTransport>,
         hypergraph: None,
         replica_store: None,
+        local_message_collector: None,
+        current_frame: None,
     });
     TestPipelineRig {
         pipeline,
