@@ -153,7 +153,7 @@ impl Default for P2PConfig {
 /// Update when an operator rotates IPs.
 pub const MAINNET_BOOTSTRAP_PEERS: &[&str] = &[
     "/ip4/165.140.86.86/udp/8336/quic-v1/p2p/QmRECrGL6yDoMgSydFDN5bhnnpJLAByKVuieAbwmmAiodC",
-    "/ip4/191.96.166.157/udp/8336/quic-v1/p2p/QmdjbsbkDmsuxgawTkZmUihCoqJ5dVmciExQ2wKr11Nwjz",
+    "/ip4/147.124.202.2/udp/8336/quic-v1/p2p/QmdjbsbkDmsuxgawTkZmUihCoqJ5dVmciExQ2wKr11Nwjz",
     "/ip4/109.94.96.183/udp/8336/quic-v1/p2p/QmQfp3dpBdX48o1P2HxDLQNtoEJaXvSKejSDBUyxewsHRr",
     "/ip4/23.239.107.34/udp/8336/quic-v1/p2p/QmYajrEX6uk1xzobw1vvUUd2a69vJYKnmGwq1KFciuHzaF",
     "/ip4/23.239.96.122/udp/8336/quic-v1/p2p/QmQr15mPeMExsrymb9Q6episZbzPJduJRCKwpyLierXRHA",

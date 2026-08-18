@@ -135,6 +135,25 @@ pub(crate) async fn start(
     // (view-churn + journal memory leak). See `reprime_after_genesis`.
     engines::reprime_after_genesis(crdt.as_ref(), storage.shards_store.as_ref());
 
+    // Unified-tree cutover, applied ONCE ON BOOT (not frame-gated): the whole
+    // flag-day sequence (consolidate + QUIL grid → genesis + prover-tree wipe/
+    // rebuild from the genesis committee + unified flip) runs here, before
+    // consensus, so the node comes up already in the reset state. Idempotent via
+    // a persisted marker; deterministic across nodes (reseed uses the fixed
+    // cutover frame, not the local head). The frame-gated paths check
+    // `boot_reset_applied` and no-op once this has run.
+    if std::env::var("QUIL_DISABLE_UNIFIED").is_err() {
+        crate::unified_consolidation::boot_apply_cutover_reset(
+            &hg_store,
+            &crdt,
+            shards_store.as_ref(),
+            db_arc.as_ref(),
+            clock_store.as_ref(),
+            network,
+            &config.engine.genesis_seed,
+        );
+    }
+
     // One-time corrective restore of the global-committee provers' Seniority.
     // The re-bootstrapped mainnet left the genesis archive provers at
     // Seniority=0 (a pre-fix eviction that kicked global provers zeroes

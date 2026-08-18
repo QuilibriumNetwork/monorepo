@@ -1057,6 +1057,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                     if !archive_mode_recv
                                                         && exec_num
                                                             == quil_execution::global_intrinsic::materialize::unified_tree_cutover_frame()
+                                                        && !crate::unified_consolidation::boot_reset_applied(&hg_store_for_recv)
                                                     {
                                                         match quil_engine::genesis::reset_prover_tree_to_genesis(
                                                             &crdt_for_recv,

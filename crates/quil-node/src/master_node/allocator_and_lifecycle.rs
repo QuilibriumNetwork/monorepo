@@ -303,6 +303,12 @@ pub(crate) fn init(
                 // genesis and a seeded testnet/localnet uses the seed keys, so `&[]`
                 // suffices here.
                 std::sync::Arc::new(move |frame: u64| -> bool {
+                    // Skip if the one-time BOOT cutover reset already ran — re-wiping
+                    // the prover tree here would delete provers that re-joined after
+                    // the boot reset.
+                    if crate::unified_consolidation::boot_reset_applied(&store) {
+                        return true;
+                    }
                     match quil_engine::genesis::reset_prover_tree_to_genesis(
                         &hg, store.as_ref(), frame, net, &seed, &[],
                     ) {

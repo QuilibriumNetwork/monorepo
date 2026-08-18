@@ -31,6 +31,133 @@ pub fn is_consolidated(hg: &quil_store::RocksHypergraphStore) -> bool {
     hg.raw_db().get(MARKER_KEY).ok().flatten().is_some()
 }
 
+/// Marker recording that the one-time BOOT cutover reset (grid → genesis +
+/// prover-tree wipe/rebuild + unified flip) has run. Distinct from the
+/// consolidation marker so the reset is applied exactly once even on a DB that
+/// was only consolidated.
+const BOOT_RESET_MARKER_KEY: &[u8] = b"\x00__quil_boot_cutover_reset_v1__";
+
+/// Whether the one-time boot cutover reset has already been applied — the
+/// frame-gated reset paths check this so they never re-apply on top of it.
+pub fn boot_reset_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
+    hg.raw_db().get(BOOT_RESET_MARKER_KEY).ok().flatten().is_some()
+}
+
+/// Apply the ENTIRE unified-tree cutover ONCE, ON BOOT — not gated on reaching a
+/// frame number. Idempotent via [`BOOT_RESET_MARKER_KEY`]. Runs BEFORE consensus
+/// starts, so the node comes up already in the reset state. Deterministic across
+/// nodes: every step is a pure function of committed state + the network's genesis
+/// (the reseed uses the fixed cutover frame, not the local head), so all upgraded
+/// nodes converge on the identical grid + prover tree regardless of their head.
+///
+/// Steps (mirrors the flag-day sequence, minus the frame gate):
+///  1. consolidate split apps' per-sub-shard trees → their single app.l2 tree;
+///  2. reset the QUIL shard grid to the network genesis topology (64-way mainnet,
+///     single testnet), dropping cascade rows + pending QUIL changes;
+///  3. wipe + rebuild the global prover tree from the genesis committee;
+///  4. flip the CRDT to unified-tree commitments.
+pub fn boot_apply_cutover_reset(
+    hg: &Arc<quil_store::RocksHypergraphStore>,
+    crdt: &Arc<HypergraphCrdt>,
+    shards_store: &dyn ShardsStore,
+    shards_db: &dyn quil_types::store::KvDb,
+    clock_store: &dyn ClockStore,
+    network: u8,
+    genesis_seed: &str,
+) -> bool {
+    if boot_reset_applied(hg) {
+        crdt.set_unified_tree(true);
+        return false;
+    }
+    let head = clock_store
+        .get_latest_global_clock_frame()
+        .ok()
+        .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
+        .unwrap_or(0);
+    // Deterministic reseed/commit frame — the cutover constant, identical on
+    // every node (NOT the local head, which varies).
+    let reset_frame = unified_tree_cutover_frame();
+    info!(head, reset_frame, network, "BOOT cutover reset: applying the full flag-day reset now (not frame-gated)…");
+
+    // 1. Consolidate (idempotent). Best-effort — a failure here still lets the
+    //    grid/prover reset proceed (they rebuild from committed vertices).
+    match quil_forest_migrate::run_unified_consolidation_in_place(hg.as_ref(), shards_store, 0, head)
+    {
+        Ok(n) => info!(apps = n, "boot cutover reset: consolidation complete"),
+        Err(e) => warn!(error = %e, "boot cutover reset: consolidation FAILED (continuing)"),
+    }
+
+    // 2. QUIL grid → network genesis topology.
+    let quil = quil_execution::domains::QUIL_TOKEN;
+    let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
+    let mut grid_key = Vec::with_capacity(3 + 32);
+    grid_key.extend_from_slice(&l1);
+    grid_key.extend_from_slice(&quil);
+    let genesis_prefixes: Vec<Vec<u32>> = if network == 0 {
+        (0..64u32).map(|i| vec![i]).collect()
+    } else {
+        vec![vec![]]
+    };
+    match shards_db.new_batch(false) {
+        Ok(txn) => {
+            let mut removed_rows = 0usize;
+            if let Ok(rows) = shards_store.range_app_shards() {
+                for s in rows.into_iter().filter(|s| s.shard_key == grid_key) {
+                    let _ = shards_store.delete_app_shard(txn.as_ref(), &s.shard_key, &s.prefix);
+                    removed_rows += 1;
+                }
+            }
+            for p in &genesis_prefixes {
+                let _ = shards_store.put_app_shard(
+                    txn.as_ref(),
+                    &quil_types::store::ShardInfo {
+                        shard_key: grid_key.clone(),
+                        prefix: p.clone(),
+                        size: Vec::new(),
+                        data_shards: 0,
+                        commitment: Vec::new(),
+                    },
+                );
+            }
+            if let Ok(pending) = shards_store.all_pending_shard_changes() {
+                for pc in pending {
+                    if pc.parent.len() >= 32 && pc.parent[..32] == quil {
+                        let _ = shards_store.delete_pending_shard_change(
+                            txn.as_ref(),
+                            &pc.parent,
+                            pc.effective_epoch,
+                        );
+                    }
+                }
+            }
+            let _ = txn.commit();
+            info!(removed_rows, genesis_shards = genesis_prefixes.len(), "boot cutover reset: QUIL grid rebuilt to genesis");
+        }
+        Err(e) => warn!(error = %e, "boot cutover reset: shards txn open failed — grid NOT reset"),
+    }
+
+    // 3. Prover tree: wipe + rebuild from the genesis committee.
+    match quil_engine::genesis::reset_prover_tree_to_genesis(
+        crdt,
+        hg.as_ref(),
+        reset_frame,
+        network,
+        genesis_seed,
+        &[],
+    ) {
+        Ok(seeded) => info!(seeded, "boot cutover reset: prover tree wiped + rebuilt from genesis committee"),
+        Err(e) => warn!(error = %e, "boot cutover reset: prover-tree reset FAILED"),
+    }
+
+    // 4. Flip to unified commitments + persist the marker.
+    crdt.set_unified_tree(true);
+    if let Err(e) = hg.raw_db().put(BOOT_RESET_MARKER_KEY, [1u8]) {
+        warn!(error = %e, "boot cutover reset: marker write FAILED — will re-run next boot");
+    }
+    info!("BOOT cutover reset: complete — node is now in unified/genesis-reset state");
+    true
+}
+
 /// Run the one-time consolidation if it hasn't run (idempotent via the persisted
 /// marker), then set the CRDT's unified-tree flag from the current head frame.
 /// Returns whether unified mode is active after this call. Call once at boot,
