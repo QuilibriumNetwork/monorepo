@@ -314,6 +314,15 @@ async fn run_record_only_backfill(
     // `endpoints` so each round prefers a different archive.
     let max_rounds = endpoints.len() + 2;
     let mut filled = 0u64;
+    // Why heights failed, so an unresolved range is diagnosable from the warn
+    // alone. These are NOT interchangeable: `invalid` means an archive DID serve
+    // the record and this node rejected it locally, `unavailable` means no
+    // archive had it. Collapsed into one number they sent a #620 field report
+    // hunting an archive-side gap for a range the archives were serving.
+    // Tallies count ATTEMPTS, not distinct heights — a height retried across
+    // rounds contributes once per round; the ratio is the signal.
+    let (mut invalid, mut unavailable, mut timed_out) = (0usize, 0usize, 0usize);
+    let (mut store_failed, mut connect_failed) = (0usize, 0usize);
     for round in 0..max_rounds {
         if remaining.is_empty() || cancel.is_cancelled() {
             break;
@@ -323,6 +332,7 @@ async fn run_record_only_backfill(
             Ok(c) => c,
             Err(e) => {
                 debug!(%addr, error = %e, "record-only backfill: connect failed, rotating");
+                connect_failed += 1;
                 continue;
             }
         };
@@ -347,6 +357,7 @@ async fn run_record_only_backfill(
                     // endpoint may still serve the honest record for `n`.
                     if !frame_validate(&frame) {
                         debug!(%addr, frame = n, "record-only backfill: frame failed validation — skipping");
+                        invalid += 1;
                         still.push(n);
                         continue;
                     }
@@ -354,6 +365,7 @@ async fn run_record_only_backfill(
                     // execution side effects.
                     if let Err(e) = clock_store.put_global_frame(&frame, None) {
                         warn!(error = %e, frame = n, "record-only backfill: store failed");
+                        store_failed += 1;
                         still.push(n);
                     } else {
                         filled += 1;
@@ -362,10 +374,12 @@ async fn run_record_only_backfill(
                 Ok(Err(e)) => {
                     // This endpoint lacks it; retry on another next round.
                     debug!(%addr, frame = n, error = %e, "record-only backfill: frame unavailable");
+                    unavailable += 1;
                     still.push(n);
                 }
                 Err(_) => {
                     debug!(%addr, frame = n, "record-only backfill: fetch timeout");
+                    timed_out += 1;
                     still.push(n);
                 }
             }
@@ -375,15 +389,97 @@ async fn run_record_only_backfill(
     if remaining.is_empty() {
         info!(filled, attempted = initial, "record-only frame-record backfill complete");
     } else {
+        // No inference about canonicality is drawn here. The old wording
+        // ("likely uncommitted/orphaned, correctly not canonical") was written
+        // for the RESEED path, which fetches ABOVE the canonical head where that
+        // story is right; it is provably wrong for a gap-scan range, whose `hi+1`
+        // is a present canonical record, so the heights beneath it cannot be
+        // orphaned — the canonical chain is contiguous by frame number. Report
+        // what was observed and let the tallies say why.
         warn!(
             filled,
             attempted = initial,
-            unrecoverable = remaining.len(),
-            "record-only backfill finished with frames no peer could serve — \
-             these heights are likely uncommitted/orphaned (correctly not canonical)"
+            unresolved = remaining.len(),
+            invalid,
+            unavailable,
+            timed_out,
+            store_failed,
+            connect_failed,
+            lo,
+            hi,
+            "record-only backfill could not fill every height this pass",
         );
     }
     BackfillOutcome { filled: promoted_local + filled, unresolved: remaining.len() as u64 }
+}
+
+/// Lowest frame a gap-scan descent may attempt on `network`.
+///
+/// Genesis is the obvious floor: nothing below it ever existed. On MAINNET the
+/// real floor is higher. Frames at or below the 2.1.0 flag day
+/// (`GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME`, the pre-migration head the chain
+/// rewound to) were produced by pre-migration provers, so step 1 of
+/// [`archive_frame_is_valid`] — the genesis-prover allowlist — rejects every one
+/// of them. Its own comment says so: "expected for legacy pre-migration frames".
+/// An archive serves those records perfectly well; this node fetches them and
+/// then drops them. Descending there is therefore guaranteed-unfillable work,
+/// not a transient peer failure, and it is what a non-archive's depth cap aims
+/// at once the descent reaches the boundary.
+///
+/// The flag day is a MAINNET history artefact — other networks never rewound and
+/// must not inherit the constant, or their backfill would be floored above every
+/// frame they have.
+fn gap_backfill_floor(network: u32) -> u64 {
+    let genesis = quil_engine::genesis::expected_genesis_frame_number(network);
+    if network == 0 {
+        genesis.max(quil_crypto::GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME + 1)
+    } else {
+        genesis
+    }
+}
+
+/// The sub-range of `[gap_lo, hi]` a pass will actually attempt: clamped UP to
+/// `floor_frame`, then bounded by the depth cap measured DOWN from the gap top.
+/// `None` when the whole gap lies below the floor.
+///
+/// The order is load-bearing. Clamping first and capping second keeps the cap
+/// from re-admitting heights the floor just excluded; capping first would put
+/// `lo` below the floor whenever the cap is deeper than the distance from the
+/// gap top down to it.
+fn clamped_backfill_range(
+    gap_lo: u64,
+    hi: u64,
+    floor_frame: u64,
+    max_backfill_depth: Option<u64>,
+) -> Option<(u64, u64)> {
+    if hi < floor_frame {
+        return None;
+    }
+    let mut lo = gap_lo.max(floor_frame);
+    if let Some(depth) = max_backfill_depth {
+        lo = lo.max(hi.saturating_sub(depth.saturating_sub(1)));
+    }
+    Some((lo, hi))
+}
+
+/// Heights this pass intends to fetch, once every gap is clamped.
+///
+/// The raw hole size is NOT the objective and must not be reported as if it
+/// were. On a bootstrapped mainnet node it counts the 244,199 fictional
+/// sub-genesis heights, and on a non-archive it counts the legacy range beneath
+/// the flag day — so the headline number can sit in the hundreds of thousands
+/// while the descent intends a few thousand, or none at all. Logged alone it
+/// reads as a stall that never moves, which is exactly how it was read in the
+/// field.
+fn intended_backfill_count(
+    gaps: &[(u64, u64)],
+    floor_frame: u64,
+    max_backfill_depth: Option<u64>,
+) -> u64 {
+    gaps.iter()
+        .filter_map(|&(lo, hi)| clamped_backfill_range(lo, hi, floor_frame, max_backfill_depth))
+        .map(|(lo, hi)| hi - lo + 1)
+        .sum()
 }
 
 /// Widest inclusive range handed to a single [`run_record_only_backfill`]
@@ -488,9 +584,24 @@ async fn run_all_gap_backfill(
         return;
     }
     let total: u64 = gaps.iter().map(|(lo, hi)| hi - lo + 1).sum();
+    let intended = intended_backfill_count(&gaps, floor_frame, max_backfill_depth);
+    if intended == 0 {
+        // Every hole is below the floor: fictional sub-genesis heights, legacy
+        // pre-flag-day heights, or both. Say that plainly instead of logging a
+        // six-figure `missing_frames` the descent will never touch.
+        info!(
+            gap_count = gaps.len(),
+            missing_frames = total,
+            floor_frame,
+            "gap scan: every hole is below the backfill floor — nothing to fetch",
+        );
+        return;
+    }
     info!(
         gap_count = gaps.len(),
         missing_frames = total,
+        intended_frames = intended,
+        floor_frame,
         "gap scan: found frame-record holes — backfilling \
          (local candidates first, peers as fallback)",
     );
@@ -506,23 +617,27 @@ async fn run_all_gap_backfill(
         // height: if frame 1 is present no gap can start there, and if it is
         // absent while anything above it is stored, that range IS the floor
         // gap. So this identifies it without the scan having to tag it.
-        // Entirely below genesis — an artefact of the scan reporting the range
-        // under the store's floor without knowing where the chain starts.
-        // Nothing down there ever existed, so there is nothing to fetch.
-        if hi < floor_frame {
-            debug!(lo = gap_lo, hi, floor_frame, "gap scan: range is below genesis — skipping");
+        // Entirely below the floor — fictional sub-genesis heights (the scan
+        // reports the range under the store's floor without knowing where the
+        // chain starts) or legacy pre-flag-day heights this node can never
+        // validate. Either way there is nothing to fetch.
+        let Some((lo, _)) = clamped_backfill_range(gap_lo, hi, floor_frame, max_backfill_depth)
+        else {
+            debug!(
+                lo = gap_lo,
+                hi,
+                floor_frame,
+                "gap scan: range is entirely below the backfill floor — skipping",
+            );
             continue;
-        }
-        let mut lo = gap_lo.max(floor_frame);
-        if let Some(depth) = max_backfill_depth {
-            lo = lo.max(hi.saturating_sub(depth.saturating_sub(1)));
-        }
+        };
         if lo > gap_lo {
             info!(
                 gap_lo,
                 hi,
                 bounded_lo = lo,
-                "gap scan: descent bounded (genesis floor and/or depth limit)",
+                floor_frame,
+                "gap scan: descent bounded (backfill floor and/or depth limit)",
             );
         }
         let mut progressed = false;
@@ -2165,15 +2280,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     .saturating_mul(quil_types::consensus::epoch_length_frames()),
                             )
                         };
-                        // Lowest height that exists on this network. The scan
-                        // reports the range under the store's floor without
-                        // knowing where the chain starts, and `bootstrap_genesis`
-                        // guarantees the genesis record is present — so that
-                        // reported range is entirely below genesis and must be
-                        // discarded rather than fetched.
-                        let floor_frame = quil_engine::genesis::expected_genesis_frame_number(
-                            network as u32,
-                        );
+                        // Lowest height this node can actually fill. Two floors
+                        // fold into one: genesis (the scan reports the range under
+                        // the store's floor without knowing where the chain starts,
+                        // and `bootstrap_genesis` guarantees the genesis record is
+                        // present, so that range is fictional) and, on mainnet, the
+                        // 2.1.0 flag day — everything at or below it is a legacy
+                        // frame the genesis-prover allowlist rejects on arrival.
+                        let floor_frame = gap_backfill_floor(network as u32);
                         spawner.detach("gap-backfill", async move {
                             run_gap_backfill_loop(
                                 gap_pool,
@@ -3181,6 +3295,90 @@ mod gap_backfill_tests {
         assert_eq!(backfill_chunks(7, 9), vec![(7, 9)]);
         assert_eq!(backfill_chunks(5, 5), vec![(5, 5)]);
         assert_eq!(backfill_chunks(9, 8), Vec::new());
+    }
+
+    /// MAINNET's floor is the 2.1.0 flag day, not genesis.
+    ///
+    /// Frames at or below `GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME` were produced by
+    /// pre-migration provers, so step 1 of `archive_frame_is_valid` — the
+    /// genesis-prover allowlist — drops every one of them. They are canonical and
+    /// archives serve them; this node fetches and then discards them, which is
+    /// indistinguishable from "no peer had it" in the unresolved count.
+    ///
+    /// Reported against #620 from a wiped non-archive: the descent walked down to
+    /// 669975 and stalled there permanently, and the range read as an archive-side
+    /// gap. The heights below are quoted from that report — all served by
+    /// quilscan, none fillable here.
+    #[test]
+    fn the_mainnet_floor_excludes_the_legacy_range_below_the_flag_day() {
+        let floor = gap_backfill_floor(0);
+        assert_eq!(floor, quil_crypto::GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME + 1);
+        assert!(
+            floor > quil_engine::genesis::expected_genesis_frame_number(0),
+            "the flag day sits above mainnet genesis, so it is the binding floor",
+        );
+        for n in [669464u64, 669500, 669700, 669900, 669975] {
+            assert!(n < floor, "frame {n} is pre-flag-day and must be excluded");
+        }
+        assert!(
+            669976 >= floor,
+            "the first 2.1.0 frame must stay fillable — the floor must not overshoot",
+        );
+    }
+
+    /// Other networks never rewound, so they must not inherit the mainnet
+    /// constant — it sits above every frame they have, and a testnet that
+    /// adopted it would floor its backfill out of existence.
+    #[test]
+    fn only_mainnet_carries_the_flag_day_floor() {
+        for network in [1u32, 2, 7] {
+            assert_eq!(
+                gap_backfill_floor(network),
+                quil_engine::genesis::expected_genesis_frame_number(network),
+                "network {network} has no flag day",
+            );
+        }
+    }
+
+    /// Clamp before cap. A depth cap deeper than the distance from the gap top
+    /// down to the floor must not reach past it.
+    #[test]
+    fn the_depth_cap_cannot_reach_below_the_floor() {
+        // Cap of 1000 from a top of 1010 would reach 11; the floor holds at 1000.
+        assert_eq!(clamped_backfill_range(5, 1010, 1000, Some(1000)), Some((1000, 1010)));
+        // Cap bites inside the permitted range.
+        assert_eq!(clamped_backfill_range(5, 1010, 1000, Some(4)), Some((1007, 1010)));
+        // Entirely below the floor.
+        assert_eq!(clamped_backfill_range(5, 999, 1000, None), None);
+        // Straddling: only the part at/above the floor survives.
+        assert_eq!(clamped_backfill_range(5, 1000, 1000, None), Some((1000, 1000)));
+    }
+
+    /// The headline number must report what the pass INTENDS, not the raw hole.
+    ///
+    /// These are the exact gaps a wiped mainnet non-archive reported under #620.
+    /// `missing_frames` logged 669,974 and did not move, which read as a stall;
+    /// in fact 244,199 of it is the fictional sub-genesis range and the other
+    /// 425,775 is the legacy range below the flag day. The true objective is
+    /// zero — there is nothing on this node left to fetch.
+    #[test]
+    fn the_headline_count_reports_intent_not_the_raw_hole() {
+        let gaps = vec![(1u64, 244_199u64), (244_201, 669_975)];
+        assert_eq!(
+            gaps.iter().map(|(lo, hi)| hi - lo + 1).sum::<u64>(),
+            669_974,
+            "precondition: this is the number that was read as a stall",
+        );
+        let depth = Some(3 * 720u64); // non-archive cap: 3 epochs
+        assert_eq!(
+            intended_backfill_count(&gaps, gap_backfill_floor(0), depth),
+            0,
+            "every reported hole is below the mainnet floor",
+        );
+        // A hole ABOVE the flag day is still counted, and still depth-bounded.
+        let live = vec![(669_976u64, 698_605u64)];
+        assert_eq!(intended_backfill_count(&live, gap_backfill_floor(0), depth), 2160);
+        assert_eq!(intended_backfill_count(&live, gap_backfill_floor(0), None), 28_630);
     }
 
     fn test_store() -> Arc<quil_store::RocksClockStore> {
