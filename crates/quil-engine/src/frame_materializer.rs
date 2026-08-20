@@ -97,6 +97,14 @@ pub struct FrameMaterializer {
     /// and is only flipped on by tests that exercise the kick path.
     evictions_enabled: bool,
 
+    /// Epoch of the last inline eviction/registry-refresh pass. The expensive
+    /// `refresh_from_store` full-scan + `find_eviction_candidates` census now run
+    /// INLINE only once per epoch boundary (allocations are epoch-stable, so
+    /// per-frame freshness buys nothing — the recv-loop + archive poller keep the
+    /// shared registry epoch-fresh for consensus on the same cadence). `u64::MAX`
+    /// = "no pass yet", so the first frame after boot always refreshes.
+    last_eviction_pass_epoch: AtomicU64,
+
     /// MAINNET-ONLY 2.1.0.25 frozen-era recovery (see `FROZEN_ERA_RECOVERY_*`).
     /// When true, frames in `[FROZEN_ERA_RECOVERY_START..FROZEN_ERA_RECOVERY_CUTOFF)`
     /// are materialized as a deterministic no-op. Set only for `network == 0`;
@@ -237,6 +245,7 @@ impl FrameMaterializer {
             archive_mode,
             eviction_grace_frames: 360,
             evictions_enabled: false,
+            last_eviction_pass_epoch: AtomicU64::new(u64::MAX),
             frozen_era_recovery_enabled: false,
             rocks_hg_store: None,
             unified_cutover_consolidate: None,
@@ -967,6 +976,10 @@ impl FrameMaterializer {
         // which stalls in the field (header flow to the global chain pauses), so
         // the flip was never triggered at the due frame. Its reassignment writes
         // ride the same `commit_frame_with_global_cursor` batch below.
+        if mat_stage_timing {
+            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: process_message loop done (delta from lock = request execution only)");
+        }
         if let Err(e) = self
             .execution_manager
             .apply_global_due_shard_changes(frame_number)
@@ -976,7 +989,7 @@ impl FrameMaterializer {
         }
         if mat_stage_timing {
             info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
-                "MAT stage: process_message + apply_due done (delta from lock = request/apply work)");
+                "MAT stage: apply_due_shard_changes done (delta = split/merge reassign + grid flip)");
         }
         if let Err(e) = self
             .execution_manager
@@ -989,10 +1002,25 @@ impl FrameMaterializer {
             info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
                 "MAT stage: commit_frame_with_global_cursor done (delta = the main CRDT commit)");
         }
-        if let (Some(eviction_reg), Some(rocks_store)) =
-            (self.eviction_registry.as_ref(), self.rocks_hg_store.as_ref())
-        {
-            eviction_reg.refresh_from_store(rocks_store);
+        // Run the expensive registry refresh + eviction census INLINE only at
+        // epoch boundaries (and the first frame after boot). `refresh_from_store`
+        // clears + rebuilds the whole registry from a full RocksDB scan with a
+        // double blob-deserialize (~2s/frame); since allocations are epoch-stable
+        // (`effective_status` is epoch-quantized), per-frame freshness bought
+        // nothing on the hot path. Consensus reads of the shared registry stay
+        // epoch-fresh via the recv-loop (`message_loop`) and archive poller
+        // (`archive_sync`) refreshers, which already run on this same cadence.
+        let cur_eviction_epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        let run_eviction_pass = self
+            .last_eviction_pass_epoch
+            .swap(cur_eviction_epoch, Ordering::SeqCst)
+            != cur_eviction_epoch;
+        if run_eviction_pass {
+            if let (Some(eviction_reg), Some(rocks_store)) =
+                (self.eviction_registry.as_ref(), self.rocks_hg_store.as_ref())
+            {
+                eviction_reg.refresh_from_store(rocks_store);
+            }
         }
 
         // 6. Prune orphan joins from prover registry
@@ -1009,7 +1037,7 @@ impl FrameMaterializer {
         // causing split-brain shard summaries. Mirrors Go's
         // `EvictInactiveProvers(..., evictionState)` at
         // `frame_materializer.go:285`.
-        if self.archive_mode {
+        if self.archive_mode && run_eviction_pass {
             if let Some(eviction_reg) = self.eviction_registry.as_ref() {
                 // Build the size-aware effective halt map. The coverage
                 // monitor stamps `u64::MAX` on every shard with

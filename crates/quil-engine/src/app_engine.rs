@@ -947,7 +947,22 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                                     prost::Message::encode_to_vec(&att),
                                 );
                             }
+                            info!(
+                                frame = frame_number,
+                                openings = openings.len(),
+                                "app-shard proof: storage attestation generated + attached to frame header"
+                            );
+                        } else {
+                            warn!(
+                                frame = frame_number,
+                                "app-shard proof: vote-openings decoded EMPTY — frame carries NO storage attestation (the global storage gate will withhold this shard's reward)"
+                            );
                         }
+                    } else {
+                        warn!(
+                            frame = frame_number,
+                            "app-shard proof: build_vote_openings produced nothing (no readable replicas for this shard) — frame carries NO storage attestation (the global storage gate will withhold this shard's reward)"
+                        );
                     }
                 }
             }
@@ -1592,9 +1607,20 @@ impl AppConsensusEngine {
     /// CW proposal check). Use this instead of assigning `last_materialized_frame`
     /// directly so `shard_mat_frame` stays consistent (audit #3).
     fn set_materialized_frame(&mut self, n: u64) {
+        let prev = self.last_materialized_frame;
         self.last_materialized_frame = n;
         self.shard_mat_frame
             .store(n, std::sync::atomic::Ordering::Relaxed);
+        // The CW verify gate nullifies any proposal where `mat + 1 != N`
+        // (app_engine.rs ~2326). If this line never logs a non-zero `now`, the
+        // shard is wedged at genesis: every proposal is nullified, nothing
+        // finalizes, and `mat` can never advance (self-sustaining deadlock).
+        info!(
+            filter = %hex::encode(&self.filter[..self.filter.len().min(8)]),
+            prev,
+            now = n,
+            "app-shard materialized height advanced"
+        );
     }
 
     /// Persist a certified shard frame as the shard clock head so the next

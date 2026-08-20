@@ -415,6 +415,11 @@ pub(crate) fn spawn_all(
                 }
                 quil_engine::message_collector::SubmitOutcome::Filtered => {
                     quil_engine::metrics::inc_grpc_submits_rejected();
+                    tracing::warn!(
+                        peer = %auth.peer_id,
+                        rank,
+                        "gRPC submit REJECTED by message collector (reason logged by collector: attestation / stale-shard-address / buffer-full / prover-only)"
+                    );
                     Err("message collector rejected".into())
                 }
             }

@@ -129,7 +129,10 @@ impl ArchiveAppShardIngest {
             Some(h) if !h.address.is_empty() => {
                 (h.address.clone(), h.frame_number, h.requests_root.clone())
             }
-            _ => return,
+            _ => {
+                debug!("archive ingest: shard frame missing header or empty address — dropping");
+                return;
+            }
         };
 
         // Already materialized (or older) — ignore.
@@ -140,9 +143,26 @@ impl ArchiveAppShardIngest {
         // 1. Quorum BLS cert + VDF against the shard committee.
         match self.validator.validate(&frame) {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => {
+                warn!(
+                    frame = frame_number,
+                    address = %hex::encode(&address[..address.len().min(8)]),
+                    "archive ingest: shard frame REJECTED — quorum cert / signature validation returned false"
+                );
+                return;
+            }
             Err(e) => {
-                debug!(frame = frame_number, error = %e, "archive ingest: frame validation failed");
+                // Elevated from debug: this is the primary "why wasn't my shard
+                // frame accepted" signal. A common cause is the anchored GLOBAL
+                // frame being absent from the local clock store (ρ_N unavailable,
+                // frame_validator.rs), which chains directly off any global-frame
+                // propagation gap.
+                warn!(
+                    frame = frame_number,
+                    address = %hex::encode(&address[..address.len().min(8)]),
+                    error = %e,
+                    "archive ingest: shard frame validation FAILED — rejecting"
+                );
                 return;
             }
         }
@@ -154,6 +174,15 @@ impl ArchiveAppShardIngest {
             .filter_map(|b| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok())
             .collect();
         if canonical.len() != frame.requests.len() {
+            warn!(
+                frame = frame_number,
+                address = %hex::encode(&address[..address.len().min(8)]),
+                converted = canonical.len(),
+                total = frame.requests.len(),
+                "archive ingest: {} of {} request bundles failed canonical conversion (consensus-wire converter gap) — rejecting frame",
+                frame.requests.len().saturating_sub(canonical.len()),
+                frame.requests.len(),
+            );
             return;
         }
         let recomputed = match compute_requests_root(
@@ -165,7 +194,15 @@ impl ArchiveAppShardIngest {
             self.hypergraph.has_forest(),
         ) {
             Ok(r) => r,
-            Err(_) => return,
+            Err(e) => {
+                warn!(
+                    frame = frame_number,
+                    address = %hex::encode(&address[..address.len().min(8)]),
+                    error = %e,
+                    "archive ingest: requests_root recompute errored — rejecting frame"
+                );
+                return;
+            }
         };
         if recomputed != requests_root {
             warn!(frame = frame_number, "archive ingest: requests_root mismatch — rejecting");

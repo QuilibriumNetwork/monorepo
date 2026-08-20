@@ -841,18 +841,22 @@ pub(crate) async fn start(
         info!("shard orchestration subscriber spawned");
     }
 
-    // Archive: subscribe to each active shard's per-shard gossip topics so the
-    // shard-frame firehose actually reaches this node. The message-loop already
-    // routes un-matched shard-frame traffic → `ArchiveAppShardIngest`, but only
-    // if the archive is MESHED on that shard's topic. The legacy `[0xFF; len]`
-    // catch-all relied on blossomsub's overlapping-bitmask (bloom-cover) mesh;
-    // under stock libp2p::gossipsub topics are EXACT-MATCH `IdentTopic`s, so the
-    // all-ones bitmask meshes with nobody. Subscribe per-shard instead (frame =
-    // ingest; consensus/prover/dispatch/cw = relay so the shard's provers —
-    // including separate-process cluster committee members — mesh through the
-    // archive). Re-scan periodically for new/split shards. `app_address == filter
-    // == shard_key l2` (app_engine.rs:1224), so the shard's 32-byte l2 is the
-    // topic seed.
+    // Archive: subscribe to each active shard's FRAME topic so the shard-frame
+    // firehose actually reaches this node. The message-loop routes un-matched
+    // shard-frame traffic → `ArchiveAppShardIngest`, but only if the archive is
+    // MESHED on that shard's frame topic. The legacy `[0xFF; len]` catch-all
+    // relied on blossomsub's overlapping-bitmask (bloom-cover) mesh; under stock
+    // libp2p::gossipsub topics are EXACT-MATCH `IdentTopic`s, so the all-ones
+    // bitmask meshes with nobody. Subscribe per-shard instead.
+    //
+    // FRAME-ONLY: earlier this ALSO subscribed the consensus/prover/dispatch/cw
+    // topics so shard provers could mesh through the archive — but that made the
+    // archive relay hundreds of millions of per-shard CW consensus messages
+    // (dropping ~25%), which starved the whole gossip layer and stopped
+    // GLOBAL_FRAME + frame propagation. Shard provers now mesh their consensus
+    // DIRECTLY; the archive only ingests frames. Re-scan periodically for
+    // new/split shards. `app_address == filter == shard_key l2`
+    // (app_engine.rs:1224), so the shard's 32-byte l2 is the topic seed.
     // A CLUSTER MASTER (remote workers via `data_worker_stream_multiaddrs`) must
     // also mesh on its shards' frame topics: its app-shard frames are finalized in
     // SEPARATE worker processes and only reach the master over `shard_frame_bitmask`
@@ -888,24 +892,23 @@ pub(crate) async fn start(
                 }
                 for f in filters {
                     if subscribed.insert(f.clone()) {
+                        // FRAME topic ONLY — the archive/cluster-master ingests
+                        // finalized app-shard frames here (materialize / serve /
+                        // cluster mirror). It deliberately does NOT subscribe to the
+                        // per-shard CONSENSUS topics (`consensus`/`prover`/`dispatch`
+                        // and especially `cw` = commonware-simplex votes/certs/blocks):
+                        // subscribing meshes+relays them, and relaying every shard's
+                        // CW traffic made this node forward hundreds of millions of
+                        // consensus messages (dropping ~25% of them), starving the
+                        // gossip layer so GLOBAL_FRAME + shard frames stopped
+                        // propagating. Shard provers (incl. cluster committee members)
+                        // mesh their consensus DIRECTLY, not through the archive.
                         p2p_sub
                             .subscribe(quil_engine::bitmasks::shard_frame_bitmask(&f))
                             .await;
-                        p2p_sub
-                            .subscribe(quil_engine::bitmasks::shard_consensus_bitmask(&f))
-                            .await;
-                        p2p_sub
-                            .subscribe(quil_engine::bitmasks::shard_prover_bitmask(&f))
-                            .await;
-                        p2p_sub
-                            .subscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&f))
-                            .await;
-                        p2p_sub
-                            .subscribe(quil_engine::bitmasks::shard_cw_bitmask(&f))
-                            .await;
                         info!(
                             shard = %hex::encode(&f),
-                            "archive subscribed to per-shard gossip topics",
+                            "archive subscribed to per-shard FRAME topic (consensus relay disabled)",
                         );
                     }
                 }

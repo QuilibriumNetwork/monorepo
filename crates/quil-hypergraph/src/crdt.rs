@@ -1760,13 +1760,32 @@ impl HypergraphCrdt {
             _ => return None,
         };
         let forest = self.forest.read().unwrap();
-        let ver = self
-            .resolve_phase_version_with(&forest, app, phase_idx)
+        let resolved = self.resolve_phase_version_with(&forest, app, phase_idx);
+        let ver = resolved.unwrap_or(0);
+        let parent_leaves = forest
+            .app_subtree_leaf_count(app, PHASES[phase_idx], ver, shard_bits)
             .unwrap_or(0);
-        let children_bits = forest
+        let bifurcation = forest
             .first_split_bifurcation(app, PHASES[phase_idx], ver, shard_bits, max_extra_bits)
             .ok()
-            .flatten()?;
+            .flatten();
+        // Split-proposer diagnostic: pins WHY an over-crowded shard does / doesn't
+        // produce children. `resolved_version=None` ⇒ version fell back to 0 (an
+        // empty read → leaf_count 0 → no split; the read_shard_phase_root path
+        // instead falls back to forest_version); `parent_leaves<2` ⇒ empty-split
+        // guard fired; `children=0` with parent_leaves≥2 ⇒ data too clustered to
+        // bifurcate within the bit budget.
+        tracing::info!(
+            app = hex::encode(app),
+            shard_bits_len = shard_bits.len(),
+            phase_idx,
+            resolved_version = ?resolved,
+            used_version = ver,
+            parent_leaves,
+            children = bifurcation.as_ref().map(|c| c.len()).unwrap_or(0),
+            "split-proposer: bifurcation probe"
+        );
+        let children_bits = bifurcation?;
         Some(
             children_bits
                 .iter()

@@ -1927,6 +1927,21 @@ impl GlobalIntrinsic {
         let unproven_storage = op.global_frame_number > 0
             && state_size_u64 > 0
             && op.storage_attestation.is_empty();
+        if unproven_storage {
+            // Previously silent: the reward basis is zeroed here WITHOUT halting
+            // or evicting, so from the operator seat the node looks healthy while
+            // being paid 0. Surface it — a persistent stream of these means the
+            // shard's producer is not attaching a storage attestation (see the
+            // app-engine "no storage openings built" log), so no reward proof is
+            // ever earned even though the shard carries committed data.
+            tracing::warn!(
+                address = %hex::encode(&op.address[..op.address.len().min(8)]),
+                frame_number = op.frame_number,
+                global_frame_number = op.global_frame_number,
+                state_size = state_size_u64,
+                "proof-of-storage gate: shard has committed data but frame carries NO storage attestation — WITHHOLDING reward (basis zeroed), frame NOT halted; prover silently paid 0 for this shard"
+            );
+        }
         let (state_size_u64, shard_count_u64) = if unproven_storage {
             (0u64, 0u64)
         } else {
@@ -2300,6 +2315,22 @@ impl GlobalIntrinsic {
         if due.is_empty() {
             return Ok(());
         }
+        // Wedge detector: a due change is only cleared (delete_pending) after the
+        // whole reassign+grid-flip txn commits below. Any error aborts the frame
+        // and leaves the record still due NEXT frame, re-running the O(provers)
+        // reassign forever with no grid change. Logging the due set every frame
+        // makes the recurrence visible — the SAME (parent, effective_epoch)
+        // appearing on consecutive frames is the wedge signature.
+        tracing::info!(
+            frame = frame_number,
+            cur_epoch,
+            due = due.len(),
+            changes = ?due
+                .iter()
+                .map(|c| (hex::encode(&c.parent), c.effective_epoch, c.kind))
+                .collect::<Vec<_>>(),
+            "apply_due_shard_changes: applying due shard changes"
+        );
 
         // 1. Reassign every affected prover's allocation onto the new
         //    topology (committed hypergraph state, via `state`). Done FIRST:
@@ -2308,7 +2339,19 @@ impl GlobalIntrinsic {
         //    local grid below, keeping the two views consistent.
         let va_disc = vertex_adds_discriminator()?;
         for change in &due {
-            self.reassign_shard_allocations(state, &va_disc, change, frame_number)?;
+            if let Err(e) =
+                self.reassign_shard_allocations(state, &va_disc, change, frame_number)
+            {
+                tracing::error!(
+                    frame = frame_number,
+                    parent = hex::encode(&change.parent),
+                    effective_epoch = change.effective_epoch,
+                    kind = ?change.kind,
+                    error = %e,
+                    "apply_due_shard_changes: reassign FAILED — frame aborts, pending record NOT cleared (will re-fire next frame)"
+                );
+                return Err(e);
+            }
         }
 
         // 2. Flip the LOCAL grid topology + consume the pending records.

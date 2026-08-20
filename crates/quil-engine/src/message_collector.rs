@@ -243,6 +243,9 @@ impl MessageCollector {
         // reject it during degraded coverage.
         if self.prover_only_mode.load(std::sync::atomic::Ordering::Relaxed) {
             if !is_prover_message(&data) {
+                tracing::debug!(
+                    "message collector: submit rejected — prover-only (degraded coverage) mode, non-prover message"
+                );
                 return SubmitOutcome::Filtered;
             }
         }
@@ -282,9 +285,21 @@ impl MessageCollector {
             let valid = self.valid_shard_addresses.read().unwrap();
             for c in &checks {
                 if c.global_frame_number > 0 && !c.has_attestation {
+                    tracing::warn!(
+                        address = %hex::encode(&c.address[..c.address.len().min(8)]),
+                        frame_number = c.frame_number,
+                        global_frame_number = c.global_frame_number,
+                        "message collector: shard-frame submit REJECTED — storage frame carries no storage attestation (empty storage_attestation_root)"
+                    );
                     return SubmitOutcome::Filtered;
                 }
                 if !valid.is_empty() && !valid.contains(&c.address) {
+                    tracing::warn!(
+                        address = %hex::encode(&c.address[..c.address.len().min(8)]),
+                        frame_number = c.frame_number,
+                        valid_shard_count = valid.len(),
+                        "message collector: shard-frame submit REJECTED — address not in current valid-shard set (stale / pre-split / wrong-grid address)"
+                    );
                     return SubmitOutcome::Filtered;
                 }
             }
@@ -303,7 +318,13 @@ impl MessageCollector {
         match buffer.add(data) {
             AddOutcome::Added => SubmitOutcome::Accepted,
             AddOutcome::Duplicate => SubmitOutcome::Duplicate,
-            AddOutcome::Full => SubmitOutcome::Filtered,
+            AddOutcome::Full => {
+                tracing::warn!(
+                    rank,
+                    "message collector: submit rejected — rank buffer full (per-rank count/byte cap reached)"
+                );
+                SubmitOutcome::Filtered
+            }
         }
     }
 
