@@ -284,14 +284,23 @@ impl MessageCollector {
         if !checks.is_empty() {
             let valid = self.valid_shard_addresses.read().unwrap();
             for c in &checks {
+                // A storage frame with NO attestation is NOT invalid: the app-shard
+                // validator binds an empty `storage_attestation_root` into its
+                // deterministic output like any other value (frame_validator.rs),
+                // and the GLOBAL proof-of-storage gate withholds only the REWARD for
+                // a data-bearing shard WITHOUT halting (intrinsic.rs). Rejecting it
+                // here wedged the shard: its frames never entered the mempool → never
+                // got included → the shard could not advance (e.g. frame_number=1
+                // with no replicas yet to attest). So do NOT filter on a missing
+                // attestation — let it through; the intrinsic zeros the reward if the
+                // shard carries committed data, and the shard still progresses.
                 if c.global_frame_number > 0 && !c.has_attestation {
-                    tracing::warn!(
+                    tracing::debug!(
                         address = %hex::encode(&c.address[..c.address.len().min(8)]),
                         frame_number = c.frame_number,
                         global_frame_number = c.global_frame_number,
-                        "message collector: shard-frame submit REJECTED — storage frame carries no storage attestation (empty storage_attestation_root)"
+                        "message collector: storage frame carries no attestation — ACCEPTING (reward withheld by the intrinsic if data-bearing; frame not wedged)"
                     );
-                    return SubmitOutcome::Filtered;
                 }
                 if !valid.is_empty() && !valid.contains(&c.address) {
                     tracing::warn!(

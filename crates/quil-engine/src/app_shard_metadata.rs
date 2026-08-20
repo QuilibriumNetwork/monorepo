@@ -482,7 +482,21 @@ pub fn partition_shard_leaves(
             None => 0,
         }
     };
-    partition_leaves(base_prefix, LEAF_MAX_BYTES, SHARD_TREE_BRANCH, 32, &size_of)
+    let leaves = partition_leaves(base_prefix, LEAF_MAX_BYTES, SHARD_TREE_BRANCH, 32, &size_of);
+    // DIAGNOSTIC: the committed size THIS crdt reports for the shard subtree.
+    // `root_size == 0` ⇒ this crdt holds NO data for the shard, so there are no
+    // leaves to seal/attest — distinct from "replicas not sealed yet". A
+    // data-bearing shard reading 0 here (while the global intrinsic sees size > 0)
+    // is the cluster-worker possession gap: the worker's own crdt is unsynced /
+    // unmaterialized, so it can't prove storage it can't see.
+    tracing::debug!(
+        shard_key = %hex::encode(shard_key),
+        base_prefix = ?base_prefix,
+        root_size = size_of(base_prefix),
+        leaves = leaves.len(),
+        "partition_shard_leaves: shard size seen by this crdt (0 => no data to attest)"
+    );
+    leaves
 }
 
 #[cfg(test)]

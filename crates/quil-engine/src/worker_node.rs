@@ -125,6 +125,12 @@ pub struct WorkerOnlyNode {
     /// Per-worker inclusion prover — required for requests_root tree
     /// commit.
     inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
+    /// Per-worker replica-store KV handle (the worker's own RocksDB). Required
+    /// for storage-attestation generation: the attestation block seals + attests
+    /// from a `ReplicaStore` backed by this. `None` (the old cluster default)
+    /// meant the whole attestation block was skipped — the worker NEVER attested,
+    /// so its shard reward was silently zeroed by the global proof-of-storage gate.
+    kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
     /// Current engine handle (set after Respawn).
     engine_handle: std::sync::Mutex<Option<AppEngineHandle>>,
     /// Channel for engine events back to the master stream.
@@ -219,6 +225,7 @@ impl WorkerOnlyNode {
             hypergraph: None,
             execution_engine: None,
             inclusion_prover: None,
+            kv_db: None,
             engine_handle: std::sync::Mutex::new(None),
             engine_event_tx,
             engine_event_rx: std::sync::Mutex::new(Some(engine_event_rx)),
@@ -246,6 +253,17 @@ impl WorkerOnlyNode {
         self.hypergraph = Some(hypergraph);
         self.execution_engine = Some(execution_engine);
         self.inclusion_prover = Some(inclusion_prover);
+        self
+    }
+
+    /// Attach the worker's own KV handle (its RocksDB) to back the
+    /// storage-attestation `ReplicaStore`. Without this a cluster worker cannot
+    /// seal replicas or emit a storage attestation, so its shard reward is
+    /// silently withheld by the global proof-of-storage gate. The replica store
+    /// uses a disjoint keyspace from the hypergraph store, so sharing the one DB
+    /// is safe (mirrors the master/thread-worker single-DB layout).
+    pub fn with_kv_db(mut self, kv_db: Arc<dyn quil_types::store::KvDb>) -> Self {
+        self.kv_db = Some(kv_db);
         self
     }
 
@@ -675,16 +693,20 @@ impl WorkerOnlyNode {
             // `db.worker_path_prefix`) and therefore its own
             // CRDT/exec-mgr instance, mirroring Go's cluster mode.
             hypergraph: self.hypergraph.clone(),
-            // Cluster-mode worker: falls back to `hypergraph` for the storage
-            // source (per-worker possession in cluster mode needs the same
-            // master-source wiring as thread mode — separate follow-up).
-            storage_source_hypergraph: None,
+            // Cluster-mode worker: the shard's committed data lives in the
+            // worker's OWN hypergraph (forest-synced + self-materialized), so the
+            // storage source IS that same crdt — the SDR seal reads it directly.
+            // (The intra-crdt sync step is then a no-op; sealing from own_crdt is
+            // what populates the replica store for `build_vote_openings`.)
+            storage_source_hypergraph: self.hypergraph.clone(),
             execution_engine: self.execution_engine.clone(),
             inclusion_prover: self.inclusion_prover.clone(),
-            // Cluster mode: worker process owns its own DB and can
-            // back this with a real KV handle once the wiring is in
-            // place. Until then, fall through to the in-memory store.
-            kv_db: None,
+            // Cluster mode: back the replica store with the worker's OWN RocksDB
+            // (wired via `with_kv_db`). REQUIRED for storage-attestation
+            // generation — with `None` the whole attestation block (app_engine.rs,
+            // gated on `Some(kv)`) was skipped, so the worker NEVER attested and
+            // its shard reward was silently zeroed by the global gate.
+            kv_db: self.kv_db.clone(),
             // (P3) Cluster-mode app-shard CW: mirror thread mode by honoring the
             // configured flag. The worker's own p2p subscribes to
             // `shard_cw_bitmask` and routes inbound CW to the engine (see

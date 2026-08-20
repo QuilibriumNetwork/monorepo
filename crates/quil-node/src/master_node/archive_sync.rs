@@ -2579,11 +2579,29 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 // snapshot at any root — the post-sync
                                 // server-claim match only proves
                                 // internal consistency, not authority.
-                                let expected_root = sync_cs
-                                    .get_latest_global_frame()
-                                    .ok()
-                                    .and_then(|f| f.header.map(|h| h.prover_tree_commitment))
-                                    .unwrap_or_default();
+                                //
+                                // TEMPORARY ESCAPE (archive<->archive only): when the
+                                // whole archive set has FORKED, every archive's local
+                                // prover root differs from the header lineage, so pinning
+                                // to the header root makes the peer sync refuse forever
+                                // (`peer root != header-committed root`) and the fork
+                                // never heals. Archives are trusted (not malicious) and
+                                // the durable safeguard is verifying the prover root at
+                                // consensus BEFORE signing (so a future fork HALTS instead
+                                // of silently persisting). So for a diverged ARCHIVE in
+                                // mismatch-recovery, reconcile with an EMPTY expected root
+                                // = trust the peer's snapshot, letting the archive set
+                                // converge to a common tree. Regulars keep the hard pin.
+                                // Remove once consensus verifies the prover root (#1).
+                                let expected_root = if sync_archive_mode && mismatch_recovery {
+                                    Vec::new()
+                                } else {
+                                    sync_cs
+                                        .get_latest_global_frame()
+                                        .ok()
+                                        .and_then(|f| f.header.map(|h| h.prover_tree_commitment))
+                                        .unwrap_or_default()
+                                };
                                 // Forest sync of the global prover shard, pinned
                                 // to the latest verified frame's
                                 // prover_tree_commitment (empty ⇒ trust). Pulls
@@ -2608,7 +2626,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         // (converged is meaningful) — a bootstrap
                                         // trust-sync (empty root) leaves the flag
                                         // for the normal verify path to set.
-                                        if converged && !expected_root.is_empty() {
+                                        if converged
+                                            && (!expected_root.is_empty()
+                                                || (sync_archive_mode && mismatch_recovery))
+                                        {
                                             if let Some(m) = sync_mat.as_ref() {
                                                 let vf = sync_cs
                                                     .get_latest_global_frame()

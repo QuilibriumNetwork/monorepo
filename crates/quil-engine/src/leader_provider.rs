@@ -117,37 +117,61 @@ impl GlobalLeaderProvider {
     /// Returns empty only when no CRDT is wired (unit tests) or the shard
     /// truly has no root — tolerated by the empty-root branch in
     /// `verify_prover_root`.
-    fn compute_prover_root(&self, frame_number: u64) -> Vec<u8> {
-        let Some(hg) = self.hypergraph.as_ref() else {
-            return Vec::new();
-        };
-        // Bind the PARENT (frame_number-1) prover-shard root: the deterministic
-        // post-materialize-(N-1) value recorded by the frame materializer, which
-        // every node reproduces identically. Do NOT read the LIVE forest here —
-        // it is RACY: the async materializer lags the (faster) produce path, so a
-        // live read lands on N-2/N-1 unpredictably and forks the commitment (the
-        // prover-root-mismatch storm).
-        //
-        // SERIAL/MONOTONIC GATE: the leader must not produce frame N until its
-        // materializer has recorded the parent (N-1) root. Produce outruns the
-        // async materializer by ~1-2 frames, so briefly BLOCK for the in-flight
-        // materialize(N-1) to record rather than reading the lagging forest.
-        // Bounded so a genuinely-behind materializer (deep catch-up) can't wedge
-        // proposing — past the deadline we fall back to a best-effort live read
-        // (tolerated by the empty/degenerate branch and `verify_prover_root`'s
-        // empty-root skip). Once produce paces to materialize, the wait is a
-        // single poll.
+    /// Non-blocking single read of the local prover root for `frame_number`: the
+    /// deterministic post-materialize-(N-1) value recorded by the frame
+    /// materializer, with the genesis (frame ≤ 1) live-forest fallback. `None` when
+    /// the parent (N-1) is not yet recorded (frame > 1). Do NOT read the LIVE
+    /// forest for a post-genesis frame — it is RACY (the async materializer lags
+    /// the faster produce path, so a live read lands on N-2/N-1 unpredictably and
+    /// forks the commitment). Shared by the blocking produce path
+    /// (`compute_prover_root`) and the non-blocking vote-verify path
+    /// (`LeaderProvider::local_prover_root`) so both bind the identical root.
+    fn prover_root_read(&self, frame_number: u64) -> Option<Vec<u8>> {
+        let hg = self.hypergraph.as_ref()?;
         let parent = frame_number.saturating_sub(1);
-        let mut recorded = hg.prover_root_at(parent);
+        let root = match hg.prover_root_at(parent) {
+            Some(r) => r,
+            // Genesis has no parent to materialize — read the live genesis forest
+            // (deterministic; every node's genesis is identical).
+            None if frame_number <= 1 => {
+                let global_shard = quil_types::store::ShardKey {
+                    l1: [0u8; 3],
+                    l2: [0xffu8; 32],
+                };
+                hg.compute_shard_root("vertex", "adds", &global_shard)
+            }
+            // Post-genesis parent not recorded yet — the caller decides (produce
+            // blocks then declines; vote-verify nullifies). NEVER a live read.
+            None => return None,
+        };
+        // A real forest root is 32 bytes; reject the empty/degenerate case.
+        if root.len() == 32 || root.len() >= 64 {
+            Some(root)
+        } else {
+            None
+        }
+    }
+
+    fn compute_prover_root(&self, frame_number: u64) -> Vec<u8> {
+        if self.hypergraph.is_none() {
+            return Vec::new();
+        }
+        // SERIAL/MONOTONIC GATE: the leader must not produce frame N until its
+        // materializer has recorded the parent (N-1) root (see `prover_root_read`
+        // for why a live read is racy). Produce outruns the async materializer by
+        // ~1-2 frames, so briefly BLOCK for the in-flight materialize(N-1) to
+        // record rather than reading the lagging forest. Bounded so a genuinely-
+        // behind materializer (deep catch-up) can't wedge proposing — past the
+        // deadline we DECLINE (empty → the view nullifies) rather than producing on
+        // a stale/frozen root (which is exactly what let a fleet-wide materializer
+        // wedge keep advancing the chain on FROZEN state).
+        let mut recorded = self.prover_root_read(frame_number);
         if recorded.is_none() && frame_number > 1 {
             // How long the leader blocks for the in-flight materialize(N-1) to
             // record before declining (view nullifies). Env-tunable so nodes on
-            // slower hardware — where the materialize commit occasionally throttles
-            // on a RocksDB write-stall despite the compaction tuning in
-            // `RocksDb::open` — can absorb residual jitter within their view budget
-            // instead of missing the proposal. Keep it below the CW leader timeout
-            // so a genuinely-wedged materializer still yields the view rather than
-            // holding it to the end.
+            // slower hardware can absorb residual jitter within their view budget.
+            // Keep it below the CW leader timeout so a genuinely-wedged materializer
+            // still yields the view rather than holding it to the end.
             let max_wait_ms: u64 = std::env::var("QUIL_MATERIALIZE_WAIT_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -157,40 +181,19 @@ impl GlobalLeaderProvider {
             let deadline = std::time::Instant::now() + max_wait;
             while recorded.is_none() && std::time::Instant::now() < deadline {
                 std::thread::sleep(POLL);
-                recorded = hg.prover_root_at(parent);
+                recorded = self.prover_root_read(frame_number);
             }
             if recorded.is_none() {
-                // STRICT GATE: never produce frame N on a stale root. We do NOT
-                // fall back to a live forest read — that stale read is exactly what
-                // let a fleet-wide materializer wedge keep producing frames on a
-                // FROZEN root (the whole chain advanced on unmaterialized state).
-                // Return empty so the caller DECLINES to propose (the view
-                // nullifies); this node resumes producing only once its materializer
-                // records the parent (N-1) root.
                 tracing::warn!(
                     frame = frame_number,
-                    parent,
+                    parent = frame_number.saturating_sub(1),
                     "parent (N-1) prover root not materialized before deadline — \
                      declining to produce (never build N on an unmaterialized N-1)"
                 );
                 return Vec::new();
             }
         }
-        // Genesis (frame ≤ 1) has no parent to materialize — read the live genesis
-        // forest. Every other frame is `recorded` by the strict gate above.
-        let root = recorded.unwrap_or_else(|| {
-            let global_shard = quil_types::store::ShardKey {
-                l1: [0u8; 3],
-                l2: [0xffu8; 32],
-            };
-            hg.compute_shard_root("vertex", "adds", &global_shard)
-        });
-        // A real forest root is 32 bytes; reject the empty/degenerate case.
-        if root.len() == 32 || root.len() >= 64 {
-            root
-        } else {
-            Vec::new()
-        }
+        recorded.unwrap_or_default()
     }
 
     /// Compute the prover shard's phase 1/2/3 roots (vertex-removes,
@@ -334,6 +337,15 @@ pub fn compute_global_requests_root(
 }
 
 impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
+    /// Non-blocking local prover root for `frame_number` (the vote-verify side of
+    /// `compute_prover_root`): reads the recorded post-materialize-(N-1) value
+    /// without the produce-path blocking wait. `None` if this node hasn't
+    /// materialized N-1 yet — the vote seam nullifies in that case, which paces
+    /// production to materialization instead of signing a root it can't reproduce.
+    fn local_prover_root(&self, frame_number: u64) -> Option<Vec<u8>> {
+        self.prover_root_read(frame_number)
+    }
+
     /// Return leaders for the next rank, ordered by the prover
     /// registry's VDF-distance walk seeded by the parent frame's
     /// Poseidon-hashed output.

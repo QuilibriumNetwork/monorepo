@@ -280,6 +280,10 @@ pub(crate) async fn start(
         min_active_provers_for_propose,
     )
     .with_state_engines(crdt.clone(), exec_manager, inclusion_prover)
+    // Back the storage-attestation replica store with the worker's own RocksDB
+    // (disjoint keyspace from the hypergraph store). Without this the cluster
+    // worker never emits a storage attestation and its shard reward is withheld.
+    .with_kv_db(db_arc.clone() as Arc<dyn quil_types::store::KvDb>)
     .with_registry_refresh(registry_refresh);
 
     // Wire the prover-tree syncer so the worker can sync the global

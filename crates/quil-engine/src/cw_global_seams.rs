@@ -254,6 +254,43 @@ impl GlobalProposer for GlobalSeamProposer {
                     );
                     return false;
                 }
+                // VERIFY THE PROVER ROOT AGAINST LOCAL STATE BEFORE SIGNING. The
+                // prover_tree_commitment is a deterministic function of committed
+                // state through N-1 — which a valid voter has already materialized —
+                // so reproducing it is a cheap local read. FAIL CLOSED: nullify if it
+                // differs (a genuine prover-tree FORK) OR if we can't reproduce it yet
+                // (not materialized to N-1). Previously the seam only checked the
+                // leader's proof was self-consistent with the leader's OWN declared
+                // root, so a divergent leader's frame finalized and every follower
+                // reconcile-stormed forever. Nullifying makes a fork HALT (no quorum
+                // forms) and paces production to materialization. Genesis (frame ≤ 1)
+                // is deterministic/degenerate — skip.
+                let n = header.frame_number;
+                if n > 1 {
+                    match self.leader_provider.local_prover_root(n) {
+                        Some(local) if local == header.prover_tree_commitment => {}
+                        Some(local) => {
+                            tracing::warn!(
+                                view,
+                                frame = n,
+                                local = %hex::encode(&local),
+                                declared = %hex::encode(&header.prover_tree_commitment),
+                                "cw verify: prover_tree_commitment != local computation \
+                                 (prover-tree FORK) — nullify"
+                            );
+                            return false;
+                        }
+                        None => {
+                            tracing::warn!(
+                                view,
+                                frame = n,
+                                "cw verify: cannot reproduce prover root — parent (N-1) not \
+                                 materialized locally (lag) — nullify",
+                            );
+                            return false;
+                        }
+                    }
+                }
                 self.block_meta.lock().unwrap().insert(digest, header.frame_number);
                 tracing::debug!(view, frame = header.frame_number, "cw verify: OK (vote)");
                 true
