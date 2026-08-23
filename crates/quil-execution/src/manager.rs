@@ -186,7 +186,19 @@ impl ExecutionEngineManager {
     /// frame's messages are processed and BEFORE `commit_frame_with_global_cursor`,
     /// so the reassignment writes ride the same commit batch.
     pub fn apply_global_due_shard_changes(&self, frame_number: u64) -> Result<()> {
+        // Confirm whether the per-frame ~5s materialize cost is the WAIT to acquire
+        // this write lock (contention with another engines-lock holder — e.g. a
+        // concurrent materializer or a background task) vs actual apply work.
+        let engines_lock_start = std::time::Instant::now();
         let mut engines = self.engines.write().unwrap();
+        let engines_lock_ms = engines_lock_start.elapsed().as_millis() as u64;
+        if engines_lock_ms > 500 {
+            tracing::warn!(
+                frame = frame_number,
+                ms = engines_lock_ms,
+                "apply_global_due_shard_changes: waited >500ms for the engines WRITE lock (contention, not apply work)"
+            );
+        }
         let Some(engine) = engines.get_mut("global") else {
             return Ok(());
         };

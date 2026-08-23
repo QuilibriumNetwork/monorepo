@@ -152,6 +152,19 @@ pub(crate) async fn start(
             network,
             &config.engine.genesis_seed,
         );
+        // Consolidation-only re-run. The full reset above is gated by its own
+        // marker and now SKIPS (already applied), but it only ever set the
+        // BOOT_RESET marker — never the CONSOLIDATION marker — so `is_consolidated`
+        // is still false. This path (success-gated on its own marker, and it does
+        // NOT touch the prover tree) re-runs the fold. Its enumeration now includes
+        // every GRID app, so QUIL's historical sub-shard data finally folds into
+        // its unified app tree — the empty-app-tree bug that made splits impossible.
+        crate::unified_consolidation::boot_consolidate_and_gate(
+            &hg_store,
+            shards_store.as_ref(),
+            clock_store.as_ref(),
+            &crdt,
+        );
     }
 
     // One-time corrective restore of the global-committee provers' Seniority.
@@ -401,6 +414,23 @@ pub(crate) async fn start(
                             filter[32..].iter().map(|b| *b as u32).collect();
                         crdt_pr.canonical_bits_for_prefix(&app, &parent_prefix)
                     };
+                // DIAGNOSTIC: the sub-shard's own committed leaf count, read the
+                // WORKING way (`sub_shard_metadata_for_filter` — the byte-suffix
+                // sub_meta path the reward calc uses). If this is >0 while the probe
+                // shows the app-address tree empty (`whole_tree_leaves:0`), the
+                // QUIL data is in the SUB-SHARD layout, not a unified app tree — so
+                // `first_split_bifurcation` (which reads the app tree) must be
+                // retargeted at the sub-shard.
+                let sub_shard_leaves = crdt_pr
+                    .sub_shard_metadata_for_filter(filter)
+                    .map(|m| m.leaf_count)
+                    .unwrap_or(0);
+                tracing::info!(
+                    filter = hex::encode(filter),
+                    sub_shard_leaves,
+                    parent_bits_len = parent_bits.len(),
+                    "split-proposer: sub-shard (byte-suffix) leaf count for the over-crowded shard"
+                );
                 // Descend up to 16 extra bits past any uniform run to the branch.
                 crdt_pr.propose_split_children("vertex", "adds", &app, &parent_bits, 16)
             },

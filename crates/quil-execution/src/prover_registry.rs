@@ -1605,76 +1605,105 @@ fn decode_allocation(
 /// committed frame. Returns (public_key, prover_address) per matching prover,
 /// sorted by address for a stable order. Mirrors `get_active_provers`' intent
 /// (raw-Active only; Leaving/Joining are intentionally not reassigned).
+/// A single committed-state scan of the global prover shard, REUSABLE across
+/// many filters in one frame. [`Self::scan`] does the ONE expensive full-shard
+/// pass; [`Self::active_on_filter`] is a cheap in-memory filter over the result.
+/// Hoisting the scan OUT of `reassign_shard_allocations`' per-due-change loop
+/// turns N full prover-shard scans into one — critical when many splits/merges
+/// come due at an epoch boundary (the 48s materialize spikes). This stays
+/// COMMITTED-state (deterministic — every node scans the identical tree) and
+/// MUST NOT be replaced by the async registry cache, which can differ across
+/// nodes and would diverge the prover tree (the fork `#1` halts on).
+pub struct CommittedProverScan {
+    addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>>,
+    allocations: Vec<(Vec<u8>, ProverAllocationInfo)>,
+}
+
+impl CommittedProverScan {
+    /// One destructive pass over the committed global prover shard, collecting
+    /// prover pubkeys (by address) and every allocation.
+    pub fn scan(hg: &quil_hypergraph::HypergraphCrdt) -> Self {
+        let shard = ShardKey {
+            l1: [0u8; 3],
+            l2: [0xffu8; 32],
+        };
+        let mut addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut allocations: Vec<(Vec<u8>, ProverAllocationInfo)> = Vec::new();
+
+        let mut cb = |vk: Vec<u8>, data: Vec<u8>| {
+            if vk.len() != 64 {
+                return;
+            }
+            let root = match deserialize_go_tree(&data) {
+                Ok(Some(r)) => r,
+                _ => return,
+            };
+            let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+                return;
+            };
+            if type_hash == TYPE_HASH_ALLOCATION {
+                if let Some((prover_ref, alloc)) = decode_allocation(&vk, &root) {
+                    allocations.push((prover_ref, alloc));
+                }
+                return;
+            }
+            if let Some("prover:Prover") = class_for_type_hash(&type_hash) {
+                if let Some(info) = decode_prover(&vk, &root) {
+                    addr_to_pubkey.insert(info.address.clone(), info.public_key);
+                }
+            }
+        };
+        let _ = hg.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut cb);
+        Self {
+            addr_to_pubkey,
+            allocations,
+        }
+    }
+
+    /// The `(public_key, prover_address)` active on `filter` at `frame_number`.
+    /// Matches `get_active_provers`' committee eligibility (effective_status via
+    /// `committee_eligible`) — NOT raw `status == Active` — with the same
+    /// strict→lenient fallback, so the reassignment moves EXACTLY the provers the
+    /// rest of consensus considers on `filter`. A raw-Active check strands
+    /// epoch-boundary re-confirmers (effective-Active but not raw-Active), which
+    /// is precisely the "2 of 4 not moved" bug: the split flips at an epoch
+    /// boundary where some members are mid-re-confirm.
+    pub fn active_on_filter(&self, filter: &[u8], frame_number: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let collect = |lenient: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
+            let mut v: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            for (prover_ref, alloc) in &self.allocations {
+                if alloc.confirmation_filter != filter
+                    || !committee_eligible(alloc, frame_number, lenient)
+                {
+                    continue;
+                }
+                if let Some(pubkey) = self.addr_to_pubkey.get(prover_ref) {
+                    v.push((pubkey.clone(), prover_ref.clone()));
+                }
+            }
+            v
+        };
+        // Strict first; fall back to the lenient (empty-committee) floor for a
+        // non-empty (app-shard) filter, exactly as `get_active_provers` does.
+        let mut out = collect(false);
+        if out.is_empty() && !filter.is_empty() {
+            out = collect(true);
+        }
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        out.dedup_by(|a, b| a.1 == b.1);
+        out
+    }
+}
+
+/// Back-compat single-call wrapper: one scan + one filter. Prefer
+/// `CommittedProverScan::scan(hg)` ONCE + `active_on_filter` per filter when
+/// reassigning multiple due changes in a frame (avoids N full scans).
 pub fn active_provers_on_filter_committed(
     hg: &quil_hypergraph::HypergraphCrdt,
     filter: &[u8],
     frame_number: u64,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let shard = ShardKey {
-        l1: [0u8; 3],
-        l2: [0xffu8; 32],
-    };
-
-    // Single destructive pass over the committed global prover shard,
-    // collecting both prover pubkeys (by address) and allocations.
-    let mut addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    let mut allocations: Vec<(Vec<u8>, ProverAllocationInfo)> = Vec::new();
-
-    let mut cb = |vk: Vec<u8>, data: Vec<u8>| {
-        if vk.len() != 64 {
-            return;
-        }
-        let root = match deserialize_go_tree(&data) {
-            Ok(Some(r)) => r,
-            _ => return,
-        };
-        let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
-            return;
-        };
-        if type_hash == TYPE_HASH_ALLOCATION {
-            if let Some((prover_ref, alloc)) = decode_allocation(&vk, &root) {
-                allocations.push((prover_ref, alloc));
-            }
-            return;
-        }
-        if let Some("prover:Prover") = class_for_type_hash(&type_hash) {
-            if let Some(info) = decode_prover(&vk, &root) {
-                addr_to_pubkey.insert(info.address.clone(), info.public_key);
-            }
-        }
-    };
-    let _ = hg.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut cb);
-
-    // Match `get_active_provers`' committee eligibility (effective_status via
-    // `committee_eligible`) — NOT raw `status == Active` — with the same
-    // strict→lenient fallback, so the reassignment moves EXACTLY the provers the
-    // rest of consensus considers on `filter`. A raw-Active check strands
-    // epoch-boundary re-confirmers (effective-Active but not raw-Active), which
-    // is precisely the "2 of 4 not moved" bug: the split flips at an epoch
-    // boundary where some members are mid-re-confirm.
-    let collect = |lenient: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut v: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for (prover_ref, alloc) in &allocations {
-            if alloc.confirmation_filter != filter
-                || !committee_eligible(alloc, frame_number, lenient)
-            {
-                continue;
-            }
-            if let Some(pubkey) = addr_to_pubkey.get(prover_ref) {
-                v.push((pubkey.clone(), prover_ref.clone()));
-            }
-        }
-        v
-    };
-    // Strict first; fall back to the lenient (empty-committee) floor for a
-    // non-empty (app-shard) filter, exactly as `get_active_provers` does.
-    let mut out = collect(false);
-    if out.is_empty() && !filter.is_empty() {
-        out = collect(true);
-    }
-    out.sort_by(|a, b| a.1.cmp(&b.1));
-    out.dedup_by(|a, b| a.1 == b.1);
-    out
+    CommittedProverScan::scan(hg).active_on_filter(filter, frame_number)
 }
 
 /// Enumerate EVERY registered prover on the global prover shard from COMMITTED

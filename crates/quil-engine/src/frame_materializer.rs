@@ -76,6 +76,12 @@ pub struct FrameMaterializer {
     prover_root_mismatch: AtomicBool,
     /// Frame number at which prover root was last verified.
     prover_root_verified_frame: AtomicU64,
+    /// The DECLARED prover root from #1's most recent FORK nullify — the lineage
+    /// the proposers agree on. The archive reconcile pins its sync to THIS, not to
+    /// this node's own finalized-header root: a forked OUTLIER's finalized root is
+    /// a lineage no peer holds ("no reachable peer holds the finalized prover
+    /// root"), so it must instead converge to the proposers' root.
+    fork_target_root: std::sync::RwLock<Option<Vec<u8>>>,
     /// Whether a prover sync is currently in progress.
     prover_sync_in_progress: AtomicBool,
 
@@ -240,6 +246,7 @@ impl FrameMaterializer {
             prover_root_synced: AtomicBool::new(false),
             prover_root_mismatch: AtomicBool::new(false),
             prover_root_verified_frame: AtomicU64::new(0),
+            fork_target_root: std::sync::RwLock::new(None),
             prover_sync_in_progress: AtomicBool::new(false),
             _prover_address: prover_address,
             archive_mode,
@@ -1427,6 +1434,30 @@ impl FrameMaterializer {
             self.prover_root_mismatch.store(false, Ordering::Relaxed);
             self.prover_root_verified_frame.store(frame_number, Ordering::Relaxed);
         }
+    }
+
+    /// Force the prover-root mismatch flag ON from OUTSIDE the materialize path.
+    /// The global vote seam calls this when it nullifies a proposal on a
+    /// prover-tree FORK: during such a halt NO frame finalizes, so the
+    /// materializer never runs `verify_prover_root` to set the flag itself — and
+    /// the archive reconcile loop (which gates on `prover_root_mismatch_detected`)
+    /// would sit idle forever, never healing the fork. This routes the vote-time
+    /// fork detection to the same flag so the reconcile fires DURING the halt.
+    pub fn flag_prover_root_mismatch(&self, declared_target_root: Vec<u8>) {
+        self.prover_root_synced.store(false, Ordering::Relaxed);
+        self.prover_root_mismatch.store(true, Ordering::Relaxed);
+        self.prover_root_verified_frame.store(0, Ordering::Relaxed);
+        // The proposers' root — the lineage the reconcile should converge onto.
+        if !declared_target_root.is_empty() {
+            *self.fork_target_root.write().unwrap() = Some(declared_target_root);
+        }
+    }
+
+    /// The DECLARED root the archive reconcile should converge to (set by #1's
+    /// FORK nullify via [`Self::flag_prover_root_mismatch`]). `None` until a fork
+    /// is detected.
+    pub fn fork_target_root(&self) -> Option<Vec<u8>> {
+        self.fork_target_root.read().unwrap().clone()
     }
 
     /// Whether a prover-root mismatch has been positively detected and not yet

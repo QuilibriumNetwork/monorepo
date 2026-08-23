@@ -217,7 +217,31 @@ impl GlobalExecutionEngine {
             // any reassignment written this frame; a no-op except at the cutover
             // frame on a materializing archive.
             intrinsic.maybe_apply_split_reset(frame_number, state)?;
+            // DIAGNOSTIC: `commit()` re-applies the WHOLE changeset and does NOT
+            // clear it (only `abort()` does). If this path never clears it, the
+            // changeset accumulates and re-commits every frame — a growing cost
+            // that matches the observed 5s→25s materialize climb. Log the size +
+            // time so we can confirm accumulation before changing the clearing.
+            let cs_len = state.changeset_len();
+            let commit_start = std::time::Instant::now();
             state.commit()?;
+            let commit_ms = commit_start.elapsed().as_millis() as u64;
+            if commit_ms > 500 {
+                tracing::warn!(
+                    frame = frame_number,
+                    ms = commit_ms,
+                    changeset = cs_len,
+                    "apply_due: state.commit() SLOW — changeset size shown (large/growing ⇒ not cleared after commit)"
+                );
+            }
+            // CLEAR the changeset now that commit() has pushed it into the CRDT,
+            // matching the commit+abort pairing at every other site (e.g. the
+            // per-op path, engines.rs:1123). Without this the changeset was STUCK:
+            // a past frame's writes (observed constant at 3534) were re-applied
+            // every frame — idempotent, so the root stayed correct, but it burned
+            // ~4.7s/frame. The changes are already durable in the CRDT (which
+            // commit_frame flushes); the changeset is only a staging buffer.
+            state.abort();
         }
         Ok(())
     }

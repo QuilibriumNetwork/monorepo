@@ -145,6 +145,11 @@ pub struct CwGlobalDeps {
     /// node's data dir so consensus resumes across restarts (the default is a
     /// random temp dir → every restart replays from the migration head).
     pub storage_directory: std::path::PathBuf,
+    /// Wired to the frame materializer's `flag_prover_root_mismatch`; the vote
+    /// seam invokes it on a prover-tree FORK so the archive prover-tree reconcile
+    /// fires during the resulting halt (nothing materializes then to set the flag
+    /// the normal way). `None` on non-archive nodes.
+    pub on_prover_fork: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
 }
 
 /// Build the committee, start the simplex engine, and return the inbound router.
@@ -186,6 +191,7 @@ pub fn start_cw_global_consensus(deps: CwGlobalDeps) -> Option<CwInboundRouter> 
         deps.storage_directory,
         deps.global_frame_publisher,
         deps.local_prover_address,
+        deps.on_prover_fork,
     );
 
     tracing::info!("commonware-simplex global consensus started");

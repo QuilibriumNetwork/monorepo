@@ -2296,7 +2296,23 @@ impl GlobalIntrinsic {
             return Ok(());
         };
         let cur_epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        let pending_scan_start = std::time::Instant::now();
         let all_pending = store.all_pending_shard_changes()?;
+        let pending_scan_ms = pending_scan_start.elapsed().as_millis() as u64;
+        if pending_scan_ms > 500 {
+            // A slow scan that returns few/zero LIVE entries = tombstone
+            // accumulation in the pending-change keyspace (many create+delete
+            // cycles over the chain's life). This runs every frame (inline via
+            // invoke_frame_header on request frames, standalone otherwise), so it
+            // shows up as the per-frame materialize floor. A range compaction of
+            // the pending keyspace drops the tombstones.
+            tracing::warn!(
+                frame = frame_number,
+                ms = pending_scan_ms,
+                live = all_pending.len(),
+                "apply_due: all_pending_shard_changes scan SLOW (tombstone bloat in the pending-change keyspace)"
+            );
+        }
         if !all_pending.is_empty() {
             // Fires every frame while a change waits for its E+2 boundary — debug
             // to avoid per-frame spam; the apply itself logs at info.
@@ -2338,10 +2354,24 @@ impl GlobalIntrinsic {
         //    the frame's state changeset is aborted before we mutate the
         //    local grid below, keeping the two views consistent.
         let va_disc = vertex_adds_discriminator()?;
+        // ONE committed-state prover-shard scan for the whole frame, shared across
+        // ALL due changes — instead of a full O(provers) scan per change (the
+        // N×full-scan cost that spikes to tens of seconds when a batch comes due at
+        // an epoch boundary). Committed state, so reassignment stays deterministic
+        // across nodes (do NOT swap for the async registry cache — that forks the
+        // prover tree). None when no hypergraph (reassign falls back to the cache).
+        let prover_scan = self
+            .hypergraph
+            .as_ref()
+            .map(|hg| crate::prover_registry::CommittedProverScan::scan(hg));
         for change in &due {
-            if let Err(e) =
-                self.reassign_shard_allocations(state, &va_disc, change, frame_number)
-            {
+            if let Err(e) = self.reassign_shard_allocations(
+                state,
+                &va_disc,
+                change,
+                frame_number,
+                prover_scan.as_ref(),
+            ) {
                 tracing::error!(
                     frame = frame_number,
                     parent = hex::encode(&change.parent),
@@ -2623,6 +2653,9 @@ impl GlobalIntrinsic {
         va_disc: &[u8; 32],
         change: &PendingShardChange,
         frame_number: u64,
+        // ONE committed-state scan shared across all due changes this frame
+        // (built by the caller). `None` ⇒ scan on demand / fall back to the cache.
+        scan: Option<&crate::prover_registry::CommittedProverScan>,
     ) -> Result<()> {
         let pr = self.prover_registry.as_ref();
         // Proceed when EITHER committed-state (preferred) OR the cache is
@@ -2636,7 +2669,11 @@ impl GlobalIntrinsic {
         // Enumerate `(public_key, prover_address)` on `filter`: committed state
         // via the CRDT when present (deterministic), else the async cache.
         let enumerate = |filter: &[u8]| -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-            if let Some(hg) = self.hypergraph.as_ref() {
+            if let Some(scan) = scan {
+                // Reuse the ONE per-frame committed scan (deterministic).
+                Ok(scan.active_on_filter(filter, frame_number))
+            } else if let Some(hg) = self.hypergraph.as_ref() {
+                // No shared scan supplied — scan on demand (still committed state).
                 Ok(crate::prover_registry::active_provers_on_filter_committed(
                     hg, filter, frame_number,
                 ))

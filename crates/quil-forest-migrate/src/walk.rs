@@ -669,6 +669,24 @@ pub fn run_unified_consolidation_in_place(
             shard_keys.insert(sk);
         }
     }
+    // ALSO enumerate every app in the current GRID (`shards_store`). Without this
+    // an app whose state is entirely HISTORICAL — no commit within the lookback
+    // window and not in the alt-shard index — is MISSED: e.g. QUIL, whose recent
+    // writes are prover-only, so it never appeared via the two sources above and
+    // its app tree was left EMPTY (splits could never see any data). The grid key
+    // is `L1(3) ‖ L2(32)`; the app address is the L2.
+    if let Ok(rows) = shards_store.range_app_shards() {
+        for s in rows {
+            if s.shard_key.len() >= 3 + 32 {
+                let mut l2 = [0u8; 32];
+                l2.copy_from_slice(&s.shard_key[3..3 + 32]);
+                shard_keys.insert(ShardKey {
+                    l1: get_bloom_filter_indices(&l2, 256, 3),
+                    l2,
+                });
+            }
+        }
+    }
 
     let mut consolidated = 0usize;
     for shard_key in &shard_keys {
@@ -989,6 +1007,111 @@ mod tests {
             assert!(root.is_some(), "shard {i} committed");
             assert_ne!(root, empty, "shard {i} is non-empty, unlike shard 1");
         }
+    }
+
+    /// The mainnet regression the grid-enumeration fix closes: an app whose
+    /// state is entirely HISTORICAL — reachable via NEITHER the alt-shard index
+    /// NOR any recent shard commit, only via the current grid (`shards_store`) —
+    /// must still be folded into its single app tree by the boot consolidation.
+    /// This is exactly the condition that left QUIL's unified app tree EMPTY
+    /// (its recent writes were prover-only), so splits could never see any data.
+    #[test]
+    fn consolidation_folds_grid_only_app_that_the_legacy_enumeration_misses() {
+        use quil_execution::domains::QUIL_TOKEN;
+        use quil_store::{RocksDb, RocksShardsStore};
+        use quil_types::store::{KvDb, ShardInfo, ShardsStore};
+
+        let src = tempfile::tempdir().unwrap();
+        let src_db = open_db(src.path());
+        let hg = RocksHypergraphStore::new(src_db.clone());
+
+        // QUIL carries state ONLY in the hypergraph, keyed under the SAME l1 the
+        // consolidation reconstructs (`bloom(l2)`), across three sub-shards.
+        let quil = QUIL_TOKEN;
+        let app_key = ShardKey { l2: quil, l1: get_bloom_filter_indices(&quil, 256, 3) };
+        let type_key = vec![0xFFu8; 32];
+        for (b0, tag) in [(0x00u8, 0xA1u8), (0x04, 0xB2), (0xFC, 0xC3)] {
+            let mut data_addr = [0u8; 32];
+            data_addr[0] = b0;
+            data_addr[31] = tag;
+            let mut vk = quil.to_vec();
+            vk.extend_from_slice(&data_addr);
+            let blob = vertex_blob(&[(&type_key, b"token:Coin")]);
+            hg.save_vertex_underlying("vertex", "adds", &app_key, &vk, &blob).unwrap();
+        }
+
+        // Precondition: BOTH legacy enumeration sources are empty, so the pre-fix
+        // consolidation (alt-shard ∪ recent-commits) would never reach QUIL.
+        assert!(
+            HypergraphStore::range_alt_shard_addresses(&hg).unwrap().is_empty(),
+            "QUIL is NOT in the alt-shard index (historical, prover-only recent writes)"
+        );
+        assert!(
+            HypergraphStore::get_root_commits(&hg, 0).unwrap().is_empty(),
+            "no recent shard commit lists QUIL"
+        );
+
+        // The QUIL grid IS registered in the shards store as a multi-prefix split.
+        let shdb = RocksDb::open_in_memory().unwrap();
+        let shards_store = RocksShardsStore::new(shdb.inner());
+        let mut sk35 = Vec::with_capacity(35);
+        sk35.extend_from_slice(&app_key.l1);
+        sk35.extend_from_slice(&quil);
+        {
+            let txn = shdb.new_batch(false).unwrap();
+            for p in [0u32, 1, 63] {
+                shards_store
+                    .put_app_shard(
+                        txn.as_ref(),
+                        &ShardInfo {
+                            shard_key: sk35.clone(),
+                            prefix: vec![p],
+                            size: Vec::new(),
+                            data_shards: 0,
+                            commitment: Vec::new(),
+                        },
+                    )
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        // REGRESSION GUARD: with an EMPTY grid, QUIL is enumerated by NONE of the
+        // three sources → nothing is consolidated. This is the pre-fix behavior.
+        {
+            let empty_shdb = RocksDb::open_in_memory().unwrap();
+            let empty_store = RocksShardsStore::new(empty_shdb.inner());
+            let n = run_unified_consolidation_in_place(&hg, &empty_store, 0, 0).unwrap();
+            assert_eq!(n, 0, "without the grid source QUIL is missed — the empty-app-tree bug");
+        }
+
+        // THE FIX: the grid source enumerates QUIL and folds it into ONE app tree.
+        let n = run_unified_consolidation_in_place(&hg, &shards_store, 0, 0).unwrap();
+        assert_eq!(n, 1, "QUIL enumerated via the grid and consolidated");
+
+        // The app tree is now POPULATED (was [0;32] = empty before the fold).
+        let forest = Forest::with_namespace(src_db.clone(), quil_store::FOREST_NAMESPACE.to_vec());
+        let vadds_root = forest.app_subtree_root(&quil, Phase::VertexAdds, 0, &[]).unwrap();
+        assert_ne!(vadds_root, [0u8; 32], "unified app tree is non-empty after the fold");
+
+        // A seeded vertex proves DIRECTLY against the unified app root (shard =
+        // subtree at the empty prefix) — the leaf really landed in the app tree.
+        let mut probe = [0u8; 32];
+        probe[0] = 0xFC;
+        probe[31] = 0xC3;
+        let expected =
+            quil_tries::vertex_leaf_value(&vertex_blob(&[(&type_key, b"token:Coin")])).unwrap();
+        let (val, proof) = forest
+            .shard_phase_get_with_proof_raw(&quil, Phase::VertexAdds, 0, &probe)
+            .unwrap();
+        assert_eq!(val.as_deref(), Some(&expected[..]));
+        proof
+            .verify_existence(
+                jmt::RootHash(vadds_root),
+                quil_forest::shard_path_key_hash(&probe),
+                &expected,
+            )
+            .expect("folded leaf verifies against the unified app root");
     }
 
     #[test]

@@ -24,6 +24,20 @@ impl RocksShardsStore {
     pub fn new(db: Arc<rocksdb::DB>) -> Self {
         Self { db }
     }
+
+    /// Compact the pending-shard-change keyspace to drop accumulated deletion
+    /// tombstones. `all_pending_shard_changes` range-scans this narrow prefix
+    /// EVERY frame; over the chain's life many pending changes are created and
+    /// deleted (split/merge/leave at E+2, plus reset/fork churn), and the
+    /// uncompacted tombstones make that scan cost seconds even when 0 live entries
+    /// remain — which shows up as a per-frame materialize floor. The range is a
+    /// 2-byte prefix, so this is cheap; call once on boot.
+    pub fn compact_pending_changes(&self) {
+        let lower = [SHARD, PENDING_SHARD_CHANGE];
+        let upper = [SHARD, PENDING_SHARD_CHANGE + 1];
+        self.db
+            .compact_range(Some(lower.as_slice()), Some(upper.as_slice()));
+    }
 }
 
 /// Build the RocksDB key for an app shard entry.

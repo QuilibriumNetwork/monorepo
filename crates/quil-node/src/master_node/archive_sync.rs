@@ -2437,6 +2437,22 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 local_prover_address: sync_pa.to_vec(),
                                                 resolve_peer,
                                                 storage_directory: sync_cw_storage_dir.clone(),
+                                                // Route vote-time FORK detection to
+                                                // the SAME materializer flag the
+                                                // reconcile loop reads (`sync_mat` is
+                                                // a clone of this Arc), so a fork that
+                                                // halts consensus still wakes the
+                                                // archive prover-tree reconcile.
+                                                on_prover_fork: frame_materializer
+                                                    .clone()
+                                                    .map(|fm| {
+                                                        std::sync::Arc::new(move |declared: Vec<u8>| {
+                                                            fm.flag_prover_root_mismatch(declared)
+                                                        })
+                                                            as std::sync::Arc<
+                                                                dyn Fn(Vec<u8>) + Send + Sync,
+                                                            >
+                                                    }),
                                             };
                                             // NOTE: deliberately NO journal reset here. Resetting
                                             // the global journal on a re-seed/head change discards
@@ -2563,7 +2579,44 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                      reconciling via peer prover-tree sync"
                                 );
                             }
-                            if let Some(addr) = sync_pool.get_all().await.first() {
+                            // DETERMINISTIC CONVERGENCE TARGET + TRY EVERY PEER.
+                            // Pin to the latest FINALIZED frame's
+                            // prover_tree_commitment — a single value every archive
+                            // reads identically from its durable clock store (the
+                            // frame carried a QC, so it is an agreed anchor) — and try
+                            // ALL peers, not just `.first()`. A same-lineage peer (on
+                            // this node's own fork) refuses (Ok(false)); we keep going
+                            // until a peer on the finalized lineage converges. The old
+                            // `.first()` + EMPTY expected-root just re-pulled a
+                            // same-lineage peer every cycle (no-op — the local root
+                            // never moved, `match_ok=true` but nothing changed), so a
+                            // forked archive never crossed to the finalized lineage.
+                            // Archive-only branch (regulars never reach here). Still
+                            // trusts archives are honest — the durable safeguard is #1
+                            // (verify prover root BEFORE signing), which HALTS a future
+                            // fork rather than letting it persist silently.
+                            // Target the DECLARED root #1 is nullifying against (the
+                            // proposers' lineage, set via the FORK callback) — a
+                            // forked OUTLIER must converge to the proposers, whose
+                            // root NO local finalized header holds (exactly the
+                            // "no reachable peer holds the finalized prover root"
+                            // case we hit). Fall back to the latest-finalized
+                            // commitment when no fork target is recorded yet
+                            // (bootstrap / healthy node).
+                            let expected_root = sync_mat
+                                .as_ref()
+                                .and_then(|m| m.fork_target_root())
+                                .filter(|r| !r.is_empty())
+                                .or_else(|| {
+                                    sync_cs
+                                        .get_latest_global_frame()
+                                        .ok()
+                                        .and_then(|f| f.header.map(|h| h.prover_tree_commitment))
+                                })
+                                .unwrap_or_default();
+                            let reconcile_peers = sync_pool.get_all().await;
+                            let mut reconcile_converged = false;
+                            for addr in reconcile_peers.iter() {
                                 // Snapshot the local reward balance before the
                                 // sync pulls fresh leaves. Compared against the
                                 // post-sync balance to surface credits that
@@ -2572,45 +2625,19 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 let pre_balance = quil_execution::global_intrinsic::prover_shard_update::
                                     read_reward_balance_for(&sync_crdt, &sync_pa)
                                     .unwrap_or_else(|_| num_bigint::BigInt::from(0));
-                                // Pin the sync to the latest verified
-                                // frame's prover_tree_commitment.
-                                // Without this, a malicious archive
-                                // could serve a self-consistent fake
-                                // snapshot at any root — the post-sync
-                                // server-claim match only proves
-                                // internal consistency, not authority.
-                                //
-                                // TEMPORARY ESCAPE (archive<->archive only): when the
-                                // whole archive set has FORKED, every archive's local
-                                // prover root differs from the header lineage, so pinning
-                                // to the header root makes the peer sync refuse forever
-                                // (`peer root != header-committed root`) and the fork
-                                // never heals. Archives are trusted (not malicious) and
-                                // the durable safeguard is verifying the prover root at
-                                // consensus BEFORE signing (so a future fork HALTS instead
-                                // of silently persisting). So for a diverged ARCHIVE in
-                                // mismatch-recovery, reconcile with an EMPTY expected root
-                                // = trust the peer's snapshot, letting the archive set
-                                // converge to a common tree. Regulars keep the hard pin.
-                                // Remove once consensus verifies the prover root (#1).
-                                let expected_root = if sync_archive_mode && mismatch_recovery {
-                                    Vec::new()
-                                } else {
-                                    sync_cs
-                                        .get_latest_global_frame()
-                                        .ok()
-                                        .and_then(|f| f.header.map(|h| h.prover_tree_commitment))
-                                        .unwrap_or_default()
-                                };
-                                // Forest sync of the global prover shard, pinned
-                                // to the latest verified frame's
-                                // prover_tree_commitment (empty ⇒ trust). Pulls
-                                // the commitment diff + changed vertices' blobs.
+                                // Forest sync of the global prover shard, pinned to the
+                                // finalized prover_tree_commitment. A peer whose tree
+                                // does not match it returns Ok(false) → try the next.
                                 match crate::forest_sync::sync_single_shard_verified(
                                     addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &expected_root,
                                 ).await {
                                     Ok(converged) => {
-                                        info!(match_ok = converged, "incremental prover tree sync complete");
+                                        if !converged {
+                                            debug!(peer = %addr, "reconcile: peer not on finalized lineage — trying next");
+                                            continue;
+                                        }
+                                        reconcile_converged = true;
+                                        info!(peer = %addr, match_ok = converged, "incremental prover tree sync complete");
                                         // Refresh registry with updated data.
                                         let pr = sync_pr.clone();
                                         let hs3 = sync_hg.clone();
@@ -2637,6 +2664,19 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     .and_then(|f| f.header.map(|h| h.frame_number))
                                                     .unwrap_or(0);
                                                 m.set_prover_root_synced(true, vf);
+                                                // BRIDGE THE FOREST SYNC TO THE VOTE GATE. The
+                                                // trust-sync updated the forest TREE, but #1 (the
+                                                // vote seam) and the producer read the IN-MEMORY
+                                                // `prover_root_by_frame[head]` recorded at
+                                                // materialize time — the STALE forked value the
+                                                // reconcile does NOT touch. Without re-seeding it
+                                                // the sync converges every 5 min (match_ok=true)
+                                                // yet #1 keeps nullifying on the old root and the
+                                                // halt never clears. `record_current_prover_root`
+                                                // re-records that entry from the freshly-synced
+                                                // LIVE forest root, so the vote gate now sees the
+                                                // converged root and consensus can resume.
+                                                m.record_current_prover_root();
                                                 // SHARD/CURSOR CONSISTENCY. The reconcile just
                                                 // pulled the global prover shard to the head's
                                                 // (QC'd) prover_tree_commitment. If the durable
@@ -2701,9 +2741,18 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         // startup failed, the lifecycle gate stayed
                                         // held. Unblock it now that we have data.
                                         sync_pl.set_sync_complete();
+                                        break; // converged onto the finalized lineage — stop trying peers
                                     }
-                                    Err(e) => warn!(error = %e, "incremental prover tree sync failed"),
+                                    Err(e) => {
+                                        warn!(peer = %addr, error = %e, "incremental prover tree sync failed — trying next peer");
+                                    }
                                 }
+                            }
+                            if !reconcile_converged {
+                                warn!(
+                                    peers = reconcile_peers.len(),
+                                    "reconcile: no reachable peer holds the finalized prover root this round — will retry next cycle"
+                                );
                             }
                         }
                         _ = sync_token.cancelled() => break,

@@ -88,8 +88,16 @@ pub(crate) fn init(
     // shard_keys against archives. A second `Arc<dyn ShardsStore>`
     // is built later for the gRPC server's `GetAppShards` handler;
     // both share the same underlying RocksDB column family.
+    let shards_store_concrete = quil_store::RocksShardsStore::new(db_arc.inner());
+    // One-time boot compaction of the pending-shard-change keyspace: drop the
+    // deletion tombstones accumulated over the chain's life (create+delete of a
+    // pending change on every split/merge/leave at E+2, plus reset/fork churn).
+    // `all_pending_shard_changes` range-scans this prefix EVERY frame on the
+    // materialize hot path, and the uncompacted tombstones make it cost seconds
+    // even with 0 live entries. Cheap (2-byte prefix).
+    shards_store_concrete.compact_pending_changes();
     let shards_store: Arc<dyn quil_types::store::ShardsStore> =
-        Arc::new(quil_store::RocksShardsStore::new(db_arc.inner()));
+        Arc::new(shards_store_concrete);
     let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
 
     // Check latest stored frame

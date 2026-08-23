@@ -1761,10 +1761,29 @@ impl HypergraphCrdt {
         };
         let forest = self.forest.read().unwrap();
         let resolved = self.resolve_phase_version_with(&forest, app, phase_idx);
-        let ver = resolved.unwrap_or(0);
+        // Fall back to the global forest version — NOT 0 — exactly like
+        // `read_shard_phase_root`. The unified app tree's version is often not
+        // tracked under the app-address key (no phase_versions entry / head
+        // marker), so `resolve` returns None; reading at version 0 sees an EMPTY
+        // tree (leaf_count 0 → empty-split guard → NO split ever proposed), while
+        // the forest version reads the real committed state.
+        let ver = resolved.unwrap_or_else(|| self.forest_version.load(Ordering::SeqCst));
         let parent_leaves = forest
             .app_subtree_leaf_count(app, PHASES[phase_idx], ver, shard_bits)
             .unwrap_or(0);
+        // DIAGNOSTIC: whole-tree leaf count at `ver` (empty bit-path) distinguishes
+        // a VERSION problem (whole_tree==0 ⇒ the app tree is empty at `ver`, data
+        // lives at a different version) from a BIT-PATH problem (whole_tree>0 but
+        // parent_leaves==0 ⇒ data present but not under `shard_bits`). Plus the
+        // persisted head version for the app-address key and the raw forest_version.
+        let whole_tree_leaves = forest
+            .app_subtree_leaf_count(app, PHASES[phase_idx], ver, &[])
+            .unwrap_or(u64::MAX);
+        let head_ver_app = forest
+            .read_head_version(app, PHASES[phase_idx])
+            .ok()
+            .flatten();
+        let forest_ver = self.forest_version.load(Ordering::SeqCst);
         let bifurcation = forest
             .first_split_bifurcation(app, PHASES[phase_idx], ver, shard_bits, max_extra_bits)
             .ok()
@@ -1781,7 +1800,10 @@ impl HypergraphCrdt {
             phase_idx,
             resolved_version = ?resolved,
             used_version = ver,
+            forest_version = forest_ver,
+            head_ver_app = ?head_ver_app,
             parent_leaves,
+            whole_tree_leaves,
             children = bifurcation.as_ref().map(|c| c.len()).unwrap_or(0),
             "split-proposer: bifurcation probe"
         );
