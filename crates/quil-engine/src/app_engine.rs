@@ -1727,17 +1727,51 @@ impl AppConsensusEngine {
             warn!(core_id = self.core_id, "app-shard bootstrap: validator not ready");
             return false;
         };
-        if !matches!(validate_app_frame_panic_safe(validator, &anchor, false), Ok(true)) {
-            warn!(core_id = self.core_id, frame = anchor_n, "app-shard bootstrap: archive anchor failed validation");
-            return false;
+        match validate_app_frame_panic_safe(validator, &anchor, false) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    core_id = self.core_id,
+                    frame = anchor_n,
+                    global_frame = anchor.header.as_ref().map(|h| h.global_frame_number),
+                    signature_present = anchor.header.as_ref().and_then(|h| h.public_key_signature_bls48581.as_ref()).is_some(),
+                    "app-shard bootstrap: archive anchor validation returned false"
+                );
+                return false;
+            }
+            Err(error) => {
+                let header = anchor.header.as_ref().expect("checked above");
+                let signature = header.public_key_signature_bls48581.as_ref();
+                warn!(
+                    core_id = self.core_id,
+                    frame = anchor_n,
+                    global_frame = header.global_frame_number,
+                    state_root_lengths = ?header.state_roots.iter().map(Vec::len).collect::<Vec<_>>(),
+                    signature_present = signature.is_some(),
+                    signature_len = signature.map(|s| s.signature.len()),
+                    bitmask_len = signature.map(|s| s.bitmask.len()),
+                    storage_attestation_root_len = header.storage_attestation_root.len(),
+                    error = %error,
+                    "app-shard bootstrap: archive anchor validation failed"
+                );
+                return false;
+            }
         }
         if synced_to == 0 {
             return true;
         }
         let predecessor = predecessor.expect("non-genesis chain checked above");
-        if !matches!(validate_app_frame_panic_safe(validator, &predecessor, false), Ok(true)) {
-            warn!(core_id = self.core_id, frame = synced_to, "app-shard bootstrap: predecessor failed validation");
-            return false;
+        match validate_app_frame_panic_safe(validator, &predecessor, false) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(core_id = self.core_id, frame = synced_to, "app-shard bootstrap: predecessor validation returned false");
+                return false;
+            }
+            Err(error) => {
+                warn!(core_id = self.core_id, frame = synced_to, error = %error,
+                    "app-shard bootstrap: predecessor validation failed");
+                return false;
+            }
         }
         self.commit_shard_clock_head(&predecessor, synced_to);
         self.reconcile_with_sync(synced_to).await;
