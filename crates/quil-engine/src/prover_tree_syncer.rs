@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 use quil_types::error::Result;
+use quil_types::proto::global::AppShardFrame;
 
 /// Syncs the global prover tree (vertex-adds set for the global
 /// intrinsic address) from an archive. Returns `true` if the
@@ -38,5 +39,11 @@ pub trait ProverTreeSyncer: Send + Sync {
     /// sync.
     async fn sync_shard_tree(&self, _filter: &[u8], _expected_roots: &[Vec<u8>]) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Fetch an app-shard frame from an archive. `frame_number == 0` requests
+    /// the latest frame and is used to seed an empty worker's clock lineage.
+    async fn get_app_shard_frame(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<AppShardFrame>> {
+        Ok(None)
     }
 }

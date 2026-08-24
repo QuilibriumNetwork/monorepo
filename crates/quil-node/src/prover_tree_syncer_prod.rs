@@ -334,4 +334,19 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
         );
         self.sync_single_shard(l2.to_vec(), expected_roots).await
     }
+
+    async fn get_app_shard_frame(
+        &self,
+        filter: &[u8],
+        frame_number: u64,
+    ) -> Result<Option<quil_types::proto::global::AppShardFrame>> {
+        let addr = self.resolve_addr().await;
+        let mut client = ArchiveClient::connect_mtls(&addr, &self.falcon_signing_key)
+            .await
+            .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
+        client
+            .get_app_shard_frame(filter.to_vec(), frame_number)
+            .await
+            .map_err(|e| QuilError::Internal(format!("get app-shard frame: {e}")))
+    }
 }

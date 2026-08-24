@@ -71,6 +71,14 @@ pub enum AppEngineMessage {
     /// so the gap would re-fire forever and later-arriving full frames
     /// could be re-applied on top of the already-synced tree.
     ShardSyncCompleted { synced_to_frame: u64 },
+    /// A worker with no local app-shard clock head fetched an archive anchor and
+    /// synced its tree to that anchor's pre-state. The engine validates the
+    /// certified frames, installs the predecessor as its local clock head, then
+    /// restarts simplex from that lineage.
+    ShardBootstrapCompleted {
+        anchor: quil_types::proto::global::AppShardFrame,
+        predecessor: Option<quil_types::proto::global::AppShardFrame>,
+    },
     /// (P3 / commonware-simplex) A frame this shard's simplex engine FINALIZED
     /// (prost-encoded `AppShardFrame`). Routed from `AppSeamFinalizer::on_finalized`
     /// (which runs on the simplex engine thread) into the engine run loop so it
@@ -1696,6 +1704,82 @@ impl AppConsensusEngine {
         self.try_materialize_follower_frames().await;
     }
 
+    /// Frame N advertises state after N-1, so install certified frame N-1 as
+    /// the clock head after the worker tree has synced to N's roots.
+    async fn install_archive_bootstrap(
+        &mut self,
+        anchor: quil_types::proto::global::AppShardFrame,
+        predecessor: Option<quil_types::proto::global::AppShardFrame>,
+    ) -> bool {
+        let synced_to = match archive_bootstrap_predecessor_height(
+            &self.app_address,
+            &anchor,
+            predecessor.as_ref(),
+        ) {
+            Ok(height) => height,
+            Err(error) => {
+                warn!(core_id = self.core_id, error, "app-shard bootstrap: invalid archive chain");
+                return false;
+            }
+        };
+        let anchor_n = anchor.header.as_ref().expect("checked above").frame_number;
+        let Some(validator) = self.app_frame_validator.as_ref() else {
+            warn!(core_id = self.core_id, "app-shard bootstrap: validator not ready");
+            return false;
+        };
+        match validate_app_frame_panic_safe(validator, &anchor, false) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    core_id = self.core_id,
+                    frame = anchor_n,
+                    global_frame = anchor.header.as_ref().map(|h| h.global_frame_number),
+                    signature_present = anchor.header.as_ref().and_then(|h| h.public_key_signature_bls48581.as_ref()).is_some(),
+                    "app-shard bootstrap: archive anchor validation returned false"
+                );
+                return false;
+            }
+            Err(error) => {
+                let header = anchor.header.as_ref().expect("checked above");
+                let signature = header.public_key_signature_bls48581.as_ref();
+                warn!(
+                    core_id = self.core_id,
+                    frame = anchor_n,
+                    global_frame = header.global_frame_number,
+                    state_root_lengths = ?header.state_roots.iter().map(Vec::len).collect::<Vec<_>>(),
+                    signature_present = signature.is_some(),
+                    signature_len = signature.map(|s| s.signature.len()),
+                    bitmask_len = signature.map(|s| s.bitmask.len()),
+                    storage_attestation_root_len = header.storage_attestation_root.len(),
+                    error = %error,
+                    "app-shard bootstrap: archive anchor validation failed"
+                );
+                return false;
+            }
+        }
+        if synced_to == 0 {
+            return true;
+        }
+        let predecessor = predecessor.expect("non-genesis chain checked above");
+        match validate_app_frame_panic_safe(validator, &predecessor, false) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(core_id = self.core_id, frame = synced_to, "app-shard bootstrap: predecessor validation returned false");
+                return false;
+            }
+            Err(error) => {
+                warn!(core_id = self.core_id, frame = synced_to, error = %error,
+                    "app-shard bootstrap: predecessor validation failed");
+                return false;
+            }
+        }
+        self.commit_shard_clock_head(&predecessor, synced_to);
+        self.reconcile_with_sync(synced_to).await;
+        info!(core_id = self.core_id, anchor_frame = anchor_n, synced_to,
+            "app-shard bootstrap installed archive predecessor and synced pre-state");
+        true
+    }
+
     /// (B) At the moment this worker's anchored global frame reaches the unified
     /// cutover, fold its covered app's pre-cutover per-sub-shard trees into the
     /// single app.l2 tree (the consolidation hook) and flip its CRDT to unified —
@@ -1926,6 +2010,14 @@ impl AppConsensusEngine {
                         Some(AppEngineMessage::ShardSyncCompleted { synced_to_frame }) => {
                             self.reconcile_with_sync(synced_to_frame).await;
                         }
+                        Some(AppEngineMessage::ShardBootstrapCompleted { anchor, predecessor }) => {
+                            if !self.install_archive_bootstrap(anchor, predecessor).await {
+                                continue;
+                            }
+                            if let Some(old) = self.cw_handle.take() {
+                                old.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                         Some(AppEngineMessage::CwFinalizedFrame {
                             frame,
                             cert,
@@ -1946,6 +2038,17 @@ impl AppConsensusEngine {
                                     // (the block is still verified at `verify`, so this
                                     // is authorization/DoS hardening, not a safety hole).
                                     if quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&from).is_some() {
+                                        if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data.as_slice()) {
+                                            if let Some(header) = frame.header.as_ref() {
+                                                let cursor = self.shard_mat_frame.load(std::sync::atomic::Ordering::Relaxed);
+                                                if header.frame_number > cursor.saturating_add(1) {
+                                                    let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
+                                                        filter: self.filter.clone(),
+                                                        missing_frames: vec![cursor.saturating_add(1)],
+                                                    });
+                                                }
+                                            }
+                                        }
                                         (h.ingest_block)(data);
                                     } else {
                                         tracing::debug!(
@@ -3565,6 +3668,39 @@ impl AppConsensusEngine {
     }
 }
 
+/// Verify the structural relation between an archive anchor N and its required
+/// predecessor N-1. Certificate validation remains in `install_archive_bootstrap`;
+/// keeping this portion pure makes the fail-closed bootstrap boundary testable.
+fn archive_bootstrap_predecessor_height(
+    app_address: &[u8],
+    anchor: &quil_types::proto::global::AppShardFrame,
+    predecessor: Option<&quil_types::proto::global::AppShardFrame>,
+) -> std::result::Result<u64, &'static str> {
+    let anchor_header = anchor.header.as_ref().ok_or("anchor has no header")?;
+    if anchor_header.frame_number == 0 {
+        return Err("anchor is genesis");
+    }
+    if anchor_header.address != app_address || anchor_header.state_roots.len() != 4 {
+        return Err("malformed or wrong-shard anchor");
+    }
+    let synced_to = anchor_header.frame_number - 1;
+    if synced_to == 0 {
+        return Ok(0);
+    }
+    let predecessor = predecessor.ok_or("archive omitted predecessor")?;
+    let previous_header = predecessor.header.as_ref().ok_or("predecessor has no header")?;
+    if previous_header.address != app_address || previous_header.frame_number != synced_to {
+        return Err("non-contiguous or wrong-shard predecessor");
+    }
+    let expected_parent = quil_crypto::poseidon::hash_bytes_to_32(&previous_header.output)
+        .map(|h| h.to_vec())
+        .map_err(|_| "invalid predecessor output")?;
+    if anchor_header.parent_selector != expected_parent {
+        return Err("anchor does not link to predecessor");
+    }
+    Ok(synced_to)
+}
+
 // =====================================================================
 // Message validation
 // =====================================================================
@@ -4057,6 +4193,67 @@ fn validate_app_frame_panic_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bootstrap_frame(
+        address: Vec<u8>,
+        frame_number: u64,
+        output: Vec<u8>,
+        parent_selector: Vec<u8>,
+    ) -> quil_types::proto::global::AppShardFrame {
+        quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                address,
+                frame_number,
+                output,
+                parent_selector,
+                state_roots: vec![vec![1], vec![2], vec![3], vec![4]],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn archive_bootstrap_accepts_contiguous_anchor_and_predecessor() {
+        let address = vec![0xaa; 32];
+        let predecessor = bootstrap_frame(address.clone(), 6, vec![0x42; 32], vec![]);
+        let parent_selector = quil_crypto::poseidon::hash_bytes_to_32(&[0x42; 32])
+            .unwrap()
+            .to_vec();
+        let anchor = bootstrap_frame(address.clone(), 7, vec![0x43; 32], parent_selector);
+
+        assert_eq!(
+            archive_bootstrap_predecessor_height(&address, &anchor, Some(&predecessor)),
+            Ok(6)
+        );
+    }
+
+    #[test]
+    fn archive_bootstrap_rejects_missing_or_unlinked_predecessor() {
+        let address = vec![0xbb; 32];
+        let predecessor = bootstrap_frame(address.clone(), 6, vec![0x42; 32], vec![]);
+        let anchor = bootstrap_frame(address.clone(), 7, vec![0x43; 32], vec![0; 32]);
+
+        assert_eq!(
+            archive_bootstrap_predecessor_height(&address, &anchor, None),
+            Err("archive omitted predecessor")
+        );
+        assert_eq!(
+            archive_bootstrap_predecessor_height(&address, &anchor, Some(&predecessor)),
+            Err("anchor does not link to predecessor")
+        );
+    }
+
+    #[test]
+    fn archive_bootstrap_allows_first_frame_without_predecessor() {
+        let address = vec![0xcc; 32];
+        let anchor = bootstrap_frame(address.clone(), 1, vec![0x42; 32], vec![]);
+
+        assert_eq!(
+            archive_bootstrap_predecessor_height(&address, &anchor, None),
+            Ok(0)
+        );
+    }
 
     /// Go parity (`app_consensus_engine.go:718`): core 0 → `db.path`; worker
     /// core N → `worker_paths[N-1]` else `worker_path_prefix` (`%d`→N); empty

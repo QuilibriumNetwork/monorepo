@@ -725,25 +725,64 @@ impl ThreadWorkerManager {
                                                                         .ok()
                                                                         .and_then(|f| f.header)
                                                                         .map(|h| (h.frame_number, h.state_roots));
-                                                                    let (pinned_frame, expected_roots) = match latest {
-                                                                        Some((n, r)) => (n, r),
-                                                                        None => {
-                                                                            sync_in_progress.store(false, std::sync::atomic::Ordering::SeqCst);
-                                                                            continue;
-                                                                        }
-                                                                    };
-                                                                    let synced_to_frame = pinned_frame.saturating_sub(1);
                                                                     let lb = loopback_handle.clone();
                                                                     let flag = sync_in_progress.clone();
                                                                     let f = filter.clone();
                                                                     tokio::spawn(async move {
-                                                                        match syncer.sync_shard_tree(&f, &expected_roots).await {
-                                                                            Ok(true) => {
-                                                                                tracing::info!(filter = %hex::encode(&f), synced_to_frame, "app-shard catch-up sync converged");
-                                                                                lb.send(crate::app_engine::AppEngineMessage::ShardSyncCompleted { synced_to_frame });
+                                                                        match latest {
+                                                                            Some((pinned_frame, expected_roots)) => {
+                                                                                let synced_to_frame = pinned_frame.saturating_sub(1);
+                                                                                match syncer.sync_shard_tree(&f, &expected_roots).await {
+                                                                                    Ok(true) => {
+                                                                                        tracing::info!(filter = %hex::encode(&f), synced_to_frame, "app-shard catch-up sync converged");
+                                                                                        lb.send(crate::app_engine::AppEngineMessage::ShardSyncCompleted { synced_to_frame });
+                                                                                    }
+                                                                                    Ok(false) => tracing::warn!(filter = %hex::encode(&f), "app-shard catch-up sync did not converge"),
+                                                                                    Err(e) => tracing::warn!(filter = %hex::encode(&f), error = %e, "app-shard catch-up sync failed"),
+                                                                                }
                                                                             }
-                                                                            Ok(false) => tracing::warn!(filter = %hex::encode(&f), "app-shard catch-up sync did not converge"),
-                                                                            Err(e) => tracing::warn!(filter = %hex::encode(&f), error = %e, "app-shard catch-up sync failed"),
+                                                                            None => {
+                                                                                let anchor = match syncer.get_app_shard_frame(&f, 0).await {
+                                                                                    Ok(Some(frame)) => frame,
+                                                                                    Ok(None) => {
+                                                                                        tracing::warn!(filter = %hex::encode(&f), "app-shard bootstrap: archive has no frame");
+                                                                                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                                        return;
+                                                                                    }
+                                                                                    Err(e) => {
+                                                                                        tracing::warn!(filter = %hex::encode(&f), error = %e, "app-shard bootstrap: anchor fetch failed");
+                                                                                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                                        return;
+                                                                                    }
+                                                                                };
+                                                                                let Some(header) = anchor.header.as_ref() else {
+                                                                                    tracing::warn!(filter = %hex::encode(&f), "app-shard bootstrap: archive anchor has no header");
+                                                                                    flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                                    return;
+                                                                                };
+                                                                                let anchor_frame = header.frame_number;
+                                                                                let expected_roots = header.state_roots.clone();
+                                                                                let predecessor = if anchor_frame > 1 {
+                                                                                    match syncer.get_app_shard_frame(&f, anchor_frame - 1).await {
+                                                                                        Ok(frame) => frame,
+                                                                                        Err(e) => {
+                                                                                            tracing::warn!(filter = %hex::encode(&f), frame = anchor_frame, error = %e, "app-shard bootstrap: predecessor fetch failed");
+                                                                                            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                                            return;
+                                                                                        }
+                                                                                    }
+                                                                                } else {
+                                                                                    None
+                                                                                };
+                                                                                match syncer.sync_shard_tree(&f, &expected_roots).await {
+                                                                                    Ok(true) => {
+                                                                                        tracing::info!(filter = %hex::encode(&f), anchor_frame, "app-shard bootstrap tree sync converged");
+                                                                                        lb.send(crate::app_engine::AppEngineMessage::ShardBootstrapCompleted { anchor, predecessor });
+                                                                                    }
+                                                                                    Ok(false) => tracing::warn!(filter = %hex::encode(&f), "app-shard bootstrap tree sync did not converge"),
+                                                                                    Err(e) => tracing::warn!(filter = %hex::encode(&f), error = %e, "app-shard bootstrap tree sync failed"),
+                                                                                }
+                                                                            }
                                                                         }
                                                                         flag.store(false, std::sync::atomic::Ordering::SeqCst);
                                                                     });
