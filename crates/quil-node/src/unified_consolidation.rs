@@ -24,7 +24,15 @@ use tracing::{info, warn};
 /// Marker key in the hypergraph RocksDB recording that the one-time
 /// split→app-tree consolidation has completed. Its presence makes the boot
 /// consolidation a no-op.
-const MARKER_KEY: &[u8] = b"\x00__quil_unified_consolidated_v1__";
+///
+/// VERSIONED: bump the suffix whenever the consolidation LOGIC changes so every
+/// node re-runs the fold exactly once (idempotent — content-addressed JMT). v1→v2
+/// (2026-08-24): v1 enumerated apps only from the alt-shard index ∪ recent-commit
+/// window, which MISSED QUIL (historical, prover-only recent writes) → its unified
+/// app tree was left EMPTY and splits could never see data. v2 also enumerates the
+/// GRID (`range_app_shards`), folding QUIL in. Nodes stamped v1 must re-run, so the
+/// check keys on v2 and the stale v1 key is ignored.
+const MARKER_KEY: &[u8] = b"\x00__quil_unified_consolidated_v2__";
 
 /// Whether the one-time consolidation has already run on this store.
 pub fn is_consolidated(hg: &quil_store::RocksHypergraphStore) -> bool {
