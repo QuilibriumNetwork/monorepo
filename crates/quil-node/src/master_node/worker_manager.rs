@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -8,6 +9,42 @@ use quil_keys::KeyManager as _;
 use quil_types::store::ClockStore as _;
 
 use quil_lifecycle::Supervisor;
+
+/// Restore persisted local workers and recreate any configured core that is
+/// absent from the in-memory pool.
+///
+/// An empty filter is an idle worker slot, not an absent worker. Restoring only
+/// filtered records followed by all-or-nothing preallocation loses those idle
+/// slots after the first restart.
+fn restore_and_fill_worker_pool(
+    worker_manager: &dyn quil_engine::worker::WorkerManager,
+    persisted: &[quil_types::store::PersistedWorkerInfo],
+    expected_worker_count: u32,
+) -> quil_types::error::Result<(usize, usize)> {
+    let mut restored = 0;
+    for entry in persisted {
+        // This deliberately also spawns records with an empty filter: they are
+        // idle workers which must remain available for later allocations.
+        worker_manager.set_worker_filter(entry.core_id, &entry.filter, false)?;
+        if entry.manually_managed {
+            worker_manager.set_manually_managed(entry.core_id, true)?;
+        }
+        if entry.pending_filter_frame > 0 {
+            worker_manager.set_pending_filter_frame(entry.core_id, entry.pending_filter_frame)?;
+        }
+        restored += 1;
+    }
+
+    let connected: HashSet<u32> = worker_manager.check_workers_connected()?.into_iter().collect();
+    let mut created = 0;
+    for core_id in 1..=expected_worker_count {
+        if !connected.contains(&core_id) {
+            worker_manager.allocate_worker(core_id, &[])?;
+            created += 1;
+        }
+    }
+    Ok((restored, created))
+}
 
 /// Mirror a finalized `AppShardFrame` (canonical `frame_data`) into the master
 /// clock store so the store-backed `AppShardService::get_app_shard_frame` serves
@@ -889,50 +926,24 @@ pub(crate) fn init(
             } else {
                 thread_mgr.load_all_persisted()
             };
-            if !persisted.is_empty() {
-                info!(
-                    count = persisted.len(),
-                    "restoring persisted worker state from store"
-                );
-                for entry in persisted {
-                    // Resurrect the binding (filter pinned, no
-                    // consensus engine yet — `worker_allocator` will
-                    // re-attach the engine when the registry alloc
-                    // for this filter is observed Active).
-                    if !entry.filter.is_empty() {
-                        if let Err(e) = quil_engine::worker::WorkerManager::set_worker_filter(
-                            thread_mgr.as_ref(),
-                            entry.core_id,
-                            &entry.filter,
-                            false,
-                        ) {
-                            warn!(
-                                core_id = entry.core_id,
-                                error = %e,
-                                "failed to restore worker filter from store"
-                            );
-                        }
-                    }
-                    if entry.manually_managed {
-                        if let Err(e) = quil_engine::worker::WorkerManager::set_manually_managed(
-                            thread_mgr.as_ref(),
-                            entry.core_id,
-                            true,
-                        ) {
-                            warn!(
-                                core_id = entry.core_id,
-                                error = %e,
-                                "failed to restore manually_managed flag"
-                            );
-                        }
-                    }
-                    if entry.pending_filter_frame > 0 {
-                        let _ = quil_engine::worker::WorkerManager::set_pending_filter_frame(
-                            thread_mgr.as_ref(),
-                            entry.core_id,
-                            entry.pending_filter_frame,
-                        );
-                    }
+            if !archive_mode {
+                let worker_count = if config.engine.data_worker_count > 0 {
+                    config.engine.data_worker_count as u32
+                } else {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get() as u32)
+                        .unwrap_or(4)
+                        .saturating_sub(1)
+                        .max(1)
+                };
+                match restore_and_fill_worker_pool(thread_mgr.as_ref(), &persisted, worker_count) {
+                    Ok((restored, created)) => info!(
+                        workers = worker_count,
+                        restored,
+                        created,
+                        "restored and filled local worker pool"
+                    ),
+                    Err(e) => warn!(error = %e, "failed to restore and fill local worker pool"),
                 }
             }
             thread_mgr as Arc<dyn quil_engine::worker::WorkerManager>
@@ -1030,6 +1041,39 @@ pub(crate) fn init(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quil_engine::test_support::TestWorkerManager;
+    use quil_engine::worker::WorkerManager as _;
+
+    #[test]
+    fn restart_restores_idle_worker_slot_and_fills_missing_cores() {
+        // After the initial post-wipe run, core 2 is allocated and core 3 is
+        // idle. Both are persisted; restarting must retain the idle core.
+        let manager = TestWorkerManager::new();
+        let persisted = vec![
+            quil_types::store::PersistedWorkerInfo {
+                core_id: 2,
+                filter: vec![0xaa],
+                manually_managed: false,
+                allocated: true,
+                pending_filter_frame: 0,
+            },
+            quil_types::store::PersistedWorkerInfo {
+                core_id: 3,
+                filter: Vec::new(),
+                manually_managed: false,
+                allocated: false,
+                pending_filter_frame: 0,
+            },
+        ];
+
+        assert_eq!(
+            restore_and_fill_worker_pool(&manager, &persisted, 3).unwrap(),
+            (2, 1)
+        );
+        let workers = manager.range_workers().unwrap();
+        assert_eq!(workers.iter().map(|w| w.core_id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(workers.iter().find(|w| w.core_id == 3).unwrap().filter.is_empty());
+    }
 
     /// #595 regression: a fresh thread worker must install a PERSISTENT (Rocks)
     /// forest, not the CRDT's default in-memory one — otherwise the commitment
