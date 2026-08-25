@@ -400,9 +400,28 @@ pub fn bit_path_starts_with(child: &[bool], parent: &[bool]) -> bool {
 /// address (its `ConfirmationFilter` / `ShardInfo`), NOT an encoded
 /// `app ‖ bit_len ‖ packed` — so a root split's parent must be accepted as the
 /// empty-bit-path parent. Deeper shards always carry an encoded bit-path.
+///
+/// LEGACY BYTE-SUFFIX (`app ‖ level-byte`, `app_len + 1` bytes): the QUIL 64-way
+/// genesis grid registers each shard as a plain byte-suffix filter (`app ‖ [i]`,
+/// `i` in `0..64`), NOT a bit-path — too short to be `app ‖ u16 ‖ packed`. When a
+/// genesis shard takes its FIRST deep split, its parent filter arrives in this
+/// form, so decode it to the 6-bit binary of the byte (`bits_per_level = 6`,
+/// 64-way = 2^6). This is IDENTICAL to `canonical_shard_bit_paths` for the intact
+/// uniform 64-way set (prefix `[i]` → 6-bit `binary(i)`), which is exactly what
+/// the split proposer (`canonical_bits_for_prefix`) and `migrate_app_shards_to_sentinel`
+/// use — so the child-extends-parent check and the parent removal both line up.
+/// Only the intact uniform genesis grid produces a byte-suffix parent (the first
+/// deep split migrates the whole set to sentinel bit-paths), where this holds.
 pub fn decode_shard_filter_or_root(filter: &[u8], app_len: usize) -> Option<(Vec<u8>, Vec<bool>)> {
     if filter.len() == app_len {
         return Some((filter[..app_len].to_vec(), Vec::new()));
+    }
+    if filter.len() > app_len && filter.len() < app_len + SHARD_BIT_LEN_BYTES {
+        // `app ‖ level-byte(s)` legacy byte-suffix (single-byte for the QUIL
+        // 64-way genesis): 6 bits/level, MSB-first = binary of each level byte.
+        let app = filter[..app_len].to_vec();
+        let prefix: Vec<u32> = filter[app_len..].iter().map(|&b| b as u32).collect();
+        return Some((app, prefix_to_bits(&prefix, 6)));
     }
     decode_shard_bit_path(filter, app_len)
 }
@@ -991,6 +1010,47 @@ mod tests {
             }
             assert_eq!(*p, expected, "octal shard {i}");
         }
+    }
+
+    /// A QUIL genesis shard's FIRST deep split: the parent arrives as a legacy
+    /// byte-suffix filter (`app ‖ [i]`, 33 bytes) while the children are bit-path
+    /// filters. `decode_shard_filter_or_root` must decode the byte-suffix parent to
+    /// the SAME 6-bit binary the proposer/migrate use, so `shard_filter_extends`
+    /// accepts the split (the mainnet bug: byte-suffix parent → decode None →
+    /// "bit-path child must extend parent bit-path" rejection).
+    #[test]
+    fn byte_suffix_genesis_parent_decodes_and_children_extend() {
+        let app = [0x11u8; 32];
+        // Parent = QUIL genesis shard 3, byte-suffix `app ‖ 0x03` (33 bytes).
+        let mut parent = app.to_vec();
+        parent.push(0x03);
+
+        // It decodes to the 6-bit binary of 3 — identical to canonical bits for
+        // the intact uniform 64-way set.
+        let (pa, pb) = decode_shard_filter_or_root(&parent, 32).expect("byte-suffix decodes");
+        assert_eq!(pa, app.to_vec());
+        assert_eq!(pb, bits("000011"), "byte 3 → 6-bit binary");
+        let quil64: Vec<Vec<u32>> = (0..64u32).map(|i| vec![i]).collect();
+        assert_eq!(
+            canonical_shard_bit_paths(&quil64)[3],
+            bits("000011"),
+            "decode matches canonical_shard_bit_paths[3]"
+        );
+
+        // Children = 7-bit paths 0000110 / 0000111 (proposer's deep bifurcation),
+        // encoded as bit-path filters. Both must extend the parent.
+        for child_bits in [bits("0000110"), bits("0000111")] {
+            let child = encode_shard_bit_path(&app, &child_bits);
+            assert!(
+                shard_filter_extends(&child, &parent, 32),
+                "bit-path child {child_bits:?} must extend byte-suffix parent [3]"
+            );
+        }
+
+        // A child under a DIFFERENT genesis shard (shard 4 = 000100) must NOT
+        // extend parent [3] — the fix stays a bit-prefix check, not a byte one.
+        let foreign = encode_shard_bit_path(&app, &bits("0001000"));
+        assert!(!shard_filter_extends(&foreign, &parent, 32), "shard-4 child ⊄ shard-3");
     }
 
     #[test]

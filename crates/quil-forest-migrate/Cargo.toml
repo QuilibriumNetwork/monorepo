@@ -20,6 +20,8 @@ quil-execution = { path = "../quil-execution" }
 # Open the fresh destination forest DB in the run_conversion helper.
 rocksdb = { version = "0.22", default-features = false, features = ["snappy", "lz4"] }
 anyhow = "1"
+# Progress heartbeat for the (long) bounded-memory unified fold.
+tracing = "0.1"
 
 [dev-dependencies]
 # Build sample legacy trees in tests (VectorCommitmentTree::insert takes a BigInt size).
