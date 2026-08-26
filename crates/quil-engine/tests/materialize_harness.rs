@@ -454,7 +454,7 @@ fn split_fixture() -> (
         hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
         Arc::new(NoopInclusionProver),
     ));
-    let state = quil_execution::hypergraph_state::HypergraphState::new(crdt);
+    let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
     let registry = Arc::new(quil_execution::prover_registry::SharedProverRegistry::new());
 
     let gi = quil_execution::global_intrinsic::intrinsic::GlobalIntrinsic::new_with_stores(
@@ -467,6 +467,15 @@ fn split_fixture() -> (
     .with_frame_header_deps(
         registry.clone() as Arc<dyn ProverRegistry>,
         Arc::new(quil_engine::rewards::OptRewardIssuance),
+    )
+    // The active-global-prover gate reads COMMITTED state, and skips itself
+    // entirely when the hypergraph slot is empty (followers trust the finalized
+    // frame's QC instead). Without this the authorization check below is vacuous
+    // and a non-global proposer is accepted.
+    .with_kick_verify_deps(
+        Arc::new(quil_crypto::FalconKeyConstructor),
+        crdt.clone(),
+        Arc::new(NoopInclusionProver),
     );
 
     (gi, state, shards_store, registry, hg_store)
@@ -502,8 +511,17 @@ fn seed_global_prover(
     let mut vkp = vec![0xFFu8; 32];
     vkp.extend_from_slice(&prover_addr);
     hg_store.save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vkp, &prover_blob).unwrap();
+    // The gate looks the allocation up at `allocation_address(pubkey, <empty>)`,
+    // not at an arbitrary flat key: `verify_shard_op_signer_is_active_global`
+    // reads the signer's PublicKey out of the prover tree and derives the
+    // GLOBAL-filter allocation address from it. Seeding elsewhere makes a global
+    // prover unfindable; deriving it from this prover's own filter is what makes
+    // the non-global case miss (and so be rejected).
+    let alloc_addr =
+        quil_execution::global_intrinsic::materialize::allocation_address(pubkey, filter).unwrap();
+    let _ = alloc_flat_byte;
     let mut vka = vec![0xFFu8; 32];
-    vka.extend_from_slice(&[alloc_flat_byte; 32]);
+    vka.extend_from_slice(&alloc_addr);
     hg_store.save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vka, &alloc_blob).unwrap();
     txn.commit().unwrap();
     registry.refresh_from_store(hg_store);
@@ -623,9 +641,15 @@ fn shard_split_by_global_prover_registers_enumerable_child_and_rejects_non_globa
         let proposer = seed_global_prover(&state, &hg_store, &registry, &vec![0xEEu8; 57], 0xAA, &vec![0x33u8; 64]);
         let bytes = shard_split_bytes(&shard_address, &proposer);
         let res = gi.invoke_step(1, &bytes, &state);
+        let err = res.expect_err("a non-global proposer must be rejected (proposer_is_active_global)");
+        // Pin the REASON, not just the rejection: without this the test passes
+        // just as well when the op is refused for an unrelated reason (a bad
+        // signature, a missing prover vertex), which is how the authorization
+        // dimension went silently inert once the gate moved to committed state.
+        let msg = err.to_string();
         assert!(
-            res.is_err(),
-            "a non-global proposer must be rejected (proposer_is_active_global)"
+            msg.contains("not an active global prover"),
+            "expected the active-global-prover gate to reject, got: {msg}"
         );
         assert!(
             shards_store.range_app_shards().unwrap().is_empty(),
