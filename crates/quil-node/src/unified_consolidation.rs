@@ -51,6 +51,24 @@ pub fn boot_reset_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
     hg.raw_db().get(BOOT_RESET_MARKER_KEY).ok().flatten().is_some()
 }
 
+/// Marker recording that the SECOND coordinated grid reset (grid-reset v2, mainnet
+/// frame 740_000) has run on this node. DISTINCT from the v1 boot-reset marker so
+/// the v1 `boot_reset_applied` guard does not suppress v2, and so the v2 prover
+/// wipe runs exactly once (re-running would delete provers that re-joined after).
+const GRID_RESET_V2_MARKER_KEY: &[u8] = b"\x00__quil_grid_reset_v2__";
+
+/// Whether the grid-reset v2 prover wipe has already run on this node.
+pub fn grid_reset_v2_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
+    hg.raw_db().get(GRID_RESET_V2_MARKER_KEY).ok().flatten().is_some()
+}
+
+/// Record that grid-reset v2 has run (called after a successful v2 prover wipe).
+pub fn mark_grid_reset_v2_applied(hg: &quil_store::RocksHypergraphStore) {
+    if let Err(e) = hg.raw_db().put(GRID_RESET_V2_MARKER_KEY, [1u8]) {
+        warn!(error = %e, "grid-reset v2: marker write FAILED — may re-run if the frame re-materializes");
+    }
+}
+
 /// Apply the ENTIRE unified-tree cutover ONCE, ON BOOT — not gated on reaching a
 /// frame number. Idempotent via [`BOOT_RESET_MARKER_KEY`]. Runs BEFORE consensus
 /// starts, so the node comes up already in the reset state. Deterministic across

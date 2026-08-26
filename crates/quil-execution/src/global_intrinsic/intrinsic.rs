@@ -76,6 +76,16 @@ pub struct GlobalIntrinsic {
     /// than hardcoding mainnet's layout. Injected by the node; absent ⇒ reset
     /// no-ops (paired with [`Self::archive_prover_addresses`]).
     reset_genesis_prefixes: Option<Arc<Vec<Vec<u32>>>>,
+    /// Once-per-frame guard for [`Self::apply_due_shard_changes`]. It is called
+    /// BOTH once-per-frame standalone (`apply_global_due_shard_changes`) AND inline
+    /// per app-shard `FrameHeader` request (`invoke_frame_header`); with a backlog
+    /// of shard frames per shard the inline calls run the full pending-change
+    /// tombstone scan + reassign N times per global frame (the materialize balloon).
+    /// The due changes are frame-gated + idempotent, so the work only needs to run
+    /// once: this records the last global frame it completed for and short-circuits
+    /// any further call at the same frame. `u64::MAX` = "never run" so frame 0 still
+    /// applies. Set only on SUCCESS, so a failed/partial apply re-runs on retry.
+    last_due_apply_frame: std::sync::atomic::AtomicU64,
 }
 
 impl GlobalIntrinsic {
@@ -93,6 +103,7 @@ impl GlobalIntrinsic {
             reward_issuance: None,
             archive_prover_addresses: None,
             reset_genesis_prefixes: None,
+            last_due_apply_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -114,6 +125,7 @@ impl GlobalIntrinsic {
             reward_issuance: None,
             archive_prover_addresses: None,
             reset_genesis_prefixes: None,
+            last_due_apply_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -138,6 +150,7 @@ impl GlobalIntrinsic {
             reward_issuance: None,
             archive_prover_addresses: None,
             reset_genesis_prefixes: None,
+            last_due_apply_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -2286,7 +2299,29 @@ impl GlobalIntrinsic {
     /// `effective_epoch <= epoch_for_frame(frame_number)`, then removes it. The
     /// topology flip (put children / delete children) lands here at E+2, NOT at
     /// proposal time.
+    /// Once-per-frame wrapper (see `last_due_apply_frame`): the due-change apply is
+    /// invoked BOTH standalone once per frame AND inline per app-shard `FrameHeader`
+    /// request, so a backlog of shard frames would otherwise re-run the full
+    /// tombstone scan + reassign N times per global frame. The work is frame-gated
+    /// and idempotent, so run it once and short-circuit the rest. The flag is set
+    /// only on SUCCESS, so a failed/partial apply (frame aborts → retries) re-runs.
     pub fn apply_due_shard_changes(
+        &self,
+        frame_number: u64,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        if self.last_due_apply_frame.load(std::sync::atomic::Ordering::Relaxed) == frame_number {
+            return Ok(());
+        }
+        let result = self.apply_due_shard_changes_inner(frame_number, state);
+        if result.is_ok() {
+            self.last_due_apply_frame
+                .store(frame_number, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn apply_due_shard_changes_inner(
         &self,
         frame_number: u64,
         state: &HypergraphState,
@@ -2395,6 +2430,19 @@ impl GlobalIntrinsic {
         };
 
         let txn = db.new_batch(false)?;
+        // Live grid entries, so a STALE duplicate split — one whose parent an
+        // earlier-epoch change already removed — is SKIPPED instead of re-registering
+        // overlapping children. Seeded from committed state and updated as we apply,
+        // so a straddle that lands both the E+2 and E+3 change in ONE frame is caught
+        // too. The duplicate arises because the proposer re-emits a split every frame
+        // while the parent stays over-crowded (it never consults pending changes); a
+        // re-proposal that crosses the epoch boundary stamps a later effective_epoch
+        // (E+3), coexisting with the E+2 record — both would otherwise apply.
+        let mut live: std::collections::HashSet<(Vec<u8>, Vec<u32>)> = store
+            .range_app_shards()?
+            .into_iter()
+            .map(|r| (r.shard_key, r.prefix))
+            .collect();
         for change in &due {
             match change.kind {
                 ShardChangeKind::Split => {
@@ -2407,58 +2455,78 @@ impl GlobalIntrinsic {
                         &change.children,
                         bit_path_mode,
                     )?;
-                    tracing::info!(
-                        parent = hex::encode(&change.parent),
-                        bit_path_mode,
-                        // Total registered shards = 2 leaves + the co-path spine
-                        // (Option A); parent is removed.
-                        new_shards = output.new_shards.len(),
-                        removed_parent = output.removed_parent.is_some(),
-                        frame = frame_number,
-                        proposed_frame = change.proposed_frame,
-                        "applying shard split (E+2 flip)"
-                    );
-                    // Deep-bifurcation (b): the first deep split on an app must
-                    // convert that app's ENTIRE stored set to sentinel bit-path
-                    // prefixes (routing-preserving) so the set never goes mixed
-                    // (canonical can't resolve a mix). Idempotent + deterministic.
-                    if bit_path_mode && change.parent.len() >= 32 {
-                        materialize::migrate_app_shards_to_sentinel(
-                            store.as_ref(),
-                            txn.as_ref(),
-                            &grid_key(&change.parent[..32]),
-                        )?;
-                    }
-                    for (l2, path) in &output.new_shards {
-                        // Decode the registered sentinel prefix back to its bit-path
-                        // for observability (a deep path here proves the flip stored
-                        // the descended child, not an immediate-bit one).
-                        let bits = quil_forest::shard_bit_path_from_prefix(path);
-                        tracing::debug!(
-                            l2 = hex::encode(l2),
-                            prefix = ?path,
-                            bit_path = ?bits,
-                            "registering split child shard"
+                    // Skip a stale duplicate whose parent no longer exists in the grid
+                    // (already split by an earlier change) — applying it would layer a
+                    // DIFFERENT partition on top of the real children (overlapping
+                    // shards → provers on "both sides"). Still consume the pending
+                    // record below so it stops re-firing.
+                    let parent_in_grid = output.removed_parent.as_ref().map_or(true, |(l2, path)| {
+                        live.contains(&(grid_key(l2), path.clone()))
+                    });
+                    if !parent_in_grid {
+                        tracing::warn!(
+                            parent = hex::encode(&change.parent),
+                            effective_epoch = change.effective_epoch,
+                            proposed_frame = change.proposed_frame,
+                            frame = frame_number,
+                            "apply_due: SKIPPING stale split — parent already split (not in grid); consuming the duplicate pending record without re-registering overlapping children"
                         );
-                        let shard = ShardInfo {
-                            shard_key: grid_key(l2),
-                            prefix: path.clone(),
-                            size: Vec::new(),
-                            data_shards: 0,
-                            commitment: Vec::new(),
-                        };
-                        store.put_app_shard(txn.as_ref(), &shard)?;
-                    }
-                    // Deep-bifurcation (Option A): the parent is REPLACED by the
-                    // partition (spine + leaves) — remove it so the set stays
-                    // prefix-free (else the parent shadows its own children).
-                    if let Some((l2, path)) = &output.removed_parent {
-                        tracing::debug!(
-                            l2 = hex::encode(l2),
-                            prefix = ?path,
-                            "removing split parent shard (replaced by partition)"
+                    } else {
+                        tracing::info!(
+                            parent = hex::encode(&change.parent),
+                            bit_path_mode,
+                            // Total registered shards = 2 leaves + the co-path spine
+                            // (Option A); parent is removed.
+                            new_shards = output.new_shards.len(),
+                            removed_parent = output.removed_parent.is_some(),
+                            frame = frame_number,
+                            proposed_frame = change.proposed_frame,
+                            "applying shard split (E+2 flip)"
                         );
-                        store.delete_app_shard(txn.as_ref(), &grid_key(l2), path)?;
+                        // Deep-bifurcation (b): the first deep split on an app must
+                        // convert that app's ENTIRE stored set to sentinel bit-path
+                        // prefixes (routing-preserving) so the set never goes mixed
+                        // (canonical can't resolve a mix). Idempotent + deterministic.
+                        if bit_path_mode && change.parent.len() >= 32 {
+                            materialize::migrate_app_shards_to_sentinel(
+                                store.as_ref(),
+                                txn.as_ref(),
+                                &grid_key(&change.parent[..32]),
+                            )?;
+                        }
+                        for (l2, path) in &output.new_shards {
+                            // Decode the registered sentinel prefix back to its bit-path
+                            // for observability (a deep path here proves the flip stored
+                            // the descended child, not an immediate-bit one).
+                            let bits = quil_forest::shard_bit_path_from_prefix(path);
+                            tracing::debug!(
+                                l2 = hex::encode(l2),
+                                prefix = ?path,
+                                bit_path = ?bits,
+                                "registering split child shard"
+                            );
+                            let shard = ShardInfo {
+                                shard_key: grid_key(l2),
+                                prefix: path.clone(),
+                                size: Vec::new(),
+                                data_shards: 0,
+                                commitment: Vec::new(),
+                            };
+                            store.put_app_shard(txn.as_ref(), &shard)?;
+                            live.insert((grid_key(l2), path.clone()));
+                        }
+                        // Deep-bifurcation (Option A): the parent is REPLACED by the
+                        // partition (spine + leaves) — remove it so the set stays
+                        // prefix-free (else the parent shadows its own children).
+                        if let Some((l2, path)) = &output.removed_parent {
+                            tracing::debug!(
+                                l2 = hex::encode(l2),
+                                prefix = ?path,
+                                "removing split parent shard (replaced by partition)"
+                            );
+                            store.delete_app_shard(txn.as_ref(), &grid_key(l2), path)?;
+                            live.remove(&(grid_key(l2), path.clone()));
+                        }
                     }
                 }
                 ShardChangeKind::Merge => {
@@ -2546,7 +2614,15 @@ impl GlobalIntrinsic {
         frame_number: u64,
         state: &HypergraphState,
     ) -> Result<bool> {
-        if frame_number != super::materialize::unified_tree_cutover_frame() {
+        // Fires at the v1 unified cutover AND the v2 grid reset (mainnet 740_000).
+        // The grid reset is idempotent (delete all QUIL rows → rewrite genesis), so
+        // no marker is needed here — the exact-frame gate + idempotency make it safe
+        // even if the frame re-materializes. The prover-tree wipe that rides the same
+        // frame IS marker-guarded (it is not idempotent). See
+        // `materialize::quil_grid_reset_v2_frame`.
+        if frame_number != super::materialize::unified_tree_cutover_frame()
+            && frame_number != super::materialize::quil_grid_reset_v2_frame()
+        {
             return Ok(false);
         }
         let (Some(store), Some(db), Some(hg), Some(keep), Some(genesis_prefixes)) = (
@@ -4029,6 +4105,165 @@ mod tests {
                 "post-join Seniority must equal compat::GetAggregatedSeniority — \
                  not op.frame_number ({})",
                 frame_number,
+            );
+        }
+    }
+
+    /// Reproduction harness for the "duplicate ShardSplit re-proposal" concern:
+    /// the split proposer re-emits every frame because it never checks for an
+    /// existing pending change, so a split whose parent stays over-crowded through
+    /// epochs E and E+1 records a pending change at effective_epoch E+2 (from the
+    /// E proposals) AND E+3 (from the E+1 proposals). Both coexist (keyed by
+    /// `(effective_epoch, parent)`) and BOTH apply. This test shows exactly what
+    /// that does to the grid.
+    mod split_double_apply {
+        use super::*;
+        use crate::hypergraph_state::HypergraphState;
+        use quil_hypergraph::HypergraphCrdt;
+        use quil_types::crypto::{InclusionProver, Multiproof};
+        use quil_types::store::{
+            KvDb, PendingShardChange, ShardChangeKind, ShardInfo, ShardsStore,
+        };
+
+        struct StubProver;
+        impl InclusionProver for StubProver {
+            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
+            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
+            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
+            fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+                Err(QuilError::Internal("batch not supported".into()))
+            }
+            fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+        }
+        fn make_state() -> HypergraphState {
+            let store = Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new());
+            let crdt = Arc::new(HypergraphCrdt::new(store, Arc::new(StubProver)));
+            HypergraphState::new(crdt)
+        }
+
+        #[test]
+        fn duplicate_pending_splits_across_epochs_stale_one_is_skipped() {
+            let app = [0x11u8; 32];
+            // Parent = the app-root shard (post-cutover ⇒ bit-path mode).
+            let parent = app.to_vec();
+            let grid_key = {
+                let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3);
+                let mut k = l1.to_vec();
+                k.extend_from_slice(&app);
+                k
+            };
+
+            // Real in-memory shards store (grid + pending changes) + its KvDb.
+            let shdb = quil_store::RocksDb::open_in_memory().unwrap();
+            let store: Arc<dyn ShardsStore> =
+                Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
+
+            // Seed the parent (root) grid entry (sentinel-form empty bit-path).
+            {
+                let txn = shards_db.new_batch(false).unwrap();
+                store
+                    .put_app_shard(
+                        txn.as_ref(),
+                        &ShardInfo {
+                            shard_key: grid_key.clone(),
+                            prefix: quil_forest::bit_path_to_prefix(&[]),
+                            size: Vec::new(),
+                            data_shards: 0,
+                            commitment: Vec::new(),
+                        },
+                    )
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            // Two pending splits for the SAME parent at DIFFERENT effective epochs,
+            // with DIFFERENT children (the bifurcation shifted as data grew between
+            // E and E+1): E+2 → 1-bit split [0],[1]; E+3 → deeper split of the
+            // 0-branch [0,0],[0,1]. Both post-cutover (proposed_frame > cutover).
+            let (e2, e3) = (1002u64, 1003u64);
+            let proposed = 800_000u64; // > UNIFIED_TREE_CUTOVER_FRAME ⇒ bit_path_mode
+            let child = |bits: &[bool]| quil_forest::encode_shard_bit_path(&app, bits);
+            let changes = [
+                (e2, vec![child(&[false]), child(&[true])]),
+                (e3, vec![child(&[false, false]), child(&[false, true])]),
+            ];
+            for (epoch, children) in &changes {
+                let txn = shards_db.new_batch(false).unwrap();
+                store
+                    .put_pending_shard_change(
+                        txn.as_ref(),
+                        &PendingShardChange {
+                            kind: ShardChangeKind::Split,
+                            parent: parent.clone(),
+                            children: children.clone(),
+                            effective_epoch: *epoch,
+                            proposed_frame: proposed,
+                        },
+                    )
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+            // Both coexist — keyed by (effective_epoch, parent), so nothing dedups
+            // the duplicate re-proposal that straddled the epoch boundary.
+            assert_eq!(
+                store.all_pending_shard_changes().unwrap().len(),
+                2,
+                "duplicate splits for one parent at E+2 and E+3 COEXIST"
+            );
+
+            // Wire the intrinsic (no hypergraph/registry ⇒ reassign no-ops; this
+            // isolates the GRID topology effect).
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_shards_store(store.clone())
+                .with_shards_db(shards_db.clone());
+            let state = make_state();
+
+            let prefixes = |s: &Arc<dyn ShardsStore>| -> Vec<Vec<u32>> {
+                let mut v: Vec<Vec<u32>> = s
+                    .range_app_shards()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|r| r.shard_key == grid_key)
+                    .map(|r| r.prefix)
+                    .collect();
+                v.sort();
+                v
+            };
+            let p_root = quil_forest::bit_path_to_prefix(&[]);
+            let p_0 = quil_forest::bit_path_to_prefix(&[false]);
+            let p_1 = quil_forest::bit_path_to_prefix(&[true]);
+            let p_00 = quil_forest::bit_path_to_prefix(&[false, false]);
+            let p_01 = quil_forest::bit_path_to_prefix(&[false, true]);
+
+            // Apply at E+2: parent → [0],[1], root removed. This is the CORRECT split.
+            let frame_e2 = e2 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10;
+            gi.apply_due_shard_changes(frame_e2, &state).unwrap();
+            let after_e2 = prefixes(&store);
+            println!("grid after E+2 apply: {after_e2:?}");
+            assert!(after_e2.contains(&p_0) && after_e2.contains(&p_1), "E+2 children present");
+            assert!(!after_e2.contains(&p_root), "root removed by the split");
+            assert!(!after_e2.contains(&p_00), "no deeper children yet");
+
+            // Apply at E+3: the STALE duplicate targets the already-removed parent.
+            let frame_e3 = e3 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10;
+            gi.apply_due_shard_changes(frame_e3, &state).unwrap();
+            let after_e3 = prefixes(&store);
+            println!("grid after E+3 apply (fixed — stale skipped): {after_e3:?}");
+
+            // FIXED: the apply-side guard sees the parent is no longer in the grid
+            // (already split at E+2) and SKIPS the stale duplicate — so the grid is
+            // unchanged, no overlapping [0,0]/[0,1] on top of [0]. No double coverage.
+            assert_eq!(after_e3, after_e2, "stale E+3 split skipped → grid unchanged from E+2");
+            assert!(after_e3.contains(&p_0) && after_e3.contains(&p_1), "the real E+2 children remain");
+            assert!(
+                !after_e3.contains(&p_00) && !after_e3.contains(&p_01),
+                "E+3's deeper children NOT registered — no overlapping shards",
+            );
+            // Both pending records are consumed (the stale one is not left to re-fire).
+            assert!(
+                store.all_pending_shard_changes().unwrap().is_empty(),
+                "both pending records consumed",
             );
         }
     }

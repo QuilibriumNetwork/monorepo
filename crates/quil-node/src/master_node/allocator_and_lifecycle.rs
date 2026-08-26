@@ -303,21 +303,31 @@ pub(crate) fn init(
                 // genesis and a seeded testnet/localnet uses the seed keys, so `&[]`
                 // suffices here.
                 std::sync::Arc::new(move |frame: u64| -> bool {
-                    // Skip if the one-time BOOT cutover reset already ran — re-wiping
-                    // the prover tree here would delete provers that re-joined after
-                    // the boot reset.
-                    if crate::unified_consolidation::boot_reset_applied(&store) {
+                    // Two coordinated resets ride this hook: the v1 boot cutover and
+                    // the v2 grid reset (mainnet 740_000). Each has its OWN marker so
+                    // re-wiping never deletes provers that re-joined after — and the
+                    // v1 marker (already set) doesn't suppress v2.
+                    let is_v2 = frame
+                        == quil_execution::global_intrinsic::materialize::quil_grid_reset_v2_frame();
+                    if is_v2 {
+                        if crate::unified_consolidation::grid_reset_v2_applied(&store) {
+                            return true;
+                        }
+                    } else if crate::unified_consolidation::boot_reset_applied(&store) {
                         return true;
                     }
                     match quil_engine::genesis::reset_prover_tree_to_genesis(
                         &hg, store.as_ref(), frame, net, &seed, &[],
                     ) {
                         Ok(n) => {
-                            tracing::info!(seeded = n, frame, "archive at-cutover prover-tree reset complete");
+                            tracing::info!(seeded = n, frame, is_v2, "archive at-reset prover-tree reset complete");
+                            if is_v2 {
+                                crate::unified_consolidation::mark_grid_reset_v2_applied(&store);
+                            }
                             true
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, frame, "archive at-cutover prover-tree reset FAILED");
+                            tracing::warn!(error = %e, frame, "archive at-reset prover-tree reset FAILED");
                             false
                         }
                     }

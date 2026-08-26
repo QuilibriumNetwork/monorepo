@@ -1054,11 +1054,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                     // immediately instead of via the slow mismatch-recovery
                                                     // full re-pull. `== cutover` fires exactly once (in-order
                                                     // gossip application), matching the archive's reset frame.
-                                                    if !archive_mode_recv
-                                                        && exec_num
-                                                            == quil_execution::global_intrinsic::materialize::unified_tree_cutover_frame()
-                                                        && !crate::unified_consolidation::boot_reset_applied(&hg_store_for_recv)
-                                                    {
+                                                    let v1_reset = exec_num
+                                                        == quil_execution::global_intrinsic::materialize::unified_tree_cutover_frame()
+                                                        && !crate::unified_consolidation::boot_reset_applied(&hg_store_for_recv);
+                                                    let v2_reset = exec_num
+                                                        == quil_execution::global_intrinsic::materialize::quil_grid_reset_v2_frame()
+                                                        && !crate::unified_consolidation::grid_reset_v2_applied(&hg_store_for_recv);
+                                                    if !archive_mode_recv && (v1_reset || v2_reset) {
                                                         match quil_engine::genesis::reset_prover_tree_to_genesis(
                                                             &crdt_for_recv,
                                                             &hg_store_for_recv,
@@ -1067,8 +1069,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                             &genesis_seed_for_recv,
                                                             &[],
                                                         ) {
-                                                            Ok(n) => info!(seeded = n, frame = exec_num, "regular at-cutover prover-tree reset complete"),
-                                                            Err(e) => warn!(error = %e, frame = exec_num, "regular at-cutover prover-tree reset FAILED"),
+                                                            Ok(n) => {
+                                                                info!(seeded = n, frame = exec_num, v2 = v2_reset, "regular at-reset prover-tree reset complete");
+                                                                if v2_reset {
+                                                                    crate::unified_consolidation::mark_grid_reset_v2_applied(&hg_store_for_recv);
+                                                                }
+                                                            }
+                                                            Err(e) => warn!(error = %e, frame = exec_num, "regular at-reset prover-tree reset FAILED"),
                                                         }
                                                     }
                                                     match quil_engine::frame_processor::process_global_frame_with_rewards(

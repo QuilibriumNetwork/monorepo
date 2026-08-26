@@ -446,6 +446,19 @@ pub(crate) async fn start(
         coverage_monitor.set_unified_provider(std::sync::Arc::new(move || crdt_um.unified_tree()));
     }
 
+    // Idempotent split/merge emission: report the parents that already have a
+    // staged PendingShardChange so the proposer doesn't re-emit every frame (which
+    // otherwise records a conflicting later-epoch duplicate that overlaps on apply).
+    {
+        let shards_for_pending = shards_store.clone();
+        coverage_monitor.set_pending_change_provider(std::sync::Arc::new(move || {
+            shards_for_pending
+                .all_pending_shard_changes()
+                .map(|v| v.into_iter().map(|c| c.parent).collect())
+                .unwrap_or_default()
+        }));
+    }
+
     // Lazy cell holding the prover-message transport. The transport
     // itself is constructed later (it depends on the archive pool and
     // mtls seed which are resolved further down), but worker_manager

@@ -94,6 +94,34 @@ pub fn unified_tree_cutover_frame() -> u64 {
     })
 }
 
+/// SECOND coordinated QUIL grid reset ("grid-reset v2"), mainnet frame 740_000.
+/// The pre-fix split machinery left QUIL with a non-prefix-free, gapped,
+/// mixed-encoding grid (explorer showed 31 overlapping shards, ~79% of the address
+/// space uncovered). This re-fires the SAME flag-day reset — QUIL grid → 64-way
+/// genesis + drop pending changes, plus a prover-tree wipe/rebuild so provers
+/// stranded on the corrupt sub-shards re-join the clean grid. It does NOT re-run
+/// the app-tree consolidation/fold (already done; the 121M-leaf coin tree is
+/// untouched), so it completes in seconds, not hours. Gated exactly-once via a
+/// DISTINCT marker (`grid_reset_v2` — see `unified_consolidation`) so the first
+/// reset's `boot_reset_applied` guard doesn't suppress it.
+pub const QUIL_GRID_RESET_V2_FRAME: u64 = 740_000;
+
+/// Effective grid-reset-v2 frame. Defaults to [`QUIL_GRID_RESET_V2_FRAME`]
+/// (mainnet); DEV/localnet ONLY lowers it via `QUIL_GRID_RESET_V2_FRAME` so the
+/// reset is reachable in a short localnet run (which starts at frame 0). Read once
+/// and cached, like [`unified_tree_cutover_frame`], so every call site agrees and
+/// the switch stays deterministic across nodes.
+pub fn quil_grid_reset_v2_frame() -> u64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("QUIL_GRID_RESET_V2_FRAME")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(QUIL_GRID_RESET_V2_FRAME)
+    })
+}
+
 /// Whether a prior `kick_frame_number` still bars a prover from re-joining /
 /// counting at `current_frame`. `0` means "never kicked" (e.g. a voluntary
 /// leave records no KickFrameNumber). A pre-amnesty kick is forgiven only once
@@ -110,7 +138,13 @@ pub fn kick_bars_rejoin(kick_frame_number: u64, current_frame: u64) -> bool {
         kick_frame_number < KICK_AMNESTY_FRAME && current_frame >= KICK_AMNESTY_FRAME;
     let forgiven_reset = kick_frame_number < UNIFIED_RESET_AMNESTY_FRAME
         && current_frame >= UNIFIED_RESET_AMNESTY_FRAME;
-    !(forgiven_695 || forgiven_reset)
+    // Third additive window riding grid-reset v2: the v2 reset wipes non-archive
+    // provers, so a re-joining prover starts clean — this forgives any pre-v2 kick
+    // the drop missed. Tied to the (env-honoring) v2 reset frame so localnet's
+    // lowered reset carries a matching amnesty.
+    let v2 = quil_grid_reset_v2_frame();
+    let forgiven_reset_v2 = kick_frame_number < v2 && current_frame >= v2;
+    !(forgiven_695 || forgiven_reset || forgiven_reset_v2)
 }
 
 /// Protocol-level halt-risk threshold. A shard with `Active` prover

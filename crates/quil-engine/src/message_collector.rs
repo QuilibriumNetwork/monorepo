@@ -580,7 +580,7 @@ fn extract_shard_frame_checks(data: &[u8]) -> Vec<ShardFrameCheck> {
     out
 }
 
-fn extract_shard_frame_keys(data: &[u8]) -> Vec<(Vec<u8>, u64)> {
+pub fn extract_shard_frame_keys(data: &[u8]) -> Vec<(Vec<u8>, u64)> {
     extract_shard_frame_checks(data)
         .into_iter()
         .map(|c| (c.address, c.frame_number))

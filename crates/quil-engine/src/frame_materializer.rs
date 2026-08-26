@@ -406,6 +406,29 @@ impl FrameMaterializer {
             }
         }
 
+        // Grid-reset v2 (mainnet 740_000): a SECOND coordinated flag day clearing
+        // the corrupt overlapping-shard grid the pre-fix split machinery produced.
+        // It runs INDEPENDENTLY of the unified flip (already active above), so it
+        // needs its own block. The QUIL grid itself is reset by the execution engine
+        // (`maybe_apply_split_reset`, which also fires at this frame); the prover
+        // side (wipe + rebuild from the genesis committee) rides HERE because the
+        // put-only forest can't propagate a wipe through sync. The hook self-gates
+        // on the v2 marker (exactly-once); `None` (regulars use the recv path) no-ops.
+        if frame_number
+            == quil_execution::global_intrinsic::materialize::quil_grid_reset_v2_frame()
+        {
+            let reset_ok = self
+                .prover_tree_reset
+                .as_ref()
+                .map(|h| h(frame_number))
+                .unwrap_or(true);
+            if reset_ok {
+                info!(frame = frame_number, "grid-reset v2: prover-tree wiped + rebuilt (grid reset via execution engine)");
+            } else {
+                error!(frame = frame_number, "grid-reset v2: prover-tree reset FAILED");
+            }
+        }
+
         // 1. Idempotency check
         let last = self.last_materialized_frame.load(Ordering::SeqCst);
         if frame_number <= last {

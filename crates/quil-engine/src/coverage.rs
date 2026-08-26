@@ -445,6 +445,17 @@ pub struct CoverageMonitor {
     /// proposal is still working through consensus + materialize. Mirrors
     /// Go's `shard_rebalancer` cooldown.
     last_rebalance_frame: Mutex<std::collections::HashMap<Vec<u8>, u64>>,
+    /// Reports the set of shard parents that ALREADY have a staged
+    /// `PendingShardChange` (any effective epoch). The proposer skips these.
+    /// Without it, a split/merge is re-emitted EVERY frame while the parent stays
+    /// over/under-crowded — the pending change doesn't relieve the trigger until
+    /// its E+2 apply, and the per-node cooldown is defeated by leader rotation. A
+    /// re-proposal that crosses the epoch boundary then records a SECOND change at
+    /// a LATER effective epoch (E+3), which conflicts with the E+2 one on apply
+    /// (overlapping grid children). Consulting committed pending state makes
+    /// emission idempotent. Unset ⇒ no suppression (legacy / no shards store).
+    pending_change_provider:
+        std::sync::RwLock<Option<PendingChangeProvider>>,
 }
 
 /// See [`CoverageMonitor::split_feasibility`]: `(filter, factor) →` per-child
@@ -455,6 +466,11 @@ pub type SplitFeasibilityProvider = Arc<dyn Fn(&[u8], u8) -> Vec<u64> + Send + S
 /// child bit-path FILTERS (length 2), or `None` when the shard can't be split
 /// into two data-bearing halves (the empty-split guard / single leaf).
 pub type SplitProposalProvider = Arc<dyn Fn(&[u8]) -> Option<Vec<Vec<u8>>> + Send + Sync>;
+
+/// See [`CoverageMonitor::pending_change_provider`]: `() →` the set of shard
+/// parents (`ShardInfo`/filter bytes) that already have a staged pending change.
+pub type PendingChangeProvider =
+    Arc<dyn Fn() -> std::collections::HashSet<Vec<u8>> + Send + Sync>;
 
 /// Frames to wait before re-proposing a split/merge for the same shard.
 const REBALANCE_COOLDOWN_FRAMES: u64 = 30;
@@ -545,6 +561,7 @@ impl CoverageMonitor {
             split_proposer: std::sync::RwLock::new(None),
             unified_provider: std::sync::RwLock::new(None),
             last_rebalance_frame: Mutex::new(std::collections::HashMap::new()),
+            pending_change_provider: std::sync::RwLock::new(None),
         }
     }
 
@@ -566,6 +583,14 @@ impl CoverageMonitor {
     /// `propose_split_rebalance` emits legacy immediate-bit byte-suffix children.
     pub fn set_split_proposer(&self, provider: SplitProposalProvider) {
         *self.split_proposer.write().unwrap() = Some(provider);
+    }
+
+    /// Install the pending-change provider (see [`Self::pending_change_provider`]).
+    /// The node wires a closure over the shards store returning the set of parents
+    /// with a staged `PendingShardChange`; the split/merge proposers skip those so
+    /// a shard is proposed at most once until its change applies at E+2.
+    pub fn set_pending_change_provider(&self, provider: PendingChangeProvider) {
+        *self.pending_change_provider.write().unwrap() = Some(provider);
     }
 
     /// Install the unified-tree state provider (see [`Self::unified_provider`]).
@@ -885,9 +910,25 @@ impl CoverageMonitor {
             .get_prover_shard_summaries(frame_number)
             .unwrap_or_default();
         let mut last = self.last_rebalance_frame.lock().unwrap();
+        // Parents that already have a staged pending change (fetched ONCE). Skip
+        // them: the pending split doesn't drop the parent's prover count until its
+        // E+2 apply, so without this the shard is re-proposed every frame, and a
+        // re-proposal crossing the epoch boundary stamps a conflicting later-epoch
+        // change. Consulting committed pending state makes emission idempotent.
+        let pending_parents = self
+            .pending_change_provider
+            .read()
+            .unwrap()
+            .clone()
+            .map(|p| p())
+            .unwrap_or_default();
         for summary in &summaries {
             let filter = &summary.filter;
             if filter.is_empty() {
+                continue;
+            }
+            if pending_parents.contains(filter.as_slice()) {
+                // Already staged for a topology change — don't re-propose.
                 continue;
             }
             let active = summary
@@ -1104,6 +1145,15 @@ impl CoverageMonitor {
             inventory.iter().map(|e| (e.filter.as_slice(), e)).collect();
         let mut last = self.last_rebalance_frame.lock().unwrap();
         let mut emitted: HashSet<Vec<u8>> = HashSet::new();
+        // Parents already staged for a topology change (fetched once) — skip, same
+        // idempotency reason as `propose_split_rebalance`.
+        let pending_parents = self
+            .pending_change_provider
+            .read()
+            .unwrap()
+            .clone()
+            .map(|p| p())
+            .unwrap_or_default();
 
         for entry in inventory {
             let f = &entry.filter;
@@ -1114,6 +1164,9 @@ impl CoverageMonitor {
                 continue;
             };
             if emitted.contains(&parent) {
+                continue;
+            }
+            if pending_parents.contains(parent.as_slice()) {
                 continue;
             }
             let (Some(e0), Some(e1)) =
@@ -1820,6 +1873,47 @@ mod tests {
         // After cooldown: emits again.
         monitor.propose_split_rebalance(1000 + REBALANCE_COOLDOWN_FRAMES + 1);
         assert_eq!(dist.0.lock().unwrap().len(), 2, "should re-emit after cooldown");
+    }
+
+    #[test]
+    fn propose_split_suppressed_when_parent_already_has_a_pending_change() {
+        // Over-crowded shard (40 > 32) — normally a proposal.
+        let mut filter = vec![0x11u8; 32];
+        filter.push(0x05);
+        let registry: Arc<dyn quil_types::consensus::ProverRegistry> =
+            Arc::new(HotShardRegistry { filter: filter.clone(), active: 40 });
+        let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
+        let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
+        let monitor = CoverageMonitor::new(
+            registry,
+            dist_arc,
+            CoverageThresholds::mainnet(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        // A split is ALREADY staged for this parent (its pending change exists).
+        let staged = filter.clone();
+        monitor.set_pending_change_provider(Arc::new(move || {
+            let mut s = std::collections::HashSet::new();
+            s.insert(staged.clone());
+            s
+        }));
+
+        // Idempotent emission: over threshold, but no new proposal while pending.
+        monitor.propose_split_rebalance(1000);
+        assert!(
+            dist.0.lock().unwrap().is_empty(),
+            "must NOT re-propose a split whose parent already has a pending change"
+        );
+
+        // Once the change is gone (applied at E+2), a still-crowded shard proposes.
+        monitor.set_pending_change_provider(Arc::new(|| std::collections::HashSet::new()));
+        monitor.propose_split_rebalance(2000);
+        assert_eq!(
+            dist.0.lock().unwrap().len(),
+            1,
+            "resumes proposing once no pending change is staged"
+        );
     }
 
     /// §6.1 empty-split guard: a shard over the trigger is NOT split when the

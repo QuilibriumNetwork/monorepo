@@ -336,6 +336,52 @@ pub fn compute_global_requests_root(
     tree.commit(prover)
 }
 
+/// Coalesce a set of shard-frame proof messages to the TIP per shard
+/// address — the highest LOCAL frame number (`FrameHeader.frame_number`) each
+/// shard carries. Returns `(kept, superseded)`: `kept` holds one proof per shard
+/// (its tip) plus any bundle that isn't a single-shard frame (0 or >1 shard frame
+/// — e.g. a multi-shard bundle — passes through untouched); `superseded` holds the
+/// lower-frame proofs the tip replaced (the caller drops them from the mempool).
+///
+/// The global proposer's lockstep filter admits a shard proof by its ANCHOR
+/// (`global_frame_number`), NOT its count, so a shard that produced several local
+/// frames all anchored to the prior global frame passes them ALL. Rewards are
+/// per-global-frame and the tip's state roots subsume its ancestors, so only the
+/// tip needs to ride the global frame — this bounds the request set to O(#shards).
+/// Equal frame numbers (duplicate serializations of the same proof) collapse to
+/// the first seen. Order-independent: the tip for an address is the max regardless
+/// of arrival order.
+pub(crate) fn coalesce_shard_frames_to_tip(
+    shard_frame_msgs: Vec<Vec<u8>>,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut tip: std::collections::HashMap<Vec<u8>, (u64, Vec<u8>)> =
+        std::collections::HashMap::new();
+    let mut kept: Vec<Vec<u8>> = Vec::new();
+    let mut superseded: Vec<Vec<u8>> = Vec::new();
+    for raw in shard_frame_msgs {
+        let keys = crate::message_collector::extract_shard_frame_keys(&raw);
+        if keys.len() == 1 {
+            let (addr, local_frame) = keys.into_iter().next().unwrap();
+            match tip.get(&addr) {
+                // A higher-or-equal tip is already held → this is superseded
+                // (equal ⇒ a duplicate serialization of the same-height proof).
+                Some((best, _)) if *best >= local_frame => superseded.push(raw),
+                _ => {
+                    if let Some((_, old_raw)) = tip.insert(addr, (local_frame, raw)) {
+                        superseded.push(old_raw);
+                    }
+                }
+            }
+        } else {
+            // 0 keys (not a decodable single shard frame) or a multi-shard bundle:
+            // don't coalesce — pass through.
+            kept.push(raw);
+        }
+    }
+    kept.extend(tip.into_values().map(|(_, raw)| raw));
+    (kept, superseded)
+}
+
 impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
     /// Non-blocking local prover root for `frame_number` (the vote-verify side of
     /// `compute_prover_root`): reads the recorded post-materialize-(N-1) value
@@ -547,19 +593,21 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 let global_addr = [0xFFu8; 32];
                 let mut valid: Vec<Vec<u8>> = Vec::with_capacity(collected.len());
                 let mut invalid: Vec<Vec<u8>> = Vec::new();
+                // First pass: hold in-lockstep shard proofs for tip coalescing
+                // (below); validate non-shard messages inline.
+                let mut in_lockstep_shard: Vec<Vec<u8>> = Vec::new();
                 for raw in collected {
                     if crate::message_collector::bundle_has_shard_frame(&raw) {
-                        // Strict lockstep: include a shard-frame proof ONLY if it
-                        // anchors to `frame_number - 1` (or genesis anchor 0). The
-                        // materializer hard-rejects any frame carrying an
-                        // out-of-lockstep shard op, so packing a stale proof would
-                        // halt the chain — drop it here instead. A lagging shard
-                        // must re-attest against the new tip to be included.
+                        // Strict lockstep: a shard proof rides ONLY if its ANCHOR
+                        // (`global_frame_number`) is `frame_number - 1` (or genesis
+                        // anchor 0) — NOT its local frame number. The materializer
+                        // hard-rejects any frame carrying an out-of-lockstep shard op,
+                        // so packing a stale proof would halt the chain — drop it here.
                         if crate::message_collector::bundle_shard_frames_in_lockstep(
                             &raw,
                             frame_number,
                         ) {
-                            valid.push(raw);
+                            in_lockstep_shard.push(raw);
                         } else {
                             tracing::debug!(
                                 frame = frame_number,
@@ -580,6 +628,25 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                             invalid.push(raw);
                         }
                     }
+                }
+                // Tip-per-shard coalescing. The lockstep gate admits a shard
+                // proof by its ANCHOR, NOT its count — a shard that produced several
+                // local frames all anchored to the same prior global frame passes them
+                // ALL, ballooning the request set (N× attestation verify + apply-due
+                // scan in materialize). Rewards are per-global-frame and the tip's
+                // state roots subsume its ancestors, so only the HIGHEST LOCAL frame
+                // per shard address needs to ride the global frame. Coalesce to the
+                // tip → request set O(#shards).
+                let (tips, superseded) = coalesce_shard_frames_to_tip(in_lockstep_shard);
+                let coalesced = superseded.len();
+                valid.extend(tips);
+                invalid.extend(superseded);
+                if coalesced > 0 {
+                    tracing::info!(
+                        frame = frame_number,
+                        coalesced,
+                        "coalesced superseded shard-frame proofs to the per-shard tip",
+                    );
                 }
                 if !invalid.is_empty() {
                     tracing::info!(
@@ -1140,5 +1207,89 @@ mod tests {
     fn compute_prover_root_empty_without_crdt() {
         let provider = provider_with_crdt(None);
         assert!(provider.compute_prover_root(0).is_empty());
+    }
+
+    /// Build a canonical shard-frame proof bundle carrying one
+    /// `FrameHeader` for `addr` at LOCAL frame `local_frame`.
+    fn make_shard_frame(addr: u8, local_frame: u64) -> Vec<u8> {
+        use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let fh = FrameHeader {
+            address: vec![addr; 32],
+            frame_number: local_frame,
+            global_frame_number: 99,
+            ..Default::default()
+        };
+        let req = CanonicalMessageRequest {
+            inner_type_prefix: TYPE_FRAME_HEADER,
+            inner_bytes: fh.to_canonical_bytes().unwrap(),
+        };
+        CanonicalMessageBundle { requests: vec![Some(req)], timestamp: 0 }
+            .to_canonical_bytes()
+            .unwrap()
+    }
+
+    #[test]
+    fn coalesce_keeps_only_the_tip_per_shard() {
+        // Shard A (0x11): local frames 876, 878, 877 (out of order) + a duplicate
+        // 877. Shard B (0x22): a single frame 500. All share one anchor, so the
+        // lockstep filter would admit them ALL — coalescing must keep only the tip
+        // (highest LOCAL frame) per shard.
+        let msgs = vec![
+            make_shard_frame(0x11, 876),
+            make_shard_frame(0x11, 878),
+            make_shard_frame(0x11, 877),
+            make_shard_frame(0x11, 877), // duplicate serialization of the same height
+            make_shard_frame(0x22, 500),
+        ];
+
+        let (kept, superseded) = coalesce_shard_frames_to_tip(msgs);
+
+        // One tip per shard → 2 kept; the other 3 (876, 877, dup 877) superseded.
+        assert_eq!(kept.len(), 2, "one tip per shard address (A + B)");
+        assert_eq!(superseded.len(), 3, "876, 877 and the duplicate 877 dropped");
+
+        // The kept tips are exactly A@878 and B@500 (order-independent).
+        let mut kept_keys: Vec<(Vec<u8>, u64)> = kept
+            .iter()
+            .flat_map(|m| crate::message_collector::extract_shard_frame_keys(m))
+            .collect();
+        kept_keys.sort();
+        assert_eq!(
+            kept_keys,
+            vec![(vec![0x11u8; 32], 878), (vec![0x22u8; 32], 500)],
+            "kept exactly the highest LOCAL frame per shard",
+        );
+
+        // Every superseded proof is shard A below its tip — nothing from B lost.
+        for m in &superseded {
+            let keys = crate::message_collector::extract_shard_frame_keys(m);
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0].0, vec![0x11u8; 32], "only shard A frames superseded");
+            assert!(keys[0].1 < 878, "superseded frame is below the tip");
+        }
+    }
+
+    #[test]
+    fn coalesce_bounds_a_deep_backlog_to_one_per_shard() {
+        // A 1000-frame backlog for one shard (the mainnet balloon) collapses to 1.
+        let msgs: Vec<Vec<u8>> = (1..=1000u64).map(|n| make_shard_frame(0x11, n)).collect();
+        let (kept, superseded) = coalesce_shard_frames_to_tip(msgs);
+        assert_eq!(kept.len(), 1, "backlog bounded to the single tip");
+        assert_eq!(superseded.len(), 999);
+        let keys = crate::message_collector::extract_shard_frame_keys(&kept[0]);
+        assert_eq!(keys, vec![(vec![0x11u8; 32], 1000)], "tip is the highest frame");
+    }
+
+    #[test]
+    fn coalesce_passes_through_undecodable_and_leaves_empty_empty() {
+        // A non-bundle message has 0 shard-frame keys → passes through untouched.
+        let junk = b"not a bundle".to_vec();
+        let (kept, superseded) = coalesce_shard_frames_to_tip(vec![junk.clone()]);
+        assert_eq!(kept, vec![junk]);
+        assert!(superseded.is_empty());
+        // Empty in → empty out.
+        let (k, s) = coalesce_shard_frames_to_tip(Vec::new());
+        assert!(k.is_empty() && s.is_empty());
     }
 }

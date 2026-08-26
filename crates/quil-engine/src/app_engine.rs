@@ -599,13 +599,38 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 ));
             }
         }
-        // Get latest shard frame number
-        let prior_frame_number = self.clock_store
-            .get_latest_shard_clock_frame(&self.filter)
-            .ok()
-            .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
-            .unwrap_or(0);
+        // Get the latest shard frame (parent): both its local number and its GLOBAL
+        // anchor, for the cadence gate below.
+        let parent_frame = self.clock_store.get_latest_shard_clock_frame(&self.filter).ok();
+        let (prior_frame_number, parent_anchor_gfn) = parent_frame
+            .as_ref()
+            .and_then(|f| f.header.as_ref())
+            .map(|h| (h.frame_number, h.global_frame_number))
+            .unwrap_or((0, 0));
         let frame_number = prior_frame_number + 1;
+
+        // CADENCE GATE: pace app-shard production to the GLOBAL anchor. The
+        // global materializer folds EVERY app-shard frame produced between two
+        // global frames into the next global frame's `requests`; a shard finalizing
+        // many frames per global frame balloons that request set (N× attestation
+        // verifies + apply-due tombstone scans), slowing the global chain, which lets
+        // still more shard frames accumulate — a feedback loop. Bound it to ≤1 frame
+        // per global anchor: decline until the global head has advanced past the
+        // parent frame's anchor. The decision reads the PARENT's committed anchor
+        // (which every node agrees on), so rotating leaders cannot collectively
+        // out-run the global cadence — after a frame anchored at G, none propose the
+        // next until their global head passes G. Only in storage-frame mode
+        // (`anchor_gfn > 0`) and past genesis; rewards are per-global-frame, so at
+        // most one rewardable shard frame per global frame is the intended rate.
+        // NoVote → the view nullifies without killing the loop (mirrors the guards
+        // above); the leader resumes the instant the global head advances.
+        if anchor_gfn > 0 && prior_frame_number > 0 && anchor_gfn <= parent_anchor_gfn {
+            return Err(QuilError::NoVote(format!(
+                "app-shard cadence gate: global anchor {anchor_gfn} has not advanced \
+                 past parent frame {prior_frame_number}'s anchor {parent_anchor_gfn} — \
+                 pacing production to \u{2264}1 shard frame per global frame",
+            )));
+        }
 
         // STRICT GATE (mirrors the global `compute_prover_root`): never produce
         // frame N until this node has MATERIALIZED the parent N-1. `state_roots`
