@@ -1886,6 +1886,10 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
             }
         });
 
+        // This focused spawn test has no P2P layer. Its local event drain is
+        // already installed, so model the production transport-ready callback
+        // explicitly before returning the worker handle.
+        handle.set_cw_transport_ready();
         handle
     });
 
