@@ -308,7 +308,10 @@ enum PriorityState {
 enum RebindOutcome {
     /// Workers were moved onto better-ranked allocations.
     Rebound = 1,
-    /// No ranking published yet (cold start, or shard-info never loaded).
+    /// No ranking published yet: the lifecycle publishes from `evaluate`,
+    /// which returns early while any readiness gate is closed — so this
+    /// covers cold start, an unfinished prover-tree sync, an unverified
+    /// tree, and shard-info never loading alike.
     NoRanking = 2,
     /// Ranking too old to act on.
     RankingStale = 3,
@@ -1107,8 +1110,10 @@ impl WorkerAllocator {
                 PriorityState::Missing => self.log_rebind_outcome(
                     frame_number,
                     RebindOutcome::NoRanking,
-                    "lifecycle has not published a ranking yet — it evaluates \
-                     only once shard-info has loaded",
+                    "lifecycle has not published a ranking yet — it publishes \
+                     from evaluate, which returns early while any of its \
+                     readiness gates is closed (prover-tree sync, tree \
+                     verification, shard-info load)",
                 ),
                 PriorityState::Stale { published_at, age } => self.log_rebind_outcome(
                     frame_number,
