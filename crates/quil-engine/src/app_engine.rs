@@ -2123,6 +2123,11 @@ impl AppConsensusEngine {
                 // committee is buildable (the shard's active provers are present
                 // in this node's registry). No-op once running.
                 _ = cw_retry_timer.tick() => {
+                    // This timer also handles dynamic-committee rebuilds below.
+                    // Keep *both* paths behind the transport barrier: otherwise
+                    // a timer tick while CW is still waiting for a subscribed
+                    // peer can instantiate simplex and emit the very startup
+                    // messages that the barrier is meant to prevent.
                     if cw_transport_ready && self.cw_handle.is_none() {
                         // Passive-mode retry: keep trying until the committee is
                         // buildable (active provers present in this registry).
@@ -2143,7 +2148,7 @@ impl AppConsensusEngine {
                                 );
                             }
                         }
-                    } else {
+                    } else if cw_transport_ready {
                         // DYNAMIC COMMITTEE: if the shard's active-prover set
                         // changed since this instance was built (e.g. a prover's
                         // deferred activation reached its epoch, growing a 1-member
