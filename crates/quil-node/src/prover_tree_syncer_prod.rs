@@ -40,6 +40,32 @@ pub struct ProdProverTreeSyncer {
     pub archive_pool: Option<Arc<quil_rpc::ArchiveEndpointPool>>,
 }
 
+/// True when a header phase root means "this phase holds nothing".
+///
+/// Emptiness reaches us in three different encodings, and only the first
+/// was ever tested:
+///
+/// 1. a zero-LENGTH vector — a missing `expected_roots` entry;
+/// 2. 32 or 64 zero BYTES — `AppLeaderProvider` normalises a
+///    never-committed phase to `vec![0u8; if has_forest {32} else {64}]`;
+/// 3. `SPARSE_MERKLE_PLACEHOLDER_HASH` — the JMT's own empty-tree marker
+///    (`jmt/src/lib.rs`), returned as the hash of `Node::Null`. It is
+///    private to that crate, so the literal is repeated here; exporting
+///    it instead would avoid the duplication.
+///
+/// Only (1) satisfies `Vec::is_empty`, so the documented
+/// "Empty => trust (bootstrap)" path below was unreachable for (2) and
+/// (3): a node holding no data commits an empty-tree root, the peer
+/// advertises a real one, the pin refuses, nothing is pulled, and the
+/// next header commits an empty-tree root again. Nothing new is trusted
+/// here — this only makes the bootstrap path the author already
+/// described actually reachable.
+fn is_empty_anchor(root: &[u8]) -> bool {
+    root.is_empty()
+        || root.iter().all(|b| *b == 0)
+        || root == b"SPARSE_MERKLE_PLACEHOLDER_HASH__"
+}
+
 impl ProdProverTreeSyncer {
     /// The endpoint to dial for the next sync: a live archive from the pool when
     /// wired (falling back to `master_stream_addr` if the pool is empty), else
@@ -226,13 +252,31 @@ impl ProdProverTreeSyncer {
                 }
                 continue;
             };
-            // Pin: the peer's advertised APP root must equal the header app root
-            // for this phase (audit #5). Empty ⇒ trust (bootstrap).
-            if !expected.is_empty() && root_s.as_slice() != expected.as_slice() {
-                warn!(phase, "peer app root != header-committed root — not syncing subtree");
+            // Pin: the peer's advertised APP root must equal the header app
+            // root for this phase (audit #5). An empty anchor (see
+            // `is_empty_anchor`) means the shard was never committed, so
+            // there is nothing to authenticate against — trust the peer, as
+            // the original "Empty => trust (bootstrap)" note intended.
+            let anchorless = is_empty_anchor(&expected);
+            if !anchorless && root_s.as_slice() != expected.as_slice() {
+                // Log BOTH roots, as `sync_single_shard` already does for the
+                // same decision; "they differ" alone is not actionable.
+                warn!(
+                    phase,
+                    peer = %hex::encode(&root_s),
+                    expected = %hex::encode(&expected),
+                    "peer app root != header root — not syncing subtree",
+                );
                 return Ok(false);
             }
-            let pinned = if expected.is_empty() {
+            if anchorless && !expected.is_empty() {
+                info!(
+                    phase,
+                    peer = %hex::encode(&root_s),
+                    "header app root is an empty-tree anchor — bootstrapping",
+                );
+            }
+            let pinned = if anchorless {
                 None
             } else {
                 <[u8; 32]>::try_from(expected.as_slice()).ok()
@@ -255,6 +299,21 @@ impl ProdProverTreeSyncer {
     /// single-shard app and a QUIL split.
     fn caught_up_to_anchor(&self, l2: &[u8; 32], expected_roots: &[Vec<u8>]) -> bool {
         if expected_roots.len() < 4 || expected_roots.iter().any(|r| r.is_empty()) {
+            return false;
+        }
+        // An empty-tree anchor means "never committed", NOT "caught up".
+        // Below, an empty local tree is normalised to the zero root of the
+        // anchor's width — so a node holding NO data compares EQUAL to an
+        // empty anchor and skips the sync entirely, before the pin is even
+        // reached. Treat it as not caught up so the sync actually runs; a
+        // genuinely empty shard costs nothing, since the peer has no tree
+        // either and every phase short-circuits on the absent-head branch.
+        if expected_roots.iter().all(|r| is_empty_anchor(r)) {
+            info!(
+                app = %hex::encode(&l2[..8]),
+                anchor = %hex::encode(&expected_roots[0]),
+                "anchor is an empty-tree marker — running sync",
+            );
             return false;
         }
         let Some(sk) = crate::forest_sync::app_shard_key(l2) else { return false };
