@@ -1094,8 +1094,12 @@ mod tests {
         // filters with pending_filter_frame=0 to be cleared.
         alloc.on_new_frame(1000).unwrap();
 
-        // Worker should have been deallocated
-        assert!(wm.range_workers().unwrap().is_empty());
+        // Worker should have been released but remain visible as idle, which
+        // matches the production worker manager and lets it be reused.
+        let workers = wm.range_workers().unwrap();
+        assert_eq!(workers.len(), 1);
+        assert!(workers[0].filter.is_empty());
+        assert!(!workers[0].allocated);
     }
 
     #[test]
