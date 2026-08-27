@@ -106,6 +106,10 @@ pub enum AppEngineMessage {
         from: Vec<u8>,
         data: Vec<u8>,
     },
+    /// The master installed the CW subscription and observed a connected peer.
+    /// Do not start simplex before this barrier: earlier messages failed with
+    /// `NoPeersSubscribedToTopic` and were historically discarded.
+    CwTransportReady,
 }
 
 // =====================================================================
@@ -240,6 +244,11 @@ impl AppEngineHandle {
     /// attempts during the halt window are skipped.
     pub fn set_halted(&self, halted: bool) {
         let _ = self.msg_tx.try_send(AppEngineMessage::SetHalted(halted));
+    }
+
+    /// Release the CW startup barrier after the master observes a usable peer.
+    pub fn set_cw_transport_ready(&self) {
+        let _ = self.msg_tx.try_send(AppEngineMessage::CwTransportReady);
     }
 
     /// Read the engine's most-recently-published internal sizes.
@@ -1958,24 +1967,12 @@ impl AppConsensusEngine {
             }
         }
 
-        // Start the shard consensus driver: commonware-simplex (P3) + Falcon.
-        match self.start_consensus_cw((bls_signer_factory)()) {
-            Ok(handle) => {
-                self.cw_handle = Some(handle);
-                info!(
-                    core_id = self.core_id,
-                    filter = hex::encode(&self.filter),
-                    "shard commonware-simplex consensus running (EQUAL VOTES)"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    core_id = self.core_id,
-                    error = %e,
-                    "failed to start shard simplex consensus — will retry (passive until committee is present)"
-                );
-            }
-        }
+        // A CW engine must not emit its first simplex messages until its topic
+        // is subscribed locally and a remote subscriber is present. The master
+        // sends `CwTransportReady` after that condition becomes true.
+        let mut cw_transport_ready = false;
+        info!(core_id = self.core_id, filter = hex::encode(&self.filter),
+            "waiting for CW topic transport readiness before starting consensus");
 
         // Frame cleanup timer — remove stale cached frames every 60s
         let mut cleanup_timer = tokio::time::interval(Duration::from_secs(60));
@@ -2096,6 +2093,20 @@ impl AppConsensusEngine {
                                 }
                             }
                         }
+                        Some(AppEngineMessage::CwTransportReady) => {
+                            if !cw_transport_ready {
+                                cw_transport_ready = true;
+                                match self.start_consensus_cw((bls_signer_factory)()) {
+                                    Ok(handle) => {
+                                        self.cw_handle = Some(handle);
+                                        info!(core_id = self.core_id, filter = hex::encode(&self.filter),
+                                            "shard commonware-simplex consensus running after transport readiness");
+                                    }
+                                    Err(e) => warn!(core_id = self.core_id, error = %e,
+                                        "failed to start shard simplex after transport readiness — will retry"),
+                                }
+                            }
+                        }
                         None => {
                             info!(core_id = self.core_id, "message channel closed");
                             break;
@@ -2112,7 +2123,7 @@ impl AppConsensusEngine {
                 // committee is buildable (the shard's active provers are present
                 // in this node's registry). No-op once running.
                 _ = cw_retry_timer.tick() => {
-                    if self.cw_handle.is_none() {
+                    if cw_transport_ready && self.cw_handle.is_none() {
                         // Passive-mode retry: keep trying until the committee is
                         // buildable (active provers present in this registry).
                         match self.start_consensus_cw((bls_signer_factory)()) {
