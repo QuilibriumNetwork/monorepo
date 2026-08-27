@@ -69,6 +69,41 @@ pub fn mark_grid_reset_v2_applied(hg: &quil_store::RocksHypergraphStore) {
     }
 }
 
+/// Marker for prover-reset v3 (mainnet frame 747_000) — the complete tree
+/// wipe+reseed paired with the per-node worker-filter reset. DISTINCT from v1/v2
+/// so their guards don't suppress it and the v3 wipe runs exactly once.
+const PROVER_RESET_V3_MARKER_KEY: &[u8] = b"\x00__quil_prover_reset_v3__";
+
+/// Whether the prover-reset v3 wipe has already run on this node.
+pub fn prover_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
+    hg.raw_db().get(PROVER_RESET_V3_MARKER_KEY).ok().flatten().is_some()
+}
+
+/// Record that prover-reset v3 has run (after a successful v3 prover wipe).
+pub fn mark_prover_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) {
+    if let Err(e) = hg.raw_db().put(PROVER_RESET_V3_MARKER_KEY, [1u8]) {
+        warn!(error = %e, "prover-reset v3: marker write FAILED — may re-run if the frame re-materializes");
+    }
+}
+
+/// Marker for the prover-reset v3 WORKER-filter reset. Separate from the tree-wipe
+/// marker: the tree wipe is consensus state (hg store, on materializers), while the
+/// worker reset is LOCAL runtime state (worker store, on every node with workers) —
+/// they run on different paths, so each needs its own once-guard.
+const WORKER_RESET_V3_MARKER_KEY: &[u8] = b"\x00__quil_worker_reset_v3__";
+
+/// Whether the prover-reset v3 worker-filter reset has already run on this node.
+pub fn worker_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
+    hg.raw_db().get(WORKER_RESET_V3_MARKER_KEY).ok().flatten().is_some()
+}
+
+/// Record that the prover-reset v3 worker-filter reset has run.
+pub fn mark_worker_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) {
+    if let Err(e) = hg.raw_db().put(WORKER_RESET_V3_MARKER_KEY, [1u8]) {
+        warn!(error = %e, "worker-reset v3: marker write FAILED — may re-run if the frame re-materializes");
+    }
+}
+
 /// Apply the ENTIRE unified-tree cutover ONCE, ON BOOT — not gated on reaching a
 /// frame number. Idempotent via [`BOOT_RESET_MARKER_KEY`]. Runs BEFORE consensus
 /// starts, so the node comes up already in the reset state. Deterministic across

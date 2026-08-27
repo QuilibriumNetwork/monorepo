@@ -41,6 +41,7 @@ mod fork_ladder;
 mod verify_migration;
 mod forest_migration;
 mod dry_run_reset;
+mod dump_shard_state;
 mod unified_consolidation;
 mod legacy_migration;
 mod coin_rescale;
@@ -113,6 +114,13 @@ struct Args {
     /// The simulated cutover frame for `--dry-run-reset` (0 ⇒ head + 1).
     #[arg(long, default_value_t = 0)]
     dry_run_reset_frame: u64,
+
+    /// OFFLINE READ-ONLY dump of the QUIL shard grid, prover allocations (by
+    /// confirmation_filter), pending changes, and reset markers (the given path, or
+    /// config.db.path), then exit. NEVER writes — safe to run on a shut-down archive
+    /// while the network keeps running on the others.
+    #[arg(long)]
+    dump_shard_state: Option<PathBuf>,
 
     /// Archive-only: convert pre-2.1 verenc coins in the DB (config.db.path, or
     /// the given path) into compact transparent public token entries and refresh
@@ -651,6 +659,16 @@ async fn main() -> anyhow::Result<ExitCode> {
             args.network,
             args.dry_run_reset_frame,
         ) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref dump_path) = args.dump_shard_state {
+        return match dump_shard_state::run_dump_shard_state(dump_path, &config, args.network) {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");

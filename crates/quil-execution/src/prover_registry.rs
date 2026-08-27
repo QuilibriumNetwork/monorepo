@@ -795,6 +795,8 @@ fn live_allocation_status(
         | EffectiveStatus::ExpiredEpoch
         | EffectiveStatus::Rejected
         | EffectiveStatus::Kicked
+        // Superseded by a reassignment — not a live allocation on this filter.
+        | EffectiveStatus::Historic
         | EffectiveStatus::Unknown => None,
     }
 }
@@ -1514,6 +1516,7 @@ fn map_allocation_status(byte: u8) -> ProverStatus {
         3 => ProverStatus::Leaving,
         4 => ProverStatus::Rejected,
         5 => ProverStatus::Kicked,
+        6 => ProverStatus::Historic,
         _ => ProverStatus::Unknown,
     }
 }
@@ -1724,8 +1727,19 @@ pub fn all_provers_with_allocations_committed(
     // prover_address -> every confirmation_filter it is allocated on.
     let mut alloc_filters: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
 
+    // Tombstones first: `remove_vertex` marks a deletion in the "removes" phase
+    // but LEAVES the "adds" blob intact, so an adds-only walk RESURRECTS anything
+    // deleted from committed state — the non-archive records the split reset drops,
+    // and the deep allocations the allocation re-home drops. Collect the removed vks
+    // and skip them below so this reflects committed `adds ∧ ¬removes`, matching the
+    // authoritative registry cache (see the same subtraction in `ProverRegistry`).
+    let mut removed_vks: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let _ = hg.for_each_vertex_underlying_shard("vertex", "removes", &shard, &mut |vk: Vec<u8>, _| {
+        removed_vks.insert(vk);
+    });
+
     let mut cb = |vk: Vec<u8>, data: Vec<u8>| {
-        if vk.len() != 64 {
+        if vk.len() != 64 || removed_vks.contains(&vk) {
             return;
         }
         let root = match deserialize_go_tree(&data) {
