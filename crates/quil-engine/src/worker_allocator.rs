@@ -219,6 +219,11 @@ pub const REBIND_COOLDOWN_FRAMES: u64 = 30;
 /// than a few hundred frames.
 pub const MAX_REBINDS_PER_RECONCILE: usize = 4;
 
+/// How often the rebind path repeats an unchanged outcome in the log.
+/// Roughly ten minutes of frames — often enough that a fresh log window
+/// always shows the current state, rare enough not to bury the log.
+pub const REBIND_TELEMETRY_REPEAT_FRAMES: u64 = 75;
+
 /// Hysteresis for a priority rebind within the same tier: the unbound
 /// allocation must score at least this percent of the bound one before
 /// it may take its worker. Prevents two near-equal shards from trading
@@ -287,6 +292,53 @@ fn rebind_justified(challenger: &(u8, BigInt), holder: &(u8, BigInt)) -> bool {
     &challenger.1 * BigInt::from(100u64) >= &holder.1 * BigInt::from(REBIND_MARGIN_PERCENT)
 }
 
+/// Whether the lifecycle's ranking can be acted on this reconcile.
+enum PriorityState {
+    /// The lifecycle has never published — it has not completed an
+    /// evaluation with shard-info loaded since this node started.
+    Missing,
+    /// A ranking exists but predates `PRIORITY_SNAPSHOT_MAX_AGE_FRAMES`.
+    Stale { published_at: u64, age: u64 },
+    Fresh(HashMap<Vec<u8>, AllocationPriorityEntry>),
+}
+
+/// What the rebind path did, or why it did nothing. Logged so
+/// "no rebinding happened" is diagnosable without a debug build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebindOutcome {
+    /// Workers were moved onto better-ranked allocations.
+    Rebound = 1,
+    /// No ranking published yet (cold start, or shard-info never loaded).
+    NoRanking = 2,
+    /// Ranking too old to act on.
+    RankingStale = 3,
+    /// Within `REBIND_COOLDOWN_FRAMES` of the last rebind.
+    Cooldown = 4,
+    /// No unbound allocation is eligible — all orphans are mid-transition
+    /// (`Joining`/`Leaving`) or epoch-stale rather than steady `Active`.
+    NoEligibleOrphan = 5,
+    /// No bound worker may be taken: all are operator-pinned, mid-join,
+    /// or themselves not steady `Active`.
+    NoEvictableWorker = 6,
+    /// Ranked and eligible, but the best orphan does not clear the tier
+    /// or the `REBIND_MARGIN_PERCENT` margin over the worst holder.
+    BelowMargin = 7,
+}
+
+impl RebindOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rebound => "rebound",
+            Self::NoRanking => "no_ranking_published",
+            Self::RankingStale => "ranking_stale",
+            Self::Cooldown => "cooldown",
+            Self::NoEligibleOrphan => "no_eligible_orphan",
+            Self::NoEvictableWorker => "no_evictable_worker",
+            Self::BelowMargin => "below_margin",
+        }
+    }
+}
+
 /// Snapshot of the current allocation state across the network.
 #[derive(Debug, Clone)]
 pub struct AllocationSnapshot {
@@ -353,6 +405,10 @@ pub struct WorkerAllocator {
     /// Frame of the last reconcile that rebound a worker. Gates
     /// `REBIND_COOLDOWN_FRAMES`.
     last_rebind_frame: std::sync::atomic::AtomicU64,
+    /// Last logged `RebindOutcome` (as its discriminant) and the frame
+    /// it was logged at, for the rate limiter in `log_rebind_outcome`.
+    last_rebind_outcome: std::sync::atomic::AtomicU64,
+    last_rebind_outcome_frame: std::sync::atomic::AtomicU64,
 }
 
 impl WorkerAllocator {
@@ -376,6 +432,8 @@ impl WorkerAllocator {
             ),
             allocation_priority: RwLock::new(None),
             last_rebind_frame: std::sync::atomic::AtomicU64::new(0),
+            last_rebind_outcome: std::sync::atomic::AtomicU64::new(0),
+            last_rebind_outcome_frame: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -451,12 +509,6 @@ impl WorkerAllocator {
         self.record_attempt(Cooldown::Join, frame_number);
     }
 
-    /// Called on each new global frame. Reconciles the prover registry's
-    /// allocations against running worker threads.
-    ///
-    /// Key timing constants:
-    /// - `PROPOSAL_TIMEOUT_FRAMES = 10`: proposal never landed → clear filter
-    /// - `PENDING_FILTER_GRACE_FRAMES = 720`: pending join not confirmed → clear
     /// Publish the lifecycle's per-filter ranking for `frame_number`.
     ///
     /// Called once per lifecycle evaluation, after shard-info has
@@ -478,25 +530,73 @@ impl WorkerAllocator {
         }
     }
 
-    /// The published ranking, if it is recent enough to act on.
+    /// The published ranking and why it is or isn't usable.
+    ///
+    /// Returns the state rather than an `Option` so the caller can say
+    /// in the log which of "the lifecycle has never published",
+    /// "the last publish is too old" and "ranked, but nothing cleared
+    /// the bar" is happening — from the outside those are three very
+    /// different problems that all look like "no rebinding."
     ///
     /// The age check is two-sided: reconciles are driven by three
     /// independent sources (lifecycle, archive poller, frame receive)
     /// whose frame numbers can be slightly out of order, so a snapshot
     /// stamped a few frames ahead is normal and still valid.
-    fn fresh_allocation_priority(
-        &self,
-        frame_number: u64,
-    ) -> Option<HashMap<Vec<u8>, AllocationPriorityEntry>> {
-        let guard = self.allocation_priority.read().ok()?;
-        let snapshot = guard.as_ref()?;
+    fn allocation_priority_state(&self, frame_number: u64) -> PriorityState {
+        let Ok(guard) = self.allocation_priority.read() else {
+            return PriorityState::Missing;
+        };
+        let Some(snapshot) = guard.as_ref() else {
+            return PriorityState::Missing;
+        };
         let age = frame_number.abs_diff(snapshot.frame_number);
         if age > PRIORITY_SNAPSHOT_MAX_AGE_FRAMES {
-            return None;
+            return PriorityState::Stale {
+                published_at: snapshot.frame_number,
+                age,
+            };
         }
-        Some(snapshot.entries.clone())
+        PriorityState::Fresh(snapshot.entries.clone())
     }
 
+    /// Emit a rebind-path telemetry line, rate-limited.
+    ///
+    /// A node under allocation surplus reconciles every frame, so an
+    /// unconditional line here would be several thousand entries an
+    /// hour. Log when the outcome *changes* — which is the interesting
+    /// moment — and otherwise once per `REBIND_TELEMETRY_REPEAT_FRAMES`
+    /// so a steady state is still visible to an operator reading a
+    /// fresh window of the log. `info`, not `debug`: the node runs with
+    /// debug filtered out, and the whole point is that this is legible
+    /// on a live node.
+    fn log_rebind_outcome(&self, frame_number: u64, outcome: RebindOutcome, detail: &str) {
+        use std::sync::atomic::Ordering;
+        let code = outcome as u64;
+        let last_code = self.last_rebind_outcome.load(Ordering::Relaxed);
+        let last_frame = self.last_rebind_outcome_frame.load(Ordering::Relaxed);
+        let changed = last_code != code;
+        let due = last_frame == 0
+            || frame_number.abs_diff(last_frame) >= REBIND_TELEMETRY_REPEAT_FRAMES;
+        if !changed && !due {
+            return;
+        }
+        self.last_rebind_outcome.store(code, Ordering::Relaxed);
+        self.last_rebind_outcome_frame
+            .store(frame_number, Ordering::Relaxed);
+        info!(
+            frame_number,
+            outcome = outcome.as_str(),
+            detail,
+            "worker rebind under allocation surplus"
+        );
+    }
+
+    /// Called on each new global frame. Reconciles the prover registry's
+    /// allocations against running worker threads.
+    ///
+    /// Key timing constants:
+    /// - `PROPOSAL_TIMEOUT_FRAMES = 10`: proposal never landed → clear filter
+    /// - `PENDING_FILTER_GRACE_FRAMES = 720`: pending join not confirmed → clear
     pub fn on_new_frame(&self, frame_number: u64) -> Result<()> {
         // Get our prover info from the registry
         let prover_info = self
@@ -852,7 +952,11 @@ impl WorkerAllocator {
         // bind candidates by the same policy the lifecycle uses to
         // pick which surplus allocations to shed, so the workers we
         // still have run the shards we would keep.
-        let priority = self.fresh_allocation_priority(frame_number);
+        let priority_state = self.allocation_priority_state(frame_number);
+        let priority = match &priority_state {
+            PriorityState::Fresh(entries) => Some(entries.clone()),
+            _ => None,
+        };
 
         let mut bind_candidates: Vec<&quil_types::consensus::ProverAllocationInfo> =
             Vec::new();
@@ -991,13 +1095,29 @@ impl WorkerAllocator {
             // fleet) leave whatever they held bound and push the rest
             // out, and a reset can land a surplus in any order. Take
             // the workers back for the best allocations.
-            if let Some(priority) = priority.as_ref() {
-                self.rebind_surplus_by_priority(
+            match &priority_state {
+                PriorityState::Fresh(entries) => {
+                    self.rebind_surplus_by_priority(
+                        frame_number,
+                        &orphan_filters,
+                        &alloc_by_filter,
+                        entries,
+                    )?;
+                }
+                PriorityState::Missing => self.log_rebind_outcome(
                     frame_number,
-                    &orphan_filters,
-                    &alloc_by_filter,
-                    priority,
-                )?;
+                    RebindOutcome::NoRanking,
+                    "lifecycle has not published a ranking yet — it evaluates \
+                     only once shard-info has loaded",
+                ),
+                PriorityState::Stale { published_at, age } => self.log_rebind_outcome(
+                    frame_number,
+                    RebindOutcome::RankingStale,
+                    &format!(
+                        "last ranking published at frame {published_at} is {age} \
+                         frames old (max {PRIORITY_SNAPSHOT_MAX_AGE_FRAMES})"
+                    ),
+                ),
             }
         }
 
@@ -1034,6 +1154,14 @@ impl WorkerAllocator {
 
         let last_rebind = self.last_rebind_frame.load(Ordering::Relaxed);
         if last_rebind > 0 && frame_number.abs_diff(last_rebind) < REBIND_COOLDOWN_FRAMES {
+            self.log_rebind_outcome(
+                frame_number,
+                RebindOutcome::Cooldown,
+                &format!(
+                    "last rebind at frame {last_rebind}, {} of                      {REBIND_COOLDOWN_FRAMES} cooldown frames elapsed",
+                    frame_number.abs_diff(last_rebind)
+                ),
+            );
             return Ok(());
         }
 
@@ -1062,6 +1190,14 @@ impl WorkerAllocator {
             b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2))
         });
         if challengers.is_empty() {
+            self.log_rebind_outcome(
+                frame_number,
+                RebindOutcome::NoEligibleOrphan,
+                &format!(
+                    "{} unbound allocation(s), none steady Active/Paused                      (mid-transition or epoch-stale)",
+                    orphans.len()
+                ),
+            );
             return Ok(());
         }
 
@@ -1084,6 +1220,21 @@ impl WorkerAllocator {
         holders.sort_by(|a, b| {
             a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.3.cmp(&b.3))
         });
+        if holders.is_empty() {
+            self.log_rebind_outcome(
+                frame_number,
+                RebindOutcome::NoEvictableWorker,
+                "every bound worker is operator-pinned, mid-join, or not                  steady Active/Paused",
+            );
+            return Ok(());
+        }
+
+        // Captured before the vectors are consumed, so the telemetry can
+        // show the gap that was or wasn't cleared.
+        let best_challenger = (challengers[0].0, challengers[0].1.clone());
+        let worst_holder = (holders[0].0, holders[0].1.clone());
+        let challenger_count = challengers.len();
+        let holder_count = holders.len();
 
         let mut rebound = 0usize;
         for ((c_tier, c_score, c_filter), (h_tier, h_score, core_id, h_filter)) in
@@ -1119,6 +1270,25 @@ impl WorkerAllocator {
 
         if rebound > 0 {
             self.last_rebind_frame.store(frame_number, Ordering::Relaxed);
+            self.log_rebind_outcome(
+                frame_number,
+                RebindOutcome::Rebound,
+                &format!(
+                    "{rebound} worker(s) moved; {challenger_count} unbound                      candidate(s) against {holder_count} evictable worker(s)"
+                ),
+            );
+        } else {
+            self.log_rebind_outcome(
+                frame_number,
+                RebindOutcome::BelowMargin,
+                &format!(
+                    "best unbound (tier {}, score {}) does not clear                      {REBIND_MARGIN_PERCENT}% of worst bound (tier {}, score                      {}); {challenger_count} candidate(s), {holder_count}                      evictable worker(s)",
+                    best_challenger.0,
+                    best_challenger.1,
+                    worst_holder.0,
+                    worst_holder.1,
+                ),
+            );
         }
         Ok(())
     }
@@ -1648,6 +1818,41 @@ mod tests {
             bound_filters(&wm),
             vec![filters[0].clone()],
             "an out-of-date ranking must not drive worker churn"
+        );
+    }
+
+    #[test]
+    fn priority_state_distinguishes_missing_from_stale() {
+        let wm = Arc::new(MockWorkerManager::new());
+        let reg = Arc::new(TestProverRegistry::new());
+        let alloc = WorkerAllocator::new(wm, reg, vec![0xAAu8; 32]);
+        let frame = 10_000u64;
+
+        assert!(
+            matches!(alloc.allocation_priority_state(frame), PriorityState::Missing),
+            "a node whose lifecycle has never evaluated reports Missing, not Stale"
+        );
+
+        alloc.publish_allocation_priority(
+            frame - PRIORITY_SNAPSHOT_MAX_AGE_FRAMES - 1,
+            vec![(vec![0x01; 32], false, BigInt::from(5))],
+        );
+        match alloc.allocation_priority_state(frame) {
+            PriorityState::Stale { published_at, age } => {
+                assert_eq!(published_at, frame - PRIORITY_SNAPSHOT_MAX_AGE_FRAMES - 1);
+                assert_eq!(age, PRIORITY_SNAPSHOT_MAX_AGE_FRAMES + 1);
+            }
+            _ => panic!("an out-of-date ranking must report Stale with its age"),
+        }
+
+        alloc.publish_allocation_priority(
+            frame + 1,
+            vec![(vec![0x01; 32], false, BigInt::from(5))],
+        );
+        assert!(
+            matches!(alloc.allocation_priority_state(frame), PriorityState::Fresh(_)),
+            "a ranking stamped a frame ahead is still fresh — reconciles run \
+             from three sources whose frame numbers interleave"
         );
     }
 
