@@ -662,15 +662,26 @@ impl WorkerAllocator {
             .filter(|w| w.filter.is_empty() && !w.manually_managed)
             .map(|w| w.core_id)
             .collect();
+        // Sorted DESCENDING so `pop()` yields the LOWEST core id first.
+        // The proposal path (`proposer::plan_and_allocate`) sorts
+        // `free_worker_ids` ascending and hands shard k to
+        // `sorted_workers[k]`, i.e. it always plans from the lowest free
+        // core up. This fallback must agree: with ascending order + `pop()`
+        // it bound from the top down, so whenever a planned worker's
+        // pre-pin was lost the whole set shifted up by one and the lowest
+        // core was left idle (production: joins planned on cores 1..14,
+        // bindings landed on 2..15, core 1's join reported missing).
         idle_workers.sort();
+        idle_workers.reverse();
 
         // Manually-managed-but-unbound workers — the operator picked
         // these via the TUI's worker-selector at join time. We
         // consume them first when binding new Joining/Active
         // allocations to filters, so the user's selection is
-        // honored. Sorted ascending so `pop()` gives the
-        // highest-numbered first (matches `idle_workers` ordering;
-        // operators typically pick contiguous low-numbered workers).
+        // honored. Sorted descending so `pop()` gives the
+        // lowest-numbered first (matches `idle_workers` ordering and the
+        // proposal path; operators typically pick contiguous
+        // low-numbered workers).
         let mut manual_pending: Vec<u32> = self
             .worker_manager
             .range_workers()?
@@ -679,6 +690,7 @@ impl WorkerAllocator {
             .map(|w| w.core_id)
             .collect();
         manual_pending.sort();
+        manual_pending.reverse();
 
         // Track allocations that need a worker but couldn't get one
         // (idle pool empty + no manual-pending available). Without
@@ -985,6 +997,101 @@ mod tests {
         let assigned: Vec<Vec<u8>> = workers.iter().map(|w| w.filter.clone()).collect();
         assert!(assigned.contains(&vec![0x01; 32]));
         assert!(assigned.contains(&vec![0x02; 32]));
+    }
+
+    fn prover_with(allocs: Vec<ProverAllocationInfo>) -> ProverInfo {
+        ProverInfo {
+            public_key: vec![0xBB; 585],
+            address: vec![0xAA; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: allocs,
+            available_storage: 0,
+            seniority: 100,
+            delegate_address: vec![],
+        }
+    }
+
+    fn bound_cores(wm: &MockWorkerManager) -> Vec<u32> {
+        let mut v: Vec<u32> = wm
+            .range_workers()
+            .unwrap()
+            .iter()
+            .filter(|w| !w.filter.is_empty())
+            .map(|w| w.core_id)
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn fresh_assign_binds_lowest_core_ids_first() {
+        // Regression (production, post-grid-reset): the lifecycle's
+        // proposal path (`proposer::plan_and_allocate`) sorts the free
+        // worker ids ascending and plans shard k onto `sorted_workers[k]`
+        // — i.e. it always starts at the LOWEST free core. This fallback
+        // assign pass used to sort ascending and `pop()`, taking the
+        // HIGHEST core first, so the two disagreed: joins planned on
+        // cores 1..14 landed as bindings on cores 2..15 and core 1 sat
+        // idle with its join reported missing. With M > N idle workers,
+        // N allocations must occupy the N lowest cores.
+        let wm = Arc::new(MockWorkerManager::new());
+        for c in 1..=6u32 {
+            wm.allocate_worker(c, &[]).unwrap();
+        }
+
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            make_alloc(vec![0x01; 32]),
+            make_alloc(vec![0x02; 32]),
+            make_alloc(vec![0x03; 32]),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        alloc.on_new_frame(101).unwrap();
+
+        assert_eq!(
+            bound_cores(&wm),
+            vec![1, 2, 3],
+            "3 allocations over 6 idle workers must bind the 3 lowest cores, \
+             matching the order the proposal path pre-pins them in"
+        );
+    }
+
+    #[test]
+    fn manual_pending_consumed_before_auto_idle_pool() {
+        // Precedence rule must survive the ordering fix: operator-picked
+        // (`manually_managed`) unbound workers are consumed before the
+        // auto idle pool, and each pool is drained lowest-core-first.
+        let wm = Arc::new(MockWorkerManager::new());
+        for c in 1..=3u32 {
+            wm.allocate_worker(c, &[]).unwrap(); // auto idle pool
+        }
+        for c in [10u32, 11] {
+            wm.add(crate::worker::WorkerInfo {
+                core_id: c,
+                filter: Vec::new(),
+                available_storage: 0,
+                total_storage: 0,
+                manually_managed: true,
+                pending_filter_frame: 0,
+                allocated: false,
+            });
+        }
+
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            make_alloc(vec![0x01; 32]),
+            make_alloc(vec![0x02; 32]),
+            make_alloc(vec![0x03; 32]),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        alloc.on_new_frame(101).unwrap();
+
+        assert_eq!(
+            bound_cores(&wm),
+            vec![1, 10, 11],
+            "both operator-picked workers must be consumed before the auto \
+             pool, and the single auto spillover must take the lowest free \
+             core (1), not the highest (3)"
+        );
     }
 
     #[test]
