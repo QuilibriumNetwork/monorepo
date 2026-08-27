@@ -212,6 +212,26 @@ pub(crate) fn format_storage(bytes: u64) -> String {
     }
 }
 
+/// The `Size [MB]` cell — bytes as megabytes, one decimal, bare number.
+///
+/// The column states its unit in the header so the cells stay short and stay
+/// comparable at a glance; that is worth keeping. What it cost was the bottom
+/// of the range: one decimal of a megabyte resolves to ~52 KB, so every shard
+/// under that printed `0.0`, identical to an empty one.
+///
+/// A non-zero size that would round to `0.0` prints `<0.1` instead. It is an
+/// upper bound in the column's own unit, it right-aligns on the same decimal
+/// column as every other cell, and it sorts and filters as the byte value it
+/// really is — only the rendering changes.
+pub(crate) fn format_mb(v: &BigInt) -> String {
+    let mb = v.to_string().parse::<f64>().unwrap_or(0.0) / (1024.0 * 1024.0);
+    if v.sign() == Sign::Plus && mb < 0.05 {
+        "<0.1".to_string()
+    } else {
+        format!("{mb:.1}")
+    }
+}
+
 /// `formatQUIL` — reward units (1 QUIL = 10^8 units) → 8-decimal string.
 /// NOTE: distinct from the token module's 8e9/12-decimal balance format.
 pub(crate) fn format_quil_reward(raw: &BigInt) -> String {
@@ -242,6 +262,17 @@ mod tests {
         assert_eq!(format_storage(512), "512 B");
         assert_eq!(format_storage(1536), "1.5 KB");
         assert_eq!(format_storage(1024 * 1024), "1.0 MB");
+    }
+
+    #[test]
+    fn format_mb_separates_a_small_shard_from_an_empty_one() {
+        assert_eq!(format_mb(&BigInt::from(0)), "0.0");
+        assert_eq!(format_mb(&BigInt::from(2048)), "<0.1");
+        // The rounding edge: 0.05 MB is where `{:.1}` starts printing `0.1`.
+        assert_eq!(format_mb(&BigInt::from(52_428)), "<0.1");
+        assert_eq!(format_mb(&BigInt::from(52_429)), "0.1");
+        assert_eq!(format_mb(&BigInt::from(5 * 1024 * 1024)), "5.0");
+        assert_eq!(format_mb(&BigInt::from(1024 * 1024 * 1024)), "1024.0");
     }
 
     #[test]

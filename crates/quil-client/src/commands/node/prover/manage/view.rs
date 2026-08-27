@@ -63,7 +63,7 @@ fn fmt_reward(v: &BigInt) -> String {
 }
 
 fn fmt_mb(v: &BigInt) -> String {
-    format!("{:.1}", bigint_to_f64(v) / (1024.0 * 1024.0))
+    super::super::format_mb(v)
 }
 
 // ── Entry ────────────────────────────────────────────────────────────────
