@@ -854,6 +854,10 @@ pub(crate) fn init(
                                         });
                                     }
                                     WorkerToMaster::ShardActivated { core_id, filter, handle } => {
+                                        // Keep a second handle for the asynchronous CW transport
+                                        // readiness barrier below; the routing registry owns the
+                                        // original handle.
+                                        let ready_handle = handle.clone();
                                         // Push the current halt state to the
                                         // freshly-activated engine before
                                         // registering it. Without this the
@@ -877,7 +881,6 @@ pub(crate) fn init(
                                         // dispatches never reach the engine.
                                         let p2p = drain_p2p.clone();
                                         let filter_for_sub = filter.clone();
-                                        let ready_handle = handle.clone();
                                         drain_spawner.detach("shard-subscribe", async move {
                                             for topic in [
                                                 quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub),
