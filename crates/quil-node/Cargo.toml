@@ -94,3 +94,7 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 [dev-dependencies]
 tempfile = "3"
 flate2 = "1"
+# `test-util` is not part of tokio's `full`. It provides the paused clock the
+# PeerInfo publisher's wait-for-subscriber tests use to assert timing without
+# actually sleeping.
+tokio = { version = "1", features = ["full", "test-util"] }
