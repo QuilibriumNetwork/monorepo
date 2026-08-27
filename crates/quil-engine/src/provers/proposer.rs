@@ -588,9 +588,28 @@ pub fn decide_joins(
     // availableWorkers cap (Go `proposer.go:518-531`): only applied when
     // no rejections — Go submits reject XOR confirm in a single
     // DecideAllocations call, so the cap is consulted only on the
-    // confirm path. If we have zero free workers, drop all confirms; if
-    // we have some, truncate to capacity.
+    // confirm path. `pending` is registry iteration order, which is
+    // incidental. Rank confirmations before truncating, using the same
+    // halt-risk-first then reward order as `plan_and_allocate`, so scarce
+    // worker slots are committed to the most useful shards.
     if reject.is_empty() && !confirm.is_empty() && available_workers != usize::MAX {
+        confirm.sort_by(|a, b| {
+            let rank = |filter: &Vec<u8>| {
+                let key = hex::encode(filter);
+                let descriptor = desc_by_hex.get(&key).copied();
+                let halt_risk = descriptor
+                    .map(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
+                    .unwrap_or(false);
+                let score = by_hex.get(&key).cloned().unwrap_or_else(BigInt::zero);
+                (halt_risk, score)
+            };
+            let (a_halt_risk, a_score) = rank(a);
+            let (b_halt_risk, b_score) = rank(b);
+            b_halt_risk
+                .cmp(&a_halt_risk)
+                .then_with(|| b_score.cmp(&a_score))
+                .then_with(|| a.cmp(b))
+        });
         if available_workers == 0 {
             confirm.clear();
         } else if confirm.len() > available_workers {
@@ -1348,6 +1367,27 @@ mod tests {
             DEFAULT_UNITS, Strategy::RewardGreedy, usize::MAX,
         );
         assert_eq!(confirm_max.len(), 3);
+    }
+
+    #[test]
+    fn decide_joins_capacity_keeps_highest_reward_pending_filters() {
+        // Pending allocation order is deliberately worst-to-best. With one
+        // worker available, the cap must not confirm the first registry entry.
+        let shards = vec![
+            make_shard(vec![0x01], 200_000, 0, 1),
+            make_shard(vec![0x02], 250_000, 0, 1),
+            make_shard(vec![0x03], 300_000, 0, 1),
+        ];
+        let pending = vec![vec![0x01], vec![0x02], vec![0x03]];
+
+        let (reject, confirm) = decide_joins(
+            &shards, &pending, 50_000, &BigInt::from(750_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy, 1,
+        );
+
+        assert!(reject.is_empty());
+        assert_eq!(confirm, vec![vec![0x03]],
+            "highest-reward shard wins the only slot");
     }
 
     /// Joining provers do NOT count toward halt-risk classification.

@@ -502,6 +502,24 @@ impl WorkerAllocator {
 
             match alloc_by_filter.get(&worker.filter) {
                 Some(alloc) => {
+                    // `Active` is a raw wire status. An allocation whose
+                    // epoch is stale is effectively inactive until its
+                    // re-confirmation lands, so it must not pin a scarce
+                    // worker while a live allocation is unbound.
+                    if alloc.effective_status(frame_number)
+                        == quil_types::consensus::EffectiveStatus::ExpiredEpoch
+                    {
+                        info!(
+                            core_id = worker.core_id,
+                            filter = hex::encode(&worker.filter),
+                            allocation_epoch = alloc.epoch,
+                            current_epoch = quil_types::consensus::epoch_for_frame(frame_number),
+                            "epoch-expired allocation released so a live shard can use the worker"
+                        );
+                        self.worker_manager.deallocate_worker(worker.core_id)?;
+                        continue;
+                    }
+
                     // Tier-5 #8/#9: compute desired_allocated AFTER the
                     // expired-join/leave reset, mirroring Go's
                     // worker_allocator.go:421-422 + 781-816. Paused
@@ -1078,6 +1096,40 @@ mod tests {
 
         // Worker should have been deallocated
         assert!(wm.range_workers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn releases_epoch_expired_binding_for_live_allocation() {
+        let wm = Arc::new(MockWorkerManager::new());
+        let stale_filter = vec![0x01; 32];
+        let live_filter = vec![0x02; 32];
+        wm.allocate_worker(1, &stale_filter).unwrap();
+
+        let frame = 10_000;
+        let mut stale = make_alloc(stale_filter);
+        stale.epoch = 0;
+        let mut live = make_alloc(live_filter.clone());
+        live.epoch = quil_types::consensus::epoch_for_frame(frame);
+
+        let prover = ProverInfo {
+            public_key: vec![],
+            address: vec![0xAA; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![stale, live],
+            available_storage: 0,
+            seniority: 0,
+            delegate_address: vec![],
+        };
+        let reg = Arc::new(TestProverRegistry::with_prover(prover));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+
+        alloc.on_new_frame(frame).unwrap();
+
+        let workers = wm.range_workers().unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].filter, live_filter,
+            "the stale epoch binding must yield its only worker to the live allocation");
     }
 
     // -----------------------------------------------------------------
