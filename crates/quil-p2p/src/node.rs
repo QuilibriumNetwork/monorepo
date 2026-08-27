@@ -953,6 +953,13 @@ impl P2PNode {
                             Some(P2PCommand::Subscribe(bitmask)) => {
                                 swarm.behaviour_mut().blossomsub.subscribe(bitmask);
                             }
+                            Some(P2PCommand::SubscribeConfirmed { bitmask, ack }) => {
+                                swarm.behaviour_mut().blossomsub.subscribe(bitmask);
+                                let _ = ack.send(());
+                            }
+                            Some(P2PCommand::SubscribedPeerCount { bitmask, ack }) => {
+                                let _ = ack.send(swarm.behaviour().blossomsub.subscribed_peer_count(&bitmask));
+                            }
                             Some(P2PCommand::Unsubscribe(bitmask)) => {
                                 swarm.behaviour_mut().blossomsub.unsubscribe(&bitmask);
                             }
@@ -1059,6 +1066,22 @@ pub struct P2PHandle {
 impl P2PHandle {
     pub async fn subscribe(&self, bitmask: Vec<u8>) {
         let _ = self.cmd_tx.send(P2PCommand::Subscribe(bitmask)).await;
+    }
+
+    /// Subscribe and wait until the swarm loop has actually applied it.
+    pub async fn subscribe_confirmed(&self, bitmask: Vec<u8>) -> quil_types::error::Result<()> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx.send(P2PCommand::SubscribeConfirmed { bitmask, ack: ack_tx }).await
+            .map_err(|_| QuilError::P2p("p2p command channel closed (swarm shutting down?)".into()))?;
+        ack_rx.await.map_err(|_| QuilError::P2p("p2p swarm dropped subscribe ack (event loop exited)".into()))
+    }
+
+    /// Count connected peers which advertised this exact topic subscription.
+    pub async fn subscribed_peer_count(&self, bitmask: Vec<u8>) -> quil_types::error::Result<usize> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx.send(P2PCommand::SubscribedPeerCount { bitmask, ack: ack_tx }).await
+            .map_err(|_| QuilError::P2p("p2p command channel closed (swarm shutting down?)".into()))?;
+        ack_rx.await.map_err(|_| QuilError::P2p("p2p swarm dropped topic-peer-count ack (event loop exited)".into()))
     }
 
     /// Register a blossomsub-level validator on `bitmask` that filters stale
@@ -1390,6 +1413,8 @@ impl P2PHandle {
 
 enum P2PCommand {
     Subscribe(Vec<u8>),
+    SubscribeConfirmed { bitmask: Vec<u8>, ack: oneshot::Sender<()> },
+    SubscribedPeerCount { bitmask: Vec<u8>, ack: oneshot::Sender<usize> },
     Unsubscribe(Vec<u8>),
     /// Install a per-(source, target) gossip forward filter. Used by the
     /// devnet test proxy to impose bipartite network partitions.
