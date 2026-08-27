@@ -1197,6 +1197,43 @@ impl ProverLifecycle {
         // confirm and seniority-merge paths run regardless since
         // they depend on local pending state, not shard sizes.
         let shard_info_ready = readiness.shard_info_loaded;
+        if shard_info_ready {
+            // Publish this frame's ranking for the worker allocator.
+            // Scoring needs archive-sourced sizes, the world-byte
+            // total and the frame difficulty, none of which the
+            // allocator can reach — and its reconcile also runs from
+            // the archive poller and the frame-receive path, outside
+            // this function. Without the snapshot it binds workers in
+            // registry order, which decides arbitrarily which shards
+            // go unbound when we hold more allocations than workers.
+            let halt_risk_by_filter: HashMap<Vec<u8>, bool> = decide_all_descriptors
+                .iter()
+                .map(|d| {
+                    (
+                        d.filter.clone(),
+                        d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT,
+                    )
+                })
+                .collect();
+            let priority_entries: Vec<(Vec<u8>, bool, BigInt)> =
+                proposer::rank_allocated_by_score_ascending(
+                    &decide_all_descriptors,
+                    difficulty,
+                    &world_bytes,
+                    self.units,
+                    self.strategy,
+                    &std::collections::HashSet::new(),
+                )
+                .into_iter()
+                .map(|(filter, score)| {
+                    let halt_risk =
+                        halt_risk_by_filter.get(&filter).copied().unwrap_or(false);
+                    (filter, halt_risk, score)
+                })
+                .collect();
+            self.allocator
+                .publish_allocation_priority(frame_number, priority_entries);
+        }
         if !shard_info_ready {
             tracing::debug!(
                 frame = frame_number,

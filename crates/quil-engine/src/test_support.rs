@@ -274,7 +274,15 @@ impl WorkerManager for TestWorkerManager {
     }
 
     fn deallocate_worker(&self, core_id: u32) -> Result<()> {
-        self.workers.lock().unwrap().remove(&core_id);
+        // Match ThreadWorkerManager: releasing an allocation makes the
+        // existing core idle; it does not remove the worker from the node.
+        // Keeping the entry is essential for allocator tests that release a
+        // stale filter and immediately bind that core to a live allocation.
+        if let Some(worker) = self.workers.lock().unwrap().get_mut(&core_id) {
+            worker.filter.clear();
+            worker.allocated = false;
+            worker.pending_filter_frame = 0;
+        }
         Ok(())
     }
 
