@@ -64,6 +64,19 @@ pub fn rewrite_allocation_filter(old_blob: &[u8], new_filter: &[u8]) -> Result<V
     Ok(vertex_tree_to_blob(&tree))
 }
 
+/// Rewrite an allocation vertex blob's `Status` byte, preserving every other
+/// field verbatim. Used to retire a vacated allocation slot to
+/// [`materialize::STATUS_HISTORIC`] IN PLACE when a reassignment moves the prover
+/// off this filter — instead of deleting the vertex, which would permanently
+/// tombstone its `allocation_address` (the removes-phase gate in
+/// `HypergraphCrdt::get_vertex_data`) and make the slot unrepresentable if the
+/// shard is ever re-formed (split→lose-coverage→merge-back).
+pub fn set_allocation_status(old_blob: &[u8], status: u8) -> Result<Vec<u8>> {
+    let mut tree = rebuild_vertex_tree_from_blob(old_blob);
+    write_field(&mut tree, ALLOCATION_CLASS, "Status", &[status])?;
+    Ok(vertex_tree_to_blob(&tree))
+}
+
 /// Rebuild a prover's allocation hyperedge blob, replacing the atom for
 /// `old_alloc_addr` with one for `new_alloc_addr` (built from
 /// `new_alloc_tree`) while keeping every other atom byte-identical.
@@ -116,6 +129,38 @@ pub fn rebuild_hyperedge_with_reassigned_atom(
         &BigInt::from(atom_bytes.len() as u64),
     )?;
 
+    Ok(vertex_tree_to_blob(&tree))
+}
+
+/// Rebuild a prover's allocation hyperedge blob WITHOUT the atom for
+/// `drop_alloc_addr`, keeping every other atom byte-identical — the removal
+/// counterpart of [`rebuild_hyperedge_with_reassigned_atom`], used when a
+/// surplus allocation is dropped outright (not moved) so the prover is no longer
+/// enumerated on that shard. An empty/absent existing blob yields an empty
+/// hyperedge. Like the reassign builder, the trie is a pure function of its
+/// `(key, value)` set, so re-inserting the survivors in any order reproduces an
+/// identical blob across nodes.
+pub fn rebuild_hyperedge_without_atom(
+    existing_blob: &[u8],
+    drop_alloc_addr: &[u8; 32],
+) -> Result<Vec<u8>> {
+    let mut drop_key = [0u8; 64];
+    drop_key[..32].copy_from_slice(&GLOBAL_INTRINSIC_ADDRESS);
+    drop_key[32..].copy_from_slice(drop_alloc_addr);
+
+    let mut tree = VectorCommitmentTree::new();
+    if !existing_blob.is_empty() {
+        if let Some(root) = quil_tries::deserialize_go_tree(existing_blob)? {
+            let mut src = VectorCommitmentTree::new();
+            src.root = Some(root);
+            for (key, value) in src.leaves() {
+                if key.as_slice() == drop_key.as_slice() {
+                    continue;
+                }
+                tree.insert(&key, &value, &[], &BigInt::from(value.len() as u64))?;
+            }
+        }
+    }
     Ok(vertex_tree_to_blob(&tree))
 }
 

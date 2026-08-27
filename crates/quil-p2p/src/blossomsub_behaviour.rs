@@ -368,6 +368,14 @@ impl BlossomSubBehaviour {
         self.inner.mesh_peers(&topic_for(bitmask).hash()).count()
     }
 
+    /// Connected peers which advertised this exact bitmask. This becomes
+    /// useful before the mesh heartbeat has populated `mesh_peers`.
+    pub fn subscribed_peer_count(&self, bitmask: &[u8]) -> usize {
+        self.peer_subscriptions.iter().filter(|(peer, subscriptions)| {
+            self.connected_peers.contains_key(*peer) && subscriptions.contains(bitmask)
+        }).count()
+    }
+
     /// Read-only access to our own subscription set.
     pub fn subscriptions(&self) -> &HashSet<Vec<u8>> {
         &self.subscriptions
@@ -769,6 +777,20 @@ mod propagation_tests {
             .expect("behaviour")
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(30)))
             .build()
+    }
+
+    #[test]
+    fn subscribed_peer_count_requires_a_live_exact_subscriber() {
+        let mut behaviour = BlossomSubBehaviour::new(0);
+        let topic = vec![0x0c, 0xa1];
+        let peer = PeerId::random();
+        let disconnected = PeerId::random();
+        behaviour.peer_subscriptions.insert(peer, [topic.clone()].into_iter().collect());
+        behaviour.peer_subscriptions.insert(disconnected, [topic.clone()].into_iter().collect());
+        behaviour.connected_peers.insert(peer, 1);
+
+        assert_eq!(behaviour.subscribed_peer_count(&topic), 1);
+        assert_eq!(behaviour.subscribed_peer_count(&[0x0c, 0xa2]), 0);
     }
 
     /// A message published at the hub reaches every subscribed leaf. Star

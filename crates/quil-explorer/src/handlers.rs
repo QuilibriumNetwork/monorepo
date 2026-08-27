@@ -392,6 +392,7 @@ fn prover_status_to_string(status: ProverStatus) -> String {
         ProverStatus::Leaving => "leaving",
         ProverStatus::Rejected => "rejected",
         ProverStatus::Kicked => "kicked",
+        ProverStatus::Historic => "historic",
     }
     .to_string()
 }

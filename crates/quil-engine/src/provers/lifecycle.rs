@@ -316,10 +316,16 @@ impl AllocationBuckets {
                 // into `allocated_descriptors` and `plan_leaves`
                 // may emit a Leave for an allocation that's already
                 // terminal on-chain.
+                // Historic: superseded by a reassignment. Treat as "doesn't
+                // exist" like the terminals — crucially NOT in `all_ours`, so the
+                // proposer is free to re-propose joining this shard, which
+                // reactivates the retained slot (the reversibility the status
+                // exists for) instead of hitting a permanent delete-tombstone.
                 EffectiveStatus::ExpiredJoining
                 | EffectiveStatus::ExpiredLeaving
                 | EffectiveStatus::Rejected
                 | EffectiveStatus::Kicked
+                | EffectiveStatus::Historic
                 | EffectiveStatus::Unknown => {}
             }
         }

@@ -412,6 +412,14 @@ pub struct WorkerAllocator {
     /// it was logged at, for the rate limiter in `log_rebind_outcome`.
     last_rebind_outcome: std::sync::atomic::AtomicU64,
     last_rebind_outcome_frame: std::sync::atomic::AtomicU64,
+    /// Once-guard for the prover-reset-v3 worker-filter reset (mainnet frame
+    /// 747_000). Fires exactly at that frame in `on_new_frame`, clearing every
+    /// AUTO-managed worker's persisted deep filter so re-join lands on the clean
+    /// genesis grid (the local worker store is what survived the v2 tree wipe and
+    /// re-fed the cascade). In-memory is sufficient: the gate is the exact frame
+    /// (processed once, monotonic) and the clear is idempotent — unlike the
+    /// prover-TREE reseed, re-clearing auto filters has no harmful effect.
+    worker_reset_v3_done: std::sync::atomic::AtomicBool,
 }
 
 impl WorkerAllocator {
@@ -437,6 +445,7 @@ impl WorkerAllocator {
             last_rebind_frame: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome_frame: std::sync::atomic::AtomicU64::new(0),
+            worker_reset_v3_done: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -601,6 +610,34 @@ impl WorkerAllocator {
     /// - `PROPOSAL_TIMEOUT_FRAMES = 10`: proposal never landed → clear filter
     /// - `PENDING_FILTER_GRACE_FRAMES = 720`: pending join not confirmed → clear
     pub fn on_new_frame(&self, frame_number: u64) -> Result<()> {
+        // Prover-reset v3 (mainnet 747_000): clear every AUTO-managed worker's
+        // persisted filter so it re-joins onto the clean genesis grid instead of
+        // the deep filter that survived the v2 tree wipe in the local worker store
+        // and re-fed the overlap cascade. Manually-managed workers keep their pins
+        // (operator intent). Exact-frame gated + a one-shot in-memory guard; the
+        // clear is idempotent so no persisted marker is needed (unlike the
+        // prover-tree reseed on the consensus path).
+        if frame_number
+            == quil_execution::global_intrinsic::materialize::quil_prover_reset_v3_frame()
+            && !self
+                .worker_reset_v3_done
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let mut cleared = 0usize;
+            if let Ok(workers) = self.worker_manager.range_workers() {
+                for w in workers {
+                    if !w.manually_managed && !w.filter.is_empty() {
+                        if let Err(e) = self.worker_manager.deallocate_worker(w.core_id) {
+                            warn!(core_id = w.core_id, error = %e, "prover-reset v3: worker filter clear FAILED");
+                        } else {
+                            cleared += 1;
+                        }
+                    }
+                }
+            }
+            info!(frame = frame_number, cleared, "prover-reset v3: cleared auto-managed worker filters (re-join lands on genesis grid)");
+        }
+
         // Get our prover info from the registry
         let prover_info = self
             .prover_registry
@@ -792,11 +829,18 @@ impl WorkerAllocator {
                                 self.worker_manager.deallocate_worker(worker.core_id)?;
                             }
                         }
-                        ProverStatus::Rejected | ProverStatus::Kicked => {
-                            // Allocation terminally ended — clear
-                            // immediately. `Rejected` = join was
-                            // rejected; `Kicked` = leave-confirmed
-                            // (alloc status byte 5) OR evicted.
+                        ProverStatus::Rejected
+                        | ProverStatus::Kicked
+                        | ProverStatus::Historic => {
+                            // Allocation no longer lives on this filter — clear
+                            // immediately so the worker returns to the free pool.
+                            // `Rejected` = join was rejected; `Kicked` =
+                            // leave-confirmed (alloc byte 5) OR evicted; `Historic`
+                            // = vacated by a reassignment (the prover moved to
+                            // another filter — the worker must follow, so free it to
+                            // re-bind to the new active allocation rather than sit
+                            // idle pinned to the vacated one; a merge-back that
+                            // reactivates the slot re-binds a worker from the pool).
                             //
                             // `ProverStatus::Leaving` deliberately
                             // does NOT belong here — it's the
@@ -811,7 +855,7 @@ impl WorkerAllocator {
                                 core_id = worker.core_id,
                                 filter = hex::encode(&worker.filter),
                                 status = ?alloc.status,
-                                "allocation ended, clearing worker"
+                                "allocation ended/reassigned, clearing worker"
                             );
                             self.worker_manager.deallocate_worker(worker.core_id)?;
                         }

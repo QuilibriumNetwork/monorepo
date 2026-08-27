@@ -249,6 +249,16 @@ impl GlobalIntrinsic {
         self
     }
 
+    /// Install ONLY the hypergraph CRDT — the committed-state source the
+    /// deterministic reassignment / allocation re-home enumerate provers from.
+    /// The richer [`Self::with_kick_verify_deps`] also wires it but pulls in a
+    /// BLS constructor + inclusion prover; this is the minimal form for paths
+    /// (and tests) that need committed-state reads without equivocation checks.
+    pub fn with_hypergraph(mut self, hypergraph: Arc<quil_hypergraph::HypergraphCrdt>) -> Self {
+        self.hypergraph = Some(hypergraph);
+        self
+    }
+
     /// Validate a canonical-bytes global op message. Decodes the
     /// message, dispatches by type prefix, and runs the per-op
     /// structural validation + signature verification (when prover
@@ -1261,8 +1271,13 @@ impl GlobalIntrinsic {
                             let status = read_field(&alloc_tree, "allocation:ProverAllocation", "Status")
                                 .and_then(|b| b.first().copied())
                                 .unwrap_or(4);
-                            // Status 4 (left/kicked) is ok to rejoin
-                            if status != 4 {
+                            // Byte 4 (Rejected) and byte 6 (Historic) are ok to
+                            // rejoin — a Historic slot was vacated by a reassignment
+                            // and RETAINED for reactivation, so a fresh Join reclaims
+                            // it instead of being blocked by the 720-frame window.
+                            // MUST match the validate-side gate in
+                            // `verify_prover_join_allocations_expired`.
+                            if status != 4 && status != materialize::STATUS_HISTORIC {
                                 // Check if the allocation has expired (720 frame window)
                                 let join_frame = read_field(&alloc_tree, "allocation:ProverAllocation", "JoinFrameNumber")
                                     .unwrap_or_default();
@@ -2430,18 +2445,30 @@ impl GlobalIntrinsic {
         };
 
         let txn = db.new_batch(false)?;
-        // Live grid entries, so a STALE duplicate split — one whose parent an
-        // earlier-epoch change already removed — is SKIPPED instead of re-registering
-        // overlapping children. Seeded from committed state and updated as we apply,
-        // so a straddle that lands both the E+2 and E+3 change in ONE frame is caught
-        // too. The duplicate arises because the proposer re-emits a split every frame
-        // while the parent stays over-crowded (it never consults pending changes); a
-        // re-proposal that crosses the epoch boundary stamps a later effective_epoch
-        // (E+3), coexisting with the E+2 record — both would otherwise apply.
-        let mut live: std::collections::HashSet<(Vec<u8>, Vec<u32>)> = store
+        // Live grid entries, KEYED BY CANONICAL BIT-PATH (not the raw prefix) so the
+        // stale check is FORM-AGNOSTIC. A genesis shard is stored as a byte-suffix
+        // prefix (`[i]`), while `materialize_shard_split` reports `removed_parent` in
+        // SENTINEL bit-path form — comparing the raw prefixes never matches, which
+        // wrongly classified the FIRST split of every byte-suffix genesis shard as
+        // "stale" and skipped it (mainnet post-reset: QUIL stuck at 64-way, unable to
+        // split). Decode both sides to bits — sentinel via `shard_bit_path_from_prefix`,
+        // byte-suffix via the 6-bit-per-level binary (the mapping
+        // `decode_shard_filter_or_root` uses) — so the same shard compares equal in
+        // either encoding. A genuinely STALE duplicate (whose parent an earlier change
+        // already removed) still fails the membership test and is skipped. `live` is
+        // updated as we apply so a straddle that lands both the E+2 and E+3 record in
+        // ONE frame is caught too. The duplicate arises because the proposer used to
+        // re-emit a split every frame while the parent stayed over-crowded; a
+        // re-proposal crossing the epoch boundary stamps a later effective_epoch that
+        // coexists with the first — both would otherwise apply.
+        let canon_bits = |prefix: &[u32]| -> Vec<bool> {
+            quil_forest::shard_bit_path_from_prefix(prefix)
+                .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6))
+        };
+        let mut live: std::collections::HashSet<(Vec<u8>, Vec<bool>)> = store
             .range_app_shards()?
             .into_iter()
-            .map(|r| (r.shard_key, r.prefix))
+            .map(|r| (r.shard_key, canon_bits(&r.prefix)))
             .collect();
         for change in &due {
             match change.kind {
@@ -2461,7 +2488,7 @@ impl GlobalIntrinsic {
                     // shards → provers on "both sides"). Still consume the pending
                     // record below so it stops re-firing.
                     let parent_in_grid = output.removed_parent.as_ref().map_or(true, |(l2, path)| {
-                        live.contains(&(grid_key(l2), path.clone()))
+                        live.contains(&(grid_key(l2), canon_bits(path)))
                     });
                     if !parent_in_grid {
                         tracing::warn!(
@@ -2513,7 +2540,7 @@ impl GlobalIntrinsic {
                                 commitment: Vec::new(),
                             };
                             store.put_app_shard(txn.as_ref(), &shard)?;
-                            live.insert((grid_key(l2), path.clone()));
+                            live.insert((grid_key(l2), canon_bits(path)));
                         }
                         // Deep-bifurcation (Option A): the parent is REPLACED by the
                         // partition (spine + leaves) — remove it so the set stays
@@ -2525,7 +2552,7 @@ impl GlobalIntrinsic {
                                 "removing split parent shard (replaced by partition)"
                             );
                             store.delete_app_shard(txn.as_ref(), &grid_key(l2), path)?;
-                            live.remove(&(grid_key(l2), path.clone()));
+                            live.remove(&(grid_key(l2), canon_bits(path)));
                         }
                     }
                 }
@@ -2622,6 +2649,7 @@ impl GlobalIntrinsic {
         // `materialize::quil_grid_reset_v2_frame`.
         if frame_number != super::materialize::unified_tree_cutover_frame()
             && frame_number != super::materialize::quil_grid_reset_v2_frame()
+            && frame_number != super::materialize::quil_prover_reset_v3_frame()
         {
             return Ok(false);
         }
@@ -2886,12 +2914,24 @@ impl GlobalIntrinsic {
         )?;
         state.set(domain, prover_address, ha_disc, frame_number, new_he)?;
 
-        // Remove the stale vertex only when the address actually changed.
+        // Retire the vacated slot as Historic instead of DELETING it, but only
+        // when the address actually changed (a poseidon-collision re-key already
+        // updated in place above). A hard delete writes a removes-phase tombstone
+        // that `get_vertex_data` honors forever and no later `add_vertex` clears —
+        // so a shard that splits, loses coverage, and merges back could never
+        // re-represent this allocation (the address is gone for good). Flipping
+        // Status to Historic keeps the vertex: committee/worker reads exclude it
+        // (`committee_eligible`), its hyperedge atom is already dropped above, and
+        // a future reassignment TO `old_filter` reactivates the same slot.
+        let _ = vr_disc;
         if new_addr != old_addr {
-            state.delete(domain, &old_addr, vr_disc, frame_number)?;
+            let historic_blob =
+                reassignment::set_allocation_status(&old_blob, materialize::STATUS_HISTORIC)?;
+            state.set(domain, &old_addr, va_disc, frame_number, historic_blob)?;
         }
         Ok(())
     }
+
 }
 
 /// Convert an Ed448 public key (57 bytes) to a base58-encoded libp2p
@@ -4266,5 +4306,224 @@ mod tests {
                 "both pending records consumed",
             );
         }
+
+        /// Regression: a GENESIS shard is stored as a byte-suffix prefix (`[i]`),
+        /// while `materialize_shard_split` reports `removed_parent` in SENTINEL form.
+        /// The stale-split guard must treat those as the SAME shard, or it wrongly
+        /// skips the FIRST split of every genesis shard (mainnet: QUIL stuck at 64-way
+        /// after the grid reset). This exercises the multi-shard byte-suffix path that
+        /// the single-shard localnet could not.
+        #[test]
+        fn fresh_byte_suffix_genesis_split_applies_and_removes_the_parent() {
+            use quil_types::store::{
+                KvDb, PendingShardChange, ShardChangeKind, ShardInfo, ShardsStore,
+            };
+            let app = crate::domains::QUIL_TOKEN;
+            let grid_key = {
+                let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3);
+                let mut k = l1.to_vec();
+                k.extend_from_slice(&app);
+                k
+            };
+            let shdb = quil_store::RocksDb::open_in_memory().unwrap();
+            let store: Arc<dyn ShardsStore> =
+                Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
+
+            // The full 64-way byte-suffix genesis grid (`[0]..[63]`), as the reset
+            // writes it — so `migrate_app_shards_to_sentinel` canonicalizes to the
+            // 6-bit paths that match `removed_parent` (a smaller set would give a
+            // narrower width and misrepresent mainnet).
+            for i in 0..64u32 {
+                let txn = shards_db.new_batch(false).unwrap();
+                store
+                    .put_app_shard(
+                        txn.as_ref(),
+                        &ShardInfo {
+                            shard_key: grid_key.clone(),
+                            prefix: vec![i],
+                            size: Vec::new(),
+                            data_shards: 0,
+                            commitment: Vec::new(),
+                        },
+                    )
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            // FRESH split of the byte-suffix parent app‖[0] (6-bit path 000000) into
+            // its two 7-bit children 0000000 / 0000001.
+            let mut parent = app.to_vec();
+            parent.push(0x00);
+            let bits = |s: &str| -> Vec<bool> { s.chars().map(|c| c == '1').collect() };
+            let child = |b: &str| quil_forest::encode_shard_bit_path(&app, &bits(b));
+            let txn = shards_db.new_batch(false).unwrap();
+            store
+                .put_pending_shard_change(
+                    txn.as_ref(),
+                    &PendingShardChange {
+                        kind: ShardChangeKind::Split,
+                        parent: parent.clone(),
+                        children: vec![child("0000000"), child("0000001")],
+                        effective_epoch: 1002,
+                        proposed_frame: 800_000, // > cutover ⇒ bit_path_mode
+                    },
+                )
+                .unwrap();
+            txn.commit().unwrap();
+
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_shards_store(store.clone())
+                .with_shards_db(shards_db.clone());
+            let state = make_state();
+            gi.apply_due_shard_changes(1002 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10, &state)
+                .unwrap();
+
+            // The split APPLIED (was NOT skipped as stale): children present in
+            // canonical bits, and the parent 000000 is GONE — not left as a phantom.
+            let canon = |p: &Vec<u32>| {
+                quil_forest::shard_bit_path_from_prefix(p)
+                    .unwrap_or_else(|| quil_forest::prefix_to_bits(p, 6))
+            };
+            let present: Vec<Vec<bool>> = store
+                .range_app_shards()
+                .unwrap()
+                .into_iter()
+                .filter(|s| s.shard_key == grid_key)
+                .map(|s| canon(&s.prefix))
+                .collect();
+            assert!(
+                present.contains(&bits("0000000")) && present.contains(&bits("0000001")),
+                "children registered (split applied, not skipped)"
+            );
+            assert!(
+                !present.contains(&bits("000000")),
+                "byte-suffix genesis parent removed — no phantom overlapping its children"
+            );
+            // Untouched genesis siblings survive (migrated to sentinel by the split).
+            assert!(
+                present.contains(&bits("000001"))
+                    && present.contains(&bits("000010"))
+                    && present.contains(&bits("000011")),
+                "sibling genesis shards retained"
+            );
+            assert!(store.all_pending_shard_changes().unwrap().is_empty(), "pending consumed");
+        }
     }
+
+    /// Delete-free reassignment — the fix for split→lose-coverage→merge-back. A
+    /// reassignment must NOT hard-delete the vacated allocation: that writes a
+    /// permanent removes-phase tombstone (`get_vertex_data` gate), so if the shard
+    /// is re-formed the slot could never be re-represented. `rekey_allocation`
+    /// retires the vacated slot to `Historic` in place; a later reassignment BACK
+    /// reactivates the SAME address. This asserts the full Active→Historic→Active
+    /// round-trip survives real CRDT commits (where a delete would be terminal).
+    mod delete_free_reassignment {
+        use super::*;
+        use crate::global_intrinsic::materialize::{
+            allocation_address, create_allocation_vertex_tree, create_prover_vertex_tree,
+            prover_address_from_pubkey, STATUS_ACTIVE, STATUS_HISTORIC,
+        };
+        use crate::global_schema::read_field;
+        use crate::hypergraph_state::{
+            hyperedge_adds_discriminator, vertex_adds_discriminator,
+            vertex_removes_discriminator, HypergraphState,
+        };
+        use crate::prover_registry::{rebuild_vertex_tree_from_blob, vertex_tree_to_blob};
+        use quil_hypergraph::HypergraphCrdt;
+        use quil_types::crypto::{InclusionProver, Multiproof};
+
+        struct StubProver;
+        impl InclusionProver for StubProver {
+            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
+            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
+            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
+            fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+                Err(QuilError::Internal("batch not supported".into()))
+            }
+            fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+        }
+
+        /// Read the allocation Status byte at `addr` from committed state (via the
+        /// CRDT), or `None` if the vertex is absent/tombstoned — so a hard delete
+        /// would surface here as `None`, a Historic retirement as `Some(6)`.
+        fn status_at(state: &HypergraphState, addr: &[u8; 32]) -> Option<u8> {
+            let va = vertex_adds_discriminator().unwrap();
+            let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], addr, &va).unwrap()?;
+            if blob.is_empty() {
+                return None;
+            }
+            let tree = rebuild_vertex_tree_from_blob(&blob);
+            read_field(&tree, "allocation:ProverAllocation", "Status").and_then(|b| b.first().copied())
+        }
+
+        #[test]
+        fn retires_to_historic_and_reactivates_on_merge_back() {
+            let store = Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new());
+            let crdt = Arc::new(HypergraphCrdt::new(store, Arc::new(StubProver)));
+            let state = HypergraphState::new(crdt.clone());
+            let va = vertex_adds_discriminator().unwrap();
+            let vr = vertex_removes_discriminator().unwrap();
+            let ha = hyperedge_adds_discriminator().unwrap();
+
+            let pubkey = vec![0xAAu8; 897];
+            let prover_addr = prover_address_from_pubkey(&pubkey).unwrap();
+            let app = crate::domains::QUIL_TOKEN.to_vec();
+            // Parent = genesis shard 0 (byte-suffix); child = its 7-bit split.
+            let filter_a = {
+                let mut f = app.clone();
+                f.push(0x00);
+                f
+            };
+            let filter_b = quil_forest::encode_shard_bit_path(&app, &[false; 7]);
+            let addr_a = allocation_address(&pubkey, &filter_a).unwrap();
+            let addr_b = allocation_address(&pubkey, &filter_b).unwrap();
+            assert_ne!(addr_a, addr_b, "distinct filters ⇒ distinct addresses (no poseidon collision)");
+
+            // Seed prover + one Active allocation on A, commit into the CRDT.
+            state
+                .set(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &va, 1, vertex_tree_to_blob(&create_prover_vertex_tree(&pubkey, 100).unwrap()))
+                .unwrap();
+            let a_active = reassignment::set_allocation_status(
+                &vertex_tree_to_blob(&create_allocation_vertex_tree(&prover_addr, &filter_a, 1).unwrap()),
+                STATUS_ACTIVE,
+            )
+            .unwrap();
+            state
+                .set(&GLOBAL_INTRINSIC_ADDRESS[..], &addr_a, &va, 1, a_active)
+                .unwrap();
+            state.commit().unwrap();
+            crdt.commit(1).unwrap();
+            assert_eq!(status_at(&state, &addr_a), Some(STATUS_ACTIVE), "seeded Active on A");
+
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll)).with_hypergraph(crdt.clone());
+
+            // SPLIT: reassign A → B.
+            gi.rekey_allocation(&state, &va, &vr, &ha, &pubkey, &prover_addr, &filter_a, &filter_b, 10)
+                .unwrap();
+            state.commit().unwrap();
+            crdt.commit(2).unwrap();
+            assert_eq!(status_at(&state, &addr_b), Some(STATUS_ACTIVE), "B Active after split");
+            // The crux: A is RETAINED as Historic — a live vertex, not a tombstone.
+            assert_eq!(
+                status_at(&state, &addr_a),
+                Some(STATUS_HISTORIC),
+                "A retired to Historic (NOT deleted) after split"
+            );
+
+            // MERGE BACK: reassign B → A. A hard delete would have tombstoned addr_a
+            // permanently; delete-free retention lets this reactivate the SAME slot.
+            gi.rekey_allocation(&state, &va, &vr, &ha, &pubkey, &prover_addr, &filter_b, &filter_a, 20)
+                .unwrap();
+            state.commit().unwrap();
+            crdt.commit(3).unwrap();
+            assert_eq!(
+                status_at(&state, &addr_a),
+                Some(STATUS_ACTIVE),
+                "A REACTIVATED on merge-back — impossible had it been deleted"
+            );
+            assert_eq!(status_at(&state, &addr_b), Some(STATUS_HISTORIC), "B retired to Historic after merge-back");
+        }
+    }
+
 }

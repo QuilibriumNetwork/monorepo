@@ -1057,6 +1057,10 @@ async fn tier2_composite_end_to_end() {
                 event_drain.lock().push(name.to_string());
             }
         });
+        // This isolated harness has no P2P transport: the local event drain
+        // above is its complete consensus path.  Release the production
+        // transport-ready barrier explicitly once that drain is installed.
+        handle.set_cw_transport_ready();
         handle
     });
 

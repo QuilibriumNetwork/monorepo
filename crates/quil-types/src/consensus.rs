@@ -141,6 +141,16 @@ pub enum ProverStatus {
     Leaving = 4,
     Rejected = 5,
     Kicked = 6,
+    /// Superseded by a reassignment — the prover was moved OFF this filter onto
+    /// another shard, but the allocation slot is retained (not deleted) so it can
+    /// be flipped back to Active if the shard is ever re-formed (split→lose
+    /// coverage→merge back). A hard delete tombstones the `allocation_address`
+    /// permanently (see `HypergraphCrdt::get_vertex_data` — the removes-phase
+    /// tombstone gates the read and no `add_vertex` clears it), making the slot
+    /// unrepresentable forever; `Historic` is the reversible representation of
+    /// "not on this shard right now." Excluded from committees; NOT terminal.
+    /// Allocation trie byte 6 (bytes 4=Rejected, 5=Kicked already taken).
+    Historic = 7,
 }
 
 /// Allocation info for a prover on a specific shard. Mirrors
@@ -298,6 +308,10 @@ pub enum EffectiveStatus {
     ExpiredEpoch,
     Rejected,
     Kicked,
+    /// Superseded by a reassignment (see [`ProverStatus::Historic`]). Excluded
+    /// from committees, but NOT terminal — reversible back to Active if the shard
+    /// is re-formed.
+    Historic,
     Unknown,
 }
 
@@ -431,6 +445,10 @@ impl ProverAllocationInfo {
             }
             ProverStatus::Rejected => EffectiveStatus::Rejected,
             ProverStatus::Kicked => EffectiveStatus::Kicked,
+            // Superseded by a reassignment — no grace/epoch semantics; the byte
+            // maps straight through. Reversible (a later reassignment flips it
+            // back to Active), so it is intentionally NOT in `is_terminal`.
+            ProverStatus::Historic => EffectiveStatus::Historic,
             ProverStatus::Unknown => EffectiveStatus::Unknown,
         }
     }

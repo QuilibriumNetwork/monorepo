@@ -582,7 +582,13 @@ where
         let status = read_field(&alloc_tree, "allocation:ProverAllocation", "Status")
             .and_then(|b| b.first().copied())
             .unwrap_or(4);
-        if status == 4 {
+        // Byte 4 (Rejected) and byte 6 (Historic) are re-joinable: Historic is a
+        // slot vacated by a reassignment and RETAINED so it can be reactivated, so
+        // a fresh Join must be allowed to reclaim it rather than being blocked by
+        // the 720-frame still-active window. MUST stay in lockstep with the
+        // materialize-side gate in `invoke_step` (a validate/materialize mismatch
+        // would let a Join pass one and fail the other).
+        if status == 4 || status == super::materialize::STATUS_HISTORIC {
             continue;
         }
         let jf_bytes = read_field(&alloc_tree, "allocation:ProverAllocation", "JoinFrameNumber")
