@@ -4,6 +4,29 @@ use tracing::{debug, info, warn};
 
 use quil_lifecycle::Supervisor;
 
+type RemoteAppShardMap = std::collections::HashMap<
+    Vec<u8>,
+    Vec<quil_types::proto::global::AppShardInfo>,
+>;
+
+fn has_nonzero_remote_shard_size(shards: &RemoteAppShardMap) -> bool {
+    shards.values().flatten().any(|info| info.size.iter().any(|b| *b != 0))
+}
+
+async fn fetch_remote_app_shards(
+    client: &mut quil_rpc::ArchiveClient,
+    shard_keys: &[Vec<u8>],
+) -> RemoteAppShardMap {
+    let mut out = RemoteAppShardMap::with_capacity(shard_keys.len());
+    for shard_key in shard_keys {
+        match client.get_app_shards(shard_key.clone(), Vec::new()).await {
+            Ok(infos) => { out.insert(shard_key.clone(), infos); }
+            Err(e) => tracing::debug!(error = %e, "remote shard info: get_app_shards failed for one shard"),
+        }
+    }
+    out
+}
+
 pub(crate) struct GrpcArgs {
     pub config: quil_config::Config,
     pub network: u8,
@@ -1028,39 +1051,43 @@ pub(crate) fn spawn_all(
             let clock_store = self.clock_store.clone();
             let shards_store = self.shards_store.clone();
             let archive_pool = self.archive_pool.clone();
-            let prefetched: Result<HashMap<Vec<u8>, Vec<quil_types::proto::global::AppShardInfo>>, quil_types::error::QuilError> =
+            let prefetched: Result<RemoteAppShardMap, quil_types::error::QuilError> =
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async move {
                         let mut unique: HashMap<Vec<u8>, ()> = HashMap::new();
                         for s in shards_store.range_app_shards()? { unique.insert(s.shard_key, ()); }
                         let unique_keys: Vec<Vec<u8>> = unique.into_keys().collect();
-                        let mut client_opt: Option<quil_rpc::ArchiveClient> = match clock_store.get_latest_global_clock_frame() {
+                        let mut clients: Vec<quil_rpc::ArchiveClient> = Vec::new();
+                        match clock_store.get_latest_global_clock_frame() {
                             Ok(frame) => match quil_rpc::peer_dial::dial_latest_frame_prover(&frame, key_store, move |peer_id| peer_info_lookup(peer_id), &seed).await {
-                                Ok(c) => Some(c),
-                                Err(e) => { tracing::debug!(error = %e, "shard info: dial_latest_frame_prover failed, will try archive pool"); None }
+                                Ok(c) => clients.push(c),
+                                Err(e) => tracing::debug!(error = %e, "shard info: dial_latest_frame_prover failed"),
                             },
-                            Err(e) => { tracing::debug!(error = %e, "shard info: no latest frame yet, will try archive pool"); None }
-                        };
-                        if client_opt.is_none() {
-                            let endpoints = archive_pool.get_all().await;
-                            for ep in &endpoints {
-                                match quil_rpc::ArchiveClient::connect_mtls(ep, &seed).await {
-                                    Ok(c) => { tracing::debug!(endpoint = %ep, "shard info: archive-pool fallback dial succeeded"); client_opt = Some(c); break; }
-                                    Err(e) => { tracing::debug!(endpoint = %ep, error = %e, "shard info: archive-pool fallback dial failed"); }
-                                }
+                            Err(e) => tracing::debug!(error = %e, "shard info: no latest frame yet"),
+                        }
+                        // A peer can know the shard layout before it has materialized
+                        // its data. A successful all-zero response must not blank the
+                        // TUI when another archive has usable size metadata.
+                        // Query every known archive. The pool is deliberately
+                        // small (the mainnet committee currently has four
+                        // members), and a topology-only archive must not hide
+                        // a different archive with materialized state.
+                        for endpoint in archive_pool.get_all().await {
+                            match quil_rpc::ArchiveClient::connect_mtls(&endpoint, &seed).await {
+                                Ok(client) => clients.push(client),
+                                Err(e) => tracing::debug!(endpoint = %endpoint, error = %e, "shard info: archive-pool dial failed"),
                             }
                         }
-                        let mut client = client_opt.ok_or_else(|| quil_types::error::QuilError::Internal("shard info: no archive endpoint reachable for fallback".into()))?;
-                        tracing::debug!(unique_keys = unique_keys.len(), "shard info: about to fetch GetAppShards for unique parent keys");
-                        let mut out: HashMap<Vec<u8>, Vec<quil_types::proto::global::AppShardInfo>> = HashMap::with_capacity(unique_keys.len());
-                        for shard_key in unique_keys {
-                            match client.get_app_shards(shard_key.clone(), Vec::new()).await {
-                                Ok(infos) => { tracing::debug!(shard_key_hex = %hex::encode(&shard_key), infos = infos.len(), "shard info: GetAppShards returned"); out.insert(shard_key, infos); }
-                                Err(e) => { tracing::debug!(error = %e, "remote shard info: get_app_shards failed for one shard"); }
+                        if clients.is_empty() {
+                            return Err(quil_types::error::QuilError::Internal("shard info: no archive endpoint reachable for fallback".into()));
+                        }
+                        for mut client in clients {
+                            let out = fetch_remote_app_shards(&mut client, &unique_keys).await;
+                            if has_nonzero_remote_shard_size(&out) {
+                                return Ok::<_, quil_types::error::QuilError>(out);
                             }
                         }
-                        tracing::debug!(keys = out.len(), "shard info: prefetched remote shard data");
-                        Ok::<_, quil_types::error::QuilError>(out)
+                        Err(quil_types::error::QuilError::Internal("shard info: archive candidates returned no nonzero shard sizes".into()))
                     })
                 });
             let prefetched = match prefetched {
