@@ -2650,6 +2650,7 @@ impl GlobalIntrinsic {
         if frame_number != super::materialize::unified_tree_cutover_frame()
             && frame_number != super::materialize::quil_grid_reset_v2_frame()
             && frame_number != super::materialize::quil_prover_reset_v3_frame()
+            && frame_number != super::materialize::quil_prover_reset_v4_frame()
         {
             return Ok(false);
         }
@@ -2683,11 +2684,41 @@ impl GlobalIntrinsic {
                 removed_rows += 1;
             }
         }
-        // Rewrite to the network's QUIL genesis topology (mainnet = 64-way
-        // `[0]..[63]`; testnet = single `[]`), mirroring what `genesis` seeded.
-        // Prefix-free by construction, so the aliasing (and the legacy-aggregate
-        // panic) is gone.
-        for prefix in genesis_prefixes.iter() {
+        // Rewrite to the network's QUIL genesis topology. As of prover-reset v4 the
+        // genesis is seeded in SENTINEL bit-path form (`[SENTINEL, bits(i)]`), NOT the
+        // legacy byte-suffix `[i]` — this is THE fix for the byte-suffix-vs-sentinel
+        // divergence: `migrate_app_shards_to_sentinel` (which fires on the first deep
+        // split) then finds the set already sentinel and is a no-op, so the grid's
+        // encoding never changes under provers and the allocations (whose filters are
+        // derived from the grid via `shard_prefix_to_filter`) stay in the same form
+        // forever. v1/v2/v3 KEEP byte-suffix — those frames already committed with it,
+        // so re-encoding them would fork a replaying node's prover tree.
+        let is_v4 = frame_number == super::materialize::quil_prover_reset_v4_frame();
+        let effective_prefixes: Vec<Vec<u32>> = if is_v4 {
+            genesis_prefixes
+                .iter()
+                .map(|p| {
+                    let bits = quil_forest::shard_bit_path_from_prefix(p)
+                        .unwrap_or_else(|| quil_forest::prefix_to_bits(p, 6));
+                    // The ROOT shard (empty bit-path) is canonically the BARE app
+                    // address (`shard_prefix_to_filter([]) == app`), NOT the sentinel
+                    // `encode_shard_bit_path(app, [])` (`app‖0x0000`). Sentinel-encoding
+                    // it would make the grid filter disagree with a root prover's
+                    // `confirmation_filter` (bare app) → reject. Only NON-root shards
+                    // (mainnet's 64-way `[i]`, 6 bits) convert to sentinel; a single-
+                    // shard root app stays byte-suffix (and is removed on its first
+                    // split anyway). Caught by localnet on the testnet single-shard.
+                    if bits.is_empty() {
+                        p.clone()
+                    } else {
+                        quil_forest::bit_path_to_prefix(&bits)
+                    }
+                })
+                .collect()
+        } else {
+            genesis_prefixes.iter().cloned().collect()
+        };
+        for prefix in &effective_prefixes {
             store.put_app_shard(
                 txn.as_ref(),
                 &ShardInfo {
@@ -4523,6 +4554,200 @@ mod tests {
                 "A REACTIVATED on merge-back — impossible had it been deleted"
             );
             assert_eq!(status_at(&state, &addr_b), Some(STATUS_HISTORIC), "B retired to Historic after merge-back");
+        }
+    }
+
+    /// prover-reset v4 seeds the QUIL genesis grid in SENTINEL form (not legacy
+    /// byte-suffix), so `migrate_app_shards_to_sentinel` is a permanent no-op and the
+    /// grid encoding never changes under provers — the fix for the byte-suffix-vs-
+    /// sentinel divergence. v1/v2/v3 KEEP byte-suffix (already-committed history).
+    mod v4_sentinel_genesis {
+        use super::*;
+        use crate::hypergraph_state::HypergraphState;
+        use quil_hypergraph::HypergraphCrdt;
+        use quil_types::crypto::{InclusionProver, Multiproof};
+        use quil_types::store::{KvDb, ShardInfo, ShardsStore};
+
+        struct StubProver;
+        impl InclusionProver for StubProver {
+            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
+            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
+            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
+            fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+                Err(QuilError::Internal("batch not supported".into()))
+            }
+            fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+        }
+
+        fn setup() -> (Arc<dyn ShardsStore>, Arc<dyn KvDb>, GlobalIntrinsic, HypergraphState, Vec<u8>) {
+            let quil = crate::domains::QUIL_TOKEN;
+            let grid_key = {
+                let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
+                let mut k = l1.to_vec();
+                k.extend_from_slice(&quil);
+                k
+            };
+            let shdb = quil_store::RocksDb::open_in_memory().unwrap();
+            let store: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
+            // Seed a legacy BYTE-SUFFIX 64-way genesis grid.
+            let txn = shards_db.new_batch(false).unwrap();
+            for i in 0..64u32 {
+                store.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: grid_key.clone(), prefix: vec![i], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+            }
+            txn.commit().unwrap();
+            let hstore = Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new());
+            let crdt = Arc::new(HypergraphCrdt::new(hstore, Arc::new(StubProver)));
+            let state = HypergraphState::new(crdt.clone());
+            let byte_suffix_genesis: Arc<Vec<Vec<u32>>> = Arc::new((0..64u32).map(|i| vec![i]).collect());
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_shards_store(store.clone())
+                .with_shards_db(shards_db.clone())
+                .with_hypergraph(crdt)
+                .with_archive_prover_addresses(Arc::new(std::collections::HashSet::new()))
+                .with_reset_genesis_prefixes(byte_suffix_genesis);
+            (store, shards_db, gi, state, grid_key)
+        }
+
+        fn quil_grid(store: &Arc<dyn ShardsStore>, gk: &[u8]) -> Vec<quil_types::store::ShardInfo> {
+            store.range_app_shards().unwrap().into_iter().filter(|s| s.shard_key == gk).collect()
+        }
+
+        #[test]
+        fn v4_reset_seeds_sentinel_genesis_grid() {
+            let (store, _db, gi, state, gk) = setup();
+            let v4 = crate::global_intrinsic::materialize::quil_prover_reset_v4_frame();
+            assert!(gi.maybe_apply_split_reset(v4, &state).unwrap(), "v4 grid reset ran");
+
+            let rows = quil_grid(&store, &gk);
+            assert_eq!(rows.len(), 64, "64 genesis shards");
+            assert!(
+                rows.iter().all(|s| quil_forest::shard_bit_path_from_prefix(&s.prefix).is_some()),
+                "v4 seeds every genesis shard in SENTINEL form — NO byte-suffix"
+            );
+            // The grid filter a prover joins is `shard_prefix_to_filter` = the canonical
+            // sentinel `encode_shard_bit_path` form, which is exactly what `migrate`
+            // would produce — so after v4 the grid never changes encoding and the
+            // allocations (derived from it) stay matched.
+            let quil = crate::domains::QUIL_TOKEN;
+            for s in &rows {
+                let f = quil_forest::shard_prefix_to_filter(&s.shard_key[3..35], &s.prefix);
+                let bits = quil_forest::shard_bit_path_from_prefix(&s.prefix).unwrap();
+                assert_eq!(f, quil_forest::encode_shard_bit_path(&quil, &bits));
+                // And it is NOT the legacy byte-suffix `quil‖[i]`.
+                assert_ne!(f, { let mut b = quil.to_vec(); b.push(s.prefix[1] as u8); b });
+            }
+        }
+
+        #[test]
+        fn migrate_strands_byte_suffix_alloc_which_sentinel_genesis_avoids() {
+            // The EXACT mainnet mechanism, deterministic, using the real
+            // `migrate_app_shards_to_sentinel` + `shard_prefix_to_filter`.
+            let (store, db, _gi, _state, gk) = setup(); // byte-suffix 64-way genesis
+            let quil = crate::domains::QUIL_TOKEN;
+
+            // A prover on an UNSPLIT genesis shard (5) holds a byte-suffix filter,
+            // exactly as it does today after joining the legacy grid.
+            let alloc_byte_suffix = {
+                let mut f = quil.to_vec();
+                f.push(5);
+                f
+            };
+            // The archive builds its valid-shard set as {shard_prefix_to_filter(row)}.
+            let valid = |store: &Arc<dyn ShardsStore>| -> std::collections::HashSet<Vec<u8>> {
+                store
+                    .range_app_shards()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.shard_key == gk)
+                    .map(|s| quil_forest::shard_prefix_to_filter(&s.shard_key[3..35], &s.prefix))
+                    .collect()
+            };
+
+            // Before the first deep split the grid is byte-suffix → the byte-suffix
+            // allocation is a valid shard address (aligned; proofs accepted).
+            assert!(valid(&store).contains(&alloc_byte_suffix), "aligned before migrate");
+
+            // The first deep split of ANY shard runs `migrate` → the WHOLE grid flips
+            // to sentinel, but this prover's allocation was never re-keyed.
+            let txn = db.new_batch(false).unwrap();
+            crate::global_intrinsic::materialize::migrate_app_shards_to_sentinel(
+                store.as_ref(),
+                txn.as_ref(),
+                &gk,
+            )
+            .unwrap();
+            txn.commit().unwrap();
+
+            // THE BUG: its byte-suffix address is no longer in the (now sentinel)
+            // valid set → every archive rejects its coverage/reward proofs → eviction.
+            assert!(
+                !valid(&store).contains(&alloc_byte_suffix),
+                "migrate strands the byte-suffix allocation — reproduces the mainnet reject"
+            );
+            // THE FIX: with a sentinel-genesis grid (prover-reset v4), a prover on
+            // shard 5 joins the SENTINEL filter, which IS in the sentinel valid set.
+            let bits5 = quil_forest::prefix_to_bits(&[5u32], 6);
+            let alloc_sentinel = quil_forest::encode_shard_bit_path(&quil, &bits5);
+            assert!(
+                valid(&store).contains(&alloc_sentinel),
+                "the sentinel-form allocation matches the sentinel grid — no strand"
+            );
+        }
+
+        #[test]
+        fn v3_reset_keeps_byte_suffix_genesis_grid() {
+            // Same reset machinery at the v3 frame must NOT re-encode — v3 already
+            // committed byte-suffix; changing it would fork a replaying prover tree.
+            let (store, _db, gi, state, gk) = setup();
+            let v3 = crate::global_intrinsic::materialize::quil_prover_reset_v3_frame();
+            assert!(gi.maybe_apply_split_reset(v3, &state).unwrap());
+            let rows = quil_grid(&store, &gk);
+            assert_eq!(rows.len(), 64);
+            assert!(
+                rows.iter().all(|s| quil_forest::shard_bit_path_from_prefix(&s.prefix).is_none() && s.prefix.len() == 1),
+                "v3 keeps byte-suffix genesis (single-element prefix, not sentinel)"
+            );
+        }
+
+        #[test]
+        fn v4_keeps_root_shard_byte_suffix() {
+            // A single-ROOT app (testnet single-shard): the root's canonical filter
+            // is the BARE app (`shard_prefix_to_filter([]) == app`), so v4 must NOT
+            // sentinel-encode it — doing so made the grid filter `app‖0x0000` disagree
+            // with a root prover's bare-app `confirmation_filter` → reject (localnet
+            // caught this). Only shards WITH bits (mainnet's 64-way `[i]`) convert.
+            let quil = crate::domains::QUIL_TOKEN;
+            let gk = {
+                let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
+                let mut k = l1.to_vec();
+                k.extend_from_slice(&quil);
+                k
+            };
+            let shdb = quil_store::RocksDb::open_in_memory().unwrap();
+            let store: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
+            let txn = shards_db.new_batch(false).unwrap();
+            store.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: gk.clone(), prefix: vec![], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+            txn.commit().unwrap();
+            let hstore = Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new());
+            let crdt = Arc::new(HypergraphCrdt::new(hstore, Arc::new(StubProver)));
+            let state = HypergraphState::new(crdt.clone());
+            let root_genesis: Arc<Vec<Vec<u32>>> = Arc::new(vec![vec![]]);
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_shards_store(store.clone())
+                .with_shards_db(shards_db.clone())
+                .with_hypergraph(crdt)
+                .with_archive_prover_addresses(Arc::new(std::collections::HashSet::new()))
+                .with_reset_genesis_prefixes(root_genesis);
+
+            let v4 = crate::global_intrinsic::materialize::quil_prover_reset_v4_frame();
+            assert!(gi.maybe_apply_split_reset(v4, &state).unwrap());
+            let rows = quil_grid(&store, &gk);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].prefix.is_empty(), "root stays byte-suffix [] (not sentinel-encoded)");
+            // The grid filter equals the bare app — exactly a root prover's filter.
+            assert_eq!(quil_forest::shard_prefix_to_filter(&quil, &rows[0].prefix), quil.to_vec());
         }
     }
 

@@ -68,19 +68,15 @@ pub(crate) async fn start(
     let shards_store = storage.shards_store.clone();
     let hg_store = storage.hg_store.clone();
 
-    // Normalize the QUIL-token shard grid to the single-nibble (64-shard)
-    // topology. MAINNET ONLY (network 0): a DB restored via the pebble->rocksdb
-    // migration carries the legacy 64x64 = 4096 grid; with a fresh prover tree
-    // those 4096 shards each start with zero coverage and the network can never
-    // escape the coverage halt. On testnet/devnet QUIL is a single shard that
-    // splits DYNAMICALLY like every other app, so forcing a fixed grid here
-    // would fight the split logic (collapsing legitimate splits on every
-    // restart) — skip it entirely.
-    if network == 0 {
-        if let Err(e) = normalize_quil_token_grid(shards_store.as_ref(), clock_store.as_ref()) {
-            tracing::warn!(error = %e, "failed to normalize QUIL token shard grid");
-        }
-    }
+    // NOTE: the boot-time `normalize_quil_token_grid` (force QUIL to 64-way) was
+    // REMOVED. It was a one-time pebble->rocksdb migration escape (legacy 4096
+    // grid → 64), but it ran on EVERY mainnet boot and — exactly as its own doc
+    // warned for testnet — clobbered legitimate dynamic splits every restart: the
+    // local grid was forced back to 64-way while the CRDT-synced allocations kept
+    // their depth-7/10 children, so archives rejected proofs for the (real) deep
+    // shards ("address not in current valid-shard set") and provers were evicted.
+    // The 4096→64 migration is long done; the coordinated prover resets own the
+    // clean baseline now. The grid tracks splits via `apply_due_shard_changes`.
 
     // Fresh-config peer key: on first run `config.p2p.peer_priv_key` is
     // empty. Generate + persist the Ed448 identity HERE, before anything
@@ -1308,135 +1304,89 @@ pub(crate) async fn start(
 }
 
 
-/// Ensure the QUIL-token app-shard grid is the single-nibble (64-shard)
-/// topology rather than the legacy 64x64 = 4096 grid. Genesis seeds 64
-/// directly; this handles a DB restored via the pebble->rocksdb migration
-/// (which carries the old 4096 grid) so a fresh prover tree re-forms
-/// coverage over 64 shards instead of stalling on 4096 under-covered ones.
-///
-/// Idempotent: returns early when the grid is already exactly 64 QUIL
-/// shards each with a single-byte prefix. Token DATA (the `l2 = QUIL_TOKEN`
-/// tree) is never touched — only the coverage/assignment grid.
-fn normalize_quil_token_grid(
-    shards_store: &dyn quil_types::store::ShardsStore,
-    clock_store: &quil_store::RocksClockStore,
-) -> anyhow::Result<()> {
-    use quil_types::store::ClockStore as _;
-    use quil_types::store::ShardInfo;
-    let quil = quil_execution::domains::QUIL_TOKEN;
-    let all = shards_store.range_app_shards()?;
-    // QUIL entries: shard_key = L1(3) || L2(32); L2 == QUIL_TOKEN.
-    let quil_entries: Vec<&ShardInfo> = all
-        .iter()
-        .filter(|s| s.shard_key.len() >= 35 && s.shard_key[3..35] == quil[..])
-        .collect();
-    let already_normalized =
-        quil_entries.len() == 64 && quil_entries.iter().all(|s| s.prefix.len() == 1);
-    if already_normalized {
-        return Ok(());
-    }
-    // shard_key is identical across all QUIL entries (they differ only in
-    // prefix); reuse an existing one, or reconstruct it as L1 || QUIL_TOKEN.
-    let shard_key = match quil_entries.first() {
-        Some(s) => s.shard_key.clone(),
-        None => {
-            let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
-            let mut sk = Vec::with_capacity(3 + quil.len());
-            sk.extend_from_slice(&l1);
-            sk.extend_from_slice(&quil);
-            sk
-        }
-    };
-    let old_count = quil_entries.len();
-    let txn = clock_store.new_transaction(false)?;
-    for s in &quil_entries {
-        shards_store.delete_app_shard(txn.as_ref(), &s.shard_key, &s.prefix)?;
-    }
-    for i in 0..64u32 {
-        shards_store.put_app_shard(
-            txn.as_ref(),
-            &ShardInfo {
-                shard_key: shard_key.clone(),
-                prefix: vec![i],
-                size: Vec::new(),
-                data_shards: 0,
-                commitment: Vec::new(),
-            },
-        )?;
-    }
-    txn.commit()?;
-    tracing::info!(
-        old_count,
-        new_count = 64,
-        "normalized QUIL token shard grid to single-nibble (64-shard) topology"
-    );
-    Ok(())
-}
-
 #[cfg(test)]
-mod reshard_tests {
-    use super::*;
+mod grid_clobber_repro {
+    //! Reproduces the case-(2) re-divergence: the removed boot-time
+    //! `normalize_quil_token_grid` clobbered the LOCAL grid back to 64-way genesis
+    //! on every restart while the CRDT-synced ALLOCATIONS kept their split children,
+    //! so the archive's valid-shard set (built from the grid) no longer contained
+    //! the deep shards provers were allocated on → `address not in current
+    //! valid-shard set` rejects → eviction. Uses the REAL `shard_prefix_to_filter`
+    //! (the exact logic archive_sync.rs builds the valid-shard set with).
     use quil_types::store::{ClockStore, ShardInfo, ShardsStore};
 
-    /// Integration test over a real RocksShardsStore: a legacy 64x64
-    /// (`[i,j]`) QUIL grid is collapsed to exactly 64 single-nibble (`[i]`)
-    /// shards by the actual `normalize_quil_token_grid` used at node
-    /// startup; non-QUIL tokens are untouched; and it's idempotent. Guards
-    /// the reshard wiring that a DB restored via the pebble->rocksdb tool
-    /// relies on.
+    /// Build `valid_shard_addresses` exactly as archive_sync does: for each QUIL
+    /// grid row, `shard_prefix_to_filter(shard_key[3..35], prefix)`.
+    fn valid_shard_set(store: &dyn ShardsStore, quil: &[u8], gk: &[u8]) -> std::collections::HashSet<Vec<u8>> {
+        store
+            .range_app_shards()
+            .unwrap()
+            .iter()
+            .filter(|s| s.shard_key == gk)
+            .map(|s| quil_forest::shard_prefix_to_filter(&s.shard_key[3..35], &s.prefix))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     #[test]
-    fn normalize_collapses_quil_grid_to_64_idempotent() {
-        let rocks = quil_store::RocksDb::open_in_memory().expect("open in-memory db");
+    fn boot_normalize_clobber_desyncs_valid_shard_set_from_split_allocations() {
+        let rocks = quil_store::RocksDb::open_in_memory().unwrap();
         let db = rocks.inner();
         let shards = quil_store::RocksShardsStore::new(db.clone());
         let clock = quil_store::RocksClockStore::new(db.clone());
-
         let quil = quil_execution::domains::QUIL_TOKEN;
-        let mut quil_key = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3).to_vec();
-        quil_key.extend_from_slice(&quil);
+        let mut gk = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3).to_vec();
+        gk.extend_from_slice(&quil);
 
-        // A non-QUIL token shard that must survive normalization.
-        let other_l2 = [0xABu8; 32];
-        let mut other_key = quil_hypergraph::addressing::get_bloom_filter_indices(&other_l2, 256, 3).to_vec();
-        other_key.extend_from_slice(&other_l2);
-
-        // Seed a legacy [i,j] QUIL grid (100 entries: i,j in 0..10) plus the
-        // non-QUIL shard.
+        // A LEGITIMATELY-SPLIT grid, as `apply_due_shard_changes` leaves it: genesis
+        // shards 1..63 (byte-suffix) + genesis shard 0 replaced by its two depth-7
+        // children in sentinel bit-path form.
+        let child0 = quil_forest::bit_path_to_prefix(&[false; 7]); // 0000000
+        let child1 =
+            quil_forest::bit_path_to_prefix(&[false, false, false, false, false, false, true]); // 0000001
         let txn = clock.new_transaction(false).unwrap();
-        for i in 0u32..10 {
-            for j in 0u32..10 {
-                shards.put_app_shard(txn.as_ref(), &ShardInfo {
-                    shard_key: quil_key.clone(),
-                    prefix: vec![i, j],
-                    size: Vec::new(), data_shards: 0, commitment: Vec::new(),
-                }).unwrap();
-            }
+        for i in 1u32..64 {
+            shards.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: gk.clone(), prefix: vec![i], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
         }
-        shards.put_app_shard(txn.as_ref(), &ShardInfo {
-            shard_key: other_key.clone(),
-            prefix: vec![1, 2],
-            size: Vec::new(), data_shards: 0, commitment: Vec::new(),
-        }).unwrap();
+        for p in [&child0, &child1] {
+            shards.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: gk.clone(), prefix: p.clone(), size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+        }
         txn.commit().unwrap();
 
-        normalize_quil_token_grid(&shards, &clock).unwrap();
+        // The confirmation_filter a prover on the depth-7 child submits as the
+        // coverage-proof `FrameHeader.address` (== the explorer's `…794d9 000700`).
+        let deep_filter = quil_forest::shard_prefix_to_filter(&quil, &child0);
 
-        let after = shards.range_app_shards().unwrap();
-        let quil_entries: Vec<_> = after.iter()
-            .filter(|s| s.shard_key.len() >= 35 && s.shard_key[3..35] == quil[..])
-            .collect();
-        assert_eq!(quil_entries.len(), 64, "QUIL collapses to exactly 64 (from 100 [i,j])");
-        assert!(quil_entries.iter().all(|s| s.prefix.len() == 1), "all QUIL shards single-nibble");
+        // PRE-clobber (split grid = post-FIX): valid-set INCLUDES the depth-7 shard
+        // → the collector's `!valid.contains(address)` is false → proof ACCEPTED.
+        let valid_split = valid_shard_set(&shards, &quil, &gk);
+        assert!(valid_split.contains(&deep_filter), "split grid's valid-set contains the depth-7 shard the prover is on");
+
+        // CLOBBER — exactly what the removed `normalize_quil_token_grid` did on every
+        // mainnet restart: delete all QUIL rows, force 64-way genesis.
+        let txn = clock.new_transaction(false).unwrap();
+        for s in shards.range_app_shards().unwrap().into_iter().filter(|s| s.shard_key == gk) {
+            shards.delete_app_shard(txn.as_ref(), &s.shard_key, &s.prefix).unwrap();
+        }
+        for i in 0..64u32 {
+            shards.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: gk.clone(), prefix: vec![i], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+        }
+        txn.commit().unwrap();
+
+        // POST-clobber (64-way grid = the BUG): the depth-7 shard is GONE from the
+        // valid-set, but the allocation (CRDT-synced) is still on it → the collector
+        // rejects the proof with `address not in current valid-shard set`.
+        let valid_clobbered = valid_shard_set(&shards, &quil, &gk);
+        assert_eq!(valid_clobbered.len(), 64, "clobbered to 64-way genesis");
         assert!(
-            after.iter().any(|s| s.shard_key.len() >= 35 && s.shard_key[3..35] == other_l2[..] && s.prefix == vec![1, 2]),
-            "non-QUIL token shard must be left untouched"
+            !valid_clobbered.contains(&deep_filter),
+            "CLOBBER desyncs the valid-set: the depth-7 shard the prover is allocated on is no longer valid → proof rejected (the observed eviction cause)"
         );
-
-        // Idempotent: a second pass is a no-op (still 64).
-        normalize_quil_token_grid(&shards, &clock).unwrap();
-        let quil2 = shards.range_app_shards().unwrap().iter()
-            .filter(|s| s.shard_key.len() >= 35 && s.shard_key[3..35] == quil[..])
-            .count();
-        assert_eq!(quil2, 64, "normalize is idempotent");
+        // `valid_clobbered` here is byte-for-byte what archive_sync installs via
+        // `set_valid_shard_addresses`, and the collector rejects a shard-frame when
+        // `!valid.contains(&fh.address)` — so `!valid_clobbered.contains(&deep_filter)`
+        // above IS the observed reject, and `valid_split.contains(&deep_filter)` above
+        // is the accept once the grid stops being clobbered.
     }
 }

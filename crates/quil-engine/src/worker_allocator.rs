@@ -617,8 +617,10 @@ impl WorkerAllocator {
         // (operator intent). Exact-frame gated + a one-shot in-memory guard; the
         // clear is idempotent so no persisted marker is needed (unlike the
         // prover-tree reseed on the consensus path).
-        if frame_number
+        if (frame_number
             == quil_execution::global_intrinsic::materialize::quil_prover_reset_v3_frame()
+            || frame_number
+                == quil_execution::global_intrinsic::materialize::quil_prover_reset_v4_frame())
             && !self
                 .worker_reset_v3_done
                 .swap(true, std::sync::atomic::Ordering::SeqCst)

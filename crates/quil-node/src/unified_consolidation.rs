@@ -104,6 +104,23 @@ pub fn mark_worker_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) {
     }
 }
 
+/// Marker for prover-reset v4 (mainnet frame 755_000) — the re-baseline after the
+/// boot-clobber (`normalize_quil_token_grid`) was removed. DISTINCT from v2/v3 so
+/// their guards don't suppress it and the v4 wipe runs exactly once.
+const PROVER_RESET_V4_MARKER_KEY: &[u8] = b"\x00__quil_prover_reset_v4__";
+
+/// Whether the prover-reset v4 wipe has already run on this node.
+pub fn prover_reset_v4_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
+    hg.raw_db().get(PROVER_RESET_V4_MARKER_KEY).ok().flatten().is_some()
+}
+
+/// Record that prover-reset v4 has run (after a successful v4 prover wipe).
+pub fn mark_prover_reset_v4_applied(hg: &quil_store::RocksHypergraphStore) {
+    if let Err(e) = hg.raw_db().put(PROVER_RESET_V4_MARKER_KEY, [1u8]) {
+        warn!(error = %e, "prover-reset v4: marker write FAILED — may re-run if the frame re-materializes");
+    }
+}
+
 /// Apply the ENTIRE unified-tree cutover ONCE, ON BOOT — not gated on reaching a
 /// frame number. Idempotent via [`BOOT_RESET_MARKER_KEY`]. Runs BEFORE consensus
 /// starts, so the node comes up already in the reset state. Deterministic across

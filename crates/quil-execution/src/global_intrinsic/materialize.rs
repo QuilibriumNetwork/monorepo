@@ -165,6 +165,31 @@ pub fn quil_prover_reset_v3_frame() -> u64 {
     })
 }
 
+/// Coordinated QUIL prover-tree RESET v4 — the SAME complete reset as v3
+/// (tree wipe + genesis-committee reseed + per-node AUTO worker-filter clear +
+/// grid → 64-way genesis) at a LATER frame, needed because v3 (747_000) re-aligned
+/// the layers but the boot-time `normalize_quil_token_grid` (now REMOVED) then
+/// re-clobbered each archive's local grid back to 64-way on restart while the
+/// CRDT-synced allocations kept their depth-7/10 children — re-opening the
+/// divergence that gets deep-shard proofs rejected. v4 re-baselines both layers
+/// ONCE MORE; with the boot clobber gone, `apply_due_shard_changes` keeps the grid
+/// tracking the allocations durably afterwards. Additive to v3 (own marker +
+/// amnesty window), so v3's markers/forgiveness are never withdrawn.
+pub const QUIL_PROVER_RESET_V4_FRAME: u64 = 754_000;
+
+/// Effective prover-reset-v4 frame (env `QUIL_PROVER_RESET_V4_FRAME`, localnet
+/// override), cached like [`quil_prover_reset_v3_frame`].
+pub fn quil_prover_reset_v4_frame() -> u64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("QUIL_PROVER_RESET_V4_FRAME")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(QUIL_PROVER_RESET_V4_FRAME)
+    })
+}
+
 /// Whether a prior `kick_frame_number` still bars a prover from re-joining /
 /// counting at `current_frame`. `0` means "never kicked" (e.g. a voluntary
 /// leave records no KickFrameNumber). A pre-amnesty kick is forgiven only once
@@ -193,7 +218,14 @@ pub fn kick_bars_rejoin(kick_frame_number: u64, current_frame: u64) -> bool {
     // frame so localnet's lowered reset carries a matching amnesty.
     let v3 = quil_prover_reset_v3_frame();
     let forgiven_reset_v3 = kick_frame_number < v3 && current_frame >= v3;
-    !(forgiven_695 || forgiven_reset || forgiven_reset_v2 || forgiven_reset_v3)
+    // Fifth additive window riding prover-reset v4 (same reasoning as v2/v3).
+    let v4 = quil_prover_reset_v4_frame();
+    let forgiven_reset_v4 = kick_frame_number < v4 && current_frame >= v4;
+    !(forgiven_695
+        || forgiven_reset
+        || forgiven_reset_v2
+        || forgiven_reset_v3
+        || forgiven_reset_v4)
 }
 
 /// Protocol-level halt-risk threshold. A shard with `Active` prover
