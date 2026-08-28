@@ -209,13 +209,15 @@ pub type GlobalShardsProvider =
 
 /// Per-shard metadata provider used by [`GlobalRpcServer::get_app_shards`]:
 /// given a 35-byte `shard_key` (L1[3]||L2[32]) and a `prefix` path,
-/// returns `(size_be, data_shards, commitments[4])` derived from the
+/// returns `(size_be, data_shards, commitments[4], materialized_frame,
+/// latest_frame)` derived from the local archive state. The latter two values
+/// distinguish a committed app state from a stored-but-unmaterialized frame.
 /// local hypergraph CRDT's VertexAdds tree. Returns `None` for malformed
 /// keys; entries with no data return zero size/count and 64-byte zero
 /// commitments. Mirrors Go's `services.go:GetAppShards` which fills
 /// these from the engine-side shard metadata.
 pub type AppShardsProvider = Arc<
-    dyn Fn(&[u8], &[u32]) -> Option<(Vec<u8>, u64, [Vec<u8>; 4])> + Send + Sync,
+    dyn Fn(&[u8], &[u32]) -> Option<(Vec<u8>, u64, [Vec<u8>; 4], u64, u64)> + Send + Sync,
 >;
 
 /// Serves forest-sync data (JMT nodes/values of a shard/phase tree) from the
@@ -516,12 +518,12 @@ impl GlobalService for GlobalRpcServer {
             Ok(shards
                 .into_iter()
                 .map(|s| {
-                    let (size, data_shards, commitment) = match &app_shards {
+                    let (size, data_shards, commitment, materialized_frame, latest_frame) = match &app_shards {
                         Some(p) => match p(&s.shard_key, &s.prefix) {
-                            Some((sz, ds, cm)) => (sz, ds, cm.to_vec()),
-                            None => (Vec::new(), 0, (0..4).map(|_| vec![0u8; 64]).collect()),
+                            Some((sz, ds, cm, mat, latest)) => (sz, ds, cm.to_vec(), mat, latest),
+                            None => (Vec::new(), 0, (0..4).map(|_| vec![0u8; 64]).collect(), 0, 0),
                         },
-                        None => (s.size, s.data_shards, s.commitment),
+                        None => (s.size, s.data_shards, s.commitment, 0, 0),
                     };
                     global::AppShardInfo {
                         shard_key: if include_shard_key { s.shard_key } else { Vec::new() },
@@ -529,6 +531,8 @@ impl GlobalService for GlobalRpcServer {
                         size,
                         data_shards,
                         commitment,
+                        materialized_frame,
+                        latest_frame,
                     }
                 })
                 .collect())

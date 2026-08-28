@@ -44,6 +44,9 @@ fn status_color(name: &str) -> Color {
         _ => Color::Rgb(0xff, 0x44, 0x44),
     }
 }
+fn materialization_state_color(state: &str) -> Color {
+    match state { "Current" => SUCCESS, "Lag" | "Unmat" => ERROR, _ => HELP }
+}
 
 fn mode_color(mode: &str) -> Color {
     if mode == "m" {
@@ -280,11 +283,14 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         3 => a.ring.to_string(),
         4 => fmt_mb(&a.shard_size),
         5 => a.data_shards.to_string(),
-        6 => fmt_reward(&a.estimated_reward),
-        7 => a.worker_id.to_string(),
-        8 => a.status_name.clone(),
-        9 => a.mode().to_string(),
-        10 => a.next_action.clone(),
+        6 => a.materialized_frame.to_string(),
+        7 => materialization_lag(a.materialized_frame, a.latest_frame).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+        8 => materialization_state(a.materialized_frame, a.latest_frame).to_string(),
+        9 => fmt_reward(&a.estimated_reward),
+        10 => a.worker_id.to_string(),
+        11 => a.status_name.clone(),
+        12 => a.mode().to_string(),
+        13 => a.next_action.clone(),
         _ => a.default_action.clone(),
     }
 }
@@ -386,8 +392,7 @@ fn alloc_widths_fixed(
         PROVERS_WIDTH,
         RING_WIDTH,
         SIZE_WIDTH,
-        shards_w,
-        reward_w,
+        shards_w, MAT_WIDTH, LAG_WIDTH, STATE_WIDTH, reward_w,
         WORKER_WIDTH,
         STATUS_WIDTH,
         MODE_WIDTH,
@@ -492,10 +497,11 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
                 }
                 let span = match ci {
                     3 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(ring_color(a.ring))),
-                    8 if m.color_coding => {
+                    8 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(materialization_state_color(materialization_state(a.materialized_frame, a.latest_frame)))),
+                    11 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(status_color(&a.status_name)))
                     }
-                    9 if m.color_coding => {
+                    12 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(mode_color(a.mode())))
                     }
                     _ => Span::raw(cell.clone()),
@@ -527,6 +533,9 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
         3 => s.ring.to_string(),
         4 => fmt_mb(&s.shard_size),
         5 => s.data_shards.to_string(),
+        6 => s.materialized_frame.to_string(),
+        7 => materialization_lag(s.materialized_frame, s.latest_frame).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+        8 => materialization_state(s.materialized_frame, s.latest_frame).to_string(),
         _ => fmt_reward(&s.estimated_reward),
     }
 }
@@ -591,7 +600,7 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
     );
     let reward_w = fit(
         REWARD_WIDTH,
-        sorted.iter().map(|s| avail_cell(m, s, 6, 0).len()),
+        sorted.iter().map(|s| avail_cell(m, s, 9, 0).len()),
     );
     let grown = (shards_w - SHARDS_WIDTH) + (reward_w - REWARD_WIDTH);
     let mut fw = content_width.saturating_sub(AVAIL_FIXED_WIDTH + grown);
@@ -611,8 +620,7 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
         PROVERS_WIDTH,
         RING_WIDTH,
         SIZE_WIDTH,
-        shards_w,
-        reward_w,
+        shards_w, MAT_WIDTH, LAG_WIDTH, STATE_WIDTH, reward_w,
     ];
     for &col in &AVAIL_FILTERABLE_COLS {
         if col == 1 {
@@ -688,6 +696,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
                 let cell = format!("{:>w$}", avail_cell(m, s, c, fw), w = widths[c]);
                 spans.push(match c {
                     3 if m.color_coding => Span::styled(cell, Style::new().fg(ring_color(s.ring))),
+                    8 if m.color_coding => Span::styled(cell, Style::new().fg(materialization_state_color(materialization_state(s.materialized_frame, s.latest_frame)))),
                     _ => Span::raw(cell),
                 });
             }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
+use quil_types::store::{ClockStore, KvDb};
 
 use quil_lifecycle::Supervisor;
 
@@ -587,6 +588,8 @@ pub(crate) fn spawn_all(
 
     let app_shards_provider: quil_rpc::global_service::AppShardsProvider = {
         let crdt = crdt.clone();
+        let db = db_arc.clone();
+        let clock = clock_store.clone();
         Arc::new(move |shard_key: &[u8], prefix: &[u32]| {
             let info = quil_types::store::ShardInfo {
                 shard_key: shard_key.to_vec(),
@@ -596,7 +599,14 @@ pub(crate) fn spawn_all(
                 commitment: Vec::new(),
             };
             let meta = quil_engine::app_shard_metadata::get_app_shard_metadata(crdt.as_ref(), &info)?;
-            Some((meta.size, meta.data_shards, meta.commitments))
+            let filter = quil_forest::shard_prefix_to_filter(&shard_key.get(3..35)?, prefix);
+            let materialized_frame = db.get(&quil_store::encoding::consensus_materialized_cursor_key(&filter)).ok().flatten()
+                .filter(|v| v.len() == 8)
+                .map(|v| u64::from_be_bytes(v.as_slice().try_into().expect("8-byte cursor")))
+                .unwrap_or(0);
+            let latest_frame = clock.get_latest_shard_clock_frame(&filter).ok()
+                .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+            Some((meta.size, meta.data_shards, meta.commitments, materialized_frame, latest_frame))
         })
     };
 
@@ -1081,6 +1091,8 @@ pub(crate) fn spawn_all(
                             prefix: if info.prefix.is_empty() { shard_info.prefix.clone() } else { info.prefix },
                             size: info.size,
                             data_shards: info.data_shards,
+                            materialized_frame: info.materialized_frame,
+                            latest_frame: info.latest_frame,
                         });
                     }
                     Ok(out)
