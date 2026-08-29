@@ -40,16 +40,16 @@ impl EffectiveStatus {
     /// Display label (`effectiveStatus.String()`).
     pub fn label(self) -> &'static str {
         match self {
-            EffectiveStatus::Joining => "Joining",
-            EffectiveStatus::Active => "Active",
-            EffectiveStatus::Paused => "Paused",
-            EffectiveStatus::Leaving => "Leaving",
-            EffectiveStatus::ExpiredJoining => "ExpiredJoin",
-            EffectiveStatus::ExpiredLeaving => "ExpiredLeave",
-            EffectiveStatus::ExpiredEpoch => "Re-confirm!",
-            EffectiveStatus::Rejected => "Rejected",
-            EffectiveStatus::Kicked => "Kicked",
-            EffectiveStatus::Unknown => "Unknown",
+            EffectiveStatus::Joining => "joining",
+            EffectiveStatus::Active => "active",
+            EffectiveStatus::Paused => "paused",
+            EffectiveStatus::Leaving => "leaving",
+            EffectiveStatus::ExpiredJoining => "expiredJoin",
+            EffectiveStatus::ExpiredLeaving => "expiredLeave",
+            EffectiveStatus::ExpiredEpoch => "re-confirm!",
+            EffectiveStatus::Rejected => "rejected",
+            EffectiveStatus::Kicked => "kicked",
+            EffectiveStatus::Unknown => "unknown",
         }
     }
 

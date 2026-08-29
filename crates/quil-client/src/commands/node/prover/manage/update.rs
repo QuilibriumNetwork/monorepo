@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::model::{
-    AwaitFilterEntry, ColumnFilter, FilterColKind, Model, PanelFocus, PendingAction,
+    AwaitFilterEntry, ColumnFilter, ColumnSizing, FilterColKind, Model, PanelFocus, PendingAction,
     ACTION_FRAME_DELAY,
 };
 use super::msg::Msg;
@@ -409,6 +409,13 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         }
         KeyCode::Char('C') => {
             m.color_coding = !m.color_coding;
+            return vec![];
+        }
+        KeyCode::Char('w') => {
+            m.column_sizing = match m.column_sizing {
+                ColumnSizing::Dynamic => ColumnSizing::Fixed,
+                ColumnSizing::Fixed => ColumnSizing::Dynamic,
+            };
             return vec![];
         }
         KeyCode::Tab => {

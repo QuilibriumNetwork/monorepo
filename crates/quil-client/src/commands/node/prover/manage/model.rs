@@ -51,14 +51,34 @@ pub fn avail_filter_col_kind(col: usize) -> FilterColKind {
     }
 }
 
-// Column widths (mirror the Go consts).
+/// How the two tables size their columns. Toggled at runtime with `w`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColumnSizing {
+    /// Measure every column against the rows on screen: a column is as wide
+    /// as its own content needs and no wider.
+    #[default]
+    Dynamic,
+    /// The historical layout — a fixed width per column, sized for that
+    /// column's worst case rather than for what the table is showing.
+    Fixed,
+}
+
+// ── Column widths (`ColumnSizing::Fixed`) ────────────────────────────────
+//
+// Mirrors the Go consts. Shards and the reward columns are minimums rather
+// than fixed widths: their content has no upper bound and `{:>w$}` doesn't
+// clip, so an over-wide cell would shift every column after it.
+
 pub const SELECT_WIDTH: usize = 6;
 pub const FILTER_WIDTH: usize = 70;
 pub const PROVERS_WIDTH: usize = 7;
 pub const RING_WIDTH: usize = 5;
 pub const SIZE_WIDTH: usize = 10;
 pub const SHARDS_WIDTH: usize = 7;
+/// Available panel: cells carry a ` Q/f` suffix, so they need the extra room.
 pub const REWARD_WIDTH: usize = 20;
+/// Allocations panel: bare `~<value>` cells.
+pub const ALLOC_REWARD_WIDTH: usize = 14;
 pub const WORKER_WIDTH: usize = 7;
 pub const STATUS_WIDTH: usize = 12;
 pub const MODE_WIDTH: usize = 4;
@@ -71,7 +91,7 @@ pub const ALLOC_FIXED_WIDTH: usize = SELECT_WIDTH
     + RING_WIDTH
     + SIZE_WIDTH
     + SHARDS_WIDTH
-    + REWARD_WIDTH
+    + ALLOC_REWARD_WIDTH
     + WORKER_WIDTH
     + STATUS_WIDTH
     + MODE_WIDTH
@@ -83,6 +103,10 @@ pub const ALLOC_FIXED_WIDTH: usize = SELECT_WIDTH
 // 6 spaces between 7 columns, 2 external borders, 2-char sort indicator.
 pub const AVAIL_FIXED_WIDTH: usize =
     SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH + SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + 6 + 2 + 2;
+
+/// Floor for the Filter column in either layout. Filter is what gives way
+/// when the pane cannot hold the table, being the only column whose content
+/// is already truncated for display.
 pub const MIN_FILTER_WIDTH: usize = 12;
 
 pub const ACTION_FRAME_DELAY: u64 = 360;
@@ -116,6 +140,19 @@ pub struct AllocationRow {
     pub epoch: u64,
     #[allow(dead_code)]
     pub last_active_frame: u64,
+}
+
+impl AllocationRow {
+    /// The Mode cell — `m` when the row's worker is managed by hand, `a` when
+    /// the node assigns it. Cell values are lower-case; headers carry the
+    /// capital.
+    pub fn mode(&self) -> &'static str {
+        if self.manually_managed {
+            "m"
+        } else {
+            "a"
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +302,7 @@ pub struct Model {
     pub action_in_flight: bool,
     pub show_help: bool,
     pub color_coding: bool,
+    pub column_sizing: ColumnSizing,
     pub spinner_frame: usize,
 
     // Load / staleness tracking.
@@ -469,7 +507,7 @@ impl Model {
                         filter_key: format!("worker:{}", w.core_id),
                         filter_hex: String::new(),
                         status: 0,
-                        status_name: "Idle".to_string(),
+                        status_name: "idle".to_string(),
                         ring: 0,
                         active_provers: 0,
                         shard_size: BigInt::from(0),
@@ -894,13 +932,7 @@ pub fn alloc_row_text_val(row: &AllocationRow, col: usize) -> String {
     match col {
         1 => row.filter_hex.clone(),
         8 => row.status_name.clone(),
-        9 => {
-            if row.manually_managed {
-                "M".to_string()
-            } else {
-                "A".to_string()
-            }
-        }
+        9 => row.mode().to_string(),
         _ => String::new(),
     }
 }
@@ -959,11 +991,11 @@ fn action_hints(
     if let Some(w) = alloc_confirm_window(t, el) {
         return match w.state(ef, el) {
             WindowState::Open => (
-                "Reject | Confirm now".to_string(),
+                "reject | confirm now".to_string(),
                 format!("thru f{}", w.end_frame),
             ),
             WindowState::Pending => (
-                format!("Reject | Confirm@f{}", w.start_frame),
+                format!("reject | confirm@f{}", w.start_frame),
                 format!("epoch {}", w.confirm_epoch),
             ),
             WindowState::Missed => ("window missed".to_string(), "expired".to_string()),
@@ -976,9 +1008,9 @@ fn action_hints(
             } else {
                 String::new()
             };
-            ("Pause | Leave".to_string(), default)
+            ("pause | leave".to_string(), default)
         }
-        EffectiveStatus::Paused => ("Resume | Leave".to_string(), String::new()),
+        EffectiveStatus::Paused => ("resume | leave".to_string(), String::new()),
         EffectiveStatus::Joining => {
             if a.join_confirm_frame_number > 0 {
                 let act_e = epoch_for_frame(a.join_confirm_frame_number, el) + 1;
@@ -996,7 +1028,7 @@ fn action_hints(
             }
         }
         EffectiveStatus::ExpiredEpoch => {
-            ("Confirm now (renew)".to_string(), "re-confirm!".to_string())
+            ("confirm now (renew)".to_string(), "re-confirm!".to_string())
         }
         _ => (String::new(), String::new()),
     }
