@@ -147,24 +147,6 @@ fn header_text(
     s
 }
 
-/// Width a `ColumnSizing::Fixed` column needs: its constant, which doubles as
-/// the minimum, widened to the longest cell. `{:>w$}` doesn't clip, so a cell
-/// wider than its column shifts every column after it to the right; columns
-/// whose content has no fixed upper bound have to be measured even here.
-fn fit(base: usize, cells: impl Iterator<Item = usize>) -> usize {
-    cells.max().unwrap_or(0).max(base)
-}
-
-/// Width of one column: its printed header, widened to its widest cell.
-///
-/// Every column is measured, in both directions. `{:>w$}` doesn't clip, so a
-/// cell wider than its column shifts every column after it out of alignment;
-/// a column wider than its content spends the difference on blanks and pushes
-/// the columns to its right off the pane. Measuring is the fix for both.
-fn col_width(header: &str, cells: impl Iterator<Item = usize>) -> usize {
-    cells.max().unwrap_or(0).max(header.len())
-}
-
 // ── Entry ────────────────────────────────────────────────────────────────
 
 pub fn draw(f: &mut Frame, m: &mut Model) {
