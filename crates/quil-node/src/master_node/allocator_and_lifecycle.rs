@@ -303,13 +303,26 @@ pub(crate) fn init(
                 // genesis and a seeded testnet/localnet uses the seed keys, so `&[]`
                 // suffices here.
                 std::sync::Arc::new(move |frame: u64| -> bool {
-                    // Two coordinated resets ride this hook: the v1 boot cutover and
-                    // the v2 grid reset (mainnet 740_000). Each has its OWN marker so
-                    // re-wiping never deletes provers that re-joined after — and the
-                    // v1 marker (already set) doesn't suppress v2.
+                    // Three coordinated resets ride this hook: v1 boot cutover, v2
+                    // grid reset (740_000), and v3 prover reset (747_000). Each has
+                    // its OWN marker so re-wiping never deletes provers that
+                    // re-joined after, and an earlier marker never suppresses a later
+                    // reset.
+                    let is_v4 = frame
+                        == quil_execution::global_intrinsic::materialize::quil_prover_reset_v4_frame();
+                    let is_v3 = frame
+                        == quil_execution::global_intrinsic::materialize::quil_prover_reset_v3_frame();
                     let is_v2 = frame
                         == quil_execution::global_intrinsic::materialize::quil_grid_reset_v2_frame();
-                    if is_v2 {
+                    if is_v4 {
+                        if crate::unified_consolidation::prover_reset_v4_applied(&store) {
+                            return true;
+                        }
+                    } else if is_v3 {
+                        if crate::unified_consolidation::prover_reset_v3_applied(&store) {
+                            return true;
+                        }
+                    } else if is_v2 {
                         if crate::unified_consolidation::grid_reset_v2_applied(&store) {
                             return true;
                         }
@@ -320,8 +333,12 @@ pub(crate) fn init(
                         &hg, store.as_ref(), frame, net, &seed, &[],
                     ) {
                         Ok(n) => {
-                            tracing::info!(seeded = n, frame, is_v2, "archive at-reset prover-tree reset complete");
-                            if is_v2 {
+                            tracing::info!(seeded = n, frame, is_v2, is_v3, is_v4, "archive at-reset prover-tree reset complete");
+                            if is_v4 {
+                                crate::unified_consolidation::mark_prover_reset_v4_applied(&store);
+                            } else if is_v3 {
+                                crate::unified_consolidation::mark_prover_reset_v3_applied(&store);
+                            } else if is_v2 {
                                 crate::unified_consolidation::mark_grid_reset_v2_applied(&store);
                             }
                             true

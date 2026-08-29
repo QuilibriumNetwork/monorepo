@@ -121,15 +121,31 @@ pub async fn fetch_shard_sizes_from_archive(
         };
 
         match try_one_endpoint(&endpoint, falcon_signing_key, &shard_keys).await {
-            Ok(map) if !map.is_empty() => {
+            // A topology-only reply (all entries have size zero) is not usable
+            // shard-size data. Accepting it here used to set the lifecycle's
+            // shard-info-loaded gate and suppress attempts against archives
+            // that may actually have materialized state.
+            Ok(map) if has_nonzero_shard_size(&map) => {
+                let nonzero = map.values().filter(|size| **size > 0).count();
                 info!(
                     %endpoint,
                     shard_keys = shard_keys.len(),
                     shards_filtered = map.len(),
+                    shards_nonzero = nonzero,
                     attempt,
                     "shard_info refresh: success"
                 );
                 return Ok(map);
+            }
+            Ok(map) if !map.is_empty() => {
+                let msg = "endpoint returned only zero shard sizes".to_string();
+                warn!(
+                    %endpoint,
+                    attempt,
+                    shards_filtered = map.len(),
+                    "shard_info refresh: zero-valued result, rotating"
+                );
+                last_err = Some(msg);
             }
             Ok(_) => {
                 // Connected but got zero filters back — likely all
@@ -158,6 +174,14 @@ pub async fn fetch_shard_sizes_from_archive(
     Err(ShardInfoRefreshError::AllEndpointsFailed(
         last_err.unwrap_or_else(|| "no error captured".into()),
     ))
+}
+
+/// Whether an archive reply carries any materialized shard state. A nonempty
+/// map alone only establishes shard topology: `GetAppShards` can return every
+/// filter with an empty/zero `size` while an archive has not materialized the
+/// corresponding app state.
+fn has_nonzero_shard_size(sizes: &HashMap<Vec<u8>, u64>) -> bool {
+    sizes.values().any(|size| *size > 0)
 }
 
 /// Enumerate `shard_keys` against a single endpoint. Returns
@@ -292,5 +316,19 @@ mod tests {
         // 9 bytes of 0xFF → > u64::MAX
         let big = vec![0xFFu8; 9];
         assert_eq!(bigint_to_u64_saturating(&big), u64::MAX);
+    }
+
+    #[test]
+    fn topology_only_response_is_not_usable_shard_size_data() {
+        let mut sizes = HashMap::new();
+        sizes.insert(vec![0x01], 0);
+        sizes.insert(vec![0x02], 0);
+        assert!(
+            !has_nonzero_shard_size(&sizes),
+            "a nonempty all-zero response must rotate to another archive"
+        );
+
+        sizes.insert(vec![0x03], 1);
+        assert!(has_nonzero_shard_size(&sizes));
     }
 }

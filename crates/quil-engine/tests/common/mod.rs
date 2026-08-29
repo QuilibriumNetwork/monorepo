@@ -936,6 +936,15 @@ impl AppShardHarness {
             });
         }
 
+        // The in-memory harness wires every CW peer directly through the event
+        // drains above, so its transport is ready as soon as those drains exist.
+        // Production releases this barrier only after BlossomSub observes a
+        // connected topic subscriber; make the equivalent condition explicit
+        // here rather than letting tests bypass the startup contract.
+        for handle in &all_handles {
+            handle.set_cw_transport_ready();
+        }
+
         Self { filter, workers }
     }
 

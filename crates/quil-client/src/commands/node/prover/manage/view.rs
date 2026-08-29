@@ -66,7 +66,55 @@ fn fmt_reward(v: &BigInt) -> String {
 }
 
 fn fmt_mb(v: &BigInt) -> String {
-    format!("{:.1}", bigint_to_f64(v) / (1024.0 * 1024.0))
+    super::super::format_mb(v)
+}
+
+/// A column header as printed: sort indicator, name, active-filter marker.
+/// Sizing and rendering share it, so a column is never measured against a
+/// different string than it draws.
+///
+/// `compact` underscores the spaces inside a name. Measured columns sit one
+/// space apart, which leaves `Next Action Default Action` with no way to see
+/// where one header ends; `Next_Action Default_Action` reads unambiguously.
+/// The fixed layout has slack between columns and keeps the spaces.
+fn header_text(
+    name: &str,
+    idx: usize,
+    sort_col: i32,
+    asc: bool,
+    filtered: bool,
+    compact: bool,
+) -> String {
+    let mut s = if compact {
+        name.replace(' ', "_")
+    } else {
+        name.to_string()
+    };
+    if filtered {
+        s.push('*');
+    }
+    if sort_col == idx as i32 {
+        s.insert_str(0, if asc { "^|" } else { "v|" });
+    }
+    s
+}
+
+/// Width a `ColumnSizing::Fixed` column needs: its constant, which doubles as
+/// the minimum, widened to the longest cell. `{:>w$}` doesn't clip, so a cell
+/// wider than its column shifts every column after it to the right; columns
+/// whose content has no fixed upper bound have to be measured even here.
+fn fit(base: usize, cells: impl Iterator<Item = usize>) -> usize {
+    cells.max().unwrap_or(0).max(base)
+}
+
+/// Width of one column: its printed header, widened to its widest cell.
+///
+/// Every column is measured, in both directions. `{:>w$}` doesn't clip, so a
+/// cell wider than its column shifts every column after it out of alignment;
+/// a column wider than its content spends the difference on blanks and pushes
+/// the columns to its right off the pane. Measuring is the fix for both.
+fn col_width(header: &str, cells: impl Iterator<Item = usize>) -> usize {
+    cells.max().unwrap_or(0).max(header.len())
 }
 
 /// A column header as printed: sort indicator, name, active-filter marker.

@@ -101,6 +101,15 @@ debug = false
 # and overflow checks remain on. `cargo build`/`cargo check` are
 # unaffected — they use profile.dev.
 
+# Test binaries keep file/line for every frame — backtraces, panic
+# locations and test failure output are unchanged — but drop the DWARF
+# needed to inspect variables under a debugger.  That debug info is the
+# single largest thing the test profile writes: on a cold
+# `cargo test -p quil-engine --no-run` it accounts for 4.4 GB of a
+# 17.4 GB target directory, 3.4 GB of it in `debug/deps`.
+[profile.test]
+debug = "line-tables-only"
+
 # All third-party dependencies. `*` matches every package except the
 # one currently being built, so workspace members still need explicit
 # overrides below.

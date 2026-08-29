@@ -429,6 +429,46 @@ impl FrameMaterializer {
             }
         }
 
+        // Prover-reset v3 (mainnet 747_000): re-run the complete tree wipe+reseed.
+        // Pairs with the delete-free reassignment (vacated slots retire to Historic)
+        // and the per-node worker-filter reset (worker allocator) so provers re-join
+        // onto the clean genesis grid and the overlap cascade cannot re-form. Same
+        // hook, self-gated on the v3 marker; the grid is reset by the execution
+        // engine's `maybe_apply_split_reset`, which also fires at this frame.
+        if frame_number
+            == quil_execution::global_intrinsic::materialize::quil_prover_reset_v3_frame()
+        {
+            let reset_ok = self
+                .prover_tree_reset
+                .as_ref()
+                .map(|h| h(frame_number))
+                .unwrap_or(true);
+            if reset_ok {
+                info!(frame = frame_number, "prover-reset v3: prover-tree wiped + rebuilt");
+            } else {
+                error!(frame = frame_number, "prover-reset v3: prover-tree reset FAILED");
+            }
+        }
+
+        // Prover-reset v4 (mainnet 755_000): re-baseline once more after removing
+        // the boot-time grid clobber (`normalize_quil_token_grid`) that was reverting
+        // each archive's local grid to 64-way while allocations stayed split. Same
+        // hook + self-gated on the v4 marker.
+        if frame_number
+            == quil_execution::global_intrinsic::materialize::quil_prover_reset_v4_frame()
+        {
+            let reset_ok = self
+                .prover_tree_reset
+                .as_ref()
+                .map(|h| h(frame_number))
+                .unwrap_or(true);
+            if reset_ok {
+                info!(frame = frame_number, "prover-reset v4: prover-tree wiped + rebuilt");
+            } else {
+                error!(frame = frame_number, "prover-reset v4: prover-tree reset FAILED");
+            }
+        }
+
         // 1. Idempotency check
         let last = self.last_materialized_frame.load(Ordering::SeqCst);
         if frame_number <= last {

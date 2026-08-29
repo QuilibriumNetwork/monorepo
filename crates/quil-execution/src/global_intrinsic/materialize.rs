@@ -16,6 +16,13 @@ pub const STATUS_ACTIVE: u8 = 1;
 pub const STATUS_PAUSED: u8 = 2;
 pub const STATUS_LEAVING: u8 = 3;
 pub const STATUS_KICKED: u8 = 4;
+/// ALLOCATION status byte for `Historic` — an allocation superseded by a
+/// reassignment (prover moved off this filter) but RETAINED, not deleted, so the
+/// slot can be reactivated on a merge-back. Byte 6 in the allocation-status space
+/// (`map_allocation_status`: 4=Rejected, 5=Kicked already occupy 4/5; the
+/// `STATUS_KICKED=4` constant above is the PROVER-level rollup value, a separate
+/// space). Excluded from committees via `committee_eligible`.
+pub const STATUS_HISTORIC: u8 = 6;
 
 /// Flag-day frame for the spurious-kick amnesty (seniority restoration).
 ///
@@ -122,6 +129,67 @@ pub fn quil_grid_reset_v2_frame() -> u64 {
     })
 }
 
+/// Coordinated QUIL prover-tree RESET v3, mainnet frame 747_000.
+///
+/// grid-reset v2 (740_000) wiped + reseeded the prover tree, but two things
+/// defeated it: (1) provers re-joined onto their PERSISTED deep WORKER filters (in
+/// the local worker store, which the tree wipe doesn't touch), rebuilding the
+/// non-prefix-free allocation cascade; and (2) ordinary split/merge reassignment
+/// hard-DELETED vacated allocation vertices, permanently tombstoning their
+/// addresses (the removes-phase gate in `get_vertex_data`), so a merged-back shard
+/// could never re-represent its allocation.
+///
+/// v3 re-runs the complete tree wipe + genesis-committee reseed AND, at the same
+/// marker-gated frame path, clears every AUTO-managed worker's persisted filter
+/// binding so re-join lands on the clean 64-way genesis grid instead of the old
+/// deep filter (manually-managed workers keep their pins). Paired with the
+/// delete-free reassignment shipped alongside (vacated slots retire to
+/// [`STATUS_HISTORIC`], never deleted), the cascade cannot re-form and merge-back
+/// re-representation works. Gated exactly-once via its OWN marker
+/// (`prover_reset_v3` — see `unified_consolidation`).
+pub const QUIL_PROVER_RESET_V3_FRAME: u64 = 747_000;
+
+/// Effective prover-reset-v3 frame. Defaults to [`QUIL_PROVER_RESET_V3_FRAME`]
+/// (mainnet); DEV/localnet ONLY lowers it via `QUIL_PROVER_RESET_V3_FRAME` so the
+/// reset is reachable in a short localnet run. Read once and cached, like
+/// [`quil_grid_reset_v2_frame`], so every call site agrees and the switch stays
+/// deterministic across nodes.
+pub fn quil_prover_reset_v3_frame() -> u64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("QUIL_PROVER_RESET_V3_FRAME")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(QUIL_PROVER_RESET_V3_FRAME)
+    })
+}
+
+/// Coordinated QUIL prover-tree RESET v4 — the SAME complete reset as v3
+/// (tree wipe + genesis-committee reseed + per-node AUTO worker-filter clear +
+/// grid → 64-way genesis) at a LATER frame, needed because v3 (747_000) re-aligned
+/// the layers but the boot-time `normalize_quil_token_grid` (now REMOVED) then
+/// re-clobbered each archive's local grid back to 64-way on restart while the
+/// CRDT-synced allocations kept their depth-7/10 children — re-opening the
+/// divergence that gets deep-shard proofs rejected. v4 re-baselines both layers
+/// ONCE MORE; with the boot clobber gone, `apply_due_shard_changes` keeps the grid
+/// tracking the allocations durably afterwards. Additive to v3 (own marker +
+/// amnesty window), so v3's markers/forgiveness are never withdrawn.
+pub const QUIL_PROVER_RESET_V4_FRAME: u64 = 754_000;
+
+/// Effective prover-reset-v4 frame (env `QUIL_PROVER_RESET_V4_FRAME`, localnet
+/// override), cached like [`quil_prover_reset_v3_frame`].
+pub fn quil_prover_reset_v4_frame() -> u64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("QUIL_PROVER_RESET_V4_FRAME")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(QUIL_PROVER_RESET_V4_FRAME)
+    })
+}
+
 /// Whether a prior `kick_frame_number` still bars a prover from re-joining /
 /// counting at `current_frame`. `0` means "never kicked" (e.g. a voluntary
 /// leave records no KickFrameNumber). A pre-amnesty kick is forgiven only once
@@ -144,7 +212,20 @@ pub fn kick_bars_rejoin(kick_frame_number: u64, current_frame: u64) -> bool {
     // lowered reset carries a matching amnesty.
     let v2 = quil_grid_reset_v2_frame();
     let forgiven_reset_v2 = kick_frame_number < v2 && current_frame >= v2;
-    !(forgiven_695 || forgiven_reset || forgiven_reset_v2)
+    // Fourth additive window riding prover-reset v3: same reasoning as v2 — the v3
+    // wipe+reseed drops non-genesis provers, so a re-joining prover starts clean and
+    // any pre-v3 kick the drop missed is forgiven. Tied to the (env-honoring) v3
+    // frame so localnet's lowered reset carries a matching amnesty.
+    let v3 = quil_prover_reset_v3_frame();
+    let forgiven_reset_v3 = kick_frame_number < v3 && current_frame >= v3;
+    // Fifth additive window riding prover-reset v4 (same reasoning as v2/v3).
+    let v4 = quil_prover_reset_v4_frame();
+    let forgiven_reset_v4 = kick_frame_number < v4 && current_frame >= v4;
+    !(forgiven_695
+        || forgiven_reset
+        || forgiven_reset_v2
+        || forgiven_reset_v3
+        || forgiven_reset_v4)
 }
 
 /// Protocol-level halt-risk threshold. A shard with `Active` prover

@@ -46,6 +46,13 @@ fn restore_and_fill_worker_pool(
     Ok((restored, created))
 }
 
+/// `NoPeersSubscribedToTopic` is transient during gossip mesh startup; other
+/// publish errors require a different recovery path and must not be retried by
+/// the CW outbox.
+fn retryable_cw_publish_failure(error: &str, attempt: u32) -> bool {
+    error.contains("NoPeersSubscribedToTopic") && attempt < 8
+}
+
 /// Mirror a finalized `AppShardFrame` (canonical `frame_data`) into the master
 /// clock store so the store-backed `AppShardService::get_app_shard_frame` serves
 /// it. Workers commit into their OWN per-worker store (a REMOTE process in
@@ -783,15 +790,22 @@ pub(crate) fn init(
                                         }
                                         let p2p = drain_p2p.clone();
                                         drain_spawner.detach("shard-cw-publish", async move {
-                                            if let Err(e) = p2p
-                                                .publish(
-                                                    quil_engine::bitmasks::shard_cw_bitmask(&filter),
-                                                    quil_engine::bitmasks::shard_cw_frame_payload(channel, &bytes),
-                                                )
-                                                .await
-                                            {
-                                                warn!(core_id, filter = %hex::encode(&filter),
-                                                    error = %e, "shard cw publish failed");
+                                            let topic = quil_engine::bitmasks::shard_cw_bitmask(&filter);
+                                            let payload = quil_engine::bitmasks::shard_cw_frame_payload(channel, &bytes);
+                                            for attempt in 1..=8u32 {
+                                                match p2p.publish(topic.clone(), payload.clone()).await {
+                                                    Ok(()) => break,
+                                                    Err(e) if retryable_cw_publish_failure(&e.to_string(), attempt) => {
+                                                        let delay = std::time::Duration::from_millis(250u64.saturating_mul(1u64 << (attempt - 1)));
+                                                        warn!(core_id, filter = %hex::encode(&filter), attempt, ?delay, error = %e,
+                                                            "shard CW publish has no subscribed peers — retrying");
+                                                        tokio::time::sleep(delay).await;
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(core_id, filter = %hex::encode(&filter), attempt, error = %e, "shard cw publish failed");
+                                                        break;
+                                                    }
+                                                }
                                             }
                                             Ok(())
                                         });
@@ -840,6 +854,10 @@ pub(crate) fn init(
                                         });
                                     }
                                     WorkerToMaster::ShardActivated { core_id, filter, handle } => {
+                                        // Keep a second handle for the asynchronous CW transport
+                                        // readiness barrier below; the routing registry owns the
+                                        // original handle.
+                                        let ready_handle = handle.clone();
                                         // Push the current halt state to the
                                         // freshly-activated engine before
                                         // registering it. Without this the
@@ -864,13 +882,46 @@ pub(crate) fn init(
                                         let p2p = drain_p2p.clone();
                                         let filter_for_sub = filter.clone();
                                         drain_spawner.detach("shard-subscribe", async move {
-                                            p2p.subscribe(quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub)).await;
-                                            p2p.subscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub)).await;
-                                            p2p.subscribe(quil_engine::bitmasks::shard_prover_bitmask(&filter_for_sub)).await;
-                                            p2p.subscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&filter_for_sub)).await;
+                                            for topic in [
+                                                quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub),
+                                                quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub),
+                                                quil_engine::bitmasks::shard_prover_bitmask(&filter_for_sub),
+                                                quil_engine::bitmasks::shard_dispatch_bitmask(&filter_for_sub),
+                                            ] {
+                                                if let Err(e) = p2p.subscribe_confirmed(topic).await {
+                                                    warn!(core_id, filter = %hex::encode(&filter_for_sub), error = %e,
+                                                        "failed to install shard topic subscription");
+                                                    return Ok(());
+                                                }
+                                            }
                                             // (P3) Subscribe the shard's commonware-simplex topic so
                                             // committee peers' votes/certs/blocks reach this engine.
-                                            p2p.subscribe(quil_engine::bitmasks::shard_cw_bitmask(&filter_for_sub)).await;
+                                            let cw_topic = quil_engine::bitmasks::shard_cw_bitmask(&filter_for_sub);
+                                            if let Err(e) = p2p.subscribe_confirmed(cw_topic.clone()).await {
+                                                warn!(core_id, filter = %hex::encode(&filter_for_sub), error = %e,
+                                                    "failed to install shard CW topic subscription");
+                                                return Ok(());
+                                            }
+                                            let mut wait_logged = false;
+                                            loop {
+                                                match p2p.subscribed_peer_count(cw_topic.clone()).await {
+                                                    Ok(peers) if peers > 0 => {
+                                                        info!(core_id, filter = %hex::encode(&filter_for_sub), peers,
+                                                            "shard CW transport ready; starting consensus engine");
+                                                        ready_handle.set_cw_transport_ready();
+                                                        break;
+                                                    }
+                                                    Ok(_) if !wait_logged => {
+                                                        wait_logged = true;
+                                                        info!(core_id, filter = %hex::encode(&filter_for_sub),
+                                                            "waiting for a subscribed CW peer before starting consensus");
+                                                    }
+                                                    Ok(_) => {}
+                                                    Err(e) => warn!(core_id, filter = %hex::encode(&filter_for_sub), error = %e,
+                                                        "CW transport readiness check failed"),
+                                                }
+                                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                            }
                                             Ok(())
                                         });
                                         info!(
@@ -1043,6 +1094,14 @@ mod tests {
     use super::*;
     use quil_engine::test_support::TestWorkerManager;
     use quil_engine::worker::WorkerManager as _;
+
+    #[test]
+    fn cw_publish_retry_is_limited_to_missing_topic_peers() {
+        assert!(retryable_cw_publish_failure("blossomsub publish failed: NoPeersSubscribedToTopic", 1));
+        assert!(retryable_cw_publish_failure("NoPeersSubscribedToTopic", 7));
+        assert!(!retryable_cw_publish_failure("NoPeersSubscribedToTopic", 8));
+        assert!(!retryable_cw_publish_failure("p2p command channel closed", 1));
+    }
 
     #[test]
     fn restart_restores_idle_worker_slot_and_fills_missing_cores() {
