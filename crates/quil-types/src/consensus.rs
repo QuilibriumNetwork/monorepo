@@ -718,6 +718,8 @@ pub struct ShardDetail {
     pub estimated_reward: BigInt,
     pub is_allocated: bool,
     pub data_shards: u64,
+    pub materialized_frame: u64,
+    pub latest_frame: u64,
 }
 
 /// Provides shard-level info.

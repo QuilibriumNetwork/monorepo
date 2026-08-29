@@ -519,6 +519,10 @@ message AppShardInfo {
   uint64 data_shards = 3;
   repeated bytes commitment = 4;
   bytes shard_key = 5;
+  // Archive's durable materialization cursor; advanced only after state commit.
+  uint64 materialized_frame = 6;
+  // Latest app frame retained by the same archive, for a truthful backlog.
+  uint64 latest_frame = 7;
 }
 
 message GetAppShardsResponse {

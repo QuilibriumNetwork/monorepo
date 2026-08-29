@@ -853,6 +853,8 @@ impl NodeService for NodeRpcServer {
                 estimated_reward: d.estimated_reward.to_signed_bytes_be(),
                 is_allocated: d.is_allocated,
                 data_shards: d.data_shards,
+                materialized_frame: d.materialized_frame,
+                latest_frame: d.latest_frame,
             });
         }
 
