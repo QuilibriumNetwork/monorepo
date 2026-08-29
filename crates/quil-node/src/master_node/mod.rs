@@ -701,16 +701,12 @@ pub(crate) async fn start(
 
     // Hand the split-reset config to the global intrinsic so the unified-tree
     // reset (flag day) can deterministically rebuild the QUIL grid + drop every
-    // NON-archive prover record. The genesis prefix set is network-specific:
-    // mainnet QUIL is a 64-way pre-split ([0]..[63]); testnet/localnet is a single
-    // shard ([]) — mirroring `quil_engine::genesis`. GLOBAL-only + a no-op on
-    // nodes without a global engine; archives that materialize the cutover frame
-    // use it, others sync the post-reset state.
-    let reset_genesis_prefixes: Vec<Vec<u32>> = if network == 0 {
-        (0..64u32).map(|i| vec![i]).collect()
-    } else {
-        vec![vec![]]
-    };
+    // NON-archive prover record. The genesis prefix set is the canonical SENTINEL
+    // form for the network (mainnet 64-way pre-split; testnet/localnet a single
+    // root shard) — mirroring `quil_engine::genesis`. GLOBAL-only + a no-op on
+    // nodes without a global engine; every materializing node reseeds its own
+    // local grid (the grid does not sync), so all seed the same sentinel format.
+    let reset_genesis_prefixes: Vec<Vec<u32>> = quil_forest::genesis_grid_prefixes(network);
     if let Err(e) = exec_manager.install_global_split_reset_config(
         std::sync::Arc::new(genesis_prover_addrs.clone()),
         std::sync::Arc::new(reset_genesis_prefixes),

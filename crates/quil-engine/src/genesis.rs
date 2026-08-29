@@ -331,12 +331,15 @@ pub fn initialize_genesis_state(
         let is_quil = key_bytes == quil_execution::domains::QUIL_TOKEN;
         let txn = clock_store.new_transaction(false)?;
         if is_quil {
-            for i in 0..64u32 {
+            // Canonical SENTINEL 64-way genesis (never legacy byte-suffix `[i]`) so
+            // the local grid, and every filter derived from it, is sentinel from
+            // frame 0 — the same format the split-reset commits.
+            for prefix in quil_forest::genesis_grid_prefixes(0) {
                 shards_store.put_app_shard(
                     txn.as_ref(),
                     &quil_types::store::ShardInfo {
                         shard_key: shard_key.clone(),
-                        prefix: vec![i],
+                        prefix,
                         size: Vec::new(),
                         data_shards: 0,
                         commitment: Vec::new(),

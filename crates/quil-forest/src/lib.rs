@@ -504,6 +504,25 @@ pub fn bit_path_to_prefix(bit_path: &[bool]) -> Vec<u32> {
     p
 }
 
+/// Canonical QUIL genesis shard-grid prefixes for `network`, in the ONE forward
+/// format: SENTINEL bit-path prefixes. Mainnet (network 0) is the fixed 64-way
+/// pre-split — the 6-bit paths `000000`..`111111`; every other network is a
+/// single root shard (empty prefix == the whole app). The legacy byte-suffix
+/// `[i]` form is deliberately NOT produced: every grid seeder (genesis, boot
+/// reset, split-reset config, dry-run) routes through here so a node's local
+/// grid — and the confirmation filters derived from it via
+/// [`shard_prefix_to_filter`] — are sentinel everywhere. A root shard's `[]`
+/// is not the byte-suffix genesis format; its filter is the bare app address.
+pub fn genesis_grid_prefixes(network: u8) -> Vec<Vec<u32>> {
+    if network == 0 {
+        (0..64u32)
+            .map(|i| bit_path_to_prefix(&prefix_to_bits(&[i], 6)))
+            .collect()
+    } else {
+        vec![vec![]]
+    }
+}
+
 /// If `prefix` is a sentinel-tagged bit-path prefix, decode it to the bit-path;
 /// otherwise `None` (a legacy prefix — resolve via [`canonical_shard_bit_paths`]).
 /// Rejects a malformed tagged prefix (any level after the sentinel not `0`/`1`).
@@ -964,6 +983,101 @@ mod tests {
     fn canonical_unsplit_app_is_root() {
         // A single unsplit shard (empty prefix) = the whole app at the root.
         assert_eq!(canonical_shard_bit_paths(&[vec![]]), vec![Vec::<bool>::new()]);
+    }
+
+    #[test]
+    fn genesis_grid_prefixes_are_sentinel_and_never_byte_suffix() {
+        // Mainnet: 64 rows, every one a SENTINEL bit-path prefix (leading marker),
+        // never the legacy byte-suffix `[i]`. Each decodes to its 6-bit index, so
+        // routing is identical to the old form — only the stored bytes changed.
+        let mainnet = genesis_grid_prefixes(0);
+        assert_eq!(mainnet.len(), 64);
+        for (i, p) in mainnet.iter().enumerate() {
+            assert!(
+                shard_bit_path_from_prefix(p).is_some(),
+                "row {i} must be sentinel-encoded, got {p:?}"
+            );
+            assert_ne!(*p, vec![i as u32], "row {i} must NOT be legacy byte-suffix");
+            assert_eq!(
+                shard_bit_path_from_prefix(p).unwrap(),
+                prefix_to_bits(&[i as u32], 6),
+                "row {i} routes to its 6-bit index"
+            );
+        }
+        // Testnet/localnet: a single root shard (bare-app filter, not byte-suffix).
+        assert_eq!(genesis_grid_prefixes(1), vec![Vec::<u32>::new()]);
+    }
+
+    // Faithful model of the multi-node valid-shard flow that the single-shard
+    // localnet could NEVER exercise (network 1 = one root shard, always matches
+    // itself). Reproduces the mainnet 64-way fleet divergence using the REAL
+    // functions each side uses:
+    //   * archive valid-set  = { shard_prefix_to_filter(l2, row.prefix) }   (archive_sync.rs:2828)
+    //   * prover join/coverage address = shard_prefix_to_filter(l2, row.prefix) over the
+    //                                    joiner's OWN local grid              (lifecycle.rs:1083)
+    //   * collector reject    = !valid.contains(&address)                    (message_collector.rs:305)
+    // The grid is per-node and does NOT sync, so two nodes seeding genesis in
+    // different encodings produce non-matching filters → reject. This test would
+    // have FAILED before the seeder unification (byte-suffix boot/genesis seed vs
+    // sentinel v4 reset), which is exactly what shipped to prod uncaught.
+    #[test]
+    fn heterogeneous_fleet_grids_diverge_but_unified_seeders_agree() {
+        let l2 = [0x11u8; 32]; // stand-in QUIL app address (l2)
+        // Build a node's valid-shard address set the way the archive does.
+        let valid_set = |grid: &[Vec<u32>]| -> std::collections::HashSet<Vec<u8>> {
+            grid.iter().map(|p| shard_prefix_to_filter(&l2, p)).collect()
+        };
+        // The coverage/join address a prover on shard `k` submits, derived from
+        // ITS OWN local grid (same call the lifecycle join path makes).
+        let coverage_addr = |grid: &[Vec<u32>], k: usize| shard_prefix_to_filter(&l2, &grid[k]);
+
+        // Node grids: OLD binary seeds legacy byte-suffix `[i]`; FIXED binary
+        // seeds via the canonical helper (sentinel). Both are 64-way mainnet.
+        let grid_old: Vec<Vec<u32>> = (0..64u32).map(|i| vec![i]).collect();
+        let grid_fixed = genesis_grid_prefixes(0);
+
+        // Sanity: the two encodings are genuinely different bytes for the SAME
+        // shard, but route to the same bit-path (so it "looks" fine until the
+        // byte-exact valid-set check runs).
+        assert_ne!(grid_old[5], grid_fixed[5], "encodings differ byte-wise");
+        assert_eq!(
+            canonical_shard_bit_paths(&grid_old),
+            canonical_shard_bit_paths(&grid_fixed),
+            "…yet both route identically"
+        );
+
+        let archive_fixed = valid_set(&grid_fixed);
+
+        // REGRESSION (the prod bug): an OLD-binary prover's byte-suffix coverage
+        // address is NOT in a FIXED-binary archive's sentinel valid-set → the
+        // collector rejects it (`!valid.contains`) → 0 rewards.
+        let addr_old = coverage_addr(&grid_old, 5);
+        assert!(
+            !archive_fixed.contains(&addr_old),
+            "byte-suffix prover MUST be rejected by the sentinel archive — this is the bug"
+        );
+
+        // FIX (positive case): a FIXED-binary prover's address IS in the archive's
+        // valid-set for every shard → accepted.
+        for k in 0..64 {
+            assert!(
+                archive_fixed.contains(&coverage_addr(&grid_fixed, k)),
+                "fixed-binary prover accepted on shard {k}"
+            );
+        }
+
+        // INVARIANT the fix guarantees: any two nodes that seed via the helper
+        // produce BYTE-IDENTICAL valid-sets, so the fleet can never diverge as
+        // long as everyone runs the fixed seeder.
+        assert_eq!(
+            archive_fixed,
+            valid_set(&genesis_grid_prefixes(0)),
+            "two fixed-binary nodes agree byte-for-byte"
+        );
+
+        // And a HOMOGENEOUS old fleet is internally consistent (why it silently
+        // "worked" until one archive updated and flipped to sentinel).
+        assert!(valid_set(&grid_old).contains(&addr_old), "old fleet self-consistent");
     }
 
     #[test]

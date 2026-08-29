@@ -119,6 +119,15 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // balance is credited twice and the prover-tree root forks
             // timing-dependently. FLAG-DAY: changes the reward vertex encoding.
             FieldTag { name: "LastRewardFrameNumber", order: 2, size: 8, rdf_type: RdfType::Uint },
+            // order 3 — the set of shard filters ALREADY credited at
+            // `LastRewardFrameNumber`, length-prefixed (`u16 BE len ‖ filter`),
+            // sorted. Reset whenever the frame advances. This makes the
+            // idempotency guard key on (frame, SHARD) instead of frame-only: a
+            // prover on multiple shards accrues each shard's reward at the same
+            // global frame (matching Go's per-shard `applyReward`), while a
+            // re-materialize of the SAME (frame, shard) by the archive's second
+            // path still skips. Variable length.
+            FieldTag { name: "RewardedShardsBlob", order: 3, size: 512, rdf_type: RdfType::ByteArray },
         ],
     },
     // NOTE: merge:SpentMerge is NOT in the Go GLOBAL_RDF_SCHEMA turtle.

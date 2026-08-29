@@ -83,10 +83,11 @@ pub fn run_dump_shard_state(
         .unwrap_or(0);
     println!("head frame: {head}");
     println!(
-        "grid-reset v2 frame: {}   prover-reset v3 frame: {}   prover-reset v4 frame: {}   unified cutover frame: {}",
+        "grid-reset v2 frame: {}   prover-reset v3 frame: {}   prover-reset v4 frame: {}   prover-reset v5 frame: {}   unified cutover frame: {}",
         quil_execution::global_intrinsic::materialize::quil_grid_reset_v2_frame(),
         quil_execution::global_intrinsic::materialize::quil_prover_reset_v3_frame(),
         quil_execution::global_intrinsic::materialize::quil_prover_reset_v4_frame(),
+        quil_execution::global_intrinsic::materialize::quil_prover_reset_v5_frame(),
         quil_execution::global_intrinsic::materialize::unified_tree_cutover_frame(),
     );
 
@@ -96,6 +97,7 @@ pub fn run_dump_shard_state(
     println!("grid-reset v2 applied:      {}", crate::unified_consolidation::grid_reset_v2_applied(&hg_store));
     println!("prover-reset v3 applied:    {}", crate::unified_consolidation::prover_reset_v3_applied(&hg_store));
     println!("prover-reset v4 applied:    {}", crate::unified_consolidation::prover_reset_v4_applied(&hg_store));
+    println!("prover-reset v5 applied:    {}", crate::unified_consolidation::prover_reset_v5_applied(&hg_store));
     println!("unified consolidated:       {}", crate::unified_consolidation::is_consolidated(&hg_store));
 
     // QUIL grid key: l1(3) ‖ l2(32).
@@ -159,6 +161,13 @@ pub fn run_dump_shard_state(
     quil_forest_migrate::install_forest_boot(crdt.as_ref(), hg_store.as_ref(), false, network == 0);
 
     let provers = quil_execution::prover_registry::all_provers_with_allocations_committed(&crdt);
+    // ACTIVE-only view (effective_status(head)==Active) — the set that actually
+    // submits coverage. Retired (Historic, from delete-free reassignment),
+    // Rejected, Kicked, and expired allocations are excluded so the reject diff
+    // below flags only allocations that would REALLY trip the collector, not a
+    // vacated slot left behind after a split.
+    let active_provers =
+        quil_execution::prover_registry::all_provers_with_active_allocations_committed(&crdt, head);
     // Each prover is (address, pubkey, [confirmation_filter, ...]).
     let mut by_filter: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     for (_addr, _pubkey, filters) in &provers {
@@ -166,25 +175,32 @@ pub fn run_dump_shard_state(
             *by_filter.entry(filter.clone()).or_default() += 1;
         }
     }
+    let mut active_by_filter: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+    for (_addr, _pubkey, filters) in &active_provers {
+        for filter in filters {
+            *active_by_filter.entry(filter.clone()).or_default() += 1;
+        }
+    }
     let quil_filters: Vec<(&Vec<u8>, &usize)> = by_filter
         .iter()
         .filter(|(f, _)| f.len() >= 32 && f[..32] == quil[..])
         .collect();
     println!(
-        "\n--- PROVER ALLOCATIONS by confirmation_filter: {} provers, {} distinct QUIL filters ---",
+        "\n--- PROVER ALLOCATIONS by confirmation_filter: {} provers, {} distinct QUIL filters (active=N is the effective-Active subset at head {head}) ---",
         provers.len(),
         quil_filters.len()
     );
-    let mut alloc_lines: Vec<(usize, String, &'static str, usize)> = quil_filters
+    let mut alloc_lines: Vec<(usize, String, &'static str, usize, usize)> = quil_filters
         .iter()
         .map(|(f, c)| {
             let (enc, bits) = filter_bits(f);
-            (bits.len(), bits_str(&bits), enc, **c)
+            let active = active_by_filter.get(f.as_slice()).copied().unwrap_or(0);
+            (bits.len(), bits_str(&bits), enc, **c, active)
         })
         .collect();
     alloc_lines.sort();
-    for (depth, bits, enc, count) in &alloc_lines {
-        println!("  depth={depth:>2} [{enc:<11}] {bits:<12} provers={count}");
+    for (depth, bits, enc, count, active) in &alloc_lines {
+        println!("  depth={depth:>2} [{enc:<11}] {bits:<12} provers={count:<3} active={active}");
     }
     let alloc_bits: Vec<Vec<bool>> = quil_filters.iter().map(|(f, _)| filter_bits(f).1).collect();
     println!("  ALLOCATION overlapping filters (a filter prefixing another): {}", count_overlaps(&alloc_bits));
@@ -193,14 +209,19 @@ pub fn run_dump_shard_state(
     // The message collector rejects a shard-frame when `!valid.contains(&address)`,
     // where `valid` = {shard_prefix_to_filter(l2, prefix)} over the GRID rows (built
     // in archive_sync.rs) and `address` = the prover's `confirmation_filter`. So an
-    // allocation filter that is NOT byte-for-byte one of these grid filters is a
-    // shard whose coverage/reward proofs every archive rejects. This lists exactly
-    // those, side-stepping the 8-byte truncation in the live reject log.
+    // ACTIVE allocation filter that is NOT byte-for-byte one of these grid filters is
+    // a shard whose coverage/reward proofs every archive rejects. Only Active provers
+    // submit, so the diff is over the active set (a retired/Historic slot on a
+    // now-split parent is NOT a live reject and must not be counted here).
     let grid_valid_set: std::collections::HashSet<Vec<u8>> = grid
         .iter()
         .map(|s| quil_forest::shard_prefix_to_filter(&s.shard_key[3..35], &s.prefix))
         .collect();
-    let mut rejected: Vec<(usize, String, &'static str, Vec<u8>, usize)> = quil_filters
+    let active_quil_filters: Vec<(&Vec<u8>, &usize)> = active_by_filter
+        .iter()
+        .filter(|(f, _)| f.len() >= 32 && f[..32] == quil[..])
+        .collect();
+    let mut rejected: Vec<(usize, String, &'static str, Vec<u8>, usize)> = active_quil_filters
         .iter()
         .filter(|(f, _)| !grid_valid_set.contains(f.as_slice()))
         .map(|(f, c)| {
@@ -210,11 +231,24 @@ pub fn run_dump_shard_state(
         .collect();
     rejected.sort();
     println!(
-        "\n--- ALLOCATION filters NOT in the GRID valid-set (BYTE-EXACT) — these get rejected: {} ---",
+        "\n--- ACTIVE allocation filters NOT in the GRID valid-set (BYTE-EXACT) — these get rejected: {} ---",
         rejected.len()
     );
     for (depth, bits, enc, filter, count) in &rejected {
-        println!("  depth={depth:>2} [{enc:<11}] {bits:<14} provers={count:<3} filter={}", hex::encode(filter));
+        println!("  depth={depth:>2} [{enc:<11}] {bits:<14} active={count:<3} filter={}", hex::encode(filter));
+    }
+    // Retired/non-active allocations that are off-grid — expected after a split
+    // (delete-free reassignment leaves the vacated parent slot as Historic). Shown
+    // as a count so an operator isn't alarmed by a non-zero reject line.
+    let off_grid_nonactive = quil_filters
+        .iter()
+        .filter(|(f, _)| {
+            !grid_valid_set.contains(f.as_slice())
+                && !active_by_filter.contains_key(f.as_slice())
+        })
+        .count();
+    if off_grid_nonactive > 0 {
+        println!("  (off-grid NON-active allocations — retired/Historic after a split, benign: {off_grid_nonactive})");
     }
     // The reverse: grid shards with NO prover allocated (spine/empty — expected),
     // shown only as a count so the diff above stays focused.

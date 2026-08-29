@@ -1066,7 +1066,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                     let v4_reset = exec_num
                                                         == quil_execution::global_intrinsic::materialize::quil_prover_reset_v4_frame()
                                                         && !crate::unified_consolidation::prover_reset_v4_applied(&hg_store_for_recv);
-                                                    if !archive_mode_recv && (v1_reset || v2_reset || v3_reset || v4_reset) {
+                                                    let v5_reset = exec_num
+                                                        == quil_execution::global_intrinsic::materialize::quil_prover_reset_v5_frame()
+                                                        && !crate::unified_consolidation::prover_reset_v5_applied(&hg_store_for_recv);
+                                                    if !archive_mode_recv && (v1_reset || v2_reset || v3_reset || v4_reset || v5_reset) {
                                                         match quil_engine::genesis::reset_prover_tree_to_genesis(
                                                             &crdt_for_recv,
                                                             &hg_store_for_recv,
@@ -1076,8 +1079,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                             &[],
                                                         ) {
                                                             Ok(n) => {
-                                                                info!(seeded = n, frame = exec_num, v2 = v2_reset, v3 = v3_reset, v4 = v4_reset, "regular at-reset prover-tree reset complete");
-                                                                if v4_reset {
+                                                                info!(seeded = n, frame = exec_num, v2 = v2_reset, v3 = v3_reset, v4 = v4_reset, v5 = v5_reset, "regular at-reset prover-tree reset complete");
+                                                                if v5_reset {
+                                                                    crate::unified_consolidation::mark_prover_reset_v5_applied(&hg_store_for_recv);
+                                                                } else if v4_reset {
                                                                     crate::unified_consolidation::mark_prover_reset_v4_applied(&hg_store_for_recv);
                                                                 } else if v3_reset {
                                                                     crate::unified_consolidation::mark_prover_reset_v3_applied(&hg_store_for_recv);

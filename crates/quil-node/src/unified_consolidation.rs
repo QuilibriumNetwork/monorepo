@@ -121,6 +121,24 @@ pub fn mark_prover_reset_v4_applied(hg: &quil_store::RocksHypergraphStore) {
     }
 }
 
+/// Prover-reset v5 marker (759_000): clears the byte-suffix allocations the
+/// old-binary fleet re-joined with post-v4 and re-baselines to sentinel now that
+/// every seeder is sentinel. DISTINCT from v2/v3/v4 so their guards don't
+/// suppress it and the v5 wipe runs exactly once.
+const PROVER_RESET_V5_MARKER_KEY: &[u8] = b"\x00__quil_prover_reset_v5__";
+
+/// Whether the prover-reset v5 wipe has already run on this node.
+pub fn prover_reset_v5_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
+    hg.raw_db().get(PROVER_RESET_V5_MARKER_KEY).ok().flatten().is_some()
+}
+
+/// Record that prover-reset v5 has run (after a successful v5 prover wipe).
+pub fn mark_prover_reset_v5_applied(hg: &quil_store::RocksHypergraphStore) {
+    if let Err(e) = hg.raw_db().put(PROVER_RESET_V5_MARKER_KEY, [1u8]) {
+        warn!(error = %e, "prover-reset v5: marker write FAILED — may re-run if the frame re-materializes");
+    }
+}
+
 /// Apply the ENTIRE unified-tree cutover ONCE, ON BOOT — not gated on reaching a
 /// frame number. Idempotent via [`BOOT_RESET_MARKER_KEY`]. Runs BEFORE consensus
 /// starts, so the node comes up already in the reset state. Deterministic across
@@ -171,11 +189,11 @@ pub fn boot_apply_cutover_reset(
     let mut grid_key = Vec::with_capacity(3 + 32);
     grid_key.extend_from_slice(&l1);
     grid_key.extend_from_slice(&quil);
-    let genesis_prefixes: Vec<Vec<u32>> = if network == 0 {
-        (0..64u32).map(|i| vec![i]).collect()
-    } else {
-        vec![vec![]]
-    };
+    // Canonical SENTINEL genesis (never the legacy byte-suffix `[i]`) — a fresh
+    // boot must seed the same format the split-reset commits, or a node that
+    // boots past the reset frame (and never re-materializes it) would re-seed a
+    // byte-suffix grid and re-open the encoding divergence.
+    let genesis_prefixes: Vec<Vec<u32>> = quil_forest::genesis_grid_prefixes(network);
     match shards_db.new_batch(false) {
         Ok(txn) => {
             let mut removed_rows = 0usize;

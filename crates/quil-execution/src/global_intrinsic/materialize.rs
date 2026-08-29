@@ -190,6 +190,32 @@ pub fn quil_prover_reset_v4_frame() -> u64 {
     })
 }
 
+/// Coordinated QUIL prover-tree RESET v5 — the SAME complete reset as v4 (tree
+/// wipe + genesis-committee reseed + per-node AUTO worker-filter clear + grid →
+/// genesis) at a LATER frame. v4 seeded a SENTINEL grid in the reset itself, but
+/// the boot-time genesis seeders still produced BYTE-SUFFIX, so any node that
+/// booted fresh / state-jumped past v4 re-seeded byte-suffix and re-joined
+/// byte-suffix — leaving the network in a MIXED state (byte-suffix + sentinel
+/// allocations) that never self-healed because inactivity eviction is off (the
+/// stranded provers never re-joined). v5 re-baselines ONCE MORE, but now ALL
+/// seeders route through `quil_forest::genesis_grid_prefixes` (sentinel), so the
+/// post-v5 state STAYS sentinel — the boot-clobber hole v4 fell into is closed.
+/// Additive to v4 (own marker + amnesty window); v4's markers/forgiveness stand.
+pub const QUIL_PROVER_RESET_V5_FRAME: u64 = 759_000;
+
+/// Effective prover-reset-v5 frame (env `QUIL_PROVER_RESET_V5_FRAME`, localnet
+/// override), cached like [`quil_prover_reset_v4_frame`].
+pub fn quil_prover_reset_v5_frame() -> u64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("QUIL_PROVER_RESET_V5_FRAME")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(QUIL_PROVER_RESET_V5_FRAME)
+    })
+}
+
 /// Whether a prior `kick_frame_number` still bars a prover from re-joining /
 /// counting at `current_frame`. `0` means "never kicked" (e.g. a voluntary
 /// leave records no KickFrameNumber). A pre-amnesty kick is forgiven only once
@@ -221,11 +247,15 @@ pub fn kick_bars_rejoin(kick_frame_number: u64, current_frame: u64) -> bool {
     // Fifth additive window riding prover-reset v4 (same reasoning as v2/v3).
     let v4 = quil_prover_reset_v4_frame();
     let forgiven_reset_v4 = kick_frame_number < v4 && current_frame >= v4;
+    // Sixth additive window riding prover-reset v5 (same reasoning as v2/v3/v4).
+    let v5 = quil_prover_reset_v5_frame();
+    let forgiven_reset_v5 = kick_frame_number < v5 && current_frame >= v5;
     !(forgiven_695
         || forgiven_reset
         || forgiven_reset_v2
         || forgiven_reset_v3
-        || forgiven_reset_v4)
+        || forgiven_reset_v4
+        || forgiven_reset_v5)
 }
 
 /// Protocol-level halt-risk threshold. A shard with `Active` prover

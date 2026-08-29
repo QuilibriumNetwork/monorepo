@@ -308,13 +308,19 @@ pub(crate) fn init(
                     // its OWN marker so re-wiping never deletes provers that
                     // re-joined after, and an earlier marker never suppresses a later
                     // reset.
+                    let is_v5 = frame
+                        == quil_execution::global_intrinsic::materialize::quil_prover_reset_v5_frame();
                     let is_v4 = frame
                         == quil_execution::global_intrinsic::materialize::quil_prover_reset_v4_frame();
                     let is_v3 = frame
                         == quil_execution::global_intrinsic::materialize::quil_prover_reset_v3_frame();
                     let is_v2 = frame
                         == quil_execution::global_intrinsic::materialize::quil_grid_reset_v2_frame();
-                    if is_v4 {
+                    if is_v5 {
+                        if crate::unified_consolidation::prover_reset_v5_applied(&store) {
+                            return true;
+                        }
+                    } else if is_v4 {
                         if crate::unified_consolidation::prover_reset_v4_applied(&store) {
                             return true;
                         }
@@ -333,8 +339,10 @@ pub(crate) fn init(
                         &hg, store.as_ref(), frame, net, &seed, &[],
                     ) {
                         Ok(n) => {
-                            tracing::info!(seeded = n, frame, is_v2, is_v3, is_v4, "archive at-reset prover-tree reset complete");
-                            if is_v4 {
+                            tracing::info!(seeded = n, frame, is_v2, is_v3, is_v4, is_v5, "archive at-reset prover-tree reset complete");
+                            if is_v5 {
+                                crate::unified_consolidation::mark_prover_reset_v5_applied(&store);
+                            } else if is_v4 {
                                 crate::unified_consolidation::mark_prover_reset_v4_applied(&store);
                             } else if is_v3 {
                                 crate::unified_consolidation::mark_prover_reset_v3_applied(&store);

@@ -114,9 +114,16 @@ impl RemoteWorkerManager {
         let mut workers = HashMap::new();
 
         for (core_id, endpoint) in worker_endpoints {
+            // Show the effective scheme (https under mTLS), matching the actual
+            // dial in `connect_to_worker`, not the raw `http://` endpoint.
+            let display_endpoint = if client_tls.is_some() {
+                endpoint.replacen("http://", "https://", 1)
+            } else {
+                endpoint.clone()
+            };
             info!(
                 core_id,
-                endpoint = %endpoint,
+                endpoint = %display_endpoint,
                 "registered remote worker"
             );
             workers.insert(core_id, RemoteWorkerState {
@@ -184,6 +191,16 @@ impl RemoteWorkerManager {
         }
 
         for (core_id, endpoint) in endpoints {
+            // Log the EFFECTIVE scheme: `connect_to_worker` dials https (mTLS)
+            // when `client_tls` is set, swapping the endpoint's `http://` →
+            // `https://`. Mirror that here so the log matches the real dial
+            // instead of showing the raw `http://` (a cosmetic artifact that
+            // looked like plaintext even under mTLS).
+            let display_endpoint = if self.client_tls.is_some() {
+                endpoint.replacen("http://", "https://", 1)
+            } else {
+                endpoint.clone()
+            };
             match connect_to_worker(&endpoint, self.client_tls.as_ref()).await {
                 Ok(channel) => {
                     let (owed_filter, chan) = {
@@ -203,7 +220,7 @@ impl RemoteWorkerManager {
                             (None, channel)
                         }
                     };
-                    info!(core_id, endpoint = %endpoint, "connected to remote worker");
+                    info!(core_id, endpoint = %display_endpoint, "connected to remote worker");
                     let _ = self.event_tx.send(RemoteWorkerEvent::Connected { core_id }).await;
                     // Re-issue the deferred Respawn now that the worker is up.
                     if let Some(filter) = owed_filter {
@@ -221,7 +238,7 @@ impl RemoteWorkerManager {
                 Err(e) => {
                     warn!(
                         core_id,
-                        endpoint = %endpoint,
+                        endpoint = %display_endpoint,
                         error = %e,
                         "failed to connect to remote worker"
                     );

@@ -620,7 +620,9 @@ impl WorkerAllocator {
         if (frame_number
             == quil_execution::global_intrinsic::materialize::quil_prover_reset_v3_frame()
             || frame_number
-                == quil_execution::global_intrinsic::materialize::quil_prover_reset_v4_frame())
+                == quil_execution::global_intrinsic::materialize::quil_prover_reset_v4_frame()
+            || frame_number
+                == quil_execution::global_intrinsic::materialize::quil_prover_reset_v5_frame())
             && !self
                 .worker_reset_v3_done
                 .swap(true, std::sync::atomic::Ordering::SeqCst)

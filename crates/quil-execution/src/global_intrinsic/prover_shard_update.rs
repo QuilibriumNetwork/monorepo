@@ -615,20 +615,51 @@ pub fn materialize_prover_shard_update(
     }
 
     // Apply per-participant rewards + activity updates.
+    let mut credited_provers = 0usize;
+    let mut total_reward = BigInt::from(0);
     for (ring, participants) in &ctx.participants_by_ring {
         let share = rewards_per_ring.get(ring);
         for &idx in participants {
             let prover = &ctx.active_provers[idx];
 
             if let Some(share_amount) = share {
-                if share_amount.sign() != num_bigint::Sign::NoSign {
-                    apply_reward(state, current_frame_number, prover, share_amount)?;
+                if share_amount.sign() != num_bigint::Sign::NoSign
+                    && apply_reward(
+                        state,
+                        current_frame_number,
+                        prover,
+                        &frame_header.address,
+                        share_amount,
+                    )?
+                {
+                    credited_provers += 1;
+                    total_reward += share_amount;
                 }
             }
 
             update_allocation_activity(state, current_frame_number, prover, &frame_header.address)?;
         }
     }
+
+    // Per-shard-frame reward-accrual signal. Unlike the worker-side "reward
+    // balance updated by sync" (which only fires on an occasional prover-tree
+    // sync that happens to change the balance — sparse + lumpy, a poor proxy for
+    // whether a shard is actually earning), this logs on EVERY reward
+    // distribution, deterministically, from the committed count of provers
+    // credited + the total issued for this shard frame. A zero-credit frame is
+    // logged too (participants present but nothing credited ⇒ withheld basis /
+    // idempotent re-materialize / non-Active committee), so a reward STALL is
+    // visible per frame instead of silent. `participants` is the committee size
+    // that was eligible, so `credited < participants` flags a partial payout.
+    let participants: usize = ctx.participants_by_ring.values().map(|p| p.len()).sum();
+    tracing::info!(
+        shard = %hex::encode(&frame_header.address[..frame_header.address.len().min(8)]),
+        frame = current_frame_number,
+        credited_provers,
+        participants,
+        total_reward = %total_reward,
+        "shard reward distribution",
+    );
 
     Ok(())
 }
@@ -637,14 +668,19 @@ pub fn materialize_prover_shard_update(
 ///
 /// Go equivalent: `applyReward` at
 /// `global_prover_shard_update.go:400`.
+/// Returns `true` if the balance was actually credited, `false` if the credit
+/// was a no-op (zero share, or the idempotency guard already credited this
+/// (frame, shard)). Callers use this for an accurate per-frame reward-accrual
+/// count. `filter` is the shard's confirmation filter (`FrameHeader.address`).
 fn apply_reward(
     state: &HypergraphState,
     frame_number: u64,
     prover: &ProverInfo,
+    filter: &[u8],
     share: &BigInt,
-) -> Result<()> {
+) -> Result<bool> {
     if share.sign() == num_bigint::Sign::NoSign {
-        return Ok(());
+        return Ok(false);
     }
 
     let reward_addr = reward_address(&prover.address)?;
@@ -658,39 +694,45 @@ fn apply_reward(
         _ => quil_tries::VectorCommitmentTree::new(),
     };
 
-    // Per-frame idempotency guard (mirrors `accrue_active_seniority`). Reward
-    // crediting is ADDITIVE and NOT nonce-protected like token spends, and the
-    // global frame is applied by TWO paths on an archive — the serial
-    // materializer AND the archive poller's `process_global_frame`. Without this
-    // guard the balance is credited once per path (and again on any
-    // re-materialize), and because the paths commit at different times the
-    // prover-tree root as-of-frame-N depends on interleaving → a timing-dependent
-    // fork across nodes. Gate on `LastRewardFrameNumber` so a frame credits at
-    // most once, deterministically, however many times it is applied.
-    // Presence-checked: a fresh reward vertex has NO `LastRewardFrameNumber`
-    // field, so it is creditable at any frame (including frame 0). Only once the
-    // field exists do we gate `frame_number <= last`. (A bare
-    // `read_..._u64`-defaults-to-0 gate would wrongly skip a first-ever credit at
-    // frame 0.)
+    // Idempotency guard. Reward crediting is ADDITIVE and NOT nonce-protected
+    // like token spends, and the global frame is applied by TWO paths on an
+    // archive — the serial materializer AND the archive poller's
+    // `process_global_frame`. Without a guard the balance is credited once per
+    // path (and again on any re-materialize), and because the paths commit at
+    // different times the prover-tree root as-of-frame-N depends on interleaving
+    // → a timing-dependent fork. Presence-checked: a fresh reward vertex has no
+    // `LastRewardFrameNumber`, so it is creditable at any frame (incl. 0).
+    // (frame, SHARD)-keyed idempotency guard (Go parity: Go's `applyReward` takes
+    // the shard filter and has no frame guard). A prover allocated to more than
+    // one shard accrues EACH shard's reward at the same global frame; the
+    // archive's SECOND materialization of the same (frame, shard) still skips.
+    // `RewardedShardsBlob` holds the filters already credited at
+    // `LastRewardFrameNumber`, reset when the frame advances.
     let cls = "reward:ProverReward";
-    if let Some(bytes) = read_field(&reward_tree, cls, "LastRewardFrameNumber") {
-        let last_reward_frame = bytes
-            .get(..8)
-            .and_then(|s| s.try_into().ok())
-            .map(u64::from_be_bytes)
-            .unwrap_or(0);
-        if frame_number <= last_reward_frame {
-            return Ok(());
+    let last_reward_frame = read_field(&reward_tree, cls, "LastRewardFrameNumber")
+        .and_then(|b| b.get(..8).and_then(|s| s.try_into().ok()).map(u64::from_be_bytes));
+    match last_reward_frame {
+        // Strictly older frame re-materialized — already fully credited.
+        Some(last) if frame_number < last => return Ok(false),
+        // Same frame — credit only shards not yet credited this frame.
+        Some(last) if frame_number == last => {
+            let mut shards = decode_rewarded_shards(&reward_tree, cls);
+            if shards.iter().any(|s| s.as_slice() == filter) {
+                return Ok(false);
+            }
+            add_to_reward_balance(&mut reward_tree, share)?;
+            shards.push(filter.to_vec());
+            shards.sort();
+            encode_rewarded_shards(&mut reward_tree, cls, &shards)?;
+            // LastRewardFrameNumber is already == frame_number; leave it.
+        }
+        // New (higher) frame, or a fresh vertex — credit and reset the set.
+        _ => {
+            add_to_reward_balance(&mut reward_tree, share)?;
+            write_field(&mut reward_tree, cls, "LastRewardFrameNumber", &frame_number.to_be_bytes())?;
+            encode_rewarded_shards(&mut reward_tree, cls, &[filter.to_vec()])?;
         }
     }
-
-    add_to_reward_balance(&mut reward_tree, share)?;
-    write_field(
-        &mut reward_tree,
-        cls,
-        "LastRewardFrameNumber",
-        &frame_number.to_be_bytes(),
-    )?;
 
     let blob = vertex_tree_to_blob(&reward_tree);
     state.set(domain, &reward_addr, &va_disc, frame_number, blob)?;
@@ -716,7 +758,46 @@ fn apply_reward(
         }
     }
 
-    Ok(())
+    Ok(true)
+}
+
+/// Decode the `RewardedShardsBlob` field → the shard filters already credited at
+/// `LastRewardFrameNumber`. Format: repeated `u16 BE len ‖ filter`, sorted.
+/// Absent field or a malformed tail yields the (partial) set parsed so far.
+fn decode_rewarded_shards(
+    tree: &quil_tries::VectorCommitmentTree,
+    cls: &str,
+) -> Vec<Vec<u8>> {
+    let Some(blob) = read_field(tree, cls, "RewardedShardsBlob") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 2 <= blob.len() {
+        let len = u16::from_be_bytes([blob[i], blob[i + 1]]) as usize;
+        i += 2;
+        if i + len > blob.len() {
+            break; // malformed tail — stop
+        }
+        out.push(blob[i..i + len].to_vec());
+        i += len;
+    }
+    out
+}
+
+/// Encode a SORTED shard-filter set into the `RewardedShardsBlob` field
+/// (`u16 BE len ‖ filter` each). Caller sorts for a deterministic commitment.
+fn encode_rewarded_shards(
+    tree: &mut quil_tries::VectorCommitmentTree,
+    cls: &str,
+    shards: &[Vec<u8>],
+) -> Result<()> {
+    let mut blob = Vec::new();
+    for s in shards {
+        blob.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        blob.extend_from_slice(s);
+    }
+    write_field(tree, cls, "RewardedShardsBlob", &blob)
 }
 
 /// Update an allocation's `LastActiveFrameNumber`.
@@ -1111,15 +1192,57 @@ mod tests {
             BigInt::from_bytes_be(num_bigint::Sign::Plus, &bal_bytes)
         };
 
-        // Credits accumulate ACROSS frames.
-        apply_reward(&state, 50, &p, &BigInt::from(1000)).unwrap();
-        apply_reward(&state, 51, &p, &BigInt::from(500)).unwrap();
+        // Legacy path (frames < the fork frame). Credits accumulate ACROSS frames.
+        let shard = [0xAAu8; 32];
+        apply_reward(&state, 50, &p, &shard, &BigInt::from(1000)).unwrap();
+        apply_reward(&state, 51, &p, &shard, &BigInt::from(500)).unwrap();
         assert_eq!(read_bal(), BigInt::from(1500));
 
         // Per-frame IDEMPOTENT: a second credit at an already-credited frame
         // (the double-processing case: materializer + archive poller) is a no-op.
-        apply_reward(&state, 51, &p, &BigInt::from(999)).unwrap();
+        apply_reward(&state, 51, &p, &shard, &BigInt::from(999)).unwrap();
         assert_eq!(read_bal(), BigInt::from(1500), "reward must not double-credit a frame");
+    }
+
+    #[test]
+    fn multi_shard_reward_per_frame_shard_guard() {
+        let read_bal = |state: &HypergraphState, p: &ProverInfo| -> BigInt {
+            let reward_addr = reward_address(&p.address).unwrap();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], &reward_addr, &va_disc)
+                .unwrap()
+                .unwrap();
+            let tree = rebuild_vertex_tree_from_blob(&blob);
+            let bal = read_field(&tree, "reward:ProverReward", "Balance").unwrap();
+            BigInt::from_bytes_be(num_bigint::Sign::Plus, &bal)
+        };
+        let shard_a = vec![0x01u8; 32];
+        let shard_b = vec![0x02u8; 32];
+
+        let state = make_state();
+        let p = fake_prover(1, 1, 0, &shard_a);
+
+        // A prover on TWO shards accrues BOTH at the same global frame.
+        assert!(apply_reward(&state, 100, &p, &shard_a, &BigInt::from(1000)).unwrap());
+        assert!(
+            apply_reward(&state, 100, &p, &shard_b, &BigInt::from(500)).unwrap(),
+            "different shard at same frame MUST credit"
+        );
+        assert_eq!(read_bal(&state, &p), BigInt::from(1500), "both shards accrue");
+
+        // Dual-path re-materialize of the SAME (frame, shard) is idempotent.
+        assert!(!apply_reward(&state, 100, &p, &shard_a, &BigInt::from(999)).unwrap());
+        assert!(!apply_reward(&state, 100, &p, &shard_b, &BigInt::from(999)).unwrap());
+        assert_eq!(read_bal(&state, &p), BigInt::from(1500), "same (frame,shard) no double-credit");
+
+        // A strictly older frame re-materialized is skipped (already credited).
+        assert!(!apply_reward(&state, 99, &p, &shard_a, &BigInt::from(777)).unwrap());
+        assert_eq!(read_bal(&state, &p), BigInt::from(1500), "older frame skipped");
+
+        // The NEXT frame resets the per-frame set — the same shard credits again.
+        assert!(apply_reward(&state, 101, &p, &shard_a, &BigInt::from(200)).unwrap());
+        assert_eq!(read_bal(&state, &p), BigInt::from(1700), "new frame credits again");
     }
 
     #[test]
@@ -1541,7 +1664,7 @@ mod tests {
         share: &BigInt,
     ) {
         crdt.commit(frame_n).unwrap(); // 1. pre-reward root (caches frame-N)
-        apply_reward(state, frame_n, prover, share).unwrap(); // 2. additive mint
+        apply_reward(state, frame_n, prover, &[0xBBu8; 32], share).unwrap(); // 2. additive mint
         state.commit().unwrap(); //           drain reward → CRDT tree (dirty)
         crdt.commit_with_global_cursor(frame_n, cursor_key).unwrap(); // 3. cursor
     }
@@ -1563,8 +1686,8 @@ mod tests {
         q: &ProverInfo,
         share: &BigInt,
     ) -> Vec<quil_types::store::ShardKey> {
-        apply_reward(state, 0, p, share).unwrap();
-        apply_reward(state, 0, q, share).unwrap();
+        apply_reward(state, 0, p, &[0xBBu8; 32], share).unwrap();
+        apply_reward(state, 0, q, &[0xBBu8; 32], share).unwrap();
         state.commit().unwrap();
         crdt.commit_with_global_cursor(0, cursor_key).unwrap();
         crdt.commit(0).unwrap().keys().cloned().collect()

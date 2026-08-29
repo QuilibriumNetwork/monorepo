@@ -2651,6 +2651,7 @@ impl GlobalIntrinsic {
             && frame_number != super::materialize::quil_grid_reset_v2_frame()
             && frame_number != super::materialize::quil_prover_reset_v3_frame()
             && frame_number != super::materialize::quil_prover_reset_v4_frame()
+            && frame_number != super::materialize::quil_prover_reset_v5_frame()
         {
             return Ok(false);
         }
@@ -2693,8 +2694,13 @@ impl GlobalIntrinsic {
         // derived from the grid via `shard_prefix_to_filter`) stay in the same form
         // forever. v1/v2/v3 KEEP byte-suffix — those frames already committed with it,
         // so re-encoding them would fork a replaying node's prover tree.
-        let is_v4 = frame_number == super::materialize::quil_prover_reset_v4_frame();
-        let effective_prefixes: Vec<Vec<u32>> = if is_v4 {
+        // v4 AND v5 seed SENTINEL. (As of the seeder unification the passed
+        // `genesis_prefixes` are already sentinel, so this conversion is a
+        // no-op safety net that keeps the reset correct even if a caller ever
+        // supplies byte-suffix genesis.)
+        let is_sentinel_reset = frame_number == super::materialize::quil_prover_reset_v4_frame()
+            || frame_number == super::materialize::quil_prover_reset_v5_frame();
+        let effective_prefixes: Vec<Vec<u32>> = if is_sentinel_reset {
             genesis_prefixes
                 .iter()
                 .map(|p| {

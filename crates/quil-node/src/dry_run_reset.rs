@@ -110,12 +110,9 @@ pub fn run_dry_run_reset(
 
     // ---- RESET ----
     println!("\n--- running reset at frame {cutover_frame} ---");
-    // (1) QUIL grid → genesis topology (mainnet 64-way, testnet single).
-    let genesis_prefixes: Vec<Vec<u32>> = if network == 0 {
-        (0..64u32).map(|i| vec![i]).collect()
-    } else {
-        vec![vec![]]
-    };
+    // (1) QUIL grid → genesis topology (mainnet 64-way, testnet single), in the
+    // canonical sentinel format the real reset commits.
+    let genesis_prefixes: Vec<Vec<u32>> = quil_forest::genesis_grid_prefixes(network);
     let txn = KvDb::new_batch(&db, false)?;
     for s in &before_rows {
         shards_store.delete_app_shard(txn.as_ref(), &s.shard_key, &s.prefix)?;

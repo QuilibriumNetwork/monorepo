@@ -1779,6 +1779,80 @@ pub fn all_provers_with_allocations_committed(
     out
 }
 
+/// Like [`all_provers_with_allocations_committed`] but keeps ONLY the filters on
+/// which the prover is effectively `Active` at `frame_number`. Retired (Historic),
+/// Rejected, Kicked, and expired Joining/Leaving allocations are dropped — those
+/// provers do NOT submit coverage, so they can never trip the message collector's
+/// valid-shard reject. Use this (not the all-status walk) when diagnosing which
+/// allocations would ACTUALLY be rejected by the current grid, so a retired slot
+/// left behind by delete-free reassignment isn't false-flagged.
+pub fn all_provers_with_active_allocations_committed(
+    hg: &quil_hypergraph::HypergraphCrdt,
+    frame_number: u64,
+) -> Vec<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>)> {
+    let shard = ShardKey {
+        l1: [0u8; 3],
+        l2: [0xffu8; 32],
+    };
+    let mut addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let mut alloc_filters: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+
+    let mut removed_vks: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let _ = hg.for_each_vertex_underlying_shard("vertex", "removes", &shard, &mut |vk: Vec<u8>, _| {
+        removed_vks.insert(vk);
+    });
+
+    let mut cb = |vk: Vec<u8>, data: Vec<u8>| {
+        if vk.len() != 64 || removed_vks.contains(&vk) {
+            return;
+        }
+        let root = match deserialize_go_tree(&data) {
+            Ok(Some(r)) => r,
+            _ => return,
+        };
+        let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+            return;
+        };
+        if type_hash == TYPE_HASH_ALLOCATION {
+            if let Some((prover_ref, alloc)) = decode_allocation(&vk, &root) {
+                // Only allocations that are effectively Active at this frame — the
+                // set that actually submits coverage (mirrors the app-engine's
+                // propose gate and `live_allocation_status`).
+                if alloc.effective_status(frame_number)
+                    == quil_types::consensus::EffectiveStatus::Active
+                {
+                    alloc_filters
+                        .entry(prover_ref)
+                        .or_default()
+                        .push(alloc.confirmation_filter);
+                }
+            }
+            return;
+        }
+        if let Some("prover:Prover") = class_for_type_hash(&type_hash) {
+            if let Some(info) = decode_prover(&vk, &root) {
+                addr_to_pubkey.insert(info.address.clone(), info.public_key);
+            }
+        }
+    };
+    let _ = hg.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut cb);
+
+    let mut out: Vec<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>)> = addr_to_pubkey
+        .into_iter()
+        .filter_map(|(addr, pubkey)| {
+            let mut filters = alloc_filters.remove(&addr)?;
+            if filters.is_empty() {
+                return None;
+            }
+            filters.sort();
+            filters.dedup();
+            Some((addr, pubkey, filters))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Decode a `leafroot:LeafRootRegistration` vertex into
 /// `((member, leaf_id), record)`. `leaf_id = leaf_id_bytes(shard_filter,
 /// prefix)`. Returns `None` if required fields are missing.
