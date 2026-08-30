@@ -462,8 +462,15 @@ const STATE_JUMP_MAX_FRAME: u64 = 672_000;
 /// Only state-jump when the gap to the network head is large enough that
 /// replaying it via the verified poller is impractical; within this many frames
 /// of head the poller catches up fine and a full-state snapshot isn't warranted.
-/// For non-archives this is the SOLE gate on when a jump fires.
-const STATE_JUMP_MIN_GAP: u64 = 1_000;
+/// For non-archives this is the SOLE gate on when a jump fires. DEV/localnet may
+/// lower it via `QUIL_STATE_JUMP_MIN_GAP` so a jump is reachable within a short
+/// run (mainnet leaves the default).
+fn state_jump_min_gap() -> u64 {
+    std::env::var("QUIL_STATE_JUMP_MIN_GAP")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1_000)
+}
 /// Backoff between state-jump retry passes when the node IS far behind but no peer
 /// completed a jump this pass (empty/failing pool at boot, transient peer errors).
 /// Short enough to catch up quickly once a usable archive appears; long enough not
@@ -577,7 +584,7 @@ async fn run_state_jump(
         // Within MIN_GAP of head → the verified poller catches up fine; don't
         // snapshot THIS peer. (Another peer may still be far enough ahead, so try
         // the rest rather than aborting the whole jump.)
-        if target <= local_head.saturating_add(STATE_JUMP_MIN_GAP) {
+        if target <= local_head.saturating_add(state_jump_min_gap()) {
             continue;
         }
         if !frame_validate(&head) {
@@ -616,147 +623,127 @@ async fn run_state_jump(
         // A forged prover tree would otherwise be written to local state and the
         // cursor advanced past it (suppressing re-materialization), poisoning
         // seniority / committee membership / reward balances until the periodic
-        // verified reconcile. `sync_single_shard_verified` returns Ok(false) when
-        // the peer's root != anchor → try another peer (a partial/forged jump
-        // must NOT be committed).
-        match crate::forest_sync::sync_single_shard_verified(
+        // verified reconcile. `sync_single_shard_verified` returns `None` when the
+        // peer can't serve the anchored version → try another peer (a
+        // partial/forged jump must NOT be committed). On success it returns the
+        // frame `G` the anchored (pre-N) tree corresponds to — `anchor` binds
+        // `prover_root_at(N-1)`, so `G == target - 1` — and the cursor is pinned
+        // there so startup RE-MATERIALIZES frame `target` forward from the
+        // authenticated pre-state (rather than skipping it, which would fork).
+        let prover_pinned_frame = match crate::forest_sync::sync_single_shard_verified(
             &addr, &seed, crdt.clone(), &[0xffu8; 32], &anchor,
         )
         .await
         {
-            Ok(true) => {}
-            Ok(false) => {
-                warn!(%addr, target, "state-jump: peer prover-tree root != authenticated anchor — trying another peer");
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                warn!(%addr, target, "state-jump: peer cannot serve the authenticated prover-tree anchor version — trying another peer");
                 continue;
             }
             Err(e) => {
                 warn!(%addr, error = %e, "state-jump: prover tree sync failed — trying another peer");
                 continue;
             }
-        }
+        };
 
-        // Every app-shard forest tree. `range_app_shards` yields one `ShardInfo`
-        // per sub-shard (a QUIL app has 64, each with its own `prefix`), which
-        // maps directly to the forest sub-shard id `addr_path_shard_id(l2,
-        // prefix)`.
+        // Every app's forest tree. Post-cutover (UNIFIED mode) an app is ONE tree
+        // keyed by the BARE app address (`l2`); its sub-shards are subtrees of that
+        // tree, NOT separate forest trees. So we sync PER-APP, keyed by `l2` — NOT
+        // per-sub-shard `addr_path_shard_id(l2, prefix)`, which addresses the LEGACY
+        // per-prefix trees. Those are orphaned residue that `--reclaim-legacy-forest`
+        // deletes and that will not carry live state once QUIL splits, so pulling
+        // them would sync nothing.
         //
-        // AUTHENTICATION: app-shard consensus is per-APP (its filter is the
-        // 32-byte L2), and the app-shard frame's `state_roots[0]` is the app's
-        // AGGREGATE vertex-adds root over ALL its sub-shards
-        // (`compute_shard_root` rolls the prefixes up — the SAME value the app
-        // header advertises and the CW pre-state gate checks at finalize). So we
-        // group sub-shards by app, pull every sub-shard, then recompute that
-        // aggregate root locally and cross-check it against the peer's attested
-        // app-shard frame. A torn/partial/forged app tree fails the check and we
-        // retry a fresh N on another peer.
-        //
-        // On mainnet the peer set is already the genesis-archive allowlist (see
-        // message_loop.rs "FAKE ARCHIVE" drop), so this binds the synced state to
-        // a canonical archive's signed frame header. Peers that serve no app
-        // frame (or a zero root) for an app are synced on trust — the app-shard
-        // CW fail-closed pre-state gate re-checks `state_roots[0]` on the next
-        // produced frame, so a bad jump self-corrects rather than persisting.
+        // AUTHENTICATION: app-shard consensus is per-APP; its frame's `state_roots[0]`
+        // is the app's aggregate vertex-adds root — and, like the global
+        // `prover_tree_commitment`, it binds the PRE-application root. So we pull
+        // ROOT-ADDRESSED (`sync_single_shard_verified` → `resolve_root` maps the
+        // anchor to the peer's version), not the peer's post-application head — the
+        // same off-by-one fix as the prover tree. A peer that can't serve the
+        // anchored version falls back to a trust sync of the SAME unified tree; the
+        // per-app CW fail-closed pre-state gate re-checks `state_roots` on the next
+        // produced frame, so a drifted app tree self-corrects. `state_roots[1..4]`
+        // are pinned only to the peer head (QUIL's other phases are empty; a
+        // multi-phase app would need per-phase anchoring here).
         let _ = &anchor;
         // Regulars skip the ALL-shards pull (see `sync_all_shards`): prover tree
         // + cursor advance is enough to stop them replaying ancient history.
         let mut shard_count = 0usize;
         if sync_all_shards {
             let shard_rows = shards_store.range_app_shards().unwrap_or_default();
-            // app L2 -> (l1, [sub-shard forest ids]); dedup sub-shard ids (QUIL
-            // sub-shards share an l1‖l2 shard_key but differ in prefix).
-            let mut apps: std::collections::BTreeMap<[u8; 32], ([u8; 3], Vec<Vec<u8>>)> =
-                Default::default();
+            // Distinct app L2s (the bare-address unified trees to sync).
+            let mut apps: std::collections::BTreeSet<[u8; 32]> = Default::default();
             for row in &shard_rows {
                 if row.shard_key.len() < 35 {
                     continue;
                 }
-                let mut l1 = [0u8; 3];
-                l1.copy_from_slice(&row.shard_key[0..3]);
                 let mut l2 = [0u8; 32];
                 l2.copy_from_slice(&row.shard_key[3..35]);
-                let shard_id = quil_forest::Forest::addr_path_shard_id(&l2, &row.prefix);
-                let entry = apps.entry(l2).or_insert_with(|| (l1, Vec::new()));
-                if !entry.1.contains(&shard_id) {
-                    entry.1.push(shard_id);
-                }
+                apps.insert(l2);
             }
             let mut aborted = false;
-            'apps: for (l2, (l1, shard_ids)) in &apps {
+            'apps: for l2 in &apps {
                 if cancel.is_cancelled() {
                     return None;
                 }
-                // 1. Pull every sub-shard tree of this app.
-                for shard_id in shard_ids {
-                    if cancel.is_cancelled() {
-                        return None;
-                    }
-                    if let Err(e) = crate::forest_sync::pull_shard_from_peer(
-                        &addr,
-                        &seed,
-                        crdt.clone(),
-                        shard_id,
-                    )
-                    .await
-                    {
-                        // A vertex-adds (anchor) failure means we didn't reach the
-                        // peer's generation for this shard — abort and retry a fresh
-                        // N on another peer (a partial jump must NOT be committed).
-                        warn!(
-                            %addr, error = %e,
-                            "state-jump: shard sync failed — aborting, retrying another peer",
-                        );
-                        aborted = true;
-                        break 'apps;
-                    }
-                    shard_count += 1;
-                }
-                // 2. Cross-check the synced app tree against the peer's attested
-                //    app-shard frame (filter == the 32-byte app L2). frame 0 == the
-                //    peer's latest frame on that filter; state_roots[0] is the
-                //    aggregate vertex-adds root.
-                let attested = match client.get_app_shard_frame(l2.to_vec(), 0).await {
-                    Ok(Some(f)) => f
-                        .header
-                        .and_then(|h| h.state_roots.into_iter().next()),
-                    Ok(None) => None,
+                // The app's AUTHENTICATED per-phase pre-state roots (`state_roots`
+                // of its latest per-app CW frame) — the root-address anchors for all
+                // four phases. A zero/absent entry ⇒ that phase is synced to head.
+                let state_roots: Vec<Vec<u8>> = match client.get_app_shard_frame(l2.to_vec(), 0).await
+                {
+                    Ok(Some(f)) => f.header.map(|h| h.state_roots).unwrap_or_default(),
+                    Ok(None) => Vec::new(),
                     Err(e) => {
                         debug!(%addr, error = %e, "state-jump: app-shard frame fetch failed — app synced on trust");
-                        None
+                        Vec::new()
                     }
                 };
-                if let Some(root) = attested.filter(|r| r.iter().any(|b| *b != 0)) {
-                    // Local aggregate vertex-adds root over the freshly-synced
-                    // sub-shards, via the SAME accessor (`compute_shard_root`, which
-                    // rolls up `app_prefixes(l2)`) that produced the header and that
-                    // the app-shard CW pre-state gate re-checks at finalize. `l1` is
-                    // ignored by the accessor (it keys on l2), so its source is moot.
-                    let shard_key = quil_types::store::ShardKey { l1: *l1, l2: *l2 };
-                    let local = crdt.compute_shard_root("vertex", "adds", &shard_key);
-                    let local_nonzero = local.iter().any(|b| *b != 0);
-                    if local_nonzero && local != root {
-                        // Definitive: we synced real app state but it DISAGREES with
-                        // the peer's attested frame root — forged or torn. Retry a
-                        // fresh N on another peer (a bad jump must NOT be committed).
-                        warn!(
-                            %addr,
-                            app = %hex::encode(l2),
-                            peer = %hex::encode(&root),
-                            local = %hex::encode(&local),
-                            "state-jump: synced app tree root != peer's attested app-shard frame — aborting, retrying another peer",
-                        );
+                let phase_anchor = |i: usize| -> &[u8] {
+                    match state_roots.get(i) {
+                        Some(r) if r.iter().any(|b| *b != 0) => r.as_slice(),
+                        _ => &[],
+                    }
+                };
+                let anchors =
+                    [phase_anchor(0), phase_anchor(1), phase_anchor(2), phase_anchor(3)];
+                // Sync the UNIFIED app tree keyed by the bare L2, ROOT-ADDRESSING
+                // every phase we have an anchor for (empty ⇒ trust that phase to head
+                // — never the legacy sub-shards). All-empty anchors ⇒ `Some(0)`
+                // (trust sync), so `Ok(None)` only occurs with a real anchor.
+                match crate::forest_sync::sync_shard_phases_verified(
+                    &addr, &seed, crdt.clone(), &l2[..], anchors,
+                )
+                .await
+                {
+                    Ok(Some(_)) => {
+                        shard_count += 1;
+                    }
+                    Ok(None) => {
+                        // Anchored pull unavailable (peer pruned that version) or a
+                        // verified root disagreed. Fall back to a trust sync of the
+                        // unified tree so we still carry the app state; the CW gate
+                        // reconciles. Abort (retry peer) only if even that fails.
+                        match crate::forest_sync::sync_single_shard_verified(
+                            &addr, &seed, crdt.clone(), &l2[..], &[],
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                debug!(%addr, app = %hex::encode(l2), "state-jump: app anchored pull unavailable — synced unified tree on trust");
+                                shard_count += 1;
+                            }
+                            Err(e) => {
+                                warn!(%addr, error = %e, app = %hex::encode(l2), "state-jump: app unified-tree trust sync failed — aborting, retrying another peer");
+                                aborted = true;
+                                break 'apps;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(%addr, error = %e, app = %hex::encode(l2), "state-jump: app unified-tree sync failed — aborting, retrying another peer");
                         aborted = true;
                         break 'apps;
-                    } else if !local_nonzero {
-                        // Couldn't reproduce the aggregate locally (this app's
-                        // sub-shard prefixes may not be declared in the onboarding
-                        // forest yet) — can't authenticate, so sync on trust. The CW
-                        // fail-closed pre-state gate re-checks state_roots[0] on the
-                        // next produced frame, so a bad jump self-corrects.
-                        debug!(%addr, app = %hex::encode(l2), "state-jump: local app root empty — cannot authenticate, synced on trust");
                     }
-                    // else (local_nonzero && local == root): app tree authenticated.
-                } else {
-                    debug!(%addr, app = %hex::encode(l2), "state-jump: no attested app-shard root — app synced on trust");
                 }
             }
             if aborted {
@@ -765,13 +752,19 @@ async fn run_state_jump(
         }
 
         // Commit the jump: store the head frame record (clock head → target),
-        // then advance the durable materialized cursor so the startup
-        // re-materialize does NOT replay/re-apply [local_head+1..=target].
+        // then advance the durable materialized cursor. The prover tree was
+        // anchored to `prover_pinned_frame` (= target-1, the pre-`target` state
+        // frame `target`'s `prover_tree_commitment` binds), so the cursor pins
+        // THERE — startup then re-materializes (`prover_pinned_frame`..=target]
+        // (just frame `target`) forward from the authenticated pre-state. Pinning
+        // at `target` instead would mark `target` applied while the state is one
+        // frame behind, forking the next produced `prover_tree_commitment`.
         if let Err(e) = clock_store.put_global_frame(&head, None) {
             warn!(error = %e, target, "state-jump: store head frame failed — aborting");
             return None;
         }
-        if let Err(e) = clock_store.put_global_materialized_cursor(target) {
+        let cursor_frame = prover_pinned_frame.min(target);
+        if let Err(e) = clock_store.put_global_materialized_cursor(cursor_frame) {
             warn!(error = %e, "state-jump: cursor advance failed");
         }
         // Refresh the prover registry from the freshly-synced prover tree.
@@ -794,7 +787,7 @@ async fn run_state_jump(
         //   * otherwise we ARE far behind, or we couldn't read a usable peer this
         //     pass (empty/failing pool at early boot) → retry (boot) or give up to
         //     the caller (runtime re-fire).
-        let far_behind = best_jumpable > local_head.saturating_add(STATE_JUMP_MIN_GAP);
+        let far_behind = best_jumpable > local_head.saturating_add(state_jump_min_gap());
         if !far_behind && reachable {
             return None;
         }
@@ -2631,13 +2624,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 match crate::forest_sync::sync_single_shard_verified(
                                     addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &expected_root,
                                 ).await {
-                                    Ok(converged) => {
-                                        if !converged {
+                                    Ok(conv) => {
+                                        if conv.is_none() {
                                             debug!(peer = %addr, "reconcile: peer not on finalized lineage — trying next");
                                             continue;
                                         }
                                         reconcile_converged = true;
-                                        info!(peer = %addr, match_ok = converged, "incremental prover tree sync complete");
+                                        info!(peer = %addr, match_ok = conv.is_some(), "incremental prover tree sync complete");
                                         // Refresh registry with updated data.
                                         let pr = sync_pr.clone();
                                         let hs3 = sync_hg.clone();
@@ -2653,7 +2646,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         // (converged is meaningful) — a bootstrap
                                         // trust-sync (empty root) leaves the flag
                                         // for the normal verify path to set.
-                                        if converged
+                                        if conv.is_some()
                                             && (!expected_root.is_empty()
                                                 || (sync_archive_mode && mismatch_recovery))
                                         {

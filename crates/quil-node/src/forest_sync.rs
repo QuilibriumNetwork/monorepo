@@ -203,43 +203,132 @@ pub async fn sync_subtree_one_phase(
 }
 
 /// Sync a SINGLE-shard forest tree (all four phases + blobs) from `addr`,
-/// verifying the vertex-adds (phase 0) root against `expected_va_root` when it
-/// is non-empty (empty ⇒ trust the peer's latest snapshot, e.g. bootstrap).
-/// Returns whether phase 0 converged. The prover tree (`[0xff; 32]`) is the
-/// canonical single-shard app this covers.
+/// anchoring ONLY phase 0 to `expected_va_root` (empty ⇒ trust the peer's latest
+/// snapshot). A thin wrapper over [`sync_shard_phases_verified`] — correct for
+/// the global prover tree (`[0xff; 32]`), whose phases 1-3 never change
+/// (allocations use delete-free `Historic` reassignment, not removes), so pinning
+/// only phase 0 keeps the whole tree consistent. Returns `Some(global_frame)`
+/// (the frame the verified state is at, for cursor pinning) or `None` (retry).
 pub async fn sync_single_shard_verified(
     addr: &str,
     falcon_signing_key: &[u8],
     crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     shard_id: &[u8],
     expected_va_root: &[u8],
-) -> Result<bool> {
+) -> Result<Option<u64>> {
+    sync_shard_phases_verified(
+        addr,
+        falcon_signing_key,
+        crdt,
+        shard_id,
+        [expected_va_root, &[], &[], &[]],
+    )
+    .await
+}
+
+/// Sync a single-shard forest tree (all four phases + blobs), ROOT-ADDRESSING
+/// each phase whose `expected[i]` is non-empty. Returns `Some(global_frame)` from
+/// phase 0's `resolve_root` (the frame the verified state corresponds to, for
+/// cursor pinning; `0` when phase 0 is unanchored) or `None` (caller retries
+/// another peer). `shard_id` is a single tree id — `[0xff; 32]` for the prover
+/// tree, or a bare app L2 for a unified app tree.
+///
+/// ROOT-ADDRESSED anchoring (fixes a state-jump off-by-one): a frame commitment —
+/// the global `prover_tree_commitment`, and equally an app-shard frame's
+/// `state_roots[i]` — binds the PRE-application root (`root_at(N-1)`), while a
+/// peer's live forest head is POST-application. Comparing the head directly
+/// against the anchor is an off-by-one that stops matching the moment the tree
+/// mutates every frame, so a fresh node can never anchor. Instead `resolve_root`
+/// maps each anchor to the peer's `(version, global_frame)` and we sync that EXACT
+/// version (retained — `resolve_root` found it within the prune window), so the
+/// pulled tree hashes to the anchor by construction.
+///
+/// Phase 0 is crucial and frame-anchored: a `resolve_root` miss ⇒ the peer
+/// pruned/never-had it ⇒ retry another peer. An auxiliary phase (1-3) whose anchor
+/// is not in the version index but EQUALS the peer's current head is an
+/// empty/unchanged tree (its root was never separately committed) — sync the head;
+/// any other miss fails.
+pub async fn sync_shard_phases_verified(
+    addr: &str,
+    falcon_signing_key: &[u8],
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    shard_id: &[u8],
+    expected: [&[u8]; 4],
+) -> Result<Option<u64>> {
     let mut client = ArchiveClient::connect_mtls(addr, falcon_signing_key)
         .await
         .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
     let handle = tokio::runtime::Handle::current();
-    let mut va_converged = false;
+    // The global frame the verified phase-0 tree corresponds to (from
+    // `resolve_root`); 0 when phase 0 is unanchored (bootstrap/trust sync).
+    let mut pinned_frame: u64 = 0;
     for phase in 0u32..4 {
-        let head = client
-            .get_forest_head(shard_id.to_vec(), phase)
-            .await
-            .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))?;
-        let Some((v_s, root_s)) = head else { continue };
-        if phase == 0 && !expected_va_root.is_empty() && root_s.as_slice() != expected_va_root {
+        let exp = expected[phase as usize];
+        let (source_version, remote_root) = if exp.is_empty() {
+            let head = client
+                .get_forest_head(shard_id.to_vec(), phase)
+                .await
+                .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))?;
+            let Some((v_s, root_s)) = head else { continue };
+            (v_s, <[u8; 32]>::try_from(root_s.as_slice()).ok())
+        } else {
+            let Ok(anchor) = <[u8; 32]>::try_from(exp) else {
+                return Ok(None);
+            };
+            match client
+                .resolve_root(shard_id.to_vec(), phase, anchor.to_vec())
+                .await
+                .map_err(|e| QuilError::Internal(format!("resolve_root: {e}")))?
+            {
+                Some((v, g)) => {
+                    if phase == 0 {
+                        pinned_frame = g;
+                    }
+                    (v, Some(anchor))
+                }
+                None => {
+                    if phase == 0 {
+                        warn!(
+                            anchor = %hex::encode(exp),
+                            "peer has no version for the authenticated phase-0 anchor (behind/pruned) — trying another peer",
+                        );
+                        return Ok(None);
+                    }
+                    // Auxiliary phase: accept ONLY if the anchor is the peer's
+                    // current head (empty/unchanged tree — root never separately
+                    // versioned); else the peer can't serve the anchored version.
+                    let head = client
+                        .get_forest_head(shard_id.to_vec(), phase)
+                        .await
+                        .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))?;
+                    match head {
+                        Some((v_s, root_s)) if root_s.as_slice() == exp => (v_s, Some(anchor)),
+                        _ => {
+                            warn!(
+                                phase,
+                                anchor = %hex::encode(exp),
+                                "peer cannot serve the anchored phase version — trying another peer",
+                            );
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        };
+        let got =
+            sync_one_phase(&mut client, &handle, &crdt, shard_id, phase, source_version, remote_root)
+                .await?;
+        if !exp.is_empty() && got.as_slice() != exp {
             warn!(
-                peer = %hex::encode(&root_s),
-                expected = %hex::encode(expected_va_root),
-                "peer vertex-adds root != expected — not syncing",
+                phase,
+                got = %hex::encode(got),
+                expected = %hex::encode(exp),
+                "phase root != anchor after root-addressed pull — not committing",
             );
-            return Ok(false);
-        }
-        let rr = <[u8; 32]>::try_from(root_s.as_slice()).ok();
-        let got = sync_one_phase(&mut client, &handle, &crdt, shard_id, phase, v_s, rr).await?;
-        if phase == 0 {
-            va_converged = expected_va_root.is_empty() || got.as_slice() == expected_va_root;
+            return Ok(None);
         }
     }
-    Ok(va_converged)
+    Ok(Some(pinned_frame))
 }
 
 /// Pull ONE forest tree (all four phases + blobs) from `addr` into the CRDT,

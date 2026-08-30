@@ -678,8 +678,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                         match crate::forest_sync::sync_single_shard_verified(
                                                             &addr, &seed, crdt_for_bootstrap, &[0xffu8; 32], &expected_root,
                                                         ).await {
-                                                            Ok(converged) => {
-                                                                info!(addr = %addr, match_ok = converged, "prover tree bootstrap synced");
+                                                            Ok(conv) => {
+                                                                info!(addr = %addr, match_ok = conv.is_some(), "prover tree bootstrap synced");
                                                             }
                                                             Err(e) => {
                                                                 warn!(addr = %addr, error = %e, "prover tree bootstrap sync failed");
