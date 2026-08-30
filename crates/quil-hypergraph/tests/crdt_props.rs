@@ -861,6 +861,9 @@ fn live_size_all_phases_tombstones_and_world_sum() {
         d[31] = tag;
         Location { app_address: app, data_address: d }
     };
+    // Shard 0 lookup: BOTH the legacy byte-suffix `app ‖ 0x00` AND the sentinel
+    // `app ‖ 0x0006 ‖ 0x00` must resolve to the same (sentinel-keyed) bucket now
+    // that `sub_meta_for` matches by canonical bit-path.
     let s0 = |c: &HypergraphCrdt| {
         c.sub_shard_metadata_for_filter(&[app.as_slice(), &[0u8]].concat())
             .map(|m| (m.leaf_count, m.size))
@@ -907,6 +910,64 @@ fn live_size_all_phases_tombstones_and_world_sum() {
     c.warm_sizes(&[app]).unwrap();
     assert_eq!(c.total_size(), BigInt::from(13));
     assert_eq!(s0(&c), Some((3, BigInt::from(7))));
+}
+
+/// REGRESSION (post-reset "GetAppShards size 0 → no join candidates / no rewards"):
+/// a persisted size-bucket cache keyed under the OLD encoding (byte-suffix `[i]`)
+/// must NOT be restored over the CURRENT sentinel prefixes. On a restart after a
+/// byte-suffix→sentinel grid reset, `warm_sizes`' fast path used to blindly
+/// overwrite `sub_meta` with the stale byte-suffix cache, so every `sub_meta_for`
+/// fold (which keys by the current sentinel prefixes) missed → size 0. The fix
+/// rejects the mismatched cache and rebuilds sentinel-keyed.
+#[test]
+fn warm_sizes_rejects_stale_encoded_bucket_cache() {
+    use num_bigint::BigInt;
+    // Sentinel `ShardInfo.prefix` for QUIL 64-way shard `i`: `[SENTINEL, b5..b0]`
+    // (the 6-bit binary of `i`, MSB-first) — matches `bit_path_to_prefix`.
+    let sentinel_prefix = |i: u32| -> Vec<u32> {
+        let mut p = vec![0xFFFF_FFFFu32];
+        for b in (0..6).rev() {
+            p.push((i >> b) & 1);
+        }
+        p
+    };
+
+    // Shared store so instance 2 is a genuine RESTART on instance 1's persisted state.
+    let store = Arc::new(MemStore::new());
+    let app = [0x11u8; 32];
+
+    // Instance 1: byte-suffix 64-way grid; add data to shard 0; commit persists a
+    // BYTE-SUFFIX bucket cache (key = `app ‖ 0x00000000`, len 36).
+    let c1 = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+    c1.set_shard_partition(app, 1);
+    let mut d = [0u8; 32];
+    d[31] = 1; // top 6 bits 0 ⇒ shard 0
+    c1.add_vertex(&Location { app_address: app, data_address: d }, b"aaaa").unwrap();
+    c1.commit(1).unwrap();
+    assert!(
+        !c1.dump_persisted_size_buckets(&app).is_empty()
+            && c1.dump_persisted_size_buckets(&app).iter().all(|(kl, _, _)| *kl == 36),
+        "instance 1 persisted a byte-suffix cache"
+    );
+
+    // Instance 2 (restart) on the SAME store, now with the SENTINEL grid (a reset
+    // flipped the encoding). sub_meta starts empty.
+    let c2 = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+    c2.set_app_shard_prefixes(app, (0..64u32).map(sentinel_prefix).collect());
+    c2.warm_sizes(&[app]).unwrap();
+
+    // The stale byte-suffix cache was NOT restored; the rebuild re-keyed to the
+    // current sentinel prefixes, so shard 0's size resolves non-zero (was 0).
+    let m = c2
+        .sub_shard_metadata_for_filter(&[app.as_slice(), &[0u8]].concat())
+        .expect("shard 0 metadata after warm");
+    assert_eq!(m.leaf_count, 1, "shard-0 leaf count resolves post-reset");
+    assert_eq!(m.size, BigInt::from(4u64), "shard-0 live size resolves post-reset");
+    // Self-healed: the persisted cache is now sentinel-keyed (len 60).
+    assert!(
+        c2.dump_persisted_size_buckets(&app).iter().all(|(kl, _, _)| *kl == 60),
+        "cache re-persisted under sentinel keys"
+    );
 }
 
 /// Level-1 global commitments: each of the 256 buckets is the root of a tree

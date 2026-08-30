@@ -139,6 +139,93 @@ pub fn mark_prover_reset_v5_applied(hg: &quil_store::RocksHypergraphStore) {
     }
 }
 
+/// Reseed the LOCAL QUIL grid to the sentinel genesis ON BOOT if this node is
+/// past the v5 frame but never ran v5 (state-jumped / synced past 759_000). The
+/// prover tree is consensus state and arrives via sync (so it's the wiped
+/// post-v5 state), but the GRID is LOCAL and does NOT sync — a state-jumping
+/// node keeps its stale pre-v5 grid, so `fetch_shard_sizes_from_archive` can't
+/// build sentinel descriptors and the lifecycle's `ProposeJoin` gate never opens
+/// (the observed post-v5 "no joins land" — the 64-way grid is present on
+/// materializing archives but the fleet never refills it). Grid-only + marker-
+/// idempotent: after this runs once the frame-gated v5 path also no-ops.
+pub fn boot_apply_v5_grid_reset(
+    hg: &quil_store::RocksHypergraphStore,
+    shards_store: &dyn ShardsStore,
+    shards_db: &dyn quil_types::store::KvDb,
+    clock_store: &dyn ClockStore,
+    network: u8,
+) -> bool {
+    if prover_reset_v5_applied(hg) {
+        return false;
+    }
+    let head = clock_store
+        .get_latest_global_clock_frame()
+        .ok()
+        .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
+        .unwrap_or(0);
+    let v5 = quil_execution::global_intrinsic::materialize::quil_prover_reset_v5_frame();
+    if head < v5 {
+        // Not yet past v5 — the frame-gated reset (materialize/recv path) owns it.
+        return false;
+    }
+    info!(
+        head, v5, network,
+        "BOOT v5 grid reset: past v5 without the marker (state-jumped) — reseeding local grid to sentinel genesis"
+    );
+    let quil = quil_execution::domains::QUIL_TOKEN;
+    let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
+    let mut grid_key = Vec::with_capacity(3 + 32);
+    grid_key.extend_from_slice(&l1);
+    grid_key.extend_from_slice(&quil);
+    let genesis_prefixes = quil_forest::genesis_grid_prefixes(network);
+    match shards_db.new_batch(false) {
+        Ok(txn) => {
+            let mut removed_rows = 0usize;
+            if let Ok(rows) = shards_store.range_app_shards() {
+                for s in rows.into_iter().filter(|s| s.shard_key == grid_key) {
+                    let _ = shards_store.delete_app_shard(txn.as_ref(), &s.shard_key, &s.prefix);
+                    removed_rows += 1;
+                }
+            }
+            for p in &genesis_prefixes {
+                let _ = shards_store.put_app_shard(
+                    txn.as_ref(),
+                    &quil_types::store::ShardInfo {
+                        shard_key: grid_key.clone(),
+                        prefix: p.clone(),
+                        size: Vec::new(),
+                        data_shards: 0,
+                        commitment: Vec::new(),
+                    },
+                );
+            }
+            if let Ok(pending) = shards_store.all_pending_shard_changes() {
+                for pc in pending {
+                    if pc.parent.len() >= 32 && pc.parent[..32] == quil {
+                        let _ = shards_store.delete_pending_shard_change(
+                            txn.as_ref(),
+                            &pc.parent,
+                            pc.effective_epoch,
+                        );
+                    }
+                }
+            }
+            let _ = txn.commit();
+            info!(
+                removed_rows,
+                genesis_shards = genesis_prefixes.len(),
+                "BOOT v5 grid reset: QUIL grid reseeded to sentinel genesis"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "BOOT v5 grid reset: shards txn open failed — grid NOT reset");
+            return false;
+        }
+    }
+    mark_prover_reset_v5_applied(hg);
+    true
+}
+
 /// Apply the ENTIRE unified-tree cutover ONCE, ON BOOT — not gated on reaching a
 /// frame number. Idempotent via [`BOOT_RESET_MARKER_KEY`]. Runs BEFORE consensus
 /// starts, so the node comes up already in the reset state. Deterministic across

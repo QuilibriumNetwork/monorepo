@@ -8,7 +8,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use quil_types::crypto::{InclusionProver, Multiproof};
 use quil_types::error::{QuilError, Result};
@@ -32,6 +32,38 @@ impl Transaction for NoopTxn {
     fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
+/// A write-THROUGH transaction over [`MemStore`]'s shared kv map — so plain
+/// key/value writes (`set`/`get`/`delete`), e.g. the persisted size-bucket cache
+/// (`SIZE_BUCKETS_KEY`), survive across CRDT instances built on the same store
+/// (a simulated restart). Writes land immediately; `commit`/`abort` are no-ops.
+pub struct MemTxn {
+    kv: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+}
+
+impl Transaction for MemTxn {
+    fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.kv.lock().unwrap().get(k).cloned())
+    }
+    fn set(&self, k: &[u8], v: &[u8]) -> Result<()> {
+        self.kv.lock().unwrap().insert(k.to_vec(), v.to_vec());
+        Ok(())
+    }
+    fn commit(self: Box<Self>) -> Result<()> { Ok(()) }
+    fn delete(&self, k: &[u8]) -> Result<()> {
+        self.kv.lock().unwrap().remove(k);
+        Ok(())
+    }
+    fn abort(self: Box<Self>) -> Result<()> { Ok(()) }
+    fn new_iter(&self, _: &[u8], _: &[u8]) -> Result<Box<dyn KvIterator>> {
+        Err(QuilError::Internal("iterator not supported on in-memory state".into()))
+    }
+    fn delete_range(&self, lo: &[u8], hi: &[u8]) -> Result<()> {
+        self.kv.lock().unwrap().retain(|k, _| k.as_slice() < lo || k.as_slice() >= hi);
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
 /// Minimal in-memory `HypergraphStore` for tests. Stores node and root
 /// data in hash maps; all other operations are no-ops.
 pub struct MemStore {
@@ -42,6 +74,10 @@ pub struct MemStore {
     /// `vk` bytes without round-tripping them through the debug-format
     /// string keys used by `nodes`.
     per_vertex: Mutex<HashMap<(String, Vec<u8>), Vec<u8>>>,
+    /// Plain kv keyspace (the `Transaction` get/set surface), shared so a
+    /// transaction and successive CRDT instances on the same store see the same
+    /// data — needed to exercise the persisted size-bucket cache.
+    kv: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
 }
 
 impl MemStore {
@@ -50,6 +86,7 @@ impl MemStore {
             nodes: Mutex::new(HashMap::new()),
             roots: Mutex::new(HashMap::new()),
             per_vertex: Mutex::new(HashMap::new()),
+            kv: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -78,7 +115,7 @@ impl MemStore {
 
 impl HypergraphStore for MemStore {
     fn new_transaction(&self, _: bool) -> Result<Box<dyn Transaction>> {
-        Ok(Box::new(NoopTxn))
+        Ok(Box::new(MemTxn { kv: self.kv.clone() }))
     }
     fn get_node_by_key(&self, set: &str, phase: &str, shard: &ShardKey, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let k = Self::node_key(set, phase, shard, key);

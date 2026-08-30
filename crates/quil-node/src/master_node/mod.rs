@@ -161,6 +161,17 @@ pub(crate) async fn start(
             clock_store.as_ref(),
             &crdt,
         );
+        // v5 catch-up: a node that state-jumped past frame 759_000 never ran the
+        // v5 grid reseed (the grid is LOCAL and doesn't sync), so its stale grid
+        // blocks `ProposeJoin` and it can't refill the shards. Reseed the local
+        // grid to sentinel genesis on boot if past v5 and the marker is unset.
+        crate::unified_consolidation::boot_apply_v5_grid_reset(
+            &hg_store,
+            shards_store.as_ref(),
+            db_arc.as_ref(),
+            clock_store.as_ref(),
+            network,
+        );
     }
 
     // One-time corrective restore of the global-committee provers' Seniority.

@@ -4620,6 +4620,57 @@ mod tests {
         }
 
         #[test]
+        fn v5_reset_seeds_full_sentinel_grid_not_empty() {
+            // DIAGNOSTIC (post-v5 "no joins landed"): with the REAL mainnet config
+            // (reset_genesis_prefixes = genesis_grid_prefixes(0), already sentinel),
+            // the v5 reset must leave a NON-EMPTY 64-way sentinel grid — the shard
+            // set that plan_and_allocate needs to propose re-joins into. An empty
+            // grid here would mean the wipe deleted the rows and reseeded nothing,
+            // which is exactly what would produce empty /provers/shards + no joins.
+            let quil = crate::domains::QUIL_TOKEN;
+            let grid_key = {
+                let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
+                let mut k = l1.to_vec();
+                k.extend_from_slice(&quil);
+                k
+            };
+            let shdb = quil_store::RocksDb::open_in_memory().unwrap();
+            let store: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
+            // Pre-state: a mixed grid (as mainnet had pre-v5), to be replaced.
+            let txn = shards_db.new_batch(false).unwrap();
+            for i in 0..10u32 {
+                store.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: grid_key.clone(), prefix: vec![i], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+            }
+            txn.commit().unwrap();
+            let hstore = Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new());
+            let crdt = Arc::new(HypergraphCrdt::new(hstore, Arc::new(StubProver)));
+            let state = HypergraphState::new(crdt.clone());
+            // REAL mainnet reset config: canonical sentinel genesis.
+            let mainnet_genesis: Arc<Vec<Vec<u32>>> = Arc::new(quil_forest::genesis_grid_prefixes(0));
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_shards_store(store.clone())
+                .with_shards_db(shards_db.clone())
+                .with_hypergraph(crdt)
+                .with_archive_prover_addresses(Arc::new(std::collections::HashSet::new()))
+                .with_reset_genesis_prefixes(mainnet_genesis);
+
+            let v5 = crate::global_intrinsic::materialize::quil_prover_reset_v5_frame();
+            assert!(gi.maybe_apply_split_reset(v5, &state).unwrap(), "v5 grid reset ran");
+            let rows = quil_grid(&store, &grid_key);
+            assert_eq!(rows.len(), 64, "v5 must leave a NON-EMPTY 64-way grid");
+            assert!(
+                rows.iter().all(|s| quil_forest::shard_bit_path_from_prefix(&s.prefix).is_some()),
+                "every v5 genesis shard is SENTINEL"
+            );
+            // And a prover can derive a joinable 35B filter from every row.
+            for s in &rows {
+                let f = quil_forest::shard_prefix_to_filter(&s.shard_key[3..35], &s.prefix);
+                assert_eq!(f.len(), 35, "each grid row yields a 35B sentinel join filter");
+            }
+        }
+
+        #[test]
         fn v4_reset_seeds_sentinel_genesis_grid() {
             let (store, _db, gi, state, gk) = setup();
             let v4 = crate::global_intrinsic::materialize::quil_prover_reset_v4_frame();

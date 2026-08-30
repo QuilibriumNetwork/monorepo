@@ -1862,6 +1862,30 @@ mod tests {
     }
 
     #[test]
+    fn materialize_prover_join_sentinel_filter_lands() {
+        // DIAGNOSTIC (post-v5 "no joins landed"): a re-join to a SENTINEL grid
+        // shard (35-byte `app‖bit_len‖packed` filter) must materialize into an
+        // allocation carrying that exact filter — the same path a wiped prover
+        // takes to refill the 64-way sentinel grid. If this rejects/mangles the
+        // sentinel filter, no re-join can land.
+        let quil = [0x11u8; 32];
+        let sentinel = quil_forest::shard_prefix_to_filter(
+            &quil,
+            &quil_forest::genesis_grid_prefixes(0)[5],
+        );
+        assert_eq!(sentinel.len(), 35, "genesis sentinel filter is 35B");
+        let pk = vec![0xCDu8; 585];
+        let output = materialize_prover_join(&pk, &[sentinel.clone()], 100, 0).unwrap();
+        assert_eq!(output.allocations.len(), 1, "one allocation created");
+        let (_addr, tree) = &output.allocations[0];
+        assert_eq!(
+            read_field(tree, "allocation:ProverAllocation", "ConfirmationFilter").unwrap(),
+            sentinel,
+            "allocation must carry the exact 35B sentinel filter it joined"
+        );
+    }
+
+    #[test]
     fn materialize_prover_join_with_seniority() {
         let pk = vec![0xBBu8; 585];
         let output = materialize_prover_join(&pk, &[vec![0x01u8; 32]], 10, 999).unwrap();

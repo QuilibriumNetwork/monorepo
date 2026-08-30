@@ -107,6 +107,12 @@ pub fn convert_shard(
 /// `[0..64)`); every other app defaults to a SINGLE shard (empty prefix) and
 /// splits dynamically via shard-split logic. Mirrors the genesis registry
 /// (`genesis.rs` QUIL = 64) and the user's "non-QUIL defaults to 1" model.
+///
+/// NOTE: this is BYTE-SUFFIX `[i]`, matching how the forest was MIGRATED — the
+/// forest sub-shard id is `app ‖ raw_prefix_bytes` (`Forest::addr_path_shard_id`),
+/// so the CRDT partition encoding must equal the forest's on-disk encoding or
+/// `compute_shard_root` reads the wrong (empty) subtree. See the grid(sentinel)-
+/// vs-forest(byte-suffix) reconciliation note.
 pub fn quil_shards_for_app(app_address: &[u8; 32]) -> Vec<Vec<u32>> {
     if app_address == &quil_execution::domains::QUIL_TOKEN {
         (0..64u32).map(|i| vec![i]).collect()
@@ -483,12 +489,20 @@ pub fn install_forest_if_migrated(
 /// state (committed frames but no forest) — that MUST run `--migrate-db` first.
 /// Idempotent: no-op if the forest is already persistent.
 /// `mainnet_quil_grid`: when true (mainnet, network 0), declare QUIL's fixed
-/// 64-way (`depth 1`) uniform split — the legacy topology the pebble→rocksdb
-/// migration and the committed mainnet state root depend on. When false
-/// (testnet/devnet), QUIL is left at the default single-shard partition and
-/// splits dynamically like every other app; declaring a split here would make
-/// genesis `commit(0)` aggregate over 64 sub-shards and fork against the
-/// single-shard shards-store registry.
+/// 64-way (`depth 1`) genesis grid — in the SENTINEL bit-path encoding
+/// ([`quil_forest::genesis_grid_prefixes`]), matching the post-v5 shards-store
+/// grid. This is deliberately NOT the legacy byte-suffix `[i]` form: seeding
+/// byte-suffix here, then having `refresh_crdt_shard_prefixes` read the sentinel
+/// grid, was a partition TRANSITION on every boot, forcing a full-forest
+/// `rebucket_app` (the 30m–2hr archive boot). Seeding sentinel makes `refresh` a
+/// no-op, so no rebucket. Safe: the committed root is invariant to this encoding
+/// (a shard tree's root is `f(leaves)` — the storage-key namespace isn't hashed —
+/// and app aggregation is by bit-path, identical for `[i]` and `binary(i)`), and
+/// under unified mode reads go to the bare-app tree, so the per-prefix trees are
+/// never read. When false (testnet/devnet), QUIL is left at the default
+/// single-shard partition and splits dynamically like every other app; declaring
+/// a split here would make genesis `commit(0)` aggregate over 64 sub-shards and
+/// fork against the single-shard shards-store registry.
 pub fn install_forest_boot(
     crdt: &quil_hypergraph::HypergraphCrdt,
     hg: &RocksHypergraphStore,
@@ -504,7 +518,10 @@ pub fn install_forest_boot(
             quil_store::FOREST_NAMESPACE.to_vec(),
         ));
         if mainnet_quil_grid {
-            crdt.set_shard_partition(quil_execution::domains::QUIL_TOKEN, 1);
+            crdt.set_app_shard_prefixes(
+                quil_execution::domains::QUIL_TOKEN,
+                quil_forest::genesis_grid_prefixes(0),
+            );
         }
         true
     } else {
@@ -527,9 +544,11 @@ pub fn install_forest_boot(
 /// NOT gate on `has_forest_data()` — a syncing node is pulling authenticated
 /// state from peers and will fill the (initially empty) forest itself.
 /// `mainnet_quil_grid`: see [`install_forest_boot`]. Mainnet declares the fixed
-/// 64-way QUIL split so a syncing node computes the network-consistent app root;
-/// testnet/devnet leaves QUIL single-shard (its network is single-shard, so the
-/// default is already correct and a declared split would produce a wrong root).
+/// 64-way QUIL grid in the SENTINEL encoding (`genesis_grid_prefixes(0)`, matching
+/// the post-v5 shards-store grid) so a syncing node computes the
+/// network-consistent app root without a per-boot rebucket transition; testnet/
+/// devnet leaves QUIL single-shard (its network is single-shard, so the default is
+/// already correct and a declared split would produce a wrong root).
 pub fn install_forest_for_sync(
     crdt: &quil_hypergraph::HypergraphCrdt,
     hg: &RocksHypergraphStore,
@@ -543,7 +562,10 @@ pub fn install_forest_for_sync(
         quil_store::FOREST_NAMESPACE.to_vec(),
     ));
     if mainnet_quil_grid {
-        crdt.set_shard_partition(quil_execution::domains::QUIL_TOKEN, 1);
+        crdt.set_app_shard_prefixes(
+            quil_execution::domains::QUIL_TOKEN,
+            quil_forest::genesis_grid_prefixes(0),
+        );
     }
     true
 }

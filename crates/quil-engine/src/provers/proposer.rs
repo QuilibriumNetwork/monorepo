@@ -1235,6 +1235,55 @@ mod tests {
     }
 
     #[test]
+    fn post_v5_normal_node_proposes_joins_to_sentinel_grid() {
+        // DIAGNOSTIC (post-v5 "no joins landed"): a normal node with free
+        // workers and NO allocations, facing the post-v5 mainnet grid — 64-way
+        // SENTINEL shards that carry committed coin data (size>0) but have zero
+        // provers on them (active_count=0 ⇒ halt-risk). This is exactly the state
+        // right after the v5 wipe. If `plan_and_allocate` returns EMPTY here, the
+        // planner never proposes a join and the network can't refill — the
+        // observed wedge. Uses the REAL sentinel filters the grid produces.
+        let quil = [0x11u8; 32];
+        let sentinel_prefixes = quil_forest::genesis_grid_prefixes(0);
+        assert_eq!(sentinel_prefixes.len(), 64);
+        let shards: Vec<ShardDescriptor> = sentinel_prefixes
+            .iter()
+            .map(|p| {
+                let filter = quil_forest::shard_prefix_to_filter(&quil, p);
+                assert_eq!(filter.len(), 35, "genesis grid filter must be sentinel (35B)");
+                ShardDescriptor {
+                    filter,
+                    size: 100_000,
+                    ring: 0,
+                    shards: 1,
+                    active_on_ring: 0,
+                    total_active_joining: 0,
+                    active_count: 0,
+                }
+            })
+            .collect();
+
+        let free_workers: Vec<u32> = (1..=14).collect();
+        let proposals = plan_and_allocate(
+            &shards,
+            50_000,
+            &BigInt::from(6_400_000u64),
+            DEFAULT_UNITS,
+            &free_workers,
+            free_workers.len(),
+            Strategy::RewardGreedy,
+        );
+
+        assert!(
+            !proposals.is_empty(),
+            "a node with 14 free workers MUST propose joins to the 64-way sentinel grid post-v5"
+        );
+        for p in &proposals {
+            assert_eq!(p.filter.len(), 35, "proposed join filter must be a sentinel (35B) grid filter");
+        }
+    }
+
+    #[test]
     fn plan_and_allocate_data_greedy_deterministic_lexicographic() {
         let shards = vec![
             make_shard(vec![0x02], 10_000, 0, 1),

@@ -42,6 +42,7 @@ mod verify_migration;
 mod forest_migration;
 mod dry_run_reset;
 mod dump_shard_state;
+mod reclaim_legacy_forest;
 mod unified_consolidation;
 mod legacy_migration;
 mod coin_rescale;
@@ -121,6 +122,14 @@ struct Args {
     /// while the network keeps running on the others.
     #[arg(long)]
     dump_shard_state: Option<PathBuf>,
+
+    /// OFFLINE one-time reclaim of the orphaned pre-cutover QUIL forest trees (the
+    /// per-prefix byte-suffix trees the unified-tree consolidation copied from but
+    /// never deleted). Streaming range-delete + compact; asserts the unified app
+    /// root is unchanged (no consensus effect). Destructive — run with the node
+    /// shut down. Empty path uses config.db.path. Idempotent (marker-gated).
+    #[arg(long)]
+    reclaim_legacy_forest: Option<PathBuf>,
 
     /// Archive-only: convert pre-2.1 verenc coins in the DB (config.db.path, or
     /// the given path) into compact transparent public token entries and refresh
@@ -669,6 +678,20 @@ async fn main() -> anyhow::Result<ExitCode> {
 
     if let Some(ref dump_path) = args.dump_shard_state {
         return match dump_shard_state::run_dump_shard_state(dump_path, &config, args.network) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref reclaim_path) = args.reclaim_legacy_forest {
+        return match reclaim_legacy_forest::run_reclaim_legacy_forest(
+            reclaim_path,
+            &config,
+            args.network,
+        ) {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");

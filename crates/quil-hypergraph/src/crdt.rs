@@ -198,7 +198,90 @@ pub struct HypergraphCrdt {
     unified_tree: AtomicBool,
 }
 
+/// READ-ONLY snapshot of where an app's forest leaves actually live — the
+/// UNIFIED app tree (keyed by the bare app address, post-699500 home of state)
+/// vs the LEGACY per-prefix byte-suffix sub-shard trees (`addr_path_shard_id(app,
+/// [i])`, where pre-cutover / freshly-migrated QUIL state was written). Lets an
+/// operator tell "unified tree populated" (healthy) apart from "data stranded in
+/// legacy trees, consolidation never drained it". Produced by
+/// [`HypergraphCrdt::dump_app_forest_stats`]; not on any consensus path.
+#[derive(Clone, Debug)]
+pub struct AppForestStats {
+    /// Unified app tree, per phase (0=VertexAdds .. 3=HyperedgeRemoves):
+    /// `(leaf_count, root, version_read_at)`.
+    pub unified: [(u64, [u8; 32], u64); 4],
+    /// Legacy byte-suffix trees `[i]` (i in 0..64) with ANY VertexAdds leaves —
+    /// `(i, vertex_adds_leaf_count)`. Empty once fully drained into the unified tree.
+    pub legacy_nonempty: Vec<(u32, u64)>,
+    /// Sum of VertexAdds leaves across ALL 64 legacy per-prefix trees.
+    pub legacy_total_vertex_adds: u64,
+}
+
 impl HypergraphCrdt {
+    /// READ-ONLY diagnostic: the PERSISTED per-sub-shard size buckets
+    /// (`SIZE_BUCKETS_KEY`) that `warm_sizes` restores and `sub_meta_for` /
+    /// GetAppShards / the reward basis read — returned for `app` as
+    /// `(bucket_key_len, raw_count, live_size)`. The key is
+    /// `addr_path_shard_id(app, prefix) = app(32) ‖ prefix_bytes`, so the LENGTH
+    /// reveals the ENCODING: 36 (`app ‖ [i]`, one u32) = byte-suffix, 60
+    /// (`app ‖ [SENTINEL, b×6]`, seven u32) = sentinel. If the buckets are
+    /// byte-suffix while the live CRDT prefixes (post-refresh) are sentinel, every
+    /// `sub_meta_for` fold misses → GetAppShards reports size 0 → the proposer sees
+    /// no join candidates and the reward basis is 0. Does NOT run `warm_sizes`
+    /// (no scan) — reads the cache verbatim.
+    pub fn dump_persisted_size_buckets(&self, app: &[u8; 32]) -> Vec<(usize, u64, i128)> {
+        let read_txn = match self.store.new_transaction(false) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let blob = match read_txn.get(SIZE_BUCKETS_KEY) {
+            Ok(Some(b)) => b,
+            _ => return Vec::new(),
+        };
+        let mut out: Vec<(usize, u64, i128)> = deserialize_buckets(&blob)
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(&app[..]))
+            .map(|(k, (c, s))| (k.len(), c, s))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// READ-ONLY diagnostic (see [`AppForestStats`]): resolve each tree's exact
+    /// committed version the same way the live reader does
+    /// ([`Self::read_shard_phase_root`]), then read the UNIFIED app tree (keyed by
+    /// the bare app address) and the 64 LEGACY per-prefix byte-suffix trees. If
+    /// the unified VertexAdds count is ~total and legacy is ~0, state is where the
+    /// live path reads it; if unified is ~0 while legacy holds the leaves, the
+    /// one-time consolidation never drained them.
+    pub fn dump_app_forest_stats(&self, app: &[u8; 32]) -> AppForestStats {
+        let forest = self.forest.read().unwrap();
+        let resolve = |sid: &[u8], pi: usize| -> u64 {
+            self.resolve_phase_version_with(&forest, sid, pi)
+                .unwrap_or_else(|| self.forest_version.load(Ordering::SeqCst))
+        };
+        let mut unified = [(0u64, [0u8; 32], 0u64); 4];
+        for (pi, slot) in unified.iter_mut().enumerate() {
+            let ver = resolve(app, pi);
+            let count = forest.shard_phase_leaf_count(app, PHASES[pi], ver).unwrap_or(0);
+            let root =
+                forest.shard_phase_root(app, PHASES[pi], ver).ok().flatten().unwrap_or([0u8; 32]);
+            *slot = (count, root, ver);
+        }
+        let mut legacy_nonempty = Vec::new();
+        let mut legacy_total_vertex_adds = 0u64;
+        for i in 0..64u32 {
+            let sid = Forest::addr_path_shard_id(app, &[i]);
+            let ver = resolve(&sid, 0); // phase 0 = VertexAdds = the state
+            let count = forest.shard_phase_leaf_count(&sid, PHASES[0], ver).unwrap_or(0);
+            if count > 0 {
+                legacy_nonempty.push((i, count));
+                legacy_total_vertex_adds += count;
+            }
+        }
+        AppForestStats { unified, legacy_nonempty, legacy_total_vertex_adds }
+    }
+
     pub fn new(store: Arc<dyn HypergraphStore>, prover: Arc<dyn InclusionProver>) -> Self {
         Self {
             store,
@@ -289,9 +372,22 @@ impl HypergraphCrdt {
     /// `warm_sizes` (persisted fast-path or cold scan), which must not be clobbered.
     pub fn set_app_shard_prefixes(&self, app: [u8; 32], prefixes: Vec<Vec<u32>>) -> bool {
         let set = if prefixes.is_empty() { vec![Vec::new()] } else { prefixes };
+        // Change-detection is ORDER-INDEPENDENT: a shard set is semantically a
+        // SET, and routing is value-matched (an address finds its matching prefix
+        // regardless of position), so a mere re-ordering must NOT read as a
+        // transition. Comparing the raw `Vec` order once made a boot where the
+        // shards-store range order differed from the seeded order (e.g. the forest
+        // default vs the reset grid) look like a split EVERY boot, triggering a
+        // full `rebucket_app` re-scan of all committed coins (the 30m-2hr hang).
+        // Storage keeps the caller's order (routing derives bit-paths from it).
+        let sorted = |v: &[Vec<u32>]| {
+            let mut s = v.to_vec();
+            s.sort();
+            s
+        };
         let mut w = self.app_shard_prefixes.write().unwrap();
         match w.get(&app) {
-            Some(existing) if *existing == set => false, // unchanged
+            Some(existing) if sorted(existing) == sorted(&set) => false, // unchanged set
             Some(_) => {
                 w.insert(app, set);
                 true // genuine split/merge transition
@@ -1078,11 +1174,43 @@ impl HypergraphCrdt {
     /// query `(app, prefix)` — an O(#sub-shards) read of the maintained buckets,
     /// no tree scan. `prefix` empty ⇒ whole app.
     fn sub_meta_for(&self, app: &[u8; 32], prefix: &[u32]) -> (u64, i128) {
+        // Match by CANONICAL bit-path, not raw `starts_with`: the lookup prefix
+        // and the CRDT's stored prefixes can be in DIFFERENT encodings (a byte-
+        // suffix `[i]` vs a sentinel `[SENTINEL, bits]` after a reset). A raw
+        // compare misses — a sentinel prefix never `starts_with([i])` — so every
+        // sentinel-shard lookup returned size 0, zeroing rewards and making
+        // GetAppShards report empty (post-v5 "no rewards / no join candidates").
+        // `shard_bit_paths` is the SPLIT-AWARE canonical decode (aligned with
+        // `app_prefixes`), so this handles non-uniform / non-6-bit splits too.
+        // `prefix` empty ⇒ whole app.
+        let prefixes = self.app_prefixes(app);
+        let bit_paths = self.shard_bit_paths(app);
+        // The lookup prefix's canonical bits: its entry in the set if it IS a
+        // current shard, else a best-effort decode (a parent prefix not itself a
+        // current shard — sentinel-tagged if present, else the 6-bit QUIL split).
+        let lookup_bits = prefixes
+            .iter()
+            .position(|p| p == prefix)
+            .and_then(|i| bit_paths.get(i).cloned())
+            .unwrap_or_else(|| {
+                if prefix.is_empty() {
+                    Vec::new()
+                } else {
+                    quil_forest::shard_bit_path_from_prefix(prefix)
+                        .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6))
+                }
+            });
         let m = self.sub_meta.read().unwrap();
-        self.app_prefixes(app)
-            .into_iter()
-            .filter(|p| p.starts_with(prefix))
-            .filter_map(|p| m.get(&Forest::addr_path_shard_id(app, &p)).copied())
+        prefixes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                bit_paths
+                    .get(*i)
+                    .map(|b| b.starts_with(&lookup_bits))
+                    .unwrap_or(false)
+            })
+            .filter_map(|(_, p)| m.get(&Forest::addr_path_shard_id(app, p)).copied())
             .fold((0u64, 0i128), |(c, s), (pc, ps)| (c + pc, s + ps))
     }
 
@@ -1100,17 +1228,146 @@ impl HypergraphCrdt {
     /// bucket by the forest partition, then persist. `apps` is the COMPLETE set
     /// of committed app addresses (the node passes it from
     /// `shards_store.range_app_shards()`). Runs at most once ever.
+    /// Whether a size-bucket map is keyed consistently with each app's CURRENT
+    /// `app_prefixes` — every bucket key for an app must be one of that app's
+    /// current-prefix shard ids (`addr_path_shard_id(app, prefix)`). A cache
+    /// written under a since-replaced encoding (byte-suffix vs sentinel) or under
+    /// a pre-split parent prefix carries keys absent from the current set and
+    /// fails this, so [`warm_sizes`] rebuilds instead of restoring stale keys.
+    /// Missing expected keys are fine (a shard with no data has no bucket); only
+    /// UNEXPECTED keys (belonging to a prior encoding/partition) reject the cache.
+    fn buckets_match_current_prefixes(
+        &self,
+        apps: &[[u8; 32]],
+        m: &HashMap<Vec<u8>, (u64, i128)>,
+    ) -> bool {
+        for &app in apps {
+            if app == [0xFFu8; 32] {
+                continue; // prover shard excluded from world size (never bucketed)
+            }
+            let expected: std::collections::HashSet<Vec<u8>> = self
+                .app_prefixes(&app)
+                .iter()
+                .map(|p| Forest::addr_path_shard_id(&app, p))
+                .collect();
+            for k in m.keys() {
+                if k.starts_with(&app[..]) && !expected.contains(k) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Re-key a stale-encoded bucket map to the CURRENT prefixes by canonical
+    /// bit-path, WITHOUT rescanning committed state. A byte-suffix `[i]` bucket and
+    /// the sentinel `binary(i)` bucket describe the SAME shard and carry the same
+    /// `(raw_count, live_size)`, so an encoding flip is a pure key remap. Returns
+    /// `None` — signalling the caller to do a full rescan — if any app-owned bucket
+    /// maps to zero or more-than-one current prefix (a genuine partition change,
+    /// e.g. a split, needs real re-attribution, not a remap). Keys not owned by any
+    /// `apps` entry pass through unchanged.
+    fn transcode_buckets_to_current(
+        &self,
+        apps: &[[u8; 32]],
+        stale: &HashMap<Vec<u8>, (u64, i128)>,
+    ) -> Option<HashMap<Vec<u8>, (u64, i128)>> {
+        let per_app: HashMap<[u8; 32], (Vec<Vec<u32>>, Vec<Vec<bool>>)> = apps
+            .iter()
+            .map(|&app| (app, (self.app_prefixes(&app), self.shard_bit_paths(&app))))
+            .collect();
+        let mut out: HashMap<Vec<u8>, (u64, i128)> = HashMap::new();
+        for (k, v) in stale {
+            let Some(&app) = apps.iter().find(|a| k.starts_with(&a[..])) else {
+                out.insert(k.clone(), *v); // foreign key — keep verbatim
+                continue;
+            };
+            let (prefixes, bit_paths) = per_app.get(&app).unwrap();
+            // Already a current-prefix key ⇒ keep as-is.
+            if prefixes.iter().any(|p| Forest::addr_path_shard_id(&app, p) == *k) {
+                let e = out.entry(k.clone()).or_insert((0, 0));
+                e.0 += v.0;
+                e.1 += v.1;
+                continue;
+            }
+            // Decode the stale key's prefix (`app(32) ‖ u32-BE levels`) → bit-path,
+            // then find the single current prefix sharing those canonical bits.
+            let prefix_bytes = &k[app.len().min(k.len())..];
+            if prefix_bytes.len() % 4 != 0 {
+                return None;
+            }
+            let stale_prefix: Vec<u32> = prefix_bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let stale_bits = quil_forest::shard_bit_path_from_prefix(&stale_prefix)
+                .unwrap_or_else(|| quil_forest::prefix_to_bits(&stale_prefix, 6));
+            let mut matched: Option<&Vec<u32>> = None;
+            for (i, b) in bit_paths.iter().enumerate() {
+                if *b == stale_bits {
+                    if matched.is_some() {
+                        return None; // ambiguous — needs a real scan
+                    }
+                    matched = prefixes.get(i);
+                }
+            }
+            let cur_prefix = matched?; // no current shard with these bits ⇒ rescan
+            let e = out
+                .entry(Forest::addr_path_shard_id(&app, cur_prefix))
+                .or_insert((0, 0));
+            e.0 += v.0;
+            e.1 += v.1;
+        }
+        Some(out)
+    }
+
     pub fn warm_sizes(&self, apps: &[[u8; 32]]) -> Result<()> {
         if self.sizes_warmed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        // Fast path: restore the persisted buckets.
-        let read_txn = self.store.new_transaction(false)?;
-        if let Some(blob) = read_txn.get(SIZE_BUCKETS_KEY)? {
-            *self.sub_meta.write().unwrap() = deserialize_buckets(&blob);
-            return Ok(());
+        // Fast path: restore the persisted buckets — but ONLY if their key
+        // encoding still matches the CURRENT prefixes. The cache is keyed
+        // `addr_path_shard_id(app, prefix)` for the prefixes in force when it was
+        // written; if the shard set has since been re-encoded (a byte-suffix →
+        // sentinel grid reset), a blind restore reinstates STALE keys that
+        // `sub_meta_for` — which folds by the current sentinel prefixes — can never
+        // match, zeroing GetAppShards sizes and the reward basis (post-reset
+        // "no join candidates / no rewards"). On mismatch: keep the current
+        // in-memory buckets if a `rebucket_app` this boot already re-keyed them to
+        // the current prefixes (the `refresh_crdt_shard_prefixes` path), re-persist,
+        // and skip the rescan; otherwise fall through to a fresh scan that re-keys.
+        let blob = {
+            let read_txn = self.store.new_transaction(false)?;
+            read_txn.get(SIZE_BUCKETS_KEY)?
+        };
+        if let Some(blob) = blob {
+            let restored = deserialize_buckets(&blob);
+            if self.buckets_match_current_prefixes(apps, &restored) {
+                *self.sub_meta.write().unwrap() = restored;
+                return Ok(());
+            }
+            // Stale encoding (a byte-suffix→sentinel grid flip since the cache was
+            // written). Prefer, in order: the already-rebuilt in-memory buckets (a
+            // `rebucket_app` this boot); a no-rescan TRANSCODE that re-keys the
+            // stale buckets to the current prefixes by canonical bit-path (a
+            // byte-suffix `[i]` bucket and the sentinel `binary(i)` bucket carry the
+            // same `(count,size)`); else fall through to a full cold scan.
+            let current = self.sub_meta.read().unwrap().clone();
+            let replacement = if !current.is_empty()
+                && self.buckets_match_current_prefixes(apps, &current)
+            {
+                Some(current)
+            } else {
+                self.transcode_buckets_to_current(apps, &restored)
+            };
+            if let Some(buckets) = replacement {
+                let txn = self.store.new_transaction(false)?;
+                txn.set(SIZE_BUCKETS_KEY, &serialize_buckets(&buckets))?;
+                txn.commit()?;
+                *self.sub_meta.write().unwrap() = buckets;
+                return Ok(());
+            }
         }
-        drop(read_txn);
         let mut buckets: HashMap<Vec<u8>, (u64, i128)> = HashMap::new();
         for &app in apps {
             self.scan_app_buckets(&app, &mut buckets)?;
@@ -1246,7 +1503,21 @@ impl HypergraphCrdt {
         }
         let mut app = [0u8; 32];
         app.copy_from_slice(&filter[..32]);
-        let prefix: Vec<u32> = filter[32..].iter().map(|&b| b as u32).collect();
+        // Decode the filter suffix into a prefix `sub_meta_for` can canonicalize.
+        // A SENTINEL filter (`app ‖ bit_len ‖ packed`, ≥2 suffix bytes) must be
+        // decoded to its bit-path — NOT read byte-for-byte, which yields garbage
+        // like `[0,6,0]` that matches no shard. A legacy 1-byte byte-suffix and
+        // the bare-app root are passed through (canonicalized downstream).
+        let suffix = &filter[32..];
+        let prefix: Vec<u32> = if suffix.is_empty() {
+            Vec::new()
+        } else if suffix.len() == 1 {
+            vec![suffix[0] as u32]
+        } else if let Some((_, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) {
+            quil_forest::bit_path_to_prefix(&bits)
+        } else {
+            suffix.iter().map(|&b| b as u32).collect()
+        };
         let (count, size) = self.sub_meta_for(&app, &prefix);
         if count == 0 && size == 0 {
             return None;
@@ -1352,12 +1623,41 @@ impl HypergraphCrdt {
             l1: crate::addressing::get_bloom_filter_indices(&app, 256, 3),
             l2: app,
         };
-        // The registered prefix whose canonical wire filter equals `filter`.
-        // Falls back to the empty prefix (whole app / unsplit) when unmatched.
-        let prefix = self
-            .app_prefixes(&app)
-            .into_iter()
-            .find(|p| quil_forest::shard_prefix_to_filter(&app, p).as_slice() == filter)
+        // The registered prefix for this filter's shard, matched by CANONICAL
+        // bit-path (NOT a byte-exact wire compare, which misses when the filter
+        // and the stored prefix are in different encodings — a byte-suffix
+        // filter vs a sentinel prefix post-reset — silently falling back to the
+        // whole-app root). Decode the filter suffix to its bit-path and find the
+        // registered shard with the same canonical bits. Empty ⇒ whole app.
+        let suffix = &filter[32..];
+        let lookup_prefix: Vec<u32> = if suffix.is_empty() {
+            Vec::new()
+        } else if suffix.len() == 1 {
+            vec![suffix[0] as u32]
+        } else if let Some((_, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) {
+            quil_forest::bit_path_to_prefix(&bits)
+        } else {
+            suffix.iter().map(|&b| b as u32).collect()
+        };
+        let prefixes = self.app_prefixes(&app);
+        let bit_paths = self.shard_bit_paths(&app);
+        let lookup_bits = prefixes
+            .iter()
+            .position(|p| p == &lookup_prefix)
+            .and_then(|i| bit_paths.get(i).cloned())
+            .unwrap_or_else(|| {
+                if lookup_prefix.is_empty() {
+                    Vec::new()
+                } else {
+                    quil_forest::shard_bit_path_from_prefix(&lookup_prefix)
+                        .unwrap_or_else(|| quil_forest::prefix_to_bits(&lookup_prefix, 6))
+                }
+            });
+        let prefix = prefixes
+            .iter()
+            .enumerate()
+            .find(|(i, _)| bit_paths.get(*i).map(|b| *b == lookup_bits).unwrap_or(false))
+            .map(|(_, p)| p.clone())
             .unwrap_or_default();
         self.sub_shard_commitment(set_type, phase_type, &shard_key, &prefix)
     }

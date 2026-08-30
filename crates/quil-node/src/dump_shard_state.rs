@@ -160,6 +160,81 @@ pub fn run_dump_shard_state(
     ));
     quil_forest_migrate::install_forest_boot(crdt.as_ref(), hg_store.as_ref(), false, network == 0);
 
+    // ---- UNIFIED APP TREE vs LEGACY per-prefix trees (is QUIL state populated?) ----
+    // Post-699500 (UNIFIED_TREE_CUTOVER_FRAME) QUIL commits into ONE tree per phase
+    // keyed by the bare app address; the shard grid is pure navigation (subtree reads
+    // by bit-path). The pre-cutover / --migrate-db writes went to per-prefix
+    // byte-suffix trees `addr_path_shard_id(QUIL, [i])`. If the unified tree holds the
+    // state, reads land; if state is still stranded in the legacy trees, the one-time
+    // consolidation never drained it — the post-v5 empty-shards suspect.
+    let stats = crdt.dump_app_forest_stats(&quil);
+    let phase_names = ["VertexAdds", "VertexRemoves", "HyperedgeAdds", "HyperedgeRemoves"];
+    println!("\n--- QUIL UNIFIED app tree (keyed by bare app address) ---");
+    for (pi, (count, root, ver)) in stats.unified.iter().enumerate() {
+        println!(
+            "  phase {pi} {:<17} leaves={count:<12} ver={ver:<4} root={}",
+            phase_names[pi],
+            hex::encode(root)
+        );
+    }
+    let unified_state_leaves = stats.unified[0].0; // VertexAdds = live vertex/coin count
+    println!("  UNIFIED VertexAdds leaves (QUIL state size): {unified_state_leaves}");
+    println!("\n--- QUIL LEGACY per-prefix byte-suffix trees (addr_path_shard_id(QUIL,[i])) ---");
+    println!(
+        "  legacy trees with data: {}   total legacy VertexAdds leaves: {}",
+        stats.legacy_nonempty.len(),
+        stats.legacy_total_vertex_adds
+    );
+    for (i, count) in &stats.legacy_nonempty {
+        println!("    shard [{i:>2}] leaves={count}");
+    }
+    let legacy = stats.legacy_total_vertex_adds;
+    let verdict = if unified_state_leaves == 0 && legacy > 0 {
+        "STRANDED — state is ONLY in legacy per-prefix trees; unified tree EMPTY (consolidation did not drain)"
+    } else if unified_state_leaves == 0 && legacy == 0 {
+        "EMPTY — no QUIL VertexAdds leaves in either unified or legacy trees"
+    } else if unified_state_leaves >= legacy && legacy > 0 {
+        // Unified holds the full count; the legacy copies were never deleted
+        // (put-only forest) — orphaned duplicates, benign for correctness.
+        "POPULATED — unified tree holds the full state; legacy trees are orphaned put-only residue (reclaimable disk, not read on the live path)"
+    } else if unified_state_leaves > 0 && legacy == 0 {
+        "POPULATED — unified tree holds the state, legacy drained (healthy)"
+    } else {
+        // unified > 0 but strictly fewer than legacy ⇒ consolidation moved only part.
+        "PARTIAL — unified tree has FEWER leaves than legacy; consolidation is incomplete"
+    };
+    println!("  VERDICT: {verdict}");
+
+    // ---- PERSISTED SIZE BUCKETS (what GetAppShards / the reward basis read) ----
+    // `sub_meta_for` folds these by `addr_path_shard_id(app, current-CRDT-prefix)`.
+    // If they're byte-suffix (key len 36) while the live CRDT prefixes are sentinel
+    // (post-refresh), every fold misses → GetAppShards size 0 → the proposer sees no
+    // join candidates and rewards compute 0. Key len 60 = sentinel (matches the grid).
+    let buckets = crdt.dump_persisted_size_buckets(&quil);
+    println!("\n--- QUIL PERSISTED size buckets (hgsz:buckets — GetAppShards/reward basis) ---");
+    if buckets.is_empty() {
+        println!("  (no persisted buckets — warm_sizes never ran / cache absent; live node cold-scans on boot)");
+    } else {
+        let byte_suffix = buckets.iter().filter(|(kl, _, _)| *kl == 36).count();
+        let sentinel = buckets.iter().filter(|(kl, _, _)| *kl == 60).count();
+        let other = buckets.len() - byte_suffix - sentinel;
+        let total_size: i128 = buckets.iter().map(|(_, _, s)| *s).sum();
+        let total_count: u64 = buckets.iter().map(|(_, c, _)| *c).sum();
+        println!(
+            "  buckets: {}   byte-suffix(len36)={byte_suffix}   sentinel(len60)={sentinel}   other={other}",
+            buckets.len()
+        );
+        println!("  total raw_count={total_count}   total live_size={total_size}");
+        let enc = if sentinel > 0 && byte_suffix == 0 {
+            "SENTINEL — matches the grid/CRDT; GetAppShards sizes resolve (healthy)"
+        } else if byte_suffix > 0 && sentinel == 0 {
+            "BYTE-SUFFIX — MISMATCHES the sentinel grid: sub_meta_for folds miss → GetAppShards size 0 → no join candidates / 0 reward basis"
+        } else {
+            "MIXED — some byte-suffix, some sentinel (partial rebucket)"
+        };
+        println!("  ENCODING: {enc}");
+    }
+
     let provers = quil_execution::prover_registry::all_provers_with_allocations_committed(&crdt);
     // ACTIVE-only view (effective_status(head)==Active) — the set that actually
     // submits coverage. Retired (Historic, from delete-free reassignment),
@@ -255,6 +330,78 @@ pub fn run_dump_shard_state(
     let alloc_filter_set: std::collections::HashSet<&Vec<u8>> = quil_filters.iter().map(|(f, _)| *f).collect();
     let empty_grid = grid_valid_set.iter().filter(|gf| !alloc_filter_set.contains(gf)).count();
     println!("  (grid shards with no prover allocation — spine/empty, expected: {empty_grid})");
+
+    // ---- STATUS BREAKDOWN (raw byte → effective) — why active=N ----
+    // A fresh join is `Joining` (byte) until it confirms in epoch E+1, when the byte
+    // flips to `Active` but effective status stays `Joining` until the E+2
+    // activation boundary (deferred activation). Surfacing BOTH tells, before the
+    // boundary, a confirmed-but-deferred slot (`Active → Joining`, healthy, will
+    // activate) from an unconfirmed one (`Joining → Joining`, confirm not done yet).
+    // `ExpiredJoining` (missed the confirm slot) / `ExpiredEpoch` (missed a
+    // re-confirm) are genuine stalls.
+    let diag = quil_execution::prover_registry::allocation_status_breakdown(&crdt, head, &quil);
+    let epoch_len = if network == 0 {
+        quil_types::consensus::EPOCH_LENGTH_FRAMES
+    } else {
+        quil_types::consensus::TESTNET_EPOCH_LENGTH_FRAMES
+    };
+    let cur_epoch = head / epoch_len;
+    let next_boundary = (cur_epoch + 1) * epoch_len;
+    println!(
+        "\n--- QUIL allocation STATUS (raw byte → effective) at head {head} (epoch {cur_epoch}, next boundary frame {next_boundary}, +{} frames) ---",
+        next_boundary.saturating_sub(head)
+    );
+    if diag.by_status.is_empty() {
+        println!("  (no QUIL allocations)");
+    } else {
+        for ((raw, eff), count) in &diag.by_status {
+            println!("  {raw:<10} → {eff:<16} {count}");
+        }
+        // Joins bucketed by proposal epoch: due to confirm in epoch+1.
+        if !diag.joining_by_epoch.is_empty() {
+            print!("  Joining-byte by PROPOSAL epoch:");
+            for (e, c) in &diag.joining_by_epoch {
+                print!("  E{e}={c}(confirm due E{})", e + 1);
+            }
+            println!();
+        }
+        if !diag.confirmed_by_epoch.is_empty() {
+            print!("  Active-byte by CONFIRM epoch:");
+            for (e, c) in &diag.confirmed_by_epoch {
+                print!("  E{e}={c}(active E{})", e + 1);
+            }
+            println!();
+        }
+        let sum_eff = |name: &str| -> usize {
+            diag.by_status.iter().filter(|((_, e), _)| e == name).map(|(_, c)| *c).sum()
+        };
+        let expired = sum_eff("ExpiredJoining") + sum_eff("ExpiredEpoch");
+        let active = sum_eff("Active");
+        let confirmed_deferred: usize = diag
+            .by_status
+            .iter()
+            .filter(|((r, e), _)| r == "Active" && e == "Joining")
+            .map(|(_, c)| *c)
+            .sum();
+        // A Joining-byte alloc whose proposal epoch < cur_epoch is PAST its confirm
+        // window (should have confirmed in proposal+1 ≤ cur_epoch); one at cur_epoch
+        // is not due until next epoch.
+        let overdue: usize =
+            diag.joining_by_epoch.iter().filter(|(e, _)| **e < cur_epoch).map(|(_, c)| *c).sum();
+        let not_yet_due: usize =
+            diag.joining_by_epoch.iter().filter(|(e, _)| **e >= cur_epoch).map(|(_, c)| *c).sum();
+        if expired > 0 {
+            println!("  → STALL: {expired} Expired (missed confirm/re-confirm window) — the confirm path is broken.");
+        } else if overdue > 0 {
+            println!("  → OVERDUE: {overdue} joins proposed in a PAST epoch are still unconfirmed — confirm submission is not landing (a running node should have confirmed by now).");
+        } else if not_yet_due > 0 && confirmed_deferred == 0 && active == 0 {
+            println!("  → NOT YET DUE: {not_yet_due} joins proposed THIS epoch; confirm is due next epoch (E{}). Run the node forward and re-check — Joining→Joining is expected here.", cur_epoch + 1);
+        } else if confirmed_deferred > 0 {
+            println!("  → HEALTHY: {confirmed_deferred} confirmed, in deferred-activation window; expect active>0 after their activation epoch.");
+        } else if active > 0 {
+            println!("  → ACTIVE: {active} allocations effectively Active.");
+        }
+    }
 
     println!("\n=== DUMP COMPLETE ===");
     Ok(())

@@ -1853,6 +1853,89 @@ pub fn all_provers_with_active_allocations_committed(
     out
 }
 
+/// READ-ONLY diagnostic: tally committed allocations whose `confirmation_filter`
+/// begins with `app` by the PAIR `(raw status byte, effective status)` at
+/// `frame_number` (`{:?}` of [`ProverStatus`] / [`EffectiveStatus`]). Surfacing
+/// the raw byte alongside the effective status distinguishes, BEFORE the E+2
+/// activation boundary, a confirmed-but-deferred allocation (`Active → Joining` —
+/// its join confirmed, it's just waiting to activate; healthy) from an
+/// unconfirmed one (`Joining → Joining` — the confirm hasn't happened yet; will
+/// become `ExpiredJoining` if it misses its slot). Used by `--dump-shard-state`.
+pub struct QuilAllocDiag {
+    /// `(raw ProverStatus, EffectiveStatus)` → count.
+    pub by_status: std::collections::BTreeMap<(String, String), usize>,
+    /// Joining-BYTE allocations bucketed by their PROPOSAL epoch
+    /// (`epoch_for_frame(JoinFrameNumber)`) → count. A join proposed in epoch E
+    /// is due to confirm in epoch E+1; comparing against the head's epoch tells a
+    /// not-yet-due join from an overdue (confirm-path-broken) one.
+    pub joining_by_epoch: std::collections::BTreeMap<u64, usize>,
+    /// Active-BYTE allocations bucketed by their CONFIRM epoch
+    /// (`epoch_for_frame(JoinConfirmFrameNumber)`) → count — the confirmed set.
+    pub confirmed_by_epoch: std::collections::BTreeMap<u64, usize>,
+}
+
+pub fn allocation_status_breakdown(
+    hg: &quil_hypergraph::HypergraphCrdt,
+    frame_number: u64,
+    app: &[u8],
+) -> QuilAllocDiag {
+    use quil_types::consensus::epoch_for_frame;
+    let shard = ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+    let mut removed_vks: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let _ = hg.for_each_vertex_underlying_shard("vertex", "removes", &shard, &mut |vk: Vec<u8>, _| {
+        removed_vks.insert(vk);
+    });
+    let mut diag = QuilAllocDiag {
+        by_status: std::collections::BTreeMap::new(),
+        joining_by_epoch: std::collections::BTreeMap::new(),
+        confirmed_by_epoch: std::collections::BTreeMap::new(),
+    };
+    let mut cb = |vk: Vec<u8>, data: Vec<u8>| {
+        if vk.len() != 64 || removed_vks.contains(&vk) {
+            return;
+        }
+        let root = match deserialize_go_tree(&data) {
+            Ok(Some(r)) => r,
+            _ => return,
+        };
+        let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+            return;
+        };
+        if type_hash != TYPE_HASH_ALLOCATION {
+            return;
+        }
+        if let Some((_prover_ref, alloc)) = decode_allocation(&vk, &root) {
+            if !alloc.confirmation_filter.starts_with(app) {
+                return;
+            }
+            let key = (
+                format!("{:?}", alloc.status),
+                format!("{:?}", alloc.effective_status(frame_number)),
+            );
+            *diag.by_status.entry(key).or_insert(0) += 1;
+            match alloc.status {
+                quil_types::consensus::ProverStatus::Joining if alloc.join_frame_number > 0 => {
+                    *diag
+                        .joining_by_epoch
+                        .entry(epoch_for_frame(alloc.join_frame_number))
+                        .or_insert(0) += 1;
+                }
+                quil_types::consensus::ProverStatus::Active
+                    if alloc.join_confirm_frame_number > 0 =>
+                {
+                    *diag
+                        .confirmed_by_epoch
+                        .entry(epoch_for_frame(alloc.join_confirm_frame_number))
+                        .or_insert(0) += 1;
+                }
+                _ => {}
+            }
+        }
+    };
+    let _ = hg.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut cb);
+    diag
+}
+
 /// Decode a `leafroot:LeafRootRegistration` vertex into
 /// `((member, leaf_id), record)`. `leaf_id = leaf_id_bytes(shard_filter,
 /// prefix)`. Returns `None` if required fields are missing.
