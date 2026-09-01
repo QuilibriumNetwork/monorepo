@@ -10,9 +10,9 @@ use quil_types::proto::node::{GetProverRewardWitnessRequest, GetTokensByAccountR
 use super::TokenCtx;
 use crate::util;
 
-/// Decode the current balance of a `reward:ProverReward` witness.  A missing
-/// vertex is an ordinary zero claimable balance; a present witness must use the
-/// fixed-width encoding promised by the node RPC.
+/// Decode the current balance of a `reward:ProverReward` witness. A missing
+/// vertex is distinct from a present zero balance; a present witness must use
+/// the fixed-width encoding promised by the node RPC.
 pub(super) fn claimable_reward_value(found: bool, value: &[u8]) -> anyhow::Result<Option<u128>> {
     if !found {
         return Ok(None);
@@ -106,23 +106,24 @@ pub async fn run(tc: &TokenCtx) -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("GetProverRewardWitness: {e}"))?
                 .into_inner();
-            let claimable = claimable_reward_value(reward.found, &reward.value)?
-                .unwrap_or_default();
-            let claimable_display =
-                util::float_string_12(&BigInt::from(claimable), &util::conversion_factor());
-            if claimable == 0 {
-                println!("Claimable prover rewards: {claimable_display} QUIL");
-            } else {
-                println!(
-                    "Claimable prover rewards: {claimable_display} QUIL \
-                     (mint manually; proven at global frame {})",
-                    reward.cited_frame
-                );
-                let total_after_minting = sum + BigInt::from(claimable);
-                println!(
-                    "Total after minting: {} QUIL",
-                    util::float_string_12(&total_after_minting, &util::conversion_factor())
-                );
+            match claimable_reward_value(reward.found, &reward.value)? {
+                None => println!("Claimable prover rewards: unavailable (no reward record found)"),
+                Some(claimable) => {
+                    let claimable_display =
+                        util::float_string_12(&BigInt::from(claimable), &util::conversion_factor());
+                    println!(
+                        "Claimable prover rewards: {claimable_display} QUIL \
+                         (proven at global frame {})",
+                        reward.cited_frame
+                    );
+                    if claimable != 0 {
+                        let total_after_minting = sum + BigInt::from(claimable);
+                        println!(
+                            "Total after minting: {} QUIL",
+                            util::float_string_12(&total_after_minting, &util::conversion_factor())
+                        );
+                    }
+                }
             }
         }
         Err(_) => println!("Claimable prover rewards: unavailable (prover wallet unavailable)"),
@@ -135,7 +136,7 @@ mod tests {
     use super::claimable_reward_value;
 
     #[test]
-    fn missing_reward_witness_is_zero_claimable_balance() {
+    fn missing_reward_witness_is_distinct_from_a_zero_balance() {
         assert_eq!(claimable_reward_value(false, &[]).unwrap(), None);
     }
 
