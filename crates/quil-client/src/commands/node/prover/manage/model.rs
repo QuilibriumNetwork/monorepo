@@ -344,9 +344,9 @@ impl Model {
         Model {
             auto_managed: true,
             color_coding: true,
-            alloc_sort_col: 7, // Worker column
+            alloc_sort_col: 10, // Worker column
             alloc_sort_asc: true,
-            avail_sort_col: 6, // Reward column
+            avail_sort_col: 9, // Reward column
             avail_sort_asc: false,
             reachable: false,
             ..Default::default()
@@ -1065,5 +1065,19 @@ fn action_hints(
             ("confirm now (renew)".to_string(), "re-confirm!".to_string())
         }
         _ => (String::new(), String::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_sort_allocations_by_worker_and_available_by_reward() {
+        let m = Model::new();
+        assert_eq!(ALLOC_COL_NAMES[m.alloc_sort_col as usize], "Worker");
+        assert!(m.alloc_sort_asc);
+        assert_eq!(AVAIL_COL_NAMES[m.avail_sort_col as usize], "Reward [Q/f]");
+        assert!(!m.avail_sort_asc);
     }
 }
