@@ -1,14 +1,27 @@
-//! `qclient token balance` — sum of legacy + tx + pending balances.
+//! `qclient token balance` — spendable wallet balance plus claimable prover rewards.
 //!
 //! Port of `client/cmd/token/balance.go`.
 
 use num_bigint::{BigInt, Sign};
 
 use quil_execution::domains::QUIL_TOKEN;
-use quil_types::proto::node::GetTokensByAccountRequest;
+use quil_types::proto::node::{GetProverRewardWitnessRequest, GetTokensByAccountRequest};
 
 use super::TokenCtx;
 use crate::util;
+
+/// Decode the current balance of a `reward:ProverReward` witness.  A missing
+/// vertex is an ordinary zero claimable balance; a present witness must use the
+/// fixed-width encoding promised by the node RPC.
+pub(super) fn claimable_reward_value(found: bool, value: &[u8]) -> anyhow::Result<Option<u128>> {
+    if !found {
+        return Ok(None);
+    }
+    let value: [u8; 16] = value
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("reward witness returned a malformed value"))?;
+    Ok(Some(u128::from_le_bytes(value)))
+}
 
 pub async fn run(tc: &TokenCtx) -> anyhow::Result<()> {
     let mut client = tc.connect().await?;
@@ -76,5 +89,66 @@ pub async fn run(tc: &TokenCtx) -> anyhow::Result<()> {
         formatted,
         hex::encode(&account)
     );
+
+    // Rewards live in a separate mutable prover vertex and are not spendable
+    // until `qclient token mint` submits a mint transaction.  Query the exact
+    // same witness used by that command, but do not request or submit a proof.
+    match super::lattice::Wallet::load(tc) {
+        Ok(wallet) => {
+            let owner = quil_crypto::poseidon::hash_bytes_to_32(&wallet.falcon_pk)
+                .map_err(|e| anyhow::anyhow!("prover address: {e}"))?
+                .to_vec();
+            let reward = client
+                .get_prover_reward_witness(tonic::Request::new(GetProverRewardWitnessRequest {
+                    domain: QUIL_TOKEN.to_vec(),
+                    owner_prover_address: owner,
+                }))
+                .await
+                .map_err(|e| anyhow::anyhow!("GetProverRewardWitness: {e}"))?
+                .into_inner();
+            let claimable = claimable_reward_value(reward.found, &reward.value)?
+                .unwrap_or_default();
+            let claimable_display =
+                util::float_string_12(&BigInt::from(claimable), &util::conversion_factor());
+            if claimable == 0 {
+                println!("Claimable prover rewards: {claimable_display} QUIL");
+            } else {
+                println!(
+                    "Claimable prover rewards: {claimable_display} QUIL \
+                     (mint manually; proven at global frame {})",
+                    reward.cited_frame
+                );
+                let total_after_minting = sum + BigInt::from(claimable);
+                println!(
+                    "Total after minting: {} QUIL",
+                    util::float_string_12(&total_after_minting, &util::conversion_factor())
+                );
+            }
+        }
+        Err(_) => println!("Claimable prover rewards: unavailable (prover wallet unavailable)"),
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claimable_reward_value;
+
+    #[test]
+    fn missing_reward_witness_is_zero_claimable_balance() {
+        assert_eq!(claimable_reward_value(false, &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn reward_witness_value_is_little_endian_u128() {
+        assert_eq!(
+            claimable_reward_value(true, &123_456_789u128.to_le_bytes()).unwrap(),
+            Some(123_456_789),
+        );
+    }
+
+    #[test]
+    fn present_reward_witness_requires_fixed_width_value() {
+        assert!(claimable_reward_value(true, &[0; 15]).is_err());
+    }
 }
