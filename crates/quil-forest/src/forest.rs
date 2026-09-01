@@ -18,6 +18,7 @@ use jmt::storage::{
 use jmt::{KeyHash, OwnedValue, Sha256Jmt, Version};
 use sha2::{Digest, Sha256};
 
+use crate::store::SizeIndex;
 use crate::{commit_pruning, ForestStore, MemTreeStore, RocksTreeStore, TreeId};
 
 /// A per-tree store the forest opens on demand, over either RocksDB or an
@@ -73,6 +74,21 @@ impl TreeWriter for TreeStore {
         match self {
             TreeStore::Rocks(s) => s.write_node_batch(batch),
             TreeStore::Mem(s) => s.write_node_batch(batch),
+        }
+    }
+}
+
+impl SizeIndex for TreeStore {
+    fn get_size_sum(&self, node_key: &NodeKey) -> Result<Option<u128>> {
+        match self {
+            TreeStore::Rocks(s) => s.get_size_sum(node_key),
+            TreeStore::Mem(s) => s.get_size_sum(node_key),
+        }
+    }
+    fn put_size_sum(&self, node_key: &NodeKey, size: u128) -> Result<()> {
+        match self {
+            TreeStore::Rocks(s) => s.put_size_sum(node_key, size),
+            TreeStore::Mem(s) => s.put_size_sum(node_key, size),
         }
     }
 }
@@ -177,6 +193,181 @@ fn leaf_count_if_under(leaf: &LeafNode, bit_path: &[bool]) -> u64 {
         key.get(byte).map(|b| (b >> bit) & 1 == 1).unwrap_or(false) == want
     });
     under as u64
+}
+
+/// Leaf count of the subtree at `bit_path` within a shard/phase JMT at `version`,
+/// read over ANY [`TreeReader`] — the local store OR a peer's tree via a
+/// `RemoteTreeReader`. The generic engine behind [`Forest::app_subtree_leaf_count`]:
+/// pass a remote reader to count an archive's subtree (the TRUE forest data
+/// distribution) without a local copy. Descends nibble-by-nibble to the subtree
+/// node and returns its native JMT leaf count (or a sub-nibble range for a
+/// non-nibble-aligned bit_path). `0` for an empty/absent subtree.
+pub fn subtree_leaf_count<R: TreeReader>(
+    reader: &R,
+    version: u64,
+    bit_path: &[bool],
+) -> Result<u64> {
+    let mut cur_key = NodeKey::new(version, NibblePath::new(vec![]));
+    let mut cur_node = match reader.get_node_option(&cur_key)? {
+        Some(n) => n,
+        None => return Ok(0),
+    };
+    if bit_path.is_empty() {
+        return Ok(match cur_node {
+            Node::Internal(int) => int.leaf_count() as u64,
+            Node::Leaf(_) => 1,
+            Node::Null => 0,
+        });
+    }
+    let full = bit_path.len() / 4;
+    let rem = bit_path.len() % 4;
+    for i in 0..full {
+        let nib_val = bits_to_nibble(&bit_path[i * 4..i * 4 + 4]);
+        let int = match cur_node {
+            Node::Leaf(leaf) => return Ok(leaf_count_if_under(&leaf, bit_path)),
+            Node::Null => return Ok(0),
+            Node::Internal(int) => int,
+        };
+        let child = int
+            .children_sorted()
+            .find(|(nibble, _)| nibble.as_usize() as u8 == nib_val)
+            .map(|(nibble, c)| (nibble, c.version));
+        let (nibble, cver) = match child {
+            Some(x) => x,
+            None => return Ok(0),
+        };
+        cur_key = cur_key.gen_child_node_key(cver, nibble);
+        cur_node = match reader.get_node_option(&cur_key)? {
+            Some(n) => n,
+            None => return Ok(0),
+        };
+    }
+    Ok(match cur_node {
+        Node::Null => 0,
+        Node::Leaf(leaf) => leaf_count_if_under(&leaf, bit_path),
+        Node::Internal(int) => {
+            if rem == 0 {
+                int.leaf_count() as u64
+            } else {
+                let top = bits_to_nibble(&bit_path[full * 4..]);
+                let width = 16u8 >> rem;
+                let start = top << (4 - rem);
+                int.subtree_leaf_count(start, width) as u64
+            }
+        }
+    })
+}
+
+/// Summed leaf `size` under `node_key`, memoized into the [`SizeIndex`] side
+/// column. Leaf → its own size (`vertex_leaf_size`); internal → Σ children
+/// (recursing). A cold miss is O(subtree) and populates every node it visits;
+/// once memoized it is O(1). Because the memo key is the version-stamped
+/// [`NodeKey`] and JMT is copy-on-write, only freshly-rewritten nodes miss
+/// after warm-up, so a post-insert read costs O(depth) — the rewritten path
+/// plus already-cached siblings.
+pub fn node_size_sum<S: TreeReader + SizeIndex>(store: &S, node_key: &NodeKey) -> Result<u128> {
+    if let Some(s) = store.get_size_sum(node_key)? {
+        return Ok(s);
+    }
+    let node = match store.get_node_option(node_key)? {
+        Some(n) => n,
+        None => return Ok(0),
+    };
+    let s = match node {
+        Node::Null => 0u128,
+        Node::Leaf(leaf) => store
+            .get_value_option(node_key.version(), leaf.key_hash())?
+            .map(|v| crate::vertex_leaf_size(&v))
+            .unwrap_or(0),
+        Node::Internal(int) => {
+            let mut acc = 0u128;
+            for (nibble, child) in int.children_sorted() {
+                let ck = node_key.gen_child_node_key(child.version, nibble);
+                acc = acc.saturating_add(node_size_sum(store, &ck)?);
+            }
+            acc
+        }
+    };
+    store.put_size_sum(node_key, s)?;
+    Ok(s)
+}
+
+/// Summed leaf `size` under the subtree at `bit_path` in `version` — the
+/// verkle-style per-shard size aggregate the reward/join basis needs, O(depth)
+/// once warm. Size counterpart of [`subtree_leaf_count`]; mirrors its nibble
+/// navigation, including the partial-nibble (non-4-bit-aligned) shard boundary.
+/// Requires a writable [`SizeIndex`] store (it memoizes as it descends), so it
+/// runs over the LOCAL forest store — not a `RemoteTreeReader`.
+pub fn subtree_size<S: TreeReader + SizeIndex>(
+    store: &S,
+    version: u64,
+    bit_path: &[bool],
+) -> Result<u128> {
+    let mut cur_key = NodeKey::new(version, NibblePath::new(vec![]));
+    let mut cur_node = match store.get_node_option(&cur_key)? {
+        Some(n) => n,
+        None => return Ok(0),
+    };
+    if bit_path.is_empty() {
+        return node_size_sum(store, &cur_key);
+    }
+    let full = bit_path.len() / 4;
+    let rem = bit_path.len() % 4;
+    for i in 0..full {
+        let nib_val = bits_to_nibble(&bit_path[i * 4..i * 4 + 4]);
+        let int = match cur_node {
+            Node::Leaf(leaf) => {
+                return Ok(if leaf_count_if_under(&leaf, bit_path) == 1 {
+                    node_size_sum(store, &cur_key)?
+                } else {
+                    0
+                });
+            }
+            Node::Null => return Ok(0),
+            Node::Internal(int) => int,
+        };
+        let child = int
+            .children_sorted()
+            .find(|(nibble, _)| nibble.as_usize() as u8 == nib_val)
+            .map(|(nibble, c)| (nibble, c.version));
+        let (nibble, cver) = match child {
+            Some(x) => x,
+            None => return Ok(0),
+        };
+        cur_key = cur_key.gen_child_node_key(cver, nibble);
+        cur_node = match store.get_node_option(&cur_key)? {
+            Some(n) => n,
+            None => return Ok(0),
+        };
+    }
+    Ok(match cur_node {
+        Node::Null => 0,
+        Node::Leaf(leaf) => {
+            if leaf_count_if_under(&leaf, bit_path) == 1 {
+                node_size_sum(store, &cur_key)?
+            } else {
+                0
+            }
+        }
+        Node::Internal(int) => {
+            if rem == 0 {
+                node_size_sum(store, &cur_key)?
+            } else {
+                let top = bits_to_nibble(&bit_path[full * 4..]);
+                let width = 16u8 >> rem;
+                let start = top << (4 - rem);
+                let mut acc = 0u128;
+                for (nibble, child) in int.children_sorted() {
+                    let n = nibble.as_usize() as u8;
+                    if n >= start && n < start + width {
+                        let ck = cur_key.gen_child_node_key(child.version, nibble);
+                        acc = acc.saturating_add(node_size_sum(store, &ck)?);
+                    }
+                }
+                acc
+            }
+        }
+    })
 }
 
 /// A shard's committed state after one frame: the four phase roots (the
@@ -763,55 +954,25 @@ impl Forest {
         bit_path: &[bool],
     ) -> Result<u64> {
         let store = self.store(&TreeId::shard_phase(app_address, phase));
-        let mut cur_key = NodeKey::new(version, NibblePath::new(vec![]));
-        let mut cur_node = match store.get_node_option(&cur_key)? {
-            Some(n) => n,
-            None => return Ok(0), // empty tree
-        };
-        if bit_path.is_empty() {
-            return Ok(match cur_node {
-                Node::Internal(int) => int.leaf_count() as u64,
-                Node::Leaf(_) => 1,
-                Node::Null => 0,
-            });
-        }
-        let full = bit_path.len() / 4;
-        let rem = bit_path.len() % 4;
-        for i in 0..full {
-            let nib_val = bits_to_nibble(&bit_path[i * 4..i * 4 + 4]);
-            let int = match cur_node {
-                Node::Leaf(leaf) => return Ok(leaf_count_if_under(&leaf, bit_path)),
-                Node::Null => return Ok(0),
-                Node::Internal(int) => int,
-            };
-            let child = int
-                .children_sorted()
-                .find(|(nibble, _)| nibble.as_usize() as u8 == nib_val)
-                .map(|(nibble, c)| (nibble, c.version));
-            let (nibble, cver) = match child {
-                Some(x) => x,
-                None => return Ok(0),
-            };
-            cur_key = cur_key.gen_child_node_key(cver, nibble);
-            cur_node = match store.get_node_option(&cur_key)? {
-                Some(n) => n,
-                None => return Ok(0),
-            };
-        }
-        Ok(match cur_node {
-            Node::Null => 0,
-            Node::Leaf(leaf) => leaf_count_if_under(&leaf, bit_path),
-            Node::Internal(int) => {
-                if rem == 0 {
-                    int.leaf_count() as u64
-                } else {
-                    let top = bits_to_nibble(&bit_path[full * 4..]);
-                    let width = 16u8 >> rem;
-                    let start = top << (4 - rem);
-                    int.subtree_leaf_count(start, width) as u64
-                }
-            }
-        })
+        subtree_leaf_count(&store, version, bit_path)
+    }
+
+    /// Summed leaf `size` under `bit_path` in the app's phase tree — the SIZE
+    /// counterpart of [`Self::app_subtree_leaf_count`], via the memoized
+    /// [`crate::subtree_size`] Merkle-sum side index. `bit_path == []` is the
+    /// whole-tree size. O(depth) once the side index is warm; a cold subtree is
+    /// computed and memoized on first read. This is the per-shard reward/join
+    /// size basis with no full-tree rescan — the fast replacement for the CRDT's
+    /// `rebucket_app` leaf iteration.
+    pub fn app_subtree_size(
+        &self,
+        app_address: &[u8],
+        phase: Phase,
+        version: u64,
+        bit_path: &[bool],
+    ) -> Result<u128> {
+        let store = self.store(&TreeId::shard_phase(app_address, phase));
+        subtree_size(&store, version, bit_path)
     }
 
     /// Find the MEANINGFUL split point for a shard: descend its subtree bit-by-bit

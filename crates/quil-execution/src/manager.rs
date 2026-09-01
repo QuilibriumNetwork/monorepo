@@ -21,6 +21,10 @@ pub struct ExecutionEngineManager {
     /// vertices visible to `prover_registry::refresh_from_store` and
     /// to peer HyperSync.
     crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    /// The shard grid store (`None` for app-shard-only managers). Held so
+    /// [`Self::refresh_shard_prefixes`] can re-read the grid after a split/merge
+    /// flip and re-attribute the CRDT's per-app prefix sets + size buckets.
+    shards_store: Option<Arc<dyn quil_types::store::ShardsStore>>,
 }
 
 impl ExecutionEngineManager {
@@ -75,6 +79,9 @@ impl ExecutionEngineManager {
         shards_store: Option<Arc<dyn quil_types::store::ShardsStore>>,
         shards_db: Option<Arc<dyn quil_types::store::KvDb>>,
     ) -> Self {
+        // Keep a handle for `refresh_shard_prefixes` before the store is moved into
+        // the global engine below.
+        let shards_store_for_manager = shards_store.clone();
         let mut engines: HashMap<String, Box<dyn ShardExecutionEngine>> = HashMap::new();
 
         if include_global {
@@ -131,7 +138,51 @@ impl ExecutionEngineManager {
         Self {
             engines: RwLock::new(engines),
             crdt,
+            shards_store: shards_store_for_manager,
         }
+    }
+
+    /// Re-attribute the CRDT's per-app shard prefixes + size buckets to the
+    /// CURRENT grid in the shards store. MUST be called after a split/merge flips
+    /// the grid (`apply_global_due_shard_changes`) — otherwise the CRDT keeps the
+    /// PRE-split partition, so `sub_meta_for` (GetAppShards size / the reward
+    /// basis) can't resolve the new deep-split sub-shards and reports size 0 for
+    /// them (the parent bucket lingers on a now-merged shallow prefix). Mirrors the
+    /// node's `refresh_crdt_shard_prefixes`: for each app whose registered shard
+    /// set TRANSITIONED, `rebucket_app` re-scans committed state and re-partitions
+    /// the buckets to the new leaves. Cheap when nothing changed
+    /// (`set_app_shard_prefixes` returns false → no rescan). Returns the number of
+    /// apps whose prefix set actually changed (0 in the steady state).
+    pub fn refresh_shard_prefixes(&self) -> usize {
+        let Some(store) = self.shards_store.as_ref() else {
+            return 0;
+        };
+        let rows = match store.range_app_shards() {
+            Ok(r) => r,
+            Err(_) => return 0,
+        };
+        let mut by_app: HashMap<[u8; 32], Vec<Vec<u32>>> = HashMap::new();
+        for row in rows {
+            if row.shard_key.len() >= 35 {
+                let mut l2 = [0u8; 32];
+                l2.copy_from_slice(&row.shard_key[3..35]);
+                by_app.entry(l2).or_default().push(row.prefix);
+            }
+        }
+        let mut changed = 0usize;
+        for (app, prefixes) in by_app {
+            if self.crdt.set_app_shard_prefixes(app, prefixes) {
+                changed += 1;
+                if let Err(e) = self.crdt.rebucket_app(&app) {
+                    tracing::warn!(
+                        app = %hex::encode(app),
+                        error = %e,
+                        "refresh_shard_prefixes: rebucket_app failed after shard-set change"
+                    );
+                }
+            }
+        }
+        changed
     }
 
     /// The hypergraph CRDT these engines commit to — used by the forest sync,

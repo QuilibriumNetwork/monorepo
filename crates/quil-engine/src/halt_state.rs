@@ -47,9 +47,11 @@ impl HaltState {
         Self::default()
     }
 
-    /// `true` iff at least one shard is currently halted. This is the
-    /// gate used by `ProverLifecycle::join_proposal_ready` and the
-    /// eviction scheduler.
+    /// `true` iff at least one shard is currently halted. Gates the
+    /// LEAVE/swap proposal path (coverage view is unreliable while halted),
+    /// `coverage_publish` (reward-proof submission), and worker production
+    /// drain. It does NOT gate JOINs — a halted shard must still be able to
+    /// attract joiners to recover.
     pub fn any_halted(&self) -> bool {
         !self.halted_shards.read().unwrap().is_empty()
     }

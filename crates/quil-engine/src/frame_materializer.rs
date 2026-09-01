@@ -1075,6 +1075,19 @@ impl FrameMaterializer {
             info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
                 "MAT stage: commit_frame_with_global_cursor done (delta = the main CRDT commit)");
         }
+        // A split/merge that flipped the grid this frame (at the E+2 boundary) must
+        // re-attribute the CRDT's per-app prefixes + size buckets to the new leaves.
+        // Without this the serial materializer leaves the CRDT on the PRE-split
+        // partition (only boot / the inline-fallback poller refreshed), so
+        // `sub_meta_for` — GetAppShards size + the reward basis — can't resolve the
+        // new deep-split sub-shards and reports size 0 for them (the parent bucket
+        // lingers on a now-merged shallow prefix), starving joins + rewards.
+        // No-op (just a grid read + compare) when nothing changed.
+        let prefix_changes = self.execution_manager.refresh_shard_prefixes();
+        if prefix_changes > 0 {
+            info!(frame = frame_number, apps = prefix_changes,
+                "MAT stage: shard grid changed — re-partitioned CRDT prefixes + size buckets");
+        }
         // Run the expensive registry refresh + eviction census INLINE only at
         // epoch boundaries (and the first frame after boot). `refresh_from_store`
         // clears + rebuilds the whole registry from a full RocksDB scan with a

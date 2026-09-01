@@ -39,7 +39,10 @@ mod store;
 // (crates/jmt: gen_child_node_key + NibblePath::new made pub).
 mod sync;
 
-pub use forest::{rollup_phase_roots, Forest, Phase, ShardRoots, PHASES};
+pub use forest::{
+    node_size_sum, rollup_phase_roots, subtree_leaf_count, subtree_size, Forest, Phase,
+    ShardRoots, PHASES,
+};
 pub use sync::{diff_leaves, diff_leaves_under_prefix};
 // Re-export so sync callers can name the diff's key type + the reader bound
 // without depending on jmt directly.
@@ -48,7 +51,7 @@ pub use jmt::KeyHash;
 pub use membership_proof::{
     verify_vertex_membership, MembershipProof, ShardAggregation, VertexMembershipProof,
 };
-pub use store::{ForestStore, MemTreeStore, RocksTreeStore};
+pub use store::{ForestStore, MemTreeStore, RocksTreeStore, SizeIndex};
 
 /// Namespaces a single tree within the shared RocksDB. The `level` (1/2/3)
 /// plus an `id` (app address, shard id, …) uniquely identifies a tree; its

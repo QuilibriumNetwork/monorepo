@@ -656,6 +656,34 @@ impl HypergraphCrdt {
         Ok(())
     }
 
+    /// Stage a removes-phase tombstone for `id` whose forest leaf carries the
+    /// removed vertex's `size` (its original add-blob length). Unlike an empty
+    /// `stage(.., &[])` — whose `vertex_leaf_value(&[])` has size 0 — this lets
+    /// the removes tree's subtree-size aggregate equal the sum of removed sizes,
+    /// so `forest_app_buckets` can net LIVE size as `adds − removes` in O(depth).
+    /// The blob store still holds an empty blob (a tombstone carries no data);
+    /// only the forest leaf's size field differs. Idempotent: re-removing stamps
+    /// the same original size (never a stale 0), so a double-remove is stable.
+    fn stage_sized_tombstone(
+        &self,
+        shard: &ShardKey,
+        phase_idx: usize,
+        id: &[u8],
+        size: u64,
+    ) -> Result<()> {
+        let data_address = if id.len() >= 64 { id[32..64].to_vec() } else { id.to_vec() };
+        let value = quil_tries::sized_tombstone_leaf_value(size)?;
+        {
+            let mut p = self.pending.write().unwrap();
+            p.entry((shard.clone(), phase_idx)).or_default().insert(data_address, value);
+        }
+        {
+            let mut b = self.pending_blobs.write().unwrap();
+            b.entry((shard.clone(), phase_idx)).or_default().insert(id.to_vec(), Vec::new());
+        }
+        Ok(())
+    }
+
     // ---- read helpers (KV blobs + tombstone check) ----------------------
 
     /// The staged-or-committed blob for `(shard, phase, id)`, or `None`.
@@ -739,8 +767,12 @@ impl HypergraphCrdt {
         if new_placeholder {
             self.stage(&shard, 0, &id, &[])?;
         }
-        // Tombstone in the removes phase.
-        self.stage(&shard, 1, &id, &[])?;
+        // Tombstone in the removes phase, carrying the ORIGINAL add size (from the
+        // committed/staged add blob, independent of `present` so a double-remove
+        // re-stamps the same size rather than zeroing it) so the forest removes
+        // subtree-size nets out the removed leaf in `forest_app_buckets`.
+        let orig_size = existing.as_ref().map(|b| b.len()).unwrap_or(0) as u64;
+        self.stage_sized_tombstone(&shard, 1, &id, orig_size)?;
 
         // Removing a present vertex frees its live size (adds MINUS removes).
         let d_size = if present { -(value_size as i128) } else { 0 };
@@ -777,7 +809,11 @@ impl HypergraphCrdt {
         if existing.is_none() {
             self.stage(&shard, 2, &id, &[])?;
         }
-        self.stage(&shard, 3, &id, &[])?;
+        // Tombstone carrying the original hyperedge-add size (see `remove_vertex`),
+        // so the forest HyperedgeRemoves subtree-size nets it out in
+        // `forest_app_buckets`.
+        let orig_size = existing.as_ref().map(|b| b.len()).unwrap_or(0) as u64;
+        self.stage_sized_tombstone(&shard, 3, &id, orig_size)?;
         // FIX: a removed hyperedge frees its live size — previously this was never
         // subtracted (hyperedges have only existed on the excluded prover shard,
         // so it was a latent no-op until now).
@@ -1370,7 +1406,7 @@ impl HypergraphCrdt {
         }
         let mut buckets: HashMap<Vec<u8>, (u64, i128)> = HashMap::new();
         for &app in apps {
-            self.scan_app_buckets(&app, &mut buckets)?;
+            self.forest_app_buckets(&app, &mut buckets)?;
         }
         // Persist the freshly-computed baseline so subsequent restarts take the
         // fast path.
@@ -1444,6 +1480,77 @@ impl HypergraphCrdt {
         Ok(())
     }
 
+    /// Forest-aggregate equivalent of [`scan_app_buckets`]: build `app`'s
+    /// per-sub-shard `(raw_count, live_size)` buckets from the unified app tree's
+    /// Merkle-sum aggregates — [`Forest::app_subtree_leaf_count`] (count) +
+    /// [`Forest::app_subtree_size`] (size) at each current shard's bit-path —
+    /// instead of a full O(all-leaves) leaf iteration. **O(shards × depth)**: the
+    /// epoch-boundary [`rebucket_app`] no longer rescans the whole tree (the ~2h
+    /// QUIL stall that stalled FrameHeader flow → froze rewards). `size` is the
+    /// LIVE size `(VertexAdds − VertexRemoves) + (HyperedgeAdds − HyperedgeRemoves)`
+    /// (the removes tombstones carry the removed sizes — see
+    /// [`Self::stage_sized_tombstone`]); `count` is the VertexAdds subtree leaf
+    /// count (incl. removed leaves, matching the scan's raw count). Produces
+    /// byte-identical buckets to `scan_app_buckets` — unit-validated for adds,
+    /// removes, and hyperedges. Falls back to the scan only when the app isn't on
+    /// the unified tree.
+    fn forest_app_buckets(
+        &self,
+        app: &[u8; 32],
+        buckets: &mut HashMap<Vec<u8>, (u64, i128)>,
+    ) -> Result<()> {
+        if *app == [0xFFu8; 32] {
+            return Ok(()); // prover shard excluded from world size
+        }
+        if !self.unified_tree() {
+            return self.scan_app_buckets(app, buckets);
+        }
+        let prefixes = self.app_prefixes(app);
+        let single = prefixes.len() == 1 && prefixes[0].is_empty();
+        let bit_paths = if single { Vec::new() } else { self.shard_bit_paths(app) };
+        let forest = self.forest.read().unwrap();
+        // Same version resolution as `unified_subtree_leaf_count` /
+        // `propose_split_children`: the per-phase head, else the global forest
+        // version (NOT 0, which reads an empty tree). Each phase tree resolves
+        // independently.
+        let fallback_ver = self.forest_version.load(Ordering::SeqCst);
+        let ver = |ph: usize| self.resolve_phase_version_with(&forest, app, ph).unwrap_or(fallback_ver);
+        let (ver_va, ver_vr, ver_ha, ver_hr) = (ver(0), ver(1), ver(2), ver(3));
+        let empty_bits: Vec<bool> = Vec::new();
+        for (i, prefix) in prefixes.iter().enumerate() {
+            let bits: &[bool] = if single { &empty_bits } else { &bit_paths[i] };
+            // COUNT: raw VertexAdds leaf count — INCLUDING removed leaves (whose add
+            // leaf, or an empty placeholder, is retained), matching
+            // `scan_app_buckets` (`e.0 += 1` for every add, no `v_removed` check).
+            let count = forest
+                .app_subtree_leaf_count(app, PHASES[0], ver_va, bits)
+                .unwrap_or(0);
+            // SIZE: LIVE size = adds − removes across both vertex and hyperedge
+            // phases. The forest add-trees RETAIN removed leaves (removes are a
+            // SEPARATE phase tree, not deletions), and each removes-phase tombstone
+            // now carries the removed leaf's original size (`stage_sized_tombstone`
+            // / `sized_tombstone_leaf_value`), so the removes subtree-size sums the
+            // removed sizes exactly. Thus `scan_app_buckets`'s present-only
+            // `blob.len()` sum == (VertexAdds − VertexRemoves) + (HyperedgeAdds −
+            // HyperedgeRemoves) — a pure O(depth) subtree subtraction, no leaf scan.
+            // Clamp at 0 (a shard can't have negative live size).
+            let va = forest.app_subtree_size(app, PHASES[0], ver_va, bits).unwrap_or(0) as i128;
+            let vr = forest.app_subtree_size(app, PHASES[1], ver_vr, bits).unwrap_or(0) as i128;
+            let ha = forest.app_subtree_size(app, PHASES[2], ver_ha, bits).unwrap_or(0) as i128;
+            let hr = forest.app_subtree_size(app, PHASES[3], ver_hr, bits).unwrap_or(0) as i128;
+            let size = ((va - vr) + (ha - hr)).max(0);
+            // Match `scan_app_buckets`, which only creates a bucket for a shard a
+            // leaf actually routes to — never an empty `(0, 0)` placeholder.
+            if count == 0 && size == 0 {
+                continue;
+            }
+            let e = buckets.entry(Forest::addr_path_shard_id(app, prefix)).or_insert((0, 0));
+            e.0 += count;
+            e.1 += size;
+        }
+        Ok(())
+    }
+
     /// Re-partition `app`'s per-sub-shard size buckets against the CURRENT prefix
     /// set. Called when a shard split/merge changes an app's registered shards:
     /// the incremental [`bump_meta`] only routes NEW writes, so data written before
@@ -1460,7 +1567,44 @@ impl HypergraphCrdt {
         // Rebuild the app's buckets from committed state under a lock held across
         // the swap so a concurrent commit can't interleave a stale partition.
         let mut fresh: HashMap<Vec<u8>, (u64, i128)> = HashMap::new();
-        self.scan_app_buckets(app, &mut fresh)?;
+        self.forest_app_buckets(app, &mut fresh)?;
+        // Validation shadow (`QUIL_REBUCKET_SHADOW=1`): recompute the buckets via
+        // the legacy full-leaf `scan_app_buckets` and log any divergence. The
+        // forest Merkle-sum MUST be byte-identical to the scan — the per-shard
+        // `(count, size)` is the consensus-relevant reward/join basis, so a
+        // mismatch would be a soft-fork. OFF in production: the scan is exactly
+        // the O(all-leaves) cost the forest aggregate replaces (the ~2h QUIL
+        // epoch-boundary stall). Used to validate value-preservation on localnet
+        // across real splits + vertex removes + hyperedges before relying on it.
+        if std::env::var("QUIL_REBUCKET_SHADOW").as_deref() == Ok("1") {
+            let mut scan: HashMap<Vec<u8>, (u64, i128)> = HashMap::new();
+            match self.scan_app_buckets(app, &mut scan) {
+                Err(e) => tracing::warn!(error = %e, "rebucket shadow: scan_app_buckets failed"),
+                Ok(()) if scan == fresh => tracing::info!(
+                    app = %hex::encode(&app[..4]),
+                    shards = fresh.len(),
+                    "rebucket shadow: forest == scan OK"
+                ),
+                Ok(()) => {
+                    let mut keys: std::collections::BTreeSet<&Vec<u8>> =
+                        scan.keys().collect();
+                    keys.extend(fresh.keys());
+                    for k in keys {
+                        let sv = scan.get(k).copied().unwrap_or((0, 0));
+                        let fv = fresh.get(k).copied().unwrap_or((0, 0));
+                        if sv != fv {
+                            tracing::error!(
+                                app = %hex::encode(&app[..4]),
+                                shard = %hex::encode(k),
+                                scan_count = sv.0, scan_size = sv.1,
+                                forest_count = fv.0, forest_size = fv.1,
+                                "REBUCKET SHADOW MISMATCH — forest aggregate != leaf scan"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let mut m = self.sub_meta.write().unwrap();
         // Drop every bucket belonging to this app (keys are `app(32) ‖ prefix`),
         // clearing the orphaned parent/ancestor buckets, then install the fresh set.
@@ -2643,4 +2787,108 @@ fn id_matches_path(id: &[u8], path: &[i32]) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod size_index_tests {
+    use super::*;
+    use crate::testing::{MemStore, StubProver};
+    use std::sync::Arc;
+
+    fn crdt() -> HypergraphCrdt {
+        HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver))
+    }
+
+    /// A coin-shaped vertex whose data-address top bits route it to a shard: byte0
+    /// selects the top-of-tree bit-path (so `< 0x04` → shard `[0]`, `0x04` → `[1]`
+    /// in the binary grid the tests below use), the rest disambiguates the leaf.
+    fn at(app: [u8; 32], b0: u8, b1: u8, b2: u8) -> Location {
+        Location {
+            app_address: app,
+            data_address: {
+                let mut a = [0u8; 32];
+                a[0] = b0;
+                a[1] = b1;
+                a[2] = b2;
+                a
+            },
+        }
+    }
+
+    /// The forest Merkle-sum aggregate (`forest_app_buckets`) MUST produce
+    /// byte-identical per-shard `(count, size)` to the legacy full-leaf scan
+    /// (`scan_app_buckets`). The per-shard basis is consensus-relevant (reward +
+    /// join gate), so the O(depth) fast path can't change any value. This is the
+    /// pure-adds case across a 2-way split grid — the split/rebucket path the
+    /// localnet genesis shard is too small to exercise.
+    #[test]
+    fn forest_buckets_match_scan_adds_split() {
+        let app = [7u8; 32];
+        let c = crdt();
+        c.set_unified_tree(true);
+        // Binary split grid: shard `[0]` (top-6-bits 000000) and `[1]` (000001).
+        c.set_app_shard_prefixes(app, vec![vec![0u32], vec![1u32]]);
+        // Three leaves under `[0]` (byte0 == 0x00) + one under `[1]` (byte0 0x04).
+        c.add_vertex(&at(app, 0x00, 0xFF, 0x11), b"coin-a").unwrap();
+        c.add_vertex(&at(app, 0x00, 0xFE, 0x22), b"coin-bb").unwrap();
+        c.add_vertex(&at(app, 0x00, 0xF0, 0x33), b"coin-ccc").unwrap();
+        c.add_vertex(&at(app, 0x04, 0xAB, 0x44), b"coin-dddd").unwrap();
+        c.commit(1).unwrap();
+
+        let mut scan = HashMap::new();
+        c.scan_app_buckets(&app, &mut scan).unwrap();
+        let mut forest = HashMap::new();
+        c.forest_app_buckets(&app, &mut forest).unwrap();
+
+        assert!(
+            scan.values().any(|(cnt, _)| *cnt > 0),
+            "precondition: scan found leaves (grid/version wired)"
+        );
+        assert_eq!(
+            forest, scan,
+            "forest Merkle-sum buckets must equal the leaf-scan buckets\n\
+             forest={forest:?}\nscan={scan:?}"
+        );
+    }
+
+    /// Same equality invariant, now stressing the removes paths that most diverge
+    /// between the two code sides: `scan_app_buckets` excludes a removed leaf from
+    /// `live_size` (but still counts it in `raw_count`), while the forest retains
+    /// the add leaf and nets it out via the sized removes tombstone. Covers a spent
+    /// coin, a DOUBLE remove (tombstone must re-stamp the same size, not zero it), a
+    /// removed-but-never-added placeholder, and a removed hyperedge.
+    #[test]
+    fn forest_buckets_match_scan_with_removes() {
+        let app = [8u8; 32];
+        let c = crdt();
+        c.set_unified_tree(true);
+        c.set_app_shard_prefixes(app, vec![vec![0u32], vec![1u32]]);
+        c.add_vertex(&at(app, 0x00, 0xFF, 0x11), b"coin-a").unwrap();
+        c.add_vertex(&at(app, 0x04, 0xAB, 0x44), b"coin-dddd").unwrap();
+        // Add then remove a leaf under `[0]` — a spent coin, removed TWICE (the
+        // second remove must not zero the tombstone's recorded size).
+        let spent = at(app, 0x00, 0x12, 0x99);
+        c.add_vertex(&spent, b"spent-coin-xyz").unwrap();
+        c.remove_vertex(&spent).unwrap();
+        c.remove_vertex(&spent).unwrap();
+        // Remove an id that was never added — an empty add placeholder + tombstone.
+        c.remove_vertex(&at(app, 0x00, 0x77, 0x77)).unwrap();
+        // A live hyperedge and a removed one under `[1]`.
+        c.add_hyperedge(&at(app, 0x04, 0x01, 0x02), b"edge-live").unwrap();
+        let dead_edge = at(app, 0x04, 0x03, 0x04);
+        c.add_hyperedge(&dead_edge, b"edge-dead-longer").unwrap();
+        c.remove_hyperedge(&dead_edge).unwrap();
+        c.commit(1).unwrap();
+
+        let mut scan = HashMap::new();
+        c.scan_app_buckets(&app, &mut scan).unwrap();
+        let mut forest = HashMap::new();
+        c.forest_app_buckets(&app, &mut forest).unwrap();
+
+        assert_eq!(
+            forest, scan,
+            "forest vs scan must agree under removes (spent, double-remove, \
+             never-added, removed hyperedge)\nforest={forest:?}\nscan={scan:?}"
+        );
+    }
 }

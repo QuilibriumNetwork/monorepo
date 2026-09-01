@@ -358,10 +358,6 @@ pub struct LifecycleReadiness {
     /// The local prover-tree root commitment has been verified at
     /// or past `frame_number` against an archive snapshot.
     pub tree_verified: bool,
-    /// No coverage halt is currently active. While halted, the
-    /// lifecycle defers all propose/confirm actions to avoid making
-    /// allocation decisions on stale shard data.
-    pub no_halt: bool,
     /// Initial `GetAppShards` refresh has completed at least once.
     /// Gates auto-pick branches (Propose*) but NOT confirm/seniority
     /// branches (those depend only on local pending state).
@@ -987,7 +983,6 @@ impl ProverLifecycle {
                 let verified = self.prover_root_verified_frame.load(Ordering::Relaxed);
                 verified > 0 && verified >= frame_number
             },
-            no_halt: !self.halt_state.any_halted(),
             shard_info_loaded: self.shard_info_loaded(),
             join_cooldown_ok,
             identity_known: !self.prover_address.is_empty(),

@@ -61,8 +61,20 @@ use quil_types::store::SnapshotReadable;
 /// session still holds an `Arc` clone, in which case release waits for
 /// that session to finish. So this count bounds disk-version retention;
 /// raising it widens the catch-up window at the cost of pinning more
-/// versions on a busy archive. Tunable.
-pub const MAX_GENERATIONS: usize = 128;
+/// versions on a busy archive.
+///
+/// Widened to TWO FULL EPOCHS (2 × `EPOCH_LENGTH_FRAMES` = 1440 frames ≈ ~4h at
+/// 10s/frame) to CLOSE THE STATE-JUMP DEAD ZONE. At 128 a node lagging 128–1000
+/// frames could neither incrementally sync — its target prover-tree version was
+/// already pruned past this cap, so `resolve_root` returns a `(version, frame)`
+/// from the persistent index whose tree DATA is gone → the pulled tree hashes to
+/// a different root → `phase root != anchor` forever — nor state-jump, since the
+/// gap was below `state_jump_min_gap` (1000). The prover tree churns EVERY frame
+/// now, so historical roots don't otherwise persist. Making retention (1440) >
+/// the state-jump threshold (1000) guarantees a node anywhere below the jump
+/// trigger still finds its target retained, so it can always incrementally
+/// converge. Costs ~11× the pinned RocksDB versions on a busy archive.
+pub const MAX_GENERATIONS: usize = 2 * quil_types::consensus::EPOCH_LENGTH_FRAMES as usize;
 
 /// One snapshot generation: a (root, frame_number) pair the manager
 /// has seen, plus an optional point-in-time snapshot of the underlying
@@ -356,20 +368,21 @@ mod tests {
     #[test]
     fn evicts_oldest_beyond_max_generations() {
         let m = SnapshotManager::new();
-        for i in 0..(MAX_GENERATIONS as u64 + 5) {
+        // Encode the index across 4 bytes — MAX_GENERATIONS (1440) exceeds a
+        // single byte's range, so a `u8` index would collide roots.
+        let root_for = |i: u64| {
             let mut root = vec![0u8; 32];
-            root[31] = i as u8;
-            m.publish(root, i);
+            root[28..32].copy_from_slice(&(i as u32).to_be_bytes());
+            root
+        };
+        for i in 0..(MAX_GENERATIONS as u64 + 5) {
+            m.publish(root_for(i), i);
         }
         assert_eq!(m.generation_count(), MAX_GENERATIONS);
         // The oldest 5 should have been evicted.
-        let mut oldest_root = vec![0u8; 32];
-        oldest_root[31] = 0u8;
-        assert!(m.acquire(&oldest_root).is_none());
+        assert!(m.acquire(&root_for(0)).is_none());
         // The newest should still be available.
-        let mut newest_root = vec![0u8; 32];
-        newest_root[31] = (MAX_GENERATIONS as u64 + 4) as u8;
-        assert!(m.acquire(&newest_root).is_some());
+        assert!(m.acquire(&root_for(MAX_GENERATIONS as u64 + 4)).is_some());
     }
 
     #[test]
@@ -444,10 +457,11 @@ mod tests {
         // No other Arc references → Drop has not fired yet.
         assert_eq!(*counter.lock().unwrap(), 0);
 
-        // Push enough new generations to evict the first.
+        // Push enough new generations to evict the first. Encode the index across
+        // 4 bytes (MAX_GENERATIONS exceeds a single byte's range).
         for i in 2..=(MAX_GENERATIONS as u64 + 1) {
             let mut root = vec![0u8; 32];
-            root[31] = i as u8;
+            root[28..32].copy_from_slice(&(i as u32).to_be_bytes());
             m.publish(root, i);
         }
         // Generation [0x01; 32] should have been evicted, dropping

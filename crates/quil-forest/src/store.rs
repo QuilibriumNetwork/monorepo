@@ -54,6 +54,20 @@ pub struct MemTreeStore {
     values: RwLock<HashMap<KeyHash, Vec<(Version, Option<OwnedValue>)>>>,
     /// Stale records keyed by `(stale_since_version, node_key)` for pruning.
     stale: RwLock<BTreeMap<(Version, NodeKey), ()>>,
+    /// Per-node memoized subtree size sums (the in-memory analogue of the
+    /// RocksDB [`TAG_SIZE`] side column).
+    sizes: RwLock<HashMap<NodeKey, u128>>,
+}
+
+impl SizeIndex for MemTreeStore {
+    fn get_size_sum(&self, node_key: &NodeKey) -> Result<Option<u128>> {
+        Ok(self.sizes.read().unwrap().get(node_key).copied())
+    }
+
+    fn put_size_sum(&self, node_key: &NodeKey, size: u128) -> Result<()> {
+        self.sizes.write().unwrap().insert(node_key.clone(), size);
+        Ok(())
+    }
 }
 
 impl MemTreeStore {
@@ -63,6 +77,7 @@ impl MemTreeStore {
         self.nodes.write().unwrap().clear();
         self.values.write().unwrap().clear();
         self.stale.write().unwrap().clear();
+        self.sizes.write().unwrap().clear();
     }
 }
 
@@ -160,6 +175,30 @@ const TAG_STALE: u8 = b's';
 /// can fetch the changed vertices' blobs. Written at commit time (which has the
 /// raw keys); read by the sync server.
 const TAG_PREIMAGE: u8 = b'p';
+/// Merkle-sum size-index tag: `prefix ++ 'z' ++ borsh(node_key) -> u128 BE`.
+/// A per-node memo of the summed leaf `size` (each vertex leaf's `[32..40]`
+/// u64, via [`crate::vertex_leaf_size`]) under that node. JMT maintains a
+/// per-node `leaf_count` natively but NOT size; this recovers the verkle-style
+/// per-branch size aggregate the QUIL shard/reward basis needs, WITHOUT
+/// changing any node hash — it is off-consensus, local telemetry only. Keyed
+/// by the version-stamped [`NodeKey`], so an unchanged subtree's memo stays
+/// valid across later commits (JMT is copy-on-write): a read after an insert
+/// recomputes only the freshly-rewritten root-to-leaf path, reusing every
+/// cached sibling, so per-shard size is O(depth) once warm instead of the
+/// O(all-leaves) rescan `rebucket_app` does today.
+const TAG_SIZE: u8 = b'z';
+
+/// A store that can memoize per-node subtree size sums (the [`TAG_SIZE`]
+/// side column). Split from [`TreeReader`] so the generic
+/// [`crate::subtree_size`] / [`crate::node_size_sum`] walkers work over both
+/// the RocksDB store and the in-memory test store.
+pub trait SizeIndex {
+    /// The memoized summed leaf size under `node_key`, or `None` if not yet
+    /// computed.
+    fn get_size_sum(&self, node_key: &NodeKey) -> Result<Option<u128>>;
+    /// Memoize `size` as the summed leaf size under `node_key`.
+    fn put_size_sum(&self, node_key: &NodeKey, size: u128) -> Result<()>;
+}
 
 /// A [`TreeReader`]/[`TreeWriter`]/[`ForestStore`] over a shared RocksDB,
 /// scoped to one tree by a [`TreeId`] prefix. Node keys:
@@ -204,6 +243,13 @@ impl RocksTreeStore {
         let mut k = self.prefix.clone();
         k.push(TAG_VALUE);
         k.extend_from_slice(&key_hash.0);
+        k
+    }
+
+    fn size_key_bytes(&self, node_key: &NodeKey) -> Vec<u8> {
+        let mut k = self.prefix.clone();
+        k.push(TAG_SIZE);
+        k.extend_from_slice(&borsh::to_vec(node_key).expect("NodeKey borsh"));
         k
     }
 
@@ -283,6 +329,22 @@ impl RocksTreeStore {
         // `TAG_STALE` (=='s') + 1: the next tag byte, an exclusive upper bound.
         *hi.last_mut().unwrap() = TAG_STALE + 1;
         (lo, hi)
+    }
+}
+
+impl SizeIndex for RocksTreeStore {
+    fn get_size_sum(&self, node_key: &NodeKey) -> Result<Option<u128>> {
+        match self.db.get(self.size_key_bytes(node_key))? {
+            Some(b) if b.len() == 16 => {
+                Ok(Some(u128::from_be_bytes(b.as_slice().try_into().unwrap())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn put_size_sum(&self, node_key: &NodeKey, size: u128) -> Result<()> {
+        self.db.put(self.size_key_bytes(node_key), size.to_be_bytes())?;
+        Ok(())
     }
 }
 
@@ -416,6 +478,7 @@ impl ForestStore for RocksTreeStore {
         let (lo, hi) = self.stale_scan_bounds();
         // Collect stale records with stale_since_version <= min first.
         let mut doomed_nodes: Vec<Vec<u8>> = Vec::new();
+        let mut doomed_sizes: Vec<Vec<u8>> = Vec::new();
         let mut doomed_stale: Vec<Vec<u8>> = Vec::new();
         {
             let mut it = self.db.raw_iterator();
@@ -446,6 +509,13 @@ impl ForestStore for RocksTreeStore {
                 node_k.push(TAG_NODE);
                 node_k.extend_from_slice(nk_borsh);
                 doomed_nodes.push(node_k);
+                // The parallel size-index memo (TAG_SIZE) for the same NodeKey
+                // is pruned in lockstep so the side column can't outgrow the
+                // node column.
+                let mut size_k = self.prefix.clone();
+                size_k.push(TAG_SIZE);
+                size_k.extend_from_slice(nk_borsh);
+                doomed_sizes.push(size_k);
                 doomed_stale.push(k.to_vec());
                 it.next();
             }
@@ -453,6 +523,9 @@ impl ForestStore for RocksTreeStore {
         let mut wb = rocksdb::WriteBatch::default();
         for nk in &doomed_nodes {
             wb.delete(nk);
+        }
+        for sk in &doomed_sizes {
+            wb.delete(sk);
         }
         for sk in &doomed_stale {
             wb.delete(sk);

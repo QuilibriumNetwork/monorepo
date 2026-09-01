@@ -587,18 +587,25 @@ pub async fn handle_prover_shards(method: Method, State(state): State<ExplorerSt
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut response: Vec<RestProverShardSummary> = Vec::new();
     for summary in &summaries {
+        let filter_hex = hex::encode(&summary.filter);
+        // Drop stale, off-grid filters: obsolete ancestor-depth prefixes left in
+        // the prover registry after the grid split deeper (e.g. a depth-5 parent
+        // whose data now lives in its depth-7 children). Their filter matches no
+        // current grid shard, so they carry no data and no reward basis — surfacing
+        // them as "provers, size 0" is misleading. A filter that maps to a live
+        // shard is kept, INCLUDING an empty spine shard (present in the grid with
+        // size "0"). Criterion: present in the current-grid `shard_sizes` map.
+        let (size_bytes, data_shards) = match shard_sizes.get(&filter_hex) {
+            Some((size, ds)) => (size.to_string(), *ds),
+            None => continue,
+        };
         let mut counts: BTreeMap<String, i64> = BTreeMap::new();
         for (status, count) in &summary.status_counts {
             counts.insert(prover_status_to_string(*status), *count as i64);
         }
-        let filter_hex = hex::encode(&summary.filter);
         seen.insert(filter_hex.clone());
         let active_workers = counts.get("active").copied().unwrap_or(0)
             + counts.get("joining").copied().unwrap_or(0);
-        let (size_bytes, data_shards) = match shard_sizes.get(&filter_hex) {
-            Some((size, ds)) => (size.to_string(), *ds),
-            None => (String::new(), 0),
-        };
         response.push(RestProverShardSummary {
             filter: filter_hex,
             counts,

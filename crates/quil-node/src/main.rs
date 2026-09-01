@@ -43,6 +43,8 @@ mod forest_migration;
 mod dry_run_reset;
 mod dump_shard_state;
 mod reclaim_legacy_forest;
+mod test_prover_sync;
+mod query_shards;
 mod unified_consolidation;
 mod legacy_migration;
 mod coin_rescale;
@@ -130,6 +132,22 @@ struct Args {
     /// shut down. Empty path uses config.db.path. Idempotent (marker-gated).
     #[arg(long)]
     reclaim_legacy_forest: Option<PathBuf>,
+
+    /// LIVE check: connect to an archive over :8340 Falcon-mTLS, pull its head
+    /// global frame, and run the root-addressed prover-tree sync against it into a
+    /// fresh in-memory forest — verifying the synced root == the frame's
+    /// prover_tree_commitment. Pass `ip:8340` for a specific archive, or the flag
+    /// alone to use engine.archiveEndpoints / the embedded genesis archives.
+    /// Read-only against the archive; then exit.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    test_prover_sync: Option<String>,
+
+    /// LIVE GetAppShards query of the QUIL grid from an archive over :8340 (remote
+    /// equivalent of --dump-shard-state's grid view: per-shard prefix, size,
+    /// data_shards, materialized/latest frame). Pass `ip:8340`, or the flag alone
+    /// for engine.archiveEndpoints / embedded genesis archives. Read-only; then exit.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    query_shards: Option<String>,
 
     /// Archive-only: convert pre-2.1 verenc coins in the DB (config.db.path, or
     /// the given path) into compact transparent public token entries and refresh
@@ -692,6 +710,40 @@ async fn main() -> anyhow::Result<ExitCode> {
             &config,
             args.network,
         ) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref archive_addr) = args.test_prover_sync {
+        return match test_prover_sync::run_test_prover_sync(
+            archive_addr,
+            &config,
+            &args.config,
+            args.network,
+        )
+        .await
+        {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref archive_addr) = args.query_shards {
+        return match query_shards::run_query_shards(
+            archive_addr,
+            &config,
+            &args.config,
+            args.network,
+        )
+        .await
+        {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");

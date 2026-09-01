@@ -289,6 +289,18 @@ pub fn compute_shard_halt_durations(
     // with `u64::MAX`. Uses `active_count` from the shard summary
     // (ProverStatus::Active count).
     for summary in summaries {
+        // GUARD: a zero-size shard has no data to protect — never halt it,
+        // mirroring the `check()` detection sweep's `entry.size == 0` skip and
+        // the proposer's `raw_size == 0` continue. Without this, STALE OFF-GRID
+        // filters (old-depth / ancestor prefixes left behind as the grid splits
+        // deeper) with a few stranded provers each trip a PERMANENT `u64::MAX`
+        // halt, inflating `halted_count` and wedging `any_halted()` true — which
+        // suppresses `coverage_publish` (reward proofs) and blocks leave/swap
+        // re-homing network-wide, even though every real data-bearing shard is
+        // fully covered. Only real shards (size > 0) can hold a halt.
+        if summary.total_size == 0 {
+            continue;
+        }
         let active_count = summary
             .status_counts
             .get(&ProverStatus::Active)
@@ -1501,13 +1513,37 @@ mod tests {
     use super::*;
 
     fn summary_with_active(filter: &[u8], active: u32) -> ProverShardSummary {
+        // A real, data-bearing shard (nonzero size) so the halt logic under
+        // test actually applies; the zero-size guard is covered separately by
+        // `zero_size_shard_below_threshold_is_not_halted`.
+        summary_with_active_size(filter, active, 1000)
+    }
+
+    fn summary_with_active_size(filter: &[u8], active: u32, total_size: u64) -> ProverShardSummary {
         let mut status_counts = HashMap::new();
         status_counts.insert(ProverStatus::Active, active);
         ProverShardSummary {
             filter: filter.to_vec(),
             status_counts,
-            total_size: 0,
+            total_size,
         }
+    }
+
+    #[test]
+    fn zero_size_shard_below_threshold_is_not_halted() {
+        // A zero-size shard (empty spine or STALE off-grid ancestor filter)
+        // with a few stranded provers below the halt threshold must NOT get a
+        // halt duration — only real data-bearing shards can halt. Regression
+        // for the mass stale-filter halts that wedged `any_halted()` true.
+        let t = LowCoverageStreakTracker::new();
+        let thresholds = CoverageThresholds::mainnet(); // halt_threshold=3
+        let summaries = vec![
+            summary_with_active_size(b"stale-offgrid", 2, 0), // below threshold, NO data
+            summary_with_active_size(b"real-data", 2, 5_000), // below threshold, HAS data
+        ];
+        let out = compute_shard_halt_durations(&t, &summaries, &thresholds);
+        assert_eq!(out.get(&b"stale-offgrid".to_vec()), None, "zero-size shard must not halt");
+        assert_eq!(out.get(&b"real-data".to_vec()), Some(&u64::MAX), "real shard still halts");
     }
 
     fn alloc(

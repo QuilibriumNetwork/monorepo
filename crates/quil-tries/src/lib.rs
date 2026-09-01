@@ -17,7 +17,8 @@ pub use serialize::{
 };
 pub use tree::{MultiKeyTraversalProof, TraversalSubProof, VectorCommitmentTree};
 pub use vertex_commit::{
-    split_vertex_leaf, vertex_commitment, vertex_leaf_value, ShaInclusionProver, VERTEX_LEAF_LEN,
+    sized_tombstone_leaf_value, split_vertex_leaf, vertex_commitment, vertex_leaf_value,
+    ShaInclusionProver, VERTEX_LEAF_LEN,
 };
 
 /// 64-way branching factor (6 bits per nibble).

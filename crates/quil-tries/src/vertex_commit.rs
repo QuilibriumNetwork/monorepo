@@ -112,6 +112,22 @@ pub fn vertex_commitment(blob: &[u8]) -> Result<[u8; 32]> {
 /// The shard-leaf value for a vertex: `commitment(32) ‖ size(u64 BE)`, where
 /// `size` is the serialized blob's byte length — matching the legacy
 /// `Σ blob.len()` size accounting, now committed into the state root.
+/// A removes-phase tombstone leaf that carries the removed vertex's `size` (its
+/// original add-blob byte length) in the size field, while keeping the empty
+/// commitment of the historical tombstone (`vertex_leaf_value(&[])`). This lets
+/// the forest removes-tree subtree-size aggregate equal the sum of removed
+/// sizes, so a shard's LIVE size is the O(depth) subtree subtraction
+/// `adds − removes` (see `HypergraphCrdt::forest_app_buckets`). The commitment
+/// is unchanged from the old size-0 tombstone, so ONLY the 8 size bytes differ;
+/// this changes the removes-tree root only for shards that actually record a
+/// remove (none on mainnet QUIL today) — a forward, non-retroactive encoding
+/// that every node must adopt before removes begin.
+pub fn sized_tombstone_leaf_value(size: u64) -> Result<Vec<u8>> {
+    let mut v = vertex_leaf_value(&[])?;
+    v[32..VERTEX_LEAF_LEN].copy_from_slice(&size.to_be_bytes());
+    Ok(v)
+}
+
 pub fn vertex_leaf_value(blob: &[u8]) -> Result<Vec<u8>> {
     let commitment = vertex_commitment(blob)?;
     let mut v = Vec::with_capacity(VERTEX_LEAF_LEN);
