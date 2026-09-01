@@ -1034,6 +1034,8 @@ mod tests {
             active_provers: provers,
             shard_size: BigInt::from(0),
             data_shards: shards,
+            materialized_frame: 0,
+            latest_frame: 0,
             estimated_reward: BigInt::from(0),
             join_frame: 0,
             leave_frame: 0,
@@ -1057,6 +1059,8 @@ mod tests {
             ring: 1,
             shard_size: BigInt::from(size),
             data_shards: 2,
+            materialized_frame: 0,
+            latest_frame: 0,
             estimated_reward: BigInt::from(reward),
         }
     }
@@ -1137,32 +1141,35 @@ mod tests {
             w,
             vec![
                 6,  // "Select"
-                51, // Filter — what the pane has left
+                35, // Filter — what the pane has left
                 7,  // "Provers"
                 4,  // "Ring"
                 9,  // "Size_[MB]"
                 8,  // "10076371", wider than "Shards"
+                3,  // "Mat"
+                5,  // "Lag"
+                7,  // "joining", wider than "State"
                 12, // "Reward_[Q/f]"
-                8,  // "^|Worker"
+                6,  // "Worker"
                 7,  // "joining", wider than "Status"
                 4,  // "Mode"
                 11, // "Next_Action", wider than "confirmed"
                 14, // "Default_Action", wider than "active@e972"
             ]
         );
-        assert_eq!(fw, 51);
-        // 12 columns + 11 separators + 2 borders fill the pane exactly.
-        assert_eq!(w.iter().sum::<usize>() + 11 + 2, 154);
+        assert_eq!(fw, 35);
+        // 15 columns + 14 separators + 2 borders fill the pane exactly.
+        assert_eq!(w.iter().sum::<usize>() + 14 + 2, 154);
     }
 
     #[test]
     fn fixed_sizing_reproduces_the_historical_layout() {
         let (w, fw) = alloc_col_widths(&fixed(), 154, &joining_table());
-        assert_eq!(w, vec![6, 20, 7, 5, 10, 8, 14, 9, 12, 4, 30, 16]);
-        assert_eq!(fw, 20);
-        assert_eq!(w.iter().sum::<usize>() + 11, 152);
-        // 30 columns of Next Action for a 9-column value, in a row 152 wide.
-        assert_eq!(w[10], NEXT_ACTION_WIDTH);
+        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 8, 8, 14, 7, 12, 4, 30, 16]);
+        assert_eq!(fw, 12);
+        assert_eq!(w.iter().sum::<usize>() + 14, 170);
+        // 30 columns of Next Action for a 9-column value in the fixed layout.
+        assert_eq!(w[13], NEXT_ACTION_WIDTH);
     }
 
     #[test]
@@ -1191,11 +1198,11 @@ mod tests {
         rows[3].next_action = "reject | confirm now".to_string();
         let (after, after_fw) = alloc_col_widths(&m, 154, &rows);
 
-        assert_eq!(before[10], 11);
-        assert_eq!(after[10], 20);
+        assert_eq!(before[13], 11);
+        assert_eq!(after[13], 20);
         // Filter gives back exactly what Next Action took; the row still fits.
         assert_eq!(before_fw - after_fw, 9);
-        assert_eq!(after.iter().sum::<usize>() + 11 + 2, 154);
+        assert_eq!(after.iter().sum::<usize>() + 14 + 2, 154);
     }
 
     #[test]
@@ -1204,10 +1211,10 @@ mod tests {
         let rows = joining_table();
         // Wide pane: Filter stops at the longest hex rather than padding on.
         assert_eq!(alloc_col_widths(&m, 300, &rows).1, 64);
-        assert_eq!(alloc_col_widths(&m, 167, &rows).1, 64);
+        assert_eq!(alloc_col_widths(&m, 167, &rows).1, 48);
         // Narrower: Filter absorbs the shortfall…
-        assert_eq!(alloc_col_widths(&m, 154, &rows).1, 51);
-        assert_eq!(alloc_col_widths(&m, 118, &rows).1, 15);
+        assert_eq!(alloc_col_widths(&m, 154, &rows).1, 35);
+        assert_eq!(alloc_col_widths(&m, 118, &rows).1, 12);
         // …down to the floor, past which the row is clipped rather than shrunk.
         assert_eq!(alloc_col_widths(&m, 115, &rows).1, MIN_FILTER_WIDTH);
         assert_eq!(alloc_col_widths(&m, 40, &rows).1, MIN_FILTER_WIDTH);
