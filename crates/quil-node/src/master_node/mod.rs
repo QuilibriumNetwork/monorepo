@@ -496,6 +496,7 @@ pub(crate) async fn start(
         &mut sup,
         worker_manager::WorkerManagerArgs {
             config: config.clone(),
+            network,
             archive_mode,
             p2p_handle: p2p_handle.clone(),
             db_arc: db_arc.clone(),
@@ -792,7 +793,7 @@ pub(crate) async fn start(
             // Falcon network identity for :8340 dials (present iff we have a
             // transport identity, gated by mtls_seed as before).
             falcon_signing_key: mtls_seed.map(|_| falcon_signing_key.clone()),
-            publish_to_blossomsub: archive_mode,
+            publish_to_blossomsub: archive_mode || network != 0,
         });
 
     // Hand the freshly-built transport to the worker_manager so its

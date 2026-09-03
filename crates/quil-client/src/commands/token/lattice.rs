@@ -192,6 +192,7 @@ pub async fn scan_owned_coins(
         .map_err(|e| anyhow::anyhow!("ListDomainCoins: {e}"))?
         .into_inner()
         .coins;
+    eprintln!("[INFO] ListDomainCoins returned {} coins for domain", coins.len());
 
     let a_otk = &w.mp.a_otk;
     let mut owned = Vec::new();

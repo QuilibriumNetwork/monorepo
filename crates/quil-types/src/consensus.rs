@@ -230,7 +230,7 @@ pub fn epoch_length_frames() -> u64 {
 /// `validate_confirm_timing`, lifecycle confirm/leave emission, materialize,
 /// `effective_status`) reads `epoch_length_frames()`, so setting this once at
 /// startup auto-scales every timing rule consistently.
-pub const TESTNET_EPOCH_LENGTH_FRAMES: u64 = 60;
+pub const TESTNET_EPOCH_LENGTH_FRAMES: u64 = 30;
 
 /// Pin the process-global epoch length from the network id at node startup.
 /// Mainnet (`network == 0`) keeps the 720-frame default; every other network

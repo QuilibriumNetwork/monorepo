@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use quil_engine::prover_message_transport::ProverMessageTransport;
 use quil_rpc::{ArchiveClient, ArchiveEndpointPool};
@@ -144,11 +144,14 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         // Fan out to archives concurrently. Each closure connects + submits
         // independently so a slow / unreachable archive does not block the
         // others.
-        let archive_addrs = if self.falcon_signing_key.is_some() {
+        let mut archive_addrs = if self.falcon_signing_key.is_some() {
             self.archive_pool.get_all().await
         } else {
             Vec::new()
         };
+        if archive_addrs.is_empty() && self.falcon_signing_key.is_some() {
+            archive_addrs.push("127.0.0.1:8350".to_string());
+        }
         let archive_count = archive_addrs.len();
 
         let grpc_future = {
@@ -165,14 +168,17 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                     async move {
                         match ArchiveClient::connect_mtls(&stream_addr, &seed).await {
                             Ok(mut client) => match client.submit_global_message(bytes).await {
-                                Ok(()) => Ok(stream_addr),
+                                Ok(()) => {
+                                    info!(addr = %stream_addr, "prover bundle submitted successfully to archive via mTLS gRPC");
+                                    Ok(stream_addr)
+                                }
                                 Err(e) => {
-                                    debug!(addr = %stream_addr, error = %e, "prover bundle submit rejected by archive");
+                                    warn!(addr = %stream_addr, error = %e, "prover bundle submit rejected by archive");
                                     Err((stream_addr, format!("submit rejected: {e}")))
                                 }
                             },
                             Err(e) => {
-                                debug!(addr = %stream_addr, error = %e, "prover bundle submit: archive connect failed");
+                                warn!(addr = %stream_addr, error = %e, "prover bundle submit: archive connect failed");
                                 Err((stream_addr, format!("connect failed: {e}")))
                             }
                         }

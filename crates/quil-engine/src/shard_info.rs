@@ -25,7 +25,7 @@ use quil_types::consensus::{
     ProverInfo, ProverRegistry, ProverStatus, ShardDetail,
 };
 use quil_types::error::Result;
-use quil_types::store::{ShardInfo, ShardsStore};
+use quil_types::store::{ClockStore, ShardInfo, ShardsStore};
 
 use crate::rewards::pomw_basis;
 
@@ -530,21 +530,48 @@ pub fn local_app_shard_get_sizes(
     crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
     shards_store: std::sync::Arc<dyn ShardsStore>,
 ) -> impl Fn(&[u8], &ShardInfo) -> Result<Vec<ShardSizeEntry>> + Send + Sync {
+    local_app_shard_get_sizes_with_clock(crdt, shards_store, None)
+}
+
+/// `get_sizes` closure for `get_shard_info` with an optional `ClockStore` to
+/// populate the real `materialized_frame` and `latest_frame` numbers.
+pub fn local_app_shard_get_sizes_with_clock(
+    crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    shards_store: std::sync::Arc<dyn ShardsStore>,
+    clock_store: Option<std::sync::Arc<dyn ClockStore>>,
+) -> impl Fn(&[u8], &ShardInfo) -> Result<Vec<ShardSizeEntry>> + Send + Sync {
     move |shard_key: &[u8], shard_info: &ShardInfo| -> Result<Vec<ShardSizeEntry>> {
         let mut sub_shards = shards_store.get_app_shards(shard_key, &[])?;
         if sub_shards.is_empty() {
             sub_shards = vec![shard_info.clone()];
         }
 
+        let l2 = if shard_key.len() >= 35 {
+            &shard_key[3..35]
+        } else if shard_key.len() > 3 {
+            &shard_key[3..]
+        } else {
+            &shard_key[..]
+        };
         let mut out = Vec::with_capacity(sub_shards.len());
         for sub in &sub_shards {
             if let Some(meta) = crate::app_shard_metadata::get_app_shard_metadata(&crdt, sub) {
+                let (mat_fn, latest_fn) = match &clock_store {
+                    Some(cs) => {
+                        let filter = quil_forest::shard_prefix_to_filter(l2, &sub.prefix);
+                        cs.get_latest_shard_clock_frame(&filter)
+                            .ok()
+                            .and_then(|f| f.header.map(|h| (h.frame_number, h.frame_number)))
+                            .unwrap_or((0, 0))
+                    }
+                    None => (0, 0),
+                };
                 out.push(ShardSizeEntry {
                     prefix: sub.prefix.clone(),
                     size: meta.size,
                     data_shards: meta.data_shards,
-                    materialized_frame: 0,
-                    latest_frame: 0,
+                    materialized_frame: mat_fn,
+                    latest_frame: latest_fn,
                 });
             }
         }

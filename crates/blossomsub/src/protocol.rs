@@ -39,9 +39,9 @@ use void::Void;
 
 pub(crate) const SIGNING_PREFIX: &[u8] = b"libp2p-pubsub:";
 
-/// Maximum RPC message size accepted/produced by the BlossomSub codec (16 MiB),
+/// Maximum RPC message size accepted/produced by the BlossomSub codec (128 MiB),
 /// matching the reference implementation in `quil-p2p`.
-pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+pub const MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
 /// Maximum length (bytes) of a bitmask topic accepted in an inbound SUBSCRIBE.
 /// A `TopicHash` wraps the raw bitmask `Vec<u8>` and is retained in the

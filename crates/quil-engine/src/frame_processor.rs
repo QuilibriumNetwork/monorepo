@@ -86,9 +86,25 @@ pub fn process_global_frame_with_rewards(
         // skipping validate would silently accept unsigned join /
         // kick / seniority_merge / shard_split / shard_merge /
         // frame_header messages.
+        let route_addr = if let Ok(req) = quil_execution::message_envelope::CanonicalMessageRequest::from_canonical_bytes(&request_bytes) {
+            if quil_execution::token_engine::is_token_type_prefix(req.inner_type_prefix) {
+                quil_execution::domains::QUIL_TOKEN.to_vec()
+            } else {
+                GLOBAL_ADDRESS.to_vec()
+            }
+        } else if let Ok(bundle) = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(&request_bytes) {
+            if bundle.requests.iter().filter_map(|r| r.as_ref()).any(|r| quil_execution::token_engine::is_token_type_prefix(r.inner_type_prefix)) {
+                quil_execution::domains::QUIL_TOKEN.to_vec()
+            } else {
+                GLOBAL_ADDRESS.to_vec()
+            }
+        } else {
+            GLOBAL_ADDRESS.to_vec()
+        };
+
         if let Err(e) = execution_manager.validate_message(
             frame_number,
-            &GLOBAL_ADDRESS,
+            &route_addr,
             &request_bytes,
         ) {
             debug!(
@@ -104,7 +120,7 @@ pub fn process_global_frame_with_rewards(
         match execution_manager.process_message(
             frame_number,
             fee_multiplier,
-            &GLOBAL_ADDRESS,
+            &route_addr,
             &request_bytes,
         ) {
             Ok(_) => {
@@ -119,6 +135,12 @@ pub fn process_global_frame_with_rewards(
                 );
                 skipped += 1;
             }
+        }
+    }
+
+    if applied > 0 {
+        if let Err(e) = execution_manager.commit_frame_with_global_cursor(frame_number) {
+            warn!(frame = frame_number, error = %e, "commit_frame_with_global_cursor failed in frame processor");
         }
     }
 
