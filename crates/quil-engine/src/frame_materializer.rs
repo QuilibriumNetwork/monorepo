@@ -692,7 +692,8 @@ impl FrameMaterializer {
         // executes prover/shard-admin ops and skips everything else —
         // app-shard data txs are owned by their shard's own consensus.
         let uncovered_shard_tx_active = frame_number
-            >= quil_execution::token_intrinsic::constants::FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX;
+            >= quil_execution::token_intrinsic::constants::FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX
+            || !self.frozen_era_recovery_enabled;
         let mut processed = 0usize;
         let mut skipped = 0usize;
         // Canonical bytes of every well-formed bundle in this frame, fed
@@ -817,7 +818,9 @@ impl FrameMaterializer {
             // global engine, owns them). Coverage is read from the
             // (consensus-deterministic) prover registry, so all nodes
             // agree on the venue for every bundle.
-            let route_addr: Vec<u8> = if uncovered_shard_tx_active {
+            let route_addr: Vec<u8> = if bundle_has_mint_op(bundle) {
+                quil_execution::domains::QUIL_TOKEN.to_vec()
+            } else if uncovered_shard_tx_active {
                 // A DEPLOY mints a brand-new shard whose target domain
                 // never pre-exists — there is no covered shard that could
                 // ever execute it. So it ALWAYS routes to its base
@@ -841,6 +844,8 @@ impl FrameMaterializer {
             } else {
                 global_addr.clone()
             };
+            let has_mint = bundle_has_mint_op(bundle);
+            quil_types::append_debug_log("MATERIALIZER", &format!("frame={}, has_mint={}, route_addr={}", frame_number, has_mint, hex::encode(&route_addr)));
             // Re-encode the proto bundle as canonical bytes.
             let bundle_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
                 Ok(b) => b,
@@ -861,7 +866,7 @@ impl FrameMaterializer {
             if bundle_bytes.len() < 4 {
                 info!(
                     frame = frame_number,
-                    "skipping bundle: encoded payload < 4 bytes (no type prefix)"
+                    "skipping empty or undersized bundle"
                 );
                 skipped += 1;
                 outcomes.push(RequestOutcome {
@@ -935,8 +940,12 @@ impl FrameMaterializer {
                     &route_addr,
                     &bundle_bytes,
                 ) {
-                    Ok(()) => None,
+                    Ok(()) => {
+                        quil_types::append_debug_log("MATERIALIZER validate_message", &format!("frame={}, route_addr={} -> OK", frame_number, hex::encode(&route_addr)));
+                        None
+                    }
                     Err(e) => {
+                        quil_types::append_debug_log("MATERIALIZER validate_message", &format!("frame={}, route_addr={} -> ERR: {}", frame_number, hex::encode(&route_addr), e));
                         info!(
                             frame = frame_number,
                             request_type = format!("0x{:08x}", request_type),
@@ -962,6 +971,7 @@ impl FrameMaterializer {
                 &bundle_bytes,
             ) {
                 Ok(_) => {
+                    quil_types::append_debug_log("MATERIALIZER process_message", &format!("frame={}, route_addr={} -> OK", frame_number, hex::encode(&route_addr)));
                     processed += 1;
                     outcomes.push(RequestOutcome {
                         status: RequestStatus::Succeeded,
@@ -969,6 +979,7 @@ impl FrameMaterializer {
                     });
                 }
                 Err(e) => {
+                    quil_types::append_debug_log("MATERIALIZER process_message", &format!("frame={}, route_addr={} -> ERR: {}", frame_number, hex::encode(&route_addr), e));
                     info!(
                         frame = frame_number,
                         request_type = format!("0x{:08x}", request_type),
@@ -1842,6 +1853,37 @@ fn bundle_deploy_base_domain(
     None
 }
 
+fn peek_raw_type_prefix(p: &[u8]) -> Option<u32> {
+    if let Ok(canon_req) =
+        quil_execution::message_envelope::CanonicalMessageRequest::from_canonical_bytes(p)
+    {
+        return Some(canon_req.inner_type_prefix);
+    }
+    if p.len() >= 4 {
+        return Some(u32::from_be_bytes([p[0], p[1], p[2], p[3]]));
+    }
+    None
+}
+
+fn bundle_has_mint_op(bundle: &quil_types::proto::global::MessageBundle) -> bool {
+    use quil_types::proto::global::message_request::Request;
+    for req in &bundle.requests {
+        let Some(r) = &req.request else { continue };
+        match r {
+            Request::MintTransaction(_) => return true,
+            Request::RawCanonicalPayload(p) => {
+                if let Some(tp) = peek_raw_type_prefix(p) {
+                    if tp == quil_execution::token_intrinsic::lattice_ct::TYPE_LATTICE_MINT {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn bundle_target_domain(bundle: &quil_types::proto::global::MessageBundle) -> Option<Vec<u8>> {
     use quil_types::proto::global::message_request::Request;
     for req in &bundle.requests {
@@ -1856,6 +1898,14 @@ fn bundle_target_domain(bundle: &quil_types::proto::global::MessageBundle) -> Op
             Request::HyperedgeRemove(h) => &h.domain,
             Request::CodeDeploy(c) => &c.domain,
             Request::CodeExecute(c) => &c.domain,
+            Request::RawCanonicalPayload(p) => {
+                if let Some(tp) = peek_raw_type_prefix(p) {
+                    if quil_execution::token_engine::is_token_type_prefix(tp) {
+                        return Some(quil_execution::domains::QUIL_TOKEN.to_vec());
+                    }
+                }
+                continue;
+            }
             _ => continue,
         };
         if domain.len() == 32 {

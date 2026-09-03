@@ -85,6 +85,24 @@ pub async fn run(tc: &TokenCtx) -> anyhow::Result<()> {
                 count += 1;
             }
         }
+        match super::lattice::scan_owned_coins(&mut client, &QUIL_TOKEN.to_vec(), &w).await {
+            Ok(owned_coins) => {
+                for c in &owned_coins {
+                    let mut amt_bytes = [0u8; 32];
+                    let b = c.amount.to_be_bytes();
+                    amt_bytes[32 - b.len()..].copy_from_slice(&b);
+                    println!(
+                        "{} QUIL (Lattice Coin 0x{})",
+                        util::format_quil(&amt_bytes),
+                        hex::encode(&c.p_bytes[..c.p_bytes.len().min(32)])
+                    );
+                    count += 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("[warn] scan lattice coins: {}", e);
+            }
+        }
     }
 
     if count == 0 {

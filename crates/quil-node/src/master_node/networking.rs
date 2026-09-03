@@ -112,7 +112,7 @@ pub(crate) async fn init(
             quil_engine::consensus_wire::GLOBAL_FRAME_TYPE,
         )
         .await;
-    if archive_mode {
+    if archive_mode || p2p_config.network != 0 {
         p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec()).await;
         p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PROVER.to_vec()).await;
         // Bulk shard subscription — an all-ones bitmask bit-COVERS every

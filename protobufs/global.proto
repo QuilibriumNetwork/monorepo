@@ -184,6 +184,7 @@ message MessageRequest {
     quilibrium.node.global.pb.ProverSeniorityMerge seniority_merge = 27;
     quilibrium.node.global.pb.ShardSplit shard_split = 28;
     quilibrium.node.global.pb.ShardMerge shard_merge = 29;
+    bytes raw_canonical_payload = 30;
   }
   int64 timestamp = 99;
 }

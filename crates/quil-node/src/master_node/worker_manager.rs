@@ -167,6 +167,7 @@ pub(crate) fn build_thread_worker_hypergraph(
 
 pub(crate) struct WorkerManagerArgs {
     pub config: quil_config::Config,
+    pub network: u8,
     pub archive_mode: bool,
     pub p2p_handle: quil_p2p::node::P2PHandle,
     pub db_arc: Arc<quil_store::RocksDb>,
@@ -215,6 +216,7 @@ pub(crate) fn init(
 ) -> Arc<dyn quil_engine::worker::WorkerManager> {
     let WorkerManagerArgs {
         config,
+        network,
         archive_mode,
         p2p_handle,
         db_arc,
@@ -609,6 +611,7 @@ pub(crate) fn init(
             // `ShardActivated`; inbound routing dispatches by filter
             // through `shard_engines` in the recv loop below.
             if let Some(mut master_rx) = thread_mgr.take_master_rx() {
+                let drain_network = network;
                 let drain_p2p = p2p_handle.clone();
                 let drain_shard_engines = shard_engines.clone();
                 let drain_halt = halt_state.clone();
@@ -797,12 +800,16 @@ pub(crate) fn init(
                                                     Ok(()) => break,
                                                     Err(e) if retryable_cw_publish_failure(&e.to_string(), attempt) => {
                                                         let delay = std::time::Duration::from_millis(250u64.saturating_mul(1u64 << (attempt - 1)));
-                                                        warn!(core_id, filter = %hex::encode(&filter), attempt, ?delay, error = %e,
+                                                        debug!(core_id, filter = %hex::encode(&filter), attempt, ?delay, error = %e,
                                                             "shard CW publish has no subscribed peers — retrying");
                                                         tokio::time::sleep(delay).await;
                                                     }
                                                     Err(e) => {
-                                                        warn!(core_id, filter = %hex::encode(&filter), attempt, error = %e, "shard cw publish failed");
+                                                        if attempt > 1 && e.to_string().contains("NoPeersSubscribedToTopic") {
+                                                            debug!(core_id, filter = %hex::encode(&filter), error = %e, "shard CW publish: no peers subscribed to topic");
+                                                        } else {
+                                                            warn!(core_id, filter = %hex::encode(&filter), attempt, error = %e, "shard cw publish failed");
+                                                        }
                                                         break;
                                                     }
                                                 }
@@ -904,6 +911,12 @@ pub(crate) fn init(
                                             }
                                             let mut wait_logged = false;
                                             loop {
+                                                if drain_network != 0 {
+                                                    info!(core_id, filter = %hex::encode(&filter_for_sub),
+                                                        "testnet/devnet: starting shard CW consensus engine immediately");
+                                                    ready_handle.set_cw_transport_ready();
+                                                    break;
+                                                }
                                                 match p2p.subscribed_peer_count(cw_topic.clone()).await {
                                                     Ok(peers) if peers > 0 => {
                                                         info!(core_id, filter = %hex::encode(&filter_for_sub), peers,

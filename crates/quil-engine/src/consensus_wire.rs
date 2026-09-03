@@ -1010,9 +1010,10 @@ fn canonical_request_to_proto(
         TYPE_ALT_SHARD_UPDATE => AltShardUpdate::from_canonical_bytes(inner)
             .ok()
             .map(|a| Request::AltShardUpdate(conversions::alt_shard_update_to_proto(&a))),
-        // Any genuinely unported variant preserves the bundle structure
-        // (count + timestamp) with a `None` inner oneof.
-        _ => None,
+        // Any variant without a specialized protobuf (including post-quantum
+        // lattice-CT transactions: TYPE_LATTICE_MINT, TYPE_LATTICE_TRANSACTION, etc.)
+        // is preserved verbatim as RawCanonicalPayload.
+        _ => Some(Request::RawCanonicalPayload(req.inner_bytes.clone())),
     };
     MessageRequest {
         timestamp: 0,
@@ -1175,9 +1176,7 @@ fn proto_message_request_to_canonical(
         Request::AltShardUpdate(p) => conversions::alt_shard_update_from_proto(p)
             .to_canonical_bytes()
             .ok()?,
-        // Any genuinely unported variant is dropped (symmetric with the
-        // `_ => None` in `canonical_request_to_proto`).
-        _ => return None,
+        Request::RawCanonicalPayload(p) => p.clone(),
     };
 
     CanonicalMessageRequest::wrap(inner_bytes).ok()

@@ -248,6 +248,7 @@ pub fn proto_message_request_to_canonical_inner_bytes(
             }
             .to_canonical_bytes()
         }
+        Inner::RawCanonicalPayload(p) => Ok(p.clone()),
 
         // Hypergraph ops (mirror `hypergraph_engine::request_to_payload`).
         Inner::VertexAdd(p) => {

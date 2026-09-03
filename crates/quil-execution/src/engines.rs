@@ -639,6 +639,17 @@ impl ShardExecutionEngine for TokenExecutionEngine {
             };
             let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
 
+            // CanonicalMessageRequest packages inner_bytes with the 4-byte type discriminator
+            // prefix. The lattice_ct decode_* functions expect the raw envelope payload without
+            // the leading type prefix. Strip it if present.
+            let payload = if inner_bytes.len() >= 4
+                && u32::from_be_bytes([inner_bytes[0], inner_bytes[1], inner_bytes[2], inner_bytes[3]]) == inner_tp
+            {
+                &inner_bytes[4..]
+            } else {
+                inner_bytes
+            };
+
             match inner_tp {
                 crate::token_engine::TYPE_TRANSACTION => {
                     // Retired (decaf448): the confidential-value path is now
@@ -657,7 +668,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     // tree's committed root. (Coexists with the decaf path during
                     // cutover; retiring the decaf providers is a follow-up.)
                     use crate::token_intrinsic::lattice_ct;
-                    let env = lattice_ct::decode_tx_envelope(inner_bytes)?;
+                    let env = lattice_ct::decode_tx_envelope(payload)?;
                     // Bound the consensus-opaque per-output memos + one-time keys
                     // before they are stored verbatim in state (griefing/state-bloat
                     // hardening #5).
@@ -695,7 +706,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     // provers' reward balances (soundness), and refresh the shadow
                     // tree. All post-quantum — no decaf, no BLS.
                     use crate::token_intrinsic::lattice_ct;
-                    let env = lattice_ct::decode_mint_envelope(inner_bytes)?;
+                    let env = lattice_ct::decode_mint_envelope(payload)?;
                     // Bound the consensus-opaque per-output memos + one-time keys
                     // (hardening #5).
                     lattice_ct::check_memos_size(&env.output_memos)?;
@@ -703,12 +714,29 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     let np = lattice_ct::production_params();
                     let is_quil = _address == &crate::domains::QUIL_TOKEN[..];
                     // Reward-tree root for the cited frame (forest, 32 bytes).
+                    // Frame F's post-state prover root is stored at `prover_root_at(F)` and
+                    // carried on frame F+1's header as `prover_tree_commitment`. Frame F's own
+                    // header carries `prover_root_at(F-1)` (parent anchor).
                     let reward_root_vec: Vec<u8> = if is_quil {
-                        let frame = self.clock_store.get_global_clock_frame(env.cited_frame)?;
-                        let header = frame.header.ok_or_else(|| {
-                            QuilError::InvalidArgument("lattice-mint: cited frame has no header".into())
-                        })?;
-                        header.prover_tree_commitment
+                        if let Some(r) = state.crdt().prover_root_at(env.cited_frame) {
+                            r
+                        } else if let Ok(next_frame) = self.clock_store.get_global_clock_frame(env.cited_frame + 1) {
+                            if let Some(h) = next_frame.header {
+                                h.prover_tree_commitment
+                            } else {
+                                let frame = self.clock_store.get_global_clock_frame(env.cited_frame)?;
+                                let header = frame.header.ok_or_else(|| {
+                                    QuilError::InvalidArgument("lattice-mint: cited frame has no header".into())
+                                })?;
+                                header.prover_tree_commitment
+                            }
+                        } else {
+                            let frame = self.clock_store.get_global_clock_frame(env.cited_frame)?;
+                            let header = frame.header.ok_or_else(|| {
+                                QuilError::InvalidArgument("lattice-mint: cited frame has no header".into())
+                            })?;
+                            header.prover_tree_commitment
+                        }
                     } else {
                         state
                             .crdt()
@@ -724,12 +752,14 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             "lattice-mint: reward root not 32 bytes (forest reward tree required)".into(),
                         )
                     })?;
+                    quil_types::append_debug_log("EXECUTION TokenEngine", &format!("frame={}, TYPE_LATTICE_MINT cited_frame={}", _frame_number, env.cited_frame));
                     // DoS guard: a malformed mint proof must not panic the block
                     // thread (consensus halt) — reject it instead (audit hardening).
                     match lattice_ct::guard_verify(|| {
                         lattice_ct::verify_mint_envelope_and_derive(np, &reward_root, _address, &env)
                     })? {
                         Some((new_coins, decrements)) => {
+                            quil_types::append_debug_log("EXECUTION TokenEngine", &format!("frame={}, TYPE_LATTICE_MINT VERIFIED! new_coins={}, decrements={}", _frame_number, new_coins.len(), decrements.len()));
                             let frame_bytes = _frame_number.to_be_bytes();
                             let result =
                                 crate::token_intrinsic::materialize::materialize_lattice_transaction(
@@ -742,6 +772,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             crate::token_intrinsic::shadow_accumulator::refresh_root(state, _address)?;
                         }
                         None => {
+                            quil_types::append_debug_log("EXECUTION TokenEngine", &format!("frame={}, TYPE_LATTICE_MINT verify FAILED (returned None)", _frame_number));
                             return Err(QuilError::InvalidArgument(
                                 "lattice-mint: mint verification failed".into(),
                             ));
@@ -752,7 +783,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     // Escrow CREATE: spend inputs, lock the value into a pending
                     // vertex (dual Falcon recipients + expiration). No coin yet.
                     use crate::token_intrinsic::lattice_ct;
-                    let env = lattice_ct::decode_pending_create(inner_bytes)?;
+                    let env = lattice_ct::decode_pending_create(payload)?;
                     // Bound all consensus-opaque fields stored verbatim in the
                     // escrow vertex before verify (griefing/state-bloat hardening #5).
                     lattice_ct::check_escrow_memo_size(&env.memo)?;
@@ -800,7 +831,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     // Escrow CLAIM/REFUND: the `to` (or `refund` after expiration)
                     // party claims the escrow into a coin; the escrow is retired.
                     use crate::token_intrinsic::{lattice_ct, materialize, spent_check};
-                    let env = lattice_ct::decode_pending_claim(inner_bytes)?;
+                    let env = lattice_ct::decode_pending_claim(payload)?;
                     // Bound the consensus-opaque claimed-coin memo + one-time key
                     // (hardening #5).
                     lattice_ct::check_memo_size(&env.output_memo)?;
@@ -879,7 +910,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                     // owner signs) into a lattice private coin; the transparent
                     // entry is nullified. Ed448 survives only here.
                     use crate::token_intrinsic::{lattice_ct, materialize, spent_check};
-                    let env = lattice_ct::decode_shield(inner_bytes)?;
+                    let env = lattice_ct::decode_shield(payload)?;
                     // Bound the consensus-opaque one-time key (hardening #5); the
                     // shield envelope carries no memo.
                     lattice_ct::check_otk_size(&env.output_otk)?;
@@ -1121,6 +1152,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 if matches!(e, QuilError::Store(_) | QuilError::Io(_)) {
                     return Err(e);
                 }
+                quil_types::append_debug_log("TokenEngine invoke_step ERROR", &format!("type=0x{:08x}: {}", inner_tp, e));
                 eprintln!("[WARN] token invoke_step failed type=0x{:08x}: {}", inner_tp, e);
             }
             Ok(())

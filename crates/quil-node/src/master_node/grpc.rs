@@ -422,8 +422,11 @@ pub(crate) fn spawn_all(
             // frame number, larger by the genesis offset) put messages
             // out of the collect range, so they never landed.
             let rank = submit_cf.effective_rank();
+            let tp = if data.len() >= 4 { u32::from_be_bytes([data[0], data[1], data[2], data[3]]) } else { 0 };
+            quil_types::append_debug_log("ARCHIVE submit_handler", &format!("peer={}, len={}, tp=0x{:08x}, rank={}", auth.peer_id, data.len(), tp, rank));
             match submit_mc.add_message_outcome(rank, data) {
                 quil_engine::message_collector::SubmitOutcome::Accepted => {
+                    quil_types::append_debug_log("ARCHIVE submit_handler", &format!("ACCEPTED into mempool, rank={}", rank));
                     tracing::debug!(peer = %auth.peer_id, rank, "accepted gRPC submit");
                     quil_engine::metrics::inc_grpc_submits_accepted();
                     Ok(())
@@ -434,10 +437,12 @@ pub(crate) fn spawn_all(
                 // being reported back to it as "message likely dropped" and
                 // triggering a wasteful gossip-fallback + retry.
                 quil_engine::message_collector::SubmitOutcome::Duplicate => {
+                    quil_types::append_debug_log("ARCHIVE submit_handler", &format!("DUPLICATE, rank={}", rank));
                     quil_engine::metrics::inc_grpc_submits_duplicate();
                     Ok(())
                 }
                 quil_engine::message_collector::SubmitOutcome::Filtered => {
+                    quil_types::append_debug_log("ARCHIVE submit_handler", &format!("FILTERED, rank={}", rank));
                     quil_engine::metrics::inc_grpc_submits_rejected();
                     tracing::warn!(
                         peer = %auth.peer_id,
@@ -687,6 +692,8 @@ pub(crate) fn spawn_all(
 
     let node_submit_mc = message_collector.clone();
     let node_submit_cf = current_frame.clone();
+    let node_submit_transport = prover_pipeline.transport.clone();
+    let node_submit_spawner = spawner.clone();
     let user_submit_handler: quil_rpc::node_service::UserSubmitHandler = Arc::new(
         move |data: Vec<u8>| -> Result<(), String> {
             if data.is_empty() {
@@ -694,7 +701,23 @@ pub(crate) fn spawn_all(
             }
             // Consensus rank, not frame number (see peer submit handler).
             let rank = node_submit_cf.effective_rank();
-            match node_submit_mc.add_message_outcome(rank, data) {
+            let outcome = node_submit_mc.add_message_outcome(rank, data.clone());
+            let tp = if data.len() >= 4 { u32::from_be_bytes([data[0], data[1], data[2], data[3]]) } else { 0 };
+            quil_types::append_debug_log("PROVER user_submit_handler", &format!("len={}, tp=0x{:08x}, rank={}, outcome={:?}", data.len(), tp, rank, outcome));
+
+            // Disseminate to the network (archive gRPC fan-out + BlossomSub)
+            let transport = node_submit_transport.clone();
+            let data_to_send = data.clone();
+            node_submit_spawner.detach("user-submit-publish", async move {
+                quil_types::append_debug_log("PROVER user_submit_handler", "calling publish_prover_bundle...");
+                match transport.publish_prover_bundle(data_to_send).await {
+                    Ok(()) => quil_types::append_debug_log("PROVER user_submit_handler", "publish_prover_bundle OK"),
+                    Err(e) => quil_types::append_debug_log("PROVER user_submit_handler", &format!("publish_prover_bundle ERR: {e}")),
+                }
+                Ok(())
+            });
+
+            match outcome {
                 // Duplicate = already delivered → success (not a drop).
                 quil_engine::message_collector::SubmitOutcome::Accepted
                 | quil_engine::message_collector::SubmitOutcome::Duplicate => Ok(()),
@@ -1021,7 +1044,11 @@ pub(crate) fn spawn_all(
                 .filter(|pr| pr.address == self.self_address)
                 .flat_map(|pr| pr.allocations.iter().filter(|a| a.is_live(frame_number)).map(|a| a.confirmation_filter.clone()))
                 .collect();
-            let local_get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(self.crdt.clone(), self.shards_store.clone());
+            let local_get_sizes = quil_engine::shard_info::local_app_shard_get_sizes_with_clock(
+                self.crdt.clone(),
+                self.shards_store.clone(),
+                Some(self.clock_store.clone() as Arc<dyn quil_types::store::ClockStore>),
+            );
             let local_result = quil_engine::shard_info::get_shard_info(
                 include_all, &self.self_address, &allocated_filters, difficulty, frame_number,
                 self.shards_store.as_ref(), self.registry.as_ref(), &local_get_sizes,
@@ -1171,7 +1198,9 @@ pub(crate) fn spawn_all(
 
     if let Ok(addr) = grpc_addr.parse::<std::net::SocketAddr>() {
         let node_rpc_service = tonic::service::interceptor::InterceptedService::new(
-            quil_types::proto::node::node_service_server::NodeServiceServer::new(node_rpc),
+            quil_types::proto::node::node_service_server::NodeServiceServer::new(node_rpc)
+                .max_decoding_message_size(128 * 1024 * 1024)
+                .max_encoding_message_size(128 * 1024 * 1024),
             quil_rpc::peer_auth_middleware::peer_auth_interceptor,
         );
         sup.spawn("node-grpc-server", move |node_grpc_token| async move {
@@ -1200,8 +1229,8 @@ pub(crate) fn spawn_all(
             // truncated them, surfacing as `h2 protocol error: error
             // reading a body` on the client. Mirrors the client limits.
             quil_types::proto::global::global_service_server::GlobalServiceServer::new(grpc_server)
-                .max_decoding_message_size(64 * 1024 * 1024)
-                .max_encoding_message_size(64 * 1024 * 1024),
+                .max_decoding_message_size(128 * 1024 * 1024)
+                .max_encoding_message_size(128 * 1024 * 1024),
             quil_rpc::peer_auth_middleware::peer_auth_interceptor,
         );
         let app_shard_service = tonic::service::interceptor::InterceptedService::new(
@@ -1240,7 +1269,9 @@ pub(crate) fn spawn_all(
         let dispatch_service = tonic::service::interceptor::InterceptedService::new(
             quil_types::proto::global::dispatch_service_server::DispatchServiceServer::new(
                 quil_rpc::dispatch_service::DispatchRpcServer::new(inbox_store.clone()),
-            ),
+            )
+            .max_decoding_message_size(128 * 1024 * 1024)
+            .max_encoding_message_size(128 * 1024 * 1024),
             quil_rpc::peer_auth_middleware::peer_auth_interceptor,
         );
 

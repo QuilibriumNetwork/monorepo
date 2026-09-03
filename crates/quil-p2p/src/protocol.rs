@@ -31,8 +31,8 @@ pub fn stream_protocol_for_network(network: u8) -> libp2p::StreamProtocol {
     }
 }
 
-/// Maximum RPC message size (16 MiB).
-pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+/// Maximum RPC message size (128 MiB).
+pub const MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
 /// Encode an RPC message to bytes with a length prefix (unsigned varint).
 pub fn encode_rpc(rpc: &pb::Rpc) -> Vec<u8> {

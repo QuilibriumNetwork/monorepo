@@ -382,20 +382,30 @@ pub fn verify_mint_reward_membership(
         .map_err(|e| QuilError::InvalidArgument(format!("mint: forest proof decode: {e}")))?;
     let vertex = match mp.inputs.first() {
         Some(v) => v,
-        None => return Ok(false),
+        None => {
+            quil_types::append_debug_log("verify_mint_reward_membership", "FAIL: mp.inputs.first() is None");
+            return Ok(false);
+        }
     };
     let mut vertex_id = [0u8; 64];
     vertex_id[..32].copy_from_slice(prover_root_domain);
     vertex_id[32..].copy_from_slice(leaf_owner_address);
     if vertex.vertex_address != vertex_id {
+        quil_types::append_debug_log("verify_mint_reward_membership", &format!("FAIL: vertex_address mismatch: got {}, expected {}", hex::encode(&vertex.vertex_address), hex::encode(vertex_id)));
         return Ok(false);
     }
-    if quil_forest::verify_vertex_membership(reward_root, vertex, &expected).is_err() {
+    if let Err(e) = quil_forest::verify_vertex_membership(reward_root, vertex, &expected) {
+        quil_types::append_debug_log("verify_mint_reward_membership", &format!("FAIL: verify_vertex_membership failed: {e}, reward_root={}", hex::encode(reward_root)));
         return Ok(false);
     }
     // Spend authority: the Falcon signer is the reward owner (self or delegate).
     let signer_addr = quil_crypto::poseidon::hash_bytes_to_32(falcon_pubkey)?;
-    Ok(signer_addr.as_slice() == owner_prover_address)
+    if signer_addr.as_slice() != owner_prover_address {
+        quil_types::append_debug_log("verify_mint_reward_membership", &format!("FAIL: signer_addr mismatch: got {}, expected {}", hex::encode(&signer_addr), hex::encode(owner_prover_address)));
+        return Ok(false);
+    }
+    quil_types::append_debug_log("verify_mint_reward_membership", "PASS");
+    Ok(true)
 }
 
 /// Verify a mint authorization **Falcon (FN-DSA-512)** signature — the
@@ -459,6 +469,7 @@ pub fn verify_lattice_pomw_mint(
     for inp in inputs {
         // A reward can be claimed once per mint (owner uniqueness within the tx).
         if !seen.insert(&inp.owner_prover_address) {
+            quil_types::append_debug_log("verify_lattice_pomw_mint", "FAIL: seen.insert returned false");
             return Ok(None);
         }
         let (prover_root_domain, leaf_owner) =
@@ -472,17 +483,21 @@ pub fn verify_lattice_pomw_mint(
             &inp.falcon_pubkey,
             inp.value,
         )? {
+            quil_types::append_debug_log("verify_lattice_pomw_mint", "FAIL: verify_mint_reward_membership returned false");
             return Ok(None);
         }
         if !verify_mint_auth_signature(&inp.falcon_pubkey, &inp.falcon_sig, inp.value, &mu, domain) {
+            quil_types::append_debug_log("verify_lattice_pomw_mint", "FAIL: verify_mint_auth_signature returned false");
             return Ok(None);
         }
     }
 
     // Confidential conservation: outputs sum to the authorized total.
     if !verify_mint_crypto(np, total, output_commitments, output_range_proofs, balance_proof)? {
+        quil_types::append_debug_log("verify_lattice_pomw_mint", "FAIL: verify_mint_crypto returned false");
         return Ok(None);
     }
+    quil_types::append_debug_log("verify_lattice_pomw_mint", &format!("PASS: total={}", total));
     Ok(Some(total))
 }
 

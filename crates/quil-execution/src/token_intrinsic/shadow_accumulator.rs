@@ -55,8 +55,10 @@ pub const ACC_ROOT_ADDRESS: [u8; 32] = {
 /// `(one_time_key P, commitment cv)` field bytes (each a wire-encoded node).
 /// Returns `Ok(None)` for non-coin vertices (metadata, pending, spent markers).
 pub fn extract_coin_leaf(blob: &[u8], domain: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-    let root = deserialize_go_tree(blob)
-        .map_err(|e| QuilError::Internal(format!("shadow-acc: coin blob decode: {e}")))?;
+    let root = match deserialize_go_tree(blob) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
     let tree = VectorCommitmentTree { root };
     // Filter on the type marker VALUE — not merely "has a [0xFF;32] leaf" — so
     // metadata/pending/spent vertices are excluded.
@@ -87,6 +89,9 @@ where
     // Collect (address, P, cv) for coins only, then sort by address.
     let mut leaves: Vec<([u8; 32], Vec<u8>, Vec<u8>)> = Vec::new();
     for (addr, blob) in coins {
+        if addr.as_slice() == ACC_ROOT_ADDRESS || addr.as_slice() == &[0xFFu8; 32] {
+            continue;
+        }
         if let Some((p, cv)) = extract_coin_leaf(&blob, domain)? {
             let mut a = [0u8; 32];
             let n = addr.len().min(32);
@@ -109,8 +114,10 @@ pub fn extract_coin_leaf_full(
     blob: &[u8],
     domain: &[u8],
 ) -> Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>)>> {
-    let root = deserialize_go_tree(blob)
-        .map_err(|e| QuilError::Internal(format!("shadow-acc: coin blob decode: {e}")))?;
+    let root = match deserialize_go_tree(blob) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
     let tree = VectorCommitmentTree { root };
     let want_type = coin_type_hash(domain)?;
     match tree.get(&COIN_KEY_TYPE) {
@@ -142,9 +149,12 @@ pub fn scan_domain_coins(
         if scan_err.is_some() {
             return;
         }
+        let addr = if key.len() >= 64 { &key[32..64] } else { &key[..] };
+        if addr == ACC_ROOT_ADDRESS || addr == &[0xFFu8; 32] {
+            return;
+        }
         match extract_coin_leaf_full(&blob, domain) {
             Ok(Some((p, cv, memo))) => {
-                let addr = if key.len() >= 64 { &key[32..64] } else { &key[..] };
                 let mut a = [0u8; 32];
                 let n = addr.len().min(32);
                 a[..n].copy_from_slice(&addr[..n]);

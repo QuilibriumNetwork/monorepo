@@ -998,6 +998,7 @@ fn describe_message_bundle(bundle: &global::MessageBundle) -> String {
             Some(R::SeniorityMerge(_)) => "SeniorityMerge",
             Some(R::ShardSplit(_)) => "ShardSplit",
             Some(R::ShardMerge(_)) => "ShardMerge",
+            Some(R::RawCanonicalPayload(_)) => "RawCanonicalPayload",
         });
     }
     tags.join(",")

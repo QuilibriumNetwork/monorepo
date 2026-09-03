@@ -585,6 +585,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // already rejected at ingest.
         // ------------------------------------------------------------------
         let collected = self.message_collector.collect_for_rank(rank);
+        if !collected.is_empty() {
+            quil_types::append_debug_log("LEADER collect_for_rank", &format!("frame={}, rank={}, collected={}", frame_number, rank, collected.len()));
+        }
         let messages = match self.message_validator.as_ref() {
             Some(validator) => {
                 // The collector holds GLOBAL messages, validated against the
@@ -617,9 +620,29 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         }
                         continue;
                     }
-                    match validator.validate_message(frame_number, &global_addr, &raw) {
-                        Ok(()) => valid.push(raw),
+                    let val_addr = if let Ok(req) = quil_execution::message_envelope::CanonicalMessageRequest::from_canonical_bytes(&raw) {
+                        if quil_execution::token_engine::is_token_type_prefix(req.inner_type_prefix) {
+                            quil_execution::domains::QUIL_TOKEN.to_vec()
+                        } else {
+                            global_addr.to_vec()
+                        }
+                    } else if let Ok(bundle) = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(&raw) {
+                        if bundle.requests.iter().filter_map(|r| r.as_ref()).any(|r| quil_execution::token_engine::is_token_type_prefix(r.inner_type_prefix)) {
+                            quil_execution::domains::QUIL_TOKEN.to_vec()
+                        } else {
+                            global_addr.to_vec()
+                        }
+                    } else {
+                        global_addr.to_vec()
+                    };
+                    let tp = if raw.len() >= 4 { u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) } else { 0 };
+                    match validator.validate_message(frame_number, &val_addr, &raw) {
+                        Ok(()) => {
+                            quil_types::append_debug_log("LEADER validate_message", &format!("frame={}, tp=0x{:08x}, val_addr={} -> VALID", frame_number, tp, hex::encode(&val_addr)));
+                            valid.push(raw);
+                        }
                         Err(e) => {
+                            quil_types::append_debug_log("LEADER validate_message", &format!("frame={}, tp=0x{:08x}, val_addr={} -> INVALID: {}", frame_number, tp, hex::encode(&val_addr), e));
                             tracing::debug!(
                                 frame = frame_number,
                                 error = %e,

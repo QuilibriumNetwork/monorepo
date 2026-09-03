@@ -68,6 +68,16 @@ pub async fn run(tc: &TokenCtx) -> anyhow::Result<()> {
                 }
             }
         }
+        match super::lattice::scan_owned_coins(&mut client, &QUIL_TOKEN.to_vec(), &w).await {
+            Ok(owned_coins) => {
+                for c in &owned_coins {
+                    sum += BigInt::from(c.amount);
+                }
+            }
+            Err(e) => {
+                eprintln!("[warn] scan lattice coins: {}", e);
+            }
+        }
     }
 
     let formatted = util::float_string_12(&sum, &util::conversion_factor());

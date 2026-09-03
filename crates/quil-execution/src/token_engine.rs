@@ -51,6 +51,11 @@ pub enum MessageKindToken {
     Transaction,
     PendingTransaction,
     MintTransaction,
+    LatticeTransaction,
+    LatticeMint,
+    LatticePending,
+    LatticePendingClaim,
+    LatticeShield,
 }
 
 impl MessageKindToken {
@@ -61,6 +66,11 @@ impl MessageKindToken {
             Self::Transaction => TYPE_TRANSACTION,
             Self::PendingTransaction => TYPE_PENDING_TRANSACTION,
             Self::MintTransaction => TYPE_MINT_TRANSACTION,
+            Self::LatticeTransaction => TYPE_LATTICE_TRANSACTION,
+            Self::LatticeMint => TYPE_LATTICE_MINT,
+            Self::LatticePending => TYPE_LATTICE_PENDING,
+            Self::LatticePendingClaim => TYPE_LATTICE_PENDING_CLAIM,
+            Self::LatticeShield => TYPE_LATTICE_SHIELD,
         }
     }
 
@@ -71,16 +81,26 @@ impl MessageKindToken {
             Self::Transaction => "transaction",
             Self::PendingTransaction => "pending_transaction",
             Self::MintTransaction => "mint_transaction",
+            Self::LatticeTransaction => "lattice_transaction",
+            Self::LatticeMint => "lattice_mint",
+            Self::LatticePending => "lattice_pending",
+            Self::LatticePendingClaim => "lattice_pending_claim",
+            Self::LatticeShield => "lattice_shield",
         }
     }
 
-    pub const fn all() -> [MessageKindToken; 5] {
+    pub const fn all() -> [MessageKindToken; 10] {
         [
             Self::TokenDeploy,
             Self::TokenUpdate,
             Self::Transaction,
             Self::PendingTransaction,
             Self::MintTransaction,
+            Self::LatticeTransaction,
+            Self::LatticeMint,
+            Self::LatticePending,
+            Self::LatticePendingClaim,
+            Self::LatticeShield,
         ]
     }
 }
@@ -99,6 +119,11 @@ pub fn peek_token_message_kind(input: &[u8]) -> Result<MessageKindToken> {
         TYPE_TRANSACTION => Ok(MessageKindToken::Transaction),
         TYPE_PENDING_TRANSACTION => Ok(MessageKindToken::PendingTransaction),
         TYPE_MINT_TRANSACTION => Ok(MessageKindToken::MintTransaction),
+        TYPE_LATTICE_TRANSACTION => Ok(MessageKindToken::LatticeTransaction),
+        TYPE_LATTICE_MINT => Ok(MessageKindToken::LatticeMint),
+        TYPE_LATTICE_PENDING => Ok(MessageKindToken::LatticePending),
+        TYPE_LATTICE_PENDING_CLAIM => Ok(MessageKindToken::LatticePendingClaim),
+        TYPE_LATTICE_SHIELD => Ok(MessageKindToken::LatticeShield),
         other => Err(QuilError::InvalidArgument(format!(
             "token dispatch: unknown type prefix 0x{:08x}",
             other
@@ -255,7 +280,7 @@ mod tests {
             .iter()
             .map(|k| k.type_prefix())
             .collect();
-        assert_eq!(ids.len(), 5);
+        assert_eq!(ids.len(), 10);
     }
 
     #[test]
