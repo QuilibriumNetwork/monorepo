@@ -26,6 +26,9 @@ pub struct ProdProverTreeSyncer {
     /// is absent or empty (the multi-process worker path, which dials its master).
     pub master_stream_addr: String,
     /// Worker's HypergraphStore (the forest shares its RocksDB).
+    /// Supplied by the caller for lifetime/ownership parity with the master
+    /// syncer; the sync paths below go through `crdt`'s own forest handle.
+    #[allow(dead_code)]
     pub hg_store: Arc<quil_store::RocksHypergraphStore>,
     /// Falcon q-prover-key signing key (1281B) — the `:8340` network identity
     /// used for the PQNoise handshake to the master.

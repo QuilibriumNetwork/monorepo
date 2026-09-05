@@ -136,6 +136,9 @@ struct WorkerState {
     allocated: bool,
     cancel: CancellationToken,
     tx: mpsc::Sender<MasterToWorker>,
+    /// Kept so the spawned worker task is owned by the supervisor; shutdown
+    /// goes through `cancel`, so the handle is never awaited.
+    #[allow(dead_code)]
     handle: Option<JoinHandle<()>>,
 }
 

@@ -68,6 +68,9 @@ struct R<'a> {
     b: &'a [u8],
     p: usize,
 }
+// The payload is the failure site ("eof", ...); it reaches callers through
+// the derived `Debug`, which rustc does not count as a read.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct DecodeError(&'static str);
 

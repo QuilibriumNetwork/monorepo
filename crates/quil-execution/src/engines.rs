@@ -75,6 +75,9 @@ pub enum ExecutionMode {
 /// Global execution engine — handles prover joins/leaves, shard management,
 /// and global state transitions.
 pub struct GlobalExecutionEngine {
+    /// Held so the engine can commit request trees once global inclusion
+    /// proving is wired in; the intrinsic does its own committing today.
+    #[allow(dead_code)]
     inclusion_prover: Arc<dyn InclusionProver>,
     intrinsic: Option<crate::global_intrinsic::intrinsic::GlobalIntrinsic>,
     crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
@@ -465,6 +468,9 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
 /// signature without actually verifying anything (paired with paths
 /// that don't exercise the verify chain).
 pub struct TokenExecutionEngine {
+    /// Set at construction and carried for parity with the Go engines;
+    /// dispatch no longer branches on it.
+    #[allow(dead_code)]
     mode: ExecutionMode,
     inclusion_prover: Arc<dyn InclusionProver>,
     state: Option<Arc<crate::hypergraph_state::HypergraphState>>,
@@ -1263,6 +1269,9 @@ impl ShardExecutionEngine for TokenExecutionEngine {
 /// on-chain existence gate. Making this structural prerequisite
 /// fail-fast lets us reject the malformed shape before paying for
 /// any crypto work, and makes the invariant unit-testable directly.
+// NOTE: this structural gate is implemented but not yet called from the
+// token dispatch path — see the doc comment above for why that matters.
+#[allow(dead_code)]
 pub(crate) fn require_traversal_proof_for_inputs(
     tx: &crate::token_intrinsic::Transaction,
 ) -> Result<()> {
@@ -1433,6 +1442,7 @@ fn extract_filter_and_load_alloc(
 /// PendingTransactionOutput canonical bytes into materialize inputs.
 /// PendingTransactionOutput has two recipients (`to` + `refund`);
 /// both produce a coin vertex.
+#[allow(dead_code)] // materialization reads outputs through the intrinsic instead
 fn parse_tx_outputs(
     raw_outputs: &[Vec<u8>],
     frame_number: u64,
@@ -1481,6 +1491,7 @@ fn parse_tx_outputs(
 /// Extract input signatures from nested TransactionInput or
 /// PendingTransactionInput canonical bytes. Both have the same
 /// layout (commitment, signature, proofs) but different type prefixes.
+#[allow(dead_code)] // see `parse_tx_outputs`
 fn parse_tx_input_sigs(raw_inputs: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
     let mut sigs = Vec::with_capacity(raw_inputs.len());
     for raw in raw_inputs {
@@ -1523,6 +1534,9 @@ fn write_tx_result(
 /// Crypto + compiler dependencies are mandatory. There is no longer a
 /// "structural peek only" fallback at dispatch time.
 pub struct ComputeExecutionEngine {
+    /// Set at construction and carried for parity with the Go engines;
+    /// dispatch no longer branches on it.
+    #[allow(dead_code)]
     mode: ExecutionMode,
     state: Option<Arc<crate::hypergraph_state::HypergraphState>>,
     key_manager: Arc<dyn quil_types::crypto::KeyManager>,
@@ -1807,6 +1821,9 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
 
 /// Hypergraph execution engine — handles vertex/hyperedge add/remove.
 pub struct HypergraphExecutionEngine {
+    /// Set at construction and carried for parity with the Go engines;
+    /// dispatch no longer branches on it.
+    #[allow(dead_code)]
     mode: ExecutionMode,
     state: Option<Arc<crate::hypergraph_state::HypergraphState>>,
     inclusion_prover: Arc<dyn InclusionProver>,
@@ -1872,6 +1889,9 @@ impl HypergraphExecutionEngine {
         self
     }
 
+    // Accessor for the mandatory dependency above; the op paths hold their
+    // own reference.
+    #[allow(dead_code)]
     fn inclusion_prover(&self) -> &Arc<dyn InclusionProver> {
         &self.inclusion_prover
     }

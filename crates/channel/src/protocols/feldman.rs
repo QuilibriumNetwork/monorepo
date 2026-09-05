@@ -13,6 +13,9 @@ pub enum FeldmanError {
     #[error("Invalid data: {0}")]
     InvalidData(String),
     #[error("Crypto error: {0}")]
+    // Reserved for crypto-layer failures; every current failure path maps to
+    // `InvalidData` or `WrongRound`.
+    #[allow(dead_code)]
     CryptoError(String),
 }
 
@@ -364,6 +367,8 @@ impl Feldman {
         lhs.ct_eq(&expected).into()
     }
     
+    // Accessor for embedders that drive Feldman VSS directly.
+    #[allow(dead_code)]
     pub fn scalar(&self) -> Option<&Scalar> {
         self.scalar.as_ref()
     }
