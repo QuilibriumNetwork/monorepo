@@ -18,7 +18,7 @@ env:
 
 jobs:
   # -----------------------------------------------------------------
-  # build — `cargo check` against the whole workspace.
+  # build — compile every workspace target early, including test-only code.
   # -----------------------------------------------------------------
   build:
     name: build (cargo check)
@@ -45,8 +45,8 @@ jobs:
           shared-key: rust-ci
           cache-on-failure: true
 
-      - name: cargo check --workspace
-        run: cargo check --workspace --locked
+      - name: cargo check --workspace --all-targets
+        run: cargo check --workspace --locked --all-targets
 
   # -----------------------------------------------------------------
   # test — `cargo nextest run` against the whole workspace.
