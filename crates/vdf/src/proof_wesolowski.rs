@@ -520,22 +520,22 @@ where
   let mut r = TN::from(0);
   r.mod_powm(&TN::from(2u64), &TN::from(iterations), &b);
 
-  // S = sum_i h_i
-  let mut S = TN::from(0);
+  // s_sum = sum_i h_i
+  let mut s_sum = TN::from(0);
   for id in ids {
       let hi = hash_to_exponent::<TN>(challenge, id.as_ref());
-      S = S + hi;
+      s_sum = s_sum + hi;
   }
 
   // lhs = pi_agg^b * x^{ r * S }
   let mut lhs = pi_agg.clone();
   lhs.pow(b.clone());
 
-  let rS = r * S;
-  let mut xrS = x.clone();
-  xrS.pow(rS);
+  let r_s = r * s_sum;
+  let mut x_rs = x.clone();
+  x_rs.pow(r_s);
 
-  lhs *= &xrS;
+  lhs *= &x_rs;
 
   if &lhs == y_agg { Ok(()) } else { Err(()) }
 }

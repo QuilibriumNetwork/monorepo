@@ -45,6 +45,8 @@ use ::rand::RngCore;
 
 uniffi::include_scaffolding!("lib");
 
+// `M` is the modulus in the FFT recurrence, named as in the KZG literature.
+#[allow(non_snake_case)]
 fn recurse_fft(
     values: &[big::BIG],
     offset: u64,
@@ -1707,11 +1709,11 @@ mod tests {
           let sig = bls_sign(&out.secret_key, b"test msg", b"test domain");
           sigs.push(sig);
         }
-        let blsAggregateOutput = bls_aggregate(
+        let bls_aggregate_output = bls_aggregate(
           &outs.iter().map(|out| out.public_key.clone()).collect::<Vec<Vec<u8>>>(),
           &sigs,
         );
-        assert!(bls_verify(&blsAggregateOutput.aggregate_public_key, &blsAggregateOutput.aggregate_signature, b"test msg", b"test domain"));
+        assert!(bls_verify(&bls_aggregate_output.aggregate_public_key, &bls_aggregate_output.aggregate_signature, b"test msg", b"test domain"));
     }
 
     #[test]
@@ -1759,11 +1761,11 @@ mod tests {
           messages.push(msg.as_bytes().to_vec());
           sigs.push(sig);
         }
-        let blsAggregateOutput = bls_aggregate(
+        let bls_aggregate_output = bls_aggregate(
           &outs.iter().map(|out| out.public_key.clone()).collect::<Vec<Vec<u8>>>(),
           &sigs,
         );
-        assert!(bls_verify_msig_mmsg(&pks, &blsAggregateOutput.aggregate_signature, &messages, b"test domain"));
+        assert!(bls_verify_msig_mmsg(&pks, &bls_aggregate_output.aggregate_signature, &messages, b"test domain"));
     }
 
     #[test]
