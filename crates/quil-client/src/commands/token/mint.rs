@@ -16,6 +16,7 @@ use quil_lattice_ct::wire;
 use quil_types::crypto::Signer;
 use quil_types::proto::node::GetProverRewardWitnessRequest;
 
+use super::balance::claimable_reward_value;
 use super::lattice::{parse_address, submit_lattice_message, Wallet};
 use super::TokenCtx;
 
@@ -41,12 +42,8 @@ pub async fn run(tc: &TokenCtx, recipient: Option<&str>) -> anyhow::Result<()> {
     if !resp.found {
         anyhow::bail!("no claimable prover reward found for this wallet");
     }
-    let mut vbuf = [0u8; 16];
-    if resp.value.len() != 16 {
-        anyhow::bail!("reward witness returned a malformed value");
-    }
-    vbuf.copy_from_slice(&resp.value);
-    let value = u128::from_le_bytes(vbuf);
+    let value = claimable_reward_value(resp.found, &resp.value)?
+        .ok_or_else(|| anyhow::anyhow!("no claimable prover reward found for this wallet"))?;
     if value == 0 {
         anyhow::bail!("prover reward balance is zero");
     }
