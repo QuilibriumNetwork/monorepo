@@ -405,7 +405,7 @@ impl<'t, 'g> Prover<'t, 'g> {
 
             // Commit the blinding factors for the input wires
             for v_b in &self.v_blinding {
-                builder = builder.rekey_with_witness_bytes(b"v_blinding", v_b.as_bytes());
+                builder = builder.rekey_with_witness_bytes(b"v_blinding", &v_b.to_bytes());
             }
 
             use rand::thread_rng;
