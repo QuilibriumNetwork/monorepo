@@ -1377,11 +1377,10 @@ pub fn encode_pending_claim(e: &PendingClaimEnvelope) -> Vec<u8> {
     out
 }
 pub fn decode_pending_claim(b: &[u8]) -> Result<PendingClaimEnvelope> {
-    let mut p = 0usize;
     let mut escrow_address = [0u8; 32];
     let s = b.get(0..32).ok_or_else(|| QuilError::InvalidArgument("lattice-ct: claim eof".into()))?;
     escrow_address.copy_from_slice(s);
-    p = 32;
+    let mut p = 32usize;
     let is_to = *b.get(p).ok_or_else(|| QuilError::InvalidArgument("lattice-ct: claim eof".into()))? != 0;
     p += 1;
     let falcon_sig = take_one(b, &mut p)?;

@@ -315,6 +315,7 @@ mod tests {
         };
         let b = a.clone();
         a.app_address[0] = 0xFF;
+        assert_eq!(a.app_address[0], 0xFF);
         assert_eq!(b.app_address[0], 0);
     }
 
