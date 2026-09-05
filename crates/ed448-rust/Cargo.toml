@@ -53,3 +53,10 @@ features = ["getrandom"]
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "docsrs"]
 features = ["docinclude"] # Activate `docinclude` during docs.rs build.
+
+# Vendored upstream code: lints are allowed at the crate level rather than
+# fixed in place, so this tree stays byte-comparable with https://github.com/lolo32/ed448-rust and
+# re-vendoring does not have to re-apply a cleanup patch. Only the cosmetic
+# lints below are silenced; soundness lints are deliberately left enabled.
+[lints.rust]
+unused_imports = "allow"

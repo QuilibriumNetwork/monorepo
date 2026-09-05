@@ -127,3 +127,13 @@ priority = -1
 
 [lints.rust]
 unreachable_pub = "warn"
+
+# Vendored upstream code (rust-libp2p 0.6.2 + the Quilibrium pure-NTRU QUIC
+# handshake): lints are allowed at the crate level rather than fixed in place,
+# so this tree stays byte-comparable with upstream and re-vendoring does not
+# have to re-apply a cleanup patch. `deprecated` covers the webpki
+# `Error::UnsupportedSignatureAlgorithm{,ForPublicKey}` variants, which the
+# rustls-webpki release this fork is pinned to still returns; migrating to the
+# `*Context` variants is an upstream change, not ours.
+deprecated = "allow"
+unused_parens = "allow"

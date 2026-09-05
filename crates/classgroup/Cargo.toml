@@ -35,3 +35,24 @@ criterion = ">=0.2"
 name = "classgroup-bench"
 harness = false
 path = "bench/bench.rs"
+
+# Originally vendored from https://github.com/poanetwork/vdf. Cosmetic lints are
+# allowed at the crate level rather than patched out, to keep the diff against
+# that upstream small and reviewable. Note this tree is NOT a pristine copy — it
+# has been patched locally more than once (`src/vdf.cpp` and `build.rs` were both
+# substantially rewritten here), so "do not touch it, it is vendored" is not a
+# reason to leave a real defect in place. Only the cosmetic lints below are
+# silenced; soundness lints are deliberately left enabled.
+#
+# `deprecated` covers build.rs's two `cc::Build::static_flag` calls. It does NOT
+# reach src/gmp/, which opens with `#![warn(deprecated)]` — an in-source
+# attribute wins over the level this table passes on the command line. So do not
+# delete this key thinking src/gmp/ proves it is dead; it is not.
+[lints.rust]
+bare_trait_objects = "allow"
+dead_code = "allow"
+deprecated = "allow"
+noop_method_call = "allow"
+non_fmt_panics = "allow"
+unexpected_cfgs = "allow"
+unused_variables = "allow"
