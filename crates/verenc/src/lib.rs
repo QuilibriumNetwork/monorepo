@@ -435,7 +435,7 @@ pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
     let pke = Elgamal::setup(&params);
     let (N, t, n) = RVE_PARAMS[0];
     let vparams = RDkgithParams{ N, t, n };
-    let mut ve = RDkgith::setup(&params, &vparams, pke.clone());
+    let ve = RDkgith::setup(&params, &vparams, pke.clone());
     let wit_recover = ve.recover(&statement.unwrap(), &decryption_key, &ve_ct);
     return wit_recover.to_bytes().to_vec();
 }
@@ -497,7 +497,7 @@ mod tests {
         OsRng::fill_bytes(&mut OsRng, &mut roundcheck);
         let rndch = chunk_data_for_verenc(roundcheck.to_vec());
         assert!(rndch.len() == 24);
-        for i in 0..1000 {
+        for _i in 0..1000 {
             let mut data: [u8; 1265] = [0u8;1265];
             OsRng::fill_bytes(&mut OsRng, &mut data);
             let chunks = chunk_data_for_verenc(data.to_vec());

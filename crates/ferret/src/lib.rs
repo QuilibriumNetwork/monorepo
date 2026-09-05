@@ -3,9 +3,7 @@
 use core::fmt;
 use std::error::Error;
 use std::ffi::CString;
-use std::os::raw::{c_char, c_void, c_int};
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha20Rng;
+use std::os::raw::{c_char, c_int};
 use std::sync::{Arc, Mutex};
 
 

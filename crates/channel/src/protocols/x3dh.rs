@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use sha2::Sha512;
 use hkdf::Hkdf;
-use ed448_goldilocks_plus::{subtle, CompressedEdwardsY, EdwardsPoint, Scalar};
+use ed448_goldilocks_plus::{EdwardsPoint, Scalar};
 use lazy_static::lazy_static;
 
 lazy_static! {

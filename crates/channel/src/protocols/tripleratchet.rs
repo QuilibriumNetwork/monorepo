@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ed448_goldilocks_plus::elliptic_curve::group::GroupEncoding;
 use ed448_goldilocks_plus::elliptic_curve::Group;
 use rand::rngs::OsRng;
-use rand::{CryptoRng, RngCore};
+use rand::RngCore;
 use sha2::{Sha512, Digest};
 use hkdf::Hkdf;
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -14,7 +14,7 @@ use thiserror::Error;
 use subtle::ConstantTimeEq;
 use super::doubleratchet::{MAX_SKIP, MAX_SKIPPED_KEYS};
 
-use super::doubleratchet::{DoubleRatchetParticipant, DoubleRatchetParticipantJson, MessageCiphertext, P2PChannelEnvelope};
+use super::doubleratchet::{DoubleRatchetParticipant, MessageCiphertext, P2PChannelEnvelope};
 use super::feldman::{Feldman, vec_to_array, FeldmanReveal, FeldmanFrag};
 use super::x3dh::{receiver_x3dh, sender_x3dh};
 
@@ -956,7 +956,12 @@ impl TripleRatchetParticipant {
           },
           Err(_) if receiving_header_key == self.current_header_key => {
               if self.async_dkg_ratchet && self.async_dkg_pubkey.is_some() {
-                  let receiving_group_key = Some(self.dkg_ratchet.public_key().to_bytes().to_vec());
+                  // This only derives the header key to *try* the decrypt; the
+                  // matching state update (`receiving_group_key`, `root_key`,
+                  // `current_header_key`, `next_header_key`) is performed by
+                  // `advance_and_decrypt` when we return
+                  // `should_advance_dkg_ratchet = true` below. Do not assign
+                  // `self.receiving_group_key` here as well.
                   let sess = Sha512::digest(&self.dkg_ratchet.public_key_bytes());
                   let hkdf = Hkdf::<Sha512>::new(
                       Some(&sess),
