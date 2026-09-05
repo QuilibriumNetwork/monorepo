@@ -43,6 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 num-bigint = "0.4"
 rand = "0.8"
 reqwest = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"

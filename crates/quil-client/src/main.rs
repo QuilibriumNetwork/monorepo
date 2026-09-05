@@ -116,6 +116,12 @@ fn main() {
 }
 
 fn real_main() -> anyhow::Result<()> {
+    // qclient's RPC dependency graph can enable more than one rustls crypto
+    // provider.  Select ring explicitly before any command creates a TLS
+    // client; otherwise rustls aborts when its process-wide default is first
+    // requested.
+    install_rustls_provider();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -153,9 +159,26 @@ fn real_main() -> anyhow::Result<()> {
     }
 }
 
+fn install_rustls_provider() {
+    // A library may have installed a provider already.  In that case keep the
+    // existing process-wide choice; at qclient startup this selects ring.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Build a multi-threaded Tokio runtime for RPC-bearing commands.
 fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_rustls_provider;
+
+    #[test]
+    fn selects_a_process_wide_rustls_provider() {
+        install_rustls_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 }
