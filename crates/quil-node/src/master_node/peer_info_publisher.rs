@@ -35,6 +35,74 @@ pub(crate) struct PeerInfoPublisherArgs {
     pub onion_routing_enabled: bool,
 }
 
+/// How long to wait for a peer to appear on the PeerInfo topic before
+/// publishing anyway. Generous next to observed mesh formation (a few
+/// seconds), and far below the mainnet republish period, so a node that
+/// really is alone still degrades to the old behaviour — one failed
+/// publish — rather than going quiet.
+const TOPIC_PEER_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Block until at least one connected peer advertises `bitmask`, or
+/// `TOPIC_PEER_WAIT` elapses. Returns the peer count actually observed.
+///
+/// BlossomSub rejects a publish outright when nobody is subscribed to the
+/// topic (`NoPeersSubscribedToTopic`); the message is not buffered for
+/// redelivery. At startup the swarm has no connections at all, so the very
+/// first PeerInfo publish is guaranteed to fail — and the next attempt is a
+/// whole republish period away, 30 minutes on mainnet. Waiting for a
+/// subscriber first turns that hole into a few seconds of delay.
+async fn wait_for_topic_peer(
+    handle: &quil_p2p::node::P2PHandle,
+    bitmask: &[u8],
+) -> usize {
+    wait_for_topic_peer_with(TOPIC_PEER_WAIT, || {
+        let handle = handle.clone();
+        let bitmask = bitmask.to_vec();
+        async move { handle.subscribed_peer_count(bitmask).await }
+    })
+    .await
+}
+
+/// The waiting policy, over any source of subscriber counts.
+async fn wait_for_topic_peer_with<F, Fut>(max_wait: std::time::Duration, count: F) -> usize
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = quil_types::error::Result<usize>>,
+{
+    let deadline = tokio::time::Instant::now() + max_wait;
+    let mut wait_logged = false;
+    loop {
+        match count().await {
+            Ok(peers) if peers > 0 => {
+                if wait_logged {
+                    info!(peers, "PeerInfo topic has subscribers; publishing");
+                }
+                return peers;
+            }
+            Ok(_) => {
+                if !wait_logged {
+                    wait_logged = true;
+                    info!("waiting for a subscribed PeerInfo peer before publishing");
+                }
+            }
+            // A dead command channel means the swarm is shutting down.
+            // Nothing to wait for; let the publish attempt report it.
+            Err(e) => {
+                warn!(error = %e, "PeerInfo topic peer count failed");
+                return 0;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                wait_secs = max_wait.as_secs(),
+                "no subscribed PeerInfo peer appeared; publishing anyway"
+            );
+            return 0;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
 pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisherArgs) {
     let PeerInfoPublisherArgs {
         p2p_handle,
@@ -134,6 +202,18 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             tokio::time::interval(std::time::Duration::from_secs(publish_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            // Tick FIRST. `interval`'s opening tick completes immediately, so
+            // this still publishes at startup without delay — but it stops the
+            // body from running twice back-to-back, which is what the trailing
+            // tick did and why every restart logged its publish failures in
+            // pairs.
+            interval.tick().await;
+
+            // Nobody subscribed yet means the publish would be rejected and
+            // dropped, not queued. Wait for a subscriber instead of burning
+            // the attempt.
+            wait_for_topic_peer(&pi_handle, &bitmask).await;
+
             // Resolve multiaddrs: prefer observed (NAT-resolved), then announce, then listen
             let observed = pi_p2p_handle.observed_addresses();
             let pubsub_addr = if !pi_announce.is_empty() {
@@ -277,9 +357,70 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                     }
                 }
             }
-
-            interval.tick().await;
         }
     });
     info!(publish_secs, "PeerInfo publisher started");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_for_topic_peer_with;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// The common case: the mesh fills in a few polls and the wait ends the
+    /// moment a subscriber appears, not at the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn returns_as_soon_as_a_subscriber_appears() {
+        let polls = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let peers = wait_for_topic_peer_with(Duration::from_secs(120), || {
+            let n = polls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(if n >= 3 { 2 } else { 0 }) }
+        })
+        .await;
+
+        assert_eq!(peers, 2);
+        assert_eq!(polls.load(Ordering::SeqCst), 4);
+        // Three one-second sleeps, nowhere near the 120 s cap.
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    /// A node that really is alone must not wait forever. It gives up at the
+    /// cap and lets the caller publish (and fail) exactly as before.
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_at_the_cap_when_no_peer_ever_appears() {
+        let started = tokio::time::Instant::now();
+        let peers =
+            wait_for_topic_peer_with(Duration::from_secs(5), || async { Ok(0) }).await;
+
+        assert_eq!(peers, 0);
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    /// A subscriber already present costs no delay at all — the fast path
+    /// every republish after the first takes.
+    #[tokio::test(start_paused = true)]
+    async fn does_not_delay_when_peers_are_already_present() {
+        let started = tokio::time::Instant::now();
+        let peers =
+            wait_for_topic_peer_with(Duration::from_secs(120), || async { Ok(7) }).await;
+
+        assert_eq!(peers, 7);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// A dead command channel means the swarm is going away; waiting on it
+    /// would hang shutdown, so the wait ends immediately.
+    #[tokio::test(start_paused = true)]
+    async fn stops_waiting_when_the_swarm_is_gone() {
+        let started = tokio::time::Instant::now();
+        let peers = wait_for_topic_peer_with(Duration::from_secs(120), || async {
+            Err(quil_types::error::QuilError::P2p("p2p command channel closed".into()))
+        })
+        .await;
+
+        assert_eq!(peers, 0);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
 }
