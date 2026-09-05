@@ -31,7 +31,7 @@ use quil_execution::token_intrinsic::transaction::{
     RecipientBundle, Transaction, TransactionInput, TransactionOutput,
 };
 use quil_types::crypto::Signer;
-use quil_types::error::{QuilError, Result};
+use quil_types::error::QuilError;
 
 use thiserror::Error;
 

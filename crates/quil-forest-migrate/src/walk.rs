@@ -892,7 +892,7 @@ pub fn run_unified_consolidation_in_place(
 mod tests {
     use super::*;
     use num_bigint::BigInt;
-    use quil_forest::{l3_leaf_key, rollup_phase_roots};
+    use quil_forest::rollup_phase_roots;
     use quil_tries::{serialize_go_tree, VectorCommitmentTree};
     use std::sync::Arc;
 

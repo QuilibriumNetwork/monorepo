@@ -9,7 +9,6 @@ use std::io::Read;
 
 use clap::{Args, Subcommand};
 
-use quil_types::crypto::Signer;
 use quil_types::proto::channel::{
     InboxMessage, InboxMessagePut, InboxMessageRequest, InboxMessageResponse,
 };

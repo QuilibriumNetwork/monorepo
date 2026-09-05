@@ -1994,7 +1994,7 @@ impl HypergraphExecutionEngine {
         msg: &hg_dispatch::DispatchedMessage,
     ) -> Result<()> {
         use crate::hypergraph_intrinsic::auth::{
-            verify_op_signature, AuthCheck, OpForAuth,
+            verify_op_signature, OpForAuth,
         };
         let op = match msg {
             hg_dispatch::DispatchedMessage::VertexAdd(v) => OpForAuth::VertexAdd(v),

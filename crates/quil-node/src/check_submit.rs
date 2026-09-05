@@ -343,7 +343,7 @@ fn build_join_bundle(
 
 /// Walk the `std::error::Error` source chain so the real cause
 /// (rustls / TCP refused / h2) is printed, not just tonic's top line.
-fn print_error_chain(e: &(dyn std::error::Error)) {
+fn print_error_chain(e: &dyn std::error::Error) {
     println!("[check-submit]   error: {e}");
     let mut src = e.source();
     while let Some(s) = src {

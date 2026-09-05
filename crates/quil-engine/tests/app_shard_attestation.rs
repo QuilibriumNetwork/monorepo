@@ -33,7 +33,6 @@
 //!     verified). Catches multi-proof packing + per-signer challenge
 //!     derivation regressions.
 
-use std::sync::Arc;
 
 use quil_crypto::{FalconKeyConstructor, WesolowskiFrameProver};
 use quil_execution::global_intrinsic::frame_header::FrameHeader;

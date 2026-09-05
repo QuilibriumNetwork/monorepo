@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use quil_execution::InMemoryProverRegistry;
 use quil_store::RocksHypergraphStore;
-use quil_types::consensus::ProverRegistry;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

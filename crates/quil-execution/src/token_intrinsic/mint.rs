@@ -768,7 +768,7 @@ pub fn verify_with_payment_input<F>(
 where
     F: FnOnce(&[u8], usize, &[u8]) -> Result<NestedPendingResult>,
 {
-    use num_bigint::{BigInt, Sign};
+    use num_bigint::BigInt;
 
     if input.proofs.len() != 1 {
         return Err(QuilError::InvalidArgument(
@@ -1246,7 +1246,7 @@ where
 /// tokens.
 pub fn materialize_authority(
     tx: &MintTransaction,
-    inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
+    _inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
 ) -> Result<super::materialize::TransactionMaterializeOutput> {
     use super::materialize::{
         coin_type_hash, create_coin_vertex_tree, create_spent_marker_tree,
@@ -1281,7 +1281,7 @@ pub fn materialize_authority(
         let addr = quil_crypto::poseidon::hash_bytes_to_32(
             &output.recipient.verification_key,
         )?;
-        let mut tree = create_coin_vertex_tree(output, &type_hash)?;
+        let tree = create_coin_vertex_tree(output, &type_hash)?;
         // Touch the commit so it matches the Go path which calls
         // `coinTree.Commit(inclusionProver, false)` — we don't use the
         // returned root, but the operation ensures internal state is

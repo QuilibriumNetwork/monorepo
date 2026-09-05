@@ -23,7 +23,9 @@
 //! `N` defaults to 32 to stay far below `q = 2^61−1` (a 2^64 range needs a
 //! larger `q`; amounts must not wrap mod `q`). Parameters are illustrative.
 
-use crate::arith::{matvec, signed_mod, SplitMix64};
+use crate::arith::SplitMix64;
+#[cfg(test)]
+use crate::arith::matvec;
 use crate::binary::{prove_bit, verify_bit, BinaryProof};
 use crate::commitment::{CommitKey, CommitParams, Commitment};
 use crate::sigma::{prove_short_opening, verify_short_opening, ShortOpeningProof, SigmaParams};
@@ -175,7 +177,6 @@ pub fn prove_range(
     if v >= (1u128 << key.n_bits) {
         return None;
     }
-    let q = params.q;
     // Fresh short (ternary) randomness for the bit-vector commitment.
     let mut prg = SplitMix64::new(seed ^ 0xB175);
     let r_b: Vec<i128> = (0..key.m()).map(|_| (prg.next_u64() % 3) as i128 - 1).collect();

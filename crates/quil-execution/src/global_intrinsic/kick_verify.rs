@@ -516,8 +516,6 @@ fn local_app_header_to_proto(
 /// Verify equivocation between two GlobalFrameHeaders.
 fn verify_global_frame_equivocation(frame1: &[u8], frame2: &[u8]) -> Result<bool> {
     // Decode both frames as protobuf GlobalFrameHeader
-    use prost::Message;
-    use quil_types::proto::global::GlobalFrameHeader;
 
     // Skip 4-byte type prefix for proto decoding
     // Note: FromCanonicalBytes in Go reads past the prefix. The proto
@@ -556,7 +554,6 @@ fn verify_global_frame_equivocation(frame1: &[u8], frame2: &[u8]) -> Result<bool
 
 /// Verify equivocation between two FrameHeaders (app shard frames).
 fn verify_app_frame_equivocation(frame1: &[u8], frame2: &[u8]) -> Result<bool> {
-    use quil_types::proto::global::FrameHeader;
 
     let h1 = match decode_app_header_from_canonical(frame1) {
         Some(h) => h,
@@ -796,7 +793,7 @@ mod tests {
 
     #[test]
     fn no_equivocation_type_mismatch() {
-        let mut f1 = make_global_frame_bytes(100, &[0x01; 516]);
+        let f1 = make_global_frame_bytes(100, &[0x01; 516]);
         let mut f2 = make_global_frame_bytes(100, &[0x02; 516]);
         // Change f2's type prefix
         f2[0..4].copy_from_slice(&FRAME_HEADER_TYPE.to_be_bytes());

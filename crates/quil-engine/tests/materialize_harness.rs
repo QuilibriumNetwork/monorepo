@@ -442,7 +442,6 @@ fn split_fixture() -> (
     Arc<quil_execution::prover_registry::SharedProverRegistry>,
     Arc<quil_store::RocksHypergraphStore>,
 ) {
-    use quil_types::store::HypergraphStore as _;
 
     let rocks = quil_store::RocksDb::open_in_memory().unwrap();
     let db = rocks.inner();

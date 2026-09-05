@@ -364,7 +364,7 @@ pub fn materialize_token_deploy(
     domain: &[u8],
     config: &super::config::TokenConfiguration,
     frame_number: u64,
-    inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
+    _inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
 ) -> Result<[u8; 32]> {
     let metadata_addr = crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS;
     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;

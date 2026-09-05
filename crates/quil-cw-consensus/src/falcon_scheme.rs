@@ -413,7 +413,7 @@ impl Subject for TestSubject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_cryptography::certificate::{Scheme as _, Verifier as _};
+    use commonware_cryptography::certificate::Verifier as _;
     use commonware_cryptography::sha256::Digest as Sha256Digest;
     use commonware_math::algebra::Random;
     use commonware_parallel::Sequential;
