@@ -164,6 +164,21 @@ pub(crate) fn reconstruct_local_proposal(
     })
 }
 
+/// What one [`run_record_only_backfill`] call achieved over its range.
+///
+/// The two fields have to be read TOGETHER. `filled == 0` alone does not mean
+/// the range was unobtainable — it also describes a range that was already
+/// complete by the time the call ran, which happens whenever the poller closes
+/// a hole between the gap scan and the backfill reaching it. Only
+/// `filled == 0 && unresolved > 0` means "nobody could serve these heights".
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BackfillOutcome {
+    /// Frame records newly stored — local candidate promotions plus peer fetches.
+    filled: u64,
+    /// Heights still missing when the call gave up.
+    unresolved: u64,
+}
+
 /// Record-only frame backfill for the restart "hole" `[lo, hi]`.
 ///
 /// On restart the forks tree re-seeds at the latest-QC frame N and
@@ -188,6 +203,9 @@ pub(crate) fn reconstruct_local_proposal(
 /// absent (uncommitted / TC-orphaned and correctly not part of the
 /// canonical chain), so after trying the known endpoints we give up on the
 /// remainder and log it rather than wedging.
+///
+/// Reports what the call achieved, so a caller walking a wide gap
+/// chunk-by-chunk knows whether to keep descending — see [`BackfillOutcome`].
 #[allow(clippy::too_many_arguments)]
 async fn run_record_only_backfill(
     pool: Arc<quil_rpc::ArchiveEndpointPool>,
@@ -198,9 +216,9 @@ async fn run_record_only_backfill(
     lo: u64,
     hi: u64,
     cancel: tokio_util::sync::CancellationToken,
-) {
+) -> BackfillOutcome {
     if lo > hi {
-        return;
+        return BackfillOutcome::default();
     }
     info!(lo, hi, "record-only frame-record backfill started");
 
@@ -217,8 +235,8 @@ async fn run_record_only_backfill(
     // together they share the same record hole, so NO peer can serve it — but
     // each one holds the missing frames locally as candidates. Walk first, then
     // fall back to peers only for whatever isn't present locally.
+    let mut promoted_local = 0u64;
     if let Some(mut cur) = anchor {
-        let mut promoted_local = 0u64;
         while !cancel.is_cancelled() {
             let Some(h) = cur.header.as_ref() else { break };
             let fnum = h.frame_number;
@@ -282,7 +300,7 @@ async fn run_record_only_backfill(
         .collect();
     if remaining.is_empty() {
         info!(lo, hi, "record-only backfill: no holes, nothing to do");
-        return;
+        return BackfillOutcome { filled: promoted_local, unresolved: 0 };
     }
     let initial = remaining.len();
     info!(holes = initial, lo, hi, "record-only backfill: filling missing frame records");
@@ -290,12 +308,21 @@ async fn run_record_only_backfill(
     let endpoints = pool.get_all().await;
     if endpoints.is_empty() {
         warn!(holes = initial, "record-only backfill: no archive endpoints known yet — skipping");
-        return;
+        return BackfillOutcome { filled: promoted_local, unresolved: initial as u64 };
     }
     // One pass per known endpoint, plus a little slack; we rotate through
     // `endpoints` so each round prefers a different archive.
     let max_rounds = endpoints.len() + 2;
     let mut filled = 0u64;
+    // Why heights failed, so an unresolved range is diagnosable from the warn
+    // alone. These are NOT interchangeable: `invalid` means an archive DID serve
+    // the record and this node rejected it locally, `unavailable` means no
+    // archive had it. Collapsed into one number they sent a #620 field report
+    // hunting an archive-side gap for a range the archives were serving.
+    // Tallies count ATTEMPTS, not distinct heights — a height retried across
+    // rounds contributes once per round; the ratio is the signal.
+    let (mut invalid, mut unavailable, mut timed_out) = (0usize, 0usize, 0usize);
+    let (mut store_failed, mut connect_failed) = (0usize, 0usize);
     for round in 0..max_rounds {
         if remaining.is_empty() || cancel.is_cancelled() {
             break;
@@ -305,6 +332,7 @@ async fn run_record_only_backfill(
             Ok(c) => c,
             Err(e) => {
                 debug!(%addr, error = %e, "record-only backfill: connect failed, rotating");
+                connect_failed += 1;
                 continue;
             }
         };
@@ -329,6 +357,7 @@ async fn run_record_only_backfill(
                     // endpoint may still serve the honest record for `n`.
                     if !frame_validate(&frame) {
                         debug!(%addr, frame = n, "record-only backfill: frame failed validation — skipping");
+                        invalid += 1;
                         still.push(n);
                         continue;
                     }
@@ -336,6 +365,7 @@ async fn run_record_only_backfill(
                     // execution side effects.
                     if let Err(e) = clock_store.put_global_frame(&frame, None) {
                         warn!(error = %e, frame = n, "record-only backfill: store failed");
+                        store_failed += 1;
                         still.push(n);
                     } else {
                         filled += 1;
@@ -344,10 +374,12 @@ async fn run_record_only_backfill(
                 Ok(Err(e)) => {
                     // This endpoint lacks it; retry on another next round.
                     debug!(%addr, frame = n, error = %e, "record-only backfill: frame unavailable");
+                    unavailable += 1;
                     still.push(n);
                 }
                 Err(_) => {
                     debug!(%addr, frame = n, "record-only backfill: fetch timeout");
+                    timed_out += 1;
                     still.push(n);
                 }
             }
@@ -357,31 +389,180 @@ async fn run_record_only_backfill(
     if remaining.is_empty() {
         info!(filled, attempted = initial, "record-only frame-record backfill complete");
     } else {
+        // No inference about canonicality is drawn here. The old wording
+        // ("likely uncommitted/orphaned, correctly not canonical") was written
+        // for the RESEED path, which fetches ABOVE the canonical head where that
+        // story is right; it is provably wrong for a gap-scan range, whose `hi+1`
+        // is a present canonical record, so the heights beneath it cannot be
+        // orphaned — the canonical chain is contiguous by frame number. Report
+        // what was observed and let the tallies say why.
         warn!(
             filled,
             attempted = initial,
-            unrecoverable = remaining.len(),
-            "record-only backfill finished with frames no peer could serve — \
-             these heights are likely uncommitted/orphaned (correctly not canonical)"
+            unresolved = remaining.len(),
+            invalid,
+            unavailable,
+            timed_out,
+            store_failed,
+            connect_failed,
+            lo,
+            hi,
+            "record-only backfill could not fill every height this pass",
         );
+    }
+    BackfillOutcome { filled: promoted_local + filled, unresolved: remaining.len() as u64 }
+}
+
+/// Lowest frame a gap-scan descent may attempt on `network`.
+///
+/// Genesis is the obvious floor: nothing below it ever existed. On MAINNET the
+/// real floor is higher. Frames at or below the 2.1.0 flag day
+/// (`GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME`, the pre-migration head the chain
+/// rewound to) were produced by pre-migration provers, so step 1 of
+/// [`archive_frame_is_valid`] — the genesis-prover allowlist — rejects every one
+/// of them. Its own comment says so: "expected for legacy pre-migration frames".
+/// An archive serves those records perfectly well; this node fetches them and
+/// then drops them. Descending there is therefore guaranteed-unfillable work,
+/// not a transient peer failure, and it is what a non-archive's depth cap aims
+/// at once the descent reaches the boundary.
+///
+/// The flag day is a MAINNET history artefact — other networks never rewound and
+/// must not inherit the constant, or their backfill would be floored above every
+/// frame they have.
+fn gap_backfill_floor(network: u32) -> u64 {
+    let genesis = quil_engine::genesis::expected_genesis_frame_number(network);
+    if network == 0 {
+        genesis.max(quil_crypto::GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME + 1)
+    } else {
+        genesis
     }
 }
 
-/// Scan the ENTIRE persisted frame-record range for internal gaps left by
-/// prior restarts and backfill each one. The reseed-anchored backfill
-/// (`run_record_only_backfill` called from bootstrap) only covers the single
-/// open range ABOVE the head (`[canonical_head+1, reseed-1]`); it does not see
-/// the many small 2-3 frame holes scattered BELOW the head that accumulate
-/// across repeated restart rounds. This driver finds every such hole (a cheap
-/// key-only keyspace scan) and reuses `run_record_only_backfill` per hole —
-/// which promotes the locally-stashed candidate frames FIRST (the common case:
+/// The sub-range of `[gap_lo, hi]` a pass will actually attempt: clamped UP to
+/// `floor_frame`, then bounded by the depth cap measured DOWN from the gap top.
+/// `None` when the whole gap lies below the floor.
+///
+/// The order is load-bearing. Clamping first and capping second keeps the cap
+/// from re-admitting heights the floor just excluded; capping first would put
+/// `lo` below the floor whenever the cap is deeper than the distance from the
+/// gap top down to it.
+fn clamped_backfill_range(
+    gap_lo: u64,
+    hi: u64,
+    floor_frame: u64,
+    max_backfill_depth: Option<u64>,
+) -> Option<(u64, u64)> {
+    if hi < floor_frame {
+        return None;
+    }
+    let mut lo = gap_lo.max(floor_frame);
+    if let Some(depth) = max_backfill_depth {
+        lo = lo.max(hi.saturating_sub(depth.saturating_sub(1)));
+    }
+    Some((lo, hi))
+}
+
+/// Heights this pass intends to fetch, once every gap is clamped.
+///
+/// The raw hole size is NOT the objective and must not be reported as if it
+/// were. On a bootstrapped mainnet node it counts the 244,199 fictional
+/// sub-genesis heights, and on a non-archive it counts the legacy range beneath
+/// the flag day — so the headline number can sit in the hundreds of thousands
+/// while the descent intends a few thousand, or none at all. Logged alone it
+/// reads as a stall that never moves, which is exactly how it was read in the
+/// field.
+fn intended_backfill_count(
+    gaps: &[(u64, u64)],
+    floor_frame: u64,
+    max_backfill_depth: Option<u64>,
+) -> u64 {
+    gaps.iter()
+        .filter_map(|&(lo, hi)| clamped_backfill_range(lo, hi, floor_frame, max_backfill_depth))
+        .map(|(lo, hi)| hi - lo + 1)
+        .sum()
+}
+
+/// Widest inclusive range handed to a single [`run_record_only_backfill`]
+/// call. That function materializes `(lo..=hi)` into a `Vec<u64>` (one store
+/// lookup per height) and then fetches whatever is left one serial RPC at a
+/// time, so an unsplit range is unbounded work with an unbounded allocation in
+/// front of it. Small holes — the restart-leftover case — fit in one chunk and
+/// are unaffected; the bound exists for the floor gap, which on a node that
+/// state-jumped near head spans the entire chain beneath the jump target.
+const MAX_BACKFILL_CHUNK: u64 = 512;
+
+/// Split an inclusive gap into chunks of at most [`MAX_BACKFILL_CHUNK`]
+/// frames, ordered HIGH to LOW.
+///
+/// The order is not cosmetic. [`run_record_only_backfill`] resolves frames by
+/// walking `parent_selector` down from the record immediately above its range,
+/// so each chunk needs the chunk above it already filled to have an anchor at
+/// all. Descending also means the frames a node needs soonest — the ones just
+/// below its floor, which is where a storage attestation's ρ_N anchor lands —
+/// arrive first, and an interrupted descent leaves the store contiguous
+/// downward from its head rather than perforated.
+fn backfill_chunks(lo: u64, hi: u64) -> Vec<(u64, u64)> {
+    if lo > hi {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut top = hi;
+    loop {
+        let bottom = top.saturating_sub(MAX_BACKFILL_CHUNK - 1).max(lo);
+        chunks.push((bottom, top));
+        if bottom == lo {
+            break;
+        }
+        top = bottom - 1;
+    }
+    chunks
+}
+
+/// Scan the ENTIRE persisted frame-record range for gaps and backfill each
+/// one. Two shapes are covered, both invisible to the poller's forward-fill
+/// (which only climbs from its own cursor toward the head):
+///
+/// - **Internal holes** — the many small 2-3 frame holes scattered BELOW the
+///   head that accumulate across repeated restart rounds (each round's
+///   finalization-lag gap). The reseed-anchored backfill only ever covered the
+///   single open range ABOVE the head, `[canonical_head+1, reseed-1]`.
+/// - **The floor hole** — everything beneath the LOWEST stored record. A state
+///   jump stores its target frame and nothing under it, so this is the normal
+///   post-jump shape, and until `find_global_frame_record_gaps` learned to
+///   report it there was no mechanism anywhere that would fill it.
+///
+/// Per hole it reuses [`run_record_only_backfill`], which promotes the
+/// locally-stashed candidate frames FIRST (the common case for restart holes:
 /// the frames are present as candidates on this very node) and only falls back
 /// to peers for anything genuinely absent locally.
+///
+/// `floor_frame` is the lowest height that can exist on this network — its
+/// genesis frame. The scan cannot know it (see
+/// `find_global_frame_record_gaps`), so clamping is this caller's job, and
+/// skipping it would be actively harmful: `bootstrap_genesis` writes the
+/// genesis record on every node, so `earliest` IS genesis and the reported
+/// floor gap is the whole invented range BENEATH it — 244,199 frames on
+/// mainnet that never existed. Left unclamped this burns a chunk of pointless
+/// fetches at every startup.
+///
+/// `max_backfill_depth` bounds how far below a gap's TOP to descend, for every
+/// gap. Measuring from the top is what makes it useful: the heights a node
+/// needs soonest are the ones just under the records it already has. Descent
+/// also stops early at the first chunk nothing could fill — see
+/// [`run_record_only_backfill`]'s return value.
+///
+/// `unfillable` carries ranges a previous pass failed to fill completely
+/// across passes, so a periodic re-scan does not re-grind heights that are
+/// permanently unobtainable.
+#[allow(clippy::too_many_arguments)]
 async fn run_all_gap_backfill(
     pool: Arc<quil_rpc::ArchiveEndpointPool>,
     clock_store: Arc<quil_store::RocksClockStore>,
     frame_validate: quil_rpc::frame_sync::FrameValidator,
     seed: Vec<u8>,
+    floor_frame: u64,
+    max_backfill_depth: Option<u64>,
+    unfillable: &mut std::collections::HashSet<(u64, u64)>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     // The gap scan walks the whole frame keyspace (key-only, no decode) — run
@@ -394,42 +575,178 @@ async fn run_all_gap_backfill(
     {
         Ok(g) => g,
         Err(e) => {
-            warn!(error = %e, "restart gap scan: scan task failed");
+            warn!(error = %e, "gap scan: scan task failed");
             return;
         }
     };
     if gaps.is_empty() {
-        info!("restart gap scan: no internal frame-record gaps");
+        info!("gap scan: no frame-record gaps");
         return;
     }
     let total: u64 = gaps.iter().map(|(lo, hi)| hi - lo + 1).sum();
+    let intended = intended_backfill_count(&gaps, floor_frame, max_backfill_depth);
+    if intended == 0 {
+        // Every hole is below the floor: fictional sub-genesis heights, legacy
+        // pre-flag-day heights, or both. Say that plainly instead of logging a
+        // six-figure `missing_frames` the descent will never touch.
+        info!(
+            gap_count = gaps.len(),
+            missing_frames = total,
+            floor_frame,
+            "gap scan: every hole is below the backfill floor — nothing to fetch",
+        );
+        return;
+    }
     info!(
         gap_count = gaps.len(),
         missing_frames = total,
-        "restart gap scan: found internal frame-record holes — backfilling \
+        intended_frames = intended,
+        floor_frame,
+        "gap scan: found frame-record holes — backfilling \
          (local candidates first, peers as fallback)",
     );
-    for (lo, hi) in gaps {
+    for (gap_lo, hi) in gaps {
         if cancel.is_cancelled() {
             break;
         }
-        // Anchor at the present record immediately above the hole; its
-        // `parent_selector` chain walks down through [lo, hi]. The record at
-        // hi+1 is guaranteed present (gaps are strictly BETWEEN stored frames).
-        let anchor = clock_store.get_global_frame(hi + 1).ok();
-        run_record_only_backfill(
+        if unfillable.contains(&(gap_lo, hi)) {
+            debug!(lo = gap_lo, hi, "gap scan: range already found unfillable — skipping");
+            continue;
+        }
+        // The floor gap is the one that starts at the lowest backfillable
+        // height: if frame 1 is present no gap can start there, and if it is
+        // absent while anything above it is stored, that range IS the floor
+        // gap. So this identifies it without the scan having to tag it.
+        // Entirely below the floor — fictional sub-genesis heights (the scan
+        // reports the range under the store's floor without knowing where the
+        // chain starts) or legacy pre-flag-day heights this node can never
+        // validate. Either way there is nothing to fetch.
+        let Some((lo, _)) = clamped_backfill_range(gap_lo, hi, floor_frame, max_backfill_depth)
+        else {
+            debug!(
+                lo = gap_lo,
+                hi,
+                floor_frame,
+                "gap scan: range is entirely below the backfill floor — skipping",
+            );
+            continue;
+        };
+        if lo > gap_lo {
+            info!(
+                gap_lo,
+                hi,
+                bounded_lo = lo,
+                floor_frame,
+                "gap scan: descent bounded (backfill floor and/or depth limit)",
+            );
+        }
+        let mut progressed = false;
+        let mut stalled = false;
+        for (chunk_lo, chunk_hi) in backfill_chunks(lo, hi) {
+            if cancel.is_cancelled() {
+                break;
+            }
+            // Anchor at the present record immediately above the chunk; its
+            // `parent_selector` chain walks down through it. `hi+1` is present
+            // by construction for an internal hole, and is the earliest stored
+            // record for a floor gap. Chunks descend, so each one's anchor is
+            // the frame the previous chunk just filled.
+            let anchor = clock_store.get_global_frame(chunk_hi + 1).ok();
+            let outcome = run_record_only_backfill(
+                pool.clone(),
+                clock_store.clone(),
+                frame_validate.clone(),
+                anchor,
+                seed.clone(),
+                chunk_lo,
+                chunk_hi,
+                cancel.clone(),
+            )
+            .await;
+            progressed |= outcome.filled > 0;
+            if outcome.filled == 0 && outcome.unresolved > 0 {
+                // Nothing in this chunk was obtainable. Descending further
+                // cannot help — below the migration boundary every frame fails
+                // the genesis-prover allowlist, and no peer serves a height
+                // that was never canonical.
+                //
+                // `filled == 0` on its own is NOT that signal: a chunk the
+                // poller closed between the scan and here reports zero fills
+                // and zero unresolved, and stopping on it would abandon the
+                // rest of a perfectly fillable descent.
+                stalled = true;
+                debug!(
+                    lo = chunk_lo,
+                    hi = chunk_hi,
+                    unresolved = outcome.unresolved,
+                    "gap scan: chunk could not be served — stopping this gap's descent",
+                );
+                break;
+            }
+        }
+        if stalled && !progressed && !cancel.is_cancelled() {
+            unfillable.insert((gap_lo, hi));
+        }
+    }
+    info!("gap scan: backfill pass complete");
+}
+
+/// Epoch slots a leaf-root registration vertex retains ({prev, current, next} —
+/// see the `PrevEpoch`/`PrevLeafRoot`/`PrevNumBlocks` tags in
+/// `quil_execution::global_schema`). A storage attestation's ρ_N anchor is
+/// resolved against one of these, so this is how many epochs of global frame
+/// records a non-archive needs beneath its floor for its own attestations to
+/// verify — and the natural bound on how far one should backfill.
+const LEAF_ROOT_EPOCH_SLOTS: u64 = 3;
+
+/// How long to wait between whole-keyspace gap scans.
+///
+/// The scan itself is a key-only prefix iteration, but it is not free on a
+/// full archive, and a hole that a pass could not fill will not become
+/// fillable seconds later. The interval is long enough that repeated passes
+/// cost nothing measurable and short enough that a gap opened at RUNTIME —
+/// the far-behind state-jump rescue is the one that opens a fresh floor hole
+/// mid-run — gets filled without waiting for the next restart.
+const GAP_RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Re-run [`run_all_gap_backfill`] for the life of the node.
+///
+/// This used to fire once, at bootstrap. That was enough only while the
+/// gaps it looked for were restart leftovers. A runtime state jump moves the
+/// store's floor up in one step and leaves everything beneath it missing, so
+/// the interesting gap now routinely appears long after bootstrap has passed.
+///
+/// Ranges that a pass cannot fill are remembered and skipped, so the steady
+/// state on a node with permanently-unobtainable holes is one keyspace scan
+/// per interval and no fetches.
+#[allow(clippy::too_many_arguments)]
+async fn run_gap_backfill_loop(
+    pool: Arc<quil_rpc::ArchiveEndpointPool>,
+    clock_store: Arc<quil_store::RocksClockStore>,
+    frame_validate: quil_rpc::frame_sync::FrameValidator,
+    seed: Vec<u8>,
+    floor_frame: u64,
+    max_backfill_depth: Option<u64>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let mut unfillable: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    loop {
+        run_all_gap_backfill(
             pool.clone(),
             clock_store.clone(),
             frame_validate.clone(),
-            anchor,
             seed.clone(),
-            lo,
-            hi,
+            floor_frame,
+            max_backfill_depth,
+            &mut unfillable,
             cancel.clone(),
         )
         .await;
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(GAP_RESCAN_INTERVAL) => {}
+        }
     }
-    info!("restart gap scan: backfill pass complete");
 }
 
 /// Switch for the reseed-anchored record-only backfill (the "record-only-backfill"
@@ -1920,22 +2237,68 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         }
                     }
 
-                    // Beyond the single reseed-anchored gap above, an archive
-                    // restarted many times accumulates many small internal
-                    // frame-record holes scattered BELOW the head (each round's
-                    // finalization-lag gap). Scan the whole keyspace for all of
-                    // them and backfill from local candidates (peers as
-                    // fallback). Archive-only (non-archives don't serve ranges);
-                    // detached + best-effort so it never blocks bringup.
-                    if sync_archive_mode {
+                    // Beyond the single reseed-anchored gap above, a node
+                    // accumulates frame-record holes the poller cannot reach:
+                    // the small internal ones each restart round leaves behind,
+                    // and the whole range beneath the store's floor after a
+                    // state jump. Scan the keyspace for both and backfill from
+                    // local candidates (peers as fallback). Detached +
+                    // best-effort so it never blocks bringup, and looping so a
+                    // gap opened at RUNTIME (the far-behind jump rescue) is
+                    // covered too, not just what bootstrap happened to see.
+                    //
+                    // Run for EVERY role, not just archives. Serving ranges to
+                    // the network is the archive's reason to want contiguity,
+                    // but it is not the only one: a regular's app-shard storage
+                    // attestation anchors ρ_N to an exact global frame that must
+                    // be present locally, which is the same contiguity argument
+                    // the poller's forward-fill is enabled network-wide for.
+                    //
+                    // What differs by role is DEPTH. An archive descends until
+                    // the frames stop being obtainable — it is the authoritative
+                    // range server, so the full history is the point. A regular
+                    // only needs the window its attestations can reference: the
+                    // leaf-root registration vertex retains three epoch slots
+                    // ({prev, current, next} — `global_schema.rs`), so three
+                    // epochs below a gap's top covers every epoch an in-flight
+                    // opening can be validated against. Descending further would
+                    // make every regular re-fetch the chain down to the
+                    // migration boundary for state it will never be asked for —
+                    // ~31k serial fetches on a node that has just adopted a head
+                    // far above its records.
+                    {
                         let gap_pool = sync_archive_pool.clone();
                         let gap_cs = sync_cs.clone();
                         let gap_validate = sync_frame_validate.clone();
                         let gap_cancel = sync_token.clone();
                         let seed = seed.clone();
-                        spawner.detach("restart-gap-backfill", async move {
-                            run_all_gap_backfill(gap_pool, gap_cs, gap_validate, (*seed).clone(), gap_cancel)
-                                .await;
+                        let max_backfill_depth = if sync_archive_mode {
+                            None
+                        } else {
+                            Some(
+                                LEAF_ROOT_EPOCH_SLOTS
+                                    .saturating_mul(quil_types::consensus::epoch_length_frames()),
+                            )
+                        };
+                        // Lowest height this node can actually fill. Two floors
+                        // fold into one: genesis (the scan reports the range under
+                        // the store's floor without knowing where the chain starts,
+                        // and `bootstrap_genesis` guarantees the genesis record is
+                        // present, so that range is fictional) and, on mainnet, the
+                        // 2.1.0 flag day — everything at or below it is a legacy
+                        // frame the genesis-prover allowlist rejects on arrival.
+                        let floor_frame = gap_backfill_floor(network as u32);
+                        spawner.detach("gap-backfill", async move {
+                            run_gap_backfill_loop(
+                                gap_pool,
+                                gap_cs,
+                                gap_validate,
+                                (*seed).clone(),
+                                floor_frame,
+                                max_backfill_depth,
+                                gap_cancel,
+                            )
+                            .await;
                             Ok(())
                         });
                     }
@@ -2901,4 +3264,396 @@ mod validation_tests {
         };
         assert!(!archive_frame_is_valid(&frame, &addrs, &verifier()));
     }
+}
+
+#[cfg(test)]
+mod gap_backfill_tests {
+    use super::*;
+    use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+    use quil_types::store::ClockStore as _;
+
+    /// Chunks cover the gap exactly, none exceeds the bound, and they descend
+    /// — each chunk's anchor is the record the chunk above it just filled.
+    #[test]
+    fn chunks_descend_and_cover_the_gap_exactly() {
+        let chunks = backfill_chunks(1, 3 * MAX_BACKFILL_CHUNK);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.windows(2).all(|w| w[0].0 > w[1].1), "must descend: {chunks:?}");
+        assert!(
+            chunks.iter().all(|(lo, hi)| hi - lo + 1 <= MAX_BACKFILL_CHUNK),
+            "no chunk may exceed the bound: {chunks:?}",
+        );
+        assert_eq!(chunks.first().unwrap().1, 3 * MAX_BACKFILL_CHUNK, "starts at the top");
+        assert_eq!(chunks.last().unwrap().0, 1, "bottoms out at the gap floor");
+        // Contiguous with no overlap.
+        assert!(chunks.windows(2).all(|w| w[0].0 == w[1].1 + 1), "contiguous: {chunks:?}");
+    }
+
+    /// A gap smaller than the bound is one chunk; an empty gap is none.
+    #[test]
+    fn small_and_empty_gaps() {
+        assert_eq!(backfill_chunks(7, 9), vec![(7, 9)]);
+        assert_eq!(backfill_chunks(5, 5), vec![(5, 5)]);
+        assert_eq!(backfill_chunks(9, 8), Vec::new());
+    }
+
+    /// MAINNET's floor is the 2.1.0 flag day, not genesis.
+    ///
+    /// Frames at or below `GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME` were produced by
+    /// pre-migration provers, so step 1 of `archive_frame_is_valid` — the
+    /// genesis-prover allowlist — drops every one of them. They are canonical and
+    /// archives serve them; this node fetches and then discards them, which is
+    /// indistinguishable from "no peer had it" in the unresolved count.
+    ///
+    /// Reported against #620 from a wiped non-archive: the descent walked down to
+    /// 669975 and stalled there permanently, and the range read as an archive-side
+    /// gap. The heights below are quoted from that report — all served by
+    /// quilscan, none fillable here.
+    #[test]
+    fn the_mainnet_floor_excludes_the_legacy_range_below_the_flag_day() {
+        let floor = gap_backfill_floor(0);
+        assert_eq!(floor, quil_crypto::GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME + 1);
+        assert!(
+            floor > quil_engine::genesis::expected_genesis_frame_number(0),
+            "the flag day sits above mainnet genesis, so it is the binding floor",
+        );
+        for n in [669464u64, 669500, 669700, 669900, 669975] {
+            assert!(n < floor, "frame {n} is pre-flag-day and must be excluded");
+        }
+        assert!(
+            669976 >= floor,
+            "the first 2.1.0 frame must stay fillable — the floor must not overshoot",
+        );
+    }
+
+    /// Other networks never rewound, so they must not inherit the mainnet
+    /// constant — it sits above every frame they have, and a testnet that
+    /// adopted it would floor its backfill out of existence.
+    #[test]
+    fn only_mainnet_carries_the_flag_day_floor() {
+        for network in [1u32, 2, 7] {
+            assert_eq!(
+                gap_backfill_floor(network),
+                quil_engine::genesis::expected_genesis_frame_number(network),
+                "network {network} has no flag day",
+            );
+        }
+    }
+
+    /// Clamp before cap. A depth cap deeper than the distance from the gap top
+    /// down to the floor must not reach past it.
+    #[test]
+    fn the_depth_cap_cannot_reach_below_the_floor() {
+        // Cap of 1000 from a top of 1010 would reach 11; the floor holds at 1000.
+        assert_eq!(clamped_backfill_range(5, 1010, 1000, Some(1000)), Some((1000, 1010)));
+        // Cap bites inside the permitted range.
+        assert_eq!(clamped_backfill_range(5, 1010, 1000, Some(4)), Some((1007, 1010)));
+        // Entirely below the floor.
+        assert_eq!(clamped_backfill_range(5, 999, 1000, None), None);
+        // Straddling: only the part at/above the floor survives.
+        assert_eq!(clamped_backfill_range(5, 1000, 1000, None), Some((1000, 1000)));
+    }
+
+    /// The headline number must report what the pass INTENDS, not the raw hole.
+    ///
+    /// These are the exact gaps a wiped mainnet non-archive reported under #620.
+    /// `missing_frames` logged 669,974 and did not move, which read as a stall;
+    /// in fact 244,199 of it is the fictional sub-genesis range and the other
+    /// 425,775 is the legacy range below the flag day. The true objective is
+    /// zero — there is nothing on this node left to fetch.
+    #[test]
+    fn the_headline_count_reports_intent_not_the_raw_hole() {
+        let gaps = vec![(1u64, 244_199u64), (244_201, 669_975)];
+        assert_eq!(
+            gaps.iter().map(|(lo, hi)| hi - lo + 1).sum::<u64>(),
+            669_974,
+            "precondition: this is the number that was read as a stall",
+        );
+        let depth = Some(3 * 720u64); // non-archive cap: 3 epochs
+        assert_eq!(
+            intended_backfill_count(&gaps, gap_backfill_floor(0), depth),
+            0,
+            "every reported hole is below the mainnet floor",
+        );
+        // A hole ABOVE the flag day is still counted, and still depth-bounded.
+        let live = vec![(669_976u64, 698_605u64)];
+        assert_eq!(intended_backfill_count(&live, gap_backfill_floor(0), depth), 2160);
+        assert_eq!(intended_backfill_count(&live, gap_backfill_floor(0), None), 28_630);
+    }
+
+    fn test_store() -> Arc<quil_store::RocksClockStore> {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        Arc::new(quil_store::RocksClockStore::new(db.inner()))
+    }
+
+    /// A frame chain in which every frame's `parent_selector` is its parent's
+    /// candidate identity, `Poseidon(parent.output)` — the same derivation
+    /// `put_global_clock_frame_candidate` keys on, which is what lets the
+    /// backfill walk the chain downward with no peer.
+    fn chain(len: u64) -> Vec<GlobalFrame> {
+        let output = |n: u64| {
+            let mut o = vec![0u8; 516];
+            o[..8].copy_from_slice(&n.to_be_bytes());
+            o
+        };
+        (1..=len)
+            .map(|n| GlobalFrame {
+                header: Some(GlobalFrameHeader {
+                    frame_number: n,
+                    output: output(n),
+                    parent_selector: if n == 1 {
+                        vec![0u8; 32]
+                    } else {
+                        quil_crypto::poseidon::hash_bytes_to_32(&output(n - 1)).unwrap().to_vec()
+                    },
+                    prover: vec![0u8; 32],
+                    ..Default::default()
+                }),
+                requests: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// The post-state-jump shape: a record at the jump target with NOTHING
+    /// beneath it, and the missing heights sitting locally as consensus
+    /// candidates. The gap scan must see that floor hole and the backfill must
+    /// promote the candidates into records.
+    ///
+    /// Before the scan reported the floor gap this could not work at any layer
+    /// above it: the driver was handed an empty gap list, logged "no gaps" and
+    /// returned, so frames 1..=7 stayed absent forever. Nothing else revisits
+    /// heights below the store's floor — the poller's forward-fill only climbs
+    /// from its cursor.
+    ///
+    /// Runs with an EMPTY endpoint pool on purpose: this asserts the local
+    /// ancestor-chain half, which needs no network at all.
+    #[tokio::test]
+    async fn floor_hole_is_filled_from_local_candidates() {
+        let store = test_store();
+        let frames = chain(10);
+        let txn = store.new_transaction(false).unwrap();
+        // Records: only the top three. Candidates: everything below them.
+        for f in &frames[7..] {
+            store.put_global_frame(f, None).unwrap();
+        }
+        for f in &frames[..7] {
+            store.put_global_clock_frame_candidate(f, txn.as_ref()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert_eq!(
+            store.find_global_frame_record_gaps(),
+            vec![(1, 7)],
+            "precondition: the store's floor is frame 8, so 1..=7 is a floor gap",
+        );
+
+        let mut unfillable = std::collections::HashSet::new();
+        run_all_gap_backfill(
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60))),
+            store.clone(),
+            Arc::new(|_: &GlobalFrame| true),
+            vec![0u8; 32],
+            1,
+            None,
+            &mut unfillable,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        for n in 1..=10u64 {
+            assert!(
+                store.get_global_frame(n).is_ok(),
+                "frame {n} should have been promoted to a record",
+            );
+        }
+        assert_eq!(
+            store.find_global_frame_record_gaps(),
+            Vec::new(),
+            "the store must be contiguous from the lowest backfillable height",
+        );
+        assert!(unfillable.is_empty(), "a gap that was filled is not unfillable");
+    }
+
+    /// A gap wider than one chunk is descended across several, each anchored
+    /// on the record the chunk above it just promoted. Nothing else in the
+    /// suite exercises that handoff — a single-chunk fixture would pass even
+    /// if the chunks were emitted in ascending order, which leaves every chunk
+    /// but the top one with no anchor to walk down from.
+    #[tokio::test]
+    async fn descent_spans_multiple_chunks() {
+        let top = MAX_BACKFILL_CHUNK + 88;
+        let store = test_store();
+        let frames = chain(top);
+        let txn = store.new_transaction(false).unwrap();
+        store.put_global_frame(frames.last().unwrap(), None).unwrap();
+        for f in &frames[..frames.len() - 1] {
+            store.put_global_clock_frame_candidate(f, txn.as_ref()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert_eq!(store.find_global_frame_record_gaps(), vec![(1, top - 1)]);
+        assert!(backfill_chunks(1, top - 1).len() > 1, "fixture must span >1 chunk");
+
+        let mut unfillable = std::collections::HashSet::new();
+        run_all_gap_backfill(
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60))),
+            store.clone(),
+            Arc::new(|_: &GlobalFrame| true),
+            vec![0u8; 32],
+            1,
+            None,
+            &mut unfillable,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            store.find_global_frame_record_gaps(),
+            Vec::new(),
+            "every chunk must have been filled, not just the first",
+        );
+    }
+
+    /// `filled == 0` is ambiguous on its own, which is why the descent's stop
+    /// rule reads `unresolved` too. A range that is ALREADY complete — the
+    /// shape whenever the poller closes a hole between the gap scan and the
+    /// backfill reaching it — fills nothing and leaves nothing unresolved.
+    #[tokio::test]
+    async fn an_already_complete_range_reports_nothing_unresolved() {
+        let store = test_store();
+        for f in &chain(10) {
+            store.put_global_frame(f, None).unwrap();
+        }
+
+        let outcome = run_record_only_backfill(
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60))),
+            store.clone(),
+            Arc::new(|_: &GlobalFrame| true),
+            None,
+            vec![0u8; 32],
+            3,
+            5,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(outcome, BackfillOutcome { filled: 0, unresolved: 0 });
+    }
+
+    /// Contrast: a range nobody can serve — no local candidates, no endpoints —
+    /// fills nothing and reports every height unresolved. This is the pair that
+    /// stops the descent.
+    #[tokio::test]
+    async fn an_unservable_range_reports_its_heights_unresolved() {
+        let store = test_store();
+        let frames = chain(10);
+        store.put_global_frame(&frames[9], None).unwrap();
+
+        let outcome = run_record_only_backfill(
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60))),
+            store.clone(),
+            Arc::new(|_: &GlobalFrame| true),
+            None,
+            vec![0u8; 32],
+            3,
+            5,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(outcome, BackfillOutcome { filled: 0, unresolved: 3 });
+    }
+
+    /// A non-archive bounds the descent to the leaf-root epoch window. The gap
+    /// shape here is the one a real node actually has — an INTERNAL hole
+    /// between the genesis record and a block of recently-gossiped frames —
+    /// not a floor gap, which cannot occur once genesis is a record.
+    ///
+    /// Measured from the gap's TOP: the heights a node needs soonest are the
+    /// ones just under the records it already holds. Capping from the bottom
+    /// instead would fetch the oldest, least useful end of the range.
+    #[tokio::test]
+    async fn descent_is_bounded_by_max_depth_measured_from_the_gap_top() {
+        let store = test_store();
+        let frames = chain(12);
+        let txn = store.new_transaction(false).unwrap();
+        // Genesis-like record at 1, a block at 10..=12, hole at 2..=9.
+        store.put_global_frame(&frames[0], None).unwrap();
+        for f in &frames[9..] {
+            store.put_global_frame(f, None).unwrap();
+        }
+        for f in &frames[1..9] {
+            store.put_global_clock_frame_candidate(f, txn.as_ref()).unwrap();
+        }
+        txn.commit().unwrap();
+        assert_eq!(store.find_global_frame_record_gaps(), vec![(2, 9)]);
+
+        let mut unfillable = std::collections::HashSet::new();
+        run_all_gap_backfill(
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60))),
+            store.clone(),
+            Arc::new(|_: &GlobalFrame| true),
+            vec![0u8; 32],
+            1,
+            Some(3),
+            &mut unfillable,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        for n in 7..=9u64 {
+            assert!(store.get_global_frame(n).is_ok(), "frame {n} is inside the window");
+        }
+        for n in 2..=6u64 {
+            assert!(
+                store.get_global_frame(n).is_err(),
+                "frame {n} is below the window and must be left alone",
+            );
+        }
+    }
+
+    /// The range the scan reports beneath the store's floor is FICTIONAL on a
+    /// bootstrapped node: `bootstrap_genesis` writes the genesis record, so
+    /// `earliest` IS genesis and everything under it is a height that never
+    /// existed — 244,199 of them on mainnet.
+    ///
+    /// Unclamped, the driver would hand that range to the backfill, which with
+    /// no local candidates reports every height unresolved and would both burn
+    /// a chunk of fetches and record the range as unfillable. `floor_frame`
+    /// must make it disappear before any of that: no fetches, and nothing
+    /// added to `unfillable`.
+    #[tokio::test]
+    async fn the_fictional_range_below_genesis_is_never_fetched() {
+        let genesis = 500u64;
+        let store = test_store();
+        let frames = chain(genesis + 2);
+        for f in &frames[(genesis - 1) as usize..] {
+            store.put_global_frame(f, None).unwrap();
+        }
+        assert_eq!(
+            store.find_global_frame_record_gaps(),
+            vec![(1, genesis - 1)],
+            "precondition: the scan reports the fictional sub-genesis range",
+        );
+
+        let mut unfillable = std::collections::HashSet::new();
+        run_all_gap_backfill(
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60))),
+            store.clone(),
+            Arc::new(|_: &GlobalFrame| true),
+            vec![0u8; 32],
+            genesis,
+            None,
+            &mut unfillable,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            unfillable.is_empty(),
+            "a range below genesis must be discarded, not attempted and then \
+             blacklisted: {unfillable:?}",
+        );
+    }
+
 }
