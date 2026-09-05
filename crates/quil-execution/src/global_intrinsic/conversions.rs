@@ -350,6 +350,11 @@ pub fn prover_resume_to_proto(r: &ProverResume) -> pb::ProverResume {
 // ProverConfirm/Reject ↔ proto
 // =====================================================================
 
+// `filter` is deprecated in global.proto in favour of the repeated `filters`,
+// but it is still on the wire: peers that predate the change send it, and
+// dropping it here would change the encoded bytes. Carried through verbatim
+// until the field is retired from the proto.
+#[allow(deprecated)]
 pub fn prover_confirm_from_proto(pb: &pb::ProverConfirm) -> ProverConfirm {
     ProverConfirm {
         filter: pb.filter.clone(),
@@ -363,6 +368,7 @@ pub fn prover_confirm_from_proto(pb: &pb::ProverConfirm) -> ProverConfirm {
     }
 }
 
+#[allow(deprecated)] // see `prover_confirm_from_proto`
 pub fn prover_confirm_to_proto(c: &ProverConfirm) -> pb::ProverConfirm {
     pb::ProverConfirm {
         filter: c.filter.clone(),
@@ -410,6 +416,7 @@ fn confirm_leaf_roots_to_proto(
     }
 }
 
+#[allow(deprecated)] // see `prover_confirm_from_proto`
 pub fn prover_reject_from_proto(pb: &pb::ProverReject) -> ProverReject {
     ProverReject {
         filter: pb.filter.clone(),
@@ -422,6 +429,7 @@ pub fn prover_reject_from_proto(pb: &pb::ProverReject) -> ProverReject {
     }
 }
 
+#[allow(deprecated)] // see `prover_confirm_from_proto`
 pub fn prover_reject_to_proto(r: &ProverReject) -> pb::ProverReject {
     pb::ProverReject {
         filter: r.filter.clone(),
@@ -552,6 +560,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // deprecated `filter` is part of what round-trips
     fn prover_confirm_round_trip() {
         let pb = pb::ProverConfirm {
             filter: vec![0x44u8; 32],
@@ -566,6 +575,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // deprecated `filter` is part of what round-trips
     fn prover_reject_round_trip() {
         let pb = pb::ProverReject {
             filter: vec![],
