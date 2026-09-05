@@ -55,7 +55,7 @@ use super::{shadow_accumulator, spent_check};
 
 /// Message type prefix for a post-quantum confidential (lattice-CT) transaction —
 /// its `inner_bytes` is a [`TxEnvelope`]. Distinct from the decaf
-/// `TYPE_TRANSACTION` (`0x0509`) so both paths coexist during cutover.
+/// `TYPE_TRANSACTION` (`0x0509`) so both paths coexist.
 pub const TYPE_LATTICE_TRANSACTION: u32 = 0x0512;
 
 /// Message type prefix for a post-quantum (lattice/Falcon) MINT transaction — its
@@ -80,6 +80,11 @@ pub const TYPE_LATTICE_SHIELD: u32 = 0x0516;
 /// limb-embedded / dual-modulus balance (see module docs).
 pub const AMOUNT_BITS: usize = 20;
 
+/// Amount width for the coefficient-PACKED confidential path (single-commitment,
+/// so `< q ≈ 2^36`; wider amounts use the full-width limb path). The packed
+/// value `v = ⟪g,b⟩` must not wrap `q`, so this stays comfortably below 36.
+pub const PACKED_TX_BITS: usize = 32;
+
 /// Ring-Σ masking bound `B` — the same `2^17` the proofs are parameterized at.
 const MASK_BOUND: i64 = 1 << 17;
 
@@ -91,10 +96,17 @@ const SIG_KEY_SEED: u64 = 0x5175_4c43_5349_4731; // "QuLCSIG1"
 /// Nothing-up-my-sleeve seed for the full-width limb range key.
 const LIMB_RANGE_KEY_SEED: u64 = 0x5175_4c43_4c4d_4231; // "QuLCLMB1"
 
+/// Nothing-up-my-sleeve seed for the PACKED (coefficient-packed) range key.
+const PACKED_RANGE_KEY_SEED: u64 = 0x5175_4c50_4143_4b31; // "QuLPACK1"
+
 /// Network-wide public parameters for the lattice-CT money path.
 pub struct NetworkParams {
     range_key: RingRangeKey,
     limb_range_key: RingRangeKey,
+    /// Coefficient-packed bit-commitment key (`ℓ=1`) for the ZK packed range proof
+    /// ([`quil_lattice_ct::labrador_ct`]). Bits live in the coefficients of one
+    /// message ring element, committed under this key.
+    packed_key: RingCommitKey,
 }
 
 impl NetworkParams {
@@ -111,7 +123,12 @@ impl NetworkParams {
                 quil_lattice_ct::limb_balance::RANGE_BITS,
                 LIMB_RANGE_KEY_SEED,
             ),
+            packed_key: RingCommitKey::production(1, PACKED_RANGE_KEY_SEED),
         }
+    }
+    /// The coefficient-packed bit-commitment key for ZK packed range proofs.
+    pub fn packed_key(&self) -> &RingCommitKey {
+        &self.packed_key
     }
     /// The full-width limb range/commit key (the Gap-2 balance rides on this).
     pub fn limb_range_key(&self) -> &RingRangeKey {
@@ -190,6 +207,24 @@ fn limbs_msg(amount: u128) -> PolyVec {
     PolyVec(limbs_of(amount, VALUE_LIMBS).iter().map(|&l| const_poly(l as u128)).collect())
 }
 
+/// The UNIFORM fw coin message: each base-2^8 limb as an 8-bit BIT-POLY (bits in
+/// coeffs 0..7). An fw coin is `value_key.commit(bitpoly_msg(amount); r)`; its value
+/// is `Σ_l 2^{8l}·⟪g8, bit_l⟫`.
+fn bitpoly_msg(amount: u128) -> PolyVec {
+    PolyVec(
+        limbs_of(amount, VALUE_LIMBS)
+            .iter()
+            .map(|&l| {
+                let mut p = quil_lattice_ct::rq::Poly::zero();
+                for i in 0..8 {
+                    p.c[i] = (l >> i) & 1;
+                }
+                p
+            })
+            .collect(),
+    )
+}
+
 /// Commit a full-width `amount` under the `ℓ = VALUE_LIMBS` value key.
 fn commit_amount(vkey: &RingCommitKey, amount: u128, r: &PolyVec) -> RingCommitment {
     vkey.commit(&limbs_msg(amount), r)
@@ -228,16 +263,20 @@ pub fn open_ring_memo(
     let amount = u128::from_le_bytes(plain.get(..16)?.try_into().ok()?);
     let r_out = wire::decode_polyvec(plain.get(16..)?).ok()?;
 
-    // Recompute cv exactly as `build_spend_transaction`'s output loop does.
+    // Recompute cv and match. An fw coin is `value_key.commit(bitpoly_msg(amount); r)`;
+    // try that first, then fall back to the legacy limb-value form (`commit_amount`) so
+    // both forms scan.
     let vkey = np.value_key();
     let vlink = np.value_link_params();
-    let c = commit_amount(&vkey, amount, &r_out);
-    let cv = wire::encode_polyvec(&vlink.compress(&c));
-    if cv == coin_cv {
-        Some((amount, r_out))
-    } else {
-        None
+    let c_fw = vkey.commit(&bitpoly_msg(amount), &r_out);
+    if wire::encode_polyvec(&vlink.compress(&c_fw)) == coin_cv {
+        return Some((amount, r_out));
     }
+    let c_legacy = commit_amount(&vkey, amount, &r_out);
+    if wire::encode_polyvec(&vlink.compress(&c_legacy)) == coin_cv {
+        return Some((amount, r_out));
+    }
+    None
 }
 
 /// Slice one `ℓ = VALUE_LIMBS` value commitment into its `VALUE_LIMBS` virtual
@@ -276,6 +315,22 @@ pub fn verify_transaction_crypto(
     fee: u128,
     include_fee: bool,
 ) -> Result<bool> {
+    verify_transaction_crypto_ext(np, input_commitments, output_commitments, balance_proof, fee, include_fee, false)
+}
+
+/// `verify_transaction_crypto` with `range_free`: when `true` the limb balance's
+/// built-in output range_rq is not expected (the caller verified the packed
+/// per-limb ranges instead).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_transaction_crypto_ext(
+    np: &NetworkParams,
+    input_commitments: &[Vec<u8>],
+    output_commitments: &[Vec<u8>],
+    balance_proof: &[u8],
+    fee: u128,
+    include_fee: bool,
+    range_free: bool,
+) -> Result<bool> {
     // Full-width: each commitment is one ℓ=VALUE_LIMBS vector-message
     // commitment; slice it into virtual per-limb commitments and run the
     // carry-chain balance, which also range-proves every OUTPUT limb (non-negative
@@ -290,13 +345,14 @@ pub fn verify_transaction_crypto(
     let proof: LimbBalanceProof = wire::decode_limb_balance(balance_proof).map_err(|e| {
         QuilError::InvalidArgument(format!("lattice-ct: limb-balance decode: {e:?}"))
     })?;
-    Ok(verify_limb_balance(
+    Ok(quil_lattice_ct::limb_balance::verify_limb_balance_ext(
         np.limb_range_key(),
         &in_virtual,
         &out_virtual,
         fee_amt,
         VALUE_LIMBS,
         &proof,
+        range_free,
     ))
 }
 
@@ -316,9 +372,49 @@ pub fn mint_virtual_input(amount: u128) -> RingCommitment {
     }
 }
 
+/// Build the coefficient-PACKED per-limb range proofs for a set of output
+/// commitments (one blob per output). Shared by the transfer, mint, and shield
+/// builders so all three emit the packed-only format. `out_rand[i]` is the
+/// randomness `output_commitments[i]` was committed with.
+pub(crate) fn packed_output_range_blobs(
+    np: &NetworkParams,
+    output_commitments: &[Vec<u8>],
+    out_amounts: &[u128],
+    out_rand: &[PolyVec],
+    seed: u64,
+) -> Result<Vec<Vec<u8>>> {
+    let packed_key = np.packed_key();
+    let limb_vkey = np.limb_range_key().value_key();
+    output_commitments
+        .iter()
+        .enumerate()
+        .map(|(i, cb)| -> Result<Vec<u8>> {
+            let out_c = decode_commit(cb)?;
+            let ranges = super::packed_range::prove_packed_limb_ranges(
+                packed_key,
+                &limb_vkey,
+                &out_c,
+                out_amounts[i],
+                &out_rand[i],
+                VALUE_LIMBS,
+                quil_lattice_ct::limb_balance::RANGE_BITS,
+                seed ^ (0x7000 + i as u64),
+            )?;
+            Ok(super::packed_range::encode_packed_limb_ranges(&ranges))
+        })
+        .collect()
+}
+
 /// Verify a mint's confidential conservation: every output is in range and the
 /// outputs sum **exactly** to the authorized `mint_amount` (no over-mint). The
 /// caller separately verifies the mint *authorization* (who may mint this).
+/// Decode a full-width amortized IPA proof from its `balance_proof` bytes
+/// (compact codec), fail-closed on malformed input.
+fn decode_fw_proof(bytes: &[u8]) -> Result<quil_lattice_ct::labrador::FullCtZkIpaProof> {
+    quil_lattice_ct::wire::decode_full_ct_zk_ipa_compact(bytes)
+        .map_err(|_| QuilError::InvalidArgument("full-width: malformed IPA proof bytes".into()))
+}
+
 pub fn verify_mint_crypto(
     np: &NetworkParams,
     mint_amount: u128,
@@ -326,14 +422,32 @@ pub fn verify_mint_crypto(
     output_range_proofs: &[Vec<u8>],
     balance_proof: &[u8],
 ) -> Result<bool> {
-    // Output ranges are folded into the limb-balance proof (each output limb is
-    // range-proved there); `output_range_proofs` is vestigial in the full-width
-    // path and ignored — the mint's conservation + non-negativity ride entirely
-    // on `balance_proof`.
-    let _ = output_range_proofs;
+    // FULL-WIDTH amortized path: one IPA proof (in `balance_proof`) covers per-limb
+    // ranges + conservation `Σ output coins = mint_amount`; the outputs ARE fw coins.
+    if super::packed_range::is_fw_output_ranges(output_range_proofs) {
+        let out_coins: std::result::Result<Vec<RingCommitment>, _> =
+            output_commitments.iter().map(|b| decode_commit(b)).collect();
+        return super::packed_range::verify_fw_mint(&np.value_key(), mint_amount, &out_coins?, &decode_fw_proof(balance_proof)?);
+    }
+    // PACKED-only: every mint output carries coefficient-packed per-limb range
+    // proofs (non-negativity), value-linked to its commitment; the limb balance is
+    // range_free. The non-packed `range_rq` mint format is not accepted.
+    if !super::packed_range::is_packed_output_ranges(output_range_proofs) {
+        return Ok(false);
+    }
+    let out_c: std::result::Result<Vec<RingCommitment>, _> =
+        output_commitments.iter().map(|b| decode_commit(b)).collect();
+    let out_c = out_c?;
+    let limb_vkey = np.limb_range_key().value_key();
+    if !super::packed_range::verify_packed_output_ranges(
+        np.packed_key(), &limb_vkey, &out_c, output_range_proofs,
+        quil_lattice_ct::limb_balance::RANGE_BITS,
+    )? {
+        return Ok(false);
+    }
     let vin = wire::encode_commitment(&mint_virtual_input(mint_amount));
-    // virtual(+1) − outputs(−1) = 0 ⇔  Σ outputs = mint_amount.
-    verify_transaction_crypto(np, &[vin], output_commitments, balance_proof, 0, false)
+    // virtual(+1) − outputs(−1) = 0 ⇔  Σ outputs = mint_amount (range_free balance).
+    verify_transaction_crypto_ext(np, &[vin], output_commitments, balance_proof, 0, false, true)
 }
 
 // =====================================================================
@@ -664,20 +778,67 @@ pub fn build_mint_transaction(
     }
 
     // Conservation + non-negativity: virtual(mint) − Σ outputs = 0, full-width.
-    let balance = prove_limb_balance_bound(
+    // range_free ⇒ output ranges are the PACKED per-limb proofs (no legacy range_rq).
+    let balance = quil_lattice_ct::limb_balance::prove_limb_balance_bound_ext(
         np.limb_range_key(), &in_virtual, &in_rand, &out_virtual, &out_rand,
-        &in_amounts, &out_amounts, 0, VALUE_LIMBS, seed ^ 0x500,
+        &in_amounts, &out_amounts, 0, VALUE_LIMBS, seed ^ 0x500, true,
     )
     .ok_or_else(|| QuilError::Internal("lattice-ct: mint balance failed (outputs ≠ mint amount?)".into()))?;
+    let output_range_proofs = packed_output_range_blobs(np, &output_commitments, &out_amounts, &out_rand, seed ^ 0x5100)?;
 
     Ok(BuiltTransaction {
         input_spend_proofs: Vec::new(),
         output_commitments,
-        output_range_proofs: Vec::new(), // folded into the limb balance
+        output_range_proofs,
         balance_proof: wire::encode_limb_balance(&balance),
         fee: mint_amount, // carries the (public) minted total for the envelope
         new_coins,
         output_rand: out_rand.iter().map(wire::encode_polyvec).collect(),
+    })
+}
+
+/// Wallet: build a FULL-WIDTH (fw) MINT. Output coins are
+/// fw coins (`production(FW_COIN_SEED).commit(bit-polys)`); the single amortized IPA
+/// proof (ranges + conservation `Σ outputs = mint_amount`) rides `balance_proof`, and
+/// `output_range_proofs` carry the fw marker. The stored coin `cv` is the same
+/// `vlink.compress(coin)` form (dimension-compatible), so the coin vertex / accumulator
+/// are unchanged; `output_rand` carries each fw coin's randomness for the memo.
+pub fn build_fw_mint_transaction(
+    np: &NetworkParams,
+    mint_amount: u128,
+    outputs: &[NewOutput],
+    seed: u64,
+) -> Result<BuiltTransaction> {
+    use quil_lattice_ct::labrador_ct::fullwidth::{commit_fw_mint, prove_fw_tx_ipa_zk};
+    use quil_lattice_ct::wire::{encode_commitment, encode_full_ct_zk_ipa_compact, encode_polyvec};
+    let vlink = np.value_link_params();
+    let out_amounts: Vec<u128> = outputs.iter().map(|o| o.amount).collect();
+    let (stmt, wit, coins) = commit_fw_mint(
+        super::packed_range::FW_N_LIMBS,
+        mint_amount,
+        &out_amounts,
+        &np.value_key(),
+        seed,
+    );
+    let proof = prove_fw_tx_ipa_zk(&stmt, &wit, seed ^ 0xF117)
+        .ok_or_else(|| QuilError::Internal("lattice-ct: fw mint prove failed (outputs ≠ mint amount?)".into()))?;
+    let mut new_coins = Vec::with_capacity(outputs.len());
+    let mut output_commitments = Vec::with_capacity(outputs.len());
+    let mut output_rand = Vec::with_capacity(outputs.len());
+    for ((out, coin), r) in outputs.iter().zip(&coins).zip(&wit.rand) {
+        let cv = vlink.compress(coin);
+        new_coins.push((out.recipient_otk.clone(), encode_polyvec(&cv)));
+        output_commitments.push(encode_commitment(coin));
+        output_rand.push(encode_polyvec(r));
+    }
+    Ok(BuiltTransaction {
+        input_spend_proofs: Vec::new(),
+        output_commitments,
+        output_range_proofs: super::packed_range::fw_output_ranges_marker(),
+        balance_proof: encode_full_ct_zk_ipa_compact(&proof),
+        fee: mint_amount,
+        new_coins,
+        output_rand,
     })
 }
 
@@ -704,21 +865,27 @@ pub fn build_shield_transaction(
     // Conservation: virtual(amount) − output = 0 (output commits the public amount),
     // full-width limb balance (folds the output-limb range proofs).
     let vin = mint_virtual_input(amount);
-    let balance = prove_limb_balance_bound(
+    // range_free ⇒ the output range is the PACKED per-limb proof (no legacy range_rq).
+    let balance = quil_lattice_ct::limb_balance::prove_limb_balance_bound_ext(
         np.limb_range_key(),
         &[virtual_limbs(&vin)?],
         &[PolyVec::zero(vkey.a1.cols)],
         &[virtual_limbs(&c_out)?],
-        &[r_out],
+        &[r_out.clone()],
         &[amount],
         &[amount],
         0,
         VALUE_LIMBS,
         seed ^ 0x6,
+        true,
     )
     .ok_or_else(|| QuilError::Internal("shield: balance failed".into()))?;
 
     let output_commitment = wire::encode_commitment(&c_out);
+    let output_range_proof = packed_output_range_blobs(np, &[output_commitment.clone()], &[amount], &[r_out], seed ^ 0x6100)?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
     let msg = shield_message(domain, amount, &output_commitment);
     let signer = quil_crypto::Ed448Signer::from_bytes(ed448_secret, ed448_pubkey)
         .map_err(|e| QuilError::Internal(format!("shield: ed448 key: {e:?}")))?;
@@ -730,9 +897,43 @@ pub fn build_shield_transaction(
         ed448_pubkey: ed448_pubkey.to_vec(),
         ed448_sig,
         output_commitment,
-        output_range_proof: Vec::new(), // folded into the limb balance
+        output_range_proof, // coefficient-packed per-limb ranges
         output_otk: recipient_otk,
         balance_proof: wire::encode_limb_balance(&balance),
+    })
+}
+
+/// Wallet: build a FULL-WIDTH (fw) one-way SHIELD. The
+/// output is a single fw coin conserving the public `amount`; the fw proof rides
+/// `balance_proof`, the fw marker rides `output_range_proof`. Ed448 ownership +
+/// signature are unchanged (verify runs conservation through the fw mint dispatch).
+#[allow(clippy::too_many_arguments)]
+pub fn build_fw_shield_transaction(
+    np: &NetworkParams,
+    domain: &[u8],
+    transparent_address: [u8; 32],
+    ed448_secret: &[u8; 57],
+    ed448_pubkey: &[u8],
+    amount: u128,
+    recipient_otk: Vec<u8>,
+    seed: u64,
+) -> Result<ShieldEnvelope> {
+    let (coins, proof_bytes) =
+        crate::token_intrinsic::packed_range::prove_fw_mint_bytes(&np.value_key(), amount, &[amount], seed)?;
+    let output_commitment = coins.into_iter().next().unwrap_or_default();
+    let msg = shield_message(domain, amount, &output_commitment);
+    let signer = quil_crypto::Ed448Signer::from_bytes(ed448_secret, ed448_pubkey)
+        .map_err(|e| QuilError::Internal(format!("fw shield: ed448 key: {e:?}")))?;
+    let ed448_sig = quil_types::crypto::Signer::sign(&signer, &msg)
+        .map_err(|e| QuilError::Internal(format!("fw shield: ed448 sign: {e:?}")))?;
+    Ok(ShieldEnvelope {
+        transparent_address,
+        ed448_pubkey: ed448_pubkey.to_vec(),
+        ed448_sig,
+        output_commitment,
+        output_range_proof: vec![crate::token_intrinsic::packed_range::RANGE_V_FULLWIDTH], // fw marker
+        output_otk: recipient_otk,
+        balance_proof: proof_bytes,
     })
 }
 
@@ -755,11 +956,13 @@ pub fn build_pending_create(
     seed: u64,
 ) -> Result<PendingCreateEnvelope> {
     let outputs = [NewOutput { amount: escrow_amount, recipient_otk: Vec::new() }];
-    let built = build_spend_transaction(np, root, depth, domain, inputs, &outputs, fee, seed)?;
+    let mut built = build_spend_transaction(np, root, depth, domain, inputs, &outputs, fee, seed)?;
+    // Single escrow output ⇒ its packed per-limb ranges are output_range_proofs[0].
+    let escrow_range_proof = built.output_range_proofs.drain(..).next().unwrap_or_default();
     Ok(PendingCreateEnvelope {
         input_spend_proofs: built.input_spend_proofs,
         escrow_commitment: built.output_commitments.into_iter().next().unwrap(),
-        escrow_range_proof: Vec::new(), // folded into the limb balance
+        escrow_range_proof,
         balance_proof: built.balance_proof,
         fee,
         to_key,
@@ -769,8 +972,18 @@ pub fn build_pending_create(
         change_commitments: Vec::new(),
         change_otks: Vec::new(),
         change_memos: Vec::new(),
+        change_range_proofs: Vec::new(),
     })
 }
+
+// NOTE: escrow uses the legacy limb-value coin format, NOT the full-width (fw) format.
+// Escrow CREATE (`build_pending_create`) and CLAIM/REFUND (`build_pending_claim` /
+// `verify_lattice_pending_claim`) both encode the escrow with `limbs_msg` (limb-value)
+// and value-link it, so the escrow `cv` matches on claim — self-consistent and
+// end-to-end tested (`escrow_create_scan_claim_end_to_end`). An fw escrow coin
+// (message = `bitpoly_msg`) would NOT match a limb-value claim reconstruction, leaving
+// funds UNCLAIMABLE; giving escrow the fw format requires changing CREATE, CLAIM (claim
+// by fw-spending the escrow coin into an fw output), and the output-coin encoding together.
 
 /// Wallet: build an escrow CLAIM/REFUND. The claimant knows the escrow amount +
 /// randomness (`escrow_r`, from the memo) and holds the `to`/`refund` Falcon key.
@@ -855,6 +1068,25 @@ pub fn build_spend_transaction(
     fee: u128,
     seed: u64,
 ) -> Result<BuiltTransaction> {
+    // Packed-only by default: the legacy range_rq confidential format is retired.
+    build_spend_transaction_ext(np, root, depth, domain, inputs, outputs, fee, seed, true)
+}
+
+/// `build_spend_transaction` with `range_free`: when `true` the limb balance omits
+/// the output `range_rq` (the caller adds packed per-limb ranges to
+/// `output_range_proofs`, verified `range_free` on the node).
+#[allow(clippy::too_many_arguments)]
+pub fn build_spend_transaction_ext(
+    np: &NetworkParams,
+    root: &[u8],
+    depth: usize,
+    domain: &[u8],
+    inputs: &[SpendInput],
+    outputs: &[NewOutput],
+    fee: u128,
+    seed: u64,
+    range_free: bool,
+) -> Result<BuiltTransaction> {
     use quil_lattice_ct::membership::{prove_spend, MembershipParams};
     use quil_lattice_ct::module::PolyVec;
 
@@ -911,20 +1143,125 @@ pub fn build_spend_transaction(
     }
 
     // --- full-width balance: Σ C'_in = Σ C_out + fee (carry chain) ---
-    let balance = prove_limb_balance_bound(
+    let balance = quil_lattice_ct::limb_balance::prove_limb_balance_bound_ext(
         np.limb_range_key(), &in_virtual, &in_rand, &out_virtual, &out_rand,
-        &in_amounts, &out_amounts, fee, VALUE_LIMBS, seed ^ 0x400,
+        &in_amounts, &out_amounts, fee, VALUE_LIMBS, seed ^ 0x400, range_free,
     )
     .ok_or_else(|| QuilError::Internal("lattice-ct: balance proof failed (not conserving?)".into()))?;
+
+    // In range_free mode the limb balance omits its output range_rq; supply the
+    // coefficient-PACKED per-limb ranges instead (one blob per output). Every
+    // caller (transfer, escrow, tests) thus emits the packed-only format.
+    let output_range_proofs = if range_free {
+        packed_output_range_blobs(np, &output_commitments, &out_amounts, &out_rand, seed ^ 0x7000)?
+    } else {
+        Vec::new() // legacy: ranges folded into the limb balance
+    };
 
     Ok(BuiltTransaction {
         input_spend_proofs,
         output_commitments,
-        output_range_proofs: Vec::new(), // folded into the limb balance
+        output_range_proofs,
         balance_proof: wire::encode_limb_balance(&balance),
         fee,
         new_coins,
         output_rand: out_rand.iter().map(wire::encode_polyvec).collect(),
+    })
+}
+
+/// Wallet: build a FULL-WIDTH (fw) confidential TRANSFER.
+/// Inputs are spent with the EXISTING spend proofs (value_key `c_prime`s); outputs are
+/// fw coins; and ONE fw IPA proof covers the output ranges + the carry-chain balance,
+/// binding each input's value to its spend-proof `c_prime` (the fw↔c_prime value-link).
+/// So no separate limb-balance / packed ranges — one proof, marker `RANGE_V_FULLWIDTH`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_fw_spend_transaction(
+    np: &NetworkParams,
+    root: &[u8],
+    depth: usize,
+    domain: &[u8],
+    inputs: &[SpendInput],
+    outputs: &[NewOutput],
+    fee: u128,
+    seed: u64,
+) -> Result<BuiltTransaction> {
+    use quil_lattice_ct::labrador_ct::fullwidth::{commit_fw_transfer_ext, prove_fw_transfer_ipa_zk};
+    use quil_lattice_ct::membership::{prove_spend, MembershipParams};
+    use quil_lattice_ct::module::PolyVec;
+
+    let vlink = np.value_link_params();
+    // UNIFORM fw: both the coins and the c_primes are `value_key.commit(bit-polys)`,
+    // so minted/transferred coins are spendable via the (message-agnostic) membership
+    // relation. The spend proof's message is the coin's BIT-POLYS, not limb values.
+    let value_key = np.value_key();
+    let mp = MembershipParams::production(depth);
+    let root_node = wire::decode_polyvec(root)
+        .map_err(|e| QuilError::InvalidArgument(format!("lattice-ct: root decode: {e:?}")))?;
+    let mut prg = quil_lattice_ct::arith::SplitMix64::new(seed);
+    let out_amounts: Vec<u128> = outputs.iter().map(|o| o.amount).collect();
+    let in_amounts: Vec<u128> = inputs.iter().map(|i| i.amount).collect();
+
+    // Outputs as fw coins (production(FW_COIN_SEED).commit(bit-polys)); build them with
+    // the transfer helper so their randomness matches the proof witness. The proof also
+    // needs the input c_primes, so build the spend proofs FIRST to get them.
+    // --- inputs: spend proofs bound to mu (derived from the fw output commitments) ---
+    // First materialize the fw output coins (deterministic from out_amounts + seed) to
+    // fix the challenge, THEN the spends, THEN the one fw proof over both.
+    // Build the fw statement/witness once we have the c_primes; but the outputs are part
+    // of `mu`, so pre-compute the fw output coins here (same rand the proof will use).
+    let (pre_stmt, _pre_wit, pre_coins) = commit_fw_transfer_ext(
+        super::packed_range::FW_N_LIMBS, &in_amounts,
+        // placeholder c_primes/r_p just to fix the output coins deterministically:
+        &vec![commit_amount(&value_key, 0, &PolyVec::zero(value_key.a1.cols)); inputs.len()],
+        &vec![PolyVec::zero(value_key.a1.cols); inputs.len()],
+        &out_amounts, fee, &value_key, &value_key, seed,
+    );
+    let output_commitments: Vec<Vec<u8>> = pre_coins.iter().map(wire::encode_commitment).collect();
+    let mut new_coins = Vec::with_capacity(outputs.len());
+    for (out, coin) in outputs.iter().zip(&pre_coins) {
+        new_coins.push((out.recipient_otk.clone(), wire::encode_polyvec(&vlink.compress(coin))));
+    }
+    let _ = pre_stmt;
+    let mu = tx_challenge(domain, &output_commitments, fee);
+
+    let mut input_spend_proofs = Vec::with_capacity(inputs.len());
+    let mut in_cprimes = Vec::with_capacity(inputs.len());
+    let mut in_rp = Vec::with_capacity(inputs.len());
+    for (i, inp) in inputs.iter().enumerate() {
+        // The coin's message is BIT-POLYS (uniform fw), so C' = value_key.commit(bit_polys; r').
+        let v = bitpoly_msg(inp.amount);
+        let r_prime = PolyVec::sample_short(value_key.a1.cols, ETA, &mut prg);
+        let path: Vec<_> = inp
+            .auth_path
+            .iter()
+            .map(|b| wire::decode_polyvec(b))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| QuilError::InvalidArgument(format!("lattice-ct: auth path decode: {e:?}")))?;
+        let sp = prove_spend(
+            &mp, &vlink, &root_node, &inp.sk, &v, &inp.r_coin, &r_prime, inp.leaf_index, &path, &mu,
+            seed ^ (0xA000 + i as u64),
+        )
+        .ok_or_else(|| QuilError::Internal("lattice-ct: spend proof failed (bad witness?)".into()))?;
+        in_cprimes.push(sp.c_prime.clone());
+        in_rp.push(r_prime);
+        input_spend_proofs.push(wire::encode_spend(&sp));
+    }
+
+    // The one fw transfer proof over the REAL spend c_primes + the fw output coins.
+    let (stmt, wit, _coins) = commit_fw_transfer_ext(
+        super::packed_range::FW_N_LIMBS, &in_amounts, &in_cprimes, &in_rp, &out_amounts, fee, &value_key, &value_key, seed,
+    );
+    let proof = prove_fw_transfer_ipa_zk(&stmt, &wit, seed ^ 0xF337)
+        .ok_or_else(|| QuilError::Internal("lattice-ct: fw transfer prove failed (not conserving?)".into()))?;
+
+    Ok(BuiltTransaction {
+        input_spend_proofs,
+        output_commitments,
+        output_range_proofs: super::packed_range::fw_output_ranges_marker(),
+        balance_proof: quil_lattice_ct::wire::encode_full_ct_zk_ipa_compact(&proof),
+        fee,
+        new_coins,
+        output_rand: Vec::new(),
     })
 }
 
@@ -949,6 +1286,10 @@ pub struct PendingCreateEnvelope {
     pub change_commitments: Vec<Vec<u8>>,
     pub change_otks: Vec<Vec<u8>>,
     pub change_memos: Vec<Vec<u8>>,
+    /// Packed per-limb range proof for each change coin (parallel to
+    /// `change_commitments`). The escrow's own packed ranges ride
+    /// `escrow_range_proof`. Empty ⇒ no change.
+    pub change_range_proofs: Vec<Vec<u8>>,
 }
 
 /// Escrow CLAIM/REFUND on the wire.
@@ -981,6 +1322,7 @@ pub fn encode_pending_create(e: &PendingCreateEnvelope) -> Vec<u8> {
     put_vecs(&mut out, &e.change_commitments);
     put_vecs(&mut out, &e.change_otks);
     put_vecs(&mut out, &e.change_memos);
+    put_vecs(&mut out, &e.change_range_proofs);
     out
 }
 pub fn decode_pending_create(b: &[u8]) -> Result<PendingCreateEnvelope> {
@@ -1004,6 +1346,7 @@ pub fn decode_pending_create(b: &[u8]) -> Result<PendingCreateEnvelope> {
     let change_commitments = take_vecs(b, &mut p).unwrap_or_default();
     let change_otks = take_vecs(b, &mut p).unwrap_or_default();
     let change_memos = take_vecs(b, &mut p).unwrap_or_default();
+    let change_range_proofs = take_vecs(b, &mut p).unwrap_or_default();
     Ok(PendingCreateEnvelope {
         input_spend_proofs,
         escrow_commitment,
@@ -1017,6 +1360,7 @@ pub fn decode_pending_create(b: &[u8]) -> Result<PendingCreateEnvelope> {
         change_commitments,
         change_otks,
         change_memos,
+        change_range_proofs,
     })
 }
 
@@ -1075,18 +1419,23 @@ pub fn verify_lattice_pending_create(
     escrow_range_proof: &[u8],
     change_commitments: &[Vec<u8>],
     change_otks: &[Vec<u8>],
+    change_range_proofs: &[Vec<u8>],
     balance_proof: &[u8],
     fee: u128,
 ) -> Result<Option<(Vec<Vec<u8>>, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)>> {
-    if change_otks.len() != change_commitments.len() {
+    if change_otks.len() != change_commitments.len()
+        || change_range_proofs.len() != change_commitments.len()
+    {
         return Ok(None);
     }
     // Outputs are the escrow followed by any change coins; the balance proof
-    // conserves over all of them (Σ inputs = escrow + Σ change + fee).
+    // conserves over all of them (Σ inputs = escrow + Σ change + fee). Every
+    // output carries its packed per-limb ranges (escrow + change) — the legacy
+    // range_rq format is not accepted.
     let mut outs = vec![escrow_commitment.to_vec()];
     outs.extend(change_commitments.iter().cloned());
     let mut range_proofs = vec![escrow_range_proof.to_vec()];
-    range_proofs.extend(std::iter::repeat(Vec::new()).take(change_commitments.len()));
+    range_proofs.extend(change_range_proofs.iter().cloned());
     let mu = tx_challenge(domain, &outs, fee);
     let key_images = match verify_lattice_transaction(
         np,
@@ -1717,6 +2066,14 @@ pub fn verify_lattice_transaction(
     include_fee: bool,
     mu: &[u8],
 ) -> Result<Option<Vec<Vec<u8>>>> {
+    // Every confidential transaction MUST carry either the coefficient-packed per-limb
+    // ranges OR the full-width (fw) amortized marker; the non-packed `range_rq` format
+    // is not accepted. A tx with neither tag is rejected here.
+    if !super::packed_range::is_packed_output_ranges(output_range_proofs)
+        && !super::packed_range::is_fw_output_ranges(output_range_proofs)
+    {
+        return Ok(None);
+    }
     // The token's committed coin-set root (+ its log-growing depth).
     let (depth, root) = match shadow_accumulator::read_root(state, domain)? {
         Some(dr) => dr,
@@ -1742,9 +2099,49 @@ pub fn verify_lattice_transaction(
         c_primes.push(cp);
     }
 
-    // Balance over the revealed pseudo-inputs `C'` and the outputs (full-width
-    // limb balance; output-limb ranges are folded in, `output_range_proofs`
-    // vestigial and ignored).
+    // FULL-WIDTH amortized path: ONE IPA proof (in `balance_proof`) covers the output
+    // ranges AND the carry-chain balance, with each input's value PINNED to its spend
+    // `c_prime` (the fw↔c_prime value-link inside the proof). Outputs ARE fw coins.
+    if super::packed_range::is_fw_output_ranges(output_range_proofs) {
+        let out_coins: std::result::Result<Vec<RingCommitment>, _> =
+            output_commitments.iter().map(|b| decode_commit(b)).collect();
+        let c_prime_c: std::result::Result<Vec<RingCommitment>, _> =
+            c_primes.iter().map(|b| decode_commit(b)).collect();
+        let eff_fee = if include_fee { fee } else { 0 };
+        if !super::packed_range::verify_fw_transfer(&np.value_key(), &out_coins?, &c_prime_c?, eff_fee, &decode_fw_proof(balance_proof)?)? {
+            return Ok(None);
+        }
+        return Ok(Some(key_images));
+    }
+
+    // PACKED-RANGE path: when `output_range_proofs` carry the coefficient-packed
+    // per-limb ranges (tag `RANGE_V_PACKED_LIMBS`), the coin format, spend proofs
+    // and carry-chain balance stay LIMB (unchanged); only the OUTPUT range proofs
+    // are packed (each limb range-proved + value-linked to its commitment slice).
+    // The balance still binds the real values; packed ranges prove non-negativity.
+    if super::packed_range::is_packed_output_ranges(output_range_proofs) {
+        let out_c: std::result::Result<Vec<RingCommitment>, _> =
+            output_commitments.iter().map(|b| decode_commit(b)).collect();
+        let out_c = out_c?;
+        let limb_vkey = np.limb_range_key().value_key();
+        if !super::packed_range::verify_packed_output_ranges(
+            np.packed_key(),
+            &limb_vkey,
+            &out_c,
+            output_range_proofs,
+            quil_lattice_ct::limb_balance::RANGE_BITS,
+        )? {
+            return Ok(None);
+        }
+        // Balance-only limb carry chain — range_free, since the packed per-limb
+        // ranges above already prove output non-negativity (no redundant range_rq).
+        if !verify_transaction_crypto_ext(np, &c_primes, output_commitments, balance_proof, fee, include_fee, true)? {
+            return Ok(None);
+        }
+        return Ok(Some(key_images));
+    }
+
+    // Otherwise: full-width limb balance with legacy range_rq folded in.
     let _ = output_range_proofs;
     if !verify_transaction_crypto(np, &c_primes, output_commitments, balance_proof, fee, include_fee)? {
         return Ok(None);
@@ -2085,6 +2482,123 @@ mod tests {
                 .is_some(),
             "the scanned-and-rebuilt wallet spend verifies through the engine"
         );
+
+    }
+
+    #[test]
+    fn open_ring_memo_scans_fw_coin() {
+        // The wallet SCAN recovers (amount, r) for an fw coin (`value_key.commit(
+        // bitpoly_msg(amount); r)`) — open_ring_memo recomputes the fw cv and matches.
+        let np = NetworkParams::with_bits(16);
+        let vkey = np.value_key();
+        let vlink = np.value_link_params();
+        let mut prg = SplitMix64::new(0x5CA4);
+        let amount = 12_345u128;
+        let r = PolyVec::sample_short(vkey.a1.cols, ETA, &mut prg);
+        let coin = vkey.commit(&bitpoly_msg(amount), &r);
+        let cv = wire::encode_polyvec(&vlink.compress(&coin));
+        let ss = [7u8; 32];
+        let memo = build_output_memo(b"kemct", amount, &r, &ss);
+        let (_kem, ring_memo) = split_output_memo(&memo).unwrap();
+        assert_eq!(
+            open_ring_memo(&np, &ss, &cv, &ring_memo),
+            Some((amount, r.clone())),
+            "fw coin scans: recovers amount + randomness by recomputing the fw cv"
+        );
+        // A legacy (limb-value) coin with the same amount/r still scans (dual-format).
+        let legacy = vkey.commit(&limbs_msg(amount), &r);
+        let cv_legacy = wire::encode_polyvec(&vlink.compress(&legacy));
+        assert!(open_ring_memo(&np, &ss, &cv_legacy, &ring_memo).is_some(), "legacy coin still scans");
+    }
+
+    #[test]
+    fn fw_to_fw_spend_end_to_end() {
+        // An fw coin (`value_key.commit(bit-polys; r)`) is
+        // materialized into the accumulator, then SPENT via build_fw_spend_transaction
+        // into fw output coins. The whole thing verifies through verify_lattice_transaction
+        // — proving the (message-agnostic) membership relation spends fw coins with the
+        // uniform fw money path. The coin is constructed directly (no memo/scan).
+        use super::super::materialize::{coin_type_hash, create_lattice_coin_vertex_tree};
+        use super::super::shadow_accumulator;
+        use crate::hypergraph_state::HypergraphState;
+        use quil_lattice_ct::accumulator::ACC_NODE_RANK;
+        use quil_lattice_ct::membership::MembershipParams;
+        use quil_lattice_ct::wire;
+        use quil_types::store::HypergraphStore;
+        use std::sync::Arc;
+
+        let np = NetworkParams::with_bits(16);
+        let vkey = np.value_key();
+        let vlink = np.value_link_params();
+        let domain = &[0x51u8; 32][..];
+        let mp = MembershipParams::production(1);
+        let a_otk = &mp.a_otk;
+        let cols = a_otk.cols;
+        let mut prg = quil_lattice_ct::arith::SplitMix64::new(0xF00FEE);
+
+        // Wallet spend key (eta=1 so the stealth secret stays within the membership bound).
+        let sk = PolyVec::sample_short(cols, 1, &mut prg);
+        // The fw coin: value_key.commit(bitpoly_msg(amount); r_coin).
+        let amount = 100u128;
+        let r_coin = PolyVec::sample_short(vkey.a1.cols, ETA, &mut prg);
+        let coin_c = vkey.commit(&bitpoly_msg(amount), &r_coin);
+        let cv = wire::encode_polyvec(&vlink.compress(&coin_c));
+        let p = a_otk.matvec(&sk);
+        let p_bytes = wire::encode_polyvec(&p);
+
+        // Materialize the fw coin (+ decoys) into committed state.
+        let store = Arc::new(quil_hypergraph::testing::MemStore::new());
+        let txn = quil_types::store::HypergraphStore::new_transaction(&*store, false).unwrap();
+        let th = coin_type_hash(domain).unwrap();
+        let shard = {
+            use quil_hypergraph::addressing::{shard_key_for_location, Location};
+            let mut app = [0u8; 32];
+            app.copy_from_slice(domain);
+            shard_key_for_location(&Location { app_address: app, data_address: [0u8; 32] })
+        };
+        let mut insert = |p_b: &[u8], cv_b: &[u8], tag: u8| {
+            let tree = create_lattice_coin_vertex_tree(&[0, 0, 0, 1], p_b, cv_b, &[], &th).unwrap();
+            let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+            let mut addr = quil_crypto::poseidon::hash_bytes_to_32(&blob).unwrap();
+            addr[0] = tag;
+            let mut key = domain.to_vec();
+            key.extend_from_slice(&addr);
+            store.save_vertex_underlying(txn.as_ref(), "vertex", "adds", &shard, &key, &blob).unwrap();
+        };
+        let decoy = |prg: &mut quil_lattice_ct::arith::SplitMix64| wire::encode_polyvec(&PolyVec::sample_short(ACC_NODE_RANK, ETA, prg));
+        insert(&decoy(&mut prg), &decoy(&mut prg), 0x01);
+        insert(&p_bytes, &cv, 0x02);
+        insert(&decoy(&mut prg), &decoy(&mut prg), 0x03);
+
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver)));
+        let state = HypergraphState::new(crdt);
+        shadow_accumulator::refresh_root(&state, domain).unwrap();
+
+        // Fetch the accumulator witness for the fw coin.
+        let (depth, root, ws) = shadow_accumulator::coin_spend_witnesses(&state, domain, &[p_bytes.clone()]).unwrap();
+        assert!(ws[0].found, "fw coin found in accumulator");
+
+        let inputs = vec![SpendInput {
+            sk,
+            amount,
+            r_coin,
+            leaf_index: ws[0].leaf_index as usize,
+            auth_path: ws[0].auth_path.clone(),
+        }];
+        let outputs = vec![
+            NewOutput { amount: 60, recipient_otk: wire::encode_polyvec(&PolyVec::sample_short(cols, ETA, &mut prg)) },
+            NewOutput { amount: 38, recipient_otk: wire::encode_polyvec(&PolyVec::sample_short(cols, ETA, &mut prg)) },
+        ];
+        let fwtx = build_fw_spend_transaction(&np, &root, depth, domain, &inputs, &outputs, 2, 21)
+            .unwrap_or_else(|e| panic!("build_fw_spend_transaction failed: {e}"));
+        assert_eq!(fwtx.output_range_proofs, crate::token_intrinsic::packed_range::fw_output_ranges_marker());
+        let fw_mu = tx_challenge(domain, &fwtx.output_commitments, 2);
+        let kis = verify_lattice_transaction(
+            &np, &state, domain, &fwtx.input_spend_proofs, &fwtx.output_commitments,
+            &fwtx.output_range_proofs, &fwtx.balance_proof, 2, true, &fw_mu,
+        )
+        .unwrap();
+        assert!(kis.is_some(), "fw→fw spend (fw coin → fw outputs) verifies through the engine");
     }
 
     #[test]
@@ -2200,7 +2714,7 @@ mod tests {
         let create_env = PendingCreateEnvelope {
             input_spend_proofs: built.input_spend_proofs.clone(),
             escrow_commitment: built.output_commitments[0].clone(),
-            escrow_range_proof: Vec::new(),
+            escrow_range_proof: built.output_range_proofs[0].clone(),
             balance_proof: built.balance_proof.clone(),
             fee: 0,
             to_key: falcon_r.public_key().to_vec(),
@@ -2210,13 +2724,15 @@ mod tests {
             change_commitments: vec![built.output_commitments[1].clone()],
             change_otks: vec![change_otk],
             change_memos: vec![change_memo],
+            change_range_proofs: vec![built.output_range_proofs[1].clone()],
         };
 
         // ── Materialize the escrow create (verify + write escrow + change coin) ──
         let (_ki, escrow_cv, change_coins) = verify_lattice_pending_create(
             &np, &state, domain,
             &create_env.input_spend_proofs, &create_env.escrow_commitment, &create_env.escrow_range_proof,
-            &create_env.change_commitments, &create_env.change_otks, &create_env.balance_proof, create_env.fee,
+            &create_env.change_commitments, &create_env.change_otks, &create_env.change_range_proofs,
+            &create_env.balance_proof, create_env.fee,
         )
         .unwrap()
         .expect("escrow create verifies");
@@ -2380,7 +2896,7 @@ mod tests {
                 forest_proof,
             }],
             output_commitments: built.output_commitments.clone(),
-            output_range_proofs: Vec::new(),
+            output_range_proofs: built.output_range_proofs.clone(),
             output_otks: built.new_coins.iter().map(|(p, _)| p.clone()).collect(),
             balance_proof: built.balance_proof.clone(),
             output_memos: vec![memo],
@@ -2783,21 +3299,27 @@ mod tests {
         let r_out = PolyVec::sample_short(vkey.a1.cols, ETA, &mut prg);
         let c_out = vkey.commit(&limbs_msg(amount), &r_out);
         let vin = mint_virtual_input(amount);
-        let balance = prove_limb_balance_bound(
+        let balance = quil_lattice_ct::limb_balance::prove_limb_balance_bound_ext(
             np.limb_range_key(),
             &[virtual_limbs(&vin).unwrap()],
             &[PolyVec::zero(vkey.a1.cols)],
             &[virtual_limbs(&c_out).unwrap()],
-            &[r_out],
+            &[r_out.clone()],
             &[amount],
             &[amount],
             0,
             VALUE_LIMBS,
             0x44,
+            true,
         )
         .unwrap();
         let out_c = wire::encode_commitment(&c_out);
-        let rp_b: Vec<u8> = Vec::new();
+        // Packed per-limb range for the shielded output.
+        let rp_b: Vec<u8> = packed_output_range_blobs(&np, &[out_c.clone()], &[amount], &[r_out], 0x4400)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
         let bal_b = wire::encode_limb_balance(&balance);
 
         // Ed448-sign the shield context.
@@ -2832,17 +3354,142 @@ mod tests {
         ];
         let mint = build_mint_transaction(&np, 100, &outputs, 0x33).unwrap();
         let out_c = mint.output_commitments.clone();
+        let rp = mint.output_range_proofs.clone(); // packed per-limb ranges
         let bal = mint.balance_proof.clone();
 
         assert!(
-            verify_mint_crypto(&np, 100, &out_c, &[], &bal).unwrap(),
+            verify_mint_crypto(&np, 100, &out_c, &rp, &bal).unwrap(),
             "outputs summing to the mint amount verify"
         );
         // Claiming a larger mint amount than the outputs sum to ⇒ reject (no over-mint).
         assert!(
-            !verify_mint_crypto(&np, 101, &out_c, &[], &bal).unwrap(),
+            !verify_mint_crypto(&np, 101, &out_c, &rp, &bal).unwrap(),
             "a mint amount != Σ outputs must reject"
         );
+    }
+
+    #[test]
+    fn fw_transfer_node_verifies_with_network_value_key() {
+        // The fw TRANSFER over the REAL network value_key (ell=VALUE_LIMBS with all
+        // A2 rows equal — the shape a spend's c_prime actually uses). 2-in/2-out,
+        // balanced; each input pinned to its c_prime.
+        let np = NetworkParams::with_bits(16);
+        let vkey = np.value_key();
+        let ins = [1_000_000u128, 5_000u128];
+        let outs = [900_000u128, 100_000u128];
+        let fee = 5_000u128;
+        let pr = &crate::token_intrinsic::packed_range::prove_fw_transfer_bytes;
+        let vf = &crate::token_intrinsic::packed_range::verify_fw_transfer_bytes;
+        let (out_bytes, cprime_bytes, proof_bytes) = pr(&vkey, &ins, &outs, fee, 0x9911).unwrap();
+        assert!(vf(&vkey, &out_bytes, &cprime_bytes, fee, &proof_bytes).unwrap(), "fw transfer with network value_key verifies");
+        // Wrong fee ⇒ balance target mismatch ⇒ reject.
+        assert!(!vf(&vkey, &out_bytes, &cprime_bytes, fee + 1, &proof_bytes).unwrap_or(false), "wrong fee rejects");
+        // Tampered output coin ⇒ reject.
+        let mut bad = out_bytes.clone();
+        *bad[0].last_mut().unwrap() ^= 1;
+        assert!(!vf(&vkey, &bad, &cprime_bytes, fee, &proof_bytes).unwrap_or(false), "tampered output rejects");
+        // Tampered c_prime (input value) ⇒ opening binding fails ⇒ reject (anti-inflation).
+        let mut badcp = cprime_bytes.clone();
+        *badcp[0].last_mut().unwrap() ^= 1;
+        assert!(!vf(&vkey, &out_bytes, &badcp, fee, &proof_bytes).unwrap_or(false), "tampered c_prime rejects");
+        println!("FW TRANSFER node proof = {} KB", proof_bytes.len() / 1024);
+    }
+
+    #[test]
+    fn build_fw_shield_transaction_verifies_through_engine() {
+        use ed448_rust::{PrivateKey, PublicKey};
+        // WALLET BUILD: build_fw_shield_transaction emits an fw coin + fw
+        // marker + fw proof; verify_lattice_shield accepts it (conservation via fw).
+        let np = NetworkParams::with_bits(16);
+        let domain = &[0x51u8; 32][..];
+        let sk = PrivateKey::from(&[3u8; 57]);
+        let pubkey = PublicKey::from(&sk).as_byte().to_vec();
+        let owner = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
+        let amount = 250_000u128;
+        let env = build_fw_shield_transaction(&np, domain, [0xAB; 32], &[3u8; 57], &pubkey, amount, vec![0xEE; 200], 0x8181).unwrap();
+        let back = decode_shield(&encode_shield(&env)).unwrap();
+        assert!(
+            verify_lattice_shield(&np, domain, &owner, amount, &back.ed448_pubkey, &back.ed448_sig, &back.output_commitment, &back.output_range_proof, &back.balance_proof)
+                .unwrap()
+                .is_some(),
+            "wallet-built fw shield verifies through the engine"
+        );
+    }
+
+    #[test]
+    fn shield_fw_amortized_verifies_through_engine() {
+        use ed448_rust::{PrivateKey, PublicKey};
+        // SHIELD via the fw path: conservation runs through verify_mint_crypto, so a
+        // shield carrying the fw marker + fw proof dispatches to verify_fw_mint. A
+        // single output coin commits the public transparent amount.
+        let np = NetworkParams::with_bits(16);
+        let domain = &[0x51u8; 32][..];
+        let sk = PrivateKey::from(&[3u8; 57]);
+        let pubkey = PublicKey::from(&sk).as_byte().to_vec();
+        let owner = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
+        let amount = 250_000u128;
+        let (coins, proof) = crate::token_intrinsic::packed_range::prove_fw_mint_bytes(&np.value_key(), amount, &[amount], 0x5111).unwrap();
+        let output_commitment = coins[0].clone();
+        let msg = shield_message(domain, amount, &output_commitment);
+        let sig = sk.sign(&msg, None).unwrap().to_vec();
+        let marker = crate::token_intrinsic::packed_range::RANGE_V_FULLWIDTH; // single tag byte
+        assert!(
+            verify_lattice_shield(&np, domain, &owner, amount, &pubkey, &sig, &output_commitment, &[marker], &proof)
+                .unwrap()
+                .is_some(),
+            "fw shield conserving the public amount verifies through the engine"
+        );
+        // Claiming a LARGER amount than the coin conserves: sign the larger amount so
+        // ownership+sig pass, then the fw conservation (Σ output = amount) rejects.
+        let msg2 = shield_message(domain, amount + 1, &output_commitment);
+        let sig2 = sk.sign(&msg2, None).unwrap().to_vec();
+        assert!(
+            verify_lattice_shield(&np, domain, &owner, amount + 1, &pubkey, &sig2, &output_commitment, &[marker], &proof)
+                .unwrap()
+                .is_none(),
+            "fw shield over-claiming the amount rejects on conservation"
+        );
+    }
+
+    #[test]
+    fn build_fw_mint_transaction_verifies_through_engine() {
+        // WALLET BUILD: build_fw_mint_transaction emits fw coins + the fw
+        // marker + the fw proof; the built tx verifies through verify_mint_crypto.
+        let np = NetworkParams::with_bits(16);
+        let outputs = vec![
+            NewOutput { amount: 600_000, recipient_otk: vec![0xA1u8; 200] },
+            NewOutput { amount: 400_000, recipient_otk: vec![0xA2u8; 200] },
+        ];
+        let tx = build_fw_mint_transaction(&np, 1_000_000, &outputs, 0x4242).unwrap();
+        assert_eq!(tx.output_range_proofs, crate::token_intrinsic::packed_range::fw_output_ranges_marker());
+        assert!(
+            verify_mint_crypto(&np, 1_000_000, &tx.output_commitments, &tx.output_range_proofs, &tx.balance_proof).unwrap(),
+            "wallet-built fw mint verifies through the engine"
+        );
+        // Over-claim ⇒ reject.
+        assert!(
+            !verify_mint_crypto(&np, 1_000_001, &tx.output_commitments, &tx.output_range_proofs, &tx.balance_proof).unwrap_or(false),
+            "claiming more than the outputs conserve rejects"
+        );
+        assert_eq!(tx.new_coins.len(), 2, "two output coins emitted for materialize");
+    }
+
+    #[test]
+    fn mint_fw_amortized_verifies_through_engine() {
+        // The full-width amortized mint dispatched THROUGH verify_mint_crypto: the
+        // fw marker rides `output_range_proofs`, the single IPA proof rides
+        // `balance_proof`, and the outputs ARE fw coins. Honest conservation verifies;
+        // a wrong claimed mint amount and a tampered coin reject (fail-closed).
+        let np = NetworkParams::with_bits(16);
+        let mint = 1_000_000u128;
+        let outs = [600_000u128, 400_000u128];
+        let (coins, proof_bytes) = crate::token_intrinsic::packed_range::prove_fw_mint_bytes(&np.value_key(), mint, &outs, 0x77).unwrap();
+        let marker = crate::token_intrinsic::packed_range::fw_output_ranges_marker();
+        assert!(verify_mint_crypto(&np, mint, &coins, &marker, &proof_bytes).unwrap(), "fw mint conserves ⇒ verifies through engine");
+        assert!(!verify_mint_crypto(&np, mint + 1, &coins, &marker, &proof_bytes).unwrap_or(false), "wrong mint amount rejects");
+        let mut bad = coins.clone();
+        *bad[0].last_mut().unwrap() ^= 1;
+        assert!(!verify_mint_crypto(&np, mint, &bad, &marker, &proof_bytes).unwrap_or(false), "tampered coin rejects");
     }
 
     #[test]
@@ -3053,22 +3700,34 @@ mod tests {
         };
         let (o1, r_o1) = make_out(60, 0x201);
         let (o2, r_o2) = make_out(38, 0x202);
-        let balance = prove_limb_balance_bound(
+        // PACKED-only: range_free limb balance + coefficient-packed per-limb ranges.
+        let balance = quil_lattice_ct::limb_balance::prove_limb_balance_bound_ext(
             np.limb_range_key(),
             &[virtual_limbs(&c_prime).unwrap()],
             &[r_prime.clone()],
             &[virtual_limbs(&o1).unwrap(), virtual_limbs(&o2).unwrap()],
-            &[r_o1, r_o2],
+            &[r_o1.clone(), r_o2.clone()],
             &[100],
             &[60, 38],
             2,
             VALUE_LIMBS,
             0x400,
+            true,
         )
         .expect("balances");
 
         let out_c = vec![wire::encode_commitment(&o1), wire::encode_commitment(&o2)];
-        let out_rp: Vec<Vec<u8>> = Vec::new();
+        let limb_vkey = np.limb_range_key().value_key();
+        let pack = |oc: &RingCommitment, amt: u128, r: &PolyVec, s: u64| {
+            crate::token_intrinsic::packed_range::encode_packed_limb_ranges(
+                &crate::token_intrinsic::packed_range::prove_packed_limb_ranges(
+                    np.packed_key(), &limb_vkey, oc, amt, r, VALUE_LIMBS,
+                    quil_lattice_ct::limb_balance::RANGE_BITS, s,
+                )
+                .unwrap(),
+            )
+        };
+        let out_rp: Vec<Vec<u8>> = vec![pack(&o1, 60, &r_o1, 0x501), pack(&o2, 38, &r_o2, 0x502)];
         let bal_bytes = wire::encode_limb_balance(&balance);
 
         // ---- Verify the whole transaction.

@@ -27,7 +27,13 @@ use super::TokenCtx;
 
 type Client = NodeServiceClient<Channel>;
 
-const SNTRUP761_PK_LEN: usize = 1158;
+/// The KEM public-key length — the CANONICAL crypto-crate constant, so the
+/// address offsets can never silently drift from the KEM if it changes.
+const SNTRUP761_PK_LEN: usize = quil_crypto::sntrup761::SNTRUP761_PUBLIC_KEY_LEN;
+/// KEM identity tag folded into the address parameter fingerprint (below), so a
+/// KEM change — which the `R_q` fingerprint alone would miss — also invalidates
+/// old addresses (an unspendable-coin guard on the stealth/memo side).
+const KEM_ID: &[u8] = b"sntrup761";
 
 /// One spendable coin the wallet has scanned + opened.
 pub struct OwnedCoin {
@@ -43,15 +49,94 @@ pub struct LatticeAddress {
     pub big_b: PolyVec,
 }
 
-/// Parse a `hex(kem_pk ‖ wire(B))` recipient address.
+/// Confidential-address wire version (byte 0 of the address).
+pub const ADDR_VERSION: u8 = 1;
+/// Escrow/pending address version (DISTINCT from `ADDR_VERSION`), so a
+/// confidential address pasted into a pending-transfer (or vice-versa) fails
+/// closed instead of silently misparsing into garbage keys → locked funds.
+pub const PENDING_VERSION: u8 = 2;
+/// Length of the lattice-parameters fingerprint embedded in the address.
+pub const ADDR_FP_LEN: usize = 8;
+
+/// A fingerprint of the lattice parameters that make a spend public key `B`
+/// meaningful: the modulus `q`, the ring degree `d`, and the full OTK matrix
+/// `A_otk` (itself a function of `q`, `κ`, `λ`, and its seed, since `B = A_otk·b`).
+/// An address minted under different parameters carries a DIFFERENT fingerprint,
+/// so a cross-parameter send FAILS CLOSED (the recipient could never spend a coin
+/// created under the sender's mismatched `A_otk`/`q`).
+pub fn params_fingerprint() -> [u8; ADDR_FP_LEN] {
+    use sha2::{Digest, Sha256};
+    let mp = MembershipParams::production(1);
+    let mut h = Sha256::new();
+    h.update(b"quil-lattice-ct/address-params-fingerprint/v2");
+    h.update(quil_lattice_ct::params::MODULUS_Q.to_le_bytes());
+    h.update((quil_lattice_ct::rq::Poly::D as u64).to_le_bytes());
+    // Bind the KEM identity too: the address carries a KEM pubkey and spendability
+    // needs the KEM to match (sender encapsulates / recipient decapsulates). A KEM
+    // change that left q/d/A_otk untouched would otherwise pass unnoticed.
+    h.update((KEM_ID.len() as u64).to_le_bytes());
+    h.update(KEM_ID);
+    h.update((SNTRUP761_PK_LEN as u64).to_le_bytes());
+    for row in &mp.a_otk.m {
+        for p in row {
+            for &c in &p.c {
+                h.update(c.to_le_bytes());
+            }
+        }
+    }
+    let d = h.finalize();
+    let mut fp = [0u8; ADDR_FP_LEN];
+    fp.copy_from_slice(&d[..ADDR_FP_LEN]);
+    fp
+}
+
+/// Serialize this wallet's confidential receiving address:
+/// `VERSION(1) ‖ FINGERPRINT(8) ‖ kem_pk ‖ wire(B)`.
+pub fn encode_address(kem_pk: &[u8], big_b: &PolyVec) -> Vec<u8> {
+    debug_assert_eq!(
+        kem_pk.len(),
+        SNTRUP761_PK_LEN,
+        "kem_pk must be exactly the KEM public-key length, else parse offsets corrupt both fields"
+    );
+    let mut out = Vec::with_capacity(1 + ADDR_FP_LEN + kem_pk.len() + 4);
+    out.push(ADDR_VERSION);
+    out.extend_from_slice(&params_fingerprint());
+    out.extend_from_slice(kem_pk);
+    out.extend_from_slice(&wire::encode_polyvec(big_b));
+    out
+}
+
+/// Parse a `VERSION ‖ FINGERPRINT ‖ kem_pk ‖ wire(B)` recipient address, and
+/// REJECT (fail closed) if it was minted under different lattice parameters —
+/// sending to such an address would create a coin the recipient cannot spend.
 pub fn parse_address(hex_str: &str) -> anyhow::Result<LatticeAddress> {
     let raw = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str))
         .map_err(|e| anyhow::anyhow!("invalid recipient address hex: {e}"))?;
-    if raw.len() <= SNTRUP761_PK_LEN {
+    let header = 1 + ADDR_FP_LEN;
+    if raw.len() <= header + SNTRUP761_PK_LEN {
         anyhow::bail!("recipient address too short");
     }
-    let kem_pk = raw[..SNTRUP761_PK_LEN].to_vec();
-    let big_b = wire::decode_polyvec(&raw[SNTRUP761_PK_LEN..])
+    if raw[0] != ADDR_VERSION {
+        anyhow::bail!(
+            "unsupported confidential-address version {} (expected {}) — the address \
+             format changed; ask the recipient for a current address.",
+            raw[0],
+            ADDR_VERSION
+        );
+    }
+    let fp = &raw[1..header];
+    let expected = params_fingerprint();
+    if fp != expected {
+        anyhow::bail!(
+            "recipient confidential address was generated under DIFFERENT lattice \
+             parameters (modulus q / OTK matrix). REFUSING to send: a coin created for \
+             this address would be UNSPENDABLE by the recipient. Ask the recipient for \
+             an address generated under the current parameters."
+        );
+    }
+    let body = &raw[header..];
+    let kem_pk = body[..SNTRUP761_PK_LEN].to_vec();
+    let big_b = wire::decode_polyvec(&body[SNTRUP761_PK_LEN..])
         .map_err(|e| anyhow::anyhow!("invalid recipient B: {e:?}"))?;
     Ok(LatticeAddress { kem_pk, big_b })
 }
@@ -76,23 +161,123 @@ pub fn derive_spend_base(
 ) -> anyhow::Result<PolyVec> {
     let legacy = config_dir.join("q-lattice-spend.key");
     if legacy.exists() {
-        eprintln!(
-            "[WARN] using DEPRECATED plaintext lattice spend key {} — the spend base \
-             is now derived from the (encrypted) keystore; delete this file once your \
-             coins are migrated so no spend secret sits in the clear.",
-            legacy.display()
-        );
-        let raw = hex::decode(std::fs::read_to_string(&legacy)?.trim())?;
-        return wire::decode_polyvec(&raw).map_err(|e| anyhow::anyhow!("decode b: {e:?}"));
+        // A legacy plaintext key is used ONLY if it decodes AND validates. Two
+        // failure modes are DISTINGUISHED, because they are NOT the same risk:
+        //   * decode succeeds but validation fails → a well-formed key that is
+        //     incompatible with the current parameters (the clean "params changed"
+        //     signal). Regenerate.
+        //   * decode FAILS (unreadable / non-hex / truncated / wrong wire) → could
+        //     be a genuine parameter mismatch OR local CORRUPTION of a real key.
+        //     We still regenerate (the derived keystore key is the canonical
+        //     identity), but we flag corruption explicitly so a user who DID hold a
+        //     standalone legacy key is warned that a NEW spend identity is adopted.
+        // NOTE: adopting a new identity makes any coins held under the OLD key
+        // inaccessible. This is safe only while no confidential coins exist; a
+        // confirmation gate should precede launch (see LABRADOR_ASSESSMENT §8.5).
+        let decoded = std::fs::read_to_string(&legacy)
+            .ok()
+            .and_then(|s| hex::decode(s.trim()).ok())
+            .and_then(|raw| wire::decode_polyvec(&raw).ok());
+        match decoded {
+            Some(b) if validate_spend_base(&b, cols).is_ok() => {
+                eprintln!(
+                    "[WARN] using DEPRECATED plaintext lattice spend key {} — the spend \
+                     base is now derived from the (encrypted) keystore; delete this file \
+                     once your coins are migrated so no spend secret sits in the clear.",
+                    legacy.display()
+                );
+                return Ok(b);
+            }
+            Some(_) => {
+                eprintln!(
+                    "[WARN] legacy lattice spend key {} decoded but is INCOMPATIBLE with \
+                     the current lattice parameters — REGENERATING the canonical spend \
+                     base from your keystore secret. Any coins held under the OLD key \
+                     will be INACCESSIBLE under the new key; recover them first if you \
+                     have any. Delete the stale file once done.",
+                    legacy.display()
+                );
+            }
+            None => {
+                eprintln!(
+                    "[WARN] legacy lattice spend key {} could NOT be decoded (unreadable, \
+                     truncated, or from different parameters — possibly CORRUPTED). \
+                     REGENERATING the canonical spend base from your keystore secret. If \
+                     this file was a real, coin-bearing key, those coins will be \
+                     INACCESSIBLE under the regenerated identity — restore a good copy of \
+                     the key before proceeding if so.",
+                    legacy.display()
+                );
+            }
+        }
+        // Regenerate ONCE: move the stale/incompatible file aside so subsequent
+        // loads go straight to the (deterministic) derived key without re-warning
+        // or re-regenerating. Bytes are PRESERVED in a `.bak` (never deleted), so a
+        // user who needs to recover an old coin-bearing key still has them.
+        let bak = legacy.with_file_name("q-lattice-spend.key.incompatible.bak");
+        match std::fs::rename(&legacy, &bak) {
+            Ok(()) => eprintln!(
+                "[INFO] moved the stale spend key to {} — the wallet will use the derived \
+                 key from now on (this one-time migration will not repeat).",
+                bak.display()
+            ),
+            Err(e) => eprintln!(
+                "[WARN] could not move the stale spend key {} aside ({e}); it will be \
+                 re-checked on the next run. Move or delete it manually to silence this.",
+                legacy.display()
+            ),
+        }
+        // fall through to derivation
     }
     // Domain-separated seed = SHA3-256("…/wallet-spend-base/v1" ‖ onion_secret),
-    // then a full-entropy short-vector expansion (eta=1).
+    // then a full-entropy short-vector expansion (eta=1). This derivation is
+    // MODULUS-INDEPENDENT (produces a ternary vector), so it re-derives IDENTICALLY
+    // under any q — a q change never silently corrupts the derived spend key.
     use sha3::{Digest, Sha3_256};
     let mut h = Sha3_256::new();
     h.update(b"quil-lattice-ct/wallet-spend-base/v1");
     h.update(onion_secret);
     let seed = h.finalize();
-    Ok(quil_lattice_ct::stealth::hash_to_short_polyvec(&seed, cols))
+    let b = quil_lattice_ct::stealth::hash_to_short_polyvec(&seed, cols);
+    // Defensive: the derived key MUST validate; a failure here is a params bug.
+    validate_spend_base(&b, cols)?;
+    Ok(b)
+}
+
+/// Reject a spend base that is not compatible with the current lattice
+/// parameters. A valid spend base is (a) the right module rank (`cols`) and
+/// (b) ternary (`‖b‖∞ ≤ 1`, the derivation's η=1 invariant, so that the stealth
+/// `sk = offset + b` stays within the membership bound `‖sk‖∞ ≤ SECRET_NORM_ETA`
+/// (=2) given `offset` is also η=1). A key generated under a different modulus
+/// `q` decodes to a large-coefficient / wrong-length vector and is caught here —
+/// so the wallet NEVER silently signs with an incompatible key (which would
+/// produce coins nobody can spend, or spends that don't verify).
+fn validate_spend_base(b: &PolyVec, cols: usize) -> anyhow::Result<()> {
+    if b.len() != cols {
+        anyhow::bail!(
+            "lattice spend base has module rank {} but the current parameters expect {} — \
+             INCOMPATIBLE (generated under different lattice parameters). Refusing to use it. \
+             If you hold no confidential coins under the old key, remove the stale key so it \
+             re-derives from your keystore under the current parameters.",
+            b.len(),
+            cols
+        );
+    }
+    // The spend base is η=1 by construction; enforcing ≤1 (not SECRET_NORM_ETA=2)
+    // is the tight bound that actually guarantees ‖offset+b‖∞ ≤ 2.
+    let bound = 1u64;
+    let norm = b.inf_norm();
+    if norm > bound {
+        anyhow::bail!(
+            "lattice spend base is NOT short (‖b‖∞ = {norm} > {bound}) — this key is \
+             INCOMPATIBLE with the current modulus q (its coefficients decoded to \
+             large values, the signature of a key generated under a different q). \
+             Refusing to sign with a corrupt spend key. If you hold no confidential \
+             coins under the old key, regenerate by removing the stale key so the \
+             spend base re-derives from your (modulus-independent) keystore secret."
+        );
+    }
+    Ok(())
 }
 
 /// The wallet's lattice keys + params, gathered once per command.
@@ -139,9 +324,12 @@ impl Wallet {
         quil_crypto::FalconSigner::from_bytes(&self.falcon_sk, &self.falcon_pk)
     }
 
-    /// This wallet's escrow/pending receiving address: `hex(kem_pk ‖ falcon_pk)`.
+    /// This wallet's escrow/pending receiving address:
+    /// `hex(PENDING_VERSION ‖ kem_pk ‖ falcon_pk)`.
     pub fn pending_address(&self) -> Vec<u8> {
-        let mut a = self.kem_pk.clone();
+        let mut a = Vec::with_capacity(1 + self.kem_pk.len() + self.falcon_pk.len());
+        a.push(PENDING_VERSION);
+        a.extend_from_slice(&self.kem_pk);
         a.extend_from_slice(&self.falcon_pk);
         a
     }
@@ -157,11 +345,22 @@ pub struct PendingAddress {
 pub fn parse_pending_address(hex_str: &str) -> anyhow::Result<PendingAddress> {
     let raw = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str))
         .map_err(|e| anyhow::anyhow!("invalid pending address hex: {e}"))?;
-    if raw.len() <= SNTRUP761_PK_LEN {
-        anyhow::bail!("pending address too short (expected kem_pk ‖ falcon_pk)");
+    if raw.len() <= 1 + SNTRUP761_PK_LEN {
+        anyhow::bail!("pending address too short (expected VERSION ‖ kem_pk ‖ falcon_pk)");
     }
-    let kem_pk = raw[..SNTRUP761_PK_LEN].to_vec();
-    let falcon_pk = raw[SNTRUP761_PK_LEN..].to_vec();
+    if raw[0] != PENDING_VERSION {
+        // A confidential address (ADDR_VERSION) or any other type must NOT be
+        // silently misparsed into a garbage claim key → locked escrow.
+        anyhow::bail!(
+            "not a pending/escrow address (version {} ≠ {}) — did you paste a confidential \
+             address? Use `token transfer` for that.",
+            raw[0],
+            PENDING_VERSION
+        );
+    }
+    let body = &raw[1..];
+    let kem_pk = body[..SNTRUP761_PK_LEN].to_vec();
+    let falcon_pk = body[SNTRUP761_PK_LEN..].to_vec();
     Ok(PendingAddress { kem_pk, falcon_pk })
 }
 
@@ -297,6 +496,8 @@ pub async fn submit_spend(
     }
 
     let seed = rand::random::<u64>();
+    // Packed-only by default: `build_spend_transaction` emits the coefficient-packed
+    // per-limb ranges in `output_range_proofs` (the legacy range_rq format is retired).
     let tx = build_spend_transaction(w.np, root, depth, domain, inputs, &outputs, 0, seed)
         .map_err(|e| anyhow::anyhow!("build spend transaction: {e}"))?;
 
@@ -308,6 +509,8 @@ pub async fn submit_spend(
             Ok(build_output_memo(&kem_cts[i], outputs[i].amount, &r_out, &secrets[i]))
         })
         .collect::<anyhow::Result<_>>()?;
+    // `env.output_range_proofs` already carries the packed per-limb ranges
+    // (copied from the built tx by `from_built`).
 
     let mut msg = TYPE_LATTICE_TRANSACTION.to_be_bytes().to_vec();
     msg.extend_from_slice(&encode_tx_envelope(&env));
@@ -405,4 +608,116 @@ pub fn select_to_cover(mut owned: Vec<OwnedCoin>, target: u128) -> anyhow::Resul
         anyhow::bail!("insufficient balance: have {total}, need {target} (base units)");
     }
     Ok((selected, total))
+}
+
+#[cfg(test)]
+mod spend_key_guard_tests {
+    use super::*;
+    use quil_lattice_ct::rq::Poly;
+
+    /// The compatibility guard: a valid (short, right-rank) spend base passes;
+    /// a wrong-rank one and a non-short one (the signature of a key generated
+    /// under a different modulus q) are REJECTED, never silently accepted.
+    #[test]
+    fn validate_spend_base_rejects_incompatible() {
+        let cols = 4usize;
+        // Honest derived spend base: ternary, short → accepted.
+        let good = hash_to_short_polyvec(b"seed-material-for-test", cols);
+        assert!(validate_spend_base(&good, cols).is_ok(), "honest short spend base accepted");
+
+        // Wrong module rank → rejected.
+        assert!(validate_spend_base(&good, cols + 1).is_err(), "wrong-rank key rejected");
+
+        // Non-short key (a large coefficient ~ the shape of a key decoded under a
+        // DIFFERENT modulus q) → rejected loudly.
+        let mut polys = good.0.clone();
+        let mut c = vec![0i64; Poly::D];
+        c[0] = (Poly::Q / 2) as i64; // huge centered coefficient
+        polys[0] = Poly::from_signed(&c);
+        let corrupt = PolyVec(polys);
+        assert!(validate_spend_base(&corrupt, cols).is_err(), "non-short (q-incompatible) key rejected");
+    }
+
+    /// An INCOMPATIBLE legacy plaintext spend key is NOT used and NOT a hard
+    /// error — `derive_spend_base` REGENERATES a valid short key from the
+    /// (modulus-independent) keystore secret. Safe because no coins exist.
+    #[test]
+    fn derive_spend_base_regenerates_on_incompatible_legacy() {
+        let dir = std::env::temp_dir().join(format!("quil-spendkey-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cols = 4usize;
+        // Write an incompatible legacy key: a wire-encoded vector with a huge
+        // (non-short) coefficient — the signature of a key from a different q.
+        let mut polys = hash_to_short_polyvec(b"x", cols).0;
+        let mut c = vec![0i64; Poly::D];
+        c[0] = (Poly::Q / 2) as i64;
+        polys[0] = Poly::from_signed(&c);
+        let bad = PolyVec(polys);
+        let encoded = hex::encode(wire::encode_polyvec(&bad));
+        std::fs::write(dir.join("q-lattice-spend.key"), encoded).unwrap();
+
+        // derive_spend_base must NOT return the corrupt key; it regenerates.
+        let b = derive_spend_base(&dir, b"onion-secret-material", cols).expect("regenerates");
+        assert!(validate_spend_base(&b, cols).is_ok(), "regenerated key is valid + short");
+        assert_ne!(b.0, bad.0, "did not use the incompatible legacy key");
+        // ONE-TIME: the stale file is moved aside (preserved as .bak, not deleted),
+        // so the migration does not repeat on the next load.
+        assert!(!dir.join("q-lattice-spend.key").exists(), "stale key moved aside");
+        assert!(dir.join("q-lattice-spend.key.incompatible.bak").exists(), "stale bytes preserved in .bak");
+        // Deterministic + does not regenerate again: same secret → same key,
+        // now via the plain derivation path (no legacy file present).
+        let b2 = derive_spend_base(&dir, b"onion-secret-material", cols).unwrap();
+        assert_eq!(b.0, b2.0, "derivation is deterministic and stable across loads");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The address parameter fingerprint round-trips, and a mismatched
+    /// fingerprint / version is REJECTED (cross-parameter sends fail closed).
+    #[test]
+    fn address_fingerprint_round_trips_and_rejects_mismatch() {
+        let kem_pk = vec![7u8; SNTRUP761_PK_LEN];
+        let big_b = hash_to_short_polyvec(b"B-material", 4);
+        let addr = encode_address(&kem_pk, &big_b);
+        let hex_addr = hex::encode(&addr);
+        // Round-trip under the current params.
+        let parsed = parse_address(&hex_addr).expect("current-params address parses");
+        assert_eq!(parsed.kem_pk, kem_pk);
+        assert_eq!(parsed.big_b.0, big_b.0);
+        assert_eq!(&addr[1..1 + ADDR_FP_LEN], &params_fingerprint()[..], "fingerprint embedded");
+
+        // Flip a fingerprint byte → different (foreign) parameters → REJECTED.
+        let mut foreign = addr.clone();
+        foreign[1] ^= 0xFF;
+        assert!(parse_address(&hex::encode(&foreign)).is_err(), "mismatched-param address rejected");
+
+        // Unsupported version → REJECTED.
+        let mut bad_ver = addr.clone();
+        bad_ver[0] = ADDR_VERSION.wrapping_add(1);
+        assert!(parse_address(&hex::encode(&bad_ver)).is_err(), "wrong version rejected");
+    }
+
+    /// Confidential and escrow/pending addresses have DISTINCT version bytes, so
+    /// pasting one where the other is expected fails closed (no garbage misparse
+    /// → no locked funds).
+    #[test]
+    fn address_types_do_not_cross_parse() {
+        let kem_pk = vec![7u8; SNTRUP761_PK_LEN];
+        let big_b = hash_to_short_polyvec(b"B", 4);
+        let conf = encode_address(&kem_pk, &big_b); // ADDR_VERSION
+        assert!(
+            parse_pending_address(&hex::encode(&conf)).is_err(),
+            "a confidential address must NOT parse as a pending/escrow address"
+        );
+        // A pending address: PENDING_VERSION ‖ kem_pk ‖ falcon_pk.
+        let mut pend = vec![PENDING_VERSION];
+        pend.extend_from_slice(&kem_pk);
+        pend.extend_from_slice(&[9u8; 64]); // dummy falcon_pk
+        assert!(
+            parse_address(&hex::encode(&pend)).is_err(),
+            "a pending address must NOT parse as a confidential address"
+        );
+        let parsed = parse_pending_address(&hex::encode(&pend)).expect("pending parses under its own version");
+        assert_eq!(parsed.kem_pk, kem_pk);
+        assert_eq!(parsed.falcon_pk, vec![9u8; 64]);
+    }
 }

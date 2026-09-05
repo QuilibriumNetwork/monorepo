@@ -91,6 +91,21 @@ pub fn prove_limb_balance(
     n_limbs: usize,
     seed: u64,
 ) -> Option<(Vec<Vec<RingCommitment>>, Vec<Vec<RingCommitment>>, LimbBalanceProof)> {
+    prove_limb_balance_ext(range_key, in_amounts, out_amounts, fee, n_limbs, seed, false)
+}
+
+/// `prove_limb_balance` (self-generating) with a `range_free` flag — the proof
+/// omits the output-limb `range_rq` when `true`.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub fn prove_limb_balance_ext(
+    range_key: &RingRangeKey,
+    in_amounts: &[u128],
+    out_amounts: &[u128],
+    fee: u128,
+    n_limbs: usize,
+    seed: u64,
+    range_free: bool,
+) -> Option<(Vec<Vec<RingCommitment>>, Vec<Vec<RingCommitment>>, LimbBalanceProof)> {
     use crate::arith::SplitMix64;
     // The commit key MUST share (a1, a2_val) with the range key, else range
     // proofs on these commitments reject.
@@ -109,7 +124,7 @@ pub fn prove_limb_balance(
     };
     let in_c = commit_amounts(in_amounts, &mut prg);
     let out_c = commit_amounts(out_amounts, &mut prg);
-    let proof = prove_limb_balance_core(range_key, &in_c, &out_c, in_amounts, out_amounts, fee, n_limbs, seed)?;
+    let proof = prove_limb_balance_core(range_key, &in_c, &out_c, in_amounts, out_amounts, fee, n_limbs, seed, range_free)?;
     Some((
         in_c.iter().map(|a| a.iter().map(|x| x.0.clone()).collect()).collect(),
         out_c.iter().map(|a| a.iter().map(|x| x.0.clone()).collect()).collect(),
@@ -136,6 +151,29 @@ pub fn prove_limb_balance_bound(
     n_limbs: usize,
     seed: u64,
 ) -> Option<LimbBalanceProof> {
+    prove_limb_balance_bound_ext(
+        range_key, in_virtual, in_rand, out_virtual, out_rand, in_amounts, out_amounts, fee, n_limbs, seed, false,
+    )
+}
+
+/// `prove_limb_balance_bound` with a `range_free` mode: when `true`, the built
+/// proof omits the output-limb `range_rq` (the caller supplies packed per-limb
+/// ranges out-of-band) — smaller proof, same balance. Verify with
+/// `verify_limb_balance_ext(.., range_free=true)`.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_limb_balance_bound_ext(
+    range_key: &RingRangeKey,
+    in_virtual: &[Vec<RingCommitment>],
+    in_rand: &[PolyVec],
+    out_virtual: &[Vec<RingCommitment>],
+    out_rand: &[PolyVec],
+    in_amounts: &[u128],
+    out_amounts: &[u128],
+    fee: u128,
+    n_limbs: usize,
+    seed: u64,
+    range_free: bool,
+) -> Option<LimbBalanceProof> {
     // Pair each limb commitment with its amount's shared randomness.
     let pair = |vc: &[Vec<RingCommitment>], rand: &[PolyVec]| -> Vec<Vec<(RingCommitment, PolyVec)>> {
         vc.iter()
@@ -145,12 +183,13 @@ pub fn prove_limb_balance_bound(
     };
     let in_c = pair(in_virtual, in_rand);
     let out_c = pair(out_virtual, out_rand);
-    prove_limb_balance_core(range_key, &in_c, &out_c, in_amounts, out_amounts, fee, n_limbs, seed)
+    prove_limb_balance_core(range_key, &in_c, &out_c, in_amounts, out_amounts, fee, n_limbs, seed, range_free)
 }
 
 /// The carry-chain + range + per-limb-opening core, over pre-built commitments
 /// (each `(commitment, randomness)`). Shared by [`prove_limb_balance`] (fresh
 /// commitments) and [`prove_limb_balance_bound`] (externally-supplied).
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn prove_limb_balance_core(
     range_key: &RingRangeKey,
@@ -161,6 +200,7 @@ fn prove_limb_balance_core(
     fee: u128,
     n_limbs: usize,
     seed: u64,
+    range_free: bool,
 ) -> Option<LimbBalanceProof> {
     use crate::arith::SplitMix64;
     let vkey = &range_key.value_key();
@@ -188,15 +228,19 @@ fn prove_limb_balance_core(
     // Range-prove each OUTPUT limb ∈ [0, 2^RANGE_BITS): bounds amounts non-negative
     // so no output can inflate value. (Inputs are pre-validated coins.)
     debug_assert_eq!(range_key.n_bits(), RANGE_BITS);
-    let mut out_ranges = Vec::with_capacity(out_c.len());
-    for (i, a) in out_c.iter().enumerate() {
-        let vlimbs = limbs_of(out_amounts[i], n_limbs);
-        let mut row = Vec::with_capacity(n_limbs);
-        for (j, (cc, cr)) in a.iter().enumerate() {
-            let rp = prove_range_rq(range_key, cc, vlimbs[j], cr, ETA, BAL_MASK, seed ^ (0xD00 + (i * n_limbs + j) as u64))?;
-            row.push(rp);
+    // Output-limb range proofs — skipped in range_free mode (the caller carries
+    // the coefficient-packed per-limb ranges instead).
+    let mut out_ranges = Vec::with_capacity(if range_free { 0 } else { out_c.len() });
+    if !range_free {
+        for (i, a) in out_c.iter().enumerate() {
+            let vlimbs = limbs_of(out_amounts[i], n_limbs);
+            let mut row = Vec::with_capacity(n_limbs);
+            for (j, (cc, cr)) in a.iter().enumerate() {
+                let rp = prove_range_rq(range_key, cc, vlimbs[j], cr, ETA, BAL_MASK, seed ^ (0xD00 + (i * n_limbs + j) as u64))?;
+                row.push(rp);
+            }
+            out_ranges.push(row);
         }
-        out_ranges.push(row);
     }
 
     // Commit the carries c_0..c_{L-2} and range-prove (c_j + MAX_CARRY) ∈ [0, 2·MAX_CARRY).
@@ -250,7 +294,7 @@ fn prove_limb_balance_core(
     Some(LimbBalanceProof { carries, carry_ranges, out_ranges, per_limb })
 }
 
-/// Verify a full-width limb balance.
+/// Verify a full-width limb balance (with the built-in output-limb range_rq).
 pub fn verify_limb_balance(
     range_key: &RingRangeKey,
     in_c: &[Vec<RingCommitment>],
@@ -259,11 +303,34 @@ pub fn verify_limb_balance(
     n_limbs: usize,
     proof: &LimbBalanceProof,
 ) -> bool {
+    verify_limb_balance_ext(range_key, in_c, out_c, fee, n_limbs, proof, false)
+}
+
+/// `verify_limb_balance` with a `range_free` mode: when `true`, the OUTPUT-limb
+/// range proofs are NOT expected here (`out_ranges` empty) because the caller
+/// supplies them out-of-band (the coefficient-packed per-limb ranges); the carry
+/// range proofs and the carry-chain balance are checked as usual. The caller MUST
+/// have verified the external output ranges — a `range_free` verify alone does not
+/// prove output non-negativity.
+pub fn verify_limb_balance_ext(
+    range_key: &RingRangeKey,
+    in_c: &[Vec<RingCommitment>],
+    out_c: &[Vec<RingCommitment>],
+    fee: u128,
+    n_limbs: usize,
+    proof: &LimbBalanceProof,
+    range_free: bool,
+) -> bool {
     let vkey = &range_key.value_key();
+    let out_ranges_ok = if range_free {
+        proof.out_ranges.is_empty()
+    } else {
+        proof.out_ranges.len() == out_c.len()
+    };
     if proof.carries.len() != n_limbs - 1
         || proof.carry_ranges.len() != n_limbs - 1
         || proof.per_limb.len() != n_limbs
-        || proof.out_ranges.len() != out_c.len()
+        || !out_ranges_ok
         || range_key.n_bits() != RANGE_BITS
     {
         return false;
@@ -271,14 +338,17 @@ pub fn verify_limb_balance(
     let fee_limbs = limbs_of(fee, n_limbs);
 
     // Output-limb range proofs: each out limb ∈ [0, 2^RANGE_BITS) ⇒ non-negative,
-    // bounded amounts ⇒ no output inflates value.
-    for (i, a) in out_c.iter().enumerate() {
-        if proof.out_ranges[i].len() != n_limbs || a.len() != n_limbs {
-            return false;
-        }
-        for (j, cc) in a.iter().enumerate() {
-            if !verify_range_rq(range_key, cc, &proof.out_ranges[i][j], ETA, BAL_MASK) {
+    // bounded amounts ⇒ no output inflates value. Skipped in range_free mode (the
+    // caller verified the packed per-limb ranges instead).
+    if !range_free {
+        for (i, a) in out_c.iter().enumerate() {
+            if proof.out_ranges[i].len() != n_limbs || a.len() != n_limbs {
                 return false;
+            }
+            for (j, cc) in a.iter().enumerate() {
+                if !verify_range_rq(range_key, cc, &proof.out_ranges[i][j], ETA, BAL_MASK) {
+                    return false;
+                }
             }
         }
     }
@@ -349,6 +419,24 @@ mod tests {
         let (in_c, out_c, pf) =
             prove_limb_balance(&rk, &[v_in], &[o1, o2], fee, L, 7).expect("balances");
         assert!(verify_limb_balance(&rk, &in_c, &out_c, fee, L, &pf));
+    }
+
+    #[test]
+    fn range_free_balance_omits_output_ranges_and_binds() {
+        // range_free: the proof omits the output range_rq (smaller); verify with
+        // range_free=true accepts, range_free=false rejects (empty out_ranges).
+        let rk = rkey();
+        let v_in = (1u128 << 40) + 5;
+        let (o1, o2, fee) = ((1u128 << 40) - 100, 103u128, 2u128);
+        // Commit under the value key (self-generated), then reuse as the "bound"
+        // commitments so we can build a range_free proof over them.
+        let (in_c, out_c, rf) = prove_limb_balance_ext(&rk, &[v_in], &[o1, o2], fee, L, 7, true).unwrap();
+        assert!(rf.out_ranges.is_empty(), "range_free omits output range_rq");
+        // range_free=true accepts (carry ranges + carry-chain balance still bind;
+        // output ranges come from the packed per-limb proofs out-of-band).
+        assert!(verify_limb_balance_ext(&rk, &in_c, &out_c, fee, L, &rf, true));
+        // Strict mode REJECTS the empty-out_ranges proof (no output range guarantee).
+        assert!(!verify_limb_balance_ext(&rk, &in_c, &out_c, fee, L, &rf, false), "strict rejects empty out_ranges");
     }
 
     #[test]

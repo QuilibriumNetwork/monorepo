@@ -989,6 +989,59 @@ mod tests {
     }
 
     #[test]
+    fn size_index_maintained_at_write_time_and_survives_churn() {
+        // The regression this guards: the Merkle-sum size index used to be
+        // populated only LAZILY on read (`node_size_sum` cold-walk). After an
+        // epoch of churn the head version's nodes were all fresh, un-memoized
+        // NodeKeys, so the next per-shard size read cold-walked the whole tree —
+        // the epoch-boundary halt. Now every commit maintains the index in the
+        // same batch, so the head root's sum is always present and correct with
+        // NO lazy recompute. This asserts exactly that: read `get_size_sum` at
+        // the head root DIRECTLY (never calling `node_size_sum`) and require it.
+        use jmt::storage::{NibblePath, NodeKey};
+
+        // A vertex leaf value: commitment(32) ‖ size(u64 BE) = 40 bytes.
+        let leaf = |size: u64| {
+            let mut v = vec![0u8; 40];
+            v[32..40].copy_from_slice(&size.to_be_bytes());
+            v
+        };
+        let store = MemTreeStore::default();
+
+        // v0: three leaves, sizes 10/20/30.
+        let leaves_v0: Vec<(Vec<u8>, Vec<u8>)> = [10u64, 20, 30]
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (format!("k{i}").into_bytes(), leaf(s)))
+            .collect();
+        commit(&store, 0, leaves_v0).unwrap();
+        let root0 = NodeKey::new(0, NibblePath::new(vec![]));
+        assert_eq!(
+            store.get_size_sum(&root0).unwrap(),
+            Some(60u128),
+            "v0 root sum must be persisted at WRITE time (10+20+30), not lazily"
+        );
+
+        // v1 (churn): rewrite k1 20→200 and add k3=5. JMT is copy-on-write, so
+        // the v1 root is a FRESH NodeKey whose sum this commit must maintain by
+        // combining the new child (k1/k3) with the UNCHANGED v0 children (k0/k2)
+        // via their already-persisted sums — the exact cross-version reuse that
+        // keeps head warm without a walk.
+        let leaves_v1: Vec<(Vec<u8>, Vec<u8>)> =
+            vec![(b"k1".to_vec(), leaf(200)), (b"k3".to_vec(), leaf(5))];
+        commit(&store, 1, leaves_v1).unwrap();
+        let root1 = NodeKey::new(1, NibblePath::new(vec![]));
+        assert_eq!(
+            store.get_size_sum(&root1).unwrap(),
+            Some(245u128),
+            "v1 head root sum stays warm+correct after churn (10+200+30+5)"
+        );
+
+        // The public read path agrees (and, being warm, is O(depth)).
+        assert_eq!(subtree_size(&store, 1, &[]).unwrap(), 245u128);
+    }
+
+    #[test]
     fn genesis_grid_prefixes_are_sentinel_and_never_byte_suffix() {
         // Mainnet: 64 rows, every one a SENTINEL bit-path prefix (leading marker),
         // never the legacy byte-suffix `[i]`. Each decodes to its 6-bit index, so

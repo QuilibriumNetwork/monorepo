@@ -607,3 +607,17 @@ mod tests {
         assert!(decode_legacy_verenc_coin(&tree).unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+mod _size_probe {
+    use super::*;
+    #[test]
+    fn print_transparent_coin_size() {
+        let coin = TransparentCoin { owner_address: [0xabu8; 32], amount: 123456789u128 };
+        let th = [0xffu8; 32];
+        let origin = [0xcdu8; 32];
+        let tree = create_transparent_coin_tree(&coin, &th, &origin).unwrap();
+        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        println!("TRANSPARENT_COIN_SERIALIZED_BYTES = {}", blob.len());
+    }
+}

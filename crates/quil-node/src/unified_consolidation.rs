@@ -341,6 +341,42 @@ pub fn boot_apply_cutover_reset(
     true
 }
 
+/// Set the unified-tree flag at boot WITHOUT running consolidation — safe to call
+/// BEFORE the first `rebucket_app` (which fires in `refresh_crdt_shard_prefixes`
+/// when a split landed while the node was down). If consolidation has ALREADY run
+/// (persisted marker) and the chain is at/after the cutover, activate unified mode
+/// now so that boot re-partition uses the O(depth) forest size index (seeded moments
+/// earlier by `warm_size_index`) instead of `forest_app_buckets`'s O(all-leaves)
+/// `scan_app_buckets` fallback — the fallback fires precisely when `unified_tree()`
+/// is still false, which it is until `boot_consolidate_and_gate` runs LATER. A
+/// not-yet-consolidated node stays legacy here and is gated normally below.
+/// Returns whether unified mode was activated.
+pub fn pre_gate_unified_if_consolidated(
+    hg: &Arc<quil_store::RocksHypergraphStore>,
+    clock_store: &dyn ClockStore,
+    crdt: &HypergraphCrdt,
+) -> bool {
+    if !is_consolidated(hg) {
+        return false;
+    }
+    let head = clock_store
+        .get_latest_global_clock_frame()
+        .ok()
+        .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
+        .unwrap_or(0);
+    let active = head >= unified_tree_cutover_frame();
+    if active {
+        crdt.set_unified_tree(true);
+        info!(
+            head,
+            cutover = unified_tree_cutover_frame(),
+            "unified-tree gate pre-set at boot (already consolidated) — boot re-partition uses the \
+             forest size index, not the full-leaf scan"
+        );
+    }
+    active
+}
+
 /// Run the one-time consolidation if it hasn't run (idempotent via the persisted
 /// marker), then set the CRDT's unified-tree flag from the current head frame.
 /// Returns whether unified mode is active after this call. Call once at boot,

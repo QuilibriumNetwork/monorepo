@@ -770,6 +770,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         &env.escrow_range_proof,
                         &env.change_commitments,
                         &env.change_otks,
+                        &env.change_range_proofs,
                         &env.balance_proof,
                         env.fee,
                     ))? {

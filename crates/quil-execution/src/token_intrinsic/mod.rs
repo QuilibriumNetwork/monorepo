@@ -20,6 +20,7 @@ pub mod lattice_ct;
 pub mod legacy_migration;
 pub mod materialize;
 pub mod metadata_schema;
+pub mod packed_range;
 pub mod mint;
 pub mod rdf_schema;
 pub mod pending;

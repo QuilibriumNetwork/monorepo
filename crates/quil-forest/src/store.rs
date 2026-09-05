@@ -16,7 +16,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use jmt::storage::{
-    LeafNode, Node, NodeBatch, NodeKey, StaleNodeIndex, TreeReader, TreeUpdateBatch, TreeWriter,
+    LeafNode, NibblePath, Node, NodeBatch, NodeKey, StaleNodeIndex, TreeReader, TreeUpdateBatch, TreeWriter,
 };
 use jmt::{KeyHash, OwnedValue, Version};
 
@@ -120,6 +120,14 @@ impl TreeWriter for MemTreeStore {
                 _ => hist.push((*version, val.clone())),
             }
         }
+        drop(values);
+        // Maintain the size index in lockstep (nodes + values are now visible
+        // to the child/value lookups inside `batch_size_sums`).
+        let sums = batch_size_sums(self, batch)?;
+        let mut sizes = self.sizes.write().unwrap();
+        for (nk, s) in sums {
+            sizes.insert(nk, s);
+        }
         Ok(())
     }
 }
@@ -188,6 +196,11 @@ const TAG_PREIMAGE: u8 = b'p';
 /// O(all-leaves) rescan `rebucket_app` does today.
 const TAG_SIZE: u8 = b'z';
 
+/// Nodes per `WriteBatch` flush during the one-time size-index backfill
+/// ([`RocksTreeStore::seed_size_index_batched`]). Large enough to amortize the
+/// per-batch WAL write across many nodes, small enough to bound peak memory.
+const SEED_BATCH: usize = 65_536;
+
 /// A store that can memoize per-node subtree size sums (the [`TAG_SIZE`]
 /// side column). Split from [`TreeReader`] so the generic
 /// [`crate::subtree_size`] / [`crate::node_size_sum`] walkers work over both
@@ -198,6 +211,74 @@ pub trait SizeIndex {
     fn get_size_sum(&self, node_key: &NodeKey) -> Result<Option<u128>>;
     /// Memoize `size` as the summed leaf size under `node_key`.
     fn put_size_sum(&self, node_key: &NodeKey, size: u128) -> Result<()>;
+}
+
+/// Compute the `size_sum` for **every** node in a commit's [`NodeBatch`],
+/// bottom-up, so the [`TAG_SIZE`] side index can be persisted in the SAME
+/// atomic write as the nodes it summarizes. This is what keeps the Merkle-sum
+/// size index permanently warm at head: each freshly-written node gets its sum
+/// computed from its children's sums right now — the children are either in
+/// this batch (a child's nibble path is its parent's plus one nibble, so
+/// deepest-first ordering computes them before their parent) or already carry a
+/// persisted sum from an earlier commit. Without this, the index was populated
+/// only lazily on read; after an epoch of churn essentially every node at head
+/// was a fresh (unmemoized) `NodeKey`, so the next `rebucket_app` degenerated
+/// into a cold O(all-leaves) re-walk with random I/O — the epoch-boundary halt.
+///
+/// The `node_size_sum` fallback (a cold child not yet in the index) only fires
+/// before the one-time [`crate::Forest::seed_size_index`] backfill has run over
+/// a pre-existing tree; it self-heals by memoizing what it visits. Once the
+/// tree is seeded, every child is a hit and this is O(nodes written per frame).
+pub(crate) fn batch_size_sums<S: TreeReader + SizeIndex>(
+    store: &S,
+    batch: &NodeBatch,
+) -> Result<Vec<(NodeKey, u128)>> {
+    // Deepest nibble path first: a child's path is its parent's + one nibble,
+    // so processing longest paths first guarantees each internal node's
+    // in-batch children are already computed when we reach it.
+    let mut ordered: Vec<(&NodeKey, &Node)> = batch.nodes().iter().collect();
+    ordered.sort_by(|a, b| {
+        b.0.nibble_path()
+            .num_nibbles()
+            .cmp(&a.0.nibble_path().num_nibbles())
+    });
+    let mut computed: HashMap<NodeKey, u128> = HashMap::with_capacity(ordered.len());
+    let mut out: Vec<(NodeKey, u128)> = Vec::with_capacity(ordered.len());
+    for (nk, node) in ordered {
+        let s: u128 = match node {
+            Node::Null => 0,
+            Node::Leaf(leaf) => {
+                let kh = leaf.key_hash();
+                // The leaf's value is normally written in THIS commit; if the
+                // node moved version without its value changing (a sibling
+                // insert re-keys the leaf), read the still-current value.
+                let val = match batch.values().get(&(nk.version(), kh)) {
+                    Some(Some(v)) => Some(v.clone()),
+                    Some(None) => None, // tombstone written this commit
+                    None => store.get_value_option(nk.version(), kh)?,
+                };
+                val.map(|b| crate::vertex_leaf_size(&b)).unwrap_or(0)
+            }
+            Node::Internal(int) => {
+                let mut acc = 0u128;
+                for (nibble, child) in int.children_sorted() {
+                    let ck = nk.gen_child_node_key(child.version, nibble);
+                    let cs = match computed.get(&ck) {
+                        Some(v) => *v,
+                        None => match store.get_size_sum(&ck)? {
+                            Some(v) => v,
+                            None => crate::node_size_sum(store, &ck)?,
+                        },
+                    };
+                    acc = acc.saturating_add(cs);
+                }
+                acc
+            }
+        };
+        computed.insert(nk.clone(), s);
+        out.push((nk.clone(), s));
+    }
+    Ok(out)
 }
 
 /// A [`TreeReader`]/[`TreeWriter`]/[`ForestStore`] over a shared RocksDB,
@@ -253,6 +334,179 @@ impl RocksTreeStore {
         k
     }
 
+    /// A read-only iterator tuned for a one-shot sequential sweep of a tag range:
+    /// checksums off (this rebuilds a LOCAL side index — a corrupt block would fail
+    /// borsh decode anyway, and XXH3 was ~3% of the boot CPU), block cache untouched
+    /// (a full-tree sweep must not evict the live working set), and a wide readahead
+    /// so the kernel streams whole SST files instead of faulting a block at a time.
+    fn seq_iter(&self, tag: u8) -> (rocksdb::DBRawIterator<'_>, Vec<u8>) {
+        let mut lo = self.prefix.clone();
+        lo.push(tag);
+        let mut hi = self.prefix.clone();
+        hi.push(tag + 1); // next tag byte — exclusive upper bound
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.set_verify_checksums(false);
+        ro.fill_cache(false);
+        ro.set_readahead_size(8 << 20);
+        let mut it = self.db.raw_iterator_opt(ro);
+        it.seek(&lo);
+        (it, hi)
+    }
+
+    /// One-time backfill of the `TAG_SIZE` Merkle-sum index over the whole tree at
+    /// `version` — the FAST path for the boot seed.
+    ///
+    /// The obvious implementation, a top-down recursive walk, is pathological here:
+    /// node keys sort by `(version, num_nibbles, path)`, so a node and its children
+    /// sit in DISJOINT regions of the keyspace (they differ in `num_nibbles`). A
+    /// depth-first walk therefore bounces between regions on every step, and since
+    /// each ~KB SST block holds hundreds of nodes it gets evicted and re-decompressed
+    /// O(depth) times — on NVMe the disk is idle and the CPU melts in LZ4 (the
+    /// multi-day archive boot: ~300 nodes/s, 27% in `LZ4_decompress`). Parallelism
+    /// only multiplies the block-cache thrash and allocator/memcg contention.
+    ///
+    /// Instead: two SEQUENTIAL scans (each block decompressed exactly once), then a
+    /// bottom-up compute entirely in memory —
+    ///   1. sweep the value column → `key_hash → live leaf size` (latest write
+    ///      `<= version`; tombstone ⇒ 0);
+    ///   2. sweep the node column: LEAF sizes resolve immediately from (1) and are
+    ///      written inline; INTERNAL nodes are stashed with their child keys;
+    ///   3. sort the stashed internals by `num_nibbles` DESCENDING — a child always
+    ///      has one more nibble than its parent, so deepest-first guarantees every
+    ///      child's size is known before its parent (the same topological order
+    ///      [`batch_size_sums`] uses) — and sum each from its children.
+    /// All writes go through `WriteBatch`es flushed every [`SEED_BATCH`] nodes. Peak
+    /// memory is one `u128`/leaf plus the internal adjacency (internals are ~1/15th
+    /// of nodes), i.e. a few GB for a ~100M-node tree — fine for an archive host, and
+    /// the trade that turns days of random I/O into minutes of sequential streaming.
+    ///
+    /// Resumable at the whole-tree granularity via the root memo (mid-seed crashes
+    /// re-run from scratch, but the run is now minutes). Returns the tree's total
+    /// size; caller flushes + sets its `seeded` marker AFTER this returns.
+    /// `on_flush(cumulative_nodes_written)` fires per batch flush for a live heartbeat.
+    pub fn seed_size_index_batched(
+        &self,
+        version: u64,
+        on_flush: &(dyn Fn(u64) + Sync),
+    ) -> Result<u128> {
+        let root_key = NodeKey::new(version, NibblePath::new(vec![]));
+        // Whole-tree resume: root memo present ⇒ already seeded.
+        if let Some(s) = self.get_size_sum(&root_key)? {
+            on_flush(0);
+            return Ok(s);
+        }
+
+        // ---- Pass 1: value column → live leaf size by key_hash. -------------
+        // Keys: prefix ++ 'v' ++ key_hash(32) ++ version_be(8); values sort ascending
+        // by version within a key_hash, so the last entry `<= version` wins.
+        let khs = self.prefix.len() + 1;
+        let mut leaf_size: HashMap<[u8; 32], u128> = HashMap::new();
+        {
+            let (mut it, hi) = self.seq_iter(TAG_VALUE);
+            while it.valid() {
+                let k = match it.key() {
+                    Some(k) if k < hi.as_slice() => k,
+                    _ => break,
+                };
+                if k.len() >= khs + 40 {
+                    let mut vb = [0u8; 8];
+                    vb.copy_from_slice(&k[khs + 32..khs + 40]);
+                    if u64::from_be_bytes(vb) <= version {
+                        let mut kh = [0u8; 32];
+                        kh.copy_from_slice(&k[khs..khs + 32]);
+                        // Payload: 0x01 ++ value, or 0x00/empty tombstone.
+                        let sz = match it.value() {
+                            Some(v) if v.first() == Some(&0x01) => crate::vertex_leaf_size(&v[1..]),
+                            _ => 0,
+                        };
+                        leaf_size.insert(kh, sz);
+                    }
+                }
+                it.next();
+            }
+        }
+
+        // ---- Pass 2: node column → write leaf sizes, stash internals. -------
+        let mut node_size: HashMap<NodeKey, u128> = HashMap::new();
+        let mut internals: Vec<(NodeKey, Vec<NodeKey>)> = Vec::new();
+        let mut wb = rocksdb::WriteBatch::default();
+        let mut pending = 0u64;
+        let mut written = 0u64;
+        {
+            let (mut it, hi) = self.seq_iter(TAG_NODE);
+            while it.valid() {
+                let (k, v) = match (it.key(), it.value()) {
+                    (Some(k), Some(v)) if k < hi.as_slice() => (k, v),
+                    _ => break,
+                };
+                let nk: NodeKey = borsh::from_slice(&k[khs..])?;
+                match borsh::from_slice::<Node>(v)? {
+                    Node::Null => {}
+                    Node::Leaf(leaf) => {
+                        let s = leaf_size.get(&leaf.key_hash().0).copied().unwrap_or(0);
+                        node_size.insert(nk.clone(), s);
+                        wb.put(self.size_key_bytes(&nk), s.to_be_bytes());
+                        pending += 1;
+                    }
+                    Node::Internal(int) => {
+                        let kids = int
+                            .children_sorted()
+                            .map(|(nibble, child)| nk.gen_child_node_key(child.version, nibble))
+                            .collect();
+                        internals.push((nk, kids));
+                    }
+                }
+                if pending >= SEED_BATCH as u64 {
+                    self.db.write(std::mem::take(&mut wb))?;
+                    written += pending;
+                    pending = 0;
+                    on_flush(written);
+                }
+                it.next();
+            }
+        }
+        drop(leaf_size); // no longer needed once leaves are summed
+
+        // ---- Pass 3: sum internals bottom-up (deepest nibble path first). ---
+        internals.sort_unstable_by(|a, b| {
+            b.0.nibble_path()
+                .num_nibbles()
+                .cmp(&a.0.nibble_path().num_nibbles())
+        });
+        let mut root_size = 0u128;
+        for (nk, kids) in &internals {
+            let mut acc = 0u128;
+            for ck in kids {
+                acc = acc.saturating_add(node_size.get(ck).copied().unwrap_or(0));
+            }
+            node_size.insert(nk.clone(), acc);
+            wb.put(self.size_key_bytes(nk), acc.to_be_bytes());
+            pending += 1;
+            if nk.nibble_path().num_nibbles() == 0 {
+                root_size = acc; // the root (empty path) — its sum is the tree total
+            }
+            if pending >= SEED_BATCH as u64 {
+                self.db.write(std::mem::take(&mut wb))?;
+                written += pending;
+                pending = 0;
+                on_flush(written);
+            }
+        }
+        // A single-leaf tree has no internal root: take the root memo directly.
+        if internals.iter().all(|(nk, _)| nk.nibble_path().num_nibbles() != 0) {
+            root_size = node_size.get(&root_key).copied().unwrap_or(0);
+        }
+
+        self.db.write(std::mem::take(&mut wb))?;
+        written += pending;
+        // Force memtable→SST so the index is durable BEFORE the caller sets the
+        // `seeded` marker (else a crash could leave the marker over an index still
+        // only in an unflushed memtable).
+        self.db.flush()?;
+        on_flush(written);
+        Ok(root_size)
+    }
+
     /// The preimage key for a leaf's `KeyHash` (see [`TAG_PREIMAGE`]).
     pub fn preimage_key(&self, key_hash: &KeyHash) -> Vec<u8> {
         let mut k = self.prefix.clone();
@@ -305,6 +559,21 @@ impl RocksTreeStore {
                 None => return Ok(()), // empty prefix — nothing scoped to clear
             }
         };
+        let mut wb = rocksdb::WriteBatch::default();
+        wb.delete_range(&lower, &upper);
+        self.db.write(wb)?;
+        Ok(())
+    }
+
+    /// Delete this tree's entire `TAG_SIZE` Merkle-sum side index (leaving the
+    /// nodes/values intact), forcing the next [`seed_size_index_batched`] to do a
+    /// full cold re-seed. Used to (re)build the index for a legacy tree written
+    /// before the index existed, and by tests to exercise the cold seed path.
+    pub fn clear_size_index(&self) -> Result<()> {
+        let mut lower = self.prefix.clone();
+        lower.push(TAG_SIZE);
+        let mut upper = self.prefix.clone();
+        upper.push(TAG_SIZE + 1); // TAG_SIZE ('z') + 1 — exclusive upper bound
         let mut wb = rocksdb::WriteBatch::default();
         wb.delete_range(&lower, &upper);
         self.db.write(wb)?;
@@ -410,6 +679,10 @@ impl TreeWriter for RocksTreeStore {
             };
             wb.put(k, payload);
         }
+        // Maintain the Merkle-sum size index in lockstep with the nodes.
+        for (nk, s) in batch_size_sums(self, batch)? {
+            wb.put(self.size_key_bytes(&nk), s.to_be_bytes());
+        }
         self.db.write(wb)?;
         Ok(())
     }
@@ -445,6 +718,12 @@ impl RocksTreeStore {
         for idx in &batch.stale_node_index_batch {
             // Value is empty — the key carries everything the pruner needs.
             out.push((self.stale_key_bytes(idx), Vec::new()));
+        }
+        // Stage the Merkle-sum size index alongside the nodes/values so the
+        // side column is written in the SAME atomic batch as the commit it
+        // summarizes (the CRDT's cursor-carrying write). Keeps head warm.
+        for (nk, s) in batch_size_sums(self, &batch.node_batch)? {
+            out.push((self.size_key_bytes(&nk), s.to_be_bytes().to_vec()));
         }
         Ok(out)
     }

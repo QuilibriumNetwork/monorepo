@@ -98,10 +98,14 @@ pub async fn create(
         (Vec::new(), Vec::new(), Vec::new())
     };
 
+    // Packed per-limb ranges: [0] = escrow, [1..] = change (from the built tx).
+    let escrow_range_proof = built.output_range_proofs.first().cloned().unwrap_or_default();
+    let change_range_proofs: Vec<Vec<u8>> =
+        built.output_range_proofs.iter().skip(1).cloned().collect();
     let env = PendingCreateEnvelope {
         input_spend_proofs: built.input_spend_proofs,
         escrow_commitment: built.output_commitments[0].clone(),
-        escrow_range_proof: Vec::new(),
+        escrow_range_proof,
         balance_proof: built.balance_proof,
         fee: 0,
         to_key: to.falcon_pk,
@@ -111,6 +115,7 @@ pub async fn create(
         change_commitments,
         change_otks,
         change_memos,
+        change_range_proofs,
     };
     submit_lattice_message(&mut client, TYPE_LATTICE_PENDING, &encode_pending_create(&env)).await?;
 

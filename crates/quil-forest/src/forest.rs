@@ -975,6 +975,44 @@ impl Forest {
         subtree_size(&store, version, bit_path)
     }
 
+    /// One-time backfill: force-populate the memoized [`crate::SizeIndex`] for
+    /// the ENTIRE phase tree at `version`, walking every reachable node once and
+    /// memoizing its size sum. Equivalent to `app_subtree_size(.., &[])` but
+    /// named for its side effect. This seeds the baseline the write-time
+    /// maintenance ([`crate::batch_size_sums`]) then keeps warm: after seeding,
+    /// every freshly-written node finds its children's sums already present, so
+    /// per-shard size stays O(depth) instead of degrading to an O(all-leaves)
+    /// cold re-walk at the next `rebucket_app`. O(all-leaves) ONCE per DB;
+    /// returns the whole-tree size. Runs on a quiescent boot DB, never the
+    /// consensus hot path.
+    /// `on_flush(newly_seeded_nodes)` fires once per batch flush + at the end, so the
+    /// caller can log a progress heartbeat over the (minutes-to-hours) backfill.
+    /// Delete an app phase tree's size index (nodes/values untouched), forcing a
+    /// full cold re-seed on the next [`Self::seed_size_index`]. No-op on the
+    /// in-memory backend. For rebuilding a legacy tree's index (or tests).
+    pub fn clear_size_index(&self, app_address: &[u8], phase: Phase) -> Result<()> {
+        match self.store(&TreeId::shard_phase(app_address, phase)) {
+            TreeStore::Rocks(s) => s.clear_size_index(),
+            TreeStore::Mem(_) => Ok(()),
+        }
+    }
+
+    pub fn seed_size_index(
+        &self,
+        app_address: &[u8],
+        phase: Phase,
+        version: u64,
+        on_flush: &(dyn Fn(u64) + Sync),
+    ) -> Result<u128> {
+        let store = self.store(&TreeId::shard_phase(app_address, phase));
+        match &store {
+            // RocksDB: the batched, WAL-amortized, nibble-parallel seed. Boot hot loop.
+            TreeStore::Rocks(s) => s.seed_size_index_batched(version, on_flush),
+            // In-memory (tests/bench): the generic memoizing walk is fine (no heartbeat).
+            TreeStore::Mem(_) => subtree_size(&store, version, &[]),
+        }
+    }
+
     /// Find the MEANINGFUL split point for a shard: descend its subtree bit-by-bit
     /// from `shard_bits` to the SHALLOWEST bit where the data divides into TWO
     /// non-empty halves, and return the two child bit-paths (`shard_bits ++ …0`,
@@ -1534,6 +1572,65 @@ mod tests {
 
     fn leaves(n: u32, tag: u8) -> Vec<(Vec<u8>, Vec<u8>)> {
         (0..n).map(|i| (i.to_be_bytes().to_vec(), vec![tag ^ i as u8; 40])).collect()
+    }
+
+    /// The batched boot seed (`seed_size_index` on RocksDB → `seed_size_index_batched`)
+    /// must produce EXACTLY the generic memoizing walk's totals, populate the memo so
+    /// subsequent `app_subtree_size` reads are correct, and be idempotent (resume-safe).
+    #[test]
+    fn seed_size_index_batched_matches_generic_and_is_idempotent() {
+        let d_gen = tempfile::tempdir().unwrap();
+        let d_bat = tempfile::tempdir().unwrap();
+        let gen = Forest::new(open_db(d_gen.path()));
+        let bat = Forest::new(open_db(d_bat.path()));
+        let app = b"seed-batch-test".to_vec();
+        let apply_puts = |f: &Forest, puts: Vec<(Vec<u8>, Vec<u8>)>| {
+            let db = f.db().unwrap().clone();
+            for (k, v) in puts {
+                db.put(&k, &v).unwrap();
+            }
+        };
+        // 800 distinct-key leaves with varied sizes ⇒ a genuinely branching JMT.
+        let ls: Vec<(Vec<u8>, Vec<u8>)> = (0..800u32)
+            .map(|i| {
+                let mut vk = [0u8; 64];
+                vk[..4].copy_from_slice(&i.to_be_bytes());
+                (crate::l3_leaf_key(&vk, &[0x04]), vec![(i % 251) as u8; 1 + (i % 50) as usize])
+            })
+            .collect();
+        for f in [&gen, &bat] {
+            let (_r, puts) = f.commit_shard_phase_staged(&app, Phase::VertexAdds, 0, ls.clone()).unwrap();
+            apply_puts(f, puts);
+            // The commit warms the index at write time; strip it so both forests
+            // start COLD — the legacy-archive scenario the boot backfill exists for.
+            f.clear_size_index(&app, Phase::VertexAdds).unwrap();
+        }
+        // Reference: the generic memoizing walk (individual puts), cold.
+        let g = gen.app_subtree_size(&app, Phase::VertexAdds, 0, &[]).unwrap();
+        // The batched boot seed — capture the progress heartbeat's reported count.
+        let reported = std::sync::atomic::AtomicU64::new(0);
+        let b = bat
+            .seed_size_index(&app, Phase::VertexAdds, 0, &|n| {
+                reported.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+            })
+            .unwrap();
+        assert_eq!(b, g, "batched seed total == generic walk total");
+        assert!(
+            reported.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "cold parallel seed reported a nonzero seeded-node count"
+        );
+        assert!(b > 0, "non-empty tree seeds a non-zero size");
+        // The memo is populated: a whole-tree read now returns the seeded total,
+        // and a sub-path read is consistent with the generic forest's.
+        assert_eq!(bat.app_subtree_size(&app, Phase::VertexAdds, 0, &[]).unwrap(), b);
+        let sub = &[false, true];
+        assert_eq!(
+            bat.app_subtree_size(&app, Phase::VertexAdds, 0, sub).unwrap(),
+            gen.app_subtree_size(&app, Phase::VertexAdds, 0, sub).unwrap(),
+            "sub-path size matches after batched seed"
+        );
+        // Idempotent (crash-resume): a second seed returns the same total via memo hits.
+        assert_eq!(bat.seed_size_index(&app, Phase::VertexAdds, 0, &|_| {}).unwrap(), b);
     }
 
     /// The option-B sync loop end to end at the forest level: a behind target

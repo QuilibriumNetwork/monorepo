@@ -318,14 +318,27 @@ pub async fn sync_shard_phases_verified(
         let got =
             sync_one_phase(&mut client, &handle, &crdt, shard_id, phase, source_version, remote_root)
                 .await?;
-        if !exp.is_empty() && got.as_slice() != exp {
-            warn!(
-                phase,
-                got = %hex::encode(got),
-                expected = %hex::encode(exp),
-                "phase root != anchor after root-addressed pull — not committing",
-            );
-            return Ok(None);
+        if !exp.is_empty() {
+            if got.as_slice() != exp {
+                warn!(
+                    phase,
+                    got = %hex::encode(got),
+                    expected = %hex::encode(exp),
+                    "phase root != anchor after root-addressed pull — not committing",
+                );
+                return Ok(None);
+            }
+            // Index the just-synced anchor into this node's root→version map so it
+            // can later SERVE `resolve_root` for it. The sync install path does not
+            // touch the index `commit_inner` maintains, so without this a node that
+            // obtained its tree via sync/reconcile (e.g. an archive that reconciled
+            // its prover tree rather than materializing it) misses on `resolve_root`
+            // for its CURRENT roots and cannot bootstrap peers. `pinned_frame` is
+            // phase 0's resolved global frame (the same header frame for phases 1-3);
+            // 0 ⇒ unanchored/bootstrap ⇒ nothing to index against a frame.
+            if pinned_frame != 0 {
+                let _ = crdt.index_synced_root(shard_id, phase as usize, exp, pinned_frame);
+            }
         }
     }
     Ok(Some(pinned_frame))

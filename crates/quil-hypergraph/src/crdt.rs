@@ -1417,6 +1417,96 @@ impl HypergraphCrdt {
         Ok(())
     }
 
+    /// One-time backfill of the forest Merkle-sum size index (the per-node
+    /// `TAG_SIZE` side column) over a pre-existing tree, so the write-time
+    /// maintenance ([`quil_forest::batch_size_sums`]) keeps it warm from a
+    /// complete baseline. Returns `true` iff it actually seeded (so the caller
+    /// can log), `false` if it was skipped (marker already set, or non-unified).
+    ///
+    /// Marker-gated (`SIZE_INDEX_SEEDED_KEY`): walks each phase tree at most once
+    /// per DB. MUST run at boot BEFORE the materializer replays or produces and
+    /// BEFORE the first `rebucket_app`, so the size walk lands on a quiescent DB
+    /// (~the "30m–2h archive boot") rather than cold-walking on the consensus
+    /// hot path at an epoch-boundary split (the network-wide halt this fixes).
+    /// Idempotent: a crash mid-seed leaves the marker unset and re-seeds next
+    /// boot — already-memoized nodes are cheap hits, so the re-walk resumes.
+    pub fn warm_size_index(&self, apps: &[[u8; 32]]) -> Result<bool> {
+        // NOTE: NOT gated on `unified_tree()` — this must run at boot BEFORE the
+        // unified flag is set (which happens in `boot_consolidate_and_gate`,
+        // after the first `rebucket_app` in `refresh_crdt_shard_prefixes`). It
+        // seeds the on-disk tree regardless of the in-memory routing mode;
+        // seeding a non-unified node's trees is harmless (its `rebucket_app`
+        // uses the legacy scan and never reads the index). The marker gate keeps
+        // it a once-per-DB operation.
+        {
+            let read_txn = self.store.new_transaction(false)?;
+            if read_txn.get(SIZE_INDEX_SEEDED_KEY)?.is_some() {
+                return Ok(false);
+            }
+        }
+        {
+            let forest = self.forest.read().unwrap();
+            let fallback_ver = self.forest_version.load(Ordering::SeqCst);
+            for &app in apps {
+                if app == [0xFFu8; 32] {
+                    continue; // prover shard excluded from world size
+                }
+                tracing::info!(
+                    app = %hex::encode(&app[..4]),
+                    "size-index backfill: seeding app — ONE-TIME sequential full-tree sweep (node \
+                     will not produce until done; restarts cleanly if interrupted; progress logged \
+                     periodically)"
+                );
+                let start = std::time::Instant::now();
+                let mut total: u128 = 0;
+                for ph in 0..4 {
+                    let ver = self
+                        .resolve_phase_version_with(&forest, &app, ph)
+                        .unwrap_or(fallback_ver);
+                    // Throttled progress heartbeat (~every 30s). `nodes` is the cumulative
+                    // count of size-index entries written for this phase tree (leaves as they
+                    // stream in, then internals summed bottom-up), so the rate reflects the
+                    // sequential sweep's throughput.
+                    let ph_start = std::time::Instant::now();
+                    let last_log_s = std::sync::atomic::AtomicU64::new(0);
+                    let on_flush = |nodes: u64| {
+                        let el = ph_start.elapsed().as_secs();
+                        let prev = last_log_s.load(Ordering::Relaxed);
+                        if el >= prev.saturating_add(30)
+                            && last_log_s
+                                .compare_exchange(prev, el, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                        {
+                            tracing::info!(
+                                app = %hex::encode(&app[..4]),
+                                phase = ph,
+                                nodes_seeded = nodes,
+                                elapsed_s = el,
+                                nodes_per_s = nodes / el.max(1),
+                                "size-index backfill: progress"
+                            );
+                        }
+                    };
+                    total = total.saturating_add(
+                        forest
+                            .seed_size_index(&app, PHASES[ph], ver, &on_flush)
+                            .unwrap_or(0),
+                    );
+                }
+                tracing::info!(
+                    app = %hex::encode(&app[..4]),
+                    size = total as u64,
+                    ms = start.elapsed().as_millis() as u64,
+                    "size-index backfill: seeded app phase trees (one-time)"
+                );
+            }
+        }
+        let txn = self.store.new_transaction(false)?;
+        txn.set(SIZE_INDEX_SEEDED_KEY, b"1")?;
+        txn.commit()?;
+        Ok(true)
+    }
+
     /// Stream `app`'s committed vertex/hyperedge adds+removes and accumulate the
     /// per-sub-shard `(raw_count, live_size)` buckets into `buckets`, routing each
     /// leaf by the CURRENT prefix set (`app_prefixes` / `shard_bit_paths`). The
@@ -2355,6 +2445,52 @@ impl HypergraphCrdt {
         self.store.get_root_version(set, phase, shard_id, &root).ok().flatten()
     }
 
+    /// Index the current head root of (`shard_id`, `phase_idx`) into the
+    /// sync-by-hash `root → (version, frame)` map at `frame` — but ONLY if that
+    /// head root still equals `expect_root` (the just-verified sync anchor).
+    ///
+    /// This is what lets a node that obtained a tree via SYNC/reconcile
+    /// ([`crate::forest_sync`]) rather than via its own [`commit_inner`] later
+    /// SERVE [`resolve_root`] for that root. `commit_inner` maintains the
+    /// root→version index via [`put_root_version`], but the sync install path
+    /// (`sync_shard_phase_from`) writes the tree at its coordinated version WITHOUT
+    /// touching that index — so an archive that reconciled its prover tree (instead
+    /// of materializing it frame-by-frame) answers `resolve_root` with a MISS for
+    /// its CURRENT roots and can't be a bootstrap source, even though it holds the
+    /// exact tree. Calling this after a verified phase sync closes that gap.
+    ///
+    /// The head-root equality guard makes it race-safe against a concurrent commit
+    /// that moved the head to a different root: we index the version at which the
+    /// synced root actually lives, or skip if the head no longer matches.
+    pub fn index_synced_root(
+        &self,
+        shard_id: &[u8],
+        phase_idx: usize,
+        expect_root: &[u8],
+        frame: u64,
+    ) -> Result<()> {
+        if phase_idx >= 4 || expect_root.len() != 32 || frame == 0 {
+            return Ok(());
+        }
+        let (set, phase) = PHASE_STR[phase_idx];
+        let (head_root, ver) = {
+            let forest = self.forest.read().unwrap();
+            (
+                self.read_shard_phase_root(&forest, shard_id, phase_idx),
+                self.resolve_phase_version_with(&forest, shard_id, phase_idx),
+            )
+        };
+        if head_root.as_slice() != expect_root {
+            return Ok(()); // head moved under us (concurrent commit) — don't mis-map
+        }
+        let Some(ver) = ver else { return Ok(()) };
+        let txn = self.store.new_transaction(false)?;
+        self.store
+            .put_root_version(txn.as_ref(), set, phase, shard_id, expect_root, ver, frame)?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Sync-by-hash SERVER (split apps): the sub-shard manifest that folds into
     /// an aggregate `app_root` — `[(prefix_words, sub_root, sub_version)]`.
     /// `app` is the 32-byte app address (ShardKey.l2). `None` ⇒ not a known
@@ -2722,6 +2858,10 @@ impl HypergraphCrdt {
 /// nibble sequence. Bytes are big-endian bit order.
 /// KV key for the persisted per-sub-shard live-size buckets (one small blob).
 const SIZE_BUCKETS_KEY: &[u8] = b"hgsz:buckets";
+/// Marker: the forest Merkle-sum size index has been backfilled over this DB's
+/// pre-existing tree ([`HypergraphCrdt::warm_size_index`]). Present ⇒ the index
+/// is warm and kept so by write-time maintenance; absent ⇒ backfill on boot.
+const SIZE_INDEX_SEEDED_KEY: &[u8] = b"hgsz:seeded";
 
 /// `[count u32][ (klen u32)(shard_id)(count u64)(size i128) ]*` — the persisted
 /// per-sub-shard `(raw_count, live_size)` map. Small (one entry per sub-shard).

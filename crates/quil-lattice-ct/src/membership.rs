@@ -1600,6 +1600,70 @@ mod tests {
     }
 
     #[test]
+    fn spend_proof_works_with_bitpoly_message_fw_coin() {
+        // The spend relation is message-AGNOSTIC —
+        // it binds "C and C' share the same 16-poly message under value_key" without
+        // caring whether those polys are limb VALUES or BIT-POLYS. So an fw coin
+        // (`value_key.commit(bit_polys; r)`) spends with NO change to the membership
+        // machinery; only the message content differs.
+        use crate::value_link::ValueLinkParams;
+        let depth = 5;
+        let vlink = ValueLinkParams::production();
+        let params = MembershipParams::production(depth);
+        let sk = short_sk(1);
+        let mut prg = crate::arith::SplitMix64::new(0x5EED);
+        // The message is BIT-POLYS: amount 100 → 16 limbs → each an 8-bit bit-poly.
+        let v = {
+            let limbs = crate::limb_balance::limbs_of(100u128, crate::value_link::VALUE_LIMBS);
+            PolyVec(
+                limbs
+                    .iter()
+                    .map(|&x| {
+                        let mut p = Poly::zero();
+                        for i in 0..8 {
+                            p.c[i] = (x >> i) & 1;
+                        }
+                        p
+                    })
+                    .collect(),
+            )
+        };
+        let r_coin = PolyVec::sample_short(LAMBDA, crate::module::ETA, &mut prg);
+        let r_prime = PolyVec::sample_short(LAMBDA, crate::module::ETA, &mut prg);
+        let c = vlink.vkey.commit(&v, &r_coin);
+        let cv = vlink.compress(&c);
+        let p_otk = params.a_otk.matvec(&sk);
+        let leaf = hash_leaf(&params.acc, &p_otk, &cv);
+        let mut acc = crate::accumulator::Accumulator::new(params.acc.clone());
+        acc.insert(rand_node(1));
+        let idx = acc.insert(leaf);
+        acc.insert(rand_node(2));
+        let root = acc.root();
+        let path = acc.auth_path(idx);
+        let mu = b"fw-spend-tx";
+
+        let proof = prove_spend(&params, &vlink, &root, &sk, &v, &r_coin, &r_prime, idx, &path, mu, 7)
+            .expect("fw (bit-poly) coin spends");
+        assert_eq!(
+            verify_spend(&params, &vlink, &root, &proof, mu),
+            Some(params.bk.matvec(&sk)),
+            "fw coin spend verifies + yields key image — membership relation is message-agnostic"
+        );
+        // C' commits the SAME bit-poly message (re-randomized): its t1 differs from C's.
+        assert_ne!(proof.c_prime.t1, c.t1, "C' re-randomized");
+        // Tampering C' rejects.
+        let mut bad = SpendProof {
+            commitment: proof.commitment.clone(),
+            key_image: proof.key_image.clone(),
+            c_prime: proof.c_prime.clone(),
+            combined: proof.combined.clone(),
+            chain: proof.chain.clone(),
+        };
+        bad.c_prime.t2.0[0].c[0] ^= 1;
+        assert!(verify_spend(&params, &vlink, &root, &bad, mu).is_none(), "tampered C' rejects");
+    }
+
+    #[test]
     fn membership_proof_wire_round_trips() {
         let sk = short_sk(2);
         let (params, root, cv, idx, path) = setup(4, &sk, &[20, 21, 22, 23]);

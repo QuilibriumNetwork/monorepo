@@ -25,6 +25,8 @@ pub mod arith;
 pub mod binary;
 pub mod binary_rq;
 pub mod commitment;
+pub mod labrador;
+pub mod labrador_ct;
 pub mod limb_balance;
 pub mod linear;
 pub mod linear_rq;

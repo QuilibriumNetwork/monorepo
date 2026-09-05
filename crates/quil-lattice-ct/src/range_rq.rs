@@ -174,19 +174,19 @@ pub fn verify_value_binding(
 
 // ── Complete range proof: value binding + per-coordinate bit validity ──────
 
-use crate::binary_rq::{prove_bit_rq, verify_bit_rq, BinRqParams, BinaryProofRq};
+use crate::binary_rq::{
+    prove_bits_rq, verify_bits_rq, BinRqParams, BitsProofRq,
+};
 
-/// A complete ring-form range proof: the bit-vector commitment, one binary
-/// proof per coordinate (bit validity), and the value-binding opening.
+/// A complete ring-form range proof: the bit-vector commitment, ONE amortized
+/// bit-vector proof (all coordinates are bits, [`BitsProofRq`]), and the
+/// value-binding opening. The bit validity used to be `n_bits` separate
+/// per-coordinate proofs; the amortized form is ~6× smaller for the same
+/// guarantee (see [`prove_bits_rq`]).
 pub struct RangeProofRq {
     pub c_b: RingCommitment,
-    pub bit_proofs: Vec<BinaryProofRq>,
+    pub bits_proof: BitsProofRq,
     pub binding: RingOpeningProof,
-}
-
-/// The `(c_b.t1, c_b.t2[i])` coordinate view as a scalar commitment.
-fn coord_view(c_b: &RingCommitment, i: usize) -> RingCommitment {
-    RingCommitment { t1: c_b.t1.clone(), t2: PolyVec(vec![c_b.t2.0[i].clone()]) }
 }
 
 /// Prove `v ∈ [0, 2^N)` — the full range proof. Commits the bit-vector, proves
@@ -215,17 +215,13 @@ pub fn prove_range_rq(
             p
         })
         .collect();
-    let c_b = key.bit_key().commit(&PolyVec(bit_polys), &r_b);
+    let bits = PolyVec(bit_polys);
+    let bkey = key.bit_key();
+    let c_b = bkey.commit(&bits, &r_b);
 
-    // (a) per-coordinate bit validity.
+    // (a) bit validity — ONE amortized proof over all n_bits coordinates.
     let bin = BinRqParams { mask_bound, eta, tau: crate::params::CHALLENGE_WEIGHT_TAU };
-    let mut bit_proofs = Vec::with_capacity(key.n_bits);
-    for i in 0..key.n_bits {
-        let ck = key.bit_coord_key(i);
-        let cvi = coord_view(&c_b, i);
-        let bp = prove_bit_rq(&ck, &cvi, bits_u[i] as u8, &r_b, &bin, b"", seed ^ (i as u64 + 1))?;
-        bit_proofs.push(bp);
-    }
+    let bits_proof = prove_bits_rq(&bkey, &c_b, &bits, &r_b, &bin, b"", seed ^ 0x5175)?;
 
     // (b) value binding: N·(r_v; r_b) = D, a commitment-to-zero opening.
     let s = r_v.concat(&r_b);
@@ -233,7 +229,7 @@ pub fn prove_range_rq(
     let p = RingSigmaParams { mask_bound, eta, tau: crate::params::CHALLENGE_WEIGHT_TAU };
     let binding = prove_ring_opening(&key.combined_matrix(), &d, &s, &p, b"", seed ^ 0x81)?;
 
-    Some(RangeProofRq { c_b, bit_proofs, binding })
+    Some(RangeProofRq { c_b, bits_proof, binding })
 }
 
 /// Verify a complete range proof.
@@ -244,21 +240,18 @@ pub fn verify_range_rq(
     eta: i64,
     mask_bound: i64,
 ) -> bool {
-    if proof.bit_proofs.len() != key.n_bits || proof.c_b.t2.0.len() != key.n_bits {
+    if proof.c_b.t2.0.len() != key.n_bits {
         return false;
     }
     let bin = BinRqParams { mask_bound, eta, tau: crate::params::CHALLENGE_WEIGHT_TAU };
-    for i in 0..key.n_bits {
-        let ck = key.bit_coord_key(i);
-        let cvi = coord_view(&proof.c_b, i);
-        if !verify_bit_rq(&ck, &cvi, &proof.bit_proofs[i], &bin, b"") {
-            return false;
-        }
+    if !verify_bits_rq(&key.bit_key(), &proof.c_b, &proof.bits_proof, &bin, b"") {
+        return false;
     }
     let d = bind_target(c_v, &proof.c_b);
     let p = RingSigmaParams { mask_bound, eta, tau: crate::params::CHALLENGE_WEIGHT_TAU };
     verify_ring_opening(&key.combined_matrix(), &d, &proof.binding, &p, b"")
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -296,7 +289,6 @@ mod tests {
         let (c_v, r_v) = commit_v(&key, v, 1);
         let proof = prove_range_rq(&key, &c_v, v, &r_v, ETA, B, 3).expect("in range");
         assert!(verify_range_rq(&key, &c_v, &proof, ETA, B));
-        assert_eq!(proof.bit_proofs.len(), 8);
     }
 
     #[test]
@@ -316,5 +308,20 @@ mod tests {
         let (c_b, proof) = prove_value_binding(&key, &c_v, v, &r_v, ETA, B, 4).unwrap();
         let (c_other, _r) = commit_v(&key, 2000, 3);
         assert!(!verify_value_binding(&key, &c_other, &c_b, &proof, ETA, B));
+    }
+
+    #[test]
+    fn range_proof_wire_size_is_amortized() {
+        // The (now amortized) range proof encodes far smaller than the old
+        // per-bit form (13 × ~86KB bit-proofs). Sanity floor at RANGE_BITS.
+        let n = 13;
+        let key = RingRangeKey::production(n, 7);
+        let v = 0x1ABCu64 & ((1 << n) - 1);
+        let (c_v, r_v) = commit_v(&key, v, 1);
+        let proof = prove_range_rq(&key, &c_v, v, &r_v, ETA, B, 3).unwrap();
+        assert!(verify_range_rq(&key, &c_v, &proof, ETA, B));
+        let bytes = crate::wire::encode_range(&proof).len();
+        println!("RANGE_AGG n_bits={n} wire_bytes={bytes} (per-bit form was ~{}KB)", 13 * 86);
+        assert!(bytes < 400_000, "amortized range proof must be well under the ~1.1MB per-bit form");
     }
 }

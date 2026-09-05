@@ -44,12 +44,62 @@ pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandl
     ) {
         tracing::info!("Phase-3 JMT forest installed on global CRDT — state commits to the forest");
     }
+    // Seed the forest Merkle-sum size index ONCE (marker-gated), BEFORE the first
+    // `rebucket_app` — which fires immediately below in `refresh_crdt_shard_prefixes`
+    // whenever a split landed while this node was down (the post-split grid loaded
+    // from the shards store TRANSITIONS the app's prefix set → re-partition). With a
+    // cold index that boot rebucket cold-walks the whole app tree (121M leaves) — the
+    // multi-hour boot stall that wedged the fleet at the epoch-1084 split. The index
+    // is maintained at write time thereafter (`quil_forest::batch_size_sums`), so this
+    // is the ONLY full walk this DB ever does; subsequent boots skip it via the marker.
+    {
+        let mut seed_apps: Vec<[u8; 32]> = Vec::new();
+        if let Ok(rows) = storage.shards_store.range_app_shards() {
+            let mut seen = std::collections::HashSet::new();
+            for s in rows {
+                if s.shard_key.len() == 35 {
+                    let mut l2 = [0u8; 32];
+                    l2.copy_from_slice(&s.shard_key[3..35]);
+                    if seen.insert(l2) {
+                        seed_apps.push(l2);
+                    }
+                }
+            }
+        }
+        let t = std::time::Instant::now();
+        match crdt.warm_size_index(&seed_apps) {
+            Ok(true) => info!(
+                apps = seed_apps.len(),
+                ms = t.elapsed().as_millis() as u64,
+                "size-index backfill complete (one-time; kept warm by write-time maintenance)"
+            ),
+            Ok(false) => {} // already seeded (marker present) — silent
+            Err(e) => tracing::warn!(error = %e, "warm_size_index (size-index backfill) failed"),
+        }
+    }
+    // Set the unified-tree gate BEFORE the first rebucket below. `refresh_crdt_shard_prefixes`
+    // rebuckets any app whose loaded (post-split) grid differs from the in-memory default, and
+    // `forest_app_buckets` falls back to the O(all-leaves) `scan_app_buckets` while `unified_tree()`
+    // is false. That flag is otherwise only set later in `boot_consolidate_and_gate`, so a
+    // post-split boot would cold-scan the whole app tree here — defeating the seed above and
+    // re-wedging the archive. An already-consolidated, past-cutover node activates unified now so
+    // this rebucket uses the O(depth) seeded forest index. (A non-consolidated node stays legacy
+    // here and is gated normally by `boot_consolidate_and_gate`.)
+    if std::env::var("QUIL_DISABLE_UNIFIED").is_err() {
+        crate::unified_consolidation::pre_gate_unified_if_consolidated(
+            &storage.hg_store,
+            storage.clock_store.as_ref(),
+            crdt.as_ref(),
+        );
+    }
     // Feed the CRDT each app's REAL shard-prefix set from the shards store so
     // `commit_inner` aggregates the actual (possibly non-uniform, dynamically
     // split) shard set — not just the uniform QUIL default from
     // `install_forest_boot`. Empty store (pre-genesis) → the QUIL default stands.
     // Re-run each frame by the poller so a mid-run split (applied at an epoch
-    // boundary) is picked up deterministically on every node.
+    // boundary) is picked up deterministically on every node. With the size index
+    // now seeded (above) AND unified pre-gated, a post-split re-partition here is
+    // O(shards×depth), not a walk.
     let populated =
         refresh_crdt_shard_prefixes(crdt.as_ref(), storage.shards_store.as_ref());
     if populated > 0 {
@@ -75,11 +125,13 @@ pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandl
     // no `ProposeJoin` ever fires. All four phase sets are primed
     // because remote callers verify commitments across all phases,
     // not just vertex_adds.
+    // Hoisted out of the prime block below so the size-index backfill (run
+    // after the unified-tree flag is set) can reuse the same app list.
+    let mut committed_apps: Vec<[u8; 32]> = Vec::new();
     {
         let mut primed_keys: std::collections::HashSet<Vec<u8>> =
             std::collections::HashSet::new();
         let mut primed_count = 0usize;
-        let mut committed_apps: Vec<[u8; 32]> = Vec::new();
         if let Ok(shards) = storage.shards_store.range_app_shards() {
             for s in shards {
                 if s.shard_key.len() != 35 {
@@ -98,19 +150,13 @@ pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandl
             }
         }
         info!(shards = primed_count, "app shards primed in CRDT phase_sets");
-        // Seed the per-sub-shard live-size buckets from the migrated committed
-        // baseline ONCE, before any frame is processed — the world-size
-        // denominator + per-sub-shard reward `state_size` are Σ of these live
-        // buckets, and the migrated coins never passed through `add_vertex`, so
-        // without this they'd be omitted. Steady-state growth is then tracked
-        // incrementally by the mutation counters (never re-scanned).
-        info!(apps = committed_apps.len(), "seeding per-sub-shard live-size baseline (one-time; persisted after)");
-        if let Err(e) = crdt.warm_sizes(&committed_apps) {
-            tracing::warn!(error = %e, "warm_sizes (live-size baseline) failed");
-        } else {
-            info!(apps = committed_apps.len(), "seeded per-sub-shard live-size baseline");
-        }
     }
+    // NOTE: the per-sub-shard live-size baseline (`warm_sizes`) is seeded below,
+    // AFTER the unified-tree flag is set and AFTER the size-index backfill — so
+    // that if `warm_sizes` has to recompute buckets from the forest (a shard-set
+    // change since the persisted cache, e.g. a split landed just before a
+    // restart), the Merkle-sum size index it reads is already warm and the
+    // recompute is O(shards×depth), not a cold O(all-leaves) walk.
 
     // UNIFIED_APP_TREE cutover: run the one-time split→app-tree consolidation (a
     // no-op after the first boot, via a persisted marker) and set the CRDT's
@@ -128,6 +174,18 @@ pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandl
             storage.clock_store.as_ref(),
             crdt.as_ref(),
         );
+    }
+    // Seed the per-sub-shard live-size buckets from the committed baseline ONCE,
+    // before any frame is processed — the world-size denominator + per-sub-shard
+    // reward `state_size` are Σ of these live buckets, and migrated coins never
+    // passed through `add_vertex`, so without this they'd be omitted. Steady-state
+    // growth is then tracked incrementally. Runs AFTER the size-index backfill so
+    // any forest recompute here reads a warm index (see the note above).
+    info!(apps = committed_apps.len(), "seeding per-sub-shard live-size baseline (one-time; persisted after)");
+    if let Err(e) = crdt.warm_sizes(&committed_apps) {
+        tracing::warn!(error = %e, "warm_sizes (live-size baseline) failed");
+    } else {
+        info!(apps = committed_apps.len(), "seeded per-sub-shard live-size baseline");
     }
     // Eagerly run one commit at startup so the per-shard tree blob
     // lands at `[0x2F, vertex, adds, {l1=[0;3], l2=[0xff;32]}]`
@@ -311,6 +369,15 @@ pub(crate) fn refresh_crdt_shard_prefixes(
         // single-shard and this stays inert on them until that gap is closed —
         // see the size-bucket note in shard_data_migration_design.
         if crdt.set_app_shard_prefixes(app, prefixes) {
+            // Log BEFORE the rebucket so a slow one isn't silent. `unified` tells which
+            // path it takes: true ⇒ O(depth) forest size index; false ⇒ the O(all-leaves)
+            // `scan_app_buckets` fallback (the multi-hour cold walk to avoid at boot).
+            let t = std::time::Instant::now();
+            info!(
+                app = %hex::encode(app),
+                unified = crdt.unified_tree(),
+                "shard set changed (split/merge) — re-partitioning size buckets…"
+            );
             if let Err(e) = crdt.rebucket_app(&app) {
                 warn!(
                     app = %hex::encode(app),
@@ -320,6 +387,7 @@ pub(crate) fn refresh_crdt_shard_prefixes(
             } else {
                 info!(
                     app = %hex::encode(app),
+                    ms = t.elapsed().as_millis() as u64,
                     "shard set changed (split/merge) — re-partitioned size buckets"
                 );
             }

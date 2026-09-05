@@ -37,25 +37,41 @@
 /// over the `d` coefficients. (Dilithium/Kyber standard.)
 pub const RING_DEGREE_D: usize = 256;
 
-/// Modulus `q` — NTT-friendly prime (`q ≡ 1 mod 2d = 512`). **Estimator-set to
-/// `≈2^28`**: small enough that M-LWE clears 128-bit at rank 6 (a larger `q`
-/// forced a bigger rank — `q=2^32` needed rank 7-8), large enough for the
-/// amount limb-sum (`2^23`) and the range-proof soundness slack (`~2^20`).
-// EXACT-SLACK RE-PARAMETERIZATION (2026-07-15): q raised 2^28 → 2^36. The special-
-// soundness extractor recovers the RELAXED quantity c̄·m, and the relaxed-binding
-// reduction adds a ‖c̄‖_1 ≤ 2τ challenge factor to the M-SIS solution norm →
-// commit-binding β≈2^30.6, H_B β≈2^33.4, BOTH ≥ old q=2^28 (BROKEN). q≈2^36 (with
-// λ=9, below) restores: commit-binding 2^287, H_B 2^141, M-LWE hiding 2^195.
-pub const MODULUS_Q: u64 = 68719484929; // ≈ 2^36, prime, ≡ 1 mod 512 (Sage-verified)
-/// Approximate `log2(q)`.
+/// Modulus `q` — a PARTIALLY-SPLIT prime `≈2^36` with `ord_512(q)=64`, so `X^256+1`
+/// splits into `t=4` IRREDUCIBLE degree-64 factors (not the 256 LINEAR factors of a
+/// fully-split `q≡1 mod 512`). WHY: in a fully-split ring the
+/// Lyubashevsky–Seiler invertible-difference lemma is vacuous, so LaBRADOR-style
+/// amortized challenge DIFFERENCES `c_i−c_j` are non-invertible with prob ≈256/q
+/// ≈2^-28 — capping soundness at ~2^-28. With t=4
+/// the LS18 invertibility radius `q^{1/4}/√4 ≈ 256 ≫ ‖c_i−c_j‖ (≤2)`, so every
+/// low-norm challenge difference is invertible ⇒ soundness back to ~2^-125.
+/// M-SIS ≥128-bit and range arithmetic are SPLIT-INDEPENDENT (depend on |q|,d,
+/// rank), so the estimator margins carry over (`|q|` essentially unchanged).
+/// `q ≡ 1 mod 8` so a future radix-2 block NTT is possible; the current build
+/// uses the (q-agnostic) schoolbook multiply for correctness — block-NTT perf is
+/// a validated follow-up.
+// Prior (fully-split) q was 68719484929 (2^36+8193, q≡1 mod 512). See git history.
+pub const MODULUS_Q: u64 = 68719476713; // < 2^36 (by 23), prime, ord_512=64 → t=4 partial split
+/// Bits to represent a coefficient in `[0, q)`. `q < 2^36`, so `ceil(log2 q) = 36`.
 pub const MODULUS_Q_BITS: u32 = 36;
 
 // ── Module dimensions (M-SIS / M-LWE) ─────────────────────────────────────
 
 /// M-SIS binding height `κ` (ring elements) = **6** (estimator). Binding
-/// dimension `κ·d = 1536`. M-SIS is ≫128-bit here — binding/soundness are not
-/// the constraint (the rank is driven by M-LWE, below).
+/// dimension `κ·d = 1536`. M-SIS is ≫128-bit here for the BDLOP commitments at
+/// their (short, η≈2) opening norms — binding/soundness are not the constraint
+/// (the rank is driven by M-LWE, below).
 pub const SIS_RANK_KAPPA: usize = 6;
+
+/// M-SIS binding height for the LaBRADOR fold commitments (`A`, `B_a`, `B_b`) =
+/// **8** — LARGER than the CT commitments' `κ=6` on purpose. LaBRADOR's extracted
+/// openings are far longer than the base η≈2 witnesses (norm growth across the
+/// recursion; the sound recursive path bounds them by the actual ℓ2 < q), and at
+/// that norm `κ=6` sits at only ~128–135-bit M-SIS with essentially zero comfort.
+/// `κ=8` (binding dim `κ·d = 2048`) restores a comfortable ≫128-bit margin
+/// (confirmed by a lattice-estimator core-SVP run). This is LOCAL to LaBRADOR
+/// — the CT commitment scheme keeps `SIS_RANK_KAPPA = 6` (independently analyzed).
+pub const LABRADOR_RANK_KAPPA: usize = 8;
 
 /// M-LWE randomness rank `λ` (ring elements) = **9** (raised from 6). At the new
 /// `q≈2^36` a larger `q` weakens LWE (`λ=6, q=2^36` → only **2^116** hiding); the
@@ -144,9 +160,21 @@ mod tests {
     }
 
     #[test]
-    fn ntt_friendly_modulus() {
-        // q ≡ 1 (mod 2d) is required for a full NTT of degree d.
-        assert_eq!((MODULUS_Q as u128 - 1) % (2 * RING_DEGREE_D as u128), 0);
+    fn partial_split_modulus() {
+        // q must NOT be ≡ 1 mod 2d: a fully-split ring's vacuous invertible-difference
+        // lemma caps soundness at ~2^-28. We require ord_512(q) = 64 → X^256+1 factors
+        // into t=4 degree-64 irreducibles, giving the LS18 invertibility margin.
+        let m = 2 * RING_DEGREE_D as u64; // 512
+        assert_ne!((MODULUS_Q - 1) % m, 0, "q must NOT be fully-split (≡1 mod 2d)");
+        let mut ord = 1u64;
+        let mut x = MODULUS_Q % m;
+        while x != 1 {
+            x = x * (MODULUS_Q % m) % m;
+            ord += 1;
+        }
+        assert_eq!(ord, 64, "ord_512(q) must be 64 (t = 256/64 = 4 partial split)");
+        // q ≡ 1 mod 8 keeps a future radix-2 block NTT possible.
+        assert_eq!((MODULUS_Q - 1) % 8, 0, "q ≡ 1 mod 8 for a future block NTT");
     }
 
     #[test]
