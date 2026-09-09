@@ -7,10 +7,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::model::{
     AwaitFilterEntry, ColumnFilter, ColumnSizing, FilterColKind, Model, PanelFocus, PendingAction,
-    ACTION_FRAME_DELAY,
 };
 use super::msg::Msg;
-use super::super::epoch::epoch_len;
+use super::super::epoch::{epoch_len, ConfirmWindow, WindowState};
 
 const MAX_AWAIT_RETRIES: u32 = 3;
 
@@ -382,6 +381,9 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if m.join_picker_active {
         return handle_join_picker_key(m, ev);
     }
+    if m.show_help {
+        return handle_help_key(m, ev);
+    }
     if m.filter_edit_active {
         return handle_filter_edit_key(m, ev);
     }
@@ -397,6 +399,31 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     handle_normal_key(m, ev)
 }
 
+/// Help is a full screen of its own, so while it is up the cursor keys page
+/// through it rather than moving a table nobody can see.
+fn handle_help_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
+    if is_quit(&ev) {
+        return vec![Cmd::Quit];
+    }
+    // One line is the pinned title; the rest is what a page covers.
+    let page = (m.height as usize).saturating_sub(1).max(1);
+    let max = m.help_lines.saturating_sub(page);
+    match ev.code {
+        KeyCode::Char('h') | KeyCode::Esc => {
+            m.show_help = false;
+            m.help_offset = 0;
+        }
+        KeyCode::Up | KeyCode::Char('k') => m.help_offset = m.help_offset.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => m.help_offset = (m.help_offset + 1).min(max),
+        KeyCode::PageUp => m.help_offset = m.help_offset.saturating_sub(page),
+        KeyCode::PageDown => m.help_offset = (m.help_offset + page).min(max),
+        KeyCode::Home => m.help_offset = 0,
+        KeyCode::End => m.help_offset = max,
+        _ => {}
+    }
+    vec![]
+}
+
 fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if is_quit(&ev) {
         return vec![Cmd::Quit];
@@ -404,7 +431,8 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     let c = ch(&ev);
     match ev.code {
         KeyCode::Char('h') => {
-            m.show_help = !m.show_help;
+            m.show_help = true;
+            m.help_offset = 0;
             return vec![];
         }
         KeyCode::Char('C') => {
@@ -416,6 +444,10 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
                 ColumnSizing::Dynamic => ColumnSizing::Fixed,
                 ColumnSizing::Fixed => ColumnSizing::Dynamic,
             };
+            return vec![];
+        }
+        KeyCode::Char('e') => {
+            m.threshold_unit = m.threshold_unit.toggled();
             return vec![];
         }
         KeyCode::Tab => {
@@ -606,45 +638,37 @@ fn action_confirm(m: &mut Model) -> Vec<Cmd> {
     if !m.focus.is_alloc() {
         return wrong_panel(m, "Confirm");
     }
-    // Pre-filter to rows whose confirm window is currently open.
+    // Use the same epoch-aligned window and current frame as the hints.
+    let current_frame = m.epoch_frame();
     let mut confirm_rows = Vec::new();
-    let mut earliest: u64 = 0;
+    let mut earliest: Option<u64> = None;
     for row in m.selected_alloc_rows() {
-        let mut action_frame = 0u64;
-        match row.status {
-            1 => {
-                if row.join_frame > 0 {
-                    action_frame = row.join_frame + ACTION_FRAME_DELAY;
-                    if m.frame_number >= action_frame
-                        && m.frame_number < row.join_frame + ACTION_FRAME_DELAY * 2
-                    {
-                        confirm_rows.push(row.clone());
-                    }
-                }
-            }
-            4 => {
-                if row.leave_frame > 0 {
-                    action_frame = row.leave_frame + ACTION_FRAME_DELAY;
-                    if m.frame_number >= action_frame
-                        && m.frame_number < row.leave_frame + ACTION_FRAME_DELAY * 2
-                    {
-                        confirm_rows.push(row.clone());
-                    }
-                }
-            }
-            _ => {}
+        let proposal_frame = match row.status {
+            1 if row.confirm_frame == 0 => row.join_frame,
+            4 if row.leave_confirm_frame == 0 => row.leave_frame,
+            _ => continue,
+        };
+        if proposal_frame == 0 {
+            continue;
         }
-        if action_frame > m.frame_number && (earliest == 0 || action_frame < earliest) {
-            earliest = action_frame;
+        let window = ConfirmWindow::for_frame(proposal_frame, m.epoch_length);
+        match window.state(current_frame, m.epoch_length) {
+            WindowState::Open => confirm_rows.push(row),
+            WindowState::Pending => {
+                earliest = Some(earliest.map_or(window.start_frame, |f| f.min(window.start_frame)));
+            }
+            WindowState::Missed => {}
         }
     }
-    if confirm_rows.is_empty() && earliest > 0 {
-        m.status_msg = format!(
-            "Confirm not yet available (current frame: {}, opens at: {}). Applicable action(s): Reject",
-            m.frame_number, earliest
-        );
-        m.status_is_error = true;
-        return vec![];
+    if confirm_rows.is_empty() {
+        if let Some(earliest) = earliest {
+            m.status_msg = format!(
+                "Confirm not yet available (current frame: {}, opens at: {}). Applicable action(s): Reject",
+                current_frame, earliest
+            );
+            m.status_is_error = true;
+            return vec![];
+        }
     }
     start_multi_filter_action(m, "Confirm", confirm_rows, |s| s == 1 || s == 4)
 }
@@ -1081,4 +1105,63 @@ fn handle_join_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         _ => {}
     }
     vec![]
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_types::proto::node::{NodeInfoResponse, ShardAllocationInfo};
+
+    #[test]
+    fn confirm_key_uses_the_same_epoch_window_as_the_hint() {
+        // Proposals need not be at the start of an epoch. Test mainnet,
+        // shorter testnet epochs, and the RPC's zero-length fallback.
+        for epoch_length in [720, 60, 0] {
+            let el = epoch_len(epoch_length);
+            for status in [1, 4] {
+                for (frame, expected) in [
+                    (el + el / 2, false),
+                    (2 * el, true),
+                    (3 * el - 1, true),
+                    (3 * el, false),
+                ] {
+                    let filter = vec![0xab];
+                    let mut alloc = ShardAllocationInfo {
+                        filter: filter.clone(),
+                        status,
+                        epoch: frame / el,
+                        ..Default::default()
+                    };
+                    if status == 1 {
+                        alloc.join_frame_number = el + el / 4;
+                    } else {
+                        alloc.leave_frame_number = el + el / 4;
+                    }
+                    let mut model = Model::new();
+                    model.process_refresh_data(Some(NodeInfoResponse {
+                        shard_allocations: vec![alloc],
+                        current_epoch: frame / el,
+                        epoch_length_frames: epoch_length,
+                        last_received_frame: frame,
+                        ..Default::default()
+                    }), None, None);
+                    // ShardInfo may lag; lifecycle decisions use NodeInfo's frame.
+                    assert_eq!(model.frame_number, 0);
+                    if expected {
+                        assert_eq!(model.allocations[0].next_action.label, "(reject|confirm)");
+                        assert_eq!(model.allocations[0].next_action.at_frame, None);
+                    }
+                    let cmds = handle_key(&mut model, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+                    let sent = cmds.iter().any(|cmd| matches!(cmd,
+                        Cmd::Lifecycle { action, filters, .. } if action == "Confirm" && filters == &vec![filter.clone()]
+                    ));
+                    assert_eq!(sent, expected, "epoch length {epoch_length}, status {status}, frame {frame}");
+                    if frame < 2 * el {
+                        assert!(model.status_msg.contains(&format!("opens at: {}", 2 * el)));
+                    }
+                }
+            }
+        }
+    }
 }
