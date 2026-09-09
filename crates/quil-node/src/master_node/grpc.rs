@@ -41,6 +41,42 @@ async fn fetch_remote_app_shards(
     out
 }
 
+/// The filters this prover currently owns, for `GetShardInfo`'s
+/// `include_all == false` view.
+///
+/// The registry has two lookups and both take a bare `&[u8]`: `get_provers` is
+/// keyed by *confirmation filter*, `get_prover_info` by *address*. This site
+/// asked `get_provers` for the local address. An address is never a filter key
+/// — `SharedProverRegistry::get_provers` misses `filter_cache` and returns
+/// empty — so the owned set was always empty and `include_all == false`
+/// filtered every shard away: `qclient node prover shards` printed "No
+/// allocated shards" on a node whose `node prover status` listed twenty-seven.
+/// `GetNodeInfo` builds the same view from `get_prover_info`, and this matches
+/// its liveness predicate so the two surfaces agree allocation for allocation.
+fn owned_filters(
+    registry: &dyn quil_types::consensus::ProverRegistry,
+    address: &[u8],
+    frame_number: u64,
+) -> std::collections::HashSet<Vec<u8>> {
+    let Ok(Some(info)) = registry.get_prover_info(address) else {
+        return std::collections::HashSet::new();
+    };
+    info.allocations
+        .iter()
+        .filter(|a| {
+            // Same predicate as `GetNodeInfo`. `ExpiredEpoch` is an Active
+            // data-shard allocation that missed this epoch's re-confirm: not
+            // live, but not lost either — it comes back the moment the prover
+            // re-registers. `status` shows it as `re-confirm!`, so dropping it
+            // here would put the two surfaces back into disagreement over
+            // exactly the allocation the operator most needs to act on.
+            let eff = a.effective_status(frame_number);
+            eff.is_live() || eff == quil_types::consensus::EffectiveStatus::ExpiredEpoch
+        })
+        .map(|a| a.confirmation_filter.clone())
+        .collect()
+}
+
 pub(crate) struct GrpcArgs {
     /// Filter → covering thread worker's stores (wallet reads of app state).
     pub worker_app_states: super::worker_manager::WorkerAppStates,
@@ -1531,12 +1567,8 @@ pub(crate) fn spawn_all(
                 }
                 Err(_) => (0u64, cf),
             };
-            let provers = self.registry.get_provers(&self.self_address).unwrap_or_default();
-            let allocated_filters: std::collections::HashSet<Vec<u8>> = provers
-                .iter()
-                .filter(|pr| pr.address == self.self_address)
-                .flat_map(|pr| pr.allocations.iter().filter(|a| a.is_live(frame_number)).map(|a| a.confirmation_filter.clone()))
-                .collect();
+            let allocated_filters =
+                owned_filters(self.registry.as_ref(), &self.self_address, frame_number);
             let local_get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(self.crdt.clone(), self.shards_store.clone());
             let local_result = quil_engine::shard_info::get_shard_info(
                 include_all, &self.self_address, &allocated_filters, difficulty, frame_number,
@@ -2428,5 +2460,223 @@ mod composite_scan_tests {
         assert!(composite_page(&scans, stores.clone(), Some(&[9; 32]), None, &scan_store).is_err());
         let other = vec![(high, store()), (quil_forest::encode_shard_bit_path(&app, &[false, true]), store())];
         assert!(composite_page(&scans, other, id.as_ref(), None, &scan_store).is_err());
+    }
+}
+
+#[cfg(test)]
+mod owned_filter_tests {
+    use super::owned_filters;
+    use quil_types::consensus::{
+        EffectiveStatus, ProverAllocationInfo, ProverInfo, ProverRegistry, ProverShardSummary,
+        ProverStatus,
+    };
+    use quil_types::error::Result;
+
+    const ADDRESS: [u8; 32] = [7u8; 32];
+    const FILTER: [u8; 4] = [1, 2, 3, 4];
+
+    /// A registry that keys `get_provers` by filter, the way the production
+    /// `SharedProverRegistry` does.
+    ///
+    /// `quil_engine::test_support::TestProverRegistry` returns every prover for
+    /// any filter, which is exactly why an address handed to a filter-keyed
+    /// lookup passed unnoticed: under that stub the buggy call and the correct
+    /// one are indistinguishable.
+    struct FilterKeyedRegistry {
+        provers: Vec<ProverInfo>,
+    }
+
+    impl FilterKeyedRegistry {
+        fn under(&self, filter: &[u8]) -> Vec<ProverInfo> {
+            self.provers
+                .iter()
+                .filter(|p| {
+                    p.allocations
+                        .iter()
+                        .any(|a| a.confirmation_filter == filter)
+                })
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl ProverRegistry for FilterKeyedRegistry {
+        fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>> {
+            Ok(self.provers.iter().find(|p| p.address == address).cloned())
+        }
+        fn get_provers(&self, filter: &[u8]) -> Result<Vec<ProverInfo>> {
+            Ok(self.under(filter))
+        }
+        fn get_provers_by_status(
+            &self,
+            filter: &[u8],
+            status: ProverStatus,
+        ) -> Result<Vec<ProverInfo>> {
+            Ok(self
+                .under(filter)
+                .into_iter()
+                .filter(|p| p.status == status)
+                .collect())
+        }
+        fn get_active_provers(&self, filter: &[u8], _frame: u64) -> Result<Vec<ProverInfo>> {
+            Ok(self.under(filter))
+        }
+        fn get_prover_count(&self, filter: &[u8]) -> Result<usize> {
+            Ok(self.under(filter).len())
+        }
+        fn get_next_prover(
+            &self,
+            _input: &[u8; 32],
+            _filter: &[u8],
+            _frame: u64,
+        ) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn get_ordered_provers(
+            &self,
+            _input: &[u8; 32],
+            _filter: &[u8],
+            _frame: u64,
+        ) -> Result<Vec<Vec<u8>>> {
+            Ok(Vec::new())
+        }
+        fn get_prover_shard_summaries(&self, _frame: u64) -> Result<Vec<ProverShardSummary>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn allocation(filter: &[u8], status: ProverStatus, join_frame: u64) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            status,
+            confirmation_filter: filter.to_vec(),
+            rejection_filter: Vec::new(),
+            join_frame_number: join_frame,
+            leave_frame_number: 0,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: 0,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: join_frame,
+            epoch: 0,
+            ring: 0,
+            vertex_address: Vec::new(),
+        }
+    }
+
+    fn registry(allocs: Vec<ProverAllocationInfo>) -> FilterKeyedRegistry {
+        FilterKeyedRegistry {
+            provers: vec![ProverInfo {
+                public_key: Vec::new(),
+                address: ADDRESS.to_vec(),
+                status: ProverStatus::Active,
+                kick_frame_number: 0,
+                allocations: allocs,
+                available_storage: 1 << 30,
+                seniority: 0,
+                delegate_address: Vec::new(),
+            }],
+        }
+    }
+
+    /// The regression: the local prover holds one Active allocation, and the
+    /// owned set has to contain its filter. Against the old
+    /// `get_provers(&self_address)` this is empty — an address is not a filter
+    /// key — and `GetShardInfo(include_all: false)` returns nothing.
+    #[test]
+    fn an_active_allocation_is_owned() {
+        let reg = registry(vec![allocation(&FILTER, ProverStatus::Active, 100)]);
+        assert_eq!(
+            reg.provers[0].allocations[0].effective_status(200),
+            EffectiveStatus::Active
+        );
+        assert!(
+            reg.get_provers(&ADDRESS).unwrap().is_empty(),
+            "the regression fixture must distinguish addresses from filters"
+        );
+        let owned = owned_filters(&reg, &ADDRESS, 200);
+        assert_eq!(owned.len(), 1, "the prover's own allocation went missing");
+        assert!(owned.contains(&FILTER.to_vec()));
+    }
+
+    /// Terminal, historic, unknown, and expired Joining/Leaving slots are not owned.
+    #[test]
+    fn dead_allocations_are_not_owned() {
+        let stale = [9u8; 4];
+        let mut leaving = allocation(&[8; 4], ProverStatus::Leaving, 100);
+        leaving.leave_frame_number = 100;
+        let reg = registry(vec![
+            allocation(&FILTER, ProverStatus::Kicked, 100),
+            allocation(&stale, ProverStatus::Joining, 100),
+            allocation(&[5; 4], ProverStatus::Rejected, 100),
+            allocation(&[6; 4], ProverStatus::Historic, 100),
+            allocation(&[7; 4], ProverStatus::Unknown, 100),
+            leaving,
+        ]);
+        // Frame 5000 is epoch 6; a join proposed in epoch 0 had to be
+        // confirmed in epoch 1, so it reads as implicitly rejected.
+        assert!(owned_filters(&reg, &ADDRESS, 5_000).is_empty());
+    }
+
+    #[test]
+    fn pending_paused_and_leaving_allocations_are_owned() {
+        let mut deferred = allocation(&[4; 4], ProverStatus::Active, 100);
+        deferred.join_confirm_frame_number = 101;
+        assert_eq!(deferred.effective_status(200), EffectiveStatus::Joining);
+        let reg = registry(vec![
+            allocation(&[1; 4], ProverStatus::Joining, 100),
+            allocation(&[2; 4], ProverStatus::Paused, 100),
+            allocation(&[3; 4], ProverStatus::Leaving, 100),
+            deferred,
+        ]);
+        assert_eq!(
+            owned_filters(&reg, &ADDRESS, 200),
+            [[1; 4], [2; 4], [3; 4], [4; 4]]
+                .into_iter()
+                .map(Vec::from)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn ownership_is_address_scoped_and_filters_are_unique() {
+        let mut reg = registry(vec![
+            allocation(&FILTER, ProverStatus::Active, 100),
+            allocation(&FILTER, ProverStatus::Paused, 100),
+        ]);
+        let mut other = reg.provers[0].clone();
+        other.address = vec![8; 32];
+        other.allocations = vec![allocation(&[9; 4], ProverStatus::Active, 100)];
+        reg.provers.push(other);
+        assert_eq!(
+            owned_filters(&reg, &ADDRESS, 200),
+            [FILTER.to_vec()].into_iter().collect()
+        );
+    }
+
+    /// A stale-epoch allocation is still owned. It is an Active data-shard
+    /// allocation that missed this epoch's re-confirm — recoverable, and shown
+    /// by `node prover status` as `re-confirm!`. Dropping it here would put
+    /// `shards` and `status` back into disagreement over precisely the
+    /// allocation the operator most needs to act on.
+    #[test]
+    fn a_stale_epoch_allocation_is_still_owned() {
+        let reg = registry(vec![allocation(&FILTER, ProverStatus::Active, 100)]);
+        assert_eq!(
+            reg.provers[0].allocations[0].effective_status(5_000),
+            EffectiveStatus::ExpiredEpoch,
+            "fixture no longer produces the state under test"
+        );
+        assert!(owned_filters(&reg, &ADDRESS, 5_000).contains(&FILTER.to_vec()));
+    }
+
+    /// An address the registry has never seen yields nothing rather than
+    /// erroring; a node that is not a prover simply owns no filters.
+    #[test]
+    fn an_unknown_address_owns_nothing() {
+        let reg = registry(vec![allocation(&FILTER, ProverStatus::Active, 100)]);
+        assert!(owned_filters(&reg, &[0u8; 32], 200).is_empty());
     }
 }
