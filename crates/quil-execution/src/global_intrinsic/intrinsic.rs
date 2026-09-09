@@ -4848,6 +4848,68 @@ mod tests {
             assert_eq!(read_status(&state, &child, "allocation:ProverAllocation"), Some(materialize::STATUS_ACTIVE));
         }
 
+        #[test]
+        fn reject_batch_updates_joining_and_leaving_allocations() {
+            quil_crypto::init();
+            let state = make_state();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let pubkey = vec![0xABu8; 897];
+            let prover_addr = prover_address_from_pubkey(&pubkey).unwrap();
+            let prover_tree = create_prover_vertex_tree(&pubkey, 100).unwrap();
+            state.set(
+                &GLOBAL_INTRINSIC_ADDRESS[..],
+                &prover_addr,
+                &va_disc,
+                1,
+                vertex_tree_to_blob(&prover_tree),
+            ).unwrap();
+
+            let filters = vec![vec![0x31u8; 32], vec![0x32u8; 32]];
+            let expected_statuses = [STATUS_KICKED, materialize::STATUS_ACTIVE];
+            let mut addresses = Vec::new();
+            for (filter, status) in filters.iter().zip([materialize::STATUS_JOINING, materialize::STATUS_LEAVING]) {
+                let address = allocation_address(&pubkey, filter).unwrap();
+                let mut allocation =
+                    create_allocation_vertex_tree(&prover_addr, filter, 1).unwrap();
+                write_field(
+                    &mut allocation,
+                    "allocation:ProverAllocation",
+                    "Status",
+                    &[status],
+                ).unwrap();
+                state.set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &address,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&allocation),
+                ).unwrap();
+                addresses.push(address);
+            }
+
+            let op = ProverReject {
+                // Canonical encoding reserves this field; filters[] is the
+                // signed batch of target allocations.
+                filter: vec![],
+                frame_number: 777,
+                public_key_signature_bls48581: Some(AddressedSignature {
+                    signature: vec![0x55u8; AddressedSignature::SIG_LEN_SINGLE],
+                    address: prover_addr.to_vec(),
+                }),
+                filters,
+            };
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
+            gi.invoke_step(777, &op.to_canonical_bytes().unwrap(), &state).unwrap();
+
+            for (address, expected_status) in addresses.into_iter().zip(expected_statuses) {
+                assert_eq!(
+                    read_status(&state, &address, "allocation:ProverAllocation"),
+                    Some(expected_status),
+                    "each filter in a reject batch must take its status-specific reject transition",
+                );
+            }
+        }
+
         // Rejecting one pending join must not set the whole prover's status
         // to the rejected allocation's status (4): the registry would drop the
         // prover, and its still-active session allocation would be attributed
