@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet};
 use num_bigint::{BigInt, Sign};
 
 use quil_types::proto::node::{
-    GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo, WorkerInfoResponse,
+    GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo, ShardRewardInfo, WorkerInfo,
+    WorkerInfoResponse,
 };
 
 use super::super::epoch::{
@@ -504,7 +505,10 @@ impl Model {
                 row.data_shards = info.data_shards;
                 row.materialized_frame = info.materialized_frame;
                 row.latest_frame = info.latest_frame;
-                row.estimated_reward = BigInt::from_bytes_be(Sign::Plus, &info.estimated_reward);
+                if eff == EffectiveStatus::Active && wid >= 0 {
+                    row.estimated_reward =
+                        BigInt::from_bytes_be(Sign::Plus, &info.estimated_reward);
+                }
             }
             allocs.push(row);
         }
@@ -1072,6 +1076,37 @@ fn action_hints(
 mod tests {
     use super::*;
 
+    fn allocation(filter: Vec<u8>, epoch: u64) -> ShardAllocationInfo {
+        ShardAllocationInfo {
+            filter,
+            status: 1,
+            epoch,
+            ..Default::default()
+        }
+    }
+
+    fn shard_info(filter: Vec<u8>, reward: u8) -> GetShardInfoResponse {
+        GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter,
+                estimated_reward: vec![reward],
+                ..Default::default()
+            }],
+            frame_number: 2_160,
+            ..Default::default()
+        }
+    }
+
+    fn node_info(allocation: ShardAllocationInfo) -> NodeInfoResponse {
+        NodeInfoResponse {
+            shard_allocations: vec![allocation],
+            current_epoch: 3,
+            epoch_length_frames: 720,
+            last_received_frame: 2_160,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn defaults_sort_allocations_by_worker_and_available_by_reward() {
         let m = Model::new();
@@ -1079,5 +1114,48 @@ mod tests {
         assert!(m.alloc_sort_asc);
         assert_eq!(AVAIL_COL_NAMES[m.avail_sort_col as usize], "Reward [Q/f]");
         assert!(!m.avail_sort_asc);
+    }
+
+    #[test]
+    fn only_active_allocations_with_assigned_workers_show_rewards() {
+        let filter = vec![0xab];
+        let workers = WorkerInfoResponse {
+            worker_info: vec![WorkerInfo {
+                core_id: 4,
+                filter: filter.clone(),
+                ..Default::default()
+            }],
+        };
+
+        let mut active = Model::new();
+        active.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            Some(shard_info(filter.clone(), 42)),
+            Some(workers),
+        );
+        assert_eq!(active.allocations[0].estimated_reward, BigInt::from(42));
+
+        let mut expired_epoch = Model::new();
+        expired_epoch.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 2))),
+            Some(shard_info(filter.clone(), 42)),
+            None,
+        );
+        assert_eq!(expired_epoch.allocations[0].status_name, "re-confirm!");
+        assert_eq!(expired_epoch.allocations[0].worker_id, -1);
+        assert_eq!(
+            expired_epoch.allocations[0].estimated_reward,
+            BigInt::from(0)
+        );
+
+        let mut unassigned = Model::new();
+        unassigned.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            Some(shard_info(filter, 42)),
+            None,
+        );
+        assert_eq!(unassigned.allocations[0].status_name, "active");
+        assert_eq!(unassigned.allocations[0].worker_id, -1);
+        assert_eq!(unassigned.allocations[0].estimated_reward, BigInt::from(0));
     }
 }
