@@ -7,8 +7,7 @@ use std::collections::{HashMap, HashSet};
 use num_bigint::{BigInt, Sign};
 
 use quil_types::proto::node::{
-    GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo, ShardRewardInfo, WorkerInfo,
-    WorkerInfoResponse,
+    GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo, WorkerInfoResponse,
 };
 
 use super::super::epoch::{
@@ -1079,13 +1078,15 @@ mod tests {
     fn allocation(filter: Vec<u8>, epoch: u64) -> ShardAllocationInfo {
         ShardAllocationInfo {
             filter,
-            status: 1,
+            status: super::super::super::epoch::raw_status::ACTIVE,
             epoch,
             ..Default::default()
         }
     }
 
     fn shard_info(filter: Vec<u8>, reward: u8) -> GetShardInfoResponse {
+        use quil_types::proto::node::ShardRewardInfo;
+
         GetShardInfoResponse {
             shards: vec![ShardRewardInfo {
                 filter,
@@ -1109,6 +1110,8 @@ mod tests {
 
     #[test]
     fn only_active_allocations_with_assigned_workers_show_rewards() {
+        use quil_types::proto::node::WorkerInfo;
+
         let filter = vec![0xab];
         let workers = WorkerInfoResponse {
             worker_info: vec![WorkerInfo {
@@ -1149,4 +1152,99 @@ mod tests {
         assert_eq!(unassigned.allocations[0].worker_id, -1);
         assert_eq!(unassigned.allocations[0].estimated_reward, BigInt::from(0));
     }
+
+    #[test]
+    fn assigned_inactive_allocations_keep_metadata_without_rewards() {
+        use super::super::super::epoch::raw_status;
+        use quil_types::proto::node::WorkerInfo;
+
+        let filter = vec![0xab];
+        for (status, epoch, join_confirm_frame, label) in [
+            (raw_status::ACTIVE, 2, 0, "re-confirm!"),
+            (raw_status::JOINING, 3, 0, "joining"),
+            (raw_status::ACTIVE, 3, 2_160, "joining"),
+            (raw_status::PAUSED, 3, 0, "paused"),
+            (raw_status::LEAVING, 3, 0, "leaving"),
+        ] {
+            let mut alloc = allocation(filter.clone(), epoch);
+            alloc.status = status;
+            alloc.join_confirm_frame_number = join_confirm_frame;
+            let mut info = shard_info(filter.clone(), 42);
+            info.shards[0].ring = 7;
+            info.shards[0].active_provers = 9;
+            info.shards[0].shard_size = vec![64];
+            info.shards[0].data_shards = 3;
+            info.shards[0].materialized_frame = 2_100;
+            info.shards[0].latest_frame = 2_160;
+            let mut model = Model::new();
+            model.process_refresh_data(
+                Some(node_info(alloc)),
+                Some(info),
+                Some(WorkerInfoResponse {
+                    worker_info: vec![WorkerInfo {
+                        core_id: 0,
+                        filter: filter.clone(),
+                        ..Default::default()
+                    }],
+                }),
+            );
+            let row = &model.allocations[0];
+            assert_eq!(row.status_name, label);
+            assert_eq!(row.worker_id, 0);
+            assert_eq!(row.estimated_reward, BigInt::from(0), "{label}");
+            assert_eq!(row.ring, 7);
+            assert_eq!(row.active_provers, 9);
+            assert_eq!(row.shard_size, BigInt::from(64));
+            assert_eq!(row.data_shards, 3);
+            assert_eq!(row.materialized_frame, 2_100);
+            assert_eq!(row.latest_frame, 2_160);
+        }
+    }
+
+    #[test]
+    fn refresh_clears_rewards_when_worker_or_active_status_is_lost() {
+        use quil_types::proto::node::WorkerInfo;
+
+        let filter = vec![0xab];
+        let workers = WorkerInfoResponse {
+            worker_info: vec![WorkerInfo {
+                core_id: 0,
+                filter: filter.clone(),
+                ..Default::default()
+            }],
+        };
+        let mut model = Model::new();
+        model.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            Some(shard_info(filter.clone(), 42)),
+            Some(workers.clone()),
+        );
+        assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
+
+        // A successful empty worker response replaces cached assignments.
+        model.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            None,
+            Some(WorkerInfoResponse { worker_info: vec![] }),
+        );
+        assert_eq!(model.allocations[0].worker_id, -1);
+        assert_eq!(model.allocations[0].estimated_reward, BigInt::from(0));
+
+        model.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            None,
+            Some(workers),
+        );
+        assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
+
+        // Cached shard and worker data must not preserve an expired reward.
+        model.process_refresh_data(
+            Some(node_info(allocation(filter, 2))),
+            None,
+            None,
+        );
+        assert_eq!(model.allocations[0].status_name, "re-confirm!");
+        assert_eq!(model.allocations[0].estimated_reward, BigInt::from(0));
+    }
+
 }
