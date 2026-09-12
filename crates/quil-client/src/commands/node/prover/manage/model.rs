@@ -7,8 +7,7 @@ use std::collections::{HashMap, HashSet};
 use num_bigint::{BigInt, Sign};
 
 use quil_types::proto::node::{
-    GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo, ShardRewardInfo, WorkerInfo,
-    WorkerInfoResponse,
+    GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo, WorkerInfoResponse,
 };
 
 use super::super::epoch::{
@@ -1079,13 +1078,15 @@ mod tests {
     fn allocation(filter: Vec<u8>, epoch: u64) -> ShardAllocationInfo {
         ShardAllocationInfo {
             filter,
-            status: 1,
+            status: 2,
             epoch,
             ..Default::default()
         }
     }
 
     fn shard_info(filter: Vec<u8>, reward: u8) -> GetShardInfoResponse {
+        use quil_types::proto::node::ShardRewardInfo;
+
         GetShardInfoResponse {
             shards: vec![ShardRewardInfo {
                 filter,
@@ -1118,6 +1119,8 @@ mod tests {
 
     #[test]
     fn only_active_allocations_with_assigned_workers_show_rewards() {
+        use quil_types::proto::node::WorkerInfo;
+
         let filter = vec![0xab];
         let workers = WorkerInfoResponse {
             worker_info: vec![WorkerInfo {
