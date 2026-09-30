@@ -11,27 +11,27 @@ use quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerif
 static NEXT_LANE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 pub(crate) const WORKER_FILE_NAME: &str = "quil-amount-proof-worker";
+/// First argument that runs the node executable as the worker (see `main`).
+pub(crate) const WORKER_MODE_ARG: &str = "--amount-proof-worker";
 pub(crate) const WORKER_PATH_ENV: &str = "QUIL_AMOUNT_WORKER_PATH";
 
 /// Resolution order: `proofWorker.path`, then `QUIL_AMOUNT_WORKER_PATH`, then
-/// the worker file beside the running node executable. The result must be an
+/// the running node executable itself, started in its worker mode
+/// ([`WORKER_MODE_ARG`]); the returned flag says which. The result must be an
 /// existing regular file with an absolute path; the client does not attest its
 /// bytes, so the path must come from trusted local configuration.
-pub(crate) fn resolve_worker_path(config: &ProofWorkerConfig) -> anyhow::Result<PathBuf> {
-    let candidate = if !config.path.is_empty() {
-        PathBuf::from(&config.path)
+pub(crate) fn resolve_worker_path(config: &ProofWorkerConfig) -> anyhow::Result<(PathBuf, bool)> {
+    let (candidate, own_executable) = if !config.path.is_empty() {
+        (PathBuf::from(&config.path), false)
     } else if let Some(path) = std::env::var_os(WORKER_PATH_ENV).filter(|path| !path.is_empty()) {
-        PathBuf::from(path)
+        (PathBuf::from(path), false)
     } else {
-        std::env::current_exe()?
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("node executable has no parent directory"))?
-            .join(WORKER_FILE_NAME)
+        (std::env::current_exe()?, true)
     };
     let path = std::fs::canonicalize(&candidate).map_err(|e| {
         anyhow::anyhow!(
-            "token proof worker not found at {}: {e}. Set proofWorker.path or {WORKER_PATH_ENV}, \
-             install {WORKER_FILE_NAME} beside the node binary, or set proofWorker.disabled: true",
+            "token proof worker not found at {}: {e}. Fix or unset proofWorker.path and {WORKER_PATH_ENV} \
+             (the node runs itself as the worker by default), or set proofWorker.disabled: true",
             candidate.display()
         )
     })?;
@@ -40,7 +40,7 @@ pub(crate) fn resolve_worker_path(config: &ProofWorkerConfig) -> anyhow::Result<
         "token proof worker path {} is not a regular file",
         path.display()
     );
-    Ok(path)
+    Ok((path, own_executable))
 }
 
 /// Build the shared verifier client, or `None` when the operator disabled the
@@ -51,9 +51,12 @@ pub(crate) fn build_worker(config: &ProofWorkerConfig) -> anyhow::Result<Option<
         return Ok(None);
     }
     config.validate().map_err(anyhow::Error::msg)?;
-    let path = resolve_worker_path(config)?;
+    let (path, own_executable) = resolve_worker_path(config)?;
     let mut worker = WorkerVerifier::new(path.clone(), config.cpu_seconds, Duration::from_secs(config.wall_timeout_secs))
         .map_err(|e| anyhow::anyhow!("token proof worker configuration rejected: {e:?}"))?;
+    if own_executable {
+        worker = worker.with_worker_mode_arg(WORKER_MODE_ARG);
+    }
     if config.address_space_bytes > 0 {
         if cfg!(target_os = "linux") {
             worker = worker
@@ -174,7 +177,12 @@ mod tests {
             std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let explicit = ProofWorkerConfig { path: worker.to_string_lossy().into_owned(), ..Default::default() };
-        assert_eq!(resolve_worker_path(&explicit).unwrap(), std::fs::canonicalize(&worker).unwrap());
+        assert_eq!(resolve_worker_path(&explicit).unwrap(), (std::fs::canonicalize(&worker).unwrap(), false));
+        assert_eq!(
+            resolve_worker_path(&ProofWorkerConfig::default()).unwrap(),
+            (std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap(), true),
+            "with nothing configured the node runs itself as the worker"
+        );
         let missing = ProofWorkerConfig { path: directory.path().join("absent").to_string_lossy().into_owned(), ..Default::default() };
         assert!(resolve_worker_path(&missing).is_err());
         let directory_path = ProofWorkerConfig { path: directory.path().to_string_lossy().into_owned(), ..Default::default() };

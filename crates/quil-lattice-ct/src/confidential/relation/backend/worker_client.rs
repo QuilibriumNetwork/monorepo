@@ -87,6 +87,9 @@ pub struct WorkerVerifier {
     admission_wait: Duration,
     /// Resident-memory cap enforced on each child by this process.
     max_resident_bytes: Option<u64>,
+    /// Argument placed before the worker arguments, for an executable that is
+    /// the worker only in a mode (a node running itself as its worker).
+    worker_mode_arg: Option<&'static str>,
 }
 
 /// Node-wide admission: one lock file per slot (`<path>` for slot 0, then
@@ -133,7 +136,13 @@ impl WorkerVerifier {
         }
         Ok(Self { executable, cpu_seconds, wall_timeout, address_space_bytes: None, native_threads: None,
             slots: Arc::new(Slots::new(1)), shared_admission: None,
-            lane: 0, admission_wait: Duration::ZERO, max_resident_bytes: None })
+            lane: 0, admission_wait: Duration::ZERO, max_resident_bytes: None, worker_mode_arg: None })
+    }
+
+    /// Start the executable with `arg` first, selecting its worker mode.
+    pub fn with_worker_mode_arg(mut self, arg: &'static str) -> Self {
+        self.worker_mode_arg = Some(arg);
+        self
     }
 
     /// Allow up to `max` verifications in flight per node (1..=64). Every
@@ -270,6 +279,7 @@ impl WorkerVerifier {
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
+        command.args(self.worker_mode_arg);
         command.arg("--cpu-seconds").arg(self.cpu_seconds.to_string());
         if let Some(bytes) = self.address_space_bytes {
             command.arg("--address-space-bytes").arg(bytes.to_string());

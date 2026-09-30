@@ -182,23 +182,21 @@ COPY ./node /opt/ceremonyclient/node
 
 # -----------------------------------------------------------------------------
 # Stage: build-node
-# Builds the Rust node (crates/quil-node) and its confidential token proof
-# verifier worker (quil-amount-proof-worker), which the node runs as a child
-# process resolved beside its own binary.
+# Builds the Rust node (crates/quil-node). The node also runs itself as its
+# confidential token proof verifier worker, so it is the only binary.
 # -----------------------------------------------------------------------------
 FROM build-context AS build-node
 COPY ./node /opt/ceremonyclient/node
 WORKDIR /opt/ceremonyclient/node
-# build.sh compiles the Rust `quil-node` crate and the proof worker in release
-# mode and installs them at node/build/<platform>/. The wildcard copy lets this
-# same Dockerfile serve amd64/arm64 Linux builds without a platform switch.
-# build.sh writes to node/build/<platform>/, outside the cache-mounted target/,
-# so the cp after the && finds the binaries on the real filesystem.
+# build.sh compiles the Rust `quil-node` crate in release mode and installs it
+# at node/build/<platform>/node. The wildcard copy lets this same Dockerfile
+# serve amd64/arm64 Linux builds without a platform switch. build.sh writes to
+# node/build/<platform>/, outside the cache-mounted target/, so the cp after the
+# && finds the binary on the real filesystem.
 RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,id=cargo-target-node,target=/opt/ceremonyclient/target \
-    ./build.sh && cp build/*/node /usr/bin/node && \
-    cp build/*/quil-amount-proof-worker /usr/bin/quil-amount-proof-worker
+    ./build.sh && cp build/*/node /usr/bin/node
 
 # -----------------------------------------------------------------------------
 # Stage: build-qclient
@@ -248,8 +246,6 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build-node /usr/bin/node /usr/local/bin/node
-# Token proof verifier worker, resolved by the node as its sibling file.
-COPY --from=build-node /usr/bin/quil-amount-proof-worker /usr/local/bin/quil-amount-proof-worker
 WORKDIR /root
 ENTRYPOINT ["node"]
 
@@ -258,7 +254,6 @@ ENTRYPOINT ["node"]
 # -----------------------------------------------------------------------------
 FROM scratch AS node
 COPY --from=build-node /usr/bin/node /node
-COPY --from=build-node /usr/bin/quil-amount-proof-worker /quil-amount-proof-worker
 ENTRYPOINT [ "/node" ]
 
 FROM scratch AS qclient-unix
@@ -296,7 +291,6 @@ LABEL org.opencontainers.image.ref.name=$GIT_BRANCH
 LABEL org.opencontainers.image.revision=$GIT_COMMIT
 
 COPY --from=build-node /usr/bin/node /usr/local/bin
-COPY --from=build-node /usr/bin/quil-amount-proof-worker /usr/local/bin
 COPY --from=build-qclient /usr/bin/qclient /usr/local/bin
 
 WORKDIR /root

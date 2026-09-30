@@ -153,18 +153,16 @@ COPY --exclude=node . .
 
 FROM build-avx512 AS build-node-avx512
 
-# Build and install the node and its confidential token proof verifier worker
-# (quil-amount-proof-worker), which the node runs as a child process resolved
-# beside its own binary.
+# Build and install the node. It also runs itself as its confidential token
+# proof verifier worker, so it is the only binary.
 COPY ./node /opt/ceremonyclient/node
 WORKDIR /opt/ceremonyclient/node
 
-# build.sh compiles the Rust `quil-node` crate and the proof worker in release
-# mode. The AVX-512 suffix on the output directory is driven by the AVX512 env
-# var; with it set the binaries land in node/build/amd64_avx512_linux/.
+# build.sh compiles the Rust `quil-node` crate in release mode. The AVX-512
+# suffix on the output directory is driven by the AVX512 env var; with it set
+# the binary lands at node/build/amd64_avx512_linux/node.
 ENV AVX512=1
-RUN ./build.sh && cp build/*/node /usr/bin/node && \
-    cp build/*/quil-amount-proof-worker /usr/bin/quil-amount-proof-worker
+RUN ./build.sh && cp build/*/node /usr/bin/node
 
 FROM build-avx512 AS build-qclient-avx512
 ARG TARGETOS
@@ -185,10 +183,9 @@ RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=lo
     cargo build --release -p quil-client --bin qclient && \
     cp target/release/qclient /usr/bin/qclient
 
-# Allows exporting the node binaries
+# Allows exporting single binary
 FROM scratch AS node
 COPY --from=build-node-avx512 /usr/bin/node /node
-COPY --from=build-node-avx512 /usr/bin/quil-amount-proof-worker /quil-amount-proof-worker
 ENTRYPOINT [ "/node" ]
 
 # Allows exporting single binary
@@ -224,7 +221,6 @@ LABEL org.opencontainers.image.ref.name=$GIT_BRANCH
 LABEL org.opencontainers.image.revision=$GIT_COMMIT
 
 COPY --from=build-node-avx512 /usr/bin/node /usr/local/bin
-COPY --from=build-node-avx512 /usr/bin/quil-amount-proof-worker /usr/local/bin
 COPY --from=build-qclient-avx512 /usr/bin/qclient /usr/local/bin
 
 WORKDIR /root

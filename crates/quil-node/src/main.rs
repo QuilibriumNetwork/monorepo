@@ -387,8 +387,19 @@ struct Args {
     log_filter: Option<String>,
 }
 
+fn main() -> anyhow::Result<ExitCode> {
+    // The node is its own token proof worker (proof_worker.rs): in that mode it
+    // verifies one request and exits, before logging, the runtime or arguments.
+    #[cfg(feature = "native-proof")]
+    if std::env::args().nth(1).as_deref() == Some(proof_worker::WORKER_MODE_ARG) {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(quil_lattice_ct::confidential::relation::backend::worker_request::run_worker(&args));
+    }
+    node_main()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<ExitCode> {
+async fn node_main() -> anyhow::Result<ExitCode> {
     initialize_tls_provider();
     let args = Args::parse();
 

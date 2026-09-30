@@ -118,6 +118,44 @@ pub fn verify_amount_proof(request: &WorkerRequest<'_>) -> Result<bool, super::n
     native::verify_owned(relation, &proof, NativeBudget { max_native_bytes: request.submission_bytes })
 }
 
+/// The worker process's entry point, shared by the standalone
+/// `quil-amount-proof-worker` binary and a node that runs itself as its worker:
+/// apply the requested OS limits, read one request from stdin, verify it, and
+/// return the process exit code. `args` excludes the program name.
+#[cfg(feature = "native-proof")]
+pub fn run_worker(args: &[String]) -> i32 {
+    use super::worker_limits::{apply_address_space_limit, apply_to_current_worker, exit_when_orphaned};
+    use super::worker_process::{INVALID_EXIT, READINESS_REQUEST, VALID_EXIT};
+    use std::io::Read;
+    let cpu = if (args.len() == 2 || args.len() == 4) && args[0] == "--cpu-seconds" {
+        args[1].parse::<u64>().ok()
+    } else { None };
+    if cpu.map_or(true, |seconds| apply_to_current_worker(seconds).is_err()) {
+        return 82;
+    }
+    if args.len() == 4 && (args[2] != "--address-space-bytes"
+        || args[3].parse::<u64>().ok().map_or(true, |bytes| apply_address_space_limit(bytes).is_err())) {
+        return 82;
+    }
+    if exit_when_orphaned().is_err() {
+        return 82;
+    }
+    let mut bytes = Vec::new();
+    if std::io::stdin().take(MAX_REQUEST_BYTES as u64).read_to_end(&mut bytes).is_err() {
+        82
+    } else if bytes == READINESS_REQUEST {
+        // Reached only after loader startup and configured OS limits succeed.
+        // This is a local ABI check, not a native proof self-test.
+        VALID_EXIT
+    } else if let Ok(request) = WorkerRequest::decode(&bytes) {
+        match verify_amount_proof(&request) {
+            Ok(true) => VALID_EXIT,
+            Ok(false) => INVALID_EXIT,
+            Err(_) => 82,
+        }
+    } else { 82 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
