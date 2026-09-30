@@ -350,14 +350,19 @@ fn log_slow_processing(
 /// client leaves idle; a request that finds its connection gone goes once
 /// more on a fresh connection to the same archive instead of counting
 /// against it.
-async fn fetch_frame(
-    client: &mut ArchiveClient,
+async fn fetch_frame<S, F, C>(
+    client: &mut S,
     addr: &str,
     number: u64,
-    falcon_signing_key: &[u8],
+    connect: &C,
     call_timeout: Duration,
     connection: &mut ConnectionTraffic,
-) -> Result<Result<GlobalFrame, ArchiveClientError>, tokio::time::error::Elapsed> {
+) -> Result<Result<GlobalFrame, ArchiveClientError>, tokio::time::error::Elapsed>
+where
+    S: PollerFrameSource,
+    C: Fn(String) -> F,
+    F: std::future::Future<Output = Result<S, ArchiveClientError>>,
+{
     let started = Instant::now();
     let mut result = tokio::time::timeout(call_timeout, client.get_global_frame(number)).await;
     if let Ok(Err(error)) = &result {
@@ -370,7 +375,7 @@ async fn fetch_frame(
                 fetched_on_connection = connection.frames,
                 "archive connection gone under the poller; reconnecting"
             );
-            let Ok(fresh) = ArchiveClient::connect_archive(addr, falcon_signing_key).await else {
+            let Ok(fresh) = connect(addr.to_owned()).await else {
                 return result;
             };
             *client = fresh;
@@ -628,6 +633,29 @@ fn forward_fill_due(last_frame: u64, has_genesis: bool, head: u64) -> bool {
     (last_frame > 0 || has_genesis) && head > last_frame + 1
 }
 
+/// The single fetch surface [`run_archive_poller`] needs from its remote
+/// source: `GetGlobalFrame(n)`, with `0` meaning "latest head". Extracted
+/// from [`ArchiveClient`] so tests can inject an in-process fake source and
+/// drive the poller loop deterministically (see the `forward_fill_tests`
+/// tests); production goes through the impl below over the real mTLS client.
+#[tonic::async_trait]
+pub(crate) trait PollerFrameSource: Send {
+    async fn get_global_frame(
+        &mut self,
+        frame_number: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError>;
+}
+
+#[tonic::async_trait]
+impl PollerFrameSource for ArchiveClient {
+    async fn get_global_frame(
+        &mut self,
+        frame_number: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError> {
+        ArchiveClient::get_global_frame(self, frame_number).await
+    }
+}
+
 /// Long-running task that polls a chosen archive endpoint for the current
 /// head, and forward-fills any gap from the previously seen head. The
 /// returned future runs until `cancel` fires; callers register it with
@@ -636,9 +664,31 @@ pub async fn run_archive_poller(
     pool: Arc<ArchiveEndpointPool>,
     clock_store: Arc<RocksClockStore>,
     falcon_signing_key: Vec<u8>,
-    mut config: ArchivePollerConfig,
+    config: ArchivePollerConfig,
     cancel: CancellationToken,
 ) {
+    run_archive_poller_with_connector(pool, clock_store, config, cancel, move |addr: String| {
+        let key = falcon_signing_key.clone();
+        async move { ArchiveClient::connect_archive(&addr, &key).await }
+    })
+    .await
+}
+
+/// Generic core of [`run_archive_poller`]: identical loop, with the remote
+/// source injectable via `connect` (production passes a closure over
+/// `ArchiveClient::connect_archive`; tests pass an in-process fake). Kept
+/// crate-private — the mTLS wrapper above is the public entry point.
+pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
+    pool: Arc<ArchiveEndpointPool>,
+    clock_store: Arc<RocksClockStore>,
+    mut config: ArchivePollerConfig,
+    cancel: CancellationToken,
+    connect: C,
+) where
+    S: PollerFrameSource,
+    C: Fn(String) -> F,
+    F: std::future::Future<Output = Result<S, ArchiveClientError>>,
+{
     info!("archive frame poller started");
     pool.wait_nonempty(&cancel).await;
     if cancel.is_cancelled() {
@@ -658,7 +708,7 @@ pub async fn run_archive_poller(
     // Reuse a single client for as long as it works AND it keeps us moving
     // forward. Switch endpoints on an RPC failure OR when an endpoint stops
     // being ahead of us (see the no-progress handling below).
-    let mut current_client: Option<(String, ArchiveClient)> = None;
+    let mut current_client: Option<(String, S)> = None;
     let mut connection = ConnectionTraffic::new();
     // Use the local store's latest as our starting "last seen", so a
     // restart doesn't re-fetch frames we already have.
@@ -718,6 +768,7 @@ pub async fn run_archive_poller(
     // it — a recently-produced frame that's briefly unavailable is served by
     // its producer within a few frames, so a large lag means "permanent".
     const UNFILLABLE_HEAD_MARGIN: u64 = 16;
+    const MAX_FORWARD_FILL_PER_TICK: u64 = 512;
 
     let mut ticker = tokio::time::interval(config.poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -836,7 +887,7 @@ pub async fn run_archive_poller(
         // Acquire a working client.
         if current_client.is_none() {
             if let Some(addr) = pool.next().await {
-                match ArchiveClient::connect_archive(&addr, &falcon_signing_key).await {
+                match connect(addr.clone()).await {
                     Ok(c) => {
                         info!(%addr, "archive poller connected");
                         current_client = Some((addr, c));
@@ -859,7 +910,7 @@ pub async fn run_archive_poller(
             }
         }
 
-        let Some((addr, ref mut client)) = current_client.as_mut().map(|(a, c)| (a.clone(), c))
+        let Some((addr, client)) = current_client.as_mut().map(|(a, c)| (a.clone(), c))
         else {
             continue;
         };
@@ -870,7 +921,7 @@ pub async fn run_archive_poller(
             client,
             &addr,
             0,
-            &falcon_signing_key,
+            &connect,
             config.call_timeout,
             &mut connection,
         )
@@ -995,6 +1046,10 @@ pub async fn run_archive_poller(
         //    Archive nodes need the full history; everyone else
         //    just wants to start from the current head.
         if config.forward_fill && forward_fill_due(last_frame, has_genesis, new_number) {
+            // Keep the cursor below an unfinished gap and resume next tick.
+            let fill_end = new_number.min(
+                last_frame.saturating_add(1).saturating_add(MAX_FORWARD_FILL_PER_TICK),
+            );
             // Track partial progress: every frame we successfully store
             // advances `last_frame`, so a failure midway does NOT throw
             // away the frames we already pulled. The previous design left
@@ -1013,7 +1068,10 @@ pub async fn run_archive_poller(
             // opposed to NotFound / transport). Counts toward the same skip via
             // its own distinct-endpoint tally.
             let mut failed_validation = false;
-            for fn_ in (last_frame + 1)..new_number {
+            for fn_ in (last_frame + 1)..fill_end {
+                if cancel.is_cancelled() {
+                    return;
+                }
                 // Store-first (non-archive): if gossip already delivered this
                 // frame, use the local copy and skip the RPC. Only frames gossip
                 // missed cost a network fetch. Fire on_frame just as the RPC arm
@@ -1028,16 +1086,18 @@ pub async fn run_archive_poller(
                     }
                 }
                 let fetch_started = Instant::now();
-                match fetch_frame(
-                    client,
-                    &addr,
-                    fn_,
-                    &falcon_signing_key,
-                    config.call_timeout,
-                    &mut connection,
-                )
-                .await
-                {
+                let fetched = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    result = fetch_frame(
+                        client,
+                        &addr,
+                        fn_,
+                        &connect,
+                        config.call_timeout,
+                        &mut connection,
+                    ) => result,
+                };
+                match fetched {
                     Ok(Ok(frame)) => {
                         let processing = Instant::now();
                         // Gate BEFORE persist — genesis-prover allowlist +
@@ -1176,6 +1236,10 @@ pub async fn run_archive_poller(
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                 }
+                continue;
+            }
+
+            if fill_end < new_number {
                 continue;
             }
         }
@@ -1631,5 +1695,355 @@ mod admit_tests {
         }
         assert_eq!(held.len(), MAX_HELD_UNCERTIFIED);
         assert_eq!(*held.keys().next().unwrap(), 11);
+    }
+}
+
+// In-process poller harness adapted from Daz's regression in #587.
+#[cfg(test)]
+mod forward_fill_tests {
+    use super::*;
+    use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+    use std::collections::BTreeMap;
+
+    /// Minimal frame that satisfies `RocksClockStore::put_global_frame`
+    /// (header present; requests empty).
+    fn mk_frame(n: u64) -> GlobalFrame {
+        GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: n,
+                output: vec![n as u8; 32],
+                ..Default::default()
+            }),
+            requests: vec![],
+        }
+    }
+
+    /// In-process archive: serves `0` as "latest" and exact frame numbers
+    /// otherwise, with a real gRPC `NotFound` status for absent frames so the
+    /// poller's NotFound-detection paths behave as in production.
+    #[derive(Clone)]
+    struct FakeArchive {
+        frames: Arc<std::sync::Mutex<BTreeMap<u64, GlobalFrame>>>,
+        requests: Arc<std::sync::Mutex<Vec<u64>>>,
+        block_at: Option<u64>,
+    }
+
+    impl FakeArchive {
+        fn serving(range: std::ops::RangeInclusive<u64>) -> Self {
+            let frames = range.map(|n| (n, mk_frame(n))).collect();
+            Self {
+                frames: Arc::new(std::sync::Mutex::new(frames)),
+                requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+                block_at: None,
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl PollerFrameSource for FakeArchive {
+        async fn get_global_frame(
+            &mut self,
+            frame_number: u64,
+        ) -> Result<GlobalFrame, ArchiveClientError> {
+            self.requests.lock().unwrap().push(frame_number);
+            if self.block_at == Some(frame_number) {
+                std::future::pending::<()>().await;
+            }
+            let frames = self.frames.lock().unwrap();
+            let found = if frame_number == 0 {
+                frames.values().next_back().cloned()
+            } else {
+                frames.get(&frame_number).cloned()
+            };
+            found.ok_or_else(|| {
+                ArchiveClientError::Rpc(tonic::Status::not_found(format!(
+                    "frame {frame_number} not found"
+                )))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_reconnects_only_for_transport_failures() {
+        struct BrokenSource(bool);
+        #[tonic::async_trait]
+        impl PollerFrameSource for BrokenSource {
+            async fn get_global_frame(&mut self, number: u64) -> Result<GlobalFrame, ArchiveClientError> {
+                if self.0 {
+                    Err(ArchiveClientError::Rpc(tonic::Status::from_error(Box::new(
+                        std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection closed"),
+                    ))))
+                } else {
+                    Ok(mk_frame(number))
+                }
+            }
+        }
+        let reconnects = std::sync::atomic::AtomicUsize::new(0);
+        let connect = |_| {
+            reconnects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async { Ok(BrokenSource(false)) }
+        };
+        let mut source = BrokenSource(true);
+        let mut traffic = ConnectionTraffic::new();
+        let frame = fetch_frame(&mut source, "archive:1", 7, &connect, Duration::from_secs(1), &mut traffic)
+            .await.unwrap().unwrap();
+        assert_eq!(frame.header.unwrap().frame_number, 7);
+        assert_eq!(reconnects.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(traffic.frames, 1);
+
+        let mut missing = FakeArchive::serving(1..=1);
+        let connect = |_| {
+            reconnects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async { Ok(FakeArchive::serving(1..=7)) }
+        };
+        assert!(matches!(fetch_frame(&mut missing, "archive:1", 7, &connect, Duration::from_secs(1), &mut traffic)
+            .await.unwrap(), Err(ArchiveClientError::Rpc(status)) if status.code() == tonic::Code::NotFound));
+        assert_eq!(reconnects.load(std::sync::atomic::Ordering::Relaxed), 1,
+            "an application status must not reconnect or bypass endpoint rotation");
+    }
+
+    struct Rig {
+        _tmp: tempfile::TempDir,
+        store: Arc<RocksClockStore>,
+        seen: Arc<std::sync::Mutex<Vec<u64>>>,
+        cancel: CancellationToken,
+        poller: tokio::task::JoinHandle<()>,
+    }
+
+    /// Spawn the real poller loop (forward_fill on — every node role runs
+    /// with it) against `fake`, over a fresh Rocks
+    /// store optionally pre-seeded with frames. `gossip` selects the role:
+    /// `None` = archive mode (always RPC-polls); `Some` = regular-node mode
+    /// (the poller consults the freshness signal first — an unstamped signal
+    /// models a client whose gossip mesh has delivered nothing, so it falls
+    /// through to the same RPC head-poll + forward-fill path).
+    async fn spawn_poller(
+        fake: FakeArchive,
+        seed_frames: &[u64],
+        gossip: Option<Arc<GossipFreshness>>,
+    ) -> Rig {
+        spawn_poller_with_jump(fake, seed_frames, gossip, None).await
+    }
+
+    /// As `spawn_poller`, but able to wire the runtime far-behind rescue hook —
+    /// the branch that decides whether a regular node state-jumps or crawls.
+    async fn spawn_poller_with_jump(
+        fake: FakeArchive,
+        seed_frames: &[u64],
+        gossip: Option<Arc<GossipFreshness>>,
+        far_behind_jump: Option<FarBehindJump>,
+    ) -> Rig {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = quil_store::RocksDb::open(tmp.path()).unwrap();
+        let store = Arc::new(RocksClockStore::new(db.inner()));
+        for n in seed_frames {
+            store.put_global_frame(&mk_frame(*n), None).unwrap();
+        }
+
+        let pool = Arc::new(ArchiveEndpointPool::new(Duration::from_secs(60)));
+        pool.add("fake-archive:8340".into()).await;
+
+        let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let seen_cb = seen.clone();
+        let config = ArchivePollerConfig {
+            poll_interval: Duration::from_millis(20),
+            call_timeout: Duration::from_secs(1),
+            forward_fill: true,
+            gossip_freshness: gossip,
+            far_behind_jump,
+            on_frame: Some(Arc::new(move |f: &GlobalFrame| {
+                if let Some(h) = f.header.as_ref() {
+                    seen_cb.lock().unwrap().push(h.frame_number);
+                }
+            })),
+            ..Default::default()
+        };
+
+        let cancel = CancellationToken::new();
+        let poller = tokio::spawn(run_archive_poller_with_connector(
+            pool,
+            store.clone(),
+            config,
+            cancel.clone(),
+            move |_addr: String| {
+                let f = fake.clone();
+                async move { Ok::<_, ArchiveClientError>(f) }
+            },
+        ));
+        Rig {
+            _tmp: tmp,
+            store,
+            seen,
+            cancel,
+            poller,
+        }
+    }
+
+    /// Wait (bounded) until the store's latest-frame cursor reaches `head`,
+    /// then stop the poller. Returns whether the head was reached at all.
+    async fn await_head_then_stop(rig: &Rig, head: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut reached = false;
+        while tokio::time::Instant::now() < deadline {
+            if rig.store.get_latest_frame_number() == Some(head) {
+                reached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        rig.cancel.cancel();
+        reached
+    }
+
+    #[tokio::test]
+    async fn genesis_only_archive_fills_from_frame_one() {
+        let rig = spawn_poller(FakeArchive::serving(1..=5), &[0], None).await;
+        assert!(await_head_then_stop(&rig, 5).await);
+        rig.poller.await.unwrap();
+        assert_eq!(*rig.seen.lock().unwrap(), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn genesis_only_regular_fills_from_frame_one() {
+        let rig = spawn_poller(
+            FakeArchive::serving(1..=5),
+            &[0],
+            Some(GossipFreshness::new()),
+        )
+        .await;
+        assert!(await_head_then_stop(&rig, 5).await);
+        rig.poller.await.unwrap();
+        assert_eq!(*rig.seen.lock().unwrap(), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn truly_empty_store_preserves_upstream_head_first_policy() {
+        let rig = spawn_poller(FakeArchive::serving(1..=5), &[], None).await;
+        assert!(await_head_then_stop(&rig, 5).await);
+        rig.poller.await.unwrap();
+        assert_eq!(*rig.seen.lock().unwrap(), vec![5]);
+        assert!(rig.store.get_global_frame(1).is_err());
+    }
+
+    /// A chunk must resume below head instead of skipping its remainder.
+    #[tokio::test]
+    async fn gap_wider_than_one_chunk_fills_contiguously_across_ticks() {
+        const HEAD: u64 = 600; // > MAX_FORWARD_FILL_PER_TICK
+        let fake = FakeArchive::serving(1..=HEAD);
+        let requests = fake.requests.clone();
+        let rig = spawn_poller(fake, &[0], None).await;
+        assert!(
+            await_head_then_stop(&rig, HEAD).await,
+            "poller did not reach head {HEAD} across multiple fill chunks"
+        );
+        rig.poller.await.unwrap();
+
+        assert!(
+            requests.lock().unwrap().iter().filter(|n| **n == 0).count() >= 2,
+            "a gap exceeding 512 frames must span multiple head polls"
+        );
+        let requested = requests.lock().unwrap();
+        let next_head_poll = requested
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, n)| **n == 0)
+            .unwrap()
+            .0;
+        assert_eq!(
+            next_head_poll, 513,
+            "first tick fetches exactly 512 gap frames"
+        );
+        drop(requested);
+        let missing: Vec<u64> = (1..=HEAD)
+            .filter(|n| rig.store.get_global_frame(*n).is_err())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "frames {missing:?} missing — a bounded chunk must resume below the head, \
+             never latch the cursor past the frames it has not fetched yet",
+        );
+        assert_eq!(
+            *rig.seen.lock().unwrap(),
+            (1..=HEAD).collect::<Vec<u64>>(),
+            "on_frame must fire once per frame, in order, across the chunk boundary",
+        );
+    }
+
+    /// Preserve the existing far-behind jump before forward-fill.
+    #[tokio::test]
+    async fn regular_node_far_behind_state_jumps_instead_of_crawling_from_genesis() {
+        const HEAD: u64 = STATE_JUMP_RUNTIME_GAP + 500; // far enough to trigger
+        const JUMP_TO: u64 = HEAD - 100;
+
+        let jumped: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jump_log = jumped.clone();
+        let jump: FarBehindJump = Arc::new(move |head: u64, _cancel: CancellationToken| {
+            jump_log.lock().unwrap().push(head);
+            Box::pin(async move { Some(JUMP_TO) })
+        });
+
+        let rig = spawn_poller_with_jump(
+            FakeArchive::serving(1..=HEAD),
+            &[],
+            Some(GossipFreshness::new()),
+            Some(jump),
+        )
+        .await;
+        assert!(
+            await_head_then_stop(&rig, HEAD).await,
+            "poller never reached head {HEAD} after the state-jump"
+        );
+        rig.poller.await.unwrap();
+
+        assert!(
+            !jumped.lock().unwrap().is_empty(),
+            "the far-behind rescue never fired — an empty store is the whole chain \
+             behind, so a regular node must state-jump rather than crawl",
+        );
+        // The jump landed at JUMP_TO, so the poller fills only above it. Nothing
+        // below may have been fetched: that crawl is exactly what the rescue exists
+        // to avoid.
+        let crawled: Vec<u64> = (1..=JUMP_TO)
+            .filter(|n| rig.store.get_global_frame(*n).is_ok())
+            .collect();
+        assert!(
+            crawled.is_empty(),
+            "frames {crawled:?} were fetched below the state-jump target — the \
+             poller crawled from genesis instead of resuming at the jump",
+        );
+        // Above the jump it still forward-fills contiguously to the head.
+        let missing: Vec<u64> = (JUMP_TO + 1..=HEAD)
+            .filter(|n| rig.store.get_global_frame(*n).is_err())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "frames {missing:?} missing above the jump target — the post-jump gap \
+             must still be forward-filled",
+        );
+    }
+    #[tokio::test]
+    async fn cancellation_interrupts_a_pending_forward_fill_fetch() {
+        let mut fake = FakeArchive::serving(1..=5);
+        fake.block_at = Some(2);
+        let requests = fake.requests.clone();
+        let rig = spawn_poller(fake, &[0], None).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if requests.lock().unwrap().contains(&2) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        rig.cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(200), rig.poller)
+            .await
+            .expect("cancellation must interrupt an in-flight fetch")
+            .unwrap();
+        assert_eq!(*rig.seen.lock().unwrap(), vec![1]);
+        assert!(rig.store.get_global_frame(5).is_err());
     }
 }
