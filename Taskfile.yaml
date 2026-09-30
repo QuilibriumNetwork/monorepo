@@ -1,28 +1,16 @@
 # https://taskfile.dev
 
-version: '3'
+version: "3"
 
 dotenv:
-  - '.env'
+  - ".env"
 
 env:
   DOCKER_BUILDKIT: '1'
-  # Native macOS builds link against an in-tree FLINT source build
-  # at `~/src/flint` (where `./configure --enable-static && make` has
-  # been run and `libflint.a` lives at the root). The Rust
-  # `classgroup` crate's build.rs walks both this in-tree layout and
-  # the install-prefix layout used inside the Linux Docker stages
-  # (`Dockerfile.source`'s `flint-builder`), so Linux tasks ignore
-  # this env. Without it set, the macOS task falls back to
-  # `brew --prefix flint`, which only ships dylibs — no `libflint.a`
-  # — and build.rs panics with `FLINT at <prefix> contains neither
-  # lib/libflint.a nor libflint.a`.
-  FLINT_DIR:
-    sh: echo "$HOME/src/flint"
 
 vars:
   VERSION:
-    sh: cat config/version.go | grep -A 1 "func GetVersion() \[\]byte {" | grep -Eo '0x[0-9a-fA-F]+' | xargs printf "%d.%d.%d"
+    sh: grep -m1 'VERSION_STRING' crates/quil-config/src/version.rs | cut -d'"' -f2
   GIT_REPO:
     sh: git config --get remote.origin.url | sed 's/\.git$//'
   GIT_BRANCH:
@@ -30,24 +18,8 @@ vars:
   GIT_COMMIT:
     sh: git log -1 --format=%h
   MAX_KEY_ID: 17
-  # Persistent local BuildKit layer cache. The Linux Docker builds compile the
-  # whole toolchain (protoc/go/GMP/FLINT) in the base stage — under amd64
-  # EMULATION on an arm64 host FLINT alone is ~1h. Without an explicit cache the
-  # `docker-container`/buildx exporter keeps nothing between runs, so it rebuilds
-  # every time. A user-controlled local cache dir survives Docker's own build-
-  # cache GC, so the toolchain layer is restored instead of recompiled. Requires
-  # a `docker-container` builder (the default `docker` driver can't export a
-  # local cache) — `_ensure_buildx` creates it once.
-  BUILDX_BUILDER: quil-cache
-  CACHE_ARGS: "--cache-from type=local,src=.docker-buildcache --cache-to type=local,dest=.docker-buildcache,mode=max"
 
 tasks:
-  _ensure_buildx:
-    internal: true
-    cmds:
-      - docker buildx inspect {{.BUILDX_BUILDER}} >/dev/null 2>&1 || docker buildx create --name {{.BUILDX_BUILDER}} --driver docker-container --bootstrap
-    silent: true
-
   status:
     desc: Display configuration info.
     cmds:
@@ -58,926 +30,148 @@ tasks:
       - echo -n "Commit    :" && echo " {{.GIT_COMMIT}}"
       - echo -n "Max Key ID:" && echo " {{.MAX_KEY_ID}}"
     silent: true
-    
+
   build_node_arm64_macos:
     desc: Build the Quilibrium node binary for MacOS ARM. Assumes it's ran from the same platform. Outputs to node/build.
     cmds:
-      - vdf/generate.sh
-      - bls48581/generate.sh
-      - verenc/generate.sh
-      - bulletproofs/generate.sh
-      - ferret/generate.sh
-      - channel/generate.sh
-      - rpm/generate.sh
-      - node/build.sh -o build/arm64_macos/node
+      - node/build.sh
 
   build_qclient_arm64_macos:
     desc: Build the qclient binary (Rust crates/quil-client) for MacOS ARM. Outputs to crates/quil-client/build.
     cmds:
-      - vdf/generate.sh
-      - bls48581/generate.sh
-      - verenc/generate.sh
-      - bulletproofs/generate.sh
-      - ferret/generate.sh
-      - channel/generate.sh
-      - rpm/generate.sh
       - CRATE_NAME=quil-client BIN_NAME=qclient OUT_BIN_NAME=qclient OUT_BASE_DIR=crates/quil-client/build node/build.sh
+
+  backup:
+    desc: Create a backup file with the critical configuration files.
+    prompt: You will be prompted for root access. Make sure you verify the generated backup file. Continue?
+    preconditions:
+      - sh: 'test -d .config'
+        msg: '.config does not exists!'
+      - sh: 'test -f .config/config.yml'
+        msg: '.config/config.yml does not exists!'
+      - sh: 'test -f .config/keys.yml'
+        msg: '.config/keys.yml does not exists!'
+      - sh: '! test -f backup.tar.gz'
+        msg: 'A previous backup.tar.gz found in the current folder!'
+    sources:
+      - '.config/config.yml'
+      - '.config/keys.yml'
+    generates:
+      - 'backup.tar.gz'
+    cmds:
+      - |
+        export TMP_DIR=$(mktemp -d)
+        export TASK_DIR=$(pwd)
+        sudo cp .config/config.yml $TMP_DIR
+        sudo cp .config/keys.yml $TMP_DIR
+        sudo chown $(whoami):$(id -gn) $TMP_DIR/*
+        cd $TMP_DIR
+        tar -czf $TASK_DIR/backup.tar.gz *
+        cd $TASK_DIR
+        sudo rm -rf $TMP_DIR
+        echo "Backup saved to: backup.tar.gz"
+        echo "Do not assume you have a backup unless you verify it!!!"
+    silent: true
+
+  restore:
+    desc: Restores a backup file with the critical configuration files.
+    preconditions:
+      - sh: '! test -d .config'
+        msg: '.config already exists, restore cannot be performed safely!'
+      - sh: 'test -f backup.tar.gz'
+        msg: 'backup.tar.gz not found in the current folder!'
+    sources:
+      - 'backup.tar.gz'
+    generates:
+      - '.config/config.yml'
+      - '.config/keys.yml'
+    cmds:
+      - |
+        mkdir .config
+        tar -xzf backup.tar.gz -C .config
+        echo "Backup restored from: backup.tar.gz"
+    silent: true
+
+  test:port:
+    desc: Test if the P2P port is visible to the world.
+    preconditions:
+      - sh: 'test -x "$(command -v nc)"'
+        msg: 'nc is not installed, install with "sudo apt install netcat"'
+      - sh: 'test -n "$NODE_PUBLIC_NAME"'
+        msg: 'The public DNS name or IP address of the server must be set in NODE_PUBLIC_NAME.'
+    cmds:
+      - 'nc -vzu ${NODE_PUBLIC_NAME} ${QUILIBRIUM_P2P_PORT:=8336}'
 
   build_node_arm64_linux:
     desc: Build the Quilibrium node binary for ARM64 Linux. Outputs to node/build.
     cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --output node/build/arm64_linux --target=node .
-
-  build_inspect_arm64_linux:
-    desc: Build the quil-node inspection executable for ARM64 Linux, with scripts/mainnet_readonly_report.sh beside it (its --inspect-bin). Outputs to node/build/arm64_linux/inspect.
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --output node/build/arm64_linux/inspect --target=inspect .
-
-  test_lattice_storage_arm64_macos:
-    desc: Test confidential coin storage, snapshots and root publication without enabling proof admission.
-    platforms: [darwin/arm64]
-    cmds:
-      - "cargo test -p quil-execution --features confidential-tokens --lib --locked token_intrinsic:: -- --test-threads=1"
-
-  test_lattice_admission_arm64_macos:
-    desc: Test token state staging, rollback and RocksDB reopen behavior; no complete native proof is generated.
-    platforms: [darwin/arm64]
-    cmds:
-      - "cargo test -p quil-execution --features native-proof --lib --locked token_intrinsic:: -- --test-threads=1"
-      - cargo test -p quil-execution --features native-proof --lib --locked hypergraph_state::tests -- --test-threads=1
-
-  test_token_self_paid_fees_arm64_macos:
-    desc: Check QUIL self-payment admission, engine regressions and current node build.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --locked dispatch::tests -- --test-threads=1
-      - cargo test -p quil-execution --features native-proof --lib --locked engines::tests -- --test-threads=1
-      - cargo check -p quil-node --locked
-
-  test_lattice_worker_process_arm64_macos:
-    desc: Check verifier subprocess verdict, failure, input bounds and timeout handling without native proving.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-lattice-ct --features confidential-tokens --lib --locked worker_ -- --test-threads=1
-
-  build_lattice_worker_arm64_macos:
-    desc: Build the experimental local amount-proof verification worker.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo build -p quil-lattice-ct --features native-proof --bin quil-amount-proof-worker --release --locked
-
-  test_lattice_worker_arm64_linux:
-    desc: Test Linux ARM64 worker CPU limits, subprocess lifecycle and Rust client verification of a saved native amount proof.
-    vars:
-      WORKER_WALL_SECS: '{{.WORKER_WALL_SECS | default "3000"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-worker --build-arg PROOF_WORKER_WALL_SECS={{.WORKER_WALL_SECS}} --progress=plain .
-
-  test_lattice_worker_admission_arm64_linux:
-    desc: Check Linux worker lifecycle, limits and cross-process admission without native proof generation.
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-worker-admission --progress=plain .
-
-  test_lattice_worker_admission_amd64_linux:
-    desc: Check Linux amd64 worker lifecycle, limits and cross-process admission without native proof generation.
-    cmds:
-      - docker build --platform linux/amd64 -f Dockerfile.source --target=test-lattice-worker-admission --progress=plain .
-
-  test_lattice_worker_amd64_linux:
-    desc: Same worker/client checks on Linux x86_64 (SIMDe portable scalar backend, no AVX); first amd64 native lattice evidence.
-    vars:
-      WORKER_WALL_SECS: '{{.WORKER_WALL_SECS | default "3000"}}'
-    cmds:
-      - docker build --platform linux/amd64 -f Dockerfile.source --target=test-lattice-worker --build-arg PROOF_WORKER_WALL_SECS={{.WORKER_WALL_SECS}} --progress=plain .
-
-  test_lattice_worker_native_arm64_macos:
-    desc: Check a saved native mint proof in the local worker, including context rejection and unavailable submission budget.
-    platforms: [darwin/arm64]
-    deps: [build_lattice_worker_arm64_macos]
-    cmds:
-      - python3 crates/quil-lattice-ct/tools/check_amount_worker.py target/release/quil-amount-proof-worker review_artifacts/2026-09-09-amount-replacement/portable_simde/mint-full-macos-pass.bin 0101010101010101010101010101010101010101010101010101010101010101 11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9
-
-  test_lattice_worker_client_arm64_macos:
-    desc: Verify a saved native mint through the Rust subprocess client, including context and local-budget errors.
-    platforms: [darwin/arm64]
-    deps: [build_lattice_worker_arm64_macos]
-    env:
-      QUIL_AMOUNT_WORKER_PATH: '{{.ROOT_DIR}}/target/release/quil-amount-proof-worker'
-      QUIL_AMOUNT_WORKER_FIXTURE: '{{.ROOT_DIR}}/review_artifacts/2026-09-09-amount-replacement/portable_simde/mint-full-macos-pass.bin'
-    cmds:
-      - cargo test -p quil-lattice-ct --features confidential-tokens --lib --release --locked worker_client_verifies_saved_native_mint -- --ignored --nocapture --test-threads=1
-
-  test_execution_context_arm64_macos:
-    desc: Check consensus global-anchor propagation through execution routing and app/global materialization regressions.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --lib --locked process_message_preserves_distinct_global_context -- --test-threads=1
-      - cargo test -p quil-engine --lib --locked app_shard_materialize -- --test-threads=1
-      - cargo test -p quil-engine --lib --locked frame_materializer::tests -- --test-threads=1
-
-  test_token_wire_arm64_macos:
-    desc: Check bounded confidential token transport, consensus byte preservation and node compilation.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --lib --locked token_carrier -- --test-threads=1
-      - cargo test -p quil-engine --lib --locked token_carrier -- --test-threads=1
-      - cargo check -p quil-node --locked
-
-  test_execution_failure_boundary_arm64_macos:
-    desc: Check operation rollback and preservation of local execution failures through frame processing.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --locked token_backend_failure_rolls_back -- --test-threads=1
-      - cargo test -p quil-engine --lib --locked frame_materializer::tests -- --test-threads=1
-      - cargo test -p quil-engine --lib --locked frame_processor::tests -- --test-threads=1
-      - cargo test -p quil-engine --lib --locked app_shard_materialize -- --test-threads=1
-
-  test_lattice_full_admission_arm64_macos:
-    desc: Prove a complete transfer, verify and commit it, reopen RocksDB, recover recipients and reject replay.
-    platforms: [darwin/arm64]
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-      TRANSACTION_PATH: '{{.TRANSACTION_PATH | default "/tmp/quil-execution-transfer.bin"}}'
-    cmds:
-      - QUIL_NATIVE_RESOURCE_TRACE='{{.RESOURCE_TRACE}}' QUIL_TEST_NATIVE_MIB='{{.NATIVE_MIB}}' QUIL_TEST_TRANSACTION_PATH='{{.TRANSACTION_PATH}}' cargo test -p quil-execution --features native-proof --lib --release --locked commit_verify::tests::complete_transfer_verifies_and_commits -- --ignored --nocapture --test-threads=1
-
-  test_lattice_admission_arm64_linux:
-    desc: Build the experimental execution adapter and run staging tests with the Linux ARM64 node toolchain.
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-admission --progress=plain .
-
-  test_lattice_admission_amd64_linux:
-    desc: Build the experimental execution adapter and run staging tests on Linux x86_64 (SIMDe portable scalar backend).
-    cmds:
-      - docker build --platform linux/amd64 -f Dockerfile.source --target=test-lattice-admission --progress=plain .
-
-  test_lattice_full_admission_arm64_linux:
-    desc: Prove, verify, stage and persist a complete transfer with the Linux ARM64 node toolchain.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-full-admission --build-arg PROOF_NATIVE_MIB={{.NATIVE_MIB}} --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --progress=plain .
-
-  test_reward_witness_arm64_macos:
-    desc: Verify QUIL reward RPC witnesses against committed roots and reject truncated or inconsistent balances.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --lib --locked reward_witness::tests -- --test-threads=1
-      - cargo check -p quil-node --locked
-
-  test_mint_authorization_witness_arm64_macos:
-    desc: Check authorization RPC bounds, claim construction, wallet compilation and node integration.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-rpc --lib --locked mint_authorization_witness_tests -- --test-threads=1
-      - cargo test -p quil-execution --features confidential-tokens --lib --locked mint_authorization -- --test-threads=1
-      - cargo test -p quil-client --features confidential-tokens --lib --locked wallet -- --test-threads=1
-      - cargo check -p quil-node --locked
-
-  test_lattice_wallet_arm64_macos:
-    desc: Test wallet derivation and memo recovery through the native macOS toolchain.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-client --features confidential-tokens --lib --locked wallet -- --test-threads=1
-
-  test_lattice_wallet_owned_scan_arm64_macos:
-    desc: Validate complete bounded wallet coin recovery and spent filtering over loopback RPC.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-client --features confidential-tokens --lib --locked commands::token::wallet::submission_tests::wallet_scans_owned_unspent_coins_over_rpc -- --exact --ignored --nocapture --test-threads=1
-
-  test_lattice_wallet_submission_arm64_macos:
-    desc: Send mint and claim fixtures through authenticated loopback RPC; no live network or native admission.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-client --features confidential-tokens --lib --locked wallet_submits_over_authenticated_rpc -- --ignored --nocapture --test-threads=1
-
-  test_lattice_wallet_escrow_lookup_arm64_macos:
-    desc: Fetch a full escrow over loopback RPC, verify its content address, and reject missing, altered and oversized records.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-client --features confidential-tokens --lib --locked wallet_fetches_content_bound_escrow_over_rpc -- --ignored --nocapture --test-threads=1
-
-  test_lattice_wallet_arm64_linux:
-    desc: Test wallet derivation and memo recovery with the Linux ARM64 node toolchain.
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-wallet --progress=plain .
-
-  test_settlement_arm64_macos:
-    desc: Cross-domain settlement units, the paid consumer bundle, the relay window, and the native wallet settlement proof.
-    platforms: [darwin/arm64]
-    vars:
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --release --locked -- settlement paid_hypergraph relayed_header custom_mint custom_token fee_credit uncovered_shard_tx entitlement proof_basis prefunded --test-threads=1
-      - cargo test -p quil-engine --lib --release --locked settlement_relay -- --test-threads=1
-      - QUIL_TEST_NATIVE_MIB='{{.NATIVE_MIB}}' cargo test -p quil-client --features native-proof --lib --release --locked wallet_rpc_proves_settlement -- --ignored --nocapture --test-threads=1
-
-  test_settlement_arm64_linux:
-    desc: Settlement units and the native wallet settlement proof on Linux ARM64 (completeness only).
-    vars:
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-settlement-wallet --build-arg PROOF_NATIVE_MIB={{.NATIVE_MIB}} --progress=plain .
-
-  test_settlement_amd64_linux:
-    desc: Settlement units (no native proof) on Linux x86_64 (completeness only).
-    cmds:
-      - docker build --platform linux/amd64 -f Dockerfile.source --target=test-settlement --progress=plain .
-
-  check_lattice_wallet_native_arm64_macos:
-    desc: Compile the wallet RPC, transfer preparation, and native proving path.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo check -p quil-client --features native-proof --lib --locked
-
-  test_lattice_wallet_full_arm64_macos:
-    desc: Exercise wallet RPC witnesses, native proving, public verification, and recipient recovery.
-    platforms: [darwin/arm64]
-    vars:
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-      TRANSACTION_PATH: '{{.TRANSACTION_PATH | default "/tmp/quil-wallet-rpc-transfer.bin"}}'
-    cmds:
-      - QUIL_TEST_NATIVE_MIB='{{.NATIVE_MIB}}' QUIL_TEST_TRANSACTION_PATH='{{.TRANSACTION_PATH}}' cargo test -p quil-client --features native-proof --lib --release --locked wallet_rpc_proves_transfer -- --ignored --nocapture --test-threads=1
-
-  test_lattice_wallet_full_arm64_linux:
-    desc: Exercise the full wallet RPC and proof path on Linux ARM64 without holding Cargo cache locks during proving.
-    vars:
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-wallet-full --build-arg PROOF_NATIVE_MIB={{.NATIVE_MIB}} --progress=plain .
-
-  test_lattice_witness_rpc_arm64_macos:
-    desc: Test coin witness RPC request/response bounds and check the optional node provider.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-hypergraph --lib --locked snapshot::tests -- --test-threads=1
-      - cargo test -p quil-rpc --lib --locked witness_tests -- --test-threads=1
-      - cargo check -p quil-node --features confidential-tokens --bin quil-node --locked
-
-  test_lattice_coin_pages_arm64_macos:
-    desc: Test bounded RocksDB coin-key paging across legacy and MVCC records.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-store --lib --locked fixed_vertex_page -- --test-threads=1
-      - cargo test -p quil-hypergraph --lib --locked fixed_vertex_page -- --test-threads=1
-
-  test_lattice_detached_abi_arm64_macos:
-    desc: Check Cargo artifact selection and execute native ABI tests outside the build cache.
-    platforms: [darwin/arm64]
-    vars:
-      TEST_PATH: '{{.TEST_PATH | default "/tmp/quil-lattice-detached-abi-tests"}}'
-    cmds:
-      - python3 crates/quil-lattice-proof-sys/tools/build_test_binary.py quil-lattice-proof-sys native-backend '{{.TEST_PATH}}' --require-test tests::sampling_error_partial_proofs_can_be_freed
-      - "{{.TEST_PATH}} --test-threads=1"
-
-  test_lattice_proof_arm64_macos:
-    desc: Test the experimental native proof ABI, Rust adapter and amount relation on macOS ARM64.
-    platforms: [darwin/arm64]
-    cmds:
-      - python3 crates/quil-lattice-proof-sys/tools/check_build_guards.py
-      - cargo test -p quil-lattice-proof-sys --features native-backend --release --locked
-      - cargo test -p quil-lattice-ct --features native-proof --release --locked confidential -- --test-threads=1
-
-  build_lattice_packed_shake_tests_arm64_macos:
-    desc: Compile the test-only packed SHAKE native benchmark without executing proofs.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-lattice-ct --features native-proof --lib --release --locked --no-run
-
-  test_lattice_public_encoding_arm64_macos:
-    desc: Check canonical public-coefficient encoding and isolated hashing cost.
-    platforms: [darwin/arm64]
-    cmds:
-      - mkdir -p target/native-diagnostics
-      - >-
-        clang -O3 -std=gnu2x -march=armv8-a+crypto
-        -Icrates/quil-lattice-proof-sys/adapter/shim
-        -Icrates/quil-lattice-proof-sys/adapter
-        -Icrates/quil-lattice-proof-sys/vendor/simde
-        -Icrates/quil-lattice-proof-sys/vendor/labrados
-        crates/quil-lattice-proof-sys/tools/public_encoding_check.c
-        crates/quil-lattice-proof-sys/vendor/labrados/fips202.c
-        -o target/native-diagnostics/public-encoding-check
-      - target/native-diagnostics/public-encoding-check
-
-  test_lattice_montgomery_arm64_macos:
-    desc: Compare bounded ARM Montgomery kernels with integer references.
-    platforms: [darwin/arm64]
-    cmds:
-      - mkdir -p target/native-diagnostics
-      - >-
-        clang -O3 -std=gnu2x -march=armv8-a+crypto
-        -Icrates/quil-lattice-proof-sys/adapter/shim
-        -Icrates/quil-lattice-proof-sys/adapter
-        -Icrates/quil-lattice-proof-sys/vendor/simde
-        -Icrates/quil-lattice-proof-sys/vendor/labrados
-        crates/quil-lattice-proof-sys/tools/ntt_montgomery_check.c
-        crates/quil-lattice-proof-sys/vendor/labrados/data.c
-        -o target/native-diagnostics/ntt-montgomery-check
-      - target/native-diagnostics/ntt-montgomery-check
-
-  test_lattice_ntt_arm64_macos:
-    desc: Check pinned transform outputs and measure forward/inverse NTT on public fixture vectors.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-lattice-proof-sys --features native-backend --release --locked
-      - cargo test -p quil-lattice-proof-sys --features native-backend --release --locked native_ntt_microbenchmark -- --ignored --nocapture --test-threads=1
-
-  test_lattice_packed_shake_arm64_macos:
-    desc: Measure a native proof of one test-only packed SHAKE circuit; not a full transaction.
-    platforms: [darwin/arm64]
-    env:
-      QUIL_NATIVE_RESOURCE_TRACE: '1'
-    cmds:
-      - cargo test -p quil-lattice-ct --features native-proof --lib --release --locked confidential::relation::boolean::packed::packed_shake_native_roundtrip -- --exact --ignored --nocapture --test-threads=1
-
-  audit_lattice_public_parameters:
-    desc: Inventory native public parameters and exact challenge-support ceilings; not a security certificate.
-    cmds:
-      - python3 crates/quil-lattice-proof-sys/tools/audit_public_parameters.py
-
-  test_lattice_proof_arm64_linux:
-    desc: Test the experimental native proof ABI, Rust adapter and amount relation using the existing Linux ARM64 toolchain.
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-proof --progress=plain .
-
-  test_lattice_issuance_arm64_macos:
-    desc: Prove and independently verify the public-inflow amount relation; funding authorization remains external.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-lattice-ct --features native-proof --release --locked native_issuance_amount_relation_roundtrip -- --ignored --nocapture --test-threads=1
-
-  test_lattice_shield_full_arm64_macos:
-    desc: Authorize a legacy source, prove confidential outputs, admit the shield, and check recovery/replay after reopening RocksDB.
-    platforms: [darwin/arm64]
-    vars:
-      TRANSACTION_PATH: '{{.TRANSACTION_PATH | default "/tmp/quil-shield.bin"}}'
-    cmds:
-      - QUIL_TEST_TRANSACTION_PATH='{{.TRANSACTION_PATH}}' cargo test -p quil-execution --features native-proof --lib --release --locked complete_shield_authorizes_proves_and_reopens -- --ignored --nocapture --test-threads=1
-
-  test_lattice_shield_dispatch_arm64_macos:
-    desc: Prove and execute a QUIL shield through the token dispatcher and verify persistence/recovery/replay.
-    platforms: [darwin/arm64]
-    vars:
-      TRANSACTION_PATH: '{{.TRANSACTION_PATH | default "/tmp/quil-dispatcher-shield.bin"}}'
-    cmds:
-      - QUIL_TEST_TRANSACTION_PATH='{{.TRANSACTION_PATH}}' cargo test -p quil-execution --features native-proof --lib --release --locked complete_shield_through_token_engine -- --ignored --nocapture --test-threads=1
-
-  test_lattice_shield_dispatch_arm64_linux:
-    desc: Execute a complete QUIL shield through the Linux ARM64 token dispatcher.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-shield-dispatch --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --progress=plain .
-
-  test_lattice_transfer_dispatch_arm64_macos:
-    desc: Prove and execute a two-input two-output confidential transfer through the token dispatcher, including same-bundle replay and RocksDB recovery.
-    platforms: [darwin/arm64]
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-      TRANSACTION_PATH: '{{.TRANSACTION_PATH | default "/tmp/quil-dispatcher-transfer.bin"}}'
-    cmds:
-      - QUIL_NATIVE_RESOURCE_TRACE='{{.RESOURCE_TRACE}}' QUIL_TEST_NATIVE_MIB='{{.NATIVE_MIB}}' QUIL_TEST_TRANSACTION_PATH='{{.TRANSACTION_PATH}}' cargo test -p quil-execution --features native-proof --lib --release --locked complete_transfer_through_token_engine -- --ignored --nocapture --test-threads=1
-
-  test_lattice_dispatch_preflight_arm64_macos:
-    desc: Check token dispatcher configuration, suite, context, dimensions and fee-asset rejection.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --release --locked dispatch::tests -- --test-threads=1
-
-  test_lattice_mint_codec_arm64_macos:
-    desc: Check token reward-mint framing, claim/output binding, conservation compiler and payload limits; no native proof is generated.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-lattice-ct --features confidential-tokens --lib --release --locked confidential::mint::tests -- --test-threads=1
-      - cargo test -p quil-lattice-ct --features confidential-tokens --lib --release --locked confidential::mint_claim::tests -- --test-threads=1
-
-  test_lattice_mint_full_arm64_macos:
-    desc: Authorize and prove a two-claim reward mint, stage reward debits with outputs, reopen RocksDB and check recovery/replay.
-    platforms: [darwin/arm64]
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      TRANSACTION_PATH: '{{.TRANSACTION_PATH | default "/tmp/quil-mint.bin"}}'
-    cmds:
-      - QUIL_NATIVE_RESOURCE_TRACE='{{.RESOURCE_TRACE}}' QUIL_TEST_TRANSACTION_PATH='{{.TRANSACTION_PATH}}' cargo test -p quil-execution --features native-proof --lib --release --locked complete_reward_mint_proves_debits_and_reopens -- --ignored --nocapture --test-threads=1
-
-  test_lattice_mint_authorization_arm64_macos:
-    desc: Prove a mint through global authorization and both claim venues, checking separate RocksDB restarts, recipient recovery and replay.
-    platforms: [darwin/arm64]
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-    cmds:
-      - QUIL_NATIVE_RESOURCE_TRACE='{{.RESOURCE_TRACE}}' cargo test -p quil-execution --features native-proof --lib --release --locked complete_reward_mint_authorizes_global_outputs_once -- --ignored --nocapture --test-threads=1
-
-  test_lattice_worker_execution_arm64_macos:
-    desc: Prove and execute a mint through worker-configured managers, then check both claim venues, restart, recovery and unavailable-worker rollback.
-    platforms: [darwin/arm64]
-    deps: [build_lattice_worker_arm64_macos]
-    env:
-      QUIL_AMOUNT_WORKER_PATH: '{{.ROOT_DIR}}/target/release/quil-amount-proof-worker'
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --release --locked complete_reward_mint_with_worker -- --ignored --nocapture --test-threads=1
-
-  test_lattice_worker_spending_arm64_macos:
-    desc: Prove and execute transfers and shields through the worker, checking state, replay, recipient recovery and RocksDB restart.
-    platforms: [darwin/arm64]
-    deps: [build_lattice_worker_arm64_macos]
-    env:
-      QUIL_AMOUNT_WORKER_PATH: '{{.ROOT_DIR}}/target/release/quil-amount-proof-worker'
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --release --locked complete_shield_with_worker -- --ignored --nocapture --test-threads=1
-      - cargo test -p quil-execution --features native-proof --lib --release --locked complete_transfer_with_worker -- --ignored --nocapture --test-threads=1
-
-  test_token_self_paid_native_arm64_macos:
-    desc: Prove a QUIL transfer and enforce positive dynamic fees through native worker admission and RocksDB recovery.
-    platforms: [darwin/arm64]
-    deps: [build_lattice_worker_arm64_macos]
-    env:
-      QUIL_AMOUNT_WORKER_PATH: '{{.ROOT_DIR}}/target/release/quil-amount-proof-worker'
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --release --locked complete_transfer_with_worker -- --ignored --nocapture --test-threads=1
-
-  test_lattice_worker_manager_arm64_macos:
-    desc: Check token worker configuration and routing through global and application execution managers.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --locked manager::tests -- --test-threads=1
-
-  test_lattice_pending_claim_native_arm64_macos:
-    desc: Prove recipient claims and refunds through the worker and both engine venues, checking global eligibility, restart, recovery and shared consumption.
-    platforms: [darwin/arm64]
-    deps: [build_lattice_worker_arm64_macos]
-    env:
-      QUIL_AMOUNT_WORKER_PATH: '{{.ROOT_DIR}}/target/release/quil-amount-proof-worker'
-      QUIL_TEST_PENDING_CLAIM_DIR: '{{.ROOT_DIR}}/review_artifacts/2026-09-09-amount-replacement/portable_simde/pending-claim-fixtures'
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --release --locked complete_pending_claim_and_refund_with_worker -- --ignored --nocapture --test-threads=1
-
-  localnet_qct3_transfer_arm64_macos:
-    desc: Drive a two-stage reward mint and a confidential transfer across a RUNNING localnet built from this tree (scripts/localnet.sh up), Nightly-length; unvalidated scaffold.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo build --release --locked -p quil-client --bin qclient
-      - scripts/localnet_qct3_e2e.sh
-
-  test_lattice_custom_mint_arm64_macos:
-    desc: Check custom-token issuance encoding, deployed-policy authorization, receipt/staging/rollback with RocksDB reopen, dispatcher routing and the wallet builder; no native proof.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-lattice-ct --features confidential-tokens --lib --locked custom_mint -- --test-threads=1
-      - cargo test -p quil-execution --features native-proof --lib --locked custom_mint -- --test-threads=1
-      - cargo test -p quil-execution --features native-proof --lib --locked wire -- --test-threads=1
-      - cargo test -p quil-client --features native-proof --lib --locked wallet_prepares_custom_mints -- --test-threads=1
-
-  test_lattice_custom_mint_native_arm64_macos:
-    desc: Prove a custom-token mint, verify it through the native worker and dispatcher, stage under the deployed policy, reopen RocksDB and recover both recipients.
-    platforms: [darwin/arm64]
-    deps: [build_lattice_worker_arm64_macos]
-    env:
-      QUIL_AMOUNT_WORKER_PATH: '{{.ROOT_DIR}}/target/release/quil-amount-proof-worker'
-    vars:
-      TRANSACTION_PATH: '{{.TRANSACTION_PATH | default "/tmp/quil-custom-mint.bin"}}'
-    cmds:
-      - QUIL_TEST_TRANSACTION_PATH='{{.TRANSACTION_PATH}}' cargo test -p quil-execution --features native-proof --lib --release --locked complete_custom_mint_with_worker -- --ignored --nocapture --test-threads=1
-
-  test_lattice_custom_mint_native_arm64_linux:
-    desc: Run the native custom-token mint worker/dispatcher/RocksDB test on Linux ARM64.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      WORKER_WALL_SECS: '{{.WORKER_WALL_SECS | default "3000"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-worker-execution --build-arg QUIL_WORKER_EXECUTION_TEST=token_intrinsic::custom_mint::tests::complete_custom_mint_with_worker --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --build-arg PROOF_WORKER_WALL_SECS={{.WORKER_WALL_SECS}} --progress=plain .
-
-  test_lattice_amount_relations_arm64_macos:
-    desc: Check the amount-relation constraints, including public commitment spends needed by escrow claims.
-    platforms: [darwin/arm64]
-    cmds:
-      - 'cargo test -p quil-lattice-ct --features confidential-tokens --lib --locked confidential::relation:: -- --test-threads=1'
-
-  test_lattice_public_spend_arm64_macos:
-    desc: Prove and verify a public-source commitment spend, checking source/context binding and proof size; no escrow admission.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-lattice-ct --features native-proof --lib --release --locked native_public_spend_roundtrip -- --ignored --nocapture --test-threads=1
-
-  test_lattice_pending_claim_arm64_macos:
-    desc: Check token pending-claim encoding, context binding, amount constraints and refund eligibility; no execution admission.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-lattice-ct --features confidential-tokens --lib --locked pending_claim_codec_context_and_refund_boundary -- --nocapture --test-threads=1
-
-  test_lattice_pending_create_arm64_macos:
-    desc: Check escrow funding framing, policy/recovery context binding, change separation and payload limits; no native proof or admission.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-lattice-ct --features confidential-tokens --lib --locked pending_creation_binds_recovery_policy_and_separates_change -- --nocapture --test-threads=1
-
-  test_lattice_memos_arm64_macos:
-    desc: Check ordinary recipient memos and dual-party escrow recovery, including authentication and cross-context/key rejection.
-    platforms: [darwin/arm64]
-    cmds:
-      - 'cargo test -p quil-lattice-ct --features confidential-tokens --lib --locked confidential::memo:: -- --test-threads=1'
-
-  test_lattice_pending_create_native_arm64_macos:
-    desc: Prove two-input escrow funding, reject ordinary-transfer reinterpretation and changed policy/recovery, recover both parties and measure the full payload.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-lattice-ct --features native-proof --lib --release --locked native_pending_creation_roundtrip -- --ignored --nocapture --test-threads=1
-
-  test_lattice_escrow_storage_arm64_macos:
-    desc: Check typed escrow storage, content-address validation and exclusion from ordinary coin accumulators.
-    platforms: [darwin/arm64]
-    cmds:
-      - 'cargo test -p quil-execution --features native-proof --lib --locked escrow::tests -- --test-threads=1'
-
-  test_lattice_worker_execution_arm64_linux:
-    desc: Check manager routing and native worker-backed mint authorization plus both claim venues on Linux ARM64.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      WORKER_WALL_SECS: '{{.WORKER_WALL_SECS | default "3000"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-worker-execution --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --build-arg PROOF_WORKER_WALL_SECS={{.WORKER_WALL_SECS}} --progress=plain .
-
-  test_lattice_mint_dispatch_arm64_macos:
-    desc: Test both mint engines with separate RocksDB stores and write the mint plus its .claim payload.
-    platforms: [darwin/arm64]
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      TRANSACTION_PATH: '{{.TRANSACTION_PATH | default "/tmp/quil-dispatch-mint.bin"}}'
-    cmds:
-      - QUIL_NATIVE_RESOURCE_TRACE='{{.RESOURCE_TRACE}}' QUIL_TEST_TRANSACTION_PATH='{{.TRANSACTION_PATH}}' cargo test -p quil-execution --features native-proof --lib --release --locked complete_reward_mint_through_global_dispatcher -- --ignored --nocapture --test-threads=1
-
-  test_lattice_mint_full_arm64_linux:
-    desc: Prove a mint through global authorization and both claim venues on Linux ARM64, including RocksDB restarts and replay after replenishment.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-mint-full --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --progress=plain .
-
-  test_lattice_mint_dispatch_arm64_linux:
-    desc: Prove and dispatch global reward authorization plus app claim on Linux ARM64, including separate RocksDB restart and replay.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-mint-dispatch --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --progress=plain .
-
-  test_lattice_mint_authorization_arm64_linux:
-    desc: Authorize, prove and persist a two-claim reward mint with Linux ARM64, including debit rollback and replay after replenishment.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-mint-authorization --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --progress=plain .
-
-  test_lattice_transfer_dispatch_arm64_linux:
-    desc: Execute a two-input two-output confidential transfer through the Linux ARM64 token dispatcher, including replay and recovery.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-transfer-dispatch --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --build-arg PROOF_NATIVE_MIB={{.NATIVE_MIB}} --progress=plain .
-
-  test_lattice_wallet_mint_full_arm64_macos:
-    desc: Prove a wallet mint and recover recipients with maximum-size membership fields; membership itself is not validated here.
-    platforms: [darwin/arm64]
-    vars:
-      TRANSACTION_PATH: '{{.TRANSACTION_PATH | default "/tmp/quil-wallet-mint.bin"}}'
-    cmds:
-      - QUIL_TEST_TRANSACTION_PATH='{{.TRANSACTION_PATH}}' cargo test -p quil-client --features native-proof --lib --release --locked wallet_proves_mint -- --ignored --nocapture --test-threads=1
-
-  test_lattice_wallet_pending_full_arm64_macos:
-    desc: Fetch escrows, prove wallet claims/refunds, submit with peer authentication and execute through a configured verifier worker over loopback RPC.
-    platforms: [darwin/arm64]
-    deps: [build_lattice_worker_arm64_macos]
-    env:
-      QUIL_AMOUNT_WORKER_PATH: '{{.ROOT_DIR}}/target/release/quil-amount-proof-worker'
-    cmds:
-      - cargo test -p quil-client --features native-proof --lib --release --locked wallet_rpc_proves_and_executes_pending_claims -- --ignored --nocapture --test-threads=1
-
-  test_lattice_wallet_pending_full_arm64_linux:
-    desc: Run the native wallet escrow lookup, authenticated submission and worker-backed claim/refund execution flow on Linux ARM64.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      WORKER_WALL_SECS: '{{.WORKER_WALL_SECS | default "3000"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-wallet-pending-full --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --build-arg PROOF_WORKER_WALL_SECS={{.WORKER_WALL_SECS}} --progress=plain .
-
-  test_lattice_wallet_pending_chain_arm64_macos:
-    desc: Fund escrows from two wallet coins, then claim/refund through authenticated RPC and the native worker, checking stored output separation and recovery.
-    platforms: [darwin/arm64]
-    deps: [build_lattice_worker_arm64_macos]
-    env:
-      QUIL_AMOUNT_WORKER_PATH: '{{.ROOT_DIR}}/target/release/quil-amount-proof-worker'
-    cmds:
-      - cargo test -p quil-client --features native-proof --lib --release --locked commands::token::wallet::native_tests::wallet_rpc_funds_then_claims_pending -- --exact --ignored --nocapture --test-threads=1
-
-  build_lattice_wallet_pending_tests_arm64_macos:
-    desc: Compile the native wallet pending fixtures, including the RocksDB restart chain.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-client --features native-proof --lib --release --locked --no-run
-
-  test_lattice_wallet_claim_command_arm64_macos:
-    desc: Exercise the native claim/refund command with an encrypted keystore and authenticated loopback RPC.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-client --features native-proof --lib --release --locked commands::token::wallet::native_tests::wallet_claim_command_proves_and_submits_both_authorities -- --exact --ignored --nocapture --test-threads=1
-
-  test_token_wallet_automatic_fee_arm64_macos:
-    desc: Prove and submit a parsed wallet transfer with pre-proving fee estimation and submission refresh.
-    platforms: [darwin/arm64]
-    env:
-      QUIL_NATIVE_RESOURCE_TRACE: '1'
-    cmds:
-      - cargo test -p quil-client --features native-proof --lib --release --locked commands::token::wallet::native_tests::wallet_transfer_command_quotes_fee_and_submits -- --exact --ignored --nocapture --test-threads=1
-
-  test_lattice_wallet_transfer_command_arm64_macos:
-    desc: Exercise the native confidential transfer command from scan through authenticated submission and recipient/change recovery.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-client --features native-proof --lib --release --locked commands::token::wallet::native_tests::wallet_transfer_command_proves_and_submits -- --exact --ignored --nocapture --test-threads=1
-
-  test_lattice_wallet_claim_command_arm64_linux:
-    desc: Exercise the native claim/refund command on Linux ARM64.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      WORKER_WALL_SECS: '{{.WORKER_WALL_SECS | default "3000"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-wallet-pending-full --build-arg QUIL_WALLET_PENDING_TEST=commands::token::wallet::native_tests::wallet_claim_command_proves_and_submits_both_authorities --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --build-arg PROOF_WORKER_WALL_SECS={{.WORKER_WALL_SECS}} --progress=plain .
-
-  test_lattice_wallet_transfer_command_arm64_linux:
-    desc: Exercise the native confidential transfer command (scan, selection, proof, authenticated submission, recovery) on Linux ARM64.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      WORKER_WALL_SECS: '{{.WORKER_WALL_SECS | default "3000"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-wallet-pending-full --build-arg QUIL_WALLET_PENDING_TEST=commands::token::wallet::native_tests::wallet_transfer_command_proves_and_submits --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --build-arg PROOF_WORKER_WALL_SECS={{.WORKER_WALL_SECS}} --progress=plain .
-
-  test_lattice_wallet_owned_scan_arm64_linux:
-    desc: Validate complete bounded wallet coin recovery and spent filtering over loopback RPC on Linux ARM64 (no native proof).
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-wallet-pending-full --build-arg QUIL_WALLET_PENDING_TEST=commands::token::wallet::submission_tests::wallet_scans_owned_unspent_coins_over_rpc --progress=plain .
-
-  test_lattice_wallet_pending_restart_arm64_macos:
-    desc: Execute the wallet funding-to-claim/refund chain and verify committed state after RocksDB reopen.
-    platforms: [darwin/arm64]
-    deps: [build_lattice_worker_arm64_macos]
-    env:
-      QUIL_AMOUNT_WORKER_PATH: '{{.ROOT_DIR}}/target/release/quil-amount-proof-worker'
-    cmds:
-      - cargo test -p quil-client --features native-proof --lib --release --locked commands::token::wallet::native_tests::wallet_rpc_funds_then_claims_pending_with_restart -- --exact --ignored --nocapture --test-threads=1
-
-  test_lattice_wallet_pending_restart_arm64_linux:
-    desc: Execute the native wallet escrow chain with RocksDB reopen on Linux ARM64.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      WORKER_WALL_SECS: '{{.WORKER_WALL_SECS | default "3000"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-wallet-pending-full --build-arg QUIL_WALLET_PENDING_TEST=commands::token::wallet::native_tests::wallet_rpc_funds_then_claims_pending_with_restart --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --build-arg PROOF_WORKER_WALL_SECS={{.WORKER_WALL_SECS}} --progress=plain .
-
-  test_lattice_wallet_pending_chain_arm64_linux:
-    desc: Fund escrows and claim/refund through authenticated RPC and the native worker on Linux ARM64.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-      WORKER_WALL_SECS: '{{.WORKER_WALL_SECS | default "3000"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-wallet-pending-full --build-arg QUIL_WALLET_PENDING_TEST=commands::token::wallet::native_tests::wallet_rpc_funds_then_claims_pending --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --build-arg PROOF_WORKER_WALL_SECS={{.WORKER_WALL_SECS}} --progress=plain .
-
-  test_lattice_wallet_mint_full_arm64_linux:
-    desc: Prove a wallet mint on Linux ARM64 with maximum-size membership fields; membership itself is not validated here.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-wallet-mint-full --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --progress=plain .
-
-  test_lattice_wallet_shield_full_arm64_macos:
-    desc: Build and independently verify a complete shield through the recipient wallet; check recipient recovery.
-    platforms: [darwin/arm64]
-    vars:
-      TRANSACTION_PATH: '{{.TRANSACTION_PATH | default "/tmp/quil-wallet-shield.bin"}}'
-    cmds:
-      - QUIL_TEST_TRANSACTION_PATH='{{.TRANSACTION_PATH}}' cargo test -p quil-client --features native-proof --lib --release --locked wallet_proves_shield -- --ignored --nocapture --test-threads=1
-
-  test_lattice_wallet_shield_full_arm64_linux:
-    desc: Build and independently verify a complete shield through the Linux ARM64 recipient wallet.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-wallet-shield-full --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --progress=plain .
-
-  test_lattice_issuance_arm64_linux:
-    desc: Prove and independently verify the public-inflow amount relation on Linux ARM64.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-issuance --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --progress=plain .
-
-  test_lattice_shield_full_arm64_linux:
-    desc: Authorize, prove and persist a complete shield with the Linux ARM64 node toolchain.
-    vars:
-      RESOURCE_TRACE: '{{.RESOURCE_TRACE | default "0"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-full-shield --build-arg PROOF_RESOURCE_TRACE={{.RESOURCE_TRACE}} --progress=plain .
-
-  test_lattice_sampling_error_arm64_macos:
-    desc: Require a full native fixture to return a sampling error without proof bytes or input corruption.
-    platforms: [darwin/arm64]
-    vars:
-      STAGE: '{{.STAGE | default "1"}}'
-      DEPTH: '{{.DEPTH | default "1"}}'
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-    cmds:
-      - cargo build -p quil-lattice-ct --features native-proof --example amount_relation_profile --release --locked
-      - target/release/examples/amount_relation_profile --native-error {{.DEPTH}} {{.STAGE}} {{.NATIVE_MIB}} quil-native-task-context-v1
-
-  test_lattice_sampling_error_arm64_linux:
-    desc: Exercise a full native sampling-error return through the Linux ARM64 toolchain.
-    vars:
-      STAGE: '{{.STAGE | default "1"}}'
-      DEPTH: '{{.DEPTH | default "1"}}'
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-proof-errors --build-arg PROOF_DEPTH={{.DEPTH}} --build-arg PROOF_ERROR_STAGE={{.STAGE}} --build-arg PROOF_NATIVE_MIB={{.NATIVE_MIB}} --progress=plain .
-
-  test_lattice_full_proof_arm64_macos:
-    desc: Prove and independently verify the fixed 2-input/2-output native fixture (default depth 1; substantial memory and time).
-    platforms: [darwin/arm64]
-    vars:
-      DEPTH: '{{.DEPTH | default "1"}}'
-      NATIVE_MIB: '{{.NATIVE_MIB | default "16384"}}'
-      PROOF_PATH: '{{.PROOF_PATH | default "/tmp/quil-native-task-proof.qpf"}}'
-    cmds:
-      - cargo build -p quil-lattice-ct --features native-proof --example amount_relation_profile --release --locked
-      - target/release/examples/amount_relation_profile --native-prove {{.DEPTH}} '{{.PROOF_PATH}}' {{.NATIVE_MIB}} quil-native-task-context-v1
-      - target/release/examples/amount_relation_profile --native-verify {{.DEPTH}} '{{.PROOF_PATH}}' {{.NATIVE_MIB}} quil-native-task-context-v1
-
-  test_lattice_full_proof_arm64_linux:
-    desc: Prove and independently verify the fixed native fixture through the Linux ARM64 release toolchain.
-    vars:
-      DEPTH: '{{.DEPTH | default "1"}}'
-      NATIVE_MIB: '{{.NATIVE_MIB | default "16384"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-proof-full --build-arg PROOF_DEPTH={{.DEPTH}} --build-arg PROOF_NATIVE_MIB={{.NATIVE_MIB}} --progress=plain .
-
-  profile_lattice_integer_gaussian:
-    desc: Measure single-thread integer Gaussian throughput with public fixtures and native callback budgets.
-    vars:
-      COUNT: '{{.COUNT | default "16384"}}'
-      ROUNDS: '{{.ROUNDS | default "5"}}'
-    cmds:
-      - cargo build -p quil-lattice-ct --features confidential-tokens --example integer_gaussian_profile --release --locked
-      - target/release/examples/integer_gaussian_profile {{.COUNT}} {{.ROUNDS}}
-
-  test_lattice_transfer_arm64_macos:
-    desc: Build a complete transfer with real memos and independently verify its proof and payload size.
-    platforms: [darwin/arm64]
-    vars:
-      DEPTH: '{{.DEPTH | default "8"}}'
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-      TRANSACTION_PATH: '{{.TRANSACTION_PATH | default "/tmp/quil-transfer.bin"}}'
-    cmds:
-      - cargo build -p quil-lattice-ct --features native-proof --example transfer_roundtrip --release --locked
-      - target/release/examples/transfer_roundtrip prove {{.DEPTH}} '{{.TRANSACTION_PATH}}' {{.NATIVE_MIB}}
-      - target/release/examples/transfer_roundtrip verify {{.DEPTH}} '{{.TRANSACTION_PATH}}' {{.NATIVE_MIB}}
-
-  test_lattice_transfer_verify_arm64_macos:
-    desc: Verify an existing complete transfer and admitted-root fixture through the Darwin ARM64 native backend.
-    platforms: [darwin/arm64]
-    requires:
-      vars: [TRANSACTION_PATH, DEPTH]
-    vars:
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-      EXPECTED_NETWORK_HEX: '{{.EXPECTED_NETWORK_HEX | default "0101010101010101010101010101010101010101010101010101010101010101"}}'
-      EXPECTED_APPLICATION_HEX: '{{.EXPECTED_APPLICATION_HEX | default "0202020202020202020202020202020202020202020202020202020202020202"}}'
-    preconditions:
-      - test -f '{{.TRANSACTION_PATH}}'
-      - test -f '{{.TRANSACTION_PATH}}.root'
-    cmds:
-      - cargo build -p quil-lattice-ct --features native-proof --example transfer_roundtrip --release --locked
-      - /usr/bin/time -l target/release/examples/transfer_roundtrip verify {{.DEPTH}} '{{.TRANSACTION_PATH}}' {{.NATIVE_MIB}} '{{.EXPECTED_NETWORK_HEX}}' '{{.EXPECTED_APPLICATION_HEX}}'
-
-  test_lattice_transfer_binding_arm64_macos:
-    desc: Check an existing complete transaction, then require native rejection after memo and owner mutations.
-    platforms: [darwin/arm64]
-    requires:
-      vars: [TRANSACTION_PATH, DEPTH]
-    vars:
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-      EXPECTED_NETWORK_HEX: '{{.EXPECTED_NETWORK_HEX | default "0101010101010101010101010101010101010101010101010101010101010101"}}'
-      EXPECTED_APPLICATION_HEX: '{{.EXPECTED_APPLICATION_HEX | default "0202020202020202020202020202020202020202020202020202020202020202"}}'
-    preconditions:
-      - test -f '{{.TRANSACTION_PATH}}'
-      - test -f '{{.TRANSACTION_PATH}}.root'
-    cmds:
-      - cargo build -p quil-lattice-ct --features native-proof --example transfer_roundtrip --release --locked
-      - target/release/examples/transfer_roundtrip verify-binding {{.DEPTH}} '{{.TRANSACTION_PATH}}' {{.NATIVE_MIB}} '{{.EXPECTED_NETWORK_HEX}}' '{{.EXPECTED_APPLICATION_HEX}}'
-
-  test_lattice_transfer_arm64_linux:
-    desc: Prove and independently verify a complete transfer through the Linux ARM64 release toolchain.
-    vars:
-      DEPTH: '{{.DEPTH | default "8"}}'
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-transfer --build-arg PROOF_DEPTH={{.DEPTH}} --build-arg PROOF_NATIVE_MIB={{.NATIVE_MIB}} --progress=plain .
-
-  test_lattice_transfer_verify_arm64_linux:
-    desc: Verify existing transaction and admitted-root fixture bytes on Linux ARM64, including Darwin-produced proofs.
-    requires:
-      vars: [TRANSACTION_PATH, DEPTH]
-    vars:
-      EXPECTED_NETWORK_HEX: '{{.EXPECTED_NETWORK_HEX | default "0101010101010101010101010101010101010101010101010101010101010101"}}'
-      EXPECTED_APPLICATION_HEX: '{{.EXPECTED_APPLICATION_HEX | default "0202020202020202020202020202020202020202020202020202020202020202"}}'
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-      IMAGE: '{{.IMAGE | default "quil-lattice-transfer-verifier:local"}}'
-    preconditions:
-      - test -f '{{.TRANSACTION_PATH}}'
-      - test -f '{{.TRANSACTION_PATH}}.root'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=lattice-transfer-runner --tag '{{.IMAGE}}' --progress=plain .
-      - docker run --rm --platform linux/arm64 --network none --read-only --mount 'type=bind,source={{.TRANSACTION_PATH}},target=/input/transaction.bin,readonly' --mount 'type=bind,source={{.TRANSACTION_PATH}}.root,target=/input/transaction.bin.root,readonly' '{{.IMAGE}}' /usr/local/bin/quil-transfer-roundtrip verify {{.DEPTH}} /input/transaction.bin {{.NATIVE_MIB}} '{{.EXPECTED_NETWORK_HEX}}' '{{.EXPECTED_APPLICATION_HEX}}'
-
-  test_lattice_transfer_binding_arm64_linux:
-    desc: Prove a complete transfer, check it and require native rejection after memo and owner mutations on Linux ARM64.
-    vars:
-      DEPTH: '{{.DEPTH | default "8"}}'
-      NATIVE_MIB: '{{.NATIVE_MIB | default "24576"}}'
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --target=test-lattice-transfer-binding --build-arg PROOF_DEPTH={{.DEPTH}} --build-arg PROOF_NATIVE_MIB={{.NATIVE_MIB}} --progress=plain .
+      # --ulimit stack=-1:-1 keeps rustc from segfaulting under qemu when
+      # cross-building (e.g. arm64 image on an amd64 host or vice versa).
+      # No effect on native builds.
+      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output node/build/arm64_linux --target=node .
 
   build_qclient_arm64_linux:
     desc: Build the qclient binary (Rust crates/quil-client) for ARM64 Linux. Outputs to crates/quil-client/build.
     cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.source --output crates/quil-client/build/arm64_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output crates/quil-client/build/arm64_linux --target=qclient .
 
   build_node_amd64_linux:
     desc: Build the Quilibrium node binary for AMD64 Linux. Outputs to node/build.
-    deps: [_ensure_buildx]
     cmds:
-      - docker buildx build --builder {{.BUILDX_BUILDER}} {{.CACHE_ARGS}} --platform linux/amd64 -f Dockerfile.source --output node/build/amd64_linux --target=node .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output node/build/amd64_linux --target=node .
 
-  build_inspect_amd64_linux:
-    desc: Build the quil-node inspection executable for AMD64 Linux, with scripts/mainnet_readonly_report.sh beside it (its --inspect-bin). Outputs to node/build/amd64_linux/inspect.
-    deps: [_ensure_buildx]
+  test_rust_amd64_linux:
+    desc: >-
+      Run the Rust workspace tests inside the AMD64 Linux build image — the
+      same environment that builds the node, carrying the GMP/FLINT/EMP native
+      deps that classgroup, bls48581, and vdf need to compile (which a bare
+      `cargo test` on a host lacking them cannot). Mirrors CI's `cargo nextest
+      run`, including the .nextest.toml skip-filter. Narrow scope by appending
+      args after `--`, e.g. `task test_rust_amd64_linux -- -p quil-engine` or
+      `task test_rust_amd64_linux -- -E 'test(materialize)'`; with no args it
+      runs the whole workspace. The cargo registry/git caches persist in named
+      volumes, but the compile target dir does not, so expect a cold compile
+      on the first run after a source change.
+    vars:
+      NEXTEST_ARGS: '{{.CLI_ARGS | default "--workspace --exclude channelwasm"}}'
     cmds:
-      - docker buildx build --builder {{.BUILDX_BUILDER}} {{.CACHE_ARGS}} --platform linux/amd64 -f Dockerfile.source --output node/build/amd64_linux/inspect --target=inspect .
-
-  build_conntest_amd64_linux:
-    desc: Build the Quilibrium node connection test binary for AMD64 Linux. Outputs to conntest/build.
-    cmds:
-      - docker build --platform linux/amd64 -f Dockerfile.conntest.source --output conntest/build/amd64_linux --target=conntest .
+      # test-context = build-context (full source + native deps) plus the node/
+      # tree that several crates embed fixtures from. Layers below build-context
+      # are already cached if the node image was built, so this is cheap.
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --target test-context -t quilibrium-rust-test:latest .
+      # The target volume persists compiled artifacts across runs so a long
+      # cold compile resumes instead of restarting; it starts empty and is
+      # populated from source exactly as CI does (CI has no prebuilt artifacts).
+      - >-
+        docker run --rm --ulimit stack=-1:-1 --platform linux/amd64
+        -v quilibrium-cargo-registry:/root/.cargo/registry
+        -v quilibrium-cargo-git:/root/.cargo/git
+        -v quilibrium-cargo-target:/opt/ceremonyclient/target
+        -w /opt/ceremonyclient quilibrium-rust-test:latest
+        bash -c 'curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/bin &&
+        cargo nextest run --locked --no-fail-fast --config-file .nextest.toml {{.NEXTEST_ARGS}}'
 
   build_node_amd64_avx512_linux:
     desc: Build the Quilibrium node binary for AMD64 Linux with AVX-512 extensions. Outputs to node/build.
-    deps: [_ensure_buildx]
     cmds:
-      - docker buildx build --builder {{.BUILDX_BUILDER}} {{.CACHE_ARGS}} --platform linux/amd64 -f Dockerfile.sourceavx512 --output node/build/amd64_avx512_linux --target=node .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output node/build/amd64_avx512_linux --target=node .
 
   build_qclient_amd64_linux:
     desc: Build the qclient binary (Rust crates/quil-client) for AMD64 Linux. Outputs to crates/quil-client/build.
-    deps: [_ensure_buildx]
     cmds:
-      - docker buildx build --builder {{.BUILDX_BUILDER}} {{.CACHE_ARGS}} --platform linux/amd64 -f Dockerfile.source --output crates/quil-client/build/amd64_linux --target=qclient .
-
-  build_qns_api_amd64_linux:
-    desc: Build the QNS API binary for AMD64 Linux. Outputs to qns-api/build.
-    cmds:
-      - docker build --platform linux/amd64 -f Dockerfile.qns-api --output qns-api/build/amd64_linux --target=qns-api .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output crates/quil-client/build/amd64_linux --target=qclient .
 
   build_qclient_amd64_avx512_linux:
     desc: Build the qclient binary (Rust crates/quil-client) for AMD64 Linux with AVX-512 extensions. Outputs to crates/quil-client/build.
-    deps: [_ensure_buildx]
     cmds:
-      - docker buildx build --builder {{.BUILDX_BUILDER}} {{.CACHE_ARGS}} --platform linux/amd64 -f Dockerfile.sourceavx512 --output crates/quil-client/build/amd64_avx512_linux --target=qclient .
-
-  build_vdf_perf_analysis_amd64_linux:
-    cmds:
-      - docker build --platform linux/amd64 -f Dockerfile.vdf.source --output vdf/build/amd64_linux --target=vdf  --progress=plain --no-cache .
-
-  build_vdf_perf_analysis_amd64_avx512_linux:
-    cmds:
-      - docker build --platform linux/amd64 -f Dockerfile.vdf.sourceavx512 --output vdf/build/amd64_avx512_linux --target=vdf-avx512 .
-
-  build_vdf_perf_analysis_amd64_zen3_linux:
-    cmds:
-      - docker build --platform linux/amd64 -f Dockerfile.vdf.sourcezen3 --output vdf/build/amd64_zen3_linux --target=vdf-zen3 --progress=plain --no-cache .
-
-  build_vdf_perf_analysis_amd64_zen4_linux:
-    cmds:
-      - docker build --platform linux/amd64 -f Dockerfile.vdf.sourcezen4 --output vdf/build/amd64_zen4_linux --target=vdf-zen4 --progress=plain --no-cache .
-  
-  build_vdf_perf_analysis_arm64_linux:
-    cmds:
-      - docker build --platform linux/arm64 -f Dockerfile.vdf.source --output vdf/build/arm64_linux --target=vdf --progress=plain --no-cache .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output crates/quil-client/build/amd64_avx512_linux --target=qclient .
 
   build:source:
     desc: Build the Quilibrium docker image from source.
     cmds:
       - |
         docker build \
-        -f Dockerfile.source \
+        -f docker/Dockerfile.source \
         --build-arg NODE_VERSION={{.VERSION}} \
         --build-arg GIT_REPO={{.GIT_REPO}} \
         --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
@@ -998,7 +192,7 @@ tasks:
     cmds:
       - |
         docker build \
-        -f Dockerfile.release \
+        -f docker/Dockerfile.release \
         --build-arg NODE_VERSION={{.VERSION}} \
         --build-arg GIT_REPO={{.GIT_REPO}} \
         --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
@@ -1031,321 +225,39 @@ tasks:
     cmds:
       - cargo test -p quil-client
 
-  test_lattice_escrow_discovery_arm64_macos:
-    desc: Check escrow discovery integration and test snapshot and wallet recovery behavior.
-    platforms: [darwin/arm64]
+  config:gen:
+    desc: >-
+      Generate configuration and keys (config.yml, keys.yml) with the
+      node-only image. Build it first with `task build:node:source`.
     cmds:
-      - cargo check -p quil-node -p quil-client --locked
-      - cargo test -p quil-execution --features confidential-tokens --lib --locked escrow_scan -- --nocapture
-      - cargo test -p quil-client --features confidential-tokens --lib --locked wallet_fetches_content_bound_escrow_over_rpc -- --ignored --nocapture --test-threads=1
-      - cargo test -p quil-client --features confidential-tokens --lib --locked wallet_prepares_pending_claims_from_authenticated_recovery_and_selected_authority -- --nocapture
-      - cargo test -p quil-rpc --lib --locked escrow_scan -- --nocapture
+      - |
+        docker run --rm \
+           -v {{.CONFIG_DIR | default "$(pwd)/.config"}}:/root/.config \
+           ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:node-only \
+           --config /root/.config --generate-keys
 
-  test_lattice_witness_index_arm64_macos:
-    desc: Validate completed-subtree paths and atomic local RocksDB index recovery.
-    platforms: [darwin/arm64]
+  build:node:source:
+    desc: Build the optimized Quilibrium node-only docker image.
     cmds:
-      - cargo test -p quil-lattice-ct --features confidential-tokens --lib --locked confidential::coin_tree -- --nocapture
-      - cargo test -p quil-execution --features confidential-tokens --lib --locked witness_index -- --nocapture
+      - |
+        docker build \
+        --target node-only \
+        -f docker/Dockerfile.source \
+        --build-arg NODE_VERSION={{.VERSION}} \
+        --build-arg GIT_REPO={{.GIT_REPO}} \
+        --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
+        --build-arg GIT_COMMIT={{.GIT_COMMIT}} \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}-node-only \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:node-only \
+        .
 
-  test_lattice_witness_bootstrap_arm64_macos:
-    desc: Check node witness-index wiring and bounded snapshot bootstrap.
-    platforms: [darwin/arm64]
+  deploy:node:
+    desc: Run the Quilibrium node using host networking and external config.
     cmds:
-      - cargo check -p quil-node --locked
-      - cargo test -p quil-execution --features confidential-tokens --lib --locked witness_index -- --nocapture
-      - cargo test -p quil-execution --features confidential-tokens --lib --locked scan -- --nocapture
-
-      - task: test_lattice_witness_node_arm64_macos
-      - task: test_lattice_witness_retry_arm64_macos
-
-  test_lattice_witness_node_arm64_macos:
-    desc: Exercise node bootstrap, incremental durable-commit updates, cache repair and observer failure isolation.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-node --bin quil-node --locked witness_index::tests::node_bootstraps_repairs_and_serves_verified_witnesses -- --exact --nocapture
-
-  test_lattice_witness_retry_arm64_macos:
-    desc: Verify retryable witness-index errors and bounded wallet preparation waits.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-rpc --lib --locked witness_index_unavailability -- --nocapture
-      - cargo test -p quil-client --lib --locked witness_retry -- --nocapture
-
-  test_lattice_fee_accounting_arm64_macos:
-    desc: Validate mixed token-bundle costs and shared checked frame fee calculations.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo check -p quil-node --locked
-      - cargo test -p quil-execution --features confidential-tokens --lib --locked manager_preserves_token_cost -- --nocapture
-      - cargo test -p quil-engine --lib --locked rewards::tests -- --nocapture
-      - cargo test -p quil-engine --lib --locked frame_processor::tests -- --nocapture
-      - cargo test -p quil-engine --lib --locked frame_materializer::tests -- --nocapture
-      - cargo test -p quil-engine --lib --locked app_shard_materialize -- --nocapture
-
-
-  test_token_fee_wallet_arm64_macos:
-    desc: Check wallet fee quote validation, CLI defaults and node integration.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-client --lib --locked commands::token -- --test-threads=1
-      - cargo check -p quil-node -p quil-client --locked
-
-  test_token_app_cursor_arm64_macos:
-    desc: Check atomic app state/cursor publication, failed commit retry, restart and strict reads.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-store --lib --locked app_cursor_ -- --test-threads=1
-      - task: test_token_app_fee_snapshot_arm64_macos
-
-  test_token_fee_relay_arm64_macos:
-    desc: Exercise worker fee RPC limits, deadlines and rebinding over loopback.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-engine --lib --locked app_fee_relay_transport_bounds_and_binding_races -- --ignored --nocapture --test-threads=1
-      - cargo check -p quil-node -p quil-client --locked
-
-  test_token_app_fee_snapshot_arm64_macos:
-    desc: Check app executor fee snapshot visibility, materialization and worker/node interfaces.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-engine --lib --locked app_fee_snapshot_ -- --test-threads=1
-      - cargo test -p quil-engine --lib --locked app_shard_materialize -- --test-threads=1
-      - task: test_token_fee_quote_rpc_arm64_macos
-
-  test_token_fee_snapshot_arm64_macos:
-    desc: Check current-frame quote snapshots and global materializer/node wiring.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --lib --locked global_quil_fee_snapshot_requires -- --test-threads=1
-      - cargo test -p quil-engine --lib --locked frame_materializer::tests -- --test-threads=1
-      - task: test_token_fee_quote_rpc_arm64_macos
-
-  test_token_fee_quote_rpc_arm64_macos:
-    desc: Check bounded fee quote RPC and regenerated node/client interfaces.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-rpc --lib --locked token_fee_quote_tests -- --test-threads=1
-      - cargo check -p quil-node -p quil-client --locked
-
-  test_token_fee_estimation_math_arm64_macos:
-    desc: Check shared fee arithmetic, conservative payload budgeting and existing frame pricing.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --lib --locked pricing::tests -- --test-threads=1
-      - task: test_lattice_fee_accounting_arm64_macos
-      - cargo check -p quil-client --locked
-
-  test_lattice_worker_startup_arm64_macos:
-    desc: Build the native worker and check bounded startup/ABI validation before node stores open.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo build -p quil-lattice-ct --features native-proof --bin quil-amount-proof-worker --locked
-      - cargo check -p quil-node --locked
-      - cargo test -p quil-node --bin quil-node --locked proof_worker::tests -- --nocapture
-      - QUIL_AMOUNT_WORKER_PATH="{{.ROOT_DIR}}/target/debug/quil-amount-proof-worker" cargo test -p quil-node --bin quil-node --locked proof_worker::tests::native_worker_passes_startup_check -- --exact --ignored --nocapture
-
-
-  test_lattice_token_fee_prerequisites_arm64_macos:
-    desc: Check single-debit fee classification and atomic token bundle rejection.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo check -p quil-node --locked
-      - cargo test -p quil-execution --features native-proof --lib --locked fees::tests -- --nocapture
-      - cargo test -p quil-execution --features native-proof --lib --locked engines::tests -- --nocapture
-
-
-  test_token_commit_setup_arm64_macos:
-    desc: Check CRDT staging preservation across transaction/root-read setup failures.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-hypergraph --features test-utils --test crdt_props --locked -- --nocapture
-
-
-  test_token_commit_retry_arm64_macos:
-    desc: Check RocksDB commit-failure recovery and CRDT commitment regressions.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-store --lib --locked crdt_failed_transaction -- --nocapture
-      - cargo test -p quil-hypergraph --features test-utils --test crdt_props --test unified_tree_commit --locked -- --nocapture
-      - cargo check -p quil-node --locked
-
-
-  test_token_commit_reads_arm64_macos:
-    desc: Check strict persisted-head/root reads and recoverable commit rejection.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-store --lib --locked crdt_commit_rejects_corrupt_heads -- --nocapture
-      - cargo test -p quil-store --lib --locked crdt_failed_transaction -- --nocapture
-      - cargo test -p quil-hypergraph --features test-utils --test crdt_props --test unified_tree_commit --locked -- --nocapture
-      - cargo check -p quil-node --locked
-
-
-  test_token_migration_append_arm64_macos:
-    desc: Check that appends preserve existing migration trees without head markers.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-store --lib --locked crdt_append_preserves_unmarked -- --nocapture
-      - task: test_token_commit_reads_arm64_macos
-
-
-  test_token_rejection_native_arm64_macos:
-    desc: Validate explicit mint/claim/refund rejection through the isolated proof worker.
-    platforms: [darwin/arm64]
-    cmds:
-      - task: test_lattice_worker_execution_arm64_macos
-      - task: test_lattice_pending_claim_native_arm64_macos
-
-
-  test_token_shared_helpers_arm64_macos:
-    desc: Check retained reward and prover helpers after removing their dependency on the legacy mint module.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo check -p quil-node --locked
-      - cargo test -p quil-execution --features native-proof --lib --locked traversal_proof::tests -- --nocapture
-      - cargo test -p quil-execution --features native-proof --lib --locked reward_witness::tests -- --nocapture
-      - cargo test -p quil-execution --features native-proof --lib --locked global_intrinsic::kick_verify::tests -- --nocapture
-
-
-  test_token_shared_admission_arm64_macos:
-    desc: Check native verifier admission shared across a node's OS processes.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-lattice-ct --features confidential-tokens --lib --locked shared_admission_coordinates_processes -- --nocapture
-      - task: test_lattice_worker_startup_arm64_macos
-
-
-  test_token_mutation_reads_arm64_macos:
-    desc: Check CRDT mutations preserve state when existing-blob or tombstone reads fail.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-hypergraph --features test-utils --test crdt_props --locked -- --nocapture
-      - cargo check -p quil-node --locked
-
-
-  test_token_atomic_staging_arm64_macos:
-    desc: Check whole-changeset CRDT staging and existing mutation/merge semantics.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-hypergraph --features test-utils --locked --lib --tests -- --nocapture
-      - cargo test -p quil-execution --features native-proof --lib --locked hypergraph_state::tests -- --nocapture
-      - cargo check -p quil-node --locked
-      - task: test_token_atomic_staging_store_arm64_macos
-
-
-  test_token_atomic_staging_store_arm64_macos:
-    desc: Check persistent commit, repair and migration append after staging changes.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-store --lib --locked crdt_ -- --nocapture
-
-
-  test_token_staging_retry_arm64_macos:
-    desc: Check token reexecution after atomic CRDT staging failure.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --locked engines::tests -- --nocapture
-      - cargo check -p quil-node --locked
-
-
-  test_global_staging_errors_arm64_macos:
-    desc: Check global staging failures reach frame callers and failed steps leave no partial changes.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --locked engines::tests -- --nocapture
-      - cargo check -p quil-node --locked
-
-
-  test_token_shared_constants_arm64_macos:
-    desc: Check retained protocol constants after detaching them from retired token implementations.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --locked token_engine::tests -- --nocapture
-      - cargo test -p quil-execution --features native-proof --lib --locked token_intrinsic::constants::tests -- --nocapture
-      - cargo test -p quil-execution --features native-proof --lib --locked token_intrinsic::legacy_migration::tests -- --nocapture
-      - cargo test -p quil-execution --features native-proof --lib --locked token_intrinsic::state::tests -- --nocapture
-      - cargo check -p quil-node --locked
-
-
-  test_token_operation_kinds_arm64_macos:
-    desc: Check active token kinds, retired-prefix rejection and execution integration.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --locked token_engine::tests -- --test-threads=1
-      - cargo test -p quil-execution --features native-proof --lib --locked engines::tests -- --test-threads=1
-      - cargo test -p quil-execution --no-default-features --lib --locked unconfigured_token_engine_rejects_all_confidential_types_before_decoding -- --test-threads=1
-      - cargo check -p quil-node -p quil-client --locked
-
-  test_token_feature_names_arm64_macos:
-    desc: Check production token feature names, disabled-feature rejection and native worker build wiring.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo check -p quil-lattice-ct --no-default-features --features confidential-tokens --locked
-      - cargo check -p quil-lattice-ct --features native-proof --bin quil-amount-proof-worker --locked
-      - task: test_token_retirement_arm64_macos
-      - cargo check -p quil-node --no-default-features --locked
-
-  test_token_retirement_arm64_macos:
-    desc: Verify retired token dispatch and wallet removal, current wallet components, and node/client builds.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --locked engines::tests -- --test-threads=1
-      - cargo test -p quil-execution --no-default-features --lib --locked unconfigured_token_engine_rejects_all_confidential_types_before_decoding -- --test-threads=1
-      - cargo test -p quil-client --lib --locked commands::token -- --test-threads=1
-      - cargo check -p quil-client --locked
-      - cargo check -p quil-client --no-default-features --locked
-      - cargo check -p quil-node --locked
-
-
-  test_token_rpc_retirement_arm64_macos:
-    desc: Check retained QCT3 witness RPCs and wallet consumers after legacy RPC removal.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-rpc --lib --locked -- --test-threads=1
-      - cargo test -p quil-client --lib --locked commands::token -- --test-threads=1
-      - cargo check -p quil-node -p quil-client --locked
-
-
-  test_token_proof_module_retirement_arm64_macos:
-    desc: Check removal of old proof modules and retained migration, QCT3 admission and clients.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-node --bin quil-node --locked legacy_migration::tests -- --test-threads=1
-      - task: test_lattice_admission_arm64_macos
-      - cargo test -p quil-client --lib --locked request_acceptance_tests -- --test-threads=1
-      - cargo test -p quil-client --lib --locked commands::token -- --test-threads=1
-      - cargo check -p quil-node -p quil-client -p quil-explorer --locked
-
-
-  test_token_decaf_verifier_retirement_arm64_macos:
-    desc: Check retained migration and canonical carriers after removing Decaf verifiers and the unused old wallet crate.
-    platforms: [darwin/arm64]
-    cmds:
-      - cargo test -p quil-execution --features native-proof --lib --locked token_intrinsic::legacy_migration::tests -- --test-threads=1
-      - cargo test -p quil-execution --features native-proof --lib --locked engines::tests -- --test-threads=1
-      - cargo test -p quil-execution --locked --test go_corpus --test decoder_fuzz -- --test-threads=1
-      - cargo test -p quil-engine --lib --locked consensus_wire::tests -- --test-threads=1
-      - cargo test -p quil-client --lib --locked request_acceptance_tests -- --test-threads=1
-      - cargo check -p quil-node -p quil-client -p quil-explorer --locked
-
-
-  test_token_carrier_retirement_arm64_macos:
-    desc: Check removal of legacy frame carrier variants, current fee collection, routing and transport.
-    platforms: [darwin/arm64]
-    cmds:
-      - task: test_token_decaf_verifier_retirement_arm64_macos
-      - cargo test -p quil-execution --features native-proof --lib --locked fees::tests -- --test-threads=1
-      - cargo test -p quil-engine --lib --locked frame_materializer::tests -- --test-threads=1
-      - cargo test -p quil-execution --lib --locked hypergraph_engine::tests -- --test-threads=1
-      - cargo test -p quil-rpc --lib --locked node_service -- --test-threads=1
-
-
-  test_token_codec_retirement_arm64_macos:
-    desc: Check sole-suite record cleanup and retained shared coin storage, configuration and migration.
-    platforms: [darwin/arm64]
-    cmds:
-      - task: test_token_carrier_retirement_arm64_macos
-      - cargo test -p quil-execution --features native-proof --lib --locked token_intrinsic::materialize::tests -- --test-threads=1
-      - cargo test -p quil-execution --features native-proof --lib --locked token_intrinsic::conversions::tests -- --test-threads=1
-      - cargo test -p quil-execution --features native-proof --lib --locked state::tests -- --test-threads=1
-      - cargo test -p quil-execution --features native-proof --lib --locked escrow::tests -- --test-threads=1
+      - |
+        docker run -d --name q-node \
+           --network host \
+           --restart unless-stopped \
+           -v {{.CONFIG_DIR | default "$(pwd)/.config"}}:/root/.config \
+           ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:node-only \
+           --signature-check=false

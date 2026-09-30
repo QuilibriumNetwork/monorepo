@@ -1,9 +1,16 @@
-client/build/
+# Build outputs: the image builds fresh. Nested per-crate target dirs
+# (e.g. crates/quil-engine/fuzz/target) are not matched by `target/` alone.
 target/
+**/target/
 node/build/
+crates/quil-client/build/
 node/.vscode/
 .git
 .gitignore
+
+# Node configuration and keys are never build inputs.
+.config*
+**/.config*
 vdf/generated/
 bls48581/generated/
 ferret/generated/

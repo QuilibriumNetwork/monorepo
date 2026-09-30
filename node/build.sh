@@ -198,6 +198,36 @@ mkdir -p "$OUT_DIR"
 cp "$BIN_SRC" "$OUT_DIR/$OUT_BIN_NAME"
 chmod +x "$OUT_DIR/$OUT_BIN_NAME"
 
+# ---------------------------------------------------------------
+# Replacement token proof verifier worker (node builds only)
+# ---------------------------------------------------------------
+# The node verifies confidential token proofs in an isolated child process,
+# `quil-amount-proof-worker`, resolved at runtime from `proofWorker.path`,
+# `QUIL_AMOUNT_WORKER_PATH`, or the file of that name beside the node
+# binary. Build and publish it alongside the node so the sibling lookup
+# works out of the box. Set SKIP_PROOF_WORKER=1 to omit it.
+WORKER_BIN_NAME="quil-amount-proof-worker"
+if [[ "$CRATE_NAME" == "quil-node" && -z "${SKIP_PROOF_WORKER:-}" ]]; then
+    worker_args=(build -p quil-lattice-ct --features native-proof --bin "$WORKER_BIN_NAME" --locked)
+    case "$CARGO_PROFILE" in
+        release) worker_args+=(--release) ;;
+        dev|debug) ;;
+        *) worker_args+=(--profile "$CARGO_PROFILE") ;;
+    esac
+    if [[ -n "$TARGET_TRIPLE" ]]; then
+        worker_args+=(--target "$TARGET_TRIPLE")
+    fi
+    cargo "${worker_args[@]}"
+    WORKER_SRC="$BUILD_ROOT/$PROFILE_DIR/$WORKER_BIN_NAME"
+    if [[ ! -f "$WORKER_SRC" ]]; then
+        echo "error: built worker not found at $WORKER_SRC" >&2
+        exit 1
+    fi
+    cp "$WORKER_SRC" "$OUT_DIR/$WORKER_BIN_NAME"
+    chmod +x "$OUT_DIR/$WORKER_BIN_NAME"
+    echo "built $OUT_DIR/$WORKER_BIN_NAME ($(du -h "$OUT_DIR/$WORKER_BIN_NAME" | cut -f1))"
+fi
+
 popd > /dev/null
 
 echo "built $OUT_DIR/$OUT_BIN_NAME ($(du -h "$OUT_DIR/$OUT_BIN_NAME" | cut -f1))"
