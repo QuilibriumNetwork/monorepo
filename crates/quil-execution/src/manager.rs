@@ -1767,7 +1767,6 @@ mod tests {
         assert!(!manager.message_commits_globally(&application, &[0, 1]));
     }
 
-    #[cfg(feature = "confidential-tokens")]
     /// Fees are credited only for what the executing venue admitted: QUIL
     /// operations on the QUIL application, a consumed settlement claim on any
     /// other application, and nothing for bundles the global intrinsic skips.
@@ -1798,10 +1797,19 @@ mod tests {
         }.to_canonical_bytes().unwrap();
         let manager = build_manager(true);
         let mixed = bundle(vec![claim.clone(), transfer.clone()]);
-        // QUIL: neither the transfer's fee — it commits through the global
-        // frame and is credited there, only if it commits — nor an
-        // (unverified there) claim.
-        assert_eq!(manager.message_token_fees(&domains::QUIL_TOKEN, &mixed).unwrap(), 0);
+        // Native-proof builds relay the transfer and credit its fee only at
+        // global commit. Without native proofs nothing is relayed, so the
+        // QUIL venue's fee helper counts the transfer's fee locally.
+        #[cfg(feature = "native-proof")]
+        let expected_transfer_fee = 0;
+        #[cfg(not(feature = "native-proof"))]
+        let expected_transfer_fee = 7;
+        assert_eq!(manager.message_token_fees(&domains::QUIL_TOKEN, &mixed).unwrap(), expected_transfer_fee);
+        // An unverified settlement claim never contributes QUIL-venue fees.
+        assert_eq!(manager.message_token_fees(&domains::QUIL_TOKEN, &bundle(vec![claim.clone()])).unwrap(), 0);
+        // Exercise single-request framing as well as a mixed bundle.
+        let single = CanonicalMessageRequest::wrap(transfer.clone()).unwrap().to_canonical_bytes().unwrap();
+        assert_eq!(manager.message_token_fees(&domains::QUIL_TOKEN, &single).unwrap(), expected_transfer_fee);
         // Another application: only the claim it verified, never QUIL fees it skipped.
         assert_eq!(manager.message_token_fees(&app, &mixed).unwrap(), 500);
         assert_eq!(manager.message_token_fees(&app, &bundle(vec![transfer.clone()])).unwrap(), 0);
