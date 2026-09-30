@@ -173,7 +173,7 @@ impl RocksDb {
         let migrations = crate::migration::rust_node_migrations();
         crate::migration::run_migrations(&db, &migrations)?;
 
-        Ok(Self { db: quil_forest::CoordinatedDb::new(db) })
+        Ok(Self { db: Self::coordinated(db) })
     }
 
     /// Inspect an existing, stopped database without writes or migrations.
@@ -231,7 +231,16 @@ impl RocksDb {
         // Leak the TempDir so it's not cleaned up while DB is open.
         // This is intentional for in-memory test stores.
         std::mem::forget(tmp);
-        Ok(Self { db: quil_forest::CoordinatedDb::new(db) })
+        Ok(Self { db: Self::coordinated(db) })
+    }
+
+    /// A writable store watches the prover registry's keys, so execution
+    /// branches can reuse a registry scan no write has changed.
+    fn coordinated(db: rocksdb::DB) -> quil_forest::CoordinatedDb {
+        quil_forest::CoordinatedDb::with_watched_prefixes(
+            db,
+            crate::encoding::prover_registry_key_prefixes(),
+        )
     }
 
     /// Share the database and its write barrier across store implementations.

@@ -7,10 +7,10 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use quil_types::store::BackingStoreIdentity;
+use quil_types::store::{BackingStoreIdentity, ScanPoint};
 use rocksdb::{
     DBIterator, DBRawIterator, IteratorMode, ReadOptions, Snapshot, WriteBatch, WriteOptions, DB,
 };
@@ -37,7 +37,13 @@ struct DatabaseInner {
     db: DB,
     writes: Mutex<WriteLedger>,
     failed_write: AtomicBool,
+    /// Process-unique, never reused: a scan of one instance never matches a
+    /// later database, even one reopened at the same path.
+    instance: u64,
+    watched: Option<Vec<Vec<u8>>>,
 }
+
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 /// Sequence numbers recorded under the write barrier. A write confined to
 /// declared two-byte prefixes is recorded per prefix; every other write is
@@ -46,6 +52,8 @@ struct DatabaseInner {
 struct WriteLedger {
     general: u64,
     disjoint: BTreeMap<[u8; 2], u64>,
+    /// Sequence after the last write that may have written a watched key.
+    watched: u64,
 }
 
 /// Two-byte key prefixes a branch read, scanned or wrote. Marking is
@@ -181,15 +189,39 @@ pub struct CoordinatedDb(Arc<DatabaseInner>);
 
 impl CoordinatedDb {
     pub fn new(db: DB) -> Self {
+        Self::open(db, None)
+    }
+
+    /// Also record the last write that may have written a key under one of
+    /// `prefixes`, so a reader can prove a scan of them is still current (see
+    /// [`CapturePoint`](quil_types::store::CapturePoint)). Every batch is
+    /// parsed; one that cannot be fully accounted for counts as such a write.
+    pub fn with_watched_prefixes(db: DB, prefixes: Vec<Vec<u8>>) -> Self {
+        Self::open(db, Some(prefixes))
+    }
+
+    fn open(db: DB, watched: Option<Vec<Vec<u8>>>) -> Self {
         let general = db.latest_sequence_number();
         Self(Arc::new(DatabaseInner {
             db,
             writes: Mutex::new(WriteLedger {
                 general,
                 disjoint: BTreeMap::new(),
+                // Nothing written before the watch is known to be unwatched.
+                watched: general,
             }),
             failed_write: AtomicBool::new(false),
+            instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            watched,
         }))
+    }
+
+    pub fn instance(&self) -> u64 {
+        self.0.instance
+    }
+
+    pub(crate) fn watched_prefixes(&self) -> Option<&[Vec<u8>]> {
+        self.0.watched.as_deref()
     }
 
     pub fn backing_store_identity(&self) -> BackingStoreIdentity {
@@ -261,15 +293,28 @@ impl CoordinatedDb {
         Ok(())
     }
 
-    /// Capture the exact sequence under the same barrier used by every writer.
-    pub(crate) fn execution_snapshot(&self) -> Result<(Snapshot<'_>, u64), DatabaseCommitError> {
-        let _guard = self.lock_writes()?;
+    /// Capture the exact sequence under the same barrier used by every writer,
+    /// with the last watched write at that sequence when keys are watched.
+    pub(crate) fn execution_snapshot(
+        &self,
+    ) -> Result<(Snapshot<'_>, u64, Option<u64>), DatabaseCommitError> {
+        let guard = self.lock_writes()?;
         let sequence = self.0.db.latest_sequence_number();
-        Ok((self.0.db.snapshot(), sequence))
+        let watched = self.0.watched.as_ref().map(|_| guard.ledger.watched);
+        Ok((self.0.db.snapshot(), sequence, watched))
     }
 
     pub fn snapshot(&self) -> Snapshot<'_> {
         self.0.db.snapshot()
+    }
+
+    /// A snapshot and the sequences bracketing it, without the write barrier
+    /// (callers may already hold it).
+    pub fn snapshot_with_scan_point(&self) -> (Snapshot<'_>, ScanPoint) {
+        let from = self.0.db.latest_sequence_number();
+        let snapshot = self.0.db.snapshot();
+        let to = self.0.db.latest_sequence_number();
+        (snapshot, ScanPoint { database: self.0.instance, from, to })
     }
     pub fn latest_sequence_number(&self) -> u64 {
         self.0.db.latest_sequence_number()
@@ -316,8 +361,11 @@ impl CoordinatedDb {
     }
     pub fn try_catch_up_with_primary(&self) -> Result<(), DatabaseCommitError> {
         let mut guard = self.lock_writes()?;
-        self.0.db.try_catch_up_with_primary()?;
-        guard.ledger.general = self.0.db.latest_sequence_number();
+        let caught_up = self.0.db.try_catch_up_with_primary();
+        let sequence = self.0.db.latest_sequence_number();
+        guard.ledger.watched = sequence;
+        caught_up?;
+        guard.ledger.general = sequence;
         Ok(())
     }
 }
@@ -338,13 +386,30 @@ impl DatabaseWriteGuard<'_> {
         if self.database.0.failed_write.load(Ordering::Acquire) {
             return Err(DatabaseCommitError::PriorWriteFailed);
         }
-        if let Err(error) = self.database.0.db.write_opt(batch, options) {
+        let watched = self
+            .database
+            .0
+            .watched
+            .as_ref()
+            .is_some_and(|prefixes| batch_may_write_under(batch.data(), prefixes));
+        let written = self.database.0.db.write_opt(batch, options);
+        if watched {
+            // Recorded even for a failed write, whose durable effect is unknown.
+            self.ledger.watched = self.database.0.db.latest_sequence_number();
+        }
+        if let Err(error) = written {
             // An I/O/WAL-sync error is not proof that no durable bytes exist.
             // Never reuse execution metadata against an ambiguous write result.
             self.database.0.failed_write.store(true, Ordering::Release);
             return Err(DatabaseCommitError::Storage(error));
         }
         Ok(())
+    }
+
+    /// The sequence after the last write that may have written a watched key,
+    /// or `None` when this database watches no keys.
+    pub fn watched_write_sequence(&self) -> Option<u64> {
+        self.database.0.watched.as_ref().map(|_| self.ledger.watched)
     }
 
     fn write_batch(
@@ -383,6 +448,191 @@ impl DatabaseWriteGuard<'_> {
         let mut options = WriteOptions::default();
         options.set_sync(true);
         self.write_batch(batch, &options)
+    }
+}
+
+pub(crate) fn key_under(prefixes: &[Vec<u8>], key: &[u8]) -> bool {
+    prefixes.iter().any(|p| key.starts_with(p))
+}
+
+/// Whether `[begin, end)` holds a key under one of `prefixes`. It meets
+/// `[p, successor(p))` exactly when begin < successor(p) and end > p; every key
+/// in that interval starts with p.
+pub(crate) fn range_meets(prefixes: &[Vec<u8>], begin: &[u8], end: &[u8]) -> bool {
+    begin < end
+        && prefixes.iter().any(|p| {
+            let below_successor = match p.iter().rposition(|&b| b != 0xff) {
+                Some(i) => {
+                    let mut successor = p[..=i].to_vec();
+                    successor[i] += 1;
+                    begin < successor.as_slice()
+                }
+                None => true,
+            };
+            below_successor && end > p.as_slice()
+        })
+}
+
+/// Whether a RocksDB `WriteBatch` representation may write a key under one of
+/// `prefixes`. The encoding is a 12-byte header (sequence, record count) and
+/// tagged records of varint-length-prefixed slices. An unknown tag, a
+/// malformed record or a count mismatch counts as a write under every prefix.
+fn batch_may_write_under(batch: &[u8], prefixes: &[Vec<u8>]) -> bool {
+    fn varint(rest: &mut &[u8]) -> Option<usize> {
+        let mut value = 0u32;
+        for shift in (0..35).step_by(7) {
+            let (&byte, tail) = rest.split_first()?;
+            *rest = tail;
+            value |= u32::from(byte & 0x7f).checked_shl(shift)?;
+            if byte & 0x80 == 0 {
+                return usize::try_from(value).ok();
+            }
+        }
+        None
+    }
+    fn slice<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
+        let len = varint(rest)?;
+        if rest.len() < len {
+            return None;
+        }
+        let (head, tail) = rest.split_at(len);
+        *rest = tail;
+        Some(head)
+    }
+    let key = |k: &[u8]| key_under(prefixes, k);
+    let range = |begin: &[u8], end: &[u8]| range_meets(prefixes, begin, end);
+    let parse = || -> Option<bool> {
+        let count = u32::from_le_bytes(batch.get(8..12)?.try_into().ok()?);
+        let mut rest = batch.get(12..)?;
+        let mut records = 0u32;
+        let mut touched = false;
+        while let Some((&tag, tail)) = rest.split_first() {
+            rest = tail;
+            match tag {
+                // Deletion, single deletion.
+                0x0 | 0x7 => touched |= key(slice(&mut rest)?),
+                // Value, merge.
+                0x1 | 0x2 => {
+                    touched |= key(slice(&mut rest)?);
+                    slice(&mut rest)?;
+                }
+                // Range deletion.
+                0xF => {
+                    let begin = slice(&mut rest)?;
+                    touched |= range(begin, slice(&mut rest)?);
+                }
+                // Column-family deletion, single deletion.
+                0x4 | 0x8 => {
+                    varint(&mut rest)?;
+                    touched |= key(slice(&mut rest)?);
+                }
+                // Column-family value, merge.
+                0x5 | 0x6 => {
+                    varint(&mut rest)?;
+                    touched |= key(slice(&mut rest)?);
+                    slice(&mut rest)?;
+                }
+                // Column-family range deletion.
+                0xE => {
+                    varint(&mut rest)?;
+                    let begin = slice(&mut rest)?;
+                    touched |= range(begin, slice(&mut rest)?);
+                }
+                // Log data: not a record and never applied.
+                0x3 => {
+                    slice(&mut rest)?;
+                    continue;
+                }
+                _ => return None,
+            }
+            records += 1;
+        }
+        (records == count).then_some(touched)
+    };
+    parse().unwrap_or(true)
+}
+
+#[cfg(test)]
+mod watched_write_tests {
+    use super::*;
+
+    fn prefixes() -> Vec<Vec<u8>> {
+        vec![vec![0x20, 0x01, 0xff], vec![0x21, 0x01]]
+    }
+
+    #[test]
+    fn batches_are_attributed_by_key_and_range() {
+        let may_write = |build: &dyn Fn(&mut WriteBatch)| {
+            let mut batch = WriteBatch::default();
+            build(&mut batch);
+            batch_may_write_under(batch.data(), &prefixes())
+        };
+        assert!(!may_write(&|_| {}));
+        assert!(may_write(&|b| b.put([0x20, 0x01, 0xff, 7], b"v")));
+        assert!(may_write(&|b| b.put([0x21, 0x01], b"v")));
+        assert!(!may_write(&|b| b.put([0x20, 0x01, 0xfe, 7], b"v")));
+        assert!(!may_write(&|b| b.put([0x21], b"v")));
+        assert!(may_write(&|b| {
+            b.put([0x05], b"v");
+            b.delete([0x20, 0x01, 0xff]);
+        }));
+        assert!(may_write(&|b| b.merge([0x21, 0x01, 9], b"v")));
+        assert!(!may_write(&|b| b.delete([0x22])));
+        // Range deletions intersecting a prefix, or spanning it.
+        assert!(may_write(&|b| b.delete_range(&[0x20, 0x01, 0xff, 5][..], &[0x20, 0x02][..])));
+        assert!(may_write(&|b| b.delete_range(&[0x00][..], &[0xff][..])));
+        assert!(may_write(&|b| b.delete_range(&[0x20, 0x01, 0xfe][..], &[0x20, 0x01, 0xff, 0][..])));
+        // Ranges ending at a prefix or starting after it do not.
+        assert!(!may_write(&|b| b.delete_range(&[0x20][..], &[0x20, 0x01, 0xff][..])));
+        assert!(!may_write(&|b| b.delete_range(&[0x20, 0x02][..], &[0x21, 0x01][..])));
+        assert!(!may_write(&|b| b.delete_range(&[0x21, 0x02][..], &[0x30][..])));
+        // An empty or reversed range writes nothing.
+        assert!(!may_write(&|b| b.delete_range(&[0x21, 0x01, 5][..], &[0x21, 0x01, 5][..])));
+        // Large values use multi-byte lengths.
+        assert!(!may_write(&|b| b.put([0x30], vec![1u8; 70_000])));
+        assert!(may_write(&|b| {
+            b.put([0x30], vec![1u8; 70_000]);
+            b.put([0x21, 0x01, 0xff], vec![2u8; 300]);
+        }));
+    }
+
+    #[test]
+    fn anything_unaccounted_for_counts_as_a_watched_write() {
+        let mut batch = WriteBatch::default();
+        batch.put([0x05], b"v");
+        let data = batch.data().to_vec();
+        assert!(!batch_may_write_under(&data, &prefixes()));
+        // Truncated record, unknown tag, record count mismatch, short header.
+        assert!(batch_may_write_under(&data[..data.len() - 1], &prefixes()));
+        let mut unknown = data.clone();
+        unknown[12] = 0x16;
+        assert!(batch_may_write_under(&unknown, &prefixes()));
+        let mut miscounted = data.clone();
+        miscounted[8] = 2;
+        assert!(batch_may_write_under(&miscounted, &prefixes()));
+        assert!(batch_may_write_under(&data[..6], &prefixes()));
+    }
+
+    #[test]
+    fn the_ledger_records_only_watched_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = CoordinatedDb::with_watched_prefixes(DB::open_default(dir.path()).unwrap(), prefixes());
+        let watched = |db: &CoordinatedDb| db.lock_writes().unwrap().watched_write_sequence().unwrap();
+        let start = watched(&db);
+        db.put([0x05], b"v").unwrap();
+        assert_eq!(watched(&db), start, "an unwatched write leaves the ledger alone");
+        db.put([0x21, 0x01, 3], b"v").unwrap();
+        let after = db.latest_sequence_number();
+        assert_eq!(watched(&db), after);
+        db.delete([0x07]).unwrap();
+        assert_eq!(watched(&db), after);
+        let (_snapshot, sequence, recorded) = db.execution_snapshot().unwrap();
+        assert_eq!((sequence, recorded), (db.latest_sequence_number(), Some(after)));
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = CoordinatedDb::new(DB::open_default(plain_dir.path()).unwrap());
+        assert_eq!(plain.lock_writes().unwrap().watched_write_sequence(), None);
+        assert_ne!(plain.instance(), db.instance());
     }
 }
 

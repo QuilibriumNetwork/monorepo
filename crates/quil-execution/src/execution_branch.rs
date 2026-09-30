@@ -107,6 +107,19 @@ impl ExecutionEngineManager {
         Ok(branch)
     }
 
+    /// [`Self::capture_execution_branch`], copying `registry` into the branch
+    /// when its last scan is provably the captured rows (see
+    /// [`SharedProverRegistry::for_execution_capture`]) instead of reading
+    /// every prover vertex through the branch again.
+    pub fn capture_execution_branch_seeded(
+        &self,
+        limits: ExecutionBranchLimits,
+        registry: &SharedProverRegistry,
+    ) -> Result<ExecutionBranch> {
+        let (branch, _guard) = self.capture_execution_branch_inner(limits, None, Some(registry))?;
+        Ok(branch)
+    }
+
     /// Keep the canonical source unchanged until the returned guard is dropped.
     /// Direct database writers remain possible and are checked by the atomic
     /// storage publication's sequence barrier. The caller also holds its frame
@@ -115,7 +128,17 @@ impl ExecutionEngineManager {
         &self,
         limits: ExecutionBranchLimits,
     ) -> Result<(ExecutionBranch, ExecutionPublicationGuard<'_>)> {
-        self.capture_execution_branch_inner(limits, None)
+        self.capture_execution_branch_inner(limits, None, None)
+    }
+
+    /// [`Self::capture_execution_branch_guarded`] with a registry seed, as in
+    /// [`Self::capture_execution_branch_seeded`].
+    pub fn capture_execution_branch_guarded_seeded(
+        &self,
+        limits: ExecutionBranchLimits,
+        registry: &SharedProverRegistry,
+    ) -> Result<(ExecutionBranch, ExecutionPublicationGuard<'_>)> {
+        self.capture_execution_branch_inner(limits, None, Some(registry))
     }
 
     /// Private execution for a worker whose engines read GLOBAL frames from a
@@ -134,7 +157,7 @@ impl ExecutionEngineManager {
         })?;
         let view = crate::global_anchor_view::GlobalAnchorView::new(anchor, max_global_frame);
         let (branch, _guard) =
-            self.capture_execution_branch_inner(limits, Some((identity, Arc::new(view))))?;
+            self.capture_execution_branch_inner(limits, Some((identity, Arc::new(view))), None)?;
         Ok(branch)
     }
 
@@ -145,6 +168,7 @@ impl ExecutionEngineManager {
             quil_types::store::BackingStoreIdentity,
             Arc<crate::global_anchor_view::GlobalAnchorView>,
         )>,
+        seed: Option<&SharedProverRegistry>,
     ) -> Result<(ExecutionBranch, ExecutionPublicationGuard<'_>)> {
         let anchor_identity = anchor.as_ref().map(|(identity, _)| identity);
         let identity = self.crdt.backing_store_identity().ok_or_else(|| {
@@ -210,7 +234,12 @@ impl ExecutionEngineManager {
             .shards_store
             .as_ref()
             .map(|_| Arc::new(OverlayShardsStore::new(storage.0.clone())));
-        let registry = SharedProverRegistry::for_execution_store(store.as_ref(), limits.registry)?;
+        let registry = SharedProverRegistry::for_execution_capture(
+            store.as_ref(),
+            limits.registry,
+            seed,
+            storage.0.capture_point(),
+        )?;
         let global_clock_store: Arc<dyn ClockStore> = match &anchor {
             Some((_, view)) => view.clone(),
             None => clock.clone(),
@@ -342,6 +371,7 @@ impl ExecutionPublicationGuard<'_> {
         }
         // A newly accepted registration must be visible after this frame, even
         // if the branch's once-per-epoch maintenance refresh preceded it.
+        let refreshed = branch.overlay().delta_generation();
         branch.registry.refresh_from_store(branch.store.as_ref())?;
         let branch_engines = branch.manager.engines.try_read().map_err(|_| {
             QuilError::ExecutionUnavailable("private execution engines are busy or poisoned".into())
@@ -399,9 +429,16 @@ impl ExecutionPublicationGuard<'_> {
         let mut write = db.lock_writes().map_err(|e| {
             QuilError::ExecutionUnavailable(format!("canonical write barrier: {e}"))
         })?;
+        // The refreshed registry holds the published rows exactly when it read
+        // the delta this plan commits and nothing else wrote them since capture.
+        let registry_rows_published = plan.delta_generation() == refreshed
+            && write
+                .watched_write_sequence()
+                .is_some_and(|watched| watched <= plan.base_sequence());
         plan.commit_locked(&mut write).map_err(|e| {
             QuilError::ExecutionUnavailable(format!("canonical execution commit: {e}"))
         })?;
+        let published = db.latest_sequence_number();
         let snapshot = Arc::new(quil_store::RocksHypergraphSnapshot::from_database(
             db.clone(),
         ));
@@ -411,6 +448,13 @@ impl ExecutionPublicationGuard<'_> {
         *self.global_venue_fee = venue_fee;
         *self.summary_rebuilds = summaries;
         registry.adopt();
+        if registry_rows_published {
+            registry.published_at(quil_types::store::ScanPoint {
+                database: db.instance(),
+                from: published,
+                to: published,
+            });
+        }
         clock_cache.adopt();
         if let Some(cache) = global_clock_cache.as_mut() {
             cache.adopt();

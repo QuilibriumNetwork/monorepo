@@ -705,3 +705,117 @@ fn registry_eviction_commits_only_to_its_overlay_with_versioned_fallback() {
         assert_eq!(prover.allocations[0].last_active_frame_number, frame);
     });
 }
+
+/// A registry may seed a branch only while no write reached the prover rows
+/// since its scan, and only when a bounded refresh of those rows would
+/// succeed: the predicate must agree with an actual refresh on every limit.
+#[test]
+fn registry_seed_needs_an_unchanged_scan_and_limits_a_refresh_would_accept() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = quil_store::RocksDb::open(dir.path()).unwrap();
+    let store = RocksHypergraphStore::new(db.inner());
+    let capture = || {
+        quil_forest::ExecutionOverlay::capture(db.inner(), registry_overlay_limits())
+            .unwrap()
+            .capture_point()
+            .unwrap()
+    };
+    let mut empty = InMemoryProverRegistry::new();
+    empty.refresh(&store).unwrap();
+    assert!(
+        !empty.reproduces(&capture(), RegistryLimits::UNBOUNDED),
+        "an empty read may have come from the unwatched legacy tree fallback"
+    );
+
+    let shard = quil_store::encoding::prover_registry_shard();
+    for (n, status) in [(1, 1), (2, 1)] {
+        store
+            .save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(n), &registry_prover_blob(status))
+            .unwrap();
+    }
+    store
+        .save_vertex_underlying("vertex", "removes", &shard, &make_vertex_key(2), b"removed")
+        .unwrap();
+    let mut registry = InMemoryProverRegistry::new();
+    registry.refresh(&store).unwrap();
+    let usage = registry.resource_usage();
+    let exact = RegistryLimits {
+        max_vertices: usage.vertices,
+        max_record_bytes: registry.largest_row,
+        max_input_bytes: usage.input_bytes,
+        max_cache_entries: usage.cache_entries,
+        max_cache_bytes: usage.cache_bytes,
+    };
+    let refreshes = |limits: RegistryLimits| {
+        let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
+        InMemoryProverRegistry::new()
+            .refresh_from_snapshot_with_limits(snapshot.as_ref(), limits)
+            .is_ok()
+    };
+    assert!(registry.reproduces(&capture(), exact) && refreshes(exact));
+    for which in 0..5 {
+        let mut limited = exact;
+        match which {
+            0 => limited.max_vertices -= 1,
+            1 => limited.max_record_bytes -= 1,
+            2 => limited.max_input_bytes -= 1,
+            3 => limited.max_cache_entries -= 1,
+            _ => limited.max_cache_bytes -= 1,
+        }
+        assert!(!registry.reproduces(&capture(), limited), "limit {which}");
+        assert!(!refreshes(limited), "limit {which}");
+    }
+
+    // Writes elsewhere leave the scan current; any prover-row write does not,
+    // including a removal and a range deletion that only overlaps the rows.
+    db.inner().put(b"unrelated", b"value").unwrap();
+    assert!(registry.reproduces(&capture(), exact));
+    let point = capture();
+    store
+        .save_vertex_underlying("vertex", "removes", &shard, &make_vertex_key(1), b"removed")
+        .unwrap();
+    assert!(!registry.reproduces(&capture(), exact));
+    assert!(registry.reproduces(&point, exact), "a view captured before the write still matches");
+    registry.refresh(&store).unwrap();
+    assert!(registry.reproduces(&capture(), RegistryLimits::UNBOUNDED));
+    let mut range = rocksdb::WriteBatch::default();
+    range.delete_range(&[0u8][..], &quil_store::encoding::prover_registry_key_prefixes()[0][..]);
+    db.inner().write(range).unwrap();
+    assert!(registry.reproduces(&capture(), RegistryLimits::UNBOUNDED), "a range ending at the rows");
+    let mut range = rocksdb::WriteBatch::default();
+    let mut end = quil_store::encoding::prover_registry_key_prefixes()[0].clone();
+    end.push(0);
+    range.delete_range(&[0u8][..], &end[..]);
+    db.inner().write(range).unwrap();
+    assert!(!registry.reproduces(&capture(), RegistryLimits::UNBOUNDED), "a range reaching them");
+
+    // Only a branch's registry reads go through its overlay here: a copy
+    // reads nothing, and a seed being refreshed is skipped, not waited for.
+    let seed = SharedProverRegistry::new();
+    seed.refresh_from_store(&store).unwrap();
+    let expected = seed.read(|r| (r.distinct_provers(), r.resource_usage()));
+    let branch_reads = |busy: bool| {
+        let overlay = Arc::new(
+            quil_forest::ExecutionOverlay::capture(db.inner(), registry_overlay_limits()).unwrap(),
+        );
+        let branch = quil_store::OverlayHypergraphStore::new(overlay.clone());
+        let _refreshing = busy.then(|| seed.inner.write().unwrap());
+        let registry = SharedProverRegistry::for_execution_capture(
+            &branch,
+            RegistryLimits::UNBOUNDED,
+            Some(&seed),
+            overlay.capture_point(),
+        )
+        .unwrap();
+        assert_eq!(registry.read(|r| (r.distinct_provers(), r.resource_usage())), expected);
+        overlay.stats().read_operations
+    };
+    assert_eq!(branch_reads(false), 0);
+    assert!(branch_reads(true) > 0);
+
+    // A store that watches nothing never yields a capture point.
+    let plain_dir = tempfile::tempdir().unwrap();
+    let plain = quil_forest::CoordinatedDb::new(rocksdb::DB::open_default(plain_dir.path()).unwrap());
+    let overlay = quil_forest::ExecutionOverlay::capture(plain, registry_overlay_limits()).unwrap();
+    assert!(overlay.capture_point().is_none());
+}

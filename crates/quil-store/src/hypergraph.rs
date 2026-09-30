@@ -32,6 +32,12 @@ struct OverlayHypergraphSnapshot {
     snapshot: OverlayDbSnapshot,
 }
 
+impl OverlayHypergraphSnapshot {
+    fn scan_point_backend(&self) -> Option<quil_types::store::ScanPoint> {
+        self.snapshot.scan_point()
+    }
+}
+
 impl OverlayHypergraphStore {
     fn backing_store_identity_backend(&self) -> quil_types::store::BackingStoreIdentity {
         quil_types::store::BackingStoreIdentity::of(&self.db.0)
@@ -706,6 +712,7 @@ pub struct RocksHypergraphSnapshot {
     /// fields drop in declaration order, so this drops first (releasing
     /// the rocksdb snapshot) while the backing `DB` is still alive.
     snapshot: rocksdb::SnapshotWithThreadMode<'static, rocksdb::DB>,
+    scan: quil_types::store::ScanPoint,
     /// Keeps the `DB` alive for as long as `snapshot` borrows it.
     _db: quil_forest::CoordinatedDb,
 }
@@ -720,7 +727,7 @@ impl RocksHypergraphSnapshot {
     /// Infallible read-view capture over a known coordinated database. The
     /// canonical publisher holds its write guard while binding the new state.
     pub fn from_database(db: quil_forest::CoordinatedDb) -> Self {
-        let snap = db.snapshot();
+        let (snap, scan) = db.snapshot_with_scan_point();
         // SAFETY: `snap` borrows the DB inside the stable Arc allocation
         // owned by `CoordinatedDb`. Moving its clone into `_db` keeps that
         // allocation alive for the snapshot, and
@@ -731,7 +738,11 @@ impl RocksHypergraphSnapshot {
         // (a `&DB` plus a raw snapshot pointer), so the transmute is sound.
         let snapshot: rocksdb::SnapshotWithThreadMode<'static, rocksdb::DB> =
             unsafe { std::mem::transmute(snap) };
-        Self { snapshot, _db: db }
+        Self { snapshot, scan, _db: db }
+    }
+
+    fn scan_point_backend(&self) -> Option<quil_types::store::ScanPoint> {
+        Some(self.scan)
     }
 }
 
@@ -940,6 +951,10 @@ macro_rules! impl_hypergraph_snapshot {
 impl SnapshotReadable for $snapshot {
     fn has_snapshot_vertex_reads(&self) -> bool {
         true
+    }
+
+    fn scan_point(&self) -> Option<quil_types::store::ScanPoint> {
+        self.scan_point_backend()
     }
 
     fn read_record(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {

@@ -768,6 +768,29 @@ pub fn hypergraph_vertex_data_v2_vk_prefix(
     k
 }
 
+/// The shard holding every prover, allocation and leaf-root registration.
+pub fn prover_registry_shard() -> quil_types::store::ShardKey {
+    quil_types::store::ShardKey { l1: [0; 3], l2: [0xff; 32] }
+}
+
+/// Every key prefix a prover registry scan reads: the fixed vertex rows of
+/// the prover shard's add and remove phases, legacy and versioned. Stores
+/// watch these so a registry scan can be reused while none was written.
+pub fn prover_registry_key_prefixes() -> Vec<Vec<u8>> {
+    let shard = prover_registry_shard();
+    let mut prefixes = Vec::new();
+    for phase in ["adds", "removes"] {
+        for mut prefix in [
+            hypergraph_vertex_data_prefix("vertex", phase, &shard),
+            hypergraph_vertex_data_v2_shard_prefix("vertex", phase, &shard),
+        ] {
+            prefix.extend_from_slice(&shard.l2);
+            prefixes.push(prefix);
+        }
+    }
+    prefixes
+}
+
 /// `…vk_prefix ‖ version_be(8)` — the full MVCC key for one vertex at one version.
 pub fn hypergraph_vertex_data_v2_key(
     set_type: &str,

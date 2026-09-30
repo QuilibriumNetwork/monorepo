@@ -706,3 +706,61 @@ fn anchored_capture_reads_bounded_global_frames_from_a_separate_store() {
     assert_eq!(master.db.inner().latest_sequence_number(), master_sequence);
     assert_eq!(worker.db.inner().latest_sequence_number(), worker_sequence);
 }
+
+/// A seeded capture copies the canonical registry only while its last scan,
+/// from a refresh or a publication, is the captured prover rows; otherwise it
+/// reads them again. Either way the branch registry is the one a read gives.
+#[test]
+fn seeded_capture_copies_only_a_registry_scan_of_the_captured_rows() {
+    let f = Fixture::new(true);
+    f.seed_prover(1, 1);
+    put_frame(f.clock.as_ref(), 0);
+    f.clock.warm_global_frame_cache().unwrap();
+    let canonical = SharedProverRegistry::new();
+    canonical.refresh_from_store(f.store.as_ref()).unwrap();
+    // Seeding skips the registry's reads through the branch, so a seeded
+    // capture reads less than one that must read the rows again.
+    let reads = |branch: &ExecutionBranch| branch.overlay().stats().read_operations;
+    let check = |seeded: bool, provers: &[u8]| {
+        let read = f.source.capture_execution_branch(limits()).unwrap();
+        let copied = f.source.capture_execution_branch_seeded(limits(), &canonical).unwrap();
+        assert_eq!(reads(&copied) < reads(&read), seeded);
+        assert_eq!(copied.registry_usage(), read.registry_usage());
+        for n in 1..=4u8 {
+            let expected = read.registry().get_prover_info(&[n; 32]).unwrap().map(|p| p.status);
+            assert_eq!(copied.registry().get_prover_info(&[n; 32]).unwrap().map(|p| p.status), expected);
+            assert_eq!(expected.is_some(), provers.contains(&n), "prover {n}");
+        }
+    };
+    check(true, &[1]);
+    f.db.inner().put(b"unrelated", b"value").unwrap();
+    check(true, &[1]);
+    f.seed_prover(2, 1);
+    check(false, &[1, 2]);
+    canonical.refresh_from_store(f.store.as_ref()).unwrap();
+    check(true, &[1, 2]);
+
+    // Publication adopts the branch registry as the published rows' scan.
+    let (mut branch, mut guard) = f
+        .source
+        .capture_execution_branch_guarded_seeded(limits(), &canonical)
+        .unwrap();
+    put_frame(branch.clock_store().as_ref(), 1);
+    let txn = branch.hypergraph_store().new_transaction(false).unwrap();
+    branch
+        .hypergraph_store()
+        .save_vertex_underlying(txn.as_ref(), "vertex", "adds", &registry_shard(), &vertex(3), &prover_blob(1))
+        .unwrap();
+    txn.commit().unwrap();
+    guard
+        .publish(&mut branch, publication_context(&f, &canonical), &canonical, |_| {})
+        .unwrap();
+    drop(guard);
+    check(true, &[1, 2, 3]);
+
+    // A budget a read would exceed is never satisfied by copying.
+    let mut tight = limits();
+    tight.registry.max_vertices = 1;
+    assert!(f.source.capture_execution_branch(tight).is_err());
+    assert!(f.source.capture_execution_branch_seeded(tight, &canonical).is_err());
+}

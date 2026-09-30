@@ -6,7 +6,8 @@
 //! belong to the caller.
 //!
 //! Limits cover logical records and operations, not RocksDB's internal cache
-//! or physical I/O. A snapshot also retains superseded versions on disk. Its
+//! or physical I/O. A snapshot also retains superseded versions on disk, and
+//! the iterators parked on it retain the table files they read. Its
 //! owner must call `close` when abandoning a branch (and enforce a lifetime
 //! policy); memory limits alone do not bound that disk retention.
 //! Inputs and JMT batch construction belong to the execution owner's frame
@@ -137,12 +138,16 @@ impl ExecutionViewAdmission {
     }
 
     /// Release every held view older than the age limit; returns how many.
+    /// Also drops the idle iterators parked on every held view.
     pub fn release_expired(&self) -> usize {
         let views: Vec<Arc<PinnedSnapshot>> = {
             let mut live = self.live.lock().unwrap_or_else(|p| p.into_inner());
             live.retain(|view| view.strong_count() > 0);
             live.iter().filter_map(Weak::upgrade).collect()
         };
+        for view in &views {
+            view.drop_idle_iterators();
+        }
         let max_age = self.max_age();
         views.iter().filter(|view| view.captured.elapsed() > max_age && view.release()).count()
     }
@@ -159,20 +164,49 @@ impl ExecutionViewAdmission {
 // As in quil-store's RocksHypergraphSnapshot: the snapshot borrows the Arc's
 // stable pointee. Declaration order MUST release the snapshot before the DB.
 struct PinnedSnapshot {
+    // Emptied before the snapshot is released (see `release`).
+    iterators: Mutex<Vec<ParkedIterator>>,
     snapshot: Mutex<Option<rocksdb::SnapshotWithThreadMode<'static, rocksdb::DB>>>,
     captured: Instant,
     admission: Arc<ExecutionViewAdmission>,
     _db: crate::CoordinatedDb,
     sequence: u64,
+    /// The database's last watched write at `sequence`, if it watches keys.
+    watched: Option<u64>,
+    #[cfg(test)]
+    iterators_created: AtomicUsize,
 }
 
 type HeldView<'a> = MutexGuard<'a, Option<rocksdb::SnapshotWithThreadMode<'static, rocksdb::DB>>>;
+
+/// Idle iterators kept per snapshot family. A scan uses one or two bounds at a
+/// time; the rest only bound what an unusual caller can hold.
+const MAX_PARKED_ITERATORS: usize = 8;
+
+/// A parked iterator pins the memtables and table files current when it was
+/// created, which the snapshot alone does not. A scan retakes its iterator
+/// within microseconds; one idle longer than this is dropped by the next
+/// capture's sweep, so a long-held branch does not retain flushed memtables.
+const MAX_PARKED_IDLE: Duration = Duration::from_secs(1);
+
+/// A snapshot iterator kept between cursor steps. A step seeks unless the
+/// iterator already sits on the step's key, where that seek would leave it, so
+/// reuse changes only the cost: a fresh iterator reads a data block from each
+/// L0 file and level on its first seek, and a next/prev from the row just
+/// returned becomes one RocksDB step. On a mainnet-sized store, building one
+/// per step made each GLOBAL parent capture take ~27 s.
+struct ParkedIterator {
+    lower: Vec<u8>,
+    upper: Vec<u8>,
+    parked_at: Instant,
+    iterator: rocksdb::DBRawIteratorWithThreadMode<'static, rocksdb::DB>,
+}
 
 impl PinnedSnapshot {
     fn new(db: crate::CoordinatedDb, admission: &Arc<ExecutionViewAdmission>) -> Result<Arc<Self>> {
         admission.release_expired();
         admission.acquire()?;
-        let (snapshot, sequence) = match db.execution_snapshot() {
+        let (snapshot, sequence, watched) = match db.execution_snapshot() {
             Ok(captured) => captured,
             Err(error) => {
                 admission.active.fetch_sub(1, Ordering::AcqRel);
@@ -183,11 +217,15 @@ impl PinnedSnapshot {
         // private snapshot cannot escape and drops before that Arc.
         let snapshot = unsafe { std::mem::transmute(snapshot) };
         let view = Arc::new(Self {
+            iterators: Mutex::new(Vec::new()),
             snapshot: Mutex::new(Some(snapshot)),
             captured: Instant::now(),
             admission: admission.clone(),
             _db: db,
             sequence,
+            watched,
+            #[cfg(test)]
+            iterators_created: AtomicUsize::new(0),
         });
         admission.live.lock().unwrap_or_else(|p| p.into_inner()).push(Arc::downgrade(&view));
         Ok(view)
@@ -205,9 +243,54 @@ impl PinnedSnapshot {
         Ok(held)
     }
 
+    /// A parked iterator with exactly these bounds, else a new one. The caller
+    /// holds `view` and parks the iterator again before dropping it.
+    fn take_iterator(&self, view: &HeldView<'_>, lower: &[u8], upper: &[u8]) -> Result<ParkedIterator> {
+        let mut parked = self.iterators.lock().map_err(|_| anyhow::anyhow!("execution view lock poisoned"))?;
+        if let Some(index) = parked.iter().position(|p| p.lower == lower && p.upper == upper) {
+            return Ok(parked.swap_remove(index));
+        }
+        drop(parked);
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_iterate_lower_bound(lower.to_vec());
+        options.set_iterate_upper_bound(upper.to_vec());
+        let iterator = view.as_ref().expect("view() holds the snapshot").raw_iterator_opt(options);
+        #[cfg(test)]
+        self.iterators_created.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: the iterator reads through the DB, which `_db` keeps alive
+        // and which drops after `iterators`, and through the snapshot, which
+        // `release` takes only after emptying `iterators`.
+        let iterator = unsafe { std::mem::transmute(iterator) };
+        Ok(ParkedIterator { lower: lower.to_vec(), upper: upper.to_vec(), parked_at: Instant::now(), iterator })
+    }
+
+    /// Keep a healthy iterator for the next step. The caller still holds the
+    /// view, so a concurrent `release` cannot miss it.
+    fn park(&self, mut iterator: ParkedIterator, _view: &HeldView<'_>) {
+        if iterator.iterator.status().is_err() {
+            return;
+        }
+        iterator.parked_at = Instant::now();
+        let mut parked = self.iterators.lock().unwrap_or_else(|p| p.into_inner());
+        if parked.len() < MAX_PARKED_ITERATORS {
+            parked.push(iterator);
+        }
+    }
+
+    /// Dropping an iterator touches neither the snapshot nor another reader.
+    fn drop_idle_iterators(&self) {
+        let mut parked = self.iterators.lock().unwrap_or_else(|p| p.into_inner());
+        parked.retain(|p| p.parked_at.elapsed() <= MAX_PARKED_IDLE);
+    }
+
     /// Drop the RocksDB snapshot now; returns whether it was still held.
     fn release(&self) -> bool {
-        let released = self.snapshot.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let released = {
+            let mut snapshot = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+            // Parked iterators pin table files and refer to the snapshot.
+            self.iterators.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            snapshot.take()
+        };
         let held = released.is_some();
         drop(released);
         if held {
@@ -235,6 +318,19 @@ struct Delta {
 impl Delta {
     fn entries(&self) -> usize {
         self.points.len() + self.ranges.len()
+    }
+
+    /// Whether a tentative write here covers a key under one of `prefixes`.
+    fn writes_under(&self, prefixes: &[Vec<u8>]) -> bool {
+        prefixes.iter().any(|p| {
+            self.points
+                .range::<[u8], _>((Bound::Included(p.as_slice()), Bound::Unbounded))
+                .next()
+                .is_some_and(|(key, _)| key.starts_with(p))
+        }) || self
+            .ranges
+            .iter()
+            .any(|(start, end)| crate::database::range_meets(prefixes, start, end))
     }
 
     fn covering_range(&self, key: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -356,6 +452,9 @@ impl ReadBudget {
 struct Inner {
     base: Option<Arc<PinnedSnapshot>>,
     delta: Arc<Delta>,
+    /// Counts the delta's changes, so a reader can prove it read the delta a
+    /// later commit publishes.
+    generation: u64,
     reads: ReadBudget,
     cursors: usize,
     // Every prefix this branch or its ancestors (before the fork) read,
@@ -405,11 +504,22 @@ pub struct ExecutionOverlay {
 pub struct PreparedOverlayCommit {
     database: crate::CoordinatedDb,
     sequence: u64,
+    generation: u64,
     touched: crate::KeyPrefixSet,
     batch: rocksdb::WriteBatch,
 }
 
 impl PreparedOverlayCommit {
+    /// The database sequence the branch was captured at.
+    pub fn base_sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// The branch's [`ExecutionOverlay::delta_generation`] this plan froze.
+    pub fn delta_generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn commit(self, destination: &crate::CoordinatedDb) -> Result<(), crate::DatabaseCommitError> {
         self.commit_locked(&mut destination.lock_writes()?)
     }
@@ -440,6 +550,7 @@ impl ExecutionOverlay {
             inner: Mutex::new(Inner {
                 base: Some(PinnedSnapshot::new(db, admission)?),
                 delta: Arc::new(Delta::default()),
+                generation: 0,
                 reads: ReadBudget::default(),
                 cursors: 0,
                 touched: crate::KeyPrefixSet::default(),
@@ -472,6 +583,7 @@ impl ExecutionOverlay {
             let plan = PreparedOverlayCommit {
                 database: base._db.clone(),
                 sequence: base.sequence,
+                generation: inner.generation,
                 touched: inner.touched.clone(),
                 batch,
             };
@@ -515,6 +627,7 @@ impl ExecutionOverlay {
             inner: Mutex::new(Inner {
                 base: Some(base.clone()),
                 delta: inner.delta.clone(),
+                generation: 0,
                 reads,
                 cursors: 0,
                 touched: inner.touched.clone(),
@@ -546,6 +659,28 @@ impl ExecutionOverlay {
 
     pub fn limits(&self) -> OverlayLimits {
         self.limits
+    }
+
+    /// Changes each time this branch's delta changes; fixed once it is frozen
+    /// for publication.
+    pub fn delta_generation(&self) -> u64 {
+        self.lock_cleanup().generation
+    }
+
+    /// The captured database view whose watched keys this branch still reads
+    /// unchanged: `None` once it has written one, is closed, or when its
+    /// database watches no keys.
+    pub fn capture_point(&self) -> Option<quil_types::store::CapturePoint> {
+        let inner = self.lock_cleanup();
+        let base = inner.base.as_ref()?;
+        if inner.delta.writes_under(base._db.watched_prefixes()?) {
+            return None;
+        }
+        Some(quil_types::store::CapturePoint {
+            database: base._db.instance(),
+            sequence: base.sequence,
+            watched: base.watched?,
+        })
     }
 
     /// Sticky storage-failure evidence, independent of whether a caller
@@ -636,6 +771,7 @@ impl ExecutionOverlay {
             }
         }
         inner.delta = Arc::new(candidate);
+        inner.generation += 1;
         Ok(())
     }
 
@@ -675,9 +811,10 @@ impl ExecutionOverlay {
             return Ok(None);
         }
         // Pin first, inspect length, then copy. An oversized stored value must
-        // not allocate an unbounded Vec before the limit can reject it.
-        let mut options = rocksdb::ReadOptions::default();
-        options.fill_cache(false);
+        // not allocate an unbounded Vec before the limit can reject it. Reads
+        // fill the block cache like canonical ones: skipping it re-reads and
+        // decompresses index blocks from disk on every read of a large store.
+        let options = rocksdb::ReadOptions::default();
         let view = base.view()?;
         let value = view.as_ref().expect("view() holds the snapshot").get_pinned_opt(key, options)?;
         match value {
@@ -752,6 +889,21 @@ impl OverlayReadView {
 
     pub fn cursor(&self, lower: &[u8], upper: &[u8]) -> Result<OverlayCursor<'_>> {
         self.overlay.cursor_at(lower, upper, Some(&self.delta))
+    }
+
+    /// Reads of this view's watched keys read its database at the captured
+    /// sequence while the view holds no tentative write to them.
+    pub fn scan_point(&self) -> Option<quil_types::store::ScanPoint> {
+        let inner = self.overlay.lock_cleanup();
+        let base = inner.base.as_ref()?;
+        if self.delta.writes_under(base._db.watched_prefixes()?) {
+            return None;
+        }
+        Some(quil_types::store::ScanPoint {
+            database: base._db.instance(),
+            from: base.sequence,
+            to: base.sequence,
+        })
     }
 }
 
@@ -875,16 +1027,19 @@ impl OverlayCursor<'_> {
                 None => break None,
             }
         };
-        let mut options = rocksdb::ReadOptions::default();
-        options.fill_cache(false);
-        options.set_iterate_lower_bound(self.lower.clone());
-        options.set_iterate_upper_bound(self.upper.clone());
+        // Reads fill the block cache: without it every seek re-reads each
+        // level's index block from disk. A parked iterator already on `key`
+        // is where either seek would put it (the key exists in this snapshot),
+        // so the usual step from the row just returned skips the seek.
         let view = base.view()?;
-        let mut it = view.as_ref().expect("view() holds the snapshot").raw_iterator_opt(options);
-        if reverse {
-            it.seek_for_prev(key);
-        } else {
-            it.seek(key);
+        let mut parked = base.take_iterator(&view, &self.lower, &self.upper)?;
+        let it = &mut parked.iterator;
+        if it.key() != Some(key) {
+            if reverse {
+                it.seek_for_prev(key);
+            } else {
+                it.seek(key);
+            }
         }
         if !inclusive && it.key() == Some(key) {
             reads.operation(self.overlay.limits)?;
@@ -933,6 +1088,7 @@ impl OverlayCursor<'_> {
             reads.record(k, v, self.overlay.limits)?;
             self.row = Some((k.to_vec(), v.to_vec()));
         }
+        base.park(parked, &view);
         Ok(())
     }
 }
@@ -1211,6 +1367,154 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Branch reads fill the block cache like canonical reads. Skipping it made
+    /// every seek re-read and decompress index blocks from disk, which on a
+    /// mainnet-sized store took each GLOBAL parent capture 30–58 s.
+    #[test]
+    fn branch_reads_fill_the_block_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = rocksdb::Cache::new_lru_cache(64 << 20);
+        let mut table = rocksdb::BlockBasedOptions::default();
+        table.set_block_cache(&cache);
+        table.set_cache_index_and_filter_blocks(true);
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        options.set_block_based_table_factory(&table);
+        let raw = rocksdb::DB::open(&options, dir.path()).unwrap();
+        for i in 0u32..20_000 {
+            raw.put(i.to_be_bytes(), [7u8; 64]).unwrap();
+        }
+        raw.flush().unwrap();
+        let overlay = ExecutionOverlay::capture(crate::CoordinatedDb::new(raw), limits()).unwrap();
+
+        let before = cache.get_usage();
+        assert!(overlay.get(&10_000u32.to_be_bytes()).unwrap().is_some());
+        let after_get = cache.get_usage();
+        assert!(after_get > before, "a branch point read must cache the block it read");
+        let mut cursor = overlay.cursor(&[0; 4], &[0xff; 4]).unwrap();
+        cursor.seek(&19_000u32.to_be_bytes()).unwrap();
+        assert!(cursor.valid());
+        assert!(cache.get_usage() > after_get, "a branch seek must cache the blocks it read");
+    }
+
+    /// Stepping through fresh cursors, as the store adapter does for every
+    /// seek/next/prev, reuses one parked RocksDB iterator per bounds. Building
+    /// one per step made each mainnet GLOBAL parent capture take ~27 s.
+    #[test]
+    fn cursor_steps_reuse_a_parked_iterator() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(dir.path());
+        for i in 0u16..512 {
+            db.put(i.to_be_bytes(), [1u8; 8]).unwrap();
+        }
+        db.flush().unwrap();
+        let overlay = ExecutionOverlay::capture(db.clone(), limits()).unwrap();
+        overlay
+            .apply(&[
+                OverlayMutation::Delete(7u16.to_be_bytes().to_vec()),
+                OverlayMutation::DeleteRange(100u16.to_be_bytes().to_vec(), 200u16.to_be_bytes().to_vec()),
+                OverlayMutation::Put(150u16.to_be_bytes().to_vec(), b"branch".to_vec()),
+            ])
+            .unwrap();
+        let expected: Vec<Vec<u8>> = (0u16..512)
+            .filter(|i| *i != 7 && !(100..200).contains(i) || *i == 150)
+            .map(|i| i.to_be_bytes().to_vec())
+            .collect();
+        let step = |from: Option<&[u8]>, reverse: bool| {
+            let mut cursor = overlay.cursor(&[0, 0], &[0xff, 0xff]).unwrap();
+            match (from, reverse) {
+                (None, false) => cursor.seek(&[0, 0]).unwrap(),
+                (None, true) => cursor.seek_for_prev(&[0xff, 0xff]).unwrap(),
+                (Some(key), false) => {
+                    cursor.seek(key).unwrap();
+                    cursor.next().unwrap();
+                }
+                (Some(key), true) => {
+                    cursor.seek_for_prev(key).unwrap();
+                    cursor.prev().unwrap();
+                }
+            }
+            cursor.key().map(<[u8]>::to_vec)
+        };
+        for reverse in [false, true] {
+            let mut seen = Vec::new();
+            while let Some(key) = step(seen.last().map(Vec::as_slice), reverse) {
+                seen.push(key);
+            }
+            if reverse {
+                seen.reverse();
+            }
+            assert_eq!(seen, expected);
+        }
+        let base = overlay.lock_inner().unwrap().base.clone().unwrap();
+        assert_eq!(base.iterators_created.load(Ordering::Relaxed), 1);
+        assert_eq!(base.iterators.lock().unwrap().len(), 1);
+
+        // A capture's sweep drops iterators left idle, which pin memtables.
+        ExecutionViewAdmission::process().release_expired();
+        assert_eq!(base.iterators.lock().unwrap().len(), 1, "a recently used iterator stays parked");
+        base.iterators.lock().unwrap()[0].parked_at -= MAX_PARKED_IDLE + Duration::from_secs(1);
+        ExecutionViewAdmission::process().release_expired();
+        assert!(base.iterators.lock().unwrap().is_empty(), "an idle iterator is dropped");
+        assert_eq!(step(None, false), expected.first().cloned(), "a step after the sweep reopens one");
+        assert_eq!(base.iterators_created.load(Ordering::Relaxed), 2);
+
+        base.release();
+        assert!(base.iterators.lock().unwrap().is_empty(), "release drops parked iterators");
+        assert!(overlay.cursor(&[0, 0], &[0xff, 0xff]).unwrap().seek(&[0, 0]).is_err());
+        drop(base);
+        overlay.close();
+        assert_eq!(db.property_int_value("rocksdb.num-snapshots").unwrap(), Some(0));
+    }
+
+    /// A branch keeps its capture point, and its views their scan point, until
+    /// a tentative write covers a watched key; a database that watches nothing
+    /// has neither.
+    #[test]
+    fn capture_and_scan_points_hold_until_a_watched_key_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::CoordinatedDb::with_watched_prefixes(
+            rocksdb::DB::open_default(dir.path()).unwrap(),
+            vec![vec![0x40, 0x01]],
+        );
+        db.put([0x40, 0x01, 1], b"row").unwrap();
+        let watched = db.lock_writes().unwrap().watched_write_sequence().unwrap();
+        db.put([0x05], b"other").unwrap();
+        let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), limits()).unwrap());
+        let point = quil_types::store::CapturePoint {
+            database: db.instance(),
+            sequence: db.latest_sequence_number(),
+            watched,
+        };
+        let scan = quil_types::store::ScanPoint { database: db.instance(), from: point.sequence, to: point.sequence };
+        assert_eq!(overlay.capture_point(), Some(point));
+        overlay
+            .apply(&[
+                OverlayMutation::Put(vec![0x05], b"branch".to_vec()),
+                OverlayMutation::DeleteRange(vec![0x30], vec![0x40, 0x01]),
+            ])
+            .unwrap();
+        assert_eq!(overlay.capture_point(), Some(point), "writes outside the watched keys");
+        let before = overlay.read_view().unwrap();
+        assert_eq!(before.scan_point(), Some(scan));
+        let generation = overlay.delta_generation();
+        overlay.apply(&[OverlayMutation::Delete(vec![0x40, 0x01, 9])]).unwrap();
+        assert_ne!(overlay.delta_generation(), generation);
+        assert_eq!(overlay.capture_point(), None);
+        assert_eq!(overlay.read_view().unwrap().scan_point(), None);
+        assert_eq!(before.scan_point(), Some(scan), "an earlier view keeps its generation");
+        let ranged = ExecutionOverlay::capture(db.clone(), limits()).unwrap();
+        ranged.apply(&[OverlayMutation::DeleteRange(vec![0x40], vec![0x40, 0x01, 0])]).unwrap();
+        assert_eq!(ranged.capture_point(), None, "a range reaching the watched keys");
+        drop(before);
+        overlay.close();
+        assert_eq!(overlay.capture_point(), None);
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = ExecutionOverlay::capture(database(plain_dir.path()), limits()).unwrap();
+        assert_eq!(plain.capture_point(), None);
     }
 
     #[test]

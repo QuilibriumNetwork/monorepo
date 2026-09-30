@@ -1172,6 +1172,33 @@ pub trait HypergraphStore: Send + Sync {
 // Supporting types used across store traits
 // ---------------------------------------------------------------------------
 
+/// Where a read-only scan read one database: the database instance and an
+/// interval containing the sequence of the snapshot it read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanPoint {
+    pub database: u64,
+    pub from: u64,
+    pub to: u64,
+}
+
+/// A captured view of one database, with the sequence of the last write to
+/// the database's watched keys when it was captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapturePoint {
+    pub database: u64,
+    pub sequence: u64,
+    pub watched: u64,
+}
+
+impl CapturePoint {
+    /// Whether a scan of the watched keys at `scan` read exactly what this
+    /// view holds there: the same database, no later than this view, and no
+    /// watched write after the scan's snapshot.
+    pub fn sees_watched_keys_of(&self, scan: &ScanPoint) -> bool {
+        scan.database == self.database && scan.to <= self.sequence && self.watched <= scan.from
+    }
+}
+
 /// Shard key: L1 bloom filter (3 bytes) + L2 app address (32 bytes).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ShardKey {
@@ -1258,6 +1285,12 @@ pub trait SnapshotReadable: Send + Sync {
     /// false because they do not pin a generation.
     fn has_snapshot_vertex_reads(&self) -> bool {
         false
+    }
+
+    /// The database state this snapshot's reads of the database's watched
+    /// keys see, if it has one. Live-store adapters must leave this `None`.
+    fn scan_point(&self) -> Option<ScanPoint> {
+        None
     }
 
     /// Read one vertex's underlying data blob at the captured sequence.

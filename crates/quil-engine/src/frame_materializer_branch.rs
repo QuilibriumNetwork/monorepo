@@ -226,9 +226,9 @@ impl FrameMaterializer {
             .frame_execution
             .try_lock()
             .map_err(|_| unavailable("materializer is busy or poisoned"))?;
-        self.capture_execution_branch_with(limits, || {
+        self.capture_execution_branch_with(limits, |registry| {
             self.execution_manager
-                .capture_execution_branch(limits.execution)
+                .capture_execution_branch_seeded(limits.execution, registry)
                 .map(|branch| (branch, ()))
         })
         .map(|(branch, ())| branch)
@@ -236,10 +236,11 @@ impl FrameMaterializer {
 
     /// The caller already holds the source frame lock. The factory may retain
     /// the execution barriers through publication without reacquiring them.
+    /// It receives the canonical registry, which may seed the branch's own.
     fn capture_execution_branch_with<T>(
         &self,
         limits: MaterializerBranchLimits,
-        capture: impl FnOnce() -> Result<(ExecutionBranch, T)>,
+        capture: impl FnOnce(&ConcreteProverRegistry) -> Result<(ExecutionBranch, T)>,
     ) -> Result<(MaterializerBranch, T)> {
         if self.prover_sync_in_progress.load(Ordering::SeqCst) {
             return Err(unavailable("materializer prover sync is active"));
@@ -301,7 +302,7 @@ impl FrameMaterializer {
         drop(halt_guard);
         let cursor = self.last_materialized_frame.load(Ordering::SeqCst);
         let epoch = self.last_eviction_pass_epoch.load(Ordering::SeqCst);
-        let (execution, retained) = capture()?;
+        let (execution, retained) = capture(registry)?;
         if read_cursor(execution.hypergraph_store().as_ref())? != cursor {
             return Err(unavailable(
                 "captured durable cursor differs from materializer cursor",

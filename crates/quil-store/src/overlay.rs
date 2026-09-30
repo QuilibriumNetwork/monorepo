@@ -109,6 +109,10 @@ impl OverlayDbSnapshot {
         self.view.as_ref().map(|_| ()).map_err(error)
     }
 
+    pub(crate) fn scan_point(&self) -> Option<quil_types::store::ScanPoint> {
+        self.view.as_ref().ok()?.scan_point()
+    }
+
     pub(crate) fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         self.view
             .as_ref()

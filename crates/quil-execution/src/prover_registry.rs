@@ -39,7 +39,9 @@ use quil_types::consensus::{
     ProverRegistry as ProverRegistryTrait, ProverShardSummary, ProverStatus,
 };
 use quil_types::error::{QuilError, Result as QuilResult};
-use quil_types::store::{HypergraphStore, ShardKey, SnapshotReadable, VertexPageLimits};
+use quil_types::store::{
+    CapturePoint, HypergraphStore, ScanPoint, ShardKey, SnapshotReadable, VertexPageLimits,
+};
 
 #[path = "registry_budget.rs"]
 mod registry_budget;
@@ -73,8 +75,17 @@ pub struct LeafRootRecord {
     pub epoch: u64,
 }
 
+#[derive(Clone)]
 pub struct InMemoryProverRegistry {
     resource_usage: RegistryUsage,
+    /// The one database state the last refresh read its rows from, if any.
+    /// `None` after the legacy tree fallback, whose key is not watched.
+    scanned: Option<ScanPoint>,
+    /// The last refresh read vertex rows rather than the legacy tree fallback.
+    from_rows: bool,
+    /// Largest key + value, and largest value, among the rows it read.
+    largest_row: usize,
+    largest_value: usize,
     /// prover_address (32 bytes) → full ProverInfo with allocations
     prover_cache: HashMap<Vec<u8>, ProverInfo>,
     /// (member_address, leaf_id) → registered leaf-root record. `leaf_id` is
@@ -111,6 +122,10 @@ impl InMemoryProverRegistry {
     pub fn new() -> Self {
         Self {
             resource_usage: RegistryUsage::default(),
+            scanned: None,
+            from_rows: false,
+            largest_row: 0,
+            largest_value: 0,
             prover_cache: HashMap::new(),
             leaf_root_cache: HashMap::new(),
             filter_cache: HashMap::new(),
@@ -126,6 +141,10 @@ impl InMemoryProverRegistry {
     /// Clear all state explicitly. A failed refresh retains the previous cache.
     pub fn clear(&mut self) {
         self.resource_usage = RegistryUsage::default();
+        self.scanned = None;
+        self.from_rows = false;
+        self.largest_row = 0;
+        self.largest_value = 0;
         self.prover_cache.clear();
         self.leaf_root_cache.clear();
         self.filter_cache.clear();
@@ -182,9 +201,12 @@ impl InMemoryProverRegistry {
     /// inserts. A failed refresh preserves the previous registry and usage.
     pub fn refresh_from_snapshot_with_limits(&mut self, snapshot: &dyn SnapshotReadable, limits: RegistryLimits) -> QuilResult<()> {
         let mut budget = RegistryBudget::new(limits)?;
-        let shard = ShardKey {
-            l1: [0u8; 3],
-            l2: [0xffu8; 32],
+        // The rows every store watches (`prover_registry_key_prefixes`).
+        let shard = quil_store::encoding::prover_registry_shard();
+        let (mut largest_row, mut largest_value) = (0usize, 0usize);
+        let mut row = |key: usize, value: usize| {
+            largest_row = largest_row.max(key.saturating_add(value));
+            largest_value = largest_value.max(value);
         };
 
         // Walk the per-vertex keyspace — the canonical record of
@@ -195,9 +217,11 @@ impl InMemoryProverRegistry {
         let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         visit_registry_vertices(snapshot, "adds", &shard, limits.page(), |vk, data| {
             budget.input(vk.len(), data.len(), true)?;
+            row(vk.len(), data.len());
             leaves.push((vk, data));
             Ok(())
         })?;
+        let from_rows = !leaves.is_empty();
 
         // Transitional bootstrap: stores from before the per-vertex
         // commit invariant have data only in the tree blob. Fall back
@@ -233,6 +257,7 @@ impl InMemoryProverRegistry {
             std::collections::HashSet::new();
         visit_registry_vertices(snapshot, "removes", &shard, limits.page(), |vk, data| {
             budget.input(vk.len(), data.len(), true)?;
+            row(vk.len(), data.len());
             removed_vks.insert(vk);
             Ok(())
         })?;
@@ -243,8 +268,28 @@ impl InMemoryProverRegistry {
         let mut replacement = Self::new();
         replacement.decode_vertices(&leaves, &mut budget)?;
         replacement.resource_usage = budget.usage;
+        replacement.from_rows = from_rows;
+        replacement.scanned = snapshot.scan_point().filter(|_| from_rows);
+        replacement.largest_row = largest_row;
+        replacement.largest_value = largest_value;
         *self = replacement;
         Ok(())
+    }
+
+    /// Whether a refresh of the view at `capture` with `limits` would read
+    /// exactly this registry's rows and succeed: no watched write since this
+    /// registry's scan, and every budget it charged fits. Budgets only grow
+    /// during a refresh, so the final usage decides; per-row and page limits
+    /// are checked against the largest row read.
+    fn reproduces(&self, capture: &CapturePoint, limits: RegistryLimits) -> bool {
+        let usage = self.resource_usage;
+        self.scanned.is_some_and(|scan| capture.sees_watched_keys_of(&scan))
+            && usage.vertices <= limits.max_vertices
+            && usage.input_bytes <= limits.max_input_bytes
+            && usage.cache_entries <= limits.max_cache_entries
+            && usage.cache_bytes <= limits.max_cache_bytes
+            && self.largest_row <= limits.max_record_bytes
+            && self.largest_value.saturating_add(64) <= limits.page().max_bytes
     }
 
     fn decode_vertices(&mut self, leaves: &[(Vec<u8>, Vec<u8>)], budget: &mut RegistryBudget) -> QuilResult<()> {
@@ -915,6 +960,14 @@ impl PreparedRegistryAdoption<'_> {
             self.adopted = true;
         }
     }
+
+    /// Record that the adopted registry holds exactly the published database's
+    /// rows at `scan`. The caller proves no other write reached them.
+    pub(crate) fn published_at(&mut self, scan: ScanPoint) {
+        if self.adopted && self.source.from_rows {
+            self.source.scanned = Some(scan);
+        }
+    }
 }
 
 impl SharedProverRegistry {
@@ -950,14 +1003,34 @@ impl SharedProverRegistry {
     /// and eviction writes must use that same branch and its original limits.
     /// Clones of this value share only this branch's cache.
     pub fn for_execution_store(store: &dyn HypergraphStore, limits: RegistryLimits) -> QuilResult<Self> {
+        Self::for_execution_capture(store, limits, None, None)
+    }
+
+    /// [`Self::for_execution_store`] for a branch captured at `capture`. When
+    /// `seed` holds a scan no watched write has changed since, and a refresh
+    /// with `limits` would accept it, its cache is copied instead of read
+    /// again: the same rows give the same registry. A busy seed is skipped.
+    pub fn for_execution_capture(
+        store: &dyn HypergraphStore,
+        limits: RegistryLimits,
+        seed: Option<&SharedProverRegistry>,
+        capture: Option<CapturePoint>,
+    ) -> QuilResult<Self> {
         let identity = store.backing_store_identity().ok_or_else(|| {
             QuilError::ExecutionUnavailable("registry requires identifiable execution store".into())
         })?;
+        let seeded = seed.zip(capture).and_then(|(seed, capture)| {
+            let source = seed.inner.try_read().ok()?;
+            source.reproduces(&capture, limits).then(|| source.clone())
+        });
+        let read = seeded.is_none();
         let registry = Self {
-            inner: Arc::new(RwLock::new(InMemoryProverRegistry::new())),
+            inner: Arc::new(RwLock::new(seeded.unwrap_or_default())),
             execution_binding: Some((identity, limits)),
         };
-        registry.refresh_from_store(store)?;
+        if read {
+            registry.refresh_from_store(store)?;
+        }
         Ok(registry)
     }
 

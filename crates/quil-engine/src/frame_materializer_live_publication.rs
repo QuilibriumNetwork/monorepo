@@ -118,9 +118,9 @@ impl FrameMaterializer {
             .frame_execution
             .try_lock()
             .map_err(|_| unavailable("canonical materializer is busy or poisoned"))?;
-        let (mut branch, mut publication) = self.capture_execution_branch_with(limits, || {
+        let (mut branch, mut publication) = self.capture_execution_branch_with(limits, |registry| {
             self.execution_manager
-                .capture_execution_branch_guarded(limits.execution)
+                .capture_execution_branch_guarded_seeded(limits.execution, registry)
         })?;
         // Node-local coverage and diagnostic writers must not be overwritten by
         // metadata captured before their update. Keep their locks through adoption.
