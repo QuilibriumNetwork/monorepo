@@ -29,6 +29,9 @@ struct RemoteWorkerState {
     endpoint: String,
     /// Currently assigned filter.
     filter: Vec<u8>,
+    /// Identity of this quote binding. Replaced on rebinding/reconnect, so an
+    /// A→B→A change cannot make an old in-flight response appear current.
+    quote_binding: std::sync::Arc<()>,
     /// Frame number when a join proposal was submitted for this worker.
     pending_filter_frame: u64,
     /// Operator-set: skip this worker during auto-allocation.
@@ -130,6 +133,7 @@ impl RemoteWorkerManager {
                 core_id,
                 endpoint,
                 filter: Vec::new(),
+                quote_binding: std::sync::Arc::new(()),
                 pending_filter_frame: 0,
                 manually_managed: false,
                 allocated: false,
@@ -206,6 +210,7 @@ impl RemoteWorkerManager {
                     let (owed_filter, chan) = {
                         let mut workers = self.workers.lock().unwrap();
                         if let Some(w) = workers.get_mut(&core_id) {
+                            w.quote_binding = std::sync::Arc::new(());
                             w.channel = Some(channel.clone());
                             w.connected = true;
                             // If a start_consensus Respawn was deferred while the
@@ -247,6 +252,103 @@ impl RemoteWorkerManager {
         }
     }
 
+    /// Read one bound worker's actual materialized pricing inputs. No fanout,
+    /// archive-derived fallback, or connection is created by this operation.
+    pub async fn app_fee_snapshot(&self, application: [u8; 32]) -> Result<quil_execution::pricing::AppFeeSnapshot> {
+        let unavailable = || quil_types::error::QuilError::ExecutionUnavailable("application fee worker unavailable".into());
+        let (core, binding, channel) = {
+            let workers = self.workers.lock().map_err(|_| unavailable())?;
+            workers.iter().filter(|(_, w)| w.filter.as_slice() == application.as_slice())
+                .filter_map(|(core, w)| w.channel.clone().map(|c| (*core, w.quote_binding.clone(), c)))
+                .min_by_key(|(core, _, _)| *core).ok_or_else(unavailable)?
+        };
+        let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel)
+            .max_decoding_message_size(1024).max_encoding_message_size(1024);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), client.get_app_fee_snapshot(
+            quil_types::proto::node::GetAppFeeSnapshotRequest { application: application.to_vec() },
+        )).await.map_err(|_| unavailable())?.map_err(|_| unavailable())?.into_inner();
+        let workers = self.workers.lock().map_err(|_| unavailable())?;
+        if response.application.as_slice() != application.as_slice()
+            || !workers.get(&core).is_some_and(|w| w.filter.as_slice() == application.as_slice()
+                && std::sync::Arc::ptr_eq(&w.quote_binding, &binding)) {
+            return Err(unavailable());
+        }
+        Ok(quil_execution::pricing::AppFeeSnapshot {
+            application, frame_number: response.frame_number, global_frame_number: response.global_frame_number,
+            difficulty: response.difficulty, world_state_bytes: response.world_state_bytes,
+            fee_multiplier_vote: response.fee_multiplier_vote,
+        })
+    }
+
+    /// Whether a standalone worker is running consensus for `filter`. A
+    /// Joining allocation is assigned to a worker whose engine starts only
+    /// when it becomes active, so the worker holds nothing to prepare from yet.
+    pub fn serves_filter(&self, filter: &[u8]) -> bool {
+        self.workers
+            .lock()
+            .map(|workers| workers.values().any(|w| Self::runs(w, filter)))
+            .unwrap_or(false)
+    }
+
+    fn runs(worker: &RemoteWorkerState, filter: &[u8]) -> bool {
+        !filter.is_empty() && worker.wants_consensus && worker.filter.as_slice() == filter
+    }
+
+    /// Leaf roots for `filter`'s next-epoch replicas, encoded by the standalone
+    /// worker running it, from its own store. `Ok(None)`: no standalone worker
+    /// runs this filter (including a Joining allocation, whose engine has not
+    /// started); the caller encodes from its own store as before. Encoding a
+    /// large shard is slow; the caller bounds concurrency, this bounds the wait.
+    pub async fn prepare_storage_confirm(
+        &self,
+        filter: &[u8],
+        targets: &[Vec<u8>],
+        frame_number: u64,
+    ) -> Result<Option<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>>> {
+        let channel = {
+            let workers = self.workers.lock().map_err(|_| QuilError::Internal("worker table poisoned".into()))?;
+            let Some(worker) = workers.values().find(|w| Self::runs(w, filter)) else {
+                return Ok(None);
+            };
+            worker.channel.clone().ok_or_else(|| {
+                QuilError::ExecutionUnavailable("worker serving this filter is not connected".into())
+            })?
+        };
+        let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel)
+            .max_decoding_message_size(16 << 20);
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            client.prepare_storage_confirm(quil_types::proto::node::PrepareStorageConfirmRequest {
+                filter: filter.to_vec(),
+                frame_number,
+                targets: targets.to_vec(),
+            }),
+        )
+        .await
+        .map_err(|_| QuilError::ExecutionUnavailable("worker storage confirm timed out".into()))?
+        {
+            Ok(response) => response.into_inner(),
+            // The worker has not bound or synced this shard yet: the caller
+            // encodes from its own store, as for a Joining allocation.
+            Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                debug!(filter = hex::encode(filter), message = status.message(), "worker cannot prepare storage confirm yet");
+                return Ok(None);
+            }
+            Err(status) => {
+                return Err(QuilError::ExecutionUnavailable(format!("worker storage confirm: {}", status.message())));
+            }
+        };
+        let roots: Vec<_> = response
+            .leaf_roots
+            .iter()
+            .map(quil_execution::global_intrinsic::conversions::confirm_leaf_roots_from_proto)
+            .collect();
+        if roots.iter().any(|group| group.filter != filter) {
+            return Err(QuilError::ExecutionUnavailable("worker returned leaf roots for another filter".into()));
+        }
+        Ok(Some(roots))
+    }
+
     /// Send a SetHalted command to every connected remote worker.
     /// Fire-and-forget per-worker — a failure on one doesn't abort
     /// the others. Mirrors the in-process broadcaster's behavior of
@@ -279,9 +381,9 @@ impl RemoteWorkerManager {
     /// Send a Respawn command to a remote worker via gRPC.
     pub async fn send_respawn(&self, core_id: u32, filter: &[u8]) -> Result<()> {
         let channel = {
-            let workers = self.workers.lock().unwrap();
-            workers.get(&core_id)
-                .and_then(|w| w.channel.clone())
+            let mut workers = self.workers.lock().unwrap();
+            workers.get_mut(&core_id)
+                .and_then(|w| { w.quote_binding = std::sync::Arc::new(()); w.channel.clone() })
                 .ok_or_else(|| QuilError::Internal(
                     format!("worker {} not connected", core_id)
                 ))?
@@ -326,12 +428,17 @@ impl WorkerManager for RemoteWorkerManager {
         let connected = {
             let mut workers = self.workers.lock().unwrap();
             if let Some(w) = workers.get_mut(&core_id) {
+                w.quote_binding = std::sync::Arc::new(());
                 w.filter = filter.to_vec();
                 // Remember whether consensus is owed, so `connect_all` can
                 // re-issue the Respawn if the worker connects later. A
                 // non-empty filter with start_consensus=false (Joining) clears
                 // it; an empty filter (idle) clears it too.
                 w.wants_consensus = start_consensus && !filter.is_empty();
+                // A worker owed consensus is allocated; otherwise the
+                // allocator's next pass re-issues the Respawn (see the thread
+                // manager).
+                w.allocated = w.wants_consensus;
                 w.channel.is_some()
             } else {
                 return Err(QuilError::InvalidArgument(
@@ -413,6 +520,7 @@ impl WorkerManager for RemoteWorkerManager {
     fn deallocate_worker(&self, core_id: u32) -> Result<()> {
         let mut workers = self.workers.lock().unwrap();
         if let Some(w) = workers.get_mut(&core_id) {
+            w.quote_binding = std::sync::Arc::new(());
             w.filter.clear();
             info!(core_id, "remote worker deallocated");
         }
@@ -599,8 +707,102 @@ mod tests {
             None,
         );
         mgr.allocate_worker(1, &[0xAA; 32]).unwrap();
+        assert!(mgr.range_workers().unwrap()[0].allocated, "a worker owed consensus is allocated");
         mgr.deallocate_worker(1).unwrap();
         let workers = mgr.range_workers().unwrap();
         assert!(workers[0].filter.is_empty());
+        mgr.set_worker_filter(1, &[0xBB; 32], false).unwrap();
+        assert!(!mgr.range_workers().unwrap()[0].allocated);
+    }
+}
+
+#[cfg(test)]
+mod fee_relay_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
+    use quil_types::proto::node;
+
+    struct Incoming(tokio::net::TcpListener);
+    impl tonic::codegen::tokio_stream::Stream for Incoming {
+        type Item = std::io::Result<tokio::net::TcpStream>;
+        fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
+            -> std::task::Poll<Option<Self::Item>> {
+            self.0.poll_accept(cx).map(|result| Some(result.map(|(stream, _)| stream)))
+        }
+    }
+
+    struct SnapshotServer {
+        mode: Arc<AtomicU8>, entered: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>,
+    }
+    #[tonic::async_trait]
+    impl node::data_ipc_service_server::DataIpcService for SnapshotServer {
+        async fn get_app_fee_snapshot(&self, request: tonic::Request<node::GetAppFeeSnapshotRequest>)
+            -> std::result::Result<tonic::Response<node::GetAppFeeSnapshotResponse>, tonic::Status> {
+            let mode = self.mode.load(Ordering::SeqCst);
+            if mode == 1 { self.entered.notify_one(); self.release.notified().await; }
+            if mode == 4 { std::future::pending::<()>().await; }
+            let application = match mode { 2 => vec![9; 32], 3 => vec![7; 2048], _ => request.into_inner().application };
+            Ok(tonic::Response::new(node::GetAppFeeSnapshotResponse { application,
+                frame_number: 42, global_frame_number: 100, difficulty: 50_000,
+                world_state_bytes: 1234, fee_multiplier_vote: 7 }))
+        }
+        async fn respawn(&self, _: tonic::Request<node::RespawnRequest>) -> std::result::Result<tonic::Response<node::RespawnResponse>, tonic::Status> {
+            Ok(tonic::Response::new(node::RespawnResponse {}))
+        }
+        async fn create_join_proof(&self, _: tonic::Request<node::CreateJoinProofRequest>) -> std::result::Result<tonic::Response<node::CreateJoinProofResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by fee relay"))
+        }
+        async fn set_halted(&self, _: tonic::Request<node::SetHaltedRequest>) -> std::result::Result<tonic::Response<node::SetHaltedResponse>, tonic::Status> {
+            Ok(tonic::Response::new(node::SetHaltedResponse {}))
+        }
+        async fn prepare_storage_confirm(&self, _: tonic::Request<node::PrepareStorageConfirmRequest>) -> std::result::Result<tonic::Response<node::PrepareStorageConfirmResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by fee relay"))
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a loopback RPC listener; run via Taskfile"]
+    async fn app_fee_relay_transport_bounds_and_binding_races() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mode = Arc::new(AtomicU8::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server = SnapshotServer { mode: mode.clone(), entered: entered.clone(), release: release.clone() };
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let mut serving = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(server))
+                .serve_with_incoming_shutdown(Incoming(listener), async { let _ = stopped.await; }).await.unwrap();
+        });
+        let manager = Arc::new(RemoteWorkerManager::new(vec![(1, endpoint)], String::new(), None));
+        manager.connect_all().await;
+        manager.set_worker_filter(1, &[7; 32], false).unwrap();
+        let snapshot = manager.app_fee_snapshot([7; 32]).await.unwrap();
+        assert_eq!((snapshot.application, snapshot.frame_number, snapshot.global_frame_number,
+            snapshot.difficulty, snapshot.world_state_bytes, snapshot.fee_multiplier_vote),
+            ([7; 32], 42, 100, 50_000, 1234, 7));
+        for bad_mode in [2, 3] {
+            mode.store(bad_mode, Ordering::SeqCst);
+            assert!(manager.app_fee_snapshot([7; 32]).await.unwrap_err().is_execution_unavailable());
+        }
+        mode.store(1, Ordering::SeqCst);
+        let in_flight = { let manager = manager.clone(); tokio::spawn(async move { manager.app_fee_snapshot([7; 32]).await }) };
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified()).await.unwrap();
+        manager.set_worker_filter(1, &[8; 32], false).unwrap();
+        manager.set_worker_filter(1, &[7; 32], false).unwrap();
+        release.notify_one();
+        assert!(in_flight.await.unwrap().is_err(), "rebinding away and back must invalidate the old response");
+        mode.store(4, Ordering::SeqCst);
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(7), manager.app_fee_snapshot([7; 32]))
+            .await.unwrap().unwrap_err().is_execution_unavailable());
+        mode.store(0, Ordering::SeqCst);
+        manager.deallocate_worker(1).unwrap();
+        assert!(manager.app_fee_snapshot([7; 32]).await.is_err());
+        stop.send(()).unwrap();
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut serving).await.is_err() {
+            serving.abort();
+            let _ = serving.await;
+        }
     }
 }

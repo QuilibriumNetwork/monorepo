@@ -35,11 +35,14 @@ pub struct GlobalState {
     /// `verify_global_frame_header` recomputes the same challenge. Empty on
     /// nodes without a CRDT wired (tolerated).
     pub global_commitments: Vec<Vec<u8>>,
-    /// Prover shard phase 1/2/3 roots (audit #5), bound into the VDF challenge
+    /// Prover shard phase 1/2/3 roots, bound into the VDF challenge
     /// alongside `prover_tree_commitment` (phase 0) and carried onto the rebuilt
     /// header so a follower recomputes the identical challenge. Mirrors
     /// `global_commitments`.
     pub prover_tree_aux_roots: Vec<Vec<u8>>,
+    /// Certified network world-state size as of the end of the parent frame
+    /// (bound into the VDF challenge when non-zero; the pricing input).
+    pub world_state_size: u64,
     pub requests_root: Vec<u8>,
     pub signature: Vec<u8>,
     /// Inbound message bundles attached to this proposal, decoded
@@ -91,6 +94,7 @@ impl GlobalState {
             prover_tree_commitment,
             global_commitments: Vec::new(),
             prover_tree_aux_roots: Vec::new(),
+            world_state_size: 0,
             requests_root,
             signature,
             messages: Vec::new(),
@@ -107,10 +111,16 @@ impl GlobalState {
         self
     }
 
-    /// Attach the prover shard's phase 1/2/3 roots (audit #5), bound into the
+    /// Attach the prover shard's phase 1/2/3 roots, bound into the
     /// VDF challenge, so the rebuilt header carries the identical bytes.
     pub fn with_prover_aux_roots(mut self, roots: Vec<Vec<u8>>) -> Self {
         self.prover_tree_aux_roots = roots;
+        self
+    }
+
+    /// Carry the certified world-state size bound into the VDF challenge.
+    pub fn with_world_state_size(mut self, size: u64) -> Self {
+        self.world_state_size = size;
         self
     }
 
@@ -141,6 +151,7 @@ impl GlobalState {
             prover_tree_commitment: h.prover_tree_commitment.clone(),
             global_commitments: h.global_commitments.clone(),
             prover_tree_aux_roots: h.prover_tree_aux_roots.clone(),
+            world_state_size: h.world_state_size,
             requests_root: h.requests_root.clone(),
             signature: h
                 .public_key_signature_bls48581

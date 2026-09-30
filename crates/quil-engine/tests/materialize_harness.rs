@@ -5,12 +5,12 @@
 //! + `RocksClockStore`, a `HypergraphCrdt` backed by that hypergraph store,
 //! an `ExecutionEngineManager`, a `SharedProverRegistry`, and a
 //! `FrameMaterializer` wired exactly as `allocator_and_lifecycle.rs` wires it
-//! (eviction registry + rocks store + shard-size source).
+//! (eviction registry + shared hypergraph store + shard-size source).
 //!
 //! This is the seam the unit tests with mock registries miss: the registry
 //! refreshes from the FLAT per-vertex keyspace while the materializer mutates
-//! the CRDT and persists via `commit_frame`. Every store-vs-CRDT bug this
-//! session lived here.
+//! the CRDT and persists via `commit_frame`. Store-vs-CRDT divergence bugs
+//! surface at this seam.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -108,7 +108,6 @@ impl MaterializeHarness {
             archive_mode,
         )
         .with_eviction_registry(registry.clone())
-        .with_rocks_hg_store(hg_store.clone())
         .with_shard_size_source(shard_size_source)
         // Evictions are disabled fleet-wide by default; the harness turns the
         // mutating kick path back on so the eviction-seam test can exercise it.
@@ -143,7 +142,7 @@ impl MaterializeHarness {
     }
 
     pub fn refresh_registry(&self) {
-        self.registry.refresh_from_store(&self.hg_store);
+        self.registry.refresh_from_store(self.hg_store.as_ref()).unwrap();
     }
 }
 
@@ -210,6 +209,7 @@ fn frame_at(n: u64) -> GlobalFrame {
     GlobalFrame {
         header: Some(GlobalFrameHeader {
             frame_number: n,
+            output: vec![n as u8; 516],
             ..Default::default()
         }),
         requests: Vec::new(),
@@ -524,7 +524,7 @@ fn seed_global_prover(
     vka.extend_from_slice(&alloc_addr);
     hg_store.save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vka, &alloc_blob).unwrap();
     txn.commit().unwrap();
-    registry.refresh_from_store(hg_store);
+    registry.refresh_from_store(hg_store.as_ref()).unwrap();
 
     // Prover vertex into the state changeset so verify's `state.get` finds
     // the pubkey at (GLOBAL, prover_addr).
@@ -577,6 +577,17 @@ fn shard_merge_bytes(parent: &[u8], children: &[Vec<u8>], proposer: &[u8; 32]) -
     .unwrap()
 }
 
+/// The intrinsic stages metadata with its message. Only the enclosing frame
+/// commit publishes the grid, state and cursor; abort then clears the message
+/// changeset so later frames cannot restage an earlier pending change.
+fn commit_fixture_frame(state: &quil_execution::hypergraph_state::HypergraphState, frame: u64) {
+    state.commit().unwrap();
+    let cursor = quil_store::encoding::global_materialized_cursor_key();
+    state.crdt().commit_with_global_cursor(frame, &cursor).unwrap();
+    state.abort();
+    assert_eq!(state.crdt().read_frame_cursor(&cursor).unwrap(), frame);
+}
+
 #[test]
 fn shard_split_by_global_prover_registers_enumerable_child_and_rejects_non_global() {
     let quil = quil_execution::domains::QUIL_TOKEN;
@@ -592,6 +603,9 @@ fn shard_split_by_global_prover_registers_enumerable_child_and_rejects_non_globa
         let bytes = shard_split_bytes(&shard_address, &proposer);
         // Propose in epoch 0 (frame 1).
         gi.invoke_step(1, &bytes, &state).expect("global proposer split must be accepted");
+        assert!(shards_store.all_pending_shard_changes().unwrap().is_empty(),
+            "an uncommitted proposal cannot publish pending metadata");
+        commit_fixture_frame(&state, 1);
 
         let count_children = |store: &dyn quil_types::store::ShardsStore| -> usize {
             store
@@ -612,10 +626,13 @@ fn shard_split_by_global_prover_registers_enumerable_child_and_rejects_non_globa
 
         // Applying within epoch 1 does nothing (E+2 not reached).
         gi.apply_due_shard_changes(720, &state).expect("apply at epoch 1"); // frame 720 = epoch 1
+        commit_fixture_frame(&state, 720);
         assert_eq!(count_children(shards_store.as_ref()), 0, "not applied before E+2");
 
         // Crossing into epoch 2 flips the topology: both children become enumerable.
         gi.apply_due_shard_changes(1440, &state).expect("apply at epoch 2"); // frame 1440 = epoch 2
+        assert_eq!(count_children(shards_store.as_ref()), 0, "topology waits for the frame commit");
+        commit_fixture_frame(&state, 1440);
         let shards = shards_store.range_app_shards().unwrap();
         let children: Vec<_> = shards
             .iter()
@@ -658,7 +675,7 @@ fn shard_split_by_global_prover_registers_enumerable_child_and_rejects_non_globa
     }
 }
 
-/// Phase F join-freeze: once a split is staged on shard S, joins targeting S
+/// Join-freeze: once a split is staged on shard S, joins targeting S
 /// (or its pending children) are rejected until the change settles at E+2.
 #[test]
 fn pending_split_freezes_joins_to_affected_shard_until_e2() {
@@ -673,6 +690,8 @@ fn pending_split_freezes_joins_to_affected_shard_until_e2() {
     // Stage a split in epoch 0 (frame 1) → effective epoch 2.
     gi.invoke_step(1, &shard_split_bytes(&shard_address, &proposer), &state)
         .expect("split staged");
+    assert!(shards_store.all_pending_shard_changes().unwrap().is_empty());
+    commit_fixture_frame(&state, 1);
     assert_eq!(shards_store.all_pending_shard_changes().unwrap().len(), 1);
 
     // Minimal join op — the freeze gate runs BEFORE signature/VDF verification,
@@ -714,6 +733,7 @@ fn pending_split_freezes_joins_to_affected_shard_until_e2() {
 
     // Once the split applies at E+2, the freeze lifts.
     gi.apply_due_shard_changes(1440, &state).expect("apply at epoch 2"); // frame 1440 = epoch 2
+    commit_fixture_frame(&state, 1440);
     assert!(shards_store.all_pending_shard_changes().unwrap().is_empty());
     assert!(!is_frozen(&gi.invoke_step(1441, &join_to(shard_address, 1441), &state)),
         "freeze must lift after the E+2 apply");
@@ -758,7 +778,7 @@ fn seed_data_prover(
     vka.extend_from_slice(&alloc_addr);
     hg_store.save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vka, &alloc_blob).unwrap();
     txn.commit().unwrap();
-    registry.refresh_from_store(hg_store);
+    registry.refresh_from_store(hg_store.as_ref()).unwrap();
 
     // Into the state changeset so `rekey_allocation`'s `state.get` finds it.
     let va = quil_execution::hypergraph_state::vertex_adds_discriminator().unwrap();
@@ -771,7 +791,7 @@ fn seed_data_prover(
     (prover_addr, alloc_addr)
 }
 
-/// Phase F deterministic reassignment: when a shard splits, each active prover
+/// Deterministic reassignment: when a shard splits, each active prover
 /// on the parent is moved to exactly one child (by the address-bucketing rule)
 /// at the E+2 boundary — its allocation re-keys to the child address with the
 /// ConfirmationFilter rewritten, and the prover's hyperedge follows.
@@ -856,7 +876,7 @@ fn split_at_e2_reassigns_active_prover_to_deterministic_child() {
     }
 }
 
-/// Phase F merge reassignment: when children merge back into a parent, every
+/// Merge reassignment: when children merge back into a parent, every
 /// active prover on any child moves to the parent at E+2. Exercises BOTH the
 /// re-key path (0x80 child → distinct parent address) and the in-place path
 /// (0x00 child → SAME address as parent via poseidon trailing-zero collision).
@@ -885,8 +905,14 @@ fn merge_at_e2_reassigns_active_provers_to_parent() {
     // Stage the merge (epoch 0 → effective epoch 2) and apply at E+2.
     gi.invoke_step(1, &shard_merge_bytes(&parent, &[child0.clone(), child1.clone()], &proposer), &state)
         .expect("merge staged");
+    assert!(_shards_store.all_pending_shard_changes().unwrap().is_empty());
+    commit_fixture_frame(&state, 1);
     assert_eq!(_shards_store.all_pending_shard_changes().unwrap().len(), 1, "one pending merge");
     gi.apply_due_shard_changes(1440, &state).expect("apply merge at epoch 2");
+    assert_eq!(_shards_store.all_pending_shard_changes().unwrap().len(), 1,
+        "staging the merge cannot consume durable metadata before commit");
+    commit_fixture_frame(&state, 1440);
+    assert!(_shards_store.all_pending_shard_changes().unwrap().is_empty());
 
     let va = quil_execution::hypergraph_state::vertex_adds_discriminator().unwrap();
     let assert_on_parent = |pk: &[u8]| {
@@ -924,7 +950,7 @@ fn merge_at_e2_reassigns_active_provers_to_parent() {
     assert!(!keys.contains(&atom_key(&a_child_alloc)), "A old child1 atom removed");
 }
 
-// ---- Gap coverage (audit 2026-06-28): invoke_join admission guards ----
+// ---- invoke_join admission guards ----
 
 fn build_join_op(pubkey: &[u8], filter: &[u8], frame: u64) -> Vec<u8> {
     use quil_execution::global_intrinsic::{ProverJoin, SignatureWithPop};

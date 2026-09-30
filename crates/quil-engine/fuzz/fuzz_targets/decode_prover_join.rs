@@ -1,6 +1,6 @@
 #![no_main]
 //! Global-intrinsic ProverJoin decode — its `merge_targets` count was
-//! hint-capped in the F9 sweep (filter count was already guarded).
+//! hint-capped (as is the filter count).
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

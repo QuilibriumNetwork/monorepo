@@ -47,7 +47,7 @@ async fn deploy_single_vertex(
         request: Some(Request::VertexAdd(op)),
         timestamp: 0,
     };
-    crate::send::send_message_request(client, &dc.key_manager, domain.to_vec(), request).await?;
+    dc.send_paid(client, domain, request).await?;
     Ok(data_address.into())
 }
 

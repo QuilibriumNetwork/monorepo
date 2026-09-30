@@ -63,6 +63,7 @@ pub fn process_global_frame_with_rewards(
         let request_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
             Ok(b) => b,
             Err(e) => {
+                if e.is_execution_unavailable() { return Err(e); }
                 debug!(
                     frame = frame_number,
                     index = i,
@@ -91,6 +92,7 @@ pub fn process_global_frame_with_rewards(
             &GLOBAL_ADDRESS,
             &request_bytes,
         ) {
+            if e.is_execution_unavailable() { return Err(e); }
             debug!(
                 frame = frame_number,
                 index = i,
@@ -111,6 +113,7 @@ pub fn process_global_frame_with_rewards(
                 applied += 1;
             }
             Err(e) => {
+                if e.is_execution_unavailable() { return Err(e); }
                 debug!(
                     frame = frame_number,
                     index = i,
@@ -226,27 +229,16 @@ pub fn process_global_frame_with_fees(
         // Compute per-bundle cost basis and fee multiplier
         let cost_basis = match execution_manager.get_cost(&request_bytes) {
             Ok(c) => c,
-            Err(_) => {
+            Err(e) => {
+                if e.is_execution_unavailable() { return Err(e); }
                 skipped += 1;
                 continue;
             }
         };
 
-        let fee_multiplier = if cost_basis == BigInt::from(0) {
-            BigInt::from(0)
-        } else {
-            let cost_u64 = cost_basis.to_u64_digits().1.first().copied().unwrap_or(1);
-            let baseline = crate::rewards::get_baseline_fee(
-                difficulty,
-                world_state_bytes,
-                cost_u64,
-                crate::rewards::QUIL_TOKEN_UNITS,
-            );
-            if cost_basis != BigInt::from(0) {
-                &baseline / &cost_basis
-            } else {
-                BigInt::from(0)
-            }
+        let fee_multiplier = match crate::rewards::fee_multiplier_for_cost(execution_manager.pricing_network(), difficulty, world_state_bytes, &cost_basis, 1) {
+            Ok(fee) => fee,
+            Err(_) => { skipped += 1; continue; }
         };
 
         // Validate before processing.
@@ -255,6 +247,7 @@ pub fn process_global_frame_with_fees(
             &GLOBAL_ADDRESS,
             &request_bytes,
         ) {
+            if e.is_execution_unavailable() { return Err(e); }
             debug!(
                 frame = frame_number,
                 error = %e,
@@ -272,6 +265,7 @@ pub fn process_global_frame_with_fees(
         ) {
             Ok(_) => applied += 1,
             Err(e) => {
+                if e.is_execution_unavailable() { return Err(e); }
                 debug!(frame = frame_number, index = i, error = %e, "skipping");
                 skipped += 1;
             }

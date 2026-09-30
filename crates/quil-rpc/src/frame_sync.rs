@@ -205,6 +205,109 @@ pub type OnFrameCallback = Arc<dyn Fn(&GlobalFrame) + Send + Sync>;
 /// (e.g. a trusted/test caller).
 pub type FrameValidator = Arc<dyn Fn(&GlobalFrame) -> bool + Send + Sync>;
 
+/// Optional durable store for validated frames, tried before the canonical
+/// `put_global_frame`. It receives a certified frame preceded by the
+/// uncertified ancestors it links down to (see [`FrameCertified`]), lowest
+/// first. True when it took all of them (an archive keeps them as candidates
+/// for publication together with their execution state); false stores them
+/// canonically as before. `on_frame` fires either way.
+pub type FrameStoreHook = Arc<dyn Fn(&[GlobalFrame]) -> bool + Send + Sync>;
+
+/// Whether a validated frame carries its own finalization certificate.
+///
+/// Validation (VDF, genesis-prover allowlist, a certificate when present) does
+/// not establish that a frame was finalized: the VDF is publicly computable, the
+/// allowlist names an unsigned header field, and a proposal from a view that was
+/// then nullified passes it. A frame with no certificate of its own is on the
+/// finalized chain only if a certified frame links down to it by parent
+/// selector, as Simplex finalizes ancestors through a descendant. With this set,
+/// the poller holds such a frame and stores it only once a certified frame it
+/// stores links to it.
+pub type FrameCertified = Arc<dyn Fn(&GlobalFrame) -> bool + Send + Sync>;
+
+/// Uncertified frames held per poller at most; the lowest go first.
+const MAX_HELD_UNCERTIFIED: usize = 256;
+
+/// Store an admitted chain (lowest first) through the store hook, else
+/// canonically, and fire `on_frame` for each stored frame in order. A failed
+/// canonical write stops at that frame, so no later frame is stored above it.
+fn store_chain(
+    config: &ArchivePollerConfig,
+    clock_store: &RocksClockStore,
+    chain: &[GlobalFrame],
+) -> quil_types::error::Result<()> {
+    if chain.is_empty() {
+        return Ok(());
+    }
+    let taken = config.store_hook.as_ref().is_some_and(|store| store(chain));
+    for frame in chain {
+        if !taken && !already_canonical(clock_store, frame) {
+            clock_store.put_global_frame(frame, None)?;
+        }
+        if let Some(ref cb) = config.on_frame {
+            cb(frame);
+        }
+    }
+    Ok(())
+}
+
+/// Whether the canonical clock already holds exactly `frame`, as it does for a
+/// head the poller reads again after reconnecting, at or below what execution
+/// published. Rewriting it changes nothing but advances the store's sequence
+/// under an in-flight atomic execution plan, which then falls back.
+fn already_canonical(clock_store: &RocksClockStore, frame: &GlobalFrame) -> bool {
+    frame
+        .header
+        .as_ref()
+        .and_then(|header| clock_store.get_global_frame(header.frame_number).ok())
+        .is_some_and(|stored| stored == *frame)
+}
+
+fn frame_identity(frame: &GlobalFrame) -> Option<[u8; 32]> {
+    quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref()?.output).ok()
+}
+
+/// What to store now for a validated `frame`, lowest first: nothing while it is
+/// uncertified (it is held), else the held ancestors it links down to by parent
+/// selector and then the frame. Held frames at or below a certified frame that
+/// it does not link to are dropped: they are not on its chain. Without a
+/// certification predicate every frame is stored as before.
+fn admit_frame(
+    certified: Option<&FrameCertified>,
+    held: &mut std::collections::BTreeMap<u64, GlobalFrame>,
+    frame: GlobalFrame,
+) -> Vec<GlobalFrame> {
+    let Some(certified) = certified else { return vec![frame] };
+    let Some(number) = frame.header.as_ref().map(|h| h.frame_number) else { return Vec::new() };
+    if !certified(&frame) {
+        held.insert(number, frame);
+        while held.len() > MAX_HELD_UNCERTIFIED {
+            held.pop_first();
+        }
+        return Vec::new();
+    }
+    let mut chain = Vec::new();
+    let mut selector = frame.header.as_ref().map(|h| h.parent_selector.clone()).unwrap_or_default();
+    let mut below = number;
+    while let Some(parent_number) = below.checked_sub(1) {
+        let links = held
+            .get(&parent_number)
+            .and_then(frame_identity)
+            .is_some_and(|identity| identity.as_slice() == selector.as_slice());
+        if !links {
+            break;
+        }
+        let parent = held.remove(&parent_number).expect("checked above");
+        selector = parent.header.as_ref().map(|h| h.parent_selector.clone()).unwrap_or_default();
+        chain.push(parent);
+        below = parent_number;
+    }
+    held.retain(|&held_number, _| held_number > number);
+    chain.reverse();
+    chain.push(frame);
+    chain
+}
+
 /// Async hook the poller invokes when a NON-ARCHIVE node finds itself far behind
 /// an endpoint's head at RUNTIME (gap ≥ [`STATE_JUMP_RUNTIME_GAP`]). The argument
 /// is the network head just observed; the hook runs a best-effort state-jump
@@ -333,6 +436,10 @@ pub struct ArchivePollerConfig {
     /// (not stored, `on_frame` not fired), mirroring the gossip
     /// `GLOBAL_FRAME` handler's drop-before-store semantics.
     pub frame_validator: Option<FrameValidator>,
+    /// See [`FrameStoreHook`]. `None` always stores canonically.
+    pub store_hook: Option<FrameStoreHook>,
+    /// See [`FrameCertified`]. `None` stores every validated frame.
+    pub frame_certified: Option<FrameCertified>,
     /// When true, the poller forward-fills every missed frame
     /// between the previously-seen head and the current head — the
     /// archive case where retaining full history is the point.
@@ -365,11 +472,22 @@ impl Default for ArchivePollerConfig {
             gossip_freshness: None,
             on_frame: None,
             frame_validator: None,
+            store_hook: None,
+            frame_certified: None,
             forward_fill: false,
             startup_barrier: None,
             far_behind_jump: None,
         }
     }
+}
+
+/// Whether the forward-fill fetches every frame between the local head and
+/// `head`. A store holding only genesis fills from frame 1: an archive that
+/// started as frame 1 was finalized stored frame 2 first, never fetched 1,
+/// and could execute nothing until it was restarted. A store with no record
+/// at all is the far-behind state-jump's to fill.
+fn forward_fill_due(last_frame: u64, has_genesis: bool, head: u64) -> bool {
+    (last_frame > 0 || has_genesis) && head > last_frame + 1
 }
 
 /// Long-running task that polls a chosen archive endpoint for the current
@@ -406,6 +524,7 @@ pub async fn run_archive_poller(
     // Use the local store's latest as our starting "last seen", so a
     // restart doesn't re-fetch frames we already have.
     let mut last_frame: u64 = clock_store.get_latest_frame_number().unwrap_or(0);
+    let has_genesis = clock_store.get_global_frame(0).is_ok();
     // Consecutive ticks where the current endpoint was not ahead of us. The
     // pool can contain endpoints that are behind, at our height, or even THIS
     // node itself (the mainnet genesis static-IP pool includes self). Latching
@@ -438,6 +557,9 @@ pub async fn run_archive_poller(
     // hole so catch-up proceeds to the frames that DO exist. Only a genuine
     // `NotFound` counts; transient errors/timeouts never trip the skip.
     let mut stall_frame: Option<u64> = None;
+    // Validated frames with no certificate of their own, until a certified frame
+    // links down to them (see `FrameCertified`).
+    let mut held: std::collections::BTreeMap<u64, GlobalFrame> = std::collections::BTreeMap::new();
     let mut stall_endpoints: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     // Distinct archives that served a frame at the stuck height which FAILED
@@ -709,7 +831,7 @@ pub async fn run_archive_poller(
         // 2. Forward-fill any missed frames in (last_frame, new_number).
         //    Archive nodes need the full history; everyone else
         //    just wants to start from the current head.
-        if config.forward_fill && last_frame > 0 && new_number > last_frame + 1 {
+        if config.forward_fill && forward_fill_due(last_frame, has_genesis, new_number) {
             // Track partial progress: every frame we successfully store
             // advances `last_frame`, so a failure midway does NOT throw
             // away the frames we already pulled. The previous design left
@@ -764,13 +886,12 @@ pub async fn run_archive_poller(
                                 break;
                             }
                         }
-                        if let Err(e) = clock_store.put_global_frame(&frame, None) {
+                        let chain = admit_frame(config.frame_certified.as_ref(), &mut held, frame);
+                        if let Err(e) = store_chain(&config, &clock_store, &chain) {
                             warn!(error = %e, frame = fn_, "store catchup frame failed");
                         }
-                        if let Some(ref cb) = config.on_frame {
-                            cb(&frame);
-                        }
-                        // Advance over each stored frame so progress is durable.
+                        // Advance over each fetched frame (stored, or held until a
+                        // certified frame links to it) so progress is durable.
                         last_frame = fn_;
                     }
                     Ok(Err(e)) => {
@@ -878,12 +999,15 @@ pub async fn run_archive_poller(
                 continue;
             }
         }
-        if let Err(e) = clock_store.put_global_frame(&head, None) {
-            warn!(error = %e, frame = new_number, "store head frame failed");
+        let admitted = admit_frame(config.frame_certified.as_ref(), &mut held, head);
+        if admitted.is_empty() {
+            debug!(frame = new_number, "head frame carries no certificate of its own — held until a certified frame links to it");
+            last_frame = new_number;
             continue;
         }
-        if let Some(ref cb) = config.on_frame {
-            cb(&head);
+        if let Err(e) = store_chain(&config, &clock_store, &admitted) {
+            warn!(error = %e, frame = new_number, "store head frame failed");
+            continue;
         }
         info!(
             head = new_number,
@@ -1126,6 +1250,7 @@ mod pool_tests {
         assert_eq!(cfg.poll_interval, Duration::from_secs(1));
         assert_eq!(cfg.call_timeout, Duration::from_secs(30));
         assert!(cfg.on_frame.is_none());
+        assert!(cfg.store_hook.is_none());
         assert!(!cfg.forward_fill);
         // Gossip backoff is opt-in — off by default (archives, and any caller
         // that doesn't wire it) so the poller always RPC-polls.
@@ -1169,5 +1294,130 @@ mod pool_tests {
         assert!(!gf.fresh_within(Duration::from_millis(0)));
         // A generous window is.
         assert!(gf.fresh_within(Duration::from_secs(60)));
+    }
+}
+
+#[cfg(test)]
+mod admit_tests {
+    use super::*;
+    use quil_types::proto::global::{GlobalFrameHeader, GlobalFrame};
+
+    #[test]
+    fn an_archive_holding_only_genesis_fills_from_frame_one() {
+        // A localnet archive that started as frame 1 was finalized: its first
+        // poll saw head 2 and must fetch frame 1 rather than store 2 alone.
+        assert!(forward_fill_due(0, true, 2));
+        assert!(!forward_fill_due(0, true, 1), "the head itself is stored directly");
+        // No record at all: the state-jump fills a far-behind store.
+        assert!(!forward_fill_due(0, false, 2));
+        assert!(forward_fill_due(5, false, 7));
+        assert!(!forward_fill_due(5, false, 6));
+    }
+
+    fn frame(number: u64, output: u8, parent: Option<&GlobalFrame>, certified: bool) -> GlobalFrame {
+        GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: number,
+                output: vec![output; 516],
+                parent_selector: parent.and_then(frame_identity).map(|id| id.to_vec()).unwrap_or_default(),
+                // The test predicate reads certification off the rank.
+                rank: if certified { 1 } else { 0 },
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        }
+    }
+
+    fn certified() -> FrameCertified {
+        Arc::new(|frame: &GlobalFrame| frame.header.as_ref().is_some_and(|h| h.rank == 1))
+    }
+
+    fn numbers(chain: &[GlobalFrame]) -> Vec<u64> {
+        chain.iter().map(|f| f.header.as_ref().unwrap().frame_number).collect()
+    }
+
+    /// Without a predicate every validated frame is stored, as before.
+    #[test]
+    fn without_a_predicate_every_frame_is_stored() {
+        let mut held = std::collections::BTreeMap::new();
+        let one = frame(1, 1, None, false);
+        assert_eq!(numbers(&admit_frame(None, &mut held, one)), vec![1]);
+        assert!(held.is_empty());
+    }
+
+    /// An uncertified frame waits, and is stored with the certified frame that
+    /// links down to it, lowest first.
+    #[test]
+    fn an_uncertified_frame_waits_for_a_certified_descendant_that_links_to_it() {
+        let predicate = certified();
+        let mut held = std::collections::BTreeMap::new();
+        let four = frame(4, 4, None, true);
+        let five = frame(5, 5, Some(&four), false);
+        let six = frame(6, 6, Some(&five), false);
+        let seven = frame(7, 7, Some(&six), true);
+        assert_eq!(numbers(&admit_frame(Some(&predicate), &mut held, four)), vec![4]);
+        assert!(admit_frame(Some(&predicate), &mut held, five).is_empty());
+        assert!(admit_frame(Some(&predicate), &mut held, six).is_empty());
+        assert_eq!(numbers(&admit_frame(Some(&predicate), &mut held, seven)), vec![5, 6, 7]);
+        assert!(held.is_empty());
+    }
+
+    /// A validated frame from another view (a nullified proposal) that no
+    /// certified frame links to is never stored.
+    #[test]
+    fn an_uncertified_frame_off_the_certified_chain_is_dropped() {
+        let predicate = certified();
+        let mut held = std::collections::BTreeMap::new();
+        let four = frame(4, 4, None, true);
+        let honest = frame(5, 5, Some(&four), false);
+        let nullified = frame(5, 9, Some(&four), false);
+        let six = frame(6, 6, Some(&honest), true);
+        admit_frame(Some(&predicate), &mut held, four);
+        assert!(admit_frame(Some(&predicate), &mut held, nullified).is_empty());
+        assert_eq!(numbers(&admit_frame(Some(&predicate), &mut held, six)), vec![6],
+            "the certified frame does not link to the held one");
+        assert!(held.is_empty(), "held frames at or below a certified frame are dropped");
+    }
+
+    /// A frame the canonical clock already holds unchanged is not rewritten
+    /// (the store's sequence stays put, so an in-flight atomic execution plan
+    /// survives), yet still reaches `on_frame`; a different frame at that
+    /// height is written as before.
+    #[test]
+    fn an_identical_canonical_frame_is_not_rewritten() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = RocksClockStore::new(db.inner());
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = fired.clone();
+        let config = ArchivePollerConfig {
+            on_frame: Some(Arc::new(move |_: &GlobalFrame| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+            ..Default::default()
+        };
+        let stored = frame(6, 6, None, true);
+        clock.put_global_frame(&stored, None).unwrap();
+        let sequence = db.inner().latest_sequence_number();
+        store_chain(&config, &clock, &[stored.clone()]).unwrap();
+        assert_eq!(db.inner().latest_sequence_number(), sequence, "not rewritten");
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let other = frame(6, 7, None, true);
+        store_chain(&config, &clock, &[other.clone()]).unwrap();
+        assert_ne!(db.inner().latest_sequence_number(), sequence);
+        assert_eq!(clock.get_global_frame(6).unwrap(), other);
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// The held set is bounded; the lowest go first.
+    #[test]
+    fn held_frames_are_bounded() {
+        let predicate = certified();
+        let mut held = std::collections::BTreeMap::new();
+        for number in 1..=(MAX_HELD_UNCERTIFIED as u64 + 10) {
+            assert!(admit_frame(Some(&predicate), &mut held, frame(number, number as u8, None, false)).is_empty());
+        }
+        assert_eq!(held.len(), MAX_HELD_UNCERTIFIED);
+        assert_eq!(*held.keys().next().unwrap(), 11);
     }
 }

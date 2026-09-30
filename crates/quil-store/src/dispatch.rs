@@ -1,4 +1,3 @@
-use std::sync::Arc;
 
 use quil_types::error::{QuilError, Result};
 
@@ -16,11 +15,11 @@ const HUB_DELETE_PREFIX: u8 = 0x42;
 /// - Hub add: `[0x41, filter..., hub_id...]` -> empty
 /// - Hub delete: `[0x42, filter..., hub_id...]` -> empty
 pub struct RocksInboxStore {
-    db: Arc<rocksdb::DB>,
+    db: quil_forest::CoordinatedDb,
 }
 
 impl RocksInboxStore {
-    pub fn new(db: Arc<rocksdb::DB>) -> Self {
+    pub fn new(db: quil_forest::CoordinatedDb) -> Self {
         Self { db }
     }
 

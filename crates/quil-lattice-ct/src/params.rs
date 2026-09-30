@@ -1,15 +1,12 @@
 //! Production parameter target — **128-bit (NIST L1)**, small-`q` + MatRiCT
-//! limb strategy — as chosen 2026-07-15.
+//! limb strategy.
 //!
-//! This module is a *specification*, not yet an instantiation: the reference
-//! implementation in the sibling modules runs over plain `Z_q` with tiny,
-//! testability-only numbers. Secure, practical parameters require the **ring
-//! form** `R_q = Z_q[X]/(X^d+1)` with NTT (security amortizes over `d`
-//! coefficients; a single structured ring challenge replaces the reference's
-//! 16 rounds of `{-1,0,1}`). Pinning the numbers here is the trigger for that
-//! port.
+//! This module is the parameter *specification*. Secure, practical parameters
+//! require the **ring form** `R_q = Z_q[X]/(X^d+1)` with NTT (security
+//! amortizes over `d` coefficients; a single structured ring challenge replaces
+//! 16 rounds of `{-1,0,1}`).
 //!
-//! # Provenance and status — ESTIMATOR-VALIDATED (2026-07-15)
+//! # Provenance
 //!
 //! Structure derives from **Dilithium** and **MatRiCT+**; the concrete `q, κ,
 //! λ` were then **checked with a core-SVP estimator run** (the Kyber/Dilithium
@@ -25,11 +22,6 @@
 //! and soundness are comfortable.
 //! * `q=2^28` also leaves headroom above the amount arithmetic (`2^23`
 //! per-limb sum) and the soundness slack (`~2^20` extracted norm).
-//!
-//! **Still required before real use:** a full lattice-estimator (Albrecht et
-//! al.) cross-check with the *exact* range-proof extracted-norm accounting,
-//! and cryptographic audit. This is the reviewed, estimator-sanity-checked
-//! direction — not a substitute for the audit.
 
 // ── Ring ────────────────────────────────────────────────────────────────
 
@@ -50,7 +42,7 @@ pub const RING_DEGREE_D: usize = 256;
 /// `q ≡ 1 mod 8` so a future radix-2 block NTT is possible; the current build
 /// uses the (q-agnostic) schoolbook multiply for correctness — block-NTT perf is
 /// a validated follow-up.
-// Prior (fully-split) q was 68719484929 (2^36+8193, q≡1 mod 512). See git history.
+// Prior (fully-split) q was 68719484929 (2^36+8193, q≡1 mod 512).
 pub const MODULUS_Q: u64 = 68719476713; // < 2^36 (by 23), prime, ord_512=64 → t=4 partial split
 /// Bits to represent a coefficient in `[0, q)`. `q < 2^36`, so `ceil(log2 q) = 36`.
 pub const MODULUS_Q_BITS: u32 = 36;

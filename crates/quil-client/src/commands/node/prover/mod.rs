@@ -1,9 +1,8 @@
 //! `qclient node prover …` — prover status + lifecycle.
 //!
-//! Read subcommands (`status`, `shards`, `shardinfo`) are implemented
-//! here; the lifecycle write subcommands (`join`, `leave`, …) are added
-//! in a later phase. All prover commands talk to the **local** node
-//! (`getNodeClient` always uses the local gRPC listener).
+//! Read subcommands (`status`, `shards`, `shardinfo`) and the lifecycle
+//! write subcommands (`join`, `leave`, …). All prover commands talk to the
+//! **local** node (`getNodeClient` always uses the local gRPC listener).
 
 use std::collections::HashMap;
 

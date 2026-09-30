@@ -1,0 +1,16 @@
+[package]
+name = "quil-lattice-proof-sys"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Experimental native lattice proof backend; not enabled for production tokens"
+links = "quil_lattice_proof"
+
+[features]
+default = []
+native-backend = []
+# Benchmark-only native knobs (QUIL_BENCH_MAX_ROUNDS). Never enable in node or wallet builds.
+bench-knobs = []
+
+[build-dependencies]
+cc = "1.2.67"

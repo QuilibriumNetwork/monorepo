@@ -54,7 +54,7 @@ pub fn derive_storage_beacon(global_frame_number: u64, global_output: &[u8]) -> 
 }
 
 /// Deterministic per-frame storage-audit selector — the cost-vs-scale
-/// decoupling from the PoRep design (`porep-shard-attestation-design`).
+/// decoupling of the PoRep design.
 /// A leaf `id` (its `leaf_id` / opening `shard_id`) is AUDITED in the
 /// frame whose beacon is `rho_n` iff `H(DST_AUDIT || rho_n || id)` —
 /// read as a big-endian fraction of `2^64` from its first 8 bytes — is
@@ -104,6 +104,9 @@ pub fn is_audited(rho_n: &[u8], id: &[u8], sample_num: u64, sample_den: u64) -> 
 /// without it, the VDF-free output collides across re-proposals and the
 /// consensus forks tree rejects the second as a parent-level conflict.
 #[allow(clippy::too_many_arguments)]
+/// Leads the relay fields in an app frame's output preimage.
+const RELAY_FIELDS_TAG: u8 = 0xFF;
+
 pub fn deterministic_app_frame_output(
     parent_selector: &[u8],
     requests_root: &[u8],
@@ -114,7 +117,7 @@ pub fn deterministic_app_frame_output(
     prover: &[u8],
     // Header metadata that downstream code consumes (difficulty feeds
     // reward/coverage accounting) but which used to sit OUTSIDE the certified
-    // output — freely substitutable on a certified frame (audit latent finding).
+    // output — freely substitutable on a certified frame.
     // Binding them here makes the finalize-time output-recompute reject any
     // tampering. FLAG-DAY: changes the app-frame digest.
     difficulty: u32,
@@ -123,11 +126,42 @@ pub fn deterministic_app_frame_output(
     // The proposer's storage-attestation root. Binding it here stops a
     // finalize-time substitution from STRIPPING the attestation (emptying the
     // root + body) under the same certified digest — which would silently drop
-    // storage-reward accounting (audit residual #2). FLAG-DAY.
+    // storage-reward accounting. FLAG-DAY.
     storage_attestation_root: &[u8],
+    // The previous-frame fee total the header carries (credited to the shard's
+    // provers by the global materializer). Bound so a certified frame cannot
+    // have its fee total substituted. FLAG-DAY.
+    fee_total: u128,
+    // The settlement relay window the header carries (`FrameHeader.settlements`):
+    // entries the global materializer turns into GLOBAL settlement records.
+    // Bound so a relayer cannot add, drop or alter entries of a certified frame.
+    settlements: &[u8],
+    // The shard's accumulator report (`FrameHeader.accumulator`): the subtree
+    // roots the global materializer folds into the application's canonical
+    // root. Bound so a relayer cannot substitute or strip a certified report.
+    // FLAG-DAY.
+    accumulator: &[u8],
+    // The spend relay (`FrameHeader.spends`): the entries the global commit
+    // decides. Bound so a relayer cannot add, drop or alter them. FLAG-DAY.
+    spends: &[u8],
 ) -> Vec<u8> {
     let mut h = Sha3_256::new();
     h.update(DST_FRAME_OUTPUT);
+    // The relay fields enter only when one is set, behind a tag no length
+    // prefix can begin with (the parent selector's u32 length follows
+    // otherwise). A frame without relays — every frame the mainnet build made —
+    // keeps that build's output, so this build validates its heads after the
+    // upgrade.
+    if fee_total != 0 || !settlements.is_empty() || !accumulator.is_empty() || !spends.is_empty() {
+        h.update([RELAY_FIELDS_TAG]);
+        h.update(fee_total.to_be_bytes());
+        h.update((settlements.len() as u32).to_be_bytes());
+        h.update(settlements);
+        h.update((accumulator.len() as u32).to_be_bytes());
+        h.update(accumulator);
+        h.update((spends.len() as u32).to_be_bytes());
+        h.update(spends);
+    }
     h.update((parent_selector.len() as u32).to_be_bytes());
     h.update(parent_selector);
     h.update((requests_root.len() as u32).to_be_bytes());
@@ -362,24 +396,75 @@ pub fn verify_frame_storage_attestation_registered<F>(
 where
     F: Fn(&[u8], &[u8], u64) -> Option<(Vec<u8>, u64, u64)>,
 {
+    explain_frame_storage_attestation_registered(
+        root, attestation, frame_number, rho_n, bitmask, poly_size, active_epoch, lookup,
+    )
+    .is_ok()
+}
+
+/// [`verify_frame_storage_attestation_registered`] with the reason it failed.
+/// A node that rejects a frame is the only party that knows why, and "which
+/// half failed" is the difference between a stale registry view and a bad
+/// proof; the acceptance rule is identical.
+#[allow(clippy::too_many_arguments)]
+pub fn explain_frame_storage_attestation_registered<F>(
+    root: &[u8],
+    attestation: &global::StorageAttestation,
+    frame_number: u64,
+    rho_n: &[u8],
+    bitmask: &[u8],
+    poly_size: u64,
+    active_epoch: u64,
+    lookup: F,
+) -> Result<(), String>
+where
+    F: Fn(&[u8], &[u8], u64) -> Option<(Vec<u8>, u64, u64)>,
+{
+    let short = |bytes: &[u8]| hex::encode(&bytes[..bytes.len().min(8)]);
     for o in &attestation.openings {
         if o.epoch != active_epoch {
-            return false;
+            return Err(format!(
+                "opening by {} for leaf {} is epoch {}, active epoch {}",
+                short(&o.member_id), short(&o.shard_id), o.epoch, active_epoch
+            ));
         }
         match lookup(&o.member_id, &o.shard_id, o.epoch) {
             Some((reg_root, reg_blocks, reg_epoch)) => {
-                if reg_epoch != active_epoch
-                    || reg_root != o.leaf_root
-                    || reg_blocks != o.num_blocks
-                {
-                    return false;
+                if reg_epoch != active_epoch {
+                    return Err(format!(
+                        "registered leaf {} of {} is epoch {}, active epoch {}",
+                        short(&o.shard_id), short(&o.member_id), reg_epoch, active_epoch
+                    ));
+                }
+                if reg_root != o.leaf_root {
+                    return Err(format!(
+                        "leaf root mismatch for {} leaf {}: registered {}, opened {}",
+                        short(&o.member_id), short(&o.shard_id), short(&reg_root), short(&o.leaf_root)
+                    ));
+                }
+                if reg_blocks != o.num_blocks {
+                    return Err(format!(
+                        "block count mismatch for {} leaf {}: registered {reg_blocks}, opened {}",
+                        short(&o.member_id), short(&o.shard_id), o.num_blocks
+                    ));
                 }
             }
             // Opened a leaf the member never registered → reject.
-            None => return false,
+            None => {
+                return Err(format!(
+                    "no registered leaf {} for member {} at epoch {active_epoch} (this node's registry view)",
+                    short(&o.shard_id), short(&o.member_id)
+                ))
+            }
         }
     }
-    verify_frame_storage_attestation_proto(root, attestation, frame_number, rho_n, bitmask, poly_size)
+    if !verify_frame_storage_attestation_proto(root, attestation, frame_number, rho_n, bitmask, poly_size) {
+        return Err(format!(
+            "possession proof failed over {} opening(s) at frame {frame_number}",
+            attestation.openings.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Producer counterpart to the verifier: open one member's challenged leaf for
@@ -1273,28 +1358,84 @@ mod tests {
         let rho = [0x55u8; 32];
         let prover = [0x66u8; 32];
         let sar = [0x99u8; 32];
-        let a = deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar);
+        let a = deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[], &[]);
         // 516-byte layout: 32-byte digest then zeros (so poseidon(output) +
         // output[..516] parent derivations are unchanged downstream).
         assert_eq!(a.len(), 516);
         assert!(a[..32].iter().any(|&b| b != 0), "digest must be non-zero");
         assert!(a[32..].iter().all(|&b| b == 0), "tail must be zero-padded");
         // Deterministic.
-        assert_eq!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar));
+        assert_eq!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[], &[]));
         // Binds every input: a different beacon, frame, rank, or content changes it.
         let rho2 = [0x56u8; 32];
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho2, 7, 0, &prover, 5, 3, 100, &sar));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 8, 0, &prover, 5, 3, 100, &sar));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 1, &prover, 5, 3, 100, &sar));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &[0x23u8; 64], &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho2, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[], &[]));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 8, 0, &prover, 5, 3, 100, &sar, 9, &[], &[], &[]));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 1, &prover, 5, 3, 100, &sar, 9, &[], &[], &[]));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &[0x23u8; 64], &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[], &[]));
         // Now-bound header metadata: difficulty, fee vote, timestamp, and the
         // storage-attestation root each change it.
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 6, 3, 100, &sar));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 4, 100, &sar));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 101, &sar));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &[0x9Au8; 32]));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 6, 3, 100, &sar, 9, &[], &[], &[]));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 4, 100, &sar, 9, &[], &[], &[]));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 101, &sar, 9, &[], &[], &[]));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &[0x9Au8; 32], 9, &[], &[], &[]));
         // Stripping the attestation (empty root) must change the output too.
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &[]));
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &[], 9, &[], &[], &[]));
+        // The previous-frame fee total is bound too.
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 10, &[], &[], &[]));
+        // The settlement relay is bound too.
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[1], &[], &[]));
+        // The spend relay is bound too.
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[], &[1]));
+        // So is the accumulator report, and it cannot trade places with the
+        // relay: the same bytes in the other field give a different output.
+        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[1], &[]));
+        assert_ne!(
+            deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[1], &[], &[]),
+            deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[1], &[]),
+        );
+    }
+
+    /// A frame without relays keeps the output the mainnet build computes
+    /// (monorepo quil-crypto porep.rs), so its heads validate after the
+    /// upgrade; any relay field, behind its tag, changes it.
+    #[test]
+    fn an_output_without_relays_is_the_mainnet_output() {
+        let (parent, rr, srs, rho, prover, sar) =
+            ([0x11u8; 32], [0x22u8; 64], vec![vec![0x33u8; 64]; 4], [0x55u8; 32], [0x66u8; 32], [0x99u8; 32]);
+        let mainnet = {
+            let mut h = Sha3_256::new();
+            h.update(DST_FRAME_OUTPUT);
+            h.update((parent.len() as u32).to_be_bytes());
+            h.update(parent);
+            h.update((rr.len() as u32).to_be_bytes());
+            h.update(rr);
+            h.update((srs.len() as u32).to_be_bytes());
+            for r in &srs {
+                h.update((r.len() as u32).to_be_bytes());
+                h.update(r);
+            }
+            h.update((rho.len() as u32).to_be_bytes());
+            h.update(rho);
+            h.update(7u64.to_be_bytes());
+            h.update(2u64.to_be_bytes());
+            h.update((prover.len() as u32).to_be_bytes());
+            h.update(prover);
+            h.update(5u32.to_be_bytes());
+            h.update(3u64.to_be_bytes());
+            h.update(100i64.to_be_bytes());
+            h.update((sar.len() as u32).to_be_bytes());
+            h.update(sar);
+            let mut out = vec![0u8; 516];
+            out[..32].copy_from_slice(&h.finalize());
+            out
+        };
+        let output = |fee: u128, settlements: &[u8], accumulator: &[u8], spends: &[u8]| {
+            deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 2, &prover, 5, 3, 100, &sar, fee, settlements, accumulator, spends)
+        };
+        assert_eq!(output(0, &[], &[], &[]), mainnet);
+        for relayed in [output(1, &[], &[], &[]), output(0, &[1], &[], &[]), output(0, &[], &[1], &[]), output(0, &[], &[], &[1])] {
+            assert_ne!(relayed, mainnet);
+        }
     }
 
     #[test]

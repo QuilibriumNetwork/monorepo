@@ -1,8 +1,7 @@
 //! `qclient node …` — node management.
 //!
-//! The `prover` subgroup (status/lifecycle) lives here. Install/update/
-//! service/config/log subcommands (OS plumbing) are added in a later
-//! phase.
+//! The `prover` subgroup (status/lifecycle) and the install/update/
+//! service/config/log subcommands (OS plumbing).
 
 use clap::Subcommand;
 

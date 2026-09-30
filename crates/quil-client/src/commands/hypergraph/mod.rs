@@ -1,8 +1,8 @@
 //! `qclient hypergraph …` — hypergraph read/write.
 //!
-//! `get vertex|hyperedge` is implemented here; the write subcommands
-//! (`put`, `remove`) are added in a later phase. Shared setup (node
-//! config, alias store, connection) is gathered in [`HypergraphCtx`].
+//! `get vertex|hyperedge` reads; the write subcommands live in `put` and
+//! `remove`. Shared setup (node config, alias store, connection) is gathered
+//! in [`HypergraphCtx`].
 
 use std::path::PathBuf;
 
@@ -54,11 +54,13 @@ pub struct HypergraphCtx {
     pub alias_store: Option<Store>,
     pub connect_opts: ConnectOpts,
     pub key_manager: std::sync::Arc<quil_keys::FileKeyManager>,
+    /// Global flags, for commands that also load the token wallet (`--pay`).
+    pub global: GlobalArgs,
 }
 
 impl HypergraphCtx {
     fn load(global: GlobalArgs) -> anyhow::Result<Self> {
-        let ctx = Context::load(global)?;
+        let ctx = Context::load(global.clone())?;
         let (node_config, config_dir) = ctx.load_node_config("default")?;
         let alias_store = alias_store::try_load_for_config_dir(&config_dir);
         let key_manager = ctx.key_manager(&node_config, &config_dir)?;
@@ -74,6 +76,7 @@ impl HypergraphCtx {
             alias_store,
             connect_opts,
             key_manager,
+            global,
         })
     }
 

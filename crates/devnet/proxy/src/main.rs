@@ -9,8 +9,7 @@
 //!
 //! All paths are wired: gossip partitioning (BlossomSub forward filter), the
 //! transparent-h2 gRPC partition proxy, frame convergence, safety, enrollment,
-//! and the result notification. Remaining work is live-integration validation
-//! (run the compose stack) and the proxy Dockerfile.
+//! and the result notification.
 
 mod blossomsub_proxy;
 mod consensus_events;

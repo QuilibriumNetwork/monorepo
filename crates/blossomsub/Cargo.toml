@@ -49,7 +49,7 @@ hex = "0.4.2"
 [features]
 wasm-bindgen = ["getrandom/js"]
 # Gates upstream libp2p-gossipsub's async-std integration + quickcheck codec
-# tests, quarantined during the fork (replaced by the BlossomSub test_harness
-# in Stage 7). Enabling it would require async-std / tracing-subscriber / an
+# tests, quarantined in the fork (superseded by the BlossomSub test_harness).
+# Enabling it would require async-std / tracing-subscriber / an
 # old quickcheck; not built by default.
 upstream-tests = []

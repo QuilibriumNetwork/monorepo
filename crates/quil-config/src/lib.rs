@@ -5,6 +5,7 @@ mod explorer;
 mod keys;
 mod logger;
 mod p2p;
+mod proof_worker;
 mod signatories;
 mod version;
 
@@ -15,6 +16,7 @@ pub use explorer::*;
 pub use keys::*;
 pub use logger::*;
 pub use p2p::*;
+pub use proof_worker::*;
 pub use signatories::*;
 pub use version::*;
 

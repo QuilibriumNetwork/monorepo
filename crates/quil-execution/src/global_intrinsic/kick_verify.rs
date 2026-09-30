@@ -167,7 +167,7 @@ pub fn verify_prover_kick_full(
     if !use_forest {
         // Parse the kick's traversal proof bytes via the same Go-format
         // decoder used by mint PoMW.
-        let traversal = crate::token_intrinsic::mint::parse_go_traversal_proof(
+        let traversal = crate::traversal_proof::parse_traversal_proof(
             &kick.traversal_proof,
         )?;
         let traversal_ok = crate::traversal_proof::verify_traversal_proof(
@@ -301,22 +301,67 @@ pub fn verify_prover_kick_full(
         }
     }
 
-    // Bitmask-overlap check. Without this, anyone can submit two
-    // BLS-valid frames signed by arbitrary signer sets and have the
-    // network kick any prover whose pubkey they paste into
-    // `kicked_prover_public_key`. Go enforces this at
-    // `global_prover_kick.go:597-643`.
-    if let Some(pr) = prover_registry {
-        let (filter1, bitmask1) = extract_kick_frame_filter_and_bitmask(&kick.conflicting_frame_1)?;
-        let (filter2, bitmask2) = extract_kick_frame_filter_and_bitmask(&kick.conflicting_frame_2)?;
-        if filter1 != filter2 {
-            return Err(QuilError::InvalidArgument(
-                "ProverKick: conflicting frames have different filters/addresses".into(),
-            ));
-        }
-        verify_kick_bitmask_overlap(kick, &filter1, &bitmask1, &bitmask2, pr, frame_number)?;
+    // Signer binding + bitmask overlap. The signature checks above verify
+    // each frame against the keys the frame itself DECLARES; on their own
+    // they prove nothing about the committee. Both checks below are
+    // required, so the registry is mandatory (fail-closed):
+    //   1. the declared keys must be exactly the active committee members
+    //      named by each frame's bitmask (as FrameHeader validation does), so
+    //      a signature over the victim's bit really is the victim's;
+    //   2. the kicked prover's bit must be set in both frames (Go
+    //      `global_prover_kick.go:597-643`).
+    // Without (1), anyone could sign two conflicting frames with their own
+    // key, set the victim's bit, and evict an honest prover.
+    let pr = prover_registry.ok_or_else(|| QuilError::InvalidArgument(
+        "ProverKick: prover registry unavailable — cannot bind signers to the committee".into(),
+    ))?;
+    let (filter1, bitmask1) = extract_kick_frame_filter_and_bitmask(&kick.conflicting_frame_1)?;
+    let (filter2, bitmask2) = extract_kick_frame_filter_and_bitmask(&kick.conflicting_frame_2)?;
+    if filter1 != filter2 {
+        return Err(QuilError::InvalidArgument(
+            "ProverKick: conflicting frames have different filters/addresses".into(),
+        ));
     }
+    let active = pr.get_active_provers(&filter1, frame_number).map_err(|e| {
+        QuilError::InvalidArgument(format!("ProverKick: get_active_provers failed: {e}"))
+    })?;
+    verify_kick_frame_signers(&kick.conflicting_frame_1, &active, bls)?;
+    verify_kick_frame_signers(&kick.conflicting_frame_2, &active, bls)?;
+    verify_kick_bitmask_overlap(kick, &filter1, &bitmask1, &bitmask2, pr, frame_number)?;
 
+    Ok(())
+}
+
+/// Bind one conflicting frame's declared signer keys to the committee: the
+/// declared (concatenated) public key must equal the aggregate of the active
+/// provers' keys at the frame's bitmask positions, in bitmask order.
+pub fn verify_kick_frame_signers(
+    frame_bytes: &[u8],
+    active: &[quil_types::consensus::ProverInfo],
+    bls: &dyn quil_types::crypto::BlsConstructor,
+) -> Result<()> {
+    let (_, agg) = kick_frame_filter_and_aggregate(frame_bytes)?;
+    let mut keys: Vec<&[u8]> = Vec::new();
+    for index in quil_consensus::bitmask::set_bit_indices(&agg.bitmask) {
+        let prover = active.get(index).ok_or_else(|| QuilError::InvalidArgument(
+            "ProverKick: conflicting frame bitmask names a non-committee index".into(),
+        ))?;
+        keys.push(prover.public_key.as_slice());
+    }
+    if keys.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "ProverKick: conflicting frame has no signers".into(),
+        ));
+    }
+    let expected = bls.aggregate_public_keys(&keys).map_err(|e| {
+        QuilError::InvalidArgument(format!("ProverKick: committee key aggregation failed: {e}"))
+    })?;
+    let declared = agg.public_key.as_ref().map(|k| k.key_value.as_slice()).unwrap_or(&[]);
+    if expected.as_slice() != declared {
+        return Err(QuilError::InvalidArgument(
+            "ProverKick: conflicting frame's declared signer keys are not the committee members its bitmask names".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -383,6 +428,14 @@ pub fn verify_kick_bitmask_overlap(
 pub fn extract_kick_frame_filter_and_bitmask(
     frame_bytes: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (filter, agg) = kick_frame_filter_and_aggregate(frame_bytes)?;
+    Ok((filter, agg.bitmask))
+}
+
+/// `(filter_or_address, aggregate signature)` of one conflicting frame.
+fn kick_frame_filter_and_aggregate(
+    frame_bytes: &[u8],
+) -> Result<(Vec<u8>, crate::hypergraph_intrinsic::canonical::AggregateSignature)> {
     if frame_bytes.len() < 4 {
         return Err(QuilError::InvalidArgument(
             "ProverKick: conflicting frame too short".into(),
@@ -396,13 +449,13 @@ pub fn extract_kick_frame_filter_and_bitmask(
         let agg = crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
             &header.public_key_signature_bls48581,
         )?;
-        Ok((Vec::new(), agg.bitmask))
+        Ok((Vec::new(), agg))
     } else if tp == FRAME_HEADER_TYPE {
         let header = super::frame_header::FrameHeader::from_canonical_bytes(frame_bytes)?;
         let agg = crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
             &header.public_key_signature_bls48581,
         )?;
-        Ok((header.address, agg.bitmask))
+        Ok((header.address, agg))
     } else {
         Err(QuilError::InvalidArgument(format!(
             "ProverKick: conflicting frame has unknown type prefix 0x{:08x}", tp
@@ -478,9 +531,8 @@ fn local_global_header_to_proto(
         parent_selector: h.parent_selector.clone(),
         global_commitments: h.global_commitments.clone(),
         prover_tree_commitment: h.prover_tree_commitment.clone(),
-        // Signature-only verify path (poseidon(output)) — aux roots aren't
-        // needed here; the local execution header doesn't carry them.
-        prover_tree_aux_roots: Vec::new(),
+        prover_tree_aux_roots: h.prover_tree_aux_roots.clone(),
+        world_state_size: h.world_state_size,
         requests_root: h.requests_root.clone(),
         prover: h.prover.clone(),
         public_key_signature_bls48581: decode_aggregate_signature_to_proto(
@@ -510,6 +562,10 @@ fn local_app_header_to_proto(
         storage_attestation_root: h.storage_attestation_root.clone(),
         global_frame_number: h.global_frame_number,
         storage_attestation: h.storage_attestation.clone(),
+        fee_total: h.fee_total.clone(),
+        settlements: h.settlements.clone(),
+        accumulator: h.accumulator.clone(),
+        spends: h.spends.clone(),
     })
 }
 
@@ -761,8 +817,8 @@ mod tests {
             proof: vec![],
             traversal_proof: vec![],
         };
-        // Same output = same frame = not different, returns false
-        // Actually they ARE identical bytes so the identity check catches it
+        // Same output = same frame = not different, returns false: the
+        // frames are identical bytes, so the identity check catches it.
         assert!(!verify_equivocation_structural(&kick).unwrap());
     }
 
@@ -852,8 +908,70 @@ mod tests {
             storage_attestation_root: Vec::new(),
             global_frame_number: 0,
             storage_attestation: Vec::new(),
+            fee_total: Vec::new(),
+            settlements: Vec::new(),
+            accumulator: Vec::new(),
+            spends: Vec::new(),
         };
         header.to_canonical_bytes().unwrap()
+    }
+
+    // -----------------------------------------------------------------
+    // verify_kick_frame_signers
+    // -----------------------------------------------------------------
+
+    fn committee_key(seed: u8) -> Vec<u8> {
+        vec![seed; quil_crypto::FALCON_PUBLIC_KEY_LEN]
+    }
+
+    fn committee(seeds: &[u8]) -> Vec<ProverInfo> {
+        seeds.iter().map(|&seed| {
+            let key = committee_key(seed);
+            let mut info = fake_prover_info(quil_crypto::poseidon::hash_bytes_to_32(&key).unwrap());
+            info.public_key = key;
+            info
+        }).collect()
+    }
+
+    fn app_frame_with_declared_keys(bitmask: &[u8], declared: Option<Vec<u8>>) -> Vec<u8> {
+        let mut bytes = app_frame_bytes(&[0x22u8; 32], bitmask);
+        let mut header = FrameHeader::from_canonical_bytes(&bytes).unwrap();
+        header.public_key_signature_bls48581 = AggregateSignature {
+            signature: vec![0xABu8; 666 * bitmask.iter().map(|b| b.count_ones() as usize).sum::<usize>()],
+            public_key: declared.map(|key_value| crate::hypergraph_intrinsic::canonical::Bls48581G2PublicKey { key_value }),
+            bitmask: bitmask.to_vec(),
+        }.to_canonical_bytes().unwrap();
+        bytes = header.to_canonical_bytes().unwrap();
+        bytes
+    }
+
+    #[test]
+    fn kick_signers_accept_the_committee_members_named_by_the_bitmask() {
+        let active = committee(&[1, 2, 3]);
+        // Bits 0 and 2 → members 1 and 3, concatenated in bitmask order.
+        let declared = [committee_key(1), committee_key(3)].concat();
+        let frame = app_frame_with_declared_keys(&[0b0000_0101], Some(declared));
+        verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).unwrap();
+    }
+
+    /// The forged-kick shape: the attacker signs with their own key but sets
+    /// the victim's bit. The declared key is not the victim's → rejected.
+    #[test]
+    fn kick_signers_reject_a_foreign_key_behind_a_committee_bit() {
+        let active = committee(&[1, 2, 3]);
+        let frame = app_frame_with_declared_keys(&[0b0000_0010], Some(committee_key(0x99)));
+        assert!(verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err());
+        // Right keys in the wrong order are rejected too.
+        let swapped = [committee_key(3), committee_key(1)].concat();
+        let frame = app_frame_with_declared_keys(&[0b0000_0101], Some(swapped));
+        assert!(verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err());
+        // Missing declared key, empty bitmask, and out-of-committee indices.
+        let frame = app_frame_with_declared_keys(&[0b0000_0001], None);
+        assert!(verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err());
+        let frame = app_frame_with_declared_keys(&[0], Some(committee_key(1)));
+        assert!(verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err());
+        let frame = app_frame_with_declared_keys(&[0b0000_1000], Some(committee_key(4)));
+        assert!(verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err());
     }
 
     #[test]

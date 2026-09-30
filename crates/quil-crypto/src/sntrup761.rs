@@ -1,7 +1,7 @@
 //! sntrup761 (Streamlined NTRU Prime) KEM — post-quantum config read/encryption
 //! keys, replacing X448.
 //!
-//! swaps the classical X448 config *read key* (the
+//! Swaps the classical X448 config *read key* (the
 //! key third parties encapsulate to when writing owner-readable data) for the
 //! NTRU-Prime KEM `sntrup761`. NTRU-family (the assumption already trusted for
 //! the Falcon signature primitive and the QUIC transport key-exchange), CPU-fast,

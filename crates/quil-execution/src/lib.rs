@@ -3,6 +3,8 @@ pub mod compute_engine;
 pub mod compute_intrinsic;
 pub mod engines;
 pub mod fees;
+pub mod pricing;
+pub mod global_anchor_view;
 pub mod global_engine;
 pub mod global_intrinsic;
 pub mod global_schema;
@@ -17,6 +19,8 @@ pub mod prover_registry;
 pub mod seniority_compat;
 #[cfg(any(test, feature = "testing-stubs"))]
 pub mod testing;
+#[cfg(all(test, feature = "confidential-tokens"))]
+mod decoder_fuzz_tests;
 pub mod token_engine;
 pub mod token_intrinsic;
 pub mod traversal_proof;
@@ -31,8 +35,9 @@ pub use global_schema::{
     ClassDef, FieldTag, RdfType, GLOBAL_CLASSES, GLOBAL_INTRINSIC_ADDRESS, GLOBAL_MAX_ORDER,
     TYPE_HASH_ALLOCATION, TYPE_HASH_PROVER, TYPE_HASH_REWARD, TYPE_HASH_TABLE,
 };
-pub use manager::ExecutionEngineManager;
-pub use prover_registry::{InMemoryProverRegistry, SharedProverRegistry};
+pub use manager::{ExecutionBranch, ExecutionBranchLimits, ExecutionEngineManager, ExecutionForkContext, ExecutionPublicationGuard};
+pub use global_anchor_view::GlobalAnchorView;
+pub use prover_registry::{InMemoryProverRegistry, RegistryLimits, RegistryUsage, SharedProverRegistry};
 
 /// Well-known domain addresses for execution engines.
 pub mod domains {

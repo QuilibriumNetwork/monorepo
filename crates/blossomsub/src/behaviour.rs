@@ -77,9 +77,8 @@ use std::{cmp::Ordering::Equal, fmt::Debug};
 /// (`prune_backoff` is seconds) while staying nowhere near overflow.
 const MAX_PEER_BACKOFF_SECS: u64 = 2 * 60 * 60;
 
-// Upstream's 5000-line async-std integration suite is quarantined during the
-// BlossomSub fork — it's replaced in Stage 7 by the deterministic
-// `test_harness` port. The file is kept (behaviour/tests.rs) as a reference.
+// Upstream's 5000-line async-std integration suite is quarantined in the
+// BlossomSub fork — superseded by the deterministic `test_harness` port. The file is kept (behaviour/tests.rs) as a reference.
 #[cfg(all(test, feature = "upstream-tests"))]
 mod tests;
 
@@ -4691,8 +4690,8 @@ impl fmt::Debug for PublishConfig {
     }
 }
 
-// Quarantined during the fork: quickcheck property test over the native RpcOut
-// fragmentation/codec (replaced by the BlossomSub wire in Stage 2).
+// Quarantined in the fork: quickcheck property test over the native RpcOut
+// fragmentation/codec (replaced by the BlossomSub wire).
 #[cfg(all(test, feature = "upstream-tests"))]
 mod local_test {
     use super::*;
@@ -4732,7 +4731,7 @@ mod local_test {
     }
 }
 
-// Stage-3 composite same/broker overlap mesh tests. These are NOT gated behind
+// Composite same/broker overlap mesh tests. These are NOT gated behind
 // the quarantined `upstream-tests` feature — they run on the default test
 // build. Ported from the `composites`/`join_composite`/`mesh_recipients`/broker
 // tests in `quil-p2p`'s `behaviour.rs`.
@@ -5250,7 +5249,7 @@ mod composite_behaviour_tests {
         assert!(gs.mesh[&simple].contains(&q));
     }
 
-    // ---- Stage 5: per-subnet mesh cap (MESH_PEERS_PER_SUBNET) ----
+    // ---- Per-subnet mesh cap (MESH_PEERS_PER_SUBNET) ----
 
     /// Register `peer` with the scorer and give it a known IP (so it buckets to
     /// a /24 · /48 for the subnet cap). Mirrors how connections feed `add_ip`.
@@ -5410,7 +5409,7 @@ mod composite_behaviour_tests {
         );
     }
 
-    /// Item 5: a direct (explicit) peer receives a composite-topic publish even
+    /// A direct (explicit) peer receives a composite-topic publish even
     /// though it is NOT a composite member (same/broker) and not in any slice
     /// mesh — direct peers are forwarded to outside the mesh/subnet/score
     /// system. Flood is disabled so the ONLY path to the direct peer is the
@@ -5457,7 +5456,7 @@ mod composite_behaviour_tests {
     }
 }
 
-/// Stage-4 tests: scoring is LIVE on the default-constructed behaviour, control
+/// Tests that scoring is LIVE on the default-constructed behaviour, control
 /// batching folds to one RPC per peer, and the IDONTWANT round trip works.
 ///
 /// Every scoring test below reaches through `gs.peer_score` (installed by

@@ -2,14 +2,13 @@
 //! [`ProverTreeSyncer`](crate::prover_tree_syncer_prod) and the archive
 //! state-jump).
 //!
-//! Each pull does two things: (1) the efficient Merkle diff of the COMMITMENT
+//! Each pull authenticates an efficient Merkle diff of the COMMITMENT
 //! (forest JMT) via [`quil_forest::diff_leaves`] through a gRPC-backed
-//! [`RemoteTreeReader`](quil_rpc::RemoteTreeReader), and (2) the readable DATA:
-//! the diff's changed leaves are mapped to their vertices (via the peer's
-//! key-hash → raw-key preimages) and those vertices' blobs are pulled and stored
-//! in the blob keyspace — where `get_vertex_data` / the prover registry read
-//! (they do NOT read the forest). Without (2) a synced node would have correct
-//! roots but no readable state.
+//! [`RemoteTreeReader`](quil_rpc::RemoteTreeReader), then downloads the readable DATA:
+//! each changed leaf names a vertex whose blob is verified and committed in
+//! the same bounded transaction as that leaf, in the blob keyspace — where `get_vertex_data` / the prover registry read
+//! (they do NOT read the forest). A failed or interrupted download cannot
+//! leave a new tree head whose data is missing.
 
 use std::sync::Arc;
 
@@ -17,7 +16,88 @@ use quil_hypergraph::addressing::get_bloom_filter_indices;
 use quil_rpc::{ArchiveClient, RemoteTreeReader};
 use quil_types::error::{QuilError, Result};
 use quil_types::store::ShardKey;
-use tracing::warn;
+use tracing::{info, warn};
+
+pub(crate) const EMPTY_PHASE_ROOT: [u8; 32] = *b"SPARSE_MERKLE_PLACEHOLDER_HASH__";
+
+pub(crate) fn is_empty_phase_root(root: &[u8]) -> bool {
+    root == [0u8; 32] || root == EMPTY_PHASE_ROOT
+}
+
+pub(crate) fn phase_anchor(root: &[u8]) -> Result<Option<[u8; 32]>> {
+    if root.is_empty() { return Ok(None); }
+    root.try_into().map(Some).map_err(|_| {
+        QuilError::InvalidArgument("phase anchor must contain exactly 32 bytes".into())
+    })
+}
+
+#[async_trait::async_trait]
+trait PhaseSourceLookup {
+    async fn head(&mut self, shard: &[u8], phase: u32) -> Result<Option<(u64, Vec<u8>)>>;
+    async fn resolve(&mut self, shard: &[u8], phase: u32, root: &[u8; 32])
+        -> Result<Option<(u64, u64)>>;
+}
+
+#[async_trait::async_trait]
+impl PhaseSourceLookup for ArchiveClient {
+    async fn head(&mut self, shard: &[u8], phase: u32) -> Result<Option<(u64, Vec<u8>)>> {
+        self.get_forest_head(shard.to_vec(), phase).await
+            .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))
+    }
+
+    async fn resolve(&mut self, shard: &[u8], phase: u32, root: &[u8; 32])
+        -> Result<Option<(u64, u64)>> {
+        self.resolve_root(shard.to_vec(), phase, root.to_vec()).await
+            .map_err(|e| QuilError::Internal(format!("resolve_root: {e}")))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum PhaseSource {
+    Empty,
+    Tree { version: u64, root: [u8; 32], global_frame: u64 },
+}
+
+/// Resolve a committed root independently of the peer's advancing live head.
+/// Empty source state is successful only when the local physical tree is empty
+/// too; sync cannot delete stale state just by skipping a missing peer phase.
+async fn resolve_phase_source(
+    source: &mut impl PhaseSourceLookup,
+    crdt: &quil_hypergraph::HypergraphCrdt,
+    shard: &[u8],
+    phase: u32,
+    expected: &[u8],
+) -> Result<Option<PhaseSource>> {
+    let empty_local = || -> Result<Option<PhaseSource>> {
+        Ok(is_empty_phase_root(&crdt.current_forest_phase_root(shard, phase as usize)?)
+            .then_some(PhaseSource::Empty))
+    };
+    if let Some(anchor) = phase_anchor(expected)? {
+        if is_empty_phase_root(&anchor) { return empty_local(); }
+        if let Some((version, global_frame)) = source.resolve(shard, phase, &anchor).await? {
+            return Ok(Some(PhaseSource::Tree { version, root: anchor, global_frame }));
+        }
+        // Phase 0 also supplies the frame cursor, so a root match without a
+        // retained root-to-frame mapping is insufficient for that phase.
+        if phase != 0 {
+            if let Some((version, root)) = source.head(shard, phase).await? {
+                if root.as_slice() == anchor {
+                    return Ok(Some(PhaseSource::Tree { version, root: anchor, global_frame: 0 }));
+                }
+            }
+        }
+        return Ok(None);
+    }
+    match source.head(shard, phase).await? {
+        None => empty_local(),
+        Some((version, root)) => {
+            let root = phase_anchor(&root)?.ok_or_else(|| {
+                QuilError::InvalidArgument("peer forest head has no root".into())
+            })?;
+            Ok(Some(PhaseSource::Tree { version, root, global_frame: 0 }))
+        }
+    }
+}
 
 /// `(set, phase)` string pair — the blob keyspace keying, matching the CRDT.
 pub(crate) fn phase_strs(phase: u32) -> (&'static str, &'static str) {
@@ -41,87 +121,107 @@ pub(crate) fn app_shard_key(shard_id: &[u8]) -> Option<ShardKey> {
     Some(ShardKey { l1: get_bloom_filter_indices(&l2, 256, 3), l2 })
 }
 
-/// Given the CHANGED key-hashes of a synced shard/phase, fetch the raw-key
-/// preimage of each (→ the vertex id), dedup, then pull and store each changed
-/// vertex's blob (the readable data) into the CRDT's blob keyspace.
-async fn fetch_changed_blobs(
+/// Download readable data before installing the corresponding tree leaves.
+/// Empty tombstones are reconstructed directly from their authenticated leaves.
+async fn fetch_sync_blob(
     client: &mut ArchiveClient,
+    crdt: &quil_hypergraph::HypergraphCrdt,
+    shard_id: &[u8],
+    phase: u32,
+    source_version: u64,
+    key: &[u8; 32],
+    leaf: &[u8],
+) -> Result<Vec<u8>> {
+    use quil_hypergraph::crdt::sync_blob_matches;
+    if sync_blob_matches(phase as usize, leaf, &[])? { return Ok(Vec::new()); }
+    let shard = app_shard_key(shard_id)
+        .ok_or_else(|| QuilError::InvalidArgument("invalid sync shard".into()))?;
+    let mut vertex_id = shard.l2.to_vec();
+    vertex_id.extend_from_slice(key);
+    if let Some(blob) = crdt.peek_synced_blob(&shard, phase as usize, &vertex_id) {
+        if sync_blob_matches(phase as usize, leaf, &blob)? { return Ok(blob); }
+    }
+    let shard_bytes = shard.l1.iter().copied().chain(shard.l2).collect();
+    let blob = client.get_vertex_blob_at(shard_bytes, phase, vertex_id.clone(), source_version)
+        .await.map_err(|e| QuilError::Internal(format!("get_vertex_blob: {e}")))?
+        .ok_or_else(|| QuilError::ExecutionUnavailable(format!(
+            "peer did not serve blob {} at phase {phase}, version {source_version}", hex::encode(&vertex_id),
+        )))?;
+    if !sync_blob_matches(phase as usize, leaf, &blob)? {
+        return Err(QuilError::InvalidArgument("peer served a blob not bound to its authenticated leaf".into()));
+    }
+    Ok(blob)
+}
+
+/// The tree head never advances without the data needed to read its new
+/// leaves. Each bounded transaction is a resumable intermediate tree; only
+/// the complete, current target root is reported as a successful sync.
+#[allow(clippy::too_many_arguments)]
+async fn sync_phase_data(
+    client: &mut ArchiveClient,
+    handle: &tokio::runtime::Handle,
     crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
     shard_id: &[u8],
     phase: u32,
-    // Version to request from the peer (the tree version the diff addressed),
-    // which pins each served blob to the authenticated leaf commitment.
     source_version: u64,
-    // The local tree version is selected after all blobs are ready; successful
-    // full-tree sync persists them with the tree in one transaction.
-    changed: Vec<([u8; 32], Vec<u8>)>,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let Some(shard) = app_shard_key(shard_id) else { return Ok(Vec::new()); };
-    let mut fetched = Vec::new();
-    let shard_key_bytes: Vec<u8> = shard.l1.iter().copied().chain(shard.l2).collect();
-    for (kh, leaf_value) in changed {
-        // Per-vertex-subtree raw-key model: the changed `key_hash` IS the
-        // vertex's 32-byte DATA address (no preimage round-trip), so the vertex
-        // id is `app(32) ‖ key_hash(32)` — the app address is this shard's `l2`.
-        let mut vertex_id = shard.l2.to_vec();
-        vertex_id.extend_from_slice(&kh);
-        // A vertex the client already holds needs no re-fetch — but ONLY if the
-        // blob we hold is the CORRECT one, i.e. it hashes to the committed
-        // `leaf_value` (commitment‖size) the diff just applied. The old
-        // `is_some()` check skipped on ANY existing blob, including an EMPTY
-        // add-side placeholder (staged by `remove_vertex` for a
-        // removed-but-never-added id) or a STALE prior-version blob. That left
-        // the real vertex data un-fetched: `read_blob` then returns the empty /
-        // stale blob and callers see nothing (e.g. a synced prover's reward
-        // balance reads 0 forever). Re-fetch unless we already hold the exact
-        // committed blob.
-        let have_correct = crdt
-            .peek_synced_blob(&shard, phase as usize, &vertex_id)
-            .filter(|b| !b.is_empty())
-            .and_then(|b| quil_tries::vertex_leaf_value(&b).ok())
-            .map(|recomputed| recomputed == leaf_value)
-            .unwrap_or(false);
-        if have_correct {
-            continue;
-        }
-        let Some(blob) = client
-            .get_vertex_blob(shard_key_bytes.clone(), phase, vertex_id.clone(), source_version)
-            .await
-            .map_err(|e| QuilError::Internal(format!("get_vertex_blob: {e}")))?
-        else {
-            // FAIL, don't skip (audit residual #4): this leaf is in the diff the
-            // peer committed to in its authenticated root, so its blob MUST exist.
-            // Skipping left the tree with a correct root but MISSING data (later
-            // reads of this vertex return nothing). Abort so the caller retries /
-            // picks another peer rather than completing an incomplete sync.
-            return Err(QuilError::Internal(format!(
-                "peer did not serve blob for changed vertex {} (phase {}, ver {}) — \
-                 incomplete sync, aborting",
-                hex::encode(&vertex_id),
-                phase,
-                source_version
-            )));
-        };
-        // SECURITY: the served blob MUST hash to the committed leaf value
-        // (`commitment ‖ size`), else a peer could serve data not bound to the
-        // authenticated shard root we just synced.
-        let recomputed = quil_tries::vertex_leaf_value(&blob)
-            .map_err(|e| QuilError::Internal(format!("vertex_leaf_value: {e}")))?;
-        if recomputed != leaf_value {
-            return Err(QuilError::Internal(format!(
-                "synced blob for {} does not match its committed commitment‖size \
-                 (peer served unbound data)",
-                hex::encode(&vertex_id)
-            )));
-        }
-        fetched.push((vertex_id, blob));
+    bit_path: Vec<bool>,
+    anchor: Option<quil_forest::SubtreeSyncAnchor>,
+) -> Result<[u8; 32]> {
+    use quil_hypergraph::crdt::{sync_blob_matches, MAX_SYNC_CHUNK_BYTES, MAX_SYNC_CHUNK_LEAVES};
+    let remote = RemoteTreeReader::new(client.clone(), handle.clone(), shard_id.to_vec(), phase);
+    let c = crdt.clone();
+    let sid = shard_id.to_vec();
+    let mut plan = tokio::task::spawn_blocking(move || {
+        c.prepare_phase_sync(&remote, source_version, &sid, phase as usize, &bit_path, anchor)
+    }).await.map_err(|e| QuilError::Internal(format!("sync preparation task: {e}")))??;
+    let planned = plan.remaining().len();
+    if planned > 0 {
+        info!(shard = %hex::encode(&shard_id[..shard_id.len().min(8)]), phase, leaves = planned, "sync phase: installing changed leaves");
     }
-    Ok(fetched)
+    let mut next_report = 1024usize;
+    while !plan.remaining().is_empty() {
+        let installed = planned - plan.remaining().len();
+        if installed >= next_report {
+            info!(shard = %hex::encode(&shard_id[..shard_id.len().min(8)]), phase, installed, planned, "sync phase: installing");
+            next_report *= 2;
+        }
+        let mut blobs = Vec::new();
+        let mut bytes = 0usize;
+        for (key, leaf) in plan.remaining().iter().take(MAX_SYNC_CHUNK_LEAVES) {
+            let Some(leaf) = leaf else {
+                // The prepared, root-checked GLOBAL diff proves absence. No
+                // readable blob is fetched for a removed local-only record.
+                blobs.push(Vec::new());
+                continue;
+            };
+            // Size is authenticated in the leaf. Flush before fetching the
+            // next blob, so collecting a cold sync never retains all blobs.
+            let size = if sync_blob_matches(phase as usize, leaf, &[])? { 0 } else {
+                let (_, size) = quil_tries::split_vertex_leaf(leaf)
+                    .ok_or_else(|| QuilError::InvalidArgument("malformed synced vertex leaf".into()))?;
+                usize::try_from(size).map_err(|_| QuilError::InvalidArgument("synced blob too large".into()))?
+            };
+            if size > MAX_SYNC_CHUNK_BYTES {
+                return Err(QuilError::ExecutionUnavailable("synced blob exceeds the transfer limit".into()));
+            }
+            if !blobs.is_empty() && bytes + size > MAX_SYNC_CHUNK_BYTES { break; }
+            let blob = fetch_sync_blob(client, crdt, shard_id, phase, source_version, key, leaf).await?;
+            bytes += blob.len();
+            blobs.push(blob);
+        }
+        let c = crdt.clone();
+        plan = tokio::task::spawn_blocking(move || {
+            c.apply_sync_chunk(&mut plan, &blobs)?;
+            Ok::<_, QuilError>(plan)
+        }).await.map_err(|e| QuilError::Internal(format!("sync installation task: {e}")))??;
+    }
+    let c = crdt.clone();
+    tokio::task::spawn_blocking(move || c.finish_phase_sync(&plan))
+        .await.map_err(|e| QuilError::Internal(format!("sync completion task: {e}")))?
 }
 
-/// Sync ONE forest tree's phase from a peer: diff + apply the commitment, then
-/// pull the changed vertices' blobs. Returns the new root (for the caller to
-/// verify, if it has an expected root).
+/// Sync one complete phase, authenticating the remote root and installing
+/// changed leaves with their readable blobs in bounded atomic transactions.
 pub async fn sync_one_phase(
     client: &mut ArchiveClient,
     handle: &tokio::runtime::Handle,
@@ -129,53 +229,14 @@ pub async fn sync_one_phase(
     shard_id: &[u8],
     phase: u32,
     source_version: u64,
-    // The peer's advertised root for this shard/phase (from `get_forest_head`).
-    // When it already equals our LOCAL root the trees are identical — the diff
-    // would return no changed leaves and fetch no blobs — so we skip the whole
-    // O(tree) diff walk (the caught-up steady state, which otherwise burns a
-    // full-tree diff every sync tick and, before this, held the forest lock while
-    // doing it). `None` (peer root unknown) always diffs.
     remote_root: Option<[u8; 32]>,
 ) -> Result<[u8; 32]> {
-    // (#1) Cheap root-check short-circuit. `compute_shard_root` is a plain
-    // forest read (no recompute); when it matches the peer root there is nothing
-    // to sync — return it without touching the diff or the forest lock.
-    if let Some(rr) = remote_root {
-        if let Some(sk) = app_shard_key(shard_id) {
-            let (s, p) = phase_strs(phase);
-            if crdt.compute_shard_root(s, p, &sk).as_slice() == rr.as_slice() {
-                return Ok(rr);
-            }
-        }
-    }
-    let remote = RemoteTreeReader::new(client.clone(), handle.clone(), shard_id.to_vec(), phase);
-    let c = crdt.clone();
-    let sid = shard_id.to_vec();
-    let prepared = tokio::task::spawn_blocking(move || {
-        c.prepare_shard_phase_sync(&remote, source_version, &sid, phase as usize)
-    })
-    .await
-    .map_err(|e| QuilError::Internal(format!("sync task join: {e}")))?
-    .map_err(|e| QuilError::Internal(format!("sync prepare: {e}")))?;
-    let changed = prepared.changed_leaves();
-    let blobs = fetch_changed_blobs(client, crdt, shard_id, phase, source_version, changed).await?;
-    let blob_shard = app_shard_key(shard_id);
-    let c = crdt.clone();
-    let (root, _) = tokio::task::spawn_blocking(move || {
-        c.apply_prepared_shard_phase_sync(prepared, blob_shard.as_ref(), &blobs)
-    })
-    .await
-    .map_err(|e| QuilError::Internal(format!("sync task join: {e}")))?
-    .map_err(|e| QuilError::Internal(format!("sync apply: {e}")))?;
-    Ok(root)
+    sync_phase_data(client, handle, crdt, shard_id, phase, source_version, Vec::new(),
+        remote_root.map(quil_forest::SubtreeSyncAnchor::AppRoot)).await
 }
 
-/// UNIFIED shard-prover subtree-range sync of ONE phase: pull only the leaves
-/// under `bit_path` (this prover's shard prefix) from the peer's APP tree
-/// (`shard_id = app`), authenticated against `pinned_app_root` (the trusted
-/// header app root), and apply to the local app tree. Returns the local subtree
-/// root (shard commitment). This is the per-shard counterpart of
-/// [`sync_one_phase`] — a shard prover NEVER pulls the whole app.
+/// Pull only the covered subtree from a unified application, pinned to the
+/// subtree commitment carried in the trusted shard header.
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_subtree_one_phase(
     client: &mut ArchiveClient,
@@ -185,35 +246,10 @@ pub async fn sync_subtree_one_phase(
     phase: u32,
     source_version: u64,
     bit_path: Vec<bool>,
-    pinned_app_root: Option<[u8; 32]>,
+    pinned_subtree_root: Option<[u8; 32]>,
 ) -> Result<[u8; 32]> {
-    let remote = RemoteTreeReader::new(client.clone(), handle.clone(), app.to_vec(), phase);
-    let c = crdt.clone();
-    let app_v = app.to_vec();
-    let prepared = tokio::task::spawn_blocking(move || {
-        c.prepare_shard_subtree_phase_sync(
-            &remote,
-            source_version,
-            &app_v,
-            phase as usize,
-            &bit_path,
-            pinned_app_root,
-        )
-    })
-    .await
-    .map_err(|e| QuilError::Internal(format!("subtree sync task join: {e}")))?
-    .map_err(|e| QuilError::Internal(format!("subtree sync prepare: {e}")))?;
-    let changed = prepared.changed_leaves();
-    let blobs = fetch_changed_blobs(client, crdt, app, phase, source_version, changed).await?;
-    let blob_shard = app_shard_key(app);
-    let c = crdt.clone();
-    let (root, _) = tokio::task::spawn_blocking(move || {
-        c.apply_prepared_shard_subtree_phase_sync(prepared, blob_shard.as_ref(), &blobs)
-    })
-    .await
-    .map_err(|e| QuilError::Internal(format!("subtree sync task join: {e}")))?
-    .map_err(|e| QuilError::Internal(format!("subtree sync apply: {e}")))?;
-    Ok(root)
+    sync_phase_data(client, handle, crdt, app, phase, source_version, bit_path,
+        pinned_subtree_root.map(quil_forest::SubtreeSyncAnchor::SubtreeRoot)).await
 }
 
 /// Sync a SINGLE-shard forest tree (all four phases + blobs) from `addr`,
@@ -269,6 +305,7 @@ pub async fn sync_shard_phases_verified(
     shard_id: &[u8],
     expected: [&[u8]; 4],
 ) -> Result<Option<u64>> {
+    for root in expected { phase_anchor(root)?; }
     let mut client = ArchiveClient::connect_mtls(addr, falcon_signing_key)
         .await
         .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
@@ -278,59 +315,17 @@ pub async fn sync_shard_phases_verified(
     let mut pinned_frame: u64 = 0;
     for phase in 0u32..4 {
         let exp = expected[phase as usize];
-        let (source_version, remote_root) = if exp.is_empty() {
-            let head = client
-                .get_forest_head(shard_id.to_vec(), phase)
-                .await
-                .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))?;
-            let Some((v_s, root_s)) = head else { continue };
-            (v_s, <[u8; 32]>::try_from(root_s.as_slice()).ok())
-        } else {
-            let Ok(anchor) = <[u8; 32]>::try_from(exp) else {
-                return Ok(None);
-            };
-            match client
-                .resolve_root(shard_id.to_vec(), phase, anchor.to_vec())
-                .await
-                .map_err(|e| QuilError::Internal(format!("resolve_root: {e}")))?
-            {
-                Some((v, g)) => {
-                    if phase == 0 {
-                        pinned_frame = g;
-                    }
-                    (v, Some(anchor))
-                }
-                None => {
-                    if phase == 0 {
-                        warn!(
-                            anchor = %hex::encode(exp),
-                            "peer has no version for the authenticated phase-0 anchor (behind/pruned) — trying another peer",
-                        );
-                        return Ok(None);
-                    }
-                    // Auxiliary phase: accept ONLY if the anchor is the peer's
-                    // current head (empty/unchanged tree — root never separately
-                    // versioned); else the peer can't serve the anchored version.
-                    let head = client
-                        .get_forest_head(shard_id.to_vec(), phase)
-                        .await
-                        .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))?;
-                    match head {
-                        Some((v_s, root_s)) if root_s.as_slice() == exp => (v_s, Some(anchor)),
-                        _ => {
-                            warn!(
-                                phase,
-                                anchor = %hex::encode(exp),
-                                "peer cannot serve the anchored phase version — trying another peer",
-                            );
-                            return Ok(None);
-                        }
-                    }
-                }
-            }
+        let Some(source) = resolve_phase_source(&mut client, &crdt, shard_id, phase, exp).await? else {
+            warn!(phase, anchor = %hex::encode(exp),
+                "phase cannot reach its anchor: source unavailable or empty source with stale local data");
+            return Ok(None);
         };
+        let PhaseSource::Tree { version: source_version, root: remote_root, global_frame } = source else {
+            continue;
+        };
+        if phase == 0 { pinned_frame = global_frame; }
         let got =
-            sync_one_phase(&mut client, &handle, &crdt, shard_id, phase, source_version, remote_root)
+            sync_one_phase(&mut client, &handle, &crdt, shard_id, phase, source_version, Some(remote_root))
                 .await?;
         if !exp.is_empty() {
             if got.as_slice() != exp {
@@ -351,7 +346,7 @@ pub async fn sync_shard_phases_verified(
             // phase 0's resolved global frame (the same header frame for phases 1-3);
             // 0 ⇒ unanchored/bootstrap ⇒ nothing to index against a frame.
             if pinned_frame != 0 {
-                let _ = crdt.index_synced_root(shard_id, phase as usize, exp, pinned_frame);
+                crdt.index_synced_root(shard_id, phase as usize, exp, pinned_frame)?;
             }
         }
     }
@@ -391,4 +386,98 @@ pub async fn pull_shard_from_peer(
         }
     }
     Ok(synced)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Peer {
+        head: Option<(u64, Vec<u8>)>,
+        resolved: Option<(u64, u64)>,
+        head_calls: usize,
+        resolve_calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl PhaseSourceLookup for Peer {
+        async fn head(&mut self, _: &[u8], _: u32) -> Result<Option<(u64, Vec<u8>)>> {
+            self.head_calls += 1;
+            Ok(self.head.clone())
+        }
+        async fn resolve(&mut self, _: &[u8], _: u32, _: &[u8; 32]) -> Result<Option<(u64, u64)>> {
+            self.resolve_calls += 1;
+            Ok(self.resolved)
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, Arc<quil_hypergraph::HypergraphCrdt>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(quil_store::RocksDb::open(dir.path()).unwrap());
+        let crdt = crate::master_node::worker_manager::build_thread_worker_hypergraph(
+            &db, Arc::new(quil_tries::ShaInclusionProver), false,
+        );
+        (dir, crdt)
+    }
+
+    #[tokio::test]
+    async fn committed_phase_resolves_history_even_when_peer_head_has_advanced() {
+        let (_dir, crdt) = fixture();
+        let mut peer = Peer { head: Some((40, vec![9; 32])), resolved: Some((12, 81)), head_calls: 0, resolve_calls: 0 };
+        assert_eq!(resolve_phase_source(&mut peer, &crdt, &[4; 32], 0, &[7; 32]).await.unwrap(),
+            Some(PhaseSource::Tree { version: 12, root: [7; 32], global_frame: 81 }));
+        assert_eq!((peer.resolve_calls, peer.head_calls), (1, 0));
+
+        // A matching live root alone cannot fabricate the phase-0 frame cursor.
+        peer.resolved = None;
+        peer.head = Some((40, vec![7; 32]));
+        assert_eq!(resolve_phase_source(&mut peer, &crdt, &[4; 32], 0, &[7; 32]).await.unwrap(), None);
+        // An unchanged auxiliary root needs no separate frame cursor.
+        assert_eq!(resolve_phase_source(&mut peer, &crdt, &[4; 32], 2, &[7; 32]).await.unwrap(),
+            Some(PhaseSource::Tree { version: 40, root: [7; 32], global_frame: 0 }));
+        peer.head = Some((40, vec![9; 32]));
+        assert_eq!(resolve_phase_source(&mut peer, &crdt, &[4; 32], 2, &[7; 32]).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn empty_or_absent_source_cannot_hide_stale_local_phase_data() {
+        let (_dir, crdt) = fixture();
+        let app = [5; 32];
+        let mut peer = Peer { head: None, resolved: None, head_calls: 0, resolve_calls: 0 };
+        for root in [[0; 32], EMPTY_PHASE_ROOT] {
+            assert_eq!(resolve_phase_source(&mut peer, &crdt, &app, 0, &root).await.unwrap(), Some(PhaseSource::Empty));
+        }
+        assert_eq!((peer.head_calls, peer.resolve_calls), (0, 0));
+        assert_eq!(resolve_phase_source(&mut peer, &crdt, &app, 0, &[]).await.unwrap(), Some(PhaseSource::Empty));
+
+        crdt.add_vertex(&quil_hypergraph::Location { app_address: app, data_address: [1; 32] }, b"stale").unwrap();
+        crdt.commit(1).unwrap();
+        let before = crdt.current_forest_phase_root(&app, 0).unwrap();
+        for root in [Vec::new(), vec![0; 32], EMPTY_PHASE_ROOT.to_vec()] {
+            assert_eq!(resolve_phase_source(&mut peer, &crdt, &app, 0, &root).await.unwrap(), None);
+            assert_eq!(crdt.current_forest_phase_root(&app, 0).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_is_distinct_from_empty_or_malformed_commitments() {
+        let (_dir, crdt) = fixture();
+        let mut peer = Peer { head: Some((0, vec![8; 32])), resolved: None, head_calls: 0, resolve_calls: 0 };
+        assert_eq!(phase_anchor(&[]).unwrap(), None);
+        assert!(!is_empty_phase_root(&[]));
+        assert_eq!(resolve_phase_source(&mut peer, &crdt, &[3; 32], 0, &[]).await.unwrap(),
+            Some(PhaseSource::Tree { version: 0, root: [8; 32], global_frame: 0 }));
+        for size in [1, 16, 31, 33, 64] {
+            assert!(resolve_phase_source(&mut peer, &crdt, &[3; 32], 0, &vec![0; size]).await.is_err());
+        }
+        assert_eq!(peer.resolve_calls, 0);
+        assert_eq!(peer.head_calls, 1);
+        for root in [vec![], vec![0; 31]] {
+            peer.head = Some((0, root));
+            assert!(resolve_phase_source(&mut peer, &crdt, &[3; 32], 0, &[]).await.is_err());
+        }
+        let mut forged = EMPTY_PHASE_ROOT;
+        forged[31] ^= 1;
+        assert!(!is_empty_phase_root(&forged));
+    }
 }

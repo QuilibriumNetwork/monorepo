@@ -7,7 +7,7 @@
 //! commitments differ between the schemes (leaf commits were already SHA-512),
 //! so the conversion is a re-roll, not a re-hash of leaf content.
 //!
-//! # The flattening (design decision "b")
+//! # The flattening
 //!
 //! In the legacy layout each shard-phase tree leaf VALUE is itself a
 //! serialized per-vertex [`VectorCommitmentTree`]
@@ -27,10 +27,12 @@ use quil_forest::l3_leaf_key;
 use quil_tries::{deserialize_go_tree, VectorCommitmentTree};
 
 mod walk;
+mod consolidation;
+pub use consolidation::run_unified_consolidation;
 pub use walk::{
-    convert_app, convert_db, convert_shard, install_forest_boot, install_forest_for_sync,
-    install_forest_if_migrated, quil_shards_for_app, run_conversion, run_conversion_in_place,
-    run_conversion_in_place_with_shards, run_unified_consolidation_in_place,
+    convert_app, convert_app_at_versions, convert_db, convert_shard, install_forest_boot,
+    install_forest_for_sync, install_forest_if_migrated, quil_shards_for_app, run_conversion,
+    run_conversion_in_place, run_conversion_in_place_with_shards, run_unified_consolidation_in_place,
     shards_for_app_from_store, ConvertReport, ShardConversion,
 };
 
@@ -159,7 +161,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        let db = std::sync::Arc::new(rocksdb::DB::open(&opts, dir.path()).unwrap());
+        let db = quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, dir.path()).unwrap());
         let forest = quil_forest::Forest::new(db);
         let committed = forest
             .commit_shard_phase(b"shard", quil_forest::Phase::VertexAdds, 0, flatten_phase_leaves(blobs).unwrap())

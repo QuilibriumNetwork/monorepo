@@ -23,13 +23,13 @@ impl quil_types::crypto::InclusionProver for StubProver {
     fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
 }
 
-fn open_db(path: &std::path::Path) -> Arc<rocksdb::DB> {
+fn open_db(path: &std::path::Path) -> quil_forest::CoordinatedDb {
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
-    Arc::new(rocksdb::DB::open(&opts, path).unwrap())
+    quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, path).unwrap())
 }
 
-fn crdt(db: Arc<rocksdb::DB>, app: [u8; 32]) -> HypergraphCrdt {
+fn crdt(db: quil_forest::CoordinatedDb, app: [u8; 32]) -> HypergraphCrdt {
     let hg = Arc::new(RocksHypergraphStore::new(db));
     let c = HypergraphCrdt::new(hg.clone() as Arc<dyn HypergraphStore>, Arc::new(StubProver));
     c.set_forest(Forest::with_namespace(hg.raw_db(), FOREST_NAMESPACE.to_vec()));

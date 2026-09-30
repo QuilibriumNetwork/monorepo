@@ -1,6 +1,6 @@
 //! End-to-end: a real commonware `simplex::Engine` finalizing on the
 //! commonware runtime, driven by our **Falcon** `SimplexFalconScheme` (equal
-//! votes). This is the P2a runtime-marriage de-risk: it proves the Engine +
+//! votes). It proves the Engine +
 //! Falcon scheme + adapters finalize a chain, using commonware's mock
 //! Automaton/Relay/Reporter over the simulated network.
 //!

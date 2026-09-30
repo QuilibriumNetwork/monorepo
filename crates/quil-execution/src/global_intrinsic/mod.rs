@@ -30,6 +30,7 @@ pub mod alt_shard_update_materialize;
 pub mod consensus_types;
 pub mod conversions;
 pub mod frame_header;
+pub mod handoff;
 pub mod intrinsic;
 pub mod kick_verify;
 pub mod materialize;

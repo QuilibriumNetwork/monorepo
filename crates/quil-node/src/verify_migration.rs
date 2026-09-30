@@ -62,7 +62,7 @@ pub fn run_verify_db(db_path: &Path, config: &quil_config::Config) -> anyhow::Re
     // Load the prover registry from the migrated hypergraph — needed to
     // build the committee (QC/TC) and validate frames.
     let registry = Arc::new(quil_execution::SharedProverRegistry::new());
-    registry.refresh_from_store(&hg_store);
+    registry.refresh_from_store(hg_store.as_ref())?;
     let registry_dyn: Arc<dyn quil_types::consensus::ProverRegistry> = registry.clone();
 
     let mut failures = 0usize;

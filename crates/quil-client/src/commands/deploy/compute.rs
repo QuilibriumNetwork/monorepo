@@ -101,7 +101,7 @@ async fn deploy_code_to_existing_domain(
         })),
         timestamp: 0,
     };
-    crate::send::send_message_request(&mut client, &dc.key_manager, domain.clone(), request).await?;
+    dc.send_paid(&mut client, &domain, request).await?;
 
     println!("Code deployed successfully");
     println!("  Domain: {}", hex::encode(&domain));

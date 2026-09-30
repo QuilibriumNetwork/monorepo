@@ -1,5 +1,4 @@
-//! Phase F — epoch-aligned deterministic prover reassignment on shard
-//! split/merge.
+//! Epoch-aligned deterministic prover reassignment on shard split/merge.
 //!
 //! When an app-shard split (parent P → children C[0..N]) or merge
 //! (children → parent) takes effect at the E+2 epoch boundary, every
@@ -226,9 +225,8 @@ mod tests {
     /// Why the split reassignment round-robins (post-cutover) instead of using
     /// `assign_child_index`: for a SMALL committee whose addresses cluster on one
     /// side of the split bit, `assign_child_index` sends everyone to the same
-    /// child and leaves the sibling permanently uncovered (the localnet
-    /// "child …80 never covered" artifact). Deterministic round-robin over the
-    /// address-sorted provers covers every child.
+    /// child and leaves the sibling permanently uncovered. Deterministic
+    /// round-robin over the address-sorted provers covers every child.
     #[test]
     fn round_robin_covers_children_where_assign_child_index_leaves_a_gap() {
         // 4 provers, all with address byte < 0x80 → all hash to child 0.

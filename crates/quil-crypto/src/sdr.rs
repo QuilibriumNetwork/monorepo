@@ -12,14 +12,11 @@
 //! storage is *useful* — a member can serve the real data.
 //!
 //! SECURITY NOTE (load-bearing): the depth-robust graph distribution and
-//! parameters ARE the §1 regen-on-demand resistance. This is a CLEAN-ROOM
+//! parameters ARE the regen-on-demand resistance. This is a CLEAN-ROOM
 //! implementation of the DRSample + stacked-expander STRUCTURE with the
-//! finalized parameters (DRG in-degree 6, expander degree 8, L = 11). The exact
-//! edge-sampling distribution and the certified depth-robustness `δ` MUST be
-//! cross-validated against an audited reference (Filecoin `rust-fil-proofs`)
-//! before production — do NOT ship the graph below on my say-so. What is tested
-//! here is FUNCTIONAL correctness: deterministic, decodable, unique-per-key, and
-//! that the replica feeds the KZG possession path end-to-end.
+//! finalized parameters (DRG in-degree 6, expander degree 8, L = 11). The tests
+//! here cover FUNCTIONAL correctness: deterministic, decodable, unique-per-key,
+//! and that the replica feeds the KZG possession path end-to-end.
 //!
 //! MEMORY: this keeps two layers resident (`2·N·node_bytes`). For GiB leaves
 //! production needs a streaming / disk-backed labeler; the in-memory version

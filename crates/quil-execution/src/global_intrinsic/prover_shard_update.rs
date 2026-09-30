@@ -69,19 +69,24 @@ pub struct ShardUpdateContext {
     pub shard_count: u64,
 }
 
-/// Recompute a genesis / no-global-anchor app-shard frame's output and require
-/// it to match the header.
+/// Recompute an app-shard frame's deterministic output from its header fields
+/// and require it to match `output`.
 ///
 /// App-shard frames carry NO VDF: the producer (`AppLeaderProvider`) stamps
-/// `porep::deterministic_app_frame_output` on every frame it makes. A frame
-/// anchored to a real global frame binds ρ_N to that anchor; a genesis /
-/// pre-global-chain frame (`global_frame_number == 0`) uses the ZERO-ANCHOR
-/// beacon, since there is no global VDF output to bind freshness to. This is the
-/// same check `quil_engine::frame_validator::BlsAppFrameValidator` runs on the
-/// no-anchor branch — it replaces the legacy Wesolowski verify, which can no
-/// longer succeed now that nothing solves a VDF for an app frame.
-fn verify_genesis_app_frame_output(frame_header: &FrameHeader) -> Result<()> {
-    let rho_n = quil_crypto::porep::derive_storage_beacon(0, &[]);
+/// `porep::deterministic_app_frame_output` on every frame it makes, binding the
+/// header fields downstream code consumes (fee total, settlement relay,
+/// storage-attestation root, ...). The committee certificate signs only
+/// `poseidon(output)`, so without this recomputation a relayer could alter
+/// those fields of a certified header. A frame anchored to a real global frame
+/// binds ρ_N to `anchor_output` (that global frame's output, resolved by the
+/// caller from its own clock store); a genesis / pre-global-chain frame
+/// (`global_frame_number == 0`) uses the zero-anchor beacon and ignores it.
+pub fn verify_app_frame_output(frame_header: &FrameHeader, anchor_output: &[u8]) -> Result<()> {
+    let rho_n = if frame_header.global_frame_number == 0 {
+        quil_crypto::porep::derive_storage_beacon(0, &[])
+    } else {
+        quil_crypto::porep::derive_storage_beacon(frame_header.global_frame_number, anchor_output)
+    };
     let expected = quil_crypto::porep::deterministic_app_frame_output(
         &frame_header.parent_selector,
         &frame_header.requests_root,
@@ -94,18 +99,164 @@ fn verify_genesis_app_frame_output(frame_header: &FrameHeader) -> Result<()> {
         frame_header.fee_multiplier_vote as u64,
         frame_header.timestamp,
         &frame_header.storage_attestation_root,
+        frame_header.fee_total_value(),
+        &frame_header.settlements,
+        &frame_header.accumulator,
+        &frame_header.spends,
     );
     if expected != frame_header.output {
         return Err(QuilError::Crypto(
-            "frame header attestation: genesis app-shard frame output does not match \
-             the deterministic digest"
+            "frame header attestation: app-shard frame output does not match the \
+             deterministic digest of its header fields"
                 .into(),
         ));
     }
     Ok(())
 }
 
-/// Verify a finalized shard FrameHeader's three-layer attestation:
+fn verify_genesis_app_frame_output(frame_header: &FrameHeader) -> Result<()> {
+    verify_app_frame_output(frame_header, &[])
+}
+
+/// Structural check of a header's settlement relay: canonical, inside the
+/// header's window, and carried only by a QUIL token shard.
+pub fn verify_settlement_relay(
+    frame_header: &FrameHeader,
+) -> Result<Vec<(u64, Vec<crate::token_intrinsic::settlement_record::SettlementEntry>)>> {
+    if frame_header.settlements.is_empty() {
+        return Ok(Vec::new());
+    }
+    if frame_header.address.len() < 32 || frame_header.address[..32] != crate::domains::QUIL_TOKEN {
+        return Err(QuilError::InvalidArgument(
+            "frame header: only QUIL token shards relay settlements".into(),
+        ));
+    }
+    crate::token_intrinsic::settlement_record::decode_relay(frame_header.frame_number, &frame_header.settlements)
+}
+
+/// Write the GLOBAL settlement record of every relayed entry not yet recorded.
+/// Idempotent: a header re-carries its window, so most entries are repeats.
+/// Returns the number of records written.
+pub fn materialize_settlement_records(
+    frame_header: &FrameHeader,
+    current_frame_number: u64,
+    state: &HypergraphState,
+) -> Result<usize> {
+    use crate::token_intrinsic::settlement_record;
+    let frames = verify_settlement_relay(frame_header)?;
+    if frames.is_empty() {
+        return Ok(0);
+    }
+    let va_disc = vertex_adds_discriminator()?;
+    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+    let mut written = 0usize;
+    for (_, entries) in &frames {
+        for entry in entries {
+            if state.get(domain, &entry.receipt, &va_disc)?.is_some_and(|b| !b.is_empty()) {
+                continue;
+            }
+            state.set(domain, &entry.receipt, &va_disc, current_frame_number, settlement_record::create_record(entry)?)?;
+            written += 1;
+        }
+    }
+    if written > 0 {
+        tracing::info!(
+            shard = %hex::encode(&frame_header.address[..frame_header.address.len().min(8)]),
+            shard_frame = frame_header.frame_number,
+            frame = current_frame_number,
+            written,
+            "settlement records written",
+        );
+    }
+    Ok(written)
+}
+
+/// Resolve the authorized historical committee before global admission and
+/// execution. Registry membership changes do not change a session's quorum.
+/// Prover metadata is still required for reward/ring attribution; missing
+/// metadata stops execution instead of shrinking the authorized committee.
+pub fn verify_frame_header_in_state(
+    state: &HypergraphState,
+    frame_header: &FrameHeader,
+    frame_prover: &dyn quil_types::crypto::FrameProver,
+    bls: &dyn quil_types::crypto::BlsConstructor,
+    registry: &dyn ProverRegistry,
+    legacy_committee_frame: u64,
+) -> Result<(Vec<ProverInfo>, Vec<u8>)> {
+    verify_frame_header_session(state, frame_header, frame_prover, bls, registry, legacy_committee_frame)
+        .map(|(members, bitmask, _)| (members, bitmask))
+}
+
+/// [`verify_frame_header_in_state`], also naming the authorized session that
+/// certified the frame (`None` for a legacy committee). Members are in the
+/// session's order.
+pub fn verify_frame_header_session(
+    state: &HypergraphState,
+    frame_header: &FrameHeader,
+    frame_prover: &dyn quil_types::crypto::FrameProver,
+    bls: &dyn quil_types::crypto::BlsConstructor,
+    registry: &dyn ProverRegistry,
+    legacy_committee_frame: u64,
+) -> Result<(Vec<ProverInfo>, Vec<u8>, Option<[u8; 32]>)> {
+    use super::handoff::frames::{self, FrameClaim};
+    state.require_full_domain_coverage(&GLOBAL_INTRINSIC_ADDRESS)?;
+    if let Some(bytes) = quil_cw_consensus::app_cert::unwrap_cert_from_header(
+        &frame_header.public_key_signature_bls48581,
+    ) {
+        let claim = FrameClaim {
+            filter: &frame_header.address,
+            frame: frame_header.frame_number,
+            view: frame_header.rank,
+            parent: &frame_header.parent_selector,
+            digest: quil_crypto::poseidon::hash_bytes_to_32(&frame_header.output)?,
+        };
+        if let Some(verified) = frames::verify(state, &claim, bytes)? {
+            if frame_header.global_frame_number == 0 {
+                verify_genesis_app_frame_output(frame_header)?;
+            }
+            let mut members = Vec::with_capacity(verified.session.members.len());
+            for key in &verified.session.members {
+                let address = prover_address_from_pubkey(key)?;
+                let mut info = registry.get_prover_info(&address)?.ok_or_else(|| {
+                    QuilError::ExecutionUnavailable("authorized session member metadata unavailable".into())
+                })?;
+                // The session names the member by key and the certificate was
+                // verified against it; the registry row only supplies reward
+                // and ring attribution. A row whose key or address disagrees
+                // (e.g. an empty key for an authorized member) is corrected
+                // from the session rather than allowed to stop every node's
+                // materialization.
+                if info.public_key != *key || info.address != address {
+                    tracing::warn!(
+                        shard = %hex::encode(&frame_header.address[..frame_header.address.len().min(8)]),
+                        member = %hex::encode(&address[..8]),
+                        registry_key = %hex::encode(&info.public_key[..info.public_key.len().min(8)]),
+                        registry_address = %hex::encode(&info.address[..info.address.len().min(8)]),
+                        "authorized session member metadata disagrees with the registry; using the session's identity",
+                    );
+                    info.public_key = key.clone();
+                    info.address = address.to_vec();
+                }
+                members.push(info);
+            }
+            let mut bitmask = Vec::new();
+            for key in &verified.certificate.signers {
+                let index = verified.session.members.binary_search(key).map_err(|_| {
+                    QuilError::InvalidSignature("certificate signer outside authorized session".into())
+                })?;
+                quil_consensus::bitmask::set_bit(&mut bitmask, index);
+            }
+            return Ok((members, bitmask, Some(verified.session.id()?)));
+        }
+    } else {
+        frames::require_legacy_allowed(state, &frame_header.address, frame_header.frame_number)?;
+    }
+    let active = registry.get_active_provers(&frame_header.address, legacy_committee_frame)?;
+    let bitmask = verify_frame_header_attestation(frame_header, frame_prover, bls, &active)?;
+    Ok((active, bitmask, None))
+}
+
+/// Verify a legacy, unregistered shard FrameHeader's three-layer attestation:
 /// leader proof-of-frame (deterministic output digest), aggregate BLS over
 /// `make_vote_message(address, rank, poseidon(output))`, and per-participant
 /// VDF multi-proofs over `sha3(parent_selector)`. Returns the participant
@@ -122,11 +273,16 @@ pub fn verify_frame_header_attestation(
     // CW path: a commonware-simplex-finalized shard frame carries no
     // BLS aggregate — its `public_key_signature_bls48581` field holds the
     // magic-prefixed simplex FINALIZATION certificate instead. Verify it against
-    // the shard committee (the active provers' Falcon keys) + the frame's VDF,
+    // the shard committee (the active provers' Falcon keys) and output digest,
     // and read the participant set (signers) off the cert.
     if let Some(cert_bytes) =
         quil_cw_consensus::app_cert::unwrap_cert_from_header(&frame_header.public_key_signature_bls48581)
     {
+        // Positive generations require authenticated global session lookup.
+        // They must never verify merely because the current keys happen to fit.
+        if quil_cw_consensus::app_cert::unverified_finalization_epoch(cert_bytes) != Some(0) {
+            return Err(QuilError::InvalidSignature("app session certificate requires global authorization".into()));
+        }
         // Output integrity. A frame anchored to a real global frame
         // (`global_frame_number > 0`) is a storage frame whose `output` is the
         // deterministic ρ_N-bound value (`deterministic_app_frame_output`); its
@@ -148,7 +304,7 @@ pub fn verify_frame_header_attestation(
             active_provers.iter().map(|p| p.public_key.clone()).collect();
         let output_digest = quil_crypto::poseidon::hash_bytes_to_32(&frame_header.output)
             .map_err(|e| QuilError::Crypto(format!("cw cert: poseidon(output): {e}")))?;
-        let signer_pubkeys = quil_cw_consensus::app_cert::verify_finalization(
+        let verified = quil_cw_consensus::app_cert::verify_finalization_details(
             cert_bytes,
             &committee_pubkeys,
             &namespace,
@@ -159,10 +315,13 @@ pub fn verify_frame_header_attestation(
                 "frame header attestation: CW finalization cert invalid / below quorum".into(),
             )
         })?;
+        if verified.finalization.proposal.round.view().get() != frame_header.rank {
+            return Err(QuilError::InvalidSignature("app header rank differs from certified view".into()));
+        }
 
         // Build the participant bitmask: index of each signer in the active set.
         let mut bitmask: Vec<u8> = Vec::new();
-        for pk in &signer_pubkeys {
+        for pk in &verified.signers {
             if let Some(idx) = active_provers.iter().position(|p| &p.public_key == pk) {
                 quil_consensus::bitmask::set_bit(&mut bitmask, idx);
             }
@@ -216,6 +375,10 @@ pub fn verify_frame_header_attestation(
         storage_attestation_root: frame_header.storage_attestation_root.clone(),
         global_frame_number: frame_header.global_frame_number,
         storage_attestation: frame_header.storage_attestation.clone(),
+        fee_total: frame_header.fee_total.clone(),
+        settlements: frame_header.settlements.clone(),
+        accumulator: frame_header.accumulator.clone(),
+        spends: frame_header.spends.clone(),
     };
 
     // Same gate as the CW path above: a storage frame (`global_frame_number > 0`)
@@ -277,14 +440,27 @@ pub fn verify_frame_header_attestation(
     Ok(agg.bitmask)
 }
 
-/// Build the per-frame context: groups participants by ring and
-/// enforces 2/3 participation. The caller passes in the already-verified
-/// bitmask (see `verify_frame_header_attestation`).
+/// Build the per-frame context: groups participants by ring and enforces 2/3
+/// participation. The caller expands the verified bitmap into `usize` indices;
+/// the committee may contain more than 256 members.
 pub fn build_shard_update_context(
     frame_header: &FrameHeader,
     active_provers: Vec<ProverInfo>,
-    participant_bitmask: &[u8],
+    participant_bitmask: &[usize],
     shard_metadata: ShardMetadata,
+) -> Result<ShardUpdateContext> {
+    build_shard_update_context_with_rings(frame_header, active_provers, participant_bitmask, shard_metadata, None)
+}
+
+/// [`build_shard_update_context`] with each member's ring given by position
+/// (a session's snapshot, [`session_member_rings`]) instead of read from its
+/// allocation at the frame's filter, which a later topology change removes.
+fn build_shard_update_context_with_rings(
+    frame_header: &FrameHeader,
+    active_provers: Vec<ProverInfo>,
+    participant_bitmask: &[usize],
+    shard_metadata: ShardMetadata,
+    rings: Option<&[u8]>,
 ) -> Result<ShardUpdateContext> {
     if frame_header.address.len() < 32 {
         return Err(QuilError::InvalidArgument(
@@ -310,7 +486,7 @@ pub fn build_shard_update_context(
     // Build the dedup'd sorted participant index list.
     let mut participants_set: std::collections::BTreeSet<usize> = Default::default();
     for &idx in participant_bitmask {
-        let i = idx as usize;
+        let i = idx;
         if i >= active_provers.len() {
             return Err(QuilError::InvalidArgument(
                 "shard update: bitmask index exceeds active prover count".into(),
@@ -337,16 +513,19 @@ pub fn build_shard_update_context(
     let mut participants_by_ring: HashMap<u8, Vec<usize>> = HashMap::new();
     for &idx in &participant_indices {
         let prover = &active_provers[idx];
-        let ring = prover
-            .allocations
-            .iter()
-            .find(|a| a.confirmation_filter == frame_header.address)
-            .map(|a| a.ring)
-            .ok_or_else(|| {
-                QuilError::InvalidArgument(
-                    "shard update: missing allocation/ring for participant".into(),
-                )
-            })?;
+        let ring = match rings {
+            Some(rings) => rings.get(idx).copied(),
+            None => prover
+                .allocations
+                .iter()
+                .find(|a| a.confirmation_filter == frame_header.address)
+                .map(|a| a.ring),
+        }
+        .ok_or_else(|| {
+            QuilError::InvalidArgument(
+                "shard update: missing allocation/ring for participant".into(),
+            )
+        })?;
         participants_by_ring.entry(ring).or_default().push(idx);
     }
 
@@ -438,7 +617,7 @@ pub fn validate_prover_shard_update(
     frame_header: &FrameHeader,
     next_frame_number: u64,
     active_provers: Option<Vec<ProverInfo>>,
-    participant_bitmask: Option<&[u8]>,
+    participant_bitmask: Option<&[usize]>,
     shard_metadata: Option<ShardMetadata>,
 ) -> Result<bool> {
     if next_frame_number != frame_header.frame_number + 1 {
@@ -549,7 +728,80 @@ fn recompute_shard_rings(
     Ok(())
 }
 
+/// The rings of an authorized session's members, in member order: recorded
+/// at the session's first rewarded frame, then read back for every later one.
+///
+/// Reading each member's allocation at reward time instead (the legacy rule)
+/// failed once a split or merge moved the member ("missing allocation/ring"),
+/// withholding the whole frame's reward from every participant, and paid a
+/// frame certified before a succession at the successor's ranks. The first
+/// computation ranks exactly as [`recompute_shard_rings`] does — join frame at
+/// the filter, then address — with a member that holds no allocation there
+/// ranked by address alone.
+fn session_member_rings(
+    state: &HypergraphState,
+    session: &[u8; 32],
+    filter: &[u8],
+    members: &[ProverInfo],
+    frame_number: u64,
+) -> Result<Vec<u8>> {
+    if let Some(rings) = super::handoff::session_rings(state, session)? {
+        if rings.len() != members.len() {
+            return Err(QuilError::Store("session ring snapshot does not match its members".into()));
+        }
+        return Ok(rings);
+    }
+    let join_frame = |p: &ProverInfo| -> u64 {
+        p.allocations
+            .iter()
+            .find(|a| a.confirmation_filter == filter)
+            .map(|a| a.join_frame_number)
+            .unwrap_or(0)
+    };
+    let mut order: Vec<usize> = (0..members.len()).collect();
+    order.sort_by(|&i, &j| {
+        join_frame(&members[i])
+            .cmp(&join_frame(&members[j]))
+            .then_with(|| members[i].address.cmp(&members[j].address))
+    });
+    let mut rings = vec![0u8; members.len()];
+    for (rank, &idx) in order.iter().enumerate() {
+        rings[idx] = (rank as u64 / RING_GROUP_SIZE) as u8;
+    }
+    super::handoff::record_session_rings(state, frame_number, session, &rings)?;
+    Ok(rings)
+}
+
 pub fn materialize_prover_shard_update(
+    frame_header: &FrameHeader,
+    current_frame_number: u64,
+    state: &HypergraphState,
+    prover_registry: &Arc<dyn ProverRegistry>,
+    frame_prover: &Arc<dyn FrameProver>,
+    reward_issuance: &Arc<dyn RewardIssuance>,
+    world_state_size: u64,
+    active_provers: Vec<ProverInfo>,
+    participant_bitmask: &[usize],
+    shard_metadata: ShardMetadata,
+) -> Result<()> {
+    materialize_prover_shard_update_with_fees(
+        frame_header, current_frame_number, state, prover_registry, frame_prover, reward_issuance,
+        world_state_size, active_provers, participant_bitmask, shard_metadata, 0, None,
+    )
+}
+
+/// [`materialize_prover_shard_update`], also crediting `committed_fees`: the
+/// fees of the confidential operations this header relayed that the global
+/// commit accepted. They are paid to the relaying shard's provers exactly like
+/// its own fee total — and only on commit, so verifying an operation the
+/// global frame then rejects earns nothing.
+///
+/// `session` names the authorized session that certified the frame; its
+/// members are rewarded at the session's recorded rings
+/// ([`session_member_rings`]) and no allocation's ring is rewritten. A legacy
+/// committee (`None`) keeps the per-allocation rings.
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_prover_shard_update_with_fees(
     frame_header: &FrameHeader,
     current_frame_number: u64,
     state: &HypergraphState,
@@ -558,24 +810,36 @@ pub fn materialize_prover_shard_update(
     reward_issuance: &Arc<dyn RewardIssuance>,
     world_state_size: u64,
     mut active_provers: Vec<ProverInfo>,
-    participant_bitmask: &[u8],
+    participant_bitmask: &[usize],
     shard_metadata: ShardMetadata,
+    committed_fees: u128,
+    session: Option<[u8; 32]>,
 ) -> Result<()> {
-    // Epoch-aligned ring (re)assignment: recompute from the current active
-    // committee before rewards are distributed, recompacting on any membership
-    // change and persisting the result. See `recompute_shard_rings`.
-    recompute_shard_rings(
-        state,
-        &frame_header.address,
-        &mut active_provers,
-        current_frame_number,
-    )?;
+    let session_rings = match &session {
+        Some(session) => Some(session_member_rings(
+            state, session, &frame_header.address, &active_provers, current_frame_number,
+        )?),
+        None => {
+            // Epoch-aligned ring (re)assignment: recompute from the current
+            // active committee before rewards are distributed, recompacting on
+            // any membership change and persisting the result. See
+            // `recompute_shard_rings`.
+            recompute_shard_rings(
+                state,
+                &frame_header.address,
+                &mut active_provers,
+                current_frame_number,
+            )?;
+            None
+        }
+    };
 
-    let ctx = build_shard_update_context(
+    let ctx = build_shard_update_context_with_rings(
         frame_header,
         active_provers,
         participant_bitmask,
         shard_metadata,
+        session_rings.as_deref(),
     )?;
 
     // Per-ring reward shares: build a single-prover allocation map
@@ -614,6 +878,27 @@ pub fn materialize_prover_shard_update(
         rewards_per_ring.insert(ring, share);
     }
 
+    // Fees collected by the shard's previous frame (fees are paid to the
+    // provers of the shard, never burned). Split equally among
+    // this frame's participants; the remainder goes to the frame's prover when
+    // it is a participant, else to the first participant.
+    let fee_total = BigInt::from(frame_header.fee_total_value()) + BigInt::from(committed_fees);
+    let participant_count: usize = ctx.participants_by_ring.values().map(|p| p.len()).sum();
+    let (fee_share, fee_remainder) = if participant_count > 0 && fee_total.sign() != num_bigint::Sign::NoSign {
+        let count = BigInt::from(participant_count as u64);
+        (&fee_total / &count, &fee_total % &count)
+    } else {
+        (BigInt::from(0), BigInt::from(0))
+    };
+    let remainder_receiver: Option<usize> = if participant_count > 0 {
+        let mut ordered: Vec<usize> = ctx.participants_by_ring.values().flatten().copied().collect();
+        ordered.sort_unstable();
+        ordered.iter().copied().find(|&idx| ctx.active_provers[idx].address == frame_header.prover)
+            .or(ordered.first().copied())
+    } else {
+        None
+    };
+
     // Apply per-participant rewards + activity updates.
     let mut credited_provers = 0usize;
     let mut total_reward = BigInt::from(0);
@@ -622,19 +907,22 @@ pub fn materialize_prover_shard_update(
         for &idx in participants {
             let prover = &ctx.active_provers[idx];
 
-            if let Some(share_amount) = share {
-                if share_amount.sign() != num_bigint::Sign::NoSign
-                    && apply_reward(
-                        state,
-                        current_frame_number,
-                        prover,
-                        &frame_header.address,
-                        share_amount,
-                    )?
-                {
-                    credited_provers += 1;
-                    total_reward += share_amount;
-                }
+            let mut amount = share.cloned().unwrap_or_else(|| BigInt::from(0));
+            amount += &fee_share;
+            if remainder_receiver == Some(idx) {
+                amount += &fee_remainder;
+            }
+            if amount.sign() != num_bigint::Sign::NoSign
+                && apply_reward(
+                    state,
+                    current_frame_number,
+                    prover,
+                    &frame_header.address,
+                    &amount,
+                )?
+            {
+                credited_provers += 1;
+                total_reward += &amount;
             }
 
             update_allocation_activity(state, current_frame_number, prover, &frame_header.address)?;
@@ -658,10 +946,54 @@ pub fn materialize_prover_shard_update(
         credited_provers,
         participants,
         total_reward = %total_reward,
+        fee_total = %fee_total,
         "shard reward distribution",
     );
 
     Ok(())
+}
+
+/// Credit the fees of a frame executed in the GLOBAL venue (reward mints,
+/// uncovered-shard operations run at the global level) to the global frame's
+/// prover (fees are paid to the prover of the affected shard, never burned).
+/// Same `apply_reward` path and `(frame, filter)` idempotency guard as the
+/// PoMW share, with the global intrinsic address as the filter so a shard
+/// credit at the same frame is unaffected. Returns
+/// whether a credit was applied (`false` for a zero total or a repeat).
+pub fn credit_global_frame_fees(
+    state: &HypergraphState,
+    frame_number: u64,
+    prover_address: &[u8],
+    fee_total: u128,
+) -> Result<bool> {
+    if fee_total == 0 || prover_address.is_empty() {
+        return Ok(false);
+    }
+    let prover = ProverInfo {
+        public_key: Vec::new(),
+        address: prover_address.to_vec(),
+        status: quil_types::consensus::ProverStatus::Active,
+        kick_frame_number: 0,
+        allocations: Vec::new(),
+        available_storage: 0,
+        seniority: 0,
+        delegate_address: Vec::new(),
+    };
+    let credited = apply_reward(
+        state,
+        frame_number,
+        &prover,
+        &GLOBAL_INTRINSIC_ADDRESS[..],
+        &BigInt::from(fee_total),
+    )?;
+    tracing::info!(
+        frame = frame_number,
+        prover = %hex::encode(&prover_address[..prover_address.len().min(8)]),
+        fee_total,
+        credited,
+        "global frame fee credit",
+    );
+    Ok(credited)
 }
 
 /// Add a reward amount to a prover's reward vertex balance.
@@ -1004,7 +1336,82 @@ mod tests {
             storage_attestation_root: Vec::new(),
             global_frame_number: 0,
             storage_attestation: Vec::new(),
+            fee_total: Vec::new(),
+            settlements: Vec::new(),
+            accumulator: Vec::new(),
+            spends: Vec::new(),
         }
+    }
+
+    fn relay_entry(receipt: u8) -> crate::token_intrinsic::settlement_record::SettlementEntry {
+        crate::token_intrinsic::settlement_record::SettlementEntry {
+            receipt: [receipt; 32], parameter_context: [2; 32], destination: [3; 32], context: [4; 32], settlement: 50,
+            payment_address: [0; 32], payment: 0, claimant: [0; 32],
+        }
+    }
+
+    fn stamp_output(header: &mut FrameHeader, anchor_output: &[u8]) {
+        let rho_n = quil_crypto::porep::derive_storage_beacon(header.global_frame_number, anchor_output);
+        header.output = quil_crypto::porep::deterministic_app_frame_output(
+            &header.parent_selector, &header.requests_root, &header.state_roots, &rho_n,
+            header.frame_number, header.rank, &header.prover, header.difficulty,
+            header.fee_multiplier_vote as u64, header.timestamp, &header.storage_attestation_root,
+            header.fee_total_value(), &header.settlements, &header.accumulator, &header.spends,
+        );
+    }
+
+    #[test]
+    fn relayed_header_fields_must_reproduce_the_certified_output() {
+        use crate::token_intrinsic::settlement_record::encode_relay;
+        let anchor = vec![0x5Au8; 516];
+        let mut header = fake_header(crate::domains::QUIL_TOKEN.to_vec(), 40);
+        header.global_frame_number = 900;
+        header.fee_total = super::super::frame_header::fee_total_field(77);
+        header.settlements = encode_relay(&[(20, vec![relay_entry(1)])]).unwrap();
+        stamp_output(&mut header, &anchor);
+        verify_app_frame_output(&header, &anchor).unwrap();
+        // A relayer cannot inject or drop settlement entries, change the fee
+        // total, or swap the anchor beacon under the same certified output.
+        let mut injected = header.clone();
+        injected.settlements = encode_relay(&[(20, vec![relay_entry(1), relay_entry(2)])]).unwrap();
+        assert!(verify_app_frame_output(&injected, &anchor).is_err());
+        let mut dropped = header.clone();
+        dropped.settlements.clear();
+        assert!(verify_app_frame_output(&dropped, &anchor).is_err());
+        let mut fee = header.clone();
+        fee.fee_total = super::super::frame_header::fee_total_field(78);
+        assert!(verify_app_frame_output(&fee, &anchor).is_err());
+        assert!(verify_app_frame_output(&header, &[0x5Bu8; 516]).is_err());
+    }
+
+    #[test]
+    fn settlement_records_are_written_once_and_only_from_quil_shards() {
+        use crate::token_intrinsic::settlement_record::{create_record, encode_relay};
+        let state = make_state();
+        let va_disc = vertex_adds_discriminator().unwrap();
+        let mut filter = crate::domains::QUIL_TOKEN.to_vec();
+        filter.push(0x03); // a split QUIL sub-shard
+        let mut header = fake_header(filter, 40);
+        header.settlements = encode_relay(&[(9, vec![relay_entry(1)]), (39, vec![relay_entry(2)])]).unwrap();
+        assert_eq!(materialize_settlement_records(&header, 1_000, &state).unwrap(), 2);
+        let record = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &[1; 32], &va_disc).unwrap().unwrap();
+        assert_eq!(record, create_record(&relay_entry(1)).unwrap());
+        // The next header re-carries the window: nothing new is written.
+        let mut next = header.clone();
+        next.frame_number = 41;
+        next.settlements = encode_relay(&[(9, vec![relay_entry(1)]), (39, vec![relay_entry(2)]), (40, vec![relay_entry(3)])]).unwrap();
+        assert_eq!(materialize_settlement_records(&next, 1_001, &state).unwrap(), 1);
+        // Outside the carrying header's window.
+        let mut stale = header.clone();
+        stale.frame_number = 42;
+        assert!(materialize_settlement_records(&stale, 1_002, &state).is_err());
+        // Another application's shard cannot relay settlements.
+        let mut other = header.clone();
+        other.address = vec![0xAA; 32];
+        assert!(verify_settlement_relay(&other).is_err());
+        assert!(materialize_settlement_records(&other, 1_003, &state).is_err());
+        other.settlements.clear();
+        assert_eq!(materialize_settlement_records(&other, 1_003, &state).unwrap(), 0);
     }
 
     #[test]
@@ -1099,7 +1506,7 @@ mod tests {
         let filter = vec![0xAAu8; 32];
         let header = fake_header(filter, 10);
         let md = ShardMetadata::default();
-        assert!(build_shard_update_context(&header, Vec::new(), &[0u8], md).is_err());
+        assert!(build_shard_update_context(&header, Vec::new(), &[0usize], md).is_err());
     }
 
     #[test]
@@ -1118,7 +1525,7 @@ mod tests {
         let p = fake_prover(1, 1, 0, &filter);
         let md = ShardMetadata::default();
         // index 5 > active_provers.len() == 1
-        assert!(build_shard_update_context(&header, vec![p], &[5u8], md).is_err());
+        assert!(build_shard_update_context(&header, vec![p], &[5usize], md).is_err());
     }
 
     #[test]
@@ -1128,7 +1535,7 @@ mod tests {
         // 3 provers, only 1 participant → 1*3 < 3*2 → rejected.
         let provers: Vec<_> = (0..3u8).map(|i| fake_prover(i + 1, i as u64, 0, &filter)).collect();
         let md = ShardMetadata::default();
-        assert!(build_shard_update_context(&header, provers, &[0u8], md).is_err());
+        assert!(build_shard_update_context(&header, provers, &[0usize], md).is_err());
     }
 
     #[test]
@@ -1137,7 +1544,7 @@ mod tests {
         let header = fake_header(filter.clone(), 10);
         let p = fake_prover(1, 1, 0, &filter);
         let md = ShardMetadata { state_size: 1000, shard_count: 0 };
-        let ctx = build_shard_update_context(&header, vec![p], &[0u8], md).unwrap();
+        let ctx = build_shard_update_context(&header, vec![p], &[0usize], md).unwrap();
         assert_eq!(ctx.shard_count, DEFAULT_SHARD_LEAVES);
         assert_eq!(ctx.state_size, 1000);
     }
@@ -1319,7 +1726,6 @@ mod tests {
             ) -> Result<quil_types::proto::global::FrameHeader> {
                 Err(QuilError::InvalidArgument("noop".into()))
             }
-            fn verify_frame_header(&self, _: &quil_types::proto::global::FrameHeader) -> Result<Vec<u8>> { Ok(Vec::new()) }
             fn prove_global_frame_header(
                 &self,
                 _: &quil_types::proto::global::GlobalFrameHeader,
@@ -1327,6 +1733,7 @@ mod tests {
                 _: &[u8],
                 _: &[Vec<u8>],
                 _: &[u8],
+                _: u64,
                 _: &dyn quil_types::crypto::Signer,
                 _: i64,
                 _: u32,
@@ -1351,7 +1758,7 @@ mod tests {
             &reward_issuance,
             4096,
             vec![p.clone()],
-            &[0u8],
+            &[0usize],
             md,
         )
         .unwrap();
@@ -1380,7 +1787,7 @@ mod tests {
 
     }
 
-    // ---- Gap coverage (audit 2026-06-28): partial-ring reward distribution.
+    // ---- Partial-ring reward distribution.
 
     fn noop_registry() -> Arc<dyn ProverRegistry> {
         struct R;
@@ -1400,8 +1807,7 @@ mod tests {
         struct F;
         impl FrameProver for F {
             fn prove_frame_header(&self, _: &[u8], _: &[u8], _: &[u8], _: &[Vec<u8>], _: &[u8], _: i64, _: u32, _: u64, _: u64, _: &[u8], _: u64) -> Result<quil_types::proto::global::FrameHeader> { Err(QuilError::InvalidArgument("noop".into())) }
-            fn verify_frame_header(&self, _: &quil_types::proto::global::FrameHeader) -> Result<Vec<u8>> { Ok(Vec::new()) }
-            fn prove_global_frame_header(&self, _: &quil_types::proto::global::GlobalFrameHeader, _: &[Vec<u8>], _: &[u8], _: &[Vec<u8>], _: &[u8], _: &dyn quil_types::crypto::Signer, _: i64, _: u32, _: u8) -> Result<quil_types::proto::global::GlobalFrameHeader> { Err(QuilError::InvalidArgument("noop".into())) }
+            fn prove_global_frame_header(&self, _: &quil_types::proto::global::GlobalFrameHeader, _: &[Vec<u8>], _: &[u8], _: &[Vec<u8>], _: &[u8], _: u64, _: &dyn quil_types::crypto::Signer, _: i64, _: u32, _: u8) -> Result<quil_types::proto::global::GlobalFrameHeader> { Err(QuilError::InvalidArgument("noop".into())) }
             fn verify_global_frame_header(&self, _: &quil_types::proto::global::GlobalFrameHeader) -> Result<Vec<u8>> { Ok(Vec::new()) }
             fn calculate_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: u32) -> Result<Vec<u8>> { Ok(Vec::new()) }
             fn verify_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: &[&[u8]]) -> Result<bool> { Ok(true) }
@@ -1419,6 +1825,81 @@ mod tests {
             }
             None => BigInt::from(0),
         }
+    }
+
+    /// The previous frame's `fee_total` is paid to the frame's participants on
+    /// top of the PoMW share: equal split, remainder to the frame's prover,
+    /// under the same per-(frame, shard) idempotency guard.
+    #[test]
+    fn shard_update_pays_fee_total_to_participants() {
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        let provers: Vec<ProverInfo> =
+            (1u8..=3).map(|s| fake_prover(s, s as u64, 0, &filter)).collect();
+        for p in &provers {
+            seed_alloc_blob(&state, p, &filter);
+        }
+        let mut header = fake_header(filter.clone(), 10);
+        // 1_000 split three ways: 333 each, remainder 1 to the frame prover.
+        header.fee_total = super::super::frame_header::fee_total_to_bytes(1_000);
+        header.prover = provers[1].address.clone();
+        let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8_000)));
+        let md = ShardMetadata { state_size: 1024, shard_count: 1 };
+
+        materialize_prover_shard_update(
+            &header, 11, &state, &noop_registry(), &noop_frame_prover(),
+            &reward_issuance, 4096, provers.clone(), &[0, 1, 2], md,
+        )
+        .unwrap();
+
+        assert_eq!(reward_balance(&state, &provers[0]), BigInt::from(1_000 + 333));
+        assert_eq!(reward_balance(&state, &provers[1]), BigInt::from(1_000 + 334));
+        assert_eq!(reward_balance(&state, &provers[2]), BigInt::from(1_000 + 333));
+
+        // Re-materializing the same (frame, shard) credits nothing more.
+        let md = ShardMetadata { state_size: 1024, shard_count: 1 };
+        materialize_prover_shard_update(
+            &header, 11, &state, &noop_registry(), &noop_frame_prover(),
+            &reward_issuance, 4096, provers.clone(), &[0, 1, 2], md,
+        )
+        .unwrap();
+        assert_eq!(reward_balance(&state, &provers[1]), BigInt::from(1_334));
+
+        // A frame prover that did not participate: the remainder goes to the
+        // lowest-index participant instead.
+        let mut header2 = fake_header(filter.clone(), 12);
+        header2.fee_total = super::super::frame_header::fee_total_to_bytes(5);
+        header2.prover = vec![0x99u8; 32];
+        let md = ShardMetadata { state_size: 1024, shard_count: 1 };
+        materialize_prover_shard_update(
+            &header2, 13, &state, &noop_registry(), &noop_frame_prover(),
+            &reward_issuance, 4096, provers.clone(), &[1, 2], md,
+        )
+        .unwrap();
+        assert_eq!(reward_balance(&state, &provers[0]), BigInt::from(1_333), "non-participant unchanged");
+        assert_eq!(reward_balance(&state, &provers[1]), BigInt::from(1_334 + 1_000 + 3));
+        assert_eq!(reward_balance(&state, &provers[2]), BigInt::from(1_333 + 1_000 + 2));
+    }
+
+    /// Global-venue fees go to the global frame's prover under the global
+    /// filter, independent of a shard credit at the same frame.
+    #[test]
+    fn global_frame_fees_credit_the_global_prover() {
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        let p = fake_prover(1, 1, 0, &filter);
+        assert!(!credit_global_frame_fees(&state, 20, &p.address, 0).unwrap());
+        assert!(credit_global_frame_fees(&state, 20, &p.address, 700).unwrap());
+        assert_eq!(reward_balance(&state, &p), BigInt::from(700));
+        // Repeat at the same frame is idempotent.
+        assert!(!credit_global_frame_fees(&state, 20, &p.address, 700).unwrap());
+        assert_eq!(reward_balance(&state, &p), BigInt::from(700));
+        // A shard credit at the same frame still lands (different filter).
+        assert!(apply_reward(&state, 20, &p, &filter, &BigInt::from(50)).unwrap());
+        assert_eq!(reward_balance(&state, &p), BigInt::from(750));
+        // Later frame accrues again.
+        assert!(credit_global_frame_fees(&state, 21, &p.address, 1).unwrap());
+        assert_eq!(reward_balance(&state, &p), BigInt::from(751));
     }
 
     /// A ring with N < RING_GROUP_SIZE participants pays each member
@@ -1475,7 +1956,7 @@ mod tests {
 
         materialize_prover_shard_update(
             &header, 11, &state, &noop_registry(), &noop_frame_prover(),
-            &reward_issuance, 4096, vec![p.clone()], &[0u8], md,
+            &reward_issuance, 4096, vec![p.clone()], &[0usize], md,
         )
         .unwrap();
 
@@ -1514,7 +1995,7 @@ mod tests {
 
         materialize_prover_shard_update(
             &header, 11, &state, &noop_registry(), &noop_frame_prover(),
-            &reward_issuance, 4096, vec![p.clone()], &[0u8], md,
+            &reward_issuance, 4096, vec![p.clone()], &[0usize], md,
         )
         .unwrap();
 
@@ -1563,7 +2044,7 @@ mod tests {
         let header = fake_header(filter.clone(), 10);
         let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(RingStub);
         let md = ShardMetadata { state_size: 1024, shard_count: 1 };
-        let indices: Vec<u8> = (0u8..9).collect();
+        let indices: Vec<usize> = (0..9).collect();
 
         materialize_prover_shard_update(
             &header, 11, &state, &noop_registry(), &noop_frame_prover(),
@@ -1576,6 +2057,45 @@ mod tests {
             assert_eq!(reward_balance(&state, p), BigInt::from(1_000), "ring-0 member share");
         }
         assert_eq!(reward_balance(&state, &provers[8]), BigInt::from(500), "ring-1 member share");
+    }
+
+    #[test]
+    fn signer_indices_above_255_retain_their_fee_share_and_activity() {
+        let state = make_state();
+        let filter = vec![0xA9; 32];
+        let provers: Vec<_> = (0..300usize).map(|i| {
+            let mut prover = fake_prover(1, i as u64 + 1, 0, &filter);
+            prover.public_key[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            prover.address = prover_address_from_pubkey(&prover.public_key).unwrap().to_vec();
+            prover.allocations[0].ring = (i / RING_GROUP_SIZE as usize) as u8;
+            prover
+        }).collect();
+        for prover in &provers {
+            seed_alloc_blob(&state, prover, &filter);
+        }
+        let mut header = fake_header(filter.clone(), 10);
+        // 240 certified signers (indices 60..299) each receive one fee unit.
+        header.fee_total = super::super::frame_header::fee_total_field(240);
+        let mut bitmap = Vec::new();
+        for i in 60..300 { quil_consensus::bitmask::set_bit(&mut bitmap, i); }
+        let indices: Vec<usize> = quil_consensus::bitmask::set_bit_indices(&bitmap).collect();
+        let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(0)));
+        materialize_prover_shard_update(
+            &header, 11, &state, &noop_registry(), &noop_frame_prover(), &reward_issuance,
+            4096, provers.clone(), &indices, ShardMetadata { state_size: 1024, shard_count: 1 },
+        ).unwrap();
+        let discriminator = vertex_adds_discriminator().unwrap();
+        for (i, prover) in provers.iter().enumerate() {
+            assert_eq!(reward_balance(&state, prover), BigInt::from(u8::from(i >= 60)), "fee for member {i}");
+            let address = allocation_address(&prover.public_key, &filter).unwrap();
+            let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS, &address, &discriminator).unwrap().unwrap();
+            let tree = rebuild_vertex_tree_from_blob(&blob);
+            let last_active = read_field(&tree, "allocation:ProverAllocation", "LastActiveFrameNumber");
+            assert_eq!(last_active, if i >= 60 { Some(11u64.to_be_bytes().to_vec()) } else { None }, "activity for member {i}");
+        }
+        let context = build_shard_update_context(&header, provers, &indices, ShardMetadata::default()).unwrap();
+        assert_eq!(context.participant_indices.len(), 240);
+        assert_eq!(context.participant_indices.last(), Some(&299));
     }
 
     /// The participant index list binds to POSITION in `active_provers`: index 0
@@ -1941,5 +2461,84 @@ mod tests {
             "frames at/below the cursor must not re-mint"
         );
         assert_eq!(clock.get_global_materialized_cursor(), Some(3));
+    }
+
+    /// A frame certified by an authorized session is rewarded at the rings
+    /// recorded at the session's first rewarded frame. Before, each member's
+    /// ring was read from its allocation at the frame's filter, so once a
+    /// split or merge moved the members the whole update failed and no
+    /// participant was paid.
+    #[test]
+    fn a_session_frame_keeps_its_rings_after_its_members_move() {
+        use quil_types::crypto::Signer as _;
+        struct RingStub;
+        impl RewardIssuance for RingStub {
+            fn calculate(
+                &self, _: u64, _: u64, _: u64,
+                provers: &[HashMap<String, ProverAllocation>],
+            ) -> Result<Vec<BigInt>> {
+                let ring = provers.first().and_then(|m| m.values().next()).map(|a| a.ring).unwrap_or(0);
+                Ok(provers.iter().map(|_| BigInt::from(8_000u64 >> ring)).collect())
+            }
+        }
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        let mut keys: Vec<Vec<u8>> =
+            (0..9).map(|_| quil_crypto::FalconSigner::generate().public_key().to_vec()).collect();
+        keys.sort();
+        let session = quil_cw_consensus::handoff::Session {
+            chain_id: [0x11; 32],
+            filter: filter.clone(),
+            generation: 1,
+            genesis: [0x33; 32],
+            base_frame: 0,
+            authorization: [0x22; 32],
+            members: keys.clone(),
+        };
+        super::super::handoff::initialize(&state, 1, &session).unwrap();
+        let id = session.id().unwrap();
+        // Members in session order; the first-ordered key joined last, so it
+        // alone ranks ninth (ring 1).
+        let mut members: Vec<ProverInfo> = keys.iter().enumerate().map(|(i, key)| {
+            let mut prover = fake_prover(i as u8 + 1, if i == 0 { 900 } else { 100 + i as u64 }, 0, &filter);
+            prover.public_key = key.clone();
+            prover.address = prover_address_from_pubkey(key).unwrap().to_vec();
+            prover
+        }).collect();
+        for prover in &members {
+            seed_alloc_blob(&state, prover, &filter);
+        }
+        let issuance: Arc<dyn RewardIssuance> = Arc::new(RingStub);
+        let md = ShardMetadata { state_size: 1024, shard_count: 1 };
+        let everyone: Vec<usize> = (0..9).collect();
+        let reward = |header_frame: u64, members: Vec<ProverInfo>, session: Option<[u8; 32]>| {
+            materialize_prover_shard_update_with_fees(
+                &fake_header(filter.clone(), header_frame), header_frame + 1, &state,
+                &noop_registry(), &noop_frame_prover(), &issuance, 4096,
+                members, &everyone, md, 0, session,
+            )
+        };
+
+        reward(10, members.clone(), Some(id)).unwrap();
+        let mut rings = vec![0u8; 9];
+        rings[0] = 1;
+        assert_eq!(super::super::handoff::session_rings(&state, &id).unwrap(), Some(rings.clone()));
+        assert_eq!(reward_balance(&state, &members[0]), BigInt::from(500));
+        assert_eq!(reward_balance(&state, &members[1]), BigInt::from(1_000));
+
+        // A split moves every member's allocation to a child filter.
+        for prover in &mut members {
+            prover.allocations[0].confirmation_filter = vec![0xAB; 34];
+        }
+        assert!(
+            reward(11, members.clone(), None).is_err(),
+            "the per-allocation rule fails once the members have moved",
+        );
+        reward(12, members.clone(), Some(id)).unwrap();
+        assert_eq!(reward_balance(&state, &members[0]), BigInt::from(1_000));
+        assert_eq!(reward_balance(&state, &members[1]), BigInt::from(2_000));
+        assert_eq!(super::super::handoff::session_rings(&state, &id).unwrap(), Some(rings.clone()));
+        assert!(super::super::handoff::record_session_rings(&state, 13, &id, &[0; 9]).is_err(),
+            "a recorded snapshot is never replaced");
     }
 }

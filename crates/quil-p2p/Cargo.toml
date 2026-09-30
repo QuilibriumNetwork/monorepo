@@ -13,7 +13,7 @@ quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-lifecycle = { path = "../quil-lifecycle" }
 quil-crypto = { path = "../quil-crypto" }
-# Phase 1: the pubsub layer is now stock `libp2p::gossipsub` (the `blossomsub`
+# The pubsub layer is stock `libp2p::gossipsub` (the `blossomsub`
 # fork crate stays in the workspace but is no longer a dependency here). Must
 # stay version-compatible with gossipsub's prometheus-client — the two share one
 # Registry, so the `Registry` type must unify.

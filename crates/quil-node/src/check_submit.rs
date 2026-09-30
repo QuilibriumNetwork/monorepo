@@ -128,7 +128,7 @@ pub async fn run_check_submit(
 
     // ---- step 2: resolve a real shard filter to join (once) ----
     // Real provers do NOT enumerate via `get_app_shards(range)` (that walks
-    // the live CRDT for every shard and times out — see the field finding);
+    // the live CRDT for every shard and times out);
     // they call `get_app_shards(specific 35-byte shard_key)` per genesis-
     // seeded shard. We reproduce that: derive the canonical QUIL_TOKEN
     // genesis shard_key from constants (L1 bloom indices || L2 domain) and

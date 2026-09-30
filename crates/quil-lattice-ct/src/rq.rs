@@ -1,10 +1,8 @@
 //! `R_q = Z_q[X]/(X^d + 1)` — the polynomial ring the production parameters
-//! (`d = 256`, `q ≈ 2^36`, prime, `ord_512(q) = 64`) live in. This is the first
-//! piece of the ring-form port: the reference modules (`commitment`, `sigma`, …)
-//! run over plain `Z_q` with tiny illustrative sizes; the production
-//! instantiation replaces those scalars with elements of `R_q`, so security
-//! amortizes over the `d` coefficients and a single structured ring challenge
-//! replaces the 16 rounds.
+//! (`d = 256`, `q ≈ 2^36`, prime, `ord_512(q) = 64`) live in. Working over `R_q`
+//! instead of plain `Z_q` scalars lets security amortize over the `d`
+//! coefficients and lets a single structured ring challenge replace 16 rounds
+//! of `{-1,0,1}`.
 //!
 //! # Multiplication
 //!

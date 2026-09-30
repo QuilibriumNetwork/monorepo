@@ -270,6 +270,15 @@ pub fn sync_app_shard_to_own_crdt(
 /// threaded as the forest sub-shard prefix instead.
 pub(crate) fn split_coverage_filter(filter: &[u8]) -> (&[u8], Vec<u32>) {
     let app = &filter[..filter.len().min(32)];
+    // A bit-path filter (`app ‖ bit_len ‖ packed bits`, every shard of a split
+    // application on the unified tree) names its subtree in SENTINEL prefix
+    // form, which is what the size metadata and the forest index are keyed by.
+    // Read as raw bytes, `[0, 1, 0x80]` is not a path anywhere, so every child
+    // shard measured 0 after a split: no leaves, no replicas, no attestation,
+    // and the storage gate paid its provers nothing.
+    if let Some((_, bits)) = quil_forest::decode_shard_bit_path(filter, 32) {
+        return (app, quil_forest::bit_path_to_prefix(&bits));
+    }
     let prefix = filter
         .get(32..)
         .unwrap_or(&[])
@@ -277,6 +286,27 @@ pub(crate) fn split_coverage_filter(filter: &[u8]) -> (&[u8], Vec<u32>) {
         .map(|&b| b as u32)
         .collect();
     (app, prefix)
+}
+
+/// Whether committed data is present in this worker's covered subtree. This
+/// is a presence check, not proof that the state matches a certified frame;
+/// the proposal/verifier pre-state checks enforce that separately.
+pub(crate) fn has_committed_shard_data(crdt: &HypergraphCrdt, filter: &[u8]) -> bool {
+    if crdt.unified_tree() {
+        let Some(bits) = crdt.canonical_bits_for_filter(filter) else {
+            return false;
+        };
+        // A sync can install a complete subtree without populating write-time
+        // size buckets. Decode the wire bit length and packed path before
+        // reading the committed forest.
+        return [("vertex", "adds"), ("vertex", "removes"),
+                ("hyperedge", "adds"), ("hyperedge", "removes")].iter()
+            .any(|(set, phase)| crdt.unified_subtree_leaf_count(set, phase, &filter[..32], &bits) > 0);
+    }
+    let (app, sub_prefix) = split_coverage_filter(filter);
+    let mut shard_key = quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3).to_vec();
+    shard_key.extend_from_slice(app);
+    !partition_shard_leaves(crdt, &shard_key, &sub_prefix).is_empty()
 }
 
 /// Worker confirm / epoch-boundary hook (PoRep wiring E). For each shard
@@ -477,10 +507,21 @@ pub fn partition_shard_leaves(
             data_shards: 0,
             commitment: Vec::new(),
         };
-        match get_app_shard_metadata(crdt, &shard) {
+        let bucketed = match get_app_shard_metadata(crdt, &shard) {
             Some(md) => md.size_bigint().to_u64().unwrap_or(u64::MAX),
             None => 0,
+        };
+        if bucketed > 0 {
+            return bucketed;
         }
+        // The size buckets are written with the data; a subtree this node
+        // received by sync, or inherited when its shard split or merged, has
+        // none, and a child shard's members then partitioned no leaves, sealed
+        // no replicas and attested nothing (every child frame after a split
+        // paid 0). The forest's Merkle-sum index sees the data regardless.
+        let app: Option<[u8; 32]> = shard_key.get(3..35).and_then(|a| a.try_into().ok());
+        let Some(bits) = quil_forest::shard_bit_path_from_prefix(prefix) else { return 0 };
+        app.and_then(|app| crdt.unified_live_size_at_bits(&app, &bits)).unwrap_or(0)
     };
     let leaves = partition_leaves(base_prefix, LEAF_MAX_BYTES, SHARD_TREE_BRANCH, 32, &size_of);
     // DIAGNOSTIC: the committed size THIS crdt reports for the shard subtree.
@@ -513,6 +554,60 @@ mod tests {
         let store: Arc<dyn HypergraphStore> = Arc::new(MemStore::new());
         let prover: Arc<dyn InclusionProver> = Arc::new(StubProver);
         Arc::new(HypergraphCrdt::new(store, prover))
+    }
+
+    /// A bit-path filter names its subtree in sentinel prefix form; a legacy
+    /// byte-suffix filter keeps its bytes. (Read raw, a child shard's filter
+    /// tail measured 0 after every split.)
+    #[test]
+    fn coverage_filter_prefix_is_the_sentinel_path_for_bit_path_filters() {
+        let app = [0x71u8; 32];
+        let bits = vec![true, false, true];
+        let filter = quil_forest::encode_shard_bit_path(&app, &bits);
+        let (a, prefix) = split_coverage_filter(&filter);
+        assert_eq!(a, &app);
+        assert_eq!(prefix, quil_forest::bit_path_to_prefix(&bits));
+        let (a, root) = split_coverage_filter(&app);
+        assert_eq!((a, root), (&app[..], Vec::new()));
+        let mut legacy = app.to_vec();
+        legacy.push(0x80);
+        assert_eq!(split_coverage_filter(&legacy).1, vec![0x80]);
+    }
+
+    #[test]
+    fn split_readiness_uses_committed_forest_after_reopen_without_size_buckets() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store: Arc<dyn HypergraphStore> = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE.to_vec()));
+        crdt.set_unified_tree(true);
+        let app = [0x71; 32];
+        // A non-byte-aligned path exercises the wire bit length and padding.
+        // Data in this subtree must not mark its empty sibling ready.
+        let bits = vec![true, false, true, true, false, true, false, true, true];
+        let mut sibling = bits.clone();
+        *sibling.last_mut().unwrap() = false;
+        let filter = quil_forest::encode_shard_bit_path(&app, &bits);
+        let sibling_filter = quil_forest::encode_shard_bit_path(&app, &sibling);
+        let mut address = [0; 32];
+        address[0] = 0xb5;
+        address[1] = 0x80;
+        let location = Location { app_address: app, data_address: address };
+        crdt.add_vertex(&location, b"committed covered data").unwrap();
+        assert!(!has_committed_shard_data(&crdt, &filter), "staged writes are not possession");
+        crdt.commit(1).unwrap();
+        assert!(has_committed_shard_data(&crdt, &filter));
+        assert!(!has_committed_shard_data(&crdt, &sibling_filter));
+        drop(crdt);
+
+        let reopened = HypergraphCrdt::new(store, Arc::new(StubProver));
+        reopened.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE.to_vec()));
+        reopened.set_unified_tree(true);
+        assert!(reopened.total_size().is_zero(), "fixture has not warmed write-time metadata");
+        assert!(has_committed_shard_data(&reopened, &filter));
+        assert!(has_committed_shard_data(&reopened, &app));
+        assert!(!has_committed_shard_data(&reopened, &sibling_filter));
+        assert!(!has_committed_shard_data(&reopened, &filter[..34]), "malformed filter stays gated");
     }
 
     #[test]
@@ -590,7 +685,7 @@ mod tests {
             (0..nodes * 32).map(|i| (i as u8).wrapping_add(seed)).collect()
         };
 
-        // E4: worker builds the confirm leaf roots + replicas.
+        // The worker builds the confirm leaf roots + replicas.
         let (groups, replicas) = compute_confirm_leaf_roots(
             &filter, &member, epoch, &prefixes, poly_size, &params, &leaf_data_for,
         );
@@ -604,7 +699,7 @@ mod tests {
             reg.insert((member.clone(), lid, epoch), (e.leaf_root.clone(), e.num_blocks, epoch));
         }
 
-        // E5: per-frame openings built from the stored replicas.
+        // Per-frame openings built from the stored replicas.
         let mut openings = Vec::new();
         for (prefix, replica) in &replicas {
             let lid = leaf_id_bytes(&filter, prefix);
@@ -619,7 +714,7 @@ mod tests {
             &openings, frame, &rho_n, &bitmask, poly_size,
         );
 
-        // C: the verifier accepts against the registered roots for this epoch.
+        // The verifier accepts against the registered roots for this epoch.
         let good = |m: &[u8], l: &[u8], e: u64| reg.get(&(m.to_vec(), l.to_vec(), e)).cloned();
         assert!(
             quil_crypto::porep::verify_frame_storage_attestation_registered(

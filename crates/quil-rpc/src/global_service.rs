@@ -57,7 +57,13 @@ pub struct CachingFrameLookup<F: FrameLookup> {
     frames: std::sync::RwLock<std::collections::BTreeMap<u64, Arc<global::GlobalFrame>>>,
     proposals: std::sync::RwLock<std::collections::BTreeMap<u64, Arc<global::GlobalProposal>>>,
     latest: std::sync::RwLock<Option<(std::time::Instant, Arc<global::GlobalFrame>)>>,
+    // Separate miss locks keep cache hits independent of storage latency.
+    // Stripes bound bookkeeping while allowing unrelated heights to load.
+    frame_loads: [std::sync::Mutex<()>; 32],
+    proposal_loads: [std::sync::Mutex<()>; 32],
+    latest_load: std::sync::Mutex<()>,
     capacity: usize,
+    frame_capacity: usize,
     latest_ttl: std::time::Duration,
 }
 
@@ -72,15 +78,27 @@ impl<F: FrameLookup> CachingFrameLookup<F> {
             frames: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             proposals: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             latest: std::sync::RwLock::new(None),
+            frame_loads: std::array::from_fn(|_| std::sync::Mutex::new(())),
+            proposal_loads: std::array::from_fn(|_| std::sync::Mutex::new(())),
+            latest_load: std::sync::Mutex::new(()),
             capacity,
+            frame_capacity: capacity,
             latest_ttl,
         }
     }
 
+    /// Disable the duplicate frame map when the backing clock store already
+    /// retains finalized frames. Proposal caching remains independently bounded.
+    pub fn with_frame_capacity(mut self, capacity: usize) -> Self {
+        self.frame_capacity = capacity;
+        self
+    }
+
     fn insert_frame(&self, n: u64, frame: Arc<global::GlobalFrame>) {
+        if self.frame_capacity == 0 { return; }
         let mut w = self.frames.write().unwrap();
         w.insert(n, frame);
-        while w.len() > self.capacity {
+        while w.len() > self.frame_capacity {
             // Drop the lowest frame number — the tip is the hot set.
             let lowest = match w.keys().next().copied() {
                 Some(k) => k,
@@ -110,6 +128,12 @@ impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
                 return Ok((**frame).clone());
             }
         }
+        let _load = self.latest_load.lock().unwrap();
+        if let Some((at, frame)) = self.latest.read().unwrap().as_ref() {
+            if at.elapsed() < self.latest_ttl {
+                return Ok((**frame).clone());
+            }
+        }
         let frame = self.inner.get_latest_frame()?;
         let arc = Arc::new(frame.clone());
         // Opportunistically populate the by-number cache too: the head is
@@ -124,11 +148,18 @@ impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
     }
 
     fn get_frame(&self, frame_number: u64) -> Result<global::GlobalFrame, String> {
+        if self.frame_capacity == 0 { return self.inner.get_frame(frame_number); }
+        if let Some(frame) = self.frames.read().unwrap().get(&frame_number).cloned() {
+            return Ok((*frame).clone());
+        }
+        let _load = self.frame_loads[(frame_number % 32) as usize].lock().unwrap();
         if let Some(frame) = self.frames.read().unwrap().get(&frame_number).cloned() {
             return Ok((*frame).clone());
         }
         let frame = self.inner.get_frame(frame_number)?;
-        self.insert_frame(frame_number, Arc::new(frame.clone()));
+        if self.frame_capacity > 0 {
+            self.insert_frame(frame_number, Arc::new(frame.clone()));
+        }
         Ok(frame)
     }
 
@@ -136,6 +167,10 @@ impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
         &self,
         frame_number: u64,
     ) -> Result<global::GlobalProposal, String> {
+        if let Some(p) = self.proposals.read().unwrap().get(&frame_number).cloned() {
+            return Ok((*p).clone());
+        }
+        let _load = self.proposal_loads[(frame_number % 32) as usize].lock().unwrap();
         if let Some(p) = self.proposals.read().unwrap().get(&frame_number).cloned() {
             return Ok((*p).clone());
         }
@@ -149,15 +184,12 @@ impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
         // Catch-up — the dominant repeated-read workload — pulls exactly
         // these settled, well-below-head proposals.
         const PROPOSAL_SETTLE_MARGIN: u64 = 4;
-        let head = self
-            .latest
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(|(_, f)| f.header.as_ref().map(|h| h.frame_number))
-            .unwrap_or(0);
+        // Proposal-only catchup must refresh the head itself; it cannot rely
+        // on another RPC having populated (and kept refreshing) latest.
+        let head = self.get_latest_frame().ok()
+            .and_then(|f| f.header.map(|h| h.frame_number));
         if frame_number == 0
-            || (head > 0 && frame_number + PROPOSAL_SETTLE_MARGIN <= head)
+            || head.is_some_and(|h| h.saturating_sub(frame_number) >= PROPOSAL_SETTLE_MARGIN)
         {
             self.insert_proposal(frame_number, Arc::new(proposal.clone()));
         }
@@ -226,6 +258,7 @@ pub type AppShardsProvider = Arc<
 /// node against the trusted header root, so nothing served here is trusted on
 /// its own. Installed by the node (which owns the CRDT).
 pub trait ForestServer: Send + Sync {
+    fn global_vertex_proof(&self, _root: [u8; 32], _address: [u8; 32]) -> Option<Vec<u8>> { None }
     /// `borsh(NodeKey)` → `borsh(Node)` (None if absent / malformed key).
     fn serve_node(&self, shard_id: &[u8], phase: u32, node_key: &[u8]) -> Option<Vec<u8>>;
     /// `(version, key_hash)` → leaf value (None if absent).
@@ -238,8 +271,8 @@ pub trait ForestServer: Send + Sync {
     fn serve_preimage(&self, shard_id: &[u8], phase: u32, key_hash: [u8; 32]) -> Option<Vec<u8>>;
     /// A vertex's committed blob (the readable data), keyed under the app
     /// ShardKey bytes (`l1[3] ‖ l2[32]`). `version` MVCC-pins the read to the
-    /// tree version the diff addressed (0 ⇒ latest).
-    fn serve_vertex_blob(&self, shard_key: &[u8], phase: u32, id: &[u8], version: u64)
+    /// tree version the diff addressed (`None` means latest).
+    fn serve_vertex_blob(&self, shard_key: &[u8], phase: u32, id: &[u8], version: Option<u64>)
         -> Option<Vec<u8>>;
     /// Sync-by-hash: authenticated tree `root` → local `(version, global_frame)`
     /// for a `(shard_id, phase)` tree. None if never committed here or pruned.
@@ -266,6 +299,8 @@ pub struct GlobalRpcServer {
     global_shards: Option<GlobalShardsProvider>,
     app_shards: Option<AppShardsProvider>,
     forest_server: Option<Arc<dyn ForestServer>>,
+    global_vertex_proof_source: Option<quil_engine::storage_history::GlobalVertexProofSource>,
+    archive_directory: Option<Arc<crate::ArchiveEndpointPool>>,
     /// Broadcast channel for `StreamGlobalMessages`. Producers
     /// (BlossomSub recv loop) send each received message; every
     /// connected streamer gets a `Receiver` clone.
@@ -286,6 +321,31 @@ pub struct GlobalRpcServer {
         Option<Arc<dyn Fn(&crate::peer_auth_middleware::AuthenticatedPeer) -> bool + Send + Sync>>,
 }
 
+// Shared across peer-facing server instances. A cancelled RPC keeps its
+// permit inside the blocking closure until storage work actually finishes.
+static FOREST_READ_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+static HISTORY_FORWARD_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+async fn forest_read<T: Send + 'static>(
+    server: Option<Arc<dyn ForestServer>>,
+    read: impl FnOnce(&dyn ForestServer) -> Option<T> + Send + 'static,
+) -> Result<Option<T>, Status> {
+    let Some(server) = server else { return Ok(None) };
+    bounded_forest_read(&FOREST_READ_WORKERS, move || read(server.as_ref())).await
+}
+
+async fn bounded_forest_read<T: Send + 'static>(
+    workers: &'static tokio::sync::Semaphore,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Status> {
+    let permit = workers.try_acquire()
+        .map_err(|_| Status::resource_exhausted("forest read workers busy; retry later"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read()
+    }).await.map_err(|e| Status::internal(format!("forest read task failed: {e}")))
+}
+
 impl GlobalRpcServer {
     pub fn new(frames: Arc<dyn FrameLookup>) -> Self {
         Self {
@@ -297,6 +357,8 @@ impl GlobalRpcServer {
             global_shards: None,
             app_shards: None,
             forest_server: None,
+            global_vertex_proof_source: None,
+            archive_directory: None,
             message_broadcast: None,
             self_peer_id: None,
             prover_authorizer: None,
@@ -363,6 +425,16 @@ impl GlobalRpcServer {
         self
     }
 
+    pub fn with_global_vertex_proof_source(mut self, source: Option<quil_engine::storage_history::GlobalVertexProofSource>) -> Self {
+        self.global_vertex_proof_source = source;
+        self
+    }
+
+    pub fn with_archive_directory(mut self, pool: Arc<crate::ArchiveEndpointPool>) -> Self {
+        self.archive_directory = Some(pool);
+        self
+    }
+
     pub fn with_app_shards_provider(mut self, p: AppShardsProvider) -> Self {
         self.app_shards = Some(p);
         self
@@ -408,6 +480,39 @@ impl GlobalRpcServer {
 
 #[tonic::async_trait]
 impl GlobalService for GlobalRpcServer {
+    async fn get_archive_endpoints(
+        &self, request: Request<global::GetArchiveEndpointsRequest>,
+    ) -> Result<Response<global::GetArchiveEndpointsResponse>, Status> {
+        self.require_self_identity(request.extensions())?;
+        let pool = self.archive_directory.as_ref().ok_or_else(|| Status::unavailable("archive directory unavailable"))?;
+        let endpoints = pool.get_all().await.into_iter()
+            .filter(|entry| !entry.is_empty() && entry.len() <= 512).take(32).collect();
+        Ok(Response::new(global::GetArchiveEndpointsResponse { endpoints }))
+    }
+    async fn get_global_vertex_proof(
+        &self,
+        request: Request<global::GetGlobalVertexProofRequest>,
+    ) -> Result<Response<global::GetGlobalVertexProofResponse>, Status> {
+        use quil_engine::storage_history::verify_global_vertex_proof;
+        let req = request.into_inner();
+        let root: [u8; 32] = req.root.as_slice().try_into().map_err(|_| Status::invalid_argument("GLOBAL root must be 32 bytes"))?;
+        let address: [u8; 32] = req.address.as_slice().try_into().map_err(|_| Status::invalid_argument("GLOBAL address must be 32 bytes"))?;
+        let mut proof = forest_read(self.forest_server.clone(), move |s| s.global_vertex_proof(root, address)).await?;
+        if proof.is_none() && req.allow_forward {
+            if let Some(source) = self.global_vertex_proof_source.as_ref() {
+                let _permit = HISTORY_FORWARD_WORKERS.try_acquire().map_err(|_| Status::resource_exhausted("history forwarding busy"))?;
+                proof = tokio::time::timeout(std::time::Duration::from_secs(10), source(root, address))
+                    .await.map_err(|_| Status::unavailable("historical proof forwarding timed out"))?
+                    .map_err(|e| Status::unavailable(e.to_string()))?;
+            }
+        }
+        if let Some(bytes) = proof.as_ref() {
+            verify_global_vertex_proof(&root, &address, bytes).map_err(|e| Status::data_loss(e.to_string()))?;
+        }
+        Ok(Response::new(global::GetGlobalVertexProofResponse {
+            found: proof.is_some(), proof: proof.unwrap_or_default(),
+        }))
+    }
     async fn get_global_frame(
         &self,
         request: Request<global::GetGlobalFrameRequest>,
@@ -510,6 +615,9 @@ impl GlobalService for GlobalRpcServer {
                     .map_err(|e| format!("range_app_shards: {e}"))?
             };
             let include_shard_key = req.shard_key.len() != 35;
+            let pending = shards_store
+                .all_pending_shard_changes()
+                .map_err(|e| format!("all_pending_shard_changes: {e}"))?;
             // `RocksShardsStore` only persists the prefix path bytes — it
             // doesn't carry `size`, `data_shards`, or `commitment`. Fill
             // those in by consulting the live CRDT via the provider. Without
@@ -518,6 +626,7 @@ impl GlobalService for GlobalRpcServer {
             Ok(shards
                 .into_iter()
                 .map(|s| {
+                    let pending_change = frozen_by_pending_change(&s.shard_key, &s.prefix, &pending);
                     let (size, data_shards, commitment, materialized_frame, latest_frame) = match &app_shards {
                         Some(p) => match p(&s.shard_key, &s.prefix) {
                             Some((sz, ds, cm, mat, latest)) => (sz, ds, cm.to_vec(), mat, latest),
@@ -533,6 +642,7 @@ impl GlobalService for GlobalRpcServer {
                         commitment,
                         materialized_frame,
                         latest_frame,
+                        pending_change,
                     }
                 })
                 .collect())
@@ -687,10 +797,7 @@ impl GlobalService for GlobalRpcServer {
         request: Request<global::GetForestNodeRequest>,
     ) -> Result<Response<global::GetForestNodeResponse>, Status> {
         let req = request.into_inner();
-        let node = self
-            .forest_server
-            .as_ref()
-            .and_then(|s| s.serve_node(&req.shard_id, req.phase, &req.node_key));
+        let node = forest_read(self.forest_server.clone(), move |s| s.serve_node(&req.shard_id, req.phase, &req.node_key)).await?;
         Ok(Response::new(global::GetForestNodeResponse {
             found: node.is_some(),
             node: node.unwrap_or_default(),
@@ -707,10 +814,7 @@ impl GlobalService for GlobalRpcServer {
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("key_hash must be 32 bytes"))?;
-        let value = self
-            .forest_server
-            .as_ref()
-            .and_then(|s| s.serve_value(&req.shard_id, req.phase, req.version, key_hash));
+        let value = forest_read(self.forest_server.clone(), move |s| s.serve_value(&req.shard_id, req.phase, req.version, key_hash)).await?;
         Ok(Response::new(global::GetForestValueResponse {
             found: value.is_some(),
             value: value.unwrap_or_default(),
@@ -722,10 +826,7 @@ impl GlobalService for GlobalRpcServer {
         request: Request<global::GetForestHeadRequest>,
     ) -> Result<Response<global::GetForestHeadResponse>, Status> {
         let req = request.into_inner();
-        let head = self
-            .forest_server
-            .as_ref()
-            .and_then(|s| s.serve_head(&req.shard_id, req.phase));
+        let head = forest_read(self.forest_server.clone(), move |s| s.serve_head(&req.shard_id, req.phase)).await?;
         Ok(Response::new(match head {
             Some((version, root)) => global::GetForestHeadResponse {
                 found: true,
@@ -746,10 +847,7 @@ impl GlobalService for GlobalRpcServer {
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("key_hash must be 32 bytes"))?;
-        let raw = self
-            .forest_server
-            .as_ref()
-            .and_then(|s| s.serve_preimage(&req.shard_id, req.phase, key_hash));
+        let raw = forest_read(self.forest_server.clone(), move |s| s.serve_preimage(&req.shard_id, req.phase, key_hash)).await?;
         Ok(Response::new(global::GetForestPreimageResponse {
             found: raw.is_some(),
             raw_key: raw.unwrap_or_default(),
@@ -761,10 +859,8 @@ impl GlobalService for GlobalRpcServer {
         request: Request<global::GetVertexBlobRequest>,
     ) -> Result<Response<global::GetVertexBlobResponse>, Status> {
         let req = request.into_inner();
-        let blob = self
-            .forest_server
-            .as_ref()
-            .and_then(|s| s.serve_vertex_blob(&req.shard_key, req.phase, &req.id, req.version));
+        let version = (req.exact_version || req.version != 0).then_some(req.version);
+        let blob = forest_read(self.forest_server.clone(), move |s| s.serve_vertex_blob(&req.shard_key, req.phase, &req.id, version)).await?;
         Ok(Response::new(global::GetVertexBlobResponse {
             found: blob.is_some(),
             blob: blob.unwrap_or_default(),
@@ -781,10 +877,7 @@ impl GlobalService for GlobalRpcServer {
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("root must be 32 bytes"))?;
-        let resolved = self
-            .forest_server
-            .as_ref()
-            .and_then(|s| s.resolve_root(&req.shard_id, req.phase, root));
+        let resolved = forest_read(self.forest_server.clone(), move |s| s.resolve_root(&req.shard_id, req.phase, root)).await?;
         Ok(Response::new(match resolved {
             Some((version, global_frame)) => global::ResolveRootResponse {
                 found: true,
@@ -805,10 +898,7 @@ impl GlobalService for GlobalRpcServer {
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("app_root must be 32 bytes"))?;
-        let manifest = self
-            .forest_server
-            .as_ref()
-            .and_then(|s| s.serve_app_manifest(&req.app_address, req.phase, app_root));
+        let manifest = forest_read(self.forest_server.clone(), move |s| s.serve_app_manifest(&req.app_address, req.phase, app_root)).await?;
         Ok(Response::new(match manifest {
             Some(entries) => global::GetAppManifestResponse {
                 found: true,
@@ -823,6 +913,49 @@ impl GlobalService for GlobalRpcServer {
             },
             None => global::GetAppManifestResponse { found: false, entries: Vec::new() },
         }))
+    }
+}
+
+/// Whether a recorded split or merge that has not applied yet names the shard
+/// at `(shard_key, prefix)`. The chain refuses a join that includes such a
+/// shard, so a regular node leaves it out of its join candidates.
+fn frozen_by_pending_change(
+    shard_key: &[u8],
+    prefix: &[u32],
+    pending: &[quil_types::store::PendingShardChange],
+) -> bool {
+    let Some(app) = shard_key.get(3..35) else { return false };
+    let filter = quil_forest::shard_prefix_to_filter(app, prefix);
+    pending.iter().any(|change| change.affects_shard(&filter))
+}
+
+#[cfg(test)]
+mod pending_change_tests {
+    use quil_types::store::{PendingShardChange, ShardChangeKind};
+
+    // A live width run: three shards were staged to split at frame 247 and
+    // flipped at 304. Every join the regular nodes proposed in between named
+    // one of them, and the chain refused each whole join.
+    #[test]
+    fn a_shard_named_by_a_pending_split_is_reported_frozen() {
+        let app = [0x21u8; 32];
+        let shard_key: Vec<u8> = [0u8, 0, 0].into_iter().chain(app).collect();
+        let prefix = quil_forest::bit_path_to_prefix;
+        let parent = quil_forest::encode_shard_bit_path(&app, &[false, true]);
+        let split = PendingShardChange {
+            kind: ShardChangeKind::Split,
+            parent,
+            children: vec![
+                quil_forest::encode_shard_bit_path(&app, &[false, true, false]),
+                quil_forest::encode_shard_bit_path(&app, &[false, true, true]),
+            ],
+            effective_epoch: 10,
+            proposed_frame: 247,
+        };
+        let pending = [split];
+        assert!(super::frozen_by_pending_change(&shard_key, &prefix(&[false, true]), &pending));
+        assert!(!super::frozen_by_pending_change(&shard_key, &prefix(&[false, false]), &pending));
+        assert!(!super::frozen_by_pending_change(&shard_key, &prefix(&[false, true]), &[]));
     }
 }
 
@@ -848,6 +981,30 @@ mod identity_gate_tests {
         let mut ext = tonic::Extensions::new();
         ext.insert(AuthenticatedPeer { peer_id, falcon_public_key: Vec::new() });
         ext
+    }
+
+    #[tokio::test]
+    async fn archive_directory_is_bounded_and_only_served_to_own_workers() {
+        let me = quil_p2p::PeerId::random();
+        let pool = Arc::new(crate::ArchiveEndpointPool::new(std::time::Duration::ZERO));
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup))
+            .with_self_peer_id(me.to_bytes()).with_archive_directory(pool.clone());
+        let request = |peer| {
+            let mut request = Request::new(global::GetArchiveEndpointsRequest {});
+            if let Some(peer) = peer { *request.extensions_mut() = auth_ext(peer); }
+            request
+        };
+        for peer in [None, Some(quil_p2p::PeerId::random())] {
+            assert_eq!(server.get_archive_endpoints(request(peer)).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+        }
+        assert!(server.get_archive_endpoints(request(Some(me))).await.unwrap().into_inner().endpoints.is_empty());
+        pool.add(String::new()).await;
+        pool.add("x".repeat(513)).await;
+        for index in 0..40 { pool.add(format!("192.0.2.{}:8340", index+1)).await; }
+        let endpoints = server.get_archive_endpoints(request(Some(me))).await.unwrap().into_inner().endpoints;
+        assert_eq!(endpoints.len(), 32);
+        assert_eq!(endpoints[0], "192.0.2.1:8340");
+        assert_eq!(endpoints[31], "192.0.2.32:8340");
     }
 
     #[test]
@@ -947,6 +1104,56 @@ mod caching_lookup_tests {
     }
 
     #[test]
+    fn proposal_only_catchup_populates_cache_and_handles_max_height() {
+        let cache = CachingFrameLookup::new(
+            CountingLookup::new(100), 16, std::time::Duration::from_secs(1),
+        );
+        cache.get_global_proposal(50).unwrap();
+        cache.get_global_proposal(50).unwrap();
+        assert_eq!(cache.inner.get_proposal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.inner.get_latest_calls.load(Ordering::SeqCst), 1);
+        cache.get_global_proposal(u64::MAX).unwrap();
+        cache.get_global_proposal(u64::MAX).unwrap();
+        assert_eq!(cache.inner.get_proposal_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn concurrent_cold_reads_share_store_loads() {
+        struct SlowLookup(CountingLookup);
+        impl FrameLookup for SlowLookup {
+            fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.0.get_latest_frame()
+            }
+            fn get_frame(&self, n: u64) -> Result<global::GlobalFrame, String> {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.0.get_frame(n)
+            }
+            fn get_global_proposal(&self, n: u64) -> Result<global::GlobalProposal, String> {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.0.get_global_proposal(n)
+            }
+        }
+        let cache = CachingFrameLookup::new(
+            SlowLookup(CountingLookup::new(100)), 16, std::time::Duration::from_secs(10),
+        );
+        let start = std::sync::Barrier::new(12);
+        std::thread::scope(|scope| {
+            for _ in 0..12 {
+                scope.spawn(|| {
+                    start.wait();
+                    cache.get_latest_frame().unwrap();
+                    cache.get_frame(42).unwrap();
+                    cache.get_global_proposal(50).unwrap();
+                });
+            }
+        });
+        assert_eq!(cache.inner.0.get_latest_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.inner.0.get_frame_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.inner.0.get_proposal_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn frames_cached_by_number_immutable() {
         let cache = CachingFrameLookup::new(
             CountingLookup::new(100),
@@ -1020,5 +1227,93 @@ mod caching_lookup_tests {
         let after_genesis = cache.inner.get_proposal_calls.load(Ordering::SeqCst);
         cache.get_global_proposal(0).unwrap();
         assert_eq!(cache.inner.get_proposal_calls.load(Ordering::SeqCst), after_genesis);
+    }
+}
+
+#[cfg(test)]
+mod forest_read_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_keeps_storage_slot_and_runtime_responsive() {
+        static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        // Dropping release_tx also releases the worker on assertion failure.
+        let caller = tokio::spawn(bounded_forest_read(&WORKERS, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await.unwrap().unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(bounded_forest_read(&WORKERS, || ()).await.unwrap_err().code(),
+            tonic::Code::ResourceExhausted);
+        release_tx.send(()).unwrap();
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), WORKERS.acquire())
+            .await.unwrap().unwrap();
+        drop(permit);
+        assert_eq!(bounded_forest_read(&WORKERS, || 42).await.unwrap(), 42);
+    }
+}
+
+#[cfg(test)]
+mod historical_proof_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EmptyLookup;
+    impl FrameLookup for EmptyLookup {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> { Err("unused".into()) }
+        fn get_frame(&self, _: u64) -> Result<global::GlobalFrame, String> { Err("unused".into()) }
+        fn get_global_proposal(&self, _: u64) -> Result<global::GlobalProposal, String> { Err("unused".into()) }
+    }
+
+    #[tokio::test]
+    async fn historical_proof_forwarding_is_bounded_one_hop_and_root_verified() {
+        let address = [9;32];
+        let tree = quil_execution::global_intrinsic::materialize::create_leaf_root_vertex_tree(
+            &[7;32], &[8;32], &[], 11, &[1;74], 1, 330,
+        ).unwrap();
+        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        let forest = quil_forest::Forest::in_memory();
+        let root = forest.commit_shard_phase_raw(&[0xff;32], quil_forest::Phase::VertexAdds, 0,
+            vec![(address.to_vec(), quil_tries::vertex_leaf_value(&blob).unwrap())]).unwrap();
+        let vertex: Vec<_> = [0xff;32].into_iter().chain(address).collect();
+        let bytes = quil_forest::MembershipProof { inputs:vec![forest.build_vertex_membership_proof(
+            &[0xff;32], quil_forest::Phase::VertexAdds, 0, &vertex, &blob,
+        ).unwrap()] }.to_bytes();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = {
+            let calls = calls.clone();
+            let bytes = bytes.clone();
+            Arc::new(move |_: [u8;32], _: [u8;32]| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let bytes = bytes.clone();
+                Box::pin(async move { Ok(Some(bytes)) }) as std::pin::Pin<Box<dyn std::future::Future<Output=quil_types::error::Result<Option<Vec<u8>>>> + Send>>
+            }) as quil_engine::storage_history::GlobalVertexProofSource
+        };
+        let server = GlobalRpcServer::new(Arc::new(EmptyLookup)).with_global_vertex_proof_source(Some(source));
+        let request = |root: Vec<u8>, address: Vec<u8>, allow_forward| Request::new(global::GetGlobalVertexProofRequest { root, address, allow_forward });
+        let missing = server.get_global_vertex_proof(request(root.to_vec(), address.to_vec(), false)).await.unwrap().into_inner();
+        assert!(!missing.found);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(server.get_global_vertex_proof(request(vec![0;31], address.to_vec(), true)).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let valid = server.get_global_vertex_proof(request(root.to_vec(), address.to_vec(), true)).await.unwrap().into_inner();
+        assert!(valid.found);
+        assert_eq!(valid.proof, bytes);
+        assert_eq!(server.get_global_vertex_proof(request(vec![0;32], address.to_vec(), true)).await.unwrap_err().code(), tonic::Code::DataLoss);
+        assert_eq!(server.get_global_vertex_proof(request(root.to_vec(), vec![0;32], true)).await.unwrap_err().code(), tonic::Code::DataLoss);
+        let held: Vec<_> = (0..4).map(|_| HISTORY_FORWARD_WORKERS.try_acquire().unwrap()).collect();
+        let before = calls.load(Ordering::SeqCst);
+        assert_eq!(server.get_global_vertex_proof(request(root.to_vec(), address.to_vec(), true)).await.unwrap_err().code(), tonic::Code::ResourceExhausted);
+        assert_eq!(calls.load(Ordering::SeqCst), before);
+        drop(held);
+        let unavailable = GlobalRpcServer::new(Arc::new(EmptyLookup)).with_global_vertex_proof_source(Some(
+            Arc::new(|_, _| Box::pin(async { Err(quil_types::error::QuilError::ExecutionUnavailable("pruned".into())) })),
+        ));
+        assert_eq!(unavailable.get_global_vertex_proof(request(root.to_vec(), address.to_vec(), true)).await.unwrap_err().code(), tonic::Code::Unavailable);
     }
 }

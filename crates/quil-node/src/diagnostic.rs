@@ -220,7 +220,7 @@ pub(crate) fn run_import(
         // Streaming mode: read from stdin (zero extra disk)
         info!("importing from stdin (pipe mode — zero extra disk)");
         let stdin = std::io::stdin().lock();
-        quil_store::import::import_from_reader(db.inner().as_ref(), stdin)?
+        quil_store::import::import_from_reader(&db.inner(), stdin)?
     } else {
         // File mode: validate first, then import
         info!(path = %import_path.display(), "importing from file");
@@ -231,7 +231,7 @@ pub(crate) fn run_import(
                 return Err(e.into());
             }
         }
-        quil_store::import::import_database(db.inner().as_ref(), import_path)?
+        quil_store::import::import_database(&db.inner(), import_path)?
     };
 
     info!(

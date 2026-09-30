@@ -67,12 +67,34 @@ pub struct ProverPipeline {
     pub transport: Arc<dyn ProverMessageTransport>,
     /// Live hypergraph CRDT — read by the storage-attestation confirm hook
     /// (`submit_confirm`) to partition each confirmed shard's committed
-    /// subtree into PoRep leaves. `None` disables the hook (tests / pre-wiring).
+    /// subtree into PoRep leaves. Required for data-shard confirmations.
     pub hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
     /// Replica store the confirm hook persists per-leaf SDR replicas into
     /// (keyed by `(epoch, leaf_id)`), so the per-frame producer can later
-    /// answer openings. `None` disables the hook.
+    /// answer openings. Required for data-shard confirmations.
     pub replica_store: Option<quil_store::replica_store::ReplicaStore>,
+    /// Per-shard storage: the hypergraph and replica store of the worker that
+    /// holds and attests a shard, when it is not the node's own (a thread
+    /// worker opens its own database). Confirmation must encode the same data
+    /// into the same replica store the attesting worker proves from, or the
+    /// registered leaf roots diverge from its attestations once the shard's
+    /// data changes and every storage frame is rejected.
+    pub storage_for_filter: Option<std::sync::Arc<
+        dyn Fn(&[u8]) -> Option<(std::sync::Arc<quil_hypergraph::HypergraphCrdt>, quil_store::replica_store::ReplicaStore)>
+            + Send + Sync,
+    >>,
+    /// Leaf roots prepared by the standalone (cluster-mode) worker serving a
+    /// filter, from its own store: `Ok(None)` when no such worker serves it.
+    /// Called from a blocking task. Without it the master encoded from its
+    /// own store, which lacks the shard's data, and the worker's attestations
+    /// were rejected for leaves it could never prove.
+    pub remote_storage_confirm: Option<RemoteStorageConfirm>,
+    /// Splits and merges this node has recorded but not applied. A confirm in
+    /// the epoch before one applies also registers the shards it creates from
+    /// the confirmed ones (see `pre_registration_targets`).
+    pub pending_shard_changes: Option<std::sync::Arc<
+        dyn Fn() -> Vec<quil_types::store::PendingShardChange> + Send + Sync,
+    >>,
     /// Local global-message collector, for LOOPBACK of ops this node generates
     /// for ITSELF (ShardSplit/ShardMerge from the coverage orchestrator, which
     /// runs on the frame producer). A producer must include its own generated op
@@ -87,6 +109,11 @@ pub struct ProverPipeline {
     pub current_frame: Option<Arc<CurrentFrame>>,
 }
 
+pub type RemoteStorageConfirm = std::sync::Arc<
+    dyn Fn(&[u8], &[Vec<u8>], u64) -> Result<Option<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>>>
+        + Send + Sync,
+>;
+
 /// Hard ceiling on lifecycle submissions that do NOT perform VDF
 /// compute (confirms, rejects, leaves, seniority merge). Each of
 /// these is sign + canonicalize + publish; the only legitimately
@@ -96,7 +123,101 @@ pub struct ProverPipeline {
 /// or stuck publish can't silently wedge a dispatch forever.
 const NON_VDF_SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// What a confirm encodes, per confirmed filter: the filter, from its own
+/// storage, then the shards a split or merge applying at `epoch` creates from
+/// it (see `pre_registration_targets`). A merge target two confirmed sources
+/// share is encoded once, from the first.
+fn confirm_encoding_plan(
+    filters: &[Vec<u8>],
+    changes: &[quil_types::store::PendingShardChange],
+    epoch: u64,
+) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut claimed: Vec<Vec<u8>> = filters.to_vec();
+    filters
+        .iter()
+        .map(|filter| {
+            let targets: Vec<Vec<u8>> = if filter.is_empty() {
+                Vec::new()
+            } else {
+                quil_execution::global_intrinsic::leaf_root_registration::pre_registration_targets(
+                    changes,
+                    std::slice::from_ref(filter),
+                    epoch,
+                )
+                .into_iter()
+                .filter(|target| !claimed.contains(target))
+                .collect()
+            };
+            claimed.extend(targets.iter().cloned());
+            (filter.clone(), targets)
+        })
+        .collect()
+}
+
 impl ProverPipeline {
+    fn dispatch_confirmation(
+        self: &Arc<Self>, filters: Vec<Vec<u8>>, frame_number: u64,
+        needs_storage: bool, prune_replicas: bool,
+    ) {
+        let Some(attempt) = self.lifecycle.confirmation_attempts.begin(&filters, frame_number) else {
+            tracing::info!(frame = frame_number, filters = filters.len(), needs_storage,
+                "confirmation dispatch skipped: an attempt for this filter/epoch is already recorded");
+            return;
+        };
+        tracing::info!(frame = frame_number, filters = filters.len(), needs_storage, prune_replicas,
+            "dispatching prover confirmation");
+        let me = self.clone();
+        tokio::spawn(async move {
+            // Limit expensive preparation independently from network timeouts.
+            // Keep the reservation inside the blocking task: cancelling its
+            // waiter cannot start a second encoder while the first still runs.
+            let (roots, attempt) = if needs_storage {
+                static ENCODERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+                let Ok(permit) = ENCODERS.acquire().await else { return; };
+                let encoder = me.clone();
+                let encoded_filters = filters.clone();
+                let prepared = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let roots = encoder.storage_confirm_leaf_roots(&encoded_filters, frame_number);
+                    (roots, attempt)
+                }).await;
+                match prepared {
+                    Ok((Ok(roots), attempt)) => (roots, attempt),
+                    Ok((Err(e), _attempt)) => {
+                        warn!(frame = frame_number, %e, "confirmation preparation failed; retrying on next cycle");
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(frame = frame_number, %e, "confirmation preparation task failed");
+                        return;
+                    }
+                }
+            } else {
+                (Vec::new(), attempt)
+            };
+            match tokio::time::timeout(
+                NON_VDF_SUBMIT_TIMEOUT,
+                me.submit_confirm(filters, frame_number, roots),
+            ).await {
+                Ok(Ok(())) => {
+                    attempt.published(me.current_frame.as_ref().map(|f| f.effective()).unwrap_or(frame_number));
+                    if prune_replicas {
+                        if let Some(store) = me.replica_store.as_ref() {
+                            // Keep current and next epoch replicas. Publication
+                            // alone is not an on-chain registration acknowledgement.
+                            let current_epoch = quil_types::consensus::epoch_for_frame(frame_number);
+                            if let Err(e) = store.evict_below_epoch(current_epoch) {
+                                warn!(frame = frame_number, %e, "replica cleanup failed");
+                            }
+                        }
+                    }
+                }
+                Ok(Err(e)) => warn!(frame = frame_number, %e, "confirmation submission failed"),
+                Err(_) => warn!(frame = frame_number, "confirmation submission timed out"),
+            }
+        });
+    }
+
     /// Dispatch a lifecycle action. Non-blocking: spawns a tokio task
     /// to handle the (slow) VDF + sign + submit work so the caller's
     /// frame-processing loop continues.
@@ -169,26 +290,7 @@ impl ProverPipeline {
                 });
             }
             LifecycleAction::ConfirmJoins { filters, frame_number } => {
-                let me = self.clone();
-                // TODO
-                tokio::spawn(async move {
-                    match tokio::time::timeout(
-                        NON_VDF_SUBMIT_TIMEOUT,
-                        me.submit_confirm(filters, frame_number),
-                    ).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            warn!(frame = frame_number, %e, "ConfirmJoins submission failed");
-                        }
-                        Err(_) => {
-                            warn!(
-                                frame = frame_number,
-                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
-                                "ConfirmJoins submission timed out",
-                            );
-                        }
-                    }
-                });
+                self.dispatch_confirmation(filters, frame_number, true, false);
             }
             LifecycleAction::RejectJoins { filters, frame_number } => {
                 let me = self.clone();
@@ -235,64 +337,10 @@ impl ProverPipeline {
                 });
             }
             LifecycleAction::ConfirmLeaves { filters, frame_number } => {
-                let me = self.clone();
-                // TODO
-                tokio::spawn(async move {
-                    match tokio::time::timeout(
-                        NON_VDF_SUBMIT_TIMEOUT,
-                        me.submit_confirm(filters, frame_number),
-                    ).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            warn!(frame = frame_number, %e, "ConfirmLeaves submission failed");
-                        }
-                        Err(_) => {
-                            warn!(
-                                frame = frame_number,
-                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
-                                "ConfirmLeaves submission timed out",
-                            );
-                        }
-                    }
-                });
+                self.dispatch_confirmation(filters, frame_number, false, false);
             }
             LifecycleAction::ReconfirmEpoch { filters, frame_number } => {
-                let me = self.clone();
-                // TODO
-                tokio::spawn(async move {
-                    // Re-confirm = a ProverConfirm at the current frame, which
-                    // re-encodes fresh-epoch replicas (compute_storage_confirm
-                    // puts under epoch_for_frame(frame_number)) + re-registers
-                    // leaf roots for the new epoch.
-                    match tokio::time::timeout(
-                        NON_VDF_SUBMIT_TIMEOUT,
-                        me.submit_confirm(filters, frame_number),
-                    ).await {
-                        Ok(Ok(())) => {
-                            // Only after the new-epoch replicas are persisted do
-                            // we prune the stale ones — keep_from = the epoch we
-                            // just (re)confirmed, dropping everything below it.
-                            if let Some(rs) = me.replica_store.as_ref() {
-                                let epoch =
-                                    quil_types::consensus::epoch_for_frame(frame_number);
-                                if let Err(e) = rs.evict_below_epoch(epoch) {
-                                    warn!(frame = frame_number, %e,
-                                        "replica evict_below_epoch failed after re-confirm");
-                                }
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            warn!(frame = frame_number, %e, "ReconfirmEpoch submission failed");
-                        }
-                        Err(_) => {
-                            warn!(
-                                frame = frame_number,
-                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
-                                "ReconfirmEpoch submission timed out",
-                            );
-                        }
-                    }
-                });
+                self.dispatch_confirmation(filters, frame_number, true, true);
             }
             LifecycleAction::RejectLeaves { filters, frame_number } => {
                 let me = self.clone();
@@ -475,7 +523,12 @@ impl ProverPipeline {
         Ok(())
     }
 
-    async fn submit_confirm(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {
+    async fn submit_confirm(
+        &self,
+        filters: Vec<Vec<u8>>,
+        frame_number: u64,
+        leaf_roots: Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>,
+    ) -> Result<()> {
         // Storage-attestation confirm hook (PoRep): at/after activation,
         // partition each confirmed shard, SDR-encode + persist this prover's
         // per-leaf replicas, and fold the registered leaf roots into the
@@ -483,7 +536,6 @@ impl ProverPipeline {
         // appends the leaf-root set — byte-identical to the legacy
         // concat(filters)||frame message when the set is empty (pre-activation
         // / deps absent), so default Go-parity is preserved.
-        let leaf_roots = self.storage_confirm_leaf_roots(&filters, frame_number);
         let msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
             &filters,
             frame_number,
@@ -506,30 +558,28 @@ impl ProverPipeline {
         };
         let bytes = confirm.to_canonical_bytes()?;
 
-        info!(frame = frame_number, filter_count = filters.len(), "submitting ProverConfirm");
+        info!(frame = frame_number, filter_count = filters.len(), leaf_roots = confirm.leaf_roots.len(),
+            leaf_entries = confirm.leaf_roots.iter().map(|g| g.entries.len()).sum::<usize>(),
+            "submitting ProverConfirm");
         crate::metrics::inc_prover_confirms_submitted();
         self.publish_prover_message(bytes).await
     }
 
-    /// Storage-attestation confirm hook. At/after `STORAGE_EPOCH_ACTIVATION_FRAME`,
-    /// and only when the hypergraph + replica store are wired, partition each
-    /// confirmed shard's committed subtree into PoRep leaves, SDR-encode each into
-    /// this prover's unique replica, persist them, and return the per-shard
-    /// `ConfirmLeafRoots` to fold into the confirm. Empty otherwise (legacy
-    /// byte-identical path). A hook error degrades to an empty set rather than
-    /// blocking the confirm.
+    /// Partition committed shard data into PoRep leaves, encode and persist the
+    /// next epoch's replicas, and return their roots. Preparation errors abort
+    /// submission so the lifecycle can retry. Global confirms need no replicas.
     fn storage_confirm_leaf_roots(
         &self,
         filters: &[Vec<u8>],
         frame_number: u64,
-    ) -> Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots> {
-        // Always-on: the only gate is whether the storage deps are wired
-        // (archive/worker with a hypergraph + replica store). Absent on
-        // light/test nodes → empty, byte-identical legacy confirm.
+    ) -> Result<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>> {
         let (Some(crdt), Some(replica_store)) =
             (self.hypergraph.as_ref(), self.replica_store.as_ref())
         else {
-            return Vec::new();
+            if filters.iter().all(Vec::is_empty) {
+                return Ok(Vec::new());
+            }
+            return Err(QuilError::Internal("storage confirmation requires hypergraph and replica store".into()));
         };
         // Epoch-aligned: a confirm in epoch E encodes + registers leaf roots for
         // the NEXT epoch E+1 (the `next` slot). The prover encodes ahead so that
@@ -538,23 +588,46 @@ impl ProverPipeline {
         // (`storage_vote_openings`) reads replica@CURRENT-epoch, which this same
         // store wrote one epoch earlier — so encode-ahead lines up exactly.
         let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
-        crate::app_shard_metadata::compute_storage_confirm(
-            crdt,
-            replica_store,
-            filters,
-            &self.prover_address,
-            epoch,
-            quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
-            &quil_crypto::sdr::SdrParams::default(),
-        )
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %e,
-                frame = frame_number,
-                "storage confirm hook failed; confirming without leaf roots"
-            );
-            Vec::new()
-        })
+        // Shards a split or merge applying next epoch creates from a confirmed
+        // shard are registered too, encoded from that shard's storage: its
+        // holder is on one of them once the change applies.
+        let changes = match self.pending_shard_changes.as_ref() {
+            Some(pending) if frame_number >= quil_execution::global_intrinsic::leaf_root_registration::pre_registration_frame() => pending(),
+            _ => Vec::new(),
+        };
+        let mut roots = Vec::with_capacity(filters.len());
+        for (filter, targets) in confirm_encoding_plan(filters, &changes, epoch) {
+            let filter = &filter;
+            let worker = if filter.is_empty() {
+                None
+            } else {
+                self.storage_for_filter.as_ref().and_then(|resolve| resolve(filter))
+            };
+            if worker.is_none() && !filter.is_empty() {
+                if let Some(remote) = self.remote_storage_confirm.as_ref() {
+                    if let Some(prepared) = remote(filter, &targets, frame_number)? {
+                        roots.extend(prepared);
+                        continue;
+                    }
+                }
+            }
+            let (filter_crdt, filter_replicas) = match worker.as_ref() {
+                Some((worker_crdt, worker_replicas)) => (worker_crdt.as_ref(), worker_replicas),
+                None => (crdt.as_ref(), replica_store),
+            };
+            let encoded: Vec<Vec<u8>> = std::iter::once(filter.clone()).chain(targets).collect();
+            roots.extend(crate::app_shard_metadata::compute_storage_confirm(
+                filter_crdt,
+                filter_replicas,
+                &encoded,
+                &self.prover_address,
+                epoch,
+                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+                &quil_crypto::sdr::SdrParams::default(),
+            )?);
+        }
+        Ok(roots)
+
     }
 
     async fn submit_reject(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {
@@ -802,5 +875,37 @@ impl ProverPipeline {
         } else {
             published
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::confirm_encoding_plan;
+    use quil_types::store::{PendingShardChange, ShardChangeKind};
+
+    fn change(kind: ShardChangeKind, parent: u8, children: &[u8]) -> PendingShardChange {
+        PendingShardChange {
+            kind,
+            parent: vec![parent],
+            children: children.iter().map(|c| vec![*c]).collect(),
+            effective_epoch: 8,
+            proposed_frame: 0,
+        }
+    }
+
+    #[test]
+    fn a_confirm_encodes_the_shards_a_change_creates_from_each_filter_once() {
+        let changes = vec![change(ShardChangeKind::Split, 1, &[10, 11]), change(ShardChangeKind::Merge, 2, &[20, 21])];
+        assert_eq!(
+            confirm_encoding_plan(&[vec![1], vec![20], vec![21], vec![]], &changes, 8),
+            vec![
+                (vec![1], vec![vec![10], vec![11]]),
+                (vec![20], vec![vec![2]]),
+                (vec![21], vec![]),
+                (vec![], vec![]),
+            ],
+            "each split child from the parent's storage; a shared merge target once",
+        );
+        assert_eq!(confirm_encoding_plan(&[vec![1]], &changes, 9), vec![(vec![1], vec![])], "only a change applying next epoch");
     }
 }

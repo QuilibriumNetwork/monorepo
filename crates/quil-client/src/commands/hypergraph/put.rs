@@ -73,7 +73,9 @@ pub(crate) fn build_hyperedge_add(
 #[derive(Debug, Subcommand)]
 pub enum PutCommand {
     /// Insert/update a vertex from `key=value` properties.
-    Vertex { properties: Vec<String> },
+    Vertex {
+        properties: Vec<String>,
+    },
     /// Create a hyperedge connecting atoms.
     ///
     /// `<full_address>` is the 64-byte hyperedge address (`app‖data`, hex or
@@ -123,7 +125,9 @@ async fn vertex(hc: &HypergraphCtx, domain_arg: &str, properties: &[String]) -> 
         request: Some(Request::VertexAdd(op)),
         timestamp: 0,
     };
-    crate::send::send_message_request(&mut client, &hc.key_manager, domain, request).await?;
+    // Writes are priced: the vertex add is paid by a QUIL settlement.
+    let _ = &mut client;
+    paid_send(hc, &domain, request, 0).await?;
 
     println!("Vertex submitted successfully");
     println!("Address: {}", hex::encode(&data_address));
@@ -181,9 +185,15 @@ async fn hyperedge(
         request: Some(Request::HyperedgeAdd(op)),
         timestamp: 0,
     };
-    crate::send::send_message_request(&mut client, &hc.key_manager, domain, request).await?;
+    let _ = &mut client;
+    paid_send(hc, &domain, request, 0).await?;
 
     println!("Hyperedge submitted successfully");
     println!("Full address: {}", hex::encode(id));
     Ok(())
+}
+
+async fn paid_send(hc: &HypergraphCtx, domain: &[u8], request: MessageRequest, _wait: u64) -> anyhow::Result<()> {
+    let destination: [u8; 32] = domain.try_into().map_err(|_| anyhow::anyhow!("domain must be 32 bytes"))?;
+    crate::send::send_paid_request(hc.global.clone(), &mut hc.connect().await?, &hc.key_manager, domain.to_vec(), destination, request).await
 }

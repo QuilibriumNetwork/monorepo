@@ -1,6 +1,6 @@
 //! Falcon / FN-DSA-512 post-quantum signatures for consensus.
 //!
-//! replaces the BLS48-581 signature primitive on
+//! Replaces the BLS48-581 signature primitive on
 //! the consensus path (votes, timeouts, quorum-cert shares, frame-header sigs,
 //! prover-join PoP) with Falcon. Unlike BLS, Falcon does **not** aggregate — a
 //! quorum certificate becomes a list of individual Falcon sigs + a signer

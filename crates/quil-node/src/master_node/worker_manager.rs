@@ -110,6 +110,92 @@ pub(crate) fn mirror_shard_frame_to_clock_store(
     }
 }
 
+/// Store key recording that `application`'s tree in this worker store is the
+/// unified tree ([`unified_cutover_conversion`]).
+fn unified_cutover_marker_key(application: &[u8; 32]) -> Vec<u8> {
+    let mut key = b"\x00__quil_worker_unified_cutover__".to_vec();
+    key.extend_from_slice(application);
+    key
+}
+
+/// Fold the application `filter` names into its single unified app tree
+/// (empty prefix = the whole app rebuilt from its vertices), once per worker
+/// store. A no-op at genesis (empty app).
+///
+/// The engine's unified flag lives in memory, so it asks for this again on
+/// every restart past the cutover. Rebuilding then committed the tree at
+/// version zero, and the commits after it continued from there while the
+/// store still held each vertex's blobs at the higher versions written before
+/// the restart. Reads take the greatest version, so every record updated after
+/// a restart read back its old value (live: a delivery wrote its coin, but the
+/// block's count, root and summary reverted, and every later delivery to that
+/// block failed). An app tree that already exists is therefore never rebuilt,
+/// and a first conversion commits each phase above the blobs it already holds.
+pub(crate) fn unified_cutover_conversion(
+    hg: &quil_store::RocksHypergraphStore,
+    filter: &[u8],
+) -> bool {
+    let Some(app) = filter.get(..32).and_then(|app| <[u8; 32]>::try_from(app).ok()) else {
+        return false;
+    };
+    let marker = unified_cutover_marker_key(&app);
+    if hg.raw_db().get(&marker).ok().flatten().is_some() {
+        return true;
+    }
+    let shard_key = quil_types::store::ShardKey {
+        l1: quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3),
+        l2: app,
+    };
+    let forest = quil_forest::Forest::with_namespace(
+        hg.raw_db(),
+        quil_store::FOREST_NAMESPACE.to_vec(),
+    );
+    let converted = (|| -> anyhow::Result<()> {
+        let mut heads = [None; 4];
+        let mut blobs = [None; 4];
+        for (index, (set, phase, tree)) in UNIFIED_PHASES.into_iter().enumerate() {
+            heads[index] = forest.read_head_version(&app, tree)?;
+            blobs[index] = hg.max_vertex_v2_version(set, phase, &shard_key)?;
+        }
+        if heads.iter().any(Option::is_some) {
+            // Committed as one tree already: a single-shard app before the
+            // cutover, or a store an earlier conversion rebuilt. A store whose
+            // blobs lie above its tree already reads stale values.
+            if heads.iter().zip(&blobs).any(|(head, blob)| blob > &Some(head.unwrap_or(0))) {
+                warn!(app = %hex::encode(app),
+                    "worker store holds vertex blobs above its app tree version; \
+                     updated records read stale values until this shard is resynced");
+            }
+            return Ok(());
+        }
+        let versions = blobs.map(|blob| blob.map_or(0, |version| version + 1));
+        quil_forest_migrate::convert_app_at_versions(hg, &forest, &shard_key, versions, &[Vec::new()])?;
+        Ok(())
+    })();
+    match converted {
+        Ok(()) => {
+            if let Err(error) = hg.raw_db().put(&marker, [1u8]) {
+                warn!(%error, app = %hex::encode(app),
+                    "worker unified-cutover marker write failed; the next restart checks again");
+            }
+            true
+        }
+        Err(error) => {
+            warn!(%error, app = %hex::encode(app),
+                "worker unified-cutover consolidation (convert_app) failed");
+            false
+        }
+    }
+}
+
+/// The four phase keyspaces and trees, in [`quil_forest::Phase`] order.
+const UNIFIED_PHASES: [(&str, &str, quil_forest::Phase); 4] = [
+    ("vertex", "adds", quil_forest::Phase::VertexAdds),
+    ("vertex", "removes", quil_forest::Phase::VertexRemoves),
+    ("hyperedge", "adds", quil_forest::Phase::HyperedgeAdds),
+    ("hyperedge", "removes", quil_forest::Phase::HyperedgeRemoves),
+];
+
 /// Build the hypergraph CRDT owned by one in-process (thread) worker, with a
 /// PERSISTENT (namespaced Rocks) forest installed.
 ///
@@ -124,6 +210,42 @@ pub(crate) fn mirror_shard_frame_to_clock_store(
 /// means NO durable materialized state — `RocksDb::open`'s schema marker and any
 /// Simplex liveness/consensus metadata written before the first app write don't
 /// count.
+/// Mark a worker CRDT's persisted size buckets as its initialized size
+/// accounting, without a forest scan. A worker's buckets are local: its frames
+/// commit only their phase roots, so nothing members agree on reads them. But
+/// an uninitialized CRDT refuses every execution fork ("execution capture
+/// requires initialized size accounting"), so the private-parent executor
+/// never ran on a worker: a selected parent that was notarized but not
+/// finalized then made every member abstain, and the shard wedged. The master
+/// warms its own CRDT at boot with its committed apps.
+/// The gossip topics a registered shard engine subscribes.
+fn shard_topics(filter: &[u8]) -> [Vec<u8>; 4] {
+    [
+        quil_engine::bitmasks::shard_frame_bitmask(filter),
+        quil_engine::bitmasks::shard_consensus_bitmask(filter),
+        quil_engine::bitmasks::app_prover_bitmask(filter),
+        quil_engine::bitmasks::shard_dispatch_bitmask(filter),
+    ]
+}
+
+/// The topics a deactivated shard's engine can release: those no registered
+/// engine still subscribes. The wallet submission topic is keyed by the
+/// application, so every shard of an application shares it; releasing it
+/// with one shard left the others unreachable (a live width run's transfers
+/// failed with `NoPeersSubscribedToTopic`).
+fn releasable_shard_topics<'a>(filter: &[u8], registered: impl IntoIterator<Item = &'a Vec<u8>>) -> Vec<Vec<u8>> {
+    let needed: std::collections::HashSet<Vec<u8>> =
+        registered.into_iter().flat_map(|other| shard_topics(other)).collect();
+    shard_topics(filter).into_iter().filter(|topic| !needed.contains(topic)).collect()
+}
+
+pub(crate) fn initialize_worker_size_accounting(crdt: &quil_hypergraph::HypergraphCrdt, label: &str) {
+    if let Err(error) = crdt.warm_sizes(&[]) {
+        tracing::warn!(store = label, %error,
+            "worker size accounting not initialized; selected parents cannot be executed privately");
+    }
+}
+
 pub(crate) fn build_thread_worker_hypergraph(
     db: &Arc<quil_store::RocksDb>,
     inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
@@ -162,8 +284,30 @@ pub(crate) fn build_thread_worker_hypergraph(
             "Phase-3 JMT forest installed on thread-worker CRDT — state commitments are persistent"
         );
     }
+    initialize_worker_size_accounting(&crdt, &db.inner().path().display().to_string());
+    if let (true, Some(policy)) = (crdt.forest_is_persistent(), quil_hypergraph::RetentionPolicy::from_env()) {
+        quil_hypergraph::spawn_retention_pruner(&crdt, policy, db.inner().path().display().to_string());
+    }
+    let label = db.inner().path().display().to_string();
+    crate::clock_retention::apply_snapshot_pin_limit(&crdt, &label);
+    crate::clock_retention::spawn_staged_cleanup(Arc::new(quil_store::RocksClockStore::new(db.inner())), label);
     crdt
 }
+
+/// Stores owned by one in-process (thread) worker. A worker opens its own
+/// RocksDB, so the application state it materializes is not in the master's
+/// stores; the node's RPC reads an application's wallet state from here.
+#[derive(Clone)]
+pub(crate) struct WorkerAppState {
+    pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    pub db: Arc<quil_store::RocksDb>,
+    pub hg_store: Arc<dyn quil_types::store::HypergraphStore>,
+}
+
+/// Shard filter → stores of the thread worker covering it. Filled on shard
+/// activation from the per-core stores the worker builder registers.
+pub(crate) type WorkerAppStates =
+    Arc<parking_lot::RwLock<std::collections::HashMap<Vec<u8>, WorkerAppState>>>;
 
 pub(crate) struct WorkerManagerArgs {
     pub config: quil_config::Config,
@@ -182,6 +326,8 @@ pub(crate) struct WorkerManagerArgs {
     pub file_key_manager: Arc<quil_keys::FileKeyManager>,
     pub prover_address: [u8; 32],
     pub bls_pubkey: Vec<u8>,
+    /// Filter → covering thread worker's stores (see [`WorkerAppState`]).
+    pub worker_app_states: WorkerAppStates,
     pub shard_engines: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
     >>,
@@ -207,6 +353,10 @@ pub(crate) struct WorkerManagerArgs {
     /// pool per attempt (see `worker_state_builder`).
     pub archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
     pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
+    /// Clone of the node-wide token proof verifier client; installed on
+    /// every thread worker's execution manager so they share one admission slot.
+    #[cfg(feature = "native-proof")]
+    pub proof_worker: Option<quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier>,
 }
 
 pub(crate) fn init(
@@ -231,11 +381,14 @@ pub(crate) fn init(
         prover_address,
         bls_pubkey,
         shard_engines,
+        worker_app_states,
         remote_worker_manager_for_halt,
         pi_worker_manager,
         prover_message_transport,
         archive_pool,
         spawner,
+        #[cfg(feature = "native-proof")]
+        proof_worker,
     } = args;
 
     // Worker manager — either local threads or remote gRPC workers.
@@ -250,7 +403,8 @@ pub(crate) fn init(
     // setup. Plumbed into `WorkerConsensusDeps` →
     // `AppEngineDeps::min_active_provers_for_propose` →
     // `AppLeaderProvider::prove_next_state`'s gate.
-    let min_active_provers_for_propose: u64 = if config.p2p.network == 0 { 3 } else { 1 };
+    let min_active_provers_for_propose: u64 =
+        quil_execution::token_intrinsic::constants::min_active_provers_for_shard_frames(config.p2p.network);
     let fkm_for_factory = file_key_manager.clone();
 
     let worker_manager: Arc<dyn quil_engine::worker::WorkerManager> =
@@ -406,6 +560,17 @@ pub(crate) fn init(
             let falcon_sk_for_builder = file_key_manager
                 .get_private_key(quil_types::crypto::KeyType::Falcon512)
                 .ok();
+            #[cfg(feature = "native-proof")]
+            let proof_worker_for_builder = proof_worker.clone();
+            let network_for_builder = config.p2p.network;
+            // Per-core stores, mapped to shard filters on activation.
+            let worker_stores_by_core: Arc<parking_lot::RwLock<std::collections::HashMap<u32, WorkerAppState>>> =
+                Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+            let worker_stores_for_builder = worker_stores_by_core.clone();
+            // Global frames live in the master's store; a worker's own store
+            // holds only its app-shard chain.
+            let master_clock_for_builder: Arc<dyn quil_types::store::ClockStore> =
+                clock_store.clone();
             let worker_state_builder: Arc<
                 dyn Fn(u32) -> std::result::Result<
                     quil_engine::thread_worker::WorkerOwnedDeps,
@@ -469,18 +634,31 @@ pub(crate) fn init(
                 let clock_store_for_exec: Arc<dyn quil_types::store::ClockStore> =
                     clock_store.clone();
                 let hypergraph_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
-                    Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
-                let exec_manager = Arc::new(
-                    quil_execution::ExecutionEngineManager::new(
-                        inclusion_prover.clone(),
-                        worker_key_manager,
-                        crdt.clone(),
-                        circuit_compiler,
-                        clock_store_for_exec,
-                        hypergraph_resolver,
-                        true,
-                    ),
-                );
+                    Arc::new(quil_execution::hypergraph_intrinsic::CrdtHypergraphConfigResolver::new(crdt.clone()));
+                let exec_manager = quil_execution::ExecutionEngineManager::new(
+                    inclusion_prover.clone(),
+                    worker_key_manager,
+                    crdt.clone(),
+                    circuit_compiler,
+                    clock_store_for_exec,
+                    hypergraph_resolver,
+                    true,
+                )
+                .with_pricing_network(network_for_builder)
+                .with_application_venue()
+                .and_then(|manager| manager.with_global_clock_store(master_clock_for_builder.clone()))
+                .map_err(|e| format!("worker {core_id}: {e}"))?;
+                // Same token policy and shared verifier slot as the master.
+                #[cfg(feature = "native-proof")]
+                let exec_manager = crate::proof_worker::install_token_worker(
+                    exec_manager,
+                    network_for_builder,
+                    proof_worker_for_builder.as_ref(),
+                )
+                .map_err(|e| format!("worker {core_id}: {e}"))?;
+                #[cfg(not(feature = "native-proof"))]
+                let _ = network_for_builder;
+                let exec_manager = Arc::new(exec_manager);
                 // Step-4 app-shard catch-up syncer bound to THIS worker's CRDT +
                 // store, dialing a live archive from the shared pool per attempt.
                 // Only when the Falcon key resolved (the mTLS identity); otherwise
@@ -496,49 +674,19 @@ pub(crate) fn init(
                         falcon_signing_key: sk,
                         crdt: crdt.clone(),
                         archive_pool: Some(archive_pool_for_builder.clone()),
+                        discover_archives_from_master: false,
                     })
                         as Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer>
                 });
                 // (B) Unified-cutover consolidation hook bound to THIS worker's
                 // store: fold the covered app's pre-cutover per-sub-shard trees
-                // into its single app.l2 tree (`convert_app`, empty prefix = whole
-                // app rebuilt from raw vertices) so the first unified subtree
-                // `state_root` (A) reflects pre-cutover data. A no-op at genesis
-                // (empty app). `filter[..32]` = the covered app.
+                // into its single app.l2 tree so the first unified subtree
+                // `state_root` (A) reflects pre-cutover data.
                 let hg_for_hook = hg_store_concrete.clone();
                 let unified_cutover_hook: Option<
                     Arc<dyn Fn(&[u8], u64) -> bool + Send + Sync>,
                 > = Some(Arc::new(move |filter: &[u8], _gfn: u64| -> bool {
-                    if filter.len() < 32 {
-                        return false;
-                    }
-                    let mut app = [0u8; 32];
-                    app.copy_from_slice(&filter[..32]);
-                    let shard_key = quil_types::store::ShardKey {
-                        l1: quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3),
-                        l2: app,
-                    };
-                    let forest = quil_forest::Forest::with_namespace(
-                        hg_for_hook.raw_db(),
-                        quil_store::FOREST_NAMESPACE.to_vec(),
-                    );
-                    match quil_forest_migrate::convert_app(
-                        hg_for_hook.as_ref(),
-                        &forest,
-                        &shard_key,
-                        0,
-                        &[Vec::new()],
-                    ) {
-                        Ok(_) => true,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                app = %hex::encode(app),
-                                "worker unified-cutover consolidation (convert_app) failed"
-                            );
-                            false
-                        }
-                    }
+                    unified_cutover_conversion(hg_for_hook.as_ref(), filter)
                 }));
                 tracing::info!(
                     core_id,
@@ -546,7 +694,34 @@ pub(crate) fn init(
                     has_shard_syncer = shard_syncer.is_some(),
                     "worker state initialized"
                 );
+                worker_stores_for_builder.write().insert(core_id, WorkerAppState {
+                    crdt: crdt.clone(),
+                    db: db_arc.clone(),
+                    hg_store: hg_store_concrete.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+                });
+                // Outputs committed to this worker's shard were often executed
+                // on another: their bytes live in that shard's certified frame,
+                // which only an archive holds. Pull them on the engine's own
+                // timer so a proposal reads them locally.
+                let delivery_pool = archive_pool_for_builder.clone();
+                let delivery_frame_source: Option<quil_engine::app_engine::DeliveryFrameSource> =
+                    falcon_sk_for_builder.clone().map(|key| {
+                        Arc::new(move |filter: Vec<u8>, frame_number: u64| {
+                            let pool = delivery_pool.clone();
+                            let key = key.clone();
+                            Box::pin(async move {
+                                let endpoint = pool.next().await?;
+                                let mut client = quil_rpc::ArchiveClient::connect_mtls(&endpoint, &key).await.ok()?;
+                                client.get_app_shard_frame(filter, frame_number).await.ok().flatten()
+                            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Option<quil_types::proto::global::AppShardFrame>> + Send>>
+                        }) as quil_engine::app_engine::DeliveryFrameSource
+                    });
                 Ok(quil_engine::thread_worker::WorkerOwnedDeps {
+                    delivery_frame_source,
+                    storage_history_source: falcon_sk_for_builder.clone().map(|key|
+                        crate::storage_history::from_pool(archive_pool_for_builder.clone(), key)),
+                    outgoing_history_source: falcon_sk_for_builder.clone().map(|key|
+                        crate::storage_history::outgoing_history_from_pool(archive_pool_for_builder.clone(), key)),
                     clock_store,
                     hypergraph: crdt,
                     execution_engine: exec_manager,
@@ -583,6 +758,10 @@ pub(crate) fn init(
                 // Master's global state, used as fallback when the
                 // per-worker builder fails or isn't wired.
                 hypergraph: Some(crdt.clone()),
+                // The master's grid and pending changes: a shard a recorded
+                // split or merge retires drains before its flip.
+                topology: Some(Arc::new(quil_store::RocksShardsStore::new(db_arc.inner()))
+                    as Arc<dyn quil_types::store::ShardsStore>),
                 execution_engine: Some(exec_manager.clone()),
                 inclusion_prover: Some(inclusion_prover.clone()),
                 worker_init: Some(Arc::new(|core_id: u32| {
@@ -610,7 +789,12 @@ pub(crate) fn init(
             // through `shard_engines` in the recv loop below.
             if let Some(mut master_rx) = thread_mgr.take_master_rx() {
                 let drain_p2p = p2p_handle.clone();
+                let drain_registry = prover_registry.clone();
+                let drain_pubkey = bls_pubkey.clone();
+                let drain_clock = clock_store.clone();
                 let drain_shard_engines = shard_engines.clone();
+                let drain_worker_app_states = worker_app_states.clone();
+                let drain_worker_stores = worker_stores_by_core.clone();
                 let drain_halt = halt_state.clone();
                 let drain_spawner = spawner.clone();
                 let drain_transport_cell = prover_message_transport.clone();
@@ -783,10 +967,35 @@ pub(crate) fn init(
                                         });
                                     }
                                     WorkerToMaster::CwConsensus { core_id, filter, channel, bytes } => {
-                                        // (P3) commonware-simplex message → one shard CW
+                                        // Commonware-simplex message → one shard CW
                                         // gossip topic; channel tagged into the payload.
                                         if drain_halt.any_halted() {
+                                            // Dropping consensus traffic is invisible from the
+                                            // shard's side: its members simply never certify.
+                                            debug!(core_id, filter = %hex::encode(&filter), channel,
+                                                "suppressing shard CW publish — coverage halt active");
                                             continue;
+                                        }
+                                        debug!(core_id, filter = %hex::encode(&filter), channel, bytes = bytes.len(),
+                                            "publishing shard CW message");
+                                        // A committee of one has nobody to send to: every
+                                        // publish would fail and retry for half a minute, and a
+                                        // lone Simplex host turns views quickly. A live run logged
+                                        // about 230,000 such warnings in seventeen minutes.
+                                        {
+                                            use quil_types::consensus::ProverRegistry as _;
+                                            use quil_types::store::ClockStore as _;
+                                            let frame = drain_clock.get_latest_global_clock_frame().ok()
+                                                .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+                                            // Exactly one member, and it is this node. An empty
+                                            // answer (a registry still loading) is NOT a committee
+                                            // of one: dropping a real committee's votes on it would
+                                            // be far worse than a few wasted retries.
+                                            if drain_registry.get_active_provers(&filter, frame)
+                                                .is_ok_and(|members| members.len() == 1 && members[0].public_key == drain_pubkey)
+                                            {
+                                                continue;
+                                            }
                                         }
                                         let p2p = drain_p2p.clone();
                                         drain_spawner.detach("shard-cw-publish", async move {
@@ -873,6 +1082,9 @@ pub(crate) fn init(
                                             let mut map = drain_shard_engines.write();
                                             map.insert(filter.clone(), handle);
                                         }
+                                        if let Some(stores) = drain_worker_stores.read().get(&core_id).cloned() {
+                                            drain_worker_app_states.write().insert(filter.clone(), stores);
+                                        }
                                         // Subscribe BlossomSub to the four
                                         // per-shard bitmasks. Without these
                                         // subscriptions our mesh peers won't
@@ -881,20 +1093,18 @@ pub(crate) fn init(
                                         // dispatches never reach the engine.
                                         let p2p = drain_p2p.clone();
                                         let filter_for_sub = filter.clone();
+                                        let registry_for_sub = drain_registry.clone();
+                                        let pubkey_for_sub = drain_pubkey.clone();
+                                        let clock_for_sub = drain_clock.clone();
                                         drain_spawner.detach("shard-subscribe", async move {
-                                            for topic in [
-                                                quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub),
-                                                quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub),
-                                                quil_engine::bitmasks::shard_prover_bitmask(&filter_for_sub),
-                                                quil_engine::bitmasks::shard_dispatch_bitmask(&filter_for_sub),
-                                            ] {
+                                            for topic in shard_topics(&filter_for_sub) {
                                                 if let Err(e) = p2p.subscribe_confirmed(topic).await {
                                                     warn!(core_id, filter = %hex::encode(&filter_for_sub), error = %e,
                                                         "failed to install shard topic subscription");
                                                     return Ok(());
                                                 }
                                             }
-                                            // (P3) Subscribe the shard's commonware-simplex topic so
+                                            // Subscribe the shard's commonware-simplex topic so
                                             // committee peers' votes/certs/blocks reach this engine.
                                             let cw_topic = quil_engine::bitmasks::shard_cw_bitmask(&filter_for_sub);
                                             if let Err(e) = p2p.subscribe_confirmed(cw_topic.clone()).await {
@@ -908,6 +1118,23 @@ pub(crate) fn init(
                                                     Ok(peers) if peers > 0 => {
                                                         info!(core_id, filter = %hex::encode(&filter_for_sub), peers,
                                                             "shard CW transport ready; starting consensus engine");
+                                                        ready_handle.set_cw_transport_ready();
+                                                        break;
+                                                    }
+                                                    // A committee of one has no peer to wait for:
+                                                    // it proposes and finalizes alone. Without this a
+                                                    // shard's first, sole prover never started (a live
+                                                    // run stranded a committed coin behind it).
+                                                    Ok(_) if {
+                                                        use quil_types::consensus::ProverRegistry as _;
+                                                        use quil_types::store::ClockStore as _;
+                                                        let frame = clock_for_sub.get_latest_global_clock_frame().ok()
+                                                            .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+                                                        registry_for_sub.get_active_provers(&filter_for_sub, frame)
+                                                            .is_ok_and(|members| members.len() == 1 && members[0].public_key == pubkey_for_sub)
+                                                    } => {
+                                                        info!(core_id, filter = %hex::encode(&filter_for_sub),
+                                                            "sole committee member; starting consensus without a CW peer");
                                                         ready_handle.set_cw_transport_ready();
                                                         break;
                                                     }
@@ -935,13 +1162,27 @@ pub(crate) fn init(
                                             let mut map = drain_shard_engines.write();
                                             map.remove(&filter);
                                         }
+                                        drain_worker_app_states.write().remove(&filter);
                                         let p2p = drain_p2p.clone();
                                         let filter_for_sub = filter.clone();
+                                        let engines = drain_shard_engines.clone();
                                         drain_spawner.detach("shard-unsubscribe", async move {
-                                            p2p.unsubscribe(quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub)).await;
-                                            p2p.unsubscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub)).await;
-                                            p2p.unsubscribe(quil_engine::bitmasks::shard_prover_bitmask(&filter_for_sub)).await;
-                                            p2p.unsubscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&filter_for_sub)).await;
+                                            // Decided when this runs, not when the engine
+                                            // left: a sibling or the same filter may have
+                                            // registered since. A registration racing the
+                                            // unsubscribe is caught by the second look.
+                                            let releasable = |topic: &Vec<u8>| {
+                                                releasable_shard_topics(&filter_for_sub, engines.read().keys()).contains(topic)
+                                            };
+                                            for topic in shard_topics(&filter_for_sub) {
+                                                if !releasable(&topic) {
+                                                    continue;
+                                                }
+                                                p2p.unsubscribe(topic.clone()).await;
+                                                if !releasable(&topic) {
+                                                    let _ = p2p.subscribe_confirmed(topic).await;
+                                                }
+                                            }
                                             Ok(())
                                         });
                                         info!(
@@ -1095,6 +1336,80 @@ mod tests {
     use quil_engine::test_support::TestWorkerManager;
     use quil_engine::worker::WorkerManager as _;
 
+    /// Reopen a worker store a test just dropped. The one-shot staged-frame
+    /// cleanup the builder starts holds its own handle until it finishes, so
+    /// under load the store can still be locked for a moment.
+    fn reopen(path: &std::path::Path) -> Arc<quil_store::RocksDb> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match quil_store::RocksDb::open(path) {
+                Ok(db) => return Arc::new(db),
+                Err(error) if std::time::Instant::now() < deadline && error.to_string().contains("lock") => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => panic!("reopen worker store: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_shard_leaving_keeps_the_topics_other_registered_shards_need() {
+        let app = [0x11u8; 32];
+        let root = app.to_vec();
+        let left = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let right = quil_forest::encode_shard_bit_path(&app, &[true]);
+        let submission = quil_engine::bitmasks::app_prover_bitmask(&root);
+        assert_eq!(submission, quil_engine::bitmasks::app_prover_bitmask(&left), "one submission topic per application");
+
+        // The split-away root leaves while a child still runs: the child's
+        // submission topic stays, the root's own topics go.
+        let released = releasable_shard_topics(&root, [&left]);
+        assert!(!released.contains(&submission));
+        assert_eq!(released.len(), 3);
+        // The application's last shard releases everything.
+        assert_eq!(releasable_shard_topics(&right, std::iter::empty()).len(), 4);
+        // A filter registered again before the release runs keeps all of it.
+        assert!(releasable_shard_topics(&left, [&left, &right]).is_empty());
+    }
+
+    /// A thread worker's CRDT can be forked for private execution, before and
+    /// after a restart: its size accounting is initialized when it is built.
+    /// Without that, every fork was refused and a shard whose selected parent
+    /// was notarized but not finalized wedged.
+    #[test]
+    fn a_thread_worker_crdt_can_be_forked_for_private_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = quil_hypergraph::ExecutionForkLimits {
+            overlay: quil_forest::OverlayLimits {
+                max_delta_bytes: 1 << 20,
+                max_delta_entries: 10_000,
+                max_record_bytes: 1 << 20,
+                max_read_bytes: 1 << 24,
+                max_read_operations: 100_000,
+                max_cursors: 16,
+            },
+            max_metadata_entries: 10_000,
+            max_metadata_bytes: 1 << 20,
+        };
+        let fork = |crdt: &quil_hypergraph::HypergraphCrdt| {
+            crdt.lock_execution_capture().unwrap().fork(limits, |overlay| {
+                Ok(Arc::new(quil_store::OverlayHypergraphStore::new(overlay)) as Arc<dyn quil_types::store::HypergraphStore>)
+            }).map(|fork| fork.overlay.close())
+        };
+        let app = quil_execution::domains::QUIL_TOKEN;
+        {
+            let db = reopen(dir.path());
+            let crdt = build_thread_worker_hypergraph(&db, Arc::new(quil_tries::ShaInclusionProver), false);
+            fork(&crdt).expect("a fresh worker CRDT forks");
+            crdt.add_vertex(&quil_hypergraph::Location { app_address: app, data_address: [1; 32] }, &[7; 64]).unwrap();
+            crdt.commit(1).unwrap();
+            fork(&crdt).expect("a worker CRDT with committed state forks");
+        }
+        let db = reopen(dir.path());
+        let crdt = build_thread_worker_hypergraph(&db, Arc::new(quil_tries::ShaInclusionProver), false);
+        fork(&crdt).expect("a restarted worker CRDT forks");
+    }
+
     #[test]
     fn cw_publish_retry_is_limited_to_missing_topic_peers() {
         assert!(retryable_cw_publish_failure("blossomsub publish failed: NoPeersSubscribedToTopic", 1));
@@ -1148,7 +1463,7 @@ mod tests {
         let shard_key = quil_hypergraph::shard_key_for_location(&first_location);
 
         let first_root = {
-            let db = Arc::new(quil_store::RocksDb::open(dir.path()).unwrap());
+            let db = reopen(dir.path());
             // RocksDb::open's schema marker + any Simplex/consensus metadata
             // written before the first materialized frame must NOT disqualify a
             // fresh worker from installing its persistent forest.
@@ -1181,7 +1496,7 @@ mod tests {
 
         // Drop every handle above, then REOPEN the exact worker DB. The
         // commitment root must come from RocksDB, not process memory.
-        let db = Arc::new(quil_store::RocksDb::open(dir.path()).unwrap());
+        let db = reopen(dir.path());
         let crdt =
             build_thread_worker_hypergraph(&db, Arc::new(quil_tries::ShaInclusionProver), false);
         assert!(crdt.forest_is_persistent());
@@ -1203,5 +1518,84 @@ mod tests {
         .unwrap();
         let second_root = crdt.commit(2).unwrap()[&shard_key][0].clone();
         assert_ne!(second_root, first_root);
+    }
+
+    /// A restart past the unified cutover asks for the conversion again. It
+    /// must not rebuild the tree: the rebuild committed at version zero, below
+    /// the blobs the store already held, and reads take the greatest version,
+    /// so every record updated afterwards read back its pre-restart value.
+    #[test]
+    fn a_restarted_worker_keeps_reading_what_it_writes_after_the_cutover() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = quil_hypergraph::Location { app_address: [0x2a; 32], data_address: [0x07; 32] };
+        let filter = record.app_address.to_vec();
+        let open = || {
+            let db = reopen(dir.path());
+            let crdt = build_thread_worker_hypergraph(&db, Arc::new(quil_tries::ShaInclusionProver), false);
+            let hg = quil_store::RocksHypergraphStore::new(db.inner());
+            (db, crdt, hg)
+        };
+        let head = |hg: &quil_store::RocksHypergraphStore| {
+            quil_forest::Forest::with_namespace(hg.raw_db(), quil_store::FOREST_NAMESPACE.to_vec())
+                .read_head_version(&record.app_address, quil_forest::Phase::VertexAdds)
+                .unwrap()
+        };
+        {
+            let (_db, crdt, hg) = open();
+            assert!(unified_cutover_conversion(&hg, &filter));
+            crdt.set_unified_tree(true);
+            for (frame, value) in [b"count 1", b"count 2", b"count 3", b"count 4"].into_iter().enumerate() {
+                crdt.add_vertex(&record, value).unwrap();
+                crdt.commit(frame as u64 + 1).unwrap();
+            }
+        }
+        for (restart, value) in [b"count 5", b"count 6"].into_iter().enumerate() {
+            let (db, crdt, hg) = open();
+            let before = head(&hg);
+            // The second restart also covers a store an earlier build converted:
+            // its tree exists, but no marker records it.
+            if restart == 1 {
+                db.inner().delete(unified_cutover_marker_key(&record.app_address)).unwrap();
+            }
+            assert!(unified_cutover_conversion(&hg, &filter));
+            assert_eq!(head(&hg), before, "restart {restart} rebuilt the unified tree");
+            crdt.set_unified_tree(true);
+            crdt.add_vertex(&record, value).unwrap();
+            crdt.commit(10 + restart as u64).unwrap();
+            assert_eq!(
+                crdt.get_vertex_data_checked(&record).unwrap().as_deref(),
+                Some(&value[..]),
+                "restart {restart}: an update after the restart must be read back"
+            );
+        }
+    }
+
+    /// A first conversion over versioned blobs written before it (no app tree
+    /// yet) commits above them, so the vertex's next write is the one read.
+    #[test]
+    fn a_first_conversion_commits_above_existing_blob_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = quil_hypergraph::Location { app_address: [0x2b; 32], data_address: [0x07; 32] };
+        let db = reopen(dir.path());
+        let crdt = build_thread_worker_hypergraph(&db, Arc::new(quil_tries::ShaInclusionProver), false);
+        let hg = quil_store::RocksHypergraphStore::new(db.inner());
+        let shard_key = quil_types::store::ShardKey {
+            l1: quil_hypergraph::addressing::get_bloom_filter_indices(&record.app_address, 256, 3),
+            l2: record.app_address,
+        };
+        let txn = quil_types::store::HypergraphStore::new_transaction(&hg, false).unwrap();
+        quil_types::store::HypergraphStore::save_vertex_underlying_versioned(
+            &hg, txn.as_ref(), "vertex", "adds", &shard_key, &record.to_id(), b"before the cutover", 9,
+        ).unwrap();
+        txn.commit().unwrap();
+
+        assert!(unified_cutover_conversion(&hg, &record.app_address));
+        crdt.set_unified_tree(true);
+        crdt.add_vertex(&record, b"after the cutover").unwrap();
+        crdt.commit(1).unwrap();
+        assert_eq!(
+            crdt.get_vertex_data_checked(&record).unwrap().as_deref(),
+            Some(&b"after the cutover"[..]),
+        );
     }
 }

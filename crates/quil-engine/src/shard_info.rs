@@ -541,7 +541,7 @@ pub fn local_app_shard_get_sizes(
             if let Some(meta) = crate::app_shard_metadata::get_app_shard_metadata(&crdt, sub) {
                 out.push(ShardSizeEntry {
                     prefix: sub.prefix.clone(),
-                    size: meta.size,
+                    size: reported_shard_size(&crdt, shard_key, &sub.prefix, meta.size),
                     data_shards: meta.data_shards,
                     materialized_frame: 0,
                     latest_frame: 0,
@@ -550,6 +550,47 @@ pub fn local_app_shard_get_sizes(
         }
         Ok(out)
     }
+}
+
+/// Size reported per committed-but-undelivered output of an otherwise empty
+/// shard. Only "non-zero" matters to the viability gates; this is roughly one
+/// coin vertex.
+const NOMINAL_DELIVERY_BYTES: u64 = 4096;
+
+/// The size to report for the shard at `(shard_key, prefix)`, measured at
+/// `size`. An empty shard is latent, unless the global venue has committed
+/// outputs into blocks it owns: those can only land once the shard has a
+/// committee to take delivery, so it reports a nominal size per waiting
+/// output. Archives answer `GetAppShards` with this too; a regular node's own
+/// grid never flips, so its local sizes never reach a split's empty shards.
+pub fn reported_shard_size(
+    crdt: &std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    shard_key: &[u8],
+    prefix: &[u32],
+    size: Vec<u8>,
+) -> Vec<u8> {
+    if size.iter().any(|byte| *byte != 0) {
+        return size;
+    }
+    match committed_deliveries(crdt, shard_key, prefix).filter(|n| *n > 0) {
+        Some(waiting) => waiting.saturating_mul(NOMINAL_DELIVERY_BYTES).to_be_bytes().to_vec(),
+        None => size,
+    }
+}
+
+/// Outputs and escrows committed into blocks the sub-shard owns, per GLOBAL
+/// state. `None` when the shard key or prefix cannot be read as a shard path,
+/// or the lookup fails: the shard then simply stays as empty as it measured.
+fn committed_deliveries(
+    crdt: &std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    shard_key: &[u8],
+    prefix: &[u32],
+) -> Option<u64> {
+    let application: [u8; 32] = shard_key.get(3..35)?.try_into().ok()?;
+    let filter = quil_forest::shard_prefix_to_filter(&application, prefix);
+    let (_, bits) = quil_forest::decode_shard_filter_or_root(&filter, 32)?;
+    let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
+    quil_execution::token_intrinsic::global_commit::committed_to_shard(&state, &application, &bits).ok()
 }
 
 /// Extension trait on BigInt for saturating u64 conversion.
@@ -1329,8 +1370,7 @@ mod tests {
     /// PARITY: the TUI per-prover estimate (`compute_shard_reward`) must equal
     /// the actually-minted per-prover share (`OptRewardIssuance::calculate / 8`)
     /// for the same inputs. These are two independent implementations of the
-    /// PoMW formula in two modules; this guards them against drift. (Gap
-    /// coverage 2026-06-28.)
+    /// PoMW formula in two modules; this guards them against drift.
     #[test]
     fn estimate_matches_minted_per_prover_share() {
         use crate::rewards::{pomw_basis, OptRewardIssuance};
@@ -1358,5 +1398,55 @@ mod tests {
                 assert_eq!(est, mint, "ring={ring} shards={shards}: estimate != minted/8");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod committed_delivery_size_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use quil_execution::hypergraph_state::HypergraphState;
+    use quil_execution::token_intrinsic::global_commit::{commit_entry, Outcome, SpendEntry};
+
+    // A wallet's claim committed into block 291 is owned by the empty spine
+    // shard `001`. If the archives report that shard's size as zero to the
+    // regular nodes, none joins it and the claim is never delivered.
+    #[test]
+    fn an_empty_shard_with_committed_outputs_reports_a_size() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let app = [7u8; 32];
+        let mut output = [9u8; 32];
+        output[0] = 0b0010_0011;
+        let entry = SpendEntry {
+            kind: 0x0512,
+            tx_id: [1; 32],
+            source_frame: 40,
+            context: [8; 32],
+            root_digest: None,
+            consumptions: vec![[2; 32]],
+            outputs: vec![output],
+            escrow_create: None,
+            escrow_claim: None,
+            fee: 5,
+            settlement: None,
+        };
+        let state = HypergraphState::new(crdt.clone());
+        let outcome = commit_entry(&state, 5, &app, &entry, quil_types::execution::ShardPath::WHOLE).unwrap();
+        assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
+        state.commit().unwrap();
+
+        let shard_key: Vec<u8> = [0u8; 3].into_iter().chain(app).collect();
+        let size = |bits: &[bool], measured: Vec<u8>| {
+            reported_shard_size(&crdt, &shard_key, &quil_forest::bit_path_to_prefix(bits), measured)
+        };
+        assert!(size(&[false, false, true], vec![]).iter().any(|b| *b != 0), "the empty shard owning the output");
+        assert!(size(&[true], vec![]).iter().all(|b| *b == 0), "an empty shard with nothing waiting");
+        assert_eq!(size(&[false, false, true], vec![0, 5]), vec![0, 5], "a measured size is kept");
     }
 }

@@ -17,6 +17,10 @@ pub const KEY_REGISTRY_TYPE: u32 = 0x0123;
 /// `node/consensus/global/global_consensus_engine.go`.
 pub const ARCHIVE_SERVICE_CAPABILITY_ID: u32 = 0x00050001;
 
+/// QBI v1: diagnostic source/build fingerprint, exactly 32 bytes. This is
+/// signed peer metadata, not a protocol compatibility or trust decision.
+pub const BUILD_FINGERPRINT_CAPABILITY_ID: u32 = 0x51424901;
+
 /// Outcome of attempting to decode a message from the GLOBAL_PEER_INFO_BITMASK.
 #[derive(Debug)]
 pub enum PeerInfoMessage {
@@ -62,6 +66,14 @@ pub struct CanonicalPeerInfo {
 }
 
 impl CanonicalPeerInfo {
+    pub fn build_fingerprint(&self) -> Option<[u8; 32]> {
+        let mut matches = self.capabilities.iter()
+            .filter(|c| c.protocol_identifier == BUILD_FINGERPRINT_CAPABILITY_ID);
+        let fingerprint = matches.next()?.additional_metadata.as_slice().try_into().ok()?;
+        if matches.next().is_some() { return None; }
+        Some(fingerprint)
+    }
+
     /// True if this peer advertises the archive service capability flag.
     pub fn is_archive(&self) -> bool {
         self.capabilities
@@ -297,13 +309,15 @@ pub fn decode_canonical_peer_info(data: &[u8]) -> Result<CanonicalPeerInfo> {
     }
     info.public_key = r.read_bytes()?;
     info.signature = r.read_bytes()?;
-    // last_received_frame and last_global_head_frame are only written when
-    // non-zero, so missing trailing bytes are fine.
-    if let Ok(v) = r.read_u64() {
-        info.last_received_frame = v;
-    }
-    if let Ok(v) = r.read_u64() {
-        info.last_global_head_frame = v;
+    // A head requires the preceding received-frame slot, even when it is zero.
+    match r.remaining() {
+        0 => {}
+        8 => info.last_received_frame = r.read_u64()?,
+        16 => {
+            info.last_received_frame = r.read_u64()?;
+            info.last_global_head_frame = r.read_u64()?;
+        }
+        _ => return Err(QuilError::P2p("PeerInfo: invalid frame trailer length".into())),
     }
     Ok(info)
 }
@@ -400,7 +414,7 @@ pub fn encode_canonical_peer_info(
     }
     w.write_bytes(public_key);
     w.write_bytes(signature);
-    if info.last_received_frame != 0 {
+    if info.last_received_frame != 0 || info.last_global_head_frame != 0 {
         w.write_u64(info.last_received_frame);
     }
     if info.last_global_head_frame != 0 {
@@ -709,6 +723,51 @@ impl PeerInfoManager for InMemoryPeerInfoManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_trailer_preserves_zero_received_frame_and_signing_bytes() {
+        for (received, head) in [(0, 0), (10, 0), (0, 20), (10, 20)] {
+            let info = CanonicalPeerInfo {
+                last_received_frame: received,
+                last_global_head_frame: head,
+                ..Default::default()
+            };
+            let bytes = encode_canonical_peer_info(&info, &[], &[]);
+            let decoded = decode_canonical_peer_info(&bytes).unwrap();
+            assert_eq!((decoded.last_received_frame, decoded.last_global_head_frame), (received, head));
+            assert_eq!(encode_canonical_peer_info(&decoded, &[], &[]), bytes);
+        }
+    }
+
+    #[test]
+    fn build_fingerprint_round_trips_in_signed_payload() {
+        let mut info = CanonicalPeerInfo::default();
+        assert_eq!(info.build_fingerprint(), None);
+        info.capabilities.push(CanonicalCapability {
+            protocol_identifier: BUILD_FINGERPRINT_CAPABILITY_ID,
+            additional_metadata: vec![7; 32],
+        });
+        let bytes = encode_canonical_peer_info(&info, &[], &[]);
+        let decoded = decode_canonical_peer_info(&bytes).unwrap();
+        assert_eq!(decoded.build_fingerprint(), Some([7; 32]));
+        assert_eq!(encode_canonical_peer_info(&decoded, &[], &[]), bytes);
+        info.capabilities[0].additional_metadata = vec![8; 32];
+        assert_ne!(encode_canonical_peer_info(&info, &[], &[]), bytes);
+    }
+
+    #[test]
+    fn ambiguous_or_malformed_build_fingerprint_is_unavailable() {
+        let mut info = CanonicalPeerInfo::default();
+        info.capabilities.push(CanonicalCapability {
+            protocol_identifier: BUILD_FINGERPRINT_CAPABILITY_ID,
+            additional_metadata: vec![0; 31],
+        });
+        assert_eq!(info.build_fingerprint(), None);
+        info.capabilities[0].additional_metadata.push(0);
+        assert_eq!(info.build_fingerprint(), Some([0; 32]));
+        info.capabilities.push(info.capabilities[0].clone());
+        assert_eq!(info.build_fingerprint(), None);
+    }
 
     #[test]
     fn encode_decode_roundtrip() {

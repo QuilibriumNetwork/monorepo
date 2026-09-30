@@ -43,12 +43,13 @@ pub(crate) fn init(
         // and won't shut down the node; a panic or error will.
         sup.spawn_startup_task("prover-registry-refresh", move |_token| async move {
             tokio::task::spawn_blocking(move || {
-                pr.refresh_from_store(&hs);
+                pr.refresh_from_store(hs.as_ref())?;
                 let count = pr.read(|r| r.distinct_provers());
                 tracing::info!(provers = count, "prover registry loaded (background)");
+                Ok::<(), anyhow::Error>(())
             })
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(anyhow::Error::from)?
         });
     }
 
@@ -77,6 +78,26 @@ pub(crate) fn init(
                  than this many Active provers will propose a split"
             );
             t.max_provers = n;
+        }
+        // DEV/localnet ONLY: `QUIL_MIN_PROVERS` lowers the MERGE trigger's
+        // `min_provers`. A merge fires when BOTH halves of a pair look starved
+        // (`active_count < min_provers`), and the mainnet default of 6 is above
+        // anything a localnet fields — so a freshly split shard is merged straight
+        // back, and worse, a restart makes every shard look starved for a couple of
+        // epochs while allocations re-activate. Setting this to 0 makes the trigger
+        // unreachable (`active_count >= 0` always), which is what lets a localnet
+        // HOLD a split topology long enough to test anything on it. Env-gated
+        // exactly like `QUIL_SPLIT_MAX_PROVERS` — mainnet never sets it.
+        if let Some(n) = std::env::var("QUIL_MIN_PROVERS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tracing::warn!(
+                min_provers = n,
+                "QUIL_MIN_PROVERS override active (dev/localnet only) — shard pairs with \
+                 fewer than this many Active provers each will propose a merge"
+            );
+            t.min_provers = n;
         }
         t
     };

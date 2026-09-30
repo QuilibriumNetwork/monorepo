@@ -6,7 +6,7 @@
 //! processing, then commits them atomically to the CRDT when the
 //! frame is finalized.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use num_bigint::BigInt;
 use quil_crypto::poseidon::hash_bytes_to_32;
@@ -40,22 +40,39 @@ pub(crate) fn tree_content_digest(tree: &VectorCommitmentTree) -> Vec<u8> {
 
 /// `poseidon("vertex:adds")` — 32 bytes.
 pub fn vertex_adds_discriminator() -> Result<[u8; 32]> {
-    hash_bytes_to_32(b"vertex:adds")
+    static VALUE: OnceLock<[u8; 32]> = OnceLock::new();
+    cached_discriminator(&VALUE, b"vertex:adds")
 }
 
 /// `poseidon("vertex:removes")` — 32 bytes.
 pub fn vertex_removes_discriminator() -> Result<[u8; 32]> {
-    hash_bytes_to_32(b"vertex:removes")
+    static VALUE: OnceLock<[u8; 32]> = OnceLock::new();
+    cached_discriminator(&VALUE, b"vertex:removes")
 }
 
 /// `poseidon("hyperedge:adds")` — 32 bytes.
 pub fn hyperedge_adds_discriminator() -> Result<[u8; 32]> {
-    hash_bytes_to_32(b"hyperedge:adds")
+    static VALUE: OnceLock<[u8; 32]> = OnceLock::new();
+    cached_discriminator(&VALUE, b"hyperedge:adds")
 }
 
 /// `poseidon("hyperedge:removes")` — 32 bytes.
 pub fn hyperedge_removes_discriminator() -> Result<[u8; 32]> {
-    hash_bytes_to_32(b"hyperedge:removes")
+    static VALUE: OnceLock<[u8; 32]> = OnceLock::new();
+    cached_discriminator(&VALUE, b"hyperedge:removes")
+}
+
+// These protocol labels never vary by application or network. Rehashing them
+// on every state read made a bounded block-summary recovery spend seconds in
+// Poseidon even when every block was absent. Cache only successful results;
+// initialization errors remain retryable with their original error type.
+fn cached_discriminator(cache: &OnceLock<[u8; 32]>, label: &[u8]) -> Result<[u8; 32]> {
+    if let Some(value) = cache.get() {
+        return Ok(*value);
+    }
+    let value = hash_bytes_to_32(label)?;
+    let _ = cache.set(value);
+    Ok(value)
 }
 
 /// The special metadata address within each hypergraph domain.
@@ -103,19 +120,17 @@ pub fn seal_metadata_state_at_index(
 // HypergraphState
 // =====================================================================
 
-/// One entry in the undo log built during `commit()`. Each successfully-
-/// Changeset accumulator. The execution engine creates one per frame,
-/// appends state changes during `process_message`, and commits them
-/// via `commit()` at the end of the frame.
-///
-/// (Earlier revisions kept an `undo_log` + `revert_changes` API
-/// mirroring Go's `TrackChange`/`RevertChanges`. Nothing in the
-/// workspace ever wired the revert path, and the per-node lazy tree
-/// doesn't implement `delete` — so the undo machinery has been
-/// dropped along with its sole consumer.)
+enum ExecutionChange {
+    State(StateChange),
+    Record(quil_types::store::RecordMutation),
+}
+
+/// Message changeset with savepoints for state and ancillary records. `commit`
+/// publishes the complete changeset to CRDT staging; the frame commit makes it
+/// durable. Callers clear this buffer after successful staging with `abort`.
 pub struct HypergraphState {
     crdt: Arc<HypergraphCrdt>,
-    changeset: Mutex<Vec<StateChange>>,
+    changeset: Mutex<Vec<ExecutionChange>>,
 }
 
 impl HypergraphState {
@@ -134,6 +149,24 @@ impl HypergraphState {
         &self.crdt
     }
 
+    /// Require coverage of every address in a domain before staging an
+    /// operation whose writes must all survive the commit coverage filter.
+    /// The last 6-bit path group straddles the domain/data boundary.
+    /// This checks configured coverage only, not synchronization completeness
+    /// or ownership of the domain's canonical execution venue.
+    pub fn require_full_domain_coverage(&self, domain: &[u8; 32]) -> Result<()> {
+        let prefix = self.crdt.get_covered_prefix();
+        let path = quil_tries::get_full_path(domain);
+        if prefix.len() > domain.len() * 8 / quil_tries::BRANCH_BITS
+            || path[..prefix.len()] != prefix
+        {
+            return Err(QuilError::ExecutionUnavailable(
+                "operation requires complete domain coverage".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Get a value from the CRDT. Checks the pending changeset first
     /// (reverse order for most recent), then falls back to the CRDT.
     ///
@@ -148,6 +181,7 @@ impl HypergraphState {
         // Check changeset (most recent first)
         let changeset = self.changeset.lock().unwrap();
         for change in changeset.iter().rev() {
+            let ExecutionChange::State(change) = change else { continue; };
             if change.domain == domain
                 && change.address == address
                 && change.discriminator == discriminator
@@ -163,12 +197,12 @@ impl HypergraphState {
 
         if discriminator == va_disc.as_slice() {
             let loc = location_from_domain_address(domain, address)?;
-            return Ok(self.crdt.get_vertex_data(&loc));
+            return self.crdt.get_vertex_data_checked(&loc);
         }
 
         if discriminator == ha_disc.as_slice() {
             let loc = location_from_domain_address(domain, address)?;
-            return Ok(self.crdt.get_hyperedge_data(&loc));
+            return self.crdt.get_hyperedge_data_checked(&loc);
         }
 
         Err(QuilError::InvalidArgument(
@@ -190,13 +224,13 @@ impl HypergraphState {
         let ha_disc = hyperedge_adds_discriminator()?;
 
         let event = if discriminator == va_disc.as_slice() {
-            if self.crdt.lookup_vertex(&loc) {
+            if self.crdt.get_vertex_data_checked(&loc)?.is_some() {
                 StateChangeEvent::Update
             } else {
                 StateChangeEvent::Create
             }
         } else if discriminator == ha_disc.as_slice() {
-            if self.crdt.lookup_hyperedge(&loc) {
+            if self.crdt.get_hyperedge_data_checked(&loc)?.is_some() {
                 StateChangeEvent::Update
             } else {
                 StateChangeEvent::Create
@@ -207,13 +241,13 @@ impl HypergraphState {
             ));
         };
 
-        self.changeset.lock().unwrap().push(StateChange {
+        self.changeset.lock().unwrap().push(ExecutionChange::State(StateChange {
             domain: domain.to_vec(),
             address: address.to_vec(),
             discriminator: discriminator.to_vec(),
             state_change: event,
             value,
-        });
+        }));
 
         Ok(())
     }
@@ -319,17 +353,17 @@ impl HypergraphState {
         discriminator: &[u8],
         _frame_number: u64,
     ) -> Result<()> {
-        self.changeset.lock().unwrap().push(StateChange {
+        self.changeset.lock().unwrap().push(ExecutionChange::State(StateChange {
             domain: domain.to_vec(),
             address: address.to_vec(),
             discriminator: discriminator.to_vec(),
             state_change: StateChangeEvent::Delete,
             value: Vec::new(),
-        });
+        }));
         Ok(())
     }
 
-    /// Commit the accumulated changeset to the CRDT. Walks each change
+    /// Atomically stage the accumulated changeset in the CRDT. Walks each change
     /// and applies it:
     /// - Create/Update on vertex_adds → `crdt.add_vertex`
     /// - Delete on vertex_removes → `crdt.remove_vertex`
@@ -353,8 +387,16 @@ impl HypergraphState {
 
         let prefix = self.crdt.get_covered_prefix();
 
-        let changeset = self.changeset.lock().unwrap().clone();
-        for change in &changeset {
+        let changeset = self.changeset.lock().unwrap();
+        let mut mutations = Vec::new();
+        for change in changeset.iter() {
+            let change = match change {
+                ExecutionChange::State(change) => change,
+                ExecutionChange::Record(record) => {
+                    mutations.push(quil_hypergraph::Mutation::Record(record));
+                    continue;
+                }
+            };
             let loc = location_from_domain_address(&change.domain, &change.address)?;
 
             // covered_prefix gate — drop changes whose nibble path
@@ -370,25 +412,51 @@ impl HypergraphState {
             if change.discriminator == va_disc.as_slice() {
                 match change.state_change {
                     StateChangeEvent::Create | StateChangeEvent::Update | StateChangeEvent::Initialize => {
-                        self.crdt.add_vertex(&loc, &change.value)?;
+                        mutations.push(quil_hypergraph::Mutation::AddVertex(loc, &change.value));
                     }
                     StateChangeEvent::Delete => {}
                 }
             } else if change.discriminator == vr_disc.as_slice() {
-                self.crdt.remove_vertex(&loc)?;
+                mutations.push(quil_hypergraph::Mutation::RemoveVertex(loc));
             } else if change.discriminator == ha_disc.as_slice() {
                 match change.state_change {
                     StateChangeEvent::Create | StateChangeEvent::Update | StateChangeEvent::Initialize => {
-                        self.crdt.add_hyperedge(&loc, &change.value)?;
+                        mutations.push(quil_hypergraph::Mutation::AddHyperedge(loc, &change.value));
                     }
                     StateChangeEvent::Delete => {}
                 }
             } else if change.discriminator == hr_disc.as_slice() {
-                self.crdt.remove_hyperedge(&loc)?;
+                mutations.push(quil_hypergraph::Mutation::RemoveHyperedge(loc));
             }
         }
 
-        Ok(())
+        self.crdt.apply_mutations(&mutations)
+    }
+
+    /// Ancillary writes share the message savepoint and the durable frame batch.
+    pub(crate) fn stage_records(&self, records: impl IntoIterator<Item = quil_types::store::RecordMutation>) {
+        self.changeset.lock().unwrap().extend(records.into_iter().map(ExecutionChange::Record));
+    }
+
+    pub(crate) fn pending_records(&self) -> std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        let changeset = self.changeset.lock().unwrap();
+        let mut records = self.crdt.staged_records();
+        for change in changeset.iter() {
+            if let ExecutionChange::Record(record) = change {
+                records.insert(record.key.clone(), record.value.clone());
+            }
+        }
+        records
+    }
+
+    pub(crate) fn get_record(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let changeset = self.changeset.lock().unwrap();
+        for change in changeset.iter().rev() {
+            if let ExecutionChange::Record(record) = change {
+                if record.key == key { return Ok(record.value.clone()); }
+            }
+        }
+        self.crdt.read_execution_record(key)
     }
 
     /// Abort — discard all pending changes.
@@ -415,6 +483,21 @@ impl HypergraphState {
     /// Number of pending changes.
     pub fn changeset_len(&self) -> usize {
         self.changeset.lock().unwrap().len()
+    }
+
+    /// Snapshot staged vertex-adds writes for a domain in application order.
+    /// Derived state (such as the coin accumulator) must include these writes
+    /// before commit so it can be rolled back together with its source entries.
+    pub(crate) fn pending_vertex_adds(&self, domain: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let disc = vertex_adds_discriminator()?;
+        Ok(self.changeset.lock().unwrap().iter()
+            .filter_map(|change| match change { ExecutionChange::State(change) => Some(change), _ => None })
+            .filter(|change| change.domain == domain
+                && change.discriminator == disc
+                && matches!(change.state_change,
+                    StateChangeEvent::Create | StateChangeEvent::Update | StateChangeEvent::Initialize))
+            .map(|change| (change.address.clone(), change.value.clone()))
+            .collect())
     }
 }
 
@@ -589,6 +672,62 @@ mod tests {
     }
 
     #[test]
+    fn database_read_errors_stop_reads_and_staging() {
+        let store = Arc::new(MemStore::new());
+        let state = HypergraphState::new(Arc::new(HypergraphCrdt::new(
+            store.clone(), Arc::new(NoopInclusionProver),
+        )));
+        for disc in [vertex_adds_discriminator().unwrap(), hyperedge_adds_discriminator().unwrap()] {
+            for phase in ["adds", "removes"] {
+                store.fail_vertex_reads(Some(phase));
+                assert!(state.get(&domain(), &addr(), &disc).is_err());
+                assert!(state.set(&domain(), &addr(), &disc, 1, b"data".to_vec()).is_err());
+                assert_eq!(state.changeset_len(), 0);
+            }
+            store.fail_vertex_reads(None);
+            assert_eq!(state.get(&domain(), &addr(), &disc).unwrap(), None);
+            state.set(&domain(), &addr(), &disc, 1, b"pending".to_vec()).unwrap();
+            store.fail_vertex_reads(Some("adds"));
+            assert_eq!(state.get(&domain(), &addr(), &disc).unwrap(), Some(b"pending".to_vec()));
+            state.abort();
+            assert!(state.get(&domain(), &addr(), &disc).is_err());
+        }
+    }
+
+    #[test]
+    fn commit_failure_keeps_the_entire_changeset_out_of_crdt() {
+        let store = Arc::new(MemStore::new());
+        let crdt = Arc::new(HypergraphCrdt::new(store.clone(), Arc::new(NoopInclusionProver)));
+        let state = HypergraphState::new(crdt.clone());
+        let first = Location { app_address: [7; 32], data_address: [8; 32] };
+        let second = Location { app_address: [7; 32], data_address: [9; 32] };
+        // Earlier accepted staging must survive a later batch failure.
+        crdt.add_vertex(&first, b"earlier-accepted").unwrap();
+        let va = vertex_adds_discriminator().unwrap();
+        let ha = hyperedge_adds_discriminator().unwrap();
+        state.stage_records([quil_types::store::RecordMutation {
+            key: b"test/atomic-record".to_vec(), value: Some(vec![42]),
+        }]);
+        state.set(&first.app_address, &first.data_address, &va, 1, b"replacement".to_vec()).unwrap();
+        state.set(&second.app_address, &second.data_address, &ha, 1, b"new-edge".to_vec()).unwrap();
+        // Vertex preparation succeeds, then the hyperedge tombstone read fails.
+        store.fail_vertex_reads(Some("removes"));
+        assert!(state.commit().unwrap_err().is_execution_unavailable());
+        assert_eq!(state.changeset_len(), 3);
+        assert!(crdt.staged_records().is_empty(), "metadata cannot escape failed state staging");
+        store.fail_vertex_reads(None);
+        assert_eq!(crdt.get_vertex_data_checked(&first).unwrap(), Some(b"earlier-accepted".to_vec()));
+        assert_eq!(crdt.get_hyperedge_data_checked(&second).unwrap(), None);
+        // Retry exactly the same changeset, without restaging it.
+        state.commit().unwrap();
+        assert_eq!(crdt.read_execution_record(b"test/atomic-record").unwrap(), Some(vec![42]));
+        crdt.commit(1).unwrap();
+        let reopened = HypergraphCrdt::new(store, Arc::new(NoopInclusionProver));
+        assert_eq!(reopened.get_vertex_data_checked(&first).unwrap(), Some(b"replacement".to_vec()));
+        assert_eq!(reopened.get_hyperedge_data_checked(&second).unwrap(), Some(b"new-edge".to_vec()));
+    }
+
+    #[test]
     fn get_missing_returns_none() {
         let s = stub_state();
         let disc = vertex_adds_discriminator().unwrap();
@@ -686,5 +825,23 @@ mod tests {
         s2.set(&domain(), &addr(), &disc, 1, b"data".to_vec()).unwrap();
         s2.commit().unwrap();
         assert!(s2.crdt.lookup_vertex(&loc), "in-prefix vertex should be added");
+    }
+
+    #[test]
+    fn full_domain_coverage_excludes_subtree_and_other_domain_prefixes() {
+        let s = stub_state();
+        let domain = [0xAA; 32];
+        let path = quil_tries::get_full_path(&domain);
+        let complete_groups = domain.len() * 8 / quil_tries::BRANCH_BITS;
+        for length in 0..=complete_groups {
+            s.crdt.set_covered_prefix(&path[..length]).unwrap();
+            s.require_full_domain_coverage(&domain).unwrap();
+        }
+        s.crdt.set_covered_prefix(&path[..complete_groups + 1]).unwrap();
+        assert!(s.require_full_domain_coverage(&domain).is_err());
+        s.crdt.set_covered_prefix(&[0]).unwrap();
+        assert!(s.require_full_domain_coverage(&domain).is_err());
+        s.crdt.set_covered_prefix(&[]).unwrap();
+        s.require_full_domain_coverage(&crate::domains::GLOBAL).unwrap();
     }
 }

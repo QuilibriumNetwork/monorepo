@@ -32,8 +32,10 @@ use jmt::storage::{TreeUpdateBatch, TreeWriter};
 use jmt::{RootHash, Sha256Jmt, Version};
 use sha2::Sha256;
 
+mod database;
 mod forest;
 mod membership_proof;
+mod overlay;
 mod store;
 // Efficient JMT Merkle-diff sync — enabled via the vendored jmt visibility patch
 // (crates/jmt: gen_child_node_key + NibblePath::new made pub).
@@ -43,7 +45,7 @@ pub use forest::{
     node_size_sum, rollup_phase_roots, subtree_leaf_count, subtree_size, Forest, Phase,
     ShardRoots, PHASES,
 };
-pub use sync::{diff_leaves, diff_leaves_under_prefix};
+pub use sync::{diff_leaves, diff_leaves_under_prefix, SubtreeSyncAnchor};
 // Re-export so sync callers can name the diff's key type + the reader bound
 // without depending on jmt directly.
 pub use jmt::storage::TreeReader;
@@ -52,6 +54,11 @@ pub use membership_proof::{
     verify_vertex_membership, MembershipProof, ShardAggregation, VertexMembershipProof,
 };
 pub use store::{ForestStore, MemTreeStore, RocksTreeStore, SizeIndex};
+pub use database::{CoordinatedDb, DatabaseCommitError, DatabaseWriteGuard, DisjointBatch, KeyPrefixSet};
+pub use overlay::{
+    ExecutionOverlay, ExecutionViewAdmission, OverlayCursor, OverlayLimits, OverlayMutation, OverlayReadView,
+    OverlayStats, PreparedOverlayCommit, DEFAULT_EXECUTION_VIEW_MAX_AGE,
+};
 
 /// Namespaces a single tree within the shared RocksDB. The `level` (1/2/3)
 /// plus an `id` (app address, shard id, …) uniquely identifies a tree; its
@@ -322,12 +329,12 @@ pub fn prefix_to_bits(prefix: &[u32], bits_per_level: u32) -> Vec<bool> {
 }
 
 // ---------------------------------------------------------------------------
-// Deep-bifurcation shard addressing codec (DEEP_BIFURCATION_ENCODING_SCOPE.md,
-// Phase 1). A shard's identity is its canonical address BIT-PATH (arbitrary
+// Deep-bifurcation shard addressing codec. A shard's identity is its
+// canonical address BIT-PATH (arbitrary
 // length) — not a `Vec<u32>` run through `canonical_shard_bit_paths` (which
 // collapses single-valued levels, so it can't skip the uniform bits a skewed
 // shard shares before it branches). These are the PURE codec + bit-prefix
-// helpers; the routing/proposal/migration that consume them are later phases.
+// helpers; the routing/proposal/migration that consume them live elsewhere.
 //
 // Wire form of a shard filter/address: `app ‖ bit_len(u16 BE) ‖ packed bits`,
 // where the packed bits are MSB-first, zero-padded to `ceil(bit_len/8)` bytes.
@@ -824,7 +831,7 @@ mod tests {
 
     #[test]
     fn app_root_from_shard_path_short_copath_does_not_panic() {
-        // Regression (Forest F1): `prefix_bits`/`copath` come from the wire and
+        // Regression: `prefix_bits`/`copath` come from the wire and
         // are attacker-controlled. A copath shorter than the prefix must never
         // index out of bounds (which was a remote consensus-halt panic); it just
         // yields some root that won't match the trusted app root.
@@ -841,7 +848,7 @@ mod tests {
         s.chars().map(|c| c == '1').collect()
     }
 
-    // ---- deep-bifurcation shard codec (Phase 1) ----
+    // ---- deep-bifurcation shard codec ----
 
     #[test]
     fn shard_bit_path_codec_round_trips() {

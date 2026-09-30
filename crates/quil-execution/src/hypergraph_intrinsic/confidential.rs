@@ -27,8 +27,6 @@
 //! ~1 KB + plaintext. Consensus verifies **structure** only; binding comes from
 //! the commitment being stored in state, and recoverability is the reader's
 //! check.
-//!
-//! # ⚠ PRE-AUDIT — confidential-data path.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};

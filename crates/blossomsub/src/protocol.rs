@@ -615,10 +615,9 @@ impl Decoder for GossipsubCodec {
     }
 }
 
-// Quarantined during the BlossomSub fork: this quickcheck codec property test
-// targets upstream's native RPC/topic protobuf, which Stage 2 replaces with the
-// BlossomSub wire format. Rewritten there. (Also needs the old quickcheck
-// `Gen::gen_range` API.)
+// Quarantined in the BlossomSub fork: this quickcheck codec property test
+// targets upstream's native RPC/topic protobuf, which the BlossomSub wire
+// format replaces. (Also needs the old quickcheck `Gen::gen_range` API.)
 #[cfg(all(test, feature = "upstream-tests"))]
 mod tests {
     use super::*;
@@ -721,7 +720,7 @@ mod tests {
     }
 }
 
-/// Stage-4: IDONTWANT wire round trip. Kept OUT of the quarantined
+/// IDONTWANT wire round trip. Kept OUT of the quarantined
 /// `upstream-tests`-gated `tests` module above so it runs by default.
 #[cfg(test)]
 mod stage4_wire_tests {
@@ -732,7 +731,7 @@ mod stage4_wire_tests {
 
     #[test]
     /// IDONTWANT control messages survive a full encode -> wire -> decode round
-    /// trip (Stage-4 carry-forward: decode previously dropped them).
+    /// trip (regression: decode previously dropped them).
     fn idontwant_wire_round_trip() {
         let ids = vec![
             MessageId::from(vec![1u8, 2, 3]),
@@ -767,7 +766,7 @@ mod stage4_wire_tests {
     }
 }
 
-/// Stage-7 wire-sanity guard: lock the StrictSign signing preimage so future
+/// Wire-sanity guard: lock the StrictSign signing preimage so future
 /// edits can't silently drift the on-wire signature contract away from Go's
 /// `WithStrictSignatureVerification`. `verify_signature` (above) is the
 /// authoritative reconstruction; this test pins the exact bytes it signs over.

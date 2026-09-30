@@ -24,9 +24,6 @@ use quil_execution::hypergraph_intrinsic::{
 };
 use quil_execution::hypergraph_intrinsic::canonical::AggregateSignature;
 use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
-use quil_execution::token_intrinsic::{
-    MintTransaction, PendingTransaction, Transaction, TransactionInput, TransactionOutput,
-};
 
 // ---------------------------------------------------------------------
 // Strategy helpers
@@ -393,9 +390,3 @@ decode_fuzz_test!(global_frame_header_decode_fuzz, GlobalFrameHeader);
 // =====================================================================
 // Token intrinsic
 // =====================================================================
-
-decode_fuzz_test!(transaction_decode_fuzz, Transaction);
-decode_fuzz_test!(transaction_input_decode_fuzz, TransactionInput);
-decode_fuzz_test!(transaction_output_decode_fuzz, TransactionOutput);
-decode_fuzz_test!(mint_transaction_decode_fuzz, MintTransaction);
-decode_fuzz_test!(pending_transaction_decode_fuzz, PendingTransaction);

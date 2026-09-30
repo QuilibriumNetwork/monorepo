@@ -50,6 +50,46 @@ impl Transaction for InMemoryTxn {
     }
 }
 
+// Error-propagation fixture only: store mutations remain immediate.
+struct FailingClockTxn {
+    commit_countdown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn clock_fault_due(counter: &std::sync::atomic::AtomicUsize) -> bool {
+    counter.fetch_update(std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1)) == Ok(1)
+}
+
+impl Transaction for FailingClockTxn {
+    fn get(&self, _key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn set(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn commit(self: Box<Self>) -> Result<()> {
+        if clock_fault_due(&self.commit_countdown) {
+            return Err(QuilError::Store("injected clock transaction commit failure".into()));
+        }
+        Ok(())
+    }
+    fn delete(&self, _key: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn abort(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+    fn new_iter(&self, _start: &[u8], _end: &[u8]) -> Result<Box<dyn StoreIterator>> {
+        Err(QuilError::NotFound("in-memory txn iteration unsupported".into()))
+    }
+    fn delete_range(&self, _start: &[u8], _end: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Full in-memory `ClockStore`. Backs every persistent operation
 /// with `HashMap`s keyed by the appropriate identifiers. Sufficient
 /// for happy-path consensus integration tests; not optimized for
@@ -60,6 +100,9 @@ impl Transaction for InMemoryTxn {
 /// stay small (~hundreds).
 #[derive(Default)]
 pub struct InMemoryClockStore {
+    fail_transaction_countdown: std::sync::atomic::AtomicUsize,
+    fail_commit_countdown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail_next_shard_stage: std::sync::atomic::AtomicBool,
     // Global frames
     global_frames: Mutex<HashMap<u64, gpb::GlobalFrame>>,
     /// Frame candidates indexed by `(frame_number, selector)`.
@@ -96,6 +139,19 @@ impl InMemoryClockStore {
         Self::default()
     }
 
+    /// Inject one storage error before the next shard-frame staging write.
+    /// Does not simulate transaction-commit atomicity (mutations are immediate).
+    pub fn fail_next_shard_stage(&self) {
+        self.fail_next_shard_stage.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Fail the nth subsequent transaction creation/commit (zero disables).
+    /// Tests error propagation, not rollback: mutations still apply immediately.
+    pub fn fail_clock_transaction(&self, creation: usize, commit: usize) {
+        self.fail_transaction_countdown.store(creation, std::sync::atomic::Ordering::SeqCst);
+        self.fail_commit_countdown.store(commit, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Seed a `GlobalFrame` directly. Useful for genesis bootstrapping
     /// where the genesis frame must already be present before
     /// `activate_consensus` runs `get_latest_global_clock_frame()`.
@@ -111,7 +167,10 @@ impl InMemoryClockStore {
 
 impl ClockStore for InMemoryClockStore {
     fn new_transaction(&self, _indexed: bool) -> Result<Box<dyn Transaction>> {
-        Ok(Box::new(InMemoryTxn))
+        if clock_fault_due(&self.fail_transaction_countdown) {
+            return Err(QuilError::Store("injected clock transaction creation failure".into()));
+        }
+        Ok(Box::new(FailingClockTxn { commit_countdown: self.fail_commit_countdown.clone() }))
     }
 
     // -----------------------------------------------------------------
@@ -194,6 +253,14 @@ impl ClockStore for InMemoryClockStore {
             .get(&(frame_number, selector.to_vec()))
             .cloned()
             .ok_or_else(|| QuilError::NotFound("no candidate".into()))
+    }
+
+    fn range_global_clock_frame_candidates(&self, min: u64, max: u64, limit: usize) -> Result<Vec<gpb::GlobalFrame>> {
+        let frames = self.global_frame_candidates.lock().unwrap();
+        let mut selected: Vec<_> = frames.iter()
+            .filter(|((number, _), _)| *number >= min && *number <= max).collect();
+        selected.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(selected.into_iter().take(limit).map(|(_, frame)| frame.clone()).collect())
     }
 
     fn delete_global_clock_frame_range(&self, min_frame: u64, max_frame: u64) -> Result<()> {
@@ -418,6 +485,9 @@ impl ClockStore for InMemoryClockStore {
         frame: &gpb::AppShardFrame,
         _txn: &dyn Transaction,
     ) -> Result<()> {
+        if self.fail_next_shard_stage.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(QuilError::Store("injected shard-frame staging failure".into()));
+        }
         let header = frame
             .header
             .as_ref()

@@ -1249,7 +1249,7 @@ fn be_bytes_to_u128(bytes: &[u8]) -> u128 {
 /// The reserved (non-coin) vertex addresses under the token domain.
 fn is_reserved_token_addr(addr: &[u8]) -> bool {
     use quil_execution::token_intrinsic::legacy_migration::MIGRATION_RECEIPT_ADDRESS;
-    use quil_execution::token_intrinsic::shadow_accumulator::ACC_ROOT_ADDRESS;
+    use quil_execution::token_intrinsic::constants::LEGACY_ACCUMULATOR_ROOT_ADDRESS as ACC_ROOT_ADDRESS;
     addr == MIGRATION_RECEIPT_ADDRESS.as_slice()
         || addr == ACC_ROOT_ADDRESS.as_slice()
         || addr == [0xFFu8; 32].as_slice() // token metadata/config vertex

@@ -27,6 +27,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -41,6 +42,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -2219,7 +2221,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.100",
 ]
 
 [[package]]
@@ -5796,12 +5798,11 @@ dependencies = [
  "quil-lattice-ct",
  "quil-p2p",
  "quil-rpc",
+ "quil-store",
  "quil-types",
- "quil-wallet",
  "rand 0.8.5",
  "ratatui",
  "reqwest",
- "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5813,6 +5814,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -5888,13 +5890,17 @@ dependencies = [
  "commonware-p2p",
  "commonware-parallel",
  "commonware-runtime",
+ "commonware-storage",
  "commonware-utils",
  "futures",
+ "governor",
+ "hex 0.4.3",
  "quil-crypto",
  "quil-types",
  "rand 0.8.5",
  "rand_core 0.10.1",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5922,6 +5928,7 @@ dependencies = [
  "quil-cw-consensus",
  "quil-execution",
  "quil-forest",
+ "quil-forest-migrate",
  "quil-hypergraph",
  "quil-keys",
  "quil-p2p",
@@ -5954,6 +5961,8 @@ dependencies = [
  "num-bigint 0.4.6",
  "num-traits",
  "once_cell",
+ "pqcrypto-ntruprime",
+ "pqcrypto-traits",
  "proptest",
  "prost 0.13.5",
  "quil-config",
@@ -6016,6 +6025,7 @@ dependencies = [
  "jmt",
  "num-bigint 0.4.6",
  "quil-tries",
+ "quil-types",
  "rocksdb",
  "sha2 0.10.9",
  "tempfile",
@@ -6047,6 +6057,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "borsh",
+ "getrandom 0.2.15",
  "hex 0.4.3",
  "jmt",
  "num-bigint 0.4.6",
@@ -6108,7 +6119,24 @@ dependencies = [
 name = "quil-lattice-ct"
 version = "0.1.0"
 dependencies = [
+ "aes",
+ "aes-gcm",
+ "libc",
+ "num-bigint 0.4.6",
+ "pqcrypto-ntruprime",
+ "pqcrypto-traits",
+ "quil-lattice-proof-sys",
+ "rand 0.8.5",
  "sha2 0.10.9",
+ "sha3 0.10.8",
+ "zeroize",
+]
+
+[[package]]
+name = "quil-lattice-proof-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -6155,6 +6183,7 @@ dependencies = [
  "quil-forest-migrate",
  "quil-hypergraph",
  "quil-keys",
+ "quil-lattice-ct",
  "quil-lifecycle",
  "quil-p2p",
  "quil-rpc",
@@ -6279,6 +6308,7 @@ dependencies = [
  "quil-config",
  "quil-crypto",
  "quil-execution",
+ "quil-forest",
  "quil-hypergraph",
  "quil-tries",
  "quil-types",
@@ -6299,6 +6329,7 @@ version = "0.1.0"
 dependencies = [
  "criterion 0.5.1",
  "hex 0.4.3",
+ "libc",
  "num-bigint 0.4.6",
  "num-traits",
  "quil-crypto",
@@ -6341,21 +6372,6 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-build",
-]
-
-[[package]]
-name = "quil-wallet"
-version = "0.1.0"
-dependencies = [
- "ed448-bulletproofs",
- "hex 0.4.3",
- "num-bigint 0.4.6",
- "quil-crypto",
- "quil-execution",
- "quil-types",
- "rand 0.8.5",
- "sha3 0.10.8",
- "thiserror 2.0.12",
 ]
 
 [[package]]
@@ -6992,7 +7008,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

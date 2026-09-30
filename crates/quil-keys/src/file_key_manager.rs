@@ -476,7 +476,7 @@ impl FileKeyManager {
     /// Ensure all standard keys exist AND have the expected key type,
     /// creating (or type-upgrading) any that are missing or stale.
     ///
-    /// Migration note (re-substrate cutover): older keystores carry a
+    /// Migration note: older keystores carry a
     /// **BLS48581** `q-prover-key` (type 2), but the proving key is now
     /// **Falcon-512** (type 8). A presence-only check would leave the old
     /// BLS key in place and the Falcon signer slot empty (the node then

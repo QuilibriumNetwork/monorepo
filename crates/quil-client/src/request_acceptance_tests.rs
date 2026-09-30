@@ -7,15 +7,9 @@
 //! selection, and proto shape — so a drift in either the client's construction
 //! or the node's verify will fail here.
 //!
-//! Scope: signature + structural verification that is independent of chain
-//! state. State preconditions (a deployed domain resolving to the signer's write
-//! /owner key, a coin existing in the shadow accumulator, a claimable reward
-//! balance) are assumed valid and modelled by the resolver / inputs — they are
-//! the network's precondition, not the client's output. The lattice spend paths
-//! (transfer/split/merge, escrow create/claim) additionally require a seeded
-//! accumulator root and are covered at the money-conservation level in
-//! `quil-execution`; here we cover their client-owned authorization signature
-//! (mint), which is the state-independent half.
+//! Scope: state-independent signature and structural verification for the
+//! retained deploy, compute and hypergraph client requests. QCT3 token
+//! authorization and execution are covered by the current wallet tests.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -25,7 +19,6 @@ use sha3::{Digest, Sha3_256};
 use quil_crypto::FalconKeyConstructor;
 use quil_execution::compute_intrinsic::conversions::{code_execute_from_proto, compute_update_from_proto};
 use quil_execution::compute_intrinsic::intrinsic::verify_code_execute;
-use quil_execution::domains::QUIL_TOKEN;
 // Internal (canonical) hypergraph op types the node verifies against; the engine
 // converts the proto ops the client emits into these via `from_proto` before
 // calling `verify_op_signature`. We do the same in these tests.
@@ -35,9 +28,6 @@ use quil_execution::hypergraph_intrinsic::{
     HypergraphUpdate as CanonicalHypergraphUpdate, OpForAuth,
 };
 use quil_execution::token_intrinsic::conversions::token_update_from_proto;
-use quil_execution::token_intrinsic::lattice_ct::{
-    mint_auth_message, tx_challenge, verify_mint_auth_signature,
-};
 use quil_keys::FileKeyManager;
 use quil_types::crypto::KeyType;
 use quil_types::proto::compute::{
@@ -360,26 +350,3 @@ fn code_execute_is_accepted() {
 }
 
 // ---- token mint (authorization signature) --------------------------------
-
-#[test]
-fn mint_authorization_signature_is_accepted() {
-    let km = make_km();
-    let owner = prover_pubkey(&km);
-    let domain = QUIL_TOKEN.to_vec();
-    let value: u128 = 12_345;
-    // The mint auth signature binds the outputs via mu = tx_challenge(...); the
-    // exact output commitments are the accumulator's business — here we exercise
-    // the client-owned authorization contract (same helpers the mint command
-    // uses) with a representative commitment.
-    let output_commitments = vec![vec![7u8; 32]];
-    let mu = tx_challenge(&domain, &output_commitments, value);
-
-    let signer = km.get_signer_by_id("q-prover-key").unwrap();
-    let sig = signer
-        .sign_with_domain(&mint_auth_message(value, &mu), &domain)
-        .unwrap();
-
-    assert!(verify_mint_auth_signature(&owner, &sig, value, &mu, &domain));
-    // Claiming a different value than was signed must fail.
-    assert!(!verify_mint_auth_signature(&owner, &sig, value + 1, &mu, &domain));
-}

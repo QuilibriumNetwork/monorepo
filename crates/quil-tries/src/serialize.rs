@@ -312,16 +312,23 @@ fn write_length_prefixed(w: &mut Vec<u8>, data: &[u8]) -> Result<()> {
 }
 
 fn read_length_prefixed<R: Read>(r: &mut R) -> Result<Vec<u8>> {
-    let len = read_u64(r)? as usize;
+    let len = usize::try_from(read_u64(r)?)
+        .map_err(|_| QuilError::Serialization("tree field length overflow".into()))?;
     if len > MAX_LENGTH_PREFIXED_FIELD {
         return Err(QuilError::Serialization(format!(
             "tree deserialize: length-prefixed field {} exceeds max {}",
             len, MAX_LENGTH_PREFIXED_FIELD,
         )));
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)
+    // Grow only for bytes actually present. Legacy tree blobs are also read
+    // while building bounded execution contexts; a short forged field must
+    // not allocate its declared (up to 16 MiB) length before returning EOF.
+    let mut buf = Vec::new();
+    r.take(len as u64).read_to_end(&mut buf)
         .map_err(|e| QuilError::Serialization(e.to_string()))?;
+    if buf.len() != len {
+        return Err(QuilError::Serialization("truncated tree field".into()));
+    }
     Ok(buf)
 }
 
@@ -357,6 +364,23 @@ fn read_i64<R: Read>(r: &mut R) -> Result<i64> {
 mod tests {
     use super::*;
     use num_bigint::BigInt;
+
+    #[test]
+    fn short_field_does_not_request_its_forged_declared_allocation() {
+        struct ShortRead { data: io::Cursor<Vec<u8>>, largest_request: usize }
+        impl Read for ShortRead {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.largest_request = self.largest_request.max(buffer.len());
+                self.data.read(buffer)
+            }
+        }
+        let mut reader = ShortRead {
+            data: io::Cursor::new((1u64 << 20).to_be_bytes().to_vec()), largest_request: 0,
+        };
+        let error = read_length_prefixed(&mut reader).unwrap_err().to_string();
+        assert!(error.contains("truncated tree field"), "{error}");
+        assert!(reader.largest_request <= 8192, "requested {} bytes", reader.largest_request);
+    }
 
     #[test]
     fn test_roundtrip_nil() {

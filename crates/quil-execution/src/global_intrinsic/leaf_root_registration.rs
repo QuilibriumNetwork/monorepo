@@ -273,9 +273,106 @@ pub fn leaf_id_bytes(shard_filter: &[u8], prefix: &[u32]) -> Vec<u8> {
     id
 }
 
+/// The GLOBAL frame from which a confirm may register leaves for shards a
+/// recorded split or merge creates (see [`pre_registration_targets`]).
+/// Consensus-affecting for GLOBAL; it switches with this release's other
+/// rules, at the relay activation frame. A build without the release's token
+/// suite never activates it.
+pub fn pre_registration_frame() -> u64 {
+    if let Some(Some(frame)) = PRE_REGISTRATION_OVERRIDE.get() {
+        return *frame;
+    }
+    #[cfg(feature = "confidential-tokens")]
+    return crate::token_intrinsic::global_commit::relay_activation_frame();
+    #[cfg(not(feature = "confidential-tokens"))]
+    u64::MAX
+}
+
+/// A test network's own pre-registration frame, from
+/// `QUIL_PRE_REGISTRATION_FRAME`: lets a localnet keep this release's relays
+/// while registering the old way. Every node must use the same value.
+/// Mainnet ignores it.
+static PRE_REGISTRATION_OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+
+fn pre_registration_override(network: u8, setting: Option<&str>) -> Option<u64> {
+    if network == 0 {
+        return None;
+    }
+    setting.and_then(|value| value.parse().ok())
+}
+
+/// Fix this process's pre-registration override from its network, and
+/// return it. The first call decides.
+pub fn init_pre_registration_frame(network: u8) -> Option<u64> {
+    *PRE_REGISTRATION_OVERRIDE.get_or_init(|| {
+        pre_registration_override(network, std::env::var("QUIL_PRE_REGISTRATION_FRAME").ok().as_deref())
+    })
+}
+
+/// Shards that a split or merge recorded to apply at `epoch` creates from any
+/// of `confirmed`: every child of a split whose parent is confirmed, and the
+/// target of a merge one of whose sources is confirmed. A member confirming
+/// its shard in the epoch before the change registers leaves for these too,
+/// so it holds a registration for the shard it is on when the change
+/// applies; otherwise it proves nothing for that epoch. A split assigns each
+/// member its child when it applies, so every child is named. Sorted, without
+/// the confirmed filters themselves.
+pub fn pre_registration_targets(
+    changes: &[quil_types::store::PendingShardChange],
+    confirmed: &[Vec<u8>],
+    epoch: u64,
+) -> Vec<Vec<u8>> {
+    use quil_types::store::ShardChangeKind;
+    let mut targets: Vec<Vec<u8>> = changes
+        .iter()
+        .filter(|change| change.effective_epoch == epoch)
+        .flat_map(|change| match change.kind {
+            ShardChangeKind::Split if confirmed.contains(&change.parent) => change.children.clone(),
+            ShardChangeKind::Merge if change.children.iter().any(|c| confirmed.contains(c)) => vec![change.parent.clone()],
+            _ => Vec::new(),
+        })
+        .filter(|target| !target.is_empty() && !confirmed.contains(target))
+        .collect();
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_test_network_overrides_the_pre_registration_frame() {
+        assert_eq!(pre_registration_override(1, Some("18446744073709551615")), Some(u64::MAX));
+        assert_eq!(pre_registration_override(1, Some("bad")), None);
+        assert_eq!(pre_registration_override(1, None), None);
+        assert_eq!(pre_registration_override(0, Some("5")), None, "mainnet ignores it");
+    }
+
+    #[test]
+    fn pre_registration_names_the_shards_a_change_creates_at_that_epoch() {
+        use quil_types::store::{PendingShardChange, ShardChangeKind};
+        let change = |kind, parent: u8, children: &[u8], effective_epoch| PendingShardChange {
+            kind,
+            parent: vec![parent],
+            children: children.iter().map(|c| vec![*c]).collect(),
+            effective_epoch,
+            proposed_frame: 0,
+        };
+        let changes = vec![
+            change(ShardChangeKind::Split, 1, &[10, 11], 8),
+            change(ShardChangeKind::Merge, 2, &[20, 21], 8),
+            change(ShardChangeKind::Split, 3, &[30, 31], 9),
+        ];
+        assert_eq!(pre_registration_targets(&changes, &[vec![1]], 8), vec![vec![10], vec![11]], "every child of a split");
+        assert_eq!(pre_registration_targets(&changes, &[vec![21]], 8), vec![vec![2]], "a merge's target");
+        assert!(pre_registration_targets(&changes, &[vec![3]], 8).is_empty(), "a change applying at another epoch");
+        assert!(pre_registration_targets(&changes, &[vec![10], vec![20]], 8) == vec![vec![2]],
+            "a split child is no source; a merge source is");
+        assert!(pre_registration_targets(&changes, &[vec![1], vec![10], vec![11]], 8).is_empty(),
+            "filters already confirmed are not repeated");
+    }
 
     fn sample(sig: bool) -> LeafRootRegistration {
         LeafRootRegistration {

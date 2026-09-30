@@ -63,7 +63,7 @@ pub struct CoverageThresholds {
     pub min_provers: u64,
     /// Maximum provers before a split is considered (the split TRIGGER). A shard
     /// splits only when `active > max_provers` AND its leaves can divide further
-    /// (§6.1 — the divisibility guard bounds depth to where data diverges, giving
+    /// (the divisibility guard bounds depth to where data diverges, giving
     /// convergence; there is NO separate data-count threshold).
     pub max_provers: u64,
     /// Streak length at which an initial halt is confirmed.
@@ -391,6 +391,12 @@ pub struct ShardCoverageEntry {
     pub filter: Vec<u8>,
     pub size: u64,
     pub active_count: u64,
+    /// Provers reassigned or joining here that are not yet Active. They count
+    /// as staffing for the merge trigger only: a shard a split or merge has
+    /// just created carries its provers as Joining for two epochs, and a
+    /// trigger that read that as starvation merged the merged shard again,
+    /// and again, back to the root, before any of them produced a frame.
+    pub joining_count: u64,
 }
 
 /// Caller-supplied closure that returns the universe of shards to
@@ -426,7 +432,7 @@ pub struct CoverageMonitor {
     /// zero-prover-but-non-zero-size shards (the address-creation
     /// failure mode).
     shard_inventory_provider: std::sync::RwLock<Option<ShardInventoryProvider>>,
-    /// Optional EMPTY-SPLIT GUARD (`UNIFIED_APP_TREE_DESIGN` §6.1): given a shard
+    /// Optional EMPTY-SPLIT GUARD: given a shard
     /// `(filter, factor)`, returns the leaf count of each of the `factor` proposed
     /// children under the unified app tree. A split is only proposed when ≥2 of
     /// those children are DATA-BEARING — otherwise the split would create an
@@ -436,7 +442,7 @@ pub struct CoverageMonitor {
     /// guard (legacy behavior). Interior-mutable because the monitor is
     /// `Arc`-wrapped before the CRDT exists.
     split_feasibility: std::sync::RwLock<Option<SplitFeasibilityProvider>>,
-    /// Deep-bifurcation (§6.1 encoding rework) split PROPOSER. Given a shard
+    /// Deep-bifurcation split PROPOSER. Given a shard
     /// filter, returns the child bit-path FILTERS of the shallowest real branch
     /// (`HypergraphCrdt::propose_split_children` → `first_split_bifurcation`),
     /// descending past any uniform run so BOTH children are data-bearing — or
@@ -536,10 +542,35 @@ pub fn build_shard_inventory(
                 .get_active_provers(&filter, frame_number)
                 .map(|v| v.len() as u64)
                 .unwrap_or(0);
-            out.push(ShardCoverageEntry { filter, size: bytes, active_count: active });
+            let joining = prover_registry
+                .get_provers_by_status(&filter, ProverStatus::Joining)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+            out.push(ShardCoverageEntry { filter, size: bytes, active_count: active, joining_count: joining });
         }
     }
-    out
+    let live: Vec<Vec<u8>> = prover_registry
+        .get_prover_shard_summaries(frame_number)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(crate::provers::lifecycle::has_live_allocation)
+        .map(|summary| summary.filter)
+        .collect();
+    drop_split_away(out, &live)
+}
+
+/// Drop the entries of shards the registry shows split away: a strict
+/// bit-path descendant holds live allocations (a split moves them there; a
+/// merge leaves the children's Historic, and the parent is a shard again). A
+/// regular node's own grid never flips, so it still names a split parent,
+/// whose committed-delivery count spans every block beneath it. Kept, the
+/// long-split QUIL root reads as an unstaffed data shard, and its halt stops
+/// every application shard on every regular node.
+fn drop_split_away(entries: Vec<ShardCoverageEntry>, live: &[Vec<u8>]) -> Vec<ShardCoverageEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| !crate::provers::lifecycle::is_split_parent(&entry.filter, live))
+        .collect()
 }
 
 /// Maximum total size of the shard that results from a merge: 16 GiB. A
@@ -582,7 +613,7 @@ impl CoverageMonitor {
         self.thresholds
     }
 
-    /// Install the §6.1 empty-split guard provider (see
+    /// Install the empty-split guard provider (see
     /// [`Self::split_feasibility`]). The node wires this to the unified app tree;
     /// without it, splits are proposed unconditionally (legacy). `&self` +
     /// interior mutability so it can be set through the `Arc` once the CRDT exists.
@@ -711,6 +742,10 @@ impl CoverageMonitor {
                     size: u64::MAX,
                     active_count: s.status_counts
                         .get(&ProverStatus::Active)
+                        .copied()
+                        .unwrap_or(0) as u64,
+                    joining_count: s.status_counts
+                        .get(&ProverStatus::Joining)
                         .copied()
                         .unwrap_or(0) as u64,
                 })
@@ -948,6 +983,18 @@ impl CoverageMonitor {
                 // Already staged for a topology change — don't re-propose.
                 continue;
             }
+            // Already split: its provers keep allocations on it until their
+            // leaves complete, two epochs later, and counting them re-proposed
+            // the same split. Only a
+            // child holding live allocations counts: a merge leaves the
+            // retired children's allocations Historic, and a merged parent
+            // counted them as a split and never split again.
+            if crate::provers::lifecycle::is_split_parent(
+                filter,
+                summaries.iter().filter(|s| crate::provers::lifecycle::has_live_allocation(s)).map(|s| &s.filter),
+            ) {
+                continue;
+            }
             let active = summary
                 .status_counts
                 .get(&ProverStatus::Active)
@@ -961,7 +1008,7 @@ impl CoverageMonitor {
             {
                 continue;
             }
-            // §6.1: a shard splits ONLY when BOTH hold — (1) it is OVER-CROWDED
+            // A shard splits ONLY when BOTH hold — (1) it is OVER-CROWDED
             // (`active > max_provers`, the trigger), AND (2) its leaves CAN BE
             // DIVIDED FURTHER (≥2 non-empty children). Prover-count alone is not
             // enough: splitting a shard whose data can't divide (the skewed [7,0]
@@ -985,10 +1032,10 @@ impl CoverageMonitor {
                 ?counts,
                 "split-trigger check (over-crowded; divisibility guard next)",
             );
-            // Deep-bifurcation (§6.1 encoding rework): under the unified app tree
+            // Deep-bifurcation: under the unified app tree
             // the PROPOSER descends past any uniform bit run to the shallowest
             // REAL branch and emits variable-depth bit-path child FILTERS — so a
-            // skewed shard (the localnet `[7,0]` case) splits at the branch where
+            // skewed shard (e.g. `[7,0]`) splits at the branch where
             // the data actually diverges instead of cutting at the immediate bit
             // and orphaning a child. Its `None` IS the empty-split guard (no two
             // data-bearing halves / single leaf). Absent (legacy tree) ⇒ the
@@ -1010,7 +1057,7 @@ impl CoverageMonitor {
                 if proposed.len() < 2 {
                     continue;
                 }
-                // §6.1 EMPTY-SPLIT GUARD: only propose when the split actually
+                // EMPTY-SPLIT GUARD: only propose when the split actually
                 // divides the data — ≥2 of the proposed children are data-bearing.
                 // Skips the meaningless "one child gets everything, the sibling is
                 // empty" split (which on the legacy tree also orphaned data). Only
@@ -1069,9 +1116,9 @@ impl CoverageMonitor {
     /// Three gates, all leader-side:
     /// - TRIGGER: each child's active count `< min_provers` (both starved →
     /// consolidation is warranted).
-    /// - COVERAGE (decision #3): combined active `<= max_provers` — never
+    /// - COVERAGE: combined active `<= max_provers` — never
     /// merge into an over-crowded shard.
-    /// - SIZE (decision #4, REQUIRED): combined size `<= MERGE_MAX_SIZE_BYTES`
+    /// - SIZE (REQUIRED): combined size `<= MERGE_MAX_SIZE_BYTES`
     /// (16 GiB) — never merge into an over-large shard.
     ///
     /// v1 scope: only depth-1 factor-2 shards (33-byte filters, suffix
@@ -1104,7 +1151,7 @@ impl CoverageMonitor {
                 return None; // the root has no parent to merge into
             }
             // Merge the two immediate bit-siblings `B‖0`/`B‖1` back into the branch
-            // `B` = drop-last-bit. Under Option A (prefix-free spine) `B` is a valid
+            // `B` = drop-last-bit. Under the prefix-free spine `B` is a valid
             // leaf after merge — the retained spine keeps completeness around it —
             // and `materialize_shard_merge` re-registers `B`. (Bare app when the
             // branch is empty, i.e. a 1-bit split of the root.)
@@ -1200,18 +1247,19 @@ impl CoverageMonitor {
             if e0.size == 0 && e1.size == 0 {
                 continue;
             }
-            // TRIGGER: both halves starved.
-            if e0.active_count >= self.thresholds.min_provers
-                || e1.active_count >= self.thresholds.min_provers
+            // TRIGGER: both halves starved. Provers still Joining are staffing
+            // on its way, not starvation (see `joining_count`).
+            if e0.active_count.saturating_add(e0.joining_count) >= self.thresholds.min_provers
+                || e1.active_count.saturating_add(e1.joining_count) >= self.thresholds.min_provers
             {
                 continue;
             }
             let combined_active = e0.active_count.saturating_add(e1.active_count);
-            // COVERAGE gate (#3): never merge into an over-crowded shard.
+            // COVERAGE gate: never merge into an over-crowded shard.
             if combined_active > self.thresholds.max_provers {
                 continue;
             }
-            // SIZE gate (#4): never merge into an over-large shard.
+            // SIZE gate: never merge into an over-large shard.
             let combined_size = e0.size.saturating_add(e1.size);
             if combined_size > MERGE_MAX_SIZE_BYTES {
                 tracing::info!(
@@ -1916,6 +1964,60 @@ mod tests {
         assert_eq!(dist.0.lock().unwrap().len(), 2, "should re-emit after cooldown");
     }
 
+    /// Several shards, each with a fixed count of allocations in one status.
+    struct ShardsRegistry(Vec<(Vec<u8>, quil_types::consensus::ProverStatus, u32)>);
+    impl quil_types::consensus::ProverRegistry for ShardsRegistry {
+        fn get_prover_info(&self, _: &[u8]) -> quil_types::error::Result<Option<quil_types::consensus::ProverInfo>> { Ok(None) }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> quil_types::error::Result<Vec<u8>> { Ok(Vec::new()) }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> quil_types::error::Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
+        fn get_active_provers(&self, _: &[u8], _: u64) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
+        fn get_prover_count(&self, _: &[u8]) -> quil_types::error::Result<usize> { Ok(0) }
+        fn get_provers(&self, _: &[u8]) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
+        fn get_provers_by_status(&self, _: &[u8], _: quil_types::consensus::ProverStatus) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
+        fn get_prover_shard_summaries(&self, _: u64) -> quil_types::error::Result<Vec<quil_types::consensus::ProverShardSummary>> {
+            Ok(self.0.iter().map(|(filter, status, count)| {
+                let mut status_counts = std::collections::HashMap::new();
+                status_counts.insert(*status, *count);
+                quil_types::consensus::ProverShardSummary { filter: filter.clone(), status_counts, total_size: 0 }
+            }).collect())
+        }
+    }
+
+    // A split parent keeps its provers' allocations until their leaves
+    // complete, two epochs later; counting them re-proposed the same split
+    // (frame 180 after a split applied at 123).
+    #[test]
+    fn an_already_split_parent_is_not_proposed_again() {
+        let app = [0x11u8; 32];
+        let parent = quil_forest::encode_shard_bit_path(&app, &[]);
+        let child = quil_forest::encode_shard_bit_path(&app, &[false]);
+        use quil_types::consensus::ProverStatus::{Active, Historic};
+        let proposals = |shards: Vec<(Vec<u8>, quil_types::consensus::ProverStatus, u32)>| {
+            let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
+            let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
+            let monitor = CoverageMonitor::new(
+                Arc::new(ShardsRegistry(shards)),
+                dist_arc,
+                CoverageThresholds::mainnet(),
+                Arc::new(AtomicBool::new(false)),
+            );
+            monitor.propose_split_rebalance(1000);
+            let events = dist.0.lock().unwrap();
+            events.iter().filter_map(|e| match &e.data {
+                quil_types::consensus::ControlEventData::ShardSplit { filter, .. } => Some(filter.clone()),
+                _ => None,
+            }).collect::<Vec<_>>()
+        };
+        assert_eq!(proposals(vec![(parent.clone(), Active, 40)]), vec![parent.clone()],
+            "a crowded unsplit shard is proposed");
+        assert!(proposals(vec![(parent.clone(), Active, 40), (child.clone(), Active, 4)]).is_empty(),
+            "a crowded parent with a registered child is not proposed again");
+        // After a legacy merge, the merged parent held 8 members over a
+        // split threshold of 7, and no split was ever proposed.
+        assert_eq!(proposals(vec![(parent.clone(), Active, 40), (child, Historic, 4)]), vec![parent],
+            "a merged parent whose retired child holds only Historic slots splits again");
+    }
+
     #[test]
     fn propose_split_suppressed_when_parent_already_has_a_pending_change() {
         // Over-crowded shard (40 > 32) — normally a proposal.
@@ -1957,7 +2059,7 @@ mod tests {
         );
     }
 
-    /// §6.1 empty-split guard: a shard over the trigger is NOT split when the
+    /// Empty-split guard: a shard over the trigger is NOT split when the
     /// split would put all data on one child (the sibling empty); it IS split
     /// once the data divides across children.
     #[test]
@@ -2001,7 +2103,7 @@ mod tests {
         );
     }
 
-    /// §6.1 split fires ONLY when BOTH hold: (1) OVER-CROWDED (`active >
+    /// A split fires ONLY when BOTH hold: (1) OVER-CROWDED (`active >
     /// max_provers`) AND (2) the leaves CAN DIVIDE (≥2 non-empty children). Not
     /// over-crowded ⇒ never splits (even if divisible); over-crowded but
     /// INDIVISIBLE (the skewed `[10,0]` case) ⇒ deferred by the empty-split guard.
@@ -2043,7 +2145,7 @@ mod tests {
         assert_eq!(round(40, vec![5, 5]), 1, "over-crowded AND divisible → split");
     }
 
-    /// Deep-bifurcation (§6.1 encoding rework): when a `split_proposer` is wired
+    /// Deep-bifurcation: when a `split_proposer` is wired
     /// (unified app tree) the proposal emits ITS variable-depth bit-path children
     /// verbatim — NOT `compute_proposed_shards`' immediate-bit byte-suffix ones —
     /// and the proposer's `None` supersedes the counts guard (suppresses).
@@ -2121,8 +2223,7 @@ mod tests {
             vec![ShardCoverageEntry {
                 filter: target_for_provider.clone(),
                 size: 1024, // 1 KB of data on this shard
-                active_count: 0,
-            }]
+                active_count: 0, joining_count: 0 }]
         });
         let (monitor, dist) = build_monitor_with_inventory(provider);
 
@@ -2150,6 +2251,26 @@ mod tests {
     /// halt even if the provider reports `active_count = 0`. The
     /// "no data to protect" rule means we skip it entirely.
     #[test]
+    // Every regular node's grid still held the QUIL root split
+    // away at frame 124. With outputs committed anywhere in the application
+    // the root read as sized with no provers, and its coverage halt stopped
+    // all shards network-wide. The registry shows the split.
+    #[test]
+    fn a_split_away_shard_is_not_in_the_coverage_inventory() {
+        let app = [0x31u8; 32];
+        let root = app.to_vec();
+        let child = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let entry = |filter: &Vec<u8>, size: u64, active: u64| ShardCoverageEntry {
+            filter: filter.clone(), size, active_count: active, joining_count: 0,
+        };
+        let inventory = || vec![entry(&root, 4096, 0), entry(&child, 64, 2)];
+        let kept = super::drop_split_away(inventory(), &[child.clone()]);
+        assert_eq!(kept.iter().map(|e| e.filter.clone()).collect::<Vec<_>>(), vec![child.clone()]);
+        assert_eq!(super::drop_split_away(inventory(), &[]).len(), 2, "without a live descendant the root stays");
+        assert_eq!(super::drop_split_away(inventory(), &[root.clone()]).len(), 2, "a merged parent is a shard again");
+    }
+
+    #[test]
     fn inventory_provider_skips_zero_size_shards() {
         let target_filter: Vec<u8> = vec![0xCD; 32];
         let target_for_provider = target_filter.clone();
@@ -2157,8 +2278,7 @@ mod tests {
             vec![ShardCoverageEntry {
                 filter: target_for_provider.clone(),
                 size: 0, // no data — must skip
-                active_count: 0,
-            }]
+                active_count: 0, joining_count: 0 }]
         });
         let (monitor, dist) = build_monitor_with_inventory(provider);
 
@@ -2183,7 +2303,7 @@ mod tests {
     }
 
     // =================================================================
-    // Merge rebalance trigger + 16GiB gate (decision #4) + coverage gate (#3)
+    // Merge rebalance trigger + 16GiB gate + coverage gate
     // =================================================================
 
     /// Build a monitor with an empty registry + capturing distributor.
@@ -2194,7 +2314,7 @@ mod tests {
     }
 
     fn entry(filter: Vec<u8>, size: u64, active: u64) -> ShardCoverageEntry {
-        ShardCoverageEntry { filter, size, active_count: active }
+        ShardCoverageEntry { filter, size, active_count: active, joining_count: 0 }
     }
 
     fn child(parent: &[u8], suffix: u8) -> Vec<u8> {
@@ -2216,6 +2336,28 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A shard a topology change just created carries its provers as Joining
+    /// for two epochs. That is staffing on its way, not starvation: a live
+    /// merge cascade (`0000`+`0001` → `000`, then `000`+`001` → `00`, then
+    /// `00`+`01` → `0`) came from reading it as starvation.
+    #[test]
+    fn merge_counts_joining_provers_as_staffing() {
+        let parent = vec![0xAAu8; 32];
+        let mut inv = vec![
+            entry(child(&parent, 0x00), 1 << 30, 0),
+            entry(child(&parent, 0x80), 1 << 30, 3),
+        ];
+        inv[0].joining_count = 6;
+        let (monitor, dist) = build_merge_monitor();
+        monitor.propose_merge_rebalance(100, &inv);
+        assert!(merge_events(&dist).is_empty(), "six provers joining are not starvation");
+
+        inv[0].joining_count = 1;
+        let (monitor, dist) = build_merge_monitor();
+        monitor.propose_merge_rebalance(100, &inv);
+        assert_eq!(merge_events(&dist).len(), 1, "one joining prover leaves the pair starved");
     }
 
     #[test]
@@ -2257,8 +2399,8 @@ mod tests {
     }
 
     /// Deep-bifurcation merge proposer: under the unified provider, siblings are
-    /// bit-path FILTERS and the parent is the BRANCH (drop the last bit) — under
-    /// Option A the branch is a valid leaf after merge (the retained prefix-free
+    /// bit-path FILTERS and the parent is the BRANCH (drop the last bit) — the
+    /// branch is a valid leaf after merge (the retained prefix-free
     /// spine keeps completeness around it) and `materialize_shard_merge` re-registers
     /// it. Two EMPTY siblings are latent spine placeholders → no merge; a lone
     /// sibling → no merge (both required).

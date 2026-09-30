@@ -319,7 +319,7 @@ impl LazyVectorCommitmentTree {
     }
 
     // -----------------------------------------------------------------
-    // Public API — stubs filled in by follow-up commits.
+    // Public API
     // -----------------------------------------------------------------
 
     /// Lazy Insert. Walks from the root toward the position of `key`,

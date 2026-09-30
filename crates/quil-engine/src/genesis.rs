@@ -663,17 +663,53 @@ pub fn reset_prover_tree_to_genesis(
     genesis_seed: &str,
     local_prover_pubkey: &[u8],
 ) -> Result<usize> {
+    let guard = hypergraph.lock_forest_writes();
+    reset_prover_tree_to_genesis_with_guard(hypergraph, rocks_store, &guard, frame_number, network, genesis_seed, local_prover_pubkey)
+}
+
+/// Reset through the materializer's bound store while its forest barrier is
+/// already held. The owner must discard a tentative branch if any step fails.
+pub fn reset_prover_tree_to_genesis_with_guard(
+    hypergraph: &Arc<HypergraphCrdt>,
+    store: &dyn quil_types::store::HypergraphStore,
+    guard: &quil_hypergraph::ForestWriteGuard<'_>,
+    frame_number: u64,
+    network: u8,
+    genesis_seed: &str,
+    local_prover_pubkey: &[u8],
+) -> Result<usize> {
     use quil_types::store::ShardKey;
+    hypergraph.check_forest_guard(guard)?;
+    let identity = hypergraph.backing_store_identity().ok_or_else(|| QuilError::ExecutionUnavailable("reset requires identifiable storage".into()))?;
+    if store.backing_store_identity().as_ref() != Some(&identity) {
+        return Err(QuilError::ExecutionUnavailable("prover reset store mismatch".into()));
+    }
+    // Reject an invalid configured genesis before clearing any existing state.
+    let genesis_keys = if network == 0 { Vec::new() } else {
+        resolve_testnet_prover_keys(network, genesis_seed, local_prover_pubkey)?
+    };
     // The global intrinsic prover shard: l2 = 0xff*32 (the id the CRDT commits it
     // under, `&shard.l2`).
     let prover_l2 = [0xffu8; 32];
     let shard = ShardKey { l1: [0u8; 3], l2: prover_l2 };
 
+    // 0. FENCE — committee-session authorization records share this shard. They
+    //    are not prover state: carry them across the wipe byte-for-byte, so a
+    //    managed application keeps its sessions, requests and seals. A failed
+    //    scan aborts the reset rather than silently dropping authorization.
+    let mut authorization: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    hypergraph.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut |key, blob| {
+        if key.len() == 64 && quil_execution::global_intrinsic::handoff::is_record_blob(&blob) {
+            authorization.push((key[32..].to_vec(), blob));
+        }
+    })?;
+    authorization.sort();
+
     // 1. WIPE — forest phase trees (vertex adds/removes + hyperedge adds/removes)
     //    and the underlying blob keyspace, so the rebuild starts from empty and
     //    nothing (tree node or flat blob) resurrects a dropped record.
-    hypergraph.reset_shard_forest_trees(&prover_l2)?;
-    rocks_store.clear_shard_underlying(&shard)?;
+    hypergraph.reset_shard_forest_trees_with_guard(guard, &prover_l2)?;
+    store.clear_shard_underlying(&shard)?;
 
     // 2. REBUILD via the established genesis seeders (Falcon-keyed, exact addresses).
     let seeded = if network == 0 {
@@ -684,18 +720,28 @@ pub fn reset_prover_tree_to_genesis(
         remove_offline_global_prover(hypergraph, frame_number)?;
         n
     } else {
-        let keys = resolve_testnet_prover_keys(network, genesis_seed, local_prover_pubkey)?;
         let state = HypergraphState::new(hypergraph.clone());
-        for pubkey in &keys {
+        for pubkey in &genesis_keys {
             add_prover_on_filter(&state, pubkey, 1000, frame_number, &[])?;
         }
         state.commit()?;
         hypergraph.commit(frame_number)?;
-        keys.len()
+        genesis_keys.len()
     };
+
+    if !authorization.is_empty() {
+        let va_disc = hypergraph_state::vertex_adds_discriminator()?;
+        let state = HypergraphState::new(hypergraph.clone());
+        for (address, blob) in &authorization {
+            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], address, va_disc.as_slice(), frame_number, blob.clone())?;
+        }
+        state.commit()?;
+        hypergraph.commit(frame_number)?;
+    }
 
     info!(
         seeded,
+        authorization_records = authorization.len(),
         frame = frame_number,
         network,
         "reset_prover_tree_to_genesis: global prover tree wiped + rebuilt from genesis committee"
@@ -1394,6 +1440,48 @@ mod tests {
         );
     }
 
+    /// The flag-day prover-tree reset wipes the whole global prover shard;
+    /// committee-session authorization shares that shard and must survive it.
+    #[test]
+    fn prover_tree_reset_carries_committee_authorization_across_the_wipe() {
+        use quil_execution::global_intrinsic::handoff;
+        use quil_types::crypto::Signer as _;
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = Arc::new(HypergraphCrdt::new(store.clone(), Arc::new(quil_hypergraph::testing::StubProver)));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let signers: Vec<_> = (0..2).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let mut members: Vec<Vec<u8>> = signers.iter().map(|s| s.public_key().to_vec()).collect();
+        members.sort();
+        let session = quil_cw_consensus::handoff::Session {
+            chain_id: [7; 32], filter: vec![0x61; 32], generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+            base_frame: 0, authorization: [0; 32], members: members.clone(),
+        };
+        let cursor = quil_store::encoding::global_materialized_cursor_key();
+        let state = HypergraphState::new(crdt.clone());
+        // A prover that is NOT in the genesis set: the reset must drop it.
+        add_prover_on_filter(&state, &members[1], 5, 1, &[]).unwrap();
+        handoff::initialize(&state, 1, &session).unwrap();
+        state.commit().unwrap();
+        state.abort();
+        crdt.commit_with_global_cursor(1, &cursor).unwrap();
+
+        let seed = hex::encode(&members[0]);
+        assert_eq!(reset_prover_tree_to_genesis(&crdt, &store, 2, 1, &seed, &[]).unwrap(), 1);
+        crdt.commit_with_global_cursor(2, &cursor).unwrap();
+
+        let view = handoff::CommittedView::capture(&crdt).unwrap();
+        assert_eq!(handoff::head(&view, &session.filter).unwrap(), Some(session.clone()));
+        assert_eq!(handoff::status(&view, &session.id().unwrap()).unwrap(), handoff::Status::Active);
+        assert!(handoff::manages_application(&view, &session.filter).unwrap());
+        let scan = quil_execution::prover_registry::CommittedProverScan::try_scan(&crdt).unwrap();
+        let dropped = quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(&members[1]).unwrap();
+        let kept = quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(&members[0]).unwrap();
+        let active: Vec<_> = scan.active_on_filter(&[], 2).into_iter().map(|(_, address)| address).collect();
+        assert!(active.contains(&kept.to_vec()) && !active.contains(&dropped.to_vec()));
+    }
+
     #[test]
     fn parse_mainnet_genesis() {
         let data = get_mainnet_genesis_data().unwrap();
@@ -1440,8 +1528,8 @@ mod tests {
         }
         assert_eq!(got_addrs.len(), 5, "expected 5 distinct archive addresses");
 
-        // The beacon (header.prover + first genesis prover) is the
-        // 165.140.86.86 archive's Falcon key → address 130d5a40…
+        // The beacon (header.prover + first genesis prover) is an
+        // archive's Falcon key → address 130d5a40…
         let data = get_mainnet_genesis_data().unwrap();
         let beacon_key = base64::engine::general_purpose::STANDARD
             .decode(&data.beacon_bls48581_key)

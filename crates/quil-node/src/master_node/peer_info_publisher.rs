@@ -90,6 +90,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             additional_metadata: c.additional_metadata,
         })
         .collect();
+    pi_caps.push(quil_p2p::CanonicalCapability {
+        protocol_identifier: quil_p2p::BUILD_FINGERPRINT_CAPABILITY_ID,
+        additional_metadata: hex::decode(env!("QUIL_BUILD_FINGERPRINT"))
+            .expect("build script emits a SHA-256 fingerprint"),
+    });
+    info!(
+        version = quil_config::VERSION_STRING,
+        build_fingerprint = env!("QUIL_BUILD_FINGERPRINT"),
+        "publishing local source build identity"
+    );
     // Archive nodes must advertise the archive-service capability
     // so non-archive peers (joining provers) can find them via
     // PeerInfo and fetch frames over gRPC. Without this, every
@@ -188,7 +198,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as i64,
-                version: vec![2, 1, 0],
+                version: quil_config::VERSION.to_vec(),
                 patch_number: vec![quil_config::PATCH_NUMBER],
                 capabilities: pi_caps.clone(),
                 // pubkey/signature are passed separately to

@@ -154,6 +154,8 @@ message ShardMerge {
 }
 
 message MessageRequest {
+  reserved 11, 12, 13;
+  reserved "transaction", "pending_transaction", "mint_transaction";
   oneof request {
     quilibrium.node.global.pb.ProverJoin join = 1;
     quilibrium.node.global.pb.ProverLeave leave = 2;
@@ -165,9 +167,6 @@ message MessageRequest {
     quilibrium.node.global.pb.ProverUpdate update = 8;
     quilibrium.node.token.pb.TokenDeploy token_deploy = 9;
     quilibrium.node.token.pb.TokenUpdate token_update = 10;
-    quilibrium.node.token.pb.Transaction transaction = 11;
-    quilibrium.node.token.pb.PendingTransaction pending_transaction = 12;
-    quilibrium.node.token.pb.MintTransaction mint_transaction = 13;
     quilibrium.node.hypergraph.pb.HypergraphDeploy hypergraph_deploy = 14;
     quilibrium.node.hypergraph.pb.HypergraphUpdate hypergraph_update = 15;
     quilibrium.node.hypergraph.pb.VertexAdd vertex_add = 16;
@@ -184,6 +183,10 @@ message MessageRequest {
     quilibrium.node.global.pb.ProverSeniorityMerge seniority_merge = 27;
     quilibrium.node.global.pb.ShardSplit shard_split = 28;
     quilibrium.node.global.pb.ShardMerge shard_merge = 29;
+    quilibrium.node.token.pb.TokenOperation token_operation = 30;
+    // Canonical old-session closing certificate. The authorized request and
+    // successor membership are read from committed global state.
+    bytes committee_handoff = 31;
   }
   int64 timestamp = 99;
 }
@@ -241,6 +244,11 @@ message GlobalFrameHeader {
   // prover-shard phases so catch-up sync can authenticate every phase, not just
   // vertex-adds. Bound into the VDF challenge alongside prover_tree_commitment.
   repeated bytes prover_tree_aux_roots = 12;
+  // Total network world-state size in bytes as of the end of the previous
+  // frame (the global prover shard excluded), certified by global consensus.
+  // Every execution venue prices state growth from the value on the global
+  // frame it is anchored to. Bound into the VDF challenge when non-zero.
+  uint64 world_state_size = 13;
 }
 
 message FrameHeader {
@@ -307,6 +315,35 @@ message FrameHeader {
   // folded into a global frame's requests; decoded only at the global audit.
   // Empty pre-storage / for legacy-VDF frames.
   bytes storage_attestation = 15;
+  // Sum of the proof-bound fees (QUIL base units, unsigned 16-byte big-endian)
+  // of the operations materialized in the PREVIOUS frame of this shard
+  // (frame_number - 1). Frame N's requests execute only after N is finalized,
+  // so the total a committee can verify at proposal time is the previous
+  // frame's. The global materializer credits it to the shard's provers.
+  bytes fee_total = 16;
+  // Cross-domain QUIL settlements executed by this shard in frames
+  // frame_number-32 ..= frame_number-1: each entry is source frame (u64 BE) ‖
+  // receipt ‖ parameter_context ‖ destination ‖ context ‖ settlement (u128 BE),
+  // frames ascending, receipts ascending within a frame. Re-carried for 32
+  // frames so a dropped header loses nothing; the global materializer writes
+  // one GLOBAL settlement record per receipt, skipping receipts it recorded.
+  // Only QUIL token shards carry entries.
+  bytes settlements = 17;
+  // This shard's part of the confidential coin accumulator as of frame
+  // frame_number-1: the root of the subtree its prefix covers, per block-width
+  // layer, with the coins under it (shard_accumulator::ShardReport). Carried
+  // when those coins changed in that frame, and on every 32nd frame as a
+  // heartbeat; empty otherwise and for a shard with no coins. The global
+  // materializer folds every shard's report into the application's canonical
+  // root (CROSS_SHARD_COMMIT.md §6).
+  bytes accumulator = 18;
+  // Confidential operations this shard verified in frames
+  // frame_number-8 ..= frame_number-1, as compact spend entries
+  // (global_commit::SpendEntry: consumptions, output addresses, escrow and
+  // settlement bindings, fee — never the outputs themselves). Re-carried for 8
+  // frames. The global materializer decides each once; nothing reaches shard
+  // state until the owning shard delivers it (CROSS_SHARD_COMMIT.md §8).
+  bytes spends = 19;
 }
 
 // One committee member's proof-of-storage opening for one challenge query in a
@@ -523,6 +560,9 @@ message AppShardInfo {
   uint64 materialized_frame = 6;
   // Latest app frame retained by the same archive, for a truthful backlog.
   uint64 latest_frame = 7;
+  // A recorded split or merge that has not applied yet names this shard; the
+  // chain refuses a join that includes it until the change applies.
+  bool pending_change = 8;
 }
 
 message GetAppShardsResponse {
@@ -650,13 +690,31 @@ message GetVertexBlobRequest {
   uint32 phase = 2;
   bytes id = 3;         // 64-byte vertex id (app ‖ data)
   // MVCC pin: read the vertex "as-of" this tree version (latest write <= version),
-  // matching the forest leaf that the diff addressed. 0 => latest (back-compat
-  // with unversioned callers; real commit versions start at 1).
+  // matching the forest leaf that the diff addressed. Without exact_version,
+  // 0 means latest for older callers. Exact pins can address tree version 0.
   uint64 version = 4;
+  bool exact_version = 5;
 }
 message GetVertexBlobResponse {
   bool found = 1;
   bytes blob = 2;
+}
+// A single historical GLOBAL vertex, authenticated at the requested root.
+// Bounded to 32 KiB; never installs or rewinds the recipient's GLOBAL tree.
+message GetGlobalVertexProofRequest {
+  bytes root = 1;
+  bytes address = 2;
+  bool allow_forward = 3; // a worker may ask its master to try an archive once
+}
+message GetGlobalVertexProofResponse {
+  bool found = 1;
+  bytes proof = 2;
+}
+// Worker-only discovery from its authenticated master's verified archive pool.
+// At most 32 host:port entries, each at most 512 bytes.
+message GetArchiveEndpointsRequest {}
+message GetArchiveEndpointsResponse {
+  repeated string endpoints = 1;
 }
 message ResolveRootRequest {
   bytes shard_id = 1;  // addr_path_shard_id(app, prefix) or single-shard id
@@ -698,6 +756,8 @@ service GlobalService {
   rpc GetForestHead(GetForestHeadRequest) returns (GetForestHeadResponse);
   rpc GetForestPreimage(GetForestPreimageRequest) returns (GetForestPreimageResponse);
   rpc GetVertexBlob(GetVertexBlobRequest) returns (GetVertexBlobResponse);
+  rpc GetGlobalVertexProof(GetGlobalVertexProofRequest) returns (GetGlobalVertexProofResponse);
+  rpc GetArchiveEndpoints(GetArchiveEndpointsRequest) returns (GetArchiveEndpointsResponse);
   rpc ResolveRoot(ResolveRootRequest) returns (ResolveRootResponse);
   rpc GetAppManifest(GetAppManifestRequest) returns (GetAppManifestResponse);
 }
@@ -705,6 +765,116 @@ service GlobalService {
 service AppShardService {
   rpc GetAppShardFrame (GetAppShardFrameRequest) returns (AppShardFrameResponse);
   rpc GetAppShardProposal (GetAppShardProposalRequest) returns (AppShardProposalResponse);
+  // Peer-to-peer coin scan: a node that does not cover an application asks one
+  // that does, so a wallet reads its own node rather than hunting for a node
+  // with the right coverage. Same page contract as the wallet-facing scan —
+  // snapshot-pinned, address-ordered, cursor-continued. A node that does not
+  // serve the application refuses rather than returning an empty page.
+  rpc ListShardCoins (ListShardCoinsRequest) returns (ListShardCoinsResponse);
+  // Peer-to-peer coin witnesses: the membership paths a wallet needs to SPEND
+  // a coin. A forwarded scan shows a balance; without this the holder still
+  // cannot move it from a node that does not cover the application.
+  rpc GetShardCoinWitnesses (GetShardCoinWitnessesRequest) returns (GetShardCoinWitnessesResponse);
+  // Wallet escrow discovery uses the same coverage and snapshot contract.
+  rpc ListShardEscrows (ListShardCoinsRequest) returns (ListShardEscrowsResponse);
+  // Current application vertex data from worker stores, with an explicit
+  // coverage check. Forest-sync absence on a master store is not a wallet read.
+  rpc GetShardVertex (GetShardVertexRequest) returns (GetShardVertexResponse);
+  // A shard's recorded per-frame outgoing records (fee total, settlements,
+  // spends, accumulator digest and report) for `[from_frame, through_frame]`.
+  // Unauthenticated data: a successor member accepts it only if the chain it
+  // recomputes equals its predecessor's quorum-certified history root.
+  rpc GetShardOutgoingHistory (GetShardOutgoingHistoryRequest) returns (GetShardOutgoingHistoryResponse);
+}
+
+message GetShardOutgoingHistoryRequest {
+  bytes filter = 1;
+  uint64 from_frame = 2;
+  uint64 through_frame = 3;
+}
+
+message ShardFrameOutgoing {
+  uint64 frame_number = 1;
+  bytes fee_total = 2;
+  bytes settlements = 3;
+  bytes spends = 4;
+  bytes accumulator_digest = 5;
+  bytes accumulator_report = 6;
+}
+
+// Frames in ascending order from `from_frame`, contiguous, possibly fewer than
+// requested (a bounded page); the caller continues from the next frame.
+message GetShardOutgoingHistoryResponse {
+  repeated ShardFrameOutgoing frames = 1;
+}
+
+message ShardEscrow {
+  bytes address = 1;
+  bytes raw_data = 2;
+}
+
+message ListShardEscrowsResponse {
+  bytes network = 1;
+  bytes snapshot_id = 2;
+  repeated ShardEscrow escrows = 3;
+  bytes cursor = 4;
+  bool has_more = 5;
+}
+
+message GetShardVertexRequest {
+  bytes address = 1;
+}
+
+message GetShardVertexResponse {
+  bool found = 1;
+  bytes blob = 2;
+}
+
+message GetShardCoinWitnessesRequest {
+  bytes domain = 1;
+  repeated bytes addresses = 2;
+}
+
+// Mirrors node.pb CoinWitness (node.proto imports global.proto, so the
+// peer-facing copy lives here rather than creating a cycle).
+message ShardCoinWitness {
+  bytes address = 1;
+  bool found = 2;
+  repeated bytes siblings = 3;
+  repeated bool right = 4;
+}
+
+message GetShardCoinWitnessesResponse {
+  bytes network = 1;
+  bytes root_record = 2;
+  uint32 depth = 3;
+  repeated ShardCoinWitness witnesses = 4;
+}
+
+message ListShardCoinsRequest {
+  bytes domain = 1;
+  bytes snapshot_id = 2;
+  bytes after = 3;
+}
+
+// Mirrors node.pb ConfidentialCoin; node.proto imports global.proto, so the
+// peer-facing scan carries its own copy rather than creating a cycle.
+message ShardCoin {
+  bytes address = 1;
+  uint64 frame_number = 2;
+  bytes owner = 3;
+  bytes commitment = 4;
+  bytes memo = 5;
+  uint64 position = 6;
+}
+
+message ListShardCoinsResponse {
+  bytes network = 1;
+  bytes snapshot_id = 2;
+  bytes root_record = 3;
+  repeated ShardCoin coins = 4;
+  bytes cursor = 5;
+  bool has_more = 6;
 }
 
 message SendMessage {

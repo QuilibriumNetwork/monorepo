@@ -102,17 +102,16 @@ pub fn convert_shard(
     Ok(ShardConversion { roots, num_leaves, total_size })
 }
 
-/// The default shard partition for an app in the address-path (model B) forest:
+/// The default shard partition for an app in the address-path forest:
 /// the QUIL_TOKEN domain is split ONE 64-way level (64 shards, prefixes
 /// `[0..64)`); every other app defaults to a SINGLE shard (empty prefix) and
 /// splits dynamically via shard-split logic. Mirrors the genesis registry
-/// (`genesis.rs` QUIL = 64) and the user's "non-QUIL defaults to 1" model.
+/// (`genesis.rs` QUIL = 64) and the "non-QUIL defaults to 1" rule.
 ///
 /// NOTE: this is BYTE-SUFFIX `[i]`, matching how the forest was MIGRATED — the
 /// forest sub-shard id is `app ‖ raw_prefix_bytes` (`Forest::addr_path_shard_id`),
 /// so the CRDT partition encoding must equal the forest's on-disk encoding or
-/// `compute_shard_root` reads the wrong (empty) subtree. See the grid(sentinel)-
-/// vs-forest(byte-suffix) reconciliation note.
+/// `compute_shard_root` reads the wrong (empty) subtree.
 pub fn quil_shards_for_app(app_address: &[u8; 32]) -> Vec<Vec<u32>> {
     if app_address == &quil_execution::domains::QUIL_TOKEN {
         (0..64u32).map(|i| vec![i]).collect()
@@ -153,7 +152,7 @@ fn commit_subshard_phase(
 }
 
 /// Convert one APP: read its vertices, split them into the app's shards by
-/// address (model B), commit each shard as a field-flattened tree keyed
+/// address, commit each shard as a field-flattened tree keyed
 /// `addr_path_shard_id(app, prefix)`, and aggregate the shard commitments into
 /// the app root via [`app_root_from_shard_paths`] (positioned by prefix bits).
 /// The complete shard set is committed — empty shards get the empty-JMT
@@ -178,6 +177,21 @@ pub fn convert_app(
     version: u64,
     prefixes: &[Vec<u32>],
 ) -> anyhow::Result<Option<(AppEntry, usize)>> {
+    convert_app_at_versions(hg, forest, app_shard_key, [version; 4], prefixes)
+}
+
+/// [`convert_app`] committing each phase at its own version (indexed by
+/// [`Phase`]). Reads take a vertex's greatest stored blob version, so a phase
+/// converted over existing versioned blobs must commit above them or every
+/// later write to those vertices is shadowed. An empty phase keeps a root only
+/// at version zero: the tree writes no node for an empty set at a later one.
+pub fn convert_app_at_versions(
+    hg: &RocksHypergraphStore,
+    forest: &Forest,
+    app_shard_key: &ShardKey,
+    versions: [u64; 4],
+    prefixes: &[Vec<u32>],
+) -> anyhow::Result<Option<(AppEntry, usize)>> {
     // Canonical bit-path per shard (resolves the QUIL-vs-split-marker overload +
     // supports non-uniform splits), in the SAME order as `prefixes`.
     let bit_paths = canonical_shard_bit_paths(prefixes);
@@ -196,6 +210,7 @@ pub fn convert_app(
 
     for phase in PHASES {
         let (set, ph) = phase_strs(phase);
+        let version = versions[phase as usize];
 
         // (a) v2 pass: bucket the MVCC v2 vertices by sub-shard, and record their
         // keys so the (b) unversioned scan skips any it superseded. Bounded by the
@@ -366,7 +381,7 @@ pub struct ConvertReport {
     pub global_roots: BTreeMap<u8, [u8; 32]>,
 }
 
-/// Convert the whole legacy hypergraph DB into the forest (model B).
+/// Convert the whole legacy hypergraph DB into the address-path forest.
 ///
 /// Each enumerated ShardKey is one app (its vertices are keyed by the app
 /// address). `shards_for_app` returns that app's shard partition — the list of
@@ -454,11 +469,11 @@ pub fn convert_db(
     Ok(ConvertReport { shards: shards_converted, apps: apps_converted, global_roots })
 }
 
-/// Install the Phase-3 forest on `crdt` — namespaced into `hg`'s own DB — iff
+/// Install the JMT forest on `crdt` — namespaced into `hg`'s own DB — iff
 /// that DB has already been migrated (`has_forest_data()`). Returns whether it
 /// was installed. The runtime calls this right after constructing a CRDT so a
 /// migrated node commits state to the forest while a non-migrated node keeps
-/// the KZG path (the cutover is gated on the migration, per design).
+/// the KZG path (the cutover is gated on the migration).
 pub fn install_forest_if_migrated(
     crdt: &quil_hypergraph::HypergraphCrdt,
     hg: &RocksHypergraphStore,
@@ -583,7 +598,7 @@ pub fn run_conversion(
 ) -> anyhow::Result<ConvertReport> {
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
-    let db = std::sync::Arc::new(
+    let db = quil_forest::CoordinatedDb::new(
         rocksdb::DB::open(&opts, dest_path)
             .map_err(|e| anyhow::anyhow!("open dest forest db {}: {e}", dest_path.display()))?,
     );
@@ -642,8 +657,8 @@ pub fn run_conversion_in_place_with_shards(
     convert_db(hg, &forest, version, head_frame, shards_for_app_from_store(shards_store))
 }
 
-/// UNIFIED-APP-TREE consolidation (the Phase-2 `UNIFIED_APP_TREE_DESIGN.md` §9
-/// cutover, run in place). For every SPLIT app — one with a real sub-shard
+/// UNIFIED-APP-TREE consolidation (the unified-app-tree cutover, run in
+/// place). For every SPLIT app — one with a real sub-shard
 /// partition, not a single shard — rebuild its ONE app tree
 /// (`TreeId::shard_phase(app, phase)`) from the app's vertices via
 /// [`convert_app`] with a SINGLE EMPTY prefix: all leaves land in the app tree,
@@ -688,132 +703,15 @@ fn fold_chunk_leaves() -> usize {
 /// (`commit_one_shard_phase`), so each phase's head is set to its final chunk
 /// version. Idempotent: a re-run after a crashed fold rebuilds the same per-version
 /// deltas. Returns whether the app carried any state.
+#[cfg(test)]
 fn fold_app_into_single_tree(
     hg: &RocksHypergraphStore,
     forest: &Forest,
     app_shard_key: &ShardKey,
     chunk: usize,
 ) -> anyhow::Result<bool> {
-    use quil_types::error::QuilError;
-    let chunk = chunk.max(1);
-    let shard_id = Forest::addr_path_shard_id(&app_shard_key.l2, &[]);
-    let app_hex: String =
-        app_shard_key.l2.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    let mut app_has_state = false;
-
-    for phase in PHASES {
-        let (set, ph) = phase_strs(phase);
-
-        // (a) v2 max-version leaves (bounded — nil on a freshly-migrated DB), plus
-        //     the key set to skip in the unversioned pass (superseded rewrites).
-        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        let mut v2_leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        hg.for_each_vertex_v2_max_version(set, ph, app_shard_key, |vk, blob| {
-            seen.insert(vk.to_vec());
-            v2_leaves.push((vk.to_vec(), blob.to_vec()));
-            Ok(())
-        })
-        .map_err(|e| anyhow::anyhow!("v2 scan {set}/{ph}: {e}"))?;
-
-        // Running per-phase commit state.
-        let mut next_version: u64 = 0;
-        let mut last_committed: Option<u64> = None;
-        let mut total_leaves: u64 = 0;
-        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-        // (b) unversioned ordered pass — the bulk; flush a full chunk inline so
-        //     peak memory is O(chunk), never O(app).
-        hg.for_each_vertex_unversioned_ordered(set, ph, app_shard_key, |vk, blob| {
-            if seen.contains(vk) {
-                return Ok(()); // superseded by a v2 rewrite
-            }
-            batch.push((vk.to_vec(), blob.to_vec()));
-            if batch.len() >= chunk {
-                let n = batch.len() as u64;
-                let leaves = per_vertex_phase_leaves(std::mem::take(&mut batch))
-                    .map_err(|e| QuilError::Store(e.to_string()))?;
-                forest
-                    .commit_shard_phase_raw(&shard_id, phase, next_version, leaves)
-                    .map_err(|e| QuilError::Store(e.to_string()))?;
-                last_committed = Some(next_version);
-                next_version += 1;
-                total_leaves += n;
-                if next_version % 20 == 0 {
-                    tracing::info!(
-                        app = %app_hex, phase = ph, chunks = next_version, leaves = total_leaves,
-                        "unified fold: progress (streaming chunks)"
-                    );
-                }
-            }
-            Ok(())
-        })
-        .map_err(|e| anyhow::anyhow!("stream {set}/{ph}: {e}"))?;
-
-        // Continue chunking through the tail + the v2 rewrites (v2 keys were skipped
-        // above, so this is their only writer; a later version wins regardless).
-        batch.append(&mut v2_leaves);
-        while !batch.is_empty() {
-            let take: Vec<(Vec<u8>, Vec<u8>)> =
-                batch.drain(..batch.len().min(chunk)).collect();
-            let n = take.len() as u64;
-            let leaves = per_vertex_phase_leaves(take)?;
-            forest.commit_shard_phase_raw(&shard_id, phase, next_version, leaves)?;
-            last_committed = Some(next_version);
-            next_version += 1;
-            total_leaves += n;
-        }
-
-        // (c) whole-tree-blob fallback (pre-per-vertex-commit shards) — only if the
-        //     keyspace scans found nothing. Chunked the same way.
-        if last_committed.is_none() {
-            if let Some(blob) = hg
-                .load_tree_blob(set, ph, app_shard_key)
-                .map_err(|e| anyhow::anyhow!("load_tree_blob {set}/{ph}: {e}"))?
-            {
-                if let Some(root_node) = quil_tries::deserialize_tree(&blob)
-                    .map_err(|e| anyhow::anyhow!("deserialize_tree {set}/{ph}: {e}"))?
-                {
-                    let mut t = quil_tries::VectorCommitmentTree::new();
-                    t.root = Some(root_node);
-                    let mut fb: Vec<(Vec<u8>, Vec<u8>)> = t.leaves();
-                    while !fb.is_empty() {
-                        let take: Vec<(Vec<u8>, Vec<u8>)> =
-                            fb.drain(..fb.len().min(chunk)).collect();
-                        let leaves = per_vertex_phase_leaves(take)?;
-                        forest.commit_shard_phase_raw(&shard_id, phase, next_version, leaves)?;
-                        last_committed = Some(next_version);
-                        next_version += 1;
-                    }
-                }
-            }
-        }
-
-        // Record the head at the phase's final version. An empty phase commits an
-        // empty tree at version 0 (parity with convert_app's complete-set rollup).
-        let head = match last_committed {
-            Some(v) => {
-                app_has_state = true;
-                v
-            }
-            None => {
-                forest
-                    .commit_shard_phase_raw(&shard_id, phase, 0, Vec::new())
-                    .map_err(|e| anyhow::anyhow!("commit empty {set}/{ph}: {e}"))?;
-                0
-            }
-        };
-        forest
-            .write_head_version(&shard_id, phase, head)
-            .map_err(|e| anyhow::anyhow!("write_head_version {set}/{ph}: {e}"))?;
-        if last_committed.is_some() {
-            tracing::info!(
-                app = %app_hex, phase = ph, head, leaves = total_leaves,
-                "unified fold: phase folded into the app tree"
-            );
-        }
-    }
-
-    Ok(app_has_state)
+    let snapshot = hg.capture_tree_snapshot()?.ok_or_else(|| anyhow::anyhow!("consolidation snapshot unavailable"))?;
+    crate::consolidation::fold_snapshot(snapshot.as_ref(), forest, app_shard_key, chunk)
 }
 
 pub fn run_unified_consolidation_in_place(
@@ -823,83 +721,22 @@ pub fn run_unified_consolidation_in_place(
     head_frame: u64,
 ) -> anyhow::Result<usize> {
     let forest = Forest::with_namespace(hg.raw_db(), quil_store::FOREST_NAMESPACE.to_vec());
-    let shards_for_app = shards_for_app_from_store(shards_store);
-
-    // Enumerate every app that carries state (the same union `convert_db` uses:
-    // the all-time split sub-shard index ∪ a lookback window of shard commits).
-    const LOOKBACK: u64 = 128;
-    let mut shard_keys: std::collections::HashSet<ShardKey> = std::collections::HashSet::new();
-    for addr in HypergraphStore::range_alt_shard_addresses(hg)
-        .map_err(|e| anyhow::anyhow!("range_alt_shard_addresses: {e}"))?
-    {
-        if addr.len() >= 32 {
-            let mut l2 = [0u8; 32];
-            l2.copy_from_slice(&addr[..32]);
-            shard_keys.insert(ShardKey { l2, l1: get_bloom_filter_indices(&addr, 256, 3) });
-        }
-    }
-    let lo = head_frame.saturating_sub(LOOKBACK);
-    for fno in lo..=head_frame {
-        for sk in HypergraphStore::get_root_commits(hg, fno)
-            .map_err(|e| anyhow::anyhow!("get_root_commits({fno}): {e}"))?
-            .into_keys()
-        {
-            shard_keys.insert(sk);
-        }
-    }
-    // ALSO enumerate every app in the current GRID (`shards_store`). Without this
-    // an app whose state is entirely HISTORICAL — no commit within the lookback
-    // window and not in the alt-shard index — is MISSED: e.g. QUIL, whose recent
-    // writes are prover-only, so it never appeared via the two sources above and
-    // its app tree was left EMPTY (splits could never see any data). The grid key
-    // is `L1(3) ‖ L2(32)`; the app address is the L2.
-    if let Ok(rows) = shards_store.range_app_shards() {
-        for s in rows {
-            if s.shard_key.len() >= 3 + 32 {
-                let mut l2 = [0u8; 32];
-                l2.copy_from_slice(&s.shard_key[3..3 + 32]);
-                shard_keys.insert(ShardKey {
-                    l1: get_bloom_filter_indices(&l2, 256, 3),
-                    l2,
-                });
-            }
-        }
-    }
-
-    let mut consolidated = 0usize;
-    for shard_key in &shard_keys {
-        let prefixes = shards_for_app(&shard_key.l2);
-        // Split iff there's more than one shard OR a single non-empty prefix.
-        // A single empty prefix is an unsplit app → already its own app tree.
-        let is_split = prefixes.len() > 1 || prefixes.iter().any(|p| !p.is_empty());
-        if !is_split {
-            continue;
-        }
-        // Rebuild the app's ONE tree with the bounded-memory streaming fold (empty
-        // prefix ⇒ every vertex routes to the app.l2 tree). Chunked across versions
-        // so a 100+GB app never buffers whole — the OOM the empty-prefix
-        // `convert_app` hit (its per-sub-shard streaming flush never triggers when
-        // there is only one sub-shard). Writes per-phase head versions like convert_app.
-        let _ = version; // fold is version-0-based; live commits resume at head+1
-        if fold_app_into_single_tree(hg, &forest, shard_key, fold_chunk_leaves())? {
-            consolidated += 1;
-        }
-    }
-    Ok(consolidated)
+    let _ = version;
+    crate::run_unified_consolidation(hg, &forest, shards_store, head_frame, fold_chunk_leaves())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use num_bigint::BigInt;
-    use quil_forest::{l3_leaf_key, rollup_phase_roots};
+    use quil_forest::rollup_phase_roots;
     use quil_tries::{serialize_go_tree, VectorCommitmentTree};
     use std::sync::Arc;
 
-    fn open_db(path: &std::path::Path) -> Arc<rocksdb::DB> {
+    fn open_db(path: &std::path::Path) -> quil_forest::CoordinatedDb {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        Arc::new(rocksdb::DB::open(&opts, path).unwrap())
+        quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, path).unwrap())
     }
 
     fn vertex_blob(fields: &[(&[u8], &[u8])]) -> Vec<u8> {
@@ -952,7 +789,7 @@ mod tests {
             .expect("per-vertex leaf verifies against the vertex_adds root");
     }
 
-    /// Phase-2 §9 consolidation: rebuilding a SPLIT app with a single empty
+    /// Unified-app-tree consolidation: rebuilding a SPLIT app with a single empty
     /// prefix yields ONE app tree whose root IS the JMT root (native, no
     /// `app_root_from_shard_paths` rollup) — byte-identical to unified
     /// `commit_inner` — differing from the legacy 64-way rollup (the fork), with
@@ -1094,7 +931,7 @@ mod tests {
 
     /// Seed one vertex (in vertex_adds) for `shard_addr` and register the
     /// shard in the alt-shard index so `range_alt_shard_addresses` finds it.
-    fn seed_shard(hg: &RocksHypergraphStore, db: &Arc<rocksdb::DB>, shard_addr: [u8; 32], tag: u8) {
+    fn seed_shard(hg: &RocksHypergraphStore, db: &quil_forest::CoordinatedDb, shard_addr: [u8; 32], tag: u8) {
         // Key with the SAME l1 the converter reconstructs (bloom indices of the
         // address), as production does — else the per-vertex read misses it.
         let sk = ShardKey { l2: shard_addr, l1: get_bloom_filter_indices(&shard_addr, 256, 3) };
@@ -1200,8 +1037,8 @@ mod tests {
     #[test]
     fn consolidation_folds_grid_only_app_that_the_legacy_enumeration_misses() {
         use quil_execution::domains::QUIL_TOKEN;
-        use quil_store::{RocksDb, RocksShardsStore};
-        use quil_types::store::{KvDb, ShardInfo, ShardsStore};
+        use quil_store::RocksShardsStore;
+        use quil_types::store::{ShardInfo, ShardsStore};
 
         let src = tempfile::tempdir().unwrap();
         let src_db = open_db(src.path());
@@ -1233,14 +1070,18 @@ mod tests {
             "no recent shard commit lists QUIL"
         );
 
+        // State and grid metadata belong to the same database, as required by
+        // captured execution. With no grid yet the historical app is missed.
+        let shards_store = RocksShardsStore::new(src_db.clone());
+        let n = run_unified_consolidation_in_place(&hg, &shards_store, 0, 0).unwrap();
+        assert_eq!(n, 0, "without the grid source QUIL is missed");
+
         // The QUIL grid IS registered in the shards store as a multi-prefix split.
-        let shdb = RocksDb::open_in_memory().unwrap();
-        let shards_store = RocksShardsStore::new(shdb.inner());
         let mut sk35 = Vec::with_capacity(35);
         sk35.extend_from_slice(&app_key.l1);
         sk35.extend_from_slice(&quil);
         {
-            let txn = shdb.new_batch(false).unwrap();
+            let txn = hg.new_transaction(false).unwrap();
             for p in [0u32, 1, 63] {
                 shards_store
                     .put_app_shard(
@@ -1256,15 +1097,6 @@ mod tests {
                     .unwrap();
             }
             txn.commit().unwrap();
-        }
-
-        // REGRESSION GUARD: with an EMPTY grid, QUIL is enumerated by NONE of the
-        // three sources → nothing is consolidated. This is the pre-fix behavior.
-        {
-            let empty_shdb = RocksDb::open_in_memory().unwrap();
-            let empty_store = RocksShardsStore::new(empty_shdb.inner());
-            let n = run_unified_consolidation_in_place(&hg, &empty_store, 0, 0).unwrap();
-            assert_eq!(n, 0, "without the grid source QUIL is missed — the empty-app-tree bug");
         }
 
         // THE FIX: the grid source enumerates QUIL and folds it into ONE app tree.

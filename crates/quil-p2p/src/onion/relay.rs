@@ -414,7 +414,7 @@ impl OnionRelay {
         payload: &[u8],
     ) -> Option<(Vec<u8>, CircuitId, Vec<u8>)> {
         // Bound the reply so the layered cell can't overflow the u16 length
-        // prefix (F7). Oversized RPC responses are rejected (no chunking yet).
+        // prefix. Oversized RPC responses are rejected (no chunking yet).
         if payload.len() > cell::MAX_ONION_PAYLOAD {
             tracing::debug!("onion reply dropped: payload exceeds max onion payload");
             return None;
@@ -528,7 +528,7 @@ mod tests {
         ));
     }
 
-    /// F5 regression: idle circuits are torn down (entry dropped → hop key
+    /// Regression: idle circuits are torn down (entry dropped → hop key
     /// zeroized) by the expiry sweep.
     #[tokio::test]
     async fn sweep_expired_tears_down_idle_circuits() {
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(relay.active_relays().await, 0);
     }
 
-    /// F2 regression: two peers reusing the SAME circuit id get independent
+    /// Regression: two peers reusing the SAME circuit id get independent
     /// entries — neither clobbers the other, and each only peels with its own key.
     #[tokio::test]
     async fn circuits_are_peer_scoped_no_cross_peer_clobber() {

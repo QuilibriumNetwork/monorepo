@@ -299,7 +299,7 @@ async fn main() -> anyhow::Result<()> {
                 {
                     let r = reg.clone();
                     let h = hg_store.clone();
-                    tokio::task::spawn_blocking(move || r.refresh_from_store(&h)).await?;
+                    tokio::task::spawn_blocking(move || r.refresh_from_store(h.as_ref())).await??;
                 }
                 info!(provers = reg.read(|r| r.distinct_provers()), "registry loaded");
 
@@ -547,7 +547,10 @@ async fn main() -> anyhow::Result<()> {
                         let hs2 = hg_store.clone();
                         let pa = prover_address;
                         let found = tokio::task::spawn_blocking(move || {
-                            reg.refresh_from_store(&hs2);
+                            if let Err(error) = reg.refresh_from_store(hs2.as_ref()) {
+                                warn!(%error, "prover registry refresh failed");
+                                return false;
+                            }
                             reg.read(|r| r.get_prover_info(&pa).is_some())
                         }).await.unwrap_or(false);
 

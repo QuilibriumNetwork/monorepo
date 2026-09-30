@@ -34,7 +34,7 @@ use quil_forest::{
 };
 use quil_types::crypto::InclusionProver;
 use quil_types::error::{QuilError, Result};
-use quil_types::store::{HypergraphStore, ShardKey};
+use quil_types::store::{HypergraphStore, RecordMutation, ShardKey};
 
 use crate::addressing::{shard_key_for_location, Location};
 
@@ -49,57 +49,65 @@ const PHASE_STR: [(&str, &str); 4] = [
     ("hyperedge", "removes"),
 ];
 
-/// A lock-free forest diff prepared for an atomic sync install.
-///
-/// Remote blobs bound to the changed leaves must be fetched and verified before
-/// the preparation is applied, so a transport failure cannot install a root
-/// whose readable blob state is incomplete.
-pub struct PreparedShardPhaseSync {
+/// Bound the readable data held by one sync write batch. A large bootstrap
+/// commits several batches, each with its leaves and blobs in one transaction.
+pub const MAX_SYNC_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_SYNC_CHUNK_LEAVES: usize = 256;
+
+/// Committed phase roots and a database snapshot captured under the same commit
+/// lock. Metadata (cursor, outgoing history) must be read from this handle, not
+/// from the live store. The caller still establishes authenticated data readiness
+/// and excludes concurrent layout changes/external synchronization.
+pub struct CommittedShardSnapshot {
+    pub roots: [[u8; 32]; 4],
+    pub records: Arc<dyn quil_types::store::SnapshotReadable>,
+}
+
+/// An authenticated diff whose complete reconstruction was checked before
+/// the first write. Only `apply_sync_chunk` advances it, after durable commit.
+pub struct ForestSyncPlan {
+    store: Arc<dyn HypergraphStore>,
     shard_id: Vec<u8>,
     phase_idx: usize,
-    target_version: Option<u64>,
-    leaves: Vec<(quil_forest::KeyHash, Vec<u8>)>,
-}
-
-impl PreparedShardPhaseSync {
-    pub fn changed_leaves(&self) -> Vec<([u8; 32], Vec<u8>)> {
-        self.leaves
-            .iter()
-            .map(|(key, value)| (key.0, value.clone()))
-            .collect()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.leaves.is_empty()
-    }
-}
-
-/// A lock-free authenticated subtree diff prepared for an atomic sync install.
-///
-/// This is the unified-app counterpart of [`PreparedShardPhaseSync`]. Its
-/// source subtree root is authenticated against the pinned app root before
-/// blobs are fetched, and the local subtree is checked after the joint commit.
-pub struct PreparedShardSubtreeSync {
-    app: Vec<u8>,
-    phase_idx: usize,
-    target_version: Option<u64>,
     bit_path: Vec<bool>,
-    pinned_app_root: Option<[u8; 32]>,
-    source_subtree_root: [u8; 32],
-    leaves: Vec<(quil_forest::KeyHash, Vec<u8>)>,
+    base_version: Option<u64>,
+    target_root: [u8; 32],
+    repair_existing: bool,
+    // None removes a noncanonical GLOBAL add leaf. Its historical blob
+    // versions remain available; the new version stores an absent/empty blob.
+    leaves: Vec<([u8; 32], Option<Vec<u8>>)>,
+    next: usize,
 }
 
-impl PreparedShardSubtreeSync {
-    pub fn changed_leaves(&self) -> Vec<([u8; 32], Vec<u8>)> {
-        self.leaves
-            .iter()
-            .map(|(key, value)| (key.0, value.clone()))
-            .collect()
-    }
+impl ForestSyncPlan {
+    pub fn remaining(&self) -> &[([u8; 32], Option<Vec<u8>>)] { &self.leaves[self.next..] }
+    pub fn target_root(&self) -> [u8; 32] { self.target_root }
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.leaves.is_empty()
+/// Tombstones carry the removed blob's size, but store an empty blob. The
+/// authenticated leaf itself supplies everything needed to reconstruct them.
+pub fn sync_blob_matches(phase_idx: usize, leaf: &[u8], blob: &[u8]) -> Result<bool> {
+    if phase_idx >= 4 || leaf.len() != 40 { return Ok(false); }
+    if blob.is_empty() {
+        return Ok(leaf[..32] == [0; 32]
+            && (phase_idx % 2 == 1 || leaf[32..] == [0; 8]));
     }
+    Ok(quil_tries::vertex_leaf_value(blob)? == leaf)
+}
+
+fn sync_data_key(shard_id: &[u8], phase_idx: usize, bit_path: &[bool]) -> Result<Vec<u8>> {
+    if shard_id.len() < 32 || shard_id.len() > u16::MAX as usize || phase_idx >= 4 || bit_path.len() > 256 {
+        return Err(QuilError::InvalidArgument("invalid sync data scope".into()));
+    }
+    let mut key = b"quil/forest-sync/verified-blobs/v1/".to_vec();
+    key.extend_from_slice(&(shard_id.len() as u16).to_be_bytes());
+    key.extend_from_slice(shard_id);
+    key.push(phase_idx as u8);
+    key.extend_from_slice(&(bit_path.len() as u16).to_be_bytes());
+    for chunk in bit_path.chunks(8) {
+        key.push(chunk.iter().enumerate().fold(0, |byte, (i, bit)| byte | (u8::from(*bit) << (7 - i))));
+    }
+    Ok(key)
 }
 
 /// Expand a UNIFORM 64-way split `depth` into its complete prefix set: depth 0 ⇒
@@ -140,6 +148,89 @@ type PhaseDeltas = BTreeMap<Vec<u8>, Vec<u8>>;
 /// store KV at commit; also read before commit).
 type PhaseBlobs = BTreeMap<Vec<u8>, Vec<u8>>;
 
+/// One mutation in an ordered, atomically staged batch. Data is borrowed until
+/// preparation completes; the batch owns only its changed blobs and leaves.
+pub enum Mutation<'a> {
+    AddVertex(Location, &'a [u8]),
+    RemoveVertex(Location),
+    AddHyperedge(Location, &'a [u8]),
+    RemoveHyperedge(Location),
+    Record(&'a RecordMutation),
+}
+
+#[derive(Default)]
+struct PreparedMutations {
+    deltas: HashMap<(ShardKey, usize), PhaseDeltas>,
+    blobs: HashMap<(ShardKey, usize), PhaseBlobs>,
+    metadata: Vec<(Vec<u8>, i64, i128)>,
+    records: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+}
+impl PreparedMutations {
+    fn read(&self, crdt: &HypergraphCrdt, shard: &ShardKey, phase: usize, id: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(blob) = self.blobs.get(&(shard.clone(), phase)).and_then(|m| m.get(id)) {
+            return Ok(Some(blob.clone()));
+        }
+        crdt.read_blob_checked(shard, phase, id)
+    }
+
+    fn stage(&mut self, shard: &ShardKey, phase: usize, id: &[u8], blob: &[u8], tombstone_size: Option<u64>) -> Result<()> {
+        let leaves = match tombstone_size {
+            Some(size) => vec![(id[32..64].to_vec(), quil_tries::sized_tombstone_leaf_value(size)?)],
+            None => HypergraphCrdt::per_vertex_leaf(id, blob)?,
+        };
+        self.deltas.entry((shard.clone(), phase)).or_default().extend(leaves);
+        self.blobs.entry((shard.clone(), phase)).or_default().insert(id.to_vec(), blob.to_vec());
+        Ok(())
+    }
+
+    fn bump(&mut self, crdt: &HypergraphCrdt, shard: &ShardKey, location: &Location, count: i64, size: i128) {
+        if shard.l2 != [0xff; 32] {
+            self.metadata.push((crdt.sub_shard_id_for(&shard.l2, &location.data_address), count, size));
+        }
+    }
+}
+
+/// Own drained work until durable commit succeeds. On failure, restore older
+/// entries without overwriting newer writes staged while the commit ran.
+struct PendingCommit<'a> {
+    crdt: &'a HypergraphCrdt,
+    deltas: HashMap<(ShardKey, usize), PhaseDeltas>,
+    blobs: HashMap<(ShardKey, usize), PhaseBlobs>,
+    records: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    committed: bool,
+}
+impl Drop for PendingCommit<'_> {
+    fn drop(&mut self) {
+        if self.committed { return; }
+        let mut pending = self.crdt.pending.write().unwrap();
+        let mut blobs = self.crdt.pending_blobs.write().unwrap();
+        for (phase, entries) in std::mem::take(&mut self.deltas) {
+            let target = pending.entry(phase).or_default();
+            for (key, value) in entries { target.entry(key).or_insert(value); }
+        }
+        for (phase, entries) in std::mem::take(&mut self.blobs) {
+            let target = blobs.entry(phase).or_default();
+            for (key, value) in entries { target.entry(key).or_insert(value); }
+        }
+        let mut records = self.crdt.pending_records.write().unwrap();
+        for (key, value) in std::mem::take(&mut self.records) {
+            records.entry(key).or_insert(value);
+        }
+    }
+}
+
+
+#[path = "execution_capture.rs"]
+mod execution_capture;
+pub use execution_capture::{ExecutionCapture, ExecutionFork, ExecutionForkLimits, ExecutionMetadataUsage, PreparedCrdtAdoption};
+
+/// Identifies the CRDT whose coarse forest-write barrier is held. Maintenance
+/// routines may use it without reacquiring the same non-reentrant lock.
+pub struct ForestWriteGuard<'a> {
+    source: &'a HypergraphCrdt,
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
 /// The forest-native hypergraph CRDT.
 pub struct HypergraphCrdt {
     /// Key-value store: per-vertex blobs, the shard-commit cache, the cursor.
@@ -176,6 +267,11 @@ pub struct HypergraphCrdt {
     /// materialize a frame to the identical root, so this map is identical
     /// network-wide. Bounded to the most recent frames.
     prover_root_by_frame: RwLock<std::collections::BTreeMap<u64, Vec<u8>>>,
+    /// Network world-state size (`total_size`) at the END of each materialized
+    /// global frame, recorded with the prover root. The leader stamps
+    /// `world_size_at(N-1)` on global frame N and voters check it, so the size
+    /// every venue prices from is certified by global consensus.
+    world_size_by_frame: RwLock<std::collections::BTreeMap<u64, u64>>,
     /// The exact JMT version each `(shard, phase)` tree was last committed at.
     /// `get_with_proof`/`get_root_hash_option` need the precise version a tree
     /// was written at (they do not walk back to the latest ≤ v), and each
@@ -205,20 +301,25 @@ pub struct HypergraphCrdt {
     /// the apps' real, possibly non-uniform, shard sets (matching the converter).
     #[allow(clippy::type_complexity)]
     app_shard_prefixes: RwLock<HashMap<[u8; 32], Vec<Vec<u32>>>>,
-    /// DEEP-BIFURCATION (Phase 2): each app's shard address BIT-PATHS, stored
+    /// DEEP-BIFURCATION: each app's shard address BIT-PATHS, stored
     /// DIRECTLY (not derived from `app_shard_prefixes` via
     /// `canonical_shard_bit_paths`, which can't carry a bit-path that skips
     /// uniform bits). When present for an app, [`Self::shard_bit_paths`] returns
     /// these; absent ⇒ it falls back to canonical of `app_shard_prefixes`. MUST
     /// be index-aligned with `app_shard_prefixes` (same order/count) — the routing
     /// indexes both. Empty by default (canonical source); populated at the
-    /// deep-bifurcation flag day. See `DEEP_BIFURCATION_ENCODING_SCOPE.md`.
+    /// deep-bifurcation flag day.
     #[allow(clippy::type_complexity)]
     app_shard_bit_paths: RwLock<HashMap<[u8; 32], Vec<Vec<bool>>>>,
+    /// Layout changes whose size buckets have not yet been rebuilt. Capturing
+    /// such an intermediate configuration for execution is forbidden.
+    layout_rebuilds: RwLock<std::collections::HashSet<[u8; 32]>>,
     /// Staged L3 leaf deltas per (shard, phase index).
     pending: RwLock<HashMap<(ShardKey, usize), PhaseDeltas>>,
     /// Staged per-vertex blobs per (shard, phase index).
     pending_blobs: RwLock<HashMap<(ShardKey, usize), PhaseBlobs>>,
+    /// Ancillary execution records, co-committed with forest state and cursor.
+    pending_records: RwLock<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
     /// Latest committed per-shard metadata.
     shard_metadata: RwLock<HashMap<ShardKey, ShardMetadata>>,
     /// Per-sub-shard live state metadata: `forest shard_id -> (raw_count, size)`.
@@ -233,20 +334,22 @@ pub struct HypergraphCrdt {
     sub_meta: RwLock<HashMap<Vec<u8>, (u64, i128)>>,
     /// Set once `warm_sizes` has seeded the committed baseline.
     sizes_warmed: AtomicBool,
+    size_warm_lock: std::sync::Mutex<()>,
     /// Snapshot-generation registry for sync `expected_root` gating.
     snapshot_mgr: SnapshotManager,
+    local_vertex_observer: RwLock<Option<Arc<dyn quil_types::store::LocalVertexCommitObserver>>>,
     /// Covered nibble prefix (address gating). Empty = accept all.
     covered_prefix: RwLock<Vec<i32>>,
-    /// Serializes commits against each other.
+    /// Serializes mutation batches, commits and coordinated forest updates.
     commit_lock: std::sync::Mutex<()>,
-    /// UNIFIED-APP-TREE mode (Phase 2, `UNIFIED_APP_TREE_DESIGN.md`). When set,
+    /// UNIFIED-APP-TREE mode. When set,
     /// every app commits ALL its vertices into ONE L3 tree per phase keyed by the
     /// app address (leaves raw-key positioned), so a shard is the in-place subtree
     /// at its prefix and the app-phase root is the JMT root over all shards — no
     /// separate per-sub-shard trees, no `app_root_from_shard_paths` rollup, no
     /// per-frame manifest. Per-shard commitments are read on demand via
     /// [`Forest::app_subtree_root`]. DEFAULT off (legacy separate-tree path);
-    /// flipped at the flag-day frame AFTER the one-time consolidation (§9), since
+    /// flipped at the flag-day frame AFTER the one-time consolidation, since
     /// a split app's existing data lives in the per-prefix trees until then.
     unified_tree: AtomicBool,
 }
@@ -300,6 +403,15 @@ impl HypergraphCrdt {
         out
     }
 
+    /// READ-ONLY diagnostic: the persisted `(raw_count, live_size)` bucket of
+    /// one sub-shard, keyed `addr_path_shard_id(app, prefix)`, as the last
+    /// commit wrote it. Does not run `warm_sizes`.
+    pub fn persisted_size_bucket(&self, key: &[u8]) -> Option<(u64, i128)> {
+        let read_txn = self.store.new_transaction(false).ok()?;
+        let blob = read_txn.get(SIZE_BUCKETS_KEY).ok()??;
+        deserialize_buckets(&blob).get(key).copied()
+    }
+
     /// READ-ONLY diagnostic (see [`AppForestStats`]): resolve each tree's exact
     /// committed version the same way the live reader does
     /// ([`Self::read_shard_phase_root`]), then read the UNIFIED app tree (keyed by
@@ -343,26 +455,38 @@ impl HypergraphCrdt {
             forest_version: AtomicU64::new(0),
             forest_write_lock: std::sync::Mutex::new(()),
             prover_root_by_frame: RwLock::new(std::collections::BTreeMap::new()),
+            world_size_by_frame: RwLock::new(std::collections::BTreeMap::new()),
             phase_versions: RwLock::new(HashMap::new()),
             global_versions: RwLock::new(HashMap::new()),
             app_shard_prefixes: RwLock::new(HashMap::new()),
             app_shard_bit_paths: RwLock::new(HashMap::new()),
+            layout_rebuilds: RwLock::new(std::collections::HashSet::new()),
             pending: RwLock::new(HashMap::new()),
             pending_blobs: RwLock::new(HashMap::new()),
+            pending_records: RwLock::new(BTreeMap::new()),
             shard_metadata: RwLock::new(HashMap::new()),
             sub_meta: RwLock::new(HashMap::new()),
             sizes_warmed: AtomicBool::new(false),
+            size_warm_lock: std::sync::Mutex::new(()),
             snapshot_mgr: SnapshotManager::new(),
+            local_vertex_observer: RwLock::new(None),
             covered_prefix: RwLock::new(Vec::new()),
             commit_lock: std::sync::Mutex::new(()),
             unified_tree: AtomicBool::new(false),
         }
     }
 
+    /// Install a best-effort local cache observer. Canonical commits do not
+    /// depend on delivery, and the callback must not reenter the CRDT.
+    pub fn set_local_vertex_observer(&self, observer: Arc<dyn quil_types::store::LocalVertexCommitObserver>) {
+        *self.local_vertex_observer.write().unwrap() = Some(observer);
+    }
+
     /// Enable/disable [`unified_tree`](Self::unified_tree) mode. Flag-day gated in
     /// production (set only after the one-time consolidation); tests flip it
     /// directly on a fresh CRDT.
     pub fn set_unified_tree(&self, on: bool) {
+        let _guard = self.commit_lock.lock().unwrap();
         self.unified_tree.store(on, Ordering::SeqCst);
     }
 
@@ -374,6 +498,7 @@ impl HypergraphCrdt {
     /// Install the state-commitment forest (production: the namespaced RocksDB
     /// forest sharing the store's DB). Replaces the default in-memory forest.
     pub fn set_forest(&self, forest: Forest) {
+        let _guard = self.commit_lock.lock().unwrap();
         *self.forest.write().unwrap() = forest;
     }
 
@@ -382,10 +507,51 @@ impl HypergraphCrdt {
     /// by the prover-tree syncer (its forest apply), so the two never write the
     /// forest concurrently. Poisoning is recovered (a panic mid-write is already
     /// a stop-the-materializer condition upstream). See `forest_write_lock`.
-    pub fn lock_forest_writes(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.forest_write_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    pub fn lock_forest_writes(&self) -> ForestWriteGuard<'_> {
+        ForestWriteGuard {
+            source: self,
+            _guard: self.forest_write_lock.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
+    /// Refuse a maintenance token belonging to another CRDT before any reads
+    /// or writes. The guard itself cannot be constructed outside this module.
+    pub fn check_forest_guard(&self, guard: &ForestWriteGuard<'_>) -> Result<()> {
+        if !std::ptr::eq(self, guard.source) {
+            return Err(QuilError::ExecutionUnavailable("foreign CRDT forest guard".into()));
+        }
+        Ok(())
+    }
+
+    /// Execute storage maintenance under this CRDT's forest and commit
+    /// barriers. The operation must not reenter CRDT methods. Clear cached head
+    /// versions even on failure: a partially completed operation may have
+    /// changed them. A tentative owner must discard the branch on failure.
+    pub fn maintain_forest<T>(
+        &self,
+        guard: &ForestWriteGuard<'_>,
+        operation: impl FnOnce(&Forest) -> Result<T>,
+    ) -> Result<T> {
+        self.check_forest_guard(guard)?;
+        let poisoned = |name| QuilError::ExecutionUnavailable(format!("maintenance {name} lock poisoned"));
+        let _commit = self.commit_lock.lock().map_err(|_| poisoned("commit"))?;
+        if !self.pending.read().map_err(|_| poisoned("pending"))?.is_empty()
+            || !self.pending_blobs.read().map_err(|_| poisoned("blobs"))?.is_empty()
+            || !self.pending_records.read().map_err(|_| poisoned("records"))?.is_empty()
+        {
+            return Err(QuilError::ExecutionUnavailable("maintenance has unfinished CRDT mutations".into()));
+        }
+        let forest = self.forest.read().map_err(|_| poisoned("forest"))?;
+        let identity = self.store.backing_store_identity().ok_or_else(|| QuilError::ExecutionUnavailable("maintenance requires identifiable storage".into()))?;
+        if forest.backing_store_identity().as_ref() != Some(&identity) {
+            return Err(QuilError::ExecutionUnavailable("maintenance forest/record store mismatch".into()));
+        }
+        let mut phases = self.phase_versions.write().map_err(|_| poisoned("phase versions"))?;
+        let mut globals = self.global_versions.write().map_err(|_| poisoned("global versions"))?;
+        let result = operation(&forest);
+        phases.clear();
+        globals.clear();
+        result
     }
 
     /// Always true now — the CRDT is forest-native. Retained for callers that
@@ -424,6 +590,11 @@ impl HypergraphCrdt {
     /// post-restart priming) returns `false`: the buckets there come from
     /// `warm_sizes` (persisted fast-path or cold scan), which must not be clobbered.
     pub fn set_app_shard_prefixes(&self, app: [u8; 32], prefixes: Vec<Vec<u32>>) -> bool {
+        let _guard = self.commit_lock.lock().unwrap();
+        self.set_app_shard_prefixes_locked(app, prefixes)
+    }
+
+    fn set_app_shard_prefixes_locked(&self, app: [u8; 32], prefixes: Vec<Vec<u32>>) -> bool {
         let set = if prefixes.is_empty() { vec![Vec::new()] } else { prefixes };
         // Change-detection is ORDER-INDEPENDENT: a shard set is semantically a
         // SET, and routing is value-matched (an address finds its matching prefix
@@ -439,8 +610,8 @@ impl HypergraphCrdt {
             s
         };
         let mut w = self.app_shard_prefixes.write().unwrap();
-        match w.get(&app) {
-            Some(existing) if sorted(existing) == sorted(&set) => false, // unchanged set
+        let changed = match w.get(&app) {
+            Some(existing) if sorted(existing) == sorted(&set) => return false, // unchanged set
             Some(_) => {
                 w.insert(app, set);
                 true // genuine split/merge transition
@@ -449,7 +620,42 @@ impl HypergraphCrdt {
                 w.insert(app, set);
                 false // first sight — warm_sizes owns the initial buckets
             }
+        };
+        drop(w);
+        if changed || !self.buckets_match_current_prefixes(&[app], &self.sub_meta.read().unwrap()) {
+            self.layout_rebuilds.write().unwrap().insert(app);
         }
+        changed
+    }
+
+    /// Coordinate a shard-layout change and its size buckets with commits and
+    /// execution captures. On a rebuild error, restore the previous layout so
+    /// a retry still sees the transition. This does not supply a snapshot for
+    /// callers reading these maps independently; use execution capture for
+    /// that. Explicit bit-path overrides use the low-level setters followed by
+    /// `rebucket_app` under an outer forest barrier.
+    pub fn refresh_app_shard_prefixes(&self, app: [u8; 32], prefixes: Vec<Vec<u32>>) -> Result<bool> {
+        let _guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
+            "layout commit lock poisoned".into()))?;
+        let previous = self.app_shard_prefixes.read().unwrap().get(&app).cloned();
+        let previously_dirty = self.layout_rebuilds.read().unwrap().contains(&app);
+        let changed = self.set_app_shard_prefixes_locked(app, prefixes);
+        let result = if self.layout_rebuilds.read().unwrap().contains(&app) {
+            if self.app_shard_bit_paths.read().unwrap().contains_key(&app) {
+                Err(QuilError::ExecutionUnavailable("layout refresh requires coordinated explicit bit paths".into()))
+            } else {
+                tracing::info!(app = %hex::encode(app), unified = self.unified_tree(),
+                    "shard layout refresh: rebuilding size buckets before publication");
+                self.rebucket_app_locked(&app)
+            }
+        } else { Ok(()) };
+        if let Err(error) = result {
+            let mut layouts = self.app_shard_prefixes.write().unwrap();
+            match previous { Some(prefixes) => { layouts.insert(app, prefixes); }, None => { layouts.remove(&app); } }
+            if !previously_dirty { self.layout_rebuilds.write().unwrap().remove(&app); }
+            return Err(error);
+        }
+        Ok(changed)
     }
 
     /// The complete address-path shard prefix set for `app`: a single empty
@@ -466,17 +672,20 @@ impl HypergraphCrdt {
             .unwrap_or_else(|| vec![Vec::new()])
     }
 
-    /// Declare `app`'s shard address BIT-PATHS directly (deep-bifurcation Phase 2).
+    /// Declare `app`'s shard address BIT-PATHS directly (deep-bifurcation).
     /// MUST be index-aligned with the prefix set from [`set_app_shard_prefixes`]
     /// (same order/count) — routing indexes both. Empty ⇒ clears the override
     /// (back to canonical derivation).
     pub fn set_app_shard_bit_paths(&self, app: [u8; 32], bit_paths: Vec<Vec<bool>>) {
+        let _guard = self.commit_lock.lock().unwrap();
         let mut w = self.app_shard_bit_paths.write().unwrap();
+        let changed = w.get(&app).map_or(!bit_paths.is_empty(), |old| *old != bit_paths);
         if bit_paths.is_empty() {
             w.remove(&app);
         } else {
             w.insert(app, bit_paths);
         }
+        if changed { self.layout_rebuilds.write().unwrap().insert(app); }
     }
 
     /// The canonical address bit-path of every shard of `app`, IN PREFIX ORDER —
@@ -528,18 +737,28 @@ impl HypergraphCrdt {
         shard_id: &[u8],
         phase_idx: usize,
         leaves: Vec<(Vec<u8>, Vec<u8>)>,
+        versions: &mut HashMap<(Vec<u8>, usize), u64>,
     ) -> Result<([u8; 32], u64)> {
-        let ver = self
-            .resolve_phase_version_with(forest, shard_id, phase_idx)
-            .map(|v| v + 1)
-            .unwrap_or(0);
+        let mut head = self.resolve_phase_version_checked(forest, shard_id, phase_idx)?;
+        if head.is_some() {
+            self.read_shard_phase_root_checked(forest, shard_id, phase_idx)?;
+        } else {
+            // Older migration output can contain a tree at the fallback
+            // version without a head marker. Append to it, never overwrite it
+            // as a fresh version-zero tree.
+            let fallback = self.forest_version.load(Ordering::SeqCst);
+            if forest.shard_phase_root(shard_id, PHASES[phase_idx], fallback)
+                .map_err(|e| QuilError::ExecutionUnavailable(format!("read unmarked phase root: {e}")))?.is_some() {
+                head = Some(fallback);
+            }
+        }
+        let ver = head
+            .map(|v| v.checked_add(1).ok_or_else(|| QuilError::ExecutionUnavailable("phase version exhausted".into())))
+            .transpose()?.unwrap_or(0);
         let (root, puts) = forest
             .commit_shard_phase_raw_staged(shard_id, PHASES[phase_idx], ver, leaves)
-            .map_err(|e| QuilError::Internal(format!("forest commit: {e}")))?;
-        self.phase_versions
-            .write()
-            .unwrap()
-            .insert((shard_id.to_vec(), phase_idx), ver);
+            .map_err(|e| QuilError::ExecutionUnavailable(format!("forest commit: {e}")))?;
+        versions.insert((shard_id.to_vec(), phase_idx), ver);
         for (k, v) in puts {
             txn.set(&k, &v)?;
         }
@@ -553,30 +772,31 @@ impl HypergraphCrdt {
     /// already-held forest guard, so it is safe to call while `self.forest` is
     /// read-locked (which [`resolve_phase_version`] is not — it re-locks).
     fn resolve_phase_version_with(
-        &self,
-        forest: &Forest,
-        shard_id: &[u8],
-        phase_idx: usize,
+        &self, forest: &Forest, shard_id: &[u8], phase_idx: usize,
     ) -> Option<u64> {
-        self.phase_versions
-            .read()
-            .unwrap()
-            .get(&(shard_id.to_vec(), phase_idx))
-            .copied()
-            .or_else(|| forest.read_head_version(shard_id, PHASES[phase_idx]).ok().flatten())
+        self.resolve_phase_version_checked(forest, shard_id, phase_idx).ok().flatten()
     }
 
-    /// The last-committed version of Level-1 global bucket `index`: the
-    /// in-memory cache (covers the mem backend / same-process commits) falling
-    /// back to the persisted head marker. `None` before the bucket has ever
-    /// been committed. L1 analogue of [`resolve_phase_version_with`].
+    /// Commit callers must distinguish a missing head from unreadable state.
+    fn resolve_phase_version_checked(
+        &self, forest: &Forest, shard_id: &[u8], phase_idx: usize,
+    ) -> Result<Option<u64>> {
+        if let Some(version) = self.phase_versions.read().unwrap()
+            .get(&(shard_id.to_vec(), phase_idx)).copied() { return Ok(Some(version)); }
+        forest.read_head_version(shard_id, PHASES[phase_idx])
+            .map_err(|e| QuilError::ExecutionUnavailable(format!("read phase head: {e}")))
+    }
+
     fn resolve_global_version(&self, forest: &Forest, index: u8) -> Option<u64> {
-        self.global_versions
-            .read()
-            .unwrap()
-            .get(&index)
-            .copied()
-            .or_else(|| forest.read_global_head_version(index).ok().flatten())
+        self.resolve_global_version_checked(forest, index).ok().flatten()
+    }
+
+    fn resolve_global_version_checked(&self, forest: &Forest, index: u8) -> Result<Option<u64>> {
+        if let Some(version) = self.global_versions.read().unwrap().get(&index).copied() {
+            return Ok(Some(version));
+        }
+        forest.read_global_head_version(index)
+            .map_err(|e| QuilError::ExecutionUnavailable(format!("read global head: {e}")))
     }
 
     /// The current 32-byte root of one shard/phase tree at its last committed
@@ -589,42 +809,38 @@ impl HypergraphCrdt {
     /// `commit_inner` read. Without this, migrated-but-untouched shards would read
     /// as empty and corrupt the app root.
     fn read_shard_phase_root(&self, forest: &Forest, shard_id: &[u8], phase_idx: usize) -> [u8; 32] {
-        let ver = self
-            .resolve_phase_version_with(forest, shard_id, phase_idx)
-            .unwrap_or_else(|| self.forest_version.load(Ordering::SeqCst));
-        forest
-            .shard_phase_root(shard_id, PHASES[phase_idx], ver)
-            .ok()
-            .flatten()
-            .unwrap_or([0u8; 32])
+        self.read_shard_phase_root_checked(forest, shard_id, phase_idx).unwrap_or([0; 32])
     }
 
-    /// The app's current phase root: a single-shard app is one tree keyed by the
-    /// app address; a split app aggregates its sub-shard roots (positioned by
-    /// prefix) via [`app_root_from_shard_paths`]. Used when a phase has nothing
-    /// staged this frame yet has no cached root to reuse.
-    fn current_app_phase_root(
-        &self,
-        forest: &Forest,
-        app: &[u8; 32],
-        prefixes: &[Vec<u32>],
-        phase_idx: usize,
-    ) -> Vec<u8> {
-        // Unified mode: the app is one tree keyed by the app address, so the
-        // app-phase root is that tree's root directly (no sub-shard aggregation).
-        if self.unified_tree() || (prefixes.len() == 1 && prefixes[0].is_empty()) {
-            return self.read_shard_phase_root(forest, app, phase_idx).to_vec();
+    fn read_shard_phase_root_checked(&self, forest: &Forest, shard_id: &[u8], phase_idx: usize) -> Result<[u8; 32]> {
+        let head = self.resolve_phase_version_checked(forest, shard_id, phase_idx)?;
+        let version = head.unwrap_or_else(|| self.forest_version.load(Ordering::SeqCst));
+        match forest.shard_phase_root(shard_id, PHASES[phase_idx], version)
+            .map_err(|e| QuilError::ExecutionUnavailable(format!("read phase root: {e}")))? {
+            Some(root) => Ok(root),
+            None if head.is_none() => Ok([0; 32]),
+            None => Err(QuilError::ExecutionUnavailable("persisted phase head has no root".into())),
         }
-        let bit_paths = self.shard_bit_paths(app);
-        let shard_roots: Vec<(Vec<bool>, [u8; 32])> = prefixes
-            .iter()
-            .zip(bit_paths)
+    }
+
+    fn current_app_phase_root(
+        &self, forest: &Forest, app: &[u8; 32], prefixes: &[Vec<u32>], phase_idx: usize,
+    ) -> Vec<u8> {
+        self.current_app_phase_root_checked(forest, app, prefixes, phase_idx).unwrap_or_else(|_| vec![0; 32])
+    }
+
+    fn current_app_phase_root_checked(
+        &self, forest: &Forest, app: &[u8; 32], prefixes: &[Vec<u32>], phase_idx: usize,
+    ) -> Result<Vec<u8>> {
+        if self.unified_tree() || (prefixes.len() == 1 && prefixes[0].is_empty()) {
+            return Ok(self.read_shard_phase_root_checked(forest, app, phase_idx)?.to_vec());
+        }
+        let shard_roots: Vec<(Vec<bool>, [u8; 32])> = prefixes.iter().zip(self.shard_bit_paths(app))
             .map(|(prefix, bits)| {
                 let shard_id = Forest::addr_path_shard_id(app, prefix);
-                (bits, self.read_shard_phase_root(forest, &shard_id, phase_idx))
-            })
-            .collect();
-        app_root_from_shard_paths(&shard_roots).to_vec()
+                Ok((bits, self.read_shard_phase_root_checked(forest, &shard_id, phase_idx)?))
+            }).collect::<Result<_>>()?;
+        Ok(app_root_from_shard_paths(&shard_roots).to_vec())
     }
 
     /// Borrow the legacy inclusion prover (ancillary KZG sub-tree callers).
@@ -637,6 +853,19 @@ impl HypergraphCrdt {
     /// the instant frame `frame` finishes. Bounded to the most recent 256 frames.
     /// See [`prover_root_by_frame`](Self::prover_root_by_frame).
     pub fn record_prover_root(&self, frame: u64, root: Vec<u8>) {
+        let _guard = self.commit_lock.lock().unwrap();
+        // The world size is captured at the same instant: the materializer
+        // records the root the moment frame `frame` finishes.
+        {
+            use num_traits::ToPrimitive;
+            let size = self.total_size().to_u64().unwrap_or(u64::MAX);
+            let mut sizes = self.world_size_by_frame.write().unwrap();
+            sizes.insert(frame, size);
+            while sizes.len() > 256 {
+                let oldest = *sizes.keys().next().unwrap();
+                sizes.remove(&oldest);
+            }
+        }
         if root.is_empty() {
             return;
         }
@@ -661,6 +890,12 @@ impl HypergraphCrdt {
             .cloned()
     }
 
+    /// Network world-state size at the END of global frame `frame`, if this
+    /// node recorded that frame's materialization. See `world_size_by_frame`.
+    pub fn world_size_at(&self, frame: u64) -> Option<u64> {
+        self.world_size_by_frame.read().unwrap().get(&frame).copied()
+    }
+
     // ---- covered prefix -------------------------------------------------
 
     pub fn get_covered_prefix(&self) -> Vec<i32> {
@@ -668,8 +903,11 @@ impl HypergraphCrdt {
     }
 
     pub fn set_covered_prefix(&self, prefix: &[i32]) -> Result<()> {
+        let _guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
+            "coverage commit lock poisoned".into()))?;
+        self.store.set_covered_prefix(prefix)?;
         *self.covered_prefix.write().unwrap() = prefix.to_vec();
-        self.store.set_covered_prefix(prefix)
+        Ok(())
     }
 
     // ---- per-vertex leaf helper -----------------------------------------
@@ -689,73 +927,22 @@ impl HypergraphCrdt {
         Ok(vec![(data_address, value)])
     }
 
-    /// Stage a `(id, blob)` into (shard, phase): record the blob and its single
-    /// per-vertex leaf.
-    fn stage(&self, shard: &ShardKey, phase_idx: usize, id: &[u8], blob: &[u8]) -> Result<()> {
-        let deltas = Self::per_vertex_leaf(id, blob)?;
-        {
-            let mut p = self.pending.write().unwrap();
-            let entry = p.entry((shard.clone(), phase_idx)).or_default();
-            for (k, v) in deltas {
-                entry.insert(k, v);
-            }
-        }
-        {
-            let mut b = self.pending_blobs.write().unwrap();
-            b.entry((shard.clone(), phase_idx))
-                .or_default()
-                .insert(id.to_vec(), blob.to_vec());
-        }
-        Ok(())
-    }
-
-    /// Stage a removes-phase tombstone for `id` whose forest leaf carries the
-    /// removed vertex's `size` (its original add-blob length). Unlike an empty
-    /// `stage(.., &[])` — whose `vertex_leaf_value(&[])` has size 0 — this lets
-    /// the removes tree's subtree-size aggregate equal the sum of removed sizes,
-    /// so `forest_app_buckets` can net LIVE size as `adds − removes` in O(depth).
-    /// The blob store still holds an empty blob (a tombstone carries no data);
-    /// only the forest leaf's size field differs. Idempotent: re-removing stamps
-    /// the same original size (never a stale 0), so a double-remove is stable.
-    fn stage_sized_tombstone(
-        &self,
-        shard: &ShardKey,
-        phase_idx: usize,
-        id: &[u8],
-        size: u64,
-    ) -> Result<()> {
-        let data_address = if id.len() >= 64 { id[32..64].to_vec() } else { id.to_vec() };
-        let value = quil_tries::sized_tombstone_leaf_value(size)?;
-        {
-            let mut p = self.pending.write().unwrap();
-            p.entry((shard.clone(), phase_idx)).or_default().insert(data_address, value);
-        }
-        {
-            let mut b = self.pending_blobs.write().unwrap();
-            b.entry((shard.clone(), phase_idx)).or_default().insert(id.to_vec(), Vec::new());
-        }
-        Ok(())
-    }
-
     // ---- read helpers (KV blobs + tombstone check) ----------------------
 
     /// The staged-or-committed blob for `(shard, phase, id)`, or `None`.
     fn read_blob(&self, shard: &ShardKey, phase_idx: usize, id: &[u8]) -> Option<Vec<u8>> {
+        self.read_blob_checked(shard, phase_idx, id).ok().flatten()
+    }
+
+    fn read_blob_checked(&self, shard: &ShardKey, phase_idx: usize, id: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(m) = self.pending_blobs.read().unwrap().get(&(shard.clone(), phase_idx)) {
             if let Some(b) = m.get(id) {
-                return Some(b.clone());
+                return Ok(Some(b.clone()));
             }
         }
         let (set, phase) = PHASE_STR[phase_idx];
         self.store
             .load_vertex_underlying_raw(set, phase, shard, id)
-            .ok()
-            .flatten()
-    }
-
-    /// Whether `(shard, phase, id)` has any entry (staged or committed).
-    fn has_entry(&self, shard: &ShardKey, phase_idx: usize, id: &[u8]) -> bool {
-        self.read_blob(shard, phase_idx, id).is_some()
     }
 
     // ---- per-sub-shard live metadata (size + raw count) -----------------
@@ -774,112 +961,139 @@ impl HypergraphCrdt {
         }
     }
 
-    /// Apply `(Δcount, Δsize)` to a vertex's sub-shard bucket. The global prover
-    /// shard (`l2 == 0xff`) is EXCLUDED from world size: its prover registry /
-    /// per-epoch leaf-root registry / reward vertices are not proven or stored by
-    /// regular workers, so they must never count toward the issuance denominator.
-    fn bump_meta(&self, shard: &ShardKey, data_addr: &[u8], d_count: i64, d_size: i128) {
-        if shard.l2 == [0xFFu8; 32] {
-            return;
-        }
-        let shard_id = self.sub_shard_id_for(&shard.l2, data_addr);
-        let mut m = self.sub_meta.write().unwrap();
-        let e = m.entry(shard_id).or_insert((0, 0));
-        e.0 = (e.0 as i64 + d_count).max(0) as u64;
-        e.1 += d_size;
-    }
-
     // ---- mutations ------------------------------------------------------
 
     pub fn add_vertex(&self, location: &Location, data: &[u8]) -> Result<()> {
-        let shard = shard_key_for_location(location);
-        let id = location.to_id();
-        let is_new = !self.has_entry(&shard, 0, &id);
-        self.stage(&shard, 0, &id, data)?;
-        // Live size (present vertex) + raw vertex-adds count (a NEW leaf only),
-        // bucketed by the forest sub-shard.
-        self.bump_meta(&shard, &location.data_address, i64::from(is_new), data.len() as i128);
-        Ok(())
+        self.apply_mutations(&[Mutation::AddVertex(location.clone(), data)])
     }
 
     pub fn remove_vertex(&self, location: &Location) -> Result<()> {
-        let shard = shard_key_for_location(location);
-        let id = location.to_id();
-
-        let existing = self.read_blob(&shard, 0, &id);
-        let in_removes = self.has_entry(&shard, 1, &id);
-        let present = existing.as_ref().map(|b| !b.is_empty()).unwrap_or(false) && !in_removes;
-        let value_size = if present {
-            existing.as_ref().map(|b| b.len()).unwrap_or(0)
-        } else {
-            0
-        };
-        // A removed-but-never-added id gets an empty add-side placeholder — a NEW
-        // phase-0 leaf (raw count +1), matching the scan's leaf enumeration.
-        let new_placeholder = existing.is_none();
-        if new_placeholder {
-            self.stage(&shard, 0, &id, &[])?;
-        }
-        // Tombstone in the removes phase, carrying the ORIGINAL add size (from the
-        // committed/staged add blob, independent of `present` so a double-remove
-        // re-stamps the same size rather than zeroing it) so the forest removes
-        // subtree-size nets out the removed leaf in `forest_app_buckets`.
-        let orig_size = existing.as_ref().map(|b| b.len()).unwrap_or(0) as u64;
-        self.stage_sized_tombstone(&shard, 1, &id, orig_size)?;
-
-        // Removing a present vertex frees its live size (adds MINUS removes).
-        let d_size = if present { -(value_size as i128) } else { 0 };
-        let d_count = i64::from(new_placeholder);
-        if present || new_placeholder {
-            self.bump_meta(&shard, &location.data_address, d_count, d_size);
-        }
-        Ok(())
+        self.apply_mutations(&[Mutation::RemoveVertex(location.clone())])
     }
 
     pub fn add_hyperedge(&self, location: &Location, data: &[u8]) -> Result<()> {
-        let shard = shard_key_for_location(location);
-        let id = location.to_id();
-        if self.has_entry(&shard, 3, &id) {
-            return Ok(()); // in hyperedge_removes → no-op
-        }
-        self.stage(&shard, 2, &id, data)?;
-        // Hyperedges contribute to LIVE size but not the vertex-adds count.
-        self.bump_meta(&shard, &location.data_address, 0, data.len() as i128);
-        Ok(())
+        self.apply_mutations(&[Mutation::AddHyperedge(location.clone(), data)])
     }
 
     pub fn remove_hyperedge(&self, location: &Location) -> Result<()> {
-        let shard = shard_key_for_location(location);
-        let id = location.to_id();
-        let existing = self.read_blob(&shard, 2, &id);
-        let in_removes = self.has_entry(&shard, 3, &id);
-        let present = existing.as_ref().map(|b| !b.is_empty()).unwrap_or(false) && !in_removes;
-        let value_size = if present {
-            existing.as_ref().map(|b| b.len()).unwrap_or(0)
-        } else {
-            0
-        };
-        if existing.is_none() {
-            self.stage(&shard, 2, &id, &[])?;
+        self.apply_mutations(&[Mutation::RemoveHyperedge(location.clone())])
+    }
+
+    /// Prepare the entire ordered batch before publishing any staged state.
+    /// Reads see earlier operations in this batch and previously staged work.
+    /// Serializes with other mutations, commit and coordinated forest sync.
+    /// Success stages work; it does not durably commit a frame.
+    pub fn apply_mutations(&self, mutations: &[Mutation<'_>]) -> Result<()> {
+        let _guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
+            "CRDT mutation/commit lock poisoned".into()))?;
+        let mut prepared = PreparedMutations::default();
+        for mutation in mutations {
+            let (location, data, adds_phase) = match mutation {
+                Mutation::AddVertex(location, data) => (location, Some(*data), 0),
+                Mutation::RemoveVertex(location) => (location, None, 0),
+                Mutation::AddHyperedge(location, data) => (location, Some(*data), 2),
+                Mutation::RemoveHyperedge(location) => (location, None, 2),
+                Mutation::Record(record) => {
+                    prepared.records.insert(record.key.clone(), record.value.clone());
+                    continue;
+                }
+            };
+            let shard = shard_key_for_location(location);
+            let id = location.to_id();
+            if let Some(data) = data {
+                let new_vertex = if adds_phase == 0 {
+                    prepared.read(self, &shard, 0, &id)?.is_none()
+                } else {
+                    if prepared.read(self, &shard, 3, &id)?.is_some() { continue; }
+                    false
+                };
+                prepared.stage(&shard, adds_phase, &id, data, None)?;
+                prepared.bump(self, &shard, location, i64::from(new_vertex), data.len() as i128);
+            } else {
+                let existing = prepared.read(self, &shard, adds_phase, &id)?;
+                let removed = prepared.read(self, &shard, adds_phase + 1, &id)?.is_some();
+                let size = existing.as_ref().map_or(0, |blob| blob.len());
+                let present = size != 0 && !removed;
+                let placeholder = existing.is_none();
+                if placeholder { prepared.stage(&shard, adds_phase, &id, &[], None)?; }
+                prepared.stage(&shard, adds_phase + 1, &id, &[], Some(size as u64))?;
+                // Vertex placeholders enter the raw adds count. Hyperedges
+                // contribute only live size. Repeated removes keep original size.
+                if present || (adds_phase == 0 && placeholder) {
+                    prepared.bump(self, &shard, location,
+                        i64::from(adds_phase == 0 && placeholder),
+                        if present { -(size as i128) } else { 0 });
+                }
+            }
         }
-        // Tombstone carrying the original hyperedge-add size (see `remove_vertex`),
-        // so the forest HyperedgeRemoves subtree-size nets it out in
-        // `forest_app_buckets`.
-        let orig_size = existing.as_ref().map(|b| b.len()).unwrap_or(0) as u64;
-        self.stage_sized_tombstone(&shard, 3, &id, orig_size)?;
-        // FIX: a removed hyperedge frees its live size — previously this was never
-        // subtracted (hyperedges have only existed on the excluded prover shard,
-        // so it was a latent no-op until now).
-        if present {
-            self.bump_meta(&shard, &location.data_address, 0, -(value_size as i128));
+
+        // Acquire every publication lock before changing any map. Preparation
+        // above cannot leak partial blobs, leaves or metadata on a read error.
+        let mut pending = self.pending.write().unwrap();
+        let mut blobs = self.pending_blobs.write().unwrap();
+        let mut metadata = self.sub_meta.write().unwrap();
+        let mut records = self.pending_records.write().unwrap();
+        let mut next_metadata = HashMap::new();
+        for (key, count, size) in prepared.metadata {
+            let entry = next_metadata.entry(key.clone())
+                .or_insert_with(|| metadata.get(&key).copied().unwrap_or((0u64, 0i128)));
+            entry.0 = if count >= 0 {
+                entry.0.checked_add(count as u64).ok_or_else(||
+                    QuilError::ExecutionUnavailable("CRDT metadata count overflow".into()))?
+            } else { entry.0.saturating_sub(count.unsigned_abs()) };
+            entry.1 = entry.1.checked_add(size).ok_or_else(||
+                QuilError::ExecutionUnavailable("CRDT metadata size overflow".into()))?;
         }
+        for (phase, entries) in prepared.deltas {
+            pending.entry(phase).or_default().extend(entries);
+        }
+        for (phase, entries) in prepared.blobs {
+            blobs.entry(phase).or_default().extend(entries);
+        }
+        metadata.extend(next_metadata);
+        records.extend(prepared.records);
         Ok(())
+    }
+
+    /// Whether mutations are staged in memory but not committed. A failed
+    /// in-place execution can leave them, and any later commit publishes them.
+    pub fn has_staged_mutations(&self) -> bool {
+        let _guard = self.commit_lock.lock().unwrap();
+        !self.pending.read().unwrap().is_empty()
+            || !self.pending_blobs.read().unwrap().is_empty()
+            || !self.pending_records.read().unwrap().is_empty()
+    }
+
+    /// Execution-only overlay. Callers serialize execution while deriving state.
+    /// External readers continue to use the committed store.
+    pub fn staged_records(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        let _guard = self.commit_lock.lock().unwrap();
+        self.pending_records.read().unwrap().clone()
+    }
+
+    pub fn read_execution_record(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let _guard = self.commit_lock.lock().unwrap();
+        if let Some(value) = self.pending_records.read().unwrap().get(key) {
+            return Ok(value.clone());
+        }
+        self.store.new_transaction(false)?.get(key)
     }
 
     // ---- ensure (forest loads lazily; these are compatibility no-ops) ---
 
     pub fn ensure_vertex_adds_tree(&self, _shard_key: &ShardKey) {}
     pub fn ensure_all_phase_trees(&self, _shard_key: &ShardKey) {}
+
+    /// Read one committed fixed-address page. Each store call has its own
+    /// snapshot; callers needing a multi-page snapshot must also pin/check a
+    /// committed root/version. This does not include staged forest writes.
+    pub fn page_committed_vertex_adds(
+        &self, domain: &[u8; 32], after: Option<&[u8; 32]>,
+        limits: quil_types::store::VertexPageLimits,
+    ) -> Result<quil_types::store::VertexDataPage> {
+        let shard = shard_key_for_location(&Location { app_address: *domain, data_address: [0; 32] });
+        self.store.page_vertex_underlying_fixed("vertex", "adds", &shard, domain, after, limits)
+    }
 
     /// Scan every committed vertex-adds blob of a token `domain` — one shard per
     /// domain, since `ShardKey` derives from `app_address = domain` only. Invokes
@@ -896,6 +1110,18 @@ impl HypergraphCrdt {
         let location = Location { app_address: app, data_address: [0u8; 32] };
         let shard = shard_key_for_location(&location);
         self.store.for_each_vertex_underlying("vertex", "adds", &shard, cb)
+    }
+
+    /// Collect vertex-adds blobs including writes staged since the last forest
+    /// commit. Execution uses this to derive state from earlier messages in the
+    /// same frame. Callers must serialize mutations while deriving that state;
+    /// this is not a committed snapshot for external readers.
+    pub fn collect_live_vertex_adds(&self, domain: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let app_address: [u8; 32] = domain.try_into().map_err(|_| {
+            QuilError::InvalidArgument("vertex-adds domain must be 32 bytes".into())
+        })?;
+        let shard = shard_key_for_location(&Location { app_address, data_address: [0; 32] });
+        self.collect_phase_leaves(&shard, 0, &[])
     }
 
     /// Enumerate committed `(vertex_key, blob)` for an EXPLICIT shard/phase —
@@ -916,7 +1142,54 @@ impl HypergraphCrdt {
     // ---- commit ---------------------------------------------------------
 
     pub fn commit(&self, frame_number: u64) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
-        self.commit_inner(frame_number, None)
+        self.commit_inner(frame_number, None, &[])
+    }
+
+    /// Commit frame state and its execution cursor in one store transaction.
+    pub fn commit_with_frame_cursor(
+        &self, frame_number: u64, cursor_key: &[u8],
+    ) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
+        self.commit_with_frame_cursor_and_records(frame_number, cursor_key, &[])
+    }
+
+    /// Publish frame history in the same transaction as its state and cursor.
+    /// The records must use the namespaces of stores sharing this state DB.
+    pub fn commit_with_frame_cursor_and_records(
+        &self,
+        frame_number: u64,
+        cursor_key: &[u8],
+        records: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
+        self.commit_inner(frame_number, Some(cursor_key), records)
+    }
+
+    /// Checkpoint an already completed external state import. This writes only
+    /// the cursor; it neither flushes pending mutations nor makes the import
+    /// atomic with this transaction.
+    pub fn checkpoint_frame_cursor(&self, frame_number: u64, cursor_key: &[u8]) -> Result<()> {
+        let _guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
+            "frame checkpoint commit lock poisoned".into()))?;
+        let txn = self.store.new_transaction(false)?;
+        if let Err(error) = txn.set(cursor_key, &frame_number.to_be_bytes()) {
+            let _ = txn.abort();
+            return Err(error);
+        }
+        txn.commit()
+    }
+
+    /// Read the cursor from the same store that publishes the state. Absence
+    /// means genesis; malformed bytes and read failures must not become zero.
+    pub fn read_frame_cursor(&self, cursor_key: &[u8]) -> Result<u64> {
+        let txn = self.store.new_transaction(true)?;
+        let value = txn.get(cursor_key);
+        let aborted = txn.abort();
+        let value = value?;
+        aborted?;
+        match value {
+            None => Ok(0),
+            Some(bytes) => Ok(u64::from_be_bytes(bytes.as_slice().try_into().map_err(|_|
+                QuilError::ExecutionUnavailable("malformed materialized frame cursor".into()))?)),
+        }
     }
 
     pub fn commit_with_global_cursor(
@@ -924,23 +1197,37 @@ impl HypergraphCrdt {
         frame_number: u64,
         cursor_key: &[u8],
     ) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
-        self.commit_inner(frame_number, Some(cursor_key))
+        self.commit_with_frame_cursor(frame_number, cursor_key)
     }
 
     fn commit_inner(
         &self,
         frame_number: u64,
         cursor_key: Option<&[u8]>,
+        records: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
         let _guard = self.commit_lock.lock().unwrap();
 
-        // Drain the pending deltas + blobs for this commit.
-        let pending: HashMap<(ShardKey, usize), PhaseDeltas> =
-            std::mem::take(&mut *self.pending.write().unwrap());
-        let pending_blobs: HashMap<(ShardKey, usize), PhaseBlobs> =
-            std::mem::take(&mut *self.pending_blobs.write().unwrap());
-
+        // Complete fallible store setup before taking ownership of staged
+        // writes. An unavailable transaction or root read must leave them
+        // intact for retry; the drained work below has its own recovery guard.
         let txn = self.store.new_transaction(false)?;
+        let cached = self.store.get_root_commits(frame_number)?;
+
+        // Drain the pending deltas + blobs for this commit.
+        let mut staged = PendingCommit {
+            crdt: self,
+            deltas: std::mem::take(&mut *self.pending.write().unwrap()),
+            blobs: std::mem::take(&mut *self.pending_blobs.write().unwrap()),
+            records: std::mem::take(&mut *self.pending_records.write().unwrap()),
+            committed: false,
+        };
+        let pending = &staged.deltas;
+        let pending_blobs = &staged.blobs;
+        let mut phase_versions = HashMap::new();
+        let mut global_versions = HashMap::new();
+        let mut shard_metadata = HashMap::new();
+
         let forest = self.forest.read().unwrap();
 
         // Union of shards touched this commit + shards with cached commits.
@@ -950,7 +1237,6 @@ impl HypergraphCrdt {
                 shard_keys.push(sk.clone());
             }
         }
-        let cached = self.store.get_root_commits(frame_number)?;
         for sk in cached.keys() {
             if !shard_keys.contains(sk) {
                 shard_keys.push(sk.clone());
@@ -999,7 +1285,7 @@ impl HypergraphCrdt {
                     // Otherwise read the current root (unchanged phase): a single
                     // tree, or the aggregate of the app's sub-shard roots.
                     roots[phase_idx] =
-                        self.current_app_phase_root(&forest, &shard.l2, &prefixes, phase_idx);
+                        self.current_app_phase_root_checked(&forest, &shard.l2, &prefixes, phase_idx)?;
                     continue;
                 }
                 let deltas = deltas.unwrap();
@@ -1035,6 +1321,7 @@ impl HypergraphCrdt {
                         &shard.l2,
                         phase_idx,
                         leaves,
+                        &mut phase_versions,
                     )?;
                     app_root = root;
                     sub_vers = vec![ver];
@@ -1069,10 +1356,11 @@ impl HypergraphCrdt {
                                 &shard_id,
                                 phase_idx,
                                 leaves,
+                                &mut phase_versions,
                             )?,
                             None => (
-                                self.read_shard_phase_root(&forest, &shard_id, phase_idx),
-                                self.resolve_phase_version_with(&forest, &shard_id, phase_idx)
+                                self.read_shard_phase_root_checked(&forest, &shard_id, phase_idx)?,
+                                self.resolve_phase_version_checked(&forest, &shard_id, phase_idx)?
                                     .unwrap_or(0),
                             ),
                         };
@@ -1148,7 +1436,7 @@ impl HypergraphCrdt {
                 }
             }
 
-            self.shard_metadata.write().unwrap().insert(
+            shard_metadata.insert(
                 shard.clone(),
                 ShardMetadata { commitment: roots.to_vec(), leaf_count: va_leaf_count, size: va_size },
             );
@@ -1191,10 +1479,17 @@ impl HypergraphCrdt {
         // version is staged + cached so version-exact reads
         // (`global_commitments`) address the new root.
         for (bucket, apps) in l1_buckets {
-            let ver = self
-                .resolve_global_version(&forest, bucket)
-                .map(|v| v + 1)
-                .unwrap_or(0);
+            let mut head = self.resolve_global_version_checked(&forest, bucket)?;
+            let version = head.unwrap_or_else(|| self.forest_version.load(Ordering::SeqCst));
+            let root = forest.global_root(bucket, version)
+                .map_err(|e| QuilError::ExecutionUnavailable(format!("read global root: {e}")))?;
+            if root.is_none() && head.is_some() {
+                return Err(QuilError::ExecutionUnavailable("persisted global head has no root".into()));
+            }
+            if root.is_some() { head = Some(version); }
+            let ver = head
+                .map(|v| v.checked_add(1).ok_or_else(|| QuilError::ExecutionUnavailable("global version exhausted".into())))
+                .transpose()?.unwrap_or(0);
             match forest.commit_global_staged(bucket, ver, apps) {
                 Ok((_root, puts)) => {
                     for (k, v) in puts {
@@ -1203,14 +1498,27 @@ impl HypergraphCrdt {
                     if let Some((hk, hv)) = forest.global_head_version_put(bucket, ver) {
                         txn.set(&hk, &hv)?;
                     }
-                    self.global_versions.write().unwrap().insert(bucket, ver);
+                    global_versions.insert(bucket, ver);
                 }
                 Err(e) => {
-                    tracing::warn!(bucket, error = %e, "L1 global bucket commit failed");
+                    return Err(QuilError::ExecutionUnavailable(format!("L1 global bucket {bucket} commit failed: {e}")));
                 }
             }
         }
 
+        for (key, value) in &staged.records {
+            match value {
+                Some(value) => txn.set(key, value)?,
+                None => txn.delete(key)?,
+            }
+        }
+        for (key, value) in records {
+            // Content-addressed reports recur across frames. Retain one copy
+            // without rewriting it into the WAL at every materialization.
+            if txn.get(key)?.as_deref() != Some(value.as_slice()) {
+                txn.set(key, value)?;
+            }
+        }
         if let Some(cursor_key) = cursor_key {
             txn.set(cursor_key, &frame_number.to_be_bytes())?;
         }
@@ -1220,6 +1528,22 @@ impl HypergraphCrdt {
         // frame's committed mutations (they are bumped at stage time).
         txn.set(SIZE_BUCKETS_KEY, &serialize_buckets(&self.sub_meta.read().unwrap()))?;
         txn.commit()?;
+        staged.committed = true;
+        // Publish only heads whose nodes and blobs are now durable. A failed
+        // transaction must retry from the previous head, not a missing version.
+        self.phase_versions.write().unwrap().extend(phase_versions);
+        self.global_versions.write().unwrap().extend(global_versions);
+        self.shard_metadata.write().unwrap().extend(shard_metadata);
+        let observer = self.local_vertex_observer.read().ok().and_then(|observer| observer.clone());
+        if let Some(observer) = observer {
+            let mut vertices = pending_blobs.iter().filter(|((_, phase), _)| *phase == 0)
+                .flat_map(|(_, blobs)| blobs.iter().map(|(key, value)| (key.as_slice(), value.as_slice())))
+                .chain(staged.records.iter().filter_map(|(key, value)| value.as_ref().map(|value| (key.as_slice(), value.as_slice()))));
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.committed(&mut vertices))).is_err() {
+                tracing::warn!("local vertex commit observer panicked after durable commit");
+            }
+        }
+
         Ok(result)
     }
 
@@ -1252,6 +1576,23 @@ impl HypergraphCrdt {
                 None => Vec::new(),
             })
             .collect()
+    }
+
+    /// Read all current global bucket roots without treating an unavailable
+    /// version or root as an empty bucket. Execution checkpointing must retain
+    /// that distinction; a head without its root is incomplete state.
+    pub fn global_commitments_checked(&self) -> Result<Vec<Vec<u8>>> {
+        let forest = self.forest.read().map_err(|_| QuilError::ExecutionUnavailable(
+            "global commitment forest lock poisoned".into()))?;
+        (0u8..=255).map(|index| {
+            let Some(version) = self.resolve_global_version_checked(&forest, index)? else {
+                return Ok(Vec::new());
+            };
+            forest.global_root(index, version)
+                .map_err(|error| QuilError::ExecutionUnavailable(format!("global commitment read: {error}")))?
+                .map(|root| root.to_vec())
+                .ok_or_else(|| QuilError::ExecutionUnavailable("global commitment head has no root".into()))
+        }).collect()
     }
 
     pub fn total_size(&self) -> BigInt {
@@ -1411,9 +1752,16 @@ impl HypergraphCrdt {
     }
 
     pub fn warm_sizes(&self, apps: &[[u8; 32]]) -> Result<()> {
-        if self.sizes_warmed.swap(true, Ordering::SeqCst) {
+        let _commit_guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
+            "size warm commit lock poisoned".into()))?;
+        if self.sizes_warmed.load(Ordering::Acquire) {
             return Ok(());
         }
+        if !self.pending.read().unwrap().is_empty() || !self.pending_blobs.read().unwrap().is_empty() {
+            return Err(QuilError::ExecutionUnavailable("cannot initialize size accounting with staged mutations".into()));
+        }
+        let _guard = self.size_warm_lock.lock().unwrap();
+        if self.sizes_warmed.load(Ordering::Acquire) { return Ok(()); }
         // Fast path: restore the persisted buckets — but ONLY if their key
         // encoding still matches the CURRENT prefixes. The cache is keyed
         // `addr_path_shard_id(app, prefix)` for the prefixes in force when it was
@@ -1433,6 +1781,8 @@ impl HypergraphCrdt {
             let restored = deserialize_buckets(&blob);
             if self.buckets_match_current_prefixes(apps, &restored) {
                 *self.sub_meta.write().unwrap() = restored;
+                self.sizes_warmed.store(true, Ordering::Release);
+                self.layout_rebuilds.write().unwrap().retain(|app| !apps.contains(app));
                 return Ok(());
             }
             // Stale encoding (a byte-suffix→sentinel grid flip since the cache was
@@ -1454,6 +1804,8 @@ impl HypergraphCrdt {
                 txn.set(SIZE_BUCKETS_KEY, &serialize_buckets(&buckets))?;
                 txn.commit()?;
                 *self.sub_meta.write().unwrap() = buckets;
+                self.sizes_warmed.store(true, Ordering::Release);
+                self.layout_rebuilds.write().unwrap().retain(|app| !apps.contains(app));
                 return Ok(());
             }
         }
@@ -1467,6 +1819,8 @@ impl HypergraphCrdt {
         txn.set(SIZE_BUCKETS_KEY, &serialize_buckets(&buckets))?;
         txn.commit()?;
         *self.sub_meta.write().unwrap() = buckets;
+        self.sizes_warmed.store(true, Ordering::Release);
+        self.layout_rebuilds.write().unwrap().retain(|app| !apps.contains(app));
         Ok(())
     }
 
@@ -1484,6 +1838,8 @@ impl HypergraphCrdt {
     /// Idempotent: a crash mid-seed leaves the marker unset and re-seeds next
     /// boot — already-memoized nodes are cheap hits, so the re-walk resumes.
     pub fn warm_size_index(&self, apps: &[[u8; 32]]) -> Result<bool> {
+        let _guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
+            "size index commit lock poisoned".into()))?;
         // NOTE: NOT gated on `unified_tree()` — this must run at boot BEFORE the
         // unified flag is set (which happens in `boot_consolidate_and_gate`,
         // after the first `rebucket_app` in `refresh_crdt_shard_prefixes`). It
@@ -1623,6 +1979,23 @@ impl HypergraphCrdt {
         Ok(())
     }
 
+    /// The live committed size of the unified app tree under `bits`, from the
+    /// forest's Merkle-sum index (the same `(VA − VR) + (HA − HR)` as
+    /// [`Self::forest_app_buckets`]), or `None` off the unified tree. For a
+    /// subtree this node received by sync or inherited at a split or merge,
+    /// the CRDT's size metadata was never written; the forest still knows.
+    pub fn unified_live_size_at_bits(&self, app: &[u8; 32], bits: &[bool]) -> Option<u64> {
+        if !self.unified_tree() {
+            return None;
+        }
+        let forest = self.forest.read().ok()?;
+        let fallback_ver = self.forest_version.load(Ordering::SeqCst);
+        let ver = |ph: usize| self.resolve_phase_version_with(&forest, app, ph).unwrap_or(fallback_ver);
+        let size = |ph: usize| forest.app_subtree_size(app, PHASES[ph], ver(ph), bits).unwrap_or(0) as i128;
+        let live = ((size(0) - size(1)) + (size(2) - size(3))).max(0);
+        Some(u64::try_from(live).unwrap_or(u64::MAX))
+    }
+
     /// Forest-aggregate equivalent of [`scan_app_buckets`]: build `app`'s
     /// per-sub-shard `(raw_count, live_size)` buckets from the unified app tree's
     /// Merkle-sum aggregates — [`Forest::app_subtree_leaf_count`] (count) +
@@ -1657,8 +2030,12 @@ impl HypergraphCrdt {
         // version (NOT 0, which reads an empty tree). Each phase tree resolves
         // independently.
         let fallback_ver = self.forest_version.load(Ordering::SeqCst);
-        let ver = |ph: usize| self.resolve_phase_version_with(&forest, app, ph).unwrap_or(fallback_ver);
-        let (ver_va, ver_vr, ver_ha, ver_hr) = (ver(0), ver(1), ver(2), ver(3));
+        let ver = |ph: usize| self.resolve_phase_version_checked(&forest, app, ph).map(|v| v.unwrap_or(fallback_ver));
+        let (ver_va, ver_vr, ver_ha, ver_hr) = (ver(0)?, ver(1)?, ver(2)?, ver(3)?);
+        if !single && bit_paths.len() != prefixes.len() {
+            return Err(QuilError::ExecutionUnavailable("size accounting has misaligned shard paths".into()));
+        }
+        let read_error = |e| QuilError::ExecutionUnavailable(format!("size accounting forest read: {e}"));
         let empty_bits: Vec<bool> = Vec::new();
         for (i, prefix) in prefixes.iter().enumerate() {
             let bits: &[bool] = if single { &empty_bits } else { &bit_paths[i] };
@@ -1667,7 +2044,7 @@ impl HypergraphCrdt {
             // `scan_app_buckets` (`e.0 += 1` for every add, no `v_removed` check).
             let count = forest
                 .app_subtree_leaf_count(app, PHASES[0], ver_va, bits)
-                .unwrap_or(0);
+                .map_err(read_error)?;
             // SIZE: LIVE size = adds − removes across both vertex and hyperedge
             // phases. The forest add-trees RETAIN removed leaves (removes are a
             // SEPARATE phase tree, not deletions), and each removes-phase tombstone
@@ -1677,11 +2054,16 @@ impl HypergraphCrdt {
             // `blob.len()` sum == (VertexAdds − VertexRemoves) + (HyperedgeAdds −
             // HyperedgeRemoves) — a pure O(depth) subtree subtraction, no leaf scan.
             // Clamp at 0 (a shard can't have negative live size).
-            let va = forest.app_subtree_size(app, PHASES[0], ver_va, bits).unwrap_or(0) as i128;
-            let vr = forest.app_subtree_size(app, PHASES[1], ver_vr, bits).unwrap_or(0) as i128;
-            let ha = forest.app_subtree_size(app, PHASES[2], ver_ha, bits).unwrap_or(0) as i128;
-            let hr = forest.app_subtree_size(app, PHASES[3], ver_hr, bits).unwrap_or(0) as i128;
-            let size = ((va - vr) + (ha - hr)).max(0);
+            let size_at = |phase, version| -> Result<i128> {
+                i128::try_from(forest.app_subtree_size(app, phase, version, bits).map_err(read_error)?)
+                    .map_err(|_| QuilError::ExecutionUnavailable("size accounting overflow".into()))
+            };
+            let va = size_at(PHASES[0], ver_va)?;
+            let vr = size_at(PHASES[1], ver_vr)?;
+            let ha = size_at(PHASES[2], ver_ha)?;
+            let hr = size_at(PHASES[3], ver_hr)?;
+            let size = va.checked_sub(vr).and_then(|v| v.checked_add(ha)).and_then(|v| v.checked_sub(hr))
+                .ok_or_else(|| QuilError::ExecutionUnavailable("size accounting overflow".into()))?.max(0);
             // Match `scan_app_buckets`, which only creates a bucket for a shard a
             // leaf actually routes to — never an empty `(0, 0)` placeholder.
             if count == 0 && size == 0 {
@@ -1700,13 +2082,24 @@ impl HypergraphCrdt {
     /// the split stays stranded in the now-removed parent bucket (a deep-split leaf
     /// reads size 0 → provers churn, proposing to "leave" the data-bearing child).
     /// This drops the app's existing buckets and rebuilds them from committed state
-    /// by the new routing — zero-copy (Option A leaves data in place, only the
+    /// by the new routing — zero-copy (data stays in place, only the
     /// shard boundaries move), so the app's TOTAL size is preserved and only the
     /// per-sub-shard attribution changes. Deterministic across nodes: every node
     /// runs it at the same frame the split's new prefixes become visible (the
     /// per-frame `refresh_crdt_shard_prefixes` change-detection), over identical
     /// committed state. Idempotent for an unchanged prefix set.
     pub fn rebucket_app(&self, app: &[u8; 32]) -> Result<()> {
+        let _guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
+            "rebucket commit lock poisoned".into()))?;
+        self.rebucket_app_locked(app)
+    }
+
+    fn rebucket_app_locked(&self, app: &[u8; 32]) -> Result<()> {
+        if self.pending.read().unwrap().iter().any(|((shard, _), values)| shard.l2 == *app && !values.is_empty())
+            || self.pending_blobs.read().unwrap().iter().any(|((shard, _), values)| shard.l2 == *app && !values.is_empty())
+        {
+            return Err(QuilError::ExecutionUnavailable("cannot rebuild size buckets with staged application mutations".into()));
+        }
         // Rebuild the app's buckets from committed state under a lock held across
         // the swap so a concurrent commit can't interleave a stale partition.
         let mut fresh: HashMap<Vec<u8>, (u64, i128)> = HashMap::new();
@@ -1755,6 +2148,7 @@ impl HypergraphCrdt {
         for (k, v) in fresh {
             m.insert(k, v);
         }
+        self.layout_rebuilds.write().unwrap().remove(app);
         Ok(())
     }
 
@@ -1869,7 +2263,8 @@ impl HypergraphCrdt {
                 .iter()
                 .position(|p| p == prefix)
                 .map(|i| bit_paths[i].clone())
-                .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6));
+                .unwrap_or_else(|| quil_forest::shard_bit_path_from_prefix(prefix)
+                    .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6)));
             let ver = self
                 .resolve_phase_version_with(&forest, app, phase_idx)
                 .unwrap_or(0);
@@ -1945,7 +2340,7 @@ impl HypergraphCrdt {
             .enumerate()
             .find(|(i, _)| bit_paths.get(*i).map(|b| *b == lookup_bits).unwrap_or(false))
             .map(|(_, p)| p.clone())
-            .unwrap_or_default();
+            .unwrap_or(lookup_prefix);
         self.sub_shard_commitment(set_type, phase_type, &shard_key, &prefix)
     }
 
@@ -1981,8 +2376,8 @@ impl HypergraphCrdt {
         let prefixes = self.app_prefixes(&shard_key.l2);
         // Unified mode: one app tree, so a vertex leaf proves DIRECTLY against
         // the app-phase root the header advertises — no per-sub-shard tree, no
-        // co-path aggregation (a shard-scoped verifier folds the co-path itself,
-        // spike #3). Same direct path as a genuinely single-shard app.
+        // co-path aggregation (a shard-scoped verifier folds the co-path itself).
+        // Same direct path as a genuinely single-shard app.
         let single_shard =
             self.unified_tree() || (prefixes.len() == 1 && prefixes[0].is_empty());
         let never_committed = || {
@@ -2090,10 +2485,368 @@ impl HypergraphCrdt {
         Some((v, root))
     }
 
-    /// Forest-sync CLIENT: prepare one shard/phase Merkle diff from a remote
-    /// `source` at `source_version`, without mutating local state. The caller
-    /// fetches the changed blobs and uses the companion apply method to persist
-    /// both at a fresh coordinated version.
+    /// Read one physical tree's current root without treating unreadable state
+    /// as an empty tree. Sync uses this when the authenticated source is empty.
+    /// The phases of `shard_id` whose head marker an old reset left on an
+    /// emptied tree (see [`Forest::orphaned_phase_head`]): `(phase, version)`.
+    pub fn orphaned_phase_heads(&self, shard_id: &[u8]) -> Result<Vec<(usize, u64)>> {
+        let forest = self.forest.read()
+            .map_err(|_| QuilError::ExecutionUnavailable("forest lock poisoned".into()))?;
+        let mut orphaned = Vec::new();
+        for (phase_idx, phase) in PHASES.iter().enumerate() {
+            if let Some(version) = forest.orphaned_phase_head(shard_id, *phase)
+                .map_err(|e| QuilError::ExecutionUnavailable(format!("read phase head: {e}")))? {
+                orphaned.push((phase_idx, version));
+            }
+        }
+        Ok(orphaned)
+    }
+
+    /// Drop the orphaned head markers of `shard_id`, so each such phase reads
+    /// as the empty tree it is and its next commit rebuilds from version 0.
+    /// Holds the forest write guard, so no commit or sync interleaves.
+    pub fn drop_orphaned_phase_heads(&self, shard_id: &[u8]) -> Result<Vec<(usize, u64)>> {
+        let poisoned = |name| QuilError::ExecutionUnavailable(format!("{name} lock poisoned"));
+        let forest = self.forest.write().map_err(|_| poisoned("forest"))?;
+        let mut dropped = Vec::new();
+        for (phase_idx, phase) in PHASES.iter().enumerate() {
+            if let Some(version) = forest.drop_orphaned_phase_head(shard_id, *phase)
+                .map_err(|e| QuilError::ExecutionUnavailable(format!("drop phase head: {e}")))? {
+                self.phase_versions.write().map_err(|_| poisoned("phase versions"))?
+                    .remove(&(shard_id.to_vec(), phase_idx));
+                dropped.push((phase_idx, version));
+            }
+        }
+        Ok(dropped)
+    }
+
+    pub fn current_forest_phase_root(&self, shard_id: &[u8], phase_idx: usize) -> Result<[u8; 32]> {
+        if shard_id.len() < 32 || phase_idx >= PHASES.len() {
+            return Err(QuilError::InvalidArgument("invalid forest phase scope".into()));
+        }
+        self.read_shard_phase_root_checked(&self.forest.read().unwrap(), shard_id, phase_idx)
+    }
+
+    /// Whether this scope has been checked or built by atomic blob/tree sync.
+    /// A legacy tree may have reached its root before its blob downloads failed;
+    /// it needs one complete leaf/data check before root equality is sufficient.
+    pub fn sync_data_ready(&self, shard_id: &[u8], phase_idx: usize, bit_path: &[bool]) -> Result<bool> {
+        let key = sync_data_key(shard_id, phase_idx, bit_path)?;
+        let txn = self.store.new_transaction(false)?;
+        let ready = txn.get(&key)?.as_deref() == Some(&[1]);
+        txn.abort()?;
+        Ok(ready)
+    }
+
+    /// Authenticate and preview a sync before downloading its readable blobs.
+    /// Remote reads and reconstruction do not hold the materializer's write
+    /// lock. Each later chunk rechecks the local version under that lock.
+    pub fn prepare_phase_sync<S: quil_forest::TreeReader>(
+        &self,
+        source: &S,
+        source_version: u64,
+        shard_id: &[u8],
+        phase_idx: usize,
+        bit_path: &[bool],
+        anchor: Option<quil_forest::SubtreeSyncAnchor>,
+    ) -> Result<ForestSyncPlan> {
+        if phase_idx >= 4 || shard_id.len() < 32 {
+            return Err(QuilError::InvalidArgument("invalid sync shard or phase".into()));
+        }
+        let forest = self.forest.read().unwrap();
+        let base_version = self.resolve_phase_version_with(&forest, shard_id, phase_idx);
+        let local_root = forest.app_subtree_root(shard_id, PHASES[phase_idx], base_version.unwrap_or(0), bit_path)
+            .map_err(|e| QuilError::Internal(format!("local sync root: {e}")))?;
+        let repair_existing = local_root != [0; 32] && local_root != *b"SPARSE_MERKLE_PLACEHOLDER_HASH__"
+            && !self.sync_data_ready(shard_id, phase_idx, bit_path)?;
+        let target = if repair_existing {
+            // A one-time audit also repairs previously torn installations. Its
+            // existing correct blobs can be reused without network downloads.
+            Forest::in_memory().shard_phase_reader(shard_id, PHASES[phase_idx])
+        } else {
+            forest.shard_phase_reader(shard_id, PHASES[phase_idx])
+        };
+        let (leaves, target_root) = quil_forest::diff_leaves_under_prefix(
+            source, source_version, &target, base_version.unwrap_or(0), bit_path, anchor,
+        ).map_err(|e| QuilError::Internal(format!("sync diff: {e}")))?;
+        let mut updates: std::collections::BTreeMap<_, _> = leaves.into_iter()
+            .map(|(key, value)| (key.0, Some(value))).collect();
+        // Regular masters used to replay GLOBAL operations against local shard
+        // metadata that could miss an archive's split/merge freeze. A rejected
+        // join then created local-only prover records and a membership edge,
+        // and a put-only diff could never recover. Under a pinned GLOBAL root,
+        // reconcile those extra adds too. Scope this to GLOBAL add phases: application data and remove
+        // phases retain their existing monotonic-sync contract.
+        if phase_idx % 2 == 0 && shard_id == [0xff; 32] && bit_path.is_empty() && anchor.is_some() {
+            let local = forest.shard_phase_reader(shard_id, PHASES[phase_idx]);
+            let (local_changes, _) = quil_forest::diff_leaves_under_prefix(
+                &local, base_version.unwrap_or(0), source, source_version, bit_path, None,
+            ).map_err(|e| QuilError::Internal(format!("reverse GLOBAL sync diff: {e}")))?;
+            for (key, _) in local_changes {
+                // A changed common key occurs in both diffs; keep its source
+                // value. A key occurring only in the reverse diff is absent
+                // from the source. Full root reconstruction verifies the set.
+                updates.entry(key.0).or_insert(None);
+            }
+        }
+        let leaves: Vec<_> = updates.into_iter().collect();
+        if leaves.is_empty() {
+            let local = forest.app_subtree_root(shard_id, PHASES[phase_idx], base_version.unwrap_or(0), bit_path)
+                .map_err(|e| QuilError::Internal(format!("sync root: {e}")))?;
+            if local != target_root
+                && !(base_version.is_none() && bit_path.is_empty()
+                    && target_root == *b"SPARSE_MERKLE_PLACEHOLDER_HASH__")
+            {
+                return Err(QuilError::Internal("sync would retain leaves absent from its source".into()));
+            }
+        } else {
+            let version = base_version.map_or(Some(0), |v| v.checked_add(1))
+                .ok_or_else(|| QuilError::Internal("sync version overflow".into()))?;
+            // Drop the prepared batch without publishing it. The complete
+            // result, including any GLOBAL removals, must match before writes.
+            forest.stage_synced_phase(shard_id, PHASES[phase_idx], version,
+                leaves.iter().map(|(key, value)| (quil_forest::KeyHash(*key), value.clone())),
+                bit_path, Some(target_root))
+                .map_err(|e| QuilError::Internal(format!("sync phase {phase_idx} reconstruction: {e}")))?;
+        }
+        Ok(ForestSyncPlan {
+            store: self.store.clone(), shard_id: shard_id.to_vec(), phase_idx,
+            bit_path: bit_path.to_vec(), base_version, target_root, repair_existing,
+            leaves, next: 0,
+        })
+    }
+
+    /// Install the next leaves and their verified blobs in one transaction.
+    /// A fetch failure before this call changes nothing. A failed transaction
+    /// leaves both the durable head and the plan at the preceding chunk, so a
+    /// retry or restart includes all data that still needs installation.
+    pub fn apply_sync_chunk(&self, plan: &mut ForestSyncPlan, blobs: &[Vec<u8>]) -> Result<()> {
+        let bytes = blobs.iter().try_fold(0usize, |n, blob| n.checked_add(blob.len()));
+        if !Arc::ptr_eq(&self.store, &plan.store) || blobs.is_empty()
+            || blobs.len() > plan.remaining().len() || blobs.len() > MAX_SYNC_CHUNK_LEAVES
+            || bytes.is_none_or(|bytes| bytes > MAX_SYNC_CHUNK_BYTES)
+        {
+            return Err(QuilError::InvalidArgument("invalid or oversized sync chunk".into()));
+        }
+        let leaves = &plan.remaining()[..blobs.len()];
+        for ((_, leaf), blob) in leaves.iter().zip(blobs) {
+            let matches = match leaf {
+                Some(leaf) => sync_blob_matches(plan.phase_idx, leaf, blob)?,
+                None => blob.is_empty(),
+            };
+            if !matches {
+                return Err(QuilError::InvalidArgument("synced blob does not match its authenticated leaf".into()));
+            }
+        }
+        let _forest_guard = self.forest_write_lock.lock().unwrap();
+        let _guard = self.commit_lock.lock().unwrap();
+        let forest = self.forest.read().unwrap();
+        let current = self.resolve_phase_version_with(&forest, &plan.shard_id, plan.phase_idx);
+        if current != plan.base_version {
+            return Err(QuilError::ExecutionUnavailable("sync phase advanced during download; retry".into()));
+        }
+        let app: [u8; 32] = plan.shard_id[..32].try_into().unwrap();
+        let shard = ShardKey { l1: crate::addressing::get_bloom_filter_indices(&app, 256, 3), l2: app };
+        if self.pending.read().unwrap().get(&(shard.clone(), plan.phase_idx)).is_some_and(|m| !m.is_empty()) {
+            return Err(QuilError::ExecutionUnavailable("sync phase has staged local writes; retry".into()));
+        }
+        let version = current.map_or(Some(0), |v| v.checked_add(1))
+            .ok_or_else(|| QuilError::Internal("sync version overflow".into()))?;
+        let final_chunk = blobs.len() == plan.remaining().len();
+        let staged = forest.stage_synced_phase(
+            &plan.shard_id, PHASES[plan.phase_idx], version,
+            leaves.iter().map(|(key, value)| (quil_forest::KeyHash(*key), value.clone())),
+            &plan.bit_path, final_chunk.then_some(plan.target_root),
+        ).map_err(|e| QuilError::Internal(format!("stage sync chunk: {e}")))?;
+        let txn = self.store.new_transaction(false)?;
+        for (key, value) in staged.puts() { txn.set(key, value)?; }
+        if let Some((key, value)) = forest.head_version_put(&plan.shard_id, PHASES[plan.phase_idx], version) {
+            txn.set(&key, &value)?;
+        }
+        let (set, phase) = PHASE_STR[plan.phase_idx];
+        for ((key, _), blob) in leaves.iter().zip(blobs) {
+            let mut id = app.to_vec();
+            id.extend_from_slice(key);
+            // An empty add blob hides an absent GLOBAL record from live reads
+            // and registry decoding without erasing its historical versions.
+            self.store.save_vertex_underlying_versioned(txn.as_ref(), set, phase, &shard, &id, blob, version)?;
+        }
+        // A scope that began empty is complete after every chunk. Repair of
+        // legacy state becomes complete only after checking every source leaf.
+        if !plan.repair_existing || final_chunk {
+            txn.set(&sync_data_key(&plan.shard_id, plan.phase_idx, &plan.bit_path)?, &[1])?;
+        }
+        txn.commit()?;
+        staged.publish_memory().map_err(|e| QuilError::Internal(format!("publish synced memory tree: {e}")))?;
+        self.phase_versions.write().unwrap().insert((plan.shard_id.clone(), plan.phase_idx), version);
+        plan.base_version = Some(version);
+        plan.next += blobs.len();
+        Ok(())
+    }
+
+    /// Completion is a current local root check, including a no-op diff.
+    pub fn finish_phase_sync(&self, plan: &ForestSyncPlan) -> Result<[u8; 32]> {
+        if !Arc::ptr_eq(&self.store, &plan.store) || !plan.remaining().is_empty() {
+            return Err(QuilError::InvalidArgument("unfinished sync plan".into()));
+        }
+        let _forest_guard = self.forest_write_lock.lock().unwrap();
+        let _guard = self.commit_lock.lock().unwrap();
+        let forest = self.forest.read().unwrap();
+        let current = self.resolve_phase_version_with(&forest, &plan.shard_id, plan.phase_idx);
+        if current != plan.base_version {
+            return Err(QuilError::ExecutionUnavailable("sync phase advanced before completion; retry".into()));
+        }
+        let root = forest.app_subtree_root(&plan.shard_id, PHASES[plan.phase_idx], current.unwrap_or(0), &plan.bit_path)
+            .map_err(|e| QuilError::Internal(format!("synced root: {e}")))?;
+        if root != plan.target_root
+            && !(current.is_none() && plan.bit_path.is_empty()
+                && plan.target_root == *b"SPARSE_MERKLE_PLACEHOLDER_HASH__")
+        {
+            return Err(QuilError::ExecutionUnavailable("sync root changed before completion; retry".into()));
+        }
+        Ok(plan.target_root)
+    }
+
+    /// Roll one application shard's committed state back to the retained
+    /// state whose per-phase subtree roots are `roots`, as a fresh commit at
+    /// each changed phase's next version. Versions stay monotonic, so no stale
+    /// tree record or newer blob version can shadow the restored state: a leaf
+    /// changed since is restored from its blob at the old version, an add made
+    /// since is hidden by an empty blob, and a removal made since has its blob
+    /// versions above the old version deleted (any removes-phase blob hides
+    /// its vertex). Every phase is checked against its root before anything is
+    /// written. A member whose session GLOBAL fenced below its head rewinds to
+    /// the fence this way.
+    pub fn rewind_app_shard(&self, filter: &[u8], roots: &[[u8; 32]; 4]) -> Result<()> {
+        if !self.unified_tree() || filter.len() < 32 {
+            return Err(QuilError::InvalidArgument("a rewind needs an application shard of a unified tree".into()));
+        }
+        let bits = self.canonical_bits_for_filter(filter)
+            .ok_or_else(|| QuilError::InvalidArgument("rewind filter is not a shard of its application".into()))?;
+        let app: [u8; 32] = filter[..32].try_into().unwrap();
+        let shard = ShardKey { l1: crate::addressing::get_bloom_filter_indices(&app, 256, 3), l2: app };
+        // An empty target (a phase first written after it) has no version.
+        let empty = |root: &[u8; 32]| *root == [0; 32] || *root == *b"SPARSE_MERKLE_PLACEHOLDER_HASH__";
+        let targets = (0..4).map(|phase_idx| {
+            match self.resolve_root(filter, phase_idx, roots[phase_idx]) {
+                Some((version, _)) => Ok(Some(version)),
+                None if empty(&roots[phase_idx]) => Ok(None),
+                None => Err(QuilError::ExecutionUnavailable(format!("rewind target of phase {phase_idx} is not retained here"))),
+            }
+        }).collect::<Result<Vec<Option<u64>>>>()?;
+        let _forest_guard = self.forest_write_lock.lock().unwrap();
+        let _guard = self.commit_lock.lock().unwrap();
+        if self.pending.read().unwrap().iter().any(|((key, _), values)| key.l2 == app && !values.is_empty())
+            || self.pending_blobs.read().unwrap().iter().any(|((key, _), values)| key.l2 == app && !values.is_empty())
+        {
+            return Err(QuilError::ExecutionUnavailable("cannot rewind with staged application mutations".into()));
+        }
+        let forest = self.forest.read().unwrap();
+        let txn = self.store.new_transaction(false)?;
+        let mut staged = Vec::new();
+        let mut wiped = Vec::new();
+        for (phase_idx, target) in targets.into_iter().enumerate() {
+            let Some(head) = self.resolve_phase_version_with(&forest, &app, phase_idx) else { continue };
+            let current = forest.app_subtree_root(&app, PHASES[phase_idx], head, &bits)
+                .map_err(|e| QuilError::Internal(format!("rewind root: {e}")))?;
+            if current == roots[phase_idx] {
+                continue;
+            }
+            let reader = forest.shard_phase_reader(&app, PHASES[phase_idx]);
+            let nothing = Forest::in_memory().shard_phase_reader(&app, PHASES[phase_idx]);
+            let (set, kind) = PHASE_STR[phase_idx];
+            if target.is_none() && roots[phase_idx] == [0; 32] {
+                // The whole phase tree postdates the target, which reads it as
+                // never committed: remove it rather than leave an empty tree,
+                // whose root reads differently.
+                let (all, _) = quil_forest::diff_leaves_under_prefix(&reader, head, &nothing, 0, &[], None)
+                    .map_err(|e| QuilError::Internal(format!("rewind phase listing: {e}")))?;
+                for (key, _) in all {
+                    let mut id = app.to_vec();
+                    id.extend_from_slice(&key.0);
+                    self.store.delete_vertex_underlying_versions_from(txn.as_ref(), set, kind, &shard, &id, 0)?;
+                }
+                wiped.push(phase_idx);
+                continue;
+            }
+            let (restore, since) = match target {
+                Some(target) => {
+                    let (restore, source_root) = quil_forest::diff_leaves_under_prefix(&reader, target, &reader, head, &bits, None)
+                        .map_err(|e| QuilError::Internal(format!("rewind diff: {e}")))?;
+                    if source_root != roots[phase_idx] {
+                        return Err(QuilError::Internal("rewind target version differs from its root".into()));
+                    }
+                    let (since, _) = quil_forest::diff_leaves_under_prefix(&reader, head, &reader, target, &bits, None)
+                        .map_err(|e| QuilError::Internal(format!("rewind reverse diff: {e}")))?;
+                    (restore, since)
+                }
+                None => {
+                    let (since, _) = quil_forest::diff_leaves_under_prefix(&reader, head, &nothing, 0, &bits, None)
+                        .map_err(|e| QuilError::Internal(format!("rewind reverse diff: {e}")))?;
+                    (Vec::new(), since)
+                }
+            };
+            let mut updates: BTreeMap<[u8; 32], Option<Vec<u8>>> =
+                restore.into_iter().map(|(key, value)| (key.0, Some(value))).collect();
+            for (key, _) in since {
+                updates.entry(key.0).or_insert(None);
+            }
+            let version = head.checked_add(1).ok_or_else(|| QuilError::Internal("rewind version overflow".into()))?;
+            let phase = forest.stage_synced_phase(&app, PHASES[phase_idx], version,
+                updates.iter().map(|(key, value)| (quil_forest::KeyHash(*key), value.clone())),
+                &bits, target.map(|_| roots[phase_idx]))
+                .map_err(|e| QuilError::Internal(format!("rewind phase {phase_idx}: {e}")))?;
+            if target.is_none() && !empty(&phase.root()) {
+                return Err(QuilError::Internal(format!("rewind phase {phase_idx} did not empty the shard")));
+            }
+            for (key, value) in phase.puts() { txn.set(key, value)?; }
+            if let Some((key, value)) = forest.head_version_put(&app, PHASES[phase_idx], version) {
+                txn.set(&key, &value)?;
+            }
+            for (key, value) in &updates {
+                let mut id = app.to_vec();
+                id.extend_from_slice(key);
+                match value {
+                    Some(_) => {
+                        let target = target.expect("restored leaves come from a retained target");
+                        let blob = self.store.load_vertex_underlying_at(set, kind, &shard, &id, target)?
+                            .ok_or_else(|| QuilError::ExecutionUnavailable("rewind blob is not retained here".into()))?;
+                        self.store.save_vertex_underlying_versioned(txn.as_ref(), set, kind, &shard, &id, &blob, version)?;
+                    }
+                    None if phase_idx % 2 == 0 => {
+                        self.store.save_vertex_underlying_versioned(txn.as_ref(), set, kind, &shard, &id, &[], version)?;
+                    }
+                    None => self.store.delete_vertex_underlying_versions_from(
+                        txn.as_ref(), set, kind, &shard, &id, target.map_or(0, |target| target + 1))?,
+                }
+            }
+            staged.push((phase_idx, version, phase));
+        }
+        if staged.is_empty() && wiped.is_empty() {
+            txn.abort()?;
+            return Ok(());
+        }
+        txn.commit()?;
+        for (phase_idx, version, phase) in staged {
+            phase.publish_memory().map_err(|e| QuilError::Internal(format!("publish rewound memory tree: {e}")))?;
+            self.phase_versions.write().unwrap().insert((app.to_vec(), phase_idx), version);
+        }
+        for phase_idx in wiped {
+            forest.reset_shard_phase_tree(&app, PHASES[phase_idx])
+                .map_err(|e| QuilError::Internal(format!("rewind phase reset: {e}")))?;
+            let (set, kind) = PHASE_STR[phase_idx];
+            self.store.clear_phase_root_versions(set, kind, &app)?;
+            self.phase_versions.write().unwrap().remove(&(app.to_vec(), phase_idx));
+        }
+        drop(forest);
+        self.rebucket_app_locked(&app)
+    }
+
+    /// Forest-sync CLIENT: pull one shard/phase tree from a remote `source` (at
+    /// `source_version`) via the efficient Merkle diff and apply the differing
+    /// leaves into this CRDT's forest at a fresh, COORDINATED version (so it
+    /// doesn't collide with live `commit_inner` versions). Returns the new root
+    /// for the caller to verify against the trusted target.
     ///
     /// The diff walk (remote reads) runs LOCK-FREE — it takes neither
     /// `forest_write_lock` nor `commit_lock`. JMT reads are version-exact, so the
@@ -2104,103 +2857,6 @@ impl HypergraphCrdt {
     /// apply: if a commit advanced this phase in between, the diff's leaves are
     /// stale and the apply is aborted for the caller to retry — so an expensive
     /// full-tree diff can never block the global-frame materializer.
-    ///
-    /// Prepare an authenticated phase diff without mutating local state.
-    pub fn prepare_shard_phase_sync<S: quil_forest::TreeReader>(
-        &self,
-        source: &S,
-        source_version: u64,
-        shard_id: &[u8],
-        phase_idx: usize,
-    ) -> Result<PreparedShardPhaseSync> {
-        if phase_idx >= 4 {
-            return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
-        }
-        let (target_version, leaves) = {
-            let forest = self.forest.read().unwrap();
-            let target_version = self.resolve_phase_version_with(&forest, shard_id, phase_idx);
-            let target = forest.shard_phase_reader(shard_id, PHASES[phase_idx]);
-            let leaves = quil_forest::diff_leaves(
-                source,
-                source_version,
-                &target,
-                target_version.unwrap_or(0),
-            )
-            .map_err(|e| QuilError::Internal(format!("diff_leaves: {e}")))?;
-            (target_version, leaves)
-        };
-        Ok(PreparedShardPhaseSync {
-            shard_id: shard_id.to_vec(),
-            phase_idx,
-            target_version,
-            leaves,
-        })
-    }
-
-    /// Commit a prepared diff only after its remote blobs have been fetched
-    /// and validated. A materializer advance invalidates the preparation.
-    pub fn apply_prepared_shard_phase_sync(
-        &self,
-        prepared: PreparedShardPhaseSync,
-        blob_shard: Option<&ShardKey>,
-        blobs: &[(Vec<u8>, Vec<u8>)],
-    ) -> Result<([u8; 32], u64)> {
-        let _forest_guard = self.forest_write_lock.lock().unwrap();
-        let _guard = self.commit_lock.lock().unwrap();
-        let forest = self.forest.read().unwrap();
-        let current = self.resolve_phase_version_with(
-            &forest,
-            &prepared.shard_id,
-            prepared.phase_idx,
-        );
-        if current != prepared.target_version {
-            return Err(QuilError::Internal(format!(
-                "sync phase {} advanced {:?}→{:?} during blob fetch — retry",
-                prepared.phase_idx, prepared.target_version, current,
-            )));
-        }
-        let version = current.map(|v| v + 1).unwrap_or(0);
-        let (root, puts) = forest
-            .apply_synced_shard_phase(
-                &prepared.shard_id,
-                PHASES[prepared.phase_idx],
-                version,
-                prepared.leaves,
-            )
-            .map_err(|e| QuilError::Internal(format!("apply synced shard: {e}")))?;
-        let txn = self.store.new_transaction(false)?;
-        for (key, value) in puts {
-            txn.set(&key, &value)?;
-        }
-        if let Some((key, value)) = forest.head_version_put(
-            &prepared.shard_id,
-            PHASES[prepared.phase_idx],
-            version,
-        ) {
-            txn.set(&key, &value)?;
-        }
-        if let Some(shard) = blob_shard {
-            let (set, phase) = PHASE_STR[prepared.phase_idx];
-            for (id, blob) in blobs {
-                self.store.save_vertex_underlying_versioned(
-                    txn.as_ref(),
-                    set,
-                    phase,
-                    shard,
-                    id,
-                    blob,
-                    version,
-                )?;
-            }
-        }
-        txn.commit()?;
-        self.phase_versions
-            .write()
-            .unwrap()
-            .insert((prepared.shard_id, prepared.phase_idx), version);
-        Ok((root, version))
-    }
-
     pub fn sync_shard_phase_from<S: quil_forest::TreeReader>(
         &self,
         source: &S,
@@ -2272,130 +2928,16 @@ impl HypergraphCrdt {
         Ok((root, ver, changed))
     }
 
-    /// Prepare an authenticated unified-app subtree diff without mutating local
-    /// state. Call [`apply_prepared_shard_subtree_phase_sync`](Self::apply_prepared_shard_subtree_phase_sync)
-    /// only after every changed leaf's blob has been fetched and verified.
-    pub fn prepare_shard_subtree_phase_sync<S: quil_forest::TreeReader>(
-        &self,
-        source: &S,
-        source_version: u64,
-        app: &[u8],
-        phase_idx: usize,
-        bit_path: &[bool],
-        pinned_app_root: Option<[u8; 32]>,
-    ) -> Result<PreparedShardSubtreeSync> {
-        if phase_idx >= 4 {
-            return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
-        }
-        let (target_version, leaves, source_subtree_root) = {
-            let forest = self.forest.read().unwrap();
-            let target_version = self.resolve_phase_version_with(&forest, app, phase_idx);
-            let target = forest.shard_phase_reader(app, PHASES[phase_idx]);
-            let (leaves, source_subtree_root) = quil_forest::diff_leaves_under_prefix(
-                source,
-                source_version,
-                &target,
-                target_version.unwrap_or(0),
-                bit_path,
-                pinned_app_root,
-            )
-            .map_err(|e| QuilError::Internal(format!("diff_leaves_under_prefix: {e}")))?;
-            (target_version, leaves, source_subtree_root)
-        };
-        Ok(PreparedShardSubtreeSync {
-            app: app.to_vec(),
-            phase_idx,
-            target_version,
-            bit_path: bit_path.to_vec(),
-            pinned_app_root,
-            source_subtree_root,
-            leaves,
-        })
-    }
-
-    /// Commit a prepared unified-app subtree diff and its verified blobs in one
-    /// transaction. A materializer advance invalidates the preparation.
-    pub fn apply_prepared_shard_subtree_phase_sync(
-        &self,
-        prepared: PreparedShardSubtreeSync,
-        blob_shard: Option<&ShardKey>,
-        blobs: &[(Vec<u8>, Vec<u8>)],
-    ) -> Result<([u8; 32], u64)> {
-        let _forest_guard = self.forest_write_lock.lock().unwrap();
-        let _guard = self.commit_lock.lock().unwrap();
-        let forest = self.forest.read().unwrap();
-        let current = self.resolve_phase_version_with(&forest, &prepared.app, prepared.phase_idx);
-        if current != prepared.target_version {
-            return Err(QuilError::Internal(format!(
-                "sync subtree phase {} advanced {:?}→{:?} during blob fetch — retry",
-                prepared.phase_idx, prepared.target_version, current,
-            )));
-        }
-        if prepared.is_empty() {
-            let version = current.unwrap_or(0);
-            let local = forest
-                .app_subtree_root(&prepared.app, PHASES[prepared.phase_idx], version, &prepared.bit_path)
-                .map_err(|e| QuilError::Internal(format!("app_subtree_root: {e}")))?;
-            if prepared.pinned_app_root.is_some() && local != prepared.source_subtree_root {
-                return Err(QuilError::Internal(
-                    "local subtree root != authenticated source subtree root (no-op path)".into(),
-                ));
-            }
-            return Ok((local, version));
-        }
-        let version = current.map(|v| v + 1).unwrap_or(0);
-        let (_full_root, puts) = forest
-            .apply_synced_shard_phase(
-                &prepared.app,
-                PHASES[prepared.phase_idx],
-                version,
-                prepared.leaves,
-            )
-            .map_err(|e| QuilError::Internal(format!("apply synced subtree: {e}")))?;
-        let txn = self.store.new_transaction(false)?;
-        for (key, value) in puts {
-            txn.set(&key, &value)?;
-        }
-        if let Some((key, value)) = forest.head_version_put(
-            &prepared.app,
-            PHASES[prepared.phase_idx],
-            version,
-        ) {
-            txn.set(&key, &value)?;
-        }
-        if let Some(shard) = blob_shard {
-            let (set, phase) = PHASE_STR[prepared.phase_idx];
-            for (id, blob) in blobs {
-                self.store.save_vertex_underlying_versioned(
-                    txn.as_ref(),
-                    set,
-                    phase,
-                    shard,
-                    id,
-                    blob,
-                    version,
-                )?;
-            }
-        }
-        txn.commit()?;
-        self.phase_versions
-            .write()
-            .unwrap()
-            .insert((prepared.app.clone(), prepared.phase_idx), version);
-        let local = forest
-            .app_subtree_root(&prepared.app, PHASES[prepared.phase_idx], version, &prepared.bit_path)
-            .map_err(|e| QuilError::Internal(format!("app_subtree_root: {e}")))?;
-        if prepared.pinned_app_root.is_some() && local != prepared.source_subtree_root {
-            return Err(QuilError::Internal(
-                "post-sync local subtree root != authenticated source subtree root".into(),
-            ));
-        }
-        Ok((local, version))
-    }
-
-    /// UNIFIED shard-prover subtree-range sync. This compatibility helper
-    /// applies immediately; network callers should prepare, fetch blobs, then
-    /// call [`apply_prepared_shard_subtree_phase_sync`](Self::apply_prepared_shard_subtree_phase_sync).
+    /// UNIFIED shard-prover subtree-range sync: pull ONLY the leaves under
+    /// `bit_path` (this prover's shard prefix) from `source`'s app tree and apply
+    /// them to the LOCAL app tree (keyed by `app`), returning the local SUBTREE
+    /// root — the shard commitment. `anchor` names either the whole app root or
+    /// the covered subtree root; the source is authenticated against it
+    /// (so a peer can't serve a fake subtree), and the applied local subtree root
+    /// is verified to equal the authenticated source subtree root. A shard prover
+    /// thus stores only its subtree yet holds a commitment that composes to the
+    /// global app root — never pulling the whole app. Empty `bit_path` ==
+    /// [`sync_shard_phase_from`] over the whole app tree.
     pub fn sync_shard_subtree_phase_from<S: quil_forest::TreeReader>(
         &self,
         source: &S,
@@ -2403,20 +2945,71 @@ impl HypergraphCrdt {
         app: &[u8],
         phase_idx: usize,
         bit_path: &[bool],
-        pinned_app_root: Option<[u8; 32]>,
+        anchor: Option<quil_forest::SubtreeSyncAnchor>,
     ) -> Result<([u8; 32], u64, Vec<([u8; 32], Vec<u8>)>)> {
-        let prepared = self.prepare_shard_subtree_phase_sync(
-            source,
-            source_version,
-            app,
-            phase_idx,
-            bit_path,
-            pinned_app_root,
-        )?;
-        let changed = prepared.changed_leaves();
-        let (root, version) =
-            self.apply_prepared_shard_subtree_phase_sync(prepared, None, &[])?;
-        Ok((root, version, changed))
+        if phase_idx >= 4 {
+            return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
+        }
+        // Lock-free subtree diff + authenticated source subtree root.
+        let (v_t_opt, leaves, src_subtree_root) = {
+            let forest = self.forest.read().unwrap();
+            let v_t_opt = self.resolve_phase_version_with(&forest, app, phase_idx);
+            let target = forest.shard_phase_reader(app, PHASES[phase_idx]);
+            let (leaves, src_root) = quil_forest::diff_leaves_under_prefix(
+                source,
+                source_version,
+                &target,
+                v_t_opt.unwrap_or(0),
+                bit_path,
+                anchor,
+            )
+            .map_err(|e| QuilError::Internal(format!("diff_leaves_under_prefix: {e}")))?;
+            (v_t_opt, leaves, src_root)
+        };
+        let changed: Vec<([u8; 32], Vec<u8>)> =
+            leaves.iter().map(|(k, v)| (k.0, v.clone())).collect();
+
+        // Nothing to pull — already synced. Return the current local subtree root
+        // without bumping the tree version.
+        if changed.is_empty() {
+            let forest = self.forest.read().unwrap();
+            let ver = v_t_opt.unwrap_or(0);
+            let local = forest
+                .app_subtree_root(app, PHASES[phase_idx], ver, bit_path)
+                .map_err(|e| QuilError::Internal(format!("app_subtree_root: {e}")))?;
+            if anchor.is_some() && local != src_subtree_root {
+                return Err(QuilError::Internal(
+                    "local subtree root != authenticated source subtree root (no-op path)".into(),
+                ));
+            }
+            return Ok((local, ver, changed));
+        }
+
+        let _forest_guard = self.forest_write_lock.lock().unwrap();
+        let _guard = self.commit_lock.lock().unwrap();
+        let forest = self.forest.read().unwrap();
+        let cur_opt = self.resolve_phase_version_with(&forest, app, phase_idx);
+        if cur_opt != v_t_opt {
+            return Err(QuilError::Internal(format!(
+                "sync subtree phase {phase_idx} advanced {v_t_opt:?}→{cur_opt:?} during diff — retry"
+            )));
+        }
+        let ver = cur_opt.map(|v| v + 1).unwrap_or(0);
+        let (local, puts) = forest
+            .apply_synced_subtree_phase(app, PHASES[phase_idx], ver, leaves, bit_path, src_subtree_root)
+            .map_err(|e| QuilError::Internal(format!("apply synced subtree: {e}")))?;
+        let txn = self.store.new_transaction(false)?;
+        for (k, v) in puts {
+            txn.set(&k, &v)?;
+        }
+        if let Some((hk, hv)) = forest.head_version_put(app, PHASES[phase_idx], ver) {
+            txn.set(&hk, &hv)?;
+        }
+        txn.commit()?;
+        self.phase_versions.write().unwrap().insert((app.to_vec(), phase_idx), ver);
+
+        // The staged tree was checked against the source BEFORE the write.
+        Ok((local, ver, changed))
     }
 
     /// The canonical bit-path of one shard `prefix` within an app's COMPLETE
@@ -2432,10 +3025,23 @@ impl HypergraphCrdt {
             .iter()
             .position(|p| p == prefix)
             .map(|i| bit_paths[i].clone())
-            .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6))
+            .unwrap_or_else(|| quil_forest::shard_bit_path_from_prefix(prefix)
+                .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6)))
     }
 
-    /// Leaf count under a `bit_path` in the unified app tree — the §6.1
+    /// Decode the wire filter before interpreting its prefix. A deep filter's
+    /// length and packed path bytes are not legacy six-bit shard indices.
+    pub fn canonical_bits_for_filter(&self, filter: &[u8]) -> Option<Vec<bool>> {
+        let (app, bits) = quil_forest::decode_shard_filter_or_root(filter, 32)?;
+        if filter.len() == 33 {
+            let app: [u8; 32] = app.try_into().ok()?;
+            Some(self.canonical_bits_for_prefix(&app, &[filter[32] as u32]))
+        } else {
+            Some(bits)
+        }
+    }
+
+    /// Leaf count under a `bit_path` in the unified app tree — the
     /// empty-split guard's data-bearing test (see
     /// [`quil_forest::Forest::app_subtree_leaf_count`]). Returns 0 when NOT in
     /// unified mode (the app tree isn't the source of truth then), so callers
@@ -2466,14 +3072,14 @@ impl HypergraphCrdt {
             .unwrap_or(0)
     }
 
-    /// DEEP-BIFURCATION split PROPOSAL (Phase 3): compute a shard's MEANINGFUL
+    /// DEEP-BIFURCATION split PROPOSAL: compute a shard's MEANINGFUL
     /// split children as bit-path shard filters. Runs
     /// [`Forest::first_split_bifurcation`] on the app tree from the shard's
     /// `shard_bits` — descending past any uniform run to the shallowest bit where
     /// the data divides — and encodes each child bit-path via
     /// [`quil_forest::encode_shard_bit_path`]. `None` when the shard is
     /// unsplittable (<2 leaves, or no branch within `max_extra_bits`) — the
-    /// caller then proposes nothing (the §6.1 empty-split guard, done right: not
+    /// caller then proposes nothing (the empty-split guard: not
     /// a one-sided cut but a real bifurcation). Only meaningful under unified (the
     /// app tree is the data source); returns `None` otherwise.
     pub fn propose_split_children(
@@ -2604,14 +3210,14 @@ impl HypergraphCrdt {
         shard: &ShardKey,
         phase_idx: usize,
         id: &[u8],
-        version: u64,
+        version: Option<u64>,
     ) -> Option<Vec<u8>> {
         if phase_idx >= 4 {
             return None;
         }
-        if version == 0 {
+        let Some(version) = version else {
             return self.read_blob(shard, phase_idx, id).filter(|b| !b.is_empty());
-        }
+        };
         let (set, phase) = PHASE_STR[phase_idx];
         self.store
             .load_vertex_underlying_at(set, phase, shard, id, version)
@@ -2643,7 +3249,70 @@ impl HypergraphCrdt {
             return None;
         }
         let (set, phase) = PHASE_STR[phase_idx];
-        self.store.get_root_version(set, phase, shard_id, &root).ok().flatten()
+        if let Some(indexed) = self.store.get_root_version(set, phase, shard_id, &root).ok().flatten() {
+            return Some(indexed);
+        }
+        if !self.unified_tree() || shard_id.len() <= 32 {
+            return None;
+        }
+        // Unified shard headers name a SUBTREE of the app tree. The app's
+        // root->version index cannot resolve that commitment. Search retained
+        // versions of the app, newest first, comparing only the covered subtree.
+        // This also works for databases written before subtree sync was wired.
+        // Bound unknown-root requests; no unauthenticated tree is returned when
+        // a peer is behind or the required history has been pruned.
+        const SUBTREE_ROOT_LOOKBACK: u64 = 720;
+        let bits = self.canonical_bits_for_filter(shard_id)?;
+        let app = &shard_id[..32];
+        let forest = self.forest.read().ok()?;
+        let head = self.resolve_phase_version_with(&forest, app, phase_idx)?;
+        for version in (head.saturating_sub(SUBTREE_ROOT_LOOKBACK - 1)..=head).rev() {
+            if forest.app_subtree_root(app, PHASES[phase_idx], version, &bits).ok() == Some(root) {
+                // Version is exact; a subtree lookup has no recorded global
+                // frame. Its sync caller uses the certified shard header's
+                // frame, never this zero, to advance its materialized cursor.
+                return Some((version, 0));
+            }
+        }
+        None
+    }
+
+    /// Whether this node retains the GLOBAL prover-shard (vertex-adds) tree at
+    /// `root` — committed here or indexed after a verified sync — so a proof
+    /// against it can be served.
+    pub fn global_root_available(&self, root: &[u8; 32]) -> Result<bool> {
+        Ok(self.store.get_root_version("vertex", "adds", &[0xff; 32], root)?.is_some())
+    }
+
+    /// Prove one GLOBAL vertex against a retained root, using the blob from
+    /// that root's exact version. Global headers bind parent state, so live
+    /// blobs and live proofs cannot serve reward claims once the head advances.
+    /// Serializes with commit/pruning so the blob and JMT path survive the read.
+    pub fn global_vertex_membership_at_root(
+        &self,
+        root: &[u8; 32],
+        data_address: &[u8; 32],
+    ) -> Result<Option<quil_forest::VertexMembershipProof>> {
+        let _guard = self.commit_lock.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("historical proof commit lock poisoned".into())
+        })?;
+        let app = [0xff; 32];
+        let (version, _) = self.store.get_root_version("vertex", "adds", &app, root)?
+            .ok_or_else(|| QuilError::ExecutionUnavailable("historical global reward root unavailable".into()))?;
+        let shard = ShardKey { l1: [0; 3], l2: app };
+        let mut vertex = app.to_vec();
+        vertex.extend_from_slice(data_address);
+        let blob = match self.store.load_vertex_underlying_at("vertex", "adds", &shard, &vertex, version)? {
+            Some(blob) => blob,
+            None => return Ok(None),
+        };
+        let forest = self.forest.read().unwrap();
+        let proof = forest.build_vertex_membership_proof(&app, PHASES[0], version, &vertex, &blob)
+            .map_err(|e| QuilError::ExecutionUnavailable(format!("historical global reward proof: {e}")))?;
+        // Also detects alternate backends that only implement latest-blob reads.
+        quil_forest::verify_vertex_membership(root, &proof, &[])
+            .map_err(|_| QuilError::ExecutionUnavailable("historical global reward blob/root mismatch".into()))?;
+        Ok(Some(proof))
     }
 
     /// Index the current head root of (`shard_id`, `phase_idx`) into the
@@ -2670,6 +3339,8 @@ impl HypergraphCrdt {
         expect_root: &[u8],
         frame: u64,
     ) -> Result<()> {
+        let _guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
+            "sync root index commit lock poisoned".into()))?;
         if phase_idx >= 4 || expect_root.len() != 32 || frame == 0 {
             return Ok(());
         }
@@ -2720,19 +3391,21 @@ impl HypergraphCrdt {
     /// `[0xff; 32]`. Serialized against commits via the forest write + commit
     /// locks. Idempotent.
     pub fn reset_shard_forest_trees(&self, shard_l2: &[u8]) -> Result<()> {
-        let _forest_guard = self.forest_write_lock.lock().unwrap();
-        let _commit_guard = self.commit_lock.lock().unwrap();
-        {
-            let forest = self.forest.read().unwrap();
+        let guard = self.lock_forest_writes();
+        self.reset_shard_forest_trees_with_guard(&guard, shard_l2)
+    }
+
+    pub fn reset_shard_forest_trees_with_guard(&self, guard: &ForestWriteGuard<'_>, shard_l2: &[u8]) -> Result<()> {
+        self.maintain_forest(guard, |forest| {
             forest
                 .reset_shard_phase_trees(shard_l2)
-                .map_err(|e| QuilError::Internal(format!("reset_shard_forest_trees: {e}")))?;
-        }
-        self.phase_versions
-            .write()
-            .unwrap()
-            .retain(|(sid, _), _| sid.as_slice() != shard_l2);
-        Ok(())
+                .map_err(|e| QuilError::ExecutionUnavailable(format!("reset_shard_forest_trees: {e}")))?;
+            // The index maps roots to versions of the tree just wiped. Left behind
+            // it resolves old roots to the rebuilt tree's reused versions, and the
+            // retention pruner reads the restart as a history it must not touch.
+            self.store.clear_root_versions(shard_l2)?;
+            Ok(())
+        })
     }
 
     /// Versioned-snapshot pruner: cull blob versions + forest nodes older than
@@ -2759,6 +3432,71 @@ impl HypergraphCrdt {
         Ok((watermarks.len(), nodes))
     }
 
+    /// Retention pruner: each tree keeps the last `retain_frames` of its own
+    /// frames (see `quil_store`'s retention plan), at most `max_blob_deletes`
+    /// blob versions go per call, and a forest watermark above the tree's head
+    /// (a store whose versions ran backwards) is refused. Returns
+    /// `(trees pruned, forest nodes reclaimed)`.
+    pub fn prune_retaining(&self, retain_frames: u64, max_blob_deletes: usize) -> Result<(usize, usize)> {
+        self.prune_retaining_with(retain_frames, max_blob_deletes, None)
+            .map(|pass| (pass.trees, pass.nodes))
+    }
+
+    /// [`Self::prune_retaining`], also deleting superseded JMT leaf values
+    /// below each pruned tree's watermark, at most `max_value_deletes` per call
+    /// (`None`: values are kept).
+    pub fn prune_retaining_with(
+        &self,
+        retain_frames: u64,
+        max_blob_deletes: usize,
+        max_value_deletes: Option<usize>,
+    ) -> Result<crate::retention::RetentionPass> {
+        let _guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
+            "retention prune commit lock poisoned".into()))?;
+        let forest = self.forest.read().unwrap();
+        let watermarks = self.store.prune_versioned_retaining(retain_frames, max_blob_deletes,
+            &|shard_id, phase_idx| (phase_idx < 4).then(|| self.resolve_phase_version_with(&forest, shard_id, phase_idx)).flatten())?;
+        let (mut trees, mut nodes, mut values) = (0usize, 0usize, 0usize);
+        let mut value_budget = max_value_deletes.unwrap_or(0);
+        for (shard_id, phase_idx, min_ver) in &watermarks {
+            if *phase_idx >= 4 {
+                continue;
+            }
+            match self.resolve_phase_version_checked(&forest, shard_id, *phase_idx) {
+                Ok(Some(head)) if head >= *min_ver => {}
+                head => {
+                    tracing::warn!(shard = %hex::encode(shard_id), phase = *phase_idx, min_ver, ?head,
+                        "retention watermark is above the tree head; not pruning its nodes");
+                    continue;
+                }
+            }
+            match forest.prune_shard_phase(shard_id, PHASES[*phase_idx], *min_ver) {
+                Ok(n) => {
+                    trees += 1;
+                    nodes += n;
+                }
+                Err(e) => tracing::warn!(
+                    shard = %hex::encode(shard_id),
+                    phase = *phase_idx,
+                    error = %e,
+                    "forest prune of a shard/phase tree failed (will retry next cycle)",
+                ),
+            }
+            if max_value_deletes.is_some() && value_budget > 0 {
+                match forest.prune_shard_phase_values(shard_id, PHASES[*phase_idx], *min_ver, &mut value_budget) {
+                    Ok(n) => values += n,
+                    Err(e) => tracing::warn!(
+                        shard = %hex::encode(shard_id),
+                        phase = *phase_idx,
+                        error = %e,
+                        "forest value prune of a shard/phase tree failed (will retry next cycle)",
+                    ),
+                }
+            }
+        }
+        Ok(crate::retention::RetentionPass { trees, nodes, values })
+    }
+
     /// Forest-sync CLIENT: store a blob pulled during sync (the readable data),
     /// keyed under the app ShardKey — so `get_vertex_data` / the prover registry
     /// (which read the blob keyspace, not the forest) see the synced state.
@@ -2772,6 +3510,8 @@ impl HypergraphCrdt {
         blob: &[u8],
         version: u64,
     ) -> Result<()> {
+        let _guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
+            "sync blob commit lock poisoned".into()))?;
         if phase_idx >= 4 {
             return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
         }
@@ -2797,6 +3537,8 @@ impl HypergraphCrdt {
     /// later syncs FROM us can recover the same mapping. Without it a synced node
     /// reads fine but cannot re-serve preimages downstream.
     pub fn save_synced_preimage(&self, shard_id: &[u8], phase_idx: usize, raw_key: &[u8]) -> Result<()> {
+        let _guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
+            "sync preimage commit lock poisoned".into()))?;
         if phase_idx >= 4 {
             return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
         }
@@ -2827,6 +3569,8 @@ impl HypergraphCrdt {
     }
 
     pub fn invalidate_domain_shard_commit(&self, frame_number: u64, app_address: &[u8]) -> Result<()> {
+        let _guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
+            "shard commit invalidation lock poisoned".into()))?;
         self.store.delete_shard_commits(frame_number, app_address)
     }
 
@@ -2860,12 +3604,17 @@ impl HypergraphCrdt {
     }
 
     pub fn get_vertex_data(&self, location: &Location) -> Option<Vec<u8>> {
+        self.get_vertex_data_checked(location).ok().flatten()
+    }
+
+    /// Execution must distinguish absent state from an unavailable database.
+    pub fn get_vertex_data_checked(&self, location: &Location) -> Result<Option<Vec<u8>>> {
         let shard = shard_key_for_location(location);
         let id = location.to_id();
-        if self.has_entry(&shard, 1, &id) {
-            return None; // removed
+        if self.read_blob_checked(&shard, 1, &id)?.is_some() {
+            return Ok(None); // removed
         }
-        self.read_blob(&shard, 0, &id).filter(|b| !b.is_empty())
+        Ok(self.read_blob_checked(&shard, 0, &id)?.filter(|b| !b.is_empty()))
     }
 
     pub fn get_vertex_underlying_tree_bytes(&self, location: &Location) -> Option<Vec<u8>> {
@@ -2877,12 +3626,16 @@ impl HypergraphCrdt {
     }
 
     pub fn get_hyperedge_data(&self, location: &Location) -> Option<Vec<u8>> {
+        self.get_hyperedge_data_checked(location).ok().flatten()
+    }
+
+    pub fn get_hyperedge_data_checked(&self, location: &Location) -> Result<Option<Vec<u8>>> {
         let shard = shard_key_for_location(location);
         let id = location.to_id();
-        if self.has_entry(&shard, 3, &id) {
-            return None;
+        if self.read_blob_checked(&shard, 3, &id)?.is_some() {
+            return Ok(None);
         }
-        self.read_blob(&shard, 2, &id).filter(|b| !b.is_empty())
+        Ok(self.read_blob_checked(&shard, 2, &id)?.filter(|b| !b.is_empty()))
     }
 
     pub fn get_hyperedge_extrinsic_ids(&self, location: &Location) -> Vec<[u8; 64]> {
@@ -2987,6 +3740,14 @@ impl HypergraphCrdt {
 
     // ---- snapshots (unchanged, width-agnostic) --------------------------
 
+    pub fn prepare_snapshot_publication(
+        &self,
+        root: Vec<u8>,
+        frame_number: u64,
+    ) -> Result<crate::snapshot::PreparedSnapshotPublication<'_>> {
+        self.snapshot_mgr.prepare_publication(root, frame_number)
+    }
+
     pub fn publish_snapshot(&self, root: Vec<u8>, frame_number: u64) {
         self.snapshot_mgr.publish(root, frame_number);
     }
@@ -3017,8 +3778,142 @@ impl HypergraphCrdt {
         self.snapshot_mgr.acquire(expected_root)
     }
 
+    /// Capture committed state and metadata together, excluding execution's
+    /// staged blobs and records. The caller owns the handle and must release it
+    /// promptly; this does not add a retained snapshot to the serving cache.
+    pub fn capture_committed_snapshot(&self) -> Result<Arc<dyn quil_types::store::SnapshotReadable>> {
+        let _guard = self.commit_lock.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("snapshot commit lock poisoned".into())
+        })?;
+        self.store.capture_tree_snapshot()?.ok_or_else(|| {
+            QuilError::ExecutionUnavailable("committed snapshots unsupported by this store".into())
+        })
+    }
+
+    /// Capture a full-filter checkpoint without interpreting read failures as
+    /// empty state. The forest must use the same persistent database as the
+    /// hypergraph store. Persisted phase heads are authoritative here; pending
+    /// deltas, blobs and metadata never contribute to the returned checkpoint.
+    pub fn capture_committed_shard(&self, filter: &[u8]) -> Result<CommittedShardSnapshot> {
+        let _guard = self.commit_lock.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("checkpoint commit lock poisoned".into())
+        })?;
+        self.capture_committed_shard_locked(filter)
+    }
+
+    /// Commit recovered metadata only if its input checkpoint still holds.
+    /// Application state, its cursor, and pending mutations are untouched.
+    /// The recovery progress marker belongs in `records`, so it shares the
+    /// same atomic batch as the records it certifies.
+    pub fn checkpoint_shard_records(
+        &self,
+        filter: &[u8],
+        expected_roots: &[[u8; 32]; 4],
+        cursor_key: &[u8],
+        expected_cursor: u64,
+        records: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<()> {
+        let _guard = self.commit_lock.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("history recovery commit lock poisoned".into())
+        })?;
+        let current = self.capture_committed_shard_locked(filter)?;
+        if current.roots != *expected_roots
+            || current.records.read_record(cursor_key)?.as_deref() != Some(expected_cursor.to_be_bytes().as_slice())
+        {
+            return Err(QuilError::ExecutionUnavailable("history recovery checkpoint changed".into()));
+        }
+        let txn = self.store.new_transaction(false)?;
+        for (key, value) in records {
+            if let Err(error) = txn.set(key, value) {
+                let _ = txn.abort();
+                return Err(error);
+            }
+        }
+        txn.commit()
+    }
+
+    fn capture_committed_shard_locked(&self, filter: &[u8]) -> Result<CommittedShardSnapshot> {
+        let (app, bits) = quil_forest::decode_shard_filter_or_root(filter, 32)
+            .filter(|(_, bits)| bits.len() <= 256)
+            .ok_or_else(|| QuilError::InvalidArgument("invalid checkpoint shard filter".into()))?;
+        if filter.len() == 33 && filter[32] >= 64 {
+            return Err(QuilError::InvalidArgument("aliased legacy checkpoint filter".into()));
+        }
+        let app: [u8; 32] = app.try_into().map_err(|_| {
+            QuilError::InvalidArgument("invalid checkpoint application address".into())
+        })?;
+        let forest = self.forest.read().map_err(|_| {
+            QuilError::ExecutionUnavailable("checkpoint forest lock poisoned".into())
+        })?;
+        if !forest.supports_checkpoint_reads() {
+            return Err(QuilError::ExecutionUnavailable("checkpoint requires versioned forest storage".into()));
+        }
+        let unified = self.unified_tree();
+        let shard_id = if unified {
+            app.to_vec()
+        } else {
+            let prefixes = self.app_prefixes(&app);
+            let paths = self.shard_bit_paths(&app);
+            let matches: Vec<_> = paths.iter().enumerate().filter(|(_, p)| **p == bits).collect();
+            if paths.len() != prefixes.len() || matches.len() != 1 {
+                return Err(QuilError::ExecutionUnavailable("checkpoint shard layout is unknown or ambiguous".into()));
+            }
+            Forest::addr_path_shard_id(&app, &prefixes[matches[0].0])
+        };
+        let records = self.store.capture_tree_snapshot()?.ok_or_else(|| {
+            QuilError::ExecutionUnavailable("committed snapshots unsupported by this store".into())
+        })?;
+        let read_error = |error| QuilError::ExecutionUnavailable(format!("checkpoint forest read: {error}"));
+        let mut roots = [[0; 32]; 4];
+        for (i, phase) in PHASES.iter().copied().enumerate() {
+            let head = forest.read_head_version(&shard_id, phase).map_err(read_error)?;
+            // The migration importer may have a real version-zero tree without
+            // a marker. Never substitute a different app's global forest version.
+            let version = head.unwrap_or(0);
+            let root = forest.shard_phase_root(&shard_id, phase, version).map_err(read_error)?;
+            if root.is_none() && head.is_some() {
+                return Err(QuilError::ExecutionUnavailable("checkpoint phase head has no root".into()));
+            }
+            roots[i] = if unified && !bits.is_empty() {
+                forest.app_subtree_root(&app, phase, version, &bits).map_err(read_error)?
+            } else {
+                root.unwrap_or([0; 32])
+            };
+        }
+        Ok(CommittedShardSnapshot { roots, records })
+    }
+
+    pub fn acquire_scan_snapshot(&self, id: Option<&[u8; 32]>) -> Option<GenerationHandle> {
+        self.snapshot_mgr.acquire_scan(id)
+    }
+
+    /// Start a new wallet scan at the current committed store, independently of
+    /// historical root publication. A boot-time prover snapshot may remain the
+    /// latest published generation while application coins keep changing.
+    /// Continuations still use their exact retained identity, never a new view.
+    pub fn acquire_or_capture_scan_snapshot(&self, id: Option<&[u8; 32]>) -> Result<Option<GenerationHandle>> {
+        if id.is_some() {
+            return Ok(self.snapshot_mgr.acquire_scan(id));
+        }
+        let _guard = self.commit_lock.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("scan snapshot commit lock poisoned".into())
+        })?;
+        Ok(match self.store.capture_tree_snapshot()? {
+            Some(snapshot) => self.snapshot_mgr.publish_scan_only(
+                self.forest_version.load(Ordering::SeqCst), snapshot,
+            ),
+            None => None,
+        })
+    }
+
     pub fn known_snapshot_roots(&self) -> Vec<Vec<u8>> {
         self.snapshot_mgr.known_roots()
+    }
+
+    /// Keep store snapshots only on the newest `limit` published generations
+    /// (see [`SnapshotManager::set_pinned_limit`]).
+    pub fn set_snapshot_pinned_limit(&self, limit: usize) {
+        self.snapshot_mgr.set_pinned_limit(limit);
     }
 
     pub fn close_snapshots(&self) {
@@ -3138,6 +4033,26 @@ mod size_index_tests {
 
     fn crdt() -> HypergraphCrdt {
         HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver))
+    }
+
+    /// The world size is recorded per materialized frame with the prover root
+    /// (even when the root is degenerate) and pruned with the same bound.
+    #[test]
+    fn world_size_recorded_with_each_frame() {
+        let hg = crdt();
+        assert_eq!(hg.world_size_at(7), None);
+        hg.record_prover_root(7, vec![1; 32]);
+        assert_eq!(hg.world_size_at(7), Some(0));
+        hg.add_vertex(&at([0x42; 32], 0, 1, 2), &vec![9u8; 512]).unwrap();
+        hg.record_prover_root(8, Vec::new());
+        let grown = hg.world_size_at(8).unwrap();
+        assert!(grown > 0, "recorded size reflects state at that frame");
+        assert_eq!(hg.world_size_at(7), Some(0), "earlier frames keep their size");
+        for frame in 9..300 {
+            hg.record_prover_root(frame, vec![1; 32]);
+        }
+        assert_eq!(hg.world_size_at(7), None);
+        assert!(hg.world_size_at(299).is_some());
     }
 
     /// A coin-shaped vertex whose data-address top bits route it to a shard: byte0

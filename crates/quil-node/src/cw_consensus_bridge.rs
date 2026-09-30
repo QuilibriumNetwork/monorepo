@@ -1,8 +1,6 @@
-//! Node-side wiring for the commonware-simplex global consensus (P2c),
-//! **additive + gated**: it runs only when `config.engine.consensus_committee`
-//! is non-empty and does NOT replace the existing quil-consensus path (removing
-//! that + this gate is the localnet-validated cutover step). It bridges the
-//! simplex engine's channels to the existing `:8340` transport:
+//! Node-side wiring for the commonware-simplex global consensus. It runs only
+//! when the consensus committee is non-empty, and bridges the simplex engine's
+//! channels to the existing `:8340` transport:
 //!
 //! - outbound: [`Cw8340Transport`] (`GlobalConsensusTransport`) tags each
 //! simplex message with its channel and fans it out via the existing
@@ -11,11 +9,9 @@
 //! bitmask) into the engine's matching inbound channel, resolving the sender
 //! to its committee Falcon key.
 //!
-//! These types compile and are ready to invoke; the two remaining wires — the
-//! `start_cw_global_consensus` call at the activation site and a `route(...)`
-//! arm in the receive loop — flip the path on and are applied in the
-//! localnet-validated cutover (they modify the live receive loop, so they are
-//! not enabled here).
+//! [`start_cw_global_consensus`] is called at the GLOBAL activation site, and
+//! the receive loop hands inbound consensus messages to
+//! [`CwInboundRouter::route`].
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -115,6 +111,10 @@ impl CwInboundRouter {
 /// Dependencies needed to start the simplex-backed global consensus. Mirrors the
 /// subset of `ConsensusActivationParams` the simplex path needs.
 pub struct CwGlobalDeps {
+    pub selected_parent_execution: Option<Arc<quil_engine::frame_materializer::GlobalParentExecutor>>,
+    /// Atomic finalization shared with the materializer worker. `None` keeps
+    /// the legacy order (canonical clock write, then materialization).
+    pub finalization_pipeline: Option<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>,
     pub committee_hex: Vec<String>,
     /// This node's `q-consensus-key` bytes.
     pub my_signing_key: Vec<u8>,
@@ -160,8 +160,12 @@ pub struct CwGlobalDeps {
 /// the outbound drain there).
 pub fn start_cw_global_consensus(deps: CwGlobalDeps) -> Option<CwInboundRouter> {
     if deps.committee_hex.is_empty() {
-        return None; // simplex cutover not enabled
+        return None; // simplex not enabled
     }
+    let Some(selected_execution) = deps.selected_parent_execution else {
+        tracing::error!("GLOBAL consensus requires a selected-parent execution owner");
+        return None;
+    };
     let committee_pubkeys: Vec<Vec<u8>> = deps
         .committee_hex
         .iter()
@@ -192,7 +196,9 @@ pub fn start_cw_global_consensus(deps: CwGlobalDeps) -> Option<CwInboundRouter> 
         deps.global_frame_publisher,
         deps.local_prover_address,
         deps.on_prover_fork,
-    );
+        selected_execution,
+        deps.finalization_pipeline,
+    ).inspect_err(|error| tracing::error!(%error, "GLOBAL consensus recovery refused activation")).ok()?;
 
     tracing::info!("commonware-simplex global consensus started");
     // Our own committee key — the committee build above already validated

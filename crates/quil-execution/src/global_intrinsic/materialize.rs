@@ -62,7 +62,6 @@ pub const UNIFIED_RESET_AMNESTY_FRAME: u64 = 699_500;
 /// Frame at which the state-commitment scheme switches to the UNIFIED APP TREE
 /// (one L3 JMT per app, shards = in-place subtrees; app commitment = the JMT
 /// root instead of the legacy `app_root_from_shard_paths` `hash_pair` rollup).
-/// See `crates/quil-execution/UNIFIED_APP_TREE_DESIGN.md`.
 ///
 /// This is a HARD-FORK flag day: the header `state_roots` / `prover_tree_commitment`
 /// change value, so EVERY node must switch at exactly this frame or fork. Nodes
@@ -72,11 +71,9 @@ pub const UNIFIED_RESET_AMNESTY_FRAME: u64 = 699_500;
 /// as [`KICK_AMNESTY_FRAME`]). Kept clear of the amnesty (695_000) so the two
 /// forks don't land on the same frame.
 ///
-/// Bumped 695_500 → 698_000 (2026-08-15): the original 695_500 was reached before
-/// the network was ready to switch; pushed out to give a fresh coordinated runway.
-/// Bumped 698_000 → 699_500 (2026-08-16): 698_000 was reached before the
-/// cutover-aware binary was deployed; pushed past head (698_179) for a fresh
-/// coordinated runway that also carries the split-shard reset (see
+/// Moved 695_500 → 698_000 → 699_500: each earlier frame was reached before the
+/// cutover-aware binary was deployed, so the switch was pushed past head for a
+/// fresh coordinated runway. 699_500 also carries the split-shard reset (see
 /// [`crate::global_intrinsic`] reset hook) and [`UNIFIED_RESET_AMNESTY_FRAME`].
 ///
 /// This is the MAINNET value; use [`unified_tree_cutover_frame`] (which honors
@@ -842,7 +839,7 @@ fn read_u64_field(
 /// rule: of {existing current, existing next, new}, keep the **two highest
 /// epochs**, stored epoch-sorted (orders 3..5 = lower "current", 7..9 = higher
 /// "next"). A same-epoch re-register overwrites that slot's value. Two fixed
-/// slots ⇒ no per-epoch address growth. See [[epoch-aligned-lifecycle-design]].
+/// slots ⇒ no per-epoch address growth.
 #[allow(clippy::too_many_arguments)]
 pub fn upsert_leaf_root_registration(
     existing: Option<&quil_tries::VectorCommitmentTree>,
@@ -1041,7 +1038,7 @@ pub fn build_prover_allocation_hyperedge_blob(
 /// `GLOBAL_INTRINSIC_ADDRESS || allocation_address` and its value bytes
 /// `0x00 || appAddr(32) || dataAddr(32) || commitment(64) || size(32)`.
 ///
-/// Factored out so the ProverJoin path and the Phase-F shard-reassignment
+/// Factored out so the ProverJoin path and the epoch-aligned shard-reassignment
 /// path (which re-keys an allocation from parent→child filter and must
 /// rebuild the prover's hyperedge atom for the new address) produce
 /// byte-identical atoms. Consumers (`get_hyperedge_extrinsic_ids`,
@@ -1102,6 +1099,69 @@ pub fn allocation_hyperedge_atom(
     atom_bytes.extend_from_slice(&size_bytes);
 
     Ok((atom_id, atom_bytes))
+}
+
+/// The allocation addresses a prover's hyperedge links, in key order. An
+/// empty blob links none. Every atom must name a global allocation.
+pub fn hyperedge_allocation_addresses(blob: &[u8]) -> Result<Vec<[u8; 32]>> {
+    if blob.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(root) = quil_tries::deserialize_go_tree(blob)? else {
+        return Ok(Vec::new());
+    };
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    tree.root = Some(root);
+    let mut out = Vec::new();
+    for (key, _) in tree.leaves() {
+        if key.len() != 64 || key[..32] != crate::global_schema::GLOBAL_INTRINSIC_ADDRESS[..] {
+            return Err(QuilError::InvalidArgument(
+                "prover hyperedge links a non-global allocation atom".into(),
+            ));
+        }
+        let mut address = [0u8; 32];
+        address.copy_from_slice(&key[32..]);
+        out.push(address);
+    }
+    Ok(out)
+}
+
+/// Add allocation atoms to an existing prover hyperedge, keeping every
+/// other atom byte-identical; an atom already present for an address is
+/// replaced. The trie is a pure function of its `(key, value)` set, so the
+/// result is identical on every node.
+///
+/// A join must extend the prover's hyperedge rather than replace it: the
+/// hyperedge is how a kick finds every allocation and how the prover's
+/// aggregate status is derived, so a replaced hyperedge hid the prover's
+/// earlier allocations from both.
+pub fn extend_prover_allocation_hyperedge_blob(
+    existing_blob: &[u8],
+    allocations: &[([u8; 32], &quil_tries::VectorCommitmentTree)],
+) -> Result<Vec<u8>> {
+    use num_bigint::BigInt;
+
+    let mut added = Vec::with_capacity(allocations.len());
+    for (alloc_addr, alloc_tree) in allocations {
+        added.push(allocation_hyperedge_atom(alloc_addr, alloc_tree)?);
+    }
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    if !existing_blob.is_empty() {
+        if let Some(root) = quil_tries::deserialize_go_tree(existing_blob)? {
+            let mut src = quil_tries::VectorCommitmentTree::new();
+            src.root = Some(root);
+            for (key, value) in src.leaves() {
+                if added.iter().any(|(id, _)| id.as_slice() == key.as_slice()) {
+                    continue;
+                }
+                tree.insert(&key, &value, &[], &BigInt::from(value.len() as u64))?;
+            }
+        }
+    }
+    for (atom_id, atom_bytes) in &added {
+        tree.insert(atom_id, atom_bytes, &[], &BigInt::from(atom_bytes.len() as u64))?;
+    }
+    Ok(crate::prover_registry::vertex_tree_to_blob(&tree))
 }
 
 // =====================================================================
@@ -1196,7 +1256,7 @@ pub struct ShardSplitOutput {
     /// `l2` is the first 32 bytes of the proposed shard address,
     /// `path` is the remaining bytes as `u32` nibble indices.
     pub new_shards: Vec<(Vec<u8>, Vec<u32>)>,
-    /// Deep-bifurcation (Option A): the parent shard to REMOVE — it is replaced by
+    /// Deep-bifurcation: the parent shard to REMOVE — it is replaced by
     /// the complete prefix-free partition (spine siblings + the 2 leaf children) in
     /// `new_shards`, so keeping it would make the set non-prefix-free. `None` in
     /// legacy (byte-suffix) mode, which leaves the parent in place.
@@ -1278,7 +1338,7 @@ pub fn materialize_shard_split(
         }
     }
 
-    // Deep-bifurcation (Option A): a split that DESCENDED past uniform bits leaves
+    // Deep-bifurcation: a split that DESCENDED past uniform bits leaves
     // the regions between the parent and the branch uncovered. Register the co-path
     // SPINE (the off-path siblings) as EMPTY latent shards so the set is COMPLETE
     // and PREFIX-FREE (exact-prefix routing, no fallback, no per-shard overlap),
@@ -1368,7 +1428,7 @@ pub fn migrate_app_shards_to_sentinel(
 pub struct ShardMergeOutput {
     /// (shard_l2, shard_path) pairs for each sub-shard to remove.
     pub removed_shards: Vec<(Vec<u8>, Vec<u32>)>,
-    /// Deep-bifurcation (Option A): the merged parent shard to ADD — merging the
+    /// Deep-bifurcation: the merged parent shard to ADD — merging the
     /// two sibling children `B‖0`/`B‖1` re-creates the branch `B` as a leaf sitting
     /// next to the retained spine. `None` in legacy (byte-suffix) mode, where the
     /// parent is a pre-existing catch-all row that was never removed on split.
@@ -1441,7 +1501,7 @@ pub fn materialize_shard_merge(
         }
     }
 
-    // Deep-bifurcation (Option A): re-create the merged parent (branch) as a leaf.
+    // Deep-bifurcation: re-create the merged parent (branch) as a leaf.
     // The prefix-free spine is preserved; only the sibling pair collapses into `B`.
     let added_parent = if bit_path_mode {
         let (app, parent_bits) = quil_forest::decode_shard_filter_or_root(parent_address, 32)
@@ -2025,7 +2085,7 @@ mod tests {
         assert!(materialize_prover_reject(&mut tree, 450).is_err());
     }
 
-    // ---- Gap coverage (audit 2026-06-28): epoch invariants -------------
+    // ---- Epoch invariants --------------------------------------------------
 
     /// Reject-leave restores Active but MUST NOT bump `Epoch` — the prover
     /// submitted no fresh leaf roots, so re-registering it for a new epoch
@@ -2475,7 +2535,7 @@ mod tests {
         assert!(materialize_shard_split(&parent, &[good_child, bad_child], false).is_err());
     }
 
-    /// Deep-bifurcation (bit_path_mode, Option A): the 2 bit-path child FILTERS
+    /// Deep-bifurcation (bit_path_mode): the 2 bit-path child FILTERS
     /// are registered as SENTINEL prefixes AND the co-path SPINE (off-path siblings
     /// from parent to branch) is registered as empty latent shards, so the set is
     /// complete + prefix-free; the parent is removed. A child that does NOT extend
@@ -2687,7 +2747,7 @@ mod tests {
         assert_eq!(output.removed_shards[0].0, app.to_vec());
         assert_eq!(output.removed_shards[0].1, bit_path_to_prefix(&[false, false, false, false]));
         assert_eq!(output.removed_shards[1].1, bit_path_to_prefix(&[false, false, false, true]));
-        // Option A: the merged parent (branch [0,0,0]) is re-registered as a leaf.
+        // The merged parent (branch [0,0,0]) is re-registered as a leaf.
         assert_eq!(
             output.added_parent,
             Some((app.to_vec(), bit_path_to_prefix(&[false, false, false])))

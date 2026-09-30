@@ -104,6 +104,21 @@ impl ArchiveClient {
         addr: &str,
         falcon_signing_key: &[u8],
     ) -> Result<Self, ArchiveClientError> {
+        Self::connect_pq(addr, QuilPqNoiseConnector::new(falcon_signing_key.to_vec())).await
+    }
+
+    /// Connect only to this worker's own master, which holds the same Falcon
+    /// identity. Historical canonical frames and the archive directory rely
+    /// on this pin; possession of an unrelated peer key is insufficient.
+    pub async fn connect_own_master(addr: &str, falcon_signing_key: &[u8]) -> Result<Self, ArchiveClientError> {
+        let peer = quil_p2p::Keypair::falcon_from_bytes(falcon_signing_key)
+            .map_err(|error| ArchiveClientError::TlsInit(format!("master identity: {error}")))?
+            .public().to_peer_id();
+        let connector = QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).with_expected_peer(peer);
+        Self::connect_pq(addr, connector).await
+    }
+
+    async fn connect_pq(addr: &str, connector: QuilPqNoiseConnector) -> Result<Self, ArchiveClientError> {
         // Note: scheme is `http://` — tonic's Endpoint refuses `https://`
         // unless its own `tls_config(...)` is set; we bypass that to install
         // our own PQNoise connector (no rustls/TLS on :8340 anymore).
@@ -131,7 +146,6 @@ impl ArchiveClient {
             .keep_alive_while_idle(true);
 
         debug!(%addr, "dialing archive node (PQNoise)");
-        let connector = QuilPqNoiseConnector::new(falcon_signing_key.to_vec());
         let channel = match endpoint.connect_with_connector(connector).await {
             Ok(ch) => ch,
             Err(e) => {
@@ -295,10 +309,104 @@ impl ArchiveClient {
         // leaf value no longer matches the diff → "peer served unbound data").
         let resp = self
             .inner
-            .get_vertex_blob(GetVertexBlobRequest { shard_key, phase, id, version })
+            .get_vertex_blob(GetVertexBlobRequest { shard_key, phase, id, version, exact_version: false })
             .await?
             .into_inner();
         Ok(resp.found.then_some(resp.blob))
+    }
+
+    /// Ask this worker's authenticated master for its verified archive pool.
+    pub async fn get_archive_endpoints(&mut self) -> Result<Vec<String>, ArchiveClientError> {
+        let response = self.inner.clone().max_decoding_message_size(32 * 515 + 128)
+            .get_archive_endpoints(quil_types::proto::global::GetArchiveEndpointsRequest {})
+            .await?.into_inner();
+        if response.endpoints.len() > 32 || response.endpoints.iter().any(|e| e.is_empty() || e.len() > 512) {
+            return Err(tonic::Status::data_loss("invalid archive directory dimensions").into());
+        }
+        Ok(response.endpoints)
+    }
+
+    /// Fetch and authenticate one bounded historical GLOBAL membership proof.
+    pub async fn get_global_vertex_proof(
+        &mut self, root: [u8; 32], address: [u8; 32], allow_forward: bool,
+    ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
+        let response = self.inner.clone().max_decoding_message_size(
+            quil_engine::storage_history::MAX_GLOBAL_VERTEX_PROOF_BYTES + 128,
+        ).get_global_vertex_proof(quil_types::proto::global::GetGlobalVertexProofRequest {
+            root: root.to_vec(), address: address.to_vec(), allow_forward,
+        }).await?.into_inner();
+        if !response.found { return Ok(None); }
+        quil_engine::storage_history::verify_global_vertex_proof(&root, &address, &response.proof)
+            .map_err(|e| tonic::Status::data_loss(e.to_string()))?;
+        Ok(Some(response.proof))
+    }
+
+    /// Read the blob at an exact tree version, including the first version (0).
+    pub async fn get_vertex_blob_at(
+        &mut self,
+        shard_key: Vec<u8>,
+        phase: u32,
+        id: Vec<u8>,
+        version: u64,
+    ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
+        let resp = self.inner.get_vertex_blob(GetVertexBlobRequest {
+            shard_key, phase, id, version, exact_version: true,
+        }).await?.into_inner();
+        Ok(resp.found.then_some(resp.blob))
+    }
+
+    /// Peer coin scan over the same authenticated :8340 channel: ask a node
+    /// that covers `domain` for one page. `Unavailable` means that peer does
+    /// not serve the application — try the next one, not an empty answer.
+    pub async fn list_shard_coins(
+        &mut self,
+        domain: Vec<u8>,
+        snapshot_id: Vec<u8>,
+        after: Vec<u8>,
+    ) -> Result<quil_types::proto::global::ListShardCoinsResponse, ArchiveClientError> {
+        Ok(self
+            .app_shard
+            .list_shard_coins(quil_types::proto::global::ListShardCoinsRequest { domain, snapshot_id, after })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn list_shard_escrows(
+        &mut self,
+        domain: Vec<u8>,
+        snapshot_id: Vec<u8>,
+        after: Vec<u8>,
+    ) -> Result<quil_types::proto::global::ListShardEscrowsResponse, ArchiveClientError> {
+        Ok(self.app_shard.list_shard_escrows(quil_types::proto::global::ListShardCoinsRequest {
+            domain, snapshot_id, after,
+        }).await?.into_inner())
+    }
+
+    /// A wallet vertex read with application coverage and worker-store routing.
+    /// Do not substitute a forest-sync read of the peer's master store.
+    pub async fn get_shard_vertex(
+        &mut self,
+        address: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
+        let vertex = self.app_shard.get_shard_vertex(
+            quil_types::proto::global::GetShardVertexRequest { address },
+        ).await?.into_inner();
+        Ok(vertex.found.then_some(vertex.blob))
+    }
+
+    /// Peer coin witnesses over the same authenticated channel: the membership
+    /// paths a wallet needs to spend coins on an application this node does
+    /// not cover.
+    pub async fn get_shard_coin_witnesses(
+        &mut self,
+        domain: Vec<u8>,
+        addresses: Vec<Vec<u8>>,
+    ) -> Result<quil_types::proto::global::GetShardCoinWitnessesResponse, ArchiveClientError> {
+        Ok(self
+            .app_shard
+            .get_shard_coin_witnesses(quil_types::proto::global::GetShardCoinWitnessesRequest { domain, addresses })
+            .await?
+            .into_inner())
     }
 
     /// Sync-by-hash: translate an authenticated tree `root` to the serving
@@ -393,6 +501,31 @@ impl ArchiveClient {
             .await?
             .into_inner();
         Ok(resp.frame)
+    }
+
+    /// One page of `filter`'s recorded outgoing records from `from_frame`:
+    /// contiguous and ascending, possibly shorter than requested. Unverified:
+    /// the caller authenticates it against a certified history root.
+    pub async fn get_shard_outgoing_history(
+        &mut self,
+        filter: Vec<u8>,
+        from_frame: u64,
+        through_frame: u64,
+    ) -> Result<Vec<quil_types::proto::global::ShardFrameOutgoing>, ArchiveClientError> {
+        let frames = self
+            .app_shard
+            .clone()
+            .max_decoding_message_size(crate::stub_services::MAX_OUTGOING_HISTORY_BYTES * 2)
+            .get_shard_outgoing_history(quil_types::proto::global::GetShardOutgoingHistoryRequest {
+                filter, from_frame, through_frame,
+            })
+            .await?
+            .into_inner()
+            .frames;
+        if frames.iter().enumerate().any(|(i, f)| f.frame_number != from_frame + i as u64) {
+            return Err(tonic::Status::data_loss("outgoing history page is not contiguous from the requested frame").into());
+        }
+        Ok(frames)
     }
 }
 
@@ -604,11 +737,17 @@ pub struct QuilPqNoiseConnector {
     /// The node's 1281-byte Falcon q-prover-key signing key — the `:8340`
     /// network identity presented in the PQNoise handshake.
     falcon_signing_key: Arc<Vec<u8>>,
+    expected_peer: Option<quil_p2p::PeerId>,
 }
 
 impl QuilPqNoiseConnector {
     pub fn new(falcon_signing_key: Vec<u8>) -> Self {
-        Self { falcon_signing_key: Arc::new(falcon_signing_key) }
+        Self { falcon_signing_key: Arc::new(falcon_signing_key), expected_peer: None }
+    }
+
+    pub fn with_expected_peer(mut self, peer: quil_p2p::PeerId) -> Self {
+        self.expected_peer = Some(peer);
+        self
     }
 }
 
@@ -623,6 +762,7 @@ impl Service<Uri> for QuilPqNoiseConnector {
 
     fn call(&mut self, uri: Uri) -> Self::Future {
         let falcon_signing_key = self.falcon_signing_key.clone();
+        let expected_peer = self.expected_peer;
         Box::pin(async move {
             let host = uri
                 .host()
@@ -630,8 +770,12 @@ impl Service<Uri> for QuilPqNoiseConnector {
                 .to_string();
             let port = uri.port_u16().unwrap_or(443);
             let tcp = TcpStream::connect((host.as_str(), port)).await?;
-            let (_peer, stream) =
+            let (peer, stream) =
                 crate::pqnoise_channel::pq_client_handshake(tcp, falcon_signing_key.as_ref()).await?;
+            if expected_peer.is_some_and(|expected| peer != expected) {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+                    "PQNoise server identity does not match the configured master").into());
+            }
             Ok(TokioIo::new(stream))
         })
     }
@@ -790,5 +934,33 @@ mod tests {
             "legitimate handshake must succeed (server side): {:?}",
             server_res.err(),
         );
+    }
+}
+
+#[cfg(test)]
+mod pinned_master_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn master_pin_accepts_own_key_and_rejects_a_legitimate_unrelated_peer() {
+        for same_key in [true, false] {
+            let client_key = quil_p2p::generate_falcon_signing_key();
+            let server_key = if same_key { client_key.clone() } else { quil_p2p::generate_falcon_signing_key() };
+            let expected = quil_p2p::Keypair::falcon_from_bytes(&client_key).unwrap().public().to_peer_id();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                crate::pqnoise_channel::pq_server_handshake(tcp, &server_key).await.unwrap()
+            });
+            let mut connector = QuilPqNoiseConnector::new(client_key).with_expected_peer(expected);
+            let result = tokio::time::timeout(Duration::from_secs(5),
+                connector.call(format!("http://{address}").parse().unwrap())).await.unwrap();
+            assert_eq!(result.is_ok(), same_key);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("identity does not match"), "{error}");
+            }
+            assert_eq!(server.await.unwrap().peer_id(), expected);
+        }
     }
 }

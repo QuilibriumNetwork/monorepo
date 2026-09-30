@@ -1,4 +1,4 @@
-//! SPIKE #2: does a NON-nibble-aligned shard boundary (the real 64-way / top-6-bit
+//! SPIKE: does a NON-nibble-aligned shard boundary (the real 64-way / top-6-bit
 //! QUIL split) still yield a well-defined shard commitment that composes to the
 //! single app root, and does a leaf round-trip against that app root?
 //!

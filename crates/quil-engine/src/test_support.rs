@@ -633,3 +633,42 @@ impl quil_types::crypto::KeyManager for AcceptAllKeyManager {
         Ok(true)
     }
 }
+
+/// A real Simplex finalization of `seal` by every member of `session`, for
+/// tests that drive a committee handoff without running a consensus host.
+pub fn certify_seal(
+    session: &quil_cw_consensus::handoff::Session,
+    signers: &[quil_crypto::FalconSigner],
+    seal: &quil_cw_consensus::handoff::Seal,
+) -> Vec<u8> {
+    use quil_cw_consensus::{
+        _consensus::{
+            simplex::{scheme::Namespace, types::{Finalization, Proposal, Subject}},
+            types::{Epoch, Round, View},
+        },
+        _crypto::{sha256::Digest, Signer as _},
+        _utils::{ordered::Set, N3f1},
+        app_cert::encode_finalization,
+        falcon_base::FalconPrivateKey,
+        falcon_scheme::Generic,
+        falcon_simplex::SimplexFalconScheme,
+    };
+    use quil_types::crypto::Signer as _;
+    let keys: Vec<FalconPrivateKey> = signers.iter()
+        .map(|s| FalconPrivateKey::from_bytes(s.private_key(), s.public_key()).unwrap())
+        .collect();
+    let proposal = Proposal::new(
+        Round::new(Epoch::new(session.generation), View::new(seal.view)),
+        View::new(seal.checkpoint.view),
+        Digest(seal.digest()),
+    );
+    let participants: Set<_> = keys.iter().map(|key| key.public_key()).collect::<Vec<_>>().try_into().unwrap();
+    let schemes: Vec<Generic<Namespace>> = keys.iter().cloned()
+        .map(|key| Generic::signer(&session.namespace().unwrap(), participants.clone(), key).unwrap())
+        .collect();
+    let votes: Vec<_> = schemes.iter()
+        .map(|scheme| scheme.sign::<SimplexFalconScheme, Digest>(Subject::Finalize { proposal: &proposal }).unwrap())
+        .collect();
+    let certificate = schemes[0].assemble::<SimplexFalconScheme, _, N3f1>(votes).unwrap();
+    encode_finalization(&Finalization { proposal, certificate })
+}

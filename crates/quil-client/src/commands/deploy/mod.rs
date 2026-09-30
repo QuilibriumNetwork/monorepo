@@ -115,11 +115,13 @@ pub struct DeployCtx {
     pub key_manager: Arc<FileKeyManager>,
     pub connect_opts: ConnectOpts,
     pub alias_store: Option<crate::alias_store::Store>,
+    /// Global flags, to load the QUIL wallet that pays for deploys and writes.
+    pub global: GlobalArgs,
 }
 
 impl DeployCtx {
     fn load(global: GlobalArgs) -> anyhow::Result<Self> {
-        let ctx = Context::load(global)?;
+        let ctx = Context::load(global.clone())?;
         let (node_config, config_dir) = ctx.load_node_config("default")?;
         let key_manager = ctx.key_manager(&node_config, &config_dir)?;
         let alias_store = crate::alias_store::try_load_for_config_dir(&config_dir);
@@ -134,6 +136,7 @@ impl DeployCtx {
             key_manager,
             connect_opts,
             alias_store,
+            global,
         })
     }
 
@@ -181,13 +184,35 @@ impl DeployCtx {
         })
     }
 
-    /// Submit a deploy op with a zero (32-byte) domain.
+    /// Submit a deploy op with a zero (32-byte) domain. A deploy grows world
+    /// state, so it is paid in QUIL: it executes under its intrinsic's base
+    /// domain, which the settlement's claim names as its destination.
     pub async fn send_deploy(
         &self,
         client: &mut NodeServiceClient<Channel>,
         request: MessageRequest,
     ) -> anyhow::Result<()> {
-        crate::send::send_message_request(client, &self.key_manager, vec![0u8; 32], request).await
+        use quil_types::proto::global::message_request::Request;
+        let base: [u8; 32] = match &request.request {
+            Some(Request::TokenDeploy(_)) => quil_execution::token_intrinsic::constants::token_base_domain(),
+            Some(Request::HypergraphDeploy(_)) => quil_execution::hypergraph_intrinsic::hypergraph_base_domain(),
+            Some(Request::ComputeDeploy(_)) => quil_execution::domains::COMPUTE,
+            _ => anyhow::bail!("not a deploy request"),
+        };
+        // Deploys execute in the global venue, which collects the global
+        // prover topic.
+        crate::send::send_paid_request(self.global.clone(), client, &self.key_manager, vec![0xffu8; 32], base, request).await
+    }
+
+    /// Submit a write to an existing application, paid in QUIL.
+    pub async fn send_paid(
+        &self,
+        client: &mut NodeServiceClient<Channel>,
+        domain: &[u8],
+        request: MessageRequest,
+    ) -> anyhow::Result<()> {
+        let execution: [u8; 32] = domain.try_into().map_err(|_| anyhow::anyhow!("domain must be 32 bytes"))?;
+        crate::send::send_paid_request(self.global.clone(), client, &self.key_manager, domain.to_vec(), execution, request).await
     }
 }
 

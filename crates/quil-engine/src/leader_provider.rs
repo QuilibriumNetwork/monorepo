@@ -69,6 +69,33 @@ pub struct GlobalLeaderProvider {
 }
 
 impl GlobalLeaderProvider {
+    pub(crate) fn matches_execution_source(
+        &self, manager: &Arc<quil_execution::ExecutionEngineManager>,
+    ) -> bool {
+        self.message_validator.as_ref().is_some_and(|m| Arc::ptr_eq(m, manager))
+            && self.hypergraph.as_ref().is_some_and(|h| Arc::ptr_eq(h, &manager.crdt()))
+            && self.clock_store.backing_store_identity().is_some()
+            && self.clock_store.backing_store_identity() == manager.crdt().backing_store_identity()
+    }
+
+    pub(crate) fn for_execution_branch(
+        &self, branch: &quil_execution::ExecutionBranch, rank: u64,
+        max_bytes: usize, max_items: usize, consumed: &[Vec<u8>],
+    ) -> Result<Self> {
+        let collector = Arc::new(MessageCollector::new());
+        for bytes in self.message_collector.snapshot_for_execution(rank, max_bytes, max_items)? {
+            collector.add_message(rank, bytes);
+        }
+        collector.mark_finalized(consumed);
+        Ok(Self::new(
+            Arc::new(branch.registry().clone()), self.frame_prover.clone(),
+            self.difficulty_adjuster.clone(), branch.clock_store().clone(), collector,
+            self.local_prover_address.clone(), self.local_public_key.clone(),
+            self.signer.clone(), self.inclusion_prover.clone(),
+            Some(branch.manager().clone()), Some(branch.manager().crdt()),
+        ))
+    }
+
     pub fn new(
         prover_registry: Arc<dyn ProverRegistry>,
         frame_prover: Arc<dyn FrameProver>,
@@ -126,6 +153,18 @@ impl GlobalLeaderProvider {
     /// forks the commitment). Shared by the blocking produce path
     /// (`compute_prover_root`) and the non-blocking vote-verify path
     /// (`LeaderProvider::local_prover_root`) so both bind the identical root.
+    /// The certified world-state size frame `frame_number` must declare: the
+    /// size recorded when this node materialized the parent. Genesis reads the
+    /// live (deterministic, identical everywhere) genesis size.
+    fn world_state_size_read(&self, frame_number: u64) -> Option<u64> {
+        let hg = self.hypergraph.as_ref()?;
+        if frame_number <= 1 {
+            use num_traits::ToPrimitive;
+            return hg.total_size().to_u64();
+        }
+        hg.world_size_at(frame_number - 1)
+    }
+
     fn prover_root_read(&self, frame_number: u64) -> Option<Vec<u8>> {
         let hg = self.hypergraph.as_ref()?;
         let parent = frame_number.saturating_sub(1);
@@ -200,7 +239,7 @@ impl GlobalLeaderProvider {
     /// hyperedge-adds, hyperedge-removes) — the companions to
     /// [`Self::compute_prover_root`] (phase 0). The global prover shard uses
     /// removes + hyperedge-adds (not just vertex-adds), so these must be
-    /// committed too (audit #5). An empty/degenerate phase normalizes to the
+    /// committed too. An empty/degenerate phase normalizes to the
     /// zero root so the aux vector always has exactly 3 fixed-length entries
     /// (matching what `sync_single_shard`'s zero-anchor expects).
     fn compute_prover_aux_roots(&self) -> Vec<Vec<u8>> {
@@ -392,6 +431,10 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         self.prover_root_read(frame_number)
     }
 
+    fn local_world_state_size(&self, frame_number: u64) -> Option<u64> {
+        self.world_state_size_read(frame_number)
+    }
+
     /// Return leaders for the next rank, ordered by the prover
     /// registry's VDF-distance walk seeded by the parent frame's
     /// Poseidon-hashed output.
@@ -563,6 +606,8 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 std::thread::sleep(std::time::Duration::from_millis(wait_ms as u64));
             }
         }
+        // Timed from here: the pacing above is deliberate.
+        let mut clock = crate::stage_clock::StageClock::start("GLOBAL proposal", frame_number);
 
         // ------------------------------------------------------------------
         // 3. Collect pending messages, then drop protocol-invalid ones.
@@ -585,6 +630,21 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // already rejected at ingest.
         // ------------------------------------------------------------------
         let collected = self.message_collector.collect_for_rank(rank);
+        // The VDF must commit exactly the body we can serialize. A permissive
+        // engine validator can accept bytes that are not a canonical bundle;
+        // hashing those and dropping them during the later decode makes our
+        // own proposal fail its request-root check.
+        let mut malformed = Vec::new();
+        let collected: Vec<_> = collected.into_iter().filter(|raw| {
+            let round_trip = crate::consensus_wire::decode_message_bundle(raw)
+                .and_then(|bundle| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&bundle));
+            if round_trip.as_ref().is_ok_and(|canonical| canonical == raw) { true }
+            else { malformed.push(raw.clone()); false }
+        }).collect();
+        if !malformed.is_empty() {
+            tracing::warn!(frame = frame_number, rejected = malformed.len(), "discarding non-canonical GLOBAL proposal inputs");
+            self.message_collector.remove(&malformed);
+        }
         let messages = match self.message_validator.as_ref() {
             Some(validator) => {
                 // The collector holds GLOBAL messages, validated against the
@@ -711,11 +771,13 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             message_count = messages.len(),
             "proving next global state",
         );
+        clock.mark("collect messages");
 
         // ------------------------------------------------------------------
         // 4. Compute request root from collected messages
         // ------------------------------------------------------------------
         let requests_root = self.compute_requests_root(&messages);
+        clock.mark("requests root");
 
         // ------------------------------------------------------------------
         // 5. Verify this node is an active prover and find our index
@@ -728,6 +790,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         if prover_index.is_none() {
             return Err(QuilError::Consensus("not a prover".into()));
         }
+        clock.mark("active provers");
 
         // ------------------------------------------------------------------
         // 6. Compute difficulty
@@ -776,7 +839,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             .as_ref()
             .map(|hg| hg.global_commitments())
             .unwrap_or_default();
+        clock.mark("global commitments");
         let prover_root: Vec<u8> = self.compute_prover_root(frame_number);
+        clock.mark("prover root");
         if prover_root.is_empty() && frame_number > 1 {
             // STRICT GATE (see compute_prover_root): the parent (N-1) prover root is
             // not materialized, so we cannot bind a valid prover_tree_commitment.
@@ -795,9 +860,21 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 "proving genesis global frame with EMPTY prover_tree_commitment",
             );
         }
-        // Prover shard phases 1/2/3 roots (audit #5) — bound into the VDF
+        // Prover shard phases 1/2/3 roots — bound into the VDF
         // challenge + carried on the header so catch-up authenticates all phases.
         let prover_aux_roots: Vec<Vec<u8>> = self.compute_prover_aux_roots();
+        clock.mark("prover aux roots");
+        // Certified pricing input: the network size recorded with the parent's
+        // prover root (the prover-root gate above already waited for it).
+        let world_state_size: u64 = if self.hypergraph.is_some() {
+            self.world_state_size_read(frame_number).ok_or_else(|| QuilError::Consensus(format!(
+                "cannot produce frame {frame_number}: parent {} world-state size not recorded",
+                frame_number.saturating_sub(1)
+            )))?
+        } else {
+            0
+        };
+        clock.mark("world size");
         let prove_start = std::time::Instant::now();
         let header = self.frame_prover.prove_global_frame_header(
             prior_header,
@@ -805,12 +882,14 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             &prover_root,
             &prover_aux_roots,
             &requests_root,
+            world_state_size,
             self.signer.as_ref(),
             timestamp,
             difficulty as u32,
             prover_index_u8,
         )?;
         crate::metrics::record_vdf_prove_duration(prove_start.elapsed().as_secs_f64());
+        clock.mark("vdf");
 
         // ------------------------------------------------------------------
         // 9. Assemble GlobalState
@@ -854,8 +933,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // Carry the 256 global commitments bound into the VDF challenge so the
         // rebuilt header (`global_frame_from_state`) reproduces them verbatim.
         .with_global_commitments(commitments)
-        // Same for the prover shard's phase 1/2/3 roots (audit #5).
-        .with_prover_aux_roots(prover_aux_roots);
+        // Same for the prover shard's phase 1/2/3 roots.
+        .with_prover_aux_roots(prover_aux_roots)
+        .with_world_state_size(world_state_size);
 
         // ------------------------------------------------------------------
         // 10. Build and return State<GlobalState>
@@ -908,13 +988,8 @@ mod tests {
         ) -> Result<quil_types::proto::global::FrameHeader> {
             Err(QuilError::Internal("stub".into()))
         }
-        fn verify_frame_header(
-            &self, _: &quil_types::proto::global::FrameHeader,
-        ) -> Result<Vec<u8>> {
-            Ok(Vec::new())
-        }
         fn prove_global_frame_header(
-            &self, _: &GlobalFrameHeader, _: &[Vec<u8>], _: &[u8], _: &[Vec<u8>], _: &[u8],
+            &self, _: &GlobalFrameHeader, _: &[Vec<u8>], _: &[u8], _: &[Vec<u8>], _: &[u8], _: u64,
             _: &dyn Signer, _: i64, _: u32, _: u8,
         ) -> Result<GlobalFrameHeader> {
             Err(QuilError::Internal("stub".into()))
@@ -1141,7 +1216,7 @@ mod tests {
         assert_eq!(empty, p.compute_requests_root(&[]));
     }
 
-    /// Regression (audit Finding #2 / residual): the requests_root MUST bind
+    /// Regression: the requests_root MUST bind
     /// request ORDER and MULTIPLICITY. Before keying leaves by `SHA3(index‖msg)`,
     /// a reordered or duplicated body produced the SAME root — a collision-free
     /// consensus-divergence vector (e.g. two conflicting spends `[A,B]` vs `[B,A]`

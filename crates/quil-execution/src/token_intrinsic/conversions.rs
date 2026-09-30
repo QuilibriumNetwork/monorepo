@@ -7,12 +7,6 @@ use quil_types::proto::token as pb;
 
 use super::config::{Authority, FeeBasisStruct, TokenConfiguration, TokenMintStrategy};
 use super::deploy::{TokenDeploy, TokenUpdate};
-use super::mint::{MintTransaction, MintTransactionInput, MintTransactionOutput};
-use super::pending::{PendingTransaction, PendingTransactionInput, PendingTransactionOutput};
-use super::transaction::{
-    RecipientBundle, Transaction, TransactionInput, TransactionOutput,
-};
-
 // =====================================================================
 // Authority
 // =====================================================================
@@ -65,12 +59,51 @@ pub fn mint_strategy_from_proto(p: &pb::TokenMintStrategy) -> Result<TokenMintSt
         None => Vec::new(),
     };
     Ok(TokenMintStrategy {
-        mint_behavior: p.mint_behavior as u32,
+        mint_behavior: mint_behavior_from_proto(p.mint_behavior)?,
         proof_basis: p.proof_basis as u32,
         verkle_root: p.verkle_root.clone(),
         authority,
         payment_address: p.payment_address.clone(),
         fee_basis,
+    })
+}
+
+/// The wire enum `TokenMintBehavior` is sequential (proof 1, authority 2,
+/// signature 3, payment 4); the configuration consensus reads carries the
+/// behaviour as BIT FLAGS (`MINT_WITH_PROOF` 1<<0 ... `MINT_WITH_PAYMENT`
+/// 1<<3). The two agree only for proof and authority, so these must map, never
+/// cast: cast through, a payment token is stored as a signature token
+/// (1<<2 == 4) whose authority is unset and which therefore can never mint,
+/// and a signature token becomes an unrecognized behaviour.
+fn mint_behavior_from_proto(value: i32) -> Result<u32> {
+    use super::constants::*;
+    Ok(match value {
+        0 => NO_MINT_BEHAVIOR,
+        1 => MINT_WITH_PROOF,
+        2 => MINT_WITH_AUTHORITY,
+        3 => MINT_WITH_SIGNATURE,
+        4 => MINT_WITH_PAYMENT,
+        other => {
+            return Err(quil_types::error::QuilError::InvalidArgument(format!(
+                "unknown token mint behavior: {other}"
+            )))
+        }
+    } as u32)
+}
+
+fn mint_behavior_to_proto(flags: u32) -> Result<i32> {
+    use super::constants::*;
+    Ok(match flags as u16 {
+        NO_MINT_BEHAVIOR => 0,
+        MINT_WITH_PROOF => 1,
+        MINT_WITH_AUTHORITY => 2,
+        MINT_WITH_SIGNATURE => 3,
+        MINT_WITH_PAYMENT => 4,
+        other => {
+            return Err(quil_types::error::QuilError::InvalidArgument(format!(
+                "unknown token mint behavior flags: {other}"
+            )))
+        }
     })
 }
 
@@ -90,7 +123,7 @@ pub fn mint_strategy_to_proto(m: &TokenMintStrategy) -> Result<pb::TokenMintStra
         None
     };
     Ok(pb::TokenMintStrategy {
-        mint_behavior: m.mint_behavior as i32,
+        mint_behavior: mint_behavior_to_proto(m.mint_behavior)?,
         proof_basis: m.proof_basis as i32,
         verkle_root: m.verkle_root.clone(),
         authority,
@@ -215,355 +248,33 @@ pub fn token_update_to_proto(u: &TokenUpdate) -> Result<pb::TokenUpdate> {
     })
 }
 
-// =====================================================================
-// RecipientBundle
-// =====================================================================
-
-pub fn recipient_bundle_from_proto(p: &pb::RecipientBundle) -> RecipientBundle {
-    RecipientBundle {
-        one_time_key: p.one_time_key.clone(),
-        verification_key: p.verification_key.clone(),
-        coin_balance: p.coin_balance.clone(),
-        mask: p.mask.clone(),
-        additional_reference: p.additional_reference.clone(),
-        additional_reference_key: p.additional_reference_key.clone(),
-    }
-}
-
-pub fn recipient_bundle_to_proto(r: &RecipientBundle) -> pb::RecipientBundle {
-    pb::RecipientBundle {
-        one_time_key: r.one_time_key.clone(),
-        verification_key: r.verification_key.clone(),
-        coin_balance: r.coin_balance.clone(),
-        mask: r.mask.clone(),
-        additional_reference: r.additional_reference.clone(),
-        additional_reference_key: r.additional_reference_key.clone(),
-    }
-}
-
-// =====================================================================
-// Transaction / Input / Output (flat field copies — nested messages
-// stored as canonical bytes in the canonical type)
-// =====================================================================
-
-pub fn transaction_input_from_proto(p: &pb::TransactionInput) -> TransactionInput {
-    TransactionInput {
-        commitment: p.commitment.clone(),
-        signature: p.signature.clone(),
-        proofs: p.proofs.clone(),
-    }
-}
-
-pub fn transaction_output_from_proto(p: &pb::TransactionOutput) -> Result<TransactionOutput> {
-    let recipient = match &p.recipient_output {
-        Some(r) => recipient_bundle_from_proto(r).to_canonical_bytes()?,
-        None => Vec::new(),
-    };
-    Ok(TransactionOutput {
-        frame_number: p.frame_number.clone(),
-        commitment: p.commitment.clone(),
-        recipient_output: recipient,
-    })
-}
-
-pub fn transaction_from_proto(p: &pb::Transaction) -> Result<Transaction> {
-    let inputs: Vec<Vec<u8>> = p.inputs.iter()
-        .map(|i| transaction_input_from_proto(i).to_canonical_bytes())
-        .collect::<Result<Vec<_>>>()?;
-    let outputs: Vec<Vec<u8>> = p.outputs.iter()
-        .map(|o| transaction_output_from_proto(o))
-        .collect::<Result<Vec<_>>>()?
-        .iter()
-        .map(|o| o.to_canonical_bytes())
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Transaction {
-        domain: p.domain.clone(),
-        inputs,
-        outputs,
-        fees: p.fees.clone(),
-        range_proof: p.range_proof.clone(),
-        // TraversalProof is a nested proto stored raw-prost in canonical
-        // (same convention as ProverKick); re-encode it so the request
-        // round-trips faithfully through the materializer.
-        traversal_proof: p
-            .traversal_proof
-            .as_ref()
-            .map(prost::Message::encode_to_vec)
-            .unwrap_or_default(),
-    })
-}
-
-pub fn transaction_input_to_proto(i: &TransactionInput) -> pb::TransactionInput {
-    pb::TransactionInput {
-        commitment: i.commitment.clone(),
-        signature: i.signature.clone(),
-        proofs: i.proofs.clone(),
-    }
-}
-
-pub fn transaction_output_to_proto(o: &TransactionOutput) -> Result<pb::TransactionOutput> {
-    let recipient_output = if o.recipient_output.is_empty() {
-        None
-    } else {
-        Some(recipient_bundle_to_proto(&RecipientBundle::from_canonical_bytes(
-            &o.recipient_output,
-        )?))
-    };
-    Ok(pb::TransactionOutput {
-        frame_number: o.frame_number.clone(),
-        commitment: o.commitment.clone(),
-        recipient_output,
-    })
-}
-
-pub fn transaction_to_proto(t: &Transaction) -> Result<pb::Transaction> {
-    let inputs: Vec<pb::TransactionInput> = t
-        .inputs
-        .iter()
-        .map(|b| Ok(transaction_input_to_proto(&TransactionInput::from_canonical_bytes(b)?)))
-        .collect::<Result<Vec<_>>>()?;
-    let outputs: Vec<pb::TransactionOutput> = t
-        .outputs
-        .iter()
-        .map(|b| transaction_output_to_proto(&TransactionOutput::from_canonical_bytes(b)?))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(pb::Transaction {
-        domain: t.domain.clone(),
-        inputs,
-        outputs,
-        fees: t.fees.clone(),
-        range_proof: t.range_proof.clone(),
-        traversal_proof: if t.traversal_proof.is_empty() {
-            None
-        } else {
-            prost::Message::decode(t.traversal_proof.as_slice()).ok()
-        },
-    })
-}
-
-// =====================================================================
-// PendingTransaction / Input / Output
-// =====================================================================
-
-pub fn pending_transaction_input_from_proto(
-    p: &pb::PendingTransactionInput,
-) -> PendingTransactionInput {
-    PendingTransactionInput {
-        commitment: p.commitment.clone(),
-        signature: p.signature.clone(),
-        proofs: p.proofs.clone(),
-    }
-}
-
-pub fn pending_transaction_input_to_proto(
-    i: &PendingTransactionInput,
-) -> pb::PendingTransactionInput {
-    pb::PendingTransactionInput {
-        commitment: i.commitment.clone(),
-        signature: i.signature.clone(),
-        proofs: i.proofs.clone(),
-    }
-}
-
-pub fn pending_transaction_output_from_proto(
-    p: &pb::PendingTransactionOutput,
-) -> Result<PendingTransactionOutput> {
-    let to = match &p.to {
-        Some(r) => recipient_bundle_from_proto(r).to_canonical_bytes()?,
-        None => Vec::new(),
-    };
-    let refund = match &p.refund {
-        Some(r) => recipient_bundle_from_proto(r).to_canonical_bytes()?,
-        None => Vec::new(),
-    };
-    Ok(PendingTransactionOutput {
-        frame_number: p.frame_number.clone(),
-        commitment: p.commitment.clone(),
-        to,
-        refund,
-        expiration: p.expiration,
-    })
-}
-
-pub fn pending_transaction_output_to_proto(
-    o: &PendingTransactionOutput,
-) -> Result<pb::PendingTransactionOutput> {
-    let to = if o.to.is_empty() {
-        None
-    } else {
-        Some(recipient_bundle_to_proto(&RecipientBundle::from_canonical_bytes(&o.to)?))
-    };
-    let refund = if o.refund.is_empty() {
-        None
-    } else {
-        Some(recipient_bundle_to_proto(&RecipientBundle::from_canonical_bytes(&o.refund)?))
-    };
-    Ok(pb::PendingTransactionOutput {
-        frame_number: o.frame_number.clone(),
-        commitment: o.commitment.clone(),
-        to,
-        refund,
-        expiration: o.expiration,
-    })
-}
-
-pub fn pending_transaction_from_proto(p: &pb::PendingTransaction) -> Result<PendingTransaction> {
-    let inputs: Vec<Vec<u8>> = p
-        .inputs
-        .iter()
-        .map(|i| pending_transaction_input_from_proto(i).to_canonical_bytes())
-        .collect::<Result<Vec<_>>>()?;
-    let outputs: Vec<Vec<u8>> = p
-        .outputs
-        .iter()
-        .map(|o| pending_transaction_output_from_proto(o)?.to_canonical_bytes())
-        .collect::<Result<Vec<_>>>()?;
-    Ok(PendingTransaction {
-        domain: p.domain.clone(),
-        inputs,
-        outputs,
-        fees: p.fees.clone(),
-        range_proof: p.range_proof.clone(),
-        traversal_proof: p
-            .traversal_proof
-            .as_ref()
-            .map(prost::Message::encode_to_vec)
-            .unwrap_or_default(),
-    })
-}
-
-pub fn pending_transaction_to_proto(t: &PendingTransaction) -> Result<pb::PendingTransaction> {
-    let inputs: Vec<pb::PendingTransactionInput> = t
-        .inputs
-        .iter()
-        .map(|b| {
-            Ok(pending_transaction_input_to_proto(
-                &PendingTransactionInput::from_canonical_bytes(b)?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let outputs: Vec<pb::PendingTransactionOutput> = t
-        .outputs
-        .iter()
-        .map(|b| pending_transaction_output_to_proto(&PendingTransactionOutput::from_canonical_bytes(b)?))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(pb::PendingTransaction {
-        domain: t.domain.clone(),
-        inputs,
-        outputs,
-        fees: t.fees.clone(),
-        range_proof: t.range_proof.clone(),
-        traversal_proof: if t.traversal_proof.is_empty() {
-            None
-        } else {
-            prost::Message::decode(t.traversal_proof.as_slice()).ok()
-        },
-    })
-}
-
-// =====================================================================
-// MintTransaction / Input / Output
-// =====================================================================
-
-pub fn mint_transaction_input_from_proto(p: &pb::MintTransactionInput) -> MintTransactionInput {
-    MintTransactionInput {
-        value: p.value.clone(),
-        commitment: p.commitment.clone(),
-        signature: p.signature.clone(),
-        proofs: p.proofs.clone(),
-        additional_reference: p.additional_reference.clone(),
-        additional_reference_key: p.additional_reference_key.clone(),
-    }
-}
-
-pub fn mint_transaction_input_to_proto(i: &MintTransactionInput) -> pb::MintTransactionInput {
-    pb::MintTransactionInput {
-        value: i.value.clone(),
-        commitment: i.commitment.clone(),
-        signature: i.signature.clone(),
-        proofs: i.proofs.clone(),
-        additional_reference: i.additional_reference.clone(),
-        additional_reference_key: i.additional_reference_key.clone(),
-    }
-}
-
-pub fn mint_transaction_output_from_proto(
-    p: &pb::MintTransactionOutput,
-) -> Result<MintTransactionOutput> {
-    let recipient_output = match &p.recipient_output {
-        Some(r) => recipient_bundle_from_proto(r).to_canonical_bytes()?,
-        None => Vec::new(),
-    };
-    Ok(MintTransactionOutput {
-        frame_number: p.frame_number.clone(),
-        commitment: p.commitment.clone(),
-        recipient_output,
-    })
-}
-
-pub fn mint_transaction_output_to_proto(
-    o: &MintTransactionOutput,
-) -> Result<pb::MintTransactionOutput> {
-    let recipient_output = if o.recipient_output.is_empty() {
-        None
-    } else {
-        Some(recipient_bundle_to_proto(&RecipientBundle::from_canonical_bytes(
-            &o.recipient_output,
-        )?))
-    };
-    Ok(pb::MintTransactionOutput {
-        frame_number: o.frame_number.clone(),
-        commitment: o.commitment.clone(),
-        recipient_output,
-    })
-}
-
-pub fn mint_transaction_from_proto(p: &pb::MintTransaction) -> Result<MintTransaction> {
-    let inputs: Vec<Vec<u8>> = p
-        .inputs
-        .iter()
-        .map(|i| mint_transaction_input_from_proto(i).to_canonical_bytes())
-        .collect::<Result<Vec<_>>>()?;
-    let outputs: Vec<Vec<u8>> = p
-        .outputs
-        .iter()
-        .map(|o| mint_transaction_output_from_proto(o)?.to_canonical_bytes())
-        .collect::<Result<Vec<_>>>()?;
-    Ok(MintTransaction {
-        domain: p.domain.clone(),
-        inputs,
-        outputs,
-        fees: p.fees.clone(),
-        range_proof: p.range_proof.clone(),
-    })
-}
-
-pub fn mint_transaction_to_proto(t: &MintTransaction) -> Result<pb::MintTransaction> {
-    let inputs: Vec<pb::MintTransactionInput> = t
-        .inputs
-        .iter()
-        .map(|b| Ok(mint_transaction_input_to_proto(&MintTransactionInput::from_canonical_bytes(b)?)))
-        .collect::<Result<Vec<_>>>()?;
-    let outputs: Vec<pb::MintTransactionOutput> = t
-        .outputs
-        .iter()
-        .map(|b| mint_transaction_output_to_proto(&MintTransactionOutput::from_canonical_bytes(b)?))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(pb::MintTransaction {
-        domain: t.domain.clone(),
-        inputs,
-        outputs,
-        fees: t.fees.clone(),
-        range_proof: t.range_proof.clone(),
-    })
-}
-
-// =====================================================================
-// Tests
-// =====================================================================
-
 #[cfg(test)]
 mod tests {
+    /// The wire enum and the stored bit flags agree only for proof and
+    /// authority. A raw cast made every payment token a signature token with
+    /// no authority — deployable, and impossible to mint from.
+    #[test]
+    fn mint_behavior_maps_between_the_wire_enum_and_the_stored_flags() {
+        use super::super::constants::*;
+        for (wire, flags) in [
+            (0i32, NO_MINT_BEHAVIOR),
+            (1, MINT_WITH_PROOF),
+            (2, MINT_WITH_AUTHORITY),
+            (3, MINT_WITH_SIGNATURE),
+            (4, MINT_WITH_PAYMENT),
+        ] {
+            assert_eq!(super::mint_behavior_from_proto(wire).unwrap(), flags as u32, "wire {wire}");
+            assert_eq!(super::mint_behavior_to_proto(flags as u32).unwrap(), wire, "flags {flags}");
+        }
+        // The two that a cast silently confused.
+        assert_eq!(super::mint_behavior_from_proto(4).unwrap(), MINT_WITH_PAYMENT as u32);
+        assert_ne!(super::mint_behavior_from_proto(4).unwrap(), MINT_WITH_SIGNATURE as u32);
+        assert_eq!(super::mint_behavior_from_proto(3).unwrap(), MINT_WITH_SIGNATURE as u32);
+        // A behaviour neither side knows is refused, not stored.
+        assert!(super::mint_behavior_from_proto(5).is_err());
+        assert!(super::mint_behavior_to_proto(1 << 6).is_err());
+    }
+
     use super::*;
 
     #[test]
@@ -630,15 +341,4 @@ mod tests {
         assert_eq!(back, pb);
     }
 
-    #[test]
-    fn recipient_bundle_round_trip() {
-        let pb = pb::RecipientBundle {
-            one_time_key: vec![1u8; 57], verification_key: vec![2u8; 57],
-            coin_balance: vec![3u8; 32], mask: vec![4u8; 32],
-            additional_reference: vec![5u8; 64], additional_reference_key: vec![6u8; 57],
-        };
-        let r = recipient_bundle_from_proto(&pb);
-        let back = recipient_bundle_to_proto(&r);
-        assert_eq!(back, pb);
-    }
 }

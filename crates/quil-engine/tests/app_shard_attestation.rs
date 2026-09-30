@@ -86,6 +86,10 @@ fn stamp_app_frame_output(proto: &mut quil_types::proto::global::FrameHeader, ra
         proto.fee_multiplier_vote,
         proto.timestamp,
         &proto.storage_attestation_root,
+        quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&proto.fee_total),
+        &proto.settlements,
+        &proto.accumulator,
+        &proto.spends,
     );
 }
 
@@ -295,6 +299,10 @@ fn build_and_verify_partial_with_filter(
         storage_attestation_root: Vec::new(),
         global_frame_number: 0,
         storage_attestation: Vec::new(),
+        fee_total: Vec::new(),
+        settlements: Vec::new(),
+        accumulator: Vec::new(),
+        spends: Vec::new(),
     };
 
     let returned = verify_frame_header_attestation(
@@ -453,6 +461,10 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
         storage_attestation_root: Vec::new(),
         global_frame_number: 0,
         storage_attestation: Vec::new(),
+        fee_total: Vec::new(),
+        settlements: Vec::new(),
+        accumulator: Vec::new(),
+        spends: Vec::new(),
     };
 
     // 6. Verify — must succeed. The function's return value is the
@@ -576,6 +588,10 @@ fn signing_with_raw_filter_instead_of_app_address_must_fail_verify() {
         storage_attestation_root: Vec::new(),
         global_frame_number: 0,
         storage_attestation: Vec::new(),
+        fee_total: Vec::new(),
+        settlements: Vec::new(),
+        accumulator: Vec::new(),
+        spends: Vec::new(),
     };
 
     let result = verify_frame_header_attestation(
@@ -641,10 +657,8 @@ fn shard_frame_quorum_outcome_with_filter(
     )?;
 
     // Expand bitmask → participant indices (invoke_frame_header.rs:1529).
-    let participant_indices: Vec<u8> =
-        quil_consensus::bitmask::set_bit_indices(&bitmask_bytes)
-            .filter_map(|idx| u8::try_from(idx).ok())
-            .collect();
+    let participant_indices: Vec<usize> =
+        quil_consensus::bitmask::set_bit_indices(&bitmask_bytes).collect();
 
     // The 2/3 participation quorum gate.
     let shard_md = ShardMetadata {

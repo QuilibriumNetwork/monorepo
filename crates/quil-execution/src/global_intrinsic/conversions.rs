@@ -376,7 +376,7 @@ pub fn prover_confirm_to_proto(c: &ProverConfirm) -> pb::ProverConfirm {
     }
 }
 
-fn confirm_leaf_roots_from_proto(
+pub fn confirm_leaf_roots_from_proto(
     pb: &pb::ConfirmLeafRoots,
 ) -> super::leaf_root_registration::ConfirmLeafRoots {
     super::leaf_root_registration::ConfirmLeafRoots {
@@ -393,7 +393,7 @@ fn confirm_leaf_roots_from_proto(
     }
 }
 
-fn confirm_leaf_roots_to_proto(
+pub fn confirm_leaf_roots_to_proto(
     c: &super::leaf_root_registration::ConfirmLeafRoots,
 ) -> pb::ConfirmLeafRoots {
     pb::ConfirmLeafRoots {
@@ -671,6 +671,10 @@ pub fn frame_header_from_proto(pb: &pb::FrameHeader) -> FrameHeader {
         storage_attestation_root: pb.storage_attestation_root.clone(),
         global_frame_number: pb.global_frame_number,
         storage_attestation: pb.storage_attestation.clone(),
+        fee_total: pb.fee_total.clone(),
+        settlements: pb.settlements.clone(),
+        accumulator: pb.accumulator.clone(),
+        spends: pb.spends.clone(),
     }
 }
 
@@ -726,5 +730,9 @@ pub fn frame_header_to_proto(h: &FrameHeader) -> pb::FrameHeader {
         storage_attestation_root: h.storage_attestation_root.clone(),
         global_frame_number: h.global_frame_number,
         storage_attestation: h.storage_attestation.clone(),
+        fee_total: h.fee_total.clone(),
+        settlements: h.settlements.clone(),
+        accumulator: h.accumulator.clone(),
+        spends: h.spends.clone(),
     }
 }

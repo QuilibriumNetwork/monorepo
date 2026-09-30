@@ -1,4 +1,4 @@
-//! Phase-3 A/B bench: JMT hash-commit vs the KZG branch-commit.
+//! A/B bench: JMT hash-commit vs the KZG branch-commit.
 //!
 //! Mirrors `quil-tries/benches/bench_tree.rs` at the same tree sizes (64 /
 //! 512 / 4096 leaves, keys = SHA-256(i)) so the numbers are directly

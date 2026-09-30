@@ -255,7 +255,7 @@ impl Read for Certificate {
 
 // ------------------------------------------------------------------
 // Concrete scheme bound to a subject type (what simplex will instantiate).
-// A generic `Subject` carries its own namespace; for the spike we use a
+// A generic `Subject` carries its own namespace; the tests use a
 // minimal test subject with a `Vec<u8>` namespace.
 // ------------------------------------------------------------------
 
@@ -394,7 +394,7 @@ impl Scheme for FalconCertScheme {
     }
 }
 
-/// Minimal subject for the spike round-trip (namespace `Vec<u8>`, opaque message).
+/// Minimal subject for the round-trip tests (namespace `Vec<u8>`, opaque message).
 #[derive(Clone, Debug)]
 pub struct TestSubject {
     pub message: bytes::Bytes,

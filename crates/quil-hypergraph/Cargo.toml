@@ -11,7 +11,7 @@ test-utils = []
 [dependencies]
 quil-types = { path = "../quil-types" }
 quil-tries = { path = "../quil-tries" }
-# Phase-3 state tree: JMT forest (commitment authority post-migration).
+# State tree: JMT forest (commitment authority post-migration).
 quil-forest = { path = "../quil-forest" }
 tonic = "0.12"
 tokio = { version = "1", features = ["sync", "rt"] }
@@ -20,6 +20,7 @@ thiserror = "2"
 num-bigint = "0.4"
 num-traits = "0.2"
 sha3 = "0.10"
+getrandom = "0.2"
 hex = "0.4"
 
 [dev-dependencies]

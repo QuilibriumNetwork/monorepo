@@ -208,6 +208,10 @@ pub fn proto_message_request_to_canonical_inner_bytes(
     })?;
 
     match inner {
+        Inner::CommitteeHandoff(bytes) => {
+            crate::global_intrinsic::handoff::CertificateSubmission::from_canonical_bytes(bytes)?;
+            Ok(bytes.clone())
+        }
         Inner::Join(p) => {
             crate::global_intrinsic::conversions::prover_join_from_proto(p)
                 .to_canonical_bytes()
@@ -271,6 +275,10 @@ pub fn proto_message_request_to_canonical_inner_bytes(
 
         // Token deploy / update (the confidential Transaction path is a
         // separate lattice TxEnvelope, not this proto variant).
+        Inner::TokenOperation(p) => {
+            crate::token_intrinsic::wire::domain(&p.canonical_bytes)?;
+            Ok(p.canonical_bytes.clone())
+        }
         Inner::TokenDeploy(p) => {
             crate::token_intrinsic::conversions::token_deploy_from_proto(p)?.to_canonical_bytes()
         }
@@ -292,13 +300,10 @@ pub fn proto_message_request_to_canonical_inner_bytes(
             crate::compute_intrinsic::conversions::code_execute_from_proto(p)?.to_canonical_bytes()
         }
 
-        // Still unsupported: retired decaf Transaction path (0x0509) and
-        // consensus-internal variants not submitted via the client.
+        // Consensus-internal variants not submitted via the client.
         Inner::SeniorityMerge(_)
         | Inner::Kick(_)
-        | Inner::Transaction(_)
-        | Inner::PendingTransaction(_)
-        | Inner::MintTransaction(_)
+
         | Inner::CodeFinalize(_)
         | Inner::Shard(_)
         | Inner::ShardSplit(_)

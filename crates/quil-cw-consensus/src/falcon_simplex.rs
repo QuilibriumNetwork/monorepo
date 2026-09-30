@@ -9,7 +9,7 @@
 //! the namespace, so binding it to simplex is just: `N = simplex::scheme::Namespace`
 //! and `Subject<'a, D> = simplex::types::Subject<'a, D>`. If the compile-time
 //! assertion at the bottom holds, a simplex `Engine` can be instantiated with
-//! Falcon signatures — the decisive integration gate for the migration.
+//! Falcon signatures.
 
 use crate::falcon_base::{FalconPrivateKey, FalconPublicKey, FalconSignature};
 use crate::falcon_scheme::{Certificate, Generic};

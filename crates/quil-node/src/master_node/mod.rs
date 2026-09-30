@@ -15,6 +15,7 @@ pub(crate) mod networking;
 pub(crate) mod peer_info_publisher;
 pub(crate) mod runtime_state;
 pub(crate) mod storage;
+pub(crate) mod remote_reads;
 pub(crate) mod worker_manager;
 
 pub(crate) async fn start(
@@ -36,22 +37,7 @@ pub(crate) async fn start(
     // frame evaluation. Mainnet keeps 720; testnet/devnet use a short epoch so
     // the join→confirm→activate lifecycle runs in minutes. Every epoch timing
     // rule reads `epoch_length_frames()`, so this one call scales them all.
-    quil_types::consensus::init_epoch_length_for_network(network);
-    // Localnet-only shortcut: `QUIL_EPOCH_LENGTH_FRAMES=<n>` shrinks the epoch so
-    // the join→confirm→activate lifecycle completes in a handful of frames (the
-    // confirm is gated to the epoch AFTER join). CONSENSUS PARAMETER — every node
-    // in the net MUST set the same value; localnet.sh sets it uniformly. Never
-    // set on a shared testnet/mainnet. Ignored on mainnet (network 0).
-    if network != 0 {
-        if let Ok(v) = std::env::var("QUIL_EPOCH_LENGTH_FRAMES") {
-            if let Ok(frames) = v.parse::<u64>() {
-                if frames > 0 {
-                    quil_types::consensus::set_epoch_length_frames(frames);
-                    warn!(frames, "QUIL_EPOCH_LENGTH_FRAMES override active (localnet only)");
-                }
-            }
-        }
-    }
+    crate::consensus_settings::initialize(network);
     if network != 0 {
         info!(
             network,
@@ -60,10 +46,13 @@ pub(crate) async fn start(
         );
     }
 
+    // Check executable readiness before opening stores. All managers clone
+    // this client; separate node processes also share its admission file.
+    #[cfg(feature = "native-proof")]
+    let proof_worker = crate::proof_worker::build_node_worker(config)?;
     let storage = storage::init(config, archive_mode)?;
     let db_arc = storage.db_arc.clone();
     let clock_store = storage.clock_store.clone();
-    let token_store = storage.token_store.clone();
     let key_store = storage.key_store.clone();
     let shards_store = storage.shards_store.clone();
     let hg_store = storage.hg_store.clone();
@@ -118,7 +107,12 @@ pub(crate) async fn start(
             .map_err(|e| anyhow::anyhow!("load Falcon network identity key: {e}"))?
     };
 
-    let engines = engines::init_engines(&storage, network);
+    let engines = engines::init_engines(
+        &storage,
+        network,
+        #[cfg(feature = "native-proof")]
+        proof_worker.as_ref(),
+    )?;
     let inclusion_prover = engines.inclusion_prover.clone();
     let crdt = engines.crdt.clone();
     let exec_manager = engines.exec_manager.clone();
@@ -290,6 +284,10 @@ pub(crate) async fn start(
     let shard_engines: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
     >> = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    // filter → covering thread worker's own stores, for wallet reads of
+    // application state the master's stores do not hold.
+    let worker_app_states: worker_manager::WorkerAppStates =
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     // SignerRegistry — populated from inbound KeyRegistry broadcasts
     // on GLOBAL_PEER_INFO. Consumed by consensus message verification
     // (BLS signatures from peers whose identity↔prover binding we've
@@ -365,7 +363,7 @@ pub(crate) async fn start(
         remote_worker_manager_for_halt,
     } = runtime_state::init(&mut sup, hg_store.clone(), shard_engines.clone());
 
-    // §6.1 EMPTY-SPLIT GUARD: give the coverage monitor a data-bearing test for a
+    // EMPTY-SPLIT GUARD: give the coverage monitor a data-bearing test for a
     // shard's proposed children, read from the unified app tree. A split is only
     // proposed when the data actually divides (≥2 non-empty children). Under
     // legacy mode the app tree isn't the source of truth, so it returns
@@ -395,7 +393,7 @@ pub(crate) async fn start(
         ));
     }
 
-    // Deep-bifurcation (§6.1 encoding rework): give the coverage monitor a split
+    // Deep-bifurcation: give the coverage monitor a split
     // PROPOSER that descends to the shallowest REAL branch and emits variable-
     // depth bit-path child FILTERS (`propose_split_children` → `first_split_
     // bifurcation`). Under the unified app tree only — legacy stays on the
@@ -403,6 +401,11 @@ pub(crate) async fn start(
     // `unified_tree()`, so it activates at the same cutover as the tree fork.
     {
         let crdt_pr = crdt.clone();
+        // A small test network can keep enough workers on both children to exceed
+        // the same threshold again. Limit its proposals to the root when a
+        // single split is requested; mainnet never enables this test control.
+        let split_roots_only = network != 0
+            && std::env::var("QUIL_SPLIT_ROOT_ONLY").is_ok_and(|v| v == "1");
         coverage_monitor.set_split_proposer(std::sync::Arc::new(
             move |filter: &[u8]| -> Option<Vec<Vec<u8>>> {
                 if !crdt_pr.unified_tree() || filter.len() < 32 {
@@ -421,6 +424,9 @@ pub(crate) async fn start(
                             filter[32..].iter().map(|b| *b as u32).collect();
                         crdt_pr.canonical_bits_for_prefix(&app, &parent_prefix)
                     };
+                if split_roots_only && !parent_bits.is_empty() {
+                    return None;
+                }
                 // DIAGNOSTIC: the sub-shard's own committed leaf count, read the
                 // WORKING way (`sub_shard_metadata_for_filter` — the byte-suffix
                 // sub_meta path the reward calc uses). If this is >0 while the probe
@@ -534,12 +540,15 @@ pub(crate) async fn start(
             file_key_manager: file_key_manager.clone(),
             prover_address,
             bls_pubkey: bls_pubkey.clone(),
+            worker_app_states: worker_app_states.clone(),
             shard_engines: shard_engines.clone(),
             remote_worker_manager_for_halt: remote_worker_manager_for_halt.clone(),
             pi_worker_manager: pi_worker_manager.clone(),
             prover_message_transport: prover_message_transport_cell.clone(),
             archive_pool: archive_pool.clone(),
             spawner: detached_spawner.clone(),
+            #[cfg(feature = "native-proof")]
+            proof_worker: proof_worker.clone(),
         },
     );
 
@@ -564,6 +573,7 @@ pub(crate) async fn start(
         clock_store: clock_store.clone(),
         crdt: crdt.clone(),
         hg_store: hg_store.clone(),
+        message_collector: message_collector.clone(),
     });
 
     // ---------------------------------------------------------------
@@ -842,6 +852,38 @@ pub(crate) async fn start(
         replica_store: Some(quil_store::replica_store::ReplicaStore::new(
             db_arc.clone() as Arc<dyn quil_types::store::KvDb>,
         )),
+        // Shards a thread worker holds are confirmed from that worker's own
+        // hypergraph and replica store, the ones it attests from.
+        storage_for_filter: Some({
+            let states = worker_app_states.clone();
+            Arc::new(move |filter: &[u8]| {
+                states.read().get(filter).map(|state| (
+                    state.crdt.clone(),
+                    quil_store::replica_store::ReplicaStore::new(
+                        state.db.clone() as Arc<dyn quil_types::store::KvDb>,
+                    ),
+                ))
+            })
+        }),
+        // A standalone (cluster-mode) worker holds its shard in its own
+        // process; it encodes the replicas and returns the leaf roots.
+        remote_storage_confirm: Some({
+            let cell = remote_worker_manager_for_halt.clone();
+            let runtime = tokio::runtime::Handle::current();
+            Arc::new(move |filter: &[u8], targets: &[Vec<u8>], frame_number: u64| {
+                let Some(manager) = cell.get().cloned() else {
+                    return Ok(None);
+                };
+                if !manager.serves_filter(filter) {
+                    return Ok(None);
+                }
+                runtime.block_on(manager.prepare_storage_confirm(filter, targets, frame_number))
+            })
+        }),
+        pending_shard_changes: Some({
+            let shards_store = shards_store.clone();
+            Arc::new(move || shards_store.all_pending_shard_changes().unwrap_or_default())
+        }),
         // Loopback deps so a frame PRODUCER (which runs the coverage orchestrator)
         // includes its OWN ShardSplit/ShardMerge ops even when the remote publish
         // has no acceptor — single-archive localnet, or any moment with no other
@@ -990,12 +1032,20 @@ pub(crate) async fn start(
         info!("archive shard-topic subscriber spawned");
     }
 
-    // Commonware-simplex inbound router (P2c cutover). Shared, set post-spawn at
+    // Commonware-simplex inbound router. Shared, set post-spawn at
     // the archive-sync activation site when the committee is configured; unset
     // (the default) leaves the simplex path off.
     let cw_router: Arc<
         std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>,
     > = Arc::new(std::sync::OnceLock::new());
+    // Atomic GLOBAL finalization pipeline, set at the same activation site.
+    // Archives route authenticated frames from peers (poller and gossip)
+    // through it instead of writing the canonical clock first.
+    let global_finalization: Arc<std::sync::OnceLock<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>> =
+        Arc::new(std::sync::OnceLock::new());
+    // Archive app-frame ingest, built below (it needs the gap fetcher). GLOBAL
+    // execution materializes it at the points the chain sequences.
+    let app_ingest: archive_sync::AppIngestCell = Arc::new(std::sync::OnceLock::new());
 
     // CW global-consensus committee roster. On mainnet (network 0) the committee
     // IS the embedded genesis data — the same `archive_peers` (peer_id ->
@@ -1003,7 +1053,7 @@ pub(crate) async fn start(
     // static archive pool. It is fixed by the binary, NOT a hand-populated
     // operator config: every archive would otherwise have to carry an identical
     // `consensusCommittee`/`consensusCommitteePeerIds` list, and any one archive
-    // shipping it empty (as happened on the flag-day) leaves that node unable to
+    // shipping it empty leaves that node unable to
     // start simplex (`start_cw_global_consensus returned None`), stranding it at
     // the last legacy head forever. `genesis_archive_peers()` derives each
     // member's peer id via `peer_id_from_falcon_pubkey`, so the resolve_peer map
@@ -1122,6 +1172,8 @@ pub(crate) async fn start(
         consensus_committee_peer_ids,
         consensus_leader_timeout_secs: config.engine.consensus_leader_timeout_secs,
         cw_router: cw_router.clone(),
+        global_finalization: global_finalization.clone(),
+        app_ingest: app_ingest.clone(),
         // A STABLE subdir of the node's data dir for the simplex journal, so
         // consensus resumes across restarts instead of replaying from the
         // migration head (the CW runtime otherwise defaults to a random temp
@@ -1138,10 +1190,91 @@ pub(crate) async fn start(
     });
 
 
+    // Archive-only: recover an app-shard frame this archive missed. Gossip
+    // carries a frame once, so a frame produced while this node was restarting
+    // is gone; without this the frames after it buffer forever, the durable
+    // cursor never advances, and that application's app-shard state is frozen
+    // for good — invisible while the application is whole (a wallet reads its
+    // own node) and fatal once it splits, when a wallet must read an archive.
+    // Fetched frames are fed back through the consensus loopback so they take
+    // exactly the same verify-store-and-materialize path as gossiped ones.
+    let (gap_tx, gap_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(128);
+    if archive_mode {
+        let pool = archive_pool.clone();
+        let loopback = consensus_loopback_tx.clone();
+        let key = mtls_seed.map(|_| falcon_signing_key.clone());
+        let gap_peers = peer_info_cache.clone();
+        let gap_network = config.p2p.network;
+        detached_spawner.detach("archive-shard-gap-fetch", async move {
+            use futures::StreamExt;
+            let requests = futures::stream::unfold(gap_rx, |mut rx| async move {
+                rx.recv().await.map(|request| (request, rx))
+            });
+            requests.for_each_concurrent(4, |(filter, frame_number)| {
+                let pool = pool.clone();
+                let loopback = loopback.clone();
+                let key = key.clone();
+                // The shard's own members first: they produced the frame and
+                // keep it, and they publish a stream endpoint for exactly this
+                // filter. Another archive is only a fallback, and a poor one:
+                // archives that restarted together (the usual way a gap opens)
+                // missed the same frame. A live run sat on such a gap for the
+                // whole session while every member of the shard had the frame.
+                let mut endpoints: Vec<String> = gap_peers.read().values()
+                    .flat_map(|info| info.reachability.iter()
+                        .filter(|reach| reach.filter == filter)
+                        .flat_map(|reach| reach.stream_multiaddrs.iter())
+                        .filter_map(|ma| crate::util::multiaddr::archive_multiaddr_to_host_port(ma, gap_network))
+                        .collect::<Vec<_>>())
+                    .collect();
+                endpoints.sort();
+                endpoints.dedup();
+                async move {
+                    let Some(key) = key.as_ref() else { return };
+                    // A slow peer cannot hold every shard's recovery queue.
+                    // Missing/failed requests are retried by the ingest timer.
+                    let fetched = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        if let Some(addr) = pool.next().await {
+                            endpoints.push(addr);
+                        }
+                        let mut last = "no endpoint holds the shard".to_string();
+                        for addr in endpoints.iter().take(6) {
+                            let attempt = async {
+                                let mut client = quil_rpc::ArchiveClient::connect_mtls(addr, key).await
+                                    .map_err(|e| e.to_string())?;
+                                client.get_app_shard_frame(filter.clone(), frame_number).await
+                                    .map_err(|e| e.to_string())
+                            };
+                            match attempt.await {
+                                Ok(Some(frame)) => return Ok(Some(frame)),
+                                Ok(None) => last = format!("{addr} does not have the frame"),
+                                Err(error) => last = format!("{addr}: {error}"),
+                            }
+                        }
+                        Err(last)
+                    }).await;
+                    match fetched {
+                        Ok(Ok(Some(frame))) if frame.header.as_ref().is_some_and(|h|
+                            h.address == filter && h.frame_number == frame_number) => {
+                            let data = prost::Message::encode_to_vec(&frame);
+                            tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
+                                "app-shard gap fetch recovered a missing frame");
+                            let _ = loopback.send(message_loop::gap_fetched_frame_message(&filter, data)).await;
+                        }
+                        _ => tracing::debug!(filter = %hex::encode(&filter), frame = frame_number,
+                            "app-shard gap fetch unavailable; ingest will retry"),
+                    }
+                }
+            }).await;
+            Ok(())
+        });
+    }
+
+
     // Archive-only: ingest full app-shard frames into the archive's CRDT
     // so it holds (and can serve via HyperSync) every shard's state.
     let archive_app_shard_ingest = if archive_mode {
-        Some(quil_engine::archive_ingest::ArchiveAppShardIngest::new(
+        Some(Arc::new(std::sync::Mutex::new(quil_engine::archive_ingest::ArchiveAppShardIngest::new(
             prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
             Arc::new(quil_crypto::FalconKeyConstructor)
                 as Arc<dyn quil_types::crypto::BlsConstructor>,
@@ -1149,12 +1282,14 @@ pub(crate) async fn start(
             exec_manager.clone(),
             inclusion_prover.clone(),
             crdt.clone(),
-            Some(db_arc.clone() as Arc<dyn quil_types::store::KvDb>),
             clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
-        ))
+        ).with_gap_fetch(gap_tx).sequenced())))
     } else {
         None
     };
+    if let Some(ingest) = archive_app_shard_ingest.as_ref() {
+        let _ = app_ingest.set(ingest.clone());
+    }
 
     // Explorer service is archive-only (only archives hold the full frame
     // + hypergraph history it serves) and gated by config. The recent-
@@ -1193,6 +1328,7 @@ pub(crate) async fn start(
         signer_registry: signer_registry.clone(),
         current_frame: current_frame.clone(),
         cw_router: cw_router.clone(),
+        global_finalization: global_finalization.clone(),
         last_global_head_frame: last_global_head_frame.clone(),
         gossip_freshness: gossip_freshness.clone(),
         genesis_archive_peer_ids: genesis_archive_peer_ids.clone(),
@@ -1219,6 +1355,10 @@ pub(crate) async fn start(
     // 7. gRPC service
     // ---------------------------------------------------------------
     grpc::spawn_all(&mut sup, grpc::GrpcArgs {
+        worker_app_states: worker_app_states.clone(),
+        shard_engines: shard_engines.clone(),
+        remote_fee_workers: remote_worker_manager_for_halt.clone(),
+        exec_manager: exec_manager.clone(),
         config: config.clone(),
         network,
         archive_mode,
@@ -1229,7 +1369,6 @@ pub(crate) async fn start(
         current_frame: current_frame.clone(),
         last_global_head_frame: last_global_head_frame.clone(),
         prover_address,
-        token_store: token_store.clone(),
         prover_registry: prover_registry.clone(),
         signer_registry: signer_registry.clone(),
         prover_pipeline: prover_pipeline.clone(),
@@ -1336,7 +1475,7 @@ pub(crate) async fn start(
 
 #[cfg(test)]
 mod grid_clobber_repro {
-    //! Reproduces the case-(2) re-divergence: the removed boot-time
+    //! Reproduces a grid re-divergence: the removed boot-time
     //! `normalize_quil_token_grid` clobbered the LOCAL grid back to 64-way genesis
     //! on every restart while the CRDT-synced ALLOCATIONS kept their split children,
     //! so the archive's valid-shard set (built from the grid) no longer contained

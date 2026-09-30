@@ -14,8 +14,7 @@
 //! unchanged for Ed448 today and Falcon (KeyType=5) once identities migrate. The
 //! remote `PeerId` is derived from the verified identity key.
 //!
-//! Wire is a new Rust-only protocol id (`/quilibrium/pqnoise/sntrup761/1.0.0`),
-//! consistent with the re-substrate hard fork.
+//! Wire is a new Rust-only protocol id (`/quilibrium/pqnoise/sntrup761/1.0.0`).
 
 use std::future::Future;
 use std::io;

@@ -425,13 +425,8 @@ mod tests {
     fn make_request_token_tx() -> MessageRequest {
         MessageRequest {
             timestamp: 0,
-            request: Some(MessageRequestInner::Transaction(token_pb::Transaction {
-                domain: vec![0u8; 32],
-                inputs: vec![],
-                outputs: vec![],
-                fees: vec![],
-                range_proof: vec![],
-                ..Default::default()
+            request: Some(MessageRequestInner::TokenOperation(token_pb::TokenOperation {
+                canonical_bytes: Vec::new(),
             })),
         }
     }

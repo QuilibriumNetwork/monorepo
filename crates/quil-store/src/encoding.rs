@@ -50,6 +50,12 @@ pub const CONSENSUS_MATERIALIZED_CURSOR: u8 = 0x02;
 /// Go has no equivalent record, so 0x03 under CONSENSUS is unused by a
 /// migrated Go store.
 pub const CONSENSUS_GLOBAL_MATERIALIZED_CURSOR: u8 = 0x03;
+/// Local, resumable audit of a committee session's outgoing history.
+pub const CONSENSUS_HISTORY_RECOVERY: u8 = 0x04;
+/// Local GLOBAL execution identity, distinct from a consensus certificate.
+pub const CONSENSUS_GLOBAL_EXECUTION_CHECKPOINT: u8 = 0x05;
+/// Present from before frame mutations until all materializer stages finish.
+pub const CONSENSUS_GLOBAL_EXECUTION_PENDING: u8 = 0x06;
 pub const MIGRATION: u8 = 0xF0;
 pub const WORKER: u8 = 0xFF;
 
@@ -73,7 +79,9 @@ pub const CLOCK_APP_CERTIFIED_STATE: u8 = 0x07;
 pub const CLOCK_GLOBAL_FRAME_REQUEST: u8 = 0x08;
 /// Rust-node-only: per-frame MATERIALIZATION outcomes (one per request bundle).
 /// Not a Go concept; keyed like the frame itself so it prunes with the frame.
-pub const CLOCK_GLOBAL_FRAME_OUTCOMES: u8 = 0x09;
+// 0x09 is the existing certified-state namespace. Older Rust outcome writers
+// reused it and could overwrite certification records at the same number.
+pub const CLOCK_GLOBAL_FRAME_OUTCOMES: u8 = 0xF2;
 pub const CLOCK_GLOBAL_CERTIFIED_STATE: u8 = 0x09;
 pub const CLOCK_SHARD_CERTIFIED_STATE: u8 = 0x0A;
 pub const CLOCK_QUORUM_CERTIFICATE: u8 = 0x0B;
@@ -84,6 +92,19 @@ pub const CLOCK_GLOBAL_FRAME_CANDIDATE: u8 = 0x0F;
 /// Per-frame-candidate request bundles. Mirrors Go's
 /// `CLOCK_GLOBAL_FRAME_REQUEST_CANDIDATE` (`node/store/constants.go:75`).
 pub const CLOCK_GLOBAL_FRAME_REQUEST_CANDIDATE: u8 = 0xF8;
+/// Per-shard-frame fee total (QUIL base units) recorded at materialization;
+/// carried by the next frame header for the shard's provers.
+pub const CLOCK_SHARD_FRAME_FEE_TOTAL: u8 = 0xF7;
+/// Per-shard-frame settlement relay entries recorded at materialization.
+pub const CLOCK_SHARD_FRAME_SETTLEMENTS: u8 = 0xF6;
+/// Per-shard-frame digest of the shard's accumulator report at that frame
+/// (empty for a shard holding no coins), recorded at materialization.
+pub const CLOCK_SHARD_FRAME_ACCUMULATOR: u8 = 0xF5;
+/// A shard's accumulator report bytes, stored once per distinct digest.
+pub const CLOCK_SHARD_ACCUMULATOR_REPORT: u8 = 0xF4;
+/// Per-shard-frame spend entries recorded at materialization; later headers
+/// relay them for the global commit.
+pub const CLOCK_SHARD_FRAME_SPENDS: u8 = 0xF3;
 
 pub const INDEX_EARLIEST: u8 = 0x10;
 pub const INDEX_LATEST: u8 = 0x20;
@@ -216,7 +237,54 @@ pub fn clock_global_frame_request_key(frame_number: u64, request_index: u16) -> 
     key
 }
 
-/// Per-frame materialization outcomes: [CLOCK_FRAME, 0x09, frame_number(8 BE)]
+/// [0x00, 0xF7, filter, frame_number BE]
+pub fn clock_shard_frame_fee_total_key(filter: &[u8], frame_number: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10 + filter.len());
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_SHARD_FRAME_FEE_TOTAL);
+    key.extend_from_slice(filter);
+    key.extend_from_slice(&frame_number.to_be_bytes());
+    key
+}
+
+/// [0x00, 0xF6, filter, frame_number BE]
+pub fn clock_shard_frame_settlements_key(filter: &[u8], frame_number: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10 + filter.len());
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_SHARD_FRAME_SETTLEMENTS);
+    key.extend_from_slice(filter);
+    key.extend_from_slice(&frame_number.to_be_bytes());
+    key
+}
+
+pub fn clock_shard_frame_accumulator_key(filter: &[u8], frame_number: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10 + filter.len());
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_SHARD_FRAME_ACCUMULATOR);
+    key.extend_from_slice(filter);
+    key.extend_from_slice(&frame_number.to_be_bytes());
+    key
+}
+
+pub fn clock_shard_frame_spends_key(filter: &[u8], frame_number: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10 + filter.len());
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_SHARD_FRAME_SPENDS);
+    key.extend_from_slice(filter);
+    key.extend_from_slice(&frame_number.to_be_bytes());
+    key
+}
+
+pub fn clock_shard_accumulator_report_key(filter: &[u8], digest: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + filter.len() + digest.len());
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_SHARD_ACCUMULATOR_REPORT);
+    key.extend_from_slice(filter);
+    key.extend_from_slice(digest);
+    key
+}
+
+/// Per-frame materialization outcomes: [0x00, 0xF2, frame_number(8 BE)].
 pub fn clock_global_frame_outcomes_key(frame_number: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(10);
     key.push(CLOCK_FRAME);
@@ -249,6 +317,18 @@ pub fn clock_global_frame_candidate_key(frame_number: u64, selector: &[u8]) -> V
 pub fn clock_global_frame_candidate_latest_index() -> Vec<u8> {
     vec![CLOCK_FRAME, INDEX_LATEST | CLOCK_GLOBAL_FRAME_CANDIDATE]
 }
+
+/// Staged application-shard frames. Only `commit_shard_clock_frame` reads
+/// them; no execution plan does, so their cleanup is declared disjoint.
+pub const CLOCK_SHARD_STAGED_PREFIXES: &[[u8; 2]] = &[[CLOCK_FRAME, CLOCK_SHARD_STAGED]];
+
+/// GLOBAL candidate headers and request bodies. Execution does not read these;
+/// writes confined to them do not invalidate an execution plan that never
+/// touched them.
+pub const GLOBAL_CANDIDATE_PREFIXES: &[[u8; 2]] = &[
+    [CLOCK_FRAME, CLOCK_GLOBAL_FRAME_CANDIDATE],
+    [CLOCK_FRAME, CLOCK_GLOBAL_FRAME_REQUEST_CANDIDATE],
+];
 
 /// Go's `clockGlobalFrameRequestCandidateKey`:
 /// `[0x00, 0xF8, selector, frame_number(8 BE), request_index(2 BE)]`.
@@ -642,7 +722,7 @@ pub fn hypergraph_vertex_data_key(
 }
 
 // -----------------------------------------------------------------------
-// Versioned (MVCC) blob keyspace — see crates/quil-hypergraph/VERSIONED_SNAPSHOT_SYNC.md
+// Versioned (MVCC) blob keyspace
 //
 // The forest is version-addressable but the blob KV historically was not, which
 // let an incremental sync diff the forest at a pinned version while fetching the
@@ -840,6 +920,21 @@ pub fn consensus_materialized_cursor_key(filter: &[u8]) -> Vec<u8> {
 /// CRDT commit's own batch. See [`CONSENSUS_GLOBAL_MATERIALIZED_CURSOR`].
 pub fn global_materialized_cursor_key() -> Vec<u8> {
     vec![CONSENSUS, CONSENSUS_GLOBAL_MATERIALIZED_CURSOR]
+}
+
+pub fn global_execution_checkpoint_key() -> Vec<u8> {
+    vec![CONSENSUS, CONSENSUS_GLOBAL_EXECUTION_CHECKPOINT]
+}
+
+pub fn global_execution_pending_key() -> Vec<u8> {
+    vec![CONSENSUS, CONSENSUS_GLOBAL_EXECUTION_PENDING]
+}
+
+pub fn app_history_recovery_key(filter: &[u8], session: &[u8; 32]) -> Vec<u8> {
+    let mut key = vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY];
+    key.extend_from_slice(filter);
+    key.extend_from_slice(session);
+    key
 }
 
 // -----------------------------------------------------------------------

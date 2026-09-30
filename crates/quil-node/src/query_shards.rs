@@ -25,6 +25,61 @@ fn be_to_u128(b: &[u8]) -> u128 {
     b.iter().fold(0u128, |acc, &x| (acc << 8) | x as u128)
 }
 
+/// `--query-prover-root ip:8340`: LIVE read of another node's GLOBAL head and
+/// its GLOBAL prover shard root (the forest head of shard `[0xff; 32]`, vertex
+/// adds), over the same :8340 mTLS transport the prover-tree sync uses. Only
+/// read calls; one JSON line, then exit. Compare the root with
+/// `--global-halt-report`'s `next_frame_binds.prover_root` on stopped archives.
+pub async fn run_query_prover_root(
+    archive_arg: &str,
+    config: &quil_config::Config,
+    config_dir: &Path,
+) -> anyhow::Result<()> {
+    let falcon_key = falcon_identity(config, config_dir)?;
+    let mut client = quil_rpc::ArchiveClient::connect_mtls(archive_arg, &falcon_key).await?;
+    let head = client.get_global_frame(0).await.ok().and_then(|frame| frame.header);
+    let prover = client.get_forest_head(vec![0xffu8; 32], 0).await?;
+    println!("{}", serde_json::json!({ "prover_root_query": {
+        "endpoint": archive_arg,
+        "head": head.as_ref().map(|h| serde_json::json!({
+            "frame": h.frame_number,
+            "output": hex::encode(&h.output[..h.output.len().min(8)]),
+            "prover_tree_commitment": hex::encode(&h.prover_tree_commitment),
+        })),
+        "prover_shard_head": prover.map(|(version, root)| serde_json::json!({
+            "version": version,
+            "root": hex::encode(root),
+        })),
+    }}));
+    Ok(())
+}
+
+/// The node's Falcon network identity (the :8340 mTLS key), self-contained
+/// like `keys::init`.
+pub(crate) fn falcon_identity(config: &quil_config::Config, config_dir: &Path) -> anyhow::Result<Vec<u8>> {
+    let keys_path = if config.key.key_store_file.path.is_empty() {
+        config_dir.join("keys.yml")
+    } else {
+        PathBuf::from(&config.key.key_store_file.path)
+    };
+    let proving_key_id = if config.engine.proving_key_id.is_empty() {
+        "default-proving-key".to_string()
+    } else {
+        config.engine.proving_key_id.clone()
+    };
+    let file_key_manager = quil_keys::FileKeyManager::new(
+        keys_path,
+        &config.key.key_store_file.encryption_key,
+        proving_key_id,
+        Box::new(quil_crypto::FalconKeyConstructor),
+    )?;
+    file_key_manager.set_peer_priv_key_hex(&config.p2p.peer_priv_key);
+    file_key_manager.ensure_standard_keys()?;
+    file_key_manager
+        .get_private_key(quil_types::crypto::KeyType::Falcon512)
+        .map_err(|e| anyhow::anyhow!("load Falcon network identity key: {e}"))
+}
+
 pub async fn run_query_shards(
     archive_arg: &str,
     config: &quil_config::Config,

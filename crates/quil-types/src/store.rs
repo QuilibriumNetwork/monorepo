@@ -1,10 +1,42 @@
-use crate::error::Result;
+use crate::error::{QuilError, Result};
 use crate::proto;
 use num_bigint::BigInt;
 
 // ---------------------------------------------------------------------------
 // Core KV abstractions
 // ---------------------------------------------------------------------------
+
+/// Opaque process-local identity of one backing database or execution overlay.
+/// It keeps the owner alive but grants no read/write access. Equal identities
+/// name the same allocation, not merely the same path or on-disk contents.
+#[derive(Clone)]
+pub struct BackingStoreIdentity(std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
+impl BackingStoreIdentity {
+    pub fn of<T: std::any::Any + Send + Sync>(owner: &std::sync::Arc<T>) -> Self {
+        Self(owner.clone())
+    }
+}
+
+impl PartialEq for BackingStoreIdentity {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for BackingStoreIdentity {}
+
+/// One ancillary record staged with an execution frame. `None` deletes the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordMutation {
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+}
+
+/// Optional local-cache notification after a successful durable CRDT commit:
+/// the committed vertex-adds blobs, then the execution records it wrote.
+/// The callback must not block, perform I/O, or reenter the CRDT. Dropped
+/// notifications are permitted: consumers must validate/rebuild their caches.
+pub trait LocalVertexCommitObserver: Send + Sync {
+    fn committed<'a>(&self, vertices: &mut dyn std::iter::Iterator<Item = (&'a [u8], &'a [u8])>);
+}
 
 /// Low-level key-value database interface (Pebble in Go, RocksDB in Rust).
 pub trait KvDb: Send + Sync {
@@ -169,7 +201,21 @@ pub struct RequestOutcome {
 }
 
 /// Clock/frame storage.
+/// A prepared local cache change. Acquire all fallible locks before the durable
+/// execution batch; adoption performs no I/O and must not reenter the store.
+/// Retain the guard until all related execution metadata has been adopted.
+pub trait ExecutionPublicationObserver {
+    fn adopt(&mut self);
+}
+
 pub trait ClockStore: Send + Sync {
+    /// Process-local backing storage identity for constructing execution contexts.
+    fn backing_store_identity(&self) -> Option<BackingStoreIdentity> { None }
+
+    fn prepare_execution_publication(&self) -> Result<Box<dyn ExecutionPublicationObserver + '_>> {
+        Err(QuilError::ExecutionUnavailable("clock does not support canonical execution publication".into()))
+    }
+
     fn new_transaction(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
 
     // Global frames
@@ -201,6 +247,49 @@ pub trait ClockStore: Send + Sync {
         _outcomes: &[RequestOutcome],
     ) -> Result<()> {
         Ok(())
+    }
+    /// Persist the fee total (QUIL base units) of a materialized shard frame:
+    /// the next proposal carries it as `FrameHeader.fee_total` and every
+    /// validator recomputes it, so it must survive a restart. Default no-op.
+    fn put_shard_frame_fee_total(&self, _filter: &[u8], _frame_number: u64, _fee_total: u128) -> Result<()> {
+        Ok(())
+    }
+    /// The persisted fee total of a materialized shard frame, if recorded.
+    fn get_shard_frame_fee_total(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<u128>> {
+        Ok(None)
+    }
+    /// Persist the settlement relay entries a materialized shard frame
+    /// produced (canonical `settlement_record::encode_entries` bytes, empty
+    /// for none). Later frame headers relay them. Default no-op.
+    fn put_shard_frame_settlements(&self, _filter: &[u8], _frame_number: u64, _entries: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    /// The persisted settlement entries of a shard frame, if recorded.
+    fn get_shard_frame_settlements(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    /// Persist a materialized shard frame's accumulator record: the digest of
+    /// the shard's report at that frame (empty for none), and the report bytes
+    /// under that digest. Later frame headers carry the report. Default no-op.
+    fn put_shard_frame_accumulator(&self, _filter: &[u8], _frame_number: u64, _digest: &[u8], _report: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    /// The recorded accumulator-report digest of a shard frame, if recorded.
+    fn get_shard_frame_accumulator(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    /// Persist the spend entries a materialized shard frame produced
+    /// (`spend_relay::encode_frame_entries` bytes). Default no-op.
+    fn put_shard_frame_spends(&self, _filter: &[u8], _frame_number: u64, _entries: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    /// The recorded spend entries of a shard frame, if recorded.
+    fn get_shard_frame_spends(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    /// The report bytes stored under `digest`, if recorded.
+    fn get_shard_accumulator_report(&self, _filter: &[u8], _digest: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(None)
     }
     /// Read the per-bundle materialization outcomes for a frame (empty if the
     /// frame hasn't materialized yet or the backend doesn't record them).
@@ -552,6 +641,10 @@ pub trait WorkerStore: Send + Sync {
 
 /// Application shard metadata storage.
 pub trait ShardsStore: Send + Sync {
+    /// Identity of the committed backing store. A staged metadata batch is
+    /// deliberately not an independently capturable committed store.
+    fn backing_store_identity(&self) -> Option<BackingStoreIdentity> { None }
+
     fn range_app_shards(&self) -> Result<Vec<ShardInfo>>;
     fn get_app_shards(&self, shard_key: &[u8], prefix: &[u32]) -> Result<Vec<ShardInfo>>;
     fn put_app_shard(&self, txn: &dyn Transaction, shard: &ShardInfo) -> Result<()>;
@@ -562,7 +655,7 @@ pub trait ShardsStore: Send + Sync {
         prefix: &[u32],
     ) -> Result<()>;
 
-    // ---- Epoch-aligned pending topology changes (Phase F) -------------------
+    // ---- Epoch-aligned pending topology changes -----------------------------
     // Default no-ops so light/test stores don't need to implement staging; the
     // persistent RocksDB store overrides them.
 
@@ -600,37 +693,6 @@ pub trait ShardsStore: Send + Sync {
     }
 }
 
-/// Hypergraph tree backing store (vector commitment trees).
-/// One coin's accumulator membership witness (see [`CoinWitnessProvider`]).
-#[derive(Debug, Clone)]
-pub struct CoinWitnessData {
-    pub one_time_key: Vec<u8>,
-    pub found: bool,
-    pub leaf_index: u64,
-    pub auth_path: Vec<Vec<u8>>,
-}
-
-/// One enumerated domain coin (see [`CoinWitnessProvider::list_domain_coins`]).
-#[derive(Debug, Clone)]
-pub struct DomainCoinData {
-    pub address: Vec<u8>,
-    pub one_time_key: Vec<u8>,
-    pub commitment: Vec<u8>,
-    pub memo: Vec<u8>,
-}
-
-/// One enumerated escrow/pending vertex (see
-/// [`CoinWitnessProvider::list_domain_escrows`]).
-#[derive(Debug, Clone)]
-pub struct DomainEscrowData {
-    pub address: Vec<u8>,
-    pub cv: Vec<u8>,
-    pub to_key: Vec<u8>,
-    pub refund_key: Vec<u8>,
-    pub expiration: u64,
-    pub memo: Vec<u8>,
-}
-
 /// A PoMW reward-mint witness (see [`CoinWitnessProvider::prover_reward_witness`]):
 /// the forest membership proof of the owner's `reward:ProverReward` vertex, the
 /// current claimable `value` (the Balance field), and the `cited_frame` whose
@@ -641,28 +703,75 @@ pub struct RewardWitnessData {
     pub forest_proof: Vec<u8>,
     pub value: u128,
     pub cited_frame: u64,
+    pub reward_root: Vec<u8>,
 }
 
-/// Node-side backing for the lattice confidential-transaction wallet RPCs
-/// (`GetCoinSpendWitness` / `ListDomainCoins`). Implemented by the layer that
-/// holds the live `HypergraphState` (so it can rebuild the coin accumulator),
-/// and injected into the RPC server like the other store providers.
+/// Historical global membership, not proof that the authorization is unspent.
+/// The consumer must verify its exact receipt/output fields and consensus root.
+#[derive(Debug, Clone, Default)]
+pub struct MintAuthorizationWitnessData {
+    pub found: bool,
+    pub forest_proof: Vec<u8>,
+    pub cited_frame: u64,
+    pub global_root: Vec<u8>,
+}
+
+/// Coin witness transport data, independent of lattice implementation types.
+pub struct CoinWitnessData {
+    pub address: [u8; 32],
+    pub found: bool,
+    pub siblings: Vec<Vec<u8>>,
+    pub right: Vec<bool>,
+}
+pub struct CoinWitnessBundle {
+    pub network: [u8; 32],
+    pub root_record: Vec<u8>,
+    pub depth: u8,
+    pub witnesses: Vec<CoinWitnessData>,
+}
+
+pub struct CoinData {
+    pub address: [u8; 32],
+    pub frame_number: u64,
+    /// Accumulator leaf index; part of the coin's committed content address.
+    pub position: u64,
+    pub owner: Vec<u8>,
+    pub commitment: Vec<u8>,
+    pub memo: Vec<u8>,
+}
+pub struct EscrowPageData {
+    pub network: [u8; 32],
+    pub snapshot_id: [u8; 32],
+    pub escrows: Vec<([u8; 32], Vec<u8>)>,
+    pub cursor: Option<[u8; 32]>,
+    pub has_more: bool,
+}
+
+pub struct CoinPageData {
+    pub network: [u8; 32],
+    pub snapshot_id: [u8; 32],
+    pub root_record: Vec<u8>,
+    pub coins: Vec<CoinData>,
+    pub cursor: Option<[u8; 32]>,
+    pub has_more: bool,
+}
+
+/// Node-side QCT3 wallet discovery, membership and mint-witness provider.
 pub trait CoinWitnessProvider: Send + Sync {
-    /// `(depth, root, per-key witnesses)` for a lattice spend.
-    fn coin_spend_witnesses(
-        &self,
-        domain: &[u8],
-        one_time_keys: &[Vec<u8>],
-    ) -> Result<(u32, Vec<u8>, Vec<CoinWitnessData>)>;
+    fn escrow_page(&self, _domain: &[u8; 32], _snapshot_id: Option<&[u8; 32]>, _after: Option<&[u8; 32]>) -> Result<Option<EscrowPageData>> {
+        Ok(None)
+    }
 
-    /// Enumerate the domain's committed coins (for wallet scanning).
-    fn list_domain_coins(&self, domain: &[u8]) -> Result<Vec<DomainCoinData>>;
+    fn mint_authorization_witness(&self, _receipt: &[u8; 32]) -> Result<MintAuthorizationWitnessData> {
+        Err(crate::error::QuilError::ExecutionUnavailable("mint authorization witnesses unavailable".into()))
+    }
+    fn coin_page(&self, _domain: &[u8; 32], _snapshot_id: Option<&[u8; 32]>, _after: Option<&[u8; 32]>) -> Result<Option<CoinPageData>> {
+        Ok(None)
+    }
 
-    /// Enumerate the domain's committed escrows/pending vertices (for the
-    /// `accept`/`reject` wallet flow). Default empty so existing providers
-    /// compile without change.
-    fn list_domain_escrows(&self, _domain: &[u8]) -> Result<Vec<DomainEscrowData>> {
-        Ok(Vec::new())
+    /// None means the provider has not enabled the token suite.
+    fn coin_witnesses(&self, _domain: &[u8; 32], _addresses: &[[u8; 32]]) -> Result<Option<CoinWitnessBundle>> {
+        Ok(None)
     }
 
     /// Build a PoMW reward-mint witness for `owner_prover_address` in `domain`
@@ -677,7 +786,52 @@ pub trait CoinWitnessProvider: Send + Sync {
     }
 }
 
+/// Bounds retained page data; excludes iterator/internal database memory.
+#[derive(Clone, Copy)]
+pub struct VertexPageLimits {
+    pub max_entries: usize,
+    pub max_bytes: usize,
+}
+
+pub struct VertexDataPage {
+    /// Address and latest blob, in ascending address order, for one domain.
+    pub entries: Vec<([u8; 32], Vec<u8>)>,
+    pub has_more: bool,
+}
+
 pub trait HypergraphStore: Send + Sync {
+    /// Clear legacy and versioned underlying rows in all four phases of one
+    /// shard. Forest maintenance is separate and must share the same barrier.
+    fn clear_shard_underlying(&self, _shard: &ShardKey) -> Result<()> {
+        Err(QuilError::ExecutionUnavailable("shard record reset unsupported".into()))
+    }
+
+    /// Delete every `root → (version, frame)` index entry of one shard id's four
+    /// phase trees, for a tree that was just wiped. Returns how many.
+    fn clear_root_versions(&self, _shard_id: &[u8]) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// [`Self::clear_root_versions`] for one `(set, phase)` tree.
+    fn clear_phase_root_versions(&self, _set_type: &str, _phase_type: &str, _shard_id: &[u8]) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Required when constructing an execution fork: the forest and record
+    /// store must address the same backing database/overlay. Unknown backends
+    /// cannot claim this invariant by default.
+    fn backing_store_identity(&self) -> Option<BackingStoreIdentity> { None }
+
+    /// Page fixed 64-byte domain/address keys, merging latest MVCC and legacy
+    /// values. The cursor is exclusive. Each call is a consistent snapshot;
+    /// separate calls are not automatically pinned to the same version.
+    fn page_vertex_underlying_fixed(
+        &self, _set_type: &str, _phase_type: &str, _shard: &ShardKey,
+        _domain: &[u8; 32], _after: Option<&[u8; 32]>, _limits: VertexPageLimits,
+    ) -> Result<VertexDataPage> {
+        Err(QuilError::Store("fixed vertex paging is unsupported by this backend".into()))
+    }
+
     fn new_transaction(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
 
     fn get_node_by_key(
@@ -813,9 +967,9 @@ pub trait HypergraphStore: Send + Sync {
 
     // -------------------------------------------------------------------
     // Versioned (MVCC) blob store + root→version index + split-app manifest.
-    // See crates/quil-hypergraph/VERSIONED_SNAPSHOT_SYNC.md. Default impls make
-    // the versioned store degrade to the legacy unversioned behavior so mocks
-    // and alternate backends compile unchanged; RocksHypergraphStore overrides
+    // Default impls make the versioned store degrade to the legacy unversioned
+    // behavior so mocks and alternate backends compile unchanged;
+    // RocksHypergraphStore overrides
     // them with real MVCC semantics.
     // -------------------------------------------------------------------
 
@@ -847,6 +1001,22 @@ pub trait HypergraphStore: Send + Sync {
     ) -> Result<Option<Vec<u8>>> {
         // Default: no versioning — return the latest.
         self.load_vertex_underlying_raw(set_type, phase_type, shard_key, vertex_key)
+    }
+
+    /// Delete every stored version of `vertex_key`'s blob from `first` on,
+    /// staged into `txn`. A shard rewind uses it for removals made after the
+    /// state it restores: any removes-phase blob hides its vertex, so a newer
+    /// empty one cannot undo a removal. Default: unsupported.
+    fn delete_vertex_underlying_versions_from(
+        &self,
+        _txn: &dyn Transaction,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_key: &ShardKey,
+        _vertex_key: &[u8],
+        _first: u64,
+    ) -> Result<()> {
+        Err(crate::error::QuilError::Internal("this store keeps no blob versions to delete".into()))
     }
 
     /// Record `root_hash → (version, global_frame)` for a `(shard, phase)` tree,
@@ -910,6 +1080,21 @@ pub trait HypergraphStore: Send + Sync {
     /// `(shard_id, phase_idx, min_readable_version)` so the caller can prune the
     /// matching forest trees in lockstep. Default: no-op (unversioned backends).
     fn prune_versioned(&self, _cull_frame: u64) -> Result<Vec<(Vec<u8>, usize, u64)>> {
+        Ok(Vec::new())
+    }
+
+    /// Like [`prune_versioned`](Self::prune_versioned), but each tree keeps the
+    /// last `retain_frames` of its own indexed frames, and at most
+    /// `max_blob_deletes` blob versions are deleted per call. `head` gives a
+    /// tree's current version, `(shard id, phase index)`. Trees whose versions
+    /// restart are left untouched; with a head known, a tree whose frames fall
+    /// while its versions rise is pruned conservatively.
+    fn prune_versioned_retaining(
+        &self,
+        _retain_frames: u64,
+        _max_blob_deletes: usize,
+        _head: &dyn Fn(&[u8], usize) -> Option<u64>,
+    ) -> Result<Vec<(Vec<u8>, usize, u64)>> {
         Ok(Vec::new())
     }
 
@@ -1014,6 +1199,33 @@ pub struct ChangeRecord {
 /// paths require them; in the meantime callers must still go to the
 /// live store for anything not covered here.
 pub trait SnapshotReadable: Send + Sync {
+    /// Read a metadata key at the same captured sequence as the tree data.
+    /// Consumers of commit cursors must not substitute a live-store read.
+    fn read_record(&self, _key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Err(QuilError::Store("snapshot metadata reads are unsupported by this backend".into()))
+    }
+
+    /// Page fixed domain/address vertex keys from this retained snapshot.
+    /// Reusing the same handle across pages keeps concurrent commits invisible.
+    /// Callers must bound handle lifetime/count because snapshots retain old DB data.
+    fn page_vertex_underlying_fixed(
+        &self, _set_type: &str, _phase_type: &str, _shard: &ShardKey,
+        _domain: &[u8; 32], _after: Option<&[u8; 32]>, _limits: VertexPageLimits,
+    ) -> Result<VertexDataPage> {
+        Err(QuilError::Store("fixed vertex snapshot paging is unsupported by this backend".into()))
+    }
+
+    /// [`Self::page_vertex_underlying_fixed`], passing over the rows whose
+    /// address `skip` names without copying, returning or counting them, so
+    /// a large row the caller does not want cannot fail its pages.
+    fn page_vertex_underlying_fixed_skipping(
+        &self, _set_type: &str, _phase_type: &str, _shard: &ShardKey,
+        _domain: &[u8; 32], _after: Option<&[u8; 32]>, _limits: VertexPageLimits,
+        _skip: &dyn Fn(&[u8; 32]) -> bool,
+    ) -> Result<VertexDataPage> {
+        Err(QuilError::Store("fixed vertex snapshot paging is unsupported by this backend".into()))
+    }
+
     /// Load the serialized tree blob for `(set_type, phase_type, shard_key)`
     /// as it existed when the snapshot was captured, or `None` if absent.
     fn load_tree_blob(
@@ -1038,6 +1250,14 @@ pub trait SnapshotReadable: Send + Sync {
         _path: &[i32],
     ) -> Result<Option<Vec<u8>>> {
         Ok(None)
+    }
+
+    /// Whether underlying vertex reads are supported at the captured sequence.
+    /// Recovery must distinguish an unsupported reader (whose default returns
+    /// `None`) from authenticated absence. Live-store adapters must leave this
+    /// false because they do not pin a generation.
+    fn has_snapshot_vertex_reads(&self) -> bool {
+        false
     }
 
     /// Read one vertex's underlying data blob at the captured sequence.

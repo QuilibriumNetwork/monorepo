@@ -17,8 +17,16 @@ path = "src/bin/prover_join_test.rs"
 name = "blossom-chat"
 path = "src/bin/blossom_chat.rs"
 
+[features]
+# The replacement (QCT3) token suite is the default node path. Disabling the
+# feature builds a node that rejects every confidential token operation.
+default = ["native-proof"]
+confidential-tokens = ["quil-execution/confidential-tokens", "quil-lattice-ct/confidential-tokens"]
+native-proof = ["confidential-tokens", "quil-execution/native-proof", "quil-lattice-ct/native-proof"]
+
 [dependencies]
 async-trait = "0.1"
+quil-lattice-ct = { path = "../quil-lattice-ct" }
 quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-lifecycle = { path = "../quil-lifecycle" }
@@ -30,7 +38,7 @@ quil-p2p = { path = "../quil-p2p" }
 quil-consensus = { path = "../quil-consensus" }
 quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-engine = { path = "../quil-engine" }
-# Commonware simplex consensus backend (P2 cutover): committee assembly + the
+# Commonware simplex consensus backend: committee assembly + the
 # channel Message types for the :8340 inbound routing.
 quil-cw-consensus = { path = "../quil-cw-consensus" }
 quil-rpc = { path = "../quil-rpc" }
@@ -94,3 +102,6 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 [dev-dependencies]
 tempfile = "3"
 flate2 = "1"
+
+[build-dependencies]
+sha2 = "0.10"

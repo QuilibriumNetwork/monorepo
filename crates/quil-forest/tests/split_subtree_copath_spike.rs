@@ -1,4 +1,4 @@
-//! SPIKE #3: the co-path / sync mechanic for the unified-app-tree shard model.
+//! SPIKE: the co-path / sync mechanic for the unified-app-tree shard model.
 //!
 //! A shard prover holds only its prefix-range subtree. Can it verify a leaf
 //! against the SINGLE app root without the whole tree, via
@@ -34,7 +34,7 @@ fn shard_scoped_proof_composes_leaf_to_shard_to_app_root() {
     let store = MockTreeStore::default();
     let tree = Sha256Jmt::new(&store);
 
-    // Same 6-bit-shard layout as spike #2: shard X = top-6-bits 000000
+    // Same 6-bit-shard layout as the 6-bit spike: shard X = top-6-bits 000000
     // (byte0 0x00..0x03), shard Y = 000001 (0x04..0x07), + shard Z at nibble 8.
     let mut kvs: Vec<(KeyHash, Option<Vec<u8>>)> = Vec::new();
     for b in 0u8..8 {
@@ -46,7 +46,7 @@ fn shard_scoped_proof_composes_leaf_to_shard_to_app_root() {
     let app_root = app_root.0;
 
     // Independently compute shard X's commitment = width-4 sub-range [0,4) of the
-    // 2nd-nibble node (the SAME value spike #2 validated composes to the node).
+    // 2nd-nibble node (the SAME value the 6-bit spike validated composes to the node).
     let root_key = NodeKey::new(0, NibblePath::new(vec![]));
     let root_internal = match store.get_node_option(&root_key).unwrap().unwrap() {
         Node::Internal(n) => n,

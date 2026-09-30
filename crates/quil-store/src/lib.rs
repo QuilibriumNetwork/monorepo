@@ -1,9 +1,13 @@
 mod rocksdb_store;
 mod clock;
+mod clock_codec;
+mod clock_overlay;
 mod token;
 mod key;
 mod shards;
 mod hypergraph;
+mod retention;
+mod overlay;
 mod dispatch;
 pub mod encoding;
 mod worker;
@@ -14,10 +18,11 @@ pub mod disk_monitor;
 pub mod testing;
 
 pub use rocksdb_store::{RocksDb, RocksDbMemory, RocksTransaction, RocksIterator, StoreFormat, detect_store_format};
-pub use clock::RocksClockStore;
+pub use clock::{CandidatePrune, RocksClockStore, StagedFrameCleanup};
+pub use clock_overlay::OverlayClockStore;
 pub use token::RocksTokenStore;
 pub use key::RocksKeyStore;
-pub use shards::RocksShardsStore;
-pub use hypergraph::{RocksHypergraphSnapshot, RocksHypergraphStore, VertexWrite, FOREST_NAMESPACE};
+pub use shards::{OverlayShardsStore, RocksShardsStore, ShardMetadataBatch};
+pub use hypergraph::{OverlayHypergraphStore, RocksHypergraphSnapshot, RocksHypergraphStore, VertexWrite, FOREST_NAMESPACE};
 pub use dispatch::RocksInboxStore;
 pub use worker::RocksWorkerStore;

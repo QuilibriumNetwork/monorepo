@@ -28,8 +28,8 @@ pub const VERTEX_LEAF_LEN: usize = 32 + 8;
 /// whose 32-byte root is the vertex commitment.
 ///
 /// The proof methods are Merkle sibling-revelation shaped, not KZG-opening
-/// shaped, and are not yet wired (state-root commitment is the current
-/// deliverable). They error rather than return a wrong/forgeable result.
+/// shaped, and are not implemented (only the state-root commitment is used).
+/// They error rather than return a wrong/forgeable result.
 pub struct ShaInclusionProver;
 
 impl InclusionProver for ShaInclusionProver {

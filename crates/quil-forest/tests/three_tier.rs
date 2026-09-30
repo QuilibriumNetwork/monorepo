@@ -3,7 +3,6 @@
 //! tree, which rolls up into one of the 256 Level-1 global trees. Proves the
 //! wiring, determinism, per-tree-id isolation, and on-disk round-trip.
 
-use std::sync::Arc;
 
 use jmt::{KeyHash, RootHash, Sha256Jmt};
 use quil_forest::{
@@ -11,15 +10,15 @@ use quil_forest::{
 };
 use sha2::Sha256;
 
-fn open_db(path: &std::path::Path) -> Arc<rocksdb::DB> {
+fn open_db(path: &std::path::Path) -> quil_forest::CoordinatedDb {
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
-    Arc::new(rocksdb::DB::open(&opts, path).unwrap())
+    quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, path).unwrap())
 }
 
 /// Build a Level-3 shard tree of `n` state leaves; return (root, count, size).
 fn build_shard(
-    db: &Arc<rocksdb::DB>,
+    db: &quil_forest::CoordinatedDb,
     shard_id: &[u8],
     n: u32,
 ) -> (RootHash, u64, u128) {

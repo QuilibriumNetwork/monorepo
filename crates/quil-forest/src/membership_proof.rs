@@ -213,10 +213,10 @@ mod tests {
     use crate::{Forest, Phase};
     use num_bigint::BigInt;
 
-    fn open_db(path: &std::path::Path) -> std::sync::Arc<rocksdb::DB> {
+    fn open_db(path: &std::path::Path) -> crate::CoordinatedDb {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        std::sync::Arc::new(rocksdb::DB::open(&opts, path).unwrap())
+        crate::CoordinatedDb::new(rocksdb::DB::open(&opts, path).unwrap())
     }
 
     /// Build a vertex subtree blob from `(field_key, value)` fields.

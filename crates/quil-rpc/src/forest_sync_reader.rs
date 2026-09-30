@@ -24,6 +24,9 @@ pub struct RemoteTreeReader {
     handle: tokio::runtime::Handle,
     shard_id: Vec<u8>,
     phase: u32,
+    /// Remote reads so far and when the walk started, for progress lines.
+    reads: std::sync::atomic::AtomicU64,
+    started: std::time::Instant,
 }
 
 impl RemoteTreeReader {
@@ -35,12 +38,36 @@ impl RemoteTreeReader {
         shard_id: Vec<u8>,
         phase: u32,
     ) -> Self {
-        Self { client, handle, shard_id, phase }
+        Self {
+            client,
+            handle,
+            shard_id,
+            phase,
+            reads: std::sync::atomic::AtomicU64::new(0),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Count one remote read. A walk issues one request per node or value,
+    /// so a whole tree over a long link takes a while; log at every power of
+    /// two past 1,024 reads so a slow walk shows progress in a few lines.
+    fn counted(&self) {
+        let reads = self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if reads >= 1024 && reads.is_power_of_two() {
+            tracing::info!(
+                shard = %hex::encode(&self.shard_id[..self.shard_id.len().min(8)]),
+                phase = self.phase,
+                reads,
+                elapsed_secs = self.started.elapsed().as_secs(),
+                "remote tree walk in progress",
+            );
+        }
     }
 }
 
 impl TreeReader for RemoteTreeReader {
     fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {
+        self.counted();
         let key_bytes = borsh::to_vec(node_key)?;
         let mut client = self.client.clone();
         let shard_id = self.shard_id.clone();
@@ -60,6 +87,7 @@ impl TreeReader for RemoteTreeReader {
         max_version: Version,
         key_hash: KeyHash,
     ) -> Result<Option<OwnedValue>> {
+        self.counted();
         let mut client = self.client.clone();
         let shard_id = self.shard_id.clone();
         let phase = self.phase;

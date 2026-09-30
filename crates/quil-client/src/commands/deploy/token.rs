@@ -56,9 +56,12 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
     if let Some(v) = config.get("mintstrategy") {
         let mut strat = TokenMintStrategy::default();
         match v.to_lowercase().as_str() {
+            // Custom tokens never mint by proof of meaningful work: the proof
+            // basis is a Merkle root of mint entitlements in this config
+            // (`token entitlements` builds it and prints each proof).
             "proof" => {
                 strat.mint_behavior = TokenMintBehavior::MintWithProof as i32;
-                strat.proof_basis = ProofBasisType::ProofOfMeaningfulWork as i32;
+                strat.proof_basis = ProofBasisType::MerkleEntitlementWithSignature as i32;
             }
             "authority" => strat.mint_behavior = TokenMintBehavior::MintWithAuthority as i32,
             "signature" => strat.mint_behavior = TokenMintBehavior::MintWithSignature as i32,
@@ -66,6 +69,43 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
             other => anyhow::bail!(
                 "unknown mint strategy: {other} (valid: proof, authority, signature, payment)"
             ),
+        }
+        // The mint authority: a keystore key id, resolved to its public key.
+        // Application authority keys are post-quantum only (Falcon-512).
+        if let Some(id) = config.get("authoritykey") {
+            let signer = dc.key_manager.get_signer_by_id(id)
+                .map_err(|e| anyhow::anyhow!("mint authority key {id}: {e}"))?;
+            anyhow::ensure!(
+                quil_execution::token_intrinsic::signature::is_post_quantum_authority(signer.key_type() as u32),
+                "mint authority keys must be post-quantum (Falcon-512): {id} is not"
+            );
+            strat.authority = Some(quil_types::proto::token::Authority {
+                key_type: signer.key_type() as u32,
+                public_key: signer.public_key().to_vec(),
+                can_burn: config.get("canburn").is_some_and(|v| v == "true"),
+            });
+        }
+        // A paid mint: the price per unit, paid to this payment address (the
+        // payee's `token payment-address`).
+        if let Some(v) = config.get("paymentaddress") {
+            let address = hex::decode(v.strip_prefix("0x").unwrap_or(v))
+                .map_err(|_| anyhow::anyhow!("payment address is not hex: {v}"))?;
+            anyhow::ensure!(address.len() == 32, "a payment address is 32 bytes");
+            strat.payment_address = address;
+        }
+        if let Some(v) = config.get("price") {
+            let baseline: u128 = v.parse().map_err(|_| anyhow::anyhow!("price is not a number: {v}"))?;
+            strat.fee_basis = Some(quil_types::proto::token::FeeBasis {
+                r#type: quil_types::proto::token::FeeBasisType::PerUnit as i32,
+                baseline: BigInt::from(baseline).to_bytes_be().1,
+            });
+        }
+        // The entitlement root of a proof-basis token (`token entitlements`).
+        if let Some(v) = config.get("entitlementroot") {
+            let root = hex::decode(v.strip_prefix("0x").unwrap_or(v))
+                .map_err(|_| anyhow::anyhow!("entitlement root is not hex: {v}"))?;
+            anyhow::ensure!(root.len() == 32, "an entitlement root is 32 bytes");
+            strat.verkle_root = root;
         }
         cfg.mint_strategy = Some(strat);
     }
@@ -79,6 +119,13 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
     let keys = dc.deploy_keys()?;
     cfg.owner_public_key = keys.owner;
 
+    // The domain this configuration derives, so the deployer can address the
+    // token it just created (the node derives the same value).
+    let domain = quil_execution::token_intrinsic::materialize::token_deploy_domain(
+        &quil_execution::token_intrinsic::conversions::token_config_from_proto(&cfg)
+            .map_err(|e| anyhow::anyhow!("token configuration: {e}"))?,
+    ).map_err(|e| anyhow::anyhow!("deploy domain: {e}"))?;
+
     let mut client = dc.connect().await?;
     let request = MessageRequest {
         request: Some(Request::TokenDeploy(TokenDeploy {
@@ -90,6 +137,7 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
     dc.send_deploy(&mut client, request).await?;
 
     println!("Token deployed successfully");
+    println!("Domain: {}", hex::encode(domain));
     if !cfg.name.is_empty() {
         println!("  Name: {}", cfg.name);
     }

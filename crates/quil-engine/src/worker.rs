@@ -13,7 +13,8 @@ pub trait WorkerManager: Send + Sync {
 
     /// Bind `core_id` to `filter`. `start_consensus`:
     ///   * `true` — also (re)start `AppConsensusEngine` for this
-    /// filter. Use for `Active`/`Paused` allocations.
+    /// filter, and mark the worker allocated. Use for `Active`/`Paused`
+    /// allocations.
     /// * `false` — record the filter binding only; do NOT spawn a
     /// consensus engine. Use for `Joining` allocations whose
     /// prover isn't Active yet (the engine's `leader_for_rank`

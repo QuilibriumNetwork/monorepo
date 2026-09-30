@@ -6,6 +6,9 @@ license = "Apache-2.0"
 description = "Execution engines (Global, Token, Compute, Hypergraph) for the Quilibrium node"
 
 [features]
+# Replacement coin storage; does not enable proof admission.
+confidential-tokens = ["quil-lattice-ct/confidential-tokens"]
+native-proof = ["confidential-tokens", "quil-lattice-ct/native-proof"]
 # Expose the noop crypto/store stubs used by execution-engine tests to
 # satisfy the now-mandatory `Arc<dyn ...>` constructor parameters.
 # Downstream crates that need to build a manager in their own tests
@@ -18,7 +21,7 @@ quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-crypto = { path = "../quil-crypto" }
 # Commonware-simplex finalization-cert verify (reward attribution for CW-finalized
-# app-shard frames, task #61). Acyclic: quil-cw-consensus doesn't depend on us.
+# app-shard frames). Acyclic: quil-cw-consensus doesn't depend on us.
 quil-cw-consensus = { path = "../quil-cw-consensus" }
 once_cell = "1"
 quil-tries = { path = "../quil-tries" }
@@ -44,6 +47,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
+pqcrypto-ntruprime = "0.1"
+pqcrypto-traits = "0.3"
 tempfile = "3"
 quil-store = { path = "../quil-store", features = ["test-utils"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }

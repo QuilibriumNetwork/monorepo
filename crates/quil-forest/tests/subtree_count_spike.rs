@@ -1,6 +1,6 @@
-//! SPIKE #4: per-shard leaf COUNT via `InternalNode::subtree_leaf_count` — the
-//! count half of the unified-app-tree Merkle-sum, and the data signal the split
-//! decision needs (UNIFIED_APP_TREE_DESIGN §5/§6.1).
+//! Per-shard leaf COUNT via `InternalNode::subtree_leaf_count` — the count
+//! half of the unified-app-tree Merkle-sum, and the data signal the split
+//! decision needs.
 //!
 //! Validates that, for the real 64-way / top-6-bit shard layout, a prospective
 //! shard's data-bearing leaf count is a width-N sub-range of a JMT internal node
@@ -25,7 +25,7 @@ fn subtree_leaf_count_partitions_and_decides_the_split_guard() {
     let store = MockTreeStore::default();
     let tree = Sha256Jmt::new(&store);
 
-    // Same layout as spikes #2/#3: shard X = top-6-bits 000000 (byte0 0x00..0x03
+    // Same layout as the 6-bit and co-path spikes: shard X = top-6-bits 000000 (byte0 0x00..0x03
     // → 2nd-nibble range [0,4)), shard Y = 000001 (0x04..0x07 → [4,8)). Put an
     // UNEVEN amount of data: 5 leaves in X's range, 2 in Y's, 0 elsewhere.
     let mut kvs: Vec<(KeyHash, Option<Vec<u8>>)> = Vec::new();
@@ -39,7 +39,7 @@ fn subtree_leaf_count_partitions_and_decides_the_split_guard() {
     let (_root, batch) = tree.put_value_set(kvs, 0).unwrap();
     store.write_tree_update_batch(batch).unwrap();
 
-    // Fetch the 2nd-nibble internal node (spike #2's node) WITHOUT naming the
+    // Fetch the 2nd-nibble internal node (the 6-bit spike's node) WITHOUT naming the
     // private `InternalNode` type — let inference bind it.
     let root_key = NodeKey::new(0, NibblePath::new(vec![]));
     let root_internal = match store.get_node_option(&root_key).unwrap().unwrap() {

@@ -36,6 +36,13 @@ pub struct AppShardState {
     pub storage_attestation_root: Vec<u8>,
     /// The global frame whose VDF output anchors the storage beacon (field 14).
     pub global_frame_number: u64,
+    /// Previous-frame fee total credited to the shard's provers (field 16).
+    pub fee_total: u128,
+    /// Settlement relay window the header carries (field 17). Set by the
+    /// producer after construction; empty for frames relaying nothing.
+    pub settlements: Vec<u8>,
+    pub accumulator: Vec<u8>,
+    pub spends: Vec<u8>,
     /// Cached identity (sha3-256 of output, raw bytes).
     identity_cache: Identity,
 }
@@ -57,6 +64,7 @@ impl AppShardState {
         fee_multiplier: u64,
         storage_attestation_root: Vec<u8>,
         global_frame_number: u64,
+        fee_total: u128,
     ) -> Self {
         let identity_cache = compute_output_identity(&output);
         Self {
@@ -74,6 +82,10 @@ impl AppShardState {
             fee_multiplier,
             storage_attestation_root,
             global_frame_number,
+            fee_total,
+            settlements: Vec::new(),
+            accumulator: Vec::new(),
+            spends: Vec::new(),
             identity_cache,
         }
     }
@@ -103,6 +115,10 @@ impl AppShardState {
             fee_multiplier: header.fee_multiplier_vote,
             storage_attestation_root: header.storage_attestation_root.clone(),
             global_frame_number: header.global_frame_number,
+            fee_total: quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&header.fee_total),
+            settlements: header.settlements.clone(),
+            accumulator: header.accumulator.clone(),
+            spends: header.spends.clone(),
             identity_cache,
         }
     }
@@ -158,12 +174,12 @@ mod tests {
         let s1 = AppShardState::new(
             vec![1], 10, 0, 1000, 50000,
             vec![0xAAu8; 64], vec![], vec![], vec![], vec![], vec![], 0,
-            vec![], 0,
+            vec![], 0, 0,
         );
         let s2 = AppShardState::new(
             vec![1], 10, 0, 1000, 50000,
             vec![0xAAu8; 64], vec![], vec![], vec![], vec![], vec![], 0,
-            vec![], 0,
+            vec![], 0, 0,
         );
         assert_eq!(s1.identity(), s2.identity());
         assert!(!s1.identity().is_empty());
@@ -175,7 +191,7 @@ mod tests {
             vec![1, 2], 42, 5, 1000, 100000,
             vec![0xBBu8; 64], vec![], vec![0xCCu8; 585], vec![], vec![],
             vec![0xDDu8; 74], 100,
-            vec![], 0,
+            vec![], 0, 0,
         );
         assert_eq!(s.rank(), 5);
         assert_eq!(s.timestamp(), 1000);

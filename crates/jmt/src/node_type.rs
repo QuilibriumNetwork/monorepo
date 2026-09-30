@@ -470,8 +470,7 @@ impl InternalNode {
     }
 
     /// Total leaf count under the child sub-range `[start, start+width)` — the
-    /// COUNT half of the unified-app-tree Merkle-sum (see
-    /// `crates/quil-execution/UNIFIED_APP_TREE_DESIGN.md` §5/§6.1). Uses the
+    /// COUNT half of the unified-app-tree Merkle-sum. Uses the
     /// per-[`Child`] `leaf_count` metadata jmt already maintains — no tree walk,
     /// no node-format change. `[start=0, width=16)` reproduces
     /// [`Self::leaf_count`]. Same range constraints as [`Self::subtree_hash`]:

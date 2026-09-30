@@ -16,7 +16,7 @@ quil-execution = { path = "../quil-execution" }
 quil-hypergraph = { path = "../quil-hypergraph" }
 quil-tries = { path = "../quil-tries" }
 quil-crypto = { path = "../quil-crypto" }
-# Phase-3 forest: sync-side verification (fresh-JMT root of pulled leaves).
+# JMT forest: sync-side verification (fresh-JMT root of pulled leaves).
 quil-forest-migrate = { path = "../quil-forest-migrate" }
 quil-forest = { path = "../quil-forest" }
 # RemoteTreeReader implements jmt's TreeReader over gRPC for the Merkle-diff sync.

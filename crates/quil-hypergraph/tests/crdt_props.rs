@@ -1110,3 +1110,115 @@ fn compute_shard_root_matches_commit_root_for_prover_shard() {
         "compute_shard_root (verify/leader read) must equal commit()'s vertex-adds root"
     );
 }
+
+
+#[test]
+fn commit_setup_failure_preserves_staged_writes_for_retry() {
+    for failure in [(true, false), (false, true)] {
+        let store = Arc::new(MemStore::new());
+        let crdt = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        let location = Location { app_address: [7; 32], data_address: [8; 32] };
+        crdt.add_vertex(&location, b"staged-value").unwrap();
+        store.fail_commit_setup(failure.0, failure.1);
+        assert!(crdt.commit(1).unwrap_err().is_execution_unavailable());
+        assert_eq!(store.per_vertex_count(), 0);
+        assert_eq!(crdt.get_vertex_data_checked(&location).unwrap(), Some(b"staged-value".to_vec()));
+        store.fail_commit_setup(false, false);
+        crdt.commit(1).unwrap();
+        assert_eq!(store.per_vertex_count(), 1);
+        // A new CRDT has no pending writes; this read must come from the store.
+        let reopened = HypergraphCrdt::new(store, Arc::new(StubProver));
+        assert_eq!(reopened.get_vertex_data_checked(&location).unwrap(), Some(b"staged-value".to_vec()));
+    }
+}
+
+
+#[test]
+fn mutation_read_errors_preserve_committed_state_and_roots() {
+    // Both absent and existing entries: an I/O error is neither absence nor
+    // permission to overwrite a blob or stamp a zero-sized tombstone.
+    for existing in [false, true] {
+        for (operation, phase) in [(0, "adds"), (1, "adds"), (1, "removes"),
+                                   (2, "removes"), (3, "adds"), (3, "removes")] {
+            let store = Arc::new(MemStore::new());
+            let crdt = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+            let location = Location { app_address: [7; 32], data_address: [8; 32] };
+            if existing {
+                crdt.add_vertex(&location, b"vertex-before").unwrap();
+                crdt.add_hyperedge(&location, b"edge-before").unwrap();
+            }
+            crdt.commit(1).unwrap();
+            let shard = quil_hypergraph::shard_key_for_location(&location);
+            let roots = || [("vertex", "adds"), ("vertex", "removes"),
+                ("hyperedge", "adds"), ("hyperedge", "removes")].map(|(set, phase)|
+                    crdt.compute_shard_root(set, phase, &shard));
+            let roots_before = roots();
+            store.fail_vertex_reads(Some(phase));
+            let result = match operation {
+                0 => crdt.add_vertex(&location, b"vertex-after"),
+                1 => crdt.remove_vertex(&location),
+                2 => crdt.add_hyperedge(&location, b"edge-after"),
+                3 => crdt.remove_hyperedge(&location),
+                _ => unreachable!(),
+            };
+            assert!(result.unwrap_err().is_execution_unavailable(), "operation={operation} phase={phase} existing={existing}");
+            store.fail_vertex_reads(None);
+            assert_eq!(crdt.get_vertex_data_checked(&location).unwrap(),
+                existing.then(|| b"vertex-before".to_vec()));
+            assert_eq!(crdt.get_hyperedge_data_checked(&location).unwrap(),
+                existing.then(|| b"edge-before".to_vec()));
+            assert!(crdt.commit(2).unwrap().is_empty());
+            assert_eq!(roots(), roots_before);
+        }
+    }
+}
+
+#[test]
+fn ordered_batch_matches_sequential_mutations() {
+    use quil_hypergraph::Mutation;
+    use quil_types::store::RecordMutation;
+    let first = Location { app_address: [7; 32], data_address: [8; 32] };
+    let second = Location { app_address: [7; 32], data_address: [9; 32] };
+    let record_put = RecordMutation { key: b"test/frame-record".to_vec(), value: Some(vec![1]) };
+    let record_delete = RecordMutation { key: record_put.key.clone(), value: None };
+    let record_replacement = RecordMutation { key: record_put.key.clone(), value: Some(vec![2]) };
+    let operations = [
+        Mutation::Record(&record_put),
+        Mutation::AddVertex(first.clone(), b"original"),
+        Mutation::AddVertex(first.clone(), b"updated"),
+        Mutation::RemoveVertex(first.clone()),
+        Mutation::Record(&record_delete),
+        Mutation::RemoveVertex(first.clone()),
+        Mutation::RemoveVertex(second.clone()),
+        Mutation::AddVertex(second.clone(), b"removed-first"),
+        Mutation::AddHyperedge(first.clone(), b"edge"),
+        Mutation::RemoveHyperedge(first.clone()),
+        Mutation::AddHyperedge(first.clone(), b"must-stay-removed"),
+        Mutation::AddHyperedge(second.clone(), b"live-edge"),
+        Mutation::Record(&record_replacement),
+    ];
+    let sequential = HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver));
+    let batch = HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver));
+    for operation in &operations {
+        match operation {
+            Mutation::AddVertex(loc, data) => sequential.add_vertex(loc, data),
+            Mutation::RemoveVertex(loc) => sequential.remove_vertex(loc),
+            Mutation::AddHyperedge(loc, data) => sequential.add_hyperedge(loc, data),
+            Mutation::RemoveHyperedge(loc) => sequential.remove_hyperedge(loc),
+            Mutation::Record(_) => sequential.apply_mutations(std::slice::from_ref(operation)),
+        }.unwrap();
+    }
+    batch.apply_mutations(&operations).unwrap();
+    assert_eq!(batch.commit(1).unwrap(), sequential.commit(1).unwrap());
+    assert_eq!(batch.read_execution_record(&record_put.key).unwrap(), Some(vec![2]));
+    assert_eq!(batch.read_execution_record(&record_put.key).unwrap(),
+        sequential.read_execution_record(&record_put.key).unwrap());
+    for location in [&first, &second] {
+        assert_eq!(batch.get_vertex_data_checked(location).unwrap(), sequential.get_vertex_data_checked(location).unwrap());
+        assert_eq!(batch.get_hyperedge_data_checked(location).unwrap(), sequential.get_hyperedge_data_checked(location).unwrap());
+    }
+    assert_eq!(batch.get_vertex_data_checked(&first).unwrap(), None);
+    assert_eq!(batch.get_vertex_data_checked(&second).unwrap(), None);
+    assert_eq!(batch.get_hyperedge_data_checked(&first).unwrap(), None);
+    assert_eq!(batch.get_hyperedge_data_checked(&second).unwrap(), Some(b"live-edge".to_vec()));
+}

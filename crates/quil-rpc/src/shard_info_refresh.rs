@@ -55,6 +55,15 @@ pub enum ShardInfoRefreshError {
     AllEndpointsFailed(String),
 }
 
+/// What one archive reports about the shards it holds: each shard's size,
+/// and the shards a recorded split or merge has frozen until it applies (the
+/// chain refuses a join that includes one).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ArchiveShardInfo {
+    pub sizes: HashMap<Vec<u8>, u64>,
+    pub frozen: HashSet<Vec<u8>>,
+}
+
 /// Enumerate shard_keys from the local `ShardsStore`, then dial one
 /// archive at a time and request `GetAppShards` for each shard_key
 /// in turn. Aggregates all returned `(filter, size)` pairs into a
@@ -90,7 +99,7 @@ pub async fn fetch_shard_sizes_from_archive(
     falcon_signing_key: &[u8],
     shards_store: &dyn ShardsStore,
     cap_per_attempt: Option<usize>,
-) -> Result<HashMap<Vec<u8>, u64>, ShardInfoRefreshError> {
+) -> Result<ArchiveShardInfo, ShardInfoRefreshError> {
     let pool_size = pool.len().await;
     if pool_size == 0 {
         return Err(ShardInfoRefreshError::PoolEmpty);
@@ -121,15 +130,16 @@ pub async fn fetch_shard_sizes_from_archive(
         };
 
         match try_one_endpoint(&endpoint, falcon_signing_key, &shard_keys).await {
-            Ok(map) if !map.is_empty() => {
+            Ok(found) if !found.sizes.is_empty() => {
                 info!(
                     %endpoint,
                     shard_keys = shard_keys.len(),
-                    shards_filtered = map.len(),
+                    shards_filtered = found.sizes.len(),
+                    frozen = found.frozen.len(),
                     attempt,
                     "shard_info refresh: success"
                 );
-                return Ok(map);
+                return Ok(found);
             }
             Ok(_) => {
                 // Connected but got zero filters back — likely all
@@ -167,9 +177,9 @@ async fn try_one_endpoint(
     endpoint: &str,
     falcon_signing_key: &[u8],
     shard_keys: &[Vec<u8>],
-) -> Result<HashMap<Vec<u8>, u64>, ArchiveClientError> {
+) -> Result<ArchiveShardInfo, ArchiveClientError> {
     let mut client = ArchiveClient::connect_mtls(endpoint, falcon_signing_key).await?;
-    let mut out: HashMap<Vec<u8>, u64> = HashMap::new();
+    let mut out = ArchiveShardInfo::default();
     let mut any_success = false;
     let mut last_err: Option<ArchiveClientError> = None;
     for shard_key in shard_keys {
@@ -189,32 +199,44 @@ async fn try_one_endpoint(
                 continue;
             }
         };
-        // Server omits `shard_key` in the response when the request
-        // had a non-empty key (see services.go:261:
-        // `includeShardKey := len(req.ShardKey) != 35`). Use our
-        // copy from the request to build the wire filter.
-        for info in infos {
-            let Some(filter) = build_filter(shard_key, &info.prefix) else {
-                continue;
-            };
-            if filter.is_empty() {
-                continue;
-            }
-            let size = bigint_to_u64_saturating(&info.size);
-            out.insert(filter, size);
-        }
+        record_shard_infos(shard_key, infos, &mut out);
     }
     // Distinguish "every per-shard call errored" (a real transport/handler
     // failure that was being masked as the generic 'no shard sizes' rotate
     // message) from "calls succeeded but returned no data" (legitimately
     // empty). Only the former is surfaced as an error so the caller logs
     // the actual cause at WARN; the latter stays Ok(empty).
-    if out.is_empty() && !any_success {
+    if out.sizes.is_empty() && !any_success {
         if let Some(e) = last_err {
             return Err(e);
         }
     }
     Ok(out)
+}
+
+/// Fold one `GetAppShards` reply for `shard_key` into `out`.
+///
+/// Server omits `shard_key` in the response when the request had a
+/// non-empty key (see services.go:261: `includeShardKey :=
+/// len(req.ShardKey) != 35`). Use our copy from the request to build
+/// the wire filter.
+fn record_shard_infos(
+    shard_key: &[u8],
+    infos: Vec<quil_types::proto::global::AppShardInfo>,
+    out: &mut ArchiveShardInfo,
+) {
+    for info in infos {
+        let Some(filter) = build_filter(shard_key, &info.prefix) else {
+            continue;
+        };
+        if filter.is_empty() {
+            continue;
+        }
+        if info.pending_change {
+            out.frozen.insert(filter.clone());
+        }
+        out.sizes.insert(filter, bigint_to_u64_saturating(&info.size));
+    }
 }
 
 /// Build the wire filter from `(shard_key, prefix)` — the canonical,
@@ -285,6 +307,23 @@ mod tests {
             bigint_to_u64_saturating(&[0xFF; 8]),
             u64::MAX,
         );
+    }
+
+    #[test]
+    fn a_reply_marks_the_shards_a_pending_change_froze() {
+        let shard_key: Vec<u8> = (0u8..35).collect();
+        let info = |bits: &[bool], size: u8, pending_change: bool| quil_types::proto::global::AppShardInfo {
+            prefix: quil_forest::bit_path_to_prefix(bits),
+            size: vec![size],
+            pending_change,
+            ..Default::default()
+        };
+        let mut out = ArchiveShardInfo::default();
+        record_shard_infos(&shard_key, vec![info(&[false], 7, true), info(&[true], 9, false)], &mut out);
+        let filter = |bits: &[bool]| quil_forest::encode_shard_bit_path(&shard_key[3..35], bits);
+        assert_eq!(out.sizes.get(&filter(&[false])), Some(&7), "a frozen shard still reports its size");
+        assert_eq!(out.sizes.get(&filter(&[true])), Some(&9));
+        assert_eq!(out.frozen, HashSet::from([filter(&[false])]));
     }
 
     #[test]

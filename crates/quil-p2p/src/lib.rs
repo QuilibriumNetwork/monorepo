@@ -17,9 +17,7 @@ pub mod signer_registry;
 pub mod tls_debug;
 
 // The BlossomSub behaviour + event + validation-result surface come from the
-// hardened `blossomsub` crate via the `blossomsub_behaviour` bridge. (Stage 7
-// deleted the old in-crate `behaviour` / `scoring` / `blossomsub` / bitmask
-// modules; the fork is now the sole implementation.)
+// `blossomsub_behaviour` bridge over stock `libp2p::gossipsub`.
 pub use blossomsub_behaviour::{BlossomSubBehaviour, BlossomSubEvent, ValidationResult};
 pub use libp2p::identity::Keypair;
 pub use libp2p::PeerId;
@@ -37,7 +35,7 @@ pub use peer_info::{
     peek_key_registry_timestamp, peek_peer_info_timestamp,
     CanonicalCapability, CanonicalKeyRegistry, CanonicalPeerInfo, CanonicalReachability,
     InMemoryPeerInfoManager, PeerInfoMessage, ARCHIVE_SERVICE_CAPABILITY_ID, KEY_REGISTRY_TYPE,
-    PEER_INFO_TYPE,
+    PEER_INFO_TYPE, BUILD_FINGERPRINT_CAPABILITY_ID,
 };
 pub use signer_registry::{SignerEntry, SignerRegistry};
 

@@ -1,20 +1,8 @@
 //! Ed448 peer identity derivation compatible with Quilibrium's go-libp2p fork.
 //!
 //! The Go node uses Ed448 (KeyType=4) for peer identity. Peer IDs are derived
-//! as: `PeerId = multihash(SHA2-256, protobuf(PublicKey{Type:4, Data:pubkey}))`
-//!
-//! ## Compatibility Status
-//!
-//! **Peer ID derivation**: Implemented here — produces byte-identical peer IDs
-//! to Go nodes.
-//!
-//! **Transport (noise handshake)**: NOT YET COMPATIBLE. Stock rust-libp2p uses
-//! Ed25519 for noise. To connect to Go nodes, we need to fork rust-libp2p's
-//! noise implementation to support Ed448. Until then, the Rust node can only
-//! connect to other Rust nodes using Ed25519 transport.
-//!
-//! **Message signing (BlossomSub)**: NOT YET COMPATIBLE. BlossomSub messages
-//! are signed with Ed448. Need custom signing in the BlossomSub port.
+//! as: `PeerId = multihash(SHA2-256, protobuf(PublicKey{Type:4, Data:pubkey}))`,
+//! and the derivation here produces byte-identical peer IDs.
 
 use sha2::{Digest, Sha256};
 

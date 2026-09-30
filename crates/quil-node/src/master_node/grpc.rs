@@ -10,6 +10,19 @@ type RemoteAppShardMap = std::collections::HashMap<
     Vec<quil_types::proto::global::AppShardInfo>,
 >;
 
+/// The global anchor a mint claim through this node may cite: the least
+/// anchor among its QUIL shard engines that are keeping up, so the claim is
+/// admissible at any of them. An engine more than `MINT_CLAIM_CITATION_LAG`
+/// behind the freshest has stopped producing; on a live width run one
+/// wedged shard held a node's anchor at 1180 while GLOBAL passed 1300, and no
+/// newer mint authorization could be claimed through that node.
+fn claim_anchor(anchors: &[Option<u64>]) -> Option<u64> {
+    let lag = quil_execution::token_intrinsic::constants::MINT_CLAIM_CITATION_LAG;
+    let live: Vec<u64> = anchors.iter().flatten().copied().filter(|anchor| *anchor > 0).collect();
+    let newest = *live.iter().max()?;
+    live.into_iter().filter(|anchor| newest - anchor <= lag).min()
+}
+
 fn has_nonzero_remote_shard_size(shards: &RemoteAppShardMap) -> bool {
     shards.values().flatten().any(|info| info.size.iter().any(|b| *b != 0))
 }
@@ -29,6 +42,8 @@ async fn fetch_remote_app_shards(
 }
 
 pub(crate) struct GrpcArgs {
+    /// Filter → covering thread worker's stores (wallet reads of app state).
+    pub worker_app_states: super::worker_manager::WorkerAppStates,
     pub config: quil_config::Config,
     pub network: u8,
     pub archive_mode: bool,
@@ -39,7 +54,6 @@ pub(crate) struct GrpcArgs {
     pub current_frame: Arc<quil_engine::current_frame::CurrentFrame>,
     pub last_global_head_frame: Arc<std::sync::atomic::AtomicU64>,
     pub prover_address: [u8; 32],
-    pub token_store: Arc<quil_store::RocksTokenStore>,
     pub prover_registry: Arc<quil_execution::SharedProverRegistry>,
     /// Peer→prover-key registry (KeyRegistry gossip), used to gate submit RPCs to
     /// ACTIVE provers (Go `authenticateProverFromContext`).
@@ -52,6 +66,9 @@ pub(crate) struct GrpcArgs {
     pub file_key_manager: Arc<quil_keys::FileKeyManager>,
     pub mtls_seed: Option<[u8; 57]>,
     pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
+    pub shard_engines: Arc<parking_lot::RwLock<std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>>>,
+    pub remote_fee_workers: Arc<std::sync::OnceLock<Arc<quil_engine::remote_worker::RemoteWorkerManager>>>,
     pub peer_info_cache: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
     >>,
@@ -75,6 +92,11 @@ pub(crate) struct GrpcArgs {
 struct CrdtForestServer(Arc<quil_hypergraph::HypergraphCrdt>);
 
 impl quil_rpc::global_service::ForestServer for CrdtForestServer {
+    fn global_vertex_proof(&self, root: [u8; 32], address: [u8; 32]) -> Option<Vec<u8>> {
+        let proof = self.0.global_vertex_membership_at_root(&root, &address).ok()??;
+        let bytes = quil_forest::MembershipProof { inputs: vec![proof] }.to_bytes();
+        (bytes.len() <= quil_engine::storage_history::MAX_GLOBAL_VERTEX_PROOF_BYTES).then_some(bytes)
+    }
     fn serve_node(&self, shard_id: &[u8], phase: u32, node_key: &[u8]) -> Option<Vec<u8>> {
         self.0.serve_forest_node(shard_id, phase as usize, node_key)
     }
@@ -98,7 +120,7 @@ impl quil_rpc::global_service::ForestServer for CrdtForestServer {
         shard_key: &[u8],
         phase: u32,
         id: &[u8],
-        version: u64,
+        version: Option<u64>,
     ) -> Option<Vec<u8>> {
         if shard_key.len() < 35 {
             return None;
@@ -122,82 +144,385 @@ impl quil_rpc::global_service::ForestServer for CrdtForestServer {
     }
 }
 
-/// Serves the lattice confidential-transaction wallet RPCs
-/// (`GetCoinSpendWitness` / `ListDomainCoins`) by rebuilding a token domain's
-/// coin accumulator from the live CRDT's committed coin vertices — the node-side
-/// backing a wallet uses to build ring-CT spends (per-input membership witness)
-/// and to enumerate/scan a domain's coins.
-struct CrdtCoinWitness(
-    Arc<quil_hypergraph::HypergraphCrdt>,
-    Arc<dyn quil_types::store::ClockStore>,
-);
+/// Serves QCT3 coin/escrow discovery, indexed membership and mint witnesses.
+struct CrdtCoinWitness {
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    clock: Arc<dyn quil_types::store::ClockStore>,
+    network: u8,
+    #[cfg(feature = "confidential-tokens")]
+    witness_index: Arc<crate::witness_index::NodeWitnessIndex>,
+    /// The QUIL shard's latest certified global anchor seen by this node's
+    /// shard engines (local or remote workers), bounding mint-claim citations.
+    shard_anchor: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
+    /// Application state held by this node's thread workers rather than the
+    /// master's stores: filter → worker stores. Wallet scans and coin
+    /// witnesses for such an application read the worker's CRDT and index.
+    worker_app_states: super::worker_manager::WorkerAppStates,
+    #[cfg(feature = "confidential-tokens")]
+    worker_witness_indexes: parking_lot::Mutex<std::collections::HashMap<Vec<u8>, Arc<crate::witness_index::NodeWitnessIndex>>>,
+    #[cfg(feature = "confidential-tokens")]
+    spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
+    /// Scans in progress over an application held in SEVERAL local worker
+    /// stores: the identity handed to the wallet → each store's own retained
+    /// snapshot, plus the root every page of that scan advertises.
+    composite_scans: parking_lot::Mutex<std::collections::HashMap<[u8; 32], CompositeScan>>,
+}
+
+/// One wallet scan spanning several worker stores of one application.
+///
+/// An application's shards partition its data addresses, and a scan walks
+/// addresses in ascending order, so the scan is the concatenation of each
+/// store's scan in range order. Every store keeps its own retained snapshot;
+/// the wallet sees one identity and one root for the whole scan. Pages
+/// advertise the CANONICAL application root, which is the same record in every
+/// store once delivered; the first page's copy is kept so that a store one
+/// delivery behind cannot make the scan look as if its root had moved.
+struct CompositeScan {
+    /// `(filter, that store's scan identity)`, in address-range order.
+    stores: Vec<(Vec<u8>, [u8; 32])>,
+    root_record: Option<Vec<u8>>,
+    created: std::time::Instant,
+}
+
+const COMPOSITE_SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(900);
+const MAX_COMPOSITE_SCANS: usize = 64;
+
+/// The shard path of a full filter, and the last address of its range.
+fn shard_range(filter: &[u8]) -> Option<(quil_types::execution::ShardPath, [u8; 32])> {
+    let (_, bits) = quil_forest::decode_shard_filter_or_root(filter, 32)?;
+    if bits.len() > 256 {
+        return None;
+    }
+    let mut last = [0xffu8; 32];
+    for (i, bit) in bits.iter().enumerate() {
+        if !bit {
+            last[i / 8] &= !(0x80 >> (i % 8));
+        }
+    }
+    Some((quil_types::execution::ShardPath::from_bits(&bits), last))
+}
+
+/// One store's contribution to a page.
+struct StorePage<T> {
+    entries: Vec<([u8; 32], T)>,
+    cursor: Option<[u8; 32]>,
+    has_more: bool,
+    root_record: Option<Vec<u8>>,
+}
+
+/// Serve one page of a scan over an application held in several local worker
+/// stores. `scan_store` reads one page from one store's retained snapshot (it
+/// is told which store). Returns `(scan identity, root, entries, cursor,
+/// has_more)`.
+#[allow(clippy::type_complexity)]
+/// Whether a set of shard bit paths covers every address of an application:
+/// the root, or a complete binary partition (every branch below the root is
+/// either a path in the set or split into two covered halves).
+pub(crate) fn shard_paths_cover_application(paths: &[Vec<bool>]) -> bool {
+    fn covers(paths: &[Vec<bool>], prefix: &mut Vec<bool>) -> bool {
+        if paths.iter().any(|p| p == prefix) {
+            return true;
+        }
+        if !paths.iter().any(|p| p.starts_with(prefix)) {
+            return false;
+        }
+        prefix.push(false);
+        let left = covers(paths, prefix);
+        prefix.pop();
+        prefix.push(true);
+        let right = left && covers(paths, prefix);
+        prefix.pop();
+        right
+    }
+    covers(paths, &mut Vec::new())
+}
+
+fn composite_page<T>(
+    composite_scans: &parking_lot::Mutex<std::collections::HashMap<[u8; 32], CompositeScan>>,
+    local: Vec<(Vec<u8>, Arc<quil_hypergraph::HypergraphCrdt>)>,
+    snapshot_id: Option<&[u8; 32]>,
+    after: Option<&[u8; 32]>,
+    scan_store: impl Fn(&[u8], &dyn quil_types::store::SnapshotReadable, Option<&[u8; 32]>) -> quil_types::error::Result<StorePage<T>>,
+) -> quil_types::error::Result<([u8; 32], Option<Vec<u8>>, Vec<([u8; 32], T)>, Option<[u8; 32]>, bool)> {
+    {
+        use quil_types::error::QuilError;
+        use sha2::Digest as _;
+        let mut ranged: Vec<_> = local.into_iter()
+            .map(|(filter, crdt)| shard_range(&filter).map(|(path, last)| (last, path, filter, crdt)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| QuilError::ExecutionUnavailable("a local worker store has an undecodable shard filter".into()))?;
+        ranged.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let expired = || QuilError::NotFound("coin scan snapshot unavailable or expired; restart scan".into());
+        let mut scans = composite_scans.lock();
+        scans.retain(|_, scan| scan.created.elapsed() < COMPOSITE_SCAN_TTL);
+        let id = match snapshot_id {
+            Some(id) => *id,
+            None => {
+                if scans.len() >= MAX_COMPOSITE_SCANS {
+                    return Err(QuilError::ExecutionUnavailable("too many coin scans in progress; retry shortly".into()));
+                }
+                let mut stores = Vec::with_capacity(ranged.len());
+                let mut hash = sha2::Sha256::new();
+                hash.update(b"quil/node/composite-coin-scan/v1");
+                for (_, _, filter, crdt) in &ranged {
+                    let generation = crdt.acquire_or_capture_scan_snapshot(None)?.ok_or_else(expired)?;
+                    let scan_id = generation.scan_id.ok_or_else(expired)?;
+                    hash.update(scan_id);
+                    stores.push((filter.clone(), scan_id));
+                }
+                let id: [u8; 32] = hash.finalize().into();
+                scans.insert(id, CompositeScan { stores, root_record: None, created: std::time::Instant::now() });
+                id
+            }
+        };
+        let scan = scans.get_mut(&id).ok_or_else(expired)?;
+
+        for (index, (last, path, filter, crdt)) in ranged.iter().enumerate() {
+            // Stores whose whole range lies at or below the cursor are done.
+            if after.is_some_and(|after| after >= last) {
+                continue;
+            }
+            let store_scan = scan.stores.iter().find(|(f, _)| f == filter).map(|(_, id)| *id)
+                // The node's shards changed under the scan.
+                .ok_or_else(expired)?;
+            let generation = crdt.acquire_or_capture_scan_snapshot(Some(&store_scan))?.ok_or_else(expired)?;
+            let snapshot = generation.db_snapshot.as_ref().ok_or_else(expired)?;
+            let page = scan_store(filter, snapshot.as_ref(), after)?;
+            if scan.root_record.is_none() {
+                scan.root_record = page.root_record;
+            }
+            // A store can still hold records outside its range (copied before
+            // a split); only the store that owns an address reports it.
+            let entries: Vec<_> = page.entries.into_iter().filter(|(address, _)| path.covers(address)).collect();
+            let is_last = index + 1 == ranged.len();
+            if page.has_more {
+                return Ok((id, scan.root_record.clone(), entries, page.cursor, true));
+            }
+            if is_last {
+                let cursor = page.cursor.or(after.copied());
+                return Ok((id, scan.root_record.clone(), entries, cursor, false));
+            }
+            if !entries.is_empty() {
+                // This store is exhausted: resume after the end of its range.
+                return Ok((id, scan.root_record.clone(), entries, Some(*last), true));
+            }
+        }
+        Ok((id, scan.root_record.clone(), Vec::new(), after.copied(), false))
+    }
+}
+
+impl CrdtCoinWitness {
+    fn local_crdts(local: Vec<(Vec<u8>, super::worker_manager::WorkerAppState)>) -> Vec<(Vec<u8>, Arc<quil_hypergraph::HypergraphCrdt>)> {
+        local.into_iter().map(|(filter, state)| (filter, state.crdt)).collect()
+    }
+
+    /// Every worker store covering part of `domain`, filter-ordered so the
+    /// choice is deterministic across nodes.
+    fn worker_states(&self, domain: &[u8; 32]) -> Vec<(Vec<u8>, super::worker_manager::WorkerAppState)> {
+        if domain == &[0xff; 32] {
+            return Vec::new();
+        }
+        let mut states: Vec<_> = self.worker_app_states.read().iter()
+            .filter(|(filter, _)| filter.starts_with(domain))
+            .map(|(filter, state)| (filter.clone(), state.clone()))
+            .collect();
+        states.sort_by(|a, b| a.0.cmp(&b.0));
+        states
+    }
+
+    /// The worker stores covering `domain`, if a thread worker holds it.
+    fn worker_state(&self, domain: &[u8; 32]) -> Option<(Vec<u8>, super::worker_manager::WorkerAppState)> {
+        self.worker_states(domain).into_iter().next()
+    }
+
+    /// The CRDT holding `domain`'s application state on this node.
+    fn crdt_for(&self, domain: &[u8; 32]) -> Arc<quil_hypergraph::HypergraphCrdt> {
+        self.worker_state(domain).map_or_else(|| self.crdt.clone(), |(_, state)| state.crdt)
+    }
+
+    /// Witnesses for coins that may live in different local worker stores of one
+    /// application: each coin is looked up in the store whose range holds its
+    /// address (that store's index is the only one that has it), and all of them
+    /// are folded against the same canonical root read from GLOBAL.
+    #[cfg(feature = "confidential-tokens")]
+    fn canonical_witnesses_across_stores(
+        &self,
+        domain: &[u8; 32],
+        addresses: &[[u8; 32]],
+    ) -> quil_types::error::Result<quil_execution::token_intrinsic::witnesses::Witnesses> {
+        use quil_types::error::QuilError;
+        let local = self.worker_states(domain);
+        if local.len() <= 1 {
+            return self.witness_index_for(domain).canonical_witnesses(domain, addresses, self.crdt.clone());
+        }
+        let mut merged: Option<quil_execution::token_intrinsic::witnesses::Witnesses> = None;
+        let mut found: std::collections::HashMap<[u8; 32], _> = std::collections::HashMap::new();
+        for (filter, state) in local {
+            let (path, _) = shard_range(&filter).ok_or_else(|| QuilError::ExecutionUnavailable(
+                "a local worker store has an undecodable shard filter".into()))?;
+            let owned: Vec<[u8; 32]> = addresses.iter().filter(|a| path.covers(*a)).copied().collect();
+            if owned.is_empty() {
+                continue;
+            }
+            let index = self.worker_witness_indexes.lock().entry(filter).or_insert_with(|| {
+                crate::witness_index::NodeWitnessIndex::start(
+                    state.db.clone(), state.crdt.clone(), self.network, self.spawner.clone())
+            }).clone();
+            let part = index.canonical_witnesses(domain, &owned, self.crdt.clone())?;
+            if merged.as_ref().is_some_and(|m: &quil_execution::token_intrinsic::witnesses::Witnesses| m.root != part.root) {
+                // The canonical root advanced between two stores' lookups.
+                return Err(QuilError::ExecutionUnavailable(
+                    "the application's canonical root changed during the lookup; retry".into()));
+            }
+            let quil_execution::token_intrinsic::witnesses::Witnesses { root, coins } = part;
+            for coin in coins {
+                found.insert(coin.address, coin);
+            }
+            merged.get_or_insert(quil_execution::token_intrinsic::witnesses::Witnesses { root, coins: Vec::new() });
+        }
+        let mut merged = match merged {
+            Some(merged) => merged,
+            // None of the addresses lies in a range this node holds.
+            None => return self.witness_index_for(domain).canonical_witnesses(domain, addresses, self.crdt.clone()),
+        };
+        merged.coins = addresses.iter().map(|address| found.remove(address).unwrap_or(
+            quil_execution::token_intrinsic::witnesses::CoinWitness { address: *address, path: None },
+        )).collect();
+        Ok(merged)
+    }
+
+    /// The coin witness index for `domain`: a worker's own index (started on
+    /// first use) when a thread worker holds the application.
+    #[cfg(feature = "confidential-tokens")]
+    fn witness_index_for(&self, domain: &[u8; 32]) -> Arc<crate::witness_index::NodeWitnessIndex> {
+        match self.worker_state(domain) {
+            None => self.witness_index.clone(),
+            Some((filter, state)) => self.worker_witness_indexes.lock()
+                .entry(filter)
+                .or_insert_with(|| crate::witness_index::NodeWitnessIndex::start(
+                    state.db.clone(), state.crdt.clone(), self.network, self.spawner.clone(),
+                ))
+                .clone(),
+        }
+    }
+}
 
 impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
-    fn coin_spend_witnesses(
-        &self,
-        domain: &[u8],
-        one_time_keys: &[Vec<u8>],
-    ) -> quil_types::error::Result<(u32, Vec<u8>, Vec<quil_types::store::CoinWitnessData>)> {
-        let state = quil_execution::hypergraph_state::HypergraphState::new(self.0.clone());
-        let (depth, root, witnesses) =
-            quil_execution::token_intrinsic::shadow_accumulator::coin_spend_witnesses(
-                &state,
-                domain,
-                one_time_keys,
-            )?;
-        let out = witnesses
-            .into_iter()
-            .map(|w| quil_types::store::CoinWitnessData {
-                one_time_key: w.one_time_key,
-                found: w.found,
-                leaf_index: w.leaf_index,
-                auth_path: w.auth_path,
-            })
-            .collect();
-        Ok((depth as u32, root, out))
+    fn mint_authorization_witness(&self, receipt: &[u8; 32]) -> quil_types::error::Result<quil_types::store::MintAuthorizationWitnessData> {
+        let state = quil_execution::hypergraph_state::HypergraphState::new(self.crdt.clone());
+        let anchor = (self.shard_anchor)();
+        quil_execution::token_intrinsic::mint_authorization_witness::witness(&state, self.clock.as_ref(), receipt, anchor)
+    }
+    #[cfg(feature = "confidential-tokens")]
+    fn escrow_page(&self, domain: &[u8; 32], snapshot_id: Option<&[u8; 32]>, after: Option<&[u8; 32]>) -> quil_types::error::Result<Option<quil_types::store::EscrowPageData>> {
+        use quil_execution::token_intrinsic::{state::network_identifier, scan::scan_escrow_page};
+        use quil_types::{error::QuilError, store::{EscrowPageData, VertexPageLimits}};
+        if after.is_some() && snapshot_id.is_none() {
+            return Err(QuilError::InvalidArgument("coin scan continuation requires snapshot identity".into()));
+        }
+        // An application split across several local worker stores is scanned
+        // store by store in address order (see `CompositeScan`).
+        let local = self.worker_states(domain);
+        if local.len() > 1 {
+            let network = network_identifier(self.network);
+            let (id, _root, escrows, cursor, has_more) = composite_page(&self.composite_scans, Self::local_crdts(local), snapshot_id, after, |_, snapshot, after| {
+                let page = scan_escrow_page(snapshot, &network, domain, after,
+                    VertexPageLimits { max_entries: 8, max_bytes: 240 * 1024 })?;
+                Ok(StorePage { entries: page.escrows, cursor: page.cursor, has_more: page.has_more, root_record: None })
+            })?;
+            return Ok(Some(EscrowPageData { network, snapshot_id: id, escrows, cursor, has_more }));
+        }
+        let generation = self.crdt_for(domain).acquire_or_capture_scan_snapshot(snapshot_id)?
+            .ok_or_else(|| QuilError::NotFound("coin scan snapshot unavailable or expired; restart scan".into()))?;
+        let network = network_identifier(self.network);
+        let result = scan_escrow_page(generation.db_snapshot.as_ref().unwrap().as_ref(), &network, domain, after,
+            VertexPageLimits { max_entries: 8, max_bytes: 240 * 1024 })?;
+        Ok(Some(EscrowPageData {
+            network, snapshot_id: generation.scan_id.unwrap(),
+            escrows: result.escrows,
+            cursor: result.cursor, has_more: result.has_more,
+        }))
     }
 
-    fn list_domain_coins(
-        &self,
-        domain: &[u8],
-    ) -> quil_types::error::Result<Vec<quil_types::store::DomainCoinData>> {
-        let state = quil_execution::hypergraph_state::HypergraphState::new(self.0.clone());
-        let coins = quil_execution::token_intrinsic::shadow_accumulator::scan_domain_coins(
-            &state, domain,
-        )?;
-        Ok(coins
-            .into_iter()
-            .map(
-                |(address, one_time_key, commitment, memo)| quil_types::store::DomainCoinData {
-                    address,
-                    one_time_key,
-                    commitment,
-                    memo,
-                },
-            )
-            .collect())
+    #[cfg(feature = "confidential-tokens")]
+    fn coin_page(&self, domain: &[u8; 32], snapshot_id: Option<&[u8; 32]>, after: Option<&[u8; 32]>) -> quil_types::error::Result<Option<quil_types::store::CoinPageData>> {
+        use quil_execution::token_intrinsic::{state::network_identifier, scan::scan_page};
+        use quil_types::{error::QuilError, store::{CoinPageData, CoinData, VertexPageLimits}};
+        if after.is_some() && snapshot_id.is_none() {
+            return Err(QuilError::InvalidArgument("coin scan continuation requires snapshot identity".into()));
+        }
+        // An application split across several local worker stores is scanned
+        // store by store in address order (see `CompositeScan`).
+        let local = self.worker_states(domain);
+        if local.len() > 1 {
+            let network = network_identifier(self.network);
+            let (id, root, coins, cursor, has_more) = composite_page(&self.composite_scans, Self::local_crdts(local), snapshot_id, after, |_, snapshot, after| {
+                let page = match scan_page(snapshot, &network, domain, after,
+                    VertexPageLimits { max_entries: 8, max_bytes: 240 * 1024 }) {
+                    Ok(page) => page,
+                    // A store that has received no root (a sub-shard this node
+                    // only just joined) holds no coin the network recognizes:
+                    // it adds nothing to the scan rather than failing all of it.
+                    Err(QuilError::NotFound(_)) => return Ok(StorePage {
+                        entries: Vec::new(), cursor: None, has_more: false, root_record: None,
+                    }),
+                    Err(error) => return Err(error),
+                };
+                let root_record = page.root.encode()
+                    .map_err(|e| QuilError::Internal(format!("coin scan root: {e:?}")))?.to_vec();
+                Ok(StorePage { entries: page.coins, cursor: page.cursor, has_more: page.has_more, root_record: Some(root_record) })
+            })?;
+            return Ok(Some(CoinPageData {
+                network, snapshot_id: id,
+                // No store has a root: the same answer a single rootless store gives.
+                root_record: root.ok_or_else(|| QuilError::NotFound("coin scan: no root in snapshot".into()))?,
+                coins: coins.into_iter().map(|(address, coin)| CoinData {
+                    address, frame_number: coin.frame_number, position: coin.position, owner: coin.output.owner.to_vec(),
+                    commitment: coin.output.commitment.to_bytes().to_vec(), memo: coin.output.memo.to_vec(),
+                }).collect(),
+                cursor, has_more,
+            }));
+        }
+        let generation = self.crdt_for(domain).acquire_or_capture_scan_snapshot(snapshot_id)?
+            .ok_or_else(|| QuilError::NotFound("coin scan snapshot unavailable or expired; restart scan".into()))?;
+        let network = network_identifier(self.network);
+        let result = scan_page(generation.db_snapshot.as_ref().unwrap().as_ref(), &network, domain, after,
+            VertexPageLimits { max_entries: 8, max_bytes: 240 * 1024 })?;
+        Ok(Some(CoinPageData {
+            network, snapshot_id: generation.scan_id.unwrap(),
+            root_record: result.root.encode().map_err(|e| QuilError::Internal(format!("coin scan root: {e:?}")))?.to_vec(),
+            coins: result.coins.into_iter().map(|(address, coin)| CoinData {
+                address, frame_number: coin.frame_number, position: coin.position, owner: coin.output.owner.to_vec(),
+                commitment: coin.output.commitment.to_bytes().to_vec(), memo: coin.output.memo.to_vec(),
+            }).collect(),
+            cursor: result.cursor, has_more: result.has_more,
+        }))
     }
 
-    fn list_domain_escrows(
-        &self,
-        domain: &[u8],
-    ) -> quil_types::error::Result<Vec<quil_types::store::DomainEscrowData>> {
-        let state = quil_execution::hypergraph_state::HypergraphState::new(self.0.clone());
-        let escrows = quil_execution::token_intrinsic::shadow_accumulator::scan_domain_escrows(
-            &state, domain,
-        )?;
-        Ok(escrows
-            .into_iter()
-            .map(|e| quil_types::store::DomainEscrowData {
-                address: e.address,
-                cv: e.cv,
-                to_key: e.to_key,
-                refund_key: e.refund_key,
-                expiration: e.expiration,
-                memo: e.memo,
-            })
-            .collect())
+    #[cfg(feature = "confidential-tokens")]
+    fn coin_witnesses(&self, domain: &[u8; 32], addresses: &[[u8; 32]]) -> quil_types::error::Result<Option<quil_types::store::CoinWitnessBundle>> {
+        let network = quil_execution::token_intrinsic::state::network_identifier(self.network);
+        // A spend proves against the application's canonical root, which folds
+        // every shard's subtree: each coin's path
+        // runs through the subtree its own block belongs to and then over what
+        // the other shards reported, read from GLOBAL.
+        let result = self.canonical_witnesses_across_stores(domain, addresses)?;
+        let root_record = result.root.encode().map_err(|e| quil_types::error::QuilError::Internal(format!("coin root: {e:?}")))?.to_vec();
+        Ok(Some(quil_types::store::CoinWitnessBundle {
+            network, root_record, depth: result.root.depth,
+            witnesses: result.coins.into_iter().map(|coin| {
+                let (found, siblings, right) = match coin.path {
+                    Some(path) => (true, path.siblings.iter().map(|node| node.to_bytes().to_vec()).collect(), path.right),
+                    None => (false, Vec::new(), Vec::new()),
+                };
+                quil_types::store::CoinWitnessData { address: coin.address, found, siblings, right }
+            }).collect(),
+        }))
     }
+
+
+
 
     fn prover_reward_witness(
         &self,
@@ -207,16 +532,25 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
         use quil_hypergraph::addressing::{shard_key_for_location, Location};
 
         let is_quil = domain == quil_execution::domains::QUIL_TOKEN;
+        if is_quil {
+            let owner: &[u8; 32] = owner.try_into().map_err(|_| {
+                quil_types::error::QuilError::InvalidArgument("reward owner must be 32 bytes".into())
+            })?;
+            let state = quil_execution::hypergraph_state::HypergraphState::new(self.crdt.clone());
+            return quil_execution::token_intrinsic::reward_witness::quil_reward_witness(
+                &state, self.clock.as_ref(), owner,
+            );
+        }
         // Reward vertex addressing (mirrors the engine's mint verify).
         let (prover_root_domain, leaf_owner) =
-            quil_execution::token_intrinsic::mint::derive_pomw_addressing(domain, owner)?;
+            quil_execution::token_intrinsic::reward_witness::derive_pomw_addressing(domain, owner)?;
         let reward_domain: Vec<u8> = if is_quil {
             quil_execution::domains::GLOBAL.to_vec()
         } else {
             domain.to_vec()
         };
 
-        let state = quil_execution::hypergraph_state::HypergraphState::new(self.0.clone());
+        let state = quil_execution::hypergraph_state::HypergraphState::new(self.crdt.clone());
         let va_disc = quil_execution::hypergraph_state::vertex_adds_discriminator()?;
         let blob = match state.get(&reward_domain, &leaf_owner, &va_disc)? {
             Some(b) => b,
@@ -245,20 +579,20 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
         let mut vertex_address = prover_root_domain.to_vec();
         vertex_address.extend_from_slice(&leaf_owner);
         let mp = self
-            .0
+            .crdt
             .build_membership_proof("vertex", "adds", &shard, &[(vertex_address, Vec::new())])?;
         let forest_proof = mp.to_bytes();
 
         // cited_frame = the latest committed global frame; its stored header
         // `prover_tree_commitment` is the reward root the engine resolves.
         let cited_frame = self
-            .1
+            .clock
             .get_latest_global_clock_frame()
             .ok()
             .and_then(|f| f.header.map(|h| h.frame_number))
             .unwrap_or(0);
 
-        Ok(quil_types::store::RewardWitnessData { found: true, forest_proof, value, cited_frame })
+        Ok(quil_types::store::RewardWitnessData { found: true, forest_proof, value, cited_frame, reward_root: Vec::new() })
     }
 }
 
@@ -277,7 +611,6 @@ pub(crate) fn spawn_all(
         current_frame,
         last_global_head_frame,
         prover_address,
-        token_store,
         prover_registry,
         signer_registry,
         prover_pipeline,
@@ -288,6 +621,10 @@ pub(crate) fn spawn_all(
         file_key_manager,
         mtls_seed,
         crdt,
+        exec_manager,
+        shard_engines,
+        worker_app_states,
+        remote_fee_workers,
         peer_info_cache,
         key_store,
         metrics_handle,
@@ -387,7 +724,7 @@ pub(crate) fn spawn_all(
         ) -> Result<quil_types::proto::global::GlobalProposal, String> {
             // Delegate to the shared, candidate-aware assembler so peers can
             // fetch an uncommitted TIP candidate over `GetGlobalProposal`.
-            // Without the candidate fallback, a coordinated-halt tip (a frame
+            // Without the QCT3 fallback, a coordinated-halt tip (a frame
             // some replicas produced but never committed) is invisible to sync
             // and the chain can only be unstuck manually. See
             // `archive_sync::load_committed_or_tip_candidate`.
@@ -629,22 +966,28 @@ pub(crate) fn spawn_all(
                 .unwrap_or(0);
             let latest_frame = clock.get_latest_shard_clock_frame(&filter).ok()
                 .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
-            Some((meta.size, meta.data_shards, meta.commitments, materialized_frame, latest_frame))
+            // A split's empty shards report committed deliveries, so the
+            // regular nodes this answers staff them and outputs placed there land.
+            let size = quil_engine::shard_info::reported_shard_size(&crdt, shard_key, prefix, meta.size);
+            Some((size, meta.data_shards, meta.commitments, materialized_frame, latest_frame))
         })
     };
 
-    // Wrap the clock-store lookup in a bounded read-through cache. The
-    // peer-facing GlobalService serves frame/proposal reads to the whole
-    // network; hundreds of nodes polling the same recent frames every
-    // second would otherwise hit RocksDB (and re-assemble proposals) per
-    // request. Frames are immutable by number so by-number caching is
-    // always correct; the head is cached under a 1s TTL. 256 entries per
-    // map keeps the hot tip + recent catch-up range resident.
+    // Retain finalized frames at the store so consensus, proposal assembly,
+    // and RPC all use the same 720-frame window. Restore on a blocking worker;
+    // the store publishes new entries only after successful transaction commit.
+    let warm_clock = clock_store.clone();
+    tokio::task::spawn_blocking(move || match warm_clock.warm_global_frame_cache() {
+        Ok(frames) => info!(frames, "restored finalized global frame cache"),
+        Err(error) => warn!(%error, "global frame cache restore incomplete; reads will fill misses"),
+    });
+    // Keep the proposal cache and short head TTL without retaining a second
+    // by-number copy of frames already owned by the clock store.
     let cached_lookup = quil_rpc::global_service::CachingFrameLookup::new(
         ClockStoreFrameLookup(clock_store.clone()),
         256,
         std::time::Duration::from_secs(1),
-    );
+    ).with_frame_capacity(0);
     let grpc_server = quil_rpc::GlobalRpcServer::new(
         Arc::new(cached_lookup),
     )
@@ -655,6 +998,11 @@ pub(crate) fn spawn_all(
     .with_global_shards_provider(global_shards_provider)
     .with_app_shards_provider(app_shards_provider)
     .with_forest_server(Arc::new(CrdtForestServer(crdt.clone())))
+    .with_archive_directory(archive_pool.clone())
+    .with_global_vertex_proof_source(if !archive_mode && mtls_seed.is_some() {
+        file_key_manager.get_secret_key_bytes_by_id("q-prover-key").ok()
+            .map(|key| crate::storage_history::from_pool(archive_pool.clone(), key))
+    } else { None })
     .with_message_broadcast(global_msg_tx.clone())
     // Gate worker-privileged RPCs (StreamGlobalMessages, GetWorkerInfo) to this
     // node's OWN identity: only our data-worker processes — which dial with the
@@ -704,20 +1052,169 @@ pub(crate) fn spawn_all(
             }
         },
     );
+    // What this node can answer for: an application whose shards a thread
+    // worker covers, or one whose state the node's own store holds because it
+    // materializes it (a globally executed application on a global
+    // materializer, or everything on an archive). QUIL and GLOBAL are the
+    // node's own domains. Anything else is refused or forwarded — never
+    // answered empty, which a wallet cannot tell from "you have nothing".
+    let application_coverage: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = {
+        let states = worker_app_states.clone();
+        let own = crdt.clone();
+        Arc::new(move |app: &[u8]| {
+            if app.len() != 32 || app.iter().all(|b| *b == 0xff) {
+                return true;
+            }
+            // Coverage means the WHOLE application: a regular whose workers
+            // hold one child of a split application would otherwise answer a
+            // wallet with the coins of that child alone, which the wallet
+            // cannot tell from the whole. Such a node forwards instead. An
+            // archive materializes every shard.
+            if archive_mode {
+                return true;
+            }
+            let paths: Vec<Vec<bool>> = states.read().keys()
+                .filter(|filter| filter.starts_with(app))
+                .filter_map(|filter| quil_forest::decode_shard_filter_or_root(filter, 32).map(|(_, bits)| bits))
+                .collect();
+            if !paths.is_empty() {
+                return shard_paths_cover_application(&paths);
+            }
+            if app == quil_execution::domains::QUIL_TOKEN {
+                return false;
+            }
+            let Ok(disc) = quil_execution::hypergraph_state::vertex_adds_discriminator() else {
+                return true;
+            };
+            let Ok(domain): Result<[u8; 32], _> = app.try_into() else { return true };
+            quil_execution::hypergraph_state::HypergraphState::new(own.clone())
+                .get(&domain, &quil_execution::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS, &disc)
+                .map(|blob| blob.is_some_and(|blob| !blob.is_empty()))
+                .unwrap_or(true)
+        })
+    };
+    // One coin provider, shared by the wallet-facing scan and the peer-facing
+    // scan a node without coverage forwards to.
+    let coin_provider: Arc<CrdtCoinWitness> = Arc::new(CrdtCoinWitness {
+            crdt: crdt.clone(),
+            clock: clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
+            network,
+            #[cfg(feature = "confidential-tokens")]
+            witness_index: crate::witness_index::NodeWitnessIndex::start(db_arc.clone(), crdt.clone(), network, spawner.clone()),
+            shard_anchor: {
+                let engines = shard_engines.clone();
+                let remote_workers = remote_fee_workers.clone();
+                Arc::new(move || {
+                    let quil = quil_execution::domains::QUIL_TOKEN;
+                    // Minimum over this node's QUIL shard engines: conservative
+                    // when sub-shards anchor at different frames.
+                    let (engine_count, quil_engines, anchors) = {
+                        let map = engines.read();
+                        let quil_handles: Vec<_> = map.iter()
+                            .filter(|(filter, _)| filter.starts_with(&quil))
+                            .map(|(_, handle)| handle.clone())
+                            .collect();
+                        let anchors: Vec<Option<u64>> = quil_handles.iter()
+                            .map(|handle| handle.fee_snapshot().map(|s| s.global_frame_number))
+                            .collect();
+                        (map.len(), quil_handles.len(), anchors)
+                    };
+                    let local = claim_anchor(&anchors);
+                    tracing::info!(engine_count, quil_engines, ?anchors, "mint claim witness: QUIL shard anchor view");
+                    local.or_else(|| {
+                        let remote = remote_workers.get()?.clone();
+                        tokio::runtime::Handle::try_current().ok()?
+                            .block_on(remote.app_fee_snapshot(quil)).ok()
+                            .map(|snapshot| snapshot.global_frame_number)
+                            .filter(|anchor| *anchor > 0)
+                    })
+                }) as Arc<dyn Fn() -> Option<u64> + Send + Sync>
+            },
+            worker_app_states: worker_app_states.clone(),
+            #[cfg(feature = "confidential-tokens")]
+            worker_witness_indexes: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            composite_scans: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(feature = "confidential-tokens")]
+            spawner: spawner.clone(),
+    });
+    let app_hypergraph_stores: quil_rpc::node_service::AppHypergraphStores = {
+        let states = worker_app_states.clone();
+        Arc::new(move |app: &[u8]| {
+            if archive_mode || app.len() != 32 || app.iter().all(|b| *b == 0xff) {
+                return Ok(Vec::new());
+            }
+            let guard = states.read();
+            let mut local: Vec<_> = guard.iter()
+                .filter(|(filter, _)| filter.starts_with(app))
+                .collect();
+            if !local.is_empty() || app == quil_execution::domains::QUIL_TOKEN {
+                let paths: Vec<_> = local.iter().filter_map(|(filter, _)|
+                    quil_forest::decode_shard_filter_or_root(filter, 32).map(|(_, path)| path)
+                ).collect();
+                if !shard_paths_cover_application(&paths) {
+                    return Err(tonic::Status::unavailable("application coverage changed; retry the read"));
+                }
+            }
+            local.sort_by(|a, b| a.0.cmp(b.0));
+            Ok(local.into_iter().map(|(_, state)| state.hg_store.clone()).collect())
+        })
+    };
     let mut node_rpc_builder = quil_rpc::NodeRpcServer::new()
         .with_peer_id(peer_id.to_string())
         .with_frame_counters(current_frame.clone(), last_global_head_frame.clone())
         .with_prover_address(prover_address.to_vec())
         .with_reachable(true)
-        .with_token_store(token_store.clone() as Arc<dyn quil_types::store::TokenStore>)
         .with_prover_registry(prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>)
         .with_clock_store(clock_store.clone() as Arc<dyn quil_types::store::ClockStore>)
         .with_hypergraph_store(hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>)
-        .with_coin_witness_provider(Arc::new(CrdtCoinWitness(
-            crdt.clone(),
-            clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
-        )))
+        .with_application_coverage(application_coverage.clone())
+        .with_app_hypergraph_stores(app_hypergraph_stores.clone())
+        .with_coin_witness_provider(coin_provider.clone())
         .with_submit_handler(user_submit_handler);
+    // An application this node does not hold is read from a node that does:
+    // covering nodes first, an archive last, over the peer transport
+    // Needs the Falcon transport identity to dial.
+    if let Some(falcon) = mtls_seed
+        .is_some()
+        .then(|| file_key_manager.get_secret_key_bytes_by_id("q-prover-key").ok())
+        .flatten()
+    {
+        let reader = Arc::new(crate::master_node::remote_reads::PeerCoinReader::new(
+            peer_info_cache.clone(),
+            archive_pool.clone(),
+            falcon,
+            network,
+        ));
+        tracing::info!("state reads for uncovered applications will be forwarded to covering nodes");
+        node_rpc_builder = node_rpc_builder
+            .with_remote_coin_page({
+                let reader = reader.clone();
+                Arc::new(move |domain, snapshot, after| {
+                    let reader = reader.clone();
+                    Box::pin(async move { reader.coin_page(domain, snapshot, after).await })
+                })
+            })
+            .with_remote_escrow_page({
+                let reader = reader.clone();
+                Arc::new(move |domain, snapshot, after| {
+                    let reader = reader.clone();
+                    Box::pin(async move { reader.escrow_page(domain, snapshot, after).await })
+                })
+            })
+            .with_remote_vertex({
+                let reader = reader.clone();
+                Arc::new(move |domain, data_address| {
+                    let reader = reader.clone();
+                    Box::pin(async move { reader.vertex(domain, data_address).await })
+                })
+            })
+            .with_remote_coin_witnesses(Arc::new(move |domain, addresses| {
+                let reader = reader.clone();
+                Box::pin(async move { reader.coin_witnesses(domain, addresses).await })
+            }));
+    } else {
+        tracing::warn!("no Falcon transport identity: state reads for uncovered applications cannot be forwarded");
+    }
     if let Some(h) = metrics_handle.clone() {
         // Unified exposition: the facade recorder's snapshot plus the p2p
         // `prometheus-client` families (blossomsub_* / libp2p_*, registered
@@ -891,17 +1388,36 @@ pub(crate) fn spawn_all(
                             .await
                             .map_err(|e| format!("prover transport publish failed: {}", e))?;
                     } else {
-                        // Shard-domain message (token / app intrinsic).
-                        // Route via the shard's bloom-filter bitmask;
-                        // the local node is expected to be subscribed
-                        // there if it's participating in that shard.
-                        let bitmask = quil_hypergraph::addressing::get_bloom_filter_indices(
-                            &domain, 256, 3,
-                        )
-                        .to_vec();
-                        p2p.publish(bitmask, payload)
-                            .await
-                            .map_err(|e| format!("p2p publish failed: {}", e))?;
+                        // Shard-domain message (token / app intrinsic). App
+                        // engines collect request bundles from the per-app
+                        // prover topic `0x000000 || appFilter(domain)`
+                        // (message_loop routes it to `AppEngineMessage::Prover`
+                        // → the message collector). Every sub-shard of the app
+                        // shares that topic: a wallet knows only the
+                        // application, so the bloom is taken over the 32-byte
+                        // app address on BOTH sides — `app_prover_bitmask` is
+                        // what the shards subscribe with.
+                        let bitmask = quil_engine::bitmasks::app_prover_bitmask(&domain);
+                        // A node submitting for a shard it does not follow (a
+                        // wallet on a master whose workers cover the shard, or
+                        // no coverage at all) joins the topic first; the
+                        // subscription is idempotent and publishing requires it.
+                        if let Err(e) = p2p.subscribe_confirmed(bitmask.clone()).await {
+                            return Err(format!("p2p subscribe failed: {}", e));
+                        }
+                        let mut attempt = 0;
+                        loop {
+                            match p2p.publish(bitmask.clone(), payload.clone()).await {
+                                Ok(()) => break,
+                                // A fresh subscription may not have learned the
+                                // topic's peers yet; retry briefly.
+                                Err(e) if attempt < 10 && e.to_string().contains("InsufficientPeers") => {
+                                    attempt += 1;
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                }
+                                Err(e) => return Err(format!("p2p publish failed: {}", e)),
+                            }
+                        }
                     }
                     Ok(())
                 })
@@ -1140,6 +1656,112 @@ pub(crate) fn spawn_all(
                 None => Vec::new(),
             }
         });
+    #[cfg(feature = "native-proof")]
+    {
+        let fee_frames = current_frame.clone();
+        let fee_manager = exec_manager.clone();
+        let fee_registry = prover_registry.clone();
+        let fee_local_engines = shard_engines.clone();
+        let fee_remote_workers = remote_fee_workers.clone();
+        let fee_policy = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(network);
+        let fee_clock = clock_store.clone();
+        node_rpc_builder = node_rpc_builder.with_token_fee_provider(Arc::new(move |application, global_venue| {
+            use quil_types::{error::QuilError, consensus::ProverRegistry};
+            // The global venue prices at vote 1 from the materialized global
+            // snapshot or, on a node that does not materialize global frames,
+            // the latest stored global header (consensus data).
+            let global_snapshot = || -> quil_types::error::Result<quil_rpc::node_service::TokenFeeSnapshot> {
+                let (frame_number, difficulty, world_state_bytes) =
+                    match fee_manager.global_venue_fee_snapshot(fee_frames.materialized())? {
+                        Some(snapshot) => (snapshot.frame_number, snapshot.difficulty, snapshot.world_state_bytes),
+                        None => {
+                            let header = fee_clock.get_latest_global_clock_frame().ok().and_then(|frame| frame.header)
+                                .ok_or_else(|| QuilError::ExecutionUnavailable("global venue fee snapshot not available".into()))?;
+                            (header.frame_number, header.difficulty as u64, header.world_state_size)
+                        }
+                    };
+                Ok(quil_rpc::node_service::TokenFeeSnapshot {
+                    network: fee_policy.network, observed_frame: frame_number,
+                    global_execution: true, difficulty,
+                    world_state_bytes, fee_multiplier_vote: 1,
+                })
+            };
+            if global_venue {
+                // Reward mints execute in the global venue at vote 1 whatever
+                // the QUIL shard's coverage; quote exactly those inputs.
+                return global_snapshot();
+            }
+            // EVERY priced QUIL operation is charged at the global vote of one,
+            // so QUIL is always quoted there — see
+            // `every_priced_quil_operation_is_charged_at_the_global_vote`. The
+            // relayed ones (transfer, pending, claim, shield, settlement) commit
+            // in the global frame, and the frame that merely carries them prices
+            // them the same way (`materialize_app_shard_requests`); the QUIL
+            // reward mint executes in the global venue and nowhere else
+            // (`check_venue`). Quoting QUIL from an app-shard snapshot instead
+            // returns that shard's own, much larger fee vote: a node that
+            // materializes global frames and one that does not would answer the
+            // same question very differently, and after a split a wallet MUST
+            // ask an archive, because its own node covers only part of the
+            // application.
+            if application == quil_execution::domains::QUIL_TOKEN {
+                // A global materializer's own QUIL snapshot is the most precise
+                // form of that price; every other node falls back to the
+                // anchored global header below.
+                if let Some(snapshot) = fee_manager.global_quil_fee_snapshot(fee_frames.materialized())? {
+                    return Ok(quil_rpc::node_service::TokenFeeSnapshot {
+                        network: fee_policy.network, observed_frame: snapshot.frame_number,
+                        global_execution: true, difficulty: snapshot.difficulty,
+                        world_state_bytes: snapshot.world_state_bytes, fee_multiplier_vote: 1,
+                    });
+                }
+                return global_snapshot();
+            }
+            let unavailable = || QuilError::ExecutionUnavailable("current execution-venue fee snapshot not available".into());
+            // A node that does not materialize global frames (a regular node)
+            // never advances `materialized`; its stored global chain is the
+            // reference for "not ahead of this node's view".
+            let global_frame = fee_frames.materialized().max(
+                fee_clock.get_latest_global_clock_frame().ok()
+                    .and_then(|frame| frame.header.map(|h| h.frame_number))
+                    .unwrap_or(0),
+            );
+            let active = fee_registry.get_active_provers(&application, global_frame)?;
+            // Mirror the router: an uncovered application executes in the
+            // global venue only once that rule is active; before it, the
+            // application's own shard executes it however few provers it has.
+            let globally_routed = global_frame
+                >= quil_execution::token_intrinsic::constants::global_uncovered_shard_tx_frame(network)
+                && quil_execution::token_intrinsic::constants::shard_is_globally_executed(network, active.len() as u64);
+            // An application without a viable shard committee (including an
+            // intrinsic's base domain, where deploys execute) is executed by
+            // the global venue: quote its pricing.
+            if globally_routed {
+                return global_snapshot();
+            }
+            let local = fee_local_engines.read().get(application.as_slice()).cloned()
+                .and_then(|handle| handle.fee_snapshot());
+            let snapshot = match local {
+                Some(snapshot) => snapshot,
+                None => {
+                    let remote = fee_remote_workers.get().ok_or_else(unavailable)?;
+                    // Fee providers run on the RPC's bounded blocking pool. Use
+                    // its runtime for the deadline-bounded worker RPC.
+                    tokio::runtime::Handle::current().block_on(remote.app_fee_snapshot(application))?
+                }
+            };
+            if snapshot.application != application || snapshot.global_frame_number > global_frame {
+                return Err(unavailable());
+            }
+            Ok(quil_rpc::node_service::TokenFeeSnapshot {
+                network: fee_policy.network, observed_frame: snapshot.frame_number,
+                global_execution: false, difficulty: snapshot.difficulty,
+                world_state_bytes: snapshot.world_state_bytes,
+                fee_multiplier_vote: snapshot.fee_multiplier_vote,
+            })
+        }));
+    }
+
     node_rpc_builder = node_rpc_builder.with_shard_info_provider(Arc::new(LocalShardInfoProvider {
         registry: prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
         clock_store: clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
@@ -1205,9 +1827,22 @@ pub(crate) fn spawn_all(
             quil_rpc::peer_auth_middleware::peer_auth_interceptor,
         );
         let app_shard_service = tonic::service::interceptor::InterceptedService::new(
-            quil_types::proto::global::app_shard_service_server::AppShardServiceServer::new(
-                quil_rpc::stub_services::AppShardRpcServer::new(clock_store.clone() as Arc<dyn quil_types::store::ClockStore>),
-            ),
+            quil_types::proto::global::app_shard_service_server::AppShardServiceServer::new({
+                let server = quil_rpc::stub_services::AppShardRpcServer::new(
+                    clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
+                );
+                // Answer peers asking about applications this node holds, so a
+                // node without coverage can serve its own wallet by asking one
+                // that has it.
+                server.with_coin_scan(
+                    coin_provider.clone() as Arc<dyn quil_types::store::CoinWitnessProvider>,
+                    application_coverage.clone(),
+                )
+                .with_vertex_stores(
+                    hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+                    app_hypergraph_stores.clone(),
+                )
+            }),
             quil_rpc::peer_auth_middleware::peer_auth_interceptor,
         );
         let key_registry_service = tonic::service::interceptor::InterceptedService::new(
@@ -1685,4 +2320,113 @@ pub(crate) fn spawn_all(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::shard_paths_cover_application;
+
+    #[test]
+    fn a_stalled_engine_does_not_pin_the_mint_claim_anchor() {
+        use super::claim_anchor;
+        assert_eq!(claim_anchor(&[None, Some(1293), Some(1292), Some(1293), Some(1180), Some(1261)]), Some(1292),
+            "the live run: two stalled engines are left out");
+        assert_eq!(claim_anchor(&[Some(100), Some(97)]), Some(97), "engines keeping up: the least");
+        assert_eq!(claim_anchor(&[None, Some(0)]), None);
+    }
+
+    #[test]
+    fn coverage_requires_the_whole_application() {
+        let b = |s: &str| s.chars().map(|c| c == '1').collect::<Vec<bool>>();
+        assert!(shard_paths_cover_application(&[b("")]), "the root covers everything");
+        assert!(shard_paths_cover_application(&[b("0"), b("1")]));
+        assert!(shard_paths_cover_application(&[b("00"), b("01"), b("1")]), "a deep split with its spine");
+        assert!(shard_paths_cover_application(&[b("0000"), b("0001"), b("001"), b("01"), b("1")]));
+        assert!(!shard_paths_cover_application(&[b("0")]), "one child of a split is partial");
+        assert!(!shard_paths_cover_application(&[b("00"), b("1")]), "a missing sibling is partial");
+        assert!(!shard_paths_cover_application(&[]));
+    }
+}
+
+#[cfg(test)]
+mod composite_scan_tests {
+    use super::*;
+
+    fn store() -> Arc<quil_hypergraph::HypergraphCrdt> {
+        let db: &'static quil_store::RocksDb = Box::leak(Box::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        crdt
+    }
+
+    fn address(first: u8, last: u8) -> [u8; 32] {
+        let mut a = [0u8; 32];
+        a[0] = first;
+        a[31] = last;
+        a
+    }
+
+    /// A wallet scan over an application this node holds in two worker stores
+    /// is the two stores' scans concatenated in address order, under one
+    /// identity and one root, with each address reported only by its owner.
+    #[test]
+    fn a_scan_spans_worker_stores_in_address_order_under_one_identity() {
+        let app = [0x11u8; 32];
+        let low = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let high = quil_forest::encode_shard_bit_path(&app, &[true]);
+        assert_eq!(shard_range(&low).unwrap().1[0], 0x7f);
+        assert_eq!(shard_range(&high).unwrap().1, [0xff; 32]);
+        assert_eq!(shard_range(&app).unwrap().1, [0xff; 32]);
+
+        // Two entries per page. The low store also holds a record from before
+        // the split that now belongs to the high store.
+        let contents = |filter: &[u8]| -> Vec<[u8; 32]> {
+            if filter == low.as_slice() {
+                vec![address(0x01, 1), address(0x01, 2), address(0x20, 3), address(0x90, 9)]
+            } else {
+                vec![address(0x80, 4), address(0x90, 9), address(0xf0, 5)]
+            }
+        };
+        let low_for_scan = low.clone();
+        let scan_store = move |filter: &[u8], _: &dyn quil_types::store::SnapshotReadable, after: Option<&[u8; 32]>| {
+            let rest: Vec<_> = contents(filter).into_iter().filter(|a| after.is_none_or(|after| a > after)).collect();
+            let page: Vec<_> = rest.iter().take(2).map(|a| (*a, a[31])).collect();
+            Ok(StorePage {
+                cursor: page.last().map(|(a, _)| *a),
+                has_more: rest.len() > 2,
+                entries: page,
+                root_record: Some(if filter == low_for_scan.as_slice() { vec![0xaa] } else { vec![0xbb] }),
+            })
+        };
+        let scans = parking_lot::Mutex::new(std::collections::HashMap::new());
+        // Handed over in the "wrong" order: range order must not depend on it.
+        let stores = vec![(high.clone(), store()), (low.clone(), store())];
+
+        let mut seen = Vec::new();
+        let (mut id, mut after, mut pages) = (None, None, 0);
+        loop {
+            let (scan, root, entries, cursor, has_more) =
+                composite_page(&scans, stores.clone(), id.as_ref(), after.as_ref(), &scan_store).unwrap();
+            assert_eq!(*id.get_or_insert(scan), scan, "one identity for the whole scan");
+            assert_eq!(root, Some(vec![0xaa]), "every page advertises the first page's root");
+            assert!(entries.iter().all(|(a, _)| after.is_none_or(|after| *a > after) && cursor.is_some_and(|c| *a <= c)));
+            seen.extend(entries.into_iter().map(|(_, value)| value));
+            pages += 1;
+            assert!(pages < 10, "the scan must terminate");
+            if !has_more {
+                break;
+            }
+            assert!(cursor > after, "a continued scan always advances");
+            after = cursor;
+        }
+        assert_eq!(seen, vec![1, 2, 3, 4, 9, 5], "ascending, and 0x90… only from the store that owns it");
+
+        // A continuation needs the scan it belongs to, and the same store set.
+        assert!(composite_page(&scans, stores.clone(), Some(&[9; 32]), None, &scan_store).is_err());
+        let other = vec![(high, store()), (quil_forest::encode_shard_bit_path(&app, &[false, true]), store())];
+        assert!(composite_page(&scans, other, id.as_ref(), None, &scan_store).is_err());
+    }
 }

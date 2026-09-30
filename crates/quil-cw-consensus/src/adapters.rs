@@ -6,7 +6,7 @@
 //! module implements those three commonware traits over three **narrow,
 //! Quilibrium-facing seam traits** so the engine-facing glue is fixed here and
 //! the real state wiring (leader_provider / frame validation / materialize)
-//! lives behind the seams (implemented in quil-engine, P2b):
+//! lives behind the seams (implemented in quil-engine):
 //!
 //! - [`GlobalProposer`] ← `Automaton`: build the next global frame on a parent
 //! (propose) and validate a proposed frame (verify).
@@ -34,13 +34,36 @@ use crate::falcon_simplex::SimplexFalconScheme;
 use commonware_consensus::simplex::types::{Activity, Context};
 use commonware_consensus::simplex::Plan;
 use commonware_consensus::{
-    Automaton, CertifiableAutomaton, Relay, Reporter, Viewable as _,
+    Automaton, CertifiableAutomaton, Epochable as _, Relay, Reporter, Viewable as _,
 };
 
 /// Digest type consensus agrees on (the frame identity).
 pub type Digest = Sha256Digest;
 /// simplex activity for the Falcon scheme.
 pub type FalconActivity = Activity<SimplexFalconScheme, Digest>;
+
+/// The coordinates Simplex selected for this proposal. Application frame
+/// numbers are independent of views: nullified rounds can leave gaps, and a
+/// committee transition starts another epoch. A terminal handoff must bind
+/// these exact coordinates, not infer the parent view from a local clock head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProposalContext {
+    pub epoch: u64,
+    pub view: u64,
+    pub parent_view: u64,
+    pub parent: Digest,
+}
+
+impl From<Context<Digest, FalconPublicKey>> for ProposalContext {
+    fn from(context: Context<Digest, FalconPublicKey>) -> Self {
+        Self {
+            epoch: context.epoch().get(),
+            view: context.view().get(),
+            parent_view: context.parent.0.get(),
+            parent: context.parent.1,
+        }
+    }
+}
 
 /// Re-exported so seam implementors (quil-engine) needn't depend on commonware-p2p.
 pub use commonware_p2p::Recipients;
@@ -101,6 +124,13 @@ impl BlockStore {
         self.inner.lock().get(digest).map(|stored| stored.bytes.clone())
     }
 
+    /// Refuse oversized recovery input before copying peer-controlled bytes.
+    pub fn get_bounded(&self, digest: &Digest, max_bytes: usize) -> Option<Vec<u8>> {
+        self.inner.lock().get(digest)
+            .filter(|stored| stored.bytes.len() <= max_bytes)
+            .map(|stored| stored.bytes.clone())
+    }
+
     /// Seal the exact bytes that passed application validation (or were built
     /// locally). Idempotent: once a digest is sealed, a later `seal`/`put`
     /// cannot substitute different bytes for it.
@@ -139,6 +169,9 @@ impl BlockStore {
 /// simplex calls `propose` ONLY on the round leader, so no leadership check is
 /// needed here. Both methods are called off the engine's critical path (the
 /// adapter spawns them), so a blocking VDF prove in `propose` is fine.
+/// Longest a pacing leader holds its turn before giving the view up.
+const PROPOSE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub trait GlobalProposer: Send + Sync + 'static {
     /// Build the next frame on parent `parent_digest` for consensus `view`.
     /// Returns `(frame_identity_digest, canonical_frame_bytes)`, or `None` if
@@ -146,10 +179,38 @@ pub trait GlobalProposer: Send + Sync + 'static {
     /// out and nullifies the view (mirrors the existing leader-can't-build SKIP).
     fn propose(&self, view: u64, parent_digest: Digest) -> Option<(Digest, Vec<u8>)>;
 
-    /// Validate a proposed frame `digest` for `view`. `bytes` is the frame body
+    /// Validate a proposed frame `digest` for `view` and the consensus-selected
+    /// `parent_digest`. The frame's own parent must match this digest; a valid
+    /// self-contained frame is not enough to authorize another ancestry.
+    /// `bytes` is the frame body
     /// if already delivered (via `FrameSink`), else `None` (not yet arrived →
     /// return `false` so the view nullifies rather than votes blind).
-    fn verify(&self, view: u64, digest: Digest, bytes: Option<Vec<u8>>) -> bool;
+    fn verify(&self, view: u64, parent_digest: Digest, digest: Digest, bytes: Option<Vec<u8>>) -> bool;
+
+    /// After `propose` declined: how long until asking again for the same view
+    /// can succeed, or `None` to give the view up. A leader that is only pacing
+    /// itself must hold its turn; dropping it nullifies the view at network
+    /// speed and the committee burns hundreds of views per frame.
+    fn propose_retry(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Build with all consensus coordinates. Ordinary frame implementations
+    /// can use the default; session-aware handoff implementations must override
+    /// it to validate the epoch and selected parent view before producing bytes.
+    fn propose_with_context(&self, context: ProposalContext) -> Option<(Digest, Vec<u8>)> {
+        self.propose(context.view, context.parent)
+    }
+
+    /// Validate with the same complete context as proposal production.
+    fn verify_with_context(
+        &self,
+        context: ProposalContext,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> bool {
+        self.verify(context.view, context.parent, digest, bytes)
+    }
 }
 
 /// Ships frame bytes to peers — the `Relay` behind consensus. In the node this
@@ -227,19 +288,31 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
 
     async fn propose(&mut self, context: Self::Context) -> oneshot::Receiver<Self::Digest> {
         let (tx, rx) = oneshot::channel();
-        let view: u64 = context.view().get();
-        let parent = context.parent.1;
+        let proposal_context = ProposalContext::from(context);
         let proposer = self.proposer.clone();
         let store = self.store.clone();
-        self.context.child("propose").spawn(move |_| async move {
-            if let Some((digest, bytes)) = proposer.propose(view, parent) {
-                // Locally-produced bytes came directly from the application
-                // proposer and are the value Simplex is about to certify — seal
-                // them so peer ingress can't substitute a different body later.
-                store.seal(digest, bytes);
-                let _ = tx.send(digest);
+        self.context.child("propose").spawn(move |ctx| async move {
+            // Bounded under `leader_timeout` (30s); simplex drops the receiver
+            // when the view ends.
+            let mut waited = std::time::Duration::ZERO;
+            loop {
+                if let Some((digest, bytes)) = proposer.propose_with_context(proposal_context) {
+                    // Locally-produced bytes came directly from the application
+                    // proposer and are the value Simplex is about to certify — seal
+                    // them so peer ingress can't substitute a different body later.
+                    store.seal(digest, bytes);
+                    let _ = tx.send(digest);
+                    return;
+                }
+                match proposer.propose_retry() {
+                    Some(delay) if waited < PROPOSE_PATIENCE && !tx.is_closed() => {
+                        ctx.sleep(delay).await;
+                        waited += delay;
+                    }
+                    // drop tx → receiver cancelled → simplex nullifies the view.
+                    _ => return,
+                }
             }
-            // else: drop tx → receiver cancelled → simplex nullifies the view.
         });
         rx
     }
@@ -250,7 +323,7 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
         payload: Self::Digest,
     ) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
-        let view: u64 = context.view().get();
+        let proposal_context = ProposalContext::from(context);
         let proposer = self.proposer.clone();
         let store = self.store.clone();
         self.context.child("verify").spawn(move |ctx| async move {
@@ -270,7 +343,7 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
                 waited += 1;
             }
             let verified_bytes = bytes.clone();
-            let ok = proposer.verify(view, payload, bytes);
+            let ok = proposer.verify_with_context(proposal_context, payload, bytes);
             // On success, seal the EXACT bytes the application validated, so a
             // racing peer candidate at the same digest can't replace them.
             if ok {

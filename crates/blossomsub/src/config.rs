@@ -400,7 +400,7 @@ impl Default for ConfigBuilder {
         ConfigBuilder {
             config: Config {
                 protocol: ProtocolConfig::default(),
-                // WAN-hardened defaults (Stage 5). Bumped from the upstream
+                // WAN-hardened defaults. Bumped from the upstream
                 // 5/3: a peer that briefly drops (NAT churn, jitter, loss)
                 // needs the gossip window long enough to recover missing
                 // messages via IHAVE before they age out. 24 windows ×
@@ -1055,7 +1055,7 @@ mod test {
         MessageId::from(v)
     }
 
-    /// Wire-sanity guard (Stage 7): the DEFAULT BlossomSub message-id must be
+    /// Wire-sanity guard: the DEFAULT BlossomSub message-id must be
     /// `[0x01] ++ SHA256(data)` — 33 bytes, leading byte `0x01`, digest over
     /// the message payload only. Any drift here silently corrupts IHAVE/IWANT
     /// dedup against Go nodes and every other BlossomSub peer.

@@ -1,7 +1,7 @@
-//! Capstone P2c isolation test: N simplex engines on the **real commonware
+//! Isolation test: N simplex engines on the **real commonware
 //! tokio runtime** (the one the node will host), wired through our
 //! `p2p_bridge` channels via an in-memory router that stands in for the `:8340`
-//! transport, driven by our Falcon adapters. Proves the entire P2c mechanical
+//! transport, driven by our Falcon adapters. Proves the entire mechanical
 //! stack — tokio runtime host + channel Sender/Receiver + adapters + Falcon —
 //! finalizes, without the live node.
 
@@ -35,8 +35,11 @@ impl GlobalProposer for TestProposer {
         let digest = h.finalize();
         Some((digest, digest.as_ref().to_vec()))
     }
-    fn verify(&self, _v: u64, _d: Sha256Digest, bytes: Option<Vec<u8>>) -> bool {
-        bytes.is_some()
+    fn verify(&self, view: u64, parent: Sha256Digest, digest: Sha256Digest, bytes: Option<Vec<u8>>) -> bool {
+        let mut h = Sha256::default();
+        h.update(&view.to_be_bytes());
+        h.update(parent.as_ref());
+        h.finalize() == digest && bytes.as_deref() == Some(digest.as_ref())
     }
 }
 

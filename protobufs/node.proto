@@ -188,12 +188,6 @@ message Coin {
   AccountRef owner = 3;
 }
 
-message LegacyCoin {
-  Coin coin = 1;
-  uint64 frame_number = 2;
-  bytes address = 3;
-}
-
 message MaterializedTransaction {
   bytes address = 1;
   bytes raw_balance = 2;
@@ -235,17 +229,6 @@ message GetMetricsResponse {
   bytes metrics = 1;
 }
 
-message GetTokensByAccountRequest {
-  bytes address = 1;
-  bytes domain = 2;
-}
-
-message GetTokensByAccountResponse {
-  repeated LegacyCoin legacy_coins = 1;
-  repeated MaterializedTransaction transactions = 2;
-  repeated MaterializedPendingTransaction pending_transactions = 3;
-}
-
 message GetVertexDataRequest {
   bytes address = 1;  // 64-byte vertex ID (32-byte app address + 32-byte data address)
   bool full_data = 2; // When true, return serialized tree in raw_data
@@ -263,6 +246,7 @@ message GetVertexDataResponse {
   bytes shard_l1 = 4;     // ShardKey.L1 (3 bytes)
   bytes shard_l2 = 5;     // ShardKey.L2 (32 bytes)
   bytes raw_data = 6;     // Serialized VectorCommitmentTree when full_data requested
+  optional bool present = 7; // Distinguishes absent storage from an occupied empty blob.
 }
 
 message GetHyperedgeDataRequest {
@@ -312,6 +296,30 @@ message GetShardInfoResponse {
   uint64 frame_number = 5;
 }
 
+// Advisory budget for one standalone QUIL operation, not a reservation or a
+// promise of inclusion. The node must have the execution venue's pricing state.
+message GetTokenFeeQuoteRequest {
+  bytes application = 1;
+  uint64 max_payload_bytes = 2;
+  // Quote the global execution venue (the global frame materializer) rather
+  // than the venue currently executing the application's transactions. Reward
+  // mints always execute there, whatever the QUIL shard's coverage.
+  bool global_venue = 3;
+}
+message GetTokenFeeQuoteResponse {
+  bytes application = 1;
+  bytes network = 2;
+  uint64 observed_frame = 3;
+  bool global_execution = 4;
+  uint64 difficulty = 5;
+  uint64 world_state_bytes = 6;
+  uint64 fee_multiplier_vote = 7;
+  uint64 max_payload_bytes = 8;
+  // Unsigned, exactly 16-byte big-endian QUIL base units. This is a budget,
+  // not an authorization to spend; pricing may change before inclusion.
+  bytes fee_budget = 9;
+}
+
 message RequestJoinRequest {
   repeated bytes filters = 1;
   bytes delegate = 2;
@@ -347,86 +355,46 @@ service NodeService {
   rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfoResponse);
   rpc GetWorkerInfo(GetWorkerInfoRequest) returns (WorkerInfoResponse);
   rpc Send(SendRequest) returns (SendResponse);
-  rpc GetTokensByAccount(GetTokensByAccountRequest)
-    returns (GetTokensByAccountResponse);
   rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
   rpc GetVertexData(GetVertexDataRequest) returns (GetVertexDataResponse);
   rpc GetHyperedgeData(GetHyperedgeDataRequest) returns (GetHyperedgeDataResponse);
   rpc CreateTraversalProof(CreateTraversalProofRequest)
     returns (CreateTraversalProofResponse);
   rpc GetShardInfo(GetShardInfoRequest) returns (GetShardInfoResponse);
+  rpc GetTokenFeeQuote(GetTokenFeeQuoteRequest) returns (GetTokenFeeQuoteResponse);
   rpc RequestJoin(RequestJoinRequest) returns (RequestJoinResponse);
   rpc SetManuallyManaged(SetManuallyManagedRequest) returns (SetManuallyManagedResponse);
   rpc GetLatestFrame(quilibrium.node.global.pb.GetGlobalFrameRequest)
     returns (quilibrium.node.global.pb.GlobalFrameResponse);
   rpc SubmitMessage(SubmitMessageRequest) returns (SubmitMessageResponse);
-  // Lattice confidential-transaction wallet support: coin accumulator
-  // membership witnesses + coin enumeration for scanning.
-  rpc GetCoinSpendWitness(GetCoinSpendWitnessRequest)
-    returns (GetCoinSpendWitnessResponse);
-  rpc ListDomainCoins(ListDomainCoinsRequest) returns (ListDomainCoinsResponse);
-  rpc ListDomainEscrows(ListDomainEscrowsRequest) returns (ListDomainEscrowsResponse);
+  // QCT3 wallet witnesses and paginated discovery.
+  rpc GetCoinWitnesses(GetCoinWitnessesRequest)
+    returns (GetCoinWitnessesResponse);
+  rpc ListEscrows(ListCoinsRequest) returns (ListEscrowsResponse);
+  rpc ListCoins(ListCoinsRequest) returns (ListCoinsResponse);
   rpc GetProverRewardWitness(GetProverRewardWitnessRequest) returns (GetProverRewardWitnessResponse);
-}
-
-// Request per-coin accumulator membership witnesses for the wallet to build a
-// lattice confidential spend.
-message GetCoinSpendWitnessRequest {
-  // 32-byte token domain (empty ⇒ QUIL).
-  bytes domain = 1;
-  // Wire-encoded one-time keys `P` for coins the wallet is spending.
-  repeated bytes one_time_keys = 2;
-}
-message CoinSpendWitness {
-  bytes one_time_key = 1;   // echoes the requested P
-  uint64 leaf_index = 2;    // canonical (ascending-address) index
-  repeated bytes auth_path = 3; // wire-encoded sibling nodes, bottom→top
-  bool found = 4;           // false if P is not currently in the committed set
-}
-message GetCoinSpendWitnessResponse {
-  uint32 depth = 1;         // accumulator current depth (proofs bind to this)
-  bytes root = 2;           // wire-encoded committed root at `depth`
-  repeated CoinSpendWitness witnesses = 3;
-}
-
-// Enumerate a domain's committed lattice coins for wallet scanning.
-message ListDomainCoinsRequest {
-  bytes domain = 1;
-}
-message DomainCoin {
-  bytes address = 1;      // 32-byte coin content address
-  bytes one_time_key = 2; // wire-encoded P
-  bytes commitment = 3;   // wire-encoded cv
-  bytes memo = 4;         // opaque recipient memo (kem_ciphertext ‖ ring_memo)
-}
-message ListDomainCoinsResponse {
-  repeated DomainCoin coins = 1;
-}
-
-message ListDomainEscrowsRequest {
-  bytes domain = 1;
-}
-message DomainEscrow {
-  bytes address = 1;      // 32-byte escrow (pending) vertex address
-  bytes cv = 2;           // wire-encoded escrow commitment cv = H_B(C)
-  bytes to_key = 3;       // Falcon pubkey of the claimant
-  bytes refund_key = 4;   // Falcon pubkey of the refunder
-  uint64 expiration = 5;  // frame at/after which refund is allowed
-  bytes memo = 6;         // opaque dual-party memo (to ‖ refund halves)
-}
-message ListDomainEscrowsResponse {
-  repeated DomainEscrow escrows = 1;
+  rpc GetMintAuthorizationWitness(GetMintAuthorizationWitnessRequest) returns (GetMintAuthorizationWitnessResponse);
 }
 
 message GetProverRewardWitnessRequest {
   bytes domain = 1;               // token domain (QUIL for the reward mint)
   bytes owner_prover_address = 2; // poseidon(prover Falcon pubkey)
 }
+message GetMintAuthorizationWitnessRequest {
+  bytes receipt = 1; // 32-byte authorization identity derived from the original mint
+}
+message GetMintAuthorizationWitnessResponse {
+  bool found = 1;
+  bytes forest_proof = 2; // bounded membership witness; caller checks authorization fields
+  uint64 cited_frame = 3;
+  bytes global_root = 4; // root in the cited canonical global header
+}
 message GetProverRewardWitnessResponse {
   bool found = 1;
   bytes forest_proof = 2;  // quil_forest MembershipProof bytes
   bytes value = 3;         // claimable reward Balance, 16-byte LE u128
   uint64 cited_frame = 4;  // global frame whose prover_tree_commitment is the reward root
+  bytes reward_root = 5;   // checked 32-byte QUIL root; empty for unavailable/legacy providers
 }
 
 message ConnectivityTestRequest {
@@ -469,7 +437,18 @@ message SetHaltedRequest {
 message SetHaltedResponse {
 }
 
+message GetAppFeeSnapshotRequest { bytes application = 1; }
+message GetAppFeeSnapshotResponse {
+  bytes application = 1;
+  uint64 frame_number = 2;
+  uint64 global_frame_number = 3;
+  uint64 difficulty = 4;
+  uint64 world_state_bytes = 5;
+  uint64 fee_multiplier_vote = 6;
+}
+
 service DataIPCService {
+  rpc GetAppFeeSnapshot(GetAppFeeSnapshotRequest) returns (GetAppFeeSnapshotResponse);
   rpc Respawn(RespawnRequest) returns (RespawnResponse);
   rpc CreateJoinProof(CreateJoinProofRequest) returns (CreateJoinProofResponse);
   // SetHalted broadcasts the master's coverage-halt verdict to a
@@ -477,4 +456,78 @@ service DataIPCService {
   // local engine so prove_next_state and consensus-message handlers
   // short-circuit while halted. Idempotent — same value is a no-op.
   rpc SetHalted(SetHaltedRequest) returns (SetHaltedResponse);
+  // PrepareStorageConfirm asks the standalone worker bound to `filter` to
+  // encode the next epoch's replicas from its own store and return their leaf
+  // roots for the master's ProverConfirm. Only that worker holds the shard's
+  // data and proves from those replicas.
+  rpc PrepareStorageConfirm(PrepareStorageConfirmRequest) returns (PrepareStorageConfirmResponse);
+}
+
+message PrepareStorageConfirmRequest {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  // Shards a recorded split or merge creates from `filter` when it applies
+  // next epoch. The worker also encodes and returns their leaves from its
+  // own store, so its prover is registered for the shard it then holds.
+  repeated bytes targets = 3;
+}
+
+message PrepareStorageConfirmResponse {
+  repeated quilibrium.node.global.pb.ConfirmLeafRoots leaf_roots = 1;
+}
+
+// QCT3 token suite. The serving node chooses its network context.
+message GetCoinWitnessesRequest {
+  bytes domain = 1; // Exactly 32 bytes; no implicit token domain.
+  repeated bytes addresses = 2; // Unique 32-byte coin addresses.
+}
+message CoinWitness {
+  bytes address = 1;
+  bool found = 2;
+  repeated bytes siblings = 3;
+  repeated bool right = 4;
+}
+message GetCoinWitnessesResponse {
+  bytes network = 1; // 32-byte network identifier selected by the node.
+  bytes root_record = 2; // Canonical QCT3RT record, including context and depth.
+  repeated CoinWitness witnesses = 3;
+}
+
+// Empty snapshot_id and after start a scan; continuation must repeat snapshot_id.
+message ListCoinsRequest {
+  bytes domain = 1;
+  bytes snapshot_id = 2;
+  bytes after = 3;
+}
+message ConfidentialCoin {
+  bytes address = 1;
+  uint64 frame_number = 2;
+  bytes owner = 3;
+  bytes commitment = 4;
+  bytes memo = 5;
+  // Leaf index in the application's coin accumulator; part of the coin's
+  // committed content address.
+  uint64 position = 6;
+}
+message ListCoinsResponse {
+  bytes network = 1;
+  bytes snapshot_id = 2;
+  bytes root_record = 3;
+  repeated ConfidentialCoin coins = 4;
+  bytes cursor = 5;
+  bool has_more = 6;
+}
+
+// Snapshot enumeration of public encrypted records; consumption is checked
+// separately and the server never receives the wallet's recovery keys.
+message Escrow {
+  bytes address = 1;
+  bytes raw_data = 2;
+}
+message ListEscrowsResponse {
+  bytes network = 1;
+  bytes snapshot_id = 2;
+  repeated Escrow escrows = 3;
+  bytes cursor = 4;
+  bool has_more = 5;
 }

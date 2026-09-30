@@ -1,9 +1,9 @@
 //! End-to-end forest cutover: seed a RocksDB-backed hypergraph via a KZG-style
 //! CRDT commit, migrate it in place (`run_conversion_in_place`), install the
 //! forest on a fresh CRDT (`install_forest_if_migrated`), and confirm the next
-//! commit produces 32-byte JMT forest roots — the Phase-3 state-commitment
+//! commit produces 32-byte JMT forest roots — the state-commitment
 //! authority — flowing through the same `commit` API the consensus consumers
-//! read. Ties together every B1 piece that was validated in isolation.
+//! read. Ties together pieces that are otherwise validated in isolation.
 
 use std::sync::Arc;
 
@@ -61,10 +61,10 @@ impl quil_types::crypto::InclusionProver for StubProver {
     }
 }
 
-fn open_db(path: &std::path::Path) -> Arc<rocksdb::DB> {
+fn open_db(path: &std::path::Path) -> quil_forest::CoordinatedDb {
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
-    Arc::new(rocksdb::DB::open(&opts, path).unwrap())
+    quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, path).unwrap())
 }
 
 /// A production-shaped vertex: a serialized per-vertex tree with fields.

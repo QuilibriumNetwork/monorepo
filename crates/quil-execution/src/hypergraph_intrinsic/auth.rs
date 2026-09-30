@@ -38,6 +38,14 @@ use super::{
 /// must reject the op (an op against an undeployed hypergraph is
 /// always invalid).
 pub trait HypergraphConfigResolver: Send + Sync {
+    /// Rebind state-dependent lookups to a separate execution context. An
+    /// unknown resolver must opt in; cloning its Arc could retain primary state.
+    fn for_execution_context(
+        &self, _crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    ) -> Result<Arc<dyn HypergraphConfigResolver>> {
+        Err(QuilError::ExecutionUnavailable("hypergraph resolver cannot rebind execution state".into()))
+    }
+
     fn write_public_key(&self, domain: &[u8]) -> Option<Vec<u8>>;
     /// The BLS48-581 G1 owner public key for `domain`, used to verify
     /// `HypergraphUpdate` signatures. `None` means either the
@@ -54,6 +62,53 @@ pub trait HypergraphConfigResolver: Send + Sync {
     /// (deploy-style first update — evolution check is skipped).
     fn prior_rdf_schema(&self, _domain: &[u8]) -> Option<Vec<u8>> {
         None
+    }
+}
+
+/// Resolves hypergraph write keys from committed state: the deployed
+/// application's metadata vertex (`HYPERGRAPH_METADATA_ADDRESS`) carries its
+/// configuration tree at additional-data index 16, whose field `[1 << 2]` is the
+/// Falcon write key and `[0 << 2]` the read key, and its RDF schema at
+/// `[2 << 2]`. Only applications whose type domain is the hypergraph base domain
+/// resolve. No owner key is stored at deploy, so updates stay unauthorized.
+pub struct CrdtHypergraphConfigResolver {
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+}
+
+impl CrdtHypergraphConfigResolver {
+    pub fn new(crdt: Arc<quil_hypergraph::HypergraphCrdt>) -> Self {
+        Self { crdt }
+    }
+
+    fn metadata(&self, domain: &[u8]) -> Option<quil_tries::VectorCommitmentTree> {
+        let app_address: [u8; 32] = domain.get(..32)?.try_into().ok()?;
+        let blob = self.crdt.get_vertex_data(&quil_hypergraph::addressing::Location {
+            app_address,
+            data_address: crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS,
+        })?;
+        let tree = quil_tries::VectorCommitmentTree { root: quil_tries::deserialize_go_tree(&blob).ok()? };
+        let type_domain = tree.get(&[0xff; 32])?;
+        (type_domain.get(..32)? == super::hypergraph_base_domain().as_slice()).then_some(tree)
+    }
+}
+
+impl HypergraphConfigResolver for CrdtHypergraphConfigResolver {
+    fn for_execution_context(
+        &self, crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    ) -> Result<Arc<dyn HypergraphConfigResolver>> {
+        Ok(Arc::new(Self::new(crdt)))
+    }
+
+    fn write_public_key(&self, domain: &[u8]) -> Option<Vec<u8>> {
+        let metadata = self.metadata(domain)?;
+        let config = quil_tries::VectorCommitmentTree {
+            root: quil_tries::deserialize_go_tree(metadata.get(&[16u8 << 2])?).ok()?,
+        };
+        config.get(&[1u8 << 2]).map(|key| key.to_vec()).filter(|key| !key.is_empty())
+    }
+
+    fn prior_rdf_schema(&self, domain: &[u8]) -> Option<Vec<u8>> {
+        self.metadata(domain)?.get(&[2u8 << 2]).map(|schema| schema.to_vec())
     }
 }
 
@@ -256,6 +311,38 @@ mod tests {
         signed.extend_from_slice(tag);
         signed.extend_from_slice(message);
         signer.sign_with_domain(&signed, &[]).unwrap()
+    }
+
+    #[test]
+    fn crdt_resolver_reads_the_deployed_write_key_from_committed_metadata() {
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let state = crate::hypergraph_state::HypergraphState::new(crdt.clone());
+        let signer = FalconSigner::generate();
+        let config = crate::hypergraph_intrinsic::HypergraphConfiguration {
+            read_public_key: vec![7; 1158],
+            write_public_key: signer.public_key().to_vec(),
+            owner_public_key: Vec::new(),
+        };
+        let schema = b"@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n:Note a rdfs:Class .\n";
+        let domain = crate::hypergraph_intrinsic::materialize_hypergraph_deploy_init(
+            &state, &config, schema, 1, &quil_types::crypto::NoopInclusionProver).unwrap();
+        let resolver = CrdtHypergraphConfigResolver::new(crdt.clone());
+        // Pending (uncommitted) deploys do not resolve.
+        assert!(resolver.write_public_key(&domain).is_none());
+        state.commit().unwrap();
+        state.abort();
+        assert_eq!(resolver.write_public_key(&domain).unwrap(), signer.public_key().to_vec());
+        assert_eq!(resolver.prior_rdf_schema(&domain).unwrap(), schema.to_vec());
+        assert!(resolver.write_public_key(&[9; 32]).is_none());
+        // A signed vertex removal now verifies through the resolver.
+        let data_address = vec![0x42u8; 32];
+        let msg = vertex_remove_signing_message(&domain, &data_address).unwrap();
+        let op = VertexRemove { domain: domain.to_vec(), data_address, signature: falcon_signed(&signer, &domain, b"VERTEX_REMOVE", &msg) };
+        let resolver: Arc<dyn HypergraphConfigResolver> = Arc::new(resolver);
+        assert_eq!(verify_op_signature(&resolver, &OpForAuth::VertexRemove(&op)).unwrap(), AuthCheck::Verified);
     }
 
     #[test]

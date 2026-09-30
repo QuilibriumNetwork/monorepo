@@ -24,9 +24,7 @@ use quil_execution::global_intrinsic::{
     },
 };
 use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
-use quil_execution::token_intrinsic::transaction::{
-    RecipientBundle, Transaction, TransactionInput, TransactionOutput,
-};
+
 use quil_engine::consensus_wire::{
     GlobalProposal, ProposalVote, QuorumCertificate, TimeoutCertificate, TimeoutState,
 };
@@ -223,42 +221,6 @@ fn prover_seniority_merge_round_trip() {
     assert_round_trip(
         "ProverSeniorityMerge",
         |b| ProverSeniorityMerge::from_canonical_bytes(b).map_err(|e| e.into()),
-        |t| t.to_canonical_bytes().map_err(|e| e.into()),
-    );
-}
-
-#[test]
-fn transaction_input_round_trip() {
-    assert_round_trip(
-        "TransactionInput",
-        |b| TransactionInput::from_canonical_bytes(b).map_err(|e| e.into()),
-        |t| t.to_canonical_bytes().map_err(|e| e.into()),
-    );
-}
-
-#[test]
-fn transaction_output_round_trip() {
-    assert_round_trip(
-        "TransactionOutput",
-        |b| TransactionOutput::from_canonical_bytes(b).map_err(|e| e.into()),
-        |t| t.to_canonical_bytes().map_err(|e| e.into()),
-    );
-}
-
-#[test]
-fn recipient_bundle_round_trip() {
-    assert_round_trip(
-        "RecipientBundle",
-        |b| RecipientBundle::from_canonical_bytes(b).map_err(|e| e.into()),
-        |t| t.to_canonical_bytes().map_err(|e| e.into()),
-    );
-}
-
-#[test]
-fn transaction_round_trip() {
-    assert_round_trip(
-        "Transaction",
-        |b| Transaction::from_canonical_bytes(b).map_err(|e| e.into()),
         |t| t.to_canonical_bytes().map_err(|e| e.into()),
     );
 }

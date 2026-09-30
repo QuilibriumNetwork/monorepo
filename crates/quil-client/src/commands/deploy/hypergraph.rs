@@ -20,6 +20,11 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
     if rdf_schema.is_empty() {
         anyhow::bail!("RDF schema file {rdf_file:?} is empty");
     }
+    // The deploy is paid before the network validates it, and a rejected
+    // deploy leaves its settlement unconsumed: apply the node's schema check
+    // first.
+    quil_execution::hypergraph_intrinsic::dispatch::validate_rdf_schema_bytes(&rdf_schema)
+        .map_err(|e| anyhow::anyhow!("RDF schema {rdf_file:?} would be rejected: {e}"))?;
 
     let keys = dc.deploy_keys()?;
     let deploy = HypergraphDeploy {
@@ -31,6 +36,9 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
         rdf_schema,
     };
 
+    let domain = quil_execution::hypergraph_intrinsic::HypergraphConfiguration::from_proto(deploy.config.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("hypergraph configuration missing"))
+        .and_then(|config| quil_execution::hypergraph_intrinsic::hypergraph_deploy_domain(&config).map_err(|e| anyhow::anyhow!("deploy domain: {e}")))?;
     let mut client = dc.connect().await?;
     let request = MessageRequest {
         request: Some(Request::HypergraphDeploy(deploy)),
@@ -39,5 +47,6 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
     dc.send_deploy(&mut client, request).await?;
 
     println!("Hypergraph schema deployed successfully");
+    println!("Domain: {}", hex::encode(domain));
     Ok(())
 }

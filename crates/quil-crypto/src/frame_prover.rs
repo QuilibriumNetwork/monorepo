@@ -19,7 +19,7 @@ const GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME: u64 = 669975;
 /// un-prefixed challenge, so the 2.1.0 verify rejects it).
 const DOMAIN_2_1_0: [u8; 3] = [0x02, 0x01, 0x00];
 
-/// VDF-based frame prover using the Wesolowski VDF from the vdf crate.
+/// Builds app headers and proves global headers using the Wesolowski VDF.
 pub struct WesolowskiFrameProver {
     /// VDF integer size in bits (typically 2048).
     pub int_size_bits: u16,
@@ -112,9 +112,12 @@ impl FrameProver for WesolowskiFrameProver {
         storage_attestation_root: &[u8],
         global_frame_number: u64,
     ) -> Result<global::FrameHeader> {
-        // parent = poseidon(previous_frame_output[:516]); zero on genesis.
-        let parent: Vec<u8> = if previous_frame_output.len() >= 516 {
-            crate::poseidon::hash_bytes_to_32(&previous_frame_output[..516])
+        // App outputs contain deterministic digests padded to 516 bytes; the
+        // implicit genesis output is 32 zero bytes. Hash the complete stored
+        // predecessor output in either case, matching its frame identity.
+        // An explicitly absent predecessor retains the empty-genesis sentinel.
+        let parent: Vec<u8> = if !previous_frame_output.is_empty() {
+            crate::poseidon::hash_bytes_to_32(previous_frame_output)
                 .map_err(|e| QuilError::Crypto(format!("parent poseidon: {}", e)))?
                 .to_vec()
         } else {
@@ -147,39 +150,12 @@ impl FrameProver for WesolowskiFrameProver {
             storage_attestation_root: storage_attestation_root.to_vec(),
             global_frame_number,
             storage_attestation: Vec::new(),
+            // Set by the app engine from the previous frame's materialized fees.
+            fee_total: Vec::new(),
+            settlements: Vec::new(),
+            accumulator: Vec::new(),
+            spends: Vec::new(),
         })
-    }
-
-    fn verify_frame_header(&self, header: &global::FrameHeader) -> Result<Vec<u8>> {
-        use sha3::{Digest, Sha3_256};
-
-        let mut input = Vec::new();
-        input.extend_from_slice(&header.address);
-        input.extend_from_slice(&header.frame_number.to_be_bytes());
-        input.extend_from_slice(&(header.timestamp as u64).to_be_bytes());
-        input.extend_from_slice(&header.difficulty.to_be_bytes());
-        input.extend_from_slice(&header.fee_multiplier_vote.to_be_bytes());
-        input.extend_from_slice(&header.parent_selector);
-        input.extend_from_slice(&header.requests_root);
-        for sr in &header.state_roots {
-            input.extend_from_slice(sr);
-        }
-        input.extend_from_slice(&header.prover);
-        input.extend_from_slice(&header.storage_attestation_root);
-        input.extend_from_slice(&header.global_frame_number.to_be_bytes());
-
-        let challenge: [u8; 32] = Sha3_256::digest(&input).into();
-
-        if vdf::wesolowski_verify(
-            self.int_size_bits,
-            &challenge,
-            header.difficulty,
-            &header.output,
-        ) {
-            Ok(header.output.clone())
-        } else {
-            Err(QuilError::Crypto("invalid frame header VDF proof".into()))
-        }
     }
 
     fn prove_global_frame_header(
@@ -189,6 +165,7 @@ impl FrameProver for WesolowskiFrameProver {
         prover_root: &[u8],
         prover_aux_roots: &[Vec<u8>],
         request_root: &[u8],
+        world_state_size: u64,
         signer: &dyn quil_types::crypto::Signer,
         timestamp: i64,
         difficulty: u32,
@@ -226,12 +203,18 @@ impl FrameProver for WesolowskiFrameProver {
         }
         input.extend_from_slice(prover_root);
         input.extend_from_slice(request_root);
-        // Bind the prover shard's phases 1/2/3 (audit #5 flag-day): every root
+        // Bind the prover shard's phases 1/2/3 (flag-day): every root
         // that the catch-up syncer will authenticate must be committed by the
         // frame identity, or a peer could serve divergent removes/hyperedge
         // state. Appended AFTER request_root; the verifier mirrors this exactly.
         for aux in prover_aux_roots {
             input.extend_from_slice(aux);
+        }
+        // Certified world-state size (pricing input). Appended only when
+        // non-zero so frames produced before the field existed still verify;
+        // voters reject any value other than their own recorded size.
+        if world_state_size != 0 {
+            input.extend_from_slice(&world_state_size.to_be_bytes());
         }
 
         let b: [u8; 32] = Sha3_256::digest(&input).into();
@@ -285,6 +268,7 @@ impl FrameProver for WesolowskiFrameProver {
             prover: signer.public_key().to_vec(),
             public_key_signature_bls48581: bls_sig,
             prover_tree_aux_roots: prover_aux_roots.to_vec(),
+            world_state_size,
         })
     }
 
@@ -322,9 +306,12 @@ impl FrameProver for WesolowskiFrameProver {
         }
         input.extend_from_slice(&header.prover_tree_commitment);
         input.extend_from_slice(&header.requests_root);
-        // Mirror the prove side: bind the prover shard's phases 1/2/3 (audit #5).
+        // Mirror the prove side: bind the prover shard's phases 1/2/3.
         for aux in &header.prover_tree_aux_roots {
             input.extend_from_slice(aux);
+        }
+        if header.world_state_size != 0 {
+            input.extend_from_slice(&header.world_state_size.to_be_bytes());
         }
 
         let challenge = Sha3_256::digest(&input);
@@ -658,6 +645,25 @@ mod batch_tests {
     use super::*;
     use quil_types::crypto::{BlsConstructor, FrameProver, Signer};
 
+    #[test]
+    fn app_header_links_genesis_and_padded_digests_without_a_vdf() {
+        let prover = WesolowskiFrameProver::new(2048);
+        let build = |output: &[u8]| prover.prove_frame_header(
+            output, &[1; 32], &[0; 32], &vec![vec![0; 32]; 4], &[2; 32],
+            1, 1, 0, 2, &[], 0,
+        ).unwrap();
+        let mut padded_digest = vec![0; 516];
+        padded_digest[..32].fill(3);
+        for output in [vec![0; 32], padded_digest] {
+            let header = build(&output);
+            assert_eq!(header.parent_selector, crate::poseidon::hash_bytes_to_32(&output).unwrap());
+            // The caller fills the deterministic app output; this constructor
+            // must not perform a VDF or produce a VDF output.
+            assert!(header.output.is_empty());
+        }
+        assert_eq!(build(&[]).parent_selector, vec![0; 32]);
+    }
+
     /// Build a shard `FrameHeader` with a real single-signer Falcon
     /// signature over the exact `(payload, domain)` that
     /// `verify_frame_header_signature` reconstructs.
@@ -742,7 +748,7 @@ mod batch_tests {
         );
     }
 
-    /// Audit #5 flag-day: the prover shard's phase 1/2/3 roots
+    /// Flag-day: the prover shard's phase 1/2/3 roots
     /// (`prover_tree_aux_roots`) must be BOUND into the global VDF challenge, so
     /// a peer can't serve divergent removes/hyperedge state to a catch-up
     /// syncer. Real prove → verify round-trip + tamper/strip detection.
@@ -770,6 +776,7 @@ mod batch_tests {
                 &prover_root,
                 &aux,
                 &request_root,
+                987_654_321,
                 signer.as_ref(),
                 1234,
                 difficulty,
@@ -777,6 +784,7 @@ mod batch_tests {
             )
             .expect("prove");
         assert_eq!(header.prover_tree_aux_roots, aux, "aux roots carried on header");
+        assert_eq!(header.world_state_size, 987_654_321, "world size carried on header");
 
         // Honest header: verify recomputes the identical challenge → OK.
         assert!(
@@ -791,6 +799,14 @@ mod batch_tests {
             fp.verify_global_frame_header(&tampered).is_err(),
             "tampered aux root must fail verify"
         );
+
+        // The certified world size is bound too: changing or zeroing it fails.
+        let mut resized = header.clone();
+        resized.world_state_size += 1;
+        assert!(fp.verify_global_frame_header(&resized).is_err(), "altered world size must fail verify");
+        let mut unsized_header = header.clone();
+        unsized_header.world_state_size = 0;
+        assert!(fp.verify_global_frame_header(&unsized_header).is_err(), "stripped world size must fail verify");
 
         // Strip the aux roots entirely → also FAILS (proves they are bound, not
         // silently ignored on the verify side).
@@ -824,6 +840,7 @@ mod batch_tests {
                 &vec![1u8; 32],
                 &[],
                 &vec![5u8; 32],
+                0,
                 signer.as_ref(),
                 1234,
                 128,

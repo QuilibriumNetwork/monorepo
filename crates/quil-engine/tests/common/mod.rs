@@ -55,6 +55,16 @@ pub fn build_test_exec_manager(
         hg_store,
         inclusion_prover.clone(),
     ));
+    build_test_exec_manager_on(crdt, inclusion_prover, include_global)
+}
+
+/// [`build_test_exec_manager`] over a caller-supplied CRDT, as production
+/// wires it: the worker's hypergraph IS the execution manager's state store.
+pub fn build_test_exec_manager_on(
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    inclusion_prover: Arc<dyn InclusionProver>,
+    include_global: bool,
+) -> quil_execution::ExecutionEngineManager {
     let stubs = quil_execution::testing::NoopExecutionCrypto::new();
     let hg_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
         Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
@@ -90,27 +100,19 @@ impl FrameProver for StubFrameProver {
         _storage_attestation_root: &[u8],
         global_frame_number: u64,
     ) -> QResult<gpb::FrameHeader> {
-        // Output must be unique per (frame, ts) — otherwise every rank
-        // hashes to the same identity, all states alias to the same
-        // forks node, and the 3-chain rule never finalizes.
-        let mut buf = Vec::with_capacity(64);
-        buf.extend_from_slice(&frame_number.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes());
-        buf.extend_from_slice(previous_frame_output);
-        let h = quil_crypto::poseidon::hash_bytes_to_32(&buf).unwrap_or([0u8; 32]);
-        let mut output = vec![0u8; 516];
-        output[..32].copy_from_slice(&h);
+        // Match the production constructor: AppLeaderProvider fills the
+        // deterministic app output after completing the header.
         Ok(gpb::FrameHeader {
             address: vec![0u8; 32],
             frame_number,
             rank: 0,
             timestamp,
             difficulty,
-            output,
+            output: Vec::new(),
             parent_selector: if previous_frame_output.is_empty() {
                 vec![0u8; 32]
             } else {
-                previous_frame_output[..previous_frame_output.len().min(32)].to_vec()
+                quil_crypto::poseidon::hash_bytes_to_32(previous_frame_output)?.to_vec()
             },
             requests_root: vec![0u8; 64],
             state_roots: vec![],
@@ -120,11 +122,11 @@ impl FrameProver for StubFrameProver {
             storage_attestation_root: Vec::new(),
             global_frame_number,
             storage_attestation: Vec::new(),
+            fee_total: vec![0u8; 16],
+            settlements: Vec::new(),
+            accumulator: Vec::new(),
+            spends: Vec::new(),
         })
-    }
-
-    fn verify_frame_header(&self, _h: &gpb::FrameHeader) -> QResult<Vec<u8>> {
-        Ok(vec![0u8; 516])
     }
 
     // Accept any shard FrameHeader's signature. The stub prover produces
@@ -150,6 +152,7 @@ impl FrameProver for StubFrameProver {
         prover_root: &[u8],
         _prover_aux_roots: &[Vec<u8>],
         request_root: &[u8],
+        _world_state_size: u64,
         signer: &dyn Signer,
         timestamp: i64,
         difficulty: u32,
@@ -178,7 +181,7 @@ impl FrameProver for StubFrameProver {
             timestamp,
             difficulty,
             output,
-            parent_selector: previous_frame.output.clone(),
+            parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&previous_frame.output)?.to_vec(),
             prover: signer.public_key().to_vec(),
             prover_tree_commitment: prover_root.to_vec(),
             requests_root: request_root.to_vec(),
@@ -583,6 +586,9 @@ pub struct WorkerRig {
     pub full_frames: Arc<Mutex<Vec<Vec<u8>>>>,
     /// All `AppEngineEvent`s captured for diagnostics.
     pub events: Arc<Mutex<Vec<String>>>,
+    /// The worker's own shard CRDT, where its state, cursor and outgoing
+    /// history commit (session harnesses only).
+    pub shard: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
 }
 
 pub struct AppShardHarness {
@@ -667,10 +673,10 @@ impl AppShardHarness {
         provers: Vec<TestProver>,
         registry: Arc<dyn ProverRegistry>,
     ) -> Self {
-        Self::build_inner(provers, registry, None, false)
+        Self::build_inner(provers, registry, None, false, None, None)
     }
 
-    /// (P3) Build `n` workers driving the shard with commonware-simplex + Falcon
+    /// Build `n` workers driving the shard with commonware-simplex + Falcon
     /// (`app_consensus_cw = true`). For `n == 1` the single committee member
     /// self-proposes + self-finalizes (the `NoopAppTransport` in the engine has
     /// no peers to reach); multi-worker CW needs the gossip transport wired.
@@ -680,7 +686,7 @@ impl AppShardHarness {
         let all_prover_infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
         let registry =
             Arc::new(TestProverRegistry::with_provers(all_prover_infos)) as Arc<dyn ProverRegistry>;
-        Self::build_inner(provers, registry, None, true)
+        Self::build_inner(provers, registry, None, true, None, None)
     }
 
     /// Active-path PoRep variant: every worker gets a shared committed CRDT, an
@@ -694,7 +700,30 @@ impl AppShardHarness {
         registry: Arc<dyn ProverRegistry>,
         storage: StorageHarness,
     ) -> Self {
-        Self::build_inner(provers, registry, Some(storage), false)
+        Self::build_inner(provers, registry, Some(storage), false, None, None)
+    }
+
+    /// CW workers that run GLOBALLY AUTHORIZED committee sessions: every worker
+    /// reads `global` (the authenticated GLOBAL hypergraph) and owns a
+    /// RocksDB-backed shard CRDT with a persistent forest, which the session's
+    /// committed checkpoint reads require.
+    pub fn build_cw_sessions(
+        provers: Vec<TestProver>,
+        registry: Arc<dyn ProverRegistry>,
+        global: Arc<quil_hypergraph::HypergraphCrdt>,
+    ) -> Self {
+        Self::build_inner(provers, registry, None, true, Some(global), None)
+    }
+
+    /// [`Self::build_cw_sessions`] with application state `seed` committed
+    /// into every worker's shard CRDT before its engine starts.
+    pub fn build_cw_sessions_seeded(
+        provers: Vec<TestProver>,
+        registry: Arc<dyn ProverRegistry>,
+        global: Arc<quil_hypergraph::HypergraphCrdt>,
+        seed: fn(&quil_hypergraph::HypergraphCrdt),
+    ) -> Self {
+        Self::build_inner(provers, registry, None, true, Some(global), Some(seed))
     }
 
     fn build_inner(
@@ -702,6 +731,8 @@ impl AppShardHarness {
         registry: Arc<dyn ProverRegistry>,
         storage: Option<StorageHarness>,
         app_cw: bool,
+        session_global: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+        seed: Option<fn(&quil_hypergraph::HypergraphCrdt)>,
     ) -> Self {
         let n = provers.len();
         assert!(n >= 1, "need at least one worker");
@@ -733,6 +764,13 @@ impl AppShardHarness {
                 }));
 
             let clock_store = Arc::new(InMemoryClockStore::new());
+            // A session member's per-frame history records (fee total,
+            // settlements, spends, accumulator) commit with its state into the
+            // CRDT's database, and production reads them back through a clock
+            // store over that same database. A separate in-memory clock store
+            // cannot see them once the engine's in-memory copy is gone, as for a
+            // successor restarted under its new session.
+            let mut member_clock: Option<Arc<dyn ClockStore>> = None;
             // Active-path PoRep wiring: seed the global beacon frame, build the
             // worker's replica store + confirm its leaf replicas, and pass the
             // shared CRDT so `storage_vote_openings` / the seal can run.
@@ -762,10 +800,44 @@ impl AppShardHarness {
                 )
                 .expect("seed worker storage confirm");
                 (Some(sh.crdt.clone()), Some(kv))
+            } else if session_global.is_some() {
+                let rocks: &'static quil_store::RocksDb =
+                    Box::leak(Box::new(quil_store::RocksDb::open_in_memory().unwrap()));
+                let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                    Arc::new(quil_store::RocksHypergraphStore::new(rocks.inner()))
+                        as Arc<dyn quil_types::store::HypergraphStore>,
+                    Arc::new(quil_hypergraph::testing::StubProver)
+                        as Arc<dyn quil_types::crypto::InclusionProver>,
+                ));
+                crdt.set_forest(quil_forest::Forest::with_namespace(
+                    rocks.inner(),
+                    quil_store::FOREST_NAMESPACE,
+                ));
+                if let Some(seed) = seed {
+                    seed(&crdt);
+                }
+                member_clock = Some(Arc::new(quil_store::RocksClockStore::new(rocks.inner())));
+                (Some(crdt), None)
             } else {
-                (None, None)
+                // No storage path, but the CW proposer and voter still need
+                // the request-root validator, which requires a hypergraph.
+                (
+                    Some(Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                        Arc::new(quil_hypergraph::testing::MemStore::new())
+                            as Arc<dyn quil_types::store::HypergraphStore>,
+                        Arc::new(quil_hypergraph::testing::StubProver)
+                            as Arc<dyn quil_types::crypto::InclusionProver>,
+                    ))),
+                    None,
+                )
             };
-            let frame_prover: Arc<dyn FrameProver> = Arc::new(StubFrameProver);
+            // Exercise the production app constructor under CW: it hashes the
+            // full parent output and never solves an app VDF.
+            let frame_prover: Arc<dyn FrameProver> = if app_cw {
+                Arc::new(quil_crypto::WesolowskiFrameProver::new(2048))
+            } else {
+                Arc::new(StubFrameProver)
+            };
             let message_collector =
                 Arc::new(quil_engine::message_collector::MessageCollector::new());
             let fee_manager: Arc<dyn quil_types::consensus::DynamicFeeManager> =
@@ -773,9 +845,11 @@ impl AppShardHarness {
 
             let bls_signer = prover.signer_clone();
             let deps = quil_engine::app_engine::AppEngineDeps {
-                clock_store: clock_store as Arc<dyn ClockStore>,
+            delivery_frame_source: None,
+                clock_store: member_clock.unwrap_or_else(|| clock_store as Arc<dyn ClockStore>),
                 global_anchor_store: None,
-                storage_source_hypergraph: None,
+                global_hypergraph: session_global.clone(),
+                storage_source_hypergraph: None, topology: None,
                 prover_registry: registry.clone() as Arc<dyn ProverRegistry>,
                 frame_prover,
                 message_collector,
@@ -786,7 +860,7 @@ impl AppShardHarness {
                 reward_greedy: true,
                 min_active_provers_for_propose: 1,
                 coverage_publish,
-                hypergraph: hypergraph_dep,
+                hypergraph: hypergraph_dep.clone(),
                 // Wire a minimal ExecutionEngineManager + InclusionProver
                 // so workers can carry real dispatch messages.
                 // `compute_requests_root` requires both whenever the
@@ -794,10 +868,17 @@ impl AppShardHarness {
                 // Empty buffer → 64-byte zero requests_root, so the
                 // existing wave of tests that send no messages still
                 // works.
-                execution_engine: Some(Arc::new(build_test_exec_manager(
-                    Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
-                    /* include_global */ false,
-                ))),
+                execution_engine: Some(Arc::new(match (session_global.as_ref(), hypergraph_dep.as_ref()) {
+                    (Some(_), Some(crdt)) => build_test_exec_manager_on(
+                        crdt.clone(),
+                        Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
+                        false,
+                    ),
+                    _ => build_test_exec_manager(
+                        Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
+                        /* include_global */ false,
+                    ),
+                })),
                 inclusion_prover: Some(
                     Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
                 ),
@@ -820,6 +901,7 @@ impl AppShardHarness {
                 coverage_published,
                 full_frames: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(Vec::new())),
+                shard: session_global.as_ref().and(hypergraph_dep.clone()),
             });
             pendings.push(Pending {
                 engine,
@@ -832,7 +914,7 @@ impl AppShardHarness {
         // to broadcast to peers (= every worker except self).
         let all_handles: Vec<quil_engine::app_engine::AppEngineHandle> =
             workers.iter().map(|w| w.handle.clone()).collect();
-        // (P3) Each worker's committee Falcon pubkey, so the CW event drain can
+        // Each worker's committee Falcon pubkey, so the CW event drain can
         // tag `CwIn.from` when routing `CwOut` to peers (in-memory transport).
         let all_pubkeys: Vec<Vec<u8>> =
             workers.iter().map(|w| w.prover.bls_pubkey.clone()).collect();
@@ -863,6 +945,7 @@ impl AppShardHarness {
                 .map(|(_, h)| h.clone())
                 .collect();
             let my_pubkey = all_pubkeys[idx].clone();
+            let my_handle = all_handles[idx].clone();
             let events_log = events_per_worker[idx].clone();
             let full_frames_log = full_frames_per_worker[idx].clone();
             let mut rx = pending.event_rx;
@@ -918,6 +1001,16 @@ impl AppShardHarness {
                         }
                         E::ParentSealed { .. } => {
                             events_log.lock().push("ParentSealed".into());
+                        }
+                        E::ShardDataBootstrapRequested { .. } => {
+                            events_log.lock().push("ShardDataBootstrapRequested".into());
+                            // The harness shard is genuinely empty (or already
+                            // seeded in-process), so the bootstrap converges at
+                            // once — as the production syncer reports for an
+                            // empty shard — and un-gates propose/vote.
+                            my_handle.send(quil_engine::app_engine::AppEngineMessage::ShardSyncCompleted {
+                                synced_to_frame: 0,
+                            });
                         }
                         E::CwOut { channel, bytes, .. } => {
                             events_log.lock().push("CwOut".into());
@@ -1030,7 +1123,18 @@ pub fn build_genesis_seed_hex(provers: &[TestProver]) -> String {
 pub fn stamp_app_frame_output(
     h: &mut quil_execution::global_intrinsic::frame_header::FrameHeader,
 ) {
-    let rho_n = quil_crypto::porep::derive_storage_beacon(0, &[]);
+    stamp_anchored_app_frame_output(h, &[]);
+}
+
+/// [`stamp_app_frame_output`] for a storage frame anchored to global frame
+/// `h.global_frame_number`, whose VDF output is `anchor_output`. The verifier
+/// recomputes ρ_N from its own clock store, so the anchor frame must be seeded
+/// there with the same output.
+pub fn stamp_anchored_app_frame_output(
+    h: &mut quil_execution::global_intrinsic::frame_header::FrameHeader,
+    anchor_output: &[u8],
+) {
+    let rho_n = quil_crypto::porep::derive_storage_beacon(h.global_frame_number, anchor_output);
     h.output = quil_crypto::porep::deterministic_app_frame_output(
         &h.parent_selector,
         &h.requests_root,
@@ -1043,6 +1147,10 @@ pub fn stamp_app_frame_output(
         h.fee_multiplier_vote as u64,
         h.timestamp,
         &h.storage_attestation_root,
+        h.fee_total_value(),
+        &h.settlements,
+        &h.accumulator,
+        &h.spends,
     );
 }
 
@@ -1080,7 +1188,7 @@ pub struct Tier2ArchiveRig {
     pub rocks: Arc<quil_store::RocksDb>,
     pub hg_store: Arc<quil_store::RocksHypergraphStore>,
     pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
-    pub clock_store: Arc<InMemoryClockStore>,
+    pub clock_store: Arc<quil_store::RocksClockStore>,
     pub prover_registry: Arc<quil_execution::SharedProverRegistry>,
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
     pub materializer: Arc<quil_engine::frame_materializer::FrameMaterializer>,
@@ -1150,9 +1258,13 @@ pub fn build_tier2_archive_rig_with_key_manager(
         hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
         inclusion_prover.clone(),
     ));
+    crdt.set_forest(quil_forest::Forest::with_namespace(
+        rocks.inner(),
+        quil_store::FOREST_NAMESPACE,
+    ));
 
-    // 2. Clock store (in-memory).
-    let clock_store = Arc::new(InMemoryClockStore::new());
+    // 2. Clock, forest and state share the execution database, as in production.
+    let clock_store = Arc::new(quil_store::RocksClockStore::new(rocks.inner()));
 
     // 3. Seed genesis state — provers + reward vertices + 6 placeholder
     //    app shards in QUIL_TOKEN domain.
@@ -1174,7 +1286,7 @@ pub fn build_tier2_archive_rig_with_key_manager(
     //     gate (`global_intrinsic/intrinsic.rs`) resolves this referenced
     //     frame via the clock store; without it, joins are rejected with
     //     "referenced frame 5 not in clock store" and skipped.
-    clock_store.seed_frame(gpb::GlobalFrame {
+    let referenced_frame = gpb::GlobalFrame {
         header: Some(gpb::GlobalFrameHeader {
             frame_number: 5,
             rank: 0,
@@ -1184,11 +1296,15 @@ pub fn build_tier2_archive_rig_with_key_manager(
             ..Default::default()
         }),
         requests: vec![],
-    });
+    };
+    let txn = clock_store.new_transaction(false).expect("clock transaction");
+    clock_store.put_global_clock_frame(&referenced_frame, txn.as_ref())
+        .expect("seed referenced frame");
+    txn.commit().expect("commit referenced frame");
 
     // 4. Build prover registry and refresh from the seeded store.
     let prover_registry = Arc::new(SharedProverRegistry::new());
-    prover_registry.refresh_from_store(&hg_store);
+    prover_registry.refresh_from_store(hg_store.as_ref()).unwrap();
 
     // 5. KeyManager (quil_types::crypto::KeyManager — verifies sigs).
     //    Caller-provided so adversarial tests can plug in real BLS
@@ -1301,6 +1417,9 @@ pub fn build_tier2_archive_rig_with_key_manager(
         transport: transport.clone() as Arc<dyn ProverMessageTransport>,
         hypergraph: None,
         replica_store: None,
+        storage_for_filter: None,
+        remote_storage_confirm: None,
+        pending_shard_changes: None,
         local_message_collector: None,
         current_frame: None,
     });
@@ -1397,8 +1516,22 @@ pub fn build_test_pipeline_with_registry(
         multisig_ed448_seeds: vec![],
         delegate_address: vec![],
         transport: transport as Arc<dyn ProverMessageTransport>,
-        hypergraph: None,
-        replica_store: None,
+        // Data-shard confirmations prepare next-epoch replicas before they are
+        // signed (`storage_confirm_leaf_roots`), so the rig carries a local
+        // (empty) hypergraph and an in-memory replica store like production.
+        hypergraph: Some(Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new())
+                as Arc<dyn quil_types::store::HypergraphStore>,
+            Arc::new(quil_hypergraph::testing::StubProver)
+                as Arc<dyn quil_types::crypto::InclusionProver>,
+        ))),
+        replica_store: Some(quil_store::replica_store::ReplicaStore::new(
+            Arc::new(quil_store::RocksDb::open_in_memory().expect("in-memory replica db"))
+                as Arc<dyn quil_types::store::KvDb>,
+        )),
+        storage_for_filter: None,
+        remote_storage_confirm: None,
+        pending_shard_changes: None,
         local_message_collector: None,
         current_frame: None,
     });

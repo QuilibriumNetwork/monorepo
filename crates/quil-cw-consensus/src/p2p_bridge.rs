@@ -1,5 +1,5 @@
 //! Channel-backed commonware-p2p `Sender`/`Receiver` bridging simplex's three
-//! consensus channels onto the node's existing `:8340` mTLS transport (P2c).
+//! consensus channels onto the node's existing `:8340` mTLS transport.
 //!
 //! simplex's `engine.start(vote, certificate, resolver)` wants a
 //! `(Sender, Receiver)` pair per channel. Rather than adopt commonware's own
@@ -52,14 +52,17 @@ pub struct ChannelSender<P> {
     channel: u64,
     peers: Arc<[P]>,
     out: mpsc::UnboundedSender<Outbound<P>>,
+    /// Own key and inbound queue: broadcasts are also delivered locally.
+    echo: Option<(P, mpsc::UnboundedSender<Message<P>>)>,
 }
 
-impl<P> Clone for ChannelSender<P> {
+impl<P: Clone> Clone for ChannelSender<P> {
     fn clone(&self) -> Self {
         Self {
             channel: self.channel,
             peers: self.peers.clone(),
             out: self.out.clone(),
+            echo: self.echo.clone(),
         }
     }
 }
@@ -82,6 +85,7 @@ impl<P: PublicKey> LimitedSender for ChannelSender<P> {
             channel: self.channel,
             recipients,
             out: self.out.clone(),
+            echo: self.echo.clone(),
         })
     }
 }
@@ -93,6 +97,7 @@ pub struct ChannelCheckedSender<P> {
     channel: u64,
     recipients: Vec<P>,
     out: mpsc::UnboundedSender<Outbound<P>>,
+    echo: Option<(P, mpsc::UnboundedSender<Message<P>>)>,
 }
 
 impl<P: PublicKey> CheckedSender for ChannelCheckedSender<P> {
@@ -105,6 +110,9 @@ impl<P: PublicKey> CheckedSender for ChannelCheckedSender<P> {
     fn send(self, message: impl Into<IoBufs> + Send, priority: bool) -> Unreliable<Feedback> {
         let mut bufs: IoBufs = message.into();
         let bytes = bufs.copy_to_bytes(bufs.remaining()).to_vec();
+        if let Some((me, inbound)) = self.echo {
+            let _ = inbound.send(inbound_message(me, bytes.clone()));
+        }
         let _ = self.out.send(Outbound {
             channel: self.channel,
             recipients: self.recipients,
@@ -147,10 +155,29 @@ pub fn build_channel<P: PublicKey>(
 ) -> P2pChannel<P> {
     let (inbound_tx, rx) = mpsc::unbounded_channel();
     P2pChannel {
-        sender: ChannelSender { channel, peers, out },
+        sender: ChannelSender { channel, peers, out, echo: None },
         receiver: ChannelReceiver { rx },
         inbound_tx,
     }
+}
+
+/// The vote channel, with this member's own broadcasts also delivered to its
+/// own receiver.
+///
+/// Simplex hands a vote to the local batcher only when it is first constructed.
+/// A vote replayed from the journal is rebroadcast as a retry and never reaches
+/// the batcher again, so after a restart of every member a committee whose
+/// quorum equals its size (three members or fewer) could never assemble the
+/// certificate that leaves the view. The batcher ignores an identical duplicate.
+pub fn build_vote_channel<P: PublicKey>(
+    channel: u64,
+    peers: Arc<[P]>,
+    out: mpsc::UnboundedSender<Outbound<P>>,
+    me: Option<P>,
+) -> P2pChannel<P> {
+    let mut built = build_channel(channel, peers, out);
+    built.sender.echo = me.map(|me| (me, built.inbound_tx.clone()));
+    built
 }
 
 /// Helper for the node's inbound path: wrap raw bytes + sender into a `Message`.
@@ -224,5 +251,21 @@ mod tests {
         let (from, buf) = futures::executor::block_on(ch.receiver.recv()).expect("recv");
         assert_eq!(from, a);
         assert_eq!(buf.as_ref(), b"cert-msg");
+    }
+
+    #[test]
+    fn vote_channel_delivers_own_broadcasts_locally() {
+        let me = pk();
+        let peer = pk();
+        let peers: Arc<[FalconPublicKey]> = Arc::from(vec![peer]);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound<FalconPublicKey>>();
+        let mut ch = build_vote_channel(0, peers, out_tx, Some(me.clone()));
+
+        let _ = ch.sender.send(Recipients::All, b"nullify".to_vec(), true);
+
+        assert_eq!(out_rx.try_recv().expect("still sent to peers").bytes, b"nullify");
+        let (from, buf) = futures::executor::block_on(ch.receiver.recv()).expect("recv");
+        assert_eq!(from, me);
+        assert_eq!(buf.as_ref(), b"nullify");
     }
 }

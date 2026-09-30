@@ -565,6 +565,17 @@ pub fn verify_prover_join_not_kicked(
 /// `lookup_alloc` is the per-allocation tree loader the caller
 /// supplies — it lets this helper stay free of state-store coupling.
 /// Pass `Ok(None)` for filters with no existing allocation vertex.
+/// How long the network keeps refusing a re-join of a filter whose allocation
+/// is still recorded as Joining or Leaving.
+///
+/// Expiry is computed from elapsed frames and NEVER written back, so the raw
+/// `Status` byte this verifier reads stays Joining/Leaving long after a node's
+/// own lifecycle calls the allocation expired. Both sides must use THIS
+/// constant: a node that considers such a filter re-joinable sooner just
+/// re-proposes joins the network drops as "existing allocation still active",
+/// spending its free workers on a shard it cannot take.
+pub const REJOIN_WINDOW_FRAMES: u64 = 720;
+
 pub fn verify_prover_join_allocations_expired<F>(
     op: &ProverJoin,
     pubkey: &[u8],
@@ -605,8 +616,7 @@ where
             )));
         }
         let jf = u64::from_be_bytes(jf_bytes.try_into().unwrap());
-        const REJOIN_WINDOW: u64 = 720;
-        if frame_number < jf.saturating_add(REJOIN_WINDOW) {
+        if frame_number < jf.saturating_add(REJOIN_WINDOW_FRAMES) {
             return Err(QuilError::InvalidArgument(format!(
                 "ProverJoin verify: existing allocation still active \
                  (status={}, frames_since_join={})",
@@ -711,6 +721,20 @@ pub fn verify_prover_confirm(
     )
 }
 
+/// The signed frame also commits to the storage target epoch (signed epoch + 1).
+/// A delayed message must never relabel roots for a different inclusion epoch.
+pub fn validate_confirm_epoch(signed_frame: u64, inclusion_frame: u64) -> Result<()> {
+    if signed_frame > inclusion_frame
+        || quil_types::consensus::epoch_for_frame(signed_frame)
+            != quil_types::consensus::epoch_for_frame(inclusion_frame)
+    {
+        return Err(QuilError::InvalidArgument(
+            "confirm: signed frame must be in the inclusion epoch and not in the future".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate ProverConfirm timing constraints (epoch-aligned lifecycle). Called
 /// during invoke_step with the allocation tree loaded. A proposal made in epoch
 /// E must be confirmed in EXACTLY epoch E+1 — this is what keeps committee
@@ -758,6 +782,14 @@ pub fn validate_confirm_timing(
         }
         3 => {
             // Leaving — must confirm in exactly the epoch after the leave.
+            let confirmed = crate::global_schema::read_field(
+                allocation_tree, cls, "LeaveConfirmFrameNumber",
+            ).unwrap_or_default();
+            if !confirmed.is_empty() && confirmed != [0u8; 8] {
+                return Err(QuilError::InvalidArgument(
+                    "confirm: leave already confirmed".into(),
+                ));
+            }
             let leave_frame_bytes = crate::global_schema::read_field(
                 allocation_tree, cls, "LeaveFrameNumber",
             ).unwrap_or_default();
@@ -1629,6 +1661,20 @@ mod tests {
         assert!(validate_confirm_timing(7 * E, &alloc).is_err());       // too late
     }
 
+    #[test]
+    fn confirm_epoch_rejects_delayed_and_future_signed_frames() {
+        assert!(validate_confirm_epoch(E + 1, 2 * E - 1).is_ok());
+        assert!(validate_confirm_epoch(2 * E - 1, 2 * E).is_err());
+        assert!(validate_confirm_epoch(2 * E + 1, 2 * E).is_err());
+    }
+
+    #[test]
+    fn confirm_timing_rejects_already_confirmed_leave() {
+        let mut alloc = make_alloc_tree_with_leave_frame(5 * E + 10);
+        super::super::materialize::materialize_prover_confirm(&mut alloc, 6 * E + 1).unwrap();
+        assert!(validate_confirm_timing(6 * E + 2, &alloc).is_err());
+    }
+
     /// Active re-confirm registers the NEXT epoch: allowed iff the recorded
     /// Epoch is not already ahead of the confirm epoch, and the filter is a
     /// non-empty data shard.
@@ -1655,7 +1701,7 @@ mod tests {
         assert!(validate_confirm_timing(3 * E + 5, &mk(3, &[])).is_err());
     }
 
-    // ---- Gap coverage (audit 2026-06-28): defensive arms + stale recovery ----
+    // ---- Defensive arms + stale recovery ------------------------------------
 
     /// Missing JoinFrameNumber / LeaveFrameNumber (field length != 8) is rejected
     /// rather than silently defaulting.

@@ -1,10 +1,10 @@
-//! Phase-0 profiling bench: the KZG branch-commit hot path.
+//! Profiling bench: the KZG branch-commit hot path.
 //!
 //! `VectorCommitmentTree::commit` walks the 64-branch trie and, for every
 //! branch node, builds a 4096-byte polynomial (64 children × 64-byte
 //! commitments) and runs `KzgInclusionProver::commit` — a BLS48-581 G1
 //! multiexp — with no incremental update. This bench isolates that cost at
-//! several tree sizes so the verkle-vs-hash-Merkle decision (Phase 3) rests
+//! several tree sizes so the verkle-vs-hash-Merkle choice rests
 //! on real numbers, and so a hash-Merkle branch commit can be A/B'd against
 //! it in isolation.
 //!

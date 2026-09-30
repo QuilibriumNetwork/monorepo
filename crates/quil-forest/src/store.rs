@@ -8,11 +8,11 @@
 //! the version at which it became unreachable. Persisting those records is
 //! the whole basis for pruning: to drop all history readable only below
 //! version `V`, delete every node whose `stale_since_version <= V` (and the
-//! record itself). The base spike discarded that index, so it could grow
-//! but never shrink — this module closes that gap.
+//! record itself). Discarding that index would let the store grow but never
+//! shrink, so this module persists it.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 use anyhow::Result;
 use jmt::storage::{
@@ -21,6 +21,7 @@ use jmt::storage::{
 use jmt::{KeyHash, OwnedValue, Version};
 
 use crate::TreeId;
+use crate::overlay::{KvIterator, KvStore};
 
 /// A store that can persist a full JMT [`TreeUpdateBatch`] (nodes, values,
 /// and the stale-node index) and later prune superseded nodes. This is the
@@ -288,7 +289,7 @@ pub(crate) fn batch_size_sums<S: TreeReader + SizeIndex>(
 /// `<= max_version` is a single reverse seek. This is the adapter that lets
 /// thousands of independent forest trees live in one DB.
 pub struct RocksTreeStore {
-    db: Arc<rocksdb::DB>,
+    db: KvStore,
     prefix: Vec<u8>,
 }
 
@@ -297,7 +298,7 @@ impl RocksTreeStore {
     /// tree-level byte (`0x01/0x02/0x03`). Use [`with_namespace`] when the
     /// forest shares a DB with other data whose keys could collide with those
     /// level bytes.
-    pub fn new(db: Arc<rocksdb::DB>, tree: &TreeId) -> Self {
+    pub fn new(db: crate::CoordinatedDb, tree: &TreeId) -> Self {
         Self::with_namespace(db, &[], tree)
     }
 
@@ -306,7 +307,11 @@ impl RocksTreeStore {
     /// whole forest occupies one disjoint sub-range and cannot collide with
     /// the node's clock / shard / registry keys. All node/value/stale keys
     /// inherit it via `self.prefix`.
-    pub fn with_namespace(db: Arc<rocksdb::DB>, namespace: &[u8], tree: &TreeId) -> Self {
+    pub fn with_namespace(db: crate::CoordinatedDb, namespace: &[u8], tree: &TreeId) -> Self {
+        Self::with_backend(KvStore::Rocks(db), namespace, tree)
+    }
+
+    pub(crate) fn with_backend(db: KvStore, namespace: &[u8], tree: &TreeId) -> Self {
         let mut prefix = Vec::with_capacity(namespace.len() + 2 + tree.id.len());
         prefix.extend_from_slice(namespace);
         prefix.extend_from_slice(&tree.prefix());
@@ -339,7 +344,7 @@ impl RocksTreeStore {
     /// borsh decode anyway, and XXH3 was ~3% of the boot CPU), block cache untouched
     /// (a full-tree sweep must not evict the live working set), and a wide readahead
     /// so the kernel streams whole SST files instead of faulting a block at a time.
-    fn seq_iter(&self, tag: u8) -> (rocksdb::DBRawIterator<'_>, Vec<u8>) {
+    fn seq_iter(&self, tag: u8) -> Result<(KvIterator<'_>, Vec<u8>)> {
         let mut lo = self.prefix.clone();
         lo.push(tag);
         let mut hi = self.prefix.clone();
@@ -348,9 +353,9 @@ impl RocksTreeStore {
         ro.set_verify_checksums(false);
         ro.fill_cache(false);
         ro.set_readahead_size(8 << 20);
-        let mut it = self.db.raw_iterator_opt(ro);
-        it.seek(&lo);
-        (it, hi)
+        let mut it = self.db.iterator(&lo, &hi, ro)?;
+        it.seek(&lo)?;
+        Ok((it, hi))
     }
 
     /// One-time backfill of the `TAG_SIZE` Merkle-sum index over the whole tree at
@@ -395,6 +400,10 @@ impl RocksTreeStore {
             on_flush(0);
             return Ok(s);
         }
+        // The bulk bootstrap intentionally collects a whole tree in memory.
+        // It belongs on the canonical startup path, never inside a bounded
+        // tentative frame. Ordinary lazy size lookups remain overlay-backed.
+        anyhow::ensure!(self.db.db().is_some(), "bulk size-index seeding unavailable in execution overlay");
 
         // ---- Pass 1: value column → live leaf size by key_hash. -------------
         // Keys: prefix ++ 'v' ++ key_hash(32) ++ version_be(8); values sort ascending
@@ -402,7 +411,7 @@ impl RocksTreeStore {
         let khs = self.prefix.len() + 1;
         let mut leaf_size: HashMap<[u8; 32], u128> = HashMap::new();
         {
-            let (mut it, hi) = self.seq_iter(TAG_VALUE);
+            let (mut it, hi) = self.seq_iter(TAG_VALUE)?;
             while it.valid() {
                 let k = match it.key() {
                     Some(k) if k < hi.as_slice() => k,
@@ -422,18 +431,18 @@ impl RocksTreeStore {
                         leaf_size.insert(kh, sz);
                     }
                 }
-                it.next();
+                it.next()?;
             }
         }
 
         // ---- Pass 2: node column → write leaf sizes, stash internals. -------
         let mut node_size: HashMap<NodeKey, u128> = HashMap::new();
         let mut internals: Vec<(NodeKey, Vec<NodeKey>)> = Vec::new();
-        let mut wb = rocksdb::WriteBatch::default();
+        let mut wb = self.db.batch();
         let mut pending = 0u64;
         let mut written = 0u64;
         {
-            let (mut it, hi) = self.seq_iter(TAG_NODE);
+            let (mut it, hi) = self.seq_iter(TAG_NODE)?;
             while it.valid() {
                 let (k, v) = match (it.key(), it.value()) {
                     (Some(k), Some(v)) if k < hi.as_slice() => (k, v),
@@ -457,12 +466,12 @@ impl RocksTreeStore {
                     }
                 }
                 if pending >= SEED_BATCH as u64 {
-                    self.db.write(std::mem::take(&mut wb))?;
+                    self.db.write(std::mem::replace(&mut wb, self.db.batch()))?;
                     written += pending;
                     pending = 0;
                     on_flush(written);
                 }
-                it.next();
+                it.next()?;
             }
         }
         drop(leaf_size); // no longer needed once leaves are summed
@@ -486,7 +495,7 @@ impl RocksTreeStore {
                 root_size = acc; // the root (empty path) — its sum is the tree total
             }
             if pending >= SEED_BATCH as u64 {
-                self.db.write(std::mem::take(&mut wb))?;
+                self.db.write(std::mem::replace(&mut wb, self.db.batch()))?;
                 written += pending;
                 pending = 0;
                 on_flush(written);
@@ -497,7 +506,7 @@ impl RocksTreeStore {
             root_size = node_size.get(&root_key).copied().unwrap_or(0);
         }
 
-        self.db.write(std::mem::take(&mut wb))?;
+        self.db.write(wb)?;
         written += pending;
         // Force memtable→SST so the index is durable BEFORE the caller sets the
         // `seeded` marker (else a crash could leave the marker over an index still
@@ -536,6 +545,28 @@ impl RocksTreeStore {
         Ok(())
     }
 
+    /// Whether this tree holds any key at all (node, value, stale index or
+    /// preimage).
+    pub fn has_any_key(&self) -> Result<bool> {
+        let Some(upper) = self.prefix_upper_bound() else { return Ok(false) };
+        let mut it = self.db.iterator(&self.prefix, &upper, rocksdb::ReadOptions::default())?;
+        it.seek(&self.prefix)?;
+        Ok(it.valid())
+    }
+
+    /// Exclusive upper bound covering all `prefix`-prefixed keys: increment
+    /// the last byte < 0xFF, dropping trailing 0xFF bytes. `prefix` starts
+    /// with the non-0xFF tree-level byte, so an upper bound always exists.
+    fn prefix_upper_bound(&self) -> Option<Vec<u8>> {
+        let mut u = self.prefix.clone();
+        while matches!(u.last(), Some(&0xff)) {
+            u.pop();
+        }
+        let last = u.last_mut()?;
+        *last += 1;
+        Some(u)
+    }
+
     /// Delete EVERY key of this tree — nodes, values, stale index, preimages,
     /// and the head-version marker all live under `self.prefix`, so a single
     /// range delete wipes the tree back to empty (next commit rebuilds from
@@ -543,23 +574,9 @@ impl RocksTreeStore {
     /// (which keeps the live version) — this discards the whole tree.
     pub fn clear(&self) -> Result<()> {
         let lower = self.prefix.clone();
-        // Exclusive upper bound covering all `prefix`-prefixed keys: increment
-        // the last byte < 0xFF, dropping trailing 0xFF bytes. `prefix` starts
-        // with the non-0xFF tree-level byte, so an upper bound always exists.
-        let upper = {
-            let mut u = self.prefix.clone();
-            while matches!(u.last(), Some(&0xff)) {
-                u.pop();
-            }
-            match u.last_mut() {
-                Some(b) => {
-                    *b += 1;
-                    u
-                }
-                None => return Ok(()), // empty prefix — nothing scoped to clear
-            }
-        };
-        let mut wb = rocksdb::WriteBatch::default();
+        // Empty prefix: nothing scoped to clear.
+        let Some(upper) = self.prefix_upper_bound() else { return Ok(()) };
+        let mut wb = self.db.batch();
         wb.delete_range(&lower, &upper);
         self.db.write(wb)?;
         Ok(())
@@ -574,7 +591,7 @@ impl RocksTreeStore {
         lower.push(TAG_SIZE);
         let mut upper = self.prefix.clone();
         upper.push(TAG_SIZE + 1); // TAG_SIZE ('z') + 1 — exclusive upper bound
-        let mut wb = rocksdb::WriteBatch::default();
+        let mut wb = self.db.batch();
         wb.delete_range(&lower, &upper);
         self.db.write(wb)?;
         Ok(())
@@ -633,8 +650,12 @@ impl TreeReader for RocksTreeStore {
         let vp = self.value_prefix(&key_hash);
         let mut seek = vp.clone();
         seek.extend_from_slice(&max_version.to_be_bytes());
-        let mut it = self.db.raw_iterator();
-        it.seek_for_prev(&seek);
+        let mut upper = vp.clone();
+        // Include every u64 version, even u64::MAX, in this hash bucket.
+        upper.extend_from_slice(&[0xff; 8]);
+        upper.push(0);
+        let mut it = self.db.iterator(&vp, &upper, rocksdb::ReadOptions::default())?;
+        it.seek_for_prev(&seek)?;
         if !it.valid() {
             return Ok(None);
         }
@@ -661,7 +682,7 @@ impl TreeReader for RocksTreeStore {
 
 impl TreeWriter for RocksTreeStore {
     fn write_node_batch(&self, batch: &NodeBatch) -> Result<()> {
-        let mut wb = rocksdb::WriteBatch::default();
+        let mut wb = self.db.batch();
         for (node_key, node) in batch.nodes() {
             wb.put(self.node_key_bytes(node_key), borsh::to_vec(node)?);
         }
@@ -737,6 +758,7 @@ impl RocksTreeStore {
         wb: &mut rocksdb::WriteBatch,
         batch: &TreeUpdateBatch,
     ) -> Result<()> {
+        anyhow::ensure!(self.db.db().is_some(), "execution overlay cannot stage a writable RocksDB batch; use update_puts");
         for (k, v) in self.update_puts(batch)? {
             wb.put(k, v);
         }
@@ -744,11 +766,75 @@ impl RocksTreeStore {
     }
 }
 
+impl RocksTreeStore {
+    /// Delete leaf values no read at a version `>= min_readable_version` can
+    /// return: per key hash, every version below the greatest one at or below
+    /// the watermark. A read at version `v` takes the greatest version `<= v`,
+    /// so for any `v >= min_readable_version` that is the kept floor or a newer
+    /// one. Keys whose versions all lie above the watermark are untouched. At
+    /// most `budget` deletions (decremented); a later pass continues. Returns
+    /// the number deleted.
+    ///
+    /// Only sound at the same watermark [`ForestStore::prune`] uses, which the
+    /// caller derives from the tree's retention history.
+    pub fn prune_values(&self, min_readable_version: Version, budget: &mut usize) -> Result<usize> {
+        let khs = self.prefix.len() + 1;
+        let mut doomed: Vec<Vec<u8>> = Vec::new();
+        {
+            let floor_out = |versions: &mut Vec<(Version, Vec<u8>)>, doomed: &mut Vec<Vec<u8>>, budget: &mut usize| {
+                if let Some(floor) = versions.iter().map(|(v, _)| *v).filter(|v| *v <= min_readable_version).max() {
+                    for (_, key) in versions.iter().filter(|(v, _)| *v < floor) {
+                        if *budget == 0 {
+                            break;
+                        }
+                        doomed.push(key.clone());
+                        *budget -= 1;
+                    }
+                }
+                versions.clear();
+            };
+            let (mut it, hi) = self.seq_iter(TAG_VALUE)?;
+            let mut group: Option<[u8; 32]> = None;
+            let mut versions: Vec<(Version, Vec<u8>)> = Vec::new();
+            while it.valid() && *budget > 0 {
+                let k = match it.key() {
+                    Some(k) if k < hi.as_slice() => k,
+                    _ => break,
+                };
+                if k.len() == khs + 40 {
+                    let key_hash: [u8; 32] = k[khs..khs + 32].try_into().unwrap();
+                    if group != Some(key_hash) {
+                        floor_out(&mut versions, &mut doomed, budget);
+                        group = Some(key_hash);
+                    }
+                    let version = Version::from_be_bytes(k[khs + 32..].try_into().unwrap());
+                    versions.push((version, k.to_vec()));
+                }
+                it.next()?;
+            }
+            // Only a complete group may be judged: a pass stopped by its budget
+            // leaves the partial one for the next.
+            if !it.valid() || it.key().is_none_or(|k| k >= hi.as_slice()) {
+                floor_out(&mut versions, &mut doomed, budget);
+            }
+        }
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        let mut wb = self.db.batch();
+        for key in &doomed {
+            wb.delete(key);
+        }
+        self.db.write(wb)?;
+        Ok(doomed.len())
+    }
+}
+
 impl ForestStore for RocksTreeStore {
     fn apply_update(&self, batch: &TreeUpdateBatch) -> Result<()> {
         // Nodes, values, and stale records all land in one atomic write.
-        let mut wb = rocksdb::WriteBatch::default();
-        self.stage_update(&mut wb, batch)?;
+        let mut wb = self.db.batch();
+        for (key, value) in self.update_puts(batch)? { wb.put(key, value); }
         self.db.write(wb)?;
         Ok(())
     }
@@ -760,8 +846,8 @@ impl ForestStore for RocksTreeStore {
         let mut doomed_sizes: Vec<Vec<u8>> = Vec::new();
         let mut doomed_stale: Vec<Vec<u8>> = Vec::new();
         {
-            let mut it = self.db.raw_iterator();
-            it.seek(&lo);
+            let mut it = self.db.iterator(&lo, &hi, rocksdb::ReadOptions::default())?;
+            it.seek(&lo)?;
             let vstart = self.prefix.len() + 1; // after prefix + TAG_STALE
             while it.valid() {
                 let k = match it.key() {
@@ -770,7 +856,7 @@ impl ForestStore for RocksTreeStore {
                 };
                 // Parse the 8-byte stale_since_version prefix.
                 if k.len() < vstart + 8 {
-                    it.next();
+                    it.next()?;
                     continue;
                 }
                 let mut vb = [0u8; 8];
@@ -796,10 +882,10 @@ impl ForestStore for RocksTreeStore {
                 size_k.extend_from_slice(nk_borsh);
                 doomed_sizes.push(size_k);
                 doomed_stale.push(k.to_vec());
-                it.next();
+                it.next()?;
             }
         }
-        let mut wb = rocksdb::WriteBatch::default();
+        let mut wb = self.db.batch();
         for nk in &doomed_nodes {
             wb.delete(nk);
         }

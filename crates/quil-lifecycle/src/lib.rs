@@ -67,23 +67,57 @@ impl<E: Send + 'static> DetachedSpawner<E> {
     }
 }
 
-/// Completes when SIGTERM is delivered; pends forever on non-unix.
-/// Like the `ctrl_c()` arm above it is re-registered on each select
-/// iteration — iterations only recycle on rare supervisor events, so
-/// the unwatched window is negligible.
-async fn terminate_signal() {
+/// A shutdown signal listener, registered once for the supervisor's lifetime.
+///
+/// Registering a fresh listener on every loop iteration lost signals: when
+/// another branch won the iteration, the old listener was dropped together
+/// with a signal it had already received, and a signal arriving before the
+/// next registration reached no listener. An archive with frequent detached
+/// task completions ignored a SIGTERM this way and kept running past a
+/// restart. `recv` on a persistent listener is cancel-safe.
+struct ShutdownSignal {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    }
+    listener: Option<tokio::signal::unix::Signal>,
     #[cfg(not(unix))]
-    std::future::pending::<()>().await
+    interrupt: bool,
+}
+
+impl ShutdownSignal {
+    fn terminate() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Self { listener: signal(SignalKind::terminate()).ok() }
+        }
+        #[cfg(not(unix))]
+        Self { interrupt: false }
+    }
+
+    fn interrupt() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Self { listener: signal(SignalKind::interrupt()).ok() }
+        }
+        #[cfg(not(unix))]
+        Self { interrupt: true }
+    }
+
+    /// Completes when the signal is delivered; pends forever without a listener.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        if let Some(sig) = self.listener.as_mut() {
+            if sig.recv().await.is_some() {
+                return;
+            }
+        }
+        #[cfg(not(unix))]
+        if self.interrupt {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+        std::future::pending::<()>().await
+    }
 }
 
 pub struct Supervisor<E> {
@@ -201,6 +235,8 @@ impl<E: Send + 'static> Supervisor<E> {
         // `detach_rx.recv()` would block forever even after all real
         // senders are dropped.
         drop(self.detach_tx);
+        let mut terminate = ShutdownSignal::terminate();
+        let mut interrupt = ShutdownSignal::interrupt();
         let reason = loop {
             tokio::select! {
                 Some(reg) = self.detach_rx.recv() => {
@@ -238,8 +274,8 @@ impl<E: Send + 'static> Supervisor<E> {
                         break ShutdownReason::TaskError(name, e);
                     }
                 },
-                _ = tokio::signal::ctrl_c() => break ShutdownReason::CtrlC,
-                _ = terminate_signal() => break ShutdownReason::Terminated,
+                _ = interrupt.recv() => break ShutdownReason::CtrlC,
+                _ = terminate.recv() => break ShutdownReason::Terminated,
             }
         };
 

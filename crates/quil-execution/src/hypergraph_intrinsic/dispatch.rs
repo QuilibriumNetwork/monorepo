@@ -508,7 +508,7 @@ pub fn decode_and_validate_deploy(input: &[u8]) -> Result<DispatchedDeploy> {
 /// hash fields against the schema; this validator just rejects
 /// blatantly-broken documents so deploy fails fast instead of
 /// poisoning every subsequent vertex op.
-pub(crate) fn validate_rdf_schema_bytes(schema: &[u8]) -> Result<()> {
+pub fn validate_rdf_schema_bytes(schema: &[u8]) -> Result<()> {
     if schema.is_empty() {
         return Err(QuilError::InvalidArgument(
             "hypergraph deploy: empty RDF schema".into(),

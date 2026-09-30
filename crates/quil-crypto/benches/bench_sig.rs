@@ -1,4 +1,4 @@
-//! Signature-primitive microbenchmarks — the Phase-0 profiling input for the
+//! Signature-primitive microbenchmarks — the profiling input for the
 //! consensus-signature axis (is the sig scheme a cost center worth changing?).
 //!
 //! - **Falcon-512 (FN-DSA)** is the current consensus signature (post-Falcon

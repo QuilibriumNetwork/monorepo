@@ -166,6 +166,9 @@ pub struct MessageCollector {
     /// "not yet loaded" → the address check is skipped (fail-open) so a fresh
     /// node doesn't drop everything before its first refresh.
     valid_shard_addresses: RwLock<HashSet<Vec<u8>>>,
+    /// The newest rank this collector has been collected, copied or carried
+    /// at. [`Self::add_message_newest`] files arrivals here.
+    newest_rank: std::sync::atomic::AtomicU64,
 }
 
 impl MessageCollector {
@@ -176,7 +179,45 @@ impl MessageCollector {
             shard_frame_dedup: RwLock::new(HashMap::new()),
             finalized: RwLock::new(FinalizedSet::new()),
             valid_shard_addresses: RwLock::new(HashSet::new()),
+            newest_rank: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn note_rank(&self, rank: u64) {
+        self.newest_rank.fetch_max(rank, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Re-file every held message at rank 0 and restart the newest rank: a new
+    /// consensus instance numbers its views from the start again, and a
+    /// collection only takes ranks at or below its own, so messages held at
+    /// the previous instance's ranks would stay out of reach.
+    pub fn rebase_ranks(&self) {
+        let mut buffers = self.buffers.write().unwrap();
+        let mut merged = RankBuffer::new();
+        let mut ranks: Vec<u64> = buffers.keys().copied().collect();
+        ranks.sort_unstable();
+        for rank in ranks {
+            if let Some(buffer) = buffers.remove(&rank) {
+                for message in buffer.messages {
+                    merged.add(message.data);
+                }
+            }
+        }
+        if merged.len() > 0 {
+            buffers.insert(0, merged);
+        }
+        self.newest_rank.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Add an arriving message at the newest rank the collector has seen, so
+    /// it counts as the newest message: an application shard's engine has no
+    /// rank of its own (its views are the consensus host's). Filed at rank 0,
+    /// arrivals read as the oldest messages: the first collection pruned them
+    /// and a private-parent copy, which takes the newest first, cut them
+    /// first.
+    pub fn add_message_newest(&self, data: Vec<u8>) -> bool {
+        let rank = self.newest_rank.load(std::sync::atomic::Ordering::Acquire);
+        self.add_message(rank, data)
     }
 
     /// Replace the set of valid current shard addresses (called from the
@@ -185,6 +226,30 @@ impl MessageCollector {
     /// at ingestion.
     pub fn set_valid_shard_addresses(&self, addresses: HashSet<Vec<u8>>) {
         *self.valid_shard_addresses.write().unwrap() = addresses;
+    }
+
+    /// Refresh admission from committed local topology. Archives call this
+    /// after materialization, before advertising the new global frame, so the
+    /// first child header does not wait for the periodic remote size refresh.
+    /// A failed read leaves the last successful set intact.
+    pub fn refresh_valid_shard_addresses(
+        &self,
+        store: &dyn quil_types::store::ShardsStore,
+    ) -> quil_types::error::Result<()> {
+        let rows = store.range_app_shards()?;
+        let mut valid = HashSet::with_capacity(rows.len());
+        for row in rows {
+            if row.shard_key.len() != 35 {
+                return Err(quil_types::error::QuilError::InvalidArgument(
+                    "invalid shard key in committed topology".into(),
+                ));
+            }
+            valid.insert(quil_forest::shard_prefix_to_filter(
+                &row.shard_key[3..35], &row.prefix,
+            ));
+        }
+        self.set_valid_shard_addresses(valid);
+        Ok(())
     }
 
     /// Reject a bundle if any of its embedded shard frames is at or
@@ -230,7 +295,7 @@ impl MessageCollector {
     }
 
     /// Add a message, distinguishing "newly accepted" from "we already
-    /// hold it (or a newer shard frame)" from "filtered out". A network
+    /// hold its exact bytes" from "filtered out". A network
     /// submit handler should treat both `Accepted` and `Duplicate` as
     /// SUCCESS — re-delivering something the collector already has (or has
     /// superseded) is not a dropped message; only `Filtered` is a real
@@ -258,26 +323,15 @@ impl MessageCollector {
             return SubmitOutcome::Duplicate;
         }
 
-        // Shard-frame dedup at ingest (Go parity,
-        // `message_collector.go:250-271`): a bundle carrying a shard
-        // `FrameHeader` is rejected if that shard's frame_number is at or
-        // below the last one already seen for the shard. Without this,
-        // re-gossiped or stale shard-frame proofs re-enter the mempool
-        // every round, so frames fill with already-seen proofs that the
-        // materializer must re-verify (the expensive per-proof BLS work)
-        // and then skip — the backlog explosion behind the halt. The
-        // dedup commits the new high-water marks as a side effect. A stale
-        // shard frame means we hold a newer one — a duplicate, not a drop.
+        // Candidates have not passed certificate/intrinsic validation. Their
+        // declared heights must not advance a trusted high-water mark: doing
+        // so lets an invalid candidate suppress valid frames on every retry.
+        // The bounded buffers and finalized set deduplicate exact bytes.
         let checks = extract_shard_frame_checks(&data);
 
-        // Preemptive shard-frame validation: reject a bundle whose embedded
-        // shard frame(s) have NO chance of being valid, before it enters the
-        // mempool and the leader spends per-proof BLS work on it —
-        //   1. a storage frame (global_frame_number > 0) carrying NO storage
-        //      attestation (empty `storage_attestation_root`), and
-        //   2. an `address` that isn't a real current shard (e.g. an old
-        //      4096-grid division that no longer exists in the 64-shard
-        //      topology).
+        // Reject addresses outside the known current shard set before spending
+        // certificate-verification work. Missing attestations affect rewards,
+        // not admission, and are left to intrinsic validation below.
         // The address check only engages once the valid-shard set has been
         // populated from the shards store (fail-open before the first refresh
         // so a just-started node doesn't drop everything).
@@ -312,14 +366,6 @@ impl MessageCollector {
                     return SubmitOutcome::Filtered;
                 }
             }
-        }
-
-        let shard_frames: Vec<(Vec<u8>, u64)> = checks
-            .iter()
-            .map(|c| (c.address.clone(), c.frame_number))
-            .collect();
-        if !shard_frames.is_empty() && !self.dedup_shard_frames(&shard_frames) {
-            return SubmitOutcome::Duplicate;
         }
 
         let mut buffers = self.buffers.write().unwrap();
@@ -359,6 +405,7 @@ impl MessageCollector {
     /// rate every finalized frame came out empty (messages were consumed
     /// by earlier proposals that never finalized).
     pub fn collect_for_rank(&self, rank: u64) -> Vec<Vec<u8>> {
+        self.note_rank(rank);
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         let mut messages: Vec<Vec<u8>> = Vec::new();
 
@@ -394,6 +441,57 @@ impl MessageCollector {
         }
 
         messages
+    }
+
+    /// Copy proposal inputs without pruning, consuming or changing admission
+    /// state in the public collector. At most `max_items` messages are
+    /// inspected and `max_bytes` copied, newest ranks first; what does not fit
+    /// waits for a later proposal. The copy is returned in collection order
+    /// (oldest rank first). A backlog over the budget must not fail the copy:
+    /// the public buffers are pruned only after a finalized frame, so a
+    /// restart's backlog would otherwise leave GLOBAL unable to make any
+    /// private proposal, and therefore any frame, again.
+    pub(crate) fn snapshot_for_execution(
+        &self, rank: u64, max_bytes: usize, max_items: usize,
+    ) -> quil_types::error::Result<Vec<Vec<u8>>> {
+        use quil_types::error::QuilError;
+        let unavailable = || QuilError::ExecutionUnavailable("proposal message snapshot lock failure".into());
+        self.note_rank(rank);
+        let buffers = self.buffers.read().map_err(|_| unavailable())?;
+        let finalized = self.finalized.read().map_err(|_| unavailable())?;
+        let mut ranks: Vec<_> = buffers.keys().copied().filter(|r| *r <= rank).collect();
+        ranks.sort_unstable_by(|a, b| b.cmp(a));
+        let mut seen = HashSet::new();
+        let mut taken: Vec<Vec<Vec<u8>>> = Vec::new();
+        let (mut bytes, mut inspected) = (0usize, 0usize);
+        'ranks: for rank in ranks {
+            let mut in_rank = Vec::new();
+            for message in &buffers[&rank].messages {
+                if inspected >= max_items {
+                    taken.push(in_rank);
+                    break 'ranks;
+                }
+                inspected += 1;
+                if finalized.contains(&message.hash) || seen.contains(&message.hash) { continue; }
+                if bytes.saturating_add(message.data.len()) > max_bytes {
+                    taken.push(in_rank);
+                    break 'ranks;
+                }
+                bytes += message.data.len();
+                seen.insert(message.hash);
+                in_rank.push(message.data.clone());
+            }
+            taken.push(in_rank);
+        }
+        Ok(taken.into_iter().rev().flatten().collect())
+    }
+
+    /// Age public GLOBAL inputs only after a finalized frame has materialized.
+    /// Tentative proposals use private snapshots and cannot advance this window.
+    pub fn prune_after_finalization(&self, rank: u64) {
+        if let Some(cutoff) = rank.checked_sub(RETENTION_WINDOW) {
+            self.buffers.write().unwrap().retain(|&r, _| r >= cutoff);
+        }
     }
 
     /// Mark `raw_msgs` as included in a finalized frame: remove them from
@@ -447,6 +545,63 @@ impl MessageCollector {
             buf.seen.retain(|h| !hashes.contains(h));
             buf.bytes = buf.messages.iter().map(|m| m.data.len()).sum();
         }
+        buffers.retain(|_, b| !b.messages.is_empty());
+    }
+
+    /// Hold `raw_msgs` at `rank`, for a retention window starting there, in
+    /// the order given and ahead of what arrived at `rank` itself. A proposal
+    /// that holds collected messages back (an application shard's
+    /// proof-verification budget) carries them forward, so waiting behind
+    /// other work never ages them out, including one its own collection has
+    /// just aged out; a message nobody holds back ages out as before.
+    /// Messages already consumed by a finalized frame are not held again, and
+    /// none displaces what arrived at `rank`.
+    pub fn carry_forward(&self, rank: u64, raw_msgs: &[Vec<u8>]) {
+        self.note_rank(rank);
+        if raw_msgs.is_empty() {
+            return;
+        }
+        let carried: Vec<CollectedMessage> = {
+            let finalized = self.finalized.read().unwrap();
+            let mut seen = HashSet::new();
+            raw_msgs
+                .iter()
+                .map(|data| CollectedMessage { hash: sha256(data), data: data.clone() })
+                .filter(|m| !finalized.contains(&m.hash) && seen.insert(m.hash))
+                .collect()
+        };
+        let mut buffers = self.buffers.write().unwrap();
+        let arrived = buffers.remove(&rank).unwrap_or_else(RankBuffer::new);
+        let (mut rest_count, mut rest_bytes) = (arrived.messages.len(), arrived.bytes);
+        let mut target = RankBuffer::new();
+        let mut moved = HashSet::new();
+        for m in carried {
+            let already = arrived.seen.contains(&m.hash);
+            let (count, bytes) = if already { (0, 0) } else { (1, m.data.len()) };
+            if target.messages.len() + rest_count + count > MAX_MESSAGES_PER_RANK
+                || target.bytes + rest_bytes + bytes > MAX_BYTES_PER_RANK
+            {
+                continue;
+            }
+            if already {
+                rest_count -= 1;
+                rest_bytes -= m.data.len();
+            }
+            if matches!(target.add(m.data), AddOutcome::Added) {
+                moved.insert(m.hash);
+            }
+        }
+        for m in arrived.messages {
+            if !moved.contains(&m.hash) {
+                target.add(m.data);
+            }
+        }
+        for buf in buffers.values_mut() {
+            buf.messages.retain(|m| !moved.contains(&m.hash));
+            buf.seen.retain(|h| !moved.contains(h));
+            buf.bytes = buf.messages.iter().map(|m| m.data.len()).sum();
+        }
+        buffers.insert(rank, target);
         buffers.retain(|_, b| !b.messages.is_empty());
     }
 
@@ -693,6 +848,73 @@ mod tests {
         assert_eq!(mc.pending_count(1), 500);
     }
 
+    /// A message a proposal holds back is carried to the proposal's rank, in
+    /// the proposal's order and ahead of later arrivals, and outlives the
+    /// window it arrived in; one nobody holds back still ages out. One the
+    /// proposal's own collection just aged out is held again; a consumed one
+    /// is not.
+    /// A new consensus instance restarts its views: rebased, everything held
+    /// is within its reach, and arrivals are filed at its ranks.
+    #[test]
+    fn a_rebase_brings_held_messages_within_a_restarted_instances_reach() {
+        let collector = MessageCollector::new();
+        let (held, arrival) = (vec![7u8; 32], vec![8u8; 32]);
+        collector.carry_forward(500, &[held.clone()]);
+        assert!(collector.collect_for_rank(3).is_empty(), "held above a restarted instance's ranks");
+        collector.rebase_ranks();
+        assert!(collector.add_message_newest(arrival.clone()));
+        let collected = collector.collect_for_rank(3);
+        assert!(collected.contains(&held) && collected.contains(&arrival));
+    }
+
+    /// An arrival is the newest message: filed at the newest rank the collector
+    /// has seen, a collection keeps it for the next one, and a copy limited to
+    /// one message takes it before older held messages. Filed at rank 0, the
+    /// first collection pruned it and the copy took an older message.
+    #[test]
+    fn arrivals_are_filed_as_the_newest_messages() {
+        let collector = MessageCollector::new();
+        let (held_a, held_b, arrival) = (vec![1u8; 64], vec![2u8; 64], vec![3u8; 64]);
+        collector.carry_forward(50, &[held_a.clone(), held_b.clone()]);
+        assert_eq!(collector.collect_for_rank(60).len(), 2);
+        assert!(collector.add_message_newest(arrival.clone()));
+        assert_eq!(collector.snapshot_for_execution(60, 1 << 20, 1).unwrap(), vec![arrival.clone()],
+            "a copy limited to one message takes the newest");
+        assert!(collector.collect_for_rank(65).contains(&arrival));
+        assert!(collector.collect_for_rank(65).contains(&arrival), "one collection does not prune a new arrival");
+    }
+
+    #[test]
+    fn held_back_messages_outlive_the_retention_window() {
+        let mc = MessageCollector::new();
+        mc.add_message(1, b"held".to_vec());
+        mc.add_message(1, b"idle".to_vec());
+        mc.add_message(4, b"second".to_vec());
+        mc.add_message(8, b"arrived at 8".to_vec());
+        mc.carry_forward(8, &[b"held".to_vec(), b"second".to_vec()]);
+        assert_eq!(mc.pending_count(1), 1, "moved out of its arrival rank");
+        assert_eq!(mc.pending_count(4), 0);
+        assert_eq!(mc.pending_count(8), 3, "into the proposal's rank");
+        assert_eq!(mc.collect_for_rank(8), vec![b"idle".to_vec(), b"held".to_vec(), b"second".to_vec(), b"arrived at 8".to_vec()],
+            "carried messages keep their order, ahead of later arrivals");
+        mc.remove(&[b"second".to_vec(), b"arrived at 8".to_vec()]);
+        let collected = mc.collect_for_rank(12);
+        assert!(collected.contains(&b"held".to_vec()) && collected.contains(&b"idle".to_vec()));
+        assert_eq!(mc.collect_for_rank(15), vec![b"held".to_vec()], "rank 1 aged out");
+        // Collection at 19 returns "held" and ages it out; the proposal holds
+        // it back again from its own copy.
+        assert_eq!(mc.collect_for_rank(19), vec![b"held".to_vec()]);
+        assert_eq!(mc.total_pending(), 0);
+        mc.carry_forward(19, &[b"held".to_vec()]);
+        assert_eq!(mc.collect_for_rank(30), vec![b"held".to_vec()]);
+        assert!(mc.collect_for_rank(31).is_empty(), "not held back again: it ages out");
+        // A consumed message is not held again.
+        mc.add_message(40, b"done".to_vec());
+        mc.mark_finalized(&[b"done".to_vec()]);
+        mc.carry_forward(41, &[b"done".to_vec()]);
+        assert_eq!(mc.total_pending(), 0);
+    }
+
     #[test]
     fn remove_drops_without_blacklisting() {
         // `remove` evicts messages from the live buffers but, unlike
@@ -866,6 +1088,66 @@ mod tests {
         mc.clear_shard_frame_dedup();
         // Same frame number now accepted because cache is empty.
         assert!(mc.dedup_shard_frames(&vec![(vec![0xAAu8; 32], 100)]));
+    }
+
+    #[test]
+    fn committed_split_and_merge_refresh_admission_without_remote_size_poll() {
+        use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use quil_types::store::{ClockStore, ShardInfo, ShardsStore};
+
+        let rocks = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(rocks.inner());
+        let shards = quil_store::RocksShardsStore::new(rocks.inner());
+        let collector = MessageCollector::new();
+        let app = [0x51; 32];
+        let mut key = vec![1, 2, 3];
+        key.extend_from_slice(&app);
+        let row = |prefix| ShardInfo {
+            shard_key: key.clone(), prefix, size: vec![], data_shards: 0, commitment: vec![],
+        };
+        let parent = row(vec![]);
+        let children = [row(quil_forest::bit_path_to_prefix(&[false])),
+                        row(quil_forest::bit_path_to_prefix(&[true]))];
+        let bundle = |prefix: &[u32], frame_number| {
+            let header = FrameHeader {
+                address: quil_forest::shard_prefix_to_filter(&app, prefix),
+                frame_number, global_frame_number: 10, ..Default::default()
+            };
+            CanonicalMessageBundle {
+                timestamp: 0,
+                requests: vec![Some(CanonicalMessageRequest {
+                    inner_type_prefix: TYPE_FRAME_HEADER,
+                    inner_bytes: header.to_canonical_bytes().unwrap(),
+                })],
+            }.to_canonical_bytes().unwrap()
+        };
+        let txn = clock.new_transaction(false).unwrap();
+        shards.put_app_shard(txn.as_ref(), &parent).unwrap();
+        txn.commit().unwrap();
+        collector.refresh_valid_shard_addresses(&shards).unwrap();
+        assert_eq!(collector.add_message_outcome(1, bundle(&parent.prefix, 1)), SubmitOutcome::Accepted);
+
+        let txn = clock.new_transaction(false).unwrap();
+        shards.delete_app_shard(txn.as_ref(), &key, &parent.prefix).unwrap();
+        for child in &children { shards.put_app_shard(txn.as_ref(), child).unwrap(); }
+        // A staged topology must not leak through a committed-store refresh.
+        collector.refresh_valid_shard_addresses(&shards).unwrap();
+        assert_eq!(collector.add_message_outcome(1, bundle(&children[0].prefix, 1)), SubmitOutcome::Filtered);
+        txn.commit().unwrap();
+        collector.refresh_valid_shard_addresses(&shards).unwrap();
+        for child in &children {
+            assert_eq!(collector.add_message_outcome(1, bundle(&child.prefix, 1)), SubmitOutcome::Accepted);
+        }
+        assert_eq!(collector.add_message_outcome(1, bundle(&parent.prefix, 2)), SubmitOutcome::Filtered);
+
+        let txn = clock.new_transaction(false).unwrap();
+        for child in &children { shards.delete_app_shard(txn.as_ref(), &key, &child.prefix).unwrap(); }
+        shards.put_app_shard(txn.as_ref(), &parent).unwrap();
+        txn.commit().unwrap();
+        collector.refresh_valid_shard_addresses(&shards).unwrap();
+        assert_eq!(collector.add_message_outcome(1, bundle(&parent.prefix, 2)), SubmitOutcome::Accepted);
+        assert_eq!(collector.add_message_outcome(1, bundle(&children[0].prefix, 2)), SubmitOutcome::Filtered);
     }
 
     #[test]

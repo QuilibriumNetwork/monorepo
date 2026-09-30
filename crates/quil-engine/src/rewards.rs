@@ -25,9 +25,8 @@
 //! algorithm we don't fully replicate. For the ranges seen on
 //! mainnet (difficulty ~50k-200k → generation=1 → pure square root)
 //! the low-order deviation is bounded to a few wei-equivalents and
-//! can be driven to zero by switching the backing library. This is
-//! called out in the crate README and revisited before any write-back
-//! path is wired.
+//! can be driven to zero by switching the backing library. Revisit
+//! this before any write-back path is wired.
 
 use std::collections::HashMap;
 
@@ -39,105 +38,12 @@ use num_traits::{One, ToPrimitive, Zero};
 use quil_types::consensus::{ProverAllocation, RewardIssuance};
 use quil_types::error::Result;
 
-/// Shopspring-equivalent working precision: 53 bits.
-const POMW_SCALE_BITS: u32 = 53;
-
-/// The hard-coded PoMW numerator from
-/// `proof_of_meaningful_work.go:95`:
-/// `1_125_899_906_842_624 = 2^50`, i.e. the world-state divisor
-/// (1 MB = 2^20) scaled by the bytes-in-a-GB (2^30). Go inverts the
-/// relation ahead of time for fewer steps and higher precision.
-pub const POMW_NUMERATOR: u64 = 1_125_899_906_842_624;
-
-/// QUIL token units: 8_000_000_000 (8 billion sub-units per QUIL).
-pub const QUIL_TOKEN_UNITS: u64 = 8_000_000_000;
-
-/// Compute the PoMW basis: `(POMW_NUMERATOR / world_state_bytes) ^
-/// (1/2^generation)` x `units`, where `generation` is the number of
-/// 10_000-factor reductions from `difficulty` to 0.
-///
-/// Returns `BigInt::zero()` for degenerate inputs (world_state_bytes = 0).
-pub fn pomw_basis(difficulty: u64, world_state_bytes: u64, units: u64) -> BigInt {
-    if world_state_bytes == 0 {
-        return BigInt::zero();
-    }
-
-    // Count generations: loop `difflog /= 10000` until < 10000.
-    let mut difflog = difficulty;
-    let mut generation: u32 = 0;
-    while difflog >= 10_000 {
-        difflog /= 10_000;
-        generation += 1;
-    }
-
-    // Scaled normalized value: POMW_NUMERATOR / world_state_bytes,
-    // multiplied by 2^(2^generation * POMW_SCALE_BITS) so the
-    // integer nth-root preserves ~53 bits of fractional precision.
-    // For generation=0 the exponent is 0 and we skip the root
-    // entirely; for generation=1 it's a square root of the scaled
-    // value; for generation=k it's the 2^k-th root.
-    let numerator = BigInt::from(POMW_NUMERATOR);
-    let denominator = BigInt::from(world_state_bytes);
-
-    if generation == 0 {
-        // Pure division by world_state_bytes, no root. Matches
-        // `result ^ (1/1) == result`.
-        let normalized = &numerator / &denominator;
-        return &normalized * BigInt::from(units);
-    }
-
-    // Root exponent: 2^generation.
-    let exp_denom: u32 = 1u32 << generation;
-    // Total pre-root scaling: multiply normalized by 2^(exp_denom *
-    // POMW_SCALE_BITS) so the nth-root preserves precision bits.
-    let pre_scale_bits: u32 = exp_denom * POMW_SCALE_BITS;
-    let pre_scale = BigInt::one() << pre_scale_bits;
-
-    let scaled = (&numerator << pre_scale_bits) / &denominator;
-    let rooted = scaled.nth_root(exp_denom);
-
-    // After the root, the result has `POMW_SCALE_BITS` fractional
-    // bits. Multiply by units, then shift right to remove them.
-    let mul = &rooted * BigInt::from(units);
-    let _ = pre_scale; // kept for clarity; shift is equivalent
-    mul >> POMW_SCALE_BITS
-}
-
-/// Scaled baseline fee. Mirror of
-/// `node/consensus/reward/baseline_fee.go::GetBaselineFee`.
-///
-/// The math is:
-/// ```text
-/// current = pomw_basis(difficulty, world_state_bytes, units)
-/// affected = pomw_basis(difficulty, world_state_bytes + total_added, units)
-/// delta = current - affected
-/// lhs = delta^2 / world_state_bytes
-/// rhs = total_added
-/// result = max(lhs, rhs)
-/// ```
-pub fn get_baseline_fee(
-    difficulty: u64,
-    world_state_bytes: u64,
-    total_added: u64,
-    units: u64,
-) -> BigInt {
-    let current = pomw_basis(difficulty, world_state_bytes, units);
-    let affected = pomw_basis(difficulty, world_state_bytes + total_added, units);
-    let delta = &current - &affected;
-
-    if world_state_bytes == 0 {
-        return BigInt::from(total_added);
-    }
-    let num = &delta * &delta;
-    let denom = BigInt::from(world_state_bytes);
-    let lhs = num / denom;
-    let rhs = BigInt::from(total_added);
-    if lhs >= rhs {
-        lhs
-    } else {
-        rhs
-    }
-}
+// Keep the existing engine API while execution, RPC and wallet code share one
+// implementation of the consensus pricing arithmetic.
+pub use quil_execution::pricing::{
+    fee_multiplier_for_cost, get_baseline_fee, pomw_basis, POMW_NUMERATOR, QUIL_TOKEN_UNITS,
+};
+use quil_execution::pricing::POMW_SCALE_BITS;
 
 /// PoMW reward issuance.
 pub struct OptRewardIssuance;
@@ -228,6 +134,43 @@ mod tests {
     /// Generation 0: difficulty < 10000. Exponent is `1/1`, so
     /// `pomw_basis` reduces to `(POMW_NUMERATOR / world) * units`.
     #[test]
+    fn frame_fee_cost_bounds_and_vote_are_consistent() {
+        assert_eq!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, u64::MAX, &BigInt::zero(), 7).unwrap(), BigInt::zero());
+        for cost in [1, 1024, 195_907, u64::MAX] {
+            assert_eq!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 0, &BigInt::from(cost), 1).unwrap(), BigInt::one());
+            assert_eq!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 0, &BigInt::from(cost), 7).unwrap(), BigInt::from(7));
+        }
+        assert!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 0, &BigInt::from(-1), 1).is_err());
+        assert!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 0, &(BigInt::from(u64::MAX) + 1u8), 1).is_err());
+        assert!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, u64::MAX, &BigInt::one(), 1).is_err());
+        let base = fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 1 << 30, &BigInt::from(1024), 1).unwrap();
+        assert!(base >= BigInt::one());
+        assert_eq!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 1 << 30, &BigInt::from(1024), 7).unwrap(), base * 7);
+    }
+
+    #[test]
+    fn frame_fee_multiplier_covers_baseline_without_extra_whole_units() {
+        let mut non_divisible = 0;
+        for difficulty in [5_000, 50_000, 100_000_000] {
+            for world in [1, 1_024, 1 << 20, 1 << 30] {
+                for added in [1u64, 3, 1_024, 195_907, 200_771] {
+                    let cost = BigInt::from(added);
+                    let baseline = get_baseline_fee(difficulty, world, added, QUIL_TOKEN_UNITS);
+                    let multiplier = fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, difficulty, world, &cost, 1).unwrap();
+                    assert!(&multiplier * &cost >= baseline);
+                    assert!((&multiplier - BigInt::one()) * &cost < baseline);
+                    if &baseline % &cost != BigInt::zero() { non_divisible += 1; }
+                    for vote in [0u64, 1, 7] {
+                        let voted = fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, difficulty, world, &cost, vote).unwrap();
+                        assert!(voted * &cost >= &baseline * BigInt::from(vote));
+                    }
+                }
+            }
+        }
+        assert!(non_divisible > 0, "fixtures must exercise rounding");
+    }
+
+    #[test]
     fn pomw_basis_generation_zero() {
         let difficulty = 5_000u64;
         let world = 1 << 30; // 1 GB
@@ -252,10 +195,8 @@ mod tests {
         assert_eq!(basis, BigInt::from(1_024_000_000u64));
     }
 
-    /// Basis is monotone non-decreasing in `world_state_bytes` IFF
-    /// we invert the relation correctly. Actually here it should be
-    /// NON-INCREASING in world: more world → each unit smaller →
-    /// smaller basis.
+    /// Basis is NON-INCREASING in `world_state_bytes`: more world →
+    /// each unit smaller → smaller basis.
     #[test]
     fn pomw_basis_is_non_increasing_in_world() {
         let a = pomw_basis(5_000, 1 << 20, 1_000);
@@ -364,7 +305,7 @@ mod tests {
         assert_eq!(&big, &(&small * 2), "big={} small={}", big, small);
     }
 
-    // ---- Gap coverage (audit 2026-06-28): issuance-path ring + shard scaling.
+    // ---- Issuance-path ring + shard scaling.
     // The 2^(ring+1) divisor and the sqrt-shards branch were untested in the
     // ACTUAL issuance path (every prior opt_reward test used ring=0, shards=1 —
     // only the `shard_info` estimate copy covered them). Relationships are exact

@@ -15,7 +15,6 @@
 //! versa, modulo the listen-multiaddr fields which we don't track
 //! (they're empty strings in the encoding — same on-disk shape).
 
-use std::sync::Arc;
 
 use quil_types::error::{QuilError, Result};
 use quil_types::store::{PersistedWorkerInfo, WorkerStore};
@@ -23,11 +22,11 @@ use quil_types::store::{PersistedWorkerInfo, WorkerStore};
 use crate::encoding::{WORKER, WORKER_BY_CORE, WORKER_BY_FILTER};
 
 pub struct RocksWorkerStore {
-    db: Arc<rocksdb::DB>,
+    db: quil_forest::CoordinatedDb,
 }
 
 impl RocksWorkerStore {
-    pub fn new(db: Arc<rocksdb::DB>) -> Self {
+    pub fn new(db: quil_forest::CoordinatedDb) -> Self {
         Self { db }
     }
 }

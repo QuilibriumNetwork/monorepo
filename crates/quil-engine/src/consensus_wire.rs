@@ -760,7 +760,7 @@ fn encode_frame_header(
     }
     put_bytes(&mut out, &header.prover_tree_commitment);
     put_bytes(&mut out, &header.requests_root);
-    // Prover shard phase 1/2/3 roots (audit #5). Count-prefixed like
+    // Prover shard phase 1/2/3 roots. Count-prefixed like
     // global_commitments; decode mirrors this position.
     put_u32(&mut out, header.prover_tree_aux_roots.len() as u32);
     for r in &header.prover_tree_aux_roots {
@@ -783,6 +783,11 @@ fn encode_frame_header(
         }
     };
     put_bytes(&mut out, &sig_bytes);
+    // Certified world-state size: trailing, written only when non-zero so
+    // frames produced before the field existed keep their exact bytes.
+    if header.world_state_size != 0 {
+        put_u64(&mut out, header.world_state_size);
+    }
     Ok(out)
 }
 
@@ -852,7 +857,17 @@ pub fn decode_message_bundle(
     for entry in &canonical.requests {
         match entry {
             None => requests.push(pb::MessageRequest::default()),
-            Some(req) => requests.push(canonical_request_to_proto(req)),
+            Some(req) => {
+                if matches!(req.inner_type_prefix, 0x0509 | 0x050c | 0x050f) {
+                    return Err(quil_types::error::QuilError::InvalidArgument("retired token carrier".into()));
+                }
+                if req.inner_type_prefix == quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF {
+                    // Known authorization messages must survive byte-for-byte.
+                    // A malformed one must not become a default/empty request.
+                    quil_execution::global_intrinsic::handoff::CertificateSubmission::from_canonical_bytes(&req.inner_bytes)?;
+                }
+                requests.push(canonical_request_to_proto(req));
+            }
         }
     }
     Ok(pb::MessageBundle {
@@ -876,9 +891,7 @@ fn canonical_request_to_proto(
     };
     use quil_execution::hypergraph_intrinsic::types as hg_types;
     use quil_execution::token_intrinsic::{
-        conversions as token_conv, MintTransaction, PendingTransaction, TokenDeploy, TokenUpdate,
-        Transaction, TYPE_MINT_TRANSACTION, TYPE_PENDING_TRANSACTION, TYPE_TOKEN_DEPLOY,
-        TYPE_TOKEN_UPDATE, TYPE_TRANSACTION,
+        conversions as token_conv, TokenDeploy, TokenUpdate, TYPE_TOKEN_DEPLOY, TYPE_TOKEN_UPDATE,
     };
     use quil_execution::compute_intrinsic::conversions as compute_conv;
     use quil_execution::compute_intrinsic::config::{
@@ -892,6 +905,12 @@ fn canonical_request_to_proto(
 
     let inner = &req.inner_bytes;
     let request: Option<Request> = match req.inner_type_prefix {
+        0x0512 | 0x0513 | 0x0514 | 0x0515 | 0x0516 | 0x0517 | 0x0518 | 0x0519 | 0x051A => {
+            quil_execution::token_intrinsic::wire::domain(inner).ok()
+                .map(|_| Request::TokenOperation(quil_types::proto::token::TokenOperation {
+                    canonical_bytes: inner.clone(),
+                }))
+        }
         prover_join::TYPE_PROVER_JOIN => prover_join::ProverJoin::from_canonical_bytes(inner)
             .ok()
             .map(|j| Request::Join(conversions::prover_join_to_proto(&j))),
@@ -921,6 +940,9 @@ fn canonical_request_to_proto(
         prover_ops::TYPE_PROVER_KICK => prover_ops::ProverKick::from_canonical_bytes(inner)
             .ok()
             .map(|k| Request::Kick(conversions::prover_kick_to_proto(&k))),
+        quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF =>
+            quil_execution::global_intrinsic::handoff::CertificateSubmission::from_canonical_bytes(inner)
+                .ok().map(|_| Request::CommitteeHandoff(inner.to_vec())),
         prover_ops::TYPE_SHARD_SPLIT => prover_ops::ShardSplit::from_canonical_bytes(inner)
             .ok()
             .map(|s| Request::ShardSplit(conversions::shard_split_to_proto(&s))),
@@ -972,18 +994,6 @@ fn canonical_request_to_proto(
             .ok()
             .and_then(|u| token_conv::token_update_to_proto(&u).ok())
             .map(Request::TokenUpdate),
-        TYPE_TRANSACTION => Transaction::from_canonical_bytes(inner)
-            .ok()
-            .and_then(|t| token_conv::transaction_to_proto(&t).ok())
-            .map(Request::Transaction),
-        TYPE_PENDING_TRANSACTION => PendingTransaction::from_canonical_bytes(inner)
-            .ok()
-            .and_then(|t| token_conv::pending_transaction_to_proto(&t).ok())
-            .map(Request::PendingTransaction),
-        TYPE_MINT_TRANSACTION => MintTransaction::from_canonical_bytes(inner)
-            .ok()
-            .and_then(|t| token_conv::mint_transaction_to_proto(&t).ok())
-            .map(Request::MintTransaction),
         // Compute ops — same rationale as the token ops above.
         TYPE_COMPUTE_DEPLOY => ComputeDeploy::from_canonical_bytes(inner)
             .ok()
@@ -1051,6 +1061,9 @@ pub fn proto_message_bundle_to_canonical_bytes(
 
     let mut requests: Vec<Option<CanonicalMessageRequest>> = Vec::with_capacity(bundle.requests.len());
     for req in &bundle.requests {
+        if let Some(quil_types::proto::global::message_request::Request::CommitteeHandoff(bytes)) = &req.request {
+            quil_execution::global_intrinsic::handoff::CertificateSubmission::from_canonical_bytes(bytes)?;
+        }
         match proto_message_request_to_canonical(req) {
             Some(canon_req) => requests.push(Some(canon_req)),
             None => requests.push(None),
@@ -1108,6 +1121,10 @@ fn proto_message_request_to_canonical(
         Request::Kick(p) => conversions::prover_kick_from_proto(p)
             .to_canonical_bytes()
             .ok()?,
+        Request::CommitteeHandoff(bytes) => {
+            quil_execution::global_intrinsic::handoff::CertificateSubmission::from_canonical_bytes(bytes).ok()?;
+            bytes.clone()
+        }
         Request::ShardSplit(p) => conversions::shard_split_from_proto(p)
             .to_canonical_bytes()
             .ok()?,
@@ -1132,23 +1149,15 @@ fn proto_message_request_to_canonical(
         // Token ops — symmetric with `canonical_request_to_proto` so the
         // materializer re-encodes them into `process_message` rather than
         // dropping them.
+        Request::TokenOperation(p) => {
+            quil_execution::token_intrinsic::wire::domain(&p.canonical_bytes).ok()?;
+            p.canonical_bytes.clone()
+        }
         Request::TokenDeploy(p) => token_conv::token_deploy_from_proto(p)
             .ok()?
             .to_canonical_bytes()
             .ok()?,
         Request::TokenUpdate(p) => token_conv::token_update_from_proto(p)
-            .ok()?
-            .to_canonical_bytes()
-            .ok()?,
-        Request::Transaction(p) => token_conv::transaction_from_proto(p)
-            .ok()?
-            .to_canonical_bytes()
-            .ok()?,
-        Request::PendingTransaction(p) => token_conv::pending_transaction_from_proto(p)
-            .ok()?
-            .to_canonical_bytes()
-            .ok()?,
-        Request::MintTransaction(p) => token_conv::mint_transaction_from_proto(p)
             .ok()?
             .to_canonical_bytes()
             .ok()?,
@@ -1266,6 +1275,13 @@ fn decode_frame_header(
         })
     };
 
+    let world_state_size = if c < data.len() {
+        read_u64(data, &mut c)
+            .map_err(|e| QuilError::InvalidArgument(format!("world_state_size at {}/{}: {}", c, total, e)))?
+    } else {
+        0
+    };
+
     Ok(quil_types::proto::global::GlobalFrameHeader {
         frame_number,
         rank,
@@ -1279,6 +1295,7 @@ fn decode_frame_header(
         requests_root,
         prover,
         public_key_signature_bls48581,
+        world_state_size,
     })
 }
 
@@ -1294,7 +1311,60 @@ pub fn peek_consensus_type(data: &[u8]) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replacement_carrier_preserves_canonical_bytes_through_protobuf() {
+        use prost::Message;
+        use quil_execution::message_envelope::CanonicalMessageRequest;
+        for (prefix, version) in [(0x0512u32, b"QCT3TX\0\x02"), (0x0513, b"QCT3MT\0\x02"), (0x0513, b"QCT3CM\0\x02"),
+            (0x0514, b"QCT3PE\0\x02"), (0x0515, b"QCT3PC\0\x02"),
+            (0x0516, b"QCT3SH\0\x02"), (0x0517, b"QCT3MC\0\x02"), (0x0518, b"QCT3ST\0\x02"),
+            (0x0519, b"QCT3SC\0\x02")] {
+            // Transport-only fixture: payload validity belongs to execution.
+            let mut bytes = vec![19; 200_000];
+            bytes[..4].copy_from_slice(&prefix.to_be_bytes());
+            bytes[4..12].copy_from_slice(version);
+            bytes[44..76].copy_from_slice(&quil_execution::domains::QUIL_TOKEN);
+            let canonical = CanonicalMessageRequest::wrap(bytes.clone()).unwrap();
+            let pb = super::canonical_request_to_proto(&canonical);
+            assert!(matches!(pb.request, Some(quil_types::proto::global::message_request::Request::TokenOperation(_))));
+            let wire = pb.encode_to_vec();
+            assert!(wire.len() < 256 * 1024);
+            let decoded = quil_types::proto::global::MessageRequest::decode(wire.as_slice()).unwrap();
+            assert_eq!(super::proto_message_request_to_canonical(&decoded).unwrap().inner_bytes, bytes);
+            assert_eq!(quil_execution::message_envelope::proto_message_request_to_canonical_inner_bytes(&decoded).unwrap(), bytes);
+            bytes[4] ^= 1;
+            assert!(super::canonical_request_to_proto(&CanonicalMessageRequest::wrap(bytes.clone()).unwrap()).request.is_none());
+            let invalid = quil_types::proto::global::MessageRequest {
+                request: Some(quil_types::proto::global::message_request::Request::TokenOperation(
+                    quil_types::proto::token::TokenOperation { canonical_bytes: bytes })),
+                ..Default::default()
+            };
+            assert!(super::proto_message_request_to_canonical(&invalid).is_none());
+            assert!(quil_execution::message_envelope::proto_message_request_to_canonical_inner_bytes(&invalid).is_err());
+        }
+    }
     use super::*;
+
+    /// The certified world-state size rides as a trailing field: a non-zero
+    /// value round-trips, and a zero value leaves the bytes identical to the
+    /// layout before the field existed (so older frames decode to zero).
+    #[test]
+    fn global_header_world_state_size_round_trips_and_keeps_legacy_bytes() {
+        let header = |size: u64| quil_types::proto::global::GlobalFrameHeader {
+            frame_number: 9, rank: 2, timestamp: 3, difficulty: 4,
+            output: vec![5; 516], parent_selector: vec![6; 32],
+            global_commitments: vec![vec![7; 32]], prover_tree_commitment: vec![8; 32],
+            prover_tree_aux_roots: vec![vec![9; 32]; 3], requests_root: vec![10; 32],
+            prover: vec![11; 32], public_key_signature_bls48581: None,
+            world_state_size: size,
+        };
+        let frame = |size: u64| quil_types::proto::global::GlobalFrame { header: Some(header(size)), requests: vec![] };
+        let zero = encode_global_frame(&frame(0)).unwrap();
+        let sized = encode_global_frame(&frame(0x0102_0304_0506_0708)).unwrap();
+        assert_eq!(sized.len(), zero.len() + 8);
+        assert_eq!(decode_global_frame(&zero).unwrap().header.unwrap().world_state_size, 0);
+        assert_eq!(decode_global_frame(&sized).unwrap().header.unwrap(), header(0x0102_0304_0506_0708));
+    }
 
     #[test]
     fn header_decode_rejects_alloc_bomb_counts() {
@@ -1436,6 +1506,40 @@ mod tests {
     }
 
     #[test]
+    fn handoff_certificate_roundtrips_global_bundle_and_rejects_malformed_payloads() {
+        use quil_cw_consensus::handoff::{Checkpoint, Seal};
+        use quil_execution::{global_intrinsic::handoff::CertificateSubmission,
+            message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest}};
+        use quil_types::proto::global::message_request::Request;
+        use prost::Message as _;
+        let submission = CertificateSubmission { seal: Seal { request: [1; 32], session: [2; 32], view: 5,
+            checkpoint: Checkpoint { frame: 3, view: 4, digest: [3; 32], state_roots: [[4; 32]; 4], history_root: [5; 32] } },
+            certificate: vec![7; 1200] };
+        // Wire conversion preserves the bytes; authenticated global execution
+        // separately verifies the certificate and its authorized source session.
+        let inner = submission.to_canonical_bytes().unwrap();
+        let bundle = CanonicalMessageBundle { timestamp: 17,
+            requests: vec![Some(CanonicalMessageRequest::wrap(inner.clone()).unwrap())] };
+        let canonical = bundle.to_canonical_bytes().unwrap();
+        let decoded = decode_message_bundle(&canonical).unwrap();
+        assert!(matches!(decoded.requests[0].request.as_ref(), Some(Request::CommitteeHandoff(bytes)) if *bytes == inner));
+        assert!(quil_execution::global_engine::request_is_global_op(&decoded.requests[0]));
+        assert_eq!(quil_execution::global_engine::global_kind_for_request(&decoded.requests[0]),
+            Some(quil_execution::global_engine::MessageKindGlobal::CommitteeHandoff));
+        let protobuf = quil_types::proto::global::MessageBundle::decode(decoded.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(proto_message_bundle_to_canonical_bytes(&protobuf).unwrap(), canonical);
+        assert_eq!(quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&protobuf).unwrap(), canonical);
+        let mut malformed = inner; malformed.push(0);
+        let bad = CanonicalMessageBundle { timestamp: 17,
+            requests: vec![Some(CanonicalMessageRequest::wrap(malformed.clone()).unwrap())] }.to_canonical_bytes().unwrap();
+        assert!(decode_message_bundle(&bad).is_err());
+        let mut bad_proto = protobuf;
+        bad_proto.requests[0].request = Some(Request::CommitteeHandoff(malformed));
+        assert!(proto_message_bundle_to_canonical_bytes(&bad_proto).is_err());
+        assert!(quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&bad_proto).is_err());
+    }
+
+    #[test]
     fn decode_global_frame_round_trips_two_bundles() {
         use quil_execution::global_intrinsic::frame_header::GlobalFrameHeader as CanonicalGlobalHeader;
         use quil_execution::global_intrinsic::prover_filter_ops::ProverPause;
@@ -1485,6 +1589,7 @@ mod tests {
             global_commitments: vec![vec![0x03; 32]],
             prover_tree_commitment: vec![0x04; 32],
             prover_tree_aux_roots: vec![vec![0x07; 32], vec![0x08; 32], vec![0x09; 32]],
+            world_state_size: 0,
             requests_root: vec![0x05; 32],
             prover: vec![0x06; 32],
             public_key_signature_bls48581: Vec::new(),
@@ -1504,7 +1609,7 @@ mod tests {
         let h = decoded.header.as_ref().expect("header");
         assert_eq!(h.frame_number, 12345);
         assert_eq!(h.rank, 1);
-        // Prover shard aux roots (audit #5) survive the canonical round-trip.
+        // Prover shard aux roots survive the canonical round-trip.
         assert_eq!(
             h.prover_tree_aux_roots,
             vec![vec![0x07; 32], vec![0x08; 32], vec![0x09; 32]]
@@ -1536,9 +1641,8 @@ mod tests {
 
     #[test]
     fn decode_global_frame_rejects_too_many_requests() {
-        // header_len=0 (still bogus header — but we never get to header
-        // parsing because count check fires first... actually we do
-        // parse the header. Use a minimal valid header.)
+        // The header is parsed before the request count is checked, so use a
+        // minimal valid header.
         use quil_execution::global_intrinsic::frame_header::GlobalFrameHeader as CanonicalGlobalHeader;
         let header = CanonicalGlobalHeader::default();
         let header_bytes = header.to_canonical_bytes().unwrap();
@@ -1671,6 +1775,17 @@ mod tests {
     }
 
     #[test]
+    fn canonical_bundle_rejects_retired_token_carriers() {
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        for prefix in [0x0509u32, 0x050c, 0x050f] {
+            let request = CanonicalMessageRequest::wrap(prefix.to_be_bytes().to_vec()).unwrap();
+            let bundle = CanonicalMessageBundle { requests: vec![Some(request)], timestamp: 0 };
+            let bytes = bundle.to_canonical_bytes().unwrap();
+            assert!(decode_message_bundle(&bytes).is_err());
+        }
+    }
+
+    #[test]
     fn token_compute_altshard_ops_survive_bundle_round_trip() {
         use quil_execution::compute_intrinsic::ops::{
             CodeDeployment, CodeExecute, CodeFinalize, ExecuteOperation, ExecutionResult,
@@ -1680,15 +1795,6 @@ mod tests {
         use quil_execution::global_intrinsic::consensus_types::AltShardUpdate;
         use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
         use quil_execution::token_intrinsic::deploy::{TokenDeploy, TokenUpdate};
-        use quil_execution::token_intrinsic::mint::{
-            MintTransaction, MintTransactionInput, MintTransactionOutput,
-        };
-        use quil_execution::token_intrinsic::pending::{
-            PendingTransaction, PendingTransactionInput, PendingTransactionOutput,
-        };
-        use quil_execution::token_intrinsic::transaction::{
-            Transaction, TransactionInput, TransactionOutput,
-        };
         use quil_types::proto::global::message_request::Request;
 
         // --- token ---
@@ -1698,71 +1804,6 @@ mod tests {
             rdf_schema: b"schema".to_vec(),
             public_key_signature_bls48581: vec![0x66u8; 74],
         };
-        let tx = Transaction {
-            domain: vec![0x11u8; 32],
-            inputs: vec![TransactionInput {
-                commitment: vec![1u8; 74],
-                signature: vec![2u8; 74],
-                proofs: vec![vec![3u8; 32]],
-            }
-            .to_canonical_bytes()
-            .unwrap()],
-            outputs: vec![TransactionOutput {
-                frame_number: vec![0u8; 8],
-                commitment: vec![4u8; 74],
-                recipient_output: Vec::new(),
-            }
-            .to_canonical_bytes()
-            .unwrap()],
-            fees: vec![vec![0u8, 5]],
-            range_proof: vec![6u8; 32],
-            traversal_proof: Vec::new(),
-        };
-        let pending = PendingTransaction {
-            domain: vec![0x12u8; 32],
-            inputs: vec![PendingTransactionInput {
-                commitment: vec![1u8; 74],
-                signature: vec![2u8; 74],
-                proofs: vec![vec![3u8; 32]],
-            }
-            .to_canonical_bytes()
-            .unwrap()],
-            outputs: vec![PendingTransactionOutput {
-                frame_number: vec![0u8; 8],
-                commitment: vec![4u8; 74],
-                to: Vec::new(),
-                refund: Vec::new(),
-                expiration: 42,
-            }
-            .to_canonical_bytes()
-            .unwrap()],
-            fees: vec![vec![0u8, 5]],
-            range_proof: vec![6u8; 32],
-            traversal_proof: Vec::new(),
-        };
-        let mint = MintTransaction {
-            domain: vec![0x13u8; 32],
-            inputs: vec![MintTransactionInput {
-                value: vec![0u8, 9],
-                commitment: vec![1u8; 74],
-                signature: vec![2u8; 74],
-                proofs: vec![vec![3u8; 32]],
-                additional_reference: vec![7u8; 64],
-                additional_reference_key: vec![8u8; 57],
-            }
-            .to_canonical_bytes()
-            .unwrap()],
-            outputs: vec![MintTransactionOutput {
-                frame_number: vec![0u8; 8],
-                commitment: vec![4u8; 74],
-                recipient_output: Vec::new(),
-            }
-            .to_canonical_bytes()
-            .unwrap()],
-            fees: vec![vec![0u8, 5]],
-            range_proof: vec![6u8; 32],
-        };
-
         // --- compute ---
         let compute_deploy = ComputeDeploy { config: Vec::new(), rdf_schema: b"schema".to_vec() };
         let compute_update = ComputeUpdate {
@@ -1826,9 +1867,6 @@ mod tests {
         let cases: Vec<(Vec<u8>, &str)> = vec![
             (token_deploy.to_canonical_bytes().unwrap(), "token_deploy"),
             (token_update.to_canonical_bytes().unwrap(), "token_update"),
-            (tx.to_canonical_bytes().unwrap(), "transaction"),
-            (pending.to_canonical_bytes().unwrap(), "pending"),
-            (mint.to_canonical_bytes().unwrap(), "mint"),
             (compute_deploy.to_canonical_bytes().unwrap(), "compute_deploy"),
             (compute_update.to_canonical_bytes().unwrap(), "compute_update"),
             (code_deploy.to_canonical_bytes().unwrap(), "code_deploy"),
@@ -1851,9 +1889,6 @@ mod tests {
                 (&proto.requests[0].request, want),
                 (Some(Request::TokenDeploy(_)), "token_deploy")
                     | (Some(Request::TokenUpdate(_)), "token_update")
-                    | (Some(Request::Transaction(_)), "transaction")
-                    | (Some(Request::PendingTransaction(_)), "pending")
-                    | (Some(Request::MintTransaction(_)), "mint")
                     | (Some(Request::ComputeDeploy(_)), "compute_deploy")
                     | (Some(Request::ComputeUpdate(_)), "compute_update")
                     | (Some(Request::CodeDeploy(_)), "code_deploy")

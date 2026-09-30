@@ -33,6 +33,11 @@ mod cw_consensus_bridge;
 mod dht_node;
 
 mod worker_node;
+#[cfg(feature = "confidential-tokens")]
+mod witness_index;
+
+#[cfg(feature = "native-proof")]
+mod proof_worker;
 
 mod diagnostic;
 mod check_bootstrap;
@@ -40,17 +45,22 @@ mod check_submit;
 mod fork_ladder;
 mod verify_migration;
 mod forest_migration;
+mod storage_history;
+mod consensus_settings;
 mod dry_run_reset;
 mod dump_shard_state;
+mod gen0_preflight;
 mod reclaim_legacy_forest;
 mod test_prover_sync;
 mod query_shards;
+mod adopt_prover_root;
 mod unified_consolidation;
 mod legacy_migration;
 mod coin_rescale;
 mod coin_receipt_repair;
 
 mod master_node;
+mod clock_retention;
 
 mod mem_stats;
 
@@ -101,7 +111,7 @@ struct Args {
 
     /// Convert the node's current KZG state DB (config.db.path) into a fresh
     /// JMT forest DB at the given destination path, then exit. The forest is
-    /// the Phase-3 hash-Merkle state tree; the destination MUST be a new/empty
+    /// the hash-Merkle state tree; the destination MUST be a new/empty
     /// path (its key-space collides with the source DB's).
     #[arg(long)]
     migrate_db: Option<PathBuf>,
@@ -124,6 +134,77 @@ struct Args {
     /// while the network keeps running on the others.
     #[arg(long)]
     dump_shard_state: Option<PathBuf>,
+
+    /// OFFLINE READ-ONLY generation-zero migration preflight of a STOPPED node's
+    /// master store: one JSON line per registered application shard (committee
+    /// and certificate compatibility, roots, outgoing-history availability,
+    /// handoff status, blockers), bound to one checkpoint. NEVER writes and never
+    /// copies the store.
+    #[arg(long)]
+    gen0_preflight: Option<PathBuf>,
+
+    /// Worker stores (comma-separated) searched for application frames and their
+    /// history records alongside the master, for --gen0-preflight.
+    #[arg(long, value_delimiter = ',')]
+    gen0_preflight_workers: Vec<PathBuf>,
+
+    /// Frames of outgoing history checked below each shard's head (--gen0-preflight).
+    #[arg(long, default_value_t = 64)]
+    gen0_preflight_window: u64,
+
+    /// Resume --gen0-preflight after this shard filter (hex); requires
+    /// --gen0-preflight-checkpoint from the interrupted run's header line.
+    #[arg(long)]
+    gen0_preflight_resume_after: Option<String>,
+
+    /// Refuse to run --gen0-preflight unless the stores are at this checkpoint.
+    #[arg(long)]
+    gen0_preflight_checkpoint: Option<String>,
+
+    /// --gen0-preflight of an archive that is not a committee member: its
+    /// materialized cursor and history records, which lag its clock head under
+    /// sequenced ingest, are reported as notes instead of blockers.
+    #[arg(long)]
+    gen0_preflight_archive: bool,
+
+    /// --gen0-preflight of a RUNNING node's stores: open each read-only beside
+    /// the node (no lock, every file held open) and report that point-in-time
+    /// view. Never writes the node's stores; cannot be resumed (the checkpoint
+    /// moves).
+    #[arg(long)]
+    gen0_preflight_live: bool,
+
+    /// Read-only evidence for a GLOBAL halt from this store (a master store
+    /// path): the head, the parent records the next frame binds, candidates
+    /// above the head, and GLOBAL's committee. One JSON line; compare it
+    /// across archives stopped at the same head. With --gen0-preflight-live,
+    /// opens beside a running node.
+    #[arg(long)]
+    global_halt_report: Option<PathBuf>,
+
+    /// Read-only listing of the GLOBAL prover shard's records in this store
+    /// (a master store path): one sorted `address length sha256` line each,
+    /// then a summary. Diff two archives' listings to find the records their
+    /// prover roots disagree on.
+    #[arg(long)]
+    prover_shard_dump: Option<PathBuf>,
+
+    /// With --prover-shard-dump: decode these record addresses (hex,
+    /// comma-separated) field by field instead of listing every record.
+    #[arg(long, value_delimiter = ',')]
+    prover_shard_show: Vec<String>,
+
+    /// Read-only history of the last GLOBAL frames in this store (a master
+    /// store path): each frame's requests with the outcome this node recorded,
+    /// and, for the records named by --prover-shard-show, each value they held
+    /// after each frame. JSON lines; diff two archives' output. Starts at
+    /// --history-from (default: seven frames below the head).
+    #[arg(long)]
+    global_frame_history: Option<PathBuf>,
+
+    /// With --global-frame-history: the first frame to report.
+    #[arg(long)]
+    history_from: Option<u64>,
 
     /// OFFLINE one-time reclaim of the orphaned pre-cutover QUIL forest trees (the
     /// per-prefix byte-suffix trees the unified-tree consolidation copied from but
@@ -148,6 +229,37 @@ struct Args {
     /// for engine.archiveEndpoints / embedded genesis archives. Read-only; then exit.
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     query_shards: Option<String>,
+
+    /// LIVE read-only query of another node (`ip:8340`): its GLOBAL head and
+    /// GLOBAL prover shard root, over the :8340 mTLS transport with this
+    /// node's Falcon identity. One JSON line, then exit.
+    #[arg(long)]
+    query_prover_root: Option<String>,
+
+    /// OFFLINE repair: replace this master store's GLOBAL prover shard with the
+    /// one --adopt-from holds at --adopt-root, via the node's root-addressed
+    /// sync. The root must be the state after this store's head frame. Dry run
+    /// (lists the records that would change) unless --adopt-commit, which
+    /// needs the node stopped. Needs --config for the :8340 identity.
+    #[arg(long)]
+    adopt_prover_root: Option<PathBuf>,
+
+    /// With --adopt-prover-root: the archive to pull from (`ip:8340`).
+    #[arg(long, default_value = "")]
+    adopt_from: String,
+
+    /// With --adopt-prover-root: the prover root to adopt (hex).
+    #[arg(long, default_value = "")]
+    adopt_root: String,
+
+    /// With --adopt-prover-root: write to the store (otherwise a dry run).
+    #[arg(long)]
+    adopt_commit: bool,
+
+    /// With --adopt-prover-root: accept a root held at a frame other than the
+    /// store's head. For localnet tests only.
+    #[arg(long, hide = true)]
+    adopt_any_frame: bool,
 
     /// Archive-only: convert pre-2.1 verenc coins in the DB (config.db.path, or
     /// the given path) into compact transparent public token entries and refresh
@@ -277,10 +389,16 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
+    initialize_tls_provider();
     let args = Args::parse();
 
     // Load configuration first so logger paths / filters come from it.
     let config = quil_config::load_config(&args.config)?;
+    // Token proof worker settings fail fast, before any store opens.
+    config
+        .proof_worker
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid proofWorker configuration: {e}"))?;
 
     // Initialize logging in tab-separated console format:
     //   ts \t level \t target:line \t msg \t {fields}.
@@ -615,6 +733,19 @@ async fn main() -> anyhow::Result<ExitCode> {
 
     info!(config_dir = %args.config.display(), "loaded configuration");
 
+    // Before any shard engine runs: shard frames anchored below this frame
+    // relay nothing, as the mainnet build that made them did.
+    let release_from = quil_execution::token_intrinsic::global_commit::init_orphan_replacement_frame(args.network);
+    info!(release_activation_frame = release_from, "release activation frame");
+    let relay_from = quil_execution::token_intrinsic::global_commit::init_relay_activation_frame(args.network);
+    info!(
+        relay_activation_frame = %if relay_from == u64::MAX { "never (release frame unset)".to_string() } else { relay_from.to_string() },
+        "application shard relay records"
+    );
+    if let Some(frame) = quil_execution::global_intrinsic::leaf_root_registration::init_pre_registration_frame(args.network) {
+        tracing::warn!(pre_registration_frame = frame, "QUIL_PRE_REGISTRATION_FRAME override active (test networks only)");
+    }
+
     // Verify the binary against `.dgst` + per-signatory `.dgst.sig.N`
     // using hardcoded Ed448 public keys. Fails closed; skipped on
     // Windows and when --signature-check=false.
@@ -694,6 +825,89 @@ async fn main() -> anyhow::Result<ExitCode> {
         };
     }
 
+    if let Some(ref store) = args.prover_shard_dump {
+        consensus_settings::initialize(args.network);
+        let show = match args.prover_shard_show.iter().map(hex::decode).collect::<Result<Vec<_>, _>>() {
+            Ok(show) => show,
+            Err(e) => {
+                eprintln!("--prover-shard-show: {e}");
+                return Ok(ExitCode::FAILURE);
+            }
+        };
+        let mut out = std::io::BufWriter::new(std::io::stdout());
+        return match gen0_preflight::prover_shard_dump(store, args.network, args.gen0_preflight_live, &show, &mut out) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref store) = args.global_frame_history {
+        consensus_settings::initialize(args.network);
+        let records = match args.prover_shard_show.iter().map(hex::decode).collect::<Result<Vec<_>, _>>() {
+            Ok(records) => records,
+            Err(e) => {
+                eprintln!("--prover-shard-show: {e}");
+                return Ok(ExitCode::FAILURE);
+            }
+        };
+        let mut out = std::io::BufWriter::new(std::io::stdout());
+        return match gen0_preflight::global_frame_history(store, args.network, args.gen0_preflight_live, args.history_from, &records, &mut out) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref store) = args.global_halt_report {
+        consensus_settings::initialize(args.network);
+        return match gen0_preflight::global_halt_report(store, args.network, args.gen0_preflight_live, &mut std::io::stdout()) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref master) = args.gen0_preflight {
+        // The node's epoch length and handoff policy for this network, so the
+        // preflight judges the registering epoch by the epochs GLOBAL uses.
+        consensus_settings::initialize(args.network);
+        let resume_after = match args.gen0_preflight_resume_after.as_deref().map(hex::decode).transpose() {
+            Ok(filter) => filter,
+            Err(e) => {
+                eprintln!("--gen0-preflight-resume-after: {e}");
+                return Ok(ExitCode::FAILURE);
+            }
+        };
+        if resume_after.is_some() && args.gen0_preflight_checkpoint.is_none() {
+            eprintln!("--gen0-preflight-resume-after requires --gen0-preflight-checkpoint");
+            return Ok(ExitCode::FAILURE);
+        }
+        let options = gen0_preflight::Options {
+            workers: args.gen0_preflight_workers.clone(),
+            window: args.gen0_preflight_window,
+            resume_after,
+            expect_checkpoint: args.gen0_preflight_checkpoint.clone(),
+            network: args.network,
+            archive: args.gen0_preflight_archive,
+            live: args.gen0_preflight_live,
+        };
+        return match gen0_preflight::run(master, &options) {
+            Ok(summary) if summary.blocked == 0 => Ok(ExitCode::SUCCESS),
+            Ok(_) => Ok(ExitCode::from(2)),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
     if let Some(ref dump_path) = args.dump_shard_state {
         return match dump_shard_state::run_dump_shard_state(dump_path, &config, args.network) {
             Ok(()) => Ok(ExitCode::SUCCESS),
@@ -718,6 +932,24 @@ async fn main() -> anyhow::Result<ExitCode> {
         };
     }
 
+    if let Some(ref store) = args.adopt_prover_root {
+        consensus_settings::initialize(args.network);
+        let adopt = adopt_prover_root::AdoptArgs {
+            store,
+            from: &args.adopt_from,
+            root: &args.adopt_root,
+            commit: args.adopt_commit,
+            any_frame: args.adopt_any_frame,
+        };
+        return match adopt_prover_root::run_adopt_prover_root(adopt, &config, &args.config, args.network).await {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
     if let Some(ref archive_addr) = args.test_prover_sync {
         return match test_prover_sync::run_test_prover_sync(
             archive_addr,
@@ -727,6 +959,16 @@ async fn main() -> anyhow::Result<ExitCode> {
         )
         .await
         {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref archive_addr) = args.query_prover_root {
+        return match query_shards::run_query_prover_root(archive_addr, &config, &args.config).await {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");
@@ -916,6 +1158,48 @@ async fn main() -> anyhow::Result<ExitCode> {
     result
 }
 
+/// Tonic's cluster channels can be the first TLS users in either process.
+/// Both ring and aws-lc are linked transitively, so rustls cannot select one
+/// from crate features. Match the ring provider used by the peer TLS builders
+/// before any transport task starts; an already installed provider is retained.
+fn initialize_tls_provider() {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use quil_types::crypto::Signer;
+
+    #[test]
+    fn cluster_tls_initializes_provider_in_fresh_process() {
+        const CHILD: &str = "QUIL_TEST_COLD_CLUSTER_TLS";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "startup_tests::cluster_tls_initializes_provider_in_fresh_process", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(result.status.success(), "cold TLS startup failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+        // A previous TLS test must not mask the production startup ordering.
+        assert!(tokio_rustls::rustls::crypto::CryptoProvider::get_default().is_none());
+        super::initialize_tls_provider();
+        let key = quil_crypto::FalconSigner::generate();
+        let cert = quil_rpc::quil_tls::build_worker_channel_cert(key.private_key()).unwrap();
+        let identity = tonic::transport::Identity::from_pem(cert.leaf_cert_pem, cert.leaf_key_pem);
+        let ca = tonic::transport::Certificate::from_pem(cert.ca_cert_pem);
+        tonic::transport::Endpoint::from_static("https://127.0.0.1:1")
+            .tls_config(tonic::transport::ClientTlsConfig::new()
+                .ca_certificate(ca.clone()).identity(identity.clone()).domain_name("quil-worker"))
+            .unwrap();
+        tonic::transport::Server::builder()
+            .tls_config(tonic::transport::ServerTlsConfig::new()
+                .client_ca_root(ca).identity(identity))
+            .unwrap();
+    }
+}
+
 /// Raise the soft `RLIMIT_NOFILE` to the hard limit. No-op on
 /// non-unix. Failure is non-fatal — the node may still run fine under
 /// a low limit on small networks — but a low effective limit gets a
@@ -972,4 +1256,3 @@ fn raise_fd_limit() {
         }
     }
 }
-

@@ -1,4 +1,8 @@
 pub mod app_engine;
+pub mod storage_history;
+pub mod global_anchor;
+pub mod app_handoff;
+mod app_history_recovery;
 pub mod app_glue;
 pub mod archive_ingest;
 pub mod app_shard_cache;
@@ -8,10 +12,11 @@ pub mod multi_proof_cache;
 pub mod committee;
 pub mod consensus_metrics;
 pub mod consensus_types;
-/// Commonware-simplex consensus seams (P2b): real-state impls of the
+/// Commonware-simplex consensus seams: real-state impls of the
 /// quil-cw-consensus GlobalProposer/FrameSink/FrameFinalizer traits.
 pub mod cw_app_seams;
 pub mod cw_global_seams;
+mod cw_host_supervisor;
 pub mod consensus_wire;
 pub mod coverage;
 pub mod current_frame;
@@ -23,8 +28,10 @@ pub mod fees;
 pub mod fork_choice;
 pub mod frame_chain_checker;
 pub mod frame_materializer;
+pub mod frame_maintenance;
 pub mod frame_processor;
 pub mod genesis;
+pub mod global_finalization;
 pub mod frame_replay;
 pub mod frame_validator;
 pub mod halt_state;
@@ -64,7 +71,7 @@ pub mod bitmasks {
     pub const GLOBAL_CONSENSUS: &[u8] = &[0x00];
     /// Global frame distribution.
     pub const GLOBAL_FRAME: &[u8] = &[0x00, 0x00];
-    // Commonware-simplex consensus channels (P2 cutover). Distinct bitmasks so
+    // Commonware-simplex consensus channels. Distinct bitmasks so
     // the node demuxes an inbound `:8340` message back to the right simplex
     // channel. Only used when the simplex committee is configured.
     /// simplex vote channel (id 0).
@@ -138,6 +145,26 @@ pub mod bitmasks {
         v
     }
 
+    /// The APPLICATION a shard filter belongs to: its first 32 bytes. A
+    /// whole-application shard's filter already IS that address, so this is
+    /// the identity before any split.
+    pub fn app_address_of(filter: &[u8]) -> &[u8] {
+        if filter.len() >= 32 { &filter[..32] } else { filter }
+    }
+
+    /// Per-APPLICATION submission topic, on which wallets publish operations.
+    ///
+    /// A wallet knows the application, not which sub-shard covers its coins, so
+    /// every sub-shard of a split application must listen on ONE topic: the
+    /// bloom is taken over the 32-byte application address and NEVER over the
+    /// shard's longer filter. `get_bloom_filter` hashes every byte it is given,
+    /// so keying this topic on a child filter puts the shard on a topic no
+    /// wallet can address — submissions then fail with
+    /// `NoPeersSubscribedToTopic` the moment an application splits.
+    pub fn app_prover_bitmask(filter: &[u8]) -> Vec<u8> {
+        shard_prover_bitmask(app_address_of(filter))
+    }
+
     /// Per-shard dispatch bitmask = `0x00 0x00 || appFilter`.
     pub fn shard_dispatch_bitmask(address: &[u8]) -> Vec<u8> {
         let af = shard_app_filter(address);
@@ -147,7 +174,7 @@ pub mod bitmasks {
         v
     }
 
-    /// Per-shard commonware-simplex bitmask = `0x01 || appFilter` (P3). ONE
+    /// Per-shard commonware-simplex bitmask = `0x01 || appFilter`. ONE
     /// gossip topic per shard for all CW consensus traffic; the CW channel id
     /// (0=vote,1=cert,2=resolver,3=block) is carried as the FIRST payload byte
     /// (see `shard_cw_split_payload`). The `0x01` discriminator distinguishes it
@@ -161,16 +188,128 @@ pub mod bitmasks {
         v
     }
 
-    /// Frame a CW message for gossip: `[channel_u8] || cw_bytes`.
+    /// Set in the first payload byte of a transmission that carries a nonce.
+    const SHARD_CW_NONCE_FLAG: u8 = 0x80;
+
+    /// Frame a CW message for gossip:
+    /// `[0x80 | channel] || nonce (8 bytes) || cw_bytes`.
+    ///
+    /// The nonce makes every TRANSMISSION a distinct gossip message. The gossip
+    /// message id is a hash of the content with a five-minute duplicate cache,
+    /// and a duplicate publish is reported as success. Consensus rebroadcasts
+    /// are byte-identical on purpose (Falcon signatures are randomized, so a
+    /// re-sent vote reuses its cached signature, and a restart replays its
+    /// journaled votes verbatim). Without the nonce every retry inside five
+    /// minutes was dropped before leaving the node, so a member that subscribed
+    /// a moment after the first broadcast never received that vote; in a small
+    /// committee, where every vote is needed, the view then never certified.
+    /// Receivers strip the nonce; the consensus layer sees identical votes and
+    /// ignores the repeats.
     pub fn shard_cw_frame_payload(channel: u64, cw_bytes: &[u8]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(1 + cw_bytes.len());
-        v.push(channel as u8);
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        // Distinct across restarts too: a replayed vote must not collide with
+        // the copy its previous process published less than five minutes ago.
+        let base = *BASE.get_or_init(|| {
+            let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64);
+            time ^ (u64::from(std::process::id()) << 32)
+        });
+        let nonce = base.wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed));
+        let mut v = Vec::with_capacity(9 + cw_bytes.len());
+        v.push(SHARD_CW_NONCE_FLAG | (channel as u8 & !SHARD_CW_NONCE_FLAG));
+        v.extend_from_slice(&nonce.to_be_bytes());
         v.extend_from_slice(cw_bytes);
         v
     }
 
-    /// Inverse of [`shard_cw_frame_payload`]: `(channel, cw_bytes)` or `None` if empty.
+    /// Inverse of [`shard_cw_frame_payload`]: `(channel, cw_bytes)`, or `None`
+    /// if the payload is empty or truncated. The earlier un-nonced framing
+    /// (`[channel] || cw_bytes`) is still accepted.
     pub fn shard_cw_split_payload(payload: &[u8]) -> Option<(u64, &[u8])> {
-        payload.split_first().map(|(c, rest)| (*c as u64, rest))
+        let (first, rest) = payload.split_first()?;
+        if first & SHARD_CW_NONCE_FLAG == 0 {
+            return Some((u64::from(*first), rest));
+        }
+        Some((u64::from(first & !SHARD_CW_NONCE_FLAG), rest.get(8..)?))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The framing decoder over arbitrary bytes: `None` or a split, never
+        /// a panic, and every framed payload comes back intact.
+        #[test]
+        fn shard_cw_framing_survives_arbitrary_bytes() {
+            let mut x = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = || { x ^= x >> 12; x ^= x << 25; x ^= x >> 27; x.wrapping_mul(0x2545_F491_4F6C_DD1D) };
+            for i in 0..20_000u64 {
+                let len = (next() % 64) as usize;
+                let mut bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                if i % 3 == 0 {
+                    let channel = next() % 4;
+                    let framed = shard_cw_frame_payload(channel, &bytes);
+                    assert_eq!(shard_cw_split_payload(&framed), Some((channel, bytes.as_slice())));
+                    bytes = framed;
+                    if !bytes.is_empty() {
+                        let at = (next() as usize) % bytes.len();
+                        bytes[at] ^= 1 << (next() % 8);
+                    }
+                }
+                let _ = std::panic::catch_unwind(|| shard_cw_split_payload(&bytes))
+                    .unwrap_or_else(|_| panic!("framing panicked on {}", hex::encode(&bytes)));
+            }
+        }
+
+        /// Byte-identical consensus rebroadcasts must leave the node as
+        /// distinct gossip messages, and decode to the same vote.
+        #[test]
+        fn every_shard_cw_transmission_is_a_distinct_gossip_message() {
+            let vote = b"identical signed vote bytes";
+            let first = shard_cw_frame_payload(1, vote);
+            let second = shard_cw_frame_payload(1, vote);
+            assert_ne!(first, second, "a content-hashed message id would drop the retry");
+            for payload in [&first, &second] {
+                assert_eq!(shard_cw_split_payload(payload), Some((1, vote.as_slice())));
+            }
+            // The earlier framing still decodes; truncated nonces do not.
+            assert_eq!(shard_cw_split_payload(&[3, 9, 9]), Some((3, [9u8, 9].as_slice())));
+            assert_eq!(shard_cw_split_payload(&first[..5]), None);
+            assert_eq!(shard_cw_split_payload(&[]), None);
+        }
+
+        /// A wallet addresses an application, not a shard. Every sub-shard of a
+        /// split application must therefore subscribe to the SAME submission
+        /// topic the wallet publishes on — the one keyed by the 32-byte app
+        /// address. Keying it on the shard's own filter silently strands every
+        /// submission the moment the application splits.
+        #[test]
+        fn every_sub_shard_listens_on_the_application_submission_topic() {
+            let app = [0x11u8; 32];
+            // `app ‖ bit_len(u16 BE) ‖ packed bits`, as a split child's filter.
+            let child = |bits: u16, packed: u8| {
+                let mut f = app.to_vec();
+                f.extend_from_slice(&bits.to_be_bytes());
+                f.push(packed);
+                f
+            };
+            let wallet_publishes_to = app_prover_bitmask(&app);
+            for filter in [app.to_vec(), child(1, 0x00), child(1, 0x80), child(3, 0x20)] {
+                assert_eq!(
+                    app_prover_bitmask(&filter), wallet_publishes_to,
+                    "shard {} must share the application's submission topic", hex::encode(&filter),
+                );
+            }
+            // Why the helper exists: the bloom hashes every byte it is given, so
+            // keying on the longer child filter lands on a different topic.
+            assert_ne!(shard_prover_bitmask(&child(1, 0x00)), wallet_publishes_to);
+            // Per-shard traffic stays per-shard.
+            assert_ne!(shard_frame_bitmask(&child(1, 0x00)), shard_frame_bitmask(&app));
+        }
     }
 }
+pub(crate) mod confirmation_attempts;
+pub(crate) mod stage_clock;
+pub mod shard_drain;

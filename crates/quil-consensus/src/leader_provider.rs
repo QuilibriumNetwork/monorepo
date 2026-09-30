@@ -42,4 +42,12 @@ pub trait LeaderProvider<S: Unique>: Send + Sync {
     fn local_prover_root(&self, _frame_number: u64) -> Option<Vec<u8>> {
         None
     }
+
+    /// Non-blocking read of the network world-state size this node recorded
+    /// at the end of frame N-1 — the value a valid frame N must declare. `None`
+    /// when N-1 is not materialized here, or the provider tracks no global
+    /// state (app-shard / test providers: no such verification).
+    fn local_world_state_size(&self, _frame_number: u64) -> Option<u64> {
+        None
+    }
 }

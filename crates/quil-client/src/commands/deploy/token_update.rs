@@ -3,9 +3,9 @@
 //! Port of `client/cmd/deploy/update.go` `UpdateTokenCmd`, on the current PQ
 //! auth: the owner signs the canonical `TokenUpdate` (signature field cleared)
 //! with the Falcon `q-prover-key` under domain `address ‖ "TOKEN_UPDATE"`, and
-//! the raw Falcon bytes go in the proto's `signature` field. (Unblocked by the
-//! converter fix: `token_update_from_proto` now carries the raw sig, matching
-//! the node's `engines.rs` verify.)
+//! the raw Falcon bytes go in the proto's `signature` field
+//! (`token_update_from_proto` carries the raw sig, matching the node's
+//! `engines.rs` verify).
 
 use std::collections::HashMap;
 
@@ -138,7 +138,7 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
         timestamp: 0,
     };
     // Updates are submitted on the token's own domain.
-    crate::send::send_message_request(&mut client, &dc.key_manager, domain, request).await?;
+    dc.send_paid(&mut client, &domain, request).await?;
     println!("Token update submitted successfully");
     Ok(())
 }

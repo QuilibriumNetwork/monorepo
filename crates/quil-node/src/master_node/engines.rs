@@ -10,7 +10,15 @@ pub(crate) struct EngineHandles {
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
 }
 
-pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandles {
+/// `proof_worker` is the node-wide token verifier client (a clone shares
+/// its single admission slot); `None` leaves the manager without the
+/// token suite, which then rejects confidential token operations.
+pub(crate) fn init_engines(
+    storage: &StorageHandles,
+    network: u8,
+    #[cfg(feature = "native-proof")]
+    proof_worker: Option<&quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier>,
+) -> anyhow::Result<EngineHandles> {
     // ---------------------------------------------------------------
     // 3. Create execution engines with full crypto verification
     // ---------------------------------------------------------------
@@ -23,7 +31,7 @@ pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandl
         storage.hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
         inclusion_prover.clone(),
     ));
-    // Phase-3: commit global-consensus state into the JMT forest. Install the
+    // Commit global-consensus state into the JMT forest. Install the
     // persistent forest when the DB is migrated OR brand-new/fresh (a new
     // forest-native node builds on the persistent forest from genesis instead of
     // the ephemeral in-memory default). A store with un-migrated legacy state
@@ -44,6 +52,31 @@ pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandl
     ) {
         tracing::info!("Phase-3 JMT forest installed on global CRDT — state commits to the forest");
     }
+    // The mainnet build's reset of the GLOBAL prover tree (and its prover-tree
+    // sync) cleared phase trees but kept their head markers. This build's
+    // commit reads every untouched phase's root strictly and refuses such a
+    // marker ("persisted phase head has no root"), so the first GLOBAL frame
+    // after the upgrade could not commit. Drop markers that name no root on a
+    // tree holding no key: the state this build's reset leaves.
+    if crdt.forest_is_persistent() {
+        match crdt.drop_orphaned_phase_heads(&[0xffu8; 32]) {
+            Ok(dropped) => {
+                for (phase, version) in dropped {
+                    tracing::warn!(phase, version, "dropped an orphaned head marker on the GLOBAL prover tree (an old reset emptied the phase and kept its marker)");
+                }
+            }
+            Err(error) => tracing::error!(%error, "could not check the GLOBAL prover tree's head markers"),
+        }
+    }
+    // Opt-in (`QUIL_PRUNE_RETAINED_VERSIONS=1`): superseded tree and blob
+    // versions otherwise accumulate with every commit.
+    if let (true, Some(policy)) = (crdt.forest_is_persistent(), quil_hypergraph::RetentionPolicy::from_env()) {
+        tracing::info!(?policy, "retained-version pruning enabled on the global CRDT");
+        quil_hypergraph::spawn_retention_pruner(&crdt, policy, "master".into());
+    }
+    crate::clock_retention::apply_snapshot_pin_limit(&crdt, "master");
+    crate::clock_retention::spawn_staged_cleanup(storage.clock_store.clone(), "master".into());
+    crate::clock_retention::spawn_candidate_pruner(&storage.clock_store, "master".into());
     // Seed the forest Merkle-sum size index ONCE (marker-gated), BEFORE the first
     // `rebucket_app` — which fires immediately below in `refresh_crdt_shard_prefixes`
     // whenever a split landed while this node was down (the post-split grid loaded
@@ -222,19 +255,17 @@ pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandl
         Arc::new(quil_execution::testing::NoopCircuitCompiler);
     let clock_store_for_exec: Arc<dyn quil_types::store::ClockStore> =
         storage.clock_store.clone();
-    // Hypergraph engine requires a config resolver. A real resolver
-    // would look up the HypergraphDeploy config vertex for each
-    // domain; that materialization isn't wired yet, so we use the
-    // fail-closed noop (returns None → AuthCheck::UnknownDomain →
-    // engine rejects all hypergraph write ops). Swap in a real
-    // resolver once the deploy materialization lands.
+    // Hypergraph engine requires a config resolver: it reads each deployed
+    // application's committed metadata vertex (unknown domains still resolve
+    // to nothing, so their writes are rejected).
+    // Write keys resolve from each deployed application's committed metadata.
     let hypergraph_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
-        Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
+        Arc::new(quil_execution::hypergraph_intrinsic::CrdtHypergraphConfigResolver::new(crdt.clone()));
     // Wire the shard stores so the global intrinsic's shard split/merge ops
     // actually record `PendingShardChange` and apply the topology flip at E+2.
     // Without these, proposed splits validate + "succeed" but never take effect,
     // so overcrowded shards stay overcrowded and provers re-propose every frame.
-    let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new_with_shards(
+    let exec_manager = quil_execution::ExecutionEngineManager::new_with_shards(
         inclusion_prover.clone(),
         key_manager.clone(),
         crdt.clone(),
@@ -244,14 +275,18 @@ pub(crate) fn init_engines(storage: &StorageHandles, network: u8) -> EngineHandl
         true,
         Some(storage.shards_store.clone()),
         Some(storage.db_arc.clone() as Arc<dyn quil_types::store::KvDb>),
-    ));
+    )
+    .with_pricing_network(network);
+    #[cfg(feature = "native-proof")]
+    let exec_manager = crate::proof_worker::install_token_worker(exec_manager, network, proof_worker)?;
+    let exec_manager = Arc::new(exec_manager);
     info!("execution engines initialized with BLS48-581 + Ed448 signature verification");
 
-    EngineHandles {
+    Ok(EngineHandles {
         inclusion_prover,
         crdt,
         exec_manager,
-    }
+    })
 }
 
 pub(crate) fn bootstrap_genesis(
@@ -368,29 +403,13 @@ pub(crate) fn refresh_crdt_shard_prefixes(
         // apply splits locally (no materializer), so their shards_store stays
         // single-shard and this stays inert on them until that gap is closed —
         // see the size-bucket note in shard_data_migration_design.
-        if crdt.set_app_shard_prefixes(app, prefixes) {
-            // Log BEFORE the rebucket so a slow one isn't silent. `unified` tells which
-            // path it takes: true ⇒ O(depth) forest size index; false ⇒ the O(all-leaves)
-            // `scan_app_buckets` fallback (the multi-hour cold walk to avoid at boot).
-            let t = std::time::Instant::now();
-            info!(
-                app = %hex::encode(app),
-                unified = crdt.unified_tree(),
-                "shard set changed (split/merge) — re-partitioning size buckets…"
-            );
-            if let Err(e) = crdt.rebucket_app(&app) {
-                warn!(
-                    app = %hex::encode(app),
-                    error = %e,
-                    "refresh_crdt_shard_prefixes: rebucket_app failed after shard-set change"
-                );
-            } else {
-                info!(
-                    app = %hex::encode(app),
-                    ms = t.elapsed().as_millis() as u64,
-                    "shard set changed (split/merge) — re-partitioned size buckets"
-                );
-            }
+        let t = std::time::Instant::now();
+        match crdt.refresh_app_shard_prefixes(app, prefixes) {
+            Ok(true) => info!(app = %hex::encode(app), ms = t.elapsed().as_millis() as u64,
+                "shard set changed (split/merge) — re-partitioned size buckets"),
+            Ok(false) => {},
+            Err(e) => warn!(app = %hex::encode(app), error = %e,
+                "refresh_crdt_shard_prefixes: layout unchanged after rebuild failure; will retry"),
         }
     }
     app_count

@@ -67,6 +67,8 @@ impl Transaction for MemTxn {
 /// Minimal in-memory `HypergraphStore` for tests. Stores node and root
 /// data in hash maps; all other operations are no-ops.
 pub struct MemStore {
+    read_failure_phase: Mutex<Option<String>>,
+    commit_setup_failures: Mutex<(bool, bool)>,
     nodes: Mutex<HashMap<String, Vec<u8>>>,
     roots: Mutex<HashMap<String, Vec<u8>>>,
     /// Per-vertex underlying-data keyed by `(scope_prefix, vk)` so
@@ -83,11 +85,23 @@ pub struct MemStore {
 impl MemStore {
     pub fn new() -> Self {
         Self {
+            read_failure_phase: Mutex::new(None),
+            commit_setup_failures: Mutex::new((false, false)),
             nodes: Mutex::new(HashMap::new()),
             roots: Mutex::new(HashMap::new()),
             per_vertex: Mutex::new(HashMap::new()),
             kv: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Inject underlying-blob I/O failures for one phase; test utility only.
+    pub fn fail_vertex_reads(&self, phase: Option<&str>) {
+        *self.read_failure_phase.lock().unwrap() = phase.map(str::to_owned);
+    }
+
+    /// Inject transaction-creation or root-read failures before commit staging.
+    pub fn fail_commit_setup(&self, transaction: bool, roots: bool) {
+        *self.commit_setup_failures.lock().unwrap() = (transaction, roots);
     }
 
     fn node_key(set: &str, phase: &str, shard: &ShardKey, key: &[u8]) -> String {
@@ -115,6 +129,9 @@ impl MemStore {
 
 impl HypergraphStore for MemStore {
     fn new_transaction(&self, _: bool) -> Result<Box<dyn Transaction>> {
+        if self.commit_setup_failures.lock().unwrap().0 {
+            return Err(QuilError::Store("injected transaction creation failure".into()));
+        }
         Ok(Box::new(MemTxn { kv: self.kv.clone() }))
     }
     fn get_node_by_key(&self, set: &str, phase: &str, shard: &ShardKey, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -144,8 +161,16 @@ impl HypergraphStore for MemStore {
     fn set_covered_prefix(&self, _: &[i32]) -> Result<()> { Ok(()) }
     fn set_shard_commit(&self, _: &dyn Transaction, _: u64, _: &str, _: &str, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
     fn get_shard_commit(&self, _: u64, _: &str, _: &str, _: &[u8]) -> Result<Vec<u8>> { Ok(vec![]) }
-    fn get_root_commits(&self, _: u64) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> { Ok(HashMap::new()) }
+    fn get_root_commits(&self, _: u64) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> {
+        if self.commit_setup_failures.lock().unwrap().1 {
+            return Err(QuilError::Store("injected root read failure".into()));
+        }
+        Ok(HashMap::new())
+    }
     fn load_vertex_underlying_raw(&self, set: &str, phase: &str, shard: &ShardKey, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if self.read_failure_phase.lock().unwrap().as_deref() == Some(phase) {
+            return Err(QuilError::Store("injected underlying-blob read failure".into()));
+        }
         let k = Self::node_key(set, phase, shard, key);
         Ok(self.nodes.lock().unwrap().get(&k).cloned())
     }
@@ -156,6 +181,38 @@ impl HypergraphStore for MemStore {
         self.per_vertex.lock().unwrap().insert((scope, key.to_vec()), data.to_vec());
         Ok(())
     }
+    fn page_vertex_underlying_fixed(
+        &self, set: &str, phase: &str, shard: &ShardKey, domain: &[u8; 32],
+        after: Option<&[u8; 32]>, limits: quil_types::store::VertexPageLimits,
+    ) -> Result<quil_types::store::VertexDataPage> {
+        let invalid = || quil_types::error::QuilError::InvalidArgument("invalid or oversized vertex page".into());
+        if limits.max_entries == 0 || limits.max_bytes < 64 { return Err(invalid()); }
+        let retained = limits.max_entries.checked_add(1).ok_or_else(invalid)?;
+        let scope = Self::vertex_scope(set, phase, shard);
+        let values = self.per_vertex.lock().unwrap();
+        let mut selected = std::collections::BTreeMap::new();
+        for ((s, key), value) in values.iter() {
+            if s != &scope || key.len() != 64 || &key[..32] != domain { continue; }
+            let address: [u8; 32] = key[32..].try_into().unwrap();
+            if after.is_some_and(|after| address <= *after) { continue; }
+            selected.insert(address, value);
+            if selected.len() > retained { selected.pop_last(); }
+        }
+        let mut page = quil_types::store::VertexDataPage { entries: Vec::new(), has_more: false };
+        let mut used: usize = 0;
+        for (address, value) in selected {
+            if page.entries.len() == limits.max_entries { page.has_more = true; break; }
+            let next = value.len().checked_add(64).and_then(|n| used.checked_add(n));
+            if next.is_none_or(|n| n > limits.max_bytes) {
+                if page.entries.is_empty() { return Err(invalid()); }
+                page.has_more = true; break;
+            }
+            used = next.unwrap();
+            page.entries.push((address, value.clone()));
+        }
+        Ok(page)
+    }
+
     fn for_each_vertex_underlying(&self, set: &str, phase: &str, shard: &ShardKey, callback: &mut dyn FnMut(Vec<u8>, Vec<u8>)) -> Result<usize> {
         let scope = Self::vertex_scope(set, phase, shard);
         let mut count = 0usize;
@@ -200,4 +257,28 @@ impl InclusionProver for StubProver {
         Err(QuilError::Internal("batch multiproof generation not supported".into()))
     }
     fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+}
+
+#[cfg(test)]
+mod fixed_vertex_page_tests {
+    use super::*;
+    #[test]
+    fn crdt_fixed_vertex_page_forwarding_preserves_cursor_and_limits() {
+        let store = std::sync::Arc::new(MemStore::new());
+        let domain = [7; 32];
+        let shard = crate::addressing::shard_key_for_location(&crate::addressing::Location { app_address: domain, data_address: [0; 32] });
+        let txn = store.new_transaction(false).unwrap();
+        for i in (0..3).rev() {
+            let mut key = domain.to_vec(); key.extend_from_slice(&[i; 32]);
+            store.save_vertex_underlying(txn.as_ref(), "vertex", "adds", &shard, &key, b"row").unwrap();
+        }
+        let crdt = crate::HypergraphCrdt::new(store, std::sync::Arc::new(quil_types::crypto::NoopInclusionProver));
+        let limits = quil_types::store::VertexPageLimits { max_entries: 2, max_bytes: 134 };
+        let first = crdt.page_committed_vertex_adds(&domain, None, limits).unwrap();
+        assert_eq!(first.entries, vec![([0; 32], b"row".to_vec()), ([1; 32], b"row".to_vec())]);
+        assert!(first.has_more);
+        let last = crdt.page_committed_vertex_adds(&domain, Some(&[1; 32]), limits).unwrap();
+        assert_eq!(last.entries, vec![([2; 32], b"row".to_vec())]);
+        assert!(!last.has_more);
+    }
 }

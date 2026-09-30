@@ -4,8 +4,8 @@
 //! Pre-2.1 coins are stored as verenc blobs under the hard-coded
 //! `PUBLIC_READ_KEY` — already publicly readable, so they carry no privacy but
 //! cost ~621 B each. This pass decrypts every legacy coin of the QUIL token
-//! domain and re-materializes it as a ~72 B transparent entry, then refreshes
-//! the lattice shadow-accumulator root so the new transparent set is committed.
+//! domain and re-materializes it as a compact transparent entry, then records
+//! conservation totals from the complete converted set.
 //! The decrypt is deterministic (same key everywhere) ⇒ every archive node
 //! produces byte-identical output ⇒ consensus-safe.
 //!
@@ -16,11 +16,11 @@
 use std::path::Path;
 
 use quil_execution::token_intrinsic::legacy_migration::LegacyMigrationSummary;
-use quil_execution::token_intrinsic::{legacy_migration, shadow_accumulator};
+use quil_execution::token_intrinsic::legacy_migration;
 
 /// Migrate the DB at `target` (empty → `config.db.path`) in place: decrypt every
 /// legacy verenc coin of the QUIL token domain into a transparent entry (and
-/// remove the verenc original), then refresh the shadow-accumulator root.
+/// remove the verenc original), then write the conservation receipt.
 pub fn run_migrate_legacy(target: &Path, config: &quil_config::Config) -> anyhow::Result<()> {
     let path = if target.as_os_str().is_empty() {
         config.db.path.clone()
@@ -42,7 +42,7 @@ pub fn run_migrate_legacy(target: &Path, config: &quil_config::Config) -> anyhow
             summary.migrated, summary.total_amount
         ),
         None => println!(
-            "shadow-accumulator root already present — legacy migration already applied; nothing to do"
+            "conservation receipt already present — legacy migration already applied; nothing to do"
         ),
     }
     println!("=== legacy migration complete ===");
@@ -53,10 +53,9 @@ pub fn run_migrate_legacy(target: &Path, config: &quil_config::Config) -> anyhow
 /// legacy verenc coin of the QUIL token domain into a transparent entry and
 /// PHYSICALLY DELETES the verenc original — writing straight to the KV keyspace
 /// (no `HypergraphState`, no CRDT commit), so peak memory is O(chunk) even at
-/// 100+ GB coin sets. Then writes the (empty) shadow-accumulator root + the
-/// conservation receipt directly. The forest is rebuilt afterward.
+/// 100+ GB coin sets. Then writes the conservation receipt directly. The forest is rebuilt afterward.
 ///
-/// Returns `None` when the DB is already migrated (shadow root present — an
+/// Returns `None` when the DB is already migrated (valid receipt present — an
 /// idempotent no-op), else `Some(summary)`. Shared by `--migrate-legacy` and the
 /// unified `--migrate-db` so the coin pass is byte-identical either way and
 /// always runs BEFORE the forest is built (the forest must be built over the
@@ -67,20 +66,9 @@ pub fn convert_legacy_coins_in_place(
     let inner = db.inner();
     let store = quil_store::RocksHypergraphStore::new(inner.clone());
     let domain = &quil_execution::domains::QUIL_TOKEN[..];
-    let shard = legacy_migration::coin_domain_shard(domain);
-
-    // Idempotency guard: the shadow-accumulator root vertex is written at the END
-    // of a successful migration, so its presence means "already migrated" (or a
-    // fresh 2.1 DB with no legacy coins). Read the KV directly — no CRDT.
-    let acc_vk = {
-        let mut k = domain.to_vec();
-        k.extend_from_slice(&shadow_accumulator::ACC_ROOT_ADDRESS);
-        k
-    };
-    if store
-        .load_vertex_underlying("vertex", "adds", &shard, &acc_vk)?
-        .is_some()
-    {
+    // The receipt is written only after conversion and a full transparent-set
+    // tally. A historical shadow root alone is not a completion marker.
+    if legacy_migration::read_migration_receipt_raw(&store, domain)?.is_some() {
         return Ok(None);
     }
 
@@ -109,29 +97,74 @@ pub fn convert_legacy_coins_in_place(
         legacy_migration::migrate_all_legacy_coins(&store, domain, 4096, &mut progress)
             .map_err(|e| anyhow::anyhow!("legacy coin migration failed: {e}"))?;
 
-    // Write the (empty) lattice shadow-accumulator root DIRECTLY — a pre-2.1 DB
-    // has no shielded coins, so it's provably empty (no full-set scan). Written
-    // to the same unversioned keyspace the coins use, so the forest build picks
-    // it up as a normal leaf.
-    let acc_rec = shadow_accumulator::empty_root_record(domain)
-        .map_err(|e| anyhow::anyhow!("shadow accumulator: {e}"))?;
-    store.migrate_put_vertex_underlying("vertex", "adds", &shard, &acc_vk, &acc_rec)?;
-
-    // Conservation receipt `(count u64 BE ‖ Σ u128 BE)` — the verenc originals are
-    // gone, so `--verify-db` reconciles `Σ transparent` against this instead.
-    let receipt_vk = {
-        let mut k = domain.to_vec();
-        k.extend_from_slice(&legacy_migration::MIGRATION_RECEIPT_ADDRESS);
-        k
-    };
-    let mut rec = Vec::with_capacity(24);
-    rec.extend_from_slice(&(summary.migrated as u64).to_be_bytes());
-    rec.extend_from_slice(&summary.total_amount.to_be_bytes());
-    store.migrate_put_vertex_underlying("vertex", "adds", &shard, &receipt_vk, &rec)?;
+    // Include coins converted by an earlier interrupted invocation. Its
+    // originals have already been deleted, so this invocation's counters alone
+    // cannot establish conservation. This is an offline, exclusive-DB pass.
+    let (count, total) = legacy_migration::sum_transparent_coins(&store, domain)?;
+    legacy_migration::write_migration_receipt_raw(&store, domain, count, total)?;
 
     println!(
-        "coin migration complete: {} coins, Σ = {} (shadow root + receipt written)",
-        summary.migrated, summary.total_amount
+        "coin migration invocation: {} coins, Σ = {}; complete-set receipt: {} coins, Σ = {}",
+        summary.migrated, summary.total_amount, count, total
     );
     Ok(Some(summary))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_execution::token_intrinsic::constants::LEGACY_ACCUMULATOR_ROOT_ADDRESS;
+
+    fn put_raw(store: &quil_store::RocksHypergraphStore, address: &[u8; 32], blob: &[u8]) {
+        let domain = &quil_execution::domains::QUIL_TOKEN;
+        let mut key = domain.to_vec(); key.extend_from_slice(address);
+        store.migrate_put_vertex_underlying("vertex", "adds", &legacy_migration::coin_domain_shard(domain), &key, blob).unwrap();
+    }
+
+    fn put_transparent(store: &quil_store::RocksHypergraphStore, id: u8, amount: u128, malformed: bool) {
+        let domain = &quil_execution::domains::QUIL_TOKEN;
+        let mut tree = legacy_migration::create_transparent_coin_tree(
+            &legacy_migration::TransparentCoin { owner_address: [9; 32], amount },
+            &legacy_migration::transparent_type_hash(domain).unwrap(), &[id; 32]).unwrap();
+        if malformed {
+            tree.insert(&[4], &[0; 15], &[], &num_bigint::BigInt::from(15)).unwrap();
+        }
+        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        put_raw(store, &[id; 32], &blob);
+    }
+
+    #[test]
+    fn migration_receipt_includes_previously_converted_coins_and_is_idempotent() {
+        for old_root in [false, true] {
+            let db = quil_store::RocksDb::open_in_memory().unwrap();
+            let store = quil_store::RocksHypergraphStore::new(db.inner());
+            // Model completed chunks from a prior interrupted invocation.
+            put_transparent(&store, 1, 7, false);
+            put_transparent(&store, 2, 11, false);
+            if old_root { put_raw(&store, &LEGACY_ACCUMULATOR_ROOT_ADDRESS, b"historical-root"); }
+            let summary = convert_legacy_coins_in_place(&db).unwrap().unwrap();
+            assert_eq!(summary.migrated, 0); // this run had no remaining verenc coins
+            assert_eq!(legacy_migration::read_migration_receipt_raw(&store, &quil_execution::domains::QUIL_TOKEN).unwrap(), Some((2, 18)));
+            assert!(convert_legacy_coins_in_place(&db).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn migration_does_not_complete_with_invalid_totals_or_receipt() {
+        let domain = &quil_execution::domains::QUIL_TOKEN;
+        for failure in 0..4 {
+            let db = quil_store::RocksDb::open_in_memory().unwrap();
+            let store = quil_store::RocksHypergraphStore::new(db.inner());
+            match failure {
+                0 => { put_transparent(&store, 1, u128::MAX, false); put_transparent(&store, 2, 1, false); }
+                1 => put_transparent(&store, 1, 7, true),
+                2 => put_raw(&store, &legacy_migration::MIGRATION_RECEIPT_ADDRESS, &[0; 23]),
+                _ => put_raw(&store, &legacy_migration::MIGRATION_RECEIPT_ADDRESS, &[0; 25]),
+            }
+            assert!(convert_legacy_coins_in_place(&db).is_err());
+            if failure < 2 {
+                assert!(legacy_migration::read_migration_receipt_raw(&store, domain).unwrap().is_none());
+            }
+        }
+    }
 }

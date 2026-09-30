@@ -115,118 +115,124 @@ fn empty_follower_converges_to_leader_prover_root() {
     );
 }
 
-/// A failed blob transfer must not install a matching tree with unreadable
-/// state. Once all blobs are available, tree and blob state become visible
-/// together.
 #[test]
-fn prepared_sync_waits_for_blobs_before_installing_tree() {
-    let leader = fresh_crdt();
-    seed_and_commit(&leader, 1, 1);
-    let follower = fresh_crdt();
-    let shard_id = GLOBAL_APP.to_vec();
-    let (source_version, leader_root) = leader
-        .serve_forest_head(&shard_id, 0)
-        .expect("leader phase head");
-    let reader = InProcTreeReader {
-        source: leader.clone(),
-        shard_id: shard_id.clone(),
-        phase: 0,
-    };
-    let prepared = follower
-        .prepare_shard_phase_sync(&reader, source_version, &shard_id, 0)
-        .expect("prepare sync");
-    assert!(!prepared.is_empty());
-    assert_ne!(
-        follower.compute_shard_root("vertex", "adds", &global_prover_shard()),
-        leader_root,
-        "no tree is installed before the blob transfer succeeds",
-    );
-
-    let blobs = prepared
-        .changed_leaves()
-        .into_iter()
-        .map(|(data, _)| {
-            let mut id = GLOBAL_APP.to_vec();
-            id.extend_from_slice(&data);
-            let blob = leader
-                .peek_synced_blob(&global_prover_shard(), 0, &id)
-                .expect("leader blob");
-            (id, blob)
-        })
-        .collect::<Vec<_>>();
-    follower
-        .apply_prepared_shard_phase_sync(
-            prepared,
-            Some(&global_prover_shard()),
-            &blobs,
-        )
-        .expect("atomic tree-and-blob install");
-    assert_eq!(
-        follower.compute_shard_root("vertex", "adds", &global_prover_shard()),
-        leader_root,
-    );
+fn atomic_subtree_chunks_preserve_siblings_and_install_readable_data() {
+    use quil_forest::{bit_path_to_prefix, shard_prefix_to_filter, SubtreeSyncAnchor};
+    let app = [0x71; 32];
+    let bits = [false, false, true];
+    let filter = shard_prefix_to_filter(&app, &bit_path_to_prefix(&bits));
+    let location = |byte| Location { app_address: app, data_address: [byte; 32] };
+    let source = fresh_crdt();
+    source.set_unified_tree(true);
+    for byte in [0x20, 0x30, 0x60] { source.add_vertex(&location(byte), &[byte; 48]).unwrap(); }
+    source.commit(1).unwrap();
+    let (version, _) = source.serve_forest_head(&app, 0).unwrap();
+    let root = source.sub_shard_commitment_for_filter("vertex", "adds", &filter).try_into().unwrap();
+    let reader = InProcTreeReader { source, shard_id: app.to_vec(), phase: 0 };
+    let target = fresh_crdt();
+    target.set_unified_tree(true);
+    target.add_vertex(&location(0xe0), b"local sibling").unwrap();
+    target.commit(1).unwrap();
+    let mut plan = target.prepare_phase_sync(&reader, version, &app, 0, &bits, Some(SubtreeSyncAnchor::SubtreeRoot(root))).unwrap();
+    assert_eq!(plan.remaining().len(), 2);
+    while let Some((key, _)) = plan.remaining().first() {
+        let byte = key[0];
+        target.apply_sync_chunk(&mut plan, &[vec![byte; 48]]).unwrap();
+        assert_eq!(target.get_vertex_data_checked(&location(byte)).unwrap(), Some(vec![byte; 48]));
+    }
+    assert_eq!(target.finish_phase_sync(&plan).unwrap(), root);
+    assert_eq!(target.get_vertex_data_checked(&location(0xe0)).unwrap(), Some(b"local sibling".to_vec()));
+    assert!(target.get_vertex_data_checked(&location(0x60)).unwrap().is_none());
 }
 
-/// The unified subtree path must have the same ordering guarantee as whole-tree
-/// sync: a failed blob transfer cannot advance the subtree commitment.
+/// A failed local GLOBAL replay can create records that never existed at the
+/// authenticated source. Repair must remove them, including when JMT leaves
+/// collapse to a different branch shape, and retain source values at common keys.
 #[test]
-fn prepared_subtree_sync_waits_for_blobs_before_installing_tree() {
-    use quil_types::store::ShardKey;
+fn anchored_global_sync_reconciles_local_only_records() {
+    use quil_forest::SubtreeSyncAnchor;
+    for phase in [0, 2] {
+        let add = if phase == 0 { HypergraphCrdt::add_vertex } else { HypergraphCrdt::add_hyperedge };
+        let read = if phase == 0 { HypergraphCrdt::get_vertex_data_checked } else { HypergraphCrdt::get_hyperedge_data_checked };
+        for (canonical, local) in [
+            (vec![0x10], vec![0x10, 0x11, 0xe0]),
+            (vec![0x10, 0x11, 0x12, 0xf0], vec![0x10, 0x80]),
+            (vec![0x10, 0x11, 0x12, 0xf0], vec![0x10, 0x11, 0x12, 0x80]),
+            (vec![0x10], vec![0x80]),
+        ] {
+            for audited in [false, true] {
+                let location = |key| Location { app_address: GLOBAL_APP, data_address: [key; 32] };
+                let source = fresh_crdt();
+                for &key in &canonical { add(&source, &location(key), &[key; 48]).unwrap(); }
+                source.commit(1).unwrap();
+                let (version, root) = source.serve_forest_head(&GLOBAL_APP, phase).unwrap();
+                let reader = InProcTreeReader { source, shard_id: GLOBAL_APP.to_vec(), phase };
+                let target = fresh_crdt();
+                for &key in &local {
+                    let value = if key != 0x10 && canonical.contains(&key) { vec![key; 48] }
+                        else { b"stale local record".to_vec() };
+                    add(&target, &location(key), &value).unwrap();
+                }
+                target.commit(1).unwrap();
+                if audited {
+                    // The reverse diff must also work once the one-time data audit
+                    // is complete and the forward diff prunes equal branches.
+                    let self_reader = InProcTreeReader { source: target.clone(), shard_id: GLOBAL_APP.to_vec(), phase };
+                    let (v, r) = target.serve_forest_head(&GLOBAL_APP, phase).unwrap();
+                    let mut audit = target.prepare_phase_sync(&self_reader, v, &GLOBAL_APP, phase, &[], Some(SubtreeSyncAnchor::AppRoot(r))).unwrap();
+                    let blobs: Vec<_> = audit.remaining().iter().map(|(key, _)|
+                        read(&target, &location(key[0])).unwrap().unwrap()).collect();
+                    target.apply_sync_chunk(&mut audit, &blobs).unwrap();
+                    target.finish_phase_sync(&audit).unwrap();
+                }
+                let mut plan = target.prepare_phase_sync(&reader, version, &GLOBAL_APP, phase, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
+                assert!(plan.remaining().iter().any(|(_, value)| value.is_none()));
+                while let Some((key, value)) = plan.remaining().first() {
+                    let blob = if value.is_some() { vec![key[0]; 48] } else { Vec::new() };
+                    target.apply_sync_chunk(&mut plan, &[blob]).unwrap();
+                }
+                assert_eq!(target.finish_phase_sync(&plan).unwrap(), root);
+                for &key in &canonical {
+                    assert_eq!(read(&target, &location(key)).unwrap(), Some(vec![key; 48]));
+                }
+                for &key in local.iter().filter(|key| !canonical.contains(key)) {
+                    assert!(read(&target, &location(key)).unwrap().is_none());
+                }
+                assert!(target.prepare_phase_sync(&reader, version, &GLOBAL_APP, phase, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap().remaining().is_empty());
+            }
+        }
+    }
+}
 
-    let app = *b"quil-app-address-0123456789abcd!";
-    let shard = ShardKey { l1: [0u8; 3], l2: app };
-    let vertex = Location { app_address: app, data_address: [0x00u8; 32] };
-    let leader = fresh_crdt();
-    leader.set_shard_partition(app, 1);
-    leader.set_unified_tree(true);
-    leader.add_vertex(&vertex, b"subtree-data").unwrap();
-    leader.commit(1).unwrap();
-    let leader_root = leader.compute_shard_root("vertex", "adds", &shard);
-    let pinned = <[u8; 32]>::try_from(leader_root.as_slice()).unwrap();
-
-    let follower = fresh_crdt();
-    follower.set_shard_partition(app, 1);
-    follower.set_unified_tree(true);
-    let bit_path = follower.canonical_bits_for_prefix(&app, &[0u32]);
-    let shard_id = app.to_vec();
-    let (source_version, _) = leader
-        .serve_forest_head(&shard_id, 0)
-        .expect("leader phase head");
-    let reader = InProcTreeReader { source: leader.clone(), shard_id, phase: 0 };
-    let prepared = follower
-        .prepare_shard_subtree_phase_sync(
-            &reader,
-            source_version,
-            &app,
-            0,
-            &bit_path,
-            Some(pinned),
-        )
-        .expect("prepare subtree sync");
-    assert!(!prepared.is_empty());
-    assert!(
-        !follower.lookup_vertex(&vertex),
-        "tree and blob state stay absent until blob transfer succeeds",
-    );
-
-    let blobs = prepared
-        .changed_leaves()
-        .into_iter()
-        .map(|(data, _)| {
-            let mut id = app.to_vec();
-            id.extend_from_slice(&data);
-            let blob = leader.peek_synced_blob(&shard, 0, &id).expect("leader blob");
-            (id, blob)
-        })
-        .collect::<Vec<_>>();
-    let (subtree_root, _) = follower
-        .apply_prepared_shard_subtree_phase_sync(prepared, Some(&shard), &blobs)
-        .expect("atomic subtree tree-and-blob install");
-    assert!(follower.lookup_vertex(&vertex), "blob is readable after install");
-    assert_eq!(
-        subtree_root,
-        leader.sub_shard_commitment("vertex", "adds", &shard, &[0u32]).as_slice(),
-    );
+#[test]
+fn global_reconciliation_requires_a_valid_anchor_and_never_prunes_application_data() {
+    use quil_forest::SubtreeSyncAnchor;
+    for phase in [0, 2] {
+        let add = if phase == 0 { HypergraphCrdt::add_vertex } else { HypergraphCrdt::add_hyperedge };
+        let read = if phase == 0 { HypergraphCrdt::get_vertex_data_checked } else { HypergraphCrdt::get_hyperedge_data_checked };
+        for app in [GLOBAL_APP, [0x71; 32]] {
+            let location = |key| Location { app_address: app, data_address: [key; 32] };
+            let source = fresh_crdt();
+            add(&source, &location(1), b"canonical").unwrap();
+            source.commit(1).unwrap();
+            let (version, root) = source.serve_forest_head(&app, phase).unwrap();
+            let reader = InProcTreeReader { source, shard_id: app.to_vec(), phase };
+            let target = fresh_crdt();
+            add(&target, &location(2), b"local only").unwrap();
+            target.commit(1).unwrap();
+            let before = target.serve_forest_head(&app, phase);
+            let mut wrong = root;
+            wrong[0] ^= 1;
+            assert!(target.prepare_phase_sync(&reader, version, &app, phase, &[], Some(SubtreeSyncAnchor::AppRoot(wrong))).is_err());
+            assert!(target.prepare_phase_sync(&reader, version, &app, phase, &[], None).is_err());
+            if app != GLOBAL_APP {
+                assert!(target.prepare_phase_sync(&reader, version, &app, phase, &[], Some(SubtreeSyncAnchor::AppRoot(root))).is_err());
+            }
+            assert_eq!(target.serve_forest_head(&app, phase), before);
+            assert_eq!(read(&target, &location(2)).unwrap(), Some(b"local only".to_vec()));
+            assert!(read(&target, &location(1)).unwrap().is_none());
+        }
+    }
 }
 
 /// A follower that is STALE (holds an older subset) converges after sync — the
@@ -248,7 +254,7 @@ fn stale_follower_converges_to_leader_prover_root() {
     assert_eq!(after, leader_root, "stale follower converges to the leader prover root");
 }
 
-/// Phase-2 unified: a follower syncs a SPLIT app committed in UNIFIED mode as
+/// Unified: a follower syncs a SPLIT app committed in UNIFIED mode as
 /// ONE tree (shard_id = app `l2`, not 64 sub-shard trees) and converges to the
 /// leader's app-phase root — the single-tree sync path the dispatch now routes
 /// unified apps to (`prover_tree_syncer_prod::sync_shard_tree`).
@@ -303,7 +309,7 @@ fn unified_split_app_follower_converges_via_single_tree_sync() {
     );
 }
 
-/// Phase-2 shard-prover SUBTREE-RANGE sync: a follower covering ONLY shard X
+/// Shard-prover SUBTREE-RANGE sync: a follower covering ONLY shard X
 /// pulls just X's subtree from the leader's app tree — NOT shards Y or the far
 /// shard — authenticated against the leader's app root, and its local shard
 /// commitment matches the leader's. This is what lets a shard prover store only
@@ -343,7 +349,7 @@ fn shard_prover_pulls_only_its_subtree() {
     let (v_s, _r) = leader.serve_forest_head(&shard_id, 0).expect("leader app-tree head");
     let reader = InProcTreeReader { source: leader.clone(), shard_id: shard_id.clone(), phase: 0 };
     let (subtree_root, _ver, changed) = follower
-        .sync_shard_subtree_phase_from(&reader, v_s, &app, 0, &bits_x, Some(pinned))
+        .sync_shard_subtree_phase_from(&reader, v_s, &app, 0, &bits_x, Some(quil_forest::SubtreeSyncAnchor::AppRoot(pinned)))
         .expect("subtree sync");
 
     // Subtree-scoping: ONLY shard X's leaves transferred (byte0 in 0x00..0x03) —
@@ -368,9 +374,9 @@ fn shard_prover_pulls_only_its_subtree() {
     assert_ne!(leader_y_commit, vec![0u8; 32], "leader shard Y is populated");
 }
 
-/// SPIKE (unified-cutover worker design): a worker holding ONLY its covered
+/// SPIKE: a worker holding ONLY its covered
 /// subtree reproduces the correct SUBTREE commitment, but NOT the whole-app
-/// AGGREGATE root — the un-held sibling subtrees read as empty. Crux finding:
+/// AGGREGATE root — the un-held sibling subtrees read as empty.
 /// `app_engine` publishes the per-shard `state_root` as `compute_shard_root(app)`
 /// (the whole-app aggregate over ALL sub-shards), which a subtree-only worker
 /// canNOT reproduce. So the sharded unified design requires the per-shard
@@ -406,7 +412,7 @@ fn partial_worker_reproduces_subtree_root_but_not_app_aggregate() {
     let (v_s, _r) = leader.serve_forest_head(&shard_id, 0).unwrap();
     let reader = InProcTreeReader { source: leader.clone(), shard_id: shard_id.clone(), phase: 0 };
     follower
-        .sync_shard_subtree_phase_from(&reader, v_s, &app, 0, &bits_x, Some(pinned))
+        .sync_shard_subtree_phase_from(&reader, v_s, &app, 0, &bits_x, Some(quil_forest::SubtreeSyncAnchor::AppRoot(pinned)))
         .unwrap();
 
     // (1) The SUBTREE commitment reproduces exactly on partial storage.
@@ -468,7 +474,7 @@ fn sub_shard_commitment_for_filter_matches_leader_from_partial_storage() {
     let pinned = <[u8; 32]>::try_from(leader_app.as_slice()).unwrap();
     let reader = InProcTreeReader { source: leader.clone(), shard_id: shard_id.clone(), phase: 0 };
     follower
-        .sync_shard_subtree_phase_from(&reader, v_s, &app, 0, &bits_x, Some(pinned))
+        .sync_shard_subtree_phase_from(&reader, v_s, &app, 0, &bits_x, Some(quil_forest::SubtreeSyncAnchor::AppRoot(pinned)))
         .unwrap();
 
     // The subtree-only follower computes the SAME per-shard state_root.
@@ -498,6 +504,74 @@ fn sub_shard_commitment_for_filter_unsplit_app_is_app_root() {
     let agg = crdt.compute_shard_root("vertex", "adds", &sk);
     assert_eq!(sub, agg, "unsplit app: subtree root == whole-app aggregate (no-op)");
     assert_eq!(sub.len(), 32);
+}
+
+/// Resolve the actual shard-header commitment after the archive advances this
+/// shard and its sibling, then recover only the shard at the cited version.
+#[test]
+fn unified_shard_sync_uses_the_header_subtree_at_its_retained_version() {
+    use quil_forest::{bit_path_to_prefix, shard_prefix_to_filter, SubtreeSyncAnchor};
+    for depth in [1, 4, 5, 6, 9] {
+        let app = [0x51; 32];
+        let bits = vec![false; depth];
+        let filter = shard_prefix_to_filter(&app, &bit_path_to_prefix(&bits));
+        let archive = fresh_crdt();
+        archive.set_unified_tree(true);
+        // The encoded path is meaningful even before grid metadata arrives.
+        for (first, tag) in [(0u8, 1u8), (0, 2), (0x80, 3)] {
+            let mut address = [0; 32];
+            address[0] = first;
+            address[31] = tag;
+            archive.add_vertex(&Location { app_address: app, data_address: address }, &[tag; 32]).unwrap();
+        }
+        archive.commit(1).unwrap();
+        let header_root: [u8; 32] = archive
+            .sub_shard_commitment_for_filter("vertex", "adds", &filter)
+            .try_into().unwrap();
+        let (version, app_root) = archive.serve_forest_head(&app, 0).unwrap();
+        assert_ne!(header_root, app_root, "a shard header does not carry the app root");
+        let mut newer = [0; 32];
+        newer[31] = 4;
+        archive.add_vertex(&Location { app_address: app, data_address: newer }, b"newer shard state").unwrap();
+        archive.add_vertex(&Location { app_address: app, data_address: [0x80; 32] }, b"newer sibling").unwrap();
+        archive.commit(2).unwrap();
+        let (resolved, _) = archive.resolve_root(&filter, 0, header_root).expect("retained shard root");
+        assert_eq!(resolved, version);
+
+        let worker = fresh_crdt();
+        worker.set_unified_tree(true);
+        assert_eq!(worker.canonical_bits_for_filter(&filter), Some(bits.clone()));
+        let reader = InProcTreeReader { source: archive.clone(), shard_id: app.to_vec(), phase: 0 };
+        assert!(worker.sync_shard_subtree_phase_from(
+            &reader, resolved, &app, 0, &bits, Some(SubtreeSyncAnchor::AppRoot(header_root)),
+        ).is_err(), "the former app-root interpretation must fail on this fixture");
+        let (got, _, changed) = worker.sync_shard_subtree_phase_from(
+            &reader, resolved, &app, 0, &bits, Some(SubtreeSyncAnchor::SubtreeRoot(header_root)),
+        ).unwrap();
+        assert_eq!(got, header_root);
+        assert_eq!(changed.len(), 2, "only this shard at the cited version transfers");
+        assert_eq!(worker.sub_shard_commitment_for_filter("vertex", "adds", &filter), header_root);
+        let before = worker.serve_forest_head(&app, 0);
+        let mut wrong = header_root;
+        wrong[0] ^= 1;
+        assert!(worker.sync_shard_subtree_phase_from(
+            &reader, resolved, &app, 0, &bits, Some(SubtreeSyncAnchor::SubtreeRoot(wrong)),
+        ).is_err());
+        assert_eq!(worker.serve_forest_head(&app, 0), before, "bad anchor must not write state");
+        assert!(archive.resolve_root(&filter, 0, wrong).is_none());
+
+        let ahead = fresh_crdt();
+        ahead.set_unified_tree(true);
+        let mut extra = [0; 32];
+        extra[31] = 99;
+        ahead.add_vertex(&Location { app_address: app, data_address: extra }, b"extra local leaf").unwrap();
+        ahead.commit(1).unwrap();
+        let before = ahead.serve_forest_head(&app, 0);
+        assert!(ahead.sync_shard_subtree_phase_from(
+            &reader, resolved, &app, 0, &bits, Some(SubtreeSyncAnchor::SubtreeRoot(header_root)),
+        ).is_err(), "an incompatible local tree must not be merged and published");
+        assert_eq!(ahead.serve_forest_head(&app, 0), before, "failed reconstruction leaves the prior tree intact");
+    }
 }
 
 /// Re-syncing an already-converged follower is a no-op: the root is unchanged

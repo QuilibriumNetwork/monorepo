@@ -25,11 +25,13 @@ pub(crate) struct MessageLoopArgs {
     pub coverage_monitor: Arc<quil_engine::coverage::CoverageMonitor>,
     pub worker_allocator: Arc<quil_engine::worker_allocator::WorkerAllocator>,
     pub prover_pipeline: Arc<quil_engine::prover_pipeline::ProverPipeline>,
-    /// Commonware-simplex inbound router (P2c cutover), set post-spawn at the
+    /// Commonware-simplex inbound router, set post-spawn at the
     /// activation site when `config.engine.consensus_committee` is non-empty.
     /// Unset (the default) → the simplex path is off and this adds no overhead.
     pub cw_router:
         Arc<std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>>,
+    /// Atomic GLOBAL finalization pipeline (archives with CW GLOBAL consensus).
+    pub global_finalization: Arc<std::sync::OnceLock<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>>,
     pub peer_info_cache: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
     >>,
@@ -63,11 +65,71 @@ pub(crate) struct MessageLoopArgs {
     /// shard subscription and materializes them into the archive's CRDT.
     /// `None` on non-archive nodes.
     pub archive_app_shard_ingest:
-        Option<quil_engine::archive_ingest::ArchiveAppShardIngest>,
+        Option<Arc<std::sync::Mutex<quil_engine::archive_ingest::ArchiveAppShardIngest>>>,
     /// Explorer recent-message ring. `Some` only when the explorer service
     /// is enabled; every inbound gossip message is recorded for the
     /// `GET /messages` endpoint. `None` (the default) means no overhead.
     pub recent_messages: Option<Arc<quil_explorer::RecentMessageRing>>,
+}
+
+/// The engines a message on `bitmask` reaches as a submission: every engine
+/// whose application's submission topic it is. Every shard of an application
+/// shares that topic (a wallet knows only the application). Routed to the
+/// first matching engine only, each node gave a submission to one of its
+/// shards, so a bundle routed to any other shard was never proposed there
+/// (wallet-k16).
+fn submission_engines<'a, H>(bitmask: &[u8], entries: &'a [(Vec<u8>, H)]) -> Vec<&'a H> {
+    entries
+        .iter()
+        .filter(|(filter, _)| bitmask == quil_engine::bitmasks::app_prover_bitmask(filter).as_slice())
+        .map(|(_, handle)| handle)
+        .collect()
+}
+
+/// A shard-frame message no local engine takes.
+///
+/// ARCHIVE (no local shard engines): the app-shard ingest decodes and verifies
+/// it as a full AppShardFrame (non-frame messages fail decode and are
+/// ignored), stores it for serving once admitted, and materializes the
+/// shard's state. Nothing is stored before that check: an unverified store
+/// let one forged far-future frame pin the head the archive serves.
+///
+/// CLUSTER MASTER: a full app-shard frame the master received via
+/// `shard_frame_bitmask` gossip for a filter its REMOTE workers cover — no
+/// local engine handle and no archive ingest. Mirror it into the master clock
+/// store so the store-backed `AppShardService::get_app_shard_frame` serves it;
+/// without this, cluster reads hit an empty master store (thread-mode/local
+/// frames are mirrored by the worker drain). The filter is the frame header's
+/// `address`; the bitmask check confirms this really is a shard-frame message
+/// for it (and that non-frame mesh traffic is skipped). This mirror is not
+/// verified.
+fn unrouted_shard_message(
+    bitmask: &[u8],
+    data: &[u8],
+    clock_store: &dyn quil_types::store::ClockStore,
+    archive_ingest: Option<&dyn Fn(&[u8])>,
+) {
+    if let Some(ingest) = archive_ingest {
+        ingest(data);
+        return;
+    }
+    if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data) {
+        if let Some(addr) = frame.header.as_ref().map(|h| h.address.clone()) {
+            if !addr.is_empty() && bitmask == quil_engine::bitmasks::shard_frame_bitmask(&addr).as_slice() {
+                super::worker_manager::mirror_shard_frame_to_clock_store(clock_store, &addr, data);
+            }
+        }
+    }
+}
+
+/// An app-shard frame an archive fetched to fill a gap, fed back through the
+/// consensus loopback under the frame's own gossip topic, as if gossiped.
+pub(crate) fn gap_fetched_frame_message(filter: &[u8], data: Vec<u8>) -> quil_p2p::node::ReceivedMessage {
+    quil_p2p::node::ReceivedMessage {
+        bitmask: quil_engine::bitmasks::shard_frame_bitmask(filter),
+        data,
+        from: Vec::new(),
+    }
 }
 
 pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) {
@@ -109,6 +171,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         archive_app_shard_ingest,
         recent_messages: recent_messages_for_recv,
         cw_router: cw_router_for_recv,
+        global_finalization: global_finalization_for_recv,
     } = args;
     let mut archive_ingest_for_recv = archive_app_shard_ingest;
 
@@ -219,6 +282,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         loop {
             tokio::select! {
                 _ = status_timer.tick() => {
+                    if let Some(ingest) = archive_ingest_for_recv.as_ref() {
+                        ingest.lock().unwrap_or_else(|p| p.into_inner()).retry_pending();
+                    }
                     // Periodic allocation status snapshot.
                     let peer_count = p2p_for_recv.peer_count();
                     let latest_frame = clock_store_recv.get_latest_global_frame()
@@ -331,6 +397,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         app_engine_message_spillover = sizes.app_engine_message_spillover,
                         app_engine_proposal_cache = sizes.app_engine_proposal_cache,
                         app_engine_pending_certified_parents = sizes.app_engine_pending_certified_parents,
+                        // Pinned RocksDB views of live execution branches in
+                        // this process; each retains superseded versions on disk.
+                        execution_views_held = quil_forest::ExecutionViewAdmission::process().active(),
                         "memory snapshot"
                     );
                     // jemalloc allocator stats — PROCESS-GLOBAL, so this single
@@ -485,7 +554,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 continue;
                             }
 
-                            // Commonware-simplex cutover (P2c): when the simplex
+                            // Commonware-simplex routing: when the simplex
                             // router is wired (committee configured), a message on
                             // one of its channel bitmasks is fed to the engine and
                             // the legacy dispatch below is skipped. Off by default
@@ -565,6 +634,22 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         }
                                         if !info.peer_id.is_empty() {
                                             let mut cache = pic_for_recv.write();
+                                            let fingerprint = info.build_fingerprint();
+                                            let build_changed = cache.get(&info.peer_id).map(|old| {
+                                                old.build_fingerprint() != fingerprint
+                                                    || old.version != info.version
+                                                    || old.patch_number != info.patch_number
+                                            }).unwrap_or(true);
+                                            if build_changed {
+                                                info!(
+                                                    peer = %bs58::encode(&info.peer_id).into_string(),
+                                                    version = %quil_config::format_version(&info.version),
+                                                    patch = %hex::encode(&info.patch_number),
+                                                    build_fingerprint = %fingerprint.map(hex::encode).unwrap_or_else(|| "unavailable".into()),
+                                                    local_build_fingerprint = env!("QUIL_BUILD_FINGERPRINT"),
+                                                    "verified peer build identity"
+                                                );
+                                            }
                                             cache.insert(info.peer_id.clone(), info.clone());
                                         }
                                         // Only ARCHIVE-capable peers go into the
@@ -690,7 +775,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                         // from the persisted vertex store.
                                                         let mut registry =
                                                             quil_execution::InMemoryProverRegistry::new();
-                                                        registry.refresh(&store);
+                                                        registry.refresh(store.as_ref())?;
                                                         info!(
                                                             provers_visited = registry.provers_visited(),
                                                             allocations_visited = registry.allocations_visited(),
@@ -945,7 +1030,19 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             continue;
                                         }
 
-                                        match clock_store_recv.put_global_frame(&frame, None) {
+                                        // An archive with atomic finalization keeps the
+                                        // authenticated frame as a durable certified
+                                        // candidate; its worker publishes it together
+                                        // with the execution state.
+                                        let stored = if global_finalization_for_recv
+                                            .get()
+                                            .is_some_and(|pipeline| pipeline.offer_synced(&frame))
+                                        {
+                                            Ok(())
+                                        } else {
+                                            clock_store_recv.put_global_frame(&frame, None)
+                                        };
+                                        match stored {
                                             Ok(()) => {
                                                 frames_received += 1;
                                                 // `observe` / `fetch_max` never
@@ -978,17 +1075,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 //     and never wait for missing
                                                 //     predecessors — they're already past.
                                                 let frames_to_execute: Vec<(u64, quil_types::proto::global::GlobalFrame)> =
-                                                if archive_mode_recv {
-                                                    // Archives apply GLOBAL frame state ONLY through the
-                                                    // dedicated in-order materializer (frame_materializer +
-                                                    // the archive_sync consumer), which owns the durable
-                                                    // cursor and the frozen-era no-op gate. This gossip-
-                                                    // driven `process_global_frame_with_rewards` path is a
-                                                    // SECOND, ungated state applier: it double-applies
-                                                    // rewards/prover ops and — during the flag-day recovery —
-                                                    // executes frozen-era frames the materializer is
-                                                    // no-op'ing (the "invoke_step: prover/allocation not
-                                                    // found" storm). Never run it on archives.
+                                                if archive_mode_recv || (network_for_recv != 99
+                                                    && quil_types::consensus::committee_handoff_policy().is_some()) {
+                                                    // Archives have their serial materializer. Session-enabled
+                                                    // regulars follow authenticated GLOBAL snapshots: their local
+                                                    // shard metadata can lag a split/merge freeze, so replay
+                                                    // against it can accept a join the archive rejected and
+                                                    // permanently add noncanonical prover records. Neither
+                                                    // role may also execute GLOBAL state from gossip. Legacy
+                                                    // networks and standalone devnet retain inline execution.
                                                     Vec::new()
                                                 } else if let Some(ref reel) = time_reel_for_recv {
                                                     if let Err(e) = reel.insert(Arc::new(frame.clone())) {
@@ -1120,13 +1215,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                             let exec_epoch =
                                                                 quil_types::consensus::epoch_for_frame(exec_num);
                                                             if exec_epoch != last_committee_epoch {
-                                                                pr_for_recv.refresh_from_store(&hg_store_for_recv);
-                                                                last_committee_epoch = exec_epoch;
-                                                                debug!(
-                                                                    frame = exec_num,
-                                                                    epoch = exec_epoch,
-                                                                    "epoch boundary — refreshed prover registry"
-                                                                );
+                                                                match pr_for_recv.refresh_from_store(hg_store_for_recv.as_ref()) {
+                                                                    Ok(()) => {
+                                                                        last_committee_epoch = exec_epoch;
+                                                                        debug!(frame = exec_num, epoch = exec_epoch,
+                                                                            "epoch boundary — refreshed prover registry");
+                                                                    }
+                                                                    Err(error) => warn!(frame = exec_num, %error,
+                                                                        "prover registry refresh failed; will retry"),
+                                                                }
                                                             }
                                                             if !archive_mode_recv {
                                                                 if let Err(e) = wa_for_recv.on_new_frame(exec_num) {
@@ -1269,8 +1366,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         .map(|(f, h)| (f.clone(), h.clone()))
                                         .collect()
                                 };
-                                let mut routed = false;
-                                for (filter, handle) in &entries {
+                                // An application's submission topic is shared by
+                                // every shard of it: each of this node's engines
+                                // of that application gets the submission.
+                                let submitted = submission_engines(bm, &entries);
+                                for handle in &submitted {
+                                    handle.send(quil_engine::app_engine::AppEngineMessage::Prover(received.data.clone()));
+                                }
+                                let mut routed = !submitted.is_empty();
+                                for (filter, handle) in entries.iter().filter(|_| submitted.is_empty()) {
                                     if bm == quil_engine::bitmasks::shard_consensus_bitmask(filter).as_slice() {
                                         handle.send(quil_engine::app_engine::AppEngineMessage::Consensus(received.data.clone()));
                                         routed = true;
@@ -1281,17 +1385,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         routed = true;
                                         break;
                                     }
-                                    if bm == quil_engine::bitmasks::shard_prover_bitmask(filter).as_slice() {
-                                        handle.send(quil_engine::app_engine::AppEngineMessage::Prover(received.data.clone()));
-                                        routed = true;
-                                        break;
-                                    }
                                     if bm == quil_engine::bitmasks::shard_dispatch_bitmask(filter).as_slice() {
                                         handle.send(quil_engine::app_engine::AppEngineMessage::Dispatch(received.data.clone()));
                                         routed = true;
                                         break;
                                     }
-                                    // (P3) Commonware-simplex shard traffic. Split the
+                                    // Commonware-simplex shard traffic. Split the
                                     // channel out of the payload byte, and resolve the
                                     // gossip sender's peer id → its committee Falcon key
                                     // via PeerInfo (`CanonicalPeerInfo.public_key` is the
@@ -1311,6 +1410,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 .get(&received.from)
                                                 .map(|pi| pi.public_key.clone())
                                                 .unwrap_or_default();
+                                            tracing::debug!(filter = %hex::encode(filter), channel,
+                                                sender_known = !from_key.is_empty(), bytes = cw_bytes.len(),
+                                                "routing shard CW message to its engine");
                                             handle.send(quil_engine::app_engine::AppEngineMessage::CwIn {
                                                 channel,
                                                 from: from_key,
@@ -1322,43 +1424,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                     }
                                 }
                                 if !routed {
-                                    // CLUSTER MASTER: a full app-shard frame the master received
-                                    // via `shard_frame_bitmask` gossip for a filter its REMOTE
-                                    // workers cover — no local engine handle, and (on a prover)
-                                    // no archive ingest. Mirror it into the master clock store so
-                                    // the store-backed `AppShardService::get_app_shard_frame`
-                                    // serves it; without this, cluster reads hit an empty master
-                                    // store (thread-mode/local frames are mirrored by the worker
-                                    // drain, archive frames by `archive_ingest` below). The
-                                    // filter is the frame header's `address`; the bitmask check
-                                    // confirms this really is a shard-frame message for it (and
-                                    // that non-frame mesh traffic is skipped).
-                                    if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(
-                                        &received.data[..],
-                                    ) {
-                                        if let Some(addr) =
-                                            frame.header.as_ref().map(|h| h.address.clone())
-                                        {
-                                            if !addr.is_empty()
-                                                && bm == quil_engine::bitmasks::shard_frame_bitmask(&addr).as_slice()
-                                            {
-                                                super::worker_manager::mirror_shard_frame_to_clock_store(
-                                                    clock_store_recv.as_ref(),
-                                                    &addr,
-                                                    &received.data,
-                                                );
-                                            }
-                                        }
-                                    }
-                                    // Non-shard traffic (e.g. mesh relay) — no local
-                                    // handler. On an archive (no local shard engines),
-                                    // un-routed shard-frame traffic lands here: feed it to
-                                    // the app-shard ingest, which decodes/verifies it as a
-                                    // full AppShardFrame (non-frame messages fail decode and
-                                    // are ignored) and materializes the shard's state.
-                                    if let Some(ingest) = archive_ingest_for_recv.as_mut() {
-                                        ingest.ingest(&received.data);
-                                    }
+                                    let ingest = archive_ingest_for_recv.as_ref().map(|ingest| {
+                                        move |data: &[u8]| ingest.lock().unwrap_or_else(|p| p.into_inner()).ingest(data)
+                                    });
+                                    unrouted_shard_message(
+                                        bm,
+                                        &received.data,
+                                        clock_store_recv.as_ref(),
+                                        ingest.as_ref().map(|ingest| ingest as &dyn Fn(&[u8])),
+                                    );
                                 }
                             }
                             }
@@ -1381,4 +1455,62 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         );
         Ok(())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A submission reaches every engine of its application on this node, and
+    /// no engine of another application or topic.
+    #[test]
+    fn a_submission_reaches_every_shard_engine_of_its_application() {
+        let app = [0x11u8; 32];
+        let shard = |bits: &[bool]| quil_forest::encode_shard_bit_path(&app, bits);
+        let other = quil_forest::encode_shard_bit_path(&[0x22u8; 32], &[true]);
+        let entries = vec![(shard(&[false]), 1u8), (shard(&[true, false]), 2), (other.clone(), 3), (shard(&[true, true]), 4)];
+        let topic = quil_engine::bitmasks::app_prover_bitmask(&app);
+        assert_eq!(submission_engines(&topic, &entries), vec![&1, &2, &4]);
+        let own_frames = quil_engine::bitmasks::shard_frame_bitmask(&shard(&[false]));
+        assert!(submission_engines(&own_frames, &entries).is_empty(), "a per-shard topic is not a submission");
+        assert_eq!(submission_engines(&quil_engine::bitmasks::app_prover_bitmask(&other), &entries), vec![&3]);
+    }
+
+    /// A cluster master (no archive ingest) mirrors a frame on its shard's
+    /// frame topic for serving, and not a message on another topic. An archive
+    /// hands the frame to its ingest, which stores only what it verifies, and
+    /// stores nothing before that; a frame it fetched to fill a gap arrives
+    /// under the frame's own topic.
+    #[test]
+    fn only_a_cluster_master_mirrors_a_frame_unverified() {
+        use quil_types::store::ClockStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner().clone());
+        let filter = quil_forest::encode_shard_bit_path(&[0x33u8; 32], &[true, false]);
+        let frame = |number: u64| quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                address: filter.clone(),
+                frame_number: number,
+                output: vec![number as u8; 516],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let topic = quil_engine::bitmasks::shard_frame_bitmask(&filter);
+        unrouted_shard_message(&topic, &prost::Message::encode_to_vec(&frame(7)), &clock, None);
+        assert_eq!(clock.get_shard_clock_frame(&filter, 7, false).unwrap(), frame(7));
+        assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap(), frame(7));
+        unrouted_shard_message(&[], &prost::Message::encode_to_vec(&frame(8)), &clock, None);
+        assert!(clock.get_shard_clock_frame(&filter, 8, false).is_err(), "not a shard-frame message");
+
+        let handed = std::cell::RefCell::new(Vec::new());
+        let ingest = |data: &[u8]| handed.borrow_mut().push(data.to_vec());
+        let forged = prost::Message::encode_to_vec(&frame(u64::MAX / 2));
+        unrouted_shard_message(&topic, &forged, &clock, Some(&ingest));
+        assert_eq!(*handed.borrow(), vec![forged.clone()]);
+        assert!(clock.get_shard_clock_frame(&filter, u64::MAX / 2, false).is_err(), "not stored before verification");
+        assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap(), frame(7));
+        assert_eq!(gap_fetched_frame_message(&filter, forged).bitmask, topic);
+    }
 }

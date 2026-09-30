@@ -92,7 +92,7 @@ pub enum WorkerToMaster {
         core_id: u32,
         filter: Vec<u8>,
     },
-    /// (P3) An outbound commonware-simplex message for a shard's committee.
+    /// An outbound commonware-simplex message for a shard's committee.
     /// The master publishes it on `shard_cw_bitmask(filter)` with the channel
     /// tagged into the payload (`shard_cw_frame_payload(channel, bytes)`).
     CwConsensus {
@@ -159,7 +159,7 @@ pub struct WorkerConsensusDeps {
     /// testnet=1 (single-prover clusters still progress). See
     /// `AppLeaderProvider::min_active_provers_for_propose`.
     pub min_active_provers_for_propose: u64,
-    /// (P3) Drive app-shard consensus with commonware-simplex + Falcon.
+    /// Drive app-shard consensus with commonware-simplex + Falcon.
     pub app_consensus_cw: bool,
     /// DB config → persistent per-shard simplex-journal dir (Go parity).
     pub db_config: quil_config::DbConfig,
@@ -172,6 +172,9 @@ pub struct WorkerConsensusDeps {
     /// Hypergraph CRDT used to derive per-frame `state_roots` for the
     /// FrameHeader VDF challenge.
     pub hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// The master's committed shard topology, from which a retiring shard
+    /// drains (`AppEngineDeps::topology`).
+    pub topology: Option<Arc<dyn quil_types::store::ShardsStore>>,
     /// Execution engine for the per-message `Lock` calls that feed
     /// `requests_root`.
     pub execution_engine: Option<Arc<quil_execution::ExecutionEngineManager>>,
@@ -217,11 +220,17 @@ pub struct WorkerOwnedDeps {
     /// event is simply skipped. Mirrors the `worker_node.rs` (multi-process) path.
     pub shard_syncer:
         Option<Arc<dyn crate::prover_tree_syncer::ProverTreeSyncer>>,
-    /// (B) Unified-cutover consolidation hook bound to THIS worker's CRDT/store
+    /// Unified-cutover consolidation hook bound to THIS worker's CRDT/store
     /// (see `AppEngineDeps::unified_cutover_hook`). Built by the node
     /// (`worker_state_builder`); `None` skips consolidation (still flips).
     pub unified_cutover_hook:
         Option<Arc<dyn Fn(&[u8], u64) -> bool + Send + Sync>>,
+    /// Fetches certified frames of other shards, for the outputs this shard
+    /// owns but did not execute (see `AppEngineDeps::delivery_frame_source`).
+    pub delivery_frame_source: Option<crate::app_engine::DeliveryFrameSource>,
+    pub storage_history_source: Option<crate::storage_history::GlobalVertexProofSource>,
+    /// Archive source of a predecessor's outgoing records for successor checks.
+    pub outgoing_history_source: Option<crate::app_handoff::OutgoingHistorySource>,
 }
 
 /// Thread-based worker manager. Core 0 is reserved for the master;
@@ -417,6 +426,12 @@ impl ThreadWorkerManager {
                 rt.block_on(async move {
                     let mut current_filter: Vec<u8> = Vec::new();
                     let mut engine_cancel: Option<tokio_util::sync::CancellationToken> = None;
+                    // The last engine's mempool and its application. A split or
+                    // merge moves this worker to another shard of the same
+                    // application; submissions the retired shard held (it
+                    // drains before its flip) go on to the replacement's
+                    // engine instead of being dropped with the old engine.
+                    let mut retained_mempool: Option<(Vec<u8>, Arc<crate::message_collector::MessageCollector>)> = None;
 
                     // Per-worker memory tick. Each worker owns its own RocksDB
                     // (block cache + memtables + table readers) in this thread,
@@ -495,6 +510,18 @@ impl ThreadWorkerManager {
                                             let filter_clone = filter.clone();
                                             let deps = consensus_deps.clone();
                                             let owned = worker_owned.clone();
+                                            let application = filter[..filter.len().min(32)].to_vec();
+                                            let mempool = match retained_mempool.take() {
+                                                Some((retained_application, mempool)) if retained_application == application => {
+                                                    // The new engine numbers its views from the start.
+                                                    mempool.rebase_ranks();
+                                                    info!(core_id, pending = mempool.total_pending(),
+                                                        "carrying the previous shard's pending submissions to the new shard");
+                                                    mempool
+                                                }
+                                                _ => Arc::new(crate::message_collector::MessageCollector::new()),
+                                            };
+                                            retained_mempool = Some((application, mempool.clone()));
                                             // TODO
                                             tokio::spawn(async move {
                                                 info!(core_id, filter = hex::encode(&filter_clone), "app engine spawned");
@@ -526,6 +553,7 @@ impl ThreadWorkerManager {
                                                     // Create the AppConsensusEngine with full HotStuff integration
                                                     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
                                                     let engine_deps = crate::app_engine::AppEngineDeps {
+                                                        delivery_frame_source: owned.as_ref().and_then(|o| o.delivery_frame_source.clone()),
                                                         clock_store,
                                                         // Global anchor ALWAYS comes from the master's
                                                         // shared store (`deps.clock_store`), which the
@@ -534,9 +562,17 @@ impl ThreadWorkerManager {
                                                         // this shard's chain, so anchoring to it would give
                                                         // `anchor_gfn = 0` → legacy VDF path → no rewards.
                                                         global_anchor_store: Some(deps.clock_store.clone()),
+                                                        global_hypergraph: deps.hypergraph.clone(),
                                                         prover_registry: deps.prover_registry.clone(),
                                                         frame_prover: deps.frame_prover.clone(),
-                                                        message_collector: deps.message_collector.clone(),
+                                                        // Each shard keeps its own mempool. Shared with the
+                                                        // master's GLOBAL collector and every other shard on
+                                                        // the node, a submission was pruned by whichever
+                                                        // collection or GLOBAL finalization came first, and
+                                                        // ranks (each shard's views, GLOBAL's frames) had no
+                                                        // common meaning: routed bundles reached at most
+                                                        // one shard per node.
+                                                        message_collector: mempool,
                                                         fee_manager: deps.fee_manager.clone(),
                                                         local_prover_address: deps.local_prover_address.clone(),
                                                         local_bls_pubkey: deps.local_bls_pubkey.clone(),
@@ -555,12 +591,13 @@ impl ThreadWorkerManager {
                                                         // materialized app-frames, so attesting from it
                                                         // would find no coins.
                                                         storage_source_hypergraph: deps.hypergraph.clone(),
+                                                        topology: deps.topology.clone(),
                                                         execution_engine,
                                                         inclusion_prover,
                                                         kv_db,
                                                         app_consensus_cw: deps.app_consensus_cw,
                                                         db_config: deps.db_config.clone(),
-                                                        // (B) per-worker consolidation hook (bound to this
+                                                        // Per-worker consolidation hook (bound to this
                                                         // worker's CRDT/store by worker_state_builder).
                                                         unified_cutover_hook: owned
                                                             .as_ref()
@@ -571,6 +608,11 @@ impl ThreadWorkerManager {
                                                         filter_clone.clone(),
                                                         engine_deps,
                                                         event_tx,
+                                                    );
+                                                    let engine = engine.with_storage_history_source(
+                                                        owned.as_ref().and_then(|o| o.storage_history_source.clone()),
+                                                    ).with_outgoing_history_source(
+                                                        owned.as_ref().and_then(|o| o.outgoing_history_source.clone()),
                                                     );
 
                                                     // Tell the master a shard engine just came online.
@@ -693,107 +735,38 @@ impl ThreadWorkerManager {
                                                                 }
                                                                 crate::app_engine::AppEngineEvent::AncestorSyncRequested { filter, .. }
                                                                 | crate::app_engine::AppEngineEvent::ShardDataBootstrapRequested { filter } => {
-                                                                    // Step-4 app-shard catch-up OR a proactive join-time
-                                                                    // data bootstrap (ShardDataBootstrapRequested): both
-                                                                    // stage the covered shard's data via the same syncer —
-                                                                    // catch-up path pins to the shard clock head; a fresh
-                                                                    // joiner (no clock frame) takes the archive-anchor
-                                                                    // bootstrap branch below. Convergence loops back
-                                                                    // ShardSyncCompleted / ShardBootstrapCompleted, which
-                                                                    // un-gates the engine's propose/vote.
-                                                                    // The engine hit a
-                                                                    // frame gap gossip can't fill (deeply behind).
-                                                                    // Pull the shard's forest subtree from an archive
-                                                                    // (pinned to the latest finalized header's
-                                                                    // state_roots), then loopback ShardSyncCompleted
-                                                                    // so the engine fast-forwards its materialized
-                                                                    // cursor. Mirrors worker_node.rs; before this,
-                                                                    // thread-mode workers dropped the event and a
-                                                                    // deeply-behind node wedged permanently.
                                                                     let (Some(syncer), Some(clock)) =
                                                                         (sync_syncer.clone(), sync_clock.clone())
-                                                                    else {
-                                                                        // Shared-state mode / no syncer wired.
-                                                                        debug!(core_id, "AncestorSyncRequested: no shard syncer wired — skipping");
-                                                                        continue;
-                                                                    };
-                                                                    // One in-flight sync per worker.
-                                                                    if sync_in_progress.swap(
-                                                                        true,
-                                                                        std::sync::atomic::Ordering::SeqCst,
-                                                                    ) {
+                                                                    else { continue };
+                                                                    if sync_in_progress.swap(true, std::sync::atomic::Ordering::SeqCst) {
                                                                         continue;
                                                                     }
-                                                                    // Pin ALL FOUR phases to the latest finalized
-                                                                    // header's state_roots (audit #5). Those roots
-                                                                    // are the PRE-materialization state of frame L =
-                                                                    // POST of L-1, so a converged sync brings the
-                                                                    // tree to L-1.
-                                                                    let latest = clock
-                                                                        .get_latest_shard_clock_frame(&filter)
-                                                                        .ok()
-                                                                        .and_then(|f| f.header)
-                                                                        .map(|h| (h.frame_number, h.state_roots));
+                                                                    let local = match clock.get_latest_shard_clock_frame(&filter) {
+                                                                        Ok(frame) => Some(frame),
+                                                                        Err(quil_types::error::QuilError::NotFound(_)) => None,
+                                                                        Err(error) => {
+                                                                            warn!(filter = %hex::encode(&filter), %error, "cannot determine local shard lineage for sync");
+                                                                            sync_in_progress.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                            continue;
+                                                                        }
+                                                                    };
                                                                     let lb = loopback_handle.clone();
                                                                     let flag = sync_in_progress.clone();
-                                                                    let f = filter.clone();
-                                                                    tokio::spawn(async move {
-                                                                        match latest {
-                                                                            Some((pinned_frame, expected_roots)) => {
-                                                                                let synced_to_frame = pinned_frame.saturating_sub(1);
-                                                                                match syncer.sync_shard_tree(&f, &expected_roots).await {
-                                                                                    Ok(true) => {
-                                                                                        tracing::info!(filter = %hex::encode(&f), synced_to_frame, "app-shard catch-up sync converged");
-                                                                                        lb.send(crate::app_engine::AppEngineMessage::ShardSyncCompleted { synced_to_frame });
-                                                                                    }
-                                                                                    Ok(false) => tracing::warn!(filter = %hex::encode(&f), "app-shard catch-up sync did not converge"),
-                                                                                    Err(e) => tracing::warn!(filter = %hex::encode(&f), error = %e, "app-shard catch-up sync failed"),
-                                                                                }
-                                                                            }
-                                                                            None => {
-                                                                                let anchor = match syncer.get_app_shard_frame(&f, 0).await {
-                                                                                    Ok(Some(frame)) => frame,
-                                                                                    Ok(None) => {
-                                                                                        tracing::warn!(filter = %hex::encode(&f), "app-shard bootstrap: archive has no frame");
-                                                                                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                                                                                        return;
-                                                                                    }
-                                                                                    Err(e) => {
-                                                                                        tracing::warn!(filter = %hex::encode(&f), error = %e, "app-shard bootstrap: anchor fetch failed");
-                                                                                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                                                                                        return;
-                                                                                    }
-                                                                                };
-                                                                                let Some(header) = anchor.header.as_ref() else {
-                                                                                    tracing::warn!(filter = %hex::encode(&f), "app-shard bootstrap: archive anchor has no header");
-                                                                                    flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                                                                                    return;
-                                                                                };
-                                                                                let anchor_frame = header.frame_number;
-                                                                                let expected_roots = header.state_roots.clone();
-                                                                                let predecessor = if anchor_frame > 1 {
-                                                                                    match syncer.get_app_shard_frame(&f, anchor_frame - 1).await {
-                                                                                        Ok(frame) => frame,
-                                                                                        Err(e) => {
-                                                                                            tracing::warn!(filter = %hex::encode(&f), frame = anchor_frame, error = %e, "app-shard bootstrap: predecessor fetch failed");
-                                                                                            flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                                                                                            return;
-                                                                                        }
-                                                                                    }
-                                                                                } else {
-                                                                                    None
-                                                                                };
-                                                                                match syncer.sync_shard_tree(&f, &expected_roots).await {
-                                                                                    Ok(true) => {
-                                                                                        tracing::info!(filter = %hex::encode(&f), anchor_frame, "app-shard bootstrap tree sync converged");
-                                                                                        lb.send(crate::app_engine::AppEngineMessage::ShardBootstrapCompleted { anchor, predecessor });
-                                                                                    }
-                                                                                    Ok(false) => tracing::warn!(filter = %hex::encode(&f), "app-shard bootstrap tree sync did not converge"),
-                                                                                    Err(e) => tracing::warn!(filter = %hex::encode(&f), error = %e, "app-shard bootstrap tree sync failed"),
-                                                                                }
-                                                                            }
+                                                                    struct ReleaseSyncFlag(Arc<std::sync::atomic::AtomicBool>);
+                                                                    impl Drop for ReleaseSyncFlag {
+                                                                        fn drop(&mut self) {
+                                                                            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
                                                                         }
-                                                                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                    }
+                                                                    let release_sync = ReleaseSyncFlag(flag);
+                                                                    tokio::spawn(async move {
+                                                                        let _release_sync = release_sync;
+                                                                        match crate::prover_tree_syncer::recover_shard_from_latest(
+                                                                            syncer.as_ref(), &filter, local, &lb,
+                                                                        ).await {
+                                                                            Ok(progress) => info!(filter = %hex::encode(&filter), ?progress, "archive recovery batch complete"),
+                                                                            Err(error) => warn!(filter = %hex::encode(&filter), %error, "archive recovery failed; will retry"),
+                                                                        }
                                                                     });
                                                                 }
                                                                 _ => {
@@ -949,6 +922,11 @@ impl WorkerManager for ThreadWorkerManager {
         let owned_filter = filter.to_vec();
         self.mutate(core_id, move |w| {
             w.filter = owned_filter.clone();
+            // A worker running consensus is allocated. Left unset, the
+            // allocator's next pass took an Active allocation bound this way
+            // for a Joining→Active transition and restarted the engine it had
+            // just started, which can lose a finalized frame.
+            w.allocated = start_consensus && !owned_filter.is_empty();
             let _ = w.tx.try_send(MasterToWorker::Respawn {
                 filter: owned_filter,
                 start_consensus,
@@ -1105,7 +1083,7 @@ mod tests {
         assert!(!workers[0].allocated);
     }
 
-    // ---- master↔worker boundary coverage (2026-06-29) -----------------
+    // ---- master↔worker boundary coverage -----------------
     use quil_types::store::WorkerStore as _;
 
     /// In-memory `WorkerStore` for the persist-across-restart path.
@@ -1194,5 +1172,8 @@ mod tests {
         let workers = mgr.range_workers().unwrap();
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].filter, b"active-filter");
+        assert!(workers[0].allocated, "a worker running consensus is allocated");
+        mgr.set_worker_filter(1, b"joining-filter", false).unwrap();
+        assert!(!mgr.range_workers().unwrap()[0].allocated);
     }
 }

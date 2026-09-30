@@ -1,6 +1,6 @@
 //! On-boot, one-time UNIFIED_APP_TREE consolidation + the cutover-frame gate
-//! (Phase-2 `UNIFIED_APP_TREE_DESIGN.md` §9/§10, replacing the manual
-//! `--migrate-db` cutover with an automatic startup step).
+//! (replacing the manual `--migrate-db` cutover with an automatic startup
+//! step).
 //!
 //! Two decoupled concerns:
 //!  1. **Consolidation** — rebuild every SPLIT app's per-sub-shard trees into its
@@ -26,8 +26,8 @@ use tracing::{info, warn};
 /// consolidation a no-op.
 ///
 /// VERSIONED: bump the suffix whenever the consolidation LOGIC changes so every
-/// node re-runs the fold exactly once (idempotent — content-addressed JMT). v1→v2
-/// (2026-08-24): v1 enumerated apps only from the alt-shard index ∪ recent-commit
+/// node re-runs the fold exactly once (idempotent — content-addressed JMT). v1→v2:
+/// v1 enumerated apps only from the alt-shard index ∪ recent-commit
 /// window, which MISSED QUIL (historical, prover-only recent writes) → its unified
 /// app tree was left EMPTY and splits could never see data. v2 also enumerates the
 /// GRID (`range_app_shards`), folding QUIL in. Nodes stamped v1 must re-run, so the
@@ -43,7 +43,7 @@ pub fn is_consolidated(hg: &quil_store::RocksHypergraphStore) -> bool {
 /// prover-tree wipe/rebuild + unified flip) has run. Distinct from the
 /// consolidation marker so the reset is applied exactly once even on a DB that
 /// was only consolidated.
-const BOOT_RESET_MARKER_KEY: &[u8] = b"\x00__quil_boot_cutover_reset_v1__";
+const BOOT_RESET_MARKER_KEY: &[u8] = quil_engine::frame_maintenance::BOOT_RESET_MARKER_KEY;
 
 /// Whether the one-time boot cutover reset has already been applied — the
 /// frame-gated reset paths check this so they never re-apply on top of it.
@@ -55,7 +55,7 @@ pub fn boot_reset_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
 /// frame 740_000) has run on this node. DISTINCT from the v1 boot-reset marker so
 /// the v1 `boot_reset_applied` guard does not suppress v2, and so the v2 prover
 /// wipe runs exactly once (re-running would delete provers that re-joined after).
-const GRID_RESET_V2_MARKER_KEY: &[u8] = b"\x00__quil_grid_reset_v2__";
+const GRID_RESET_V2_MARKER_KEY: &[u8] = quil_engine::frame_maintenance::GRID_RESET_V2_MARKER_KEY;
 
 /// Whether the grid-reset v2 prover wipe has already run on this node.
 pub fn grid_reset_v2_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
@@ -72,7 +72,7 @@ pub fn mark_grid_reset_v2_applied(hg: &quil_store::RocksHypergraphStore) {
 /// Marker for prover-reset v3 (mainnet frame 747_000) — the complete tree
 /// wipe+reseed paired with the per-node worker-filter reset. DISTINCT from v1/v2
 /// so their guards don't suppress it and the v3 wipe runs exactly once.
-const PROVER_RESET_V3_MARKER_KEY: &[u8] = b"\x00__quil_prover_reset_v3__";
+const PROVER_RESET_V3_MARKER_KEY: &[u8] = quil_engine::frame_maintenance::PROVER_RESET_V3_MARKER_KEY;
 
 /// Whether the prover-reset v3 wipe has already run on this node.
 pub fn prover_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
@@ -107,7 +107,7 @@ pub fn mark_worker_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) {
 /// Marker for prover-reset v4 (mainnet frame 755_000) — the re-baseline after the
 /// boot-clobber (`normalize_quil_token_grid`) was removed. DISTINCT from v2/v3 so
 /// their guards don't suppress it and the v4 wipe runs exactly once.
-const PROVER_RESET_V4_MARKER_KEY: &[u8] = b"\x00__quil_prover_reset_v4__";
+const PROVER_RESET_V4_MARKER_KEY: &[u8] = quil_engine::frame_maintenance::PROVER_RESET_V4_MARKER_KEY;
 
 /// Whether the prover-reset v4 wipe has already run on this node.
 pub fn prover_reset_v4_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
@@ -125,7 +125,7 @@ pub fn mark_prover_reset_v4_applied(hg: &quil_store::RocksHypergraphStore) {
 /// old-binary fleet re-joined with post-v4 and re-baselines to sentinel now that
 /// every seeder is sentinel. DISTINCT from v2/v3/v4 so their guards don't
 /// suppress it and the v5 wipe runs exactly once.
-const PROVER_RESET_V5_MARKER_KEY: &[u8] = b"\x00__quil_prover_reset_v5__";
+const PROVER_RESET_V5_MARKER_KEY: &[u8] = quil_engine::frame_maintenance::PROVER_RESET_V5_MARKER_KEY;
 
 /// Whether the prover-reset v5 wipe has already run on this node.
 pub fn prover_reset_v5_applied(hg: &quil_store::RocksHypergraphStore) -> bool {

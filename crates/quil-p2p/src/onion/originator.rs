@@ -297,7 +297,7 @@ impl OnionOriginator {
     /// recovers it in cleartext.
     pub fn send_message(&self, entry_circ: u32, payload: &[u8]) -> Result<(), TransportError> {
         // Bound the payload so the layered cell can't overflow the u16 length
-        // prefix (F7). Larger messages must be chunked by the caller (not yet
+        // prefix. Larger messages must be chunked by the caller (not yet
         // implemented).
         if payload.len() > cell::MAX_ONION_PAYLOAD {
             return Err(TransportError::StreamClosed);
@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(got.lock().unwrap().clone().unwrap(), b"one hop");
     }
 
-    /// F7 regression: a payload that would overflow the u16 cell length prefix
+    /// Regression: a payload that would overflow the u16 cell length prefix
     /// (after layering) is rejected at the app boundary.
     #[tokio::test]
     async fn send_message_rejects_oversized_payload() {

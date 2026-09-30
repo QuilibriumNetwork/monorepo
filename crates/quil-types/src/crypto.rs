@@ -117,6 +117,16 @@ pub trait Multiproof: Send + Sync {
 
 /// KZG polynomial commitment-based inclusion prover.
 pub trait InclusionProver: Send + Sync {
+    /// Scheduling hint for full in-memory trie commits. Hash-based branch
+    /// commitments need coarse work to amortize Rayon overhead; expensive
+    /// provers can opt into parallel traversal at a smaller leaf count.
+    /// This affects scheduling only, never commitment contents.
+    fn commit_parallel_threshold(&self) -> usize { 256 }
+
+    /// Upper budget for independently scheduled trie subtrees. Expensive
+    /// commitment arithmetic can justify more work units for load balancing.
+    fn commit_parallel_budget(&self) -> usize { 8 }
+
     fn commit_raw(&self, data: &[u8], poly_size: u64) -> Result<Vec<u8>>;
     fn prove_raw(&self, data: &[u8], index: u64, poly_size: u64) -> Result<Vec<u8>>;
     fn verify_raw(
@@ -183,19 +193,15 @@ pub trait KeyManager: Send + Sync {
     ) -> Result<bool>;
 }
 
-/// VDF-based frame header prover.
+/// Frame header construction and global-chain VDF verification.
 pub trait FrameProver: Send + Sync {
     /// Build a new app-shard `FrameHeader` for `previous_frame_output`'s
-    /// successor. The VDF challenge is `sha3(address || frame_number ||
-    /// timestamp || difficulty || fee_multiplier_vote || parent ||
-    /// requests_root || state_roots... || prover || storage_attestation_root ||
-    /// global_frame_number)` where `parent = poseidon(previous_frame_output[:516])`.
-    /// Including timestamp + fee_multiplier ensures distinct ranks within the
-    /// same frame produce distinct VDF outputs and therefore distinct
-    /// identities. The trailing `storage_attestation_root` (committee digest
-    /// over the per-member proof-of-storage openings carried with the frame) and
-    /// `global_frame_number` (the global VDF beacon anchor) bind the storage
-    /// attestation into the VDF output so neither can be altered post-solve.
+    /// successor, with `parent = poseidon(previous_frame_output)`. An empty
+    /// predecessor uses a zero parent sentinel. App frames have no VDF:
+    /// leave `output` empty for the caller to fill with the deterministic digest
+    /// after setting the rank, storage attestation and relay fields. That digest
+    /// binds the header to the selected global storage beacon (or the zero-anchor
+    /// beacon before a global chain is available).
     fn prove_frame_header(
         &self,
         previous_frame_output: &[u8],
@@ -210,11 +216,6 @@ pub trait FrameProver: Send + Sync {
         storage_attestation_root: &[u8],
         global_frame_number: u64,
     ) -> Result<crate::proto::global::FrameHeader>;
-
-    fn verify_frame_header(
-        &self,
-        header: &crate::proto::global::FrameHeader,
-    ) -> Result<Vec<u8>>;
 
     /// Build a new `GlobalFrameHeader` for `previous_frame.frame_number + 1`.
     /// Mirrors Go's `WesolowskiFrameProver.ProveGlobalFrameHeader` at
@@ -235,6 +236,9 @@ pub trait FrameProver: Send + Sync {
         // `prover_root` (phase 0) and carried in `prover_tree_aux_roots`.
         prover_aux_roots: &[Vec<u8>],
         request_root: &[u8],
+        // Certified network world-state size as of the end of the parent
+        // frame; bound into the VDF challenge when non-zero.
+        world_state_size: u64,
         signer: &dyn Signer,
         timestamp: i64,
         difficulty: u32,

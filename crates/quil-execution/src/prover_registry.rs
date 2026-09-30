@@ -20,7 +20,7 @@
 //! filter → sorted `Vec<Vec<u8>>` and do a linear scan. Fine up to
 //! ~10 K provers per filter.
 //! 2. We iterate the persisted blob cache
-//! (`RocksHypergraphStore::for_each_vertex_underlying`), not a
+//! (a retained hypergraph-store snapshot), not a
 //! live hypergraph iterator.
 //! 3. No locking — the registry is rebuilt from scratch on each
 //! `refresh()` and is read-only after that. Concurrent readers can
@@ -31,6 +31,7 @@ use std::sync::{Arc, RwLock};
 
 use num_bigint::BigInt;
 use num_traits::{Num, Signed};
+#[cfg(test)]
 use quil_store::RocksHypergraphStore;
 use quil_tries::{deserialize_go_tree, VectorCommitmentNode};
 use quil_types::consensus::{
@@ -38,7 +39,12 @@ use quil_types::consensus::{
     ProverRegistry as ProverRegistryTrait, ProverShardSummary, ProverStatus,
 };
 use quil_types::error::{QuilError, Result as QuilResult};
-use quil_types::store::ShardKey;
+use quil_types::store::{HypergraphStore, ShardKey, SnapshotReadable, VertexPageLimits};
+
+#[path = "registry_budget.rs"]
+mod registry_budget;
+pub use registry_budget::{RegistryLimits, RegistryUsage};
+use registry_budget::{collect_legacy, RegistryBudget};
 
 /// BN254 scalar field modulus, same as `iden3-crypto/ff.Modulus()`.
 /// Used for the modular-distance sort that picks "next prover" order.
@@ -68,6 +74,7 @@ pub struct LeafRootRecord {
 }
 
 pub struct InMemoryProverRegistry {
+    resource_usage: RegistryUsage,
     /// prover_address (32 bytes) → full ProverInfo with allocations
     prover_cache: HashMap<Vec<u8>, ProverInfo>,
     /// (member_address, leaf_id) → registered leaf-root record. `leaf_id` is
@@ -103,6 +110,7 @@ impl Default for InMemoryProverRegistry {
 impl InMemoryProverRegistry {
     pub fn new() -> Self {
         Self {
+            resource_usage: RegistryUsage::default(),
             prover_cache: HashMap::new(),
             leaf_root_cache: HashMap::new(),
             filter_cache: HashMap::new(),
@@ -115,8 +123,9 @@ impl InMemoryProverRegistry {
         }
     }
 
-    /// Clear all state. Called from the start of `refresh`.
+    /// Clear all state explicitly. A failed refresh retains the previous cache.
     pub fn clear(&mut self) {
+        self.resource_usage = RegistryUsage::default();
         self.prover_cache.clear();
         self.leaf_root_cache.clear();
         self.filter_cache.clear();
@@ -152,8 +161,27 @@ impl InMemoryProverRegistry {
     /// `key = 64-byte location_id` and `value = the vertex sub-tree
     /// blob`. The commitment tree blob holds only topology + per-node
     /// commitments and is not consulted here.
-    pub fn refresh(&mut self, hg_store: &Arc<RocksHypergraphStore>) {
-        self.clear();
+    pub fn refresh(&mut self, hg_store: &dyn HypergraphStore) -> QuilResult<()> {
+        self.refresh_with_limits(hg_store, RegistryLimits::UNBOUNDED)
+    }
+
+    pub fn refresh_with_limits(&mut self, hg_store: &dyn HypergraphStore, limits: RegistryLimits) -> QuilResult<()> {
+        let snapshot = hg_store.capture_tree_snapshot()?.ok_or_else(|| {
+            QuilError::Store("prover registry requires a consistent store snapshot".into())
+        })?;
+        self.refresh_from_snapshot_with_limits(snapshot.as_ref(), limits)
+    }
+
+    /// Read additions, removals and the legacy fallback at one captured store
+    /// generation. Publish the replacement cache only after every read succeeds.
+    pub fn refresh_from_snapshot(&mut self, snapshot: &dyn SnapshotReadable) -> QuilResult<()> {
+        self.refresh_from_snapshot_with_limits(snapshot, RegistryLimits::UNBOUNDED)
+    }
+
+    /// Budgets cover both phases, retained serialized input and decoded cache
+    /// inserts. A failed refresh preserves the previous registry and usage.
+    pub fn refresh_from_snapshot_with_limits(&mut self, snapshot: &dyn SnapshotReadable, limits: RegistryLimits) -> QuilResult<()> {
+        let mut budget = RegistryBudget::new(limits)?;
         let shard = ShardKey {
             l1: [0u8; 3],
             l2: [0xffu8; 32],
@@ -165,9 +193,11 @@ impl InMemoryProverRegistry {
         // populates it too. One row per `(set, phase, shard, vk)` so
         // no dedup is required.
         let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let _ = hg_store.for_each_vertex_underlying("vertex", "adds", &shard, |vk, data| {
+        visit_registry_vertices(snapshot, "adds", &shard, limits.page(), |vk, data| {
+            budget.input(vk.len(), data.len(), true)?;
             leaves.push((vk, data));
-        });
+            Ok(())
+        })?;
 
         // Transitional bootstrap: stores from before the per-vertex
         // commit invariant have data only in the tree blob. Fall back
@@ -176,13 +206,12 @@ impl InMemoryProverRegistry {
         // empty cache. The next commit re-populates the per-vertex
         // range, after which this branch is a no-op.
         if leaves.is_empty() {
-            if let Ok(Some(blob)) = hg_store.load_tree_blob("vertex", "adds", &shard) {
-                if let Ok(Some(root)) = quil_tries::deserialize_tree(&blob) {
-                    let mut t = quil_tries::VectorCommitmentTree::new();
-                    t.root = Some(root);
-                    for (k, v) in t.leaves() {
-                        leaves.push((k, v));
-                    }
+            if let Some(blob) = snapshot.load_tree_blob("vertex", "adds", &shard)? {
+                budget.input(0, blob.len(), false)?;
+                if let Some(root) = quil_tries::deserialize_tree(&blob)
+                    .map_err(|e| QuilError::Store(format!("registry legacy tree: {e}")))?
+                {
+                    collect_legacy(&root, &mut leaves, &mut budget)?;
                 }
             }
         }
@@ -202,20 +231,34 @@ impl InMemoryProverRegistry {
         // delete).
         let mut removed_vks: std::collections::HashSet<Vec<u8>> =
             std::collections::HashSet::new();
-        let _ = hg_store.for_each_vertex_underlying("vertex", "removes", &shard, |vk, _data| {
+        visit_registry_vertices(snapshot, "removes", &shard, limits.page(), |vk, data| {
+            budget.input(vk.len(), data.len(), true)?;
             removed_vks.insert(vk);
-        });
+            Ok(())
+        })?;
         if !removed_vks.is_empty() {
             leaves.retain(|(vk, _)| !removed_vks.contains(vk));
         }
 
+        let mut replacement = Self::new();
+        replacement.decode_vertices(&leaves, &mut budget)?;
+        replacement.resource_usage = budget.usage;
+        *self = replacement;
+        Ok(())
+    }
+
+    fn decode_vertices(&mut self, leaves: &[(Vec<u8>, Vec<u8>)], budget: &mut RegistryBudget) -> QuilResult<()> {
         // Two-pass walk: first collect provers, then collect allocations.
         // The iterator order is arbitrary, so if we did it in one pass
         // we'd need to synthesize stubs when an allocation arrives
         // before its prover. Two passes are cleaner.
         //
-        // Pass 1: provers.
-        for (vk, data) in &leaves {
+        // Pass 1: provers. A retired prover (status left/kicked) gets no row
+        // of its own, but its public key is kept: a row synthesized for one
+        // of its allocations in pass 2 must still carry it. An empty key there
+        // made an authorized session member unattributable (a live halt).
+        let mut retired_keys: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        for (vk, data) in leaves {
             if vk.len() != 64 {
                 continue;
             }
@@ -231,7 +274,13 @@ impl InMemoryProverRegistry {
                 Some("prover:Prover") => {
                     self.prover_vertex_count += 1;
                     if let Some(info) = decode_prover(vk, &root) {
+                        budget.prover(&info)?;
                         self.prover_cache.insert(info.address.clone(), info);
+                    } else {
+                        let key = read_bytes(&root, "prover:Prover", "PublicKey");
+                        if !key.is_empty() {
+                            retired_keys.insert(vk[32..64].to_vec(), key);
+                        }
                     }
                 }
                 Some("reward:ProverReward") => {
@@ -239,7 +288,8 @@ impl InMemoryProverRegistry {
                 }
                 Some("leafroot:LeafRootRegistration") => {
                     self.leaf_root_vertex_count += 1;
-                    if let Some((key, rec)) = decode_leaf_root(&root) {
+                    for (key, rec) in decode_leaf_root(&root) {
+                        budget.leaf_root(&key, &rec)?;
                         self.leaf_root_cache.insert(key, rec);
                     }
                 }
@@ -254,7 +304,7 @@ impl InMemoryProverRegistry {
 
         // Pass 2: allocations. Needs provers already in cache so we
         // can attach allocations to the right owner.
-        for (vk, data) in &leaves {
+        for (vk, data) in leaves {
             if vk.len() != 64 {
                 continue;
             }
@@ -272,12 +322,13 @@ impl InMemoryProverRegistry {
             let Some((prover_ref, alloc)) = decode_allocation(vk, &root) else {
                 continue;
             };
+            budget.allocation(&prover_ref, &alloc)?;
             // Find or synthesize the parent prover.
             let prover_entry = self
                 .prover_cache
                 .entry(prover_ref.clone())
                 .or_insert_with(|| ProverInfo {
-                    public_key: Vec::new(),
+                    public_key: retired_keys.get(&prover_ref).cloned().unwrap_or_default(),
                     address: prover_ref.clone(),
                     status: ProverStatus::Unknown,
                     kick_frame_number: 0,
@@ -311,7 +362,10 @@ impl InMemoryProverRegistry {
                 }
             }
         }
+        Ok(())
     }
+
+    pub fn resource_usage(&self) -> RegistryUsage { self.resource_usage }
 
     // ------------------------------------------------------------------
     // Query API (mirrors `consensus.ProverRegistry` trait methods)
@@ -770,11 +824,9 @@ impl InMemoryProverRegistry {
 /// when they submitted the Leave. Counting them as Active would
 /// inflate every shard's live coverage by the number of stuck
 /// leaves, which hides real halt-risk shards from the proposer
-/// and coverage monitor. Observed in the wild 2026-06-05: 147
-/// halt-risk shards (active ≤ 3) on the network were invisible
-/// to a node that classified every one of them as ≥4 active
-/// because each had 1+ ExpiredLeaving allocations bumping the
-/// count.
+/// and coverage monitor: a halt-risk shard (active ≤ 3) with 1+
+/// ExpiredLeaving allocations would otherwise be classified as ≥4
+/// active.
 /// - `ExpiredJoining`, `Rejected`, `Kicked` → `None` (excluded)
 /// - `Unknown` → `None`
 ///
@@ -847,13 +899,73 @@ fn committee_eligible(alloc: &ProverAllocationInfo, frame_number: u64, lenient: 
 #[derive(Clone)]
 pub struct SharedProverRegistry {
     inner: Arc<RwLock<InMemoryProverRegistry>>,
+    execution_binding: Option<(quil_types::store::BackingStoreIdentity, RegistryLimits)>,
+}
+
+pub(crate) struct PreparedRegistryAdoption<'a> {
+    source: std::sync::RwLockWriteGuard<'a, InMemoryProverRegistry>,
+    incoming: std::sync::RwLockWriteGuard<'a, InMemoryProverRegistry>,
+    adopted: bool,
+}
+
+impl PreparedRegistryAdoption<'_> {
+    pub(crate) fn adopt(&mut self) {
+        if !self.adopted {
+            std::mem::swap(&mut *self.source, &mut *self.incoming);
+            self.adopted = true;
+        }
+    }
 }
 
 impl SharedProverRegistry {
+    pub(crate) fn prepare_adoption<'a>(
+        &'a self,
+        incoming: &'a Self,
+        overlay: &quil_types::store::BackingStoreIdentity,
+    ) -> QuilResult<PreparedRegistryAdoption<'a>> {
+        if self.shares_cache_with(incoming) || self.execution_binding.is_some()
+            || incoming.execution_binding.as_ref().map(|(identity, _)| identity) != Some(overlay)
+        {
+            return Err(QuilError::ExecutionUnavailable("registry publication binding mismatch".into()));
+        }
+        let source = self.inner.try_write().map_err(|_| QuilError::ExecutionUnavailable(
+            "canonical registry is busy or poisoned".into()))?;
+        let incoming = incoming.inner.try_write().map_err(|_| QuilError::ExecutionUnavailable(
+            "private registry is busy or poisoned".into()))?;
+        Ok(PreparedRegistryAdoption { source, incoming, adopted: false })
+    }
+    /// Identity only; this does not expose or clone the mutable cache.
+    pub fn shares_cache_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(InMemoryProverRegistry::new())),
+            execution_binding: None,
         }
+    }
+
+    /// Build an independent cache from one execution store. Future refreshes
+    /// and eviction writes must use that same branch and its original limits.
+    /// Clones of this value share only this branch's cache.
+    pub fn for_execution_store(store: &dyn HypergraphStore, limits: RegistryLimits) -> QuilResult<Self> {
+        let identity = store.backing_store_identity().ok_or_else(|| {
+            QuilError::ExecutionUnavailable("registry requires identifiable execution store".into())
+        })?;
+        let registry = Self {
+            inner: Arc::new(RwLock::new(InMemoryProverRegistry::new())),
+            execution_binding: Some((identity, limits)),
+        };
+        registry.refresh_from_store(store)?;
+        Ok(registry)
+    }
+
+    fn check_execution_store(&self, identity: Option<quil_types::store::BackingStoreIdentity>) -> QuilResult<()> {
+        if self.execution_binding.as_ref().is_some_and(|(expected, _)| identity.as_ref() != Some(expected)) {
+            return Err(QuilError::ExecutionUnavailable("registry execution store mismatch".into()));
+        }
+        Ok(())
     }
 
     /// Rebuild the cache from the given hypergraph store. Takes a
@@ -863,16 +975,26 @@ impl SharedProverRegistry {
     /// address matches `LOCAL_PROVER_ADDRESS`) or any of its allocations changes
     /// across a refresh, giving operators visibility into the join → confirm
     /// lifecycle (e.g. a freshly-materialized join appearing as `status=Joining`).
-    pub fn refresh_from_store(&self, hg_store: &Arc<RocksHypergraphStore>) {
-        // Snapshot the local prover BEFORE we take the write lock for
-        // the refresh; we'll snapshot again after and diff.
+    pub fn refresh_from_store(&self, hg_store: &dyn HypergraphStore) -> QuilResult<()> {
+        self.check_execution_store(hg_store.backing_store_identity())?;
+        if let Some((_, limits)) = self.execution_binding.as_ref() {
+            // Tentative state must not emit public local-prover lifecycle logs.
+            return self.inner.write()
+                .map_err(|_| QuilError::ExecutionUnavailable("registry lock poisoned".into()))?
+                .refresh_with_limits(hg_store, *limits)
+                .map_err(|error| QuilError::ExecutionUnavailable(format!("execution registry refresh: {error}")));
+        }
+        // Snapshot the local prover BEFORE taking the write lock for
+        // the refresh; it is snapshotted again after and diffed.
         let before = self.snapshot_local_prover();
         {
-            let mut guard = self.inner.write().expect("prover registry lock poisoned");
-            guard.refresh(hg_store);
+            let mut guard = self.inner.write()
+                .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+            guard.refresh(hg_store)?;
         }
         let after = self.snapshot_local_prover();
         log_local_prover_diff(before.as_ref(), after.as_ref());
+        Ok(())
     }
 
     /// Read the LOCAL prover's `ProverInfo` (if any), keyed by the
@@ -942,8 +1064,12 @@ impl SharedProverRegistry {
         inactivity_threshold: u64,
         shard_halt_durations: &HashMap<Vec<u8>, u64>,
         state: &crate::hypergraph_state::HypergraphState,
-        store: Option<&Arc<RocksHypergraphStore>>,
+        store: Option<&dyn HypergraphStore>,
     ) -> QuilResult<Vec<Vec<u8>>> {
+        self.check_execution_store(state.crdt().backing_store_identity())?;
+        if let Some(store) = store {
+            self.check_execution_store(store.backing_store_identity())?;
+        }
         // Read phase: find candidates AND capture each candidate's
         // allocation vertex addresses from the registry cache, under one
         // read lock. The registry knows every allocation's exact vertex
@@ -1020,7 +1146,7 @@ impl SharedProverRegistry {
                     vk.extend_from_slice(&global_app);
                     vk.extend_from_slice(addr);
                     return s
-                        .load_vertex_underlying("vertex", "adds", &global_shard, &vk)
+                        .load_vertex_underlying_raw("vertex", "adds", &global_shard, &vk)
                         .map_err(|e| {
                             QuilError::Internal(format!("evict: flat-store read: {e}"))
                         });
@@ -1309,6 +1435,7 @@ fn log_local_alloc_diff(prev: &ProverAllocationInfo, new: &ProverAllocationInfo)
 }
 
 impl ProverRegistryTrait for SharedProverRegistry {
+    fn as_any(&self) -> Option<&dyn std::any::Any> { Some(self) }
     fn get_prover_info(&self, address: &[u8]) -> QuilResult<Option<ProverInfo>> {
         Ok(self
             .inner
@@ -1455,6 +1582,41 @@ impl ProverRegistryTrait for SharedProverRegistry {
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/// Page the current vertices without retaining every historical MVCC blob.
+/// The caller owns the snapshot for the whole refresh. Page bounds do not bound
+/// the complete registry cache; an execution overlay additionally enforces its
+/// cumulative read budget and the branch owner must bound retained contexts.
+fn visit_registry_vertices(
+    snapshot: &dyn SnapshotReadable,
+    phase: &str,
+    shard: &ShardKey,
+    limits: VertexPageLimits,
+    mut visit: impl FnMut(Vec<u8>, Vec<u8>) -> QuilResult<()>,
+) -> QuilResult<()> {
+    let mut after = None;
+    loop {
+        let page = snapshot.page_vertex_underlying_fixed(
+            "vertex", phase, shard, &shard.l2, after.as_ref(), limits,
+        )?;
+        if page.has_more && page.entries.is_empty() {
+            return Err(QuilError::Store("registry page made no progress".into()));
+        }
+        for (address, blob) in page.entries {
+            if after.as_ref().is_some_and(|previous| address <= *previous) {
+                return Err(QuilError::Store("registry page is not strictly ordered".into()));
+            }
+            after = Some(address);
+            let mut key = Vec::with_capacity(64);
+            key.extend_from_slice(&shard.l2);
+            key.extend_from_slice(&address);
+            visit(key, blob)?;
+        }
+        if !page.has_more {
+            return Ok(());
+        }
+    }
+}
 
 /// Modular minimum distance on the BN254 field. Mirrors Go's
 /// `utils.AbsoluteModularMinimumDistance` exactly:
@@ -1616,16 +1778,38 @@ fn decode_allocation(
 /// come due at an epoch boundary (the 48s materialize spikes). This stays
 /// COMMITTED-state (deterministic — every node scans the identical tree) and
 /// MUST NOT be replaced by the async registry cache, which can differ across
-/// nodes and would diverge the prover tree (the fork `#1` halts on).
+/// nodes and would diverge the prover tree.
 pub struct CommittedProverScan {
     addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>>,
-    allocations: Vec<(Vec<u8>, ProverAllocationInfo)>,
+    pub(crate) allocations: Vec<(Vec<u8>, ProverAllocationInfo)>,
 }
 
 impl CommittedProverScan {
     /// One destructive pass over the committed global prover shard, collecting
     /// prover pubkeys (by address) and every allocation.
     pub fn scan(hg: &quil_hypergraph::HypergraphCrdt) -> Self {
+        Self::scan_inner(hg).0
+    }
+
+    /// A scan over explicit rows, for tests that drive GLOBAL without prover
+    /// records in its hypergraph.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn from_parts(
+        addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>>,
+        allocations: Vec<(Vec<u8>, ProverAllocationInfo)>,
+    ) -> Self {
+        Self { addr_to_pubkey, allocations }
+    }
+
+    /// Like [`Self::scan`], but a failed committed-state read is an error
+    /// instead of a shorter (possibly empty) prover set. Committee membership
+    /// and reassignment must not be decided from a partial scan.
+    pub fn try_scan(hg: &quil_hypergraph::HypergraphCrdt) -> quil_types::error::Result<Self> {
+        let (scan, outcome) = Self::scan_inner(hg);
+        outcome.map(|_| scan)
+    }
+
+    fn scan_inner(hg: &quil_hypergraph::HypergraphCrdt) -> (Self, quil_types::error::Result<usize>) {
         let shard = ShardKey {
             l1: [0u8; 3],
             l2: [0xffu8; 32],
@@ -1633,8 +1817,18 @@ impl CommittedProverScan {
         let mut addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut allocations: Vec<(Vec<u8>, ProverAllocationInfo)> = Vec::new();
 
+        // Tombstones first: `remove_vertex` leaves the "adds" blob in place, so
+        // an adds-only walk resurrects deleted records (the provers the split
+        // reset drops, the allocations the re-home drops). Committed state is
+        // `adds ∧ ¬removes`, as the registry and every committed read see it; a
+        // resurrected allocation would be reassigned and seated in committees.
+        let mut removed: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let removes = hg.for_each_vertex_underlying_shard("vertex", "removes", &shard, &mut |vk: Vec<u8>, _| {
+            removed.insert(vk);
+        });
+
         let mut cb = |vk: Vec<u8>, data: Vec<u8>| {
-            if vk.len() != 64 {
+            if vk.len() != 64 || removed.contains(&vk) {
                 return;
             }
             let root = match deserialize_go_tree(&data) {
@@ -1656,11 +1850,14 @@ impl CommittedProverScan {
                 }
             }
         };
-        let _ = hg.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut cb);
-        Self {
-            addr_to_pubkey,
-            allocations,
-        }
+        let adds = hg.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut cb);
+        (
+            Self {
+                addr_to_pubkey,
+                allocations,
+            },
+            removes.and(adds),
+        )
     }
 
     /// The `(public_key, prover_address)` active on `filter` at `frame_number`.
@@ -1671,6 +1868,28 @@ impl CommittedProverScan {
     /// epoch-boundary re-confirmers (effective-Active but not raw-Active), which
     /// is precisely the "2 of 4 not moved" bug: the split flips at an epoch
     /// boundary where some members are mid-re-confirm.
+    /// Every live allocation on `filter`, whatever its lifecycle stage. A
+    /// shard a split or merge removes cannot keep allocations: one left behind
+    /// (a Joining one, say) binds its worker to a shard that no longer exists
+    /// and keeps the committee scheduler creating sessions for it. Retired
+    /// (Historic) and Kicked slots are not allocations any more and stay where
+    /// they are: moving a retired slot would overwrite the live allocation at
+    /// its destination (a stale duplicate split did exactly that, live).
+    pub fn all_on_filter(&self, filter: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = self
+            .allocations
+            .iter()
+            .filter(|(_, alloc)| alloc.confirmation_filter == filter)
+            .filter(|(_, alloc)| !matches!(alloc.status, ProverStatus::Historic | ProverStatus::Kicked))
+            .filter_map(|(prover_ref, _)| {
+                self.addr_to_pubkey.get(prover_ref).map(|pubkey| (pubkey.clone(), prover_ref.clone()))
+            })
+            .collect();
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        out.dedup_by(|a, b| a.1 == b.1);
+        out
+    }
+
     pub fn active_on_filter(&self, filter: &[u8], frame_number: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
         let collect = |lenient: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
             let mut v: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -1941,24 +2160,42 @@ pub fn allocation_status_breakdown(
 /// prefix)`. Returns `None` if required fields are missing.
 fn decode_leaf_root(
     root: &VectorCommitmentNode,
-) -> Option<((Vec<u8>, Vec<u8>, u64), LeafRootRecord)> {
+) -> Vec<((Vec<u8>, Vec<u8>, u64), LeafRootRecord)> {
     let cls = "leafroot:LeafRootRegistration";
     let member = read_bytes(root, cls, "Member");
     let shard_filter = read_bytes(root, cls, "ShardFilter");
-    let leaf_root = read_bytes(root, cls, "LeafRoot");
-    if member.is_empty() || leaf_root.is_empty() {
-        return None;
+    if member.is_empty() {
+        return Vec::new();
     }
     let prefix_bytes = read_bytes(root, cls, "Prefix");
     let prefix = crate::global_intrinsic::materialize::unpack_prefix(&prefix_bytes);
     let leaf_id = crate::global_intrinsic::leaf_id_bytes(&shard_filter, &prefix);
-    let epoch = read_u64_be(root, cls, "Epoch");
-    let rec = LeafRootRecord {
-        leaf_root,
-        num_blocks: read_u64_be(root, cls, "NumBlocks"),
-        epoch,
-    };
-    Some(((member, leaf_id, epoch), rec))
+    // EVERY populated slot, not just the middle one. The registration vertex
+    // holds up to three epochs — `upsert_leaf_root_registration` assigns the
+    // highest to the `Next` slot, the one below to `Epoch`, the one below that
+    // to `Prev` — because a confirm in epoch E registers E+1 and the audit
+    // window reaches back to E-1. Caching only the `Epoch` slot left frame
+    // validation blind to the other two: a member whose only registration was
+    // the just-written E+1 had no entry at E, so every frame it produced in
+    // epoch E was rejected as "no registered leaf ... at epoch E" even though
+    // it had confirmed. `leaf_root_registration_for_epoch` already reads all
+    // three; this is the same record, read the same way.
+    [("PrevEpoch", "PrevLeafRoot", "PrevNumBlocks"),
+     ("Epoch", "LeafRoot", "NumBlocks"),
+     ("NextEpoch", "NextLeafRoot", "NextNumBlocks")]
+        .into_iter()
+        .filter_map(|(epoch_field, root_field, blocks_field)| {
+            let leaf_root = read_bytes(root, cls, root_field);
+            if leaf_root.is_empty() {
+                return None;
+            }
+            let epoch = read_u64_be(root, cls, epoch_field);
+            Some((
+                (member.clone(), leaf_id.clone(), epoch),
+                LeafRootRecord { leaf_root, num_blocks: read_u64_be(root, cls, blocks_field), epoch },
+            ))
+        })
+        .collect()
 }
 
 // =====================================================================
@@ -2019,7 +2256,9 @@ mod tests {
         let blob = vertex_tree_to_blob(&tree);
         let root = deserialize_go_tree(&blob).unwrap().unwrap();
 
-        let ((m, leaf_id, ep), rec) = super::decode_leaf_root(&root).expect("decode");
+        let decoded = super::decode_leaf_root(&root);
+        assert_eq!(decoded.len(), 1, "a one-slot registration decodes to one entry");
+        let ((m, leaf_id, ep), rec) = decoded.into_iter().next().unwrap();
         assert_eq!(ep, 19);
         assert_eq!(m, member.to_vec());
         assert_eq!(
@@ -2029,6 +2268,41 @@ mod tests {
         assert_eq!(rec.leaf_root, vec![0x11; 74]);
         assert_eq!(rec.num_blocks, 1234);
         assert_eq!(rec.epoch, 19);
+    }
+
+    /// A confirm in epoch E registers E+1, and the audit window reaches back
+    /// to E-1, so the vertex carries up to three epochs. Frame validation
+    /// reads this cache: if it holds only the middle slot, a member whose one
+    /// registration is E+1 has nothing at E and every frame it produces that
+    /// epoch is rejected though it confirmed.
+    #[test]
+    fn every_registered_epoch_slot_is_cached_not_just_the_middle_one() {
+        let member = [0x7Bu8; 32];
+        let filter = vec![0xEF; 32];
+        let prefix = vec![9u32];
+        // Three consecutive confirms: epochs 40, 41, 42.
+        let mut tree = None;
+        for (epoch, root_byte) in [(40u64, 0x40u8), (41, 0x41), (42, 0x42)] {
+            tree = Some(crate::global_intrinsic::materialize::upsert_leaf_root_registration(
+                tree.as_ref(), &member, &filter, &prefix, epoch, &vec![root_byte; 74], 8, 1000,
+            ).unwrap());
+        }
+        let blob = vertex_tree_to_blob(tree.as_ref().unwrap());
+        let root = deserialize_go_tree(&blob).unwrap().unwrap();
+        let mut reg = InMemoryProverRegistry::new();
+        for (key, recd) in super::decode_leaf_root(&root) {
+            reg.leaf_root_cache.insert(key, recd);
+        }
+        let leaf_id = crate::global_intrinsic::leaf_id_bytes(&filter, &prefix);
+        for (epoch, expected) in [(40u64, 0x40u8), (41, 0x41), (42, 0x42)] {
+            let got = reg.get_leaf_root(&member, &leaf_id, epoch)
+                .unwrap_or_else(|| panic!("epoch {epoch} must be cached"));
+            assert_eq!(got.leaf_root, vec![expected; 74], "epoch {epoch}");
+            assert_eq!(got.epoch, epoch);
+        }
+        // An epoch it never registered stays absent.
+        assert!(reg.get_leaf_root(&member, &leaf_id, 39).is_none());
+        assert!(reg.get_leaf_root(&member, &leaf_id, 43).is_none());
     }
 
     #[test]
@@ -2044,7 +2318,7 @@ mod tests {
         // Drive the same pass-1 dispatch refresh uses.
         let blob = vertex_tree_to_blob(&tree);
         let root = deserialize_go_tree(&blob).unwrap().unwrap();
-        if let Some((key, recd)) = super::decode_leaf_root(&root) {
+        for (key, recd) in super::decode_leaf_root(&root) {
             reg.leaf_root_cache.insert(key, recd);
         }
         let leaf_id = crate::global_intrinsic::leaf_id_bytes(&filter, &prefix);
@@ -2215,7 +2489,7 @@ mod tests {
             .unwrap();
 
         let shared = SharedProverRegistry::new();
-        shared.refresh_from_store(&store);
+        shared.refresh_from_store(store.as_ref()).unwrap();
 
         let leaf_id = leaf_id_bytes(&filter, &prefix);
         let got = shared.get_leaf_root(&member, &leaf_id, epoch).expect("registered");
@@ -2244,7 +2518,7 @@ mod tests {
         store.save_vertex_underlying("vertex", "adds", &shard, &vk, &bytes).unwrap();
 
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(&store);
+        reg.refresh(store.as_ref()).unwrap();
 
         assert_eq!(reg.provers_visited(), 1);
         assert_eq!(reg.distinct_provers(), 1);
@@ -2258,7 +2532,7 @@ mod tests {
 
     /// A kicked prover vertex (Status byte 4) is DROPPED from the registry —
     /// `map_prover_status(4) → None`. Eviction zeroes Seniority before encode;
-    /// the disambiguating `KickFrameNumber` is set. (Gap coverage 2026-06-28.)
+    /// the disambiguating `KickFrameNumber` is set.
     #[test]
     fn decode_prover_kicked_byte4_is_excluded() {
         let leaves = vec![
@@ -2276,7 +2550,7 @@ mod tests {
         store.save_vertex_underlying("vertex", "adds", &shard, &vk, &bytes).unwrap();
 
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(&store);
+        reg.refresh(store.as_ref()).unwrap();
         assert_eq!(reg.distinct_provers(), 0, "kicked prover (byte 4) excluded from cache");
         assert!(reg.get_prover_info(&[0x02; 32]).is_none());
     }
@@ -2319,7 +2593,7 @@ mod tests {
             .unwrap();
 
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(&store);
+        reg.refresh(store.as_ref()).unwrap();
 
         assert_eq!(reg.provers_visited(), 1);
         assert_eq!(reg.allocations_visited(), 1);
@@ -2433,6 +2707,17 @@ mod tests {
         // Enumerating A's filter fa[0] proves the allocation seeded at
         // allocation_address(pk_a, fa[0]) was read — i.e. the reset's drop, which
         // recomputes that same address, targets exactly the vertex that exists.
+
+        // A tombstoned allocation is gone from committed state: the scan that
+        // reassigns allocations and seats committees must not resurrect it.
+        let scan = CommittedProverScan::try_scan(&crdt).unwrap();
+        assert_eq!(scan.all_on_filter(&fb[0]), vec![(pk_b.clone(), addr_b.clone())]);
+        let mut removed = vec![0xFFu8; 32];
+        removed.extend_from_slice(&allocation_address(&pk_b, &fb[0]).unwrap());
+        store.save_vertex_underlying("vertex", "removes", &shard, &removed, b"removed").unwrap();
+        let scan = CommittedProverScan::try_scan(&crdt).unwrap();
+        assert!(scan.all_on_filter(&fb[0]).is_empty(), "a removed allocation stays removed");
+        assert_eq!(scan.all_on_filter(&fa[0]), vec![(pk_a.clone(), addr_a.clone())]);
     }
 
     #[test]
@@ -2451,7 +2736,7 @@ mod tests {
             .unwrap();
 
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(&store);
+        reg.refresh(store.as_ref()).unwrap();
 
         assert_eq!(reg.rewards_visited(), 1);
         assert_eq!(reg.provers_visited(), 0);
@@ -2530,7 +2815,7 @@ mod tests {
         }
 
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(&store);
+        reg.refresh(store.as_ref()).unwrap();
         assert_eq!(reg.distinct_provers(), 4);
 
         // Query from the zero vector. The closest should be addr[0]
@@ -2580,7 +2865,7 @@ mod tests {
         store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x79), &alloc_b).unwrap();
 
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(&store);
+        reg.refresh(store.as_ref()).unwrap();
 
         // Touch activity only for filter_a.
         let touched = reg.update_prover_activity(&prover_addr, &filter_a, 9999);
@@ -2666,7 +2951,7 @@ mod tests {
         top_up_shard_quorum(&store, &shard, &filter_halted, frame, 1, 0xF0);
 
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(&store);
+        reg.refresh(store.as_ref()).unwrap();
 
         // Frame is past the inactivity start; last_active (100) predates
         // it, so inactivity counts from EVICTION_INACTIVITY_START_FRAME:
@@ -2722,7 +3007,7 @@ mod tests {
                 store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x90 + i), &alloc).unwrap();
             }
             let mut reg = InMemoryProverRegistry::new();
-            reg.refresh(&store);
+            reg.refresh(store.as_ref()).unwrap();
             let halts: HashMap<Vec<u8>, u64> = HashMap::new();
             reg.find_eviction_candidates(frame, 500, &halts)
         };
@@ -2792,7 +3077,7 @@ mod tests {
                 store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xA0 + i), &alloc).unwrap();
             }
             let mut reg = InMemoryProverRegistry::new();
-            reg.refresh(&store);
+            reg.refresh(store.as_ref()).unwrap();
             let halts: HashMap<Vec<u8>, u64> = HashMap::new();
             reg.find_eviction_candidates(frame, 500, &halts)
         };
@@ -2861,7 +3146,7 @@ mod tests {
         store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xB1), &mk_alloc(&b, confirm_frame)).unwrap();
 
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(&store);
+        reg.refresh(store.as_ref()).unwrap();
 
         let committee = |frame: u64| -> Vec<Vec<u8>> {
             let mut v: Vec<Vec<u8>> = reg
@@ -2925,7 +3210,7 @@ mod tests {
         store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xA4), &mk_alloc(&prover_b, 0)).unwrap(); // Joining
 
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(&store);
+        reg.refresh(store.as_ref()).unwrap();
 
         let summaries = reg.get_prover_shard_summaries(0);
         assert_eq!(summaries.len(), 1);
@@ -2962,7 +3247,7 @@ mod tests {
         store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xF1), &alloc_bytes).unwrap();
 
         let shared = SharedProverRegistry::new();
-        shared.refresh_from_store(&store);
+        shared.refresh_from_store(store.as_ref()).unwrap();
 
         let trait_obj: &dyn ProverRegistryTrait = &shared;
 
@@ -3049,7 +3334,7 @@ mod tests {
         top_up_shard_quorum(&store, &shard, &filter, frame, 1, 0xE0);
 
         let shared = SharedProverRegistry::new();
-        shared.refresh_from_store(&store);
+        shared.refresh_from_store(store.as_ref()).unwrap();
 
         // Build a HypergraphState over an in-memory CRDT and seed the
         // prover vertex via state.set so evict can read+write it.
@@ -3133,7 +3418,7 @@ mod tests {
         top_up_shard_quorum(&store, &shard, &filter, frame, 1, 0xE0);
 
         let shared = SharedProverRegistry::new();
-        shared.refresh_from_store(&store);
+        shared.refresh_from_store(store.as_ref()).unwrap();
 
         // The CRDT is EMPTY — the synced vertices are absent (the seam).
         let crdt = Arc::new(HypergraphCrdt::new(
@@ -3144,7 +3429,7 @@ mod tests {
         let halts: HashMap<Vec<u8>, u64> = HashMap::new();
 
         // store = None → CRDT miss → nothing kicked (reproduces the bug).
-        let none: Option<&Arc<RocksHypergraphStore>> = None;
+        let none: Option<&dyn HypergraphStore> = None;
         let evicted_none = shared
             .evict_inactive_provers(frame, 500, &halts, &state, none)
             .unwrap();
@@ -3155,7 +3440,7 @@ mod tests {
 
         // store = Some → fallback reads from the flat keyspace → kicked.
         let evicted = shared
-            .evict_inactive_provers(frame, 500, &halts, &state, Some(&store))
+            .evict_inactive_provers(frame, 500, &halts, &state, Some(store.as_ref()))
             .unwrap();
         assert_eq!(
             evicted,
@@ -3205,7 +3490,7 @@ mod tests {
         store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x72), &alloc).unwrap();
 
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(&store);
+        reg.refresh(store.as_ref()).unwrap();
 
         let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900;
         let halts: HashMap<Vec<u8>, u64> = HashMap::new();
@@ -3260,7 +3545,7 @@ mod tests {
         );
 
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(&store);
+        reg.refresh(store.as_ref()).unwrap();
         // Confirm it's an Unknown stub.
         let info = reg.get_prover_info(&prover_addr).expect("stub synthesized");
         assert_eq!(info.status, ProverStatus::Unknown);
@@ -3317,7 +3602,7 @@ mod tests {
         }
 
         let shared = SharedProverRegistry::new();
-        shared.refresh_from_store(&store);
+        shared.refresh_from_store(store.as_ref()).unwrap();
         let crdt = Arc::new(HypergraphCrdt::new(
             Arc::new(MemStore::new()),
             Arc::new(NoopInclusionProver),
@@ -3326,7 +3611,7 @@ mod tests {
         let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900;
         let halts: HashMap<Vec<u8>, u64> = HashMap::new();
         let evicted = shared
-            .evict_inactive_provers(frame, 500, &halts, &state, Some(&store))
+            .evict_inactive_provers(frame, 500, &halts, &state, Some(store.as_ref()))
             .unwrap();
         assert_eq!(evicted.len(), 25, "must cap evictions at EVICTION_MAX_PER_FRAME per call");
     }
@@ -3351,12 +3636,46 @@ mod tests {
             .unwrap();
 
         let mut reg = InMemoryProverRegistry::new();
-        reg.refresh(&store);
+        reg.refresh(store.as_ref()).unwrap();
 
         let got = reg.get_prover_info(&prover_addr).expect("orphan synthesized");
         assert!(got.public_key.is_empty());
         assert_eq!(got.allocations.len(), 1);
         assert_eq!(got.allocations[0].status, ProverStatus::Joining);
+    }
+
+    #[test]
+    fn a_retired_provers_live_allocation_keeps_its_key() {
+        // Before provers' status was derived from all allocations, rejecting
+        // one join marked a prover with an active session allocation as left.
+        // The row synthesized for that allocation had an empty key, which
+        // halted the global chain. The row stays a stub (Unknown), but it must
+        // carry the key the prover vertex still records.
+        let prover_addr = [0x45u8; 32];
+        let key = vec![0xE1u8; 897];
+        let prover_bytes = build_sub_tree(vec![
+            type_hash_leaf("prover:Prover"),
+            field_leaf("prover:Prover", "PublicKey", key.clone()),
+            field_leaf("prover:Prover", "Status", vec![4u8]),
+        ]);
+        let alloc_bytes = build_sub_tree(vec![
+            type_hash_leaf("allocation:ProverAllocation"),
+            field_leaf("allocation:ProverAllocation", "Prover", prover_addr.to_vec()),
+            field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+            field_leaf("allocation:ProverAllocation", "ConfirmationFilter", vec![0xDE; 64]),
+        ]);
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x45), &prover_bytes).unwrap();
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x46), &alloc_bytes).unwrap();
+
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(store.as_ref()).unwrap();
+
+        let got = reg.get_prover_info(&prover_addr).expect("row for the live allocation");
+        assert_eq!(got.public_key, key);
+        assert_eq!(got.status, ProverStatus::Unknown);
+        assert_eq!(got.allocations.len(), 1);
     }
 
     /// End-to-end lifecycle invariant: 100 provers, each in one of
@@ -3689,9 +4008,9 @@ mod tests {
         }
 
         // Refresh the in-memory registry from the per-vertex store
-        // (the canonical source after Phases 1-3).
+        // (the canonical source).
         let shared = SharedProverRegistry::new();
-        shared.refresh_from_store(&store);
+        shared.refresh_from_store(store.as_ref()).unwrap();
 
         // Query the live-allocation view.
         let summaries = shared
@@ -3729,4 +4048,7 @@ mod tests {
              ExpiredLeaving, Kicked × 10 each)"
         );
     }
+
+    include!("prover_registry_storage_tests.rs");
+
 }

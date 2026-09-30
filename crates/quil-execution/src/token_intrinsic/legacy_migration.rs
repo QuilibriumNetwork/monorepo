@@ -10,14 +10,74 @@
 //! consensus-safe.
 //!
 //! A transparent coin can then be **one-way shielded** into a lattice private
-//! coin with its Ed448 owner signature ([`super::lattice_ct::verify_lattice_shield`]).
+//! coin with its Ed448 owner signature through the QCT3 shield adapter.
 //! The verenc machinery runs only here, reading old coins — never for new value.
 
 use num_bigint::BigInt;
 use quil_tries::VectorCommitmentTree;
 use quil_types::error::{QuilError, Result};
 
-use super::pending::{decrypt_single_verenc, PUBLIC_READ_KEY};
+/// Public-read key for the pre-2.1 VerEnc coin fields. Matches Go
+/// `token_intrinsic_transaction.go:33`:
+/// `2cf07ca8d9ab1a4bb0902e25a9b90759dd54d881f54d52a76a17e79bf0361c325650f12746e4337ffb5940e7665ad7bf83f44af98d964bbe`.
+pub(crate) const PUBLIC_READ_KEY: [u8; 56] = [
+    0x2c, 0xf0, 0x7c, 0xa8, 0xd9, 0xab, 0x1a, 0x4b,
+    0xb0, 0x90, 0x2e, 0x25, 0xa9, 0xb9, 0x07, 0x59,
+    0xdd, 0x54, 0xd8, 0x81, 0xf5, 0x4d, 0x52, 0xa7,
+    0x6a, 0x17, 0xe7, 0x9b, 0xf0, 0x36, 0x1c, 0x32,
+    0x56, 0x50, 0xf1, 0x27, 0x46, 0xe4, 0x33, 0x7f,
+    0xfb, 0x59, 0x40, 0xe7, 0x66, 0x5a, 0xd7, 0xbf,
+    0x83, 0xf4, 0x4a, 0xf9, 0x8d, 0x96, 0x4b, 0xbe,
+];
+
+
+// =====================================================================
+// Legacy verenc decryption (migration only — decodes pre-2.1 coins into
+// transparent entries; NOT a spend path)
+// =====================================================================
+
+/// Parse a 621-byte `MPCitHVerEnc` blob (Go
+/// `MPCitHVerEncFromBytes`, `verenc/verifiable_encryption.go:139`) and
+/// build the `VerencDecrypt` payload expected by `verenc_recover`.
+fn parse_mpcith_verenc(bytes: &[u8], decryption_key: &[u8]) -> Option<verenc::VerencDecrypt> {
+    if bytes.len() != 621 {
+        return None;
+    }
+    let mut ctexts = Vec::with_capacity(3);
+    for i in 0..3 {
+        let base = i * (57 + 56);
+        ctexts.push(verenc::VerencCiphertext {
+            c1: bytes[base..base + 57].to_vec(),
+            c2: bytes[base + 57..base + 57 + 56].to_vec(),
+            i: 0,
+        });
+    }
+    let mut aux = Vec::with_capacity(3);
+    for i in 0..3 {
+        let base = 339 + i * 56;
+        aux.push(bytes[base..base + 56].to_vec());
+    }
+    Some(verenc::VerencDecrypt {
+        blinding_pubkey: bytes[507..564].to_vec(),
+        decryption_key: decryption_key.to_vec(),
+        statement: bytes[564..621].to_vec(),
+        ciphertexts: verenc::CompressedCiphertext { ctexts, aux },
+    })
+}
+
+/// Decrypt a single 621-byte VerEnc blob with the supplied decryption
+/// key and return the combined plaintext bytes. Matches Go
+/// `MPCitHVerifiableEncryptor.Decrypt` with a one-element input list.
+pub(crate) fn decrypt_single_verenc(bytes: &[u8], decryption_key: &[u8]) -> Option<Vec<u8>> {
+    let d = parse_mpcith_verenc(bytes, decryption_key)?;
+    let chunk = verenc::verenc_recover(d);
+    if chunk.is_empty() {
+        return None;
+    }
+    Some(verenc::combine_chunked_data(vec![chunk]))
+}
+
+
 
 /// The decrypted legacy coin: its Ed448-derived owner address and public amount.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,7 +303,7 @@ fn migrate_one(
     vertex_key: &[u8],
     blob: &[u8],
 ) -> Result<Option<(u128, [quil_store::VertexWrite; 2])>> {
-    use super::shadow_accumulator::ACC_ROOT_ADDRESS;
+    use super::constants::LEGACY_ACCUMULATOR_ROOT_ADDRESS as ACC_ROOT_ADDRESS;
     if vertex_key.len() < 64 {
         return Ok(None);
     }
@@ -306,12 +366,13 @@ pub fn read_migration_receipt(
 ) -> Result<Option<(u64, u128)>> {
     let disc = crate::hypergraph_state::vertex_adds_discriminator()?;
     match state.get(domain, &MIGRATION_RECEIPT_ADDRESS, &disc)? {
-        Some(rec) if rec.len() >= 24 => {
+        Some(rec) if rec.len() == 24 => {
             let count = u64::from_be_bytes(rec[0..8].try_into().unwrap());
             let total = u128::from_be_bytes(rec[8..24].try_into().unwrap());
             Ok(Some((count, total)))
         }
-        _ => Ok(None),
+        Some(_) => Err(QuilError::InvalidArgument("malformed migration receipt".into())),
+        None => Ok(None),
     }
 }
 
@@ -346,12 +407,13 @@ pub fn read_migration_receipt_raw(
     let mut vk = domain.to_vec();
     vk.extend_from_slice(&MIGRATION_RECEIPT_ADDRESS);
     match store.load_vertex_underlying("vertex", "adds", &shard, &vk)? {
-        Some(rec) if rec.len() >= 24 => {
+        Some(rec) if rec.len() == 24 => {
             let count = u64::from_be_bytes(rec[0..8].try_into().unwrap());
             let total = u128::from_be_bytes(rec[8..24].try_into().unwrap());
             Ok(Some((count, total)))
         }
-        _ => Ok(None),
+        Some(_) => Err(QuilError::InvalidArgument("malformed migration receipt".into())),
+        None => Ok(None),
     }
 }
 
@@ -392,7 +454,7 @@ pub fn sum_transparent_coins(
     store: &quil_store::RocksHypergraphStore,
     domain: &[u8],
 ) -> Result<(u64, u128)> {
-    use super::shadow_accumulator::ACC_ROOT_ADDRESS;
+    use super::constants::LEGACY_ACCUMULATOR_ROOT_ADDRESS as ACC_ROOT_ADDRESS;
     let th = transparent_type_hash(domain)?;
     let shard = coin_domain_shard(domain);
     let (mut count, mut total) = (0u64, 0u128);
@@ -418,13 +480,21 @@ pub fn sum_transparent_coins(
         let tree = VectorCommitmentTree { root };
         // Count only transparent coins (type leaf == transparent type hash).
         if tree.get(&[0xFFu8; 32]).map(|t| t == th.as_slice()).unwrap_or(false) {
-            if let Some(a) = tree.get(&[1u8 << 2]) {
-                let mut b = [0u8; 16];
-                let n = a.len().min(16);
-                b[..n].copy_from_slice(&a[..n]);
-                total = total.wrapping_add(u128::from_le_bytes(b));
-                count += 1;
-            }
+            let Some(a) = tree.get(&[1u8 << 2]).filter(|a| a.len() == 16) else {
+                scan_err = Some(QuilError::InvalidArgument("transparent coin amount must be 16 bytes".into()));
+                return;
+            };
+            let amount = u128::from_le_bytes(a.try_into().unwrap());
+            let Some(next_total) = total.checked_add(amount) else {
+                scan_err = Some(QuilError::InvalidArgument("transparent coin total overflows u128".into()));
+                return;
+            };
+            let Some(next_count) = count.checked_add(1) else {
+                scan_err = Some(QuilError::InvalidArgument("transparent coin count overflows u64".into()));
+                return;
+            };
+            total = next_total;
+            count = next_count;
         }
     })?;
     if let Some(e) = scan_err {
@@ -488,7 +558,7 @@ fn rescale_one(
     vertex_key: &[u8],
     blob: &[u8],
 ) -> Result<Option<(u128, [quil_store::VertexWrite; 2])>> {
-    use super::shadow_accumulator::ACC_ROOT_ADDRESS;
+    use super::constants::LEGACY_ACCUMULATOR_ROOT_ADDRESS as ACC_ROOT_ADDRESS;
     if vertex_key.len() < 64 {
         return Ok(None);
     }

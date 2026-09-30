@@ -95,7 +95,7 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
         request: Some(Request::HypergraphUpdate(signed)),
         timestamp: 0,
     };
-    crate::send::send_message_request(&mut client, &dc.key_manager, domain, request).await?;
+    dc.send_paid(&mut client, &domain, request).await?;
     println!("Hypergraph update submitted successfully");
     Ok(())
 }

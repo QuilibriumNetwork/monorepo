@@ -15,9 +15,7 @@ use tracing::{debug, info, warn};
 use quil_types::consensus::{ProverRegistry, ProverStatus};
 use quil_types::error::Result;
 
-use crate::worker::WorkerManager;
-#[cfg(test)]
-use crate::worker::WorkerInfo;
+use crate::worker::{WorkerInfo, WorkerManager};
 
 // =====================================================================
 // Config-driven static filter pinning
@@ -420,9 +418,28 @@ pub struct WorkerAllocator {
     /// (processed once, monotonic) and the clear is idempotent — unlike the
     /// prover-TREE reseed, re-clearing auto filters has no harmful effect.
     worker_reset_v3_done: std::sync::atomic::AtomicBool,
+    /// Authenticated GLOBAL state, for committee-session retention: a worker
+    /// whose committee session is closing stays bound until its terminal seal
+    /// is recorded, whatever the registry says about the allocation meanwhile.
+    /// The closing committee needs its quorum to finalize that seal.
+    session_authority: RwLock<Option<Arc<quil_hypergraph::HypergraphCrdt>>>,
 }
 
 impl WorkerAllocator {
+    /// Free a worker, unless its committee session is still closing.
+    fn release_worker(&self, worker: &WorkerInfo, retained: bool) -> Result<()> {
+        if retained {
+            debug!(core_id = worker.core_id, filter = hex::encode(&worker.filter),
+                "committee session still counts this member; worker stays bound until its seal is recorded");
+            return Ok(());
+        }
+        self.worker_manager.deallocate_worker(worker.core_id)
+    }
+
+    pub fn set_session_authority(&self, global: Arc<quil_hypergraph::HypergraphCrdt>) {
+        *self.session_authority.write().unwrap_or_else(|e| e.into_inner()) = Some(global);
+    }
+
     pub fn new(
         worker_manager: Arc<dyn WorkerManager>,
         prover_registry: Arc<dyn ProverRegistry>,
@@ -442,6 +459,7 @@ impl WorkerAllocator {
                 crate::provers::lifecycle::DEFAULT_CONFIRM_WINDOW_FRAMES,
             ),
             allocation_priority: RwLock::new(None),
+            session_authority: RwLock::new(None),
             last_rebind_frame: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome_frame: std::sync::atomic::AtomicU64::new(0),
@@ -699,7 +717,17 @@ impl WorkerAllocator {
                     && !bound_filters.contains(&a.confirmation_filter)
             });
 
+        let session_authority = self.session_authority.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let local_public_key = prover_info.as_ref().map(|p| p.public_key.clone());
         for worker in &workers {
+            // Retention only withholds a RELEASE below. Everything else in this
+            // pass (notably starting the engine once the allocation is Active)
+            // must still run for a retained worker.
+            let retained = match (session_authority.as_ref(), local_public_key.as_ref()) {
+                (Some(global), Some(member)) if !worker.filter.is_empty() =>
+                    crate::app_handoff::retains_worker(global, &worker.filter, member),
+                _ => false,
+            };
             if worker.filter.is_empty() {
                 // Idle worker — but check for an expired pending-join
                 // marker. `submit_join` sets `pending_filter_frame`
@@ -775,7 +803,7 @@ impl WorkerAllocator {
                          active child allocation is unbound (likely split-parent) — \
                          deallocating so the child rebinds"
                     );
-                    self.worker_manager.deallocate_worker(worker.core_id)?;
+                    self.release_worker(worker, retained)?;
                     continue;
                 }
             }
@@ -796,17 +824,20 @@ impl WorkerAllocator {
                             current_epoch = quil_types::consensus::epoch_for_frame(frame_number),
                             "epoch-expired allocation released so a live shard can use the worker"
                         );
-                        self.worker_manager.deallocate_worker(worker.core_id)?;
+                        self.release_worker(worker, retained)?;
                         continue;
                     }
 
-                    // Tier-5 #8/#9: compute desired_allocated AFTER the
+                    // Compute desired_allocated AFTER the
                     // expired-join/leave reset, mirroring Go's
                     // worker_allocator.go:421-422 + 781-816. Paused
                     // counts as "desired allocated" alongside Active —
                     // the registry maintains the filter binding while
                     // the worker pauses.
-                    let mut desired_allocated = matches!(
+                    // A retained worker runs consensus whatever its allocation
+                    // says: after a restart its engine must start again even
+                    // though the allocation is Leaving or terminal.
+                    let mut desired_allocated = retained || matches!(
                         alloc.status,
                         ProverStatus::Active | ProverStatus::Paused
                     );
@@ -830,7 +861,7 @@ impl WorkerAllocator {
                                     join_frame = alloc.join_frame_number,
                                     "join expired after 720 frames, clearing worker"
                                 );
-                                self.worker_manager.deallocate_worker(worker.core_id)?;
+                                self.release_worker(worker, retained)?;
                             }
                         }
                         ProverStatus::Rejected
@@ -861,7 +892,7 @@ impl WorkerAllocator {
                                 status = ?alloc.status,
                                 "allocation ended/reassigned, clearing worker"
                             );
-                            self.worker_manager.deallocate_worker(worker.core_id)?;
+                            self.release_worker(worker, retained)?;
                         }
                         ProverStatus::Leaving => {
                             // Live Leave (within 720-frame grace) →
@@ -885,12 +916,13 @@ impl WorkerAllocator {
                                     leave_frame = alloc.leave_frame_number,
                                     "leave expired after 720 frames, clearing worker"
                                 );
-                                self.worker_manager.deallocate_worker(worker.core_id)?;
+                                self.release_worker(worker, retained)?;
                             }
                         }
                         _ => {}
                     }
 
+                    let desired_allocated = desired_allocated || retained;
                     // Plumb desired_allocated → WorkerInfo.allocated.
                     // The lifecycle layer reads this for
                     // unallocatedWorkerCount → decide_joins
@@ -934,7 +966,7 @@ impl WorkerAllocator {
                             pending_since = worker.pending_filter_frame,
                             "proposal timed out after 10 frames, clearing worker"
                         );
-                        self.worker_manager.deallocate_worker(worker.core_id)?;
+                        self.release_worker(worker, retained)?;
                     } else if worker.pending_filter_frame == 0
                         && frame_number > PENDING_FILTER_GRACE_FRAMES
                     {
@@ -945,7 +977,7 @@ impl WorkerAllocator {
                             filter = hex::encode(&worker.filter),
                             "orphaned filter with no pending frame, clearing worker"
                         );
-                        self.worker_manager.deallocate_worker(worker.core_id)?;
+                        self.release_worker(worker, retained)?;
                     }
                 }
             }
@@ -1461,6 +1493,95 @@ mod tests {
         }
     }
 
+    /// A worker whose committee session is closing stays bound through a
+    /// terminal allocation status, is released once the seal is recorded, and
+    /// retention never suppresses the rest of the reconcile pass.
+    #[test]
+    fn closing_session_retains_only_the_release_of_its_worker() {
+        use quil_cw_consensus::handoff::{Checkpoint, Seal, Session};
+        use quil_execution::global_intrinsic::handoff::{self, CertificateSubmission, DesiredCommittee};
+        use quil_execution::hypergraph_state::HypergraphState;
+        use quil_types::crypto::Signer as _;
+
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let state = HypergraphState::new(global.clone());
+        let commit = |frame: u64| {
+            state.commit().unwrap();
+            state.abort();
+            global.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        };
+        let signers: Vec<_> = (0..2).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let local_key = signers[0].public_key().to_vec();
+        let mut members: Vec<Vec<u8>> = signers.iter().map(|s| s.public_key().to_vec()).collect();
+        members.sort();
+        let filter = vec![0x01; 32];
+        let session = Session {
+            chain_id: [7; 32], filter: filter.clone(), generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+            base_frame: 0, authorization: [0; 32], members: members.clone(),
+        };
+
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &filter).unwrap();
+        let mut kicked = make_alloc(filter.clone());
+        kicked.status = ProverStatus::Kicked;
+        let prover = |allocation: ProverAllocationInfo| ProverInfo {
+            public_key: local_key.clone(), address: vec![0xAA; 32], status: ProverStatus::Active,
+            kick_frame_number: 0, allocations: vec![allocation], available_storage: 0,
+            seniority: 100, delegate_address: vec![],
+        };
+        let bound = |wm: &MockWorkerManager| wm.range_workers().unwrap()[0].filter.clone();
+
+        // No authenticated GLOBAL state at all: nothing can be closing here.
+        let alloc = WorkerAllocator::new(
+            wm.clone(), Arc::new(TestProverRegistry::with_provers(vec![prover(kicked.clone())])), vec![0xAA; 32]);
+        alloc.set_session_authority(global.clone());
+        alloc.on_new_frame(100).unwrap();
+        assert!(bound(&wm).is_empty(), "an unreadable cursor must not pin workers forever");
+
+        // The session, not the registry, says who runs consensus: a member of
+        // an ACTIVE session keeps its worker through a terminal allocation.
+        commit(1);
+        handoff::initialize(&state, 2, &session).unwrap();
+        commit(2);
+        wm.set_worker_filter(1, &filter, true).unwrap();
+        alloc.on_new_frame(101).unwrap();
+        assert_eq!(bound(&wm), filter);
+
+        // Closing: still bound…
+        let request = handoff::schedule(&state, 3, vec![filter.clone()],
+            vec![DesiredCommittee { filter: filter.clone(), members: vec![signers[1].public_key().to_vec()] }]).unwrap();
+        commit(3);
+        wm.set_worker_filter(1, &filter, true).unwrap();
+        alloc.on_new_frame(102).unwrap();
+        assert_eq!(bound(&wm), filter);
+        // …and a retained worker still gets the rest of the pass: a fresh
+        // allocator that sees the allocation Active marks it allocated.
+        let active = WorkerAllocator::new(
+            wm.clone(), Arc::new(TestProverRegistry::with_provers(vec![prover(make_alloc(filter.clone()))])), vec![0xAA; 32]);
+        active.set_session_authority(global.clone());
+        let _ = wm.set_allocated(1, false);
+        active.on_new_frame(102).unwrap();
+        assert!(wm.range_workers().unwrap()[0].allocated, "retention must not skip the Active transition");
+
+        // Once GLOBAL state records the seal, the worker is released.
+        let seal = Seal {
+            request: request.id().unwrap(), session: session.id().unwrap(), view: 3,
+            checkpoint: Checkpoint { frame: 0, view: 0, digest: session.genesis, state_roots: [[0; 32]; 4], history_root: [9; 32] },
+        };
+        let certificate = crate::test_support::certify_seal(&session, &signers, &seal);
+        handoff::record_session_tip(&state, 4, &seal.session, &seal.checkpoint).unwrap();
+        assert!(handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate }).unwrap());
+        commit(4);
+        alloc.on_new_frame(103).unwrap();
+        assert!(bound(&wm).is_empty());
+    }
+
     #[test]
     fn no_prover_does_nothing() {
         let wm = Arc::new(MockWorkerManager::new());
@@ -1700,6 +1821,62 @@ mod tests {
             "Leaving allocation past the confirm window must NOT be reestablished \
              (the lifecycle confirms the leave instead)"
         );
+    }
+
+    /// The production worker manager, counting consensus starts.
+    struct CountingThreadWorkers {
+        inner: crate::thread_worker::ThreadWorkerManager,
+        starts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WorkerManager for CountingThreadWorkers {
+        fn set_worker_filter(&self, core_id: u32, filter: &[u8], start_consensus: bool) -> Result<()> {
+            if start_consensus && !filter.is_empty() {
+                self.starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.set_worker_filter(core_id, filter, start_consensus)
+        }
+        fn deallocate_worker(&self, core_id: u32) -> Result<()> { self.inner.deallocate_worker(core_id) }
+        fn check_workers_connected(&self) -> Result<Vec<u32>> { self.inner.check_workers_connected() }
+        fn range_workers(&self) -> Result<Vec<crate::worker::WorkerInfo>> { self.inner.range_workers() }
+        fn respawn_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> { self.inner.respawn_worker(core_id, filter) }
+        fn set_pending_filter_frame(&self, core_id: u32, frame: u64) -> Result<()> {
+            self.inner.set_pending_filter_frame(core_id, frame)
+        }
+        fn set_manually_managed(&self, core_id: u32, manual: bool) -> Result<()> {
+            self.inner.set_manually_managed(core_id, manual)
+        }
+        fn set_allocated(&self, core_id: u32, allocated: bool) -> Result<()> { self.inner.set_allocated(core_id, allocated) }
+    }
+
+    /// An Active allocation bound to an idle worker must not have its engine
+    /// restarted by the next pass, seconds after it started: a finalized frame
+    /// the engine had queued would be lost with it.
+    #[tokio::test]
+    async fn an_active_allocation_bound_to_an_idle_worker_starts_its_engine_once() {
+        let inner = crate::thread_worker::ThreadWorkerManager::new();
+        let _master = inner.take_master_rx();
+        inner.set_worker_filter(1, &[], true).unwrap();
+        let wm = Arc::new(CountingThreadWorkers { inner, starts: Default::default() });
+        let filter = vec![0x01; 32];
+        let prover = ProverInfo {
+            public_key: vec![],
+            address: vec![0xAA; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![make_alloc(filter.clone())],
+            available_storage: 0,
+            seniority: 0,
+            delegate_address: vec![],
+        };
+        let alloc = WorkerAllocator::new(wm.clone(), Arc::new(TestProverRegistry::with_prover(prover)), vec![0xAAu8; 32]);
+        alloc.on_new_frame(100).unwrap();
+        assert_eq!(wm.range_workers().unwrap()[0].filter, filter);
+        for frame in 101..104 {
+            alloc.on_new_frame(frame).unwrap();
+        }
+        assert_eq!(wm.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(wm.range_workers().unwrap()[0].allocated);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! `--migrate-db`: convert the node's existing KZG state into the Phase-3 JMT
+//! `--migrate-db`: convert the node's existing KZG state into the JMT
 //! forest **in place** — the forest is written into the same RocksDB under
 //! `quil_store::FOREST_NAMESPACE` (a reserved prefix disjoint from every
 //! hypergraph key), so the migrated DB carries both the legacy data and the

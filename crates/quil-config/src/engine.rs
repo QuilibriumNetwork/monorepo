@@ -96,10 +96,10 @@ pub struct EngineConfig {
     /// the leader's proposal before nullifying the view. MUST exceed the leader's
     /// in-`propose` VDF prove time under real contention, or every view nullifies
     /// before the proposal lands. Certification timeout is derived as this + 5s.
-    /// Default 30 (localnet-validated); raise for higher difficulty / slower CPUs.
+    /// Default 30; raise for higher difficulty / slower CPUs.
     #[serde(default = "default_consensus_leader_timeout_secs")]
     pub consensus_leader_timeout_secs: u64,
-    /// (P3) Drive APP-SHARD consensus with commonware-simplex + Falcon (EQUAL
+    /// Drive APP-SHARD consensus with commonware-simplex + Falcon (EQUAL
     /// VOTES) instead of the legacy quil-consensus HotStuff loop. Off by default;
     /// the legacy per-shard path is unchanged until this is set. Independent of
     /// [`consensus_committee`] (which gates GLOBAL consensus).

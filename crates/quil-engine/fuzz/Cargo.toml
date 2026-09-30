@@ -3,8 +3,8 @@
 # These decode functions run on attacker-controlled bytes BEFORE any
 # authentication (gossip GLOBAL_FRAME decode) or before signature checks
 # (message submission), so a panic / integer-overflow / allocation-bomb here is
-# a remote DoS. See the F9 finding (unbounded `Vec::with_capacity` on an
-# attacker u32) — this harness guards against that whole class.
+# a remote DoS (e.g. an unbounded `Vec::with_capacity` on an attacker u32) —
+# this harness guards against that whole class.
 #
 # Detached workspace (`[workspace]` below) so it never perturbs the root build;
 # the `[patch.crates-io]` block mirrors the root workspace (paths rebased two
@@ -13,7 +13,7 @@
 #
 # Run (needs nightly + FLINT for the crypto deps):
 #   cd crates/quil-engine
-#   FLINT_DIR=/Users/caheart/src/flint cargo +nightly fuzz run decode_global_frame
+#   FLINT_DIR=/path/to/flint cargo +nightly fuzz run decode_global_frame
 [package]
 name = "quil-engine-fuzz"
 version = "0.0.0"

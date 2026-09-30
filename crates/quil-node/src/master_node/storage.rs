@@ -8,7 +8,6 @@ pub(crate) struct StorageHandles {
     pub db_path: PathBuf,
     pub db_arc: Arc<quil_store::RocksDb>,
     pub clock_store: Arc<quil_store::RocksClockStore>,
-    pub token_store: Arc<quil_store::RocksTokenStore>,
     pub key_store: Arc<quil_store::RocksKeyStore>,
     pub shards_store: Arc<dyn quil_types::store::ShardsStore>,
     pub hg_store: Arc<quil_store::RocksHypergraphStore>,
@@ -80,7 +79,6 @@ pub(crate) fn init(
     // 2. Create stores
     // ---------------------------------------------------------------
     let clock_store = Arc::new(quil_store::RocksClockStore::new(db_arc.inner()));
-    let token_store = Arc::new(quil_store::RocksTokenStore::new(db_arc.inner()));
     let key_store: Arc<quil_store::RocksKeyStore> =
         Arc::new(quil_store::RocksKeyStore::new(db_arc.inner()));
     // Trait-object handle so the shard_info refresh task (lower in
@@ -115,7 +113,6 @@ pub(crate) fn init(
         db_path,
         db_arc,
         clock_store,
-        token_store,
         key_store,
         shards_store,
         hg_store,

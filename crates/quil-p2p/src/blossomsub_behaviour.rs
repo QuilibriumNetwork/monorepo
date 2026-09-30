@@ -1,8 +1,8 @@
 //! Bridge from stock libp2p `gossipsub` to the public surface that `node.rs`
 //! and the rest of `quil-p2p` expect.
 //!
-//! swaps the hardened `blossomsub` fork for stock
-//! [`libp2p::gossipsub`] to remove the custom mesh layer as a variable. The
+//! This module swaps the hardened `blossomsub` fork for stock
+//! [`libp2p::gossipsub`], removing the custom mesh layer. The
 //! public API of this module is unchanged (`BlossomSubBehaviour`,
 //! `BlossomSubEvent`, `ValidationResult`, every method `node.rs` calls), so no
 //! consumer outside this file changes shape.
@@ -15,7 +15,7 @@
 //! the topic bytes == `hex(bitmask)` verbatim). The public API stays
 //! `Vec<u8>` bitmasks — the hex is purely internal. This makes the gossip wire
 //! a new **Rust-only** wire (not compatible with Go / old-blossomsub peers),
-//! consistent with the rest of the re-substrate hard fork (Falcon sigs, tree).
+//! consistent with the rest of the Rust node's wire (Falcon signatures).
 //!
 //! ## Feature parity notes
 //! * **Late-bind signing identity.** Stock gossipsub fixes
@@ -30,7 +30,7 @@
 //! reporting Accept/Reject/Ignore before surfacing the message — so a
 //! validator still gates forwarding, matching the fork's receive-path hook.
 //! * **Composite/overlapping-bitmask mesh: dropped** (each bitmask is an
-//! exact-match topic). This is the deliberate "remove the variable" step.
+//! exact-match topic).
 //! * **Forward filter (devnet partitions): not supported on stock gossipsub.**
 //! The methods remain (API compat) but are no-ops; installing one logs a
 //! one-time warning. Devnet bipartite-partition tests won't partition until

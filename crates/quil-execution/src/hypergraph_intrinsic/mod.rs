@@ -42,6 +42,18 @@ pub fn build_hypergraph_configuration_metadata_tree(
     Ok(tree)
 }
 
+/// The domain a HypergraphDeploy of `config` creates:
+/// `poseidon(prefix ‖ SHA-512(config content))` — retired from the KZG commit;
+/// PQ-safe, no BLS48-581. Mirrors the token/compute deploy domains.
+pub fn hypergraph_deploy_domain(config: &types::HypergraphConfiguration) -> quil_types::error::Result<[u8; 32]> {
+    let config_tree = build_hypergraph_configuration_metadata_tree(config)?;
+    let config_commit = crate::hypergraph_state::tree_content_digest(&config_tree);
+    let mut preimage = Vec::with_capacity(RAW_HYPERGRAPH_PREFIX.len() + config_commit.len());
+    preimage.extend_from_slice(RAW_HYPERGRAPH_PREFIX);
+    preimage.extend_from_slice(&config_commit);
+    quil_crypto::poseidon::hash_bytes_to_32(&preimage)
+}
+
 /// Materialize a **new** HypergraphDeploy — Go `HypergraphIntrinsic.Deploy`
 /// deploy branch (hypergraph_intrinsic.go:658-707). Derives the new
 /// hypergraph app's domain from `poseidon(RAW_HYPERGRAPH_PREFIX ‖
@@ -58,14 +70,7 @@ pub fn materialize_hypergraph_deploy_init(
     inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
 ) -> quil_types::error::Result<[u8; 32]> {
     let config_tree = build_hypergraph_configuration_metadata_tree(config)?;
-    // Domain = poseidon(prefix ‖ SHA-512(config content)) — retired from the KZG
-    // commit; PQ-safe, no BLS48-581. Mirrors the token/compute deploy domains.
-    let config_commit = crate::hypergraph_state::tree_content_digest(&config_tree);
-
-    let mut preimage = Vec::with_capacity(RAW_HYPERGRAPH_PREFIX.len() + config_commit.len());
-    preimage.extend_from_slice(RAW_HYPERGRAPH_PREFIX);
-    preimage.extend_from_slice(&config_commit);
-    let domain = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
+    let domain = hypergraph_deploy_domain(config)?;
 
     let rdf = std::str::from_utf8(rdf_schema).map_err(|_| {
         quil_types::error::QuilError::InvalidArgument(
@@ -193,7 +198,7 @@ pub use dispatch::{
     HypergraphLockState, MessageKind,
 };
 
-pub use auth::{verify_op_signature, AuthCheck, HypergraphConfigResolver, OpForAuth};
+pub use auth::{verify_op_signature, AuthCheck, CrdtHypergraphConfigResolver, HypergraphConfigResolver, OpForAuth};
 
 pub use hyperedge_ops::{
     assert_hyperedge_domain_matches, build_hyperedge_add_value, extract_hyperedge_id,

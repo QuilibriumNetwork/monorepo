@@ -27,6 +27,7 @@ pub(crate) struct LifecycleInitArgs {
     pub clock_store: Arc<quil_store::RocksClockStore>,
     pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     pub hg_store: Arc<quil_store::RocksHypergraphStore>,
+    pub message_collector: Arc<quil_engine::message_collector::MessageCollector>,
 }
 
 pub(crate) fn init(
@@ -50,6 +51,7 @@ pub(crate) fn init(
         clock_store,
         crdt,
         hg_store,
+        message_collector,
     } = args;
 
     // Worker allocator — reconciles registry vs running workers
@@ -58,6 +60,12 @@ pub(crate) fn init(
         prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
         prover_address.to_vec(),
     ));
+    // Only networks that enable committee sessions consult GLOBAL state here;
+    // an unreadable authorization retains workers, which legacy networks must
+    // never be exposed to.
+    if quil_types::consensus::committee_handoff_policy().is_some() {
+        worker_allocator.set_session_authority(crdt.clone());
+    }
 
     // Compute the config-derived seniority estimate from the mainnet
     // compat table. Uses our local libp2p peer ID plus any peer IDs
@@ -253,111 +261,9 @@ pub(crate) fn init(
                 archive_mode,
             )
             .with_eviction_registry(prover_registry.clone())
-            .with_rocks_hg_store(hg_store.clone())
-            // (B/#2) At-cutover consolidation on the archive's CRDT store: fold
-            // every split app's per-sub-shard trees into its app.l2 tree from
-            // current committed vertices before the unified flip, so a split in
-            // the [boot, cutover) window is reflected. Deterministic (same frame,
-            // same committed state on every archive).
-            .with_unified_cutover_consolidate({
-                let hg = hg_store.clone();
-                let ss = shards_store.clone();
-                std::sync::Arc::new(move |frame: u64| -> bool {
-                    match quil_forest_migrate::run_unified_consolidation_in_place(
-                        hg.as_ref(),
-                        ss.as_ref(),
-                        0,
-                        frame,
-                    ) {
-                        Ok(n) => {
-                            tracing::info!(
-                                apps = n,
-                                frame,
-                                "archive at-cutover unified consolidation complete"
-                            );
-                            true
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                frame,
-                                "archive at-cutover unified consolidation FAILED"
-                            );
-                            false
-                        }
-                    }
-                })
-            })
-            // Prover-tree reset rides the same cutover flag day (archive only):
-            // wipe the global prover shard + rebuild from the network's genesis
-            // committee, so provers stranded on alias sub-shards are cleared and
-            // re-join onto the reset grid. The committee is resolved once
-            // (network-aware); the reset is deterministic across archives.
-            .with_prover_tree_reset({
-                let hg = crdt.clone();
-                let store = hg_store.clone();
-                let net = network;
-                let seed = config.engine.genesis_seed.clone();
-                // The local Falcon prover pubkey is only consulted by the testnet
-                // EMPTY-seed single-prover fallback; mainnet uses the embedded
-                // genesis and a seeded testnet/localnet uses the seed keys, so `&[]`
-                // suffices here.
-                std::sync::Arc::new(move |frame: u64| -> bool {
-                    // Three coordinated resets ride this hook: v1 boot cutover, v2
-                    // grid reset (740_000), and v3 prover reset (747_000). Each has
-                    // its OWN marker so re-wiping never deletes provers that
-                    // re-joined after, and an earlier marker never suppresses a later
-                    // reset.
-                    let is_v5 = frame
-                        == quil_execution::global_intrinsic::materialize::quil_prover_reset_v5_frame();
-                    let is_v4 = frame
-                        == quil_execution::global_intrinsic::materialize::quil_prover_reset_v4_frame();
-                    let is_v3 = frame
-                        == quil_execution::global_intrinsic::materialize::quil_prover_reset_v3_frame();
-                    let is_v2 = frame
-                        == quil_execution::global_intrinsic::materialize::quil_grid_reset_v2_frame();
-                    if is_v5 {
-                        if crate::unified_consolidation::prover_reset_v5_applied(&store) {
-                            return true;
-                        }
-                    } else if is_v4 {
-                        if crate::unified_consolidation::prover_reset_v4_applied(&store) {
-                            return true;
-                        }
-                    } else if is_v3 {
-                        if crate::unified_consolidation::prover_reset_v3_applied(&store) {
-                            return true;
-                        }
-                    } else if is_v2 {
-                        if crate::unified_consolidation::grid_reset_v2_applied(&store) {
-                            return true;
-                        }
-                    } else if crate::unified_consolidation::boot_reset_applied(&store) {
-                        return true;
-                    }
-                    match quil_engine::genesis::reset_prover_tree_to_genesis(
-                        &hg, store.as_ref(), frame, net, &seed, &[],
-                    ) {
-                        Ok(n) => {
-                            tracing::info!(seeded = n, frame, is_v2, is_v3, is_v4, is_v5, "archive at-reset prover-tree reset complete");
-                            if is_v5 {
-                                crate::unified_consolidation::mark_prover_reset_v5_applied(&store);
-                            } else if is_v4 {
-                                crate::unified_consolidation::mark_prover_reset_v4_applied(&store);
-                            } else if is_v3 {
-                                crate::unified_consolidation::mark_prover_reset_v3_applied(&store);
-                            } else if is_v2 {
-                                crate::unified_consolidation::mark_grid_reset_v2_applied(&store);
-                            }
-                            true
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, frame, "archive at-reset prover-tree reset FAILED");
-                            false
-                        }
-                    }
-                })
-            })
+            .with_global_maintenance(quil_engine::frame_maintenance::GlobalMaintenance::new(
+                network, config.engine.genesis_seed.clone(), Vec::new(),
+            ))
             // Deterministic per-shard data-size source for the eviction
             // halt gate: enumerate committed shards from the shards store
             // and key by `confirmation_filter` = L2(32) ++ prefix-byte
@@ -392,6 +298,11 @@ pub(crate) fn init(
                 })
             })
             .with_current_frame(current_frame.clone())
+            .with_shard_admission_refresh({
+                let store = shards_store.clone();
+                let collector = message_collector.clone();
+                Arc::new(move || collector.refresh_valid_shard_addresses(store.as_ref()))
+            })
             // MAINNET-ONLY 2.1.0.25 frozen-era recovery: no-op-materialize the
             // frozen range so the wedged fleet un-sticks deterministically. Off
             // on localnet/testnet, which never reach these heights anyway.

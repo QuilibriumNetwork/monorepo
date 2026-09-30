@@ -206,6 +206,7 @@ mod tests {
                 global_commitments: Vec::new(),
                 prover_tree_commitment: Vec::new(),
                 prover_tree_aux_roots: Vec::new(),
+                world_state_size: 0,
                 requests_root: Vec::new(),
                 prover: Vec::new(),
                 public_key_signature_bls48581: None,

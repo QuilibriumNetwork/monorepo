@@ -1,6 +1,4 @@
 //! Command implementations, one module per top-level cobra command group.
-//!
-//! Modules are added phase-by-phase as commands are ported.
 
 pub mod alias;
 pub mod compute;

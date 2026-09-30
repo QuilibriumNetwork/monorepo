@@ -6,8 +6,7 @@
 //! seniority weighting). Seniority is retained elsewhere (eviction / rewards /
 //! committee eligibility); only vote weight is dropped.
 //!
-//! Layers (built bottom-up; the first three are validated + tested, and were
-//! the P1 feasibility spike):
+//! Layers (built bottom-up):
 //! - [`falcon_base`]: Falcon types implementing commonware's base crypto traits
 //!   (`Signature` / `PublicKey` / `Verifier` / `Signer`).
 //! - [`falcon_scheme`]: the multi-party `certificate::Scheme` (attestations →
@@ -15,9 +14,9 @@
 //! - [`falcon_simplex`]: binds the scheme to simplex's vote subject and proves
 //!   (at compile time) that `simplex::Engine` accepts Falcon signatures.
 //!
-//! P2 (in progress) adds the Automaton / Relay / Reporter adapters and the
-//! Engine host that drives global consensus over the existing `:8340` mTLS
-//! transport. See memory `commonware_p2_global_cutover_design`.
+//! On top of these, [`adapters`] provides the Automaton / Relay / Reporter
+//! adapters and [`engine_host`] the Engine host that drives global consensus
+//! over the existing `:8340` mTLS transport.
 
 // Reference the commonware crates so the dependency graph resolves and any
 // version conflict with the workspace surfaces at build time.
@@ -38,14 +37,16 @@ pub mod falcon_scheme;
 /// compile-time proof that `simplex::Engine` accepts it.
 pub mod falcon_simplex;
 pub mod app_cert;
+pub mod handoff;
 
 /// Quilibrium adapters (Automaton / Relay / Reporter) over three narrow seam
-/// traits, plus the shared block store — the P2 global-consensus glue.
+/// traits, plus the shared block store — the global-consensus glue.
 pub mod adapters;
 
 /// `build_global_engine` — assembles a simplex `Engine` for global consensus
 /// from the seams + runtime context (hides the large simplex `Config`).
 pub mod engine_host;
+mod journal_context;
 
 /// Channel-backed commonware-p2p `Sender`/`Receiver` bridging simplex's 3
 /// channels onto the node's `:8340` transport.

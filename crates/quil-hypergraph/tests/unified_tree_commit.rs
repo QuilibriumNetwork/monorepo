@@ -1,10 +1,10 @@
-//! Phase-2 unified-app-tree: `commit_inner`'s unified path.
+//! Unified-app-tree: `commit_inner`'s unified path.
 //!
 //! A split app in UNIFIED mode commits ALL its vertices into ONE L3 tree per
 //! phase keyed by the app address (a shard = the in-place subtree), so its
 //! app-phase roots must be IDENTICAL to committing the same vertices as an
 //! unsplit single-shard app — and DIFFERENT from the legacy separate-per-shard-
-//! tree + `app_root_from_shard_paths` rollup (the §4 commitment fork). All
+//! tree + `app_root_from_shard_paths` rollup (the commitment fork). All
 //! vertices remain retrievable regardless of which sub-shard they route to.
 
 use std::sync::Arc;
@@ -25,7 +25,7 @@ fn phase_roots(crdt: &HypergraphCrdt, frame: u64) -> Vec<Vec<u8>> {
     entries.pop().unwrap()
 }
 
-/// Deep-bifurcation Phase 3: the split PROPOSAL descends to the real branch on
+/// Deep-bifurcation: the split PROPOSAL descends to the real branch on
 /// SKEWED data (the `[7,0]` localnet case) instead of cutting at the immediate
 /// bit — producing two DATA-BEARING bit-path children, never an empty child.
 #[test]
@@ -102,7 +102,7 @@ fn sentinel_bit_path_prefixes_route_to_deep_bit_paths() {
     assert_eq!(subs[1].1, vec![false, false, false, true]);
 }
 
-/// Deep-bifurcation Phase 2: the shard bit-path SOURCE is swappable. By default
+/// Deep-bifurcation: the shard bit-path SOURCE is swappable. By default
 /// it's `canonical_shard_bit_paths(prefixes)`; when directly-stored bit-paths are
 /// set they take over — including a bit-path the `Vec<u32>` prefix form could not
 /// express (a 7-bit path where 64-way canonical gives 6) — and clearing reverts.

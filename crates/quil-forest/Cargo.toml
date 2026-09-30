@@ -12,6 +12,7 @@ jmt = "0.11"
 # Per-vertex-subtree commitment: verify_vertex_membership recomputes the
 # vertex's own hash-Merkle commitment (`vertex_leaf_value`) from its blob.
 quil-tries = { path = "../quil-tries" }
+quil-types = { path = "../quil-types" }
 rocksdb = { version = "0.22", default-features = false, features = ["snappy", "lz4"] }
 sha2 = "0.10"
 borsh = { version = "1", features = ["derive"] }
