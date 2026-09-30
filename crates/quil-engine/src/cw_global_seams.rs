@@ -147,8 +147,25 @@ impl GlobalSeamProposer {
         }
     }
 
-    /// Record digest → frame_number (also used by inbound-frame ingestion so a
-    /// synced parent resolves its number).
+    /// Build peer ingress without capturing the validated parent-height index.
+    /// Peer bytes are candidates until consensus verifies them; the digest does
+    /// not authenticate a claimed height. Only validated or recovered frames
+    /// may populate `block_meta`.
+    fn peer_ingress(self: &Arc<Self>, store: BlockStore) -> Arc<dyn Fn(Vec<u8>) + Send + Sync> {
+        Arc::new(move |bytes: Vec<u8>| {
+            let Ok(frame) = decode_global_frame(&bytes) else {
+                tracing::debug!("cw block ingress: undecodable frame, dropping");
+                return;
+            };
+            let Some(header) = frame.header.as_ref() else { return };
+            let Some(digest) = frame_digest(header) else { return };
+            let frame_number = header.frame_number;
+            store.put(digest, bytes);
+            tracing::debug!(frame = frame_number, "cw block ingress: stored peer frame");
+        })
+    }
+
+    /// Record the height of a validated or locally recovered frame.
     pub fn note_frame(&self, digest: Digest, frame_number: u64) {
         self.block_meta.lock().unwrap().insert(digest, frame_number);
     }
@@ -805,7 +822,7 @@ pub struct GlobalConsensusCwHandle {
     pub inbound: [tokio::sync::mpsc::UnboundedSender<quil_cw_consensus::p2p_bridge::Message<FalconPublicKey>>; 3],
     /// Feed a peer-delivered frame's canonical bytes into the engine's
     /// `BlockStore` (so `verify` finds the block behind a proposed digest) and
-    /// record its digest→frame_number mapping. Idempotent; drops malformed bytes.
+    /// leave its parent-height metadata untouched. Drops malformed bytes.
     pub ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
 }
 
@@ -925,24 +942,57 @@ pub fn activate_global_consensus_cw(
         }
     });
 
-    // Block ingress: decode a peer frame, compute its identity digest, insert
-    // into the store, and note digest→frame_number for parent resolution.
-    let ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync> = {
-        let store = store.clone();
-        let proposer = proposer.clone();
-        Arc::new(move |bytes: Vec<u8>| {
-            let Ok(frame) = decode_global_frame(&bytes) else {
-                tracing::debug!("cw block ingress: undecodable frame, dropping");
-                return;
-            };
-            let Some(header) = frame.header.as_ref() else { return };
-            let Some(digest) = frame_digest(header) else { return };
-            let frame_number = header.frame_number;
-            store.put(digest, bytes);
-            proposer.note_frame(digest, frame_number);
-            tracing::debug!(frame = frame_number, "cw block ingress: stored peer frame");
-        })
-    };
+    // Peer ingress can store candidates, but cannot change trusted heights.
+    let ingest_block = proposer.peer_ingress(store.clone());
 
     Ok(GlobalConsensusCwHandle { inbound, ingest_block })
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::*;
+
+    struct NoProposal;
+    impl LeaderProvider<GlobalState> for NoProposal {
+        fn get_next_leaders(&self, _: Option<&State<GlobalState>>) -> quil_types::error::Result<Vec<Vec<u8>>> {
+            unreachable!()
+        }
+        fn prove_next_state(&self, _: u64, _: &[u8], _: u64, _: &Vec<u8>) -> quil_types::error::Result<State<GlobalState>> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn peer_ingress_preserves_validated_parent_height() {
+        let proposer = Arc::new(GlobalSeamProposer::new(
+            Arc::new(NoProposal),
+            Arc::new(GlobalFrameVerifier::new(Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)))),
+            vec![], Arc::new(quil_store::testing::InMemoryClockStore::new()), None,
+        ));
+        let store = BlockStore::new();
+        let ingress = proposer.peer_ingress(store.clone());
+        let mut frame = GlobalFrame { header: Some(GlobalFrameHeader {
+            frame_number: 7, output: vec![3; 516], ..Default::default()
+        }), ..Default::default() };
+        let digest = frame_digest(frame.header.as_ref().unwrap()).unwrap();
+        let honest = encode_global_frame(&frame).unwrap();
+        proposer.note_frame(digest, 7);
+        ingress(honest.clone());
+        assert_eq!(store.get(&digest), Some(honest.clone()));
+        frame.header.as_mut().unwrap().frame_number = u64::MAX / 2;
+        assert_eq!(frame_digest(frame.header.as_ref().unwrap()), Some(digest));
+        let forged = encode_global_frame(&frame).unwrap();
+        ingress(forged.clone());
+        assert_eq!(store.get(&digest), Some(forged.clone()));
+        assert_eq!(proposer.selected_parent_number(digest), Some(7));
+        store.seal(digest, honest.clone());
+        ingress(forged);
+        assert_eq!(store.get(&digest), Some(honest));
+        ingress(vec![0xff]);
+        assert_eq!(proposer.selected_parent_number(digest), Some(7));
+        frame.header.as_mut().unwrap().output = vec![4; 516];
+        let unknown = frame_digest(frame.header.as_ref().unwrap()).unwrap();
+        ingress(encode_global_frame(&frame).unwrap());
+        assert_eq!(proposer.selected_parent_number(unknown), None);
+    }
 }
