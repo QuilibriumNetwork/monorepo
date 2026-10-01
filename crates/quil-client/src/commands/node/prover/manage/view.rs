@@ -50,8 +50,8 @@ fn status_color(name: &str) -> Color {
 }
 fn materialization_state_color(state: &str) -> Color {
     match state {
-        "Current" => SUCCESS,
-        "Lag" | "Unmat" => ERROR,
+        "current" => SUCCESS,
+        "lag" | "unmat" => ERROR,
         _ => HELP,
     }
 }
@@ -235,8 +235,11 @@ pub fn draw(f: &mut Frame, m: &mut Model) {
 }
 
 fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
-    // Vertical budget split (mirrors the Go layout math).
-    let panel_budget = (area.height as i32 - 10).max(4) as u16;
+    let (actions, status) = footer_lines(m);
+    let actions = wrap_actions(actions, area.width);
+    let actions_h = actions.len().min(area.height.saturating_sub(8) as usize) as u16;
+    // Reserve every command line, plus header, titles, borders and status.
+    let panel_budget = area.height.saturating_sub(8 + actions_h);
     let alloc_h = panel_budget / 2;
     let avail_h = panel_budget - alloc_h;
 
@@ -246,7 +249,7 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         Constraint::Length(alloc_h + 2), // alloc panel (+ border)
         Constraint::Length(1),           // avail title
         Constraint::Length(avail_h + 2), // avail panel (+ border)
-        Constraint::Length(1),           // actions
+        Constraint::Length(actions_h),   // actions
         Constraint::Length(1),           // status
     ])
     .split(area);
@@ -290,7 +293,6 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     f.render_widget(Paragraph::new(avail_lines), avail_inner);
 
     // Actions + status lines.
-    let (actions, status) = footer_lines(m);
     f.render_widget(
         Paragraph::new(actions).style(Style::new().fg(HELP)),
         chunks[5],
@@ -900,6 +902,28 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
 
 // ── Footer (actions + status) ────────────────────────────────────────────
 
+/// Wrap command hints at word boundaries while retaining each hint's style.
+/// The resulting lines also give the layout its exact footer height.
+fn wrap_actions(actions: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut line = Line::default();
+    for span in actions.spans {
+        for word in span.content.split_whitespace() {
+            let word = Span::styled(word.to_owned(), span.style);
+            if !line.spans.is_empty() && line.width() + 1 + word.width() > usize::from(width) {
+                lines.push(line);
+                line = Line::default();
+            }
+            if !line.spans.is_empty() {
+                line.spans.push(Span::raw(" "));
+            }
+            line.spans.push(word);
+        }
+    }
+    lines.push(line);
+    lines
+}
+
 fn footer_lines(m: &Model) -> (Line<'static>, Line<'static>) {
     if m.filter_edit_active {
         return render_filter_edit_lines(m);
@@ -1229,8 +1253,8 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Shards", "Data shards the filter covers"),
         kv("Mat", "Highest frame this shard has materialized locally"),
         kv("Lag", "Frames behind the head: head − Mat; `-` when no head is known"),
-        kv("State", "Reading of Mat and Lag — Current: materialized up to the head;"),
-        kv("", "Lag: behind it; Unmat: nothing materialized; Unknown: no head"),
+        kv("State", "Reading of Mat and Lag — current: materialized up to the head;"),
+        kv("", "lag: behind it; unmat: nothing materialized; unknown: no head"),
         kv(
             "Reward [Q/d]",
             "Estimated whole QUIL per day; `<1` is a trickle, not nothing",
@@ -1332,6 +1356,54 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
 mod tests {
     use super::*;
     use crate::commands::node::prover::epoch::ActionHint;
+
+    #[test]
+    fn state_cells_use_lowercase_and_keep_their_colors() {
+        let m = Model::new();
+        for (mat, head, label, color) in [
+            (0, 0, "unknown", HELP),
+            (0, 10, "unmat", ERROR),
+            (5, 10, "lag", ERROR),
+            (10, 10, "current", SUCCESS),
+            (11, 10, "current", SUCCESS),
+        ] {
+            let mut a = row("01", 1, 1, 1, "", "");
+            a.materialized_frame = mat;
+            a.latest_frame = head;
+            let mut s = shard("01", 0, 0);
+            s.materialized_frame = mat;
+            s.latest_frame = head;
+            assert_eq!(alloc_cell(&m, &a, 8, 12), label);
+            assert_eq!(avail_cell(&m, &s, 8, 12), label);
+            assert_eq!(materialization_state_color(label), color);
+        }
+    }
+
+    #[test]
+    fn command_footer_wraps_and_leaves_status_visible() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for width in [40, 80, 100, 160, 320] {
+            let mut m = Model::new();
+            m.status_msg = "status is visible".to_owned();
+            let lines = wrap_actions(help_line(&m), width);
+            assert!(lines.iter().all(|line| line.width() <= usize::from(width)));
+            if width == 40 {
+                assert!(lines.len() > 1);
+            }
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|f| draw(f, &mut m)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let footer_start = 23 - lines.len() as u16;
+            let footer = (footer_start..23).map(|y| {
+                (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>()
+            }).collect::<Vec<_>>().join(" ");
+            for key in ["[tab]", "[J]", "[C]", "[e]", "[h]", "[q]"] {
+                assert!(footer.contains(key), "missing {key} at width {width}: {footer}");
+            }
+            let status = (0..width).map(|x| buffer[(x, 23)].symbol()).collect::<String>();
+            assert!(status.contains("status is visible"));
+        }
+    }
 
     /// One allocations row. Only the fields that reach a cell are meaningful.
     fn row(
@@ -1469,7 +1541,7 @@ mod tests {
                 8,  // "10076371", wider than "Shards"
                 3,  // "Mat"
                 3,  // "Lag"
-                7,  // "Unknown", wider than "State"
+                7,  // "unknown", wider than "State"
                 12, // "Reward_[Q/d]"
                 7,  // "↑Worker", including the active sort arrow
                 7,  // "joining", wider than "Status"

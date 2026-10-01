@@ -1001,7 +1001,7 @@ pub fn materialization_lag(materialized: u64, latest: u64) -> Option<u64> {
 
 pub fn materialization_state(materialized: u64, latest: u64) -> &'static str {
     match (materialized, latest) {
-        (0, 0) => "Unknown", (0, _) => "Unmat", (mat, head) if mat >= head => "Current", _ => "Lag",
+        (0, 0) => "unknown", (0, _) => "unmat", (mat, head) if mat >= head => "current", _ => "lag",
     }
 }
 
