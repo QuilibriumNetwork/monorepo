@@ -902,22 +902,24 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
 
 // ── Footer (actions + status) ────────────────────────────────────────────
 
-/// Wrap command hints at word boundaries while retaining each hint's style.
+/// Wrap between command hints, keeping each shortcut and label together.
 /// The resulting lines also give the layout its exact footer height.
 fn wrap_actions(actions: Line<'static>, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut line = Line::default();
     for span in actions.spans {
-        for word in span.content.split_whitespace() {
-            let word = Span::styled(word.to_owned(), span.style);
-            if !line.spans.is_empty() && line.width() + 1 + word.width() > usize::from(width) {
+        // Double spaces separate hints, including in the single-span mode bars.
+        // Preserve single spaces inside labels (and checkbox markers).
+        for hint in span.content.split("  ").map(str::trim).filter(|hint| !hint.is_empty()) {
+            let hint = Span::styled(hint.to_owned(), span.style);
+            if !line.spans.is_empty() && line.width() + 2 + hint.width() > usize::from(width) {
                 lines.push(line);
                 line = Line::default();
             }
             if !line.spans.is_empty() {
-                line.spans.push(Span::raw(" "));
+                line.spans.push(Span::raw("  "));
             }
-            line.spans.push(word);
+            line.spans.push(hint);
         }
     }
     lines.push(line);
@@ -1386,6 +1388,10 @@ mod tests {
             let mut m = Model::new();
             m.status_msg = "status is visible".to_owned();
             let lines = wrap_actions(help_line(&m), width);
+            for hint in help_line(&m).spans.into_iter().filter(|span| !span.content.trim().is_empty()) {
+                assert!(lines.iter().any(|line| line.spans.iter().any(|span| span == &hint)),
+                    "split command hint at width {width}: {}", hint.content);
+            }
             assert!(lines.iter().all(|line| line.width() <= usize::from(width)));
             if width == 40 {
                 assert!(lines.len() > 1);
@@ -1402,6 +1408,20 @@ mod tests {
             }
             let status = (0..width).map(|x| buffer[(x, 23)].symbol()).collect::<String>();
             assert!(status.contains("status is visible"));
+        }
+    }
+
+    #[test]
+    fn mode_footer_keeps_multiword_labels_and_styles_together() {
+        let style = Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD);
+        let lines = wrap_actions(Line::from(Span::styled(
+            "Sort: [←/→] Move column  [enter] apply  [esc] cancel", style,
+        )), 25);
+        assert_eq!(lines.len(), 3);
+        for (line, expected) in lines.iter().zip([
+            "Sort: [←/→] Move column", "[enter] apply", "[esc] cancel",
+        ]) {
+            assert_eq!(line.spans, vec![Span::styled(expected, style)]);
         }
     }
 
