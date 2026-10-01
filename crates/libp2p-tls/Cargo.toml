@@ -127,3 +127,9 @@ priority = -1
 
 [lints.rust]
 unreachable_pub = "warn"
+
+# Maintained rust-libp2p TLS fork with the Quilibrium NTRU handshake.
+# Pinned webpki still returns the deprecated UnsupportedSignatureAlgorithm
+# variants; retain compatibility while suppressing those dependency warnings.
+deprecated = "allow"
+unused_parens = "allow"

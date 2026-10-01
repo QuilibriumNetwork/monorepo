@@ -76,3 +76,9 @@ harness = false
 crate-type = ["lib", "staticlib"]
 name = "bulletproofs"
 
+# Maintained fork of https://github.com/dalek-cryptography/bulletproofs.
+# Scope cosmetic warnings here; retain soundness diagnostics.
+[lints.rust]
+dead_code = "allow"
+deprecated = "allow"
+unused_imports = "allow"
