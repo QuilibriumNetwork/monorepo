@@ -581,4 +581,87 @@ mod mpz {
         let zero = Mpz::from(-51213);
         assert_eq!(format!("{}", zero), "-51213");
     }
+
+    /// Every constructor that hands a `MaybeUninit<mpz_struct>` to GMP must
+    /// produce a fully initialised, usable value.
+    ///
+    /// These were written with `mem::uninitialized()`, which is UB for a struct
+    /// containing a pointer. The migration to `MaybeUninit` is only correct if
+    /// the GMP call really does initialise the struct before `assume_init`, so
+    /// each constructor is exercised past construction — read, mutated, and
+    /// dropped — rather than merely compared once.
+    #[test]
+    fn test_constructors_are_initialized() {
+        assert_eq!(format!("{}", Mpz::new()), "0");
+        assert_eq!(format!("{}", Mpz::one()), "1");
+        assert_eq!(Mpz::new(), Mpz::zero());
+
+        // `new_reserve` preallocates limbs; the value is still zero, and the
+        // allocation must survive being grown past the reservation.
+        let mut reserved = Mpz::new_reserve(4096);
+        assert_eq!(format!("{}", reserved), "0");
+        reserved.setbit(8192);
+        assert!(reserved.bit_length() > 4096);
+
+        // A freshly constructed value must be independently droppable, and
+        // usable as an operand afterwards.
+        let scratch = Mpz::new();
+        drop(scratch);
+        assert_eq!(&Mpz::new() + &Mpz::one(), Mpz::one());
+    }
+
+    /// `clone` must deep-copy, not alias the source's limb pointer.
+    #[test]
+    fn test_clone_is_independent() {
+        let original =
+            Mpz::from_str_radix("123456789012345678901234567890123456789012345678901234567890", 10)
+                .unwrap();
+        let mut copy = original.clone();
+        copy.setbit(1024);
+
+        assert!(copy > original);
+        assert_eq!(
+            format!("{}", original),
+            "123456789012345678901234567890123456789012345678901234567890",
+            "mutating the clone must not disturb the original"
+        );
+    }
+
+    /// The `from_str_radix` error path calls `__gmpz_clear`, which is only legal
+    /// on an initialised `mpz_t`.
+    ///
+    /// GMP documents that `mpz_init_set_str` initialises `rop` even when parsing
+    /// fails, so `assume_init` must happen *before* the success/failure branch.
+    /// Moving it into the success arm would leak on every bad parse; removing
+    /// the `__gmpz_clear` would do the same. The loop makes such a leak large
+    /// enough for a leak checker to catch, and asserts the allocator stays
+    /// healthy across many failures.
+    #[test]
+    fn test_from_str_radix_error_path() {
+        for _ in 0..1000 {
+            assert!(Mpz::from_str_radix("not a number", 10).is_err());
+        }
+
+        // Parsing must still work after repeated failures.
+        assert_eq!(
+            format!("{}", Mpz::from_str_radix("1234567890", 10).unwrap()),
+            "1234567890"
+        );
+
+        // A digit that is invalid for the given base, rather than junk.
+        assert!(Mpz::from_str_radix("2", 2).is_err());
+        assert_eq!(format!("{}", Mpz::from_str_radix("1", 2).unwrap()), "1");
+    }
+
+    /// `ParseMpzError`'s message lives in its `Display` impl.
+    ///
+    /// It used to live in the deprecated `Error::description`, with `Display`
+    /// delegating to it. Removing `description` without moving the message here
+    /// would silently change this string to the standard library's default.
+    #[test]
+    fn test_parse_error_message() {
+        let err = Mpz::from_str_radix("not a number", 10).unwrap_err();
+        assert_eq!(format!("{}", err), "invalid integer");
+        assert_eq!(err.to_string(), "invalid integer");
+    }
 }
