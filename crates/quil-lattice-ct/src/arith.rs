@@ -3,16 +3,22 @@
 //! intermediate `< 2^128`), plus a tiny deterministic PRG.
 
 /// `(a + b) mod q`.
+// Retained scalar arithmetic helpers; confidential relations use rq operations.
+#[allow(dead_code)]
 pub(crate) fn add_mod(a: u128, b: u128, q: u128) -> u128 {
     (a + b) % q
 }
 
 /// Element-wise `(a + b) mod q`.
+// Retained scalar arithmetic helpers; confidential relations use rq operations.
+#[allow(dead_code)]
 pub(crate) fn add_vec_mod(a: &[u128], b: &[u128], q: u128) -> Vec<u128> {
     a.iter().zip(b).map(|(x, y)| (x + y) % q).collect()
 }
 
 /// `Σ_j a[j]·r[j] mod q`, with signed `r` mapped into `[0, q)`.
+// Retained scalar arithmetic helpers; confidential relations use rq operations.
+#[allow(dead_code)]
 pub(crate) fn dot_mod(a: &[u128], r: &[i128], q: u128) -> u128 {
     let mut acc: u128 = 0;
     for (aj, rj) in a.iter().zip(r) {
@@ -22,17 +28,23 @@ pub(crate) fn dot_mod(a: &[u128], r: &[i128], q: u128) -> u128 {
 }
 
 /// Matrix-vector product `A·v mod q` (signed `v`).
+// Retained scalar arithmetic helpers; confidential relations use rq operations.
+#[allow(dead_code)]
 pub(crate) fn matvec(a: &[Vec<u128>], v: &[i128], q: u128) -> Vec<u128> {
     a.iter().map(|row| dot_mod(row, v, q)).collect()
 }
 
 /// Map a signed integer into `[0, q)`.
+// Retained scalar arithmetic helpers; confidential relations use rq operations.
+#[allow(dead_code)]
 pub(crate) fn signed_mod(x: i128, q: u128) -> u128 {
     let qi = q as i128;
     (((x % qi) + qi) % qi) as u128
 }
 
 /// Infinity norm of a signed vector.
+// Retained scalar arithmetic helpers; confidential relations use rq operations.
+#[allow(dead_code)]
 pub(crate) fn inf_norm(v: &[i128]) -> i128 {
     v.iter().map(|x| x.abs()).max().unwrap_or(0)
 }

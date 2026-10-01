@@ -396,6 +396,8 @@ pub fn set_app_proposal_duration_ms(ms: u64) {
 }
 
 /// The configured app-shard proposal/QC cadence.
+// Retained cadence accessor; consensus configuration supplies current timing.
+#[allow(dead_code)]
 fn app_proposal_duration() -> Duration {
     Duration::from_millis(APP_PROPOSAL_DURATION_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -2083,6 +2085,8 @@ pub struct AppConsensusEngine {
     /// `None` falls back to the in-memory stub.
     kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
     /// Drive this shard with commonware-simplex + Falcon instead of legacy.
+    // Retained configuration field; simplex startup selects the active engine.
+    #[allow(dead_code)]
     app_consensus_cw: bool,
     /// Handle to the running simplex engine (kept alive; the outbound drain
     /// + block ingress live in it). Populated by `start_consensus_cw`.
@@ -4828,6 +4832,8 @@ impl AppConsensusEngine {
 
     /// Flush spillover messages into the collector for the target rank.
     /// Called on rank change (ControlEventAppNewHead equivalent).
+    // Retained legacy rank-transition helper; simplex handles current transitions.
+    #[allow(dead_code)]
     fn flush_deferred_messages(&mut self, target_rank: u64) {
         if let Some(messages) = self.message_spillover.remove(&target_rank) {
             for msg in messages {
@@ -5315,6 +5321,8 @@ impl AppConsensusEngine {
 /// Verify the structural relation between an archive anchor N and its required
 /// predecessor N-1. Certificate validation remains in `install_archive_bootstrap`;
 /// keeping this portion pure makes the fail-closed bootstrap boundary testable.
+// Test adapter without session genesis; production uses the context-aware variant.
+#[allow(dead_code)]
 fn validate_archive_sync_anchor(
     filter: &[u8],
     materialized: u64,
@@ -5349,6 +5357,8 @@ fn validate_archive_sync_anchor_in(
     Ok(height)
 }
 
+// Test adapter without session genesis; production uses the context-aware variant.
+#[allow(dead_code)]
 fn archive_bootstrap_predecessor_height(
     app_address: &[u8],
     anchor: &quil_types::proto::global::AppShardFrame,
@@ -5512,14 +5522,22 @@ mod consensus_wire_ext {
     /// `protobufs.AppShardProposal.FromCanonicalBytes`.
     pub struct AppShardProposal {
         /// Decoded `AppShardFrame` header.
+        // Decoded wire fields retained for compatibility; consumers use state_bytes.
+        #[allow(dead_code)]
         pub header: CanonicalFrameHeader,
         /// Inner state bytes (the AppShardFrame canonical-bytes payload).
         /// We keep them around in case downstream wants to re-cache the
         /// raw proposal bytes by rank.
         #[allow(dead_code)]
         pub state_bytes: Vec<u8>,
+        // Retained decoded certificate.
+        #[allow(dead_code)]
         pub parent_qc: WireQc,
+        // Retained decoded timeout certificate.
+        #[allow(dead_code)]
         pub prior_tc: Option<WireTc>,
+        // Retained decoded vote.
+        #[allow(dead_code)]
         pub vote: WireVote,
     }
 

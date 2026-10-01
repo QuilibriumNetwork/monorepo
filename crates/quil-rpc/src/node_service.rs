@@ -305,6 +305,8 @@ impl NodeRpcServer {
     /// than returning an empty answer that a caller cannot tell apart from
     /// "there is nothing there". Applications with no declared coverage hook
     /// are served as before.
+    // Regression helper for the production serves_application/coverage_error policy.
+    #[allow(dead_code)]
     fn require_application_coverage(&self, application: &[u8]) -> Result<(), Status> {
         if self.serves_application(application) {
             return Ok(());

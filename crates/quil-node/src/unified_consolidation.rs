@@ -90,14 +90,20 @@ pub fn mark_prover_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) {
 /// marker: the tree wipe is consensus state (hg store, on materializers), while the
 /// worker reset is LOCAL runtime state (worker store, on every node with workers) —
 /// they run on different paths, so each needs its own once-guard.
+// Retained worker-reset migration marker, separate from consensus tree reset.
+#[allow(dead_code)]
 const WORKER_RESET_V3_MARKER_KEY: &[u8] = b"\x00__quil_worker_reset_v3__";
 
 /// Whether the prover-reset v3 worker-filter reset has already run on this node.
+// Retained migration query; current startup does not run this reset.
+#[allow(dead_code)]
 pub fn worker_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
     hg.raw_db().get(WORKER_RESET_V3_MARKER_KEY).ok().flatten().is_some()
 }
 
 /// Record that the prover-reset v3 worker-filter reset has run.
+// Retained migration marker writer; current startup does not run this reset.
+#[allow(dead_code)]
 pub fn mark_worker_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) {
     if let Err(e) = hg.raw_db().put(WORKER_RESET_V3_MARKER_KEY, [1u8]) {
         warn!(error = %e, "worker-reset v3: marker write FAILED — may re-run if the frame re-materializes");

@@ -150,7 +150,12 @@ fn interpolate_polynomial_point_shares(
     reconstructed_sum
 }
 
+// The matrix-inversion / Beaver-triple path in this file is a complete port of
+// the Go `rpm` package, but no caller in this workspace has been wired up to it
+// yet. Annotated per item rather than crate-wide so genuinely new dead code
+// still warns.
 /// Compare two Scalars: returns 1 if a > b, 0 otherwise, in constant time
+#[allow(dead_code)]
 fn scalar_gt(a: &Scalar, b: &Scalar) -> Choice {
     let a_bytes = a.to_bytes();
     let b_bytes = b.to_bytes();
@@ -167,6 +172,7 @@ fn scalar_gt(a: &Scalar, b: &Scalar) -> Choice {
     Choice::from(result)
 }
 
+#[allow(dead_code)] // unwired rpm matrix path, see `scalar_gt`
 fn lu_decompose(
     matrix: &[Vec<Scalar>],
 ) -> (Vec<Vec<Scalar>>, Vec<Vec<Scalar>>) {
@@ -212,6 +218,7 @@ fn lu_decompose(
     (new_a, pm)
 }
 
+#[allow(dead_code)] // unwired rpm matrix path, see `scalar_gt`
 fn invert(matrix: &[Vec<Scalar>]) -> Vec<Vec<Scalar>> {
     let n = matrix.len();
     let (a, p) = lu_decompose(matrix);
@@ -239,6 +246,7 @@ fn invert(matrix: &[Vec<Scalar>]) -> Vec<Vec<Scalar>> {
     ia
 }
 
+#[allow(dead_code)] // unwired rpm matrix path, see `scalar_gt`
 fn interpolate_matrix_shares(
     matrix_shares: &SecretSharedMatrix,
     ids: &[u64],
@@ -258,6 +266,7 @@ fn interpolate_matrix_shares(
     matrix
 }
 
+#[allow(dead_code)] // unwired rpm matrix path, see `scalar_gt`
 fn scalar_mult(a: i64, b: &[Vec<Scalar>]) -> Vec<Vec<Scalar>> {
     let mut prod = vec![vec![Scalar::ZERO; b[0].len()]; b.len()];
     let scalar_a = if a >= 0 {
@@ -299,6 +308,7 @@ fn subtract_matrices(a: &Vec<Vec<Scalar>>, b: &Vec<Vec<Scalar>>) -> Vec<Vec<Scal
     result
 }
 
+#[allow(dead_code)] // unwired rpm matrix path, see `scalar_gt`
 fn strassen(a: &Vec<Vec<Scalar>>, b: &Vec<Vec<Scalar>>) -> Vec<Vec<Scalar>> {
     let n = a.len();
     
@@ -444,6 +454,7 @@ fn generate_dot_product(
     }
 }
 
+#[allow(dead_code)] // unwired rpm matrix path, see `scalar_gt`
 fn generate_random_matrix_and_inverse_shares(
     size: u64,
     total: u64,
@@ -466,6 +477,7 @@ fn generate_random_matrix_and_inverse_shares(
     [split_output, split_inverse]
 }
 
+#[allow(dead_code)] // unwired rpm matrix path, see `scalar_gt`
 fn generate_random_beaver_triple_matrix_shares(
     size_x: u64,
     size_y: u64,
@@ -921,6 +933,7 @@ fn internal_vector_to_ffi(v: Vector) -> Vec<Vec<u8>> {
 }
 
 // SecretSharedMatrix <-> sequence<sequence<sequence<sequence<u8>>>>
+#[allow(dead_code)] // unwired rpm matrix path, see `scalar_gt`
 fn ffi_ssm_to_internal(ssm: &Vec<Vec<Vec<Vec<u8>>>>) -> SecretSharedMatrix {
     ssm.iter().map(ffi_matrix_to_internal).collect()
 }
@@ -929,6 +942,7 @@ fn internal_ssm_to_ffi(ssm: SecretSharedMatrix) -> Vec<Vec<Vec<Vec<u8>>>> {
 }
 
 // SecretSharedVector <-> sequence<sequence<sequence<u8>>>
+#[allow(dead_code)] // unwired rpm matrix path, see `scalar_gt`
 fn ffi_ssv_to_internal(ssv: &Vec<Vec<Vec<u8>>>) -> SecretSharedVector {
     ssv.iter().map(ffi_vector_to_internal).collect()
 }
