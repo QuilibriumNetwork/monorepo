@@ -525,6 +525,7 @@ async fn worker_active_storage_attestation() {
         !att.openings.is_empty(),
         "carried StorageAttestation must contain member openings",
     );
+    harness.shutdown().await;
 }
 
 /// Full worker→archive coverage attribution flow:
