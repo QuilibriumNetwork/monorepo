@@ -761,7 +761,6 @@ mod fee_relay_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a loopback RPC listener; run via Taskfile"]
     async fn app_fee_relay_transport_bounds_and_binding_races() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
