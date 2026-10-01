@@ -1,5 +1,5 @@
 use wasm_bindgen::prelude::*;
-use verenc::{new_verenc_proof, new_verenc_proof_encrypt_only, verenc_verify, verenc_compress, verenc_recover, chunk_data_for_verenc, combine_chunked_data, verenc_verify_statement, VerencProofAndBlindingKey, VerencProof, CompressedCiphertext, VerencDecrypt, VerencCiphertext, VerencShare};
+use verenc::{new_verenc_proof, new_verenc_proof_encrypt_only, verenc_verify, verenc_compress, verenc_recover, chunk_data_for_verenc, combine_chunked_data, verenc_verify_statement, VerencProof, CompressedCiphertext, VerencDecrypt, VerencCiphertext, VerencShare};
 
 // Create a new verifiable encryption proof
 #[wasm_bindgen]

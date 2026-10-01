@@ -269,7 +269,7 @@ impl GmpClassGroup {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn inner_square_impl(&mut self, ctx: &mut Ctx) {
+    fn inner_square_impl(&mut self, _ctx: &mut Ctx) {
         self.assert_valid();
         ffi::gmp_nudupl(&mut self.a, &mut self.b, &mut self.c, 1);
     }
@@ -478,7 +478,7 @@ impl ClassGroup for GmpClassGroup {
     ///
     /// Panics if called within the scope of a call to `with_context`.
     fn repeated_square(&mut self, iterations: u64) {
-        Self::with_context(|ctx| {
+        Self::with_context(|_ctx| {
             ffi::gmp_nudupl(&mut self.a, &mut self.b, &mut self.c, iterations);
         })
     }

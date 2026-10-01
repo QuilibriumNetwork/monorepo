@@ -1,12 +1,10 @@
 // src/lib.rs
 
 use core::fmt;
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha20Rng;
 use std::convert::TryFrom;
 use std::error::Error;
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int};
 use std::sync::{Arc, Mutex};
 
 uniffi::include_scaffolding!("lib");
