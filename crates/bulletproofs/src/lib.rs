@@ -41,5 +41,5 @@ pub mod uniffi_bulletproofs;
 pub use crate::uniffi_bulletproofs::{RangeProofResult, generate_input_commitments, generate_range_proof, verify_range_proof, sum_check, scalar_mult_point, scalar_mult, scalar_inverse, keygen, scalar_mult_hash_to_scalar, hash_to_scalar, scalar_addition, scalar_subtraction, scalar_to_point, alt_generator, point_addition, point_subtraction, sign_hidden, verify_hidden, sign_simple, verify_simple};
 
 // UniFFI bindings - exclude for WASM targets
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "uniffi-bindings", not(target_arch = "wasm32")))]
 uniffi::include_scaffolding!("lib");
