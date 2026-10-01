@@ -494,11 +494,11 @@ pub fn escrow(state: &HypergraphState, application: &[u8; 32], escrow: &[u8; 32]
 
 // ---- outputs orphaned by a split ----------------------------------------
 
-/// The GLOBAL frame from which a split re-places the undelivered outputs of a
-/// block it leaves without a whole owner. Consensus-affecting for GLOBAL and
-/// for every application shard's report, which switch together. Off (never)
-/// unless `QUIL_ORPHAN_REPLACE_FRAME` names a frame; on mainnet it is
-/// [`MAINNET_RELEASE_ACTIVATION_FRAME`].
+// The GLOBAL frame from which a split re-places the undelivered outputs of a
+// block it leaves without a whole owner. Consensus-affecting for GLOBAL and
+// for every application shard's report, which switch together. Off (never)
+// unless `QUIL_ORPHAN_REPLACE_FRAME` names a frame; on mainnet it is
+// [`MAINNET_RELEASE_ACTIVATION_FRAME`].
 #[cfg(test)]
 thread_local! {
     static TEST_ORPHAN_REPLACEMENT_FRAME: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };

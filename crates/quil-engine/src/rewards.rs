@@ -28,12 +28,14 @@
 //! can be driven to zero by switching the backing library. Revisit
 //! this before any write-back path is wired.
 
+#[cfg(test)]
+use num_traits::One;
 use std::collections::HashMap;
 
 use num_bigint::BigInt;
 #[allow(unused_imports)]
 use num_integer::Roots; // used via `BigInt::sqrt()` and `BigInt::nth_root()`
-use num_traits::{One, ToPrimitive, Zero};
+use num_traits::{ToPrimitive, Zero};
 
 use quil_types::consensus::{ProverAllocation, RewardIssuance};
 use quil_types::error::Result;

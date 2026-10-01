@@ -1,7 +1,8 @@
 //! Shared local witness-index serving and cooperative, single-flight bootstrap.
 //! Cache failures affect RPC availability, never consensus execution success.
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+#[cfg(test)]
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 
 use quil_execution::{hypergraph_state::HypergraphState, token_intrinsic::{
     state::network_identifier,
@@ -215,7 +216,7 @@ impl NodeWitnessIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_execution::{hypergraph_state::vertex_adds_discriminator, token_intrinsic::{roots, state::{create_coin, SnapshotLimits}}};
+    use quil_execution::{hypergraph_state::vertex_adds_discriminator, token_intrinsic::{roots, state::SnapshotLimits}};
     use quil_lattice_ct::confidential::{transfer::Output, AmountOpening, CommitmentKey};
 
     #[tokio::test]

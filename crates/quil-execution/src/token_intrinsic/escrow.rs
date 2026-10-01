@@ -1,8 +1,9 @@
 //! Typed escrow storage. These records are not ordinary coins.
 //! Construction does not admit a proof, authorize a claim, or mutate state.
 
-use num_bigint::BigInt;
+#[cfg(test)]
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
+use num_bigint::BigInt;
 use quil_lattice_ct::confidential::{
     memo::EscrowRecoveryMemo,
     pending_claim::EscrowPolicy,

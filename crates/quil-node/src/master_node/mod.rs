@@ -1486,7 +1486,7 @@ mod grid_clobber_repro {
 
     /// Build `valid_shard_addresses` exactly as archive_sync does: for each QUIL
     /// grid row, `shard_prefix_to_filter(shard_key[3..35], prefix)`.
-    fn valid_shard_set(store: &dyn ShardsStore, quil: &[u8], gk: &[u8]) -> std::collections::HashSet<Vec<u8>> {
+    fn valid_shard_set(store: &dyn ShardsStore, _quil: &[u8], gk: &[u8]) -> std::collections::HashSet<Vec<u8>> {
         store
             .range_app_shards()
             .unwrap()

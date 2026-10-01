@@ -713,7 +713,7 @@ mod tests {
 
     #[test]
     fn archive_cache_byte_budget_evicts_oldest_and_tracks_every_removal() {
-        use store::ClockStore;
+
         let s = test_db();
         s.warm_global_frame_cache().unwrap();
         let size = cached_frame(1).encoded_len();
