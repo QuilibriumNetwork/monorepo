@@ -273,6 +273,7 @@ impl SharedAppEngineSizes {
 /// master holds one, and it can be shared across message routing tasks.
 #[derive(Clone, Debug)]
 pub struct AppEngineHandle {
+    cancel: CancellationToken,
     materialized: Arc<std::sync::atomic::AtomicU64>,
     pub filter: Vec<u8>,
     msg_tx: mpsc::Sender<AppEngineMessage>,
@@ -281,6 +282,11 @@ pub struct AppEngineHandle {
 }
 
 impl AppEngineHandle {
+    /// Request cooperative shutdown. The task owner must also await its join.
+    pub fn stop(&self) {
+        self.cancel.cancel();
+    }
+
     /// Send a message to the app engine (non-blocking, drops on full).
     pub fn send(&self, msg: AppEngineMessage) {
         let _ = self.msg_tx.try_send(msg);
@@ -2161,7 +2167,9 @@ impl AppConsensusEngine {
         let sizes = SharedAppEngineSizes::new();
         let fee_snapshot = Arc::new(std::sync::Mutex::new(None));
         let shard_mat_frame = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancel = CancellationToken::new();
         let handle = AppEngineHandle {
+            cancel: cancel.clone(),
             materialized: shard_mat_frame.clone(),
             fee_snapshot: fee_snapshot.clone(),
             filter: filter.clone(),
@@ -2221,7 +2229,7 @@ impl AppConsensusEngine {
             received_full_frames: HashMap::new(),
             pending_follower_clock: None,
             materialize_failures: HashMap::new(),
-            cancel: CancellationToken::new(),
+            cancel,
             msg_rx: Some(msg_rx),
             event_tx,
             app_frame_validator: None,
@@ -7297,7 +7305,7 @@ mod tests {
         let (msg_tx, receiver) = mpsc::channel(1);
         let materialized = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stored = Arc::new(std::sync::Mutex::new(None));
-        let handle = AppEngineHandle { filter: vec![7; 32], msg_tx,
+        let handle = AppEngineHandle { cancel: CancellationToken::new(), filter: vec![7; 32], msg_tx,
             sizes: SharedAppEngineSizes::new(), materialized: materialized.clone(), fee_snapshot: stored.clone() };
         assert!(handle.fee_snapshot().is_none());
         let snapshot = quil_execution::pricing::AppFeeSnapshot {

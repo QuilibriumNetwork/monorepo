@@ -592,6 +592,7 @@ pub struct WorkerRig {
 }
 
 pub struct AppShardHarness {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
     pub filter: Vec<u8>,
     pub workers: Vec<WorkerRig>,
 }
@@ -923,6 +924,7 @@ impl AppShardHarness {
         let full_frames_per_worker: Vec<Arc<Mutex<Vec<Vec<u8>>>>> =
             workers.iter().map(|w| w.full_frames.clone()).collect();
 
+        let mut tasks = Vec::new();
         // Spawn each worker's engine + its event drain.
         for (idx, pending) in pendings.into_iter().enumerate() {
             let engine = pending.engine;
@@ -934,9 +936,9 @@ impl AppShardHarness {
             > = std::sync::Arc::new(move || {
                 Box::new(quil_crypto::FalconSigner::from_bytes(&sk, &pk))
             });
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 engine.run(factory).await;
-            });
+            }));
 
             let peer_handles: Vec<quil_engine::app_engine::AppEngineHandle> = all_handles
                 .iter()
@@ -949,7 +951,7 @@ impl AppShardHarness {
             let events_log = events_per_worker[idx].clone();
             let full_frames_log = full_frames_per_worker[idx].clone();
             let mut rx = pending.event_rx;
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 while let Some(ev) = rx.recv().await {
                     use quil_engine::app_engine::AppEngineEvent as E;
                     match &ev {
@@ -1026,7 +1028,7 @@ impl AppShardHarness {
                         }
                     }
                 }
-            });
+            }));
         }
 
         // The in-memory harness wires every CW peer directly through the event
@@ -1038,7 +1040,20 @@ impl AppShardHarness {
             handle.set_cw_transport_ready();
         }
 
-        Self { filter, workers }
+        Self { filter, workers, tasks }
+    }
+
+    /// Stop engines cooperatively and wait for engines and event drains.
+    pub async fn shutdown(self) {
+        for worker in &self.workers {
+            worker.handle.stop();
+        }
+        for task in self.tasks {
+            tokio::time::timeout(std::time::Duration::from_secs(30), task)
+                .await
+                .expect("harness shutdown timed out")
+                .expect("harness task panicked");
+        }
     }
 
     /// Wait up to `timeout` for any worker to record at least one
