@@ -262,9 +262,42 @@ mod tests {
         assert!(run_worker(worker("valid"), b"public test request", Duration::from_secs(5)).unwrap());
     }
 
+    // Adopt the deliberately orphaned fixture instead of relying on PID 1
+    // to reap it. In containers, kill(pid, 0) also succeeds for dead zombies.
+    #[cfg(target_os = "linux")]
+    struct OrphanReaper {
+        previous: libc::c_int,
+        worker: Option<libc::pid_t>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl OrphanReaper {
+        fn new() -> Self {
+            let mut previous: libc::c_int = 0;
+            assert_eq!(unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut previous as *mut libc::c_int) }, 0);
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+            Self { previous, worker: None }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for OrphanReaper {
+        fn drop(&mut self) {
+            if let Some(pid) = self.worker {
+                let mut status = 0;
+                if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == 0 {
+                    unsafe { libc::kill(pid, libc::SIGKILL); libc::waitpid(pid, &mut status, 0); }
+                }
+            }
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, self.previous) }, 0);
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn a_worker_does_not_outlive_a_parent_that_died_without_reaping_it() {
+        #[cfg(target_os = "linux")]
+        let mut reaper = OrphanReaper::new();
         let file = std::env::temp_dir().join(format!("quil-orphan-{}-{:?}", std::process::id(), Instant::now()));
         let mut parent = worker("orphan_parent");
         parent.env("QUIL_PROCESS_TEST_PID_FILE", &file);
@@ -279,7 +312,30 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         let _ = std::fs::remove_file(&file);
-        // The worker would otherwise sleep for a minute.
+        // The worker would otherwise sleep for a minute. Reaping also lets
+        // us distinguish the orphan policy from an ordinary fixture exit.
+        #[cfg(target_os = "linux")]
+        {
+            reaper.worker = Some(pid);
+            loop {
+                let mut status = 0;
+                let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if result == pid {
+                    reaper.worker = None;
+                    assert!(
+                        (libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL)
+                            || (libc::WIFEXITED(status)
+                                && libc::WEXITSTATUS(status) == super::super::worker_limits::ORPHANED_EXIT),
+                        "worker must exit through the orphan policy, got status {status}",
+                    );
+                    break;
+                }
+                assert_eq!(result, 0, "orphaned fixture must be adopted by the test");
+                assert!(Instant::now() < deadline, "orphaned worker {pid} is still running");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         while unsafe { libc::kill(pid, 0) } == 0 {
             assert!(Instant::now() < deadline, "orphaned worker {pid} is still running");
             std::thread::sleep(Duration::from_millis(50));
