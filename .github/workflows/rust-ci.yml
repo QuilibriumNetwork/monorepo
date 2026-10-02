@@ -15,6 +15,9 @@ env:
   # different fingerprints and target/ grows unboundedly.
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: short
+  # Use the runner image's installed formulae; refresh dependencies separately.
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_UPGRADE: "1"
 
 jobs:
   # -----------------------------------------------------------------
@@ -31,7 +34,8 @@ jobs:
       - name: Pull LFS files
         run: git lfs pull
 
-      - uses: ./.github/actions/setup-native-deps
+      - id: native-deps
+        uses: ./.github/actions/setup-native-deps
 
       # Toolchain channel is read from rust-toolchain.toml at the repo
       # root. Update that file, not this workflow, to bump Rust.
@@ -39,10 +43,14 @@ jobs:
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-ci
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
+          # Check artifacts must not win the immutable test-cache key race.
+          shared-key: rust-check
           cache-on-failure: true
 
       - name: cargo check --workspace
@@ -62,16 +70,20 @@ jobs:
       - name: Pull LFS files
         run: git lfs pull
 
-      - uses: ./.github/actions/setup-native-deps
+      - id: native-deps
+        uses: ./.github/actions/setup-native-deps
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-ci
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
+          shared-key: rust-test
 
       - uses: taiki-e/install-action@v2
         with:
@@ -122,9 +134,12 @@ jobs:
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           # Per-target cache key — release target/ dirs don't overlap
           # with the debug target/ used by build+test, and the three
           # release targets don't overlap with each other.
