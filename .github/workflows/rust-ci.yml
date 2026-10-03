@@ -2,7 +2,10 @@ name: rust-ci
 
 on:
   push:
-    branches: [develop]
+    # Development moves between `develop`, versioned release branches, and
+    # their milestone branches.  Keep CI on every branch that can be a PR
+    # base so regressions are attributed to the push that introduced them.
+    branches: [develop, 'develop-*', 'v[0-9]*']
   pull_request:
 
 concurrency:
