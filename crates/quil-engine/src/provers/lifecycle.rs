@@ -2216,7 +2216,7 @@ impl ProverLifecycle {
                 available_replacements.as_slice()
             };
             let score_candidates: Vec<Vec<u8>> = if !proposal_descriptors.is_empty() {
-                proposer::plan_leaves_releasing(
+                proposer::plan_leaves_releasing_spread(
                     &allocated_descriptors,
                     replacement_descriptors,
                     difficulty,
@@ -2226,6 +2226,7 @@ impl ProverLifecycle {
                     assignable_worker_ids.len(),
                     &min_hold_filters,
                     &releasable,
+                    Some(&self.prover_address),
                 )
             } else {
                 Vec::new()
