@@ -526,8 +526,40 @@ impl AppSeamProposer {
         }
     }
 
-    /// Record digest → frame_number (used by inbound-block ingestion so a synced
-    /// parent resolves its number).
+    /// Build peer ingress without capturing the validated parent-height index.
+    /// Peer bytes are candidates until consensus verifies them; the digest does
+    /// not authenticate a claimed height. Only validated or recovered frames
+    /// may populate `block_meta`.
+    fn peer_ingress(self: &Arc<Self>, store: BlockStore) -> Arc<dyn Fn(Vec<u8>) + Send + Sync> {
+        Arc::new(move |bytes: Vec<u8>| {
+            if Seal::is_encoding(&bytes) {
+                // A peer's terminal-seal proposal: a replaceable candidate until
+                // this member's own automaton verifies it against its parent.
+                if let Ok(seal) = Seal::decode(&bytes) {
+                    store.put(digest_from_identity(seal.digest()), bytes);
+                }
+                return;
+            }
+            let Some(frame) = decode_app_frame(&bytes) else {
+                tracing::debug!("cw app block ingress: undecodable frame, dropping");
+                return;
+            };
+            let Some(header) = frame.header.as_ref() else {
+                return;
+            };
+            let Some(digest) = app_frame_digest(&frame) else {
+                return;
+            };
+            let frame_number = header.frame_number;
+            store.put(digest, bytes);
+            tracing::debug!(
+                frame = frame_number,
+                "cw app block ingress: stored peer frame"
+            );
+        })
+    }
+
+    /// Record the height of a validated or locally recovered frame.
     pub fn note_frame(&self, digest: Digest, frame_number: u64) {
         self.block_meta.lock().unwrap().insert(digest, frame_number);
     }
@@ -1119,8 +1151,8 @@ pub struct AppConsensusCwHandle {
         quil_cw_consensus::p2p_bridge::Message<FalconPublicKey>,
     >; 3],
     /// Feed a peer-delivered app frame's bytes into the engine's `BlockStore`
-    /// (so `verify` finds the block behind a proposed digest) and record its
-    /// digest→frame_number. Idempotent; drops malformed bytes.
+    /// so `verify` finds the block behind a proposed digest. Peer ingress never
+    /// records an unverified height. Drops malformed bytes.
     pub ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
     /// Cooperative shutdown flag for the simplex host thread. Set it to stop this
     /// instance (the engine drops + the runtime thread returns) — used to REBUILD
@@ -1393,41 +1425,12 @@ pub fn activate_app_consensus_cw(
         }
     });
 
-    // Block ingress: decode a peer app frame, compute identity digest, store it,
-    // and note digest→frame_number for parent resolution.
-    let ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync> = {
-        let store = store.clone();
-        let proposer = proposer.clone();
-        Arc::new(move |bytes: Vec<u8>| {
-            if Seal::is_encoding(&bytes) {
-                // A peer's terminal-seal proposal: a replaceable candidate until
-                // this member's own automaton verifies it against its parent.
-                if let Ok(seal) = Seal::decode(&bytes) {
-                    store.put(digest_from_identity(seal.digest()), bytes);
-                    finalizer.retry_pending();
-                }
-                return;
-            }
-            let Some(frame) = decode_app_frame(&bytes) else {
-                tracing::debug!("cw app block ingress: undecodable frame, dropping");
-                return;
-            };
-            let Some(header) = frame.header.as_ref() else {
-                return;
-            };
-            let Some(digest) = app_frame_digest(&frame) else {
-                return;
-            };
-            let frame_number = header.frame_number;
-            store.put(digest, bytes);
-            proposer.note_frame(digest, frame_number);
-            finalizer.retry_pending();
-            tracing::debug!(
-                frame = frame_number,
-                "cw app block ingress: stored peer frame"
-            );
-        })
-    };
+    // Peer ingress can store candidates, but cannot change trusted heights.
+    let ingress = proposer.peer_ingress(store.clone());
+    let ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |bytes| {
+        ingress(bytes);
+        finalizer.retry_pending();
+    });
 
     Ok(AppConsensusCwHandle {
         inbound,
@@ -1866,6 +1869,55 @@ mod tests {
         ) -> quil_types::error::Result<State<AppShardState>> {
             unreachable!("an unavailable voter must not produce a proposal")
         }
+    }
+
+    #[test]
+    fn peer_ingress_preserves_validated_parent_height_and_delivers_seals() {
+        let proposer = Arc::new(AppSeamProposer::new(
+            Arc::new(NoProposal),
+            Arc::new(BlsAppFrameValidator::new(
+                Arc::new(crate::test_support::TestProverRegistry::default()),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            )),
+            Arc::new(|_| unreachable!()), vec![1; 32], Some(Arc::new(|_| true)),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ));
+        let store = BlockStore::new();
+        let ingress = proposer.peer_ingress(store.clone());
+        let mut frame = AppShardFrame { header: Some(quil_types::proto::global::FrameHeader {
+            address: vec![1; 32], frame_number: 7, output: vec![3; 32], ..Default::default()
+        }), ..Default::default() };
+        let digest = app_frame_digest(&frame).unwrap();
+        let honest = encode_app_frame(&frame);
+        proposer.note_frame(digest, 7);
+        ingress(honest.clone());
+        assert_eq!(store.get(&digest), Some(honest.clone()));
+        frame.header.as_mut().unwrap().frame_number = u64::MAX / 2;
+        assert_eq!(app_frame_digest(&frame), Some(digest));
+        let forged = encode_app_frame(&frame);
+        ingress(forged.clone());
+        assert_eq!(store.get(&digest), Some(forged.clone()));
+        assert_eq!(proposer.block_meta.lock().unwrap().get(&digest), Some(&7));
+        store.seal(digest, honest.clone());
+        ingress(forged);
+        assert_eq!(store.get(&digest), Some(honest));
+        ingress(vec![0xff]);
+        frame.header.as_mut().unwrap().output = vec![4; 32];
+        let unknown = app_frame_digest(&frame).unwrap();
+        ingress(encode_app_frame(&frame));
+        assert!(!proposer.block_meta.lock().unwrap().contains_key(&unknown));
+        let seal = Seal {
+            request: [1; 32], session: [2; 32], view: 9,
+            checkpoint: quil_cw_consensus::handoff::Checkpoint {
+                frame: 4, view: 7, digest: [3; 32], state_roots: [[4; 32]; 4], history_root: [5; 32],
+            },
+        };
+        let bytes = seal.encode();
+        ingress(bytes.clone());
+        assert_eq!(store.get(&digest_from_identity(seal.digest())), Some(bytes));
+        assert_eq!(proposer.block_meta.lock().unwrap().len(), 1);
+        assert_eq!(proposer.block_meta.lock().unwrap().get(&digest), Some(&7));
     }
 
     #[test]
