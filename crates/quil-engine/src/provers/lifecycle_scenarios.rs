@@ -1,3 +1,5 @@
+use quil_types::consensus::EffectiveStatus;
+
 // Deterministic histories over the real lifecycle and worker allocator.
 // Registry observations are injected; no fixture pretends to authenticate a
 // network message. Signed materialization is covered by e2e_epoch_confirm.
@@ -37,7 +39,7 @@ impl Scenario {
     }
 
     fn tick(&mut self, frame: u64) -> Vec<LifecycleAction> {
-        self.lifecycle.worker_allocator.on_new_frame(frame).unwrap();
+        self.lifecycle.allocator.on_new_frame(frame).unwrap();
         self.lifecycle.set_prover_root_verified_frame(frame);
         let actions = self.lifecycle.evaluate(frame, 50_000, self.registry.as_ref(), self.workers.as_ref()).unwrap();
         self.history.push(format!("frame={frame}, actions={actions:?}"));
@@ -194,7 +196,7 @@ fn scenario_allocation_state_and_worker_matrix() {
                         let mut scenario = Scenario::new(vec![allocation], vec![worker]);
                         // This matrix characterizes allocator state alone;
                         // targeted histories above exercise policy actions.
-                        scenario.lifecycle.worker_allocator.on_new_frame(frame).unwrap();
+                        scenario.lifecycle.allocator.on_new_frame(frame).unwrap();
                         scenario.assert_unique_workers();
                         let expected = if manual { bound } else {
                             match status {
