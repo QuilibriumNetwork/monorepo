@@ -458,6 +458,25 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     }
     let c = ch(&ev);
     match ev.code {
+        KeyCode::Char('v') => {
+            m.notice_minimum = m.notice_minimum.next();
+            m.notice_offset = 0;
+            return vec![];
+        }
+        KeyCode::PageUp => {
+            m.notice_offset = m.notice_offset.saturating_sub(m.notice_visible.max(1));
+            return vec![];
+        }
+        KeyCode::PageDown => {
+            m.notice_offset = (m.notice_offset + m.notice_visible.max(1))
+                .min(m.notice_lines.saturating_sub(m.notice_visible));
+            return vec![];
+        }
+        KeyCode::Home => { m.notice_offset = 0; return vec![]; }
+        KeyCode::End => {
+            m.notice_offset = m.notice_lines.saturating_sub(m.notice_visible);
+            return vec![];
+        }
         KeyCode::Char('h') => {
             m.show_help = true;
             m.help_offset = 0;
@@ -1140,6 +1159,32 @@ fn handle_join_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
 mod tests {
     use super::*;
     use quil_types::proto::node::{NodeInfoResponse, ShardAllocationInfo};
+
+    #[test]
+    fn notification_controls_cycle_severity_and_bound_scrolling() {
+        use super::super::model::NoticeSeverity;
+        let mut m = Model::new();
+        m.notice_lines = 10;
+        m.notice_visible = 3;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        apply_msg(&mut m, Msg::ShardLoading);
+        handle_key(&mut m, key(KeyCode::PageDown));
+        assert_eq!(m.notice_offset, 3);
+        handle_key(&mut m, key(KeyCode::End));
+        assert_eq!(m.notice_offset, 7);
+        handle_key(&mut m, key(KeyCode::PageDown));
+        assert_eq!(m.notice_offset, 7);
+        handle_key(&mut m, key(KeyCode::PageUp));
+        assert_eq!(m.notice_offset, 4);
+        handle_key(&mut m, key(KeyCode::Home));
+        assert_eq!(m.notice_offset, 0);
+        for minimum in [NoticeSeverity::Error, NoticeSeverity::Info, NoticeSeverity::Warning] {
+            m.notice_offset = 7;
+            handle_key(&mut m, key(KeyCode::Char('v')));
+            assert_eq!(m.notice_minimum, minimum);
+            assert_eq!(m.notice_offset, 0);
+        }
+    }
 
     #[test]
     fn shard_refresh_can_complete_before_node_status_and_survive_failures() {

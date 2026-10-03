@@ -301,6 +301,10 @@ pub struct Model {
     // UI.
     pub width: u16,
     pub height: u16,
+    pub notice_minimum: NoticeSeverity,
+    pub notice_offset: usize,
+    pub notice_lines: usize,
+    pub notice_visible: usize,
     pub status_msg: String,
     pub status_message_key: String,
     pub status_message_seen: Option<std::time::Instant>,
@@ -340,6 +344,23 @@ pub struct Model {
     // Broadcast accumulator for the await loop.
     pub broadcasted_filters: Vec<Vec<u8>>,
     pub broadcasted_statuses: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum NoticeSeverity {
+    Info,
+    #[default]
+    Warning,
+    Error,
+}
+
+impl NoticeSeverity {
+    pub fn next(self) -> Self {
+        match self { Self::Info => Self::Warning, Self::Warning => Self::Error, Self::Error => Self::Info }
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Info => "all", Self::Warning => "warnings+", Self::Error => "errors" }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

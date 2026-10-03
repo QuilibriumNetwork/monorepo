@@ -238,11 +238,10 @@ pub fn draw(f: &mut Frame, m: &mut Model) {
 fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let (actions, status) = footer_lines(m);
     let actions = wrap_actions(actions, area.width);
-    let status = message_lines(m, status, area.width);
-    let footer_budget = area.height.saturating_sub(9);
-    let status_h = (status.len() as u16).min(footer_budget.max(1));
-    let actions_h = (actions.len() as u16).min(footer_budget.saturating_sub(status_h));
-    // Reserve both wrapped footers, plus header, titles and panel borders.
+    let actions_h = (actions.len() as u16).min(area.height.saturating_sub(12));
+    // Content height depends only on terminal geometry, never message length.
+    let notice_h = area.height.saturating_sub(11 + actions_h).clamp(1, 3);
+    let status_h = notice_h + 2;
     let panel_budget = area.height.saturating_sub(7 + actions_h + status_h);
     let alloc_h = panel_budget / 2;
     let avail_h = panel_budget - alloc_h;
@@ -253,8 +252,8 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         Constraint::Length(alloc_h + 2), // alloc panel (+ border)
         Constraint::Length(1),           // avail title
         Constraint::Length(avail_h + 2), // avail panel (+ border)
-        Constraint::Length(actions_h),   // actions
-        Constraint::Length(status_h),    // status
+        Constraint::Length(status_h),    // notifications
+        Constraint::Length(actions_h),   // commands at the bottom
     ])
     .split(area);
 
@@ -296,15 +295,36 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let avail_lines = render_avail_panel(m, &sorted_avail, avail_inner);
     f.render_widget(Paragraph::new(avail_lines), avail_inner);
 
-    // Actions + status lines.
+    render_notifications(f, m, status, chunks[5]);
     f.render_widget(
         Paragraph::new(actions).style(Style::new().fg(HELP)),
-        chunks[5],
-    );
-    f.render_widget(
-        Paragraph::new(status).style(Style::new().fg(HELP)),
         chunks[6],
     );
+}
+
+fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, area: Rect) {
+    let mut lines = message_lines(m, primary, area.width.saturating_sub(2));
+    if lines.len() == 1 && lines[0].width() == 0 {
+        lines[0] = Line::from(Span::styled(
+            match m.notice_minimum {
+                NoticeSeverity::Info => "No notifications",
+                NoticeSeverity::Warning => "No warnings or errors",
+                NoticeSeverity::Error => "No errors",
+            }, Style::new().fg(HELP),
+        ));
+    }
+    m.notice_lines = lines.len();
+    m.notice_visible = usize::from(area.height.saturating_sub(2));
+    m.notice_offset = m.notice_offset.min(m.notice_lines.saturating_sub(m.notice_visible));
+    let title = if m.notice_lines > m.notice_visible {
+        format!(" Notifications: {} {}/{} ", m.notice_minimum.label(), m.notice_offset + 1, m.notice_lines)
+    } else { format!(" Notifications: {} ", m.notice_minimum.label()) };
+    let block = Block::default().title(title).borders(Borders::ALL)
+        .border_type(BorderType::Rounded).border_style(Style::new().fg(DIM));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(lines.into_iter().skip(m.notice_offset)
+        .take(m.notice_visible).collect::<Vec<_>>()), inner);
 }
 
 // ── Header ───────────────────────────────────────────────────────────────
@@ -1013,32 +1033,33 @@ fn update_message_lifetime(m: &mut Model) {
     }
 }
 
-/// Operational refresh messages remain independent of action/filter prompts.
+fn shard_severity(m: &Model) -> NoticeSeverity {
+    if m.shard_error.is_some() {
+        if m.cached_shard_info.is_some() { NoticeSeverity::Warning } else { NoticeSeverity::Error }
+    } else if m.shard_loading && m.shard_fetch_started.is_some_and(|t| t.elapsed().as_secs() >= 15) {
+        NoticeSeverity::Warning
+    } else { NoticeSeverity::Info }
+}
+
+/// One short notice per current state; repeated polls do not create a feed.
 fn shard_message(m: &Model) -> Option<Line<'static>> {
-    let cached = m.cached_shard_info.is_some();
-    let availability = if cached {
-        let age = m.shard_last_success.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-        format!("Showing cached shard data ({age}s old).")
-    } else { "Shard data is not available yet.".to_owned() };
-    let message = if m.shard_loading {
-        let elapsed = m.shard_fetch_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-        if let Some(error) = &m.shard_error {
-            format!("Retrying shard data ({elapsed}s; 60s limit). Last query: {error}. {availability}")
-        } else {
-            format!("Fetching shard data ({elapsed}s; 60s limit). The node may query archive peers. {availability} Node status continues updating.")
-        }
-    } else if let Some(error) = &m.shard_error {
-        format!("{error}. Retrying automatically. {availability}")
+    let elapsed = m.shard_fetch_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+    let message = if let Some(error) = &m.shard_error {
+        let reason = if error.contains("timed out") { "Shard query timed out".to_owned() }
+            else { let mut text: String = error.chars().take(90).collect();
+                if error.chars().count() > 90 { text.push('…'); } text };
+        format!("{reason}; retrying.{}", if m.cached_shard_info.is_some() { " Cached rows retained." } else { "" })
+    } else if m.shard_loading {
+        if elapsed >= 15 { format!("Shard query slow ({elapsed}s); still waiting.") }
+        else { format!("Fetching shard data ({elapsed}s).") }
     } else if let Some(shards) = &m.cached_shard_info {
         if m.shard_last_success.is_some_and(|t| t.elapsed() >= MESSAGE_TTL) { return None; }
         let elapsed = m.shard_last_duration.map(|d| d.as_secs()).unwrap_or(0);
-        format!("Shard data updated in {elapsed}s ({} shards).", shards.shards.len())
-    } else {
-        return None;
-    };
-    Some(Line::from(Span::styled(format!("{}{message}", message_timestamp(m.shard_message_time)), Style::new().fg(
-        if m.shard_error.is_some() { Color::Yellow } else { HELP },
-    ))))
+        format!("Shard data updated ({} shards, {elapsed}s).", shards.shards.len())
+    } else { return None; };
+    let color = match shard_severity(m) { NoticeSeverity::Info => HELP,
+        NoticeSeverity::Warning => Color::Yellow, NoticeSeverity::Error => ERROR };
+    Some(Line::from(Span::styled(format!("{}{message}", message_timestamp(m.shard_message_time)), Style::new().fg(color))))
 }
 
 /// Wrap message words independently of the indivisible command hints above.
@@ -1069,17 +1090,18 @@ fn wrap_message(message: Line<'static>, width: u16) -> Vec<Line<'static>> {
 }
 
 fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'static>> {
-    let shards = shard_message(m);
+    let primary_severity = if m.status_is_error { NoticeSeverity::Error } else { NoticeSeverity::Info };
+    // Filter-editor prompts are controls rather than notifications.
+    let primary = if m.filter_edit_active || primary_severity >= m.notice_minimum {
+        wrap_message(primary, width)
+    } else { Vec::new() };
+    let shard_severity = shard_severity(m);
+    let shards = if shard_severity >= m.notice_minimum {
+        shard_message(m).map(|line| wrap_message(line, width)).unwrap_or_default()
+    } else { Vec::new() };
     let mut lines = Vec::new();
-    // Keep a fetch warning visible even when a persistent action message is
-    // also present, especially when a short terminal constrains the footer.
-    if m.shard_error.is_some() {
-        if let Some(shards) = shards.clone() { lines.extend(wrap_message(shards, width)); }
-    }
-    lines.extend(wrap_message(primary, width));
-    if m.shard_error.is_none() {
-        if let Some(shards) = shards { lines.extend(wrap_message(shards, width)); }
-    }
+    if shard_severity > primary_severity { lines.extend(shards); lines.extend(primary); }
+    else { lines.extend(primary); lines.extend(shards); }
     if lines.is_empty() { lines.push(Line::default()); }
     lines
 }
@@ -1114,7 +1136,7 @@ fn help_line(m: &Model) -> Line<'static> {
     let filters_active = m.has_active_filters();
 
     // (key, desc, action-tag)
-    let entries: [(&str, &str, &str); 20] = [
+    let entries: [(&str, &str, &str); 22] = [
         ("tab", "switch", ""),
         ("↑/k", "up", ""),
         ("↓/j", "down", ""),
@@ -1133,6 +1155,8 @@ fn help_line(m: &Model) -> Line<'static> {
         ("C", "colors", "ColorCoding"),
         ("w", "widths", "ColumnSizing"),
         ("e", "frames/epochs", "ThresholdUnit"),
+        ("v", "notice level", ""),
+        ("Pg↑/↓", "notices", ""),
         ("h", "help", ""),
         ("q", "quit", ""),
     ];
@@ -1302,6 +1326,10 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Space", "Toggle selection on cursor row (advances cursor)"),
         kv("a", "Select all / deselect all rows in current panel"),
         Line::from(""),
+        sec("Notifications"),
+        kv("v", "Cycle minimum severity: warnings/errors (default), errors only, all"),
+        kv("PgUp / PgDn", "Scroll notification text; Home/End jump to first/last line"),
+        kv("", "Fixed three-row panel above commands; completed notices expire after 30s"),
         sec("Actions — Allocations panel"),
         kv(
             "l",
@@ -1472,6 +1500,53 @@ mod tests {
     use crate::commands::node::prover::epoch::ActionHint;
 
     #[test]
+    fn severity_filter_hides_routine_updates_and_preserves_errors() {
+        use std::time::{Duration, Instant};
+        let mut m = Model::new();
+        m.shard_loading = true;
+        m.shard_fetch_started = Some(Instant::now());
+        let text = |m: &Model| message_lines(m, status_line(m), 80).iter().map(ToString::to_string).collect::<String>();
+        assert!(text(&m).is_empty(), "default warnings filter hides routine fetches");
+        m.shard_fetch_started = Some(Instant::now() - Duration::from_secs(16));
+        assert!(text(&m).contains("slow (16s)"));
+        m.notice_minimum = NoticeSeverity::Error;
+        assert!(text(&m).is_empty());
+        m.shard_error = Some("Shard query timed out".into());
+        assert!(text(&m).contains("timed out"), "missing data is an error");
+        m.cached_shard_info = Some(Default::default());
+        assert!(text(&m).is_empty(), "cache-preserving failures are warnings");
+        m.notice_minimum = NoticeSeverity::Warning;
+        assert!(text(&m).contains("Cached rows retained"));
+        m.status_is_error = true;
+        m.status_msg = "Action failed".into();
+        m.notice_minimum = NoticeSeverity::Error;
+        assert!(text(&m).contains("Action failed"));
+        assert!(!text(&m).contains("Cached rows"));
+    }
+
+    #[test]
+    fn notification_panel_geometry_stays_fixed_and_commands_stay_at_bottom() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut m = Model::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let mut notification_rows = Vec::new();
+        let mut available_rows = Vec::new();
+        for message in ["", "Short warning", "A long error notification ".repeat(20).as_str()] {
+            m.status_msg = message.to_owned();
+            m.status_is_error = true;
+            terminal.draw(|f| draw(f, &mut m)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows = (0..30).map(|y| (0..80).map(|x| buffer[(x,y)].symbol()).collect::<String>()).collect::<Vec<_>>();
+            notification_rows.push(rows.iter().position(|row| row.contains("Notifications:")).unwrap());
+            available_rows.push(rows.iter().position(|row| row.contains("Available Shards:")).unwrap());
+            assert_eq!(m.notice_visible, 3);
+            assert!(rows[29].contains("[q]"));
+        }
+        assert!(notification_rows.iter().all(|y| *y == notification_rows[0]));
+        assert!(available_rows.iter().all(|y| *y == available_rows[0]));
+    }
+
+    #[test]
     fn completed_notices_expire_but_unresolved_warnings_stay_visible() {
         use std::time::{Duration, Instant, UNIX_EPOCH};
         assert_eq!(message_timestamp(Some(UNIX_EPOCH + Duration::from_secs(3723))), "[01:02:03 UTC] ");
@@ -1503,24 +1578,25 @@ mod tests {
         let mut m = Model::new();
         m.status_msg = "Confirm sent. Awaiting registry...".into();
         m.action_in_flight = true;
+        m.notice_minimum = NoticeSeverity::Info;
         m.shard_loading = true;
         m.shard_fetch_started = Some(Instant::now());
         let text = |lines: Vec<Line<'static>>| lines.into_iter().map(|l| l.to_string()).collect::<Vec<_>>().join(" ");
         let waiting = text(message_lines(&m, status_line(&m), 60));
         assert!(waiting.contains("Confirm sent"));
-        assert!(waiting.contains("archive peers"));
-        assert!(waiting.contains("Node status continues updating"));
+        assert!(waiting.contains("Fetching shard data"));
+        assert!(!waiting.contains("archive peers"));
         m.shard_error = Some("Shard query timed out".into());
         let retry = text(message_lines(&m, status_line(&m), 60));
-        assert!(retry.contains("Retrying shard data"));
+        assert!(retry.contains("retrying"));
         assert!(retry.contains("timed out"));
         m.shard_loading = false;
-        assert!(text(message_lines(&m, status_line(&m), 60)).contains("Retrying automatically"));
+        assert!(text(message_lines(&m, status_line(&m), 60)).contains("retrying"));
         m.shard_error = None;
         m.cached_shard_info = Some(Default::default());
         m.shard_last_duration = Some(std::time::Duration::from_secs(22));
         let recovered = text(message_lines(&m, status_line(&m), 60));
-        assert!(recovered.contains("updated in 22s"));
+        assert!(recovered.contains("0 shards, 22s"));
         assert!(!recovered.contains("timed out"));
     }
 
@@ -1544,9 +1620,9 @@ mod tests {
         terminal.draw(|f| draw(f, &mut m)).unwrap();
         let buffer = terminal.backend().buffer();
         let rows = (0..24).map(|y| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>();
-        let screen = rows.iter().map(|line| line.trim()).collect::<Vec<_>>().join(" ");
+        let screen = rows.iter().map(|line| line.trim().trim_matches('│').trim()).collect::<Vec<_>>().join(" ");
         assert!(screen.contains(message));
-        assert!(rows[23].contains("cached rows"));
+        assert!(screen.contains("Notifications"));
         assert!(screen.contains("[q]"));
     }
 
@@ -1595,6 +1671,7 @@ mod tests {
         for width in [40, 80, 100, 160, 320] {
             let mut m = Model::new();
             m.status_msg = "status is visible".to_owned();
+            m.notice_minimum = NoticeSeverity::Info;
             let lines = wrap_actions(help_line(&m), width);
             for hint in help_line(&m).spans.into_iter().filter(|span| !span.content.trim().is_empty()) {
                 assert!(lines.iter().any(|line| line.spans.iter().any(|span| span == &hint)),
@@ -1607,8 +1684,8 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal.draw(|f| draw(f, &mut m)).unwrap();
             let buffer = terminal.backend().buffer();
-            let footer_start = 23 - lines.len() as u16;
-            let footer = (footer_start..23).map(|y| {
+            let footer_start = 24 - lines.len() as u16;
+            let footer = (footer_start..24).map(|y| {
                 (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>()
             }).collect::<Vec<_>>().join(" ");
             for key in ["[tab]", "[J]", "[C]", "[e]", "[h]", "[q]"] {
@@ -1617,7 +1694,7 @@ mod tests {
             let status = (0..width).map(|x| buffer[(x, 23)].symbol()).collect::<String>();
             let screen = (0..24).map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join(" ");
             assert!(screen.contains("status is visible"));
-            assert!(!status.trim().is_empty());
+            assert!(status.contains("[q]"));
         }
     }
 
