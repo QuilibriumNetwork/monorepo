@@ -3196,16 +3196,6 @@ mod proposal_loop_tests {
         out
     }
 
-    /// REPRODUCTION of the "one prover ⇒ many allocations" multi-coverage that
-    /// the static reassign/rekey/proposer reads could not explain (the field
-    /// data showed 45/49/45 provers on three DIFFERENT-branch deep shards,
-    /// |00∩01| = 45 — i.e. the same ~45 nodes each covering many distinct-branch
-    /// shards at once). This is NOT reassignment and NOT a bug in any single
-    /// path: it's the coverage model. A node runs `worker_count` data workers,
-    /// and `decide_joins` greedily proposes a join for EVERY under-covered shard
-    /// up to its free-worker count in a SINGLE cycle. Give one node enough idle
-    /// workers and enough halt-risk shards spread across different top-of-tree
-    /// branches, and it lays claim to all of them at once.
     #[test]
     fn rejected_leave_renews_before_orphan_cleanup_and_grace_is_bounded() {
         let address = vec![0xCD; 32];
@@ -3233,6 +3223,16 @@ mod proposal_loop_tests {
             "a failed, unstaffed recovery remains eligible for bounded cleanup; actions={actions:?}");
     }
 
+    /// REPRODUCTION of the "one prover ⇒ many allocations" multi-coverage that
+    /// the static reassign/rekey/proposer reads could not explain (the field
+    /// data showed 45/49/45 provers on three DIFFERENT-branch deep shards,
+    /// |00∩01| = 45 — i.e. the same ~45 nodes each covering many distinct-branch
+    /// shards at once). This is NOT reassignment and NOT a bug in any single
+    /// path: it's the coverage model. A node runs `worker_count` data workers,
+    /// and `decide_joins` greedily proposes a join for EVERY under-covered shard
+    /// up to its free-worker count in a SINGLE cycle. Give one node enough idle
+    /// workers and enough halt-risk shards spread across different top-of-tree
+    /// branches, and it lays claim to all of them at once.
     #[test]
     fn one_prover_covers_many_distinct_branch_shards_in_one_cycle() {
         let address = vec![0xCDu8; 32];
