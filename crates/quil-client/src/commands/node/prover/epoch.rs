@@ -184,23 +184,6 @@ impl ConfirmWindow {
             WindowState::Missed
         }
     }
-
-    /// `confirmWindow.label` — compact human hint.
-    pub fn label(&self, verb: &str, current_frame: u64, epoch_length: u64) -> String {
-        match self.state(current_frame, epoch_length) {
-            WindowState::Open => format!(
-                "{verb} now (epoch {}, until frame {})",
-                self.confirm_epoch, self.end_frame
-            ),
-            WindowState::Pending => format!(
-                "{verb} @epoch {} (frame {})",
-                self.confirm_epoch, self.start_frame
-            ),
-            WindowState::Missed => {
-                format!("{verb} window missed (was epoch {})", self.confirm_epoch)
-            }
-        }
-    }
 }
 
 /// `allocConfirmWindow` — window for a pending Joining/Leaving allocation.
@@ -213,6 +196,153 @@ pub fn alloc_confirm_window(a: &AllocationTiming, epoch_length: u64) -> Option<C
             Some(ConfirmWindow::for_frame(a.leave_frame, epoch_length))
         }
         _ => None,
+    }
+}
+
+/// The first frame of the epoch after the one `frame` falls in — the
+/// boundary at which an epoch-aligned lifecycle transition takes effect.
+pub fn next_epoch_boundary(frame: u64, epoch_length: u64) -> u64 {
+    epoch_start_frame(epoch_for_frame(frame, epoch_length) + 1, epoch_length)
+}
+
+/// Unit the Next/Default Action thresholds are displayed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThresholdUnit {
+    #[default]
+    Frames,
+    Epochs,
+}
+
+impl ThresholdUnit {
+    pub fn toggled(self) -> Self {
+        match self {
+            ThresholdUnit::Frames => ThresholdUnit::Epochs,
+            ThresholdUnit::Epochs => ThresholdUnit::Frames,
+        }
+    }
+}
+
+/// One lifecycle hint: a verb, and — when it is bounded — the frame it falls
+/// due at. Every threshold shown is an epoch boundary, so a single stored
+/// frame renders in either unit. An empty label means "nothing to show".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActionHint {
+    pub label: String,
+    pub at_frame: Option<u64>,
+}
+
+impl ActionHint {
+    pub fn none() -> Self {
+        ActionHint::default()
+    }
+
+    pub fn text(label: impl Into<String>) -> Self {
+        ActionHint {
+            label: label.into(),
+            at_frame: None,
+        }
+    }
+
+    pub fn at(label: impl Into<String>, frame: u64) -> Self {
+        ActionHint {
+            label: label.into(),
+            at_frame: Some(frame),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.label.is_empty()
+    }
+
+    /// `verb@f<frame>` or `verb@e<epoch>`; the bare verb when unbounded, which
+    /// for a Next Action reads as "available now".
+    pub fn render(&self, unit: ThresholdUnit, epoch_length: u64) -> String {
+        match self.at_frame {
+            None => self.label.clone(),
+            Some(f) => match unit {
+                ThresholdUnit::Frames => format!("{}@f{}", self.label, f),
+                ThresholdUnit::Epochs => {
+                    format!("{}@e{}", self.label, epoch_for_frame(f, epoch_length))
+                }
+            },
+        }
+    }
+}
+
+/// The Next Action / Default Action hint pair for an allocation.
+///
+/// Next Action lists the key-bound verbs the operator may use (`reject`,
+/// `confirm`, `pause`, `resume`, `leave`), with a threshold when they are not
+/// yet available. Default Action is the single verb the network applies on
+/// its own if the operator does nothing, at the boundary it takes effect.
+/// Both are shared with `qclient node prover status` so the two surfaces
+/// speak the same vocabulary.
+pub fn action_hints(
+    t: &AllocationTiming,
+    eff: EffectiveStatus,
+    epoch_length: u64,
+    current_frame: u64,
+    next_boundary: u64,
+) -> (ActionHint, ActionHint) {
+    match eff {
+        // A proposed join, or a leave nobody has answered yet: confirm or
+        // reject it inside its one-epoch window.
+        EffectiveStatus::Joining if t.raw_status == raw_status::JOINING => {
+            confirm_hints(t, epoch_length, current_frame)
+        }
+        EffectiveStatus::Leaving if t.leave_confirm_frame == 0 => {
+            confirm_hints(t, epoch_length, current_frame)
+        }
+        // A confirmed leave is out of the operator's hands; it departs at the
+        // boundary after the confirmation.
+        EffectiveStatus::Leaving => (
+            ActionHint::none(),
+            ActionHint::at(
+                "depart",
+                next_epoch_boundary(t.leave_confirm_frame, epoch_length),
+            ),
+        ),
+        // A confirmed join short of its activation boundary is already an
+        // ordinary allocation to pause or leave.
+        EffectiveStatus::Joining => (
+            ActionHint::text("(pause|leave)"),
+            ActionHint::at(
+                "activate",
+                next_epoch_boundary(t.join_confirm_frame, epoch_length),
+            ),
+        ),
+        // A stale epoch is recoverable, so its default is the same renewal an
+        // Active allocation gets; the Status column carries the alarm.
+        EffectiveStatus::Active | EffectiveStatus::ExpiredEpoch => {
+            let default = if t.filter.is_empty() {
+                ActionHint::none() // the global filter is exempt from epoch checks
+            } else {
+                ActionHint::at("renew", next_boundary)
+            };
+            (ActionHint::text("(pause|leave)"), default)
+        }
+        EffectiveStatus::Paused => (ActionHint::text("(resume|leave)"), ActionHint::none()),
+        _ => (ActionHint::none(), ActionHint::none()),
+    }
+}
+
+/// Hints for a pending join/leave: both verbs share one window, so they are
+/// grouped under a single threshold, and letting the window close is what
+/// happens by default.
+fn confirm_hints(
+    t: &AllocationTiming,
+    epoch_length: u64,
+    current_frame: u64,
+) -> (ActionHint, ActionHint) {
+    let Some(w) = alloc_confirm_window(t, epoch_length) else {
+        // No proposal frame recorded: nothing gates the answer.
+        return (ActionHint::text("(reject|confirm)"), ActionHint::none());
+    };
+    let expire = ActionHint::at("expire", w.end_frame);
+    match w.state(current_frame, epoch_length) {
+        WindowState::Open => (ActionHint::text("(reject|confirm)"), expire),
+        WindowState::Pending => (ActionHint::at("(reject|confirm)", w.start_frame), expire),
+        WindowState::Missed => (ActionHint::none(), expire),
     }
 }
 

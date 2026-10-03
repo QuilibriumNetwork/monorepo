@@ -6,7 +6,7 @@ use num_bigint::{BigInt, Sign};
 
 use quil_types::proto::node::GetShardInfoRequest;
 
-use super::{format_quil_reward, format_storage, worker_by_filter, ProverCtx};
+use super::{format_quil_daily_round, format_storage, worker_by_filter, ProverCtx};
 
 pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     let mut client = pc.connect().await?;
@@ -43,13 +43,13 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
         let shard_size_u64 = u64::try_from(shard_size).unwrap_or(u64::MAX);
 
         println!(
-            "  Filter: {}  Size: {:<10} Shards: {:<6} Provers: {:<4} Ring: {}  Reward: ~{} QUIL/frame{}",
+            "  Filter: {}  Size: {:<10} Shards: {:<6} Provers: {:<4} Ring: {}  Reward: {:<3} Q/d{}",
             filter_hex,
             format_storage(shard_size_u64),
             shard.data_shards,
             shard.active_provers,
             shard.ring,
-            format_quil_reward(&reward),
+            format_quil_daily_round(&reward),
             suffix
         );
     }
