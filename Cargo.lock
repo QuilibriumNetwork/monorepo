@@ -6203,6 +6203,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tonic",
+ "toml 0.9.12+spec-1.1.0",
  "tower 0.4.13",
  "tracing",
  "tracing-appender",
