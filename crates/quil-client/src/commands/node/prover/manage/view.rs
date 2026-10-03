@@ -158,9 +158,9 @@ fn printed_width(s: &str) -> usize {
 /// them. Next Action does not: `(pause|leave)` has no threshold at all, and
 /// aligned on the tail it lands under the middle of `(reject|confirm)@f804960`
 /// — the column stops looking like one column. Left is the only edge its
-/// values share.
+/// values share. Filters likewise align on their prefix.
 fn alloc_left_aligned(col: usize) -> bool {
-    col == 13
+    col == 1 || col == 13
 }
 
 /// One cell padded to its column width, on the side its column aligns to.
@@ -868,15 +868,14 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
         if i > 0 {
             hdr_spans.push(Span::raw(" "));
         }
-        // The available panel has no action columns; every value is a
-        // quantity, so every column stays right-justified.
+        // Filters align on their prefix; numeric columns align on their tail.
         hdr_spans.extend(header_spans(
             &avail_header(m, i),
             widths[i],
             style,
             sorted,
             sorted && m.color_coding && !hi_sort && !hi_filter,
-            false,
+            i == 1,
         ));
     }
     let mut lines = Vec::new();
@@ -897,7 +896,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
 
         if selected {
             let cells: Vec<String> = (0..widths.len())
-                .map(|c| format!("{:>w$}", avail_cell(m, s, c, fw), w = widths[c]))
+                .map(|c| pad_cell(&avail_cell(m, s, c, fw), widths[c], c == 1))
                 .collect();
             let padded = format!("{:<width$}", cells.join(" "), width = content_width);
             lines.push(Line::from(Span::styled(
@@ -912,7 +911,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
                 if c > 0 {
                     spans.push(Span::raw(" "));
                 }
-                let cell = format!("{:>w$}", avail_cell(m, s, c, fw), w = widths[c]);
+                let cell = pad_cell(&avail_cell(m, s, c, fw), widths[c], c == 1);
                 spans.push(match c {
                     3 if m.color_coding => Span::styled(cell, Style::new().fg(ring_color(s.ring))),
                     6 | 7 | 8 if m.color_coding => {
@@ -1755,6 +1754,29 @@ mod tests {
     }
 
     #[test]
+    fn filter_prefixes_align_in_both_panels_with_selected_rows() {
+        let mut m = Model::new();
+        let allocations = [row("aabb01", 1, 1, 0, "", ""), row("aabb012345", 1, 1, 1, "", "")];
+        let available = [shard("aabb01", 1, 1), shard("aabb012345", 1, 1)];
+        for focus in [PanelFocus::Allocations, PanelFocus::Available] {
+            m.focus = focus;
+            for cursor in [0, 1] {
+                m.alloc_cursor = cursor;
+                m.avail_cursor = cursor;
+                for lines in [
+                    render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 240, 5)),
+                    render_avail_panel(&mut m, &available, Rect::new(0, 0, 240, 5)),
+                ] {
+                    let text: Vec<String> = lines.iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect()).collect();
+                    assert_eq!(text[1].find("aabb"), text[2].find("aabb"));
+                    assert!(text[1].contains("aabb01"));
+                    assert!(text[2].contains("aabb012345"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn reward_total_excludes_unstaffed_and_inactive_rows_and_counts_deferred_joins() {
         let mut m = Model::new();
         m.frame_number = 2160;
@@ -2031,14 +2053,14 @@ mod tests {
         }
     }
 
-    /// Next Action is the one column whose values do not all end the same
-    /// way, so it is the one column that cannot align on its tail. Default
+    /// Filters and Next Action share a meaningful starting edge. Default
     /// Action stays right: its thresholds are the point of the column, and
     /// they only read as a list when they line up.
     #[test]
-    fn only_next_action_aligns_left() {
+    fn filters_and_next_action_align_left() {
         assert!(alloc_left_aligned(13));
-        for c in (0..ALLOC_COL_NAMES.len()).filter(|c| *c != 13) {
+        assert!(alloc_left_aligned(1));
+        for c in (0..ALLOC_COL_NAMES.len()).filter(|c| *c != 13 && *c != 1) {
             assert!(
                 !alloc_left_aligned(c),
                 "column {c} should stay right-aligned"
