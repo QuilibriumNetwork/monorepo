@@ -34,6 +34,13 @@ pub struct TestProverRegistry {
     /// `None`, falls back to the first prover's address. Matches
     /// the leader-pin behavior the `committee` tests need.
     next_prover: Mutex<Option<Vec<u8>>>,
+    /// Registered storage leaf roots, keyed by `(member, leaf_id)` →
+    /// `(leaf_root, num_blocks, epoch)`. Production populates the equivalent via
+    /// the confirm intrinsic writing the prover trie; tests register directly so
+    /// the frame validator's registered-leaf cross-check on storage attestations
+    /// can pass. See [`Self::register_leaf_root`] / [`ProverRegistry::get_leaf_root`].
+    #[allow(clippy::type_complexity)]
+    leaf_roots: Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)>>,
 }
 
 impl Default for TestProverRegistry {
@@ -48,7 +55,25 @@ impl TestProverRegistry {
             provers: Mutex::new(Vec::new()),
             summaries: Mutex::new(Vec::new()),
             next_prover: Mutex::new(None),
+            leaf_roots: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Register a member's storage leaf root so `get_leaf_root` returns it (the
+    /// frame validator cross-checks every storage-attestation opening against
+    /// this). `leaf_id` is the opening's `shard_id` (`leaf_id_bytes(filter, prefix)`).
+    pub fn register_leaf_root(
+        &self,
+        member: &[u8],
+        leaf_id: &[u8],
+        leaf_root: Vec<u8>,
+        num_blocks: u64,
+        epoch: u64,
+    ) {
+        self.leaf_roots.lock().unwrap().insert(
+            (member.to_vec(), leaf_id.to_vec(), epoch),
+            (leaf_root, num_blocks, epoch),
+        );
     }
 
     pub fn with_provers(provers: Vec<ProverInfo>) -> Self {
@@ -94,7 +119,21 @@ impl ProverRegistry for TestProverRegistry {
             .cloned())
     }
 
-    fn get_next_prover(&self, _input: &[u8; 32], _filter: &[u8]) -> Result<Vec<u8>> {
+    fn get_leaf_root(
+        &self,
+        member: &[u8],
+        leaf_id: &[u8],
+        epoch: u64,
+    ) -> Result<Option<(Vec<u8>, u64, u64)>> {
+        Ok(self
+            .leaf_roots
+            .lock()
+            .unwrap()
+            .get(&(member.to_vec(), leaf_id.to_vec(), epoch))
+            .cloned())
+    }
+
+    fn get_next_prover(&self, _input: &[u8; 32], _filter: &[u8], _frame_number: u64) -> Result<Vec<u8>> {
         if let Some(addr) = self.next_prover.lock().unwrap().clone() {
             return Ok(addr);
         }
@@ -107,7 +146,7 @@ impl ProverRegistry for TestProverRegistry {
             .unwrap_or_default())
     }
 
-    fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<Vec<u8>>> {
+    fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _frame_number: u64) -> Result<Vec<Vec<u8>>> {
         Ok(self
             .provers
             .lock()
@@ -117,7 +156,7 @@ impl ProverRegistry for TestProverRegistry {
             .collect())
     }
 
-    fn get_active_provers(&self, _filter: &[u8]) -> Result<Vec<ProverInfo>> {
+    fn get_active_provers(&self, _filter: &[u8], _frame_number: u64) -> Result<Vec<ProverInfo>> {
         Ok(self
             .provers
             .lock()
@@ -164,13 +203,13 @@ impl ProverRegistry for TestProverRegistry {
 /// `HashMap<core_id, WorkerInfo>` so test setup is uniform:
 ///
 /// - `add(info)` inserts/replaces a worker directly (use for
-///   tests that need pre-populated state).
+/// tests that need pre-populated state).
 /// - `set_worker_filter(core_id, filter, start_consensus)`
-///   matches the production trait method and creates missing
-///   workers on demand.
+/// matches the production trait method and creates missing
+/// workers on demand.
 /// - `set_manually_managed` is also wired so tests can flip
-///   the manual flag without going through the full Worker
-///   plumbing.
+/// the manual flag without going through the full Worker
+/// plumbing.
 pub struct TestWorkerManager {
     workers: Mutex<HashMap<u32, WorkerInfo>>,
 }
@@ -235,7 +274,15 @@ impl WorkerManager for TestWorkerManager {
     }
 
     fn deallocate_worker(&self, core_id: u32) -> Result<()> {
-        self.workers.lock().unwrap().remove(&core_id);
+        // Match ThreadWorkerManager: releasing an allocation makes the
+        // existing core idle; it does not remove the worker from the node.
+        // Keeping the entry is essential for allocator tests that release a
+        // stale filter and immediately bind that core to a live allocation.
+        if let Some(worker) = self.workers.lock().unwrap().get_mut(&core_id) {
+            worker.filter.clear();
+            worker.allocated = false;
+            worker.pending_filter_frame = 0;
+        }
         Ok(())
     }
 
@@ -514,11 +561,9 @@ impl quil_keys::KeyManager for TestKeyManager {
         key_type: quil_types::crypto::KeyType,
     ) -> quil_types::error::Result<Box<dyn quil_types::crypto::Signer>> {
         match key_type {
-            quil_types::crypto::KeyType::Bls48581G1 => {
-                use quil_types::crypto::BlsConstructor;
-                let ctor = quil_crypto::Bls48581KeyConstructor;
-                ctor.from_bytes(&self.bls_private, &self.bls_public)
-            }
+            quil_types::crypto::KeyType::Falcon512 => Ok(Box::new(
+                quil_crypto::FalconSigner::from_bytes(&self.bls_private, &self.bls_public),
+            )),
             other => Err(quil_types::error::QuilError::Internal(format!(
                 "TestKeyManager does not support key type {:?}",
                 other
@@ -531,7 +576,7 @@ impl quil_keys::KeyManager for TestKeyManager {
         key_type: quil_types::crypto::KeyType,
     ) -> quil_types::error::Result<Vec<u8>> {
         match key_type {
-            quil_types::crypto::KeyType::Bls48581G1 => Ok(self.bls_public.clone()),
+            quil_types::crypto::KeyType::Falcon512 => Ok(self.bls_public.clone()),
             other => Err(quil_types::error::QuilError::Internal(format!(
                 "TestKeyManager does not support key type {:?}",
                 other
@@ -544,7 +589,7 @@ impl quil_keys::KeyManager for TestKeyManager {
         key_type: quil_types::crypto::KeyType,
     ) -> quil_types::error::Result<Vec<u8>> {
         match key_type {
-            quil_types::crypto::KeyType::Bls48581G1 => Ok(self.bls_private.clone()),
+            quil_types::crypto::KeyType::Falcon512 => Ok(self.bls_private.clone()),
             other => Err(quil_types::error::QuilError::Internal(format!(
                 "TestKeyManager does not support key type {:?}",
                 other
@@ -587,4 +632,43 @@ impl quil_types::crypto::KeyManager for AcceptAllKeyManager {
     ) -> quil_types::error::Result<bool> {
         Ok(true)
     }
+}
+
+/// A real Simplex finalization of `seal` by every member of `session`, for
+/// tests that drive a committee handoff without running a consensus host.
+pub fn certify_seal(
+    session: &quil_cw_consensus::handoff::Session,
+    signers: &[quil_crypto::FalconSigner],
+    seal: &quil_cw_consensus::handoff::Seal,
+) -> Vec<u8> {
+    use quil_cw_consensus::{
+        _consensus::{
+            simplex::{scheme::Namespace, types::{Finalization, Proposal, Subject}},
+            types::{Epoch, Round, View},
+        },
+        _crypto::{sha256::Digest, Signer as _},
+        _utils::{ordered::Set, N3f1},
+        app_cert::encode_finalization,
+        falcon_base::FalconPrivateKey,
+        falcon_scheme::Generic,
+        falcon_simplex::SimplexFalconScheme,
+    };
+    use quil_types::crypto::Signer as _;
+    let keys: Vec<FalconPrivateKey> = signers.iter()
+        .map(|s| FalconPrivateKey::from_bytes(s.private_key(), s.public_key()).unwrap())
+        .collect();
+    let proposal = Proposal::new(
+        Round::new(Epoch::new(session.generation), View::new(seal.view)),
+        View::new(seal.checkpoint.view),
+        Digest(seal.digest()),
+    );
+    let participants: Set<_> = keys.iter().map(|key| key.public_key()).collect::<Vec<_>>().try_into().unwrap();
+    let schemes: Vec<Generic<Namespace>> = keys.iter().cloned()
+        .map(|key| Generic::signer(&session.namespace().unwrap(), participants.clone(), key).unwrap())
+        .collect();
+    let votes: Vec<_> = schemes.iter()
+        .map(|scheme| scheme.sign::<SimplexFalconScheme, Digest>(Subject::Finalize { proposal: &proposal }).unwrap())
+        .collect();
+    let certificate = schemes[0].assemble::<SimplexFalconScheme, _, N3f1>(votes).unwrap();
+    encode_finalization(&Finalization { proposal, certificate })
 }

@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 use quil_config::P2PConfig;
 use quil_types::error::QuilError;
 
-use crate::behaviour::{BlossomSubBehaviour, BlossomSubEvent};
+use crate::blossomsub_behaviour::{BlossomSubBehaviour, BlossomSubEvent};
 
 /// A received message from the network.
 #[derive(Debug, Clone)]
@@ -28,6 +28,12 @@ pub struct P2PNode {
     pub peer_id: PeerId,
     keypair: Keypair,
     bootstrap_peers: Vec<(PeerId, Multiaddr)>,
+    /// Operator-configured direct peers (e.g. genesis global archives).
+    /// Pinned into every gossip mesh via `add_direct_peer` in `start()`
+    /// so sparse committee topics — `GLOBAL_CONSENSUS` is subscribed by
+    /// only the handful of global archives and relayed by no one else —
+    /// keep propagating even when the broader swarm churns.
+    direct_peers: Vec<(PeerId, Multiaddr)>,
     network: u8,
     /// If a new Ed448 key was generated, the hex-encoded config key (228 chars).
     /// The caller should persist this in the config file.
@@ -55,15 +61,89 @@ pub struct P2PNode {
     pubsub_from_peer_id: Option<PeerId>,
 }
 
+/// Parse operator-configured multiaddr strings into `(PeerId, Multiaddr)`
+/// pairs, applying the same `/dnsaddr/` → `/dns/` rewrite (and QUIC marker
+/// synthesis) the Quilibrium bootstrap entries require. Entries that don't
+/// parse or lack a `/p2p/<peer-id>` segment are skipped. Shared by both
+/// bootstrap-peer and direct-peer parsing so the two stay in lockstep.
+fn parse_peer_multiaddrs(entries: &[String]) -> Vec<(PeerId, Multiaddr)> {
+    entries
+        .iter()
+        .filter_map(|addr_str| {
+            let raw: Multiaddr = addr_str.parse().ok()?;
+            let was_dnsaddr = raw.iter().any(|p| matches!(p, Protocol::Dnsaddr(_)));
+            let mut rewritten = Multiaddr::empty();
+            let mut last_was_udp = false;
+            let mut quic_inserted = false;
+            for proto in raw.iter() {
+                match proto {
+                    Protocol::Dnsaddr(host) => {
+                        rewritten.push(Protocol::Dns(host));
+                        last_was_udp = false;
+                    }
+                    Protocol::Udp(_) => {
+                        rewritten.push(proto);
+                        last_was_udp = true;
+                    }
+                    other => {
+                        // Quilibrium `/dnsaddr/` entries omit the QUIC
+                        // marker that TXT records would have supplied —
+                        // synthesize it.
+                        if was_dnsaddr
+                            && last_was_udp
+                            && !quic_inserted
+                            && !matches!(other, Protocol::QuicV1 | Protocol::Quic)
+                        {
+                            rewritten.push(Protocol::QuicV1);
+                            quic_inserted = true;
+                        }
+                        rewritten.push(other);
+                        last_was_udp = false;
+                    }
+                }
+            }
+            let peer_id = rewritten.iter().find_map(|p| match p {
+                Protocol::P2p(id) => Some(id),
+                _ => None,
+            })?;
+            Some((peer_id, rewritten))
+        })
+        .collect()
+}
+
 impl P2PNode {
     pub fn new(config: &P2PConfig) -> quil_types::error::Result<Self> {
-        Self::new_with_options(config, false)
+        Self::new_with_options(config, false, None)
     }
 
-    pub fn new_with_options(config: &P2PConfig, force_ed25519: bool) -> quil_types::error::Result<Self> {
+    /// Construct with the Falcon `q-prover-key` as the libp2p network identity
+    /// (the Rust-only flag-day peer-id). `falcon_signing_key` is the raw
+    /// 1281-byte Falcon-512 signing key from the keystore
+    /// (`FileKeyManager::get_private_key(Falcon512)`). The Ed448
+    /// `config.peer_priv_key` is retained untouched as the seniority root and
+    /// no longer derives the network peer-id.
+    pub fn new_with_falcon_identity(
+        config: &P2PConfig,
+        falcon_signing_key: &[u8],
+    ) -> quil_types::error::Result<Self> {
+        Self::new_with_options(config, false, Some(falcon_signing_key))
+    }
+
+    pub fn new_with_options(
+        config: &P2PConfig,
+        force_ed25519: bool,
+        falcon_signing_key: Option<&[u8]>,
+    ) -> quil_types::error::Result<Self> {
         let (keypair, generated_key_hex) = if force_ed25519 {
             debug!("using Ed25519 identity (--ed25519 flag)");
             (Keypair::generate_ed25519(), None)
+        } else if let Some(falcon_sk) = falcon_signing_key {
+            // Network identity = the Falcon q-prover-key. The Ed448
+            // config.peer_priv_key stays as the seniority root and is NOT the
+            // network peer-id.
+            let kp = Keypair::falcon_from_bytes(falcon_sk)
+                .map_err(|e| QuilError::P2p(format!("falcon identity key: {}", e)))?;
+            (kp, None)
         } else if config.peer_priv_key.is_empty() {
             // Generate Ed448 key
             let id = crate::ed448_identity::Ed448Identity::generate()?;
@@ -106,56 +186,19 @@ impl P2PNode {
         // which it can't dial ("Unsupported resolved address"). Inject
         // `/quic-v1/` between `/udp/<port>` and `/p2p/<id>` for any
         // address that came in as `/dnsaddr/`.
-        let bootstrap_peers = config
-            .bootstrap_peers
-            .iter()
-            .filter_map(|addr_str| {
-                let raw: Multiaddr = addr_str.parse().ok()?;
-                let was_dnsaddr = raw
-                    .iter()
-                    .any(|p| matches!(p, Protocol::Dnsaddr(_)));
-                let mut rewritten = Multiaddr::empty();
-                let mut last_was_udp = false;
-                let mut quic_inserted = false;
-                for proto in raw.iter() {
-                    match proto {
-                        Protocol::Dnsaddr(host) => {
-                            rewritten.push(Protocol::Dns(host));
-                            last_was_udp = false;
-                        }
-                        Protocol::Udp(_) => {
-                            rewritten.push(proto);
-                            last_was_udp = true;
-                        }
-                        other => {
-                            // Quilibrium `/dnsaddr/` entries omit the
-                            // QUIC marker that TXT records would have
-                            // supplied — synthesize it.
-                            if was_dnsaddr
-                                && last_was_udp
-                                && !quic_inserted
-                                && !matches!(other, Protocol::QuicV1 | Protocol::Quic)
-                            {
-                                rewritten.push(Protocol::QuicV1);
-                                quic_inserted = true;
-                            }
-                            rewritten.push(other);
-                            last_was_udp = false;
-                        }
-                    }
-                }
-                let peer_id = rewritten.iter().find_map(|p| match p {
-                    Protocol::P2p(id) => Some(id),
-                    _ => None,
-                })?;
-                Some((peer_id, rewritten))
-            })
-            .collect();
+        let bootstrap_peers = parse_peer_multiaddrs(&config.bootstrap_peers);
+        // Operator-configured direct peers (e.g. the genesis global
+        // archives). Parsed identically to bootstrap peers; entries must
+        // carry a `/p2p/<peer-id>` segment so we can pin them by PeerId.
+        // These are registered via `add_direct_peer` + persistently dialed
+        // in `start()`.
+        let direct_peers = parse_peer_multiaddrs(&config.direct_peers);
 
         Ok(Self {
             peer_id,
             keypair,
             bootstrap_peers,
+            direct_peers,
             network: config.network,
             generated_key_hex,
             blossomsub_params: crate::BlossomsubParams::from_p2p_config(config),
@@ -178,6 +221,7 @@ impl P2PNode {
     pub fn new_for_worker(
         p2p: &P2PConfig,
         core_id: u32,
+        falcon_signing_key: Option<&[u8]>,
     ) -> quil_types::error::Result<Self> {
         if p2p.peer_priv_key.is_empty() {
             return Err(QuilError::P2p(
@@ -205,11 +249,25 @@ impl P2PNode {
                 )));
             }
         };
-        let real_keypair = Keypair::ed448_from_bytes(&real_seed)
-            .map_err(|e| QuilError::P2p(format!("real ed448 key: {}", e)))?;
-        let real_peer_id = real_keypair.public().to_peer_id();
+        // Real signing identity = the node's network identity. Under the
+        // Falcon flag day this is the Falcon q-prover-key (so a worker's pubsub
+        // messages carry the real node's Falcon peer-id in `msg.from`); falls
+        // back to the legacy Ed448 identity when no Falcon key is supplied.
+        let (real_keypair, real_peer_id) = if let Some(falcon_sk) = falcon_signing_key {
+            let kp = Keypair::falcon_from_bytes(falcon_sk)
+                .map_err(|e| QuilError::P2p(format!("real falcon key: {}", e)))?;
+            let pid = kp.public().to_peer_id();
+            (kp, pid)
+        } else {
+            let kp = Keypair::ed448_from_bytes(&real_seed)
+                .map_err(|e| QuilError::P2p(format!("real ed448 key: {}", e)))?;
+            let pid = kp.public().to_peer_id();
+            (kp, pid)
+        };
 
-        // Synthetic worker key for host identity.
+        // Synthetic worker key for host identity (connection-level only, keeps
+        // worker processes from colliding on the real node's peer-id). Remains
+        // a deterministic Ed448 synthetic derived from the Ed448 seed + core_id.
         let worker_identity =
             crate::ed448_identity::derive_worker_identity(&real_seed, core_id)?;
         let mut worker_seed = [0u8; 57];
@@ -228,7 +286,7 @@ impl P2PNode {
         // Reuse the master's bootstrap-peer parsing logic by calling
         // `new_with_options` first, then swap in the worker-specific
         // identity + signing config.
-        let mut base = Self::new_with_options(p2p, false)?;
+        let mut base = Self::new_with_options(p2p, false, None)?;
         base.keypair = worker_keypair;
         base.peer_id = worker_peer_id;
         base.pubsub_signing_keypair = Some(real_keypair);
@@ -312,7 +370,13 @@ impl P2PNode {
             .with_tokio()
             .with_tcp(
                 libp2p::tcp::Config::default(),
-                libp2p::noise::Config::new,
+                // Post-quantum, forward-secret security upgrade: PQNoise
+                // (sntrup761 KEM) replaces classical Noise_XX_25519 on the TCP
+                // path. See `crate::pqnoise_transport`. QUIC (`.with_quic()`
+                // below) is ALSO post-quantum now: the vendored `libp2p-tls`
+                // fork negotiates the sntrup761 TLS key-exchange group, so both
+                // transports are pure-NTRU — no classical fallback.
+                crate::pqnoise_transport::PqNoiseConfig::new,
                 yamux_config_fn,
             )
             .map_err(|e| QuilError::P2p(format!("tcp: {}", e)))?
@@ -480,6 +544,7 @@ impl P2PNode {
 
         let peer_id = self.peer_id;
         let bootstrap_peers = self.bootstrap_peers.clone();
+        let direct_peers = self.direct_peers.clone();
         let (msg_tx, msg_rx) = mpsc::channel::<ReceivedMessage>(4096);
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<P2PCommand>(256);
         let peer_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -487,6 +552,17 @@ impl P2PNode {
         let observed_addrs: std::sync::Arc<std::sync::RwLock<Vec<String>>> =
             std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
         let observed_addrs_writer = observed_addrs.clone();
+        // P2P prometheus registry: the blossomsub behaviour owns it (its
+        // `blossomsub_*` families are registered at construction); add the
+        // swarm-level `libp2p_*` connection families alongside, and hand the
+        // registry to the P2PHandle so the node can render it.
+        let metrics_registry = swarm.behaviour().blossomsub.metrics_registry();
+        let swarm_metrics = {
+            let mut reg = metrics_registry
+                .lock()
+                .expect("fresh registry lock cannot be poisoned");
+            crate::metrics::SwarmMetrics::register(reg.sub_registry_with_prefix("libp2p"))
+        };
 
         sup.spawn("p2p-swarm", move |cancel_token| async move {
             debug!("P2P swarm event loop started");
@@ -516,6 +592,26 @@ impl P2PNode {
                         break;
                     }
                     _ = discovery_timer.tick() => {
+                        // Keep operator-configured direct peers (e.g. the
+                        // genesis global archives) connected at all times.
+                        // Unlike bootstrap re-dial, this is gated only on
+                        // `bootstrapped` — NOT on low overall connectivity or
+                        // the discovery_count cap — because sparse committee
+                        // topics (GLOBAL_CONSENSUS) ride exclusively on these
+                        // links: no other peers relay that traffic, so a
+                        // dropped direct peer must always be re-dialed.
+                        if bootstrapped {
+                            for (dp_peer, dp_addr) in &direct_peers {
+                                if !swarm.is_connected(dp_peer) {
+                                    swarm.behaviour_mut().kademlia.add_address(dp_peer, dp_addr.clone());
+                                    let opts = DialOpts::unknown_peer_id()
+                                        .address(dp_addr.clone())
+                                        .allocate_new_port()
+                                        .build();
+                                    let _ = swarm.dial(opts);
+                                }
+                            }
+                        }
                         if bootstrapped && discovery_count < 30 {
                             discovery_count += 1;
                             let connected = swarm.connected_peers().count();
@@ -588,6 +684,26 @@ impl P2PNode {
                                             debug!(%e, %bp_peer, "dial failed");
                                         }
                                     }
+                                    // Register + dial operator-configured
+                                    // direct peers (e.g. genesis archives).
+                                    // `add_direct_peer` pins each into every
+                                    // gossip mesh (see `behaviour.rs`), so the
+                                    // sparse GLOBAL_CONSENSUS committee mesh
+                                    // forms and holds regardless of swarm
+                                    // churn; the dial establishes the
+                                    // connection that graft needs.
+                                    for (dp_peer, dp_addr) in &direct_peers {
+                                        debug!(%dp_peer, %dp_addr, "registering + dialing direct peer");
+                                        swarm.behaviour_mut().blossomsub.add_direct_peer(*dp_peer);
+                                        swarm.behaviour_mut().kademlia.add_address(dp_peer, dp_addr.clone());
+                                        let opts = DialOpts::unknown_peer_id()
+                                            .address(dp_addr.clone())
+                                            .allocate_new_port()
+                                            .build();
+                                        if let Err(e) = swarm.dial(opts) {
+                                            debug!(%e, %dp_peer, "direct peer dial failed");
+                                        }
+                                    }
                                     // Start Kademlia bootstrap
                                     if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
                                         debug!(%e, "kad bootstrap failed");
@@ -611,17 +727,29 @@ impl P2PNode {
                             libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 let count = swarm.connected_peers().count();
                                 pc_writer.store(count, std::sync::atomic::Ordering::Relaxed);
+                                swarm_metrics
+                                    .connections_established
+                                    .get_or_create(&crate::metrics::SwarmMetrics::direction_of(&endpoint))
+                                    .inc();
+                                swarm_metrics.connected_peers.set(count as i64);
                                 debug!(%peer_id, peers = count, "peer connected");
                             }
-                            libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                            libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, endpoint, .. } => {
                                 let count = swarm.connected_peers().count();
                                 pc_writer.store(count, std::sync::atomic::Ordering::Relaxed);
+                                swarm_metrics
+                                    .connections_closed
+                                    .get_or_create(&crate::metrics::SwarmMetrics::direction_of(&endpoint))
+                                    .inc();
+                                swarm_metrics.connected_peers.set(count as i64);
                                 debug!(%peer_id, cause = ?cause, peers = count, "peer disconnected");
                             }
                             libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                                swarm_metrics.dial_failures.inc();
                                 debug!(peer = ?peer_id, error = %error, "outgoing connection failed");
                             }
                             libp2p::swarm::SwarmEvent::IncomingConnectionError { error, .. } => {
+                                swarm_metrics.incoming_failures.inc();
                                 debug!(error = %error, "incoming connection failed");
                             }
                             libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
@@ -825,8 +953,24 @@ impl P2PNode {
                             Some(P2PCommand::Subscribe(bitmask)) => {
                                 swarm.behaviour_mut().blossomsub.subscribe(bitmask);
                             }
+                            Some(P2PCommand::SubscribeConfirmed { bitmask, ack }) => {
+                                swarm.behaviour_mut().blossomsub.subscribe(bitmask);
+                                let _ = ack.send(());
+                            }
+                            Some(P2PCommand::SubscribedPeerCount { bitmask, ack }) => {
+                                let _ = ack.send(swarm.behaviour().blossomsub.subscribed_peer_count(&bitmask));
+                            }
                             Some(P2PCommand::Unsubscribe(bitmask)) => {
                                 swarm.behaviour_mut().blossomsub.unsubscribe(&bitmask);
+                            }
+                            Some(P2PCommand::SetForwardFilter(filter)) => {
+                                swarm.behaviour_mut().blossomsub.set_forward_filter_boxed(filter);
+                            }
+                            Some(P2PCommand::RegisterValidator { bitmask, validator }) => {
+                                swarm
+                                    .behaviour_mut()
+                                    .blossomsub
+                                    .register_validator(bitmask, validator);
                             }
                             Some(P2PCommand::Publish { bitmask, data, ack }) => {
                                 let result = swarm.behaviour_mut().blossomsub.publish(bitmask, data);
@@ -844,17 +988,17 @@ impl P2PNode {
                                 swarm.behaviour_mut().blossomsub.blacklist_peer(peer_id);
                             }
                             Some(P2PCommand::GetPeerScore { peer, ack }) => {
-                                let s = swarm.behaviour().blossomsub.scorer.score(&peer);
+                                let s = swarm.behaviour().blossomsub.score(&peer);
                                 let _ = ack.send(s);
                             }
                             Some(P2PCommand::SetPeerScore { peer, score }) => {
                                 swarm.behaviour_mut()
-                                    .blossomsub.scorer
+                                    .blossomsub
                                     .set_application_score(peer, score);
                             }
                             Some(P2PCommand::AddPeerScore { peer, delta }) => {
                                 swarm.behaviour_mut()
-                                    .blossomsub.scorer
+                                    .blossomsub
                                     .add_application_score(peer, delta);
                             }
                             Some(P2PCommand::Reconnect { peer, ack }) => {
@@ -900,7 +1044,7 @@ impl P2PNode {
         });
 
         Ok((
-            P2PHandle { peer_id, cmd_tx, observed_addrs, peer_count },
+            P2PHandle { peer_id, cmd_tx, observed_addrs, peer_count, metrics_registry },
             msg_rx,
         ))
     }
@@ -914,6 +1058,9 @@ pub struct P2PHandle {
     observed_addrs: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
     /// Connected peer count, updated by the swarm event loop.
     peer_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// P2P prometheus registry (`blossomsub_*` + `libp2p_*` families),
+    /// rendered on demand via [`render_metrics`](Self::render_metrics).
+    metrics_registry: crate::metrics::SharedRegistry,
 }
 
 impl P2PHandle {
@@ -921,8 +1068,171 @@ impl P2PHandle {
         let _ = self.cmd_tx.send(P2PCommand::Subscribe(bitmask)).await;
     }
 
+    /// Subscribe and wait until the swarm loop has actually applied it.
+    pub async fn subscribe_confirmed(&self, bitmask: Vec<u8>) -> quil_types::error::Result<()> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx.send(P2PCommand::SubscribeConfirmed { bitmask, ack: ack_tx }).await
+            .map_err(|_| QuilError::P2p("p2p command channel closed (swarm shutting down?)".into()))?;
+        ack_rx.await.map_err(|_| QuilError::P2p("p2p swarm dropped subscribe ack (event loop exited)".into()))
+    }
+
+    /// Count connected peers which advertised this exact topic subscription.
+    pub async fn subscribed_peer_count(&self, bitmask: Vec<u8>) -> quil_types::error::Result<usize> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx.send(P2PCommand::SubscribedPeerCount { bitmask, ack: ack_tx }).await
+            .map_err(|_| QuilError::P2p("p2p command channel closed (swarm shutting down?)".into()))?;
+        ack_rx.await.map_err(|_| QuilError::P2p("p2p swarm dropped topic-peer-count ack (event loop exited)".into()))
+    }
+
+    /// Register a blossomsub-level validator on `bitmask` that filters stale
+    /// PeerInfo / KeyRegistry BEFORE the mesh forwards them, so stale gossip is
+    /// never re-broadcast (self-amplifying the flood) and only reaches the app
+    /// router's `*_ts_too_old` reject as a fallback. This is a CHEAP peek (no
+    /// canonical decode / signature verify); fresh messages `Accept` and still
+    /// get full app-level validation.
+    ///
+    /// The response is GRADUATED by how stale the timestamp is:
+    /// - within `STALE_IGNORE_PAST_MS` of now (plus the small future skew
+    ///   allowance) → `Accept`;
+    /// - moderately stale (past `STALE_IGNORE_PAST_MS` but within
+    ///   `STALE_REJECT_PAST_MS`), or future-skewed → `Ignore` (drop, NO peer
+    ///   penalty) — a message can legitimately age in transit through an honest
+    ///   relayer, who must not be punished for it;
+    /// - grossly stale (older than `STALE_REJECT_PAST_MS` ≈ 5 min) → `Reject`,
+    ///   which feeds gossipsub's P₄ invalid-message peer score. An honest,
+    ///   roughly-NTP-synced relayer never forwards a 5-minute-old PeerInfo (it
+    ///   would `Ignore` it too), so reaching us with one means the sender is
+    ///   replaying / grossly clock-skewed / flooding — a sustained stream of
+    ///   these graylists the peer (see the topic-score params in
+    ///   `set_signing_identity`).
+    pub async fn register_peer_info_staleness_validator(&self, bitmask: Vec<u8>) {
+        // Fresh window (Accept below this age). Past this but within the reject
+        // bound → Ignore (possible honest transit aging).
+        const STALE_IGNORE_PAST_MS: i64 = 60_000;
+        // Beyond this age → Reject + penalize; no honest relayer forwards
+        // something this old.
+        const STALE_REJECT_PAST_MS: i64 = 300_000; // 5 min
+        let validator: Box<
+            dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync,
+        > = Box::new(|_peer, data| {
+            use crate::ValidationResult;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            if data.len() >= 4 {
+                let tp = u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4]));
+                if tp == crate::peer_info::PEER_INFO_TYPE {
+                    if let Some(ts) = crate::peer_info::peek_peer_info_timestamp(data) {
+                        if ts < now_ms - STALE_REJECT_PAST_MS {
+                            return ValidationResult::Reject;
+                        }
+                        if ts < now_ms - STALE_IGNORE_PAST_MS || ts > now_ms + 300_000 {
+                            return ValidationResult::Ignore;
+                        }
+                    }
+                } else if tp == crate::peer_info::KEY_REGISTRY_TYPE {
+                    if let Some(ts) =
+                        crate::peer_info::peek_key_registry_timestamp(data).map(|v| v as i64)
+                    {
+                        if ts < now_ms - STALE_REJECT_PAST_MS {
+                            return ValidationResult::Reject;
+                        }
+                        if ts < now_ms - STALE_IGNORE_PAST_MS || ts > now_ms + 5_000 {
+                            return ValidationResult::Ignore;
+                        }
+                    }
+                }
+            }
+            ValidationResult::Accept
+        });
+        let _ = self
+            .cmd_tx
+            .send(P2PCommand::RegisterValidator { bitmask, validator })
+            .await;
+    }
+
+    /// Mesh-level gate for the GLOBAL_FRAME topic. Runs in the gossip poll
+    /// thread BEFORE a message is delivered to the app recv loop or forwarded to
+    /// the mesh, so it must stay O(1): it does NOT decode the frame (frames can
+    /// be up to ~15 MiB) or verify the committee cert (that would move the
+    /// expensive work an attacker is trying to trigger into the swarm thread).
+    ///
+    /// It enforces two cheap invariants and reports `Reject` (which penalises the
+    /// sender's gossip score and stops propagation) when they fail:
+    ///   1. the message carries the canonical GLOBAL_FRAME type prefix, and
+    ///   2. no single peer exceeds `MAX_FRAMES_PER_SEC` frames in a 1s window.
+    ///
+    /// (1) sheds garbage floods; (2) caps a peer that floods unique (dedup-
+    /// evading) frames — the CPU-DoS vector where each frame otherwise forces a
+    /// VDF verify downstream. Legitimate gossip is head-only (~1 frame / 10s per
+    /// source), so the bound has ~80x headroom and never trips in normal flow.
+    /// The authoritative checks (genesis prover, committee finalization cert,
+    /// VDF) still run in the recv loop; this only bounds what reaches them.
+    pub async fn register_global_frame_validator(&self, bitmask: Vec<u8>, frame_type: u32) {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        // Per-source fixed-window counter. Bounded: the mesh has at most a few
+        // dozen peers; if it somehow grows past the cap we clear it wholesale
+        // (a coarse but O(1) reset that can only *reprieve* a flooder briefly).
+        const MAX_FRAMES_PER_SEC: u32 = 8;
+        const MAP_CAP: usize = 4096;
+        let counters: std::sync::Arc<Mutex<HashMap<PeerId, (u64, u32)>>> =
+            std::sync::Arc::new(Mutex::new(HashMap::new()));
+        let validator: Box<
+            dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync,
+        > = Box::new(move |peer, data| {
+            use crate::ValidationResult;
+            // (1) cheap shape/type check — legit frames are canonical-wire with
+            // the 4-byte type prefix; anything else on this topic is bogus.
+            if data.len() < 4
+                || u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4])) != frame_type
+            {
+                return ValidationResult::Reject;
+            }
+            // (2) per-peer rate limit.
+            let now_s = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if let Ok(mut map) = counters.lock() {
+                if map.len() > MAP_CAP {
+                    map.clear();
+                }
+                let entry = map.entry(*peer).or_insert((now_s, 0));
+                if entry.0 == now_s {
+                    entry.1 = entry.1.saturating_add(1);
+                } else {
+                    *entry = (now_s, 1);
+                }
+                if entry.1 > MAX_FRAMES_PER_SEC {
+                    return ValidationResult::Reject;
+                }
+            }
+            ValidationResult::Accept
+        });
+        let _ = self
+            .cmd_tx
+            .send(P2PCommand::RegisterValidator { bitmask, validator })
+            .await;
+    }
+
     pub async fn unsubscribe(&self, bitmask: Vec<u8>) {
         let _ = self.cmd_tx.send(P2PCommand::Unsubscribe(bitmask)).await;
+    }
+
+    /// Install a per-(source, target) gossip forward filter. When the filter
+    /// returns `false` for a `(source, target)` pair, the relay to that target
+    /// is suppressed. Used by the devnet proxy to impose network partitions;
+    /// with no filter installed (the default) all forwards are allowed.
+    pub async fn set_forward_filter(
+        &self,
+        filter: impl Fn(&PeerId, &PeerId) -> bool + Send + Sync + 'static,
+    ) {
+        let _ = self
+            .cmd_tx
+            .send(P2PCommand::SetForwardFilter(Box::new(filter)))
+            .await;
     }
 
     /// Publish data to a bitmask topic. This is the send path —
@@ -1048,6 +1358,13 @@ impl P2PHandle {
         self.peer_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Render the p2p prometheus registry (blossomsub mesh/graft/prune/
+    /// message families + libp2p connection families) to prometheus text.
+    /// Empty string if the registry is unavailable — never fails.
+    pub fn render_metrics(&self) -> String {
+        crate::metrics::render(&self.metrics_registry)
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.cmd_tx.send(P2PCommand::Shutdown).await;
     }
@@ -1087,13 +1404,29 @@ impl P2PHandle {
             cmd_tx,
             observed_addrs: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
             peer_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            metrics_registry: std::sync::Arc::new(std::sync::Mutex::new(
+                prometheus_client::registry::Registry::default(),
+            )),
         }
     }
 }
 
 enum P2PCommand {
     Subscribe(Vec<u8>),
+    SubscribeConfirmed { bitmask: Vec<u8>, ack: oneshot::Sender<()> },
+    SubscribedPeerCount { bitmask: Vec<u8>, ack: oneshot::Sender<usize> },
     Unsubscribe(Vec<u8>),
+    /// Install a per-(source, target) gossip forward filter. Used by the
+    /// devnet test proxy to impose bipartite network partitions.
+    SetForwardFilter(Box<dyn Fn(&PeerId, &PeerId) -> bool + Send + Sync>),
+    /// Register a blossomsub-level per-bitmask validator. It runs on the
+    /// receive path BEFORE the mesh forwards or the app is notified, so a
+    /// `Reject`/`Ignore` stops re-gossip at the source (used to drop stale
+    /// PeerInfo/KeyRegistry before the composite broker re-broadcasts them).
+    RegisterValidator {
+        bitmask: Vec<u8>,
+        validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync>,
+    },
     Publish {
         bitmask: Vec<u8>,
         data: Vec<u8>,

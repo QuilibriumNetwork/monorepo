@@ -21,6 +21,13 @@ verenc = { path = "../verenc" }
 channel = { path = "../channel" }
 sha2 = "0.10"
 rand = "0.8"
+# Falcon / FN-DSA-512 post-quantum consensus signatures (pure Rust, Pornin).
+fn-dsa = "0.3"
+# sntrup761 (Streamlined NTRU Prime) KEM — post-quantum config read/encryption
+# keys, replacing X448. PQClean via pqcrypto-ntruprime (same crate the QUIC
+# transport key-exchange uses).
+pqcrypto-ntruprime = "0.1"
+pqcrypto-traits = "0.3"
 poseidon-rs = "0.0.10"
 ff_ce = "0.11"
 num-bigint = "0.4"
@@ -28,3 +35,10 @@ hex = "0.4"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 tracing = "0.1"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "bench_sig"
+harness = false

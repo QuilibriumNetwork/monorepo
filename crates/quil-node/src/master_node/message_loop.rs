@@ -4,28 +4,6 @@ use tracing::{debug, info, warn};
 
 use quil_lifecycle::Supervisor;
 
-/// No-op transaction for direct clock-store writes outside a batch. The clock
-/// store's `put_*` methods fall through to a direct DB write when the txn isn't
-/// a real clock batch (see `with_clock_batch`), so this just satisfies the
-/// `&dyn Transaction` parameter.
-struct NoTxn;
-impl quil_types::store::Transaction for NoTxn {
-    fn get(&self, _: &[u8]) -> quil_types::error::Result<Option<Vec<u8>>> { Ok(None) }
-    fn set(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-    fn commit(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
-    fn delete(&self, _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-    fn abort(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
-    fn new_iter(
-        &self,
-        _: &[u8],
-        _: &[u8],
-    ) -> quil_types::error::Result<Box<dyn quil_types::store::Iterator>> {
-        Err(quil_types::error::QuilError::NotFound("noop".into()))
-    }
-    fn delete_range(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
-    fn as_any(&self) -> &dyn std::any::Any { self }
-}
-
 pub(crate) struct MessageLoopArgs {
     pub clock_store: Arc<quil_store::RocksClockStore>,
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
@@ -36,18 +14,24 @@ pub(crate) struct MessageLoopArgs {
     >,
     pub archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
     pub mtls_seed: Option<[u8; 57]>,
+    /// The FALCON network-identity signing key (`q-prover-key`) for outbound
+    /// :8340 PQNoise dials — the prover-tree bootstrap sync uses this, NOT the
+    /// legacy Ed448 `mtls_seed` (which the migrated transport can no longer
+    /// decode). Present iff we have a transport identity.
+    pub prover_falcon_key: Option<Vec<u8>>,
     pub hg_store: Arc<quil_store::RocksHypergraphStore>,
     pub frame_validator: quil_engine::frame_validator::GlobalFrameVerifier,
     pub message_collector: Arc<quil_engine::message_collector::MessageCollector>,
     pub coverage_monitor: Arc<quil_engine::coverage::CoverageMonitor>,
     pub worker_allocator: Arc<quil_engine::worker_allocator::WorkerAllocator>,
     pub prover_pipeline: Arc<quil_engine::prover_pipeline::ProverPipeline>,
-    pub consensus_handle:
-        Arc<std::sync::OnceLock<quil_engine::consensus_types::GlobalEventLoopHandle>>,
-    pub vote_aggregator:
-        Arc<std::sync::OnceLock<Arc<quil_engine::vote_aggregation::VoteAggregation>>>,
-    pub timeout_aggregator:
-        Arc<std::sync::OnceLock<Arc<quil_engine::timeout_aggregation::TimeoutAggregation>>>,
+    /// Commonware-simplex inbound router, set post-spawn at the
+    /// activation site when `config.engine.consensus_committee` is non-empty.
+    /// Unset (the default) → the simplex path is off and this adds no overhead.
+    pub cw_router:
+        Arc<std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>>,
+    /// Atomic GLOBAL finalization pipeline (archives with CW GLOBAL consensus).
+    pub global_finalization: Arc<std::sync::OnceLock<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>>,
     pub peer_info_cache: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
     >>,
@@ -57,10 +41,18 @@ pub(crate) struct MessageLoopArgs {
     pub signer_registry: Arc<quil_p2p::SignerRegistry>,
     pub current_frame: Arc<quil_engine::current_frame::CurrentFrame>,
     pub last_global_head_frame: Arc<std::sync::atomic::AtomicU64>,
+    /// Stamped on every gossip-delivered `GLOBAL_FRAME` so the RPC poller can
+    /// back off while the mesh is carrying the head.
+    pub gossip_freshness: Arc<quil_rpc::GossipFreshness>,
     pub genesis_archive_peer_ids: std::collections::HashSet<Vec<u8>>,
     pub genesis_prover_addrs: std::collections::HashSet<Vec<u8>>,
     pub alert_pubkey: Vec<u8>,
     pub network: u8,
+    /// CRDT + genesis seed for the at-cutover prover-tree reset on regular nodes
+    /// (they apply frames here, not in the archive materializer). Deterministic:
+    /// every node rebuilds the identical prover tree from the genesis committee.
+    pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    pub genesis_seed: String,
     pub archive_mode: bool,
     pub prover_lifecycle: Arc<quil_engine::provers::lifecycle::ProverLifecycle>,
     pub prover_registry: Arc<quil_execution::SharedProverRegistry>,
@@ -73,7 +65,71 @@ pub(crate) struct MessageLoopArgs {
     /// shard subscription and materializes them into the archive's CRDT.
     /// `None` on non-archive nodes.
     pub archive_app_shard_ingest:
-        Option<quil_engine::archive_ingest::ArchiveAppShardIngest>,
+        Option<Arc<std::sync::Mutex<quil_engine::archive_ingest::ArchiveAppShardIngest>>>,
+    /// Explorer recent-message ring. `Some` only when the explorer service
+    /// is enabled; every inbound gossip message is recorded for the
+    /// `GET /messages` endpoint. `None` (the default) means no overhead.
+    pub recent_messages: Option<Arc<quil_explorer::RecentMessageRing>>,
+}
+
+/// The engines a message on `bitmask` reaches as a submission: every engine
+/// whose application's submission topic it is. Every shard of an application
+/// shares that topic (a wallet knows only the application). Routed to the
+/// first matching engine only, each node gave a submission to one of its
+/// shards, so a bundle routed to any other shard was never proposed there
+/// (wallet-k16).
+fn submission_engines<'a, H>(bitmask: &[u8], entries: &'a [(Vec<u8>, H)]) -> Vec<&'a H> {
+    entries
+        .iter()
+        .filter(|(filter, _)| bitmask == quil_engine::bitmasks::app_prover_bitmask(filter).as_slice())
+        .map(|(_, handle)| handle)
+        .collect()
+}
+
+/// A shard-frame message no local engine takes.
+///
+/// ARCHIVE (no local shard engines): the app-shard ingest decodes and verifies
+/// it as a full AppShardFrame (non-frame messages fail decode and are
+/// ignored), stores it for serving once admitted, and materializes the
+/// shard's state. Nothing is stored before that check: an unverified store
+/// let one forged far-future frame pin the head the archive serves.
+///
+/// CLUSTER MASTER: a full app-shard frame the master received via
+/// `shard_frame_bitmask` gossip for a filter its REMOTE workers cover — no
+/// local engine handle and no archive ingest. Mirror it into the master clock
+/// store so the store-backed `AppShardService::get_app_shard_frame` serves it;
+/// without this, cluster reads hit an empty master store (thread-mode/local
+/// frames are mirrored by the worker drain). The filter is the frame header's
+/// `address`; the bitmask check confirms this really is a shard-frame message
+/// for it (and that non-frame mesh traffic is skipped). This mirror is not
+/// verified.
+fn unrouted_shard_message(
+    bitmask: &[u8],
+    data: &[u8],
+    clock_store: &dyn quil_types::store::ClockStore,
+    archive_ingest: Option<&dyn Fn(&[u8])>,
+) {
+    if let Some(ingest) = archive_ingest {
+        ingest(data);
+        return;
+    }
+    if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data) {
+        if let Some(addr) = frame.header.as_ref().map(|h| h.address.clone()) {
+            if !addr.is_empty() && bitmask == quil_engine::bitmasks::shard_frame_bitmask(&addr).as_slice() {
+                super::worker_manager::mirror_shard_frame_to_clock_store(clock_store, &addr, data);
+            }
+        }
+    }
+}
+
+/// An app-shard frame an archive fetched to fill a gap, fed back through the
+/// consensus loopback under the frame's own gossip topic, as if gossiped.
+pub(crate) fn gap_fetched_frame_message(filter: &[u8], data: Vec<u8>) -> quil_p2p::node::ReceivedMessage {
+    quil_p2p::node::ReceivedMessage {
+        bitmask: quil_engine::bitmasks::shard_frame_bitmask(filter),
+        data,
+        from: Vec::new(),
+    }
 }
 
 pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) {
@@ -84,25 +140,26 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         mut consensus_loopback_rx,
         global_msg_tx: gmtx_for_recv,
         archive_pool: pool_for_recv,
-        mtls_seed: mtls_seed_for_recv,
+        mtls_seed: _mtls_seed_for_recv,
+        prover_falcon_key: prover_falcon_for_recv,
         hg_store: hg_store_for_recv,
         frame_validator: frame_validator_for_recv,
         message_collector: mc_for_recv,
         coverage_monitor: coverage_for_recv,
         worker_allocator: wa_for_recv,
         prover_pipeline: pp_for_recv,
-        consensus_handle: ch_for_recv,
-        vote_aggregator: va_for_recv,
-        timeout_aggregator: ta_for_recv,
         peer_info_cache: pic_for_recv,
         shard_engines: shard_engines_for_recv,
         signer_registry: sr_for_recv,
         current_frame: cf_for_recv,
         last_global_head_frame: lhf_for_recv,
+        gossip_freshness: gossip_freshness_for_recv,
         genesis_archive_peer_ids: genesis_archive_peer_ids_for_recv,
         genesis_prover_addrs: genesis_prover_addrs_for_recv,
         alert_pubkey: alert_pubkey_for_recv,
         network: network_for_recv,
+        crdt: crdt_for_recv,
+        genesis_seed: genesis_seed_for_recv,
         archive_mode: archive_mode_recv,
         prover_lifecycle: pl_for_recv,
         prover_registry: pr_for_recv,
@@ -112,6 +169,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         time_reel: time_reel_for_recv,
         spawner,
         archive_app_shard_ingest,
+        recent_messages: recent_messages_for_recv,
+        cw_router: cw_router_for_recv,
+        global_finalization: global_finalization_for_recv,
     } = args;
     let mut archive_ingest_for_recv = archive_app_shard_ingest;
 
@@ -185,6 +245,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         // validators emit; size <= ~20 keys in practice.
         let mut router_drops_by_reason: std::collections::HashMap<&'static str, u64> =
             std::collections::HashMap::new();
+        // Per-SOURCE aggregation (propagation peer -> dropped-message count).
+        // Distinguishes a targeted flood (drops concentrated on one/few peers →
+        // blacklist candidate) from systemic backlog aging (drops spread across
+        // every mesh peer → this node is overloaded, not attacked). Keyed by the
+        // authenticated `from` peer, so it is bounded by the live connection set.
+        let mut router_drops_by_source: std::collections::HashMap<Vec<u8>, u64> =
+            std::collections::HashMap::new();
         let mut status_timer = tokio::time::interval(std::time::Duration::from_secs(30));
         status_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Track the highest frame number we've fully executed (through
@@ -200,9 +267,24 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
             .ok()
             .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
             .unwrap_or(0);
+        // Epoch of the last frame whose crossing triggered a registry refresh.
+        // Prover ALLOCATIONS only take effect at epoch boundaries
+        // (`effective_status` is epoch-quantized: activation/departure/expiry all
+        // flip on `epoch_for_frame` boundaries), so the shared prover-registry
+        // cache — which drives every worker's app-shard COMMITTEE and this loop's
+        // `on_new_frame` reconcile — only needs to be refreshed once per epoch.
+        // Refreshing per-frame is both wasteful (a full O(N) store scan) and, on
+        // the recv path, was simply ABSENT: `on_new_frame` reconciled against a
+        // never-refreshed cache on non-archive nodes. Track the epoch and refresh
+        // exactly on a boundary crossing.
+        let mut last_committee_epoch: u64 =
+            quil_types::consensus::epoch_for_frame(last_executed_frame);
         loop {
             tokio::select! {
                 _ = status_timer.tick() => {
+                    if let Some(ingest) = archive_ingest_for_recv.as_ref() {
+                        ingest.lock().unwrap_or_else(|p| p.into_inner()).retry_pending();
+                    }
                     // Periodic allocation status snapshot.
                     let peer_count = p2p_for_recv.peer_count();
                     let latest_frame = clock_store_recv.get_latest_global_frame()
@@ -268,6 +350,22 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 .collect::<Vec<_>>()
                                 .join(",")
                         },
+                        // Top drop sources: `peer(short-hex)=count`, most first.
+                        // A single peer dominating ⇒ targeted flood; even spread
+                        // ⇒ this node is backlog-aging (overloaded), not attacked.
+                        drop_sources = %{
+                            let mut entries: Vec<(&Vec<u8>, &u64)> =
+                                router_drops_by_source.iter().collect();
+                            entries.sort_by(|a, b| b.1.cmp(a.1));
+                            entries.into_iter().take(8)
+                                .map(|(k, v)| {
+                                    let h = hex::encode(k);
+                                    let short = if h.len() > 12 { &h[..12] } else { &h };
+                                    format!("{}={}", short, v)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        },
                         "node status"
                     );
                     // Memory snapshot. Logged separately so the size
@@ -299,8 +397,37 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         app_engine_message_spillover = sizes.app_engine_message_spillover,
                         app_engine_proposal_cache = sizes.app_engine_proposal_cache,
                         app_engine_pending_certified_parents = sizes.app_engine_pending_certified_parents,
+                        // Pinned RocksDB views of live execution branches in
+                        // this process; each retains superseded versions on disk.
+                        execution_views_held = quil_forest::ExecutionViewAdmission::process().active(),
                         "memory snapshot"
                     );
+                    // jemalloc allocator stats — PROCESS-GLOBAL, so this single
+                    // line captures the master, every worker thread, AND the
+                    // C++ RocksDB allocations. The decisive OOM signal:
+                    //   allocated rising → true live-heap leak
+                    //   allocated flat, resident hi → fragmentation, not a leak
+                    // Compare `allocated_mb` across ticks to tell them apart.
+                    if let Some(j) = crate::mem_stats::jemalloc_stats() {
+                        info!(
+                            allocated_mb = %crate::mem_stats::fmt_mb(j.allocated),
+                            active_mb = %crate::mem_stats::fmt_mb(j.active),
+                            resident_mb = %crate::mem_stats::fmt_mb(j.resident),
+                            retained_mb = %crate::mem_stats::fmt_mb(j.retained),
+                            mapped_mb = %crate::mem_stats::fmt_mb(j.mapped),
+                            "jemalloc stats"
+                        );
+                        // Localize the leak BY ALLOCATION SIZE: the dominant
+                        // size class says small-objects-leak vs big-buffers-leak
+                        // and the exact byte size to cross-reference. Sampled
+                        // here (cheap mallctl reads), so the next status tick on
+                        // an affected node pins where the 40 GB lives.
+                        let br = crate::mem_stats::jemalloc_size_classes();
+                        info!(
+                            breakdown = %crate::mem_stats::fmt_breakdown(&br),
+                            "jemalloc size classes"
+                        );
+                    }
                 }
                 msg = async {
                     // Merge the network receive channel and the
@@ -318,6 +445,18 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                 } => {
                     match msg {
                         Some(received) => {
+                            // Explorer tap: record every inbound gossip
+                            // message for the `GET /messages` endpoint.
+                            // Only present when the explorer is enabled,
+                            // so this is a no-op otherwise.
+                            if let Some(ring) = &recent_messages_for_recv {
+                                ring.push_received(
+                                    &received.from,
+                                    &received.bitmask,
+                                    &received.data,
+                                );
+                            }
+
                             // Forward to connected StreamGlobalMessages
                             // subscribers (workers) — ONLY peer-info.
                             //
@@ -364,6 +503,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 if let Some(reason) = route_outcome.reject_reason() {
                                     *router_drops_by_reason.entry(reason).or_insert(0) += 1;
                                 }
+                                // Attribute the drop to the peer that forwarded
+                                // it (bounded by the live connection set).
+                                if !received.from.is_empty() {
+                                    *router_drops_by_source
+                                        .entry(received.from.clone())
+                                        .or_insert(0) += 1;
+                                }
                                 // Categorize for operator visibility.
                                 let topic = match received.bitmask.as_slice() {
                                     GLOBAL_PEER_INFO => {
@@ -408,11 +554,67 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 continue;
                             }
 
+                            // Commonware-simplex routing: when the simplex
+                            // router is wired (committee configured), a message on
+                            // one of its channel bitmasks is fed to the engine and
+                            // the legacy dispatch below is skipped. Off by default
+                            // (router unset) → zero overhead.
+                            if let Some(router) = cw_router_for_recv.get() {
+                                if router.route(
+                                    &received.bitmask,
+                                    &received.from,
+                                    received.data.clone(),
+                                ) {
+                                    continue;
+                                }
+                            }
+
                             match received.bitmask.as_slice() {
                             GLOBAL_PEER_INFO => {
                                 match quil_p2p::classify_peer_info_message(&received.data) {
                                     Ok(quil_p2p::PeerInfoMessage::PeerInfo(info)) => {
                                         peer_infos_received += 1;
+                                        // Signature validation MOVED here from the
+                                        // route validator (which now does timestamp
+                                        // only — Falcon verify inline on the recv
+                                        // loop was starving it and overflowing the
+                                        // per-peer send queue). Runs AFTER retrieval,
+                                        // BEFORE the entry is cached/trusted, so an
+                                        // unverified/spoofed PeerInfo never reaches
+                                        // the peer_info_cache or the archive
+                                        // admission gate below.
+                                        //   1. Falcon key/sig lengths (897 / 666).
+                                        //   2. peer_id ↔ signing-pubkey binding —
+                                        //      without it an attacker signs with
+                                        //      their OWN key but sets peer_id to a
+                                        //      genesis archive's, impersonating it to
+                                        //      the admission gate.
+                                        //   3. Falcon verify (empty domain, matching
+                                        //      `Signer::sign` = sign_with_domain(m,&[])).
+                                        if info.peer_id.is_empty()
+                                            || info.public_key.len() != 897
+                                            || info.signature.len() != 666
+                                        {
+                                            continue;
+                                        }
+                                        if info.peer_id
+                                            != quil_p2p::peer_id_from_falcon_pubkey(&info.public_key)
+                                        {
+                                            continue;
+                                        }
+                                        let signing_payload = quil_p2p::encode_canonical_peer_info(
+                                            &info,
+                                            &info.public_key,
+                                            &[],
+                                        );
+                                        if !quil_crypto::falcon_verify(
+                                            &info.public_key,
+                                            &info.signature,
+                                            &signing_payload,
+                                            &[],
+                                        ) {
+                                            continue;
+                                        }
                                         // Dedup: hash PeerInfo with timestamp zeroed
                                         // (mirrors Go's hashPeerInfo). Skip if seen.
                                         let mut dedup_info = info.clone();
@@ -432,6 +634,22 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         }
                                         if !info.peer_id.is_empty() {
                                             let mut cache = pic_for_recv.write();
+                                            let fingerprint = info.build_fingerprint();
+                                            let build_changed = cache.get(&info.peer_id).map(|old| {
+                                                old.build_fingerprint() != fingerprint
+                                                    || old.version != info.version
+                                                    || old.patch_number != info.patch_number
+                                            }).unwrap_or(true);
+                                            if build_changed {
+                                                info!(
+                                                    peer = %bs58::encode(&info.peer_id).into_string(),
+                                                    version = %quil_config::format_version(&info.version),
+                                                    patch = %hex::encode(&info.patch_number),
+                                                    build_fingerprint = %fingerprint.map(hex::encode).unwrap_or_else(|| "unavailable".into()),
+                                                    local_build_fingerprint = env!("QUIL_BUILD_FINGERPRINT"),
+                                                    "verified peer build identity"
+                                                );
+                                            }
                                             cache.insert(info.peer_id.clone(), info.clone());
                                         }
                                         // Only ARCHIVE-capable peers go into the
@@ -453,7 +671,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 || genesis_archive_peer_ids_for_recv
                                                     .contains(&info.peer_id);
                                             if !is_genesis_archive {
-                                                warn!(
+                                                debug!(
                                                     peer = peer_hex,
                                                     from = bs58::encode(&received.from).into_string(),
                                                     "FAKE ARCHIVE — peer claims archive capability but is not a genesis archive peer"
@@ -469,6 +687,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                     "verified genesis archive peer"
                                                 );
                                             }
+                                            // Authenticated network-head hint for the poller's
+                                            // reconcile: this PeerInfo is signed and genesis-archive
+                                            // verified, so its advertised head lets the poller decide
+                                            // "am I behind?" without an RPC head-fetch.
+                                            gossip_freshness_for_recv
+                                                .note_network_head(info.last_global_head_frame);
                                             let mut first_addr: Option<String> = None;
                                             for reach in &info.reachability {
                                                 for ma in &reach.stream_multiaddrs {
@@ -508,12 +732,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             if is_new && archive_peers_seen.len() == 1
                                                 && !archive_mode_for_recv {
                                                 if let (Some(seed), Some(addr)) =
-                                                    (mtls_seed_for_recv, first_addr)
+                                                    (prover_falcon_for_recv.clone(), first_addr)
                                                 {
                                                     let store = hg_store_for_recv.clone();
                                                     let cs = clock_store_recv.clone();
+                                                    let crdt_for_bootstrap = exec_mgr_for_recv.crdt();
                                                     spawner.detach("prover-tree-bootstrap", async move {
-                                                        use quil_types::proto::application::HypergraphPhaseSet::*;
                                                         // Pin sync against the most-recent verified
                                                         // frame's prover_tree_commitment (when
                                                         // available). Empty during bootstrap before
@@ -523,36 +747,35 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                             .ok()
                                                             .and_then(|f| f.header.map(|h| h.prover_tree_commitment))
                                                             .unwrap_or_default();
-                                                        for phase in [VertexAdds, VertexRemoves, HyperedgeAdds, HyperedgeRemoves] {
-                                                            match quil_rpc::ensure_prover_tree(
-                                                                &addr,
-                                                                &seed,
-                                                                phase,
-                                                                store.clone(),
-                                                                &expected_root,
-                                                            ).await {
-                                                                Ok(stats) => {
-                                                                    info!(
-                                                                        addr = %addr,
-                                                                        ?phase,
-                                                                        matched = stats.commitments_match,
-                                                                        leaves = stats.leaves_pulled,
-                                                                        "phase sync complete"
-                                                                    );
-                                                                }
-                                                                Err(e) => {
-                                                                    warn!(addr = %addr, ?phase, error = %e, "ensure_prover_tree failed");
-                                                                    break;
-                                                                }
+                                                        // Onboarding: swap the ephemeral in-memory
+                                                        // forest for the persistent RocksDB one (+ QUIL
+                                                        // partition) BEFORE syncing, so synced state is
+                                                        // durable and produced roots are network-consistent.
+                                                        // No-op once persistent.
+                                                        if quil_forest_migrate::install_forest_for_sync(
+                                                            crdt_for_bootstrap.as_ref(), store.as_ref(),
+                                                            network_for_recv == 0,
+                                                        ) {
+                                                            info!("prover-tree-bootstrap: installed persistent forest for onboarding sync");
+                                                        }
+                                                        // Forest sync of the global prover shard
+                                                        // (single-shard, all 4 phases + blobs).
+                                                        match crate::forest_sync::sync_single_shard_verified(
+                                                            &addr, &seed, crdt_for_bootstrap, &[0xffu8; 32], &expected_root,
+                                                        ).await {
+                                                            Ok(conv) => {
+                                                                info!(addr = %addr, match_ok = conv.is_some(), "prover tree bootstrap synced");
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(addr = %addr, error = %e, "prover tree bootstrap sync failed");
                                                             }
                                                         }
-                                                        info!("all 4 phases synced");
 
                                                         // Build the in-memory ProverRegistry
                                                         // from the persisted vertex store.
                                                         let mut registry =
                                                             quil_execution::InMemoryProverRegistry::new();
-                                                        registry.refresh(&store);
+                                                        registry.refresh(store.as_ref())?;
                                                         info!(
                                                             provers_visited = registry.provers_visited(),
                                                             allocations_visited = registry.allocations_visited(),
@@ -603,25 +826,38 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             Ok(reg) => {
                                                 let identity_len = reg.ed448_pubkey.len();
                                                 let prover_len = reg.bls_pubkey.len();
-                                                sr_for_recv.update(reg);
-                                                debug!(
-                                                    identity_len,
-                                                    prover_len,
-                                                    total_entries = sr_for_recv.len(),
-                                                    "ingested KeyRegistry"
-                                                );
+                                                // Finding B: `update` verifies the
+                                                // identity↔prover cross-signatures and
+                                                // rejects (returns false) any binding
+                                                // whose sigs don't validate, so a peer
+                                                // can't inject an arbitrary Ed448→BLS
+                                                // pairing.
+                                                if sr_for_recv.update(reg) {
+                                                    debug!(
+                                                        identity_len,
+                                                        prover_len,
+                                                        total_entries = sr_for_recv.len(),
+                                                        "ingested KeyRegistry"
+                                                    );
+                                                } else {
+                                                    debug!(
+                                                        identity_len,
+                                                        prover_len,
+                                                        "rejected KeyRegistry: invalid cross-signature, empty key, or stale replay"
+                                                    );
+                                                }
                                             }
                                             Err(e) => {
-                                                warn!(error = %e, "failed to decode KeyRegistry");
+                                                debug!(error = %e, "failed to decode KeyRegistry");
                                             }
                                         }
                                     }
                                     Ok(quil_p2p::PeerInfoMessage::Unknown(prefix)) => {
-                                        warn!(prefix = format!("0x{:04x}", prefix),
+                                        debug!(prefix = format!("0x{:04x}", prefix),
                                             "unknown PEER_INFO bitmask message type");
                                     }
                                     Err(e) => {
-                                        warn!(error = %e, "failed to decode PeerInfo");
+                                        debug!(error = %e, "failed to decode PeerInfo");
                                     }
                                 }
                             }
@@ -631,7 +867,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 let frame_result: std::result::Result<quil_types::proto::global::GlobalFrame, _> =
                                     quil_engine::consensus_wire::decode_global_frame(&received.data)
                                         .or_else(|canonical_err| {
-                                            warn!(error = %canonical_err, "canonical decode failed, trying proto");
+                                            debug!(error = %canonical_err, "canonical decode failed, trying proto");
                                             prost::Message::decode(received.data.as_slice())
                                                 .map_err(|e| quil_types::error::QuilError::InvalidArgument(
                                                     format!("failed to decode Protobuf message: {} (canonical: {})", e, canonical_err)
@@ -645,11 +881,58 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         // Validate prover is a genesis prover
                                         if let Some(h) = frame.header.as_ref() {
                                             if !genesis_prover_addrs_for_recv.contains(&h.prover) {
-                                                warn!(
+                                                debug!(
                                                     frame = frame_num,
                                                     prover = hex::encode(&h.prover),
                                                     from = bs58::encode(&received.from).into_string(),
                                                     "INVALID PROVER — not a genesis prover, possible attacker"
+                                                );
+                                                continue;
+                                            }
+                                        }
+
+                                        // Frame-number sanity (cheap, pre-cert). Gossip is
+                                        // head-only, so a legit frame sits at ~the network head;
+                                        // one implausibly far beyond our head can only be a forged
+                                        // number aimed at poisoning the head atomic / gossip-head
+                                        // target. Shed it before the (Falcon) cert verify below. The
+                                        // margin is deliberately huge (~1M frames ≈ months) so a
+                                        // genuinely behind node still follows the real head; a node
+                                        // that far behind uses the state-jump path, not gossip.
+                                        {
+                                            const MAX_HEAD_LEAD: u64 = 1_000_000;
+                                            let head_now = lhf_for_recv
+                                                .load(std::sync::atomic::Ordering::Relaxed);
+                                            if frame_num > head_now.saturating_add(MAX_HEAD_LEAD) {
+                                                debug!(
+                                                    frame = frame_num,
+                                                    head = head_now,
+                                                    from = bs58::encode(&received.from).into_string(),
+                                                    "gossip global frame implausibly far ahead — dropping",
+                                                );
+                                                continue;
+                                            }
+                                        }
+
+                                        // UNTRUSTED SOURCE GATE. This frame came off the open
+                                        // GLOBAL_FRAME gossip mesh (any peer can publish), not the
+                                        // mTLS-authenticated archive poller. The VDF proof below is
+                                        // PUBLICLY COMPUTABLE — it authenticates nothing — and the
+                                        // genesis-prover check above is a public-address allowlist.
+                                        // So require a committee FINALIZATION cert (CWCT) that
+                                        // verifies against the fixed global committee: this proves
+                                        // the committee actually finalized the frame. Fails closed
+                                        // (no committee / no cert / bad cert ⇒ drop) and runs BEFORE
+                                        // the expensive VDF verify so forged frames are cheap to shed.
+                                        // Legit gossip + archive frames both carry this cert.
+                                        match frame.header.as_ref() {
+                                            Some(h) if frame_validator_for_recv
+                                                .verify_global_finalization_cert(h) => {}
+                                            _ => {
+                                                debug!(
+                                                    frame = frame_num,
+                                                    from = bs58::encode(&received.from).into_string(),
+                                                    "gossip global frame missing/invalid committee finalization cert — dropping",
                                                 );
                                                 continue;
                                             }
@@ -667,15 +950,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 // Validator returned false — either VDF or BLS
                                                 // signature check rejected it. The specific
                                                 // reason is logged by `GlobalFrameVerifier::validate`.
-                                                warn!(frame = frame_num, "frame rejected by validator — dropping");
+                                                debug!(frame = frame_num, "frame rejected by validator — dropping");
                                                 continue;
                                             }
                                             Ok(Err(e)) => {
-                                                warn!(frame = frame_num, error = %e, "VDF validation error — dropping frame");
+                                                debug!(frame = frame_num, error = %e, "VDF validation error — dropping frame");
                                                 continue;
                                             }
                                             Err(_) => {
-                                                warn!(
+                                                debug!(
                                                     frame = frame_num,
                                                     output_len = frame.header.as_ref().map(|h| h.output.len()).unwrap_or(0),
                                                     "VDF validation PANIC — frame output likely corrupted, dropping"
@@ -684,7 +967,82 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             }
                                         }
 
-                                        match clock_store_recv.put_global_frame(&frame, None) {
+                                        // BIND THE BODY TO THE AUTHENTICATED HEADER. The cert + VDF
+                                        // above authenticate the header (incl. `requests_root`), but
+                                        // `frame.requests` is a separate field. An attacker could keep
+                                        // a real frame's valid header+cert+VDF and swap in a different
+                                        // request set — each request is still intrinsic-validated on
+                                        // execution, but a receiver would compute a DIVERGENT state for
+                                        // this frame. Recompute the requests root from the carried body
+                                        // and require it to equal the authenticated `requests_root`.
+                                        // (The mTLS poller path trusts its source; this gate is for the
+                                        // untrusted gossip mesh.)
+                                        // Bound the work an attacker can force. Recomputing the
+                                        // requests root builds a commitment tree over every bundle and
+                                        // converts every request. A real header+cert can be REPLAYED
+                                        // with a maximally-large tampered body (a 16 MiB frame packs
+                                        // millions of minimal bundles) to burn seconds of CPU before
+                                        // the root mismatch is detected — the check is inherently
+                                        // build-then-compare. Shed oversized bodies here, cheaply
+                                        // (O(bundles) length reads, no tree work), before the recompute.
+                                        // Typical global frames are far under these caps; a rare genuinely
+                                        // huge frame simply isn't followed over gossip and is instead
+                                        // fetched by the RPC poller (which has no such cap and trusts its
+                                        // mTLS source), so correctness is preserved.
+                                        {
+                                            const MAX_GOSSIP_GLOBAL_BUNDLES: usize = 65_536;
+                                            const MAX_GOSSIP_GLOBAL_REQUESTS: usize = 65_536;
+                                            let total_requests: usize =
+                                                frame.requests.iter().map(|b| b.requests.len()).sum();
+                                            if frame.requests.len() > MAX_GOSSIP_GLOBAL_BUNDLES
+                                                || total_requests > MAX_GOSSIP_GLOBAL_REQUESTS
+                                            {
+                                                debug!(
+                                                    frame = frame_num,
+                                                    bundles = frame.requests.len(),
+                                                    requests = total_requests,
+                                                    from = bs58::encode(&received.from).into_string(),
+                                                    "gossip global frame body oversized — dropping (poller fetches if real)",
+                                                );
+                                                continue;
+                                            }
+                                        }
+
+                                        // Recompute runs on the ATTACKER-CONTROLLED body (before the
+                                        // match rejects a forgery), so contain any panic in the
+                                        // canonical-encoding / tree path exactly like the VDF verify
+                                        // above — a panic ⇒ treat as invalid ⇒ drop, never crash the
+                                        // recv loop.
+                                        let requests_root_ok = std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| match frame.header.as_ref() {
+                                                Some(h) => frame_validator_for_recv
+                                                    .verify_global_requests_root(h, &frame.requests),
+                                                None => false,
+                                            }),
+                                        )
+                                        .unwrap_or(false);
+                                        if !requests_root_ok {
+                                            debug!(
+                                                frame = frame_num,
+                                                from = bs58::encode(&received.from).into_string(),
+                                                "gossip global frame body does not match authenticated requests_root — dropping",
+                                            );
+                                            continue;
+                                        }
+
+                                        // An archive with atomic finalization keeps the
+                                        // authenticated frame as a durable certified
+                                        // candidate; its worker publishes it together
+                                        // with the execution state.
+                                        let stored = if global_finalization_for_recv
+                                            .get()
+                                            .is_some_and(|pipeline| pipeline.offer_synced(&frame))
+                                        {
+                                            Ok(())
+                                        } else {
+                                            clock_store_recv.put_global_frame(&frame, None)
+                                        };
+                                        match stored {
                                             Ok(()) => {
                                                 frames_received += 1;
                                                 // `observe` / `fetch_max` never
@@ -695,6 +1053,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 // BlossomSub).
                                                 cf_for_recv.observe(frame_num);
                                                 lhf_for_recv.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
+                                                // Signal the RPC poller that gossip is delivering the
+                                                // head, so it backs off its redundant per-second fetch.
+                                                gossip_freshness_for_recv.stamp(frame_num);
 
                                                 // Frame execution dispatches on node mode:
                                                 //
@@ -714,24 +1075,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 //     and never wait for missing
                                                 //     predecessors — they're already past.
                                                 let frames_to_execute: Vec<(u64, quil_types::proto::global::GlobalFrame)> =
-                                                if archive_mode_recv {
-                                                    let mut out = Vec::new();
-                                                    loop {
-                                                        let next_num = last_executed_frame.saturating_add(1);
-                                                        match clock_store_recv.get_global_frame(next_num) {
-                                                            Ok(f) => out.push((next_num, f)),
-                                                            Err(_) => break,
-                                                        }
-                                                        last_executed_frame = next_num;
-                                                    }
-                                                    if frame_num > last_executed_frame {
-                                                        debug!(
-                                                            frame = frame_num,
-                                                            awaiting = last_executed_frame + 1,
-                                                            "archive: stored out-of-order frame, awaiting predecessor"
-                                                        );
-                                                    }
-                                                    out
+                                                if archive_mode_recv || (network_for_recv != 99
+                                                    && quil_types::consensus::committee_handoff_policy().is_some()) {
+                                                    // Archives have their serial materializer. Session-enabled
+                                                    // regulars follow authenticated GLOBAL snapshots: their local
+                                                    // shard metadata can lag a split/merge freeze, so replay
+                                                    // against it can accept a join the archive rejected and
+                                                    // permanently add noncanonical prover records. Neither
+                                                    // role may also execute GLOBAL state from gossip. Legacy
+                                                    // networks and standalone devnet retain inline execution.
+                                                    Vec::new()
                                                 } else if let Some(ref reel) = time_reel_for_recv {
                                                     if let Err(e) = reel.insert(Arc::new(frame.clone())) {
                                                         debug!(
@@ -785,6 +1138,56 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 };
 
                                                 for (exec_num, exec_frame) in frames_to_execute {
+                                                    // At-cutover prover-tree reset on regular nodes — run
+                                                    // LOCALLY, BEFORE processing the cutover frame, exactly as
+                                                    // the archive materializer does (which resets before it
+                                                    // materializes the frame). The reset is a deterministic pure
+                                                    // function of (cutover frame, genesis committee), so every
+                                                    // node rebuilds the identical prover tree from empty — the
+                                                    // forest JMT is put-only, so a wipe can't propagate through
+                                                    // incremental sync. Running it here converges regulars
+                                                    // immediately instead of via the slow mismatch-recovery
+                                                    // full re-pull. `== cutover` fires exactly once (in-order
+                                                    // gossip application), matching the archive's reset frame.
+                                                    let v1_reset = exec_num
+                                                        == quil_execution::global_intrinsic::materialize::unified_tree_cutover_frame()
+                                                        && !crate::unified_consolidation::boot_reset_applied(&hg_store_for_recv);
+                                                    let v2_reset = exec_num
+                                                        == quil_execution::global_intrinsic::materialize::quil_grid_reset_v2_frame()
+                                                        && !crate::unified_consolidation::grid_reset_v2_applied(&hg_store_for_recv);
+                                                    let v3_reset = exec_num
+                                                        == quil_execution::global_intrinsic::materialize::quil_prover_reset_v3_frame()
+                                                        && !crate::unified_consolidation::prover_reset_v3_applied(&hg_store_for_recv);
+                                                    let v4_reset = exec_num
+                                                        == quil_execution::global_intrinsic::materialize::quil_prover_reset_v4_frame()
+                                                        && !crate::unified_consolidation::prover_reset_v4_applied(&hg_store_for_recv);
+                                                    let v5_reset = exec_num
+                                                        == quil_execution::global_intrinsic::materialize::quil_prover_reset_v5_frame()
+                                                        && !crate::unified_consolidation::prover_reset_v5_applied(&hg_store_for_recv);
+                                                    if !archive_mode_recv && (v1_reset || v2_reset || v3_reset || v4_reset || v5_reset) {
+                                                        match quil_engine::genesis::reset_prover_tree_to_genesis(
+                                                            &crdt_for_recv,
+                                                            &hg_store_for_recv,
+                                                            exec_num,
+                                                            network_for_recv,
+                                                            &genesis_seed_for_recv,
+                                                            &[],
+                                                        ) {
+                                                            Ok(n) => {
+                                                                info!(seeded = n, frame = exec_num, v2 = v2_reset, v3 = v3_reset, v4 = v4_reset, v5 = v5_reset, "regular at-reset prover-tree reset complete");
+                                                                if v5_reset {
+                                                                    crate::unified_consolidation::mark_prover_reset_v5_applied(&hg_store_for_recv);
+                                                                } else if v4_reset {
+                                                                    crate::unified_consolidation::mark_prover_reset_v4_applied(&hg_store_for_recv);
+                                                                } else if v3_reset {
+                                                                    crate::unified_consolidation::mark_prover_reset_v3_applied(&hg_store_for_recv);
+                                                                } else if v2_reset {
+                                                                    crate::unified_consolidation::mark_grid_reset_v2_applied(&hg_store_for_recv);
+                                                                }
+                                                            }
+                                                            Err(e) => warn!(error = %e, frame = exec_num, "regular at-reset prover-tree reset FAILED"),
+                                                        }
+                                                    }
                                                     match quil_engine::frame_processor::process_global_frame_with_rewards(
                                                         &exec_mgr_for_recv,
                                                         &exec_frame,
@@ -801,6 +1204,27 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                                 "received + processed GlobalFrame"
                                                             );
                                                             coverage_for_recv.check(exec_num);
+                                                            // Epoch-boundary registry refresh: repopulate the
+                                                            // shared prover-registry cache from the just-
+                                                            // materialized store when we cross into a new epoch,
+                                                            // so the committee + `on_new_frame` reconcile read
+                                                            // the new epoch's allocations. Allocations are
+                                                            // epoch-stable, so one refresh per boundary is
+                                                            // sufficient (and avoids a per-frame full scan). This
+                                                            // is the previously-missing recv-path refresh.
+                                                            let exec_epoch =
+                                                                quil_types::consensus::epoch_for_frame(exec_num);
+                                                            if exec_epoch != last_committee_epoch {
+                                                                match pr_for_recv.refresh_from_store(hg_store_for_recv.as_ref()) {
+                                                                    Ok(()) => {
+                                                                        last_committee_epoch = exec_epoch;
+                                                                        debug!(frame = exec_num, epoch = exec_epoch,
+                                                                            "epoch boundary — refreshed prover registry");
+                                                                    }
+                                                                    Err(error) => warn!(frame = exec_num, %error,
+                                                                        "prover registry refresh failed; will retry"),
+                                                                }
+                                                            }
                                                             if !archive_mode_recv {
                                                                 if let Err(e) = wa_for_recv.on_new_frame(exec_num) {
                                                                     warn!(error = %e, "worker allocation failed");
@@ -851,7 +1275,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         } else {
                                             hex::encode(&received.data)
                                         };
-                                        warn!(
+                                        debug!(
                                             error = %e,
                                             bytes = received.data.len(),
                                             prefix = %prefix,
@@ -861,114 +1285,23 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 }
                             }
                             GLOBAL_CONSENSUS => {
+                                // Legacy Jolteon (in-house quil-consensus)
+                                // gossip topic. The commonware-simplex GLOBAL
+                                // consensus path delivers proposals/votes/certs
+                                // point-to-point over :8340 and routes them
+                                // through `cw_router`, so these gossip messages
+                                // are no longer decoded/aggregated here — count
+                                // and drop.
                                 consensus_msgs_received += 1;
-                                let current_rank = frames_received;
-                                mc_for_recv.add_message(current_rank, received.data.clone());
-                                // Route inbound consensus messages to the event
-                                // loop handle (populated once activation completes).
-                                if let Some(handle) = ch_for_recv.get() {
-                                    if let Some(tp) = quil_engine::consensus_wire::peek_consensus_type(&received.data) {
-                                        match tp {
-                                            quil_engine::consensus_wire::GLOBAL_PROPOSAL_TYPE => {
-                                                match quil_engine::consensus_wire::GlobalProposal::from_canonical_bytes(&received.data) {
-                                                    Ok(wire) => {
-                                                        // Persist the proposer vote so this node can
-                                                        // serve it via GetGlobalProposal for a peer's
-                                                        // catch-up sync. Keyed (filter, rank, selector).
-                                                        let vote_proto = wire.vote.to_proto();
-                                                        if let Err(e) = quil_types::store::ClockStore::put_proposal_vote(
-                                                            clock_store_recv.as_ref(),
-                                                            &NoTxn,
-                                                            &vote_proto,
-                                                        ) {
-                                                            debug!(error = %e, "persist proposal vote failed");
-                                                        }
-                                                        match quil_engine::consensus_types::wire_proposal_to_signed(wire) {
-                                                            Ok((sp, qc, _tc)) => {
-                                                                handle.submit_quorum_certificate(qc);
-                                                                // Skip pre-submitting the
-                                                                // proposal's
-                                                                // `previous_rank_timeout_certificate`.
-                                                                // Same hazard as the TimeoutState
-                                                                // path below: an unvalidated TC
-                                                                // would land in the pacemaker's
-                                                                // newest-TC tracker and be
-                                                                // embedded into our own next
-                                                                // outgoing timeout. Validation
-                                                                // happens later in
-                                                                // `validate_proposal` →
-                                                                // `validate_timeout_certificate`,
-                                                                // and a real TC will surface via
-                                                                // the local timeout aggregator's
-                                                                // `on_tc_created` callback once
-                                                                // enough peer timeouts arrive.
-                                                                // Feed into the rank's vote collector
-                                                                // so the proposer's self-vote counts
-                                                                // toward quorum and subsequent
-                                                                // standalone votes get verified.
-                                                                if let Some(agg) = va_for_recv.get() {
-                                                                    agg.handle_proposal(&sp);
-                                                                }
-                                                                let h = handle.clone();
-                                                                spawner.detach("global-proposal-submit", async move {
-                                                                    h.submit_proposal(sp).await;
-                                                                    Ok(())
-                                                                });
-                                                            }
-                                                            Err(e) => warn!(error = %e, "GlobalProposal bridge failed"),
-                                                        }
-                                                    }
-                                                    Err(e) => warn!(error = %e, "GlobalProposal decode failed"),
-                                                }
-                                            }
-                                            quil_engine::consensus_wire::PROPOSAL_VOTE_TYPE => {
-                                                // Route standalone votes into the per-rank aggregator.
-                                                // On reaching quorum, the aggregator's
-                                                // OnQuorumCertificateCreated callback fires
-                                                // `handle.submit_quorum_certificate`.
-                                                match quil_engine::consensus_wire::ProposalVote::from_canonical_bytes(&received.data) {
-                                                    Ok(wire) => {
-                                                        if let Some(agg) = va_for_recv.get() {
-                                                            let gv = quil_engine::vote_aggregation::wire_vote_to_global_vote(wire);
-                                                            agg.handle_vote(gv);
-                                                        }
-                                                    }
-                                                    Err(e) => warn!(error = %e, "ProposalVote decode failed"),
-                                                }
-                                            }
-                                            quil_engine::consensus_wire::TIMEOUT_STATE_TYPE => {
-                                                match quil_engine::consensus_wire::TimeoutState::from_canonical_bytes(&received.data) {
-                                                    Ok(ts) => {
-                                                        // Fast-forward the newest-QC tracker.
-                                                        // Safe: bad QCs fail later validation.
-                                                        let qc_for_handle = ts.latest_quorum_certificate.clone().into_trait_object();
-                                                        handle.submit_quorum_certificate(qc_for_handle);
-                                                        // DO NOT auto-submit the embedded
-                                                        // `prior_rank_timeout_certificate` —
-                                                        // a malformed TC would land in our
-                                                        // pacemaker's newest-TC tracker and
-                                                        // get embedded into our next timeout,
-                                                        // which peers then reject. Outgoing
-                                                        // TCs source from clock store
-                                                        // (previously validated). Local
-                                                        // aggregation forms a valid TC once
-                                                        // peer timeouts arrive.
-                                                        if let Some(agg) = ta_for_recv.get() {
-                                                            let typed = quil_engine::timeout_aggregation::wire_timeout_to_typed(ts);
-                                                            agg.handle_timeout(typed);
-                                                        }
-                                                    }
-                                                    Err(e) => warn!(error = %e, "TimeoutState decode failed"),
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
                             }
                             GLOBAL_PROVER => {
                                 prover_msgs_received += 1;
-                                let current_rank = frames_received;
+                                // Tag with the CONSENSUS RANK (matches the
+                                // gRPC submit path and the leader's
+                                // `collect_for_rank`). `frames_received` is a
+                                // session-local counter in the wrong space, so
+                                // relayed prover messages were never collected.
+                                let current_rank = cf_for_recv.effective_rank();
                                 mc_for_recv.add_message(current_rank, received.data.clone());
                             }
                             GLOBAL_ALERT => {
@@ -1033,8 +1366,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         .map(|(f, h)| (f.clone(), h.clone()))
                                         .collect()
                                 };
-                                let mut routed = false;
-                                for (filter, handle) in &entries {
+                                // An application's submission topic is shared by
+                                // every shard of it: each of this node's engines
+                                // of that application gets the submission.
+                                let submitted = submission_engines(bm, &entries);
+                                for handle in &submitted {
+                                    handle.send(quil_engine::app_engine::AppEngineMessage::Prover(received.data.clone()));
+                                }
+                                let mut routed = !submitted.is_empty();
+                                for (filter, handle) in entries.iter().filter(|_| submitted.is_empty()) {
                                     if bm == quil_engine::bitmasks::shard_consensus_bitmask(filter).as_slice() {
                                         handle.send(quil_engine::app_engine::AppEngineMessage::Consensus(received.data.clone()));
                                         routed = true;
@@ -1045,27 +1385,54 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         routed = true;
                                         break;
                                     }
-                                    if bm == quil_engine::bitmasks::shard_prover_bitmask(filter).as_slice() {
-                                        handle.send(quil_engine::app_engine::AppEngineMessage::Prover(received.data.clone()));
-                                        routed = true;
-                                        break;
-                                    }
                                     if bm == quil_engine::bitmasks::shard_dispatch_bitmask(filter).as_slice() {
                                         handle.send(quil_engine::app_engine::AppEngineMessage::Dispatch(received.data.clone()));
                                         routed = true;
                                         break;
                                     }
+                                    // Commonware-simplex shard traffic. Split the
+                                    // channel out of the payload byte, and resolve the
+                                    // gossip sender's peer id → its committee Falcon key
+                                    // via PeerInfo (`CanonicalPeerInfo.public_key` is the
+                                    // prover key = the committee member key). The Falcon
+                                    // attestation self-attributes via its embedded signer
+                                    // index, so `from` is advisory for verification — but
+                                    // it must be a valid committee key or the engine drops
+                                    // it; an empty `from` (peer not yet in PeerInfo) is a
+                                    // benign startup transient until the peer's PeerInfo
+                                    // propagates.
+                                    if bm == quil_engine::bitmasks::shard_cw_bitmask(filter).as_slice() {
+                                        if let Some((channel, cw_bytes)) =
+                                            quil_engine::bitmasks::shard_cw_split_payload(&received.data)
+                                        {
+                                            let from_key = pic_for_recv
+                                                .read()
+                                                .get(&received.from)
+                                                .map(|pi| pi.public_key.clone())
+                                                .unwrap_or_default();
+                                            tracing::debug!(filter = %hex::encode(filter), channel,
+                                                sender_known = !from_key.is_empty(), bytes = cw_bytes.len(),
+                                                "routing shard CW message to its engine");
+                                            handle.send(quil_engine::app_engine::AppEngineMessage::CwIn {
+                                                channel,
+                                                from: from_key,
+                                                data: cw_bytes.to_vec(),
+                                            });
+                                        }
+                                        routed = true;
+                                        break;
+                                    }
                                 }
                                 if !routed {
-                                    // Non-shard traffic (e.g. mesh relay) — no local
-                                    // handler. On an archive (no local shard engines),
-                                    // un-routed shard-frame traffic lands here: feed it to
-                                    // the app-shard ingest, which decodes/verifies it as a
-                                    // full AppShardFrame (non-frame messages fail decode and
-                                    // are ignored) and materializes the shard's state.
-                                    if let Some(ingest) = archive_ingest_for_recv.as_mut() {
-                                        ingest.ingest(&received.data);
-                                    }
+                                    let ingest = archive_ingest_for_recv.as_ref().map(|ingest| {
+                                        move |data: &[u8]| ingest.lock().unwrap_or_else(|p| p.into_inner()).ingest(data)
+                                    });
+                                    unrouted_shard_message(
+                                        bm,
+                                        &received.data,
+                                        clock_store_recv.as_ref(),
+                                        ingest.as_ref().map(|ingest| ingest as &dyn Fn(&[u8])),
+                                    );
                                 }
                             }
                             }
@@ -1088,4 +1455,62 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         );
         Ok(())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A submission reaches every engine of its application on this node, and
+    /// no engine of another application or topic.
+    #[test]
+    fn a_submission_reaches_every_shard_engine_of_its_application() {
+        let app = [0x11u8; 32];
+        let shard = |bits: &[bool]| quil_forest::encode_shard_bit_path(&app, bits);
+        let other = quil_forest::encode_shard_bit_path(&[0x22u8; 32], &[true]);
+        let entries = vec![(shard(&[false]), 1u8), (shard(&[true, false]), 2), (other.clone(), 3), (shard(&[true, true]), 4)];
+        let topic = quil_engine::bitmasks::app_prover_bitmask(&app);
+        assert_eq!(submission_engines(&topic, &entries), vec![&1, &2, &4]);
+        let own_frames = quil_engine::bitmasks::shard_frame_bitmask(&shard(&[false]));
+        assert!(submission_engines(&own_frames, &entries).is_empty(), "a per-shard topic is not a submission");
+        assert_eq!(submission_engines(&quil_engine::bitmasks::app_prover_bitmask(&other), &entries), vec![&3]);
+    }
+
+    /// A cluster master (no archive ingest) mirrors a frame on its shard's
+    /// frame topic for serving, and not a message on another topic. An archive
+    /// hands the frame to its ingest, which stores only what it verifies, and
+    /// stores nothing before that; a frame it fetched to fill a gap arrives
+    /// under the frame's own topic.
+    #[test]
+    fn only_a_cluster_master_mirrors_a_frame_unverified() {
+        use quil_types::store::ClockStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner().clone());
+        let filter = quil_forest::encode_shard_bit_path(&[0x33u8; 32], &[true, false]);
+        let frame = |number: u64| quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                address: filter.clone(),
+                frame_number: number,
+                output: vec![number as u8; 516],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let topic = quil_engine::bitmasks::shard_frame_bitmask(&filter);
+        unrouted_shard_message(&topic, &prost::Message::encode_to_vec(&frame(7)), &clock, None);
+        assert_eq!(clock.get_shard_clock_frame(&filter, 7, false).unwrap(), frame(7));
+        assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap(), frame(7));
+        unrouted_shard_message(&[], &prost::Message::encode_to_vec(&frame(8)), &clock, None);
+        assert!(clock.get_shard_clock_frame(&filter, 8, false).is_err(), "not a shard-frame message");
+
+        let handed = std::cell::RefCell::new(Vec::new());
+        let ingest = |data: &[u8]| handed.borrow_mut().push(data.to_vec());
+        let forged = prost::Message::encode_to_vec(&frame(u64::MAX / 2));
+        unrouted_shard_message(&topic, &forged, &clock, Some(&ingest));
+        assert_eq!(*handed.borrow(), vec![forged.clone()]);
+        assert!(clock.get_shard_clock_frame(&filter, u64::MAX / 2, false).is_err(), "not stored before verification");
+        assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap(), frame(7));
+        assert_eq!(gap_fetched_frame_message(&filter, forged).bitmask, topic);
+    }
 }

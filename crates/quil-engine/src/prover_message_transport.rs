@@ -18,13 +18,13 @@ use quil_types::proto::global::GlobalFrameHeader;
 /// Pluggable transport for prover-admin messages on `GLOBAL_PROVER`.
 ///
 /// Implementations are responsible for both:
-///   1. Fetching the latest global frame header — used by `submit_join`
-///      to stamp the join with a frame_number that the recipient
-///      archive's verifier will accept (Go rejects joins where
-///      `frame_number < head - 10`).
-///   2. Broadcasting a fully-encoded `CanonicalMessageBundle` so every
-///      archive sees it (fan out via gRPC + pubsub in production; a
-///      single in-memory network broadcast in tests).
+/// 1. Fetching the latest global frame header — used by `submit_join`
+/// to stamp the join with a frame_number that the recipient
+/// archive's verifier will accept (Go rejects joins where
+/// `frame_number < head - 10`).
+/// 2. Broadcasting a fully-encoded `CanonicalMessageBundle` so every
+/// archive sees it (fan out via gRPC + pubsub in production; a
+/// single in-memory network broadcast in tests).
 #[async_trait]
 pub trait ProverMessageTransport: Send + Sync {
     /// Returns the latest global frame header. Used by `submit_join`.

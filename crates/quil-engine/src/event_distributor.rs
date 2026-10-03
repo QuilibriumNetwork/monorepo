@@ -6,14 +6,14 @@
 //!
 //! Semantics (matching Go):
 //! - **Subscribe** allocates a buffered mpsc channel (capacity 100
-//!   matches Go's hard-coded buffer) and returns the receiver to
-//!   the caller. Subscribers are keyed by an opaque string id.
+//! matches Go's hard-coded buffer) and returns the receiver to
+//! the caller. Subscribers are keyed by an opaque string id.
 //! - **Publish** is non-blocking: for each subscriber, the distributor
-//!   `try_send`s the event and silently drops on full/closed channel.
-//!   This prevents a slow subscriber from deadlocking the event loop.
+//! `try_send`s the event and silently drops on full/closed channel.
+//! This prevents a slow subscriber from deadlocking the event loop.
 //! - **Unsubscribe** removes the subscriber from the map and drops
-//!   the sender (causing the subscriber's receiver to close on next
-//!   poll).
+//! the sender (causing the subscriber's receiver to close on next
+//! poll).
 //!
 //! Not ported from Go: the prometheus metrics wiring, the background
 //! event-stream processor (time-reel integration), and the uptime

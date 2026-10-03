@@ -1,7 +1,7 @@
 //! Tab-separated log lines with a JSON tail; `coreId` always present.
 //!
 //! ```text
-//! 2026-04-22T01:00:00Z  info  quil_node:490  P2P identity ready  {"coreId": 0, "peer_id": "Qm..."}
+//! 2026-04-22T01:00:00Z info  quil_node:490  P2P identity ready  {"coreId": 0, "peer_id": "Qm..."}
 //! ```
 //!
 //! Per-core file separation (`master.log` / `worker-N.log`) plus
@@ -334,6 +334,24 @@ pub fn build_env_filter(
     directives.push("libp2p_quic=warn".to_string());
     directives.push("libp2p_tcp=warn".to_string());
     directives.push("libp2p_swarm=warn".to_string());
+    // Stock gossipsub emits "Send Queue full" (per-peer outbound backpressure)
+    // at WARN. Under load that is routine and NOT operator-actionable, but the
+    // message lives in the dependency so we can't relabel that one line without
+    // vendoring the crate. Treat it as debug-level instead: cap gossipsub's WARN
+    // floor at `error` in normal (info) runs so it's hidden, but leave it (and
+    // the rest of gossipsub) visible under `--debug` for diagnosis. Overridable
+    // via config `logFilters` / `--log-filter` (appended after this).
+    if !debug {
+        directives.push("libp2p_gossipsub=error".to_string());
+    }
+    // The HTTP/2 + gRPC stack (h2 codec frame send/received, hyper, tonic
+    // service, and tower buffer/ready) logs thousands of per-frame debug lines
+    // that bury the node's own output under `--debug`. Cap at warn unless opted
+    // back in.
+    directives.push("h2=warn".to_string());
+    directives.push("hyper=warn".to_string());
+    directives.push("tonic=warn".to_string());
+    directives.push("tower=warn".to_string());
 
     for (component, level) in config_filters {
         directives.push(format!("{}={}", component, level));
@@ -362,10 +380,10 @@ pub fn log_filename_for_core(core_id: u32) -> String {
 /// at `<cfg.path>/<core>.log` and keeps stderr as a mirror.
 ///
 /// Rotation:
-///   * `max_size` MB — rotation trigger (0 → daily).
-///   * `max_backups` — rotated files retained (0 → 1024 cap).
-///   * `max_age` days — reaper deletes older rotations.
-///   * `compress` — gzip on rotation.
+/// * `max_size` MB — rotation trigger (0 → daily).
+/// * `max_backups` — rotated files retained (0 → 1024 cap).
+/// * `max_age` days — reaper deletes older rotations.
+/// * `compress` — gzip on rotation.
 pub fn init_logging(
     cfg: &quil_config::LogConfig,
     core_id: u32,

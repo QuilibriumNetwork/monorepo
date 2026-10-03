@@ -10,7 +10,7 @@
 //! What this module is *not*:
 //! - Not a backward chain walker. Non-archive nodes don't store full history.
 //! - Not the prover tree syncer. That's `HypergraphComparisonService.PerformSync`,
-//!   which is a 4-phase CRDT walk and lives in a separate module (TBD).
+//! which is a 4-phase CRDT walk and lives in a separate module (TBD).
 //!
 //! Architecture mirror:
 //! - Go: `pollFramesFromArchive` (lines 2161-2231)
@@ -47,34 +47,41 @@ pub enum FrameSyncError {
 pub struct ArchiveEndpointPool {
     inner: Mutex<ArchiveEndpointPoolInner>,
     notify: Notify,
+    /// How long a blacklisted endpoint stays banned before becoming
+    /// eligible again. Short enough that transient network blips don't
+    /// permanently drain the pool, long enough that we don't hammer a
+    /// struggling endpoint into the ground. A value of `Duration::ZERO`
+    /// disables blacklisting entirely: a failed endpoint's entry is
+    /// instantly expired, so it is restored on the very next `next()` and
+    /// re-accepted by `add()` — used where instant partition recovery
+    /// matters more than backing off a struggling peer.
+    blacklist_ttl: Duration,
 }
 
-/// How long a blacklisted endpoint stays banned before becoming
-/// eligible again. Short enough that transient network blips don't
-/// permanently drain the pool, long enough that we don't hammer a
-/// struggling endpoint into the ground. The previous design had no
-/// TTL — a single timeout permanently removed the endpoint, and
-/// `add()` rejected re-adds from PeerInfo discovery, so over hours
-/// of uptime the pool gradually drained to zero and every archive
-/// call surfaced as `"connect_mtls failed: transport error: deadline
-/// has expired"` even though the endpoints had long since recovered.
-const BLACKLIST_TTL: Duration = Duration::from_secs(60);
-
 struct ArchiveEndpointPoolInner {
-    /// All known archive endpoints we haven't blacklisted yet, in arrival
-    /// order. The poller's "next" pointer rotates through this list.
+    /// ALL known archive endpoints, in arrival order — once added, an
+    /// endpoint is NEVER removed. This is the set the consensus publisher
+    /// fans out to (`get_all`), so dropping an endpoint here would silently
+    /// stop delivering consensus to a committee member on a transient
+    /// connect failure (which, with a flaky :8340 mesh, collapses the
+    /// quorum). The poller's "next" pointer rotates through this list,
+    /// skipping currently-blacklisted entries for frame-polling only.
     endpoints: Vec<String>,
-    /// Endpoints that have failed recently. Each entry records the
-    /// instant of the most recent failure; entries older than
-    /// `BLACKLIST_TTL` are eligible to be restored on the next pool
-    /// operation.
+    /// Endpoints that have failed recently — a SKIP HINT for the poller's
+    /// round-robin only; it does NOT remove them from `endpoints`. Each
+    /// entry records the instant of the most recent failure; entries older
+    /// than `blacklist_ttl` are eligible to be retried.
     blacklist: HashMap<String, Instant>,
     /// Index into `endpoints` for the next pick.
     cursor: usize,
 }
 
 impl ArchiveEndpointPool {
-    pub fn new() -> Self {
+    /// Build a pool with the given blacklist TTL. `Duration::ZERO` disables
+    /// blacklisting (see the `blacklist_ttl` field). The production default
+    /// lives in `quil-config` (`EngineConfig::archive_blacklist_ttl_secs`),
+    /// not here — every caller passes an explicit TTL.
+    pub fn new(blacklist_ttl: Duration) -> Self {
         Self {
             inner: Mutex::new(ArchiveEndpointPoolInner {
                 endpoints: Vec::new(),
@@ -82,6 +89,7 @@ impl ArchiveEndpointPool {
                 cursor: 0,
             }),
             notify: Notify::new(),
+            blacklist_ttl,
         }
     }
 
@@ -93,7 +101,7 @@ impl ArchiveEndpointPool {
     pub async fn add(&self, endpoint: String) {
         let mut inner = self.inner.lock().await;
         if let Some(ts) = inner.blacklist.get(&endpoint) {
-            if ts.elapsed() < BLACKLIST_TTL {
+            if ts.elapsed() < self.blacklist_ttl {
                 return;
             }
             inner.blacklist.remove(&endpoint);
@@ -118,16 +126,17 @@ impl ArchiveEndpointPool {
 
     /// Pick the next non-blacklisted endpoint round-robin. Returns `None` if
     /// the pool is empty. Opportunistically restores endpoints whose
-    /// blacklist entry has aged past `BLACKLIST_TTL`, so a temporarily
+    /// blacklist entry has aged past `blacklist_ttl`, so a temporarily
     /// dead archive can be retried without waiting for PeerInfo
-    /// re-discovery.
-    pub(crate) async fn next(&self) -> Option<String> {
+    /// re-discovery. With a zero TTL every entry is immediately eligible,
+    /// so a failed endpoint returns to rotation on the next call.
+    pub async fn next(&self) -> Option<String> {
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
         let expired: Vec<String> = inner
             .blacklist
             .iter()
-            .filter(|(_, ts)| now.duration_since(**ts) >= BLACKLIST_TTL)
+            .filter(|(_, ts)| now.duration_since(**ts) >= self.blacklist_ttl)
             .map(|(e, _)| e.clone())
             .collect();
         for e in expired {
@@ -155,15 +164,20 @@ impl ArchiveEndpointPool {
 
     async fn blacklist(&self, endpoint: &str) {
         let mut inner = self.inner.lock().await;
+        // Record the failure so the poller's `next()` round-robin skips this
+        // endpoint for frame-polling until the TTL expires. Do NOT remove it
+        // from `endpoints`: it stays in the consensus fan-out set (`get_all`)
+        // and is never pruned — a transient poll failure must not drop a
+        // committee member from consensus delivery.
         inner.blacklist.insert(endpoint.to_string(), Instant::now());
-        inner.endpoints.retain(|e| e != endpoint);
         debug!(%endpoint, "blacklisted archive endpoint");
     }
 
     /// Wait until at least one endpoint is available. Used at startup so the
     /// poller can block instead of spinning until PeerInfo discovery feeds
-    /// it.
-    async fn wait_nonempty(&self, cancel: &CancellationToken) {
+    /// it — and by the far-behind state-jump (in `quil-node`) so it never
+    /// no-ops on an empty pool during early-boot discovery.
+    pub async fn wait_nonempty(&self, cancel: &CancellationToken) {
         loop {
             if self.len().await > 0 {
                 return;
@@ -176,24 +190,256 @@ impl ArchiveEndpointPool {
     }
 }
 
-impl Default for ArchiveEndpointPool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Callback invoked for each frame after it's stored. The poller
 /// calls this with the `GlobalFrame` proto — wiring the execution
 /// pipeline in here enables a read-only node to process frames as
 /// they arrive.
 pub type OnFrameCallback = Arc<dyn Fn(&GlobalFrame) + Send + Sync>;
 
+/// Validates a frame BEFORE it is persisted. Returns `true` to accept
+/// (store + fire `on_frame`), `false` to drop. Wired from the node's
+/// genesis-prover allowlist + VDF/BLS `GlobalFrameVerifier` so the
+/// archive-poll path gates identically to the gossip `GLOBAL_FRAME`
+/// handler — a forged frame served by a peer archive is dropped, never
+/// stored and never fired to `on_frame`. `None` disables the gate
+/// (e.g. a trusted/test caller).
+pub type FrameValidator = Arc<dyn Fn(&GlobalFrame) -> bool + Send + Sync>;
+
+/// Optional durable store for validated frames, tried before the canonical
+/// `put_global_frame`. It receives a certified frame preceded by the
+/// uncertified ancestors it links down to (see [`FrameCertified`]), lowest
+/// first. True when it took all of them (an archive keeps them as candidates
+/// for publication together with their execution state); false stores them
+/// canonically as before. `on_frame` fires either way.
+pub type FrameStoreHook = Arc<dyn Fn(&[GlobalFrame]) -> bool + Send + Sync>;
+
+/// Whether a validated frame carries its own finalization certificate.
+///
+/// Validation (VDF, genesis-prover allowlist, a certificate when present) does
+/// not establish that a frame was finalized: the VDF is publicly computable, the
+/// allowlist names an unsigned header field, and a proposal from a view that was
+/// then nullified passes it. A frame with no certificate of its own is on the
+/// finalized chain only if a certified frame links down to it by parent
+/// selector, as Simplex finalizes ancestors through a descendant. With this set,
+/// the poller holds such a frame and stores it only once a certified frame it
+/// stores links to it.
+pub type FrameCertified = Arc<dyn Fn(&GlobalFrame) -> bool + Send + Sync>;
+
+/// Uncertified frames held per poller at most; the lowest go first.
+const MAX_HELD_UNCERTIFIED: usize = 256;
+
+/// Store an admitted chain (lowest first) through the store hook, else
+/// canonically, and fire `on_frame` for each stored frame in order. A failed
+/// canonical write stops at that frame, so no later frame is stored above it.
+fn store_chain(
+    config: &ArchivePollerConfig,
+    clock_store: &RocksClockStore,
+    chain: &[GlobalFrame],
+) -> quil_types::error::Result<()> {
+    if chain.is_empty() {
+        return Ok(());
+    }
+    let taken = config.store_hook.as_ref().is_some_and(|store| store(chain));
+    for frame in chain {
+        if !taken && !already_canonical(clock_store, frame) {
+            clock_store.put_global_frame(frame, None)?;
+        }
+        if let Some(ref cb) = config.on_frame {
+            cb(frame);
+        }
+    }
+    Ok(())
+}
+
+/// Whether the canonical clock already holds exactly `frame`, as it does for a
+/// head the poller reads again after reconnecting, at or below what execution
+/// published. Rewriting it changes nothing but advances the store's sequence
+/// under an in-flight atomic execution plan, which then falls back.
+fn already_canonical(clock_store: &RocksClockStore, frame: &GlobalFrame) -> bool {
+    frame
+        .header
+        .as_ref()
+        .and_then(|header| clock_store.get_global_frame(header.frame_number).ok())
+        .is_some_and(|stored| stored == *frame)
+}
+
+fn frame_identity(frame: &GlobalFrame) -> Option<[u8; 32]> {
+    quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref()?.output).ok()
+}
+
+/// What to store now for a validated `frame`, lowest first: nothing while it is
+/// uncertified (it is held), else the held ancestors it links down to by parent
+/// selector and then the frame. Held frames at or below a certified frame that
+/// it does not link to are dropped: they are not on its chain. Without a
+/// certification predicate every frame is stored as before.
+fn admit_frame(
+    certified: Option<&FrameCertified>,
+    held: &mut std::collections::BTreeMap<u64, GlobalFrame>,
+    frame: GlobalFrame,
+) -> Vec<GlobalFrame> {
+    let Some(certified) = certified else { return vec![frame] };
+    let Some(number) = frame.header.as_ref().map(|h| h.frame_number) else { return Vec::new() };
+    if !certified(&frame) {
+        held.insert(number, frame);
+        while held.len() > MAX_HELD_UNCERTIFIED {
+            held.pop_first();
+        }
+        return Vec::new();
+    }
+    let mut chain = Vec::new();
+    let mut selector = frame.header.as_ref().map(|h| h.parent_selector.clone()).unwrap_or_default();
+    let mut below = number;
+    while let Some(parent_number) = below.checked_sub(1) {
+        let links = held
+            .get(&parent_number)
+            .and_then(frame_identity)
+            .is_some_and(|identity| identity.as_slice() == selector.as_slice());
+        if !links {
+            break;
+        }
+        let parent = held.remove(&parent_number).expect("checked above");
+        selector = parent.header.as_ref().map(|h| h.parent_selector.clone()).unwrap_or_default();
+        chain.push(parent);
+        below = parent_number;
+    }
+    held.retain(|&held_number, _| held_number > number);
+    chain.reverse();
+    chain.push(frame);
+    chain
+}
+
+/// Async hook the poller invokes when a NON-ARCHIVE node finds itself far behind
+/// an endpoint's head at RUNTIME (gap ≥ [`STATE_JUMP_RUNTIME_GAP`]). The argument
+/// is the network head just observed; the hook runs a best-effort state-jump
+/// (hypersync to a recent target) and returns the synced frame number, or `None`
+/// if no jump completed. On `Some(n)` the poller fast-forwards `last_frame` to `n`
+/// instead of forward-filling (and re-materializing) the whole gap. Boot-time
+/// far-behind is handled separately by [`ArchivePollerConfig::startup_barrier`].
+pub type FarBehindJump = Arc<
+    dyn Fn(u64, CancellationToken) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u64>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Runtime far-behind threshold: when a non-archive poller sees an endpoint whose
+/// head is at least this many frames beyond the poller's `last_frame` MID-RUN, it
+/// invokes [`FarBehindJump`] to snapshot-jump near head rather than forward-fill
+/// the entire gap. Set comfortably above `STATE_JUMP_MIN_GAP` (the boot gate) so
+/// normal small lag never triggers a jump — and a jump lands near head, so the
+/// post-jump gap is small and cannot immediately re-trigger.
+pub const STATE_JUMP_RUNTIME_GAP: u64 = 2_000;
+
+/// Shared "gossip is delivering the head" signal, written by the gossip
+/// `GLOBAL_FRAME` receive path and read by the poller.
+///
+/// Once regular nodes subscribe to the `GLOBAL_FRAME` gossip topic, finalized
+/// frames arrive over the mesh — the same frames the RPC poller fetches. When
+/// gossip keeps the head current, the poller's per-second `GetGlobalFrame(0)`
+/// call is pure redundant RPC. This tracker lets the poller *back off* while
+/// gossip is fresh and resume polling (as a gap-filler) only when the mesh goes
+/// quiet, which is the whole point of the gossip-for-global-frames path.
+///
+/// Non-archive only: archives forward-fill contiguous history and cannot trust
+/// unordered/lossy gossip to fill gaps, so their poller ignores this signal.
+pub struct GossipFreshness {
+    base: Instant,
+    /// Millis-since-`base` of the last gossip-delivered frame; 0 = none yet.
+    last_millis: std::sync::atomic::AtomicU64,
+    /// Highest frame number seen over gossip.
+    last_frame: std::sync::atomic::AtomicU64,
+    /// Highest global head advertised by a signed, genesis-verified archive
+    /// PeerInfo. This is an AUTHENTICATED "network head" hint (PeerInfo is signed
+    /// by the archive) that lets the poller answer "am I behind?" for free — the
+    /// reconcile only re-pulls when an archive advertises a head above ours,
+    /// instead of fetching a full head frame over RPC every interval. 0 = none
+    /// seen yet (⇒ don't trust it; fall back to an RPC head-poll).
+    network_head: std::sync::atomic::AtomicU64,
+}
+
+impl GossipFreshness {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: Instant::now(),
+            last_millis: std::sync::atomic::AtomicU64::new(0),
+            last_frame: std::sync::atomic::AtomicU64::new(0),
+            network_head: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Record that a frame was just delivered over gossip. Called from the
+    /// `GLOBAL_FRAME` receive path after a successful store.
+    ///
+    /// Freshness tracks head ADVANCEMENT, not mere arrival: we only refresh the
+    /// timestamp when this frame raises the gossip head. Otherwise an attacker
+    /// re-broadcasting a single valid, already-finalized OLD frame could keep
+    /// `fresh_within` permanently true without the head moving — pinning the
+    /// poller in its gossip-paused branch and (combined with a stale
+    /// `network_head` under eclipse) suppressing the RPC reconcile indefinitely.
+    /// Tying freshness to advancement means a stalled/replayed head lets
+    /// `fresh_within` lapse after the window, and the poller falls back to RPC.
+    pub fn stamp(&self, frame_number: u64) {
+        let prev = self
+            .last_frame
+            .fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
+        if frame_number > prev {
+            // Store 1-based millis so a stamp at elapsed==0 is distinguishable
+            // from the "never stamped" sentinel (0).
+            self.last_millis.store(
+                (self.base.elapsed().as_millis() as u64).saturating_add(1),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Highest frame number ever delivered over gossip.
+    pub fn head(&self) -> u64 {
+        self.last_frame.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record a network head advertised by a signed, genesis-verified archive
+    /// PeerInfo. Called from the PeerInfo receive path.
+    pub fn note_network_head(&self, frame_number: u64) {
+        self.network_head
+            .fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Highest authenticated network head seen via archive PeerInfo (0 = none).
+    pub fn network_head(&self) -> u64 {
+        self.network_head.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// True if a gossip frame landed within the last `window`.
+    pub fn fresh_within(&self, window: Duration) -> bool {
+        let last = self.last_millis.load(std::sync::atomic::Ordering::Relaxed);
+        if last == 0 {
+            return false; // never stamped
+        }
+        let last = last - 1; // undo the 1-based offset from `stamp`
+        let now = self.base.elapsed().as_millis() as u64;
+        now.saturating_sub(last) < window.as_millis() as u64
+    }
+}
+
 /// Poller configuration. Defaults match Go's `pollFramesFromArchive`.
 pub struct ArchivePollerConfig {
     pub poll_interval: Duration,
     pub call_timeout: Duration,
+    /// When set (non-archive nodes), the poller skips its RPC head-fetch while
+    /// gossip is keeping the head fresh, polling only as a gap-filler when the
+    /// mesh goes quiet — plus a periodic reconcile poll as a safety net. `None`
+    /// (the default / archives) → always poll.
+    pub gossip_freshness: Option<Arc<GossipFreshness>>,
     /// Optional callback fired for each frame after storage.
     pub on_frame: Option<OnFrameCallback>,
+    /// Optional genesis-prover + VDF/BLS gate applied to every frame
+    /// BEFORE it is stored. Frames failing this check are dropped
+    /// (not stored, `on_frame` not fired), mirroring the gossip
+    /// `GLOBAL_FRAME` handler's drop-before-store semantics.
+    pub frame_validator: Option<FrameValidator>,
+    /// See [`FrameStoreHook`]. `None` always stores canonically.
+    pub store_hook: Option<FrameStoreHook>,
+    /// See [`FrameCertified`]. `None` stores every validated frame.
+    pub frame_certified: Option<FrameCertified>,
     /// When true, the poller forward-fills every missed frame
     /// between the previously-seen head and the current head — the
     /// archive case where retaining full history is the point.
@@ -203,6 +449,19 @@ pub struct ArchivePollerConfig {
     /// state is wasted bandwidth, and the prover-tree sync provides
     /// the registry view we actually need.
     pub forward_fill: bool,
+    /// Optional one-shot barrier the poller awaits (after endpoint discovery,
+    /// before reading its starting cursor). Used by the far-behind archive
+    /// state-jump: the jump fast-forwards the clock head, and the poller must
+    /// not read its `last_frame` — nor start forward-filling — until the jump
+    /// has committed, or it would replay (re-materialize) frames the jump
+    /// already synced. `None` = no wait.
+    pub startup_barrier: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Optional runtime far-behind rescue (non-archive). When the poller falls
+    /// ≥ [`STATE_JUMP_RUNTIME_GAP`] behind an endpoint's head AFTER startup, it
+    /// invokes this hook to snapshot-jump near head instead of forward-filling
+    /// the whole gap. `None` (default / archives) → always forward-fill. See
+    /// [`FarBehindJump`].
+    pub far_behind_jump: Option<FarBehindJump>,
 }
 
 impl Default for ArchivePollerConfig {
@@ -210,10 +469,25 @@ impl Default for ArchivePollerConfig {
         Self {
             poll_interval: Duration::from_secs(1),
             call_timeout: Duration::from_secs(30),
+            gossip_freshness: None,
             on_frame: None,
+            frame_validator: None,
+            store_hook: None,
+            frame_certified: None,
             forward_fill: false,
+            startup_barrier: None,
+            far_behind_jump: None,
         }
     }
+}
+
+/// Whether the forward-fill fetches every frame between the local head and
+/// `head`. A store holding only genesis fills from frame 1: an archive that
+/// started as frame 1 was finalized stored frame 2 first, never fetched 1,
+/// and could execute nothing until it was restarted. A store with no record
+/// at all is the far-behind state-jump's to fill.
+fn forward_fill_due(last_frame: u64, has_genesis: bool, head: u64) -> bool {
+    (last_frame > 0 || has_genesis) && head > last_frame + 1
 }
 
 /// Long-running task that polls a chosen archive endpoint for the current
@@ -223,8 +497,8 @@ impl Default for ArchivePollerConfig {
 pub async fn run_archive_poller(
     pool: Arc<ArchiveEndpointPool>,
     clock_store: Arc<RocksClockStore>,
-    ed448_seed: [u8; 57],
-    config: ArchivePollerConfig,
+    falcon_signing_key: Vec<u8>,
+    mut config: ArchivePollerConfig,
     cancel: CancellationToken,
 ) {
     info!("archive frame poller started");
@@ -232,16 +506,114 @@ pub async fn run_archive_poller(
     if cancel.is_cancelled() {
         return;
     }
+    // Wait for the far-behind state-jump (if any) to commit its fast-forward
+    // before reading our starting cursor — otherwise we'd forward-fill from the
+    // pre-jump head and re-materialize frames the jump already synced.
+    if let Some(barrier) = config.startup_barrier.take() {
+        info!("archive poller: waiting for state-jump barrier before forward-fill");
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = barrier => {}
+        }
+    }
 
-    // Reuse a single client for as long as it works. Switch endpoints
-    // only when an RPC fails.
+    // Reuse a single client for as long as it works AND it keeps us moving
+    // forward. Switch endpoints on an RPC failure OR when an endpoint stops
+    // being ahead of us (see the no-progress handling below).
     let mut current_client: Option<(String, ArchiveClient)> = None;
     // Use the local store's latest as our starting "last seen", so a
     // restart doesn't re-fetch frames we already have.
     let mut last_frame: u64 = clock_store.get_latest_frame_number().unwrap_or(0);
+    let has_genesis = clock_store.get_global_frame(0).is_ok();
+    // Consecutive ticks where the current endpoint was not ahead of us. The
+    // pool can contain endpoints that are behind, at our height, or even THIS
+    // node itself (the mainnet genesis static-IP pool includes self). Latching
+    // onto such an endpoint used to wedge catch-up silently forever — we never
+    // rotated on no-progress, only on error. After a few no-progress ticks we
+    // rotate to keep searching for an endpoint that IS ahead.
+    let mut no_progress: u32 = 0;
+    const NO_PROGRESS_ROTATE_THRESHOLD: u32 = 3;
+    // Back off between no-progress polls. `poll_interval` is 1s (tuned for
+    // catch-up throughput while advancing); hammering the head every 1s — and
+    // reconnecting on every rotation — when there's nothing new would be a
+    // reconnect storm onto the shared :8340 path. When not advancing, poll far
+    // more slowly.
+    const NO_PROGRESS_BACKOFF: Duration = Duration::from_secs(5);
+    // Throttled liveness heartbeat so a not-advancing poller is diagnosable
+    // without enabling debug logs (previously it was completely silent).
+    let mut last_heartbeat = tokio::time::Instant::now();
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+    // Unfillable-gap detection for forward-fill. A single frame that NO
+    // committee archive will ever serve — e.g. a hole left when the whole
+    // archive fleet was restarted together and the re-bootstrapped chain
+    // never produced that number — otherwise wedges catch-up FOREVER: the
+    // loop breaks at `bad`, rotates endpoints, and retries `bad` every 5s
+    // against peer after peer, all returning NotFound, never advancing past
+    // it. We track the stuck frame and the DISTINCT endpoints that have
+    // returned NotFound for it; once enough distinct archives agree it's
+    // missing AND the network head is well beyond it (so it's not merely
+    // "not produced yet"), we abandon it — advance `last_frame` past the
+    // hole so catch-up proceeds to the frames that DO exist. Only a genuine
+    // `NotFound` counts; transient errors/timeouts never trip the skip.
+    let mut stall_frame: Option<u64> = None;
+    // Validated frames with no certificate of their own, until a certified frame
+    // links down to them (see `FrameCertified`).
+    let mut held: std::collections::BTreeMap<u64, GlobalFrame> = std::collections::BTreeMap::new();
+    let mut stall_endpoints: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Distinct archives that served a frame at the stuck height which FAILED
+    // validation (forged, or — the real case — a legacy pre-migration frame
+    // whose VDF/allowlist can never pass under the new chain). Tracked apart
+    // from `stall_endpoints` (NotFound) because it's a different failure mode,
+    // but it trips the same skip: if enough distinct honest archives all serve
+    // an unvalidatable frame at the same height with the head far past, no peer
+    // will ever serve a valid one, so the gap must be abandoned to make
+    // progress rather than looping "failed validation — rotating" forever.
+    let mut stall_invalid_endpoints: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Distinct archives that must independently report NotFound for the same
+    // frame before we treat it as a permanent hole.
+    const UNFILLABLE_DISTINCT_ENDPOINTS: usize = 3;
+    // The head must be at least this far past the stuck frame before we skip
+    // it — a recently-produced frame that's briefly unavailable is served by
+    // its producer within a few frames, so a large lag means "permanent".
+    const UNFILLABLE_HEAD_MARGIN: u64 = 16;
 
     let mut ticker = tokio::time::interval(config.poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Gossip-driven RPC reduction (wired on non-archive nodes only — the caller
+    // passes `gossip_freshness: Some` there and `None` for archives). While the
+    // `GLOBAL_FRAME` mesh keeps delivering the head, the receive path has
+    // already stored (and processed) each finalized frame, so the poller sources
+    // those frames from the LOCAL STORE instead of re-fetching them over RPC, and
+    // skips its `GetGlobalFrame(0)` head-poll entirely. It still fills genuine
+    // holes (frames gossip dropped) over RPC — contiguity is preserved for the
+    // ρ_N storage anchors — and forces a reconcile head-poll every
+    // `GOSSIP_RECONCILE_INTERVAL` so a silently-diverged node re-anchors. When
+    // gossip goes quiet for `GOSSIP_FRESH_WINDOW` (a few frame intervals) the
+    // poller resumes full RPC polling as the fallback.
+    const GOSSIP_FRESH_WINDOW: Duration = Duration::from_secs(30);
+    const GOSSIP_RECONCILE_INTERVAL: Duration = Duration::from_secs(120);
+    const GOSSIP_IDLE_BACKOFF: Duration = Duration::from_secs(5);
+    // Hard wall-clock bound on authenticated archive contact: even when gossip
+    // looks fresh AND PeerInfo says we're current, force a real RPC head-poll at
+    // least this often. Defense-in-depth so no combination of a stalled/replayed
+    // gossip head and a stale/withheld `network_head` (an eclipse) can suppress
+    // archive contact indefinitely — the poller re-verifies against the mTLS
+    // source on a fixed cadence regardless.
+    const HARD_RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
+    // Start "due" so the first tick always polls (establishes the endpoint and a
+    // baseline head before ceding to gossip).
+    let mut last_rpc_poll = tokio::time::Instant::now()
+        .checked_sub(GOSSIP_RECONCILE_INTERVAL)
+        .unwrap_or_else(tokio::time::Instant::now);
+    // Time of the last ACTUAL RPC head-poll (distinct from `last_rpc_poll`, which
+    // also resets when a reconcile is satisfied cheaply from PeerInfo).
+    let mut last_actual_rpc = tokio::time::Instant::now()
+        .checked_sub(HARD_RECONCILE_INTERVAL)
+        .unwrap_or_else(tokio::time::Instant::now);
 
     loop {
         tokio::select! {
@@ -249,10 +621,83 @@ pub async fn run_archive_poller(
             _ = ticker.tick() => {}
         }
 
+        // Gossip is carrying the head: drain the frames it already stored, over
+        // the local store (zero RPC), and only drop into the RPC path below if a
+        // hole is found or a reconcile is due. Checked before client acquisition
+        // so a fully-gossip-fed poller never even connects to :8340.
+        if let Some(gf) = config.gossip_freshness.clone() {
+            let reconcile_due = last_rpc_poll.elapsed() >= GOSSIP_RECONCILE_INTERVAL;
+            // Cheap, RPC-free "am I behind?" check. `network_head` is the highest
+            // head advertised by a signed, genesis-verified archive PeerInfo, so
+            // it authenticates the network height without fetching a full head
+            // frame. When it confirms we're not behind, a reconcile poll would
+            // only re-confirm what PeerInfo already told us — so satisfy the
+            // reconcile from PeerInfo instead of an RPC. Only when PeerInfo is
+            // unavailable (0) or shows an archive genuinely ahead do we spend the
+            // RPC. (Gossip going quiet is handled below — `fresh_within` fails and
+            // we fall through to a real poll, preserving the partition backstop.)
+            let net_head = gf.network_head();
+            let current_per_peerinfo = net_head > 0 && net_head <= last_frame;
+            // Hard bound overrides the cheap PeerInfo skip: guarantees periodic
+            // authenticated archive contact even under an eclipse.
+            let hard_due = last_actual_rpc.elapsed() >= HARD_RECONCILE_INTERVAL;
+            let reconcile_needs_rpc = (reconcile_due && !current_per_peerinfo) || hard_due;
+            if gf.fresh_within(GOSSIP_FRESH_WINDOW) && !reconcile_needs_rpc {
+                // If we hit the reconcile point but PeerInfo already confirms
+                // we're current, treat it as reconciled: reset the timer so we
+                // don't re-check every tick, and stay paused with no RPC.
+                if reconcile_due {
+                    last_rpc_poll = tokio::time::Instant::now();
+                }
+                let target = gf.head();
+                // Drain contiguous store-present frames (gossip delivered them);
+                // fire on_frame exactly as the RPC path would, just without the
+                // network round-trip.
+                let mut hole = false;
+                while last_frame < target {
+                    let next = last_frame + 1;
+                    match clock_store.get_global_frame(next) {
+                        Ok(frame) => {
+                            if let Some(ref cb) = config.on_frame {
+                                cb(&frame);
+                            }
+                            last_frame = next;
+                        }
+                        Err(_) => {
+                            // Gossip missed this frame — fall through to the RPC
+                            // path to fill the hole (last_frame sits just below it).
+                            hole = true;
+                            break;
+                        }
+                    }
+                }
+                if !hole {
+                    if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                        info!(
+                            local_frame = last_frame,
+                            gossip_head = target,
+                            "archive poller: gossip is carrying the head — RPC head-poll paused",
+                        );
+                        last_heartbeat = tokio::time::Instant::now();
+                    }
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(GOSSIP_IDLE_BACKOFF) => {}
+                    }
+                    continue;
+                }
+                // hole == true: fall through and let the RPC head-poll +
+                // forward-fill below fetch the missing frame(s).
+            }
+        }
+        last_rpc_poll = tokio::time::Instant::now();
+        // We're committing to an actual RPC head-poll below — reset the hard bound.
+        last_actual_rpc = tokio::time::Instant::now();
+
         // Acquire a working client.
         if current_client.is_none() {
             if let Some(addr) = pool.next().await {
-                match ArchiveClient::connect_mtls(&addr, &ed448_seed).await {
+                match ArchiveClient::connect_mtls(&addr, &falcon_signing_key).await {
                     Ok(c) => {
                         info!(%addr, "archive poller connected");
                         current_client = Some((addr, c));
@@ -309,16 +754,116 @@ pub async fn run_archive_poller(
         };
         let new_number = head.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
         if new_number == 0 || new_number <= last_frame {
-            // No progress.
+            // This endpoint is not ahead of us. It may be genuinely behind, at
+            // our exact height, or this node's own endpoint. Do NOT silently
+            // latch onto it forever (the old behavior — an extremely-behind
+            // archive whose poller happened to grab a non-advancing endpoint
+            // would sit here with zero log output). Count consecutive
+            // no-progress ticks and, past a small threshold, rotate to a
+            // different endpoint to keep looking for one that IS ahead. This is
+            // NOT a blacklist: the endpoint isn't broken, just not useful now.
+            no_progress = no_progress.saturating_add(1);
+            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                info!(
+                    %addr,
+                    local_frame = last_frame,
+                    endpoint_head = new_number,
+                    no_progress,
+                    "archive poller: not advancing — current endpoint is not ahead of us",
+                );
+                last_heartbeat = tokio::time::Instant::now();
+            }
+            if no_progress >= NO_PROGRESS_ROTATE_THRESHOLD {
+                debug!(
+                    %addr,
+                    local_frame = last_frame,
+                    endpoint_head = new_number,
+                    "archive poller: rotating off non-advancing endpoint",
+                );
+                current_client = None;
+                no_progress = 0;
+            }
+            // Back off (cancel-aware) so a not-advancing poller neither hot-loops
+            // the head nor reconnect-storms :8340 on rotation.
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(NO_PROGRESS_BACKOFF) => {}
+            }
             continue;
+        }
+        // The endpoint is ahead — we're going to make progress this tick.
+        no_progress = 0;
+
+        // 1b. Runtime far-behind rescue (non-archive): if we've fallen a long way
+        // behind the network head mid-run, snapshot-jump to a recent target
+        // instead of forward-filling (and re-materializing) the entire gap — the
+        // same rescue the startup barrier gives at boot. Without it a node that
+        // drops far behind at runtime (e.g. a long partition, or a restart onto a
+        // stale/legacy local head) grinds forward one frame at a time — across the
+        // pre-migration LEGACY range it can hit frames it can never validate and
+        // crawl a single frame per multi-archive stall. A successful jump advances
+        // the clock head + materialized cursor + registry, and lands near head, so
+        // the post-jump gap is small and this cannot immediately re-fire.
+        if let Some(ref jump) = config.far_behind_jump {
+            if config.gossip_freshness.is_some()
+                && new_number.saturating_sub(last_frame) >= STATE_JUMP_RUNTIME_GAP
+            {
+                info!(
+                    local_frame = last_frame,
+                    head = new_number,
+                    "archive poller: far behind at runtime — attempting state-jump",
+                );
+                if let Some(n) = jump(new_number, cancel.clone()).await {
+                    if n > last_frame {
+                        last_frame = n;
+                    }
+                    info!(target = n, "archive poller: runtime state-jump landed — resuming near head");
+                    continue;
+                }
+                warn!(
+                    local_frame = last_frame,
+                    head = new_number,
+                    "archive poller: runtime state-jump did not complete — forward-filling",
+                );
+            }
         }
 
         // 2. Forward-fill any missed frames in (last_frame, new_number).
         //    Archive nodes need the full history; everyone else
         //    just wants to start from the current head.
-        if config.forward_fill && last_frame > 0 && new_number > last_frame + 1 {
-            let mut catchup_failed = false;
+        if config.forward_fill && forward_fill_due(last_frame, has_genesis, new_number) {
+            // Track partial progress: every frame we successfully store
+            // advances `last_frame`, so a failure midway does NOT throw
+            // away the frames we already pulled. The previous design left
+            // `last_frame` untouched on any failure and retried the WHOLE
+            // gap against the SAME endpoint forever — a single unfetchable
+            // frame (e.g. one the source archive never persisted) wedged
+            // catch-up permanently, which is exactly the "far-behind node
+            // never catches up" symptom.
+            let mut failed_frame: Option<u64> = None;
+            // Whether the failure was a genuine gRPC NotFound (the peer
+            // affirmatively has no such frame), as opposed to a transient
+            // transport error / timeout. Only NotFound counts toward
+            // declaring a frame permanently unfillable.
+            let mut failed_not_found = false;
+            // Whether the failure was a served-but-unvalidatable frame (as
+            // opposed to NotFound / transport). Counts toward the same skip via
+            // its own distinct-endpoint tally.
+            let mut failed_validation = false;
             for fn_ in (last_frame + 1)..new_number {
+                // Store-first (non-archive): if gossip already delivered this
+                // frame, use the local copy and skip the RPC. Only frames gossip
+                // missed cost a network fetch. Fire on_frame just as the RPC arm
+                // does, so processing is identical regardless of source.
+                if config.gossip_freshness.is_some() {
+                    if let Ok(frame) = clock_store.get_global_frame(fn_) {
+                        if let Some(ref cb) = config.on_frame {
+                            cb(&frame);
+                        }
+                        last_frame = fn_;
+                        continue;
+                    }
+                }
                 match tokio::time::timeout(
                     config.call_timeout,
                     client.get_global_frame(fn_),
@@ -326,41 +871,143 @@ pub async fn run_archive_poller(
                 .await
                 {
                     Ok(Ok(frame)) => {
-                        if let Err(e) = clock_store.put_global_frame(&frame, None) {
+                        // Gate BEFORE persist — genesis-prover allowlist +
+                        // VDF/BLS, mirroring the gossip GLOBAL_FRAME handler.
+                        // A frame that fails validation is never stored and
+                        // never fired to on_frame. Treat it like an
+                        // unavailable frame: rotate to another endpoint (an
+                        // honest archive may serve the real record at this
+                        // height) rather than persisting forged data.
+                        if let Some(ref validate) = config.frame_validator {
+                            if !validate(&frame) {
+                                debug!(%addr, frame = fn_, "catchup frame failed validation — rotating endpoint");
+                                failed_frame = Some(fn_);
+                                failed_validation = true;
+                                break;
+                            }
+                        }
+                        let chain = admit_frame(config.frame_certified.as_ref(), &mut held, frame);
+                        if let Err(e) = store_chain(&config, &clock_store, &chain) {
                             warn!(error = %e, frame = fn_, "store catchup frame failed");
                         }
-                        if let Some(ref cb) = config.on_frame {
-                            cb(&frame);
-                        }
+                        // Advance over each fetched frame (stored, or held until a
+                        // certified frame links to it) so progress is durable.
+                        last_frame = fn_;
                     }
                     Ok(Err(e)) => {
-                        debug!(%addr, frame = fn_, error = %e, "catchup fetch error");
-                        catchup_failed = true;
+                        warn!(%addr, frame = fn_, error = %e, "catchup fetch error");
+                        failed_not_found = matches!(
+                            &e,
+                            ArchiveClientError::Rpc(s) if s.code() == tonic::Code::NotFound
+                        );
+                        failed_frame = Some(fn_);
                         break;
                     }
                     Err(_) => {
-                        debug!(%addr, frame = fn_, "catchup timeout");
-                        catchup_failed = true;
+                        warn!(%addr, frame = fn_, "catchup timeout");
+                        failed_frame = Some(fn_);
                         break;
                     }
                 }
             }
-            if catchup_failed {
-                // Drop the connection so we re-try with another endpoint
-                // next tick. last_frame stays where it was so we'll try
-                // the same gap again.
+            if let Some(bad) = failed_frame {
+                // Track distinct archives that report this exact frame as a
+                // genuine NotFound OR serve an unvalidatable frame at it. A new
+                // stuck frame resets both tallies.
+                if stall_frame != Some(bad) {
+                    stall_frame = Some(bad);
+                    stall_endpoints.clear();
+                    stall_invalid_endpoints.clear();
+                }
+                if failed_not_found {
+                    stall_endpoints.insert(addr.clone());
+                }
+                if failed_validation {
+                    stall_invalid_endpoints.insert(addr.clone());
+                }
+
+                // Abandon a permanently-unfillable gap. When enough DISTINCT
+                // archives have each affirmatively returned NotFound for the
+                // same frame — OR each served a frame at it that fails
+                // validation (a legacy pre-migration height the new chain can
+                // never validate) — and the network head sits well beyond it,
+                // no peer will ever serve a valid record. Retrying forever
+                // wedges catch-up at `bad` and never reaches the frames that DO
+                // exist. Skip it: advance `last_frame` past the hole so the
+                // poller resumes at `bad + 1`. The separate record-gap
+                // backfill/scan still tracks the hole for any later fill; this
+                // only unblocks forward progress.
+                let head_far_past = new_number >= bad.saturating_add(UNFILLABLE_HEAD_MARGIN);
+                let notfound_unfillable =
+                    stall_endpoints.len() >= UNFILLABLE_DISTINCT_ENDPOINTS;
+                let invalid_unfillable =
+                    stall_invalid_endpoints.len() >= UNFILLABLE_DISTINCT_ENDPOINTS;
+                if (notfound_unfillable || invalid_unfillable) && head_far_past {
+                    warn!(
+                        failed_frame = bad,
+                        head = new_number,
+                        distinct_notfound = stall_endpoints.len(),
+                        distinct_invalid = stall_invalid_endpoints.len(),
+                        skip_to = bad + 1,
+                        "catchup: frame is unfillable (NotFound or unvalidatable across multiple archives, head far past) — abandoning gap and skipping past it"
+                    );
+                    last_frame = bad;
+                    stall_frame = None;
+                    stall_endpoints.clear();
+                    stall_invalid_endpoints.clear();
+                    // Keep the current endpoint (it IS ahead and serving) and
+                    // continue straight into head processing / next fill.
+                    continue;
+                }
+
+                // `last_frame` already sits at the last good frame, so we
+                // resume from `bad` next tick — never redoing work. Rotate
+                // to a DIFFERENT endpoint (a mere missing/slow frame is not
+                // grounds to blacklist a committee member: another archive
+                // may well have it). Back off briefly so that if EVERY
+                // endpoint is missing `bad` (a genuine data hole) we cycle
+                // them at a sane cadence instead of a once-a-second mTLS
+                // reconnect storm onto the :8340 path consensus shares.
+                warn!(
+                    %addr,
+                    failed_frame = bad,
+                    resume_from = bad,
+                    head = new_number,
+                    not_found = failed_not_found,
+                    validation_failed = failed_validation,
+                    distinct_notfound = stall_endpoints.len(),
+                    distinct_invalid = stall_invalid_endpoints.len(),
+                    "catchup stalled at frame; rotating endpoint and retrying from last good frame"
+                );
                 current_client = None;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
                 continue;
             }
         }
 
         // 3. Process the new head.
-        if let Err(e) = clock_store.put_global_frame(&head, None) {
-            warn!(error = %e, frame = new_number, "store head frame failed");
+        // Gate BEFORE persist, same as the forward-fill path above and the
+        // gossip GLOBAL_FRAME handler. A head frame failing validation is
+        // dropped: don't store, don't fire on_frame, and don't advance
+        // last_frame (the next tick re-polls the head).
+        if let Some(ref validate) = config.frame_validator {
+            if !validate(&head) {
+                debug!(%addr, frame = new_number, "head frame failed validation — dropping");
+                continue;
+            }
+        }
+        let admitted = admit_frame(config.frame_certified.as_ref(), &mut held, head);
+        if admitted.is_empty() {
+            debug!(frame = new_number, "head frame carries no certificate of its own — held until a certified frame links to it");
+            last_frame = new_number;
             continue;
         }
-        if let Some(ref cb) = config.on_frame {
-            cb(&head);
+        if let Err(e) = store_chain(&config, &clock_store, &admitted) {
+            warn!(error = %e, frame = new_number, "store head frame failed");
+            continue;
         }
         info!(
             head = new_number,
@@ -377,9 +1024,18 @@ pub async fn run_archive_poller(
 mod pool_tests {
     use super::*;
 
+    /// Default TTL used by the pool tests that aren't specifically about
+    /// the disabled (zero-TTL) path.
+    const TEST_TTL: Duration = Duration::from_secs(60);
+
+    /// A pool with a normal (non-zero) blacklist TTL.
+    fn pool() -> ArchiveEndpointPool {
+        ArchiveEndpointPool::new(TEST_TTL)
+    }
+
     #[tokio::test]
     async fn add_then_get_all_returns_endpoints_in_order() {
-        let pool = ArchiveEndpointPool::new();
+        let pool = pool();
         pool.add("a.example.com:443".into()).await;
         pool.add("b.example.com:443".into()).await;
         let all = pool.get_all().await;
@@ -388,7 +1044,7 @@ mod pool_tests {
 
     #[tokio::test]
     async fn add_dedups_existing_endpoint() {
-        let pool = ArchiveEndpointPool::new();
+        let pool = pool();
         pool.add("a.example.com:443".into()).await;
         pool.add("a.example.com:443".into()).await;
         assert_eq!(pool.len().await, 1);
@@ -396,7 +1052,7 @@ mod pool_tests {
 
     #[tokio::test]
     async fn next_rotates_round_robin() {
-        let pool = ArchiveEndpointPool::new();
+        let pool = pool();
         for ep in ["a:1", "b:1", "c:1"] {
             pool.add(ep.into()).await;
         }
@@ -419,20 +1075,24 @@ mod pool_tests {
     }
 
     #[tokio::test]
-    async fn blacklist_removes_endpoint_from_rotation() {
-        let pool = ArchiveEndpointPool::new();
+    async fn blacklist_skips_rotation_but_never_prunes() {
+        let pool = pool();
         pool.add("a:1".into()).await;
         pool.add("b:1".into()).await;
         pool.blacklist("a:1").await;
-        // After blacklist, only "b:1" comes out and `add()` rejects the
-        // re-add while the blacklist entry is still fresh.
+        // Blacklist skips "a:1" in the poller's round-robin...
         assert_eq!(pool.next().await.as_deref(), Some("b:1"));
         assert_eq!(pool.next().await.as_deref(), Some("b:1"));
-        pool.add("a:1".into()).await;
+        // ...but it is NEVER removed from the pool. `get_all()` (the
+        // consensus fan-out set) must always include every known archive,
+        // so a transient poll failure can't drop a committee member from
+        // consensus delivery.
+        let mut all = pool.get_all().await;
+        all.sort();
         assert_eq!(
-            pool.get_all().await,
-            vec!["b:1"],
-            "freshly-blacklisted endpoint must not be re-addable"
+            all,
+            vec!["a:1", "b:1"],
+            "blacklist must not prune endpoints from get_all"
         );
     }
 
@@ -446,7 +1106,7 @@ mod pool_tests {
     /// PeerInfo's re-`add()`.
     #[tokio::test]
     async fn blacklist_expires_after_ttl() {
-        let pool = ArchiveEndpointPool::new();
+        let pool = pool();
         pool.add("a:1".into()).await;
         pool.blacklist("a:1").await;
         assert!(pool.next().await.is_none(), "still blacklisted within TTL");
@@ -456,7 +1116,7 @@ mod pool_tests {
         // for a unit test.
         {
             let mut inner = pool.inner.lock().await;
-            let past = Instant::now() - (BLACKLIST_TTL + Duration::from_secs(1));
+            let past = Instant::now() - (TEST_TTL + Duration::from_secs(1));
             inner.blacklist.insert("a:1".to_string(), past);
         }
 
@@ -469,39 +1129,71 @@ mod pool_tests {
         assert_eq!(pool.get_all().await, vec!["a:1"]);
     }
 
-    /// Mirror of the above for the `add()` recovery path: PeerInfo
-    /// gossip re-advertising an endpoint after its blacklist entry
-    /// expired must re-enter the pool.
+    /// A blacklisted endpoint is never pruned from the pool — it stays in
+    /// `get_all()` (consensus fan-out) the whole time, is merely skipped by
+    /// the poller's `next()` round-robin while fresh, and becomes eligible
+    /// for `next()` again once the TTL expires.
     #[tokio::test]
-    async fn add_accepts_after_blacklist_expires() {
-        let pool = ArchiveEndpointPool::new();
+    async fn blacklisted_endpoint_never_pruned_retried_after_ttl() {
+        let pool = pool();
         pool.add("a:1".into()).await;
         pool.blacklist("a:1").await;
-        pool.add("a:1".into()).await;
+        // Never pruned: still in the consensus fan-out set while blacklisted.
+        assert_eq!(
+            pool.get_all().await,
+            vec!["a:1"],
+            "blacklisted endpoint must remain in get_all"
+        );
+        // Skipped by the poller's rotation while the blacklist is fresh.
         assert!(
-            pool.get_all().await.is_empty(),
-            "add() rejected while blacklist is fresh"
+            pool.next().await.is_none(),
+            "blacklisted-within-TTL endpoint is skipped by next()"
         );
 
         // Backdate the blacklist entry past the TTL.
         {
             let mut inner = pool.inner.lock().await;
-            let past = Instant::now() - (BLACKLIST_TTL + Duration::from_secs(1));
+            let past = Instant::now() - (TEST_TTL + Duration::from_secs(1));
             inner.blacklist.insert("a:1".to_string(), past);
         }
 
-        pool.add("a:1".into()).await;
-        assert_eq!(
-            pool.get_all().await,
-            vec!["a:1"],
-            "expired-blacklist endpoint must accept re-add"
-        );
+        // After the TTL, the poller retries it; it was in get_all all along.
+        assert_eq!(pool.next().await.as_deref(), Some("a:1"), "retried after TTL");
+        assert_eq!(pool.get_all().await, vec!["a:1"]);
     }
 
     #[tokio::test]
     async fn next_returns_none_on_empty_pool() {
-        let pool = ArchiveEndpointPool::new();
+        let pool = pool();
         assert!(pool.next().await.is_none());
+    }
+
+    /// A zero TTL disables blacklisting: a failed endpoint is restored on
+    /// the very next `next()` (its entry is instantly expired), so it never
+    /// leaves rotation for more than a single pick. This is the devnet
+    /// configuration where partition recovery must be instantaneous.
+    #[tokio::test]
+    async fn blacklist_disabled_when_ttl_zero() {
+        let pool = ArchiveEndpointPool::new(Duration::ZERO);
+        pool.add("a:1".into()).await;
+        pool.add("b:1".into()).await;
+        pool.blacklist("a:1").await;
+
+        // `next()` immediately restores "a:1" (entry expired at TTL 0), so
+        // both endpoints come back into rotation without any wait.
+        let mut seen = vec![pool.next().await, pool.next().await]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["a:1", "b:1"],
+            "zero TTL must restore a blacklisted endpoint on the next pick"
+        );
+        let mut all = pool.get_all().await;
+        all.sort();
+        assert_eq!(all, vec!["a:1", "b:1"]);
     }
 
     /// `wait_nonempty` must release as soon as an endpoint arrives,
@@ -509,7 +1201,7 @@ mod pool_tests {
     /// poller → PeerInfo discovery feeds endpoint → poller resumes.
     #[tokio::test]
     async fn wait_nonempty_releases_on_add() {
-        let pool = Arc::new(ArchiveEndpointPool::new());
+        let pool = Arc::new(pool());
         let cancel = CancellationToken::new();
         let waiter_pool = pool.clone();
         let waiter_cancel = cancel.clone();
@@ -534,7 +1226,7 @@ mod pool_tests {
     /// endpoints — otherwise shutdown hangs.
     #[tokio::test]
     async fn wait_nonempty_respects_cancellation() {
-        let pool = Arc::new(ArchiveEndpointPool::new());
+        let pool = Arc::new(pool());
         let cancel = CancellationToken::new();
         let waiter_pool = pool.clone();
         let waiter_cancel = cancel.clone();
@@ -558,6 +1250,174 @@ mod pool_tests {
         assert_eq!(cfg.poll_interval, Duration::from_secs(1));
         assert_eq!(cfg.call_timeout, Duration::from_secs(30));
         assert!(cfg.on_frame.is_none());
+        assert!(cfg.store_hook.is_none());
         assert!(!cfg.forward_fill);
+        // Gossip backoff is opt-in — off by default (archives, and any caller
+        // that doesn't wire it) so the poller always RPC-polls.
+        assert!(cfg.gossip_freshness.is_none());
+    }
+
+    #[test]
+    fn gossip_freshness_starts_stale_and_tracks_head() {
+        let gf = GossipFreshness::new();
+        // Never stamped → not fresh, head 0.
+        assert!(!gf.fresh_within(Duration::from_secs(30)));
+        assert_eq!(gf.head(), 0);
+
+        gf.stamp(41);
+        gf.stamp(42);
+        // Just stamped → fresh within any reasonable window.
+        assert!(gf.fresh_within(Duration::from_secs(30)));
+        // Head is the max seen; an out-of-order older stamp never regresses it.
+        assert_eq!(gf.head(), 42);
+        gf.stamp(7);
+        assert_eq!(gf.head(), 42);
+    }
+
+    #[test]
+    fn gossip_freshness_network_head_tracks_max_only() {
+        let gf = GossipFreshness::new();
+        assert_eq!(gf.network_head(), 0, "unset ⇒ 0 (poller falls back to RPC)");
+        gf.note_network_head(500);
+        gf.note_network_head(742);
+        assert_eq!(gf.network_head(), 742);
+        // An older/lower advertisement never regresses the head.
+        gf.note_network_head(100);
+        assert_eq!(gf.network_head(), 742);
+    }
+
+    #[test]
+    fn gossip_freshness_window_expires() {
+        let gf = GossipFreshness::new();
+        gf.stamp(100);
+        // A zero-length window is never satisfied by a stamp in the past.
+        assert!(!gf.fresh_within(Duration::from_millis(0)));
+        // A generous window is.
+        assert!(gf.fresh_within(Duration::from_secs(60)));
+    }
+}
+
+#[cfg(test)]
+mod admit_tests {
+    use super::*;
+    use quil_types::proto::global::{GlobalFrameHeader, GlobalFrame};
+
+    #[test]
+    fn an_archive_holding_only_genesis_fills_from_frame_one() {
+        // A localnet archive that started as frame 1 was finalized: its first
+        // poll saw head 2 and must fetch frame 1 rather than store 2 alone.
+        assert!(forward_fill_due(0, true, 2));
+        assert!(!forward_fill_due(0, true, 1), "the head itself is stored directly");
+        // No record at all: the state-jump fills a far-behind store.
+        assert!(!forward_fill_due(0, false, 2));
+        assert!(forward_fill_due(5, false, 7));
+        assert!(!forward_fill_due(5, false, 6));
+    }
+
+    fn frame(number: u64, output: u8, parent: Option<&GlobalFrame>, certified: bool) -> GlobalFrame {
+        GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: number,
+                output: vec![output; 516],
+                parent_selector: parent.and_then(frame_identity).map(|id| id.to_vec()).unwrap_or_default(),
+                // The test predicate reads certification off the rank.
+                rank: if certified { 1 } else { 0 },
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        }
+    }
+
+    fn certified() -> FrameCertified {
+        Arc::new(|frame: &GlobalFrame| frame.header.as_ref().is_some_and(|h| h.rank == 1))
+    }
+
+    fn numbers(chain: &[GlobalFrame]) -> Vec<u64> {
+        chain.iter().map(|f| f.header.as_ref().unwrap().frame_number).collect()
+    }
+
+    /// Without a predicate every validated frame is stored, as before.
+    #[test]
+    fn without_a_predicate_every_frame_is_stored() {
+        let mut held = std::collections::BTreeMap::new();
+        let one = frame(1, 1, None, false);
+        assert_eq!(numbers(&admit_frame(None, &mut held, one)), vec![1]);
+        assert!(held.is_empty());
+    }
+
+    /// An uncertified frame waits, and is stored with the certified frame that
+    /// links down to it, lowest first.
+    #[test]
+    fn an_uncertified_frame_waits_for_a_certified_descendant_that_links_to_it() {
+        let predicate = certified();
+        let mut held = std::collections::BTreeMap::new();
+        let four = frame(4, 4, None, true);
+        let five = frame(5, 5, Some(&four), false);
+        let six = frame(6, 6, Some(&five), false);
+        let seven = frame(7, 7, Some(&six), true);
+        assert_eq!(numbers(&admit_frame(Some(&predicate), &mut held, four)), vec![4]);
+        assert!(admit_frame(Some(&predicate), &mut held, five).is_empty());
+        assert!(admit_frame(Some(&predicate), &mut held, six).is_empty());
+        assert_eq!(numbers(&admit_frame(Some(&predicate), &mut held, seven)), vec![5, 6, 7]);
+        assert!(held.is_empty());
+    }
+
+    /// A validated frame from another view (a nullified proposal) that no
+    /// certified frame links to is never stored.
+    #[test]
+    fn an_uncertified_frame_off_the_certified_chain_is_dropped() {
+        let predicate = certified();
+        let mut held = std::collections::BTreeMap::new();
+        let four = frame(4, 4, None, true);
+        let honest = frame(5, 5, Some(&four), false);
+        let nullified = frame(5, 9, Some(&four), false);
+        let six = frame(6, 6, Some(&honest), true);
+        admit_frame(Some(&predicate), &mut held, four);
+        assert!(admit_frame(Some(&predicate), &mut held, nullified).is_empty());
+        assert_eq!(numbers(&admit_frame(Some(&predicate), &mut held, six)), vec![6],
+            "the certified frame does not link to the held one");
+        assert!(held.is_empty(), "held frames at or below a certified frame are dropped");
+    }
+
+    /// A frame the canonical clock already holds unchanged is not rewritten
+    /// (the store's sequence stays put, so an in-flight atomic execution plan
+    /// survives), yet still reaches `on_frame`; a different frame at that
+    /// height is written as before.
+    #[test]
+    fn an_identical_canonical_frame_is_not_rewritten() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = RocksClockStore::new(db.inner());
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = fired.clone();
+        let config = ArchivePollerConfig {
+            on_frame: Some(Arc::new(move |_: &GlobalFrame| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+            ..Default::default()
+        };
+        let stored = frame(6, 6, None, true);
+        clock.put_global_frame(&stored, None).unwrap();
+        let sequence = db.inner().latest_sequence_number();
+        store_chain(&config, &clock, &[stored.clone()]).unwrap();
+        assert_eq!(db.inner().latest_sequence_number(), sequence, "not rewritten");
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let other = frame(6, 7, None, true);
+        store_chain(&config, &clock, &[other.clone()]).unwrap();
+        assert_ne!(db.inner().latest_sequence_number(), sequence);
+        assert_eq!(clock.get_global_frame(6).unwrap(), other);
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// The held set is bounded; the lowest go first.
+    #[test]
+    fn held_frames_are_bounded() {
+        let predicate = certified();
+        let mut held = std::collections::BTreeMap::new();
+        for number in 1..=(MAX_HELD_UNCERTIFIED as u64 + 10) {
+            assert!(admit_frame(Some(&predicate), &mut held, frame(number, number as u8, None, false)).is_empty());
+        }
+        assert_eq!(held.len(), MAX_HELD_UNCERTIFIED);
+        assert_eq!(*held.keys().next().unwrap(), 11);
     }
 }

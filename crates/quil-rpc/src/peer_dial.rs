@@ -17,7 +17,7 @@ pub async fn dial_latest_frame_prover<F>(
     frame: &GlobalFrame,
     key_store: Arc<dyn KeyStore>,
     peer_info_lookup: F,
-    self_ed448_seed: &[u8; 57],
+    self_falcon_signing_key: &[u8],
 ) -> Result<ArchiveClient>
 where
     F: Fn(&[u8]) -> Vec<String> + Send + Sync,
@@ -37,16 +37,18 @@ where
         .get_key_registry_by_prover(prover_addr)
         .map_err(|e| QuilError::Internal(format!("get_key_registry_by_prover: {e}")))?;
 
-    let identity_key = registry.identity_key.ok_or_else(|| {
-        QuilError::Internal("dial_latest_frame_prover: identity_key missing".into())
+    // The network peer-id is derived from the remote's FALCON prover key (the
+    // network identity), not its Ed448 identity key.
+    let prover_key = registry.prover_key.ok_or_else(|| {
+        QuilError::Internal("dial_latest_frame_prover: prover_key missing".into())
     })?;
-    if identity_key.key_value.is_empty() {
+    if prover_key.key_value.is_empty() {
         return Err(QuilError::Internal(
-            "dial_latest_frame_prover: identity_key.key_value empty".into(),
+            "dial_latest_frame_prover: prover_key.key_value empty".into(),
         ));
     }
 
-    let peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&identity_key.key_value);
+    let peer_id = quil_p2p::peer_id_from_falcon_pubkey(&prover_key.key_value);
     let candidates = peer_info_lookup(&peer_id);
     if candidates.is_empty() {
         return Err(QuilError::Internal(format!(
@@ -65,7 +67,7 @@ where
             ))
         })?;
 
-    ArchiveClient::connect_mtls(&socket_addr, self_ed448_seed)
+    ArchiveClient::connect_mtls(&socket_addr, self_falcon_signing_key)
         .await
         .map_err(|e: ArchiveClientError| QuilError::P2p(format!("dial frame prover: {e}")))
 }

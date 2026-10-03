@@ -49,11 +49,31 @@ message ProverResume {
   quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 3;
 }
 
+// One leaf's storage root within a shard being confirmed.
+message LeafRootEntry {
+  // The leaf's sub-shard prefix path (6-bit nibbles) within the shard tree.
+  repeated uint32 prefix = 1;
+  // The registered KZG leaf root.
+  bytes leaf_root = 2;
+  // The leaf's block count.
+  uint64 num_blocks = 3;
+}
+
+// All the leaf roots a prover registers for one shard at confirm time.
+message ConfirmLeafRoots {
+  bytes filter = 1;
+  repeated LeafRootEntry entries = 2;
+}
+
 message ProverConfirm {
   bytes filter = 1 [deprecated = true];
   uint64 frame_number = 2;
   quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 3;
   repeated bytes filters = 4;
+  // Per-shard storage leaf roots registered as part of this confirm (folded in:
+  // a confirm is the prover's per-epoch storage re-registration). Bound into the
+  // confirm's signing message.
+  repeated ConfirmLeafRoots leaf_roots = 5;
 }
 
 message ProverUpdate {
@@ -134,6 +154,8 @@ message ShardMerge {
 }
 
 message MessageRequest {
+  reserved 11, 12, 13;
+  reserved "transaction", "pending_transaction", "mint_transaction";
   oneof request {
     quilibrium.node.global.pb.ProverJoin join = 1;
     quilibrium.node.global.pb.ProverLeave leave = 2;
@@ -145,9 +167,6 @@ message MessageRequest {
     quilibrium.node.global.pb.ProverUpdate update = 8;
     quilibrium.node.token.pb.TokenDeploy token_deploy = 9;
     quilibrium.node.token.pb.TokenUpdate token_update = 10;
-    quilibrium.node.token.pb.Transaction transaction = 11;
-    quilibrium.node.token.pb.PendingTransaction pending_transaction = 12;
-    quilibrium.node.token.pb.MintTransaction mint_transaction = 13;
     quilibrium.node.hypergraph.pb.HypergraphDeploy hypergraph_deploy = 14;
     quilibrium.node.hypergraph.pb.HypergraphUpdate hypergraph_update = 15;
     quilibrium.node.hypergraph.pb.VertexAdd vertex_add = 16;
@@ -164,6 +183,10 @@ message MessageRequest {
     quilibrium.node.global.pb.ProverSeniorityMerge seniority_merge = 27;
     quilibrium.node.global.pb.ShardSplit shard_split = 28;
     quilibrium.node.global.pb.ShardMerge shard_merge = 29;
+    quilibrium.node.token.pb.TokenOperation token_operation = 30;
+    // Canonical old-session closing certificate. The authorized request and
+    // successor membership are read from committed global state.
+    bytes committee_handoff = 31;
   }
   int64 timestamp = 99;
 }
@@ -215,6 +238,17 @@ message GlobalFrameHeader {
   bytes prover = 10;
   // The confirmation signatures of the frame
   quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 11;
+  // The prover shard's phase 1/2/3 subtree roots (vertex-removes,
+  // hyperedge-adds, hyperedge-removes), in that order. `prover_tree_commitment`
+  // (field 8) is the phase-0 (vertex-adds) root; together these commit ALL FOUR
+  // prover-shard phases so catch-up sync can authenticate every phase, not just
+  // vertex-adds. Bound into the VDF challenge alongside prover_tree_commitment.
+  repeated bytes prover_tree_aux_roots = 12;
+  // Total network world-state size in bytes as of the end of the previous
+  // frame (the global prover shard excluded), certified by global consensus.
+  // Every execution venue prices state growth from the value on the global
+  // frame it is anchored to. Bound into the VDF challenge when non-zero.
+  uint64 world_state_size = 13;
 }
 
 message FrameHeader {
@@ -262,6 +296,93 @@ message FrameHeader {
   uint64 fee_multiplier_vote = 11;
   // The confirmation signatures of the frame
   quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 12;
+  // The committee-signed storage-attestation root: a deterministic digest over
+  // the canonical set of per-member proof-of-storage openings carried with this
+  // frame (see StorageAttestation). Binds *which* openings the committee
+  // attested into the signed header; a global validator recomputes this root
+  // from the openings and re-verifies possession. Replaces the per-member VDF
+  // multiproof as the proof each committee member is storing its shard data.
+  bytes storage_attestation_root = 13;
+  // The global frame this shard frame anchors its storage beacon to. The
+  // verifier loads global_frame[global_frame_number].output (the global VDF
+  // output) and derives rho_N from it — the unpredictable, lockstep-shared
+  // value that selects every committee member's challenged leaf/block/point.
+  // Committed into the VDF challenge so it cannot be altered post-hoc.
+  uint64 global_frame_number = 14;
+  // The committee's serialized StorageAttestation (the per-member PoRep
+  // openings the global frame samples + audits). Carried as opaque bytes so it
+  // survives the canonical→proto→canonical round-trip when a reward proof is
+  // folded into a global frame's requests; decoded only at the global audit.
+  // Empty pre-storage / for legacy-VDF frames.
+  bytes storage_attestation = 15;
+  // Sum of the proof-bound fees (QUIL base units, unsigned 16-byte big-endian)
+  // of the operations materialized in the PREVIOUS frame of this shard
+  // (frame_number - 1). Frame N's requests execute only after N is finalized,
+  // so the total a committee can verify at proposal time is the previous
+  // frame's. The global materializer credits it to the shard's provers.
+  bytes fee_total = 16;
+  // Cross-domain QUIL settlements executed by this shard in frames
+  // frame_number-32 ..= frame_number-1: each entry is source frame (u64 BE) ‖
+  // receipt ‖ parameter_context ‖ destination ‖ context ‖ settlement (u128 BE),
+  // frames ascending, receipts ascending within a frame. Re-carried for 32
+  // frames so a dropped header loses nothing; the global materializer writes
+  // one GLOBAL settlement record per receipt, skipping receipts it recorded.
+  // Only QUIL token shards carry entries.
+  bytes settlements = 17;
+  // This shard's part of the confidential coin accumulator as of frame
+  // frame_number-1: the root of the subtree its prefix covers, per block-width
+  // layer, with the coins under it (shard_accumulator::ShardReport). Carried
+  // when those coins changed in that frame, and on every 32nd frame as a
+  // heartbeat; empty otherwise and for a shard with no coins. The global
+  // materializer folds every shard's report into the application's canonical
+  // root (CROSS_SHARD_COMMIT.md §6).
+  bytes accumulator = 18;
+  // Confidential operations this shard verified in frames
+  // frame_number-8 ..= frame_number-1, as compact spend entries
+  // (global_commit::SpendEntry: consumptions, output addresses, escrow and
+  // settlement bindings, fee — never the outputs themselves). Re-carried for 8
+  // frames. The global materializer decides each once; nothing reaches shard
+  // state until the owning shard delivers it (CROSS_SHARD_COMMIT.md §8).
+  bytes spends = 19;
+}
+
+// One committee member's proof-of-storage opening for one challenge query in a
+// frame: a KZG opening of a randomly-challenged block of a randomly-challenged
+// leaf, plus the vector-commitment authentication path binding that block to
+// the member's registered leaf root. The evaluation point and block/leaf
+// indices are NOT carried — they are derived by the verifier from the frame's
+// storage beacon (rho_n), so the prover has no freedom over what it opens.
+message StorageOpening {
+  // The shard this opening attests to (bound into the challenge + transcript).
+  bytes shard_id = 1;
+  // The replication epoch (the SDR re-encode generation).
+  uint64 epoch = 2;
+  // The attesting member's identity.
+  bytes member_id = 3;
+  // Query index for this member (which of its challenged leaves).
+  uint32 query = 4;
+  // The registered leaf commitment — the KZG root of the leaf's
+  // vector-commitment tree.
+  bytes leaf_root = 5;
+  // Number of blocks in the leaf (sets the challenge block index + path depth).
+  uint64 num_blocks = 6;
+  // Authentication-path parent node commitments C_1..C_L (C_L == leaf_root),
+  // bottom-to-top. Empty for a single-block leaf.
+  repeated bytes path_commits = 7;
+  // KZG opening proofs for the authentication path, aligned to path_commits.
+  repeated bytes path_proofs = 8;
+  // The challenged block's KZG commitment (the bottom of the path).
+  bytes commitment = 9;
+  // The claimed evaluation at the derived point (scalar bytes).
+  bytes value = 10;
+  // The KZG opening proof for the possession opening.
+  bytes proof = 11;
+}
+
+// The set of per-member storage openings carried with an app-shard frame. The
+// frame header's storage_attestation_root commits to this set.
+message StorageAttestation {
+  repeated StorageOpening openings = 1;
 }
 
 message ProverLivenessCheck {
@@ -375,6 +496,11 @@ message GlobalFrame {
 message AppShardFrame {
   FrameHeader header = 1;
   repeated MessageBundle requests = 2;
+  // The per-member proof-of-storage openings the committee attested this frame.
+  // The header's storage_attestation_root commits to this set; a full-frame
+  // holder (gossip validator / committee member) recomputes the root and
+  // re-verifies possession against each member's registered leaf roots.
+  StorageAttestation storage_attestation = 3;
 }
 
 message GlobalAlert {
@@ -430,6 +556,13 @@ message AppShardInfo {
   uint64 data_shards = 3;
   repeated bytes commitment = 4;
   bytes shard_key = 5;
+  // Archive's durable materialization cursor; advanced only after state commit.
+  uint64 materialized_frame = 6;
+  // Latest app frame retained by the same archive, for a truthful backlog.
+  uint64 latest_frame = 7;
+  // A recorded split or merge that has not applied yet names this shard; the
+  // chain refuses a join that includes it until the change applies.
+  bool pending_change = 8;
 }
 
 message GetAppShardsResponse {
@@ -497,6 +630,117 @@ message SubmitGlobalMessageRequest {
 
 message SubmitGlobalMessageResponse {}
 
+// Direct point-to-point delivery of a global-consensus message
+// (proposal / vote / timeout) between genesis archives. Global
+// consensus is moved off BlossomSub gossip because a full-coverage
+// proposal exceeds the gossip message-size ceiling; the ~6-member
+// genesis committee is direct-peered, so proposals/votes/timeouts are
+// sent point-to-point over this mTLS RPC instead. `bitmask` carries the
+// original topic (GLOBAL_FRAME or GLOBAL_CONSENSUS) so the receiver
+// routes it through the same handler the gossip arm used. App-shard
+// consensus is unaffected (it stays on per-shard gossip topics).
+message SubmitGlobalConsensusRequest {
+  bytes bitmask = 1;
+  bytes data = 2;
+}
+
+message SubmitGlobalConsensusResponse {}
+
+// Forest-sync RPCs (JMT commitment diff + readable vertex blobs). Restored to
+// match global_service.rs / archive_client.rs.
+message GetForestNodeRequest {
+  bytes shard_id = 1;
+  uint32 phase = 2;
+  bytes node_key = 3;
+}
+message GetForestNodeResponse {
+  bool found = 1;
+  bytes node = 2;
+}
+message GetForestValueRequest {
+  bytes shard_id = 1;
+  uint32 phase = 2;
+  uint64 version = 3;
+  bytes key_hash = 4;
+}
+message GetForestValueResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+message GetForestHeadRequest {
+  bytes shard_id = 1;
+  uint32 phase = 2;
+}
+message GetForestHeadResponse {
+  bool found = 1;
+  uint64 version = 2;
+  bytes root = 3;
+}
+message GetForestPreimageRequest {
+  bytes shard_id = 1;
+  uint32 phase = 2;
+  bytes key_hash = 3;
+}
+message GetForestPreimageResponse {
+  bool found = 1;
+  bytes raw_key = 2;
+}
+message GetVertexBlobRequest {
+  bytes shard_key = 1;  // app ShardKey (l1[3] ‖ l2[32])
+  uint32 phase = 2;
+  bytes id = 3;         // 64-byte vertex id (app ‖ data)
+  // MVCC pin: read the vertex "as-of" this tree version (latest write <= version),
+  // matching the forest leaf that the diff addressed. Without exact_version,
+  // 0 means latest for older callers. Exact pins can address tree version 0.
+  uint64 version = 4;
+  bool exact_version = 5;
+}
+message GetVertexBlobResponse {
+  bool found = 1;
+  bytes blob = 2;
+}
+// A single historical GLOBAL vertex, authenticated at the requested root.
+// Bounded to 32 KiB; never installs or rewinds the recipient's GLOBAL tree.
+message GetGlobalVertexProofRequest {
+  bytes root = 1;
+  bytes address = 2;
+  bool allow_forward = 3; // a worker may ask its master to try an archive once
+}
+message GetGlobalVertexProofResponse {
+  bool found = 1;
+  bytes proof = 2;
+}
+// Worker-only discovery from its authenticated master's verified archive pool.
+// At most 32 host:port entries, each at most 512 bytes.
+message GetArchiveEndpointsRequest {}
+message GetArchiveEndpointsResponse {
+  repeated string endpoints = 1;
+}
+message ResolveRootRequest {
+  bytes shard_id = 1;  // addr_path_shard_id(app, prefix) or single-shard id
+  uint32 phase = 2;
+  bytes root = 3;      // 32-byte authenticated tree root
+}
+message ResolveRootResponse {
+  bool found = 1;
+  uint64 version = 2;       // peer's local version whose tree root == `root`
+  uint64 global_frame = 3;  // global frame at which that version committed
+}
+message GetAppManifestRequest {
+  bytes app_address = 1;  // 32-byte app address
+  uint32 phase = 2;
+  bytes app_root = 3;     // 32-byte authenticated aggregate app root
+}
+message AppManifestEntry {
+  bytes prefix = 1;   // sub-shard bit-path prefix (u32 BE words concatenated)
+  bytes root = 2;     // 32-byte sub-shard tree root
+  uint64 version = 3; // sub-shard local version
+}
+message GetAppManifestResponse {
+  bool found = 1;
+  repeated AppManifestEntry entries = 2;
+}
+
 service GlobalService {
   rpc GetGlobalFrame (GetGlobalFrameRequest) returns (GlobalFrameResponse);
   rpc GetGlobalProposal (GetGlobalProposalRequest) returns (GlobalProposalResponse);
@@ -506,11 +750,131 @@ service GlobalService {
   rpc GetWorkerInfo(GlobalGetWorkerInfoRequest) returns (GlobalGetWorkerInfoResponse);
   rpc StreamGlobalMessages(StreamGlobalMessagesRequest) returns (stream StreamGlobalMessagesResponse);
   rpc SubmitGlobalMessage(SubmitGlobalMessageRequest) returns (SubmitGlobalMessageResponse);
+  rpc SubmitGlobalConsensus(SubmitGlobalConsensusRequest) returns (SubmitGlobalConsensusResponse);
+  rpc GetForestNode(GetForestNodeRequest) returns (GetForestNodeResponse);
+  rpc GetForestValue(GetForestValueRequest) returns (GetForestValueResponse);
+  rpc GetForestHead(GetForestHeadRequest) returns (GetForestHeadResponse);
+  rpc GetForestPreimage(GetForestPreimageRequest) returns (GetForestPreimageResponse);
+  rpc GetVertexBlob(GetVertexBlobRequest) returns (GetVertexBlobResponse);
+  rpc GetGlobalVertexProof(GetGlobalVertexProofRequest) returns (GetGlobalVertexProofResponse);
+  rpc GetArchiveEndpoints(GetArchiveEndpointsRequest) returns (GetArchiveEndpointsResponse);
+  rpc ResolveRoot(ResolveRootRequest) returns (ResolveRootResponse);
+  rpc GetAppManifest(GetAppManifestRequest) returns (GetAppManifestResponse);
 }
 
 service AppShardService {
   rpc GetAppShardFrame (GetAppShardFrameRequest) returns (AppShardFrameResponse);
   rpc GetAppShardProposal (GetAppShardProposalRequest) returns (AppShardProposalResponse);
+  // Peer-to-peer coin scan: a node that does not cover an application asks one
+  // that does, so a wallet reads its own node rather than hunting for a node
+  // with the right coverage. Same page contract as the wallet-facing scan —
+  // snapshot-pinned, address-ordered, cursor-continued. A node that does not
+  // serve the application refuses rather than returning an empty page.
+  rpc ListShardCoins (ListShardCoinsRequest) returns (ListShardCoinsResponse);
+  // Peer-to-peer coin witnesses: the membership paths a wallet needs to SPEND
+  // a coin. A forwarded scan shows a balance; without this the holder still
+  // cannot move it from a node that does not cover the application.
+  rpc GetShardCoinWitnesses (GetShardCoinWitnessesRequest) returns (GetShardCoinWitnessesResponse);
+  // Wallet escrow discovery uses the same coverage and snapshot contract.
+  rpc ListShardEscrows (ListShardCoinsRequest) returns (ListShardEscrowsResponse);
+  // Current application vertex data from worker stores, with an explicit
+  // coverage check. Forest-sync absence on a master store is not a wallet read.
+  rpc GetShardVertex (GetShardVertexRequest) returns (GetShardVertexResponse);
+  // A shard's recorded per-frame outgoing records (fee total, settlements,
+  // spends, accumulator digest and report) for `[from_frame, through_frame]`.
+  // Unauthenticated data: a successor member accepts it only if the chain it
+  // recomputes equals its predecessor's quorum-certified history root.
+  rpc GetShardOutgoingHistory (GetShardOutgoingHistoryRequest) returns (GetShardOutgoingHistoryResponse);
+}
+
+message GetShardOutgoingHistoryRequest {
+  bytes filter = 1;
+  uint64 from_frame = 2;
+  uint64 through_frame = 3;
+}
+
+message ShardFrameOutgoing {
+  uint64 frame_number = 1;
+  bytes fee_total = 2;
+  bytes settlements = 3;
+  bytes spends = 4;
+  bytes accumulator_digest = 5;
+  bytes accumulator_report = 6;
+}
+
+// Frames in ascending order from `from_frame`, contiguous, possibly fewer than
+// requested (a bounded page); the caller continues from the next frame.
+message GetShardOutgoingHistoryResponse {
+  repeated ShardFrameOutgoing frames = 1;
+}
+
+message ShardEscrow {
+  bytes address = 1;
+  bytes raw_data = 2;
+}
+
+message ListShardEscrowsResponse {
+  bytes network = 1;
+  bytes snapshot_id = 2;
+  repeated ShardEscrow escrows = 3;
+  bytes cursor = 4;
+  bool has_more = 5;
+}
+
+message GetShardVertexRequest {
+  bytes address = 1;
+}
+
+message GetShardVertexResponse {
+  bool found = 1;
+  bytes blob = 2;
+}
+
+message GetShardCoinWitnessesRequest {
+  bytes domain = 1;
+  repeated bytes addresses = 2;
+}
+
+// Mirrors node.pb CoinWitness (node.proto imports global.proto, so the
+// peer-facing copy lives here rather than creating a cycle).
+message ShardCoinWitness {
+  bytes address = 1;
+  bool found = 2;
+  repeated bytes siblings = 3;
+  repeated bool right = 4;
+}
+
+message GetShardCoinWitnessesResponse {
+  bytes network = 1;
+  bytes root_record = 2;
+  uint32 depth = 3;
+  repeated ShardCoinWitness witnesses = 4;
+}
+
+message ListShardCoinsRequest {
+  bytes domain = 1;
+  bytes snapshot_id = 2;
+  bytes after = 3;
+}
+
+// Mirrors node.pb ConfidentialCoin; node.proto imports global.proto, so the
+// peer-facing scan carries its own copy rather than creating a cycle.
+message ShardCoin {
+  bytes address = 1;
+  uint64 frame_number = 2;
+  bytes owner = 3;
+  bytes commitment = 4;
+  bytes memo = 5;
+  uint64 position = 6;
+}
+
+message ListShardCoinsResponse {
+  bytes network = 1;
+  bytes snapshot_id = 2;
+  bytes root_record = 3;
+  repeated ShardCoin coins = 4;
+  bytes cursor = 5;
+  bool has_more = 6;
 }
 
 message SendMessage {

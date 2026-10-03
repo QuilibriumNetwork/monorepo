@@ -1,0 +1,101 @@
+on: [push, pull_request]
+
+name: Rust CI
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v1
+      - uses: actions-rs/cargo@v1
+        with:
+          command: check
+
+  test-no-features:
+    name: Test Suite with No Features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v1
+      - name: cargo test
+        run: >-
+          cargo test --no-default-features
+          && find -type f -iname '*.proptest-regressions' -exec cat {} +
+
+  test-default-features:
+    name: Test Suite with Default Features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v1
+      - name: cargo test
+        run: >-
+          cargo test
+          && find -type f -iname '*.proptest-regressions' -exec cat {} +
+
+  test-all-features:
+    name: Test Suite with All Features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v1
+      - name: cargo test
+        run: >-
+          cargo test --all-features
+          && find -type f -iname '*.proptest-regressions' -exec cat {} +
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v1
+      - run: rustup component add rustfmt
+      - uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+
+  #clippy:
+  #  name: Clippy
+  #  runs-on: ubuntu-latest
+  #  steps:
+  #    - uses: actions/checkout@v2
+  #    - uses: actions-rs/toolchain@v1
+  #      with:
+  #        profile: minimal
+  #        toolchain: stable
+  #        override: true
+  #    - uses: Swatinem/rust-cache@v1
+  #    - run: rustup component add clippy
+  #    - uses: actions-rs/cargo@v1
+  #      with:
+  #        command: clippy
+  #        args: -- -D warnings

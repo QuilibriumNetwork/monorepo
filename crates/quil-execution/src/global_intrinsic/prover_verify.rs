@@ -110,6 +110,20 @@ pub fn multi_filter_signing_message(filters: &[Vec<u8>], frame_number: u64) -> V
     msg
 }
 
+/// The ProverConfirm signing message: the multi-filter message with the
+/// confirm's leaf-root set appended, so the registered roots are authenticated
+/// by the prover's signature. An empty leaf-root set appends nothing, so this is
+/// byte-identical to [`multi_filter_signing_message`] for legacy confirms.
+pub fn confirm_signing_message(
+    filters: &[Vec<u8>],
+    frame_number: u64,
+    leaf_roots: &[super::leaf_root_registration::ConfirmLeafRoots],
+) -> Vec<u8> {
+    let mut msg = multi_filter_signing_message(filters, frame_number);
+    super::leaf_root_registration::append_confirm_leaf_roots(&mut msg, leaf_roots);
+    msg
+}
+
 /// Build the signing message for ProverJoin.
 /// `message = concat(filters) || frame_number_be_u64`
 ///
@@ -119,6 +133,31 @@ pub fn multi_filter_signing_message(filters: &[Vec<u8>], frame_number: u64) -> V
 /// structurally but not covered by the BLS signature.
 pub fn prover_join_signing_message(filters: &[Vec<u8>], frame_number: u64) -> Vec<u8> {
     multi_filter_signing_message(filters, frame_number)
+}
+
+/// Build the signing message for ProverLeave.
+///
+/// Unlike Confirm/Reject/Join (which sign the raw concatenation of the
+/// filters), Leave signs a LENGTH-DELIMITED framing:
+/// `filters.len()(u32 BE) || for each f { f.len()(u32 BE) || f } || frame_number(u64 BE)`.
+///
+/// This must byte-match the signer (`provers::actions::build_leave_bundle`).
+/// The verifier previously reused `multi_filter_signing_message` (raw concat),
+/// which never matched the signed bytes — so every leave failed signature
+/// verification (mass `op=ProverLeave` mempool drops, leaves never accepted,
+/// coverage stuck unable to shed workers). Keep this in lockstep with the
+/// builder.
+pub fn prover_leave_signing_message(filters: &[Vec<u8>], frame_number: u64) -> Vec<u8> {
+    let total: usize =
+        4 + filters.iter().map(|f| 4 + f.len()).sum::<usize>() + 8;
+    let mut msg = Vec::with_capacity(total);
+    msg.extend_from_slice(&(filters.len() as u32).to_be_bytes());
+    for f in filters {
+        msg.extend_from_slice(&(f.len() as u32).to_be_bytes());
+        msg.extend_from_slice(f);
+    }
+    msg.extend_from_slice(&frame_number.to_be_bytes());
+    msg
 }
 
 // =====================================================================

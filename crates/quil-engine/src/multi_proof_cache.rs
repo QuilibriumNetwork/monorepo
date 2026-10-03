@@ -51,10 +51,11 @@ impl ShardMultiProofPrecomputer {
         new_rank: u64,
         parent_selector: Vec<u8>,
         difficulty: u32,
+        frame_number: u64,
     ) {
         // Single-prover shards use the 74-byte aggregate path and
         // don't need multi-proofs.
-        let active = match self.prover_registry.get_active_provers(&self.filter) {
+        let active = match self.prover_registry.get_active_provers(&self.filter, frame_number) {
             Ok(v) => v,
             Err(_) => return,
         };

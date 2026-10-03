@@ -113,9 +113,13 @@ impl PartialEq for Field {
     fn eq(&self, other: &Self) -> bool {
         fn sign_to_choice(sign: Sign) -> Choice {
             match sign {
-                Sign::Plus => 1,
+                // `BigInt::to_u64_digits()` returns `Sign::NoSign` for zero, a
+                // valid (and common) field element — the magnitude is empty and
+                // zero is non-negative, so it must classify the same as `Plus`.
+                // Reachable from attacker-supplied signature/point bytes that
+                // decode to a zero coordinate, so this must NOT panic.
+                Sign::Plus | Sign::NoSign => 1,
                 Sign::Minus => 0,
-                Sign::NoSign => unreachable!(),
             }
             .into()
         }

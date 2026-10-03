@@ -25,7 +25,7 @@ pub(crate) fn init(
         PathBuf::from(&config.key.key_store_file.path)
     };
 
-    let bls_ctor = quil_crypto::Bls48581KeyConstructor;
+    let bls_ctor = quil_crypto::FalconKeyConstructor;
     let proving_key_id = if config.engine.proving_key_id.is_empty() {
         "default-proving-key".to_string()
     } else {
@@ -46,7 +46,7 @@ pub(crate) fn init(
 
     // Auto-create all standard keys if missing
     file_key_manager.ensure_standard_keys()?;
-    let bls_pubkey = file_key_manager.get_public_key(quil_types::crypto::KeyType::Bls48581G1)?;
+    let bls_pubkey = file_key_manager.get_public_key(quil_types::crypto::KeyType::Falcon512)?;
 
     let prover_address = quil_crypto::poseidon::hash_bytes_to_32(&bls_pubkey)?;
     // Publish the local prover address to the execution layer's static

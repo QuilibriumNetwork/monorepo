@@ -63,10 +63,52 @@ pub struct EngineConfig {
     pub archive_endpoints: Vec<String>,
     #[serde(default)]
     pub blacklist: Vec<String>,
+    /// How long (seconds) the archive endpoint pool bans a failing archive
+    /// before retrying it. `-1` disables banning entirely (a failed endpoint
+    /// is retried on the next poll tick) — devnet sets this so recovery from
+    /// a network partition is instantaneous. `0`/absent falls back to the
+    /// default below. See `quil_rpc::ArchiveEndpointPool`.
+    #[serde(default = "default_archive_blacklist_ttl_secs", alias = "archiveBlacklistTtl")]
+    pub archive_blacklist_ttl_secs: i64,
     #[serde(default = "default_alert_key")]
     pub alert_key: String,
     #[serde(default)]
     pub frame_publish: FramePublishConfig,
+    /// Hex-encoded Falcon-512 public keys of the global consensus committee
+    /// (commonware simplex). Each member's committee identity is its
+    /// **proving key** (`q-prover-key`) — the prover and consensus roles share
+    /// one Falcon-512 key, so these are the same values as the members'
+    /// `BLS_PUBKEY`/prover pubkeys. Every member (including this node) is
+    /// listed; the committee `Set<FalconPublicKey>` is assembled from these
+    /// (order-independent — the Set sorts). Empty until the simplex cutover is
+    /// enabled. Populated from `--print-identity`'s `CONSENSUS_PUBKEY` lines at
+    /// genesis (see `scripts/localnet.sh`).
+    #[serde(default)]
+    pub consensus_committee: Vec<String>,
+    /// Parallel to [`consensus_committee`]: each member's libp2p peer id
+    /// (base58), in the SAME order, so an inbound `:8340` simplex message
+    /// resolves from its authenticated mTLS peer id to the sender's committee
+    /// Falcon key. Populated from `--print-identity`'s `PEER_ID` lines at
+    /// genesis alongside the `CONSENSUS_PUBKEY` lines.
+    #[serde(default)]
+    pub consensus_committee_peer_ids: Vec<String>,
+    /// commonware-simplex leader timeout (seconds): how long a replica waits for
+    /// the leader's proposal before nullifying the view. MUST exceed the leader's
+    /// in-`propose` VDF prove time under real contention, or every view nullifies
+    /// before the proposal lands. Certification timeout is derived as this + 5s.
+    /// Default 30; raise for higher difficulty / slower CPUs.
+    #[serde(default = "default_consensus_leader_timeout_secs")]
+    pub consensus_leader_timeout_secs: u64,
+    /// Drive APP-SHARD consensus with commonware-simplex + Falcon (EQUAL
+    /// VOTES) instead of the legacy quil-consensus HotStuff loop. Off by default;
+    /// the legacy per-shard path is unchanged until this is set. Independent of
+    /// [`consensus_committee`] (which gates GLOBAL consensus).
+    #[serde(default)]
+    pub app_consensus_cw: bool,
+}
+
+fn default_consensus_leader_timeout_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +159,10 @@ fn default_worker_base_stream_port() -> u16 { 32500 }
 fn default_worker_memory_limit() -> i64 { 1792 * 1024 * 1024 }
 fn default_sync_timeout_ms() -> u64 { 4000 }
 fn default_sync_candidates() -> i32 { 8 }
+// Short enough that transient network blips don't permanently drain the
+// archive pool, long enough that we don't hammer a struggling endpoint into
+// the ground. `-1` disables banning (see `archive_blacklist_ttl_secs`).
+fn default_archive_blacklist_ttl_secs() -> i64 { 60 }
 // 64 MiB — matches the de-facto cap hardcoded in
 // `quil-rpc/src/hypergraph_sync_probe.rs`. Was 600 MiB before, which
 // is far larger than any legitimate sync message and would have been
@@ -181,6 +227,10 @@ impl EngineConfig {
         }
         if self.sync_candidates == 0 {
             self.sync_candidates = default_sync_candidates();
+        }
+        // `0`/absent → default; `-1` (disabled) and positive values preserved.
+        if self.archive_blacklist_ttl_secs == 0 {
+            self.archive_blacklist_ttl_secs = default_archive_blacklist_ttl_secs();
         }
         if self.reward_strategy.is_empty() {
             self.reward_strategy = default_reward_strategy();

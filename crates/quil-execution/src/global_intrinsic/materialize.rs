@@ -16,6 +16,244 @@ pub const STATUS_ACTIVE: u8 = 1;
 pub const STATUS_PAUSED: u8 = 2;
 pub const STATUS_LEAVING: u8 = 3;
 pub const STATUS_KICKED: u8 = 4;
+/// ALLOCATION status byte for `Historic` — an allocation superseded by a
+/// reassignment (prover moved off this filter) but RETAINED, not deleted, so the
+/// slot can be reactivated on a merge-back. Byte 6 in the allocation-status space
+/// (`map_allocation_status`: 4=Rejected, 5=Kicked already occupy 4/5; the
+/// `STATUS_KICKED=4` constant above is the PROVER-level rollup value, a separate
+/// space). Excluded from committees via `committee_eligible`.
+pub const STATUS_HISTORIC: u8 = 6;
+
+/// Flag-day frame for the spurious-kick amnesty (seniority restoration).
+///
+/// A batch of honest, active app-shard provers was spuriously KICKED at epoch
+/// boundaries by an anchor-lagged storage audit (fixed upstream via 3-slot
+/// leaf-root registration), which set Status=4 + KickFrameNumber AND zeroed
+/// Seniority with no restore path. A kick only *permanently* disqualifies a
+/// prover at the two re-join bars (`verify_prover_join_not_kicked` + the
+/// materialize-side check); `decode_prover` dropping the vertex is transient (a
+/// re-join overwrites it). So we simply stop those bars from honoring a kick
+/// recorded BEFORE this frame, once the chain reaches it: the victim re-joins
+/// with their own key → fresh Active vertex → Status recovers via the normal
+/// lifecycle, and a seniority re-merge (allowed when Seniority==0, see
+/// [`crate::global_intrinsic::verify`]) restores the value `0 + X = X`.
+///
+/// Gating on BOTH `kick_frame_number < FRAME` and `current_frame >= FRAME`
+/// makes the switch deterministic across nodes at exactly this frame (a node
+/// that upgraded early must NOT forgive kicks before the chain arrives here, or
+/// it would fork). Kicks at/after this frame are never forgiven.
+///
+/// This is the ORIGINAL amnesty (already served on mainnet, head > 695_000). It
+/// is kept at 695_000 so its forgiveness is never *withdrawn* — a second,
+/// additive amnesty rides the unified-tree reset ([`UNIFIED_RESET_AMNESTY_FRAME`]).
+pub const KICK_AMNESTY_FRAME: u64 = 695_000;
+
+/// A second, redundant amnesty riding the unified-tree reset flag day
+/// ([`UNIFIED_TREE_CUTOVER_FRAME`] = 699_500). At the reset the global archives
+/// DROP all non-archive prover records outright (not via the kick machinery), so
+/// a re-joining prover already starts with a clean vertex and no `KickFrameNumber`.
+/// This forgives any pre-reset kick the drop might have missed, so no stale kick
+/// bars a re-join around the reset. Set to the unified cutover so the two forks
+/// land on the same coordinated frame. Additive with [`KICK_AMNESTY_FRAME`]: a
+/// kick forgiven under either window stays forgiven (the 695_000 amnesty is NOT
+/// re-litigated for the [695_000, 699_500) interval).
+pub const UNIFIED_RESET_AMNESTY_FRAME: u64 = 699_500;
+
+/// Frame at which the state-commitment scheme switches to the UNIFIED APP TREE
+/// (one L3 JMT per app, shards = in-place subtrees; app commitment = the JMT
+/// root instead of the legacy `app_root_from_shard_paths` `hash_pair` rollup).
+///
+/// This is a HARD-FORK flag day: the header `state_roots` / `prover_tree_commitment`
+/// change value, so EVERY node must switch at exactly this frame or fork. Nodes
+/// run a one-time, idempotent CONSOLIDATION (split apps' per-sub-shard trees →
+/// their single app tree) at boot BEFORE the chain reaches here, then flip the
+/// commitment when `head_frame >= unified_tree_cutover_frame()` (same discipline
+/// as [`KICK_AMNESTY_FRAME`]). Kept clear of the amnesty (695_000) so the two
+/// forks don't land on the same frame.
+///
+/// Moved 695_500 → 698_000 → 699_500: each earlier frame was reached before the
+/// cutover-aware binary was deployed, so the switch was pushed past head for a
+/// fresh coordinated runway. 699_500 also carries the split-shard reset (see
+/// [`crate::global_intrinsic`] reset hook) and [`UNIFIED_RESET_AMNESTY_FRAME`].
+///
+/// This is the MAINNET value; use [`unified_tree_cutover_frame`] (which honors
+/// the dev/localnet env override) everywhere the gate is actually evaluated.
+pub const UNIFIED_TREE_CUTOVER_FRAME: u64 = 699_500;
+
+/// The effective unified-tree cutover frame. Defaults to
+/// [`UNIFIED_TREE_CUTOVER_FRAME`] (mainnet); DEV/localnet ONLY may lower it via
+/// `QUIL_UNIFIED_TREE_CUTOVER_FRAME` so the transition is reachable in a short
+/// localnet run (which starts at frame 0 — mainnet's 698_000 is never reached
+/// there). Env-gated exactly like `QUIL_SPLIT_MAX_PROVERS` / `QUIL_EPOCH_LENGTH_FRAMES`:
+/// mainnet never sets it, so mainnet is untouched. Read ONCE and cached, so every
+/// call site agrees and the per-network switch stays deterministic across nodes.
+pub fn unified_tree_cutover_frame() -> u64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("QUIL_UNIFIED_TREE_CUTOVER_FRAME")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(UNIFIED_TREE_CUTOVER_FRAME)
+    })
+}
+
+/// SECOND coordinated QUIL grid reset ("grid-reset v2"), mainnet frame 740_000.
+/// The pre-fix split machinery left QUIL with a non-prefix-free, gapped,
+/// mixed-encoding grid (explorer showed 31 overlapping shards, ~79% of the address
+/// space uncovered). This re-fires the SAME flag-day reset — QUIL grid → 64-way
+/// genesis + drop pending changes, plus a prover-tree wipe/rebuild so provers
+/// stranded on the corrupt sub-shards re-join the clean grid. It does NOT re-run
+/// the app-tree consolidation/fold (already done; the 121M-leaf coin tree is
+/// untouched), so it completes in seconds, not hours. Gated exactly-once via a
+/// DISTINCT marker (`grid_reset_v2` — see `unified_consolidation`) so the first
+/// reset's `boot_reset_applied` guard doesn't suppress it.
+pub const QUIL_GRID_RESET_V2_FRAME: u64 = 740_000;
+
+/// Effective grid-reset-v2 frame. Defaults to [`QUIL_GRID_RESET_V2_FRAME`]
+/// (mainnet); DEV/localnet ONLY lowers it via `QUIL_GRID_RESET_V2_FRAME` so the
+/// reset is reachable in a short localnet run (which starts at frame 0). Read once
+/// and cached, like [`unified_tree_cutover_frame`], so every call site agrees and
+/// the switch stays deterministic across nodes.
+pub fn quil_grid_reset_v2_frame() -> u64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("QUIL_GRID_RESET_V2_FRAME")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(QUIL_GRID_RESET_V2_FRAME)
+    })
+}
+
+/// Coordinated QUIL prover-tree RESET v3, mainnet frame 747_000.
+///
+/// grid-reset v2 (740_000) wiped + reseeded the prover tree, but two things
+/// defeated it: (1) provers re-joined onto their PERSISTED deep WORKER filters (in
+/// the local worker store, which the tree wipe doesn't touch), rebuilding the
+/// non-prefix-free allocation cascade; and (2) ordinary split/merge reassignment
+/// hard-DELETED vacated allocation vertices, permanently tombstoning their
+/// addresses (the removes-phase gate in `get_vertex_data`), so a merged-back shard
+/// could never re-represent its allocation.
+///
+/// v3 re-runs the complete tree wipe + genesis-committee reseed AND, at the same
+/// marker-gated frame path, clears every AUTO-managed worker's persisted filter
+/// binding so re-join lands on the clean 64-way genesis grid instead of the old
+/// deep filter (manually-managed workers keep their pins). Paired with the
+/// delete-free reassignment shipped alongside (vacated slots retire to
+/// [`STATUS_HISTORIC`], never deleted), the cascade cannot re-form and merge-back
+/// re-representation works. Gated exactly-once via its OWN marker
+/// (`prover_reset_v3` — see `unified_consolidation`).
+pub const QUIL_PROVER_RESET_V3_FRAME: u64 = 747_000;
+
+/// Effective prover-reset-v3 frame. Defaults to [`QUIL_PROVER_RESET_V3_FRAME`]
+/// (mainnet); DEV/localnet ONLY lowers it via `QUIL_PROVER_RESET_V3_FRAME` so the
+/// reset is reachable in a short localnet run. Read once and cached, like
+/// [`quil_grid_reset_v2_frame`], so every call site agrees and the switch stays
+/// deterministic across nodes.
+pub fn quil_prover_reset_v3_frame() -> u64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("QUIL_PROVER_RESET_V3_FRAME")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(QUIL_PROVER_RESET_V3_FRAME)
+    })
+}
+
+/// Coordinated QUIL prover-tree RESET v4 — the SAME complete reset as v3
+/// (tree wipe + genesis-committee reseed + per-node AUTO worker-filter clear +
+/// grid → 64-way genesis) at a LATER frame, needed because v3 (747_000) re-aligned
+/// the layers but the boot-time `normalize_quil_token_grid` (now REMOVED) then
+/// re-clobbered each archive's local grid back to 64-way on restart while the
+/// CRDT-synced allocations kept their depth-7/10 children — re-opening the
+/// divergence that gets deep-shard proofs rejected. v4 re-baselines both layers
+/// ONCE MORE; with the boot clobber gone, `apply_due_shard_changes` keeps the grid
+/// tracking the allocations durably afterwards. Additive to v3 (own marker +
+/// amnesty window), so v3's markers/forgiveness are never withdrawn.
+pub const QUIL_PROVER_RESET_V4_FRAME: u64 = 754_000;
+
+/// Effective prover-reset-v4 frame (env `QUIL_PROVER_RESET_V4_FRAME`, localnet
+/// override), cached like [`quil_prover_reset_v3_frame`].
+pub fn quil_prover_reset_v4_frame() -> u64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("QUIL_PROVER_RESET_V4_FRAME")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(QUIL_PROVER_RESET_V4_FRAME)
+    })
+}
+
+/// Coordinated QUIL prover-tree RESET v5 — the SAME complete reset as v4 (tree
+/// wipe + genesis-committee reseed + per-node AUTO worker-filter clear + grid →
+/// genesis) at a LATER frame. v4 seeded a SENTINEL grid in the reset itself, but
+/// the boot-time genesis seeders still produced BYTE-SUFFIX, so any node that
+/// booted fresh / state-jumped past v4 re-seeded byte-suffix and re-joined
+/// byte-suffix — leaving the network in a MIXED state (byte-suffix + sentinel
+/// allocations) that never self-healed because inactivity eviction is off (the
+/// stranded provers never re-joined). v5 re-baselines ONCE MORE, but now ALL
+/// seeders route through `quil_forest::genesis_grid_prefixes` (sentinel), so the
+/// post-v5 state STAYS sentinel — the boot-clobber hole v4 fell into is closed.
+/// Additive to v4 (own marker + amnesty window); v4's markers/forgiveness stand.
+pub const QUIL_PROVER_RESET_V5_FRAME: u64 = 759_000;
+
+/// Effective prover-reset-v5 frame (env `QUIL_PROVER_RESET_V5_FRAME`, localnet
+/// override), cached like [`quil_prover_reset_v4_frame`].
+pub fn quil_prover_reset_v5_frame() -> u64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("QUIL_PROVER_RESET_V5_FRAME")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(QUIL_PROVER_RESET_V5_FRAME)
+    })
+}
+
+/// Whether a prior `kick_frame_number` still bars a prover from re-joining /
+/// counting at `current_frame`. `0` means "never kicked" (e.g. a voluntary
+/// leave records no KickFrameNumber). A pre-amnesty kick is forgiven only once
+/// the chain has reached [`KICK_AMNESTY_FRAME`]; every other non-zero kick bars.
+pub fn kick_bars_rejoin(kick_frame_number: u64, current_frame: u64) -> bool {
+    if kick_frame_number == 0 {
+        return false;
+    }
+    // Two additive amnesty windows: the original 695_000 restoration and the
+    // redundant window riding the unified-tree reset. A kick forgiven under
+    // EITHER stays forgiven — moving the effective bar out to the reset frame
+    // must never withdraw the 695_000 forgiveness for the interim interval.
+    let forgiven_695 =
+        kick_frame_number < KICK_AMNESTY_FRAME && current_frame >= KICK_AMNESTY_FRAME;
+    let forgiven_reset = kick_frame_number < UNIFIED_RESET_AMNESTY_FRAME
+        && current_frame >= UNIFIED_RESET_AMNESTY_FRAME;
+    // Third additive window riding grid-reset v2: the v2 reset wipes non-archive
+    // provers, so a re-joining prover starts clean — this forgives any pre-v2 kick
+    // the drop missed. Tied to the (env-honoring) v2 reset frame so localnet's
+    // lowered reset carries a matching amnesty.
+    let v2 = quil_grid_reset_v2_frame();
+    let forgiven_reset_v2 = kick_frame_number < v2 && current_frame >= v2;
+    // Fourth additive window riding prover-reset v3: same reasoning as v2 — the v3
+    // wipe+reseed drops non-genesis provers, so a re-joining prover starts clean and
+    // any pre-v3 kick the drop missed is forgiven. Tied to the (env-honoring) v3
+    // frame so localnet's lowered reset carries a matching amnesty.
+    let v3 = quil_prover_reset_v3_frame();
+    let forgiven_reset_v3 = kick_frame_number < v3 && current_frame >= v3;
+    // Fifth additive window riding prover-reset v4 (same reasoning as v2/v3).
+    let v4 = quil_prover_reset_v4_frame();
+    let forgiven_reset_v4 = kick_frame_number < v4 && current_frame >= v4;
+    // Sixth additive window riding prover-reset v5 (same reasoning as v2/v3/v4).
+    let v5 = quil_prover_reset_v5_frame();
+    let forgiven_reset_v5 = kick_frame_number < v5 && current_frame >= v5;
+    !(forgiven_695
+        || forgiven_reset
+        || forgiven_reset_v2
+        || forgiven_reset_v3
+        || forgiven_reset_v4
+        || forgiven_reset_v5)
+}
 
 /// Protocol-level halt-risk threshold. A shard with `Active` prover
 /// count at or below this value is classified as halt-risk by the
@@ -189,14 +427,26 @@ pub fn update_prover_status_from_allocations(
 // ProverConfirm materialize
 // =====================================================================
 
-/// Materialize a ProverConfirm for a single allocation. Two paths:
+/// Materialize a ProverConfirm for a single allocation (epoch-aligned
+/// lifecycle). A confirm in epoch E+1 registers the allocation for its NEXT
+/// epoch E+2 (`Epoch = epoch_for_frame(frame)+1`) — the prover encodes/registers
+/// leaf roots ahead so the committee can stay frozen within an epoch. Three
+/// paths:
 ///
-/// - **Confirm join** (status 0→1): set Status=Active,
-///   JoinConfirmFrameNumber, LastActiveFrameNumber.
-/// - **Confirm leave** (status 3→4): set Status=Kicked,
-///   LeaveConfirmFrameNumber.
+/// - **Confirm join** (status 0→1): set Status=Active, JoinConfirmFrameNumber,
+/// LastActiveFrameNumber, Epoch=epoch_for_frame(frame)+1. The flipped Active
+/// byte does NOT make the prover a committee member until the activation
+/// boundary E+2 — `effective_status` reads it as `Joining` until then
+/// (deferred activation, keyed on JoinConfirmFrameNumber).
+/// - **Re-confirm** (status 1, stays Active): renew Epoch one ahead +
+/// LastActiveFrameNumber. Does NOT touch JoinConfirmFrameNumber (so the
+/// established member's activation epoch stays in the past).
+/// - **Confirm leave** (status 3, stays Leaving): set LeaveConfirmFrameNumber.
+/// The byte stays Leaving; the prover serves notice through the rest of the
+/// epoch and departs at E+2 via `effective_status` (ExpiredLeaving). Keeping
+/// the byte avoids changing committee membership mid-epoch.
 ///
-/// Returns `Err` if the allocation is not in status 0 or 3.
+/// Returns `Err` if the allocation is not in status 0, 1, or 3.
 pub fn materialize_prover_confirm(
     allocation_tree: &mut quil_tries::VectorCommitmentTree,
     frame_number: u64,
@@ -207,23 +457,39 @@ pub fn materialize_prover_confirm(
         .unwrap_or(255);
 
     let frame_bytes = frame_number.to_be_bytes();
+    // Register one epoch ahead: a confirm in epoch E+1 makes the allocation
+    // valid for E+2 (its first/next active epoch). This is the `next` slot of
+    // the two-slot {current,next} leaf-root registration.
+    let next_epoch = (quil_types::consensus::epoch_for_frame(frame_number) + 1).to_be_bytes();
 
     match status {
         STATUS_JOINING => {
-            // Confirm join → active
+            // Confirm join → Active byte, but deferred-active until E+2.
             write_field(allocation_tree, cls, "Status", &[STATUS_ACTIVE])?;
             write_field(allocation_tree, cls, "JoinConfirmFrameNumber", &frame_bytes)?;
             write_field(allocation_tree, cls, "LastActiveFrameNumber", &frame_bytes)?;
+            write_field(allocation_tree, cls, "Epoch", &next_epoch)?;
+            Ok(())
+        }
+        STATUS_ACTIVE => {
+            // Epoch re-confirm: an established Active allocation renews its
+            // registration one epoch ahead (+ activity) and stays Active. This
+            // is the close-the-loop for `EffectiveStatus::ExpiredEpoch`. The
+            // validate gate (`validate_confirm_timing`) already ensured the
+            // recorded epoch is not already ahead. JoinConfirmFrameNumber is
+            // deliberately left untouched.
+            write_field(allocation_tree, cls, "LastActiveFrameNumber", &frame_bytes)?;
+            write_field(allocation_tree, cls, "Epoch", &next_epoch)?;
             Ok(())
         }
         STATUS_LEAVING => {
-            // Confirm leave → left
-            write_field(allocation_tree, cls, "Status", &[STATUS_KICKED])?; // 4 = left/kicked
+            // Confirm leave: keep the Leaving byte; record the confirm frame.
+            // Departure is derived at the E+2 boundary by `effective_status`.
             write_field(allocation_tree, cls, "LeaveConfirmFrameNumber", &frame_bytes)?;
             Ok(())
         }
         _ => Err(QuilError::InvalidArgument(format!(
-            "materialize confirm: allocation status is {} (expected 0=joining or 3=leaving)",
+            "materialize confirm: allocation status is {} (expected 0=joining, 1=active re-confirm, or 3=leaving)",
             status
         ))),
     }
@@ -232,9 +498,9 @@ pub fn materialize_prover_confirm(
 /// Materialize a ProverReject for a single allocation. Two paths:
 ///
 /// - **Reject join** (status 0→4): set Status=Kicked,
-///   JoinRejectFrameNumber.
+/// JoinRejectFrameNumber.
 /// - **Reject leave** (status 3→1): set Status=Active,
-///   LeaveRejectFrameNumber, LastActiveFrameNumber.
+/// LeaveRejectFrameNumber, LastActiveFrameNumber.
 pub fn materialize_prover_reject(
     allocation_tree: &mut quil_tries::VectorCommitmentTree,
     frame_number: u64,
@@ -254,7 +520,12 @@ pub fn materialize_prover_reject(
             Ok(())
         }
         STATUS_LEAVING => {
-            // Reject leave → back to active
+            // Reject leave → back to Active. Do NOT bump Epoch: the prover did
+            // not submit fresh leaf roots, so re-registering it for a new epoch
+            // would make `Epoch` claim a two-slot registration that doesn't
+            // exist (the leave-reject inconsistency class). It keeps whatever
+            // epoch registration it already held and re-confirms on its normal
+            // schedule.
             write_field(allocation_tree, cls, "Status", &[STATUS_ACTIVE])?;
             write_field(allocation_tree, cls, "LeaveRejectFrameNumber", &frame_bytes)?;
             write_field(allocation_tree, cls, "LastActiveFrameNumber", &frame_bytes)?;
@@ -486,6 +757,231 @@ pub fn materialize_prover_join(
     })
 }
 
+/// Compute a leaf-root registration's 32-byte address.
+/// `poseidon("LEAF_ROOT_REGISTRATION" || member || leaf_id) → 32 bytes`.
+/// `member` is the 32-byte prover address; `leaf_id` is
+/// [`super::leaf_id_bytes`]`(shard_filter, prefix)`.
+///
+/// The epoch is deliberately **NOT** in the address: re-registration each epoch
+/// overwrites the same `(member, leaf)` vertex in place (bounded storage, no
+/// stale-epoch pruning). The current epoch is carried in the `Epoch` field, and
+/// the verifier checks it equals the active epoch.
+pub fn leaf_root_address(member: &[u8], leaf_id: &[u8]) -> Result<[u8; 32]> {
+    let mut preimage = Vec::with_capacity(22 + member.len() + leaf_id.len());
+    preimage.extend_from_slice(b"LEAF_ROOT_REGISTRATION");
+    preimage.extend_from_slice(member);
+    preimage.extend_from_slice(leaf_id);
+    quil_crypto::poseidon::hash_bytes_to_32(&preimage)
+}
+
+/// Pack a sub-shard prefix (`Vec<u32>` nibbles) into bytes (u32 BE each) for
+/// storage in the `Prefix` field.
+pub fn pack_prefix(prefix: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() * 4);
+    for p in prefix {
+        out.extend_from_slice(&p.to_be_bytes());
+    }
+    out
+}
+
+/// Inverse of [`pack_prefix`].
+pub fn unpack_prefix(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Create a leaf-root registration vertex tree.
+/// Sets: Member, ShardFilter, Prefix, Epoch, LeafRoot, NumBlocks,
+/// RegistrationFrameNumber.
+#[allow(clippy::too_many_arguments)]
+pub fn create_leaf_root_vertex_tree(
+    member: &[u8; 32],
+    shard_filter: &[u8],
+    prefix: &[u32],
+    epoch: u64,
+    leaf_root: &[u8],
+    num_blocks: u64,
+    frame_number: u64,
+) -> Result<quil_tries::VectorCommitmentTree> {
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    let cls = "leafroot:LeafRootRegistration";
+
+    write_type(&mut tree, cls)?;
+    write_field(&mut tree, cls, "Member", member)?;
+    write_field(&mut tree, cls, "ShardFilter", shard_filter)?;
+    write_field(&mut tree, cls, "Prefix", &pack_prefix(prefix))?;
+    write_field(&mut tree, cls, "Epoch", &epoch.to_be_bytes())?;
+    write_field(&mut tree, cls, "LeafRoot", leaf_root)?;
+    write_field(&mut tree, cls, "NumBlocks", &num_blocks.to_be_bytes())?;
+    write_field(&mut tree, cls, "RegistrationFrameNumber", &frame_number.to_be_bytes())?;
+
+    Ok(tree)
+}
+
+/// Read a `u64` field from a vertex tree (big-endian, first 8 bytes), `None` if
+/// absent.
+fn read_u64_field(
+    tree: &quil_tries::VectorCommitmentTree,
+    cls: &str,
+    name: &str,
+) -> Option<u64> {
+    let b = read_field(tree, cls, name)?;
+    let arr: [u8; 8] = b.get(..8)?.try_into().ok()?;
+    Some(u64::from_be_bytes(arr))
+}
+
+/// Upsert a member's leaf-root registration into the **two-slot** {current,next}
+/// vertex. The audit needs the registration for the epoch a member is currently
+/// proving AND the next epoch it has pre-confirmed to coexist (a member confirms
+/// one epoch ahead while still answering audits for the current epoch). Merge
+/// rule: of {existing current, existing next, new}, keep the **two highest
+/// epochs**, stored epoch-sorted (orders 3..5 = lower "current", 7..9 = higher
+/// "next"). A same-epoch re-register overwrites that slot's value. Two fixed
+/// slots ⇒ no per-epoch address growth.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_leaf_root_registration(
+    existing: Option<&quil_tries::VectorCommitmentTree>,
+    member: &[u8; 32],
+    shard_filter: &[u8],
+    prefix: &[u32],
+    new_epoch: u64,
+    new_leaf_root: &[u8],
+    new_num_blocks: u64,
+    frame_number: u64,
+) -> Result<quil_tries::VectorCommitmentTree> {
+    let cls = "leafroot:LeafRootRegistration";
+
+    // Gather the existing slots (prev + current + next, whichever are present).
+    let mut slots: Vec<(u64, Vec<u8>, u64)> = Vec::new();
+    if let Some(t) = existing {
+        if let Some(e) = read_u64_field(t, cls, "PrevEpoch") {
+            slots.push((
+                e,
+                read_field(t, cls, "PrevLeafRoot").unwrap_or_default(),
+                read_u64_field(t, cls, "PrevNumBlocks").unwrap_or(0),
+            ));
+        }
+        if let Some(e) = read_u64_field(t, cls, "Epoch") {
+            slots.push((
+                e,
+                read_field(t, cls, "LeafRoot").unwrap_or_default(),
+                read_u64_field(t, cls, "NumBlocks").unwrap_or(0),
+            ));
+        }
+        if let Some(e) = read_u64_field(t, cls, "NextEpoch") {
+            slots.push((
+                e,
+                read_field(t, cls, "NextLeafRoot").unwrap_or_default(),
+                read_u64_field(t, cls, "NextNumBlocks").unwrap_or(0),
+            ));
+        }
+    }
+    // Merge the new registration: same-epoch overwrites, else add.
+    slots.retain(|(e, _, _)| *e != new_epoch);
+    slots.push((new_epoch, new_leaf_root.to_vec(), new_num_blocks));
+    // Keep the THREE highest epochs (drop the lowest if 4+), epoch-sorted
+    // ascending so the vertex bytes are deterministic across nodes. The third
+    // (oldest retained) epoch covers the anchor-lagged storage audit window: an
+    // opening produced ~K frames before the audit is still anchored to the
+    // previous epoch just after a boundary, and a two-slot vertex would have
+    // already evicted it → spurious kick + seniority-zero. See the schema note.
+    slots.sort_by_key(|(e, _, _)| *e);
+    while slots.len() > 3 {
+        slots.remove(0);
+    }
+
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    write_type(&mut tree, cls)?;
+    write_field(&mut tree, cls, "Member", member)?;
+    write_field(&mut tree, cls, "ShardFilter", shard_filter)?;
+    write_field(&mut tree, cls, "Prefix", &pack_prefix(prefix))?;
+    write_field(&mut tree, cls, "RegistrationFrameNumber", &frame_number.to_be_bytes())?;
+    // Assign from the top: highest epoch → next slot, the one below → current
+    // slot, the one below that → prev slot. This keeps the historical layouts
+    // byte-identical (1 slot ⇒ `Epoch` only; 2 slots ⇒ `Epoch`+`NextEpoch`) and
+    // only writes the `Prev*` fields once a third, older epoch is retained.
+    let cur_idx = slots.len().saturating_sub(2); // len1→0, len2→0, len3→1
+    if let Some((e, lr, nb)) = slots.get(cur_idx) {
+        write_field(&mut tree, cls, "Epoch", &e.to_be_bytes())?;
+        write_field(&mut tree, cls, "LeafRoot", lr)?;
+        write_field(&mut tree, cls, "NumBlocks", &nb.to_be_bytes())?;
+    }
+    if let Some((e, lr, nb)) = slots.get(cur_idx + 1) {
+        write_field(&mut tree, cls, "NextEpoch", &e.to_be_bytes())?;
+        write_field(&mut tree, cls, "NextLeafRoot", lr)?;
+        write_field(&mut tree, cls, "NextNumBlocks", &nb.to_be_bytes())?;
+    }
+    if cur_idx >= 1 {
+        if let Some((e, lr, nb)) = slots.get(cur_idx - 1) {
+            write_field(&mut tree, cls, "PrevEpoch", &e.to_be_bytes())?;
+            write_field(&mut tree, cls, "PrevLeafRoot", lr)?;
+            write_field(&mut tree, cls, "PrevNumBlocks", &nb.to_be_bytes())?;
+        }
+    }
+    Ok(tree)
+}
+
+/// Look up the registered `(leaf_root, num_blocks)` for `member`+`leaf_id` at the
+/// given `active_epoch`, checking BOTH slots of the two-slot registration. The
+/// audit cross-checks an opening against whichever slot matches the epoch being
+/// proved. `None` if neither slot is for `active_epoch`.
+pub fn leaf_root_registration_for_epoch(
+    tree: &quil_tries::VectorCommitmentTree,
+    active_epoch: u64,
+) -> Option<(Vec<u8>, u64)> {
+    let cls = "leafroot:LeafRootRegistration";
+    if read_u64_field(tree, cls, "Epoch") == Some(active_epoch) {
+        return Some((
+            read_field(tree, cls, "LeafRoot")?,
+            read_u64_field(tree, cls, "NumBlocks").unwrap_or(0),
+        ));
+    }
+    if read_u64_field(tree, cls, "NextEpoch") == Some(active_epoch) {
+        return Some((
+            read_field(tree, cls, "NextLeafRoot")?,
+            read_u64_field(tree, cls, "NextNumBlocks").unwrap_or(0),
+        ));
+    }
+    // Prev slot: retained for the anchor-lagged audit window so a member is not
+    // spuriously kicked for an opening still anchored to the just-departed epoch.
+    if read_u64_field(tree, cls, "PrevEpoch") == Some(active_epoch) {
+        return Some((
+            read_field(tree, cls, "PrevLeafRoot")?,
+            read_u64_field(tree, cls, "PrevNumBlocks").unwrap_or(0),
+        ));
+    }
+    None
+}
+
+/// Full leaf-root registration materialize output — the single vertex tree to
+/// write to the CRDT at `address`.
+pub struct LeafRootRegistrationOutput {
+    pub address: [u8; 32],
+    pub tree: quil_tries::VectorCommitmentTree,
+}
+
+/// Materialize a [`super::LeafRootRegistration`] into its vertex tree + address.
+/// `member` is the 32-byte registering prover address.
+pub fn materialize_leaf_root_registration(
+    member: &[u8; 32],
+    reg: &super::LeafRootRegistration,
+) -> Result<LeafRootRegistrationOutput> {
+    let leaf_id = super::leaf_id_bytes(&reg.shard_filter, &reg.prefix);
+    let address = leaf_root_address(member, &leaf_id)?;
+    let tree = create_leaf_root_vertex_tree(
+        member,
+        &reg.shard_filter,
+        &reg.prefix,
+        reg.epoch,
+        &reg.leaf_root,
+        reg.num_blocks,
+        reg.frame_number,
+    )?;
+    Ok(LeafRootRegistrationOutput { address, tree })
+}
+
 /// Address for a spent ProverJoin merge marker.
 /// `poseidon("PROVER_JOIN_MERGE" || merge_target_pubkey) → 32 bytes`.
 ///
@@ -522,17 +1018,43 @@ pub fn build_prover_allocation_hyperedge_blob(
     allocations: &[([u8; 32], &quil_tries::VectorCommitmentTree)],
 ) -> Result<Vec<u8>> {
     use num_bigint::BigInt;
+
+    let mut ext_tree = quil_tries::VectorCommitmentTree::new();
+    for (alloc_addr, alloc_tree) in allocations {
+        let (atom_id, atom_bytes) = allocation_hyperedge_atom(alloc_addr, alloc_tree)?;
+        ext_tree.insert(
+            &atom_id,
+            &atom_bytes,
+            &[],
+            &BigInt::from(atom_bytes.len() as u64),
+        )?;
+    }
+
+    let _ = prover_address; // hyperedge address is the prover address (passed by caller)
+    Ok(crate::prover_registry::vertex_tree_to_blob(&ext_tree))
+}
+
+/// Build a single prover→allocation hyperedge atom: the 64-byte atom id
+/// `GLOBAL_INTRINSIC_ADDRESS || allocation_address` and its value bytes
+/// `0x00 || appAddr(32) || dataAddr(32) || commitment(64) || size(32)`.
+///
+/// Factored out so the ProverJoin path and the epoch-aligned shard-reassignment
+/// path (which re-keys an allocation from parent→child filter and must
+/// rebuild the prover's hyperedge atom for the new address) produce
+/// byte-identical atoms. Consumers (`get_hyperedge_extrinsic_ids`,
+/// ProverKick) read only the 64-byte key, so the value commitment is
+/// informational — but it must still be deterministic across nodes.
+pub fn allocation_hyperedge_atom(
+    alloc_addr: &[u8; 32],
+    alloc_tree: &quil_tries::VectorCommitmentTree,
+) -> Result<([u8; 64], Vec<u8>)> {
+    use num_bigint::BigInt;
     use quil_types::crypto::InclusionProver;
 
-    // The hyperedge atom IDs are `(GLOBAL_INTRINSIC_ADDRESS, allocation_address)`.
-    // We reuse the same convention as `genesis.rs` for byte-for-byte
-    // parity with the existing on-chain hyperedge format.
     let app_addr = crate::global_schema::GLOBAL_INTRINSIC_ADDRESS;
 
     // Tiny stand-in inclusion prover: emits a deterministic 64-byte
-    // commitment from the input bytes (no real KZG). The hyperedge
-    // consumer (`get_hyperedge_extrinsic_ids`) reads only the leaf
-    // **keys**, so the value commitment is informational.
+    // commitment from the input bytes (no real KZG).
     struct LocalProver;
     impl InclusionProver for LocalProver {
         fn commit_raw(&self, data: &[u8], _: u64) -> quil_types::error::Result<Vec<u8>> {
@@ -549,47 +1071,97 @@ pub fn build_prover_allocation_hyperedge_blob(
         fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
     }
 
-    let mut ext_tree = quil_tries::VectorCommitmentTree::new();
-    for (alloc_addr, alloc_tree) in allocations {
-        let mut atom_id = [0u8; 64];
-        atom_id[..32].copy_from_slice(&app_addr);
-        atom_id[32..].copy_from_slice(alloc_addr);
+    let mut atom_id = [0u8; 64];
+    atom_id[..32].copy_from_slice(&app_addr);
+    atom_id[32..].copy_from_slice(alloc_addr);
 
-        // value = vertex.ToBytes() shape (0x00 + appAddr + dataAddr + commitment + size32).
-        // Compute the allocation tree's commitment by walking a clone-equivalent.
-        // Since VectorCommitmentTree doesn't implement Clone, serialize +
-        // deserialize a fresh copy to avoid mutating the input.
-        let blob = crate::prover_registry::vertex_tree_to_blob(alloc_tree);
-        let mut tmp = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
-        let alloc_commitment = tmp.commit(&LocalProver);
+    // Compute the allocation tree's commitment on a clone-equivalent
+    // (VectorCommitmentTree isn't Clone) so we don't mutate the input.
+    let blob = crate::prover_registry::vertex_tree_to_blob(alloc_tree);
+    let mut tmp = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+    let alloc_commitment = tmp.commit(&LocalProver);
 
-        let alloc_size = alloc_tree
-            .root
-            .as_ref()
-            .map(|n| n.size().clone())
-            .unwrap_or_else(|| BigInt::from(0));
-        let mut size_bytes = [0u8; 32];
-        let (_, sb) = alloc_size.to_bytes_be();
-        let off = 32usize.saturating_sub(sb.len());
-        size_bytes[off..].copy_from_slice(&sb[..std::cmp::min(sb.len(), 32)]);
+    let alloc_size = alloc_tree
+        .root
+        .as_ref()
+        .map(|n| n.size().clone())
+        .unwrap_or_else(|| BigInt::from(0));
+    let mut size_bytes = [0u8; 32];
+    let (_, sb) = alloc_size.to_bytes_be();
+    let off = 32usize.saturating_sub(sb.len());
+    size_bytes[off..].copy_from_slice(&sb[..std::cmp::min(sb.len(), 32)]);
 
-        let mut atom_bytes = Vec::with_capacity(161);
-        atom_bytes.push(0x00);
-        atom_bytes.extend_from_slice(&app_addr);
-        atom_bytes.extend_from_slice(alloc_addr);
-        atom_bytes.extend_from_slice(&alloc_commitment);
-        atom_bytes.extend_from_slice(&size_bytes);
+    let mut atom_bytes = Vec::with_capacity(161);
+    atom_bytes.push(0x00);
+    atom_bytes.extend_from_slice(&app_addr);
+    atom_bytes.extend_from_slice(alloc_addr);
+    atom_bytes.extend_from_slice(&alloc_commitment);
+    atom_bytes.extend_from_slice(&size_bytes);
 
-        ext_tree.insert(
-            &atom_id,
-            &atom_bytes,
-            &[],
-            &BigInt::from(atom_bytes.len() as u64),
-        )?;
+    Ok((atom_id, atom_bytes))
+}
+
+/// The allocation addresses a prover's hyperedge links, in key order. An
+/// empty blob links none. Every atom must name a global allocation.
+pub fn hyperedge_allocation_addresses(blob: &[u8]) -> Result<Vec<[u8; 32]>> {
+    if blob.is_empty() {
+        return Ok(Vec::new());
     }
+    let Some(root) = quil_tries::deserialize_go_tree(blob)? else {
+        return Ok(Vec::new());
+    };
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    tree.root = Some(root);
+    let mut out = Vec::new();
+    for (key, _) in tree.leaves() {
+        if key.len() != 64 || key[..32] != crate::global_schema::GLOBAL_INTRINSIC_ADDRESS[..] {
+            return Err(QuilError::InvalidArgument(
+                "prover hyperedge links a non-global allocation atom".into(),
+            ));
+        }
+        let mut address = [0u8; 32];
+        address.copy_from_slice(&key[32..]);
+        out.push(address);
+    }
+    Ok(out)
+}
 
-    let _ = prover_address; // hyperedge address is the prover address (passed by caller)
-    Ok(crate::prover_registry::vertex_tree_to_blob(&ext_tree))
+/// Add allocation atoms to an existing prover hyperedge, keeping every
+/// other atom byte-identical; an atom already present for an address is
+/// replaced. The trie is a pure function of its `(key, value)` set, so the
+/// result is identical on every node.
+///
+/// A join must extend the prover's hyperedge rather than replace it: the
+/// hyperedge is how a kick finds every allocation and how the prover's
+/// aggregate status is derived, so a replaced hyperedge hid the prover's
+/// earlier allocations from both.
+pub fn extend_prover_allocation_hyperedge_blob(
+    existing_blob: &[u8],
+    allocations: &[([u8; 32], &quil_tries::VectorCommitmentTree)],
+) -> Result<Vec<u8>> {
+    use num_bigint::BigInt;
+
+    let mut added = Vec::with_capacity(allocations.len());
+    for (alloc_addr, alloc_tree) in allocations {
+        added.push(allocation_hyperedge_atom(alloc_addr, alloc_tree)?);
+    }
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    if !existing_blob.is_empty() {
+        if let Some(root) = quil_tries::deserialize_go_tree(existing_blob)? {
+            let mut src = quil_tries::VectorCommitmentTree::new();
+            src.root = Some(root);
+            for (key, value) in src.leaves() {
+                if added.iter().any(|(id, _)| id.as_slice() == key.as_slice()) {
+                    continue;
+                }
+                tree.insert(&key, &value, &[], &BigInt::from(value.len() as u64))?;
+            }
+        }
+    }
+    for (atom_id, atom_bytes) in &added {
+        tree.insert(atom_id, atom_bytes, &[], &BigInt::from(atom_bytes.len() as u64))?;
+    }
+    Ok(crate::prover_registry::vertex_tree_to_blob(&tree))
 }
 
 // =====================================================================
@@ -621,14 +1193,14 @@ pub fn create_spent_merge_tree(
 ///
 /// 1. Reads the prover's current Seniority from `prover_tree`.
 /// 2. Adds `merge_seniority` (pre-computed from the merge targets'
-///    Ed448 peer IDs via `compat::GetAggregatedSeniority`).
+/// Ed448 peer IDs via `compat::GetAggregatedSeniority`).
 /// 3. Writes the new Seniority value.
 /// 4. Creates spent-merge marker trees for each merge target.
 ///
 /// The caller is responsible for:
 /// - Computing `merge_seniority` from the merge targets (requires
-///   Ed448 key → peer ID conversion + seniority DB lookup, which are
-///   not available in the pure-data layer).
+/// Ed448 key → peer ID conversion + seniority DB lookup, which are
+/// not available in the pure-data layer).
 /// - Writing the prover tree and spent markers to the CRDT.
 ///
 /// Go equivalent: `ProverSeniorityMerge::Materialize` at
@@ -652,7 +1224,12 @@ pub fn materialize_seniority_merge(
         })
         .unwrap_or(0);
 
-    // Add merge seniority to existing
+    // ADDITIVE by design: the (overlapping-period-max-collapsed) aggregated
+    // seniority of the merge targets is added to the prover's existing score.
+    // The anti-inflation invariant is NOT here — it is the one-shot spent-merge
+    // gate in `verify::verify_prover_seniority_merge_spent_markers`, which rejects
+    // re-use of any already-consumed target (so the same merge can never be
+    // re-applied to add its seniority twice).
     let new_seniority = existing_seniority.saturating_add(merge_seniority);
 
     // Write updated seniority
@@ -679,6 +1256,25 @@ pub struct ShardSplitOutput {
     /// `l2` is the first 32 bytes of the proposed shard address,
     /// `path` is the remaining bytes as `u32` nibble indices.
     pub new_shards: Vec<(Vec<u8>, Vec<u32>)>,
+    /// Deep-bifurcation: the parent shard to REMOVE — it is replaced by
+    /// the complete prefix-free partition (spine siblings + the 2 leaf children) in
+    /// `new_shards`, so keeping it would make the set non-prefix-free. `None` in
+    /// legacy (byte-suffix) mode, which leaves the parent in place.
+    pub removed_parent: Option<(Vec<u8>, Vec<u32>)>,
+}
+
+/// The longest common bit-prefix of a set of bit-paths (the BRANCH point of a
+/// bifurcation = the two children with their differing last bit dropped).
+fn longest_common_bit_prefix(paths: &[Vec<bool>]) -> Vec<bool> {
+    let Some((first, rest)) = paths.split_first() else {
+        return Vec::new();
+    };
+    let mut prefix = first.clone();
+    for p in rest {
+        let n = prefix.iter().zip(p).take_while(|(a, b)| a == b).count();
+        prefix.truncate(n);
+    }
+    prefix
 }
 
 /// Materialize a ShardSplit.
@@ -689,6 +1285,7 @@ pub struct ShardSplitOutput {
 pub fn materialize_shard_split(
     shard_address: &[u8],
     proposed_shards: &[Vec<u8>],
+    bit_path_mode: bool,
 ) -> Result<ShardSplitOutput> {
     if shard_address.len() < 32 {
         return Err(QuilError::InvalidArgument(
@@ -702,25 +1299,125 @@ pub fn materialize_shard_split(
     }
 
     let mut new_shards = Vec::with_capacity(proposed_shards.len());
+    let mut child_bits: Vec<Vec<bool>> = Vec::new();
     for proposed in proposed_shards {
-        if proposed.len() < 32 {
-            return Err(QuilError::InvalidArgument(
-                "materialize shard split: proposed shard must be >= 32 bytes".into(),
-            ));
+        if bit_path_mode {
+            // Deep-bifurcation (post-unified-cutover): each proposed shard is a
+            // bit-path FILTER (`app(32) ‖ bit_len(u16 BE) ‖ packed bits`). The
+            // child must extend the parent's bit-path (a bit-prefix, NOT a byte
+            // prefix), and it is registered as a SENTINEL-tagged `Vec<u32>` prefix
+            // so it rides the existing `ShardInfo.prefix` with no schema change.
+            if !quil_forest::shard_filter_extends(proposed, shard_address, 32) {
+                return Err(QuilError::InvalidArgument(
+                    "materialize shard split: bit-path child must extend parent bit-path".into(),
+                ));
+            }
+            let (l2, bits) = quil_forest::decode_shard_bit_path(proposed, 32).ok_or_else(|| {
+                QuilError::InvalidArgument(
+                    "materialize shard split: malformed bit-path child filter".into(),
+                )
+            })?;
+            child_bits.push(bits.clone());
+            new_shards.push((l2, quil_forest::bit_path_to_prefix(&bits)));
+        } else {
+            if proposed.len() < 32 {
+                return Err(QuilError::InvalidArgument(
+                    "materialize shard split: proposed shard must be >= 32 bytes".into(),
+                ));
+            }
+            // Validate that proposed shard shares the parent prefix
+            if !proposed.starts_with(shard_address) {
+                return Err(QuilError::InvalidArgument(
+                    "materialize shard split: proposed shard must share parent prefix".into(),
+                ));
+            }
+            // Extract L2 (first 32 bytes) and path (remaining bytes as u32 nibble indices)
+            let l2 = proposed[..32].to_vec();
+            let path: Vec<u32> = proposed[32..].iter().map(|&b| b as u32).collect();
+            new_shards.push((l2, path));
         }
-        // Validate that proposed shard shares the parent prefix
-        if !proposed.starts_with(shard_address) {
-            return Err(QuilError::InvalidArgument(
-                "materialize shard split: proposed shard must share parent prefix".into(),
-            ));
-        }
-        // Extract L2 (first 32 bytes) and path (remaining bytes as u32 nibble indices)
-        let l2 = proposed[..32].to_vec();
-        let path: Vec<u32> = proposed[32..].iter().map(|&b| b as u32).collect();
-        new_shards.push((l2, path));
     }
 
-    Ok(ShardSplitOutput { new_shards })
+    // Deep-bifurcation: a split that DESCENDED past uniform bits leaves
+    // the regions between the parent and the branch uncovered. Register the co-path
+    // SPINE (the off-path siblings) as EMPTY latent shards so the set is COMPLETE
+    // and PREFIX-FREE (exact-prefix routing, no fallback, no per-shard overlap),
+    // and REMOVE the parent (it is replaced by the partition). The spine shards
+    // carry no data → excluded from halt-risk / proposal until data lands.
+    let removed_parent = if bit_path_mode {
+        let (app, parent_bits) =
+            quil_forest::decode_shard_filter_or_root(shard_address, 32).ok_or_else(|| {
+                QuilError::InvalidArgument("materialize shard split: bad parent filter".into())
+            })?;
+        let branch = longest_common_bit_prefix(&child_bits);
+        for sib in quil_forest::split_spine_siblings(&parent_bits, &branch) {
+            new_shards.push((app.clone(), quil_forest::bit_path_to_prefix(&sib)));
+        }
+        Some((app, quil_forest::bit_path_to_prefix(&parent_bits)))
+    } else {
+        None
+    };
+
+    Ok(ShardSplitOutput { new_shards, removed_parent })
+}
+
+/// Deep-bifurcation migration (b): convert an app's stored shard rows from
+/// `Vec<u32>` prefixes to SENTINEL-tagged bit-path prefixes, so a subsequent
+/// deep split can register children that EXTEND one of them. Necessary because
+/// `HypergraphCrdt::shard_bit_paths` decodes sentinel prefixes only when an
+/// app's whole set is sentinel (canonical bit-path derivation cannot resolve a
+/// mixed set) — so the first deep split on an app must flip that app's ENTIRE
+/// stored set, atomically, in the same deterministic txn as the split.
+///
+/// ROUTING-PRESERVING: each row is re-stored as
+/// `bit_path_to_prefix(canonical_bit_path)`, and the CRDT decodes that sentinel
+/// prefix back to the IDENTICAL bit-path the canonical fallback derived — so the
+/// migration changes the on-disk encoding without changing which leaf routes to
+/// which shard (a golden-root no-op until a genuinely deep split is added).
+///
+/// Idempotent: an app already all-sentinel (or with no dynamically-stored rows)
+/// is left untouched. Deterministic (pure function of the committed shard set),
+/// so every node produces the identical migrated rows.
+pub fn migrate_app_shards_to_sentinel(
+    store: &dyn quil_types::store::ShardsStore,
+    txn: &dyn quil_types::store::Transaction,
+    grid_key: &[u8],
+) -> Result<()> {
+    let rows: Vec<quil_types::store::ShardInfo> = store
+        .range_app_shards()?
+        .into_iter()
+        .filter(|r| r.shard_key == grid_key)
+        .collect();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    // Already migrated (all sentinel) ⇒ nothing to do. By the atomicity
+    // invariant an app is all-sentinel or all-legacy, never mixed.
+    if rows
+        .iter()
+        .all(|r| quil_forest::shard_bit_path_from_prefix(&r.prefix).is_some())
+    {
+        return Ok(());
+    }
+    let prefixes: Vec<Vec<u32>> = rows.iter().map(|r| r.prefix.clone()).collect();
+    let bit_paths = quil_forest::canonical_shard_bit_paths(&prefixes);
+    tracing::info!(
+        grid_key = hex::encode(grid_key),
+        rows = rows.len(),
+        "deep-bifurcation: migrating app shard set Vec<u32> → sentinel bit-path prefixes (routing-preserving)"
+    );
+    for (row, bits) in rows.iter().zip(bit_paths.iter()) {
+        store.delete_app_shard(txn, &row.shard_key, &row.prefix)?;
+        let migrated = quil_types::store::ShardInfo {
+            shard_key: row.shard_key.clone(),
+            prefix: quil_forest::bit_path_to_prefix(bits),
+            size: row.size.clone(),
+            data_shards: row.data_shards,
+            commitment: row.commitment.clone(),
+        };
+        store.put_app_shard(txn, &migrated)?;
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -731,6 +1428,11 @@ pub fn materialize_shard_split(
 pub struct ShardMergeOutput {
     /// (shard_l2, shard_path) pairs for each sub-shard to remove.
     pub removed_shards: Vec<(Vec<u8>, Vec<u32>)>,
+    /// Deep-bifurcation: the merged parent shard to ADD — merging the
+    /// two sibling children `B‖0`/`B‖1` re-creates the branch `B` as a leaf sitting
+    /// next to the retained spine. `None` in legacy (byte-suffix) mode, where the
+    /// parent is a pre-existing catch-all row that was never removed on split.
+    pub added_parent: Option<(Vec<u8>, Vec<u32>)>,
 }
 
 /// Materialize a ShardMerge.
@@ -741,10 +1443,18 @@ pub struct ShardMergeOutput {
 pub fn materialize_shard_merge(
     shard_addresses: &[Vec<u8>],
     parent_address: &[u8],
+    bit_path_mode: bool,
 ) -> Result<ShardMergeOutput> {
-    if parent_address.len() != 32 {
+    // Parent length must match `verify_shard_merge` (32-63 bytes). The base
+    // app address is 32 bytes; deeper shards append one split byte per level,
+    // so a merge can collapse children at ANY depth back to their immediate
+    // parent — e.g. the genesis QUIL shards live at 33-byte filters
+    // (`quil + 1 byte`), so their split children are 34-byte and merge to a
+    // 33-byte parent. (Previously this was pinned to exactly 32, which made
+    // merges impossible for the real QUIL topology.)
+    if parent_address.len() < 32 || parent_address.len() > 63 {
         return Err(QuilError::InvalidArgument(
-            "materialize shard merge: parent_address must be 32 bytes".into(),
+            "materialize shard merge: parent_address must be 32-63 bytes".into(),
         ));
     }
     if shard_addresses.len() < 2 {
@@ -755,23 +1465,55 @@ pub fn materialize_shard_merge(
 
     let mut removed_shards = Vec::with_capacity(shard_addresses.len());
     for addr in shard_addresses {
-        if addr.len() <= 32 {
-            return Err(QuilError::InvalidArgument(
-                "materialize shard merge: cannot merge base shards (must be > 32 bytes)".into(),
-            ));
+        if bit_path_mode {
+            // Deep-bifurcation (parity with `materialize_shard_split`): each merged
+            // child is a bit-path FILTER extending the parent; remove it by its
+            // SENTINEL-tagged prefix (matching how the split registered it).
+            if !quil_forest::shard_filter_extends(addr, parent_address, 32) {
+                return Err(QuilError::InvalidArgument(
+                    "materialize shard merge: bit-path child must extend parent bit-path".into(),
+                ));
+            }
+            let (l2, bits) = quil_forest::decode_shard_bit_path(addr, 32).ok_or_else(|| {
+                QuilError::InvalidArgument(
+                    "materialize shard merge: malformed bit-path child filter".into(),
+                )
+            })?;
+            removed_shards.push((l2, quil_forest::bit_path_to_prefix(&bits)));
+        } else {
+            // Each child is the parent plus one (factor 2/4) or two (factor 8)
+            // split bytes — same rule `verify_shard_merge` enforces.
+            if addr.len() != parent_address.len() + 1 && addr.len() != parent_address.len() + 2 {
+                return Err(QuilError::InvalidArgument(
+                    "materialize shard merge: child shard must be parent length + 1 or + 2 bytes"
+                        .into(),
+                ));
+            }
+            // Validate that all shards share the parent prefix
+            if !addr.starts_with(parent_address) {
+                return Err(QuilError::InvalidArgument(
+                    "materialize shard merge: shard must share parent address prefix".into(),
+                ));
+            }
+            let l2 = addr[..32].to_vec();
+            let path: Vec<u32> = addr[32..].iter().map(|&b| b as u32).collect();
+            removed_shards.push((l2, path));
         }
-        // Validate that all shards share the parent prefix
-        if !addr.starts_with(parent_address) {
-            return Err(QuilError::InvalidArgument(
-                "materialize shard merge: shard must share parent address prefix".into(),
-            ));
-        }
-        let l2 = addr[..32].to_vec();
-        let path: Vec<u32> = addr[32..].iter().map(|&b| b as u32).collect();
-        removed_shards.push((l2, path));
     }
 
-    Ok(ShardMergeOutput { removed_shards })
+    // Deep-bifurcation: re-create the merged parent (branch) as a leaf.
+    // The prefix-free spine is preserved; only the sibling pair collapses into `B`.
+    let added_parent = if bit_path_mode {
+        let (app, parent_bits) = quil_forest::decode_shard_filter_or_root(parent_address, 32)
+            .ok_or_else(|| {
+                QuilError::InvalidArgument("materialize shard merge: bad parent filter".into())
+            })?;
+        Some((app, quil_forest::bit_path_to_prefix(&parent_bits)))
+    } else {
+        None
+    };
+
+    Ok(ShardMergeOutput { removed_shards, added_parent })
 }
 
 // =====================================================================
@@ -785,11 +1527,11 @@ pub fn materialize_shard_merge(
 /// each participating prover on the shard:
 ///
 /// 1. **Reward distribution**: calculates the per-ring reward share
-///    based on difficulty, world size, and prover ring assignment, then
-///    adds it to the prover's reward balance.
+/// based on difficulty, world size, and prover ring assignment, then
+/// adds it to the prover's reward balance.
 ///
 /// 2. **Activity tracking**: updates the allocation's
-///    `LastActiveFrameNumber` to the current frame number.
+/// `LastActiveFrameNumber` to the current frame number.
 ///
 /// Both require runtime dependencies (prover registry, frame prover
 /// for BLS signature verification, reward issuance calculator,
@@ -831,7 +1573,116 @@ pub const REWARD_UNITS: u64 = 8_000_000_000;
 mod tests {
     use super::*;
     use num_bigint::BigInt;
-    use crate::global_schema::{write_type, TYPE_HASH_ALLOCATION};
+    use crate::global_schema::{write_type, read_type, TYPE_HASH_ALLOCATION};
+
+    #[test]
+    fn three_slot_registration_keeps_highest_three_and_lookup_matches_by_epoch() {
+        let member = [0x5Au8; 32];
+        let filter = vec![0x44u8; 32];
+        let prefix: Vec<u32> = vec![3, 9];
+        let mk = |existing: Option<&quil_tries::VectorCommitmentTree>, epoch: u64, lr: u8| {
+            upsert_leaf_root_registration(
+                existing, &member, &filter, &prefix, epoch, &vec![lr; 74], (epoch * 10) + 1, 1000,
+            )
+            .unwrap()
+        };
+
+        // First confirm (epoch 5) → single slot.
+        let t1 = mk(None, 5, 0x05);
+        assert_eq!(read_u64_field(&t1, "leafroot:LeafRootRegistration", "Epoch"), Some(5));
+        assert_eq!(read_u64_field(&t1, "leafroot:LeafRootRegistration", "NextEpoch"), None);
+        assert_eq!(
+            leaf_root_registration_for_epoch(&t1, 5),
+            Some((vec![0x05u8; 74], 51)),
+        );
+
+        // Pre-register the next epoch (6) → {current=5, next=6}, epoch-sorted.
+        let t2 = mk(Some(&t1), 6, 0x06);
+        assert_eq!(read_u64_field(&t2, "leafroot:LeafRootRegistration", "Epoch"), Some(5));
+        assert_eq!(read_u64_field(&t2, "leafroot:LeafRootRegistration", "NextEpoch"), Some(6));
+        // Audit can match EITHER slot by epoch.
+        assert_eq!(leaf_root_registration_for_epoch(&t2, 5), Some((vec![0x05u8; 74], 51)));
+        assert_eq!(leaf_root_registration_for_epoch(&t2, 6), Some((vec![0x06u8; 74], 61)));
+        assert_eq!(leaf_root_registration_for_epoch(&t2, 4), None);
+
+        // Roll forward to epoch 7 → keeps {5,6,7}: prev=5, current=6, next=7.
+        // The previous epoch (5) is RETAINED (three-slot) so the anchor-lagged
+        // audit can still find it just after the boundary.
+        let t3 = mk(Some(&t2), 7, 0x07);
+        assert_eq!(read_u64_field(&t3, "leafroot:LeafRootRegistration", "PrevEpoch"), Some(5));
+        assert_eq!(read_u64_field(&t3, "leafroot:LeafRootRegistration", "Epoch"), Some(6));
+        assert_eq!(read_u64_field(&t3, "leafroot:LeafRootRegistration", "NextEpoch"), Some(7));
+        assert_eq!(
+            leaf_root_registration_for_epoch(&t3, 5),
+            Some((vec![0x05u8; 74], 51)),
+            "previous epoch retained for the anchor-lagged audit window",
+        );
+        assert_eq!(leaf_root_registration_for_epoch(&t3, 6), Some((vec![0x06u8; 74], 61)));
+        assert_eq!(leaf_root_registration_for_epoch(&t3, 7), Some((vec![0x07u8; 74], 71)));
+
+        // Roll forward to epoch 8 → NOW the oldest (5) drops, keeps {6,7,8}.
+        // By this point (two epochs later) the audit anchor is well past epoch 5.
+        let t4 = mk(Some(&t3), 8, 0x08);
+        assert_eq!(read_u64_field(&t4, "leafroot:LeafRootRegistration", "PrevEpoch"), Some(6));
+        assert_eq!(read_u64_field(&t4, "leafroot:LeafRootRegistration", "Epoch"), Some(7));
+        assert_eq!(read_u64_field(&t4, "leafroot:LeafRootRegistration", "NextEpoch"), Some(8));
+        assert_eq!(leaf_root_registration_for_epoch(&t4, 5), None, "two-epochs-old slot dropped");
+        assert_eq!(leaf_root_registration_for_epoch(&t4, 8), Some((vec![0x08u8; 74], 81)));
+
+        // Same-epoch re-register overwrites that slot's value (still three slots).
+        let t5 = mk(Some(&t4), 8, 0xF8);
+        assert_eq!(leaf_root_registration_for_epoch(&t5, 8), Some((vec![0xF8u8; 74], 81)));
+        assert_eq!(read_u64_field(&t5, "leafroot:LeafRootRegistration", "Epoch"), Some(7));
+    }
+
+    #[test]
+    fn leaf_root_registration_vertex_round_trips_and_rekeys() {
+        let member = [0x7Au8; 32];
+        let reg = super::super::LeafRootRegistration {
+            shard_filter: vec![0xAB; 32],
+            prefix: vec![42, 7, 255],
+            epoch: 19,
+            leaf_root: vec![0x11; 74],
+            num_blocks: 1234,
+            frame_number: 900_000,
+            public_key_signature_bls48581: None,
+        };
+        let out = materialize_leaf_root_registration(&member, &reg).unwrap();
+
+        // The vertex's type hash resolves to the new class.
+        assert_eq!(read_type(&out.tree), Some("leafroot:LeafRootRegistration"));
+
+        // Every stored field reads back, and the (member, leaf_id, epoch) key is
+        // reconstructable from the vertex alone — exactly what the registry does.
+        let cls = "leafroot:LeafRootRegistration";
+        let r_member = read_field(&out.tree, cls, "Member").unwrap();
+        let r_filter = read_field(&out.tree, cls, "ShardFilter").unwrap();
+        let r_prefix = unpack_prefix(&read_field(&out.tree, cls, "Prefix").unwrap());
+        let r_epoch = u64::from_be_bytes(
+            read_field(&out.tree, cls, "Epoch").unwrap().try_into().unwrap(),
+        );
+        let r_leaf_root = read_field(&out.tree, cls, "LeafRoot").unwrap();
+        let r_num_blocks = u64::from_be_bytes(
+            read_field(&out.tree, cls, "NumBlocks").unwrap().try_into().unwrap(),
+        );
+        assert_eq!(r_member, member.to_vec());
+        assert_eq!(r_filter, reg.shard_filter);
+        assert_eq!(r_prefix, reg.prefix);
+        assert_eq!(r_epoch, reg.epoch);
+        assert_eq!(r_leaf_root, reg.leaf_root);
+        assert_eq!(r_num_blocks, reg.num_blocks);
+
+        // Reconstructed address matches the materialized one (epoch-independent:
+        // re-registration overwrites in place).
+        let leaf_id = super::super::leaf_id_bytes(&r_filter, &r_prefix);
+        assert_eq!(leaf_root_address(&r_member, &leaf_id).unwrap(), out.address);
+        // A later-epoch registration of the same leaf hits the SAME address.
+        let mut reg2 = reg.clone();
+        reg2.epoch = r_epoch + 1;
+        reg2.leaf_root = vec![0x22; 74];
+        let out2 = materialize_leaf_root_registration(&member, &reg2).unwrap();
+        assert_eq!(out2.address, out.address, "re-registration must overwrite in place");
+    }
 
     fn make_allocation_tree(status: u8) -> quil_tries::VectorCommitmentTree {
         let mut tree = quil_tries::VectorCommitmentTree::new();
@@ -1071,6 +1922,30 @@ mod tests {
     }
 
     #[test]
+    fn materialize_prover_join_sentinel_filter_lands() {
+        // DIAGNOSTIC (post-v5 "no joins landed"): a re-join to a SENTINEL grid
+        // shard (35-byte `app‖bit_len‖packed` filter) must materialize into an
+        // allocation carrying that exact filter — the same path a wiped prover
+        // takes to refill the 64-way sentinel grid. If this rejects/mangles the
+        // sentinel filter, no re-join can land.
+        let quil = [0x11u8; 32];
+        let sentinel = quil_forest::shard_prefix_to_filter(
+            &quil,
+            &quil_forest::genesis_grid_prefixes(0)[5],
+        );
+        assert_eq!(sentinel.len(), 35, "genesis sentinel filter is 35B");
+        let pk = vec![0xCDu8; 585];
+        let output = materialize_prover_join(&pk, &[sentinel.clone()], 100, 0).unwrap();
+        assert_eq!(output.allocations.len(), 1, "one allocation created");
+        let (_addr, tree) = &output.allocations[0];
+        assert_eq!(
+            read_field(tree, "allocation:ProverAllocation", "ConfirmationFilter").unwrap(),
+            sentinel,
+            "allocation must carry the exact 35B sentinel filter it joined"
+        );
+    }
+
+    #[test]
     fn materialize_prover_join_with_seniority() {
         let pk = vec![0xBBu8; 585];
         let output = materialize_prover_join(&pk, &[vec![0x01u8; 32]], 10, 999).unwrap();
@@ -1143,17 +2018,38 @@ mod tests {
     }
 
     #[test]
-    fn confirm_leave_sets_left_and_frame_number() {
+    fn confirm_leave_keeps_leaving_byte_and_records_confirm_frame() {
+        // Epoch-aligned: leave-confirm keeps the Leaving byte (serving notice);
+        // departure is derived at the E+2 boundary by `effective_status`.
         let mut tree = make_allocation_tree(STATUS_LEAVING);
         materialize_prover_confirm(&mut tree, 500).unwrap();
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_KICKED]); // 4 = left
+        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_LEAVING]);
         assert_eq!(read_field(&tree, "allocation:ProverAllocation", "LeaveConfirmFrameNumber").unwrap(), 500u64.to_be_bytes().to_vec());
     }
 
     #[test]
-    fn confirm_rejects_active_status() {
+    fn confirm_active_renews_storage_epoch_and_stays_active() {
+        // PoRep epoch re-confirm: an Active allocation re-confirming renews its
+        // storage Epoch (registers the NEXT epoch = epoch_for_frame(frame)+1) +
+        // LastActiveFrameNumber and stays Active. This is the close-the-loop for
+        // ExpiredEpoch — without it a stale-epoch allocation could never return.
         let mut tree = make_allocation_tree(STATUS_ACTIVE);
-        assert!(materialize_prover_confirm(&mut tree, 400).is_err());
+        let frame = 5 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10; // epoch 5
+        materialize_prover_confirm(&mut tree, frame).unwrap();
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_ACTIVE],
+            "re-confirm must keep the allocation Active",
+        );
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Epoch").unwrap(),
+            (quil_types::consensus::epoch_for_frame(frame) + 1).to_be_bytes().to_vec(),
+            "re-confirm must register the next storage epoch (one ahead)",
+        );
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "LastActiveFrameNumber").unwrap(),
+            frame.to_be_bytes().to_vec(),
+        );
     }
 
     #[test]
@@ -1189,6 +2085,100 @@ mod tests {
         assert!(materialize_prover_reject(&mut tree, 450).is_err());
     }
 
+    // ---- Epoch invariants --------------------------------------------------
+
+    /// Reject-leave restores Active but MUST NOT bump `Epoch` — the prover
+    /// submitted no fresh leaf roots, so re-registering it for a new epoch
+    /// would claim a two-slot registration that doesn't exist ("leave-reject
+    /// inconsistency class", materialize.rs comment). Load-bearing invariant.
+    #[test]
+    fn reject_leave_does_not_bump_epoch() {
+        let mut tree = make_allocation_tree(STATUS_LEAVING);
+        // Pre-existing epoch registration the prover already held.
+        write_field(&mut tree, "allocation:ProverAllocation", "Epoch", &7u64.to_be_bytes()).unwrap();
+        // Reject at a frame several epochs later.
+        let frame = 9 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 3;
+        materialize_prover_reject(&mut tree, frame).unwrap();
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_ACTIVE]
+        );
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Epoch").unwrap(),
+            7u64.to_be_bytes().to_vec(),
+            "reject-leave must leave Epoch untouched (no fresh leaf-root registration)"
+        );
+    }
+
+    /// Confirm-JOIN registers the next storage epoch (`epoch_for_frame(frame)+1`)
+    /// — the deferred-activation read-side reads ActivationEpoch off this field,
+    /// so the write that sets it must be pinned (previously only the Active
+    /// re-confirm path asserted it).
+    #[test]
+    fn confirm_join_registers_next_epoch() {
+        let mut tree = make_allocation_tree(STATUS_JOINING);
+        let frame = 3 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 5; // epoch 3
+        materialize_prover_confirm(&mut tree, frame).unwrap();
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Epoch").unwrap(),
+            4u64.to_be_bytes().to_vec(),
+            "confirm-join registers epoch_for_frame(frame)+1 = 4"
+        );
+    }
+
+    /// A second confirm on a freshly-confirmed join takes the Active re-confirm
+    /// branch: it renews Epoch + LastActive but must NOT move JoinConfirmFrameNumber
+    /// (the activation epoch is anchored to the FIRST confirm).
+    #[test]
+    fn double_confirm_join_keeps_activation_anchor() {
+        let mut tree = make_allocation_tree(STATUS_JOINING);
+        let f1 = 3 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 5;
+        let f2 = 4 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 5;
+        materialize_prover_confirm(&mut tree, f1).unwrap();
+        materialize_prover_confirm(&mut tree, f2).unwrap();
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "JoinConfirmFrameNumber").unwrap(),
+            f1.to_be_bytes().to_vec(),
+            "second confirm must not move the activation anchor"
+        );
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Epoch").unwrap(),
+            (quil_types::consensus::epoch_for_frame(f2) + 1).to_be_bytes().to_vec(),
+            "second confirm renews the storage epoch"
+        );
+    }
+
+    /// Confirm/reject on a terminal (byte-4) allocation hit the error arm —
+    /// previously only PAUSED was tested for confirm and ACTIVE for reject.
+    #[test]
+    fn confirm_and_reject_reject_terminal_status() {
+        let mut t1 = make_allocation_tree(STATUS_KICKED);
+        assert!(materialize_prover_confirm(&mut t1, 400).is_err(), "confirm on byte-4 rejected");
+        let mut t2 = make_allocation_tree(STATUS_KICKED);
+        assert!(materialize_prover_reject(&mut t2, 400).is_err(), "reject on byte-4 rejected");
+    }
+
+    /// Kick and reject-join BOTH write status byte 4 (intended overload); they
+    /// are disambiguated only by which frame field is stamped — kick sets
+    /// `KickFrameNumber`, reject-join sets `JoinRejectFrameNumber`. Pins the
+    /// contract `effective_status` + the eviction path rely on.
+    #[test]
+    fn kick_and_reject_join_share_byte4_disambiguated_by_frame_field() {
+        let cls = "allocation:ProverAllocation";
+        // Kick: byte 4 + KickFrameNumber, no JoinRejectFrameNumber.
+        let mut k = make_allocation_tree(STATUS_ACTIVE);
+        materialize_prover_kick_allocation(&mut k, 999).unwrap();
+        assert_eq!(read_field(&k, cls, "Status").unwrap(), vec![STATUS_KICKED]);
+        assert_eq!(read_field(&k, cls, "KickFrameNumber").unwrap(), 999u64.to_be_bytes().to_vec());
+        assert!(read_field(&k, cls, "JoinRejectFrameNumber").is_none(), "kick stamps no JoinRejectFrameNumber");
+        // Reject-join: byte 4 + JoinRejectFrameNumber, no KickFrameNumber.
+        let mut r = make_allocation_tree(STATUS_JOINING);
+        materialize_prover_reject(&mut r, 999).unwrap();
+        assert_eq!(read_field(&r, cls, "Status").unwrap(), vec![STATUS_KICKED]);
+        assert_eq!(read_field(&r, cls, "JoinRejectFrameNumber").unwrap(), 999u64.to_be_bytes().to_vec());
+        assert!(read_field(&r, cls, "KickFrameNumber").is_none(), "reject-join stamps no KickFrameNumber");
+    }
+
     // -----------------------------------------------------------------
     // Full lifecycle: join → confirm → pause → leave → confirm leave
     // -----------------------------------------------------------------
@@ -1218,9 +2208,10 @@ mod tests {
         materialize_prover_leave(&mut alloc, 700).unwrap();
         assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_LEAVING]);
 
-        // Confirm leave → left
+        // Confirm leave → keeps Leaving byte (departs at E+2 via read-side)
         materialize_prover_confirm(&mut alloc, 1060).unwrap();
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_KICKED]);
+        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_LEAVING]);
+        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "LeaveConfirmFrameNumber").unwrap(), 1060u64.to_be_bytes().to_vec());
     }
 
     #[test]
@@ -1513,7 +2504,8 @@ mod tests {
         let mut child2 = parent.clone();
         child2.push(0x02);
 
-        let output = materialize_shard_split(&parent, &[child1.clone(), child2.clone()]).unwrap();
+        let output =
+            materialize_shard_split(&parent, &[child1.clone(), child2.clone()], false).unwrap();
         assert_eq!(output.new_shards.len(), 2);
         assert_eq!(output.new_shards[0].0, parent); // L2 = first 32 bytes
         assert_eq!(output.new_shards[0].1, vec![0x01u32]); // path = remaining
@@ -1522,7 +2514,7 @@ mod tests {
 
     #[test]
     fn shard_split_rejects_short_parent() {
-        assert!(materialize_shard_split(&vec![0xAAu8; 31], &[]).is_err());
+        assert!(materialize_shard_split(&vec![0xAAu8; 31], &[], false).is_err());
     }
 
     #[test]
@@ -1530,7 +2522,7 @@ mod tests {
         let parent = vec![0xAAu8; 32];
         let mut child = parent.clone();
         child.push(0x01);
-        assert!(materialize_shard_split(&parent, &[child]).is_err());
+        assert!(materialize_shard_split(&parent, &[child], false).is_err());
     }
 
     #[test]
@@ -1540,7 +2532,130 @@ mod tests {
         bad_child.push(0x01);
         let mut good_child = parent.clone();
         good_child.push(0x02);
-        assert!(materialize_shard_split(&parent, &[good_child, bad_child]).is_err());
+        assert!(materialize_shard_split(&parent, &[good_child, bad_child], false).is_err());
+    }
+
+    /// Deep-bifurcation (bit_path_mode): the 2 bit-path child FILTERS
+    /// are registered as SENTINEL prefixes AND the co-path SPINE (off-path siblings
+    /// from parent to branch) is registered as empty latent shards, so the set is
+    /// complete + prefix-free; the parent is removed. A child that does NOT extend
+    /// the parent bit-path is rejected.
+    #[test]
+    fn shard_split_bit_path_mode_decodes_and_registers_sentinel() {
+        use quil_forest::{bit_path_to_prefix, encode_shard_bit_path};
+        let app = [0xAAu8; 32];
+        // Parent = the root (empty bit-path); data diverges at bit 3 → branch
+        // [0,0,0], children [0,0,0,0]/[0,0,0,1], spine [1]/[0,1]/[0,0,1].
+        let parent = encode_shard_bit_path(&app, &[]);
+        let c0 = encode_shard_bit_path(&app, &[false, false, false, false]);
+        let c1 = encode_shard_bit_path(&app, &[false, false, false, true]);
+
+        let output = materialize_shard_split(&parent, &[c0, c1], true).unwrap();
+        // 2 leaves + 3 spine siblings.
+        let prefixes: std::collections::HashSet<Vec<u32>> =
+            output.new_shards.iter().map(|(_, p)| p.clone()).collect();
+        assert_eq!(output.new_shards.len(), 5);
+        assert!(output.new_shards.iter().all(|(l2, _)| l2 == &app.to_vec()));
+        for bits in [
+            vec![false, false, false, false], // leaf [0,0,0,0]
+            vec![false, false, false, true],  // leaf [0,0,0,1]
+            vec![true],                       // spine [1]
+            vec![false, true],                // spine [0,1]
+            vec![false, false, true],         // spine [0,0,1]
+        ] {
+            assert!(prefixes.contains(&bit_path_to_prefix(&bits)), "missing {bits:?}");
+        }
+        // The parent (root) is removed → replaced by the partition.
+        assert_eq!(output.removed_parent, Some((app.to_vec(), bit_path_to_prefix(&[]))));
+
+        // A child under a DIFFERENT app (does not extend the parent) is rejected.
+        let other = encode_shard_bit_path(&[0xBBu8; 32], &[false]);
+        let good = encode_shard_bit_path(&app, &[true]);
+        assert!(materialize_shard_split(&parent, &[good, other], true).is_err());
+    }
+
+    /// Deep-bifurcation migration (b): `migrate_app_shards_to_sentinel` rewrites
+    /// an app's `Vec<u32>` prefix rows to SENTINEL bit-path prefixes that decode
+    /// back to the IDENTICAL canonical bit-path (routing-preserving), is
+    /// idempotent on a second run, and never touches OTHER apps.
+    #[test]
+    fn migrate_app_shards_to_sentinel_routing_preserving_and_idempotent() {
+        use crate::testing::NoopTxn;
+        use quil_types::store::{ShardInfo, ShardsStore, Transaction};
+        use std::sync::Mutex;
+
+        struct MemShards(Mutex<Vec<ShardInfo>>);
+        impl ShardsStore for MemShards {
+            fn range_app_shards(&self) -> Result<Vec<ShardInfo>> {
+                Ok(self.0.lock().unwrap().clone())
+            }
+            fn get_app_shards(&self, _k: &[u8], _p: &[u32]) -> Result<Vec<ShardInfo>> {
+                Ok(Vec::new())
+            }
+            fn put_app_shard(&self, _t: &dyn Transaction, s: &ShardInfo) -> Result<()> {
+                let mut v = self.0.lock().unwrap();
+                v.retain(|r| !(r.shard_key == s.shard_key && r.prefix == s.prefix));
+                v.push(s.clone());
+                Ok(())
+            }
+            fn delete_app_shard(&self, _t: &dyn Transaction, k: &[u8], p: &[u32]) -> Result<()> {
+                self.0.lock().unwrap().retain(|r| !(r.shard_key == k && r.prefix == p));
+                Ok(())
+            }
+        }
+
+        let row = |key: u8, prefix: Vec<u32>| ShardInfo {
+            shard_key: vec![key; 35],
+            prefix,
+            size: Vec::new(),
+            data_shards: 0,
+            commitment: Vec::new(),
+        };
+        // App A: a factor-2 split ({[0],[1]}); App B (different key): left alone.
+        let store = MemShards(Mutex::new(vec![
+            row(0xAA, vec![0]),
+            row(0xAA, vec![1]),
+            row(0xBB, vec![0]),
+            row(0xBB, vec![1]),
+        ]));
+        let grid_a = vec![0xAAu8; 35];
+
+        // Canonical bit-paths for A's set BEFORE migration = the routing to preserve.
+        let before = quil_forest::canonical_shard_bit_paths(&[vec![0], vec![1]]);
+
+        let txn = NoopTxn;
+        migrate_app_shards_to_sentinel(&store, &txn, &grid_a).unwrap();
+
+        let rows = store.range_app_shards().unwrap();
+        // App A rows are now ALL sentinel and decode to the SAME canonical paths.
+        let mut a_paths: Vec<Vec<bool>> = rows
+            .iter()
+            .filter(|r| r.shard_key == grid_a)
+            .map(|r| quil_forest::shard_bit_path_from_prefix(&r.prefix).expect("A row is sentinel"))
+            .collect();
+        a_paths.sort();
+        let mut want = before.clone();
+        want.sort();
+        assert_eq!(a_paths, want, "migration is routing-preserving");
+        // App B untouched (still legacy Vec<u32>).
+        for r in rows.iter().filter(|r| r.shard_key == vec![0xBBu8; 35]) {
+            assert!(
+                quil_forest::shard_bit_path_from_prefix(&r.prefix).is_none(),
+                "other apps are not migrated"
+            );
+        }
+
+        // Idempotent: a second run is a no-op (already all-sentinel).
+        let snapshot = store.range_app_shards().unwrap();
+        migrate_app_shards_to_sentinel(&store, &txn, &grid_a).unwrap();
+        let after = store.range_app_shards().unwrap();
+        let key = |v: &[ShardInfo]| {
+            let mut k: Vec<(Vec<u8>, Vec<u32>)> =
+                v.iter().map(|r| (r.shard_key.clone(), r.prefix.clone())).collect();
+            k.sort();
+            k
+        };
+        assert_eq!(key(&snapshot), key(&after), "second run is idempotent");
     }
 
     // -----------------------------------------------------------------
@@ -1555,7 +2670,7 @@ mod tests {
         let mut child2 = parent.clone();
         child2.push(0x02);
 
-        let output = materialize_shard_merge(&[child1, child2], &parent).unwrap();
+        let output = materialize_shard_merge(&[child1, child2], &parent, false).unwrap();
         assert_eq!(output.removed_shards.len(), 2);
         assert_eq!(output.removed_shards[0].0, parent);
         assert_eq!(output.removed_shards[0].1, vec![0x01u32]);
@@ -1563,11 +2678,28 @@ mod tests {
     }
 
     #[test]
+    fn shard_merge_accepts_deeper_parent() {
+        // QUIL topology: genesis shards are 33-byte filters, so their split
+        // children are 34 bytes and merge back to a 33-byte parent.
+        let mut parent = vec![0xAAu8; 32];
+        parent.push(0x05);
+        let mut c0 = parent.clone();
+        c0.push(0x00);
+        let mut c1 = parent.clone();
+        c1.push(0x80);
+        let output = materialize_shard_merge(&[c0, c1], &parent, false).unwrap();
+        assert_eq!(output.removed_shards.len(), 2);
+        assert_eq!(output.removed_shards[0].0, vec![0xAAu8; 32]); // L2
+        assert_eq!(output.removed_shards[0].1, vec![0x05u32, 0x00u32]); // path
+        assert_eq!(output.removed_shards[1].1, vec![0x05u32, 0x80u32]);
+    }
+
+    #[test]
     fn shard_merge_rejects_wrong_parent_length() {
         let parent = vec![0xAAu8; 31]; // too short
         let mut child = vec![0xAAu8; 32];
         child.push(0x01);
-        assert!(materialize_shard_merge(&[child.clone(), child], &parent).is_err());
+        assert!(materialize_shard_merge(&[child.clone(), child], &parent, false).is_err());
     }
 
     #[test]
@@ -1576,7 +2708,7 @@ mod tests {
         let base_shard = vec![0xAAu8; 32]; // exactly 32 bytes = base shard
         let mut child = parent.clone();
         child.push(0x01);
-        assert!(materialize_shard_merge(&[base_shard, child], &parent).is_err());
+        assert!(materialize_shard_merge(&[base_shard, child], &parent, false).is_err());
     }
 
     #[test]
@@ -1586,7 +2718,7 @@ mod tests {
         bad_child.push(0x01);
         let mut good_child = parent.clone();
         good_child.push(0x02);
-        assert!(materialize_shard_merge(&[good_child, bad_child], &parent).is_err());
+        assert!(materialize_shard_merge(&[good_child, bad_child], &parent, false).is_err());
     }
 
     #[test]
@@ -1594,7 +2726,37 @@ mod tests {
         let parent = vec![0xAAu8; 32];
         let mut child = parent.clone();
         child.push(0x01);
-        assert!(materialize_shard_merge(&[child], &parent).is_err());
+        assert!(materialize_shard_merge(&[child], &parent, false).is_err());
+    }
+
+    /// Deep-bifurcation (bit_path_mode): merged children are bit-path FILTERS
+    /// extending the parent; each is removed by its SENTINEL prefix (the inverse
+    /// of the split registration). A child that doesn't extend the parent is
+    /// rejected. Parity with `shard_split_bit_path_mode_decodes_and_registers_sentinel`.
+    #[test]
+    fn shard_merge_bit_path_mode_decodes_and_removes_sentinel() {
+        use quil_forest::{bit_path_to_prefix, encode_shard_bit_path};
+        let app = [0xAAu8; 32];
+        // Merge the two deep children back into their parent branch [0,0,0].
+        let parent = encode_shard_bit_path(&app, &[false, false, false]);
+        let c0 = encode_shard_bit_path(&app, &[false, false, false, false]);
+        let c1 = encode_shard_bit_path(&app, &[false, false, false, true]);
+
+        let output = materialize_shard_merge(&[c0, c1], &parent, true).unwrap();
+        assert_eq!(output.removed_shards.len(), 2);
+        assert_eq!(output.removed_shards[0].0, app.to_vec());
+        assert_eq!(output.removed_shards[0].1, bit_path_to_prefix(&[false, false, false, false]));
+        assert_eq!(output.removed_shards[1].1, bit_path_to_prefix(&[false, false, false, true]));
+        // The merged parent (branch [0,0,0]) is re-registered as a leaf.
+        assert_eq!(
+            output.added_parent,
+            Some((app.to_vec(), bit_path_to_prefix(&[false, false, false])))
+        );
+
+        // A child under a DIFFERENT app (does not extend the parent) is rejected.
+        let other = encode_shard_bit_path(&[0xBBu8; 32], &[false, false, false, false]);
+        let good = encode_shard_bit_path(&app, &[false, false, false, true]);
+        assert!(materialize_shard_merge(&[good, other], &parent, true).is_err());
     }
 
     // -----------------------------------------------------------------

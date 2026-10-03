@@ -91,7 +91,7 @@ pub fn process_memory() -> Option<ProcessMemory> {
 
 #[cfg(target_os = "linux")]
 fn parse_kb(line: &str) -> Option<u64> {
-    // "  123456 kB"
+    // " 123456 kB"
     let trimmed = line.trim();
     let num: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
     num.parse().ok()
@@ -154,6 +154,215 @@ fn mach_rss_bytes() -> Option<u64> {
 /// Pretty-print bytes as MB (rounded to 0.1).
 pub fn fmt_mb(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// jemalloc allocator stats (process-global — covers the master, every
+/// worker thread, AND the C++ RocksDB allocations, since jemalloc overrides
+/// `malloc` process-wide). This is the decisive OOM signal:
+///
+/// - `allocated` rising over time → a TRUE live-heap leak (find it with
+/// `MALLOC_CONF=prof:true` + `jeprof`, or the SIGUSR1 dump).
+/// - `allocated` flat but `resident`/`retained` high → allocator
+/// fragmentation / retained pages, NOT a leak (tune, don't chase).
+/// - `resident − allocated` is the overhead jemalloc holds beyond live data.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JemallocStats {
+    /// Bytes of live application data (the true heap working set).
+    pub allocated: u64,
+    /// Bytes in active pages (≥ allocated; includes per-size-class slack).
+    pub active: u64,
+    /// Bytes physically resident (≈ the allocator's contribution to RSS).
+    pub resident: u64,
+    /// Bytes mapped but not yet returned to the OS (fragmentation pool).
+    pub retained: u64,
+    /// Bytes in the address space mapping.
+    pub mapped: u64,
+}
+
+/// Sample jemalloc's live statistics. Advances the stats epoch first (jemalloc
+/// caches stats and only refreshes them on epoch advance). Returns `None` if
+/// the allocator isn't jemalloc (e.g. an MSVC build) or a read fails.
+#[cfg(not(target_env = "msvc"))]
+pub fn jemalloc_stats() -> Option<JemallocStats> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    // Refresh the cached statistics.
+    epoch::advance().ok()?;
+    Some(JemallocStats {
+        allocated: stats::allocated::read().ok()? as u64,
+        active: stats::active::read().ok()? as u64,
+        resident: stats::resident::read().ok()? as u64,
+        retained: stats::retained::read().ok()? as u64,
+        mapped: stats::mapped::read().ok()? as u64,
+    })
+}
+
+#[cfg(target_env = "msvc")]
+pub fn jemalloc_stats() -> Option<JemallocStats> {
+    None
+}
+
+/// Per-size-class live-byte breakdown from jemalloc — localizes a leak BY
+/// ALLOCATION SIZE without a heap profiler. jemalloc buckets every allocation
+/// into a size class (small "bins" + "large extents"); `curregs`/`curlextents`
+/// is how many are live right now. The class holding the most live bytes is
+/// where the memory is going:
+/// - dominant SMALL class (e.g. 48B, 4KiB) → many tiny objects leaking
+/// (a HashMap/Vec/Box accumulating entries).
+/// - dominant LARGE/huge class (e.g. 1MiB, 16MiB) → a few big buffers
+/// leaking (trees, replicas, messages, decoded frames).
+/// Cross-reference the size against suspect allocations to pin the source.
+#[derive(Debug, Clone, Default)]
+pub struct JemallocBreakdown {
+    /// Live bytes in small (bin) size classes, merged across arenas.
+    pub small_bytes: u64,
+    /// Live bytes in large size classes, merged across arenas.
+    pub large_bytes: u64,
+    /// Top size classes by live bytes: `(size_class_bytes, live_bytes, count)`.
+    pub top: Vec<(u64, u64, u64)>,
+}
+
+#[cfg(not(target_env = "msvc"))]
+pub fn jemalloc_size_classes() -> JemallocBreakdown {
+    use tikv_jemalloc_ctl::{epoch, raw};
+    // jemalloc's "merged across all arenas" stats index (MALLCTL_ARENAS_ALL).
+    const MERGED: usize = 4096;
+    // SAFETY: every `raw::read` names a real mallctl with the matching C type
+    // (`unsigned`→u32 counts, `size_t`→usize sizes/regions). Errors are mapped
+    // to defaults so a missing name never panics. Requires the `stats` feature.
+    unsafe fn rd_usize(name: String) -> usize {
+        raw::read::<usize>(name.as_bytes()).unwrap_or(0)
+    }
+    let mut out = JemallocBreakdown::default();
+    if epoch::advance().is_err() {
+        return out;
+    }
+    unsafe {
+        out.small_bytes =
+            rd_usize(format!("stats.arenas.{MERGED}.small.allocated\0")) as u64;
+        out.large_bytes =
+            rd_usize(format!("stats.arenas.{MERGED}.large.allocated\0")) as u64;
+
+        let mut classes: Vec<(u64, u64, u64)> = Vec::new();
+        // Small bins.
+        if let Ok(nbins) = raw::read::<u32>(b"arenas.nbins\0") {
+            for i in 0..nbins as usize {
+                let size = rd_usize(format!("arenas.bin.{i}.size\0"));
+                let regs = rd_usize(format!("stats.arenas.{MERGED}.bins.{i}.curregs\0"));
+                if size > 0 && regs > 0 {
+                    classes.push((size as u64, (size * regs) as u64, regs as u64));
+                }
+            }
+        }
+        // Large extents.
+        if let Ok(nlextents) = raw::read::<u32>(b"arenas.nlextents\0") {
+            for i in 0..nlextents as usize {
+                let size = rd_usize(format!("arenas.lextent.{i}.size\0"));
+                let cur = rd_usize(format!("stats.arenas.{MERGED}.lextents.{i}.curlextents\0"));
+                if size > 0 && cur > 0 {
+                    classes.push((size as u64, (size * cur) as u64, cur as u64));
+                }
+            }
+        }
+        classes.sort_by(|a, b| b.1.cmp(&a.1));
+        classes.truncate(8);
+        out.top = classes;
+    }
+    out
+}
+
+#[cfg(target_env = "msvc")]
+pub fn jemalloc_size_classes() -> JemallocBreakdown {
+    JemallocBreakdown::default()
+}
+
+/// Trigger a jemalloc heap-profile dump on demand (the SIGUSR1 handler in
+/// `main` calls this). Heap profiling is COMPILED IN (tikv-jemallocator's
+/// `profiling` feature) but only ACTIVE when the process was started with
+/// `MALLOC_CONF=prof:true` (see the `MALLOC_CONF` note atop `main.rs`); if it
+/// wasn't, `prof.dump` returns an error and we surface a hint rather than
+/// silently no-op.
+///
+/// We write a NULL filename to `prof.dump`, so jemalloc names the file
+/// `<prof_prefix>.<pid>.<seq>.heap` and auto-increments `<seq>` on every dump.
+/// That's the point of a signal-driven dump on a remote box: fire it twice as
+/// RSS climbs, then diff the two on any machine that has the binary:
+///   `jeprof --base=<prefix>.<pid>.0.heap ./quil-node <prefix>.<pid>.1.heap`
+/// The base-diff shows exactly which allocation stacks GREW between the two
+/// samples — i.e. the leak — instead of the whole live heap.
+#[cfg(not(target_env = "msvc"))]
+pub fn dump_heap_profile() -> Result<(), String> {
+    use tikv_jemalloc_ctl::raw;
+    // `prof.dump`'s value is a `const char *` filename; a NULL pointer is the
+    // documented sentinel for "use prof_prefix + an auto seq number".
+    // SAFETY: "prof.dump\0" is a real mallctl whose C value type is
+    // `const char *`; we pass a correctly-typed null pointer of that width.
+    unsafe {
+        raw::write(b"prof.dump\0", std::ptr::null::<std::os::raw::c_char>()).map_err(|e| {
+            format!(
+                "prof.dump failed ({e}); start the node with \
+                 MALLOC_CONF=prof:true,prof_prefix:/tmp/jeprof to enable heap profiling"
+            )
+        })
+    }
+}
+
+#[cfg(target_env = "msvc")]
+pub fn dump_heap_profile() -> Result<(), String> {
+    Err("heap profiling is not available on MSVC builds".to_string())
+}
+
+/// Render the breakdown as a compact one-line string for logging, e.g.
+/// `small=120.0MB large=38000.0MB | 2.0MiB=36000.0MB×18000 4.0KiB=80.0MB×20480 …`.
+pub fn fmt_breakdown(b: &JemallocBreakdown) -> String {
+    let mut s = format!(
+        "small={}MB large={}MB |",
+        fmt_mb(b.small_bytes),
+        fmt_mb(b.large_bytes)
+    );
+    for (size, live, count) in &b.top {
+        s.push_str(&format!(" {}={}MB×{}", fmt_size(*size), fmt_mb(*live), count));
+    }
+    s
+}
+
+/// Human size-class label (e.g. 48, 4.0KiB, 2.0MiB).
+fn fmt_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1}KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+#[cfg(all(test, not(target_env = "msvc")))]
+mod jemalloc_breakdown_tests {
+    use super::*;
+
+    /// Confirms the mallctl names + merged-arena index actually resolve at
+    /// runtime (not just compile): after a deliberate large allocation, the
+    /// breakdown must be populated and the ~8 MiB Vec must surface in a large
+    /// size class. If the names were wrong, `top` would be empty / all zero.
+    #[test]
+    fn size_class_breakdown_is_populated_and_reflects_a_big_alloc() {
+        // Hold a large allocation live so it shows up in `curlextents`.
+        let big: Vec<u8> = vec![7u8; 8 * 1024 * 1024];
+        std::hint::black_box(&big);
+        let br = jemalloc_size_classes();
+        assert!(
+            br.small_bytes > 0 || br.large_bytes > 0,
+            "breakdown empty — mallctl names/merged-arena index likely wrong"
+        );
+        assert!(!br.top.is_empty(), "no size classes returned");
+        // Every entry is well-formed: live == size*count (within the class).
+        for (size, live, count) in &br.top {
+            assert!(*size > 0 && *count > 0 && *live >= *size);
+        }
+        // The 8 MiB allocation should register in the large pool.
+        assert!(br.large_bytes >= 8 * 1024 * 1024, "8MiB alloc not in large pool");
+        drop(big);
+    }
 }
 
 /// Owning accessor bundle for the live components the master node

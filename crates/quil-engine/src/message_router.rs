@@ -7,16 +7,16 @@
 //! This module exposes two layers:
 //!
 //! 1. Stateless classification helpers (`classify_message`,
-//!    `classify_inner_type`, `classify_consensus_message`) used by the
-//!    consensus engine to decide where a message should go once it has
-//!    been admitted.
+//! `classify_inner_type`, `classify_consensus_message`) used by the
+//! consensus engine to decide where a message should go once it has
+//! been admitted.
 //! 2. A stateful [`MessageRouter`] that holds per-bitmask validator
-//!    closures so malformed bytes are dropped before they reach a
-//!    queue. The Go reference (`node/consensus/global/message_router.go`)
-//!    achieves the same thing via `pubsub.RegisterValidator`; in Rust
-//!    the network plumbing isn't pubsub, so we run the validator from
-//!    inside [`MessageRouter::route`] before the dispatcher invokes the
-//!    real handler.
+//! closures so malformed bytes are dropped before they reach a
+//! queue. The Go reference (`node/consensus/global/message_router.go`)
+//! achieves the same thing via `pubsub.RegisterValidator`; in Rust
+//! the network plumbing isn't pubsub, so we run the validator from
+//! inside [`MessageRouter::route`] before the dispatcher invokes the
+//! real handler.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -302,30 +302,32 @@ impl Default for MessageRouter {
 pub fn validator_global_peer_info() -> TopicValidator {
     use ValidationOutcome::{Accept, Reject};
     Arc::new(|data: &[u8]| -> ValidationOutcome {
+        // MESSAGE-VALIDATION LOOP: TIMESTAMP ONLY. This validator runs inline on
+        // the receive loop for every GLOBAL_PEER_INFO message. The canonical
+        // decode + signature verify (Falcon for PeerInfo, Ed448 cross-sig for
+        // KeyRegistry) are far too expensive to run here — at flood rates they
+        // starve the receive loop, which back-pressures the swarm's outbound
+        // path until the per-peer send queue overflows ("Send Queue full").
+        //
+        // They now run AFTER the message is retrieved — the GLOBAL_PEER_INFO
+        // handler runs the PeerInfo Falcon verify + peer_id↔pubkey binding
+        // before it caches/trusts the entry, and `SignerRegistry::update` runs
+        // the KeyRegistry cross-sig verify before it stores the binding — so an
+        // unverified entry is still never trusted. The only thing we can (and
+        // do) cheaply reject here is a stale/future TIMESTAMP (a pure byte peek,
+        // no allocation): 99%+ of production drops are `*_ts_too_old`, and
+        // dropping those pre-decode is the whole point.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
 
-        // Cheap pre-validate: peek the timestamp out of the raw bytes
-        // before doing the full canonical decode + Ed448 verify, which
-        // are by far the most expensive steps and dominate CPU when the
-        // mesh is forwarding millions of stale messages per hour.
-        // 99%+ of GLOBAL_PEER_INFO drops in production were
-        // `*_ts_too_old`, all of which the peek can identify without
-        // allocating or running the signature check. Peek failures
-        // (truncation / wrong type prefix) fall through to the
-        // existing full-decode error paths so genuine corruption still
-        // gets categorized correctly.
         if data.len() >= 4 {
             let tp = u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4]));
             if tp == quil_p2p::PEER_INFO_TYPE {
                 if let Some(ts) = quil_p2p::peek_peer_info_timestamp(data) {
                     if ts < now_ms - 60_000 {
                         return Reject("pi_ts_too_old");
-                    }
-                    if ts < now_ms - 1_000 {
-                        return Reject("pi_ts_stale");
                     }
                     if ts > now_ms + 300_000 {
                         return Reject("pi_ts_future");
@@ -336,85 +338,17 @@ pub fn validator_global_peer_info() -> TopicValidator {
                     if ts < now_ms - 60_000 {
                         return Reject("kr_ts_too_old");
                     }
-                    if ts < now_ms - 1_000 {
-                        return Reject("kr_ts_stale");
-                    }
                     if ts > now_ms + 5_000 {
                         return Reject("kr_ts_future");
                     }
                 }
+            } else {
+                // Neither PeerInfo nor KeyRegistry on this bitmask — cheap drop
+                // (type-prefix check, still no decode).
+                return Reject("pi_unknown_type");
             }
         }
-
-        match quil_p2p::classify_peer_info_message(data) {
-            Ok(quil_p2p::PeerInfoMessage::PeerInfo(info)) => {
-                if info.peer_id.is_empty() {
-                    return Reject("pi_empty_peer_id");
-                }
-                if info.public_key.len() != 57 {
-                    return Reject("pi_bad_pubkey_len");
-                }
-                if info.signature.len() != 114 {
-                    return Reject("pi_bad_sig_len");
-                }
-                // Re-check timestamps post-decode in case the peek was
-                // skipped (unknown type prefix path) or a malicious
-                // peer crafted a payload where peek and full decode
-                // disagree. Defense in depth — the costs at this point
-                // are already paid.
-                if info.timestamp < now_ms - 60_000 {
-                    return Reject("pi_ts_too_old");
-                }
-                if info.timestamp < now_ms - 1_000 {
-                    return Reject("pi_ts_stale");
-                }
-                if info.timestamp > now_ms + 300_000 {
-                    return Reject("pi_ts_future");
-                }
-                let signing_payload = quil_p2p::encode_canonical_peer_info(
-                    &info,
-                    &info.public_key,
-                    &[],
-                );
-                let pubkey = match ed448_rust::PublicKey::try_from(
-                    info.public_key.as_slice(),
-                ) {
-                    Ok(pk) => pk,
-                    Err(_) => return Reject("pi_pubkey_decode"),
-                };
-                if pubkey.verify(&signing_payload, &info.signature, None).is_ok() {
-                    Accept
-                } else {
-                    Reject("pi_sig_invalid")
-                }
-            }
-            Ok(quil_p2p::PeerInfoMessage::KeyRegistry) => {
-                match quil_p2p::decode_canonical_key_registry(data) {
-                    Ok(reg) => {
-                        if !reg.ed448_pubkey.is_empty() && reg.ed448_pubkey.len() != 57 {
-                            return Reject("kr_bad_ed448_len");
-                        }
-                        if !reg.bls_pubkey.is_empty() && reg.bls_pubkey.len() != 585 {
-                            return Reject("kr_bad_bls_len");
-                        }
-                        let ts = reg.last_updated_ms as i64;
-                        if ts < now_ms - 60_000 {
-                            return Reject("kr_ts_too_old");
-                        }
-                        if ts < now_ms - 1_000 {
-                            return Reject("kr_ts_stale");
-                        }
-                        if ts > now_ms + 5_000 {
-                            return Reject("kr_ts_future");
-                        }
-                        Accept
-                    }
-                    Err(_) => Reject("kr_decode_failed"),
-                }
-            }
-            Ok(quil_p2p::PeerInfoMessage::Unknown(_)) => Reject("pi_unknown_type"),
-            Err(_) => Reject("pi_classify_failed"),
-        }
+        Accept
     })
 }
 
@@ -658,7 +592,9 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let info = quil_p2p::CanonicalPeerInfo {
-            peer_id: vec![0xAA; 38],
+            // The validator requires peer_id to be derived from the signing
+            // pubkey (anti-spoofing gate), so an arbitrary id won't pass.
+            peer_id: quil_p2p::peer_id_from_ed448_pubkey(&pubkey_bytes),
             timestamp: now_ms,
             version: vec![2, 1, 0],
             patch_number: vec![20],
@@ -681,15 +617,23 @@ mod tests {
     }
 
     #[test]
-    fn router_validator_rejects_short_peer_info_payload() {
-        // A type prefix only — no body. Decoder should fail and
-        // validator should reject.
+    fn router_validator_is_timestamp_only() {
+        // The route validator now does TIMESTAMP-ONLY validation — the full
+        // decode + Falcon/Ed448 verify moved to the retrieval handler (running
+        // them inline here starved the recv loop and overflowed the send queue).
         let r = MessageRouter::new();
         r.register_validator(
             bitmasks::GLOBAL_PEER_INFO.to_vec(),
             validator_global_peer_info(),
         );
+        // A PeerInfo type prefix with no body can't be timestamp-peeked, so it
+        // is ACCEPTED here and rejected later by the handler's decode (structural
+        // validation is no longer the route gate's job).
         let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &[0x00, 0x00, 0x01, 0x01]);
+        assert!(matches!(outcome, RouteOutcome::Accepted));
+        // An unknown type prefix on this bitmask is still cheaply rejected
+        // (type-prefix check, no decode).
+        let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &[0xDE, 0xAD, 0xBE, 0xEF]);
         assert!(matches!(outcome, RouteOutcome::Rejected(_)));
     }
 

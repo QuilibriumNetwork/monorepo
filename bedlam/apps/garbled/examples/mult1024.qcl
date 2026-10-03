@@ -1,8 +1,0 @@
-// -*- go -*-
-//
-
-package main
-
-func main(a, b int1024) int1024 {
-	return a * b
-}

@@ -28,7 +28,7 @@ pub struct ProdProverMessageTransport {
     /// Ed448 seed for mTLS to archives. `None` when this node lacks an
     /// Ed448 identity (e.g. read-only client mode); in that case the
     /// gRPC fan-out is skipped and only BlossomSub carries the bundle.
-    pub ed448_seed: Option<[u8; 57]>,
+    pub falcon_signing_key: Option<Vec<u8>>,
     /// When false, the BlossomSub publish on GLOBAL_PROVER is skipped
     /// and messages are sent exclusively via direct gRPC to archives.
     /// Non-archive nodes have no need to gossip prover messages — they
@@ -67,7 +67,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         // header, just the freshest one available.
         const PER_ARCHIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         const MAX_ARCHIVES_TO_TRY: usize = 5;
-        if let Some(seed) = self.ed448_seed {
+        if let Some(seed) = self.falcon_signing_key.clone() {
             let addrs: Vec<String> = self
                 .archive_pool
                 .get_all()
@@ -77,7 +77,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                 .collect();
             let mut handles = Vec::with_capacity(addrs.len());
             for addr in addrs {
-                let seed_copy = seed;
+                let seed_copy = seed.clone();
                 let addr_for_log = addr.clone();
                 handles.push(tokio::spawn(async move {
                     let attempt = async {
@@ -144,7 +144,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         // Fan out to archives concurrently. Each closure connects + submits
         // independently so a slow / unreachable archive does not block the
         // others.
-        let archive_addrs = if self.ed448_seed.is_some() {
+        let archive_addrs = if self.falcon_signing_key.is_some() {
             self.archive_pool.get_all().await
         } else {
             Vec::new()
@@ -153,7 +153,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
 
         let grpc_future = {
             let bundle_bytes = bundle_bytes.clone();
-            let seed_opt = self.ed448_seed;
+            let seed_opt = self.falcon_signing_key.clone();
             async move {
                 if seed_opt.is_none() || archive_addrs.is_empty() {
                     return 0usize;
@@ -161,14 +161,20 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                 let seed = seed_opt.unwrap();
                 let bytes = bundle_bytes;
                 let submit = move |stream_addr: String, bytes: Vec<u8>| {
-                    let seed = seed;
+                    let seed = seed.clone();
                     async move {
                         match ArchiveClient::connect_mtls(&stream_addr, &seed).await {
                             Ok(mut client) => match client.submit_global_message(bytes).await {
                                 Ok(()) => Ok(stream_addr),
-                                Err(e) => Err((stream_addr, format!("submit rejected: {e}"))),
+                                Err(e) => {
+                                    debug!(addr = %stream_addr, error = %e, "prover bundle submit rejected by archive");
+                                    Err((stream_addr, format!("submit rejected: {e}")))
+                                }
                             },
-                            Err(e) => Err((stream_addr, format!("connect failed: {e}"))),
+                            Err(e) => {
+                                debug!(addr = %stream_addr, error = %e, "prover bundle submit: archive connect failed");
+                                Err((stream_addr, format!("connect failed: {e}")))
+                            }
                         }
                     }
                 };

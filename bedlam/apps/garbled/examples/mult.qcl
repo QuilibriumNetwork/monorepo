@@ -1,8 +1,0 @@
-// -*- go -*-
-//
-
-package main
-
-func main(a, b uint64) uint {
-	return a * b
-}

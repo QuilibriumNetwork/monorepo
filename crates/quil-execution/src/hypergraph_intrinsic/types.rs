@@ -17,9 +17,9 @@ use super::canonical::AggregateSignature;
 /// Mirror of `protobufs.HypergraphConfiguration`.
 ///
 /// Go proto fields (from `hypergraph.proto`):
-///   bytes read_public_key = 1;
-///   bytes write_public_key = 2;
-///   bytes owner_public_key = 3;
+/// bytes read_public_key = 1;
+/// bytes write_public_key = 2;
+/// bytes owner_public_key = 3;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HypergraphConfiguration {
     /// Ed448 public key — readers of this hypergraph.

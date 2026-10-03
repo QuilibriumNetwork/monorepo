@@ -11,9 +11,9 @@
 //!
 //! ```text
 //! [u32 BE type_prefix]
-//!   (for each field in proto declaration order:)
-//!     [u32 BE field_len]
-//!     [field_len bytes]
+//! (for each field in proto declaration order:)
+//! [u32 BE field_len]
+//! [field_len bytes]
 //! ```
 //!
 //! All `uint32` counts are big-endian. `bytes` fields are written as
@@ -98,27 +98,45 @@ pub struct Bls48581G2PublicKey {
 
 impl Bls48581G2PublicKey {
     /// Canonical size of the key payload (not counting the 4-byte type prefix).
-    pub const KEY_VALUE_LEN: usize = 585;
+    /// Falcon-512 public key (was 585 for BLS48-581 G2). The 0x0117 type prefix
+    /// is retained as the wrapper tag on the Rust-only network.
+    pub const KEY_VALUE_LEN: usize = 897;
 
     /// Serialize. Go equivalent: `BLS48581G2PublicKey::ToCanonicalBytes`.
+    ///
+    /// Falcon does not aggregate, so an app-shard frame's "aggregate" pubkey is
+    /// the present committee members' 897-byte keys CONCATENATED (M ≥ 1). We
+    /// therefore accept any positive multiple of [`Self::KEY_VALUE_LEN`]; a
+    /// single key (M = 1) is the common case.
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
-        if self.key_value.len() != Self::KEY_VALUE_LEN {
+        if self.key_value.is_empty() || self.key_value.len() % Self::KEY_VALUE_LEN != 0 {
             return Err(QuilError::InvalidArgument(
                 "BLS48581G2PublicKey: invalid key length".into(),
             ));
         }
-        let mut out = Vec::with_capacity(4 + Self::KEY_VALUE_LEN);
+        let mut out = Vec::with_capacity(4 + self.key_value.len());
         put_u32(&mut out, TYPE_BLS48581_G2_PUBLIC_KEY);
         out.extend_from_slice(&self.key_value);
         Ok(out)
     }
 
     /// Deserialize. Go equivalent: `BLS48581G2PublicKey::FromCanonicalBytes`.
+    ///
+    /// Reads all bytes past the 4-byte type prefix as `key_value` and validates
+    /// it is a positive multiple of [`Self::KEY_VALUE_LEN`] (see
+    /// [`to_canonical_bytes`](Self::to_canonical_bytes) for the concat rationale).
+    /// The sole caller (`AggregateSignature::from_canonical_bytes`) passes the
+    /// exact wrapped-key slice, so consuming the remainder is well-defined.
     pub fn from_canonical_bytes(data: &[u8]) -> Result<Self> {
         let mut cursor = 0usize;
         let type_prefix = read_u32(data, &mut cursor)?;
         expect_type_prefix(type_prefix, TYPE_BLS48581_G2_PUBLIC_KEY, "BLS48581G2PublicKey")?;
-        let key_value = read_bytes(data, &mut cursor, Self::KEY_VALUE_LEN)?;
+        let key_value = data[cursor..].to_vec();
+        if key_value.is_empty() || key_value.len() % Self::KEY_VALUE_LEN != 0 {
+            return Err(QuilError::InvalidArgument(
+                "BLS48581G2PublicKey: invalid key length".into(),
+            ));
+        }
         Ok(Self { key_value })
     }
 }
@@ -158,10 +176,12 @@ impl AggregateSignature {
     /// Single-signer: 74 bytes. Multi-signer: 74 + 4-byte count + N×516
     /// multi-proofs (N ≤ 64). Diverges from Go's limit — see
     /// `from_canonical_bytes`.
-    const MAX_SIG_LEN: usize = 78 + 516 * 64;
-    /// Decoded public key length when present — 4-byte type prefix +
-    /// 585 key bytes.
-    const WRAPPED_PUBKEY_LEN: usize = 4 + Bls48581G2PublicKey::KEY_VALUE_LEN;
+    const MAX_SIG_LEN: usize = 666 * 512;
+    /// Decoded public key length when present — 4-byte type prefix + M×897
+    /// key bytes. Falcon does not aggregate, so the frame-header "aggregate"
+    /// pubkey is the M present members' 897-byte keys concatenated (M ≥ 1).
+    /// A single key (M = 1) is 901.
+    const WRAPPED_PUBKEY_UNIT: usize = 4 + Bls48581G2PublicKey::KEY_VALUE_LEN;
     /// Decode limit on bitmask length (Go: `bitmaskLen > 32`).
     const MAX_BITMASK_LEN: usize = 32;
 
@@ -192,15 +212,21 @@ impl AggregateSignature {
         )?;
 
         let sig_len = read_u32(data, &mut cursor)? as usize;
-        // Wire formats: 74 (single signer) or 78 + N×516 (aggregate +
-        // u32 count + N multi-proofs). Diverges from Go's canonical
-        // gate, which omits the count prefix and would reject every
-        // multi-prover signature its own verifier produces.
-        let valid_single = sig_len == 74;
-        let valid_multi = sig_len >= 78
+        // Falcon-512 wire formats (post-BLS cutover — Falcon does not
+        // aggregate, so a signature is the members' 666-byte signatures
+        // CONCATENATED):
+        //   QC/TC: N × 666 (N ≥ 1 concatenated Falcon signatures,
+        //                    no tail). Also the single-signer app-shard frame.
+        //   frame header: M × 666 (present members' concatenated sigs)
+        //                    + u32 count + M × 516 VDF multiproofs
+        //                    ⇒ M × 1182 + 4 (M ≥ 1).
+        // The consumer (bls_verifier / frame_prover) splits by the bitmask's
+        // present-signer count; this gate is a sanity bound only.
+        let valid_qc = sig_len >= 666 && sig_len % 666 == 0 && sig_len <= Self::MAX_SIG_LEN;
+        let valid_frame = sig_len >= 1186
             && sig_len <= Self::MAX_SIG_LEN
-            && (sig_len - 78) % 516 == 0;
-        if !valid_single && !valid_multi {
+            && (sig_len - 4) % 1182 == 0;
+        if !valid_qc && !valid_frame {
             return Err(QuilError::InvalidArgument(format!(
                 "BLS48581AggregateSignature: invalid signature length {}",
                 sig_len
@@ -209,7 +235,11 @@ impl AggregateSignature {
         let signature = read_bytes(data, &mut cursor, sig_len)?;
 
         let pubkey_len = read_u32(data, &mut cursor)? as usize;
-        if pubkey_len != 0 && pubkey_len != Self::WRAPPED_PUBKEY_LEN {
+        // Accept a concat of M ≥ 1 wrapped keys: 4-byte type prefix + M×897.
+        let valid_pubkey_len = pubkey_len == 0
+            || (pubkey_len >= Self::WRAPPED_PUBKEY_UNIT
+                && (pubkey_len - 4) % Bls48581G2PublicKey::KEY_VALUE_LEN == 0);
+        if !valid_pubkey_len {
             return Err(QuilError::InvalidArgument(format!(
                 "BLS48581AggregateSignature: invalid pubkey length {}",
                 pubkey_len
@@ -283,19 +313,23 @@ impl HypergraphConfiguration {
 
     /// Validate field lengths.
     pub fn validate(&self) -> Result<()> {
-        if self.read_public_key.len() != 57 {
+        // read key is the sntrup761 KEM public key (PQ, replacing X448).
+        if self.read_public_key.len() != quil_crypto::SNTRUP761_PUBLIC_KEY_LEN {
             return Err(QuilError::InvalidArgument(
-                "HypergraphConfiguration: invalid read public key length".into(),
+                "HypergraphConfiguration: invalid read public key length (expected sntrup761 1158)".into(),
             ));
         }
-        if self.write_public_key.len() != 57 {
+        // write/owner are FALCON (FN-DSA-512, 897 B) signature keys now.
+        if self.write_public_key.len() != quil_crypto::FALCON_PUBLIC_KEY_LEN {
             return Err(QuilError::InvalidArgument(
-                "HypergraphConfiguration: invalid write public key length".into(),
+                "HypergraphConfiguration: invalid write public key length (expected Falcon 897)".into(),
             ));
         }
-        if !self.owner_public_key.is_empty() && self.owner_public_key.len() != 585 {
+        if !self.owner_public_key.is_empty()
+            && self.owner_public_key.len() != quil_crypto::FALCON_PUBLIC_KEY_LEN
+        {
             return Err(QuilError::InvalidArgument(
-                "HypergraphConfiguration: invalid owner public key length (expected 0 or 585)"
+                "HypergraphConfiguration: invalid owner public key length (expected 0 or Falcon 897)"
                     .into(),
             ));
         }
@@ -744,7 +778,7 @@ mod tests {
     #[test]
     fn aggregate_sig_round_trip_with_pubkey() {
         let sig = AggregateSignature {
-            signature: vec![0xAAu8; 74],
+            signature: vec![0xAAu8; 666],
             public_key: Some(sample_pubkey()),
             bitmask: vec![0xFF, 0x01],
         };
@@ -756,7 +790,7 @@ mod tests {
     #[test]
     fn aggregate_sig_round_trip_without_pubkey() {
         let sig = AggregateSignature {
-            signature: vec![0x11u8; 74],
+            signature: vec![0x11u8; 666],
             public_key: None,
             bitmask: Vec::new(),
         };
@@ -767,12 +801,13 @@ mod tests {
 
     #[test]
     fn aggregate_sig_round_trip_multi_signer_sig_size() {
-        // Multi-signer aggregate wire format: 74 (BLS agg) + 4 (u32
-        // count) + N × 516 (multi-proofs). Diverges from Go's canonical
-        // gate (no count prefix) but matches what `verify_frame_header_signature`
-        // actually consumes — see canonical.rs::from_canonical_bytes.
+        // Frame-header aggregate wire format for M present signers:
+        // M × 666 (concatenated Falcon member sigs) + 4 (u32 count) +
+        // M × 516 (VDF multi-proofs) ⇒ M × 1182 + 4. Matches what
+        // `verify_frame_header_signature` consumes — see
+        // canonical.rs::from_canonical_bytes (`valid_frame`).
         let sig = AggregateSignature {
-            signature: vec![0x22u8; 78 + 516 * 3],
+            signature: vec![0x22u8; 1182 * 3 + 4],
             public_key: Some(sample_pubkey()),
             bitmask: vec![0xF0],
         };
@@ -824,13 +859,13 @@ mod tests {
     #[test]
     fn hypergraph_configuration_round_trip_with_owner() {
         let c = HypergraphConfiguration {
-            read_public_key: vec![0x01u8; 57],
+            read_public_key: vec![0x01u8; 1158],
             write_public_key: vec![0x02u8; 57],
             owner_public_key: vec![0x03u8; 585],
         };
         let bytes = c.to_canonical_bytes().unwrap();
         // type(4) + 3 × (u32 len + payload)
-        assert_eq!(bytes.len(), 4 + 4 + 57 + 4 + 57 + 4 + 585);
+        assert_eq!(bytes.len(), 4 + 4 + 1158 + 4 + 57 + 4 + 585);
         // type prefix is 0x0401 — high byte 0x04, low byte 0x01
         assert_eq!(&bytes[..4], &[0x00, 0x00, 0x04, 0x01]);
         let restored = HypergraphConfiguration::from_canonical_bytes(&bytes).unwrap();
@@ -840,7 +875,7 @@ mod tests {
     #[test]
     fn hypergraph_configuration_round_trip_without_owner() {
         let c = HypergraphConfiguration {
-            read_public_key: vec![0xAAu8; 57],
+            read_public_key: vec![0xAAu8; 1158],
             write_public_key: vec![0xBBu8; 57],
             owner_public_key: Vec::new(),
         };
@@ -852,9 +887,9 @@ mod tests {
     #[test]
     fn hypergraph_configuration_validate_accepts_well_formed() {
         let c = HypergraphConfiguration {
-            read_public_key: vec![1u8; 57],
-            write_public_key: vec![2u8; 57],
-            owner_public_key: vec![3u8; 585],
+            read_public_key: vec![1u8; 1158], // sntrup761 KEM read key
+            write_public_key: vec![2u8; 897], // Falcon
+            owner_public_key: vec![3u8; 897], // Falcon
         };
         assert!(c.validate().is_ok());
     }
@@ -869,14 +904,14 @@ mod tests {
         assert!(bad_read.validate().is_err());
 
         let bad_write = HypergraphConfiguration {
-            read_public_key: vec![1u8; 57],
+            read_public_key: vec![1u8; 1158],
             write_public_key: vec![2u8; 58],
             owner_public_key: Vec::new(),
         };
         assert!(bad_write.validate().is_err());
 
         let bad_owner = HypergraphConfiguration {
-            read_public_key: vec![1u8; 57],
+            read_public_key: vec![1u8; 1158],
             write_public_key: vec![2u8; 57],
             owner_public_key: vec![3u8; 100],
         };
@@ -886,8 +921,8 @@ mod tests {
     #[test]
     fn hypergraph_configuration_validate_allows_empty_owner() {
         let c = HypergraphConfiguration {
-            read_public_key: vec![1u8; 57],
-            write_public_key: vec![2u8; 57],
+            read_public_key: vec![1u8; 1158],
+            write_public_key: vec![2u8; 897], // Falcon
             owner_public_key: Vec::new(),
         };
         assert!(c.validate().is_ok());
@@ -899,9 +934,9 @@ mod tests {
 
     fn sample_config() -> HypergraphConfiguration {
         HypergraphConfiguration {
-            read_public_key: vec![0x11u8; 57],
-            write_public_key: vec![0x22u8; 57],
-            owner_public_key: vec![0x33u8; 585],
+            read_public_key: vec![0x11u8; 1158], // sntrup761 KEM read key
+            write_public_key: vec![0x22u8; 897], // Falcon
+            owner_public_key: vec![0x33u8; 897], // Falcon
         }
     }
 
@@ -961,7 +996,7 @@ mod tests {
 
     fn sample_aggregate_sig() -> AggregateSignature {
         AggregateSignature {
-            signature: vec![0x55u8; 74],
+            signature: vec![0x55u8; 666],
             public_key: Some(sample_pubkey()),
             bitmask: vec![0x01, 0x02],
         }

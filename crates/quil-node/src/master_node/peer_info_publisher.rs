@@ -26,6 +26,13 @@ pub(crate) struct PeerInfoPublisherArgs {
     pub key_manager: Arc<quil_keys::FileKeyManager>,
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
     pub archive_mode: bool,
+    /// Network id — controls the publish cadence. Mainnet (0) republishes
+    /// every 30 min; testnet/devnet every 30 s so a freshly-joined node
+    /// discovers archives in seconds instead of waiting out the long ticker.
+    pub network: u8,
+    /// Whether the node runs the live onion relay (advertises `PROTOCOL_ROUTING`
+    /// so peers may build circuits through it). Off when `p2p.disableOnionRouting`.
+    pub onion_routing_enabled: bool,
 }
 
 pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisherArgs) {
@@ -48,6 +55,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
         key_manager: kr_key_manager,
         exec_manager,
         archive_mode,
+        network,
+        onion_routing_enabled,
     } = args;
 
     let pi_handle = p2p_handle.clone();
@@ -62,8 +71,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
         (None, Vec::new())
     };
 
-    let pi_peer_id_bytes = if !pi_ed448_pubkey.is_empty() {
-        quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&pi_ed448_pubkey)
+    // PeerInfo network identity = the Falcon prover key (q-prover-key). The
+    // Ed448 key above is retained ONLY for the KeyRegistry binding (below); it
+    // no longer derives the peer-id.
+    let pi_falcon_pubkey = kr_bls_pubkey.clone();
+    let pi_peer_id_bytes = if !pi_falcon_pubkey.is_empty() {
+        quil_p2p::peer_id_from_falcon_pubkey(&pi_falcon_pubkey)
     } else {
         peer_id.to_bytes()
     };
@@ -77,6 +90,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             additional_metadata: c.additional_metadata,
         })
         .collect();
+    pi_caps.push(quil_p2p::CanonicalCapability {
+        protocol_identifier: quil_p2p::BUILD_FINGERPRINT_CAPABILITY_ID,
+        additional_metadata: hex::decode(env!("QUIL_BUILD_FINGERPRINT"))
+            .expect("build script emits a SHA-256 fingerprint"),
+    });
+    info!(
+        version = quil_config::VERSION_STRING,
+        build_fingerprint = env!("QUIL_BUILD_FINGERPRINT"),
+        "publishing local source build identity"
+    );
     // Archive nodes must advertise the archive-service capability
     // so non-archive peers (joining provers) can find them via
     // PeerInfo and fetch frames over gRPC. Without this, every
@@ -90,9 +113,35 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
         });
     }
 
+    // Advertise onion routing (Go `onion.ProtocolRouting`) only when the live
+    // relay is enabled — the OnionNode dispatcher wired in `grpc.rs` must be
+    // running, since the transport's peer validation on both sides requires
+    // participants to carry this capability. When disabled, we must NOT advertise
+    // it, or peers would route circuits into a node that drops every cell.
+    //
+    // The capability's `additional_metadata` carries this node's sntrup761 onion
+    // PUBLIC key. Because PeerInfo is Ed448-signed (below), the onion key is bound
+    // to the node's identity — a circuit initiator authenticates it from the
+    // verified PeerInfo before encapsulating, closing the key-substitution MITM
+    // gap. (`q-onion-key` always exists via `ensure_standard_keys`.)
+    if onion_routing_enabled {
+        let onion_public_key = kr_key_manager
+            .get_public_key_bytes_by_id("q-onion-key")
+            .unwrap_or_default();
+        pi_caps.push(quil_p2p::CanonicalCapability {
+            protocol_identifier: quil_rpc::onion_service::PROTOCOL_ROUTING,
+            additional_metadata: onion_public_key,
+        });
+    }
+
+    // Mainnet: 30 min (PeerInfo is stable, gossip is dense). Testnet/devnet:
+    // 30 s so a node that joins after the startup publish discovers archives
+    // within seconds rather than waiting out a 30-min ticker.
+    let publish_secs: u64 = if network == 0 { 30 * 60 } else { 30 };
     sup.run_until_cancelled("peer-info-publisher", move |_token| async move {
         let bitmask = vec![0x00, 0x00, 0x00, 0x00]; // GLOBAL_PEER_INFO
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(publish_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             // Resolve multiaddrs: prefer observed (NAT-resolved), then announce, then listen
@@ -149,7 +198,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as i64,
-                version: vec![2, 1, 0],
+                version: quil_config::VERSION.to_vec(),
                 patch_number: vec![quil_config::PATCH_NUMBER],
                 capabilities: pi_caps.clone(),
                 // pubkey/signature are passed separately to
@@ -162,30 +211,28 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                 last_global_head_frame: pi_last_head.load(std::sync::atomic::Ordering::Relaxed),
             };
 
-            // Sign the PeerInfo with Ed448 — peers validate this
-            // signature and silently drop unsigned PeerInfo.
-            //
-            // Process:
+            // Sign the PeerInfo with the FALCON prover key (the network
+            // identity) — peers validate this signature against the Falcon
+            // peer-id and silently drop unsigned/invalid PeerInfo.
             // 1. Encode with public_key but empty signature (for signing)
-            // 2. Sign those bytes with Ed448
+            // 2. Sign those bytes with Falcon
             // 3. Re-encode with the actual signature
-            let encoded = if let Some(ref seed) = pi_ed448_seed {
-                // Step 1: encode without signature for signing
-                let msg_to_sign = quil_p2p::encode_canonical_peer_info(
-                    &info, &pi_ed448_pubkey, &[],
-                );
-                // Step 2: sign with Ed448
-                let privkey = ed448_rust::PrivateKey::from(*seed);
-                match privkey.sign(&msg_to_sign, None) {
-                    Ok(signature) => {
-                        // Step 3: re-encode with signature
-                        quil_p2p::encode_canonical_peer_info(
-                            &info, &pi_ed448_pubkey, &signature,
-                        )
-                    }
+            let encoded = if !pi_falcon_pubkey.is_empty() {
+                use quil_keys::KeyManager as _;
+                let msg_to_sign =
+                    quil_p2p::encode_canonical_peer_info(&info, &pi_falcon_pubkey, &[]);
+                let signed = kr_key_manager
+                    .get_signer(quil_types::crypto::KeyType::Falcon512)
+                    .and_then(|s| s.sign(&msg_to_sign));
+                match signed {
+                    Ok(signature) => quil_p2p::encode_canonical_peer_info(
+                        &info,
+                        &pi_falcon_pubkey,
+                        &signature,
+                    ),
                     Err(e) => {
-                        warn!("Ed448 sign failed: {:?}", e);
-                        quil_p2p::encode_canonical_peer_info(&info, &pi_ed448_pubkey, &[])
+                        warn!("Falcon PeerInfo sign failed: {:?}", e);
+                        quil_p2p::encode_canonical_peer_info(&info, &pi_falcon_pubkey, &[])
                     }
                 }
             } else {
@@ -197,8 +244,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             } else {
                 debug!(
                     capabilities = pi_caps.len(),
-                    signed = pi_ed448_seed.is_some(),
-                    pubkey_len = pi_ed448_pubkey.len(),
+                    signed = !pi_falcon_pubkey.is_empty(),
+                    pubkey_len = pi_falcon_pubkey.len(),
                     worker_reachability = worker_reachability_count,
                     "published PeerInfo"
                 );
@@ -217,7 +264,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                 kr_msg.extend_from_slice(&kr_bls_pubkey);
                 if let Ok(i2p_sig) = pv.sign(&kr_msg, None) {
                     // prover_to_identity: BLS signs ed448_pubkey with domain "KEY_REGISTRY"
-                    match kr_key_manager.get_signer(quil_types::crypto::KeyType::Bls48581G1) {
+                    match kr_key_manager.get_signer(quil_types::crypto::KeyType::Falcon512) {
                         Ok(bls_signer) => {
                             if let Ok(p2i_sig) = bls_signer.sign_with_domain(&pi_ed448_pubkey, b"KEY_REGISTRY") {
                                 let kr = quil_p2p::encode_key_registry(
@@ -244,5 +291,5 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             interval.tick().await;
         }
     });
-    info!("PeerInfo publisher started (30-minute interval)");
+    info!(publish_secs, "PeerInfo publisher started");
 }

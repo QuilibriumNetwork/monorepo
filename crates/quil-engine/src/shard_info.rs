@@ -6,7 +6,7 @@
 //! `proof_of_meaningful_work.go`:
 //!
 //! ```text
-//! per_ring  = (basis * shard_size / world_bytes) / (2^(ring+1) * sqrt(data_shards))
+//! per_ring = (basis * shard_size / world_bytes) / (2^(ring+1) * sqrt(data_shards))
 //! per_prover = per_ring / 8
 //! ```
 //!
@@ -57,6 +57,8 @@ pub struct ShardEntry {
     pub is_allocated: bool,
     /// Ring assignment (0-based).
     pub ring: u8,
+    pub materialized_frame: u64,
+    pub latest_frame: u64,
 }
 
 /// Raw shard size info returned by the size-fetching callbacks.
@@ -65,6 +67,8 @@ pub struct ShardSizeEntry {
     pub prefix: Vec<u32>,
     pub size: Vec<u8>,
     pub data_shards: u64,
+    pub materialized_frame: u64,
+    pub latest_frame: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +119,7 @@ fn compute_shard_ring_info(total_active_joining: usize) -> ShardRingInfo {
 /// - `is_allocated`: whether the local prover is allocated to this shard.
 /// - `self_address`: the local prover's address (may be empty).
 /// - `candidate_addrs`: sorted candidate addresses (only used when
-///   `is_allocated && !self_address.is_empty()`).
+/// `is_allocated && !self_address.is_empty()`).
 ///
 /// Returns `(ring, on_ring)`.
 pub fn resolve_prover_ring(
@@ -200,11 +204,11 @@ pub fn isqrt_big(n: &BigInt) -> BigInt {
 ///
 /// Formula (matching `proof_of_meaningful_work.go` Materialize):
 /// ```text
-/// factor    = shard_size * basis / world_bytes
-/// divisor   = 2^(ring + 1)
-/// factor   /= divisor
-/// factor   /= sqrt(data_shards)   [when data_shards > 1]
-/// factor   /= 8                   [constant max ring size]
+/// factor = shard_size * basis / world_bytes
+/// divisor = 2^(ring + 1)
+/// factor /= divisor
+/// factor /= sqrt(data_shards)   [when data_shards > 1]
+/// factor /= 8                   [constant max ring size]
 /// ```
 ///
 /// Returns zero for degenerate inputs.
@@ -309,10 +313,9 @@ where
             } else {
                 &shard_key[..]
             };
-            let mut bp = l2.to_vec();
-            for &p in &shard.prefix {
-                bp.push(p as u8);
-            }
+            // Canonical prefix → filter (sentinel-aware) so `allocated_filters` /
+            // `get_provers` match a deep shard's real ConfirmationFilter.
+            let bp = quil_forest::shard_prefix_to_filter(l2, &shard.prefix);
 
             let is_alloc = allocated_filters.contains(&bp);
 
@@ -423,6 +426,8 @@ where
                 provers_on_ring: on_ring,
                 is_allocated: real_is_alloc,
                 ring,
+                materialized_frame: shard.materialized_frame,
+                latest_frame: shard.latest_frame,
             });
         }
     }
@@ -445,7 +450,7 @@ where
 ///
 /// # Arguments
 /// * `include_all` — when false, only return shards the local prover
-///   is allocated to.
+/// is allocated to.
 /// * `self_address` — local prover address (empty slice if unknown).
 /// * `allocated_filters` — set of filters this prover is actively on.
 /// * `current_frame` — current frame number from the prover registry.
@@ -509,6 +514,8 @@ where
                 estimated_reward: est,
                 is_allocated: entry.is_allocated,
                 data_shards: entry.data_shards,
+                materialized_frame: entry.materialized_frame,
+                latest_frame: entry.latest_frame,
             }
         })
         .collect();
@@ -534,13 +541,109 @@ pub fn local_app_shard_get_sizes(
             if let Some(meta) = crate::app_shard_metadata::get_app_shard_metadata(&crdt, sub) {
                 out.push(ShardSizeEntry {
                     prefix: sub.prefix.clone(),
-                    size: meta.size,
+                    size: reported_shard_size(&crdt, shard_key, &sub.prefix, meta.size),
                     data_shards: meta.data_shards,
+                    materialized_frame: 0,
+                    latest_frame: 0,
                 });
             }
         }
         Ok(out)
     }
+}
+
+/// Size reported per committed-but-undelivered output of an otherwise empty
+/// shard. Only "non-zero" matters to the viability gates; this is roughly one
+/// coin vertex.
+const NOMINAL_DELIVERY_BYTES: u64 = 4096;
+
+/// The size to report for the shard at `(shard_key, prefix)`, measured at
+/// `size`. An empty shard is latent, unless the global venue has committed
+/// outputs into blocks it owns: those can only land once the shard has a
+/// committee to take delivery, so it reports a nominal size per waiting
+/// output. Archives answer `GetAppShards` with this too; a regular node's own
+/// grid never flips, so its local sizes never reach a split's empty shards.
+pub fn reported_shard_size(
+    crdt: &std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    shard_key: &[u8],
+    prefix: &[u32],
+    size: Vec<u8>,
+) -> Vec<u8> {
+    if size.iter().any(|byte| *byte != 0) {
+        return size;
+    }
+    match committed_deliveries(crdt, shard_key, prefix).filter(|n| *n > 0) {
+        Some(waiting) => waiting.saturating_mul(NOMINAL_DELIVERY_BYTES).to_be_bytes().to_vec(),
+        None => size,
+    }
+}
+
+/// [`reported_shard_size`] for one committed GLOBAL frame. An empty shard's
+/// size counts committed deliveries, GLOBAL records only a GLOBAL commit
+/// writes, and counting them reads every block the shard owns; at width 9
+/// that is up to 480 blocks per shard on every `GetAppShards`.
+#[derive(Default)]
+pub struct CommittedShardSizes {
+    kept: std::sync::Mutex<(u64, std::collections::HashMap<Vec<u8>, Vec<u8>>)>,
+}
+
+impl CommittedShardSizes {
+    /// The size to report for `(shard_key, prefix)` measured at `size`, at
+    /// the committed GLOBAL frame `committed`.
+    pub fn size(
+        &self,
+        crdt: &std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+        shard_key: &[u8],
+        prefix: &[u32],
+        size: Vec<u8>,
+        committed: u64,
+    ) -> Vec<u8> {
+        if size.iter().any(|byte| *byte != 0) {
+            return size;
+        }
+        let mut key = shard_key.to_vec();
+        key.extend(prefix.iter().flat_map(|part| part.to_be_bytes()));
+        self.kept_or(committed, key, || reported_shard_size(crdt, shard_key, prefix, size))
+    }
+
+    fn kept_or(&self, committed: u64, key: Vec<u8>, count: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
+        let mut kept = self.kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if kept.0 != committed {
+            *kept = (committed, std::collections::HashMap::new());
+        }
+        kept.1.entry(key).or_insert_with(count).clone()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn committed_shard_sizes_are_counted_once_per_committed_frame() {
+    let sizes = CommittedShardSizes::default();
+    let counted = std::cell::Cell::new(0);
+    let count = |n: u8| {
+        counted.set(counted.get() + 1);
+        vec![n]
+    };
+    assert_eq!(sizes.kept_or(7, vec![1], || count(1)), vec![1]);
+    assert_eq!(sizes.kept_or(7, vec![1], || count(2)), vec![1], "kept within the frame");
+    assert_eq!(sizes.kept_or(7, vec![2], || count(3)), vec![3], "per shard");
+    assert_eq!(sizes.kept_or(8, vec![1], || count(4)), vec![4], "recounted once the frame moves");
+    assert_eq!(counted.get(), 3);
+}
+
+/// Outputs and escrows committed into blocks the sub-shard owns, per GLOBAL
+/// state. `None` when the shard key or prefix cannot be read as a shard path,
+/// or the lookup fails: the shard then simply stays as empty as it measured.
+fn committed_deliveries(
+    crdt: &std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    shard_key: &[u8],
+    prefix: &[u32],
+) -> Option<u64> {
+    let application: [u8; 32] = shard_key.get(3..35)?.try_into().ok()?;
+    let filter = quil_forest::shard_prefix_to_filter(&application, prefix);
+    let (_, bits) = quil_forest::decode_shard_filter_or_root(&filter, 32)?;
+    let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
+    quil_execution::token_intrinsic::global_commit::committed_to_shard(&state, &application, &bits).ok()
 }
 
 /// Extension trait on BigInt for saturating u64 conversion.
@@ -868,12 +971,17 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
+                    // Confirmed for the current epoch (eval frame 2000 → epoch 2)
+                    // so always-on epoch expiry doesn't read it as ExpiredEpoch.
+                    epoch: 2,
+                    ring: 0,
                     vertex_address: vec![],
                 },
                 ProverAllocationInfo {
                     status: ProverStatus::Joining,
                     confirmation_filter: vec![0xCC, 0xDD],
                     rejection_filter: vec![],
+                    // Proposed in epoch 1; still within its epoch-2 confirm window.
                     join_frame_number: 900,
                     leave_frame_number: 0,
                     pause_frame_number: 0,
@@ -884,9 +992,12 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
+                    epoch: 0,
+                    ring: 0,
                     vertex_address: vec![],
                 },
-                // Joining but expired (join_frame=100, current=1000 > 100+720)
+                // Joining but expired: proposed in epoch 0, never confirmed in
+                // epoch 1 → implicitly rejected by epoch 2.
                 ProverAllocationInfo {
                     status: ProverStatus::Joining,
                     confirmation_filter: vec![0xEE],
@@ -901,6 +1012,8 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
+                    epoch: 0,
+                    ring: 0,
                     vertex_address: vec![],
                 },
             ],
@@ -909,7 +1022,7 @@ mod tests {
             delegate_address: vec![],
         };
 
-        let filters = build_allocated_filters(&prover, 1000);
+        let filters = build_allocated_filters(&prover, 2000); // epoch 2
         assert!(filters.contains(&vec![0xAA, 0xBB]));
         assert!(filters.contains(&vec![0xCC, 0xDD]));
         // Expired joining allocation should be excluded.
@@ -1079,9 +1192,9 @@ mod tests {
     }
     impl ProverRegistry for StubRegistry {
         fn get_prover_info(&self, _: &[u8]) -> QResult<Option<ProverInfo>> { Ok(None) }
-        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> QResult<Vec<u8>> { Ok(vec![]) }
-        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> QResult<Vec<Vec<u8>>> { Ok(vec![]) }
-        fn get_active_provers(&self, _: &[u8]) -> QResult<Vec<ProverInfo>> { Ok(vec![]) }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<u8>> { Ok(vec![]) }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<Vec<u8>>> { Ok(vec![]) }
+        fn get_active_provers(&self, _: &[u8], _: u64) -> QResult<Vec<ProverInfo>> { Ok(vec![]) }
         fn get_prover_count(&self, _: &[u8]) -> QResult<usize> { Ok(0) }
         fn get_provers(&self, filter: &[u8]) -> QResult<Vec<ProverInfo>> {
             // Single Active prover on every queried filter.
@@ -1104,6 +1217,8 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 100,
+                    epoch: 0,
+                    ring: 0,
                     vertex_address: vec![],
                 }],
                 available_storage: 1 << 30,
@@ -1303,5 +1418,88 @@ mod tests {
             details.len(),
             unique_shard_keys.len()
         );
+    }
+
+    /// PARITY: the TUI per-prover estimate (`compute_shard_reward`) must equal
+    /// the actually-minted per-prover share (`OptRewardIssuance::calculate / 8`)
+    /// for the same inputs. These are two independent implementations of the
+    /// PoMW formula in two modules; this guards them against drift.
+    #[test]
+    fn estimate_matches_minted_per_prover_share() {
+        use crate::rewards::{pomw_basis, OptRewardIssuance};
+        use quil_types::consensus::{ProverAllocation, RewardIssuance};
+        use std::collections::HashMap;
+        let difficulty = 5_000u64;
+        let world = 1u64 << 30;
+        let units = 1_000_000u64;
+        let size = 1u64 << 28;
+        let basis = pomw_basis(difficulty, world, units);
+        for ring in [0u8, 1, 2] {
+            for shards in [1u64, 4, 16] {
+                let est = compute_shard_reward(
+                    &basis,
+                    &BigInt::from(size),
+                    &BigInt::from(world),
+                    ring,
+                    shards,
+                );
+                let mut m = HashMap::new();
+                m.insert("s".to_string(), ProverAllocation { ring, shards, state_size: size });
+                let mint =
+                    &OptRewardIssuance.calculate(difficulty, world, units, &[m]).unwrap()[0]
+                        / 8;
+                assert_eq!(est, mint, "ring={ring} shards={shards}: estimate != minted/8");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod committed_delivery_size_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use quil_execution::hypergraph_state::HypergraphState;
+    use quil_execution::token_intrinsic::global_commit::{commit_entry, Outcome, SpendEntry};
+
+    // A wallet's claim committed into block 291 is owned by the empty spine
+    // shard `001`. If the archives report that shard's size as zero to the
+    // regular nodes, none joins it and the claim is never delivered.
+    #[test]
+    fn an_empty_shard_with_committed_outputs_reports_a_size() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let app = [7u8; 32];
+        let mut output = [9u8; 32];
+        output[0] = 0b0010_0011;
+        let entry = SpendEntry {
+            kind: 0x0512,
+            tx_id: [1; 32],
+            source_frame: 40,
+            context: [8; 32],
+            root_digest: None,
+            consumptions: vec![[2; 32]],
+            outputs: vec![output],
+            escrow_create: None,
+            escrow_claim: None,
+            fee: 5,
+            settlement: None,
+        };
+        let state = HypergraphState::new(crdt.clone());
+        let outcome = commit_entry(&state, 5, &app, &entry, quil_types::execution::ShardPath::WHOLE).unwrap();
+        assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
+        state.commit().unwrap();
+
+        let shard_key: Vec<u8> = [0u8; 3].into_iter().chain(app).collect();
+        let size = |bits: &[bool], measured: Vec<u8>| {
+            reported_shard_size(&crdt, &shard_key, &quil_forest::bit_path_to_prefix(bits), measured)
+        };
+        assert!(size(&[false, false, true], vec![]).iter().any(|b| *b != 0), "the empty shard owning the output");
+        assert!(size(&[true], vec![]).iter().all(|b| *b == 0), "an empty shard with nothing waiting");
+        assert_eq!(size(&[false, false, true], vec![0, 5]), vec![0, 5], "a measured size is kept");
     }
 }

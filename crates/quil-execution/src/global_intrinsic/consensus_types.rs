@@ -187,7 +187,9 @@ impl TimeoutCertificate {
         let filter = read_lp(data, &mut c)?;
         let rank = read_u64(data, &mut c)?;
         let n = read_u32(data, &mut c)? as usize;
-        let mut latest_ranks = Vec::with_capacity(n);
+        // Cap pre-allocation against remaining bytes (each rank is a u64 = 8
+        // bytes) so an attacker-chosen count can't drive an alloc-bomb.
+        let mut latest_ranks = Vec::with_capacity(n.min(data.len().saturating_sub(c) / 8));
         for _ in 0..n { latest_ranks.push(read_u64(data, &mut c)?); }
         Ok(Self { filter, rank, latest_ranks, latest_quorum_certificate: read_lp(data, &mut c)?, timestamp: read_u64(data, &mut c)?, aggregate_signature: read_lp(data, &mut c)? })
     }

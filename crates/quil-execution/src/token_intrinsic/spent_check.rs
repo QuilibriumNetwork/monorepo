@@ -60,6 +60,39 @@ pub fn check_input_not_double_spent(
     }
 }
 
+// =====================================================================
+// Lattice-CT nullifier: the double-spend marker is the KEY IMAGE, not
+// poseidon(verification_key). A spend's `verify_input_membership` returns the
+// key image `T = B_k·sk`; it is unique to the spend key regardless of which coin
+// (or re-randomization) is used, so recording/checking it prevents double-spends
+// without revealing which coin was spent.
+// =====================================================================
+
+/// The spent-marker address for a lattice-CT spend's key image:
+/// `poseidon(key_image)`. In-field, so it shares the vertex-adds keyspace with
+/// coins/markers and cannot collide with the reserved accumulator-root address.
+pub fn key_image_spent_address(key_image: &[u8]) -> Result<[u8; 32]> {
+    if key_image.is_empty() {
+        return Err(QuilError::InvalidArgument("spent check: empty key image".into()));
+    }
+    quil_crypto::poseidon::hash_bytes_to_32(key_image)
+}
+
+/// Check that a lattice-CT `key_image` has not already been spent (its marker
+/// vertex does not yet exist). `Ok(true)` = not spent (valid).
+pub fn check_key_image_not_spent(
+    state: &HypergraphState,
+    domain: &[u8],
+    key_image: &[u8],
+) -> Result<bool> {
+    let addr = key_image_spent_address(key_image)?;
+    let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+    match state.get(domain, &addr, &va_disc)? {
+        Some(_) => Ok(false), // key image already recorded ⇒ double-spend
+        None => Ok(true),
+    }
+}
+
 /// Verify a traversal proof against the shard's commitment root.
 ///
 /// This is a placeholder — full traversal proof verification requires
@@ -120,6 +153,23 @@ mod tests {
     fn wrong_vk_length_rejected() {
         let state = stub_state();
         assert!(check_output_not_spent(&state, &[0u8; 32], &[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn key_image_double_spend_detected() {
+        let state = stub_state();
+        let domain = vec![0u8; 32];
+        let key_image = vec![0x5Au8; 200]; // wire-encoded T (any bytes here)
+        // First spend: not yet recorded ⇒ valid.
+        assert!(check_key_image_not_spent(&state, &domain, &key_image).unwrap());
+        // Record the marker (what materialize does on a spend).
+        let addr = key_image_spent_address(&key_image).unwrap();
+        let disc = crate::hypergraph_state::vertex_adds_discriminator().unwrap();
+        state.set(&domain, &addr, &disc, 1, b"spent".to_vec()).unwrap();
+        // Second spend of the same key image ⇒ rejected.
+        assert!(!check_key_image_not_spent(&state, &domain, &key_image).unwrap());
+        // A different key image is unaffected.
+        assert!(check_key_image_not_spent(&state, &domain, &[0x11u8; 200]).unwrap());
     }
 
     #[test]

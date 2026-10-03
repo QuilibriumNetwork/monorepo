@@ -15,10 +15,10 @@
 //! dispatcher in `global_engine.rs` can route to today:
 //!
 //! - [`addressed_signature`] — the `BLS48581AddressedSignature`
-//!   canonical-bytes envelope (type 0x011B).
+//! canonical-bytes envelope (type 0x011B).
 //! - [`prover_filter_ops`] — canonical-bytes for `ProverLeave`,
-//!   `ProverPause`, `ProverResume`. All three share a
-//!   filter(s) + frame_number + addressed-signature layout.
+//! `ProverPause`, `ProverResume`. All three share a
+//! filter(s) + frame_number + addressed-signature layout.
 //!
 //! Further ops (`ProverJoin`, `ProverConfirm`, `ProverReject`,
 //! `ProverKick`, `ProverUpdate`, `SeniorityMerge`, `ShardSplit`,
@@ -30,9 +30,11 @@ pub mod alt_shard_update_materialize;
 pub mod consensus_types;
 pub mod conversions;
 pub mod frame_header;
+pub mod handoff;
 pub mod intrinsic;
 pub mod kick_verify;
 pub mod materialize;
+pub mod leaf_root_registration;
 pub mod proof_types;
 pub mod prover_filter_ops;
 pub mod prover_join;
@@ -40,6 +42,7 @@ pub mod prover_ops;
 pub mod prover_shard_update;
 pub mod prover_update_materialize;
 pub mod prover_verify;
+pub mod reassignment;
 pub mod seniority_merge;
 pub mod sig_with_pop;
 pub mod verify;
@@ -52,6 +55,9 @@ pub use prover_filter_ops::{
     MAX_PROVER_FILTER_LEN, TYPE_PROVER_LEAVE, TYPE_PROVER_PAUSE, TYPE_PROVER_RESUME,
 };
 pub use prover_join::{ProverJoin, TYPE_PROVER_JOIN};
+pub use leaf_root_registration::{
+    LeafRootRegistration, leaf_id_bytes, TYPE_LEAF_ROOT_REGISTRATION,
+};
 pub use seniority_merge::{SeniorityMerge, TYPE_SENIORITY_MERGE};
 pub use sig_with_pop::{SignatureWithPop, TYPE_BLS48581_SIG_WITH_POP};
 pub use frame_header::{

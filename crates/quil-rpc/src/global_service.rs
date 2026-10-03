@@ -34,6 +34,169 @@ pub trait FrameLookup: Send + Sync {
     }
 }
 
+/// Read-through, bounded in-memory cache in front of a [`FrameLookup`].
+///
+/// Why: the peer-facing `GlobalService` (`:8340`) serves `get_global_frame`
+/// and `get_global_proposal` to the whole network. With hundreds of nodes
+/// polling the same recent frames once a second, the inner clock-store impl
+/// hits RocksDB on *every* request — and `get_global_proposal` additionally
+/// re-assembles the proposal (parent QC + prior TC + proposer vote, several
+/// decodes) per call. That re-read storm is what overwhelms a handful of
+/// archives.
+///
+/// Safety: a finalized frame is **immutable by number** — the canonical
+/// chain never rewrites a committed height — so caching `get_frame(n)` /
+/// `get_global_proposal(n)` by frame number can never serve a stale-but-wrong
+/// value. The only entry that legitimately changes is the chain head, so
+/// `get_latest_frame` is cached under a short TTL rather than by key.
+///
+/// Both maps are bounded; eviction drops the *lowest* frame number, because
+/// the hot set is always the recent tip that everyone is polling.
+pub struct CachingFrameLookup<F: FrameLookup> {
+    inner: F,
+    frames: std::sync::RwLock<std::collections::BTreeMap<u64, Arc<global::GlobalFrame>>>,
+    proposals: std::sync::RwLock<std::collections::BTreeMap<u64, Arc<global::GlobalProposal>>>,
+    latest: std::sync::RwLock<Option<(std::time::Instant, Arc<global::GlobalFrame>)>>,
+    // Separate miss locks keep cache hits independent of storage latency.
+    // Stripes bound bookkeeping while allowing unrelated heights to load.
+    frame_loads: [std::sync::Mutex<()>; 32],
+    proposal_loads: [std::sync::Mutex<()>; 32],
+    latest_load: std::sync::Mutex<()>,
+    capacity: usize,
+    frame_capacity: usize,
+    latest_ttl: std::time::Duration,
+}
+
+impl<F: FrameLookup> CachingFrameLookup<F> {
+    /// `capacity` is the per-map ceiling (frames and proposals are bounded
+    /// independently); `latest_ttl` bounds how stale the served chain head
+    /// may be. A 1s TTL collapses N pollers/second into ~1 store read while
+    /// staying well inside the frame cadence.
+    pub fn new(inner: F, capacity: usize, latest_ttl: std::time::Duration) -> Self {
+        Self {
+            inner,
+            frames: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            proposals: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            latest: std::sync::RwLock::new(None),
+            frame_loads: std::array::from_fn(|_| std::sync::Mutex::new(())),
+            proposal_loads: std::array::from_fn(|_| std::sync::Mutex::new(())),
+            latest_load: std::sync::Mutex::new(()),
+            capacity,
+            frame_capacity: capacity,
+            latest_ttl,
+        }
+    }
+
+    /// Disable the duplicate frame map when the backing clock store already
+    /// retains finalized frames. Proposal caching remains independently bounded.
+    pub fn with_frame_capacity(mut self, capacity: usize) -> Self {
+        self.frame_capacity = capacity;
+        self
+    }
+
+    fn insert_frame(&self, n: u64, frame: Arc<global::GlobalFrame>) {
+        if self.frame_capacity == 0 { return; }
+        let mut w = self.frames.write().unwrap();
+        w.insert(n, frame);
+        while w.len() > self.frame_capacity {
+            // Drop the lowest frame number — the tip is the hot set.
+            let lowest = match w.keys().next().copied() {
+                Some(k) => k,
+                None => break,
+            };
+            w.remove(&lowest);
+        }
+    }
+
+    fn insert_proposal(&self, n: u64, proposal: Arc<global::GlobalProposal>) {
+        let mut w = self.proposals.write().unwrap();
+        w.insert(n, proposal);
+        while w.len() > self.capacity {
+            let lowest = match w.keys().next().copied() {
+                Some(k) => k,
+                None => break,
+            };
+            w.remove(&lowest);
+        }
+    }
+}
+
+impl<F: FrameLookup> FrameLookup for CachingFrameLookup<F> {
+    fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+        if let Some((at, frame)) = self.latest.read().unwrap().as_ref() {
+            if at.elapsed() < self.latest_ttl {
+                return Ok((**frame).clone());
+            }
+        }
+        let _load = self.latest_load.lock().unwrap();
+        if let Some((at, frame)) = self.latest.read().unwrap().as_ref() {
+            if at.elapsed() < self.latest_ttl {
+                return Ok((**frame).clone());
+            }
+        }
+        let frame = self.inner.get_latest_frame()?;
+        let arc = Arc::new(frame.clone());
+        // Opportunistically populate the by-number cache too: the head is
+        // the single most-requested frame.
+        if let Some(n) = frame.header.as_ref().map(|h| h.frame_number) {
+            if n != 0 {
+                self.insert_frame(n, arc.clone());
+            }
+        }
+        *self.latest.write().unwrap() = Some((std::time::Instant::now(), arc));
+        Ok(frame)
+    }
+
+    fn get_frame(&self, frame_number: u64) -> Result<global::GlobalFrame, String> {
+        if self.frame_capacity == 0 { return self.inner.get_frame(frame_number); }
+        if let Some(frame) = self.frames.read().unwrap().get(&frame_number).cloned() {
+            return Ok((*frame).clone());
+        }
+        let _load = self.frame_loads[(frame_number % 32) as usize].lock().unwrap();
+        if let Some(frame) = self.frames.read().unwrap().get(&frame_number).cloned() {
+            return Ok((*frame).clone());
+        }
+        let frame = self.inner.get_frame(frame_number)?;
+        if self.frame_capacity > 0 {
+            self.insert_frame(frame_number, Arc::new(frame.clone()));
+        }
+        Ok(frame)
+    }
+
+    fn get_global_proposal(
+        &self,
+        frame_number: u64,
+    ) -> Result<global::GlobalProposal, String> {
+        if let Some(p) = self.proposals.read().unwrap().get(&frame_number).cloned() {
+            return Ok((*p).clone());
+        }
+        let _load = self.proposal_loads[(frame_number % 32) as usize].lock().unwrap();
+        if let Some(p) = self.proposals.read().unwrap().get(&frame_number).cloned() {
+            return Ok((*p).clone());
+        }
+        let proposal = self.inner.get_global_proposal(frame_number)?;
+        // Only cache *settled* proposals. Near the head a proposal's
+        // best-effort parts (proposer vote, prior-rank TC) may not be
+        // persisted yet at first request and fill in moments later;
+        // caching the head would pin that incomplete view. Once a frame is
+        // a few ranks below the head, every cert it carries is long since
+        // formed and immutable, so it is safe to cache permanently.
+        // Catch-up — the dominant repeated-read workload — pulls exactly
+        // these settled, well-below-head proposals.
+        const PROPOSAL_SETTLE_MARGIN: u64 = 4;
+        // Proposal-only catchup must refresh the head itself; it cannot rely
+        // on another RPC having populated (and kept refreshing) latest.
+        let head = self.get_latest_frame().ok()
+            .and_then(|f| f.header.map(|h| h.frame_number));
+        if frame_number == 0
+            || head.is_some_and(|h| h.saturating_sub(frame_number) >= PROPOSAL_SETTLE_MARGIN)
+        {
+            self.insert_proposal(frame_number, Arc::new(proposal.clone()));
+        }
+        Ok(proposal)
+    }
+}
+
 /// Handler invoked when a peer submits a message bundle via gRPC
 /// (`submit_global_message`). The handler owns the decision about
 /// what to do with the payload — typically it's routed into the same
@@ -52,6 +215,20 @@ pub type SubmitHandler = Arc<
         + Sync,
 >;
 
+/// Handler for `submit_global_consensus`: a directly-delivered global
+/// consensus message (proposal / vote / timeout) from a peer archive.
+/// The handler routes `(bitmask, data)` into the node's consensus
+/// receive path — the same one the BlossomSub GLOBAL_FRAME /
+/// GLOBAL_CONSENSUS arms feed — so global consensus runs point-to-point
+/// instead of over gossip (which can't carry a full-coverage proposal).
+/// Receives the full `Request` so the handler can read the authenticated
+/// peer identity. Returns `Ok(())` on accept or an error string.
+pub type ConsensusDeliveryHandler = Arc<
+    dyn Fn(Request<global::SubmitGlobalConsensusRequest>) -> Result<(), String>
+        + Send
+        + Sync,
+>;
+
 /// Snapshot function for workers — called by `GetWorkerInfo`.
 pub type WorkerSnapshotFn =
     Arc<dyn Fn() -> Vec<global::GlobalGetWorkerInfoResponseItem> + Send + Sync>;
@@ -64,40 +241,221 @@ pub type GlobalShardsProvider =
 
 /// Per-shard metadata provider used by [`GlobalRpcServer::get_app_shards`]:
 /// given a 35-byte `shard_key` (L1[3]||L2[32]) and a `prefix` path,
-/// returns `(size_be, data_shards, commitments[4])` derived from the
+/// returns `(size_be, data_shards, commitments[4], materialized_frame,
+/// latest_frame)` derived from the local archive state. The latter two values
+/// distinguish a committed app state from a stored-but-unmaterialized frame.
 /// local hypergraph CRDT's VertexAdds tree. Returns `None` for malformed
 /// keys; entries with no data return zero size/count and 64-byte zero
 /// commitments. Mirrors Go's `services.go:GetAppShards` which fills
 /// these from the engine-side shard metadata.
 pub type AppShardsProvider = Arc<
-    dyn Fn(&[u8], &[u32]) -> Option<(Vec<u8>, u64, [Vec<u8>; 4])> + Send + Sync,
+    dyn Fn(&[u8], &[u32]) -> Option<(Vec<u8>, u64, [Vec<u8>; 4], u64, u64)> + Send + Sync,
 >;
+
+/// Serves forest-sync data (JMT nodes/values of a shard/phase tree) from the
+/// local CRDT's forest, for [`GlobalRpcServer::get_forest_node`] /
+/// `get_forest_value`. A pure read proxy: the diff client authenticates every
+/// node against the trusted header root, so nothing served here is trusted on
+/// its own. Installed by the node (which owns the CRDT).
+pub trait ForestServer: Send + Sync {
+    fn global_vertex_proof(&self, _root: [u8; 32], _address: [u8; 32]) -> Option<Vec<u8>> { None }
+    /// `borsh(NodeKey)` → `borsh(Node)` (None if absent / malformed key).
+    fn serve_node(&self, shard_id: &[u8], phase: u32, node_key: &[u8]) -> Option<Vec<u8>>;
+    /// `(version, key_hash)` → leaf value (None if absent).
+    fn serve_value(&self, shard_id: &[u8], phase: u32, version: u64, key_hash: [u8; 32])
+        -> Option<Vec<u8>>;
+    /// Head `(version, root)` of a shard/phase tree, for the client's
+    /// version-discovery step. None if the tree was never committed.
+    fn serve_head(&self, shard_id: &[u8], phase: u32) -> Option<(u64, [u8; 32])>;
+    /// The raw l3 key (`vertex_id ‖ field_key`) a `key_hash` was committed from.
+    fn serve_preimage(&self, shard_id: &[u8], phase: u32, key_hash: [u8; 32]) -> Option<Vec<u8>>;
+    /// A vertex's committed blob (the readable data), keyed under the app
+    /// ShardKey bytes (`l1[3] ‖ l2[32]`). `version` MVCC-pins the read to the
+    /// tree version the diff addressed (`None` means latest).
+    fn serve_vertex_blob(&self, shard_key: &[u8], phase: u32, id: &[u8], version: Option<u64>)
+        -> Option<Vec<u8>>;
+    /// Sync-by-hash: authenticated tree `root` → local `(version, global_frame)`
+    /// for a `(shard_id, phase)` tree. None if never committed here or pruned.
+    fn resolve_root(&self, shard_id: &[u8], phase: u32, root: [u8; 32]) -> Option<(u64, u64)>;
+    /// Sync-by-hash (split apps): the sub-shard manifest folding into an
+    /// aggregate `app_root` — `[(prefix_words, sub_root, sub_version)]`.
+    #[allow(clippy::type_complexity)]
+    fn serve_app_manifest(
+        &self,
+        app_address: &[u8],
+        phase: u32,
+        app_root: [u8; 32],
+    ) -> Option<Vec<(Vec<u8>, [u8; 32], u64)>>;
+}
+
+/// The committed GLOBAL frame the node's state is at, if known. Shard
+/// topology and pending changes are written only by GLOBAL commits, so rows
+/// read at one value stay current until it changes.
+pub type AppShardsVersion = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// Distinct requests whose shard rows are kept; prefixes are caller-chosen.
+const APP_SHARD_TOPOLOGY_ENTRIES: usize = 256;
+
+/// Callers waiting for the one shard-row read in progress.
+static APP_SHARDS_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One request's shard rows and whether a pending split or merge freezes each.
+type ShardTopology = Vec<(quil_types::store::ShardInfo, bool)>;
+type AppShardTopologies =
+    std::collections::HashMap<(Vec<u8>, Vec<u32>), (u64, Arc<ShardTopology>)>;
+
+/// The shard rows a `GetAppShards` request names: one application's when
+/// `shard_key` is a full 35-byte key, otherwise every application's.
+fn read_shard_topology(
+    store: &dyn ShardsStore,
+    shard_key: &[u8],
+    prefix: &[u32],
+) -> Result<ShardTopology, String> {
+    let shards = if shard_key.len() == 35 {
+        store.get_app_shards(shard_key, prefix).map_err(|e| format!("get_app_shards: {e}"))?
+    } else {
+        store.range_app_shards().map_err(|e| format!("range_app_shards: {e}"))?
+    };
+    let pending = store
+        .all_pending_shard_changes()
+        .map_err(|e| format!("all_pending_shard_changes: {e}"))?;
+    Ok(shards
+        .into_iter()
+        .map(|s| {
+            let frozen = frozen_by_pending_change(&s.shard_key, &s.prefix, &pending);
+            (s, frozen)
+        })
+        .collect())
+}
 
 /// gRPC GlobalService implementation. Serves frames from the clock
 /// store so other nodes can sync from us.
 pub struct GlobalRpcServer {
+    /// `GetAppShards` shard rows, read once per committed GLOBAL frame (see
+    /// [`AppShardsVersion`]): every prover polls them.
+    app_shard_topologies: Arc<tokio::sync::Mutex<AppShardTopologies>>,
+    app_shards_version: Option<AppShardsVersion>,
     frames: Arc<dyn FrameLookup>,
     submit_handler: Option<SubmitHandler>,
+    consensus_delivery: Option<ConsensusDeliveryHandler>,
     shards_store: Option<Arc<dyn ShardsStore>>,
     worker_snapshot: Option<WorkerSnapshotFn>,
     global_shards: Option<GlobalShardsProvider>,
     app_shards: Option<AppShardsProvider>,
+    forest_server: Option<Arc<dyn ForestServer>>,
+    global_vertex_proof_source: Option<quil_engine::storage_history::GlobalVertexProofSource>,
+    archive_directory: Option<Arc<crate::ArchiveEndpointPool>>,
     /// Broadcast channel for `StreamGlobalMessages`. Producers
     /// (BlossomSub recv loop) send each received message; every
     /// connected streamer gets a `Receiver` clone.
     message_broadcast: Option<broadcast::Sender<global::StreamGlobalMessagesResponse>>,
+    /// The node's OWN peer id (`PeerId::to_bytes()`). When set, worker-privileged
+    /// RPCs (`StreamGlobalMessages`, `GetWorkerInfo`, `GetAppShards`) require the
+    /// authenticated caller to present THIS identity — i.e. only the node's own
+    /// data-worker processes (which dial with the node's Ed448 seed) may invoke
+    /// them, mirroring Go's `bytes.Equal(GetPeerID(), peerID)` self-gate. A remote
+    /// machine handshakes as a different peer_id and is denied. `None` ⇒ no gate
+    /// (single-machine/thread mode, where there is no gRPC boundary).
+    self_peer_id: Option<Vec<u8>>,
+    /// Authorizer for prover-gated RPCs (`GetGlobalProposal`): returns `true` iff
+    /// the authenticated caller is the node's own identity OR resolves to an
+    /// ACTIVE prover (Go `authenticateProverFromContext`). `None` ⇒ no gate.
+    #[allow(clippy::type_complexity)]
+    prover_authorizer:
+        Option<Arc<dyn Fn(&crate::peer_auth_middleware::AuthenticatedPeer) -> bool + Send + Sync>>,
+}
+
+// Shared across peer-facing server instances. A cancelled RPC keeps its
+// permit inside the blocking closure until storage work actually finishes.
+static FOREST_READ_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+static HISTORY_FORWARD_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+async fn forest_read<T: Send + 'static>(
+    server: Option<Arc<dyn ForestServer>>,
+    read: impl FnOnce(&dyn ForestServer) -> Option<T> + Send + 'static,
+) -> Result<Option<T>, Status> {
+    let Some(server) = server else { return Ok(None) };
+    bounded_forest_read(&FOREST_READ_WORKERS, move || read(server.as_ref())).await
+}
+
+async fn bounded_forest_read<T: Send + 'static>(
+    workers: &'static tokio::sync::Semaphore,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Status> {
+    let permit = workers.try_acquire()
+        .map_err(|_| Status::resource_exhausted("forest read workers busy; retry later"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read()
+    }).await.map_err(|e| Status::internal(format!("forest read task failed: {e}")))
 }
 
 impl GlobalRpcServer {
     pub fn new(frames: Arc<dyn FrameLookup>) -> Self {
         Self {
+            app_shard_topologies: Arc::new(tokio::sync::Mutex::new(AppShardTopologies::new())),
+            app_shards_version: None,
             frames,
             submit_handler: None,
+            consensus_delivery: None,
             shards_store: None,
             worker_snapshot: None,
             global_shards: None,
             app_shards: None,
+            forest_server: None,
+            global_vertex_proof_source: None,
+            archive_directory: None,
             message_broadcast: None,
+            self_peer_id: None,
+            prover_authorizer: None,
+        }
+    }
+
+    /// Install the prover authorizer for `GetGlobalProposal` (self OR active
+    /// prover). See [`prover_authorizer`](Self::prover_authorizer).
+    #[allow(clippy::type_complexity)]
+    pub fn with_prover_authorizer(
+        mut self,
+        f: Arc<dyn Fn(&crate::peer_auth_middleware::AuthenticatedPeer) -> bool + Send + Sync>,
+    ) -> Self {
+        self.prover_authorizer = Some(f);
+        self
+    }
+
+    /// Guard a prover-gated RPC (`GetGlobalProposal`): the authenticated caller
+    /// must be the node's own identity OR an active prover. No-op when no
+    /// authorizer is configured.
+    fn require_prover(&self, ext: &tonic::Extensions) -> Result<(), tonic::Status> {
+        let Some(ref authz) = self.prover_authorizer else {
+            return Ok(());
+        };
+        match ext.get::<crate::peer_auth_middleware::AuthenticatedPeer>() {
+            Some(auth) if authz(auth) => Ok(()),
+            _ => Err(tonic::Status::permission_denied(
+                "GetGlobalProposal: caller is not this node's identity or an active prover",
+            )),
+        }
+    }
+
+    /// Set the node's own peer id so worker-privileged RPCs are gated to the
+    /// node's own identity (see [`self_peer_id`](Self::self_peer_id)).
+    pub fn with_self_peer_id(mut self, peer_id: Vec<u8>) -> Self {
+        self.self_peer_id = Some(peer_id);
+        self
+    }
+
+    /// Guard a worker-privileged RPC: the authenticated caller must be the node's
+    /// OWN identity. Returns `PermissionDenied` otherwise. No-op when no self
+    /// peer id is configured (thread mode). `ext` is the request's extensions.
+    fn require_self_identity(&self, ext: &tonic::Extensions) -> Result<(), tonic::Status> {
+        let Some(ref me) = self.self_peer_id else {
+            return Ok(());
+        };
+        match ext.get::<crate::peer_auth_middleware::AuthenticatedPeer>() {
+            Some(auth) if auth.peer_id.to_bytes() == *me => Ok(()),
+            _ => Err(tonic::Status::permission_denied(
+                "worker-privileged RPC: caller is not this node's own identity",
+            )),
         }
     }
 
@@ -106,8 +464,32 @@ impl GlobalRpcServer {
         self
     }
 
+    /// Install the forest-sync server (serves JMT nodes/values). Without it, the
+    /// `GetForestNode`/`GetForestValue` RPCs report "not found".
+    pub fn with_forest_server(mut self, s: Arc<dyn ForestServer>) -> Self {
+        self.forest_server = Some(s);
+        self
+    }
+
+    pub fn with_global_vertex_proof_source(mut self, source: Option<quil_engine::storage_history::GlobalVertexProofSource>) -> Self {
+        self.global_vertex_proof_source = source;
+        self
+    }
+
+    pub fn with_archive_directory(mut self, pool: Arc<crate::ArchiveEndpointPool>) -> Self {
+        self.archive_directory = Some(pool);
+        self
+    }
+
     pub fn with_app_shards_provider(mut self, p: AppShardsProvider) -> Self {
         self.app_shards = Some(p);
+        self
+    }
+
+    /// Keep `GetAppShards` shard rows until the committed GLOBAL frame moves.
+    /// Without it they are read for every request.
+    pub fn with_app_shards_version(mut self, version: AppShardsVersion) -> Self {
+        self.app_shards_version = Some(version);
         self
     }
 
@@ -130,6 +512,14 @@ impl GlobalRpcServer {
         self
     }
 
+    /// Install a handler for `submit_global_consensus` — direct
+    /// point-to-point delivery of global consensus messages between
+    /// genesis archives (replaces gossip for global consensus).
+    pub fn with_consensus_delivery(mut self, handler: ConsensusDeliveryHandler) -> Self {
+        self.consensus_delivery = Some(handler);
+        self
+    }
+
     pub fn with_shards_store(mut self, store: Arc<dyn ShardsStore>) -> Self {
         self.shards_store = Some(store);
         self
@@ -143,6 +533,39 @@ impl GlobalRpcServer {
 
 #[tonic::async_trait]
 impl GlobalService for GlobalRpcServer {
+    async fn get_archive_endpoints(
+        &self, request: Request<global::GetArchiveEndpointsRequest>,
+    ) -> Result<Response<global::GetArchiveEndpointsResponse>, Status> {
+        self.require_self_identity(request.extensions())?;
+        let pool = self.archive_directory.as_ref().ok_or_else(|| Status::unavailable("archive directory unavailable"))?;
+        let endpoints = pool.get_all().await.into_iter()
+            .filter(|entry| !entry.is_empty() && entry.len() <= 512).take(32).collect();
+        Ok(Response::new(global::GetArchiveEndpointsResponse { endpoints }))
+    }
+    async fn get_global_vertex_proof(
+        &self,
+        request: Request<global::GetGlobalVertexProofRequest>,
+    ) -> Result<Response<global::GetGlobalVertexProofResponse>, Status> {
+        use quil_engine::storage_history::verify_global_vertex_proof;
+        let req = request.into_inner();
+        let root: [u8; 32] = req.root.as_slice().try_into().map_err(|_| Status::invalid_argument("GLOBAL root must be 32 bytes"))?;
+        let address: [u8; 32] = req.address.as_slice().try_into().map_err(|_| Status::invalid_argument("GLOBAL address must be 32 bytes"))?;
+        let mut proof = forest_read(self.forest_server.clone(), move |s| s.global_vertex_proof(root, address)).await?;
+        if proof.is_none() && req.allow_forward {
+            if let Some(source) = self.global_vertex_proof_source.as_ref() {
+                let _permit = HISTORY_FORWARD_WORKERS.try_acquire().map_err(|_| Status::resource_exhausted("history forwarding busy"))?;
+                proof = tokio::time::timeout(std::time::Duration::from_secs(10), source(root, address))
+                    .await.map_err(|_| Status::unavailable("historical proof forwarding timed out"))?
+                    .map_err(|e| Status::unavailable(e.to_string()))?;
+            }
+        }
+        if let Some(bytes) = proof.as_ref() {
+            verify_global_vertex_proof(&root, &address, bytes).map_err(|e| Status::data_loss(e.to_string()))?;
+        }
+        Ok(Response::new(global::GetGlobalVertexProofResponse {
+            found: proof.is_some(), proof: proof.unwrap_or_default(),
+        }))
+    }
     async fn get_global_frame(
         &self,
         request: Request<global::GetGlobalFrameRequest>,
@@ -150,15 +573,28 @@ impl GlobalService for GlobalRpcServer {
         let req = request.into_inner();
         let frame_number = req.frame_number;
 
-        let frame = if frame_number == 0 {
-            self.frames
-                .get_latest_frame()
-                .map_err(|e| Status::not_found(format!("no frames: {}", e)))?
-        } else {
-            self.frames
-                .get_frame(frame_number)
-                .map_err(|e| Status::not_found(format!("frame {} not found: {}", frame_number, e)))?
-        };
+        // Store read runs on the blocking pool, NOT inline on a peer-gRPC
+        // runtime worker. This is the hottest serving RPC on the network
+        // (every archive poller + proposal catch-up hits it in a loop) and
+        // a global frame record can be multi-MB — a burst of inline
+        // synchronous RocksDB reads occupies the runtime's workers and
+        // starves the latency-critical consensus delivery (votes/proposals)
+        // sharing them. Same treatment as `get_app_shards` below.
+        let frames = self.frames.clone();
+        let frame = tokio::task::spawn_blocking(move || {
+            if frame_number == 0 {
+                frames
+                    .get_latest_frame()
+                    .map_err(|e| format!("no frames: {}", e))
+            } else {
+                frames
+                    .get_frame(frame_number)
+                    .map_err(|e| format!("frame {} not found: {}", frame_number, e))
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
+        .map_err(Status::not_found)?;
 
         Ok(Response::new(global::GlobalFrameResponse {
             frame: Some(frame),
@@ -170,13 +606,27 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::GetGlobalProposalRequest>,
     ) -> Result<Response<global::GlobalProposalResponse>, Status> {
+        // Prover-gated (Go `authenticateProverFromContext`, services.go:95): the
+        // global proposal is served only to this node's own identity or an ACTIVE
+        // prover.
+        self.require_prover(request.extensions())?;
         let req = request.into_inner();
         // Assemble state + parent QC + prior TC + vote from the clock store
         // (see `FrameLookup::get_global_proposal`). Mirrors Go
         // `GlobalConsensusEngine.GetGlobalProposal`; on any lookup miss Go
         // returns an empty response rather than an error (qclient shows
         // "no proposal at frame N"), so we do the same.
-        match self.frames.get_global_proposal(req.frame_number) {
+        //
+        // Offloaded to the blocking pool for the same reason as
+        // `get_global_frame`: multiple synchronous store reads (frame,
+        // parent frame, QC, TC, vote) that must not hold a peer-gRPC
+        // runtime worker while catch-up peers hammer this in a loop.
+        let frames = self.frames.clone();
+        let frame_number = req.frame_number;
+        let result = tokio::task::spawn_blocking(move || frames.get_global_proposal(frame_number))
+            .await
+            .map_err(|e| Status::internal(format!("get_global_proposal task panicked: {e}")))?;
+        match result {
             Ok(proposal) => Ok(Response::new(global::GlobalProposalResponse {
                 proposal: Some(proposal),
             })),
@@ -191,53 +641,98 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::GetAppShardsRequest>,
     ) -> Result<Response<global::GetAppShardsResponse>, Status> {
-        let shards_store = match &self.shards_store {
-            Some(s) => s,
-            None => {
-                // Shards store not wired yet — return empty list so
-                // qclient displays "no shards yet" rather than erroring.
-                return Ok(Response::new(global::GetAppShardsResponse {
-                    info: Vec::new(),
-                }));
-            }
+        let Some(shards_store) = self.shards_store.clone() else {
+            // Shards store not wired yet — return empty list so
+            // qclient displays "no shards yet" rather than erroring.
+            return Ok(Response::new(global::GetAppShardsResponse {
+                info: Vec::new(),
+            }));
         };
+        let app_shards = self.app_shards.clone();
         let req = request.into_inner();
-        let shards = if req.shard_key.len() == 35 {
-            shards_store
-                .get_app_shards(&req.shard_key, &req.prefix)
-                .map_err(|e| Status::internal(format!("get_app_shards: {e}")))?
-        } else {
-            shards_store
-                .range_app_shards()
-                .map_err(|e| Status::internal(format!("range_app_shards: {e}")))?
-        };
         let include_shard_key = req.shard_key.len() != 35;
-        // `RocksShardsStore` only persists the prefix path bytes — it
-        // doesn't carry `size`, `data_shards`, or `commitment`. Fill
-        // those in by consulting the live CRDT via the provider, which
-        // walks the per-shard phase trees and reads the root metadata.
-        // Without this, every entry would report `size=0` and the
-        // caller's `build_proposal_descriptors` filters it out → no
-        // ProposeJoin ever fires.
-        let info: Vec<global::AppShardInfo> = shards
-            .into_iter()
-            .map(|s| {
-                let (size, data_shards, commitment) = match &self.app_shards {
-                    Some(p) => match p(&s.shard_key, &s.prefix) {
-                        Some((sz, ds, cm)) => (sz, ds, cm.to_vec()),
-                        None => (Vec::new(), 0, (0..4).map(|_| vec![0u8; 64]).collect()),
-                    },
-                    None => (s.size, s.data_shards, s.commitment),
-                };
-                global::AppShardInfo {
-                    shard_key: if include_shard_key { s.shard_key } else { Vec::new() },
-                    prefix: s.prefix,
-                    size,
-                    data_shards,
-                    commitment,
+        let key = (req.shard_key, req.prefix);
+        let topologies = self.app_shard_topologies.clone();
+        let version = self.app_shards_version.clone();
+        // Detached so a caller that gives up still leaves its read behind: the
+        // blocking work cannot be cancelled, and the next caller must not
+        // start a second copy of it.
+        let task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            // Rows change only with a committed GLOBAL frame: one caller reads
+            // them per frame, and callers arriving meanwhile wait and share it.
+            let topology = {
+                APP_SHARDS_WAITING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut kept = topologies.lock_owned().await;
+                APP_SHARDS_WAITING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let version = version.as_ref().and_then(|version| version());
+                match (version, kept.get(&key)) {
+                    (Some(version), Some((at, rows))) if *at == version => rows.clone(),
+                    _ => {
+                        let (store, (shard_key, prefix)) = (shards_store, key.clone());
+                        let rows = Arc::new(
+                            tokio::task::spawn_blocking(move || read_shard_topology(store.as_ref(), &shard_key, &prefix))
+                                .await
+                                .map_err(|e| Status::internal(format!("get_app_shards task panicked: {e}")))?
+                                .map_err(Status::internal)?,
+                        );
+                        if let Some(version) = version {
+                            if kept.len() >= APP_SHARD_TOPOLOGY_ENTRIES {
+                                kept.retain(|_, (at, _)| *at == version);
+                                if kept.len() >= APP_SHARD_TOPOLOGY_ENTRIES {
+                                    kept.clear();
+                                }
+                            }
+                            kept.insert(key, (version, rows.clone()));
+                        }
+                        rows
+                    }
                 }
+            };
+            // Sizes, executed and latest frames move with every application
+            // frame: read now, from memory and per-shard indexes. `RocksShardsStore`
+            // persists only the prefix path; without the provider every entry
+            // would report `size=0` and `build_proposal_descriptors` would
+            // filter it out → no ProposeJoin.
+            let info = tokio::task::spawn_blocking(move || -> Vec<global::AppShardInfo> {
+                topology
+                    .iter()
+                    .map(|(s, pending_change)| {
+                        let (size, data_shards, commitment, materialized_frame, latest_frame) = match &app_shards {
+                            Some(p) => match p(&s.shard_key, &s.prefix) {
+                                Some((sz, ds, cm, mat, latest)) => (sz, ds, cm.to_vec(), mat, latest),
+                                None => (Vec::new(), 0, (0..4).map(|_| vec![0u8; 64]).collect(), 0, 0),
+                            },
+                            None => (s.size.clone(), s.data_shards, s.commitment.clone(), 0, 0),
+                        };
+                        global::AppShardInfo {
+                            shard_key: if include_shard_key { s.shard_key.clone() } else { Vec::new() },
+                            prefix: s.prefix.clone(),
+                            size,
+                            data_shards,
+                            commitment,
+                            materialized_frame,
+                            latest_frame,
+                            pending_change: *pending_change,
+                        }
+                    })
+                    .collect()
             })
-            .collect();
+            .await
+            .map_err(|e| Status::internal(format!("get_app_shards task panicked: {e}")))?;
+            if started.elapsed() >= std::time::Duration::from_secs(1) {
+                tracing::warn!(
+                    ms = started.elapsed().as_millis() as u64,
+                    shards = info.len(),
+                    waiting = APP_SHARDS_WAITING.load(std::sync::atomic::Ordering::Relaxed),
+                    "slow GetAppShards computation",
+                );
+            }
+            Result::<_, Status>::Ok(info)
+        });
+        let info = task
+            .await
+            .map_err(|e| Status::internal(format!("get_app_shards task failed: {e}")))??;
         Ok(Response::new(global::GetAppShardsResponse { info }))
     }
 
@@ -258,12 +753,14 @@ impl GlobalService for GlobalRpcServer {
         // collect per-phase root commitments + sizes. Matches Go's
         // `services.go:313-368` exactly. Without a provider, fall
         // back to the zero-commitment response (structured but empty)
-        // so qclient doesn't error out.
-        let (size, commitment) = match &self.global_shards {
+        // so qclient doesn't error out. The walk is heavy synchronous
+        // work → offload to the blocking pool so it doesn't hold an async
+        // worker on the dedicated peer-gRPC runtime.
+        let global_shards = self.global_shards.clone();
+        let (size, commitment) = tokio::task::spawn_blocking(move || match &global_shards {
             Some(p) => {
                 let entries = p(&l1, &l2);
-                let mut total =
-                    num_bigint::BigInt::from(0u64);
+                let mut total = num_bigint::BigInt::from(0u64);
                 let mut commits: Vec<Vec<u8>> = Vec::with_capacity(4);
                 for (commit, size_be, _leaf_count) in entries.iter() {
                     total += num_bigint::BigInt::from_signed_bytes_be(size_be);
@@ -272,7 +769,9 @@ impl GlobalService for GlobalRpcServer {
                 (total.to_signed_bytes_be(), commits)
             }
             None => (Vec::new(), (0..4).map(|_| vec![0u8; 64]).collect()),
-        };
+        })
+        .await
+        .map_err(|e| Status::internal(format!("get_global_shards task panicked: {e}")))?;
         Ok(Response::new(global::GetGlobalShardsResponse {
             size,
             commitment,
@@ -293,13 +792,12 @@ impl GlobalService for GlobalRpcServer {
 
     async fn get_worker_info(
         &self,
-        _request: Request<global::GlobalGetWorkerInfoRequest>,
+        request: Request<global::GlobalGetWorkerInfoRequest>,
     ) -> Result<Response<global::GlobalGetWorkerInfoResponse>, Status> {
-        // NOTE: Go gates this on `peer_id == self.peer_id` — an
-        // operator-only check. Our peer-auth interceptor gives us
-        // `AuthenticatedPeer`; we could add the self-peer check here
-        // but for archive-node parity we trust the caller (reads
-        // only).
+        // Worker-privileged: only the node's own data-worker processes may read
+        // the worker roster (Go `services.go:413` self-gate). A remote peer is
+        // denied.
+        self.require_self_identity(request.extensions())?;
         let workers = match &self.worker_snapshot {
             Some(s) => s(),
             None => Vec::new(),
@@ -317,8 +815,13 @@ impl GlobalService for GlobalRpcServer {
 
     async fn stream_global_messages(
         &self,
-        _request: Request<global::StreamGlobalMessagesRequest>,
+        request: Request<global::StreamGlobalMessagesRequest>,
     ) -> Result<Response<Self::StreamGlobalMessagesStream>, Status> {
+        // Worker-privileged: the full global dispatch stream is for this node's
+        // OWN data-workers only — "only local workers may stream global messages"
+        // (Go `services.go:452`). A remote machine that completes the handshake as
+        // a different peer_id must NOT be able to subscribe to our dispatch.
+        self.require_self_identity(request.extensions())?;
         let sender = self.message_broadcast.as_ref().ok_or_else(|| {
             Status::unavailable("global message broadcast not wired")
         })?;
@@ -340,14 +843,666 @@ impl GlobalService for GlobalRpcServer {
     ) -> Result<Response<global::SubmitGlobalMessageResponse>, Status> {
         match &self.submit_handler {
             Some(handler) => {
-                handler(request)
-                    .map_err(|e| Status::invalid_argument(format!("submit rejected: {}", e)))?;
-                Ok(Response::new(global::SubmitGlobalMessageResponse {}))
+                match handler(request) {
+                    Ok(()) => Ok(Response::new(global::SubmitGlobalMessageResponse {})),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "global message submit rejected by collector");
+                        Err(Status::invalid_argument(format!("submit rejected: {}", e)))
+                    }
+                }
             }
             None => {
-                debug!("submit_global_message called with no handler installed — dropping");
+                tracing::warn!("global message submit received but no handler installed — dropping");
                 Ok(Response::new(global::SubmitGlobalMessageResponse {}))
             }
         }
+    }
+
+    async fn submit_global_consensus(
+        &self,
+        request: Request<global::SubmitGlobalConsensusRequest>,
+    ) -> Result<Response<global::SubmitGlobalConsensusResponse>, Status> {
+        match &self.consensus_delivery {
+            Some(handler) => {
+                handler(request)
+                    .map_err(|e| Status::invalid_argument(format!("consensus delivery rejected: {}", e)))?;
+                Ok(Response::new(global::SubmitGlobalConsensusResponse {}))
+            }
+            None => {
+                debug!("submit_global_consensus called with no handler installed — dropping");
+                Ok(Response::new(global::SubmitGlobalConsensusResponse {}))
+            }
+        }
+    }
+
+    async fn get_forest_node(
+        &self,
+        request: Request<global::GetForestNodeRequest>,
+    ) -> Result<Response<global::GetForestNodeResponse>, Status> {
+        let req = request.into_inner();
+        let node = forest_read(self.forest_server.clone(), move |s| s.serve_node(&req.shard_id, req.phase, &req.node_key)).await?;
+        Ok(Response::new(global::GetForestNodeResponse {
+            found: node.is_some(),
+            node: node.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_forest_value(
+        &self,
+        request: Request<global::GetForestValueRequest>,
+    ) -> Result<Response<global::GetForestValueResponse>, Status> {
+        let req = request.into_inner();
+        let key_hash: [u8; 32] = req
+            .key_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("key_hash must be 32 bytes"))?;
+        let value = forest_read(self.forest_server.clone(), move |s| s.serve_value(&req.shard_id, req.phase, req.version, key_hash)).await?;
+        Ok(Response::new(global::GetForestValueResponse {
+            found: value.is_some(),
+            value: value.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_forest_head(
+        &self,
+        request: Request<global::GetForestHeadRequest>,
+    ) -> Result<Response<global::GetForestHeadResponse>, Status> {
+        let req = request.into_inner();
+        let head = forest_read(self.forest_server.clone(), move |s| s.serve_head(&req.shard_id, req.phase)).await?;
+        Ok(Response::new(match head {
+            Some((version, root)) => global::GetForestHeadResponse {
+                found: true,
+                version,
+                root: root.to_vec(),
+            },
+            None => global::GetForestHeadResponse { found: false, version: 0, root: Vec::new() },
+        }))
+    }
+
+    async fn get_forest_preimage(
+        &self,
+        request: Request<global::GetForestPreimageRequest>,
+    ) -> Result<Response<global::GetForestPreimageResponse>, Status> {
+        let req = request.into_inner();
+        let key_hash: [u8; 32] = req
+            .key_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("key_hash must be 32 bytes"))?;
+        let raw = forest_read(self.forest_server.clone(), move |s| s.serve_preimage(&req.shard_id, req.phase, key_hash)).await?;
+        Ok(Response::new(global::GetForestPreimageResponse {
+            found: raw.is_some(),
+            raw_key: raw.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_vertex_blob(
+        &self,
+        request: Request<global::GetVertexBlobRequest>,
+    ) -> Result<Response<global::GetVertexBlobResponse>, Status> {
+        let req = request.into_inner();
+        let version = (req.exact_version || req.version != 0).then_some(req.version);
+        let blob = forest_read(self.forest_server.clone(), move |s| s.serve_vertex_blob(&req.shard_key, req.phase, &req.id, version)).await?;
+        Ok(Response::new(global::GetVertexBlobResponse {
+            found: blob.is_some(),
+            blob: blob.unwrap_or_default(),
+        }))
+    }
+
+    async fn resolve_root(
+        &self,
+        request: Request<global::ResolveRootRequest>,
+    ) -> Result<Response<global::ResolveRootResponse>, Status> {
+        let req = request.into_inner();
+        let root: [u8; 32] = req
+            .root
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("root must be 32 bytes"))?;
+        let resolved = forest_read(self.forest_server.clone(), move |s| s.resolve_root(&req.shard_id, req.phase, root)).await?;
+        Ok(Response::new(match resolved {
+            Some((version, global_frame)) => global::ResolveRootResponse {
+                found: true,
+                version,
+                global_frame,
+            },
+            None => global::ResolveRootResponse { found: false, version: 0, global_frame: 0 },
+        }))
+    }
+
+    async fn get_app_manifest(
+        &self,
+        request: Request<global::GetAppManifestRequest>,
+    ) -> Result<Response<global::GetAppManifestResponse>, Status> {
+        let req = request.into_inner();
+        let app_root: [u8; 32] = req
+            .app_root
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("app_root must be 32 bytes"))?;
+        let manifest = forest_read(self.forest_server.clone(), move |s| s.serve_app_manifest(&req.app_address, req.phase, app_root)).await?;
+        Ok(Response::new(match manifest {
+            Some(entries) => global::GetAppManifestResponse {
+                found: true,
+                entries: entries
+                    .into_iter()
+                    .map(|(prefix, root, version)| global::AppManifestEntry {
+                        prefix,
+                        root: root.to_vec(),
+                        version,
+                    })
+                    .collect(),
+            },
+            None => global::GetAppManifestResponse { found: false, entries: Vec::new() },
+        }))
+    }
+}
+
+/// Whether a recorded split or merge that has not applied yet names the shard
+/// at `(shard_key, prefix)`. The chain refuses a join that includes such a
+/// shard, so a regular node leaves it out of its join candidates.
+fn frozen_by_pending_change(
+    shard_key: &[u8],
+    prefix: &[u32],
+    pending: &[quil_types::store::PendingShardChange],
+) -> bool {
+    let Some(app) = shard_key.get(3..35) else { return false };
+    let filter = quil_forest::shard_prefix_to_filter(app, prefix);
+    pending.iter().any(|change| change.affects_shard(&filter))
+}
+
+#[cfg(test)]
+mod pending_change_tests {
+    use quil_types::store::{PendingShardChange, ShardChangeKind};
+
+    // A live width run: three shards were staged to split at frame 247 and
+    // flipped at 304. Every join the regular nodes proposed in between named
+    // one of them, and the chain refused each whole join.
+    #[test]
+    fn a_shard_named_by_a_pending_split_is_reported_frozen() {
+        let app = [0x21u8; 32];
+        let shard_key: Vec<u8> = [0u8, 0, 0].into_iter().chain(app).collect();
+        let prefix = quil_forest::bit_path_to_prefix;
+        let parent = quil_forest::encode_shard_bit_path(&app, &[false, true]);
+        let split = PendingShardChange {
+            kind: ShardChangeKind::Split,
+            parent,
+            children: vec![
+                quil_forest::encode_shard_bit_path(&app, &[false, true, false]),
+                quil_forest::encode_shard_bit_path(&app, &[false, true, true]),
+            ],
+            effective_epoch: 10,
+            proposed_frame: 247,
+        };
+        let pending = [split];
+        assert!(super::frozen_by_pending_change(&shard_key, &prefix(&[false, true]), &pending));
+        assert!(!super::frozen_by_pending_change(&shard_key, &prefix(&[false, false]), &pending));
+        assert!(!super::frozen_by_pending_change(&shard_key, &prefix(&[false, true]), &[]));
+    }
+}
+
+#[cfg(test)]
+mod identity_gate_tests {
+    use super::*;
+    use crate::peer_auth_middleware::AuthenticatedPeer;
+
+    struct NoopLookup;
+    impl FrameLookup for NoopLookup {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+            Err("n/a".into())
+        }
+        fn get_frame(&self, _: u64) -> Result<global::GlobalFrame, String> {
+            Err("n/a".into())
+        }
+        fn get_global_proposal(&self, _: u64) -> Result<global::GlobalProposal, String> {
+            Err("n/a".into())
+        }
+    }
+
+    fn auth_ext(peer_id: quil_p2p::PeerId) -> tonic::Extensions {
+        let mut ext = tonic::Extensions::new();
+        ext.insert(AuthenticatedPeer { peer_id, falcon_public_key: Vec::new() });
+        ext
+    }
+
+    #[tokio::test]
+    async fn archive_directory_is_bounded_and_only_served_to_own_workers() {
+        let me = quil_p2p::PeerId::random();
+        let pool = Arc::new(crate::ArchiveEndpointPool::new(std::time::Duration::ZERO));
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup))
+            .with_self_peer_id(me.to_bytes()).with_archive_directory(pool.clone());
+        let request = |peer| {
+            let mut request = Request::new(global::GetArchiveEndpointsRequest {});
+            if let Some(peer) = peer { *request.extensions_mut() = auth_ext(peer); }
+            request
+        };
+        for peer in [None, Some(quil_p2p::PeerId::random())] {
+            assert_eq!(server.get_archive_endpoints(request(peer)).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+        }
+        assert!(server.get_archive_endpoints(request(Some(me))).await.unwrap().into_inner().endpoints.is_empty());
+        pool.add(String::new()).await;
+        pool.add("x".repeat(513)).await;
+        for index in 0..40 { pool.add(format!("192.0.2.{}:8340", index+1)).await; }
+        let endpoints = server.get_archive_endpoints(request(Some(me))).await.unwrap().into_inner().endpoints;
+        assert_eq!(endpoints.len(), 32);
+        assert_eq!(endpoints[0], "192.0.2.1:8340");
+        assert_eq!(endpoints[31], "192.0.2.32:8340");
+    }
+
+    #[test]
+    fn self_gate_allows_self_denies_others_and_missing() {
+        let me = quil_p2p::PeerId::random();
+        let other = quil_p2p::PeerId::random();
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup)).with_self_peer_id(me.to_bytes());
+        // The node's own identity (its data-workers) → allowed.
+        assert!(server.require_self_identity(&auth_ext(me)).is_ok());
+        // A different machine's identity → denied (the security fix).
+        assert!(server.require_self_identity(&auth_ext(other)).is_err());
+        // Unauthenticated (no handshake identity) → denied.
+        assert!(server.require_self_identity(&tonic::Extensions::new()).is_err());
+    }
+
+    #[test]
+    fn no_self_peer_id_configured_is_ungated() {
+        // Thread mode (workers in-process, no gRPC boundary): no gate installed,
+        // so the check is a no-op.
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup));
+        assert!(server.require_self_identity(&auth_ext(quil_p2p::PeerId::random())).is_ok());
+        assert!(server.require_self_identity(&tonic::Extensions::new()).is_ok());
+    }
+
+    #[test]
+    fn require_prover_honors_authorizer_and_presence() {
+        // Authorizer that only accepts one specific peer (the "active prover").
+        let prover = quil_p2p::PeerId::random();
+        let prover_bytes = prover.to_bytes();
+        let authz: Arc<dyn Fn(&AuthenticatedPeer) -> bool + Send + Sync> =
+            Arc::new(move |a: &AuthenticatedPeer| a.peer_id.to_bytes() == prover_bytes);
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup)).with_prover_authorizer(authz);
+        // active prover → allowed
+        assert!(server.require_prover(&auth_ext(prover)).is_ok());
+        // non-prover → denied
+        assert!(server.require_prover(&auth_ext(quil_p2p::PeerId::random())).is_err());
+        // unauthenticated → denied
+        assert!(server.require_prover(&tonic::Extensions::new()).is_err());
+        // no authorizer configured → ungated
+        let ungated = GlobalRpcServer::new(Arc::new(NoopLookup));
+        assert!(ungated.require_prover(&tonic::Extensions::new()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod caching_lookup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn frame(n: u64) -> global::GlobalFrame {
+        global::GlobalFrame {
+            header: Some(global::GlobalFrameHeader {
+                frame_number: n,
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        }
+    }
+
+    /// Counts inner calls so we can assert cache hits vs. store reads.
+    struct CountingLookup {
+        head: u64,
+        get_frame_calls: AtomicU64,
+        get_latest_calls: AtomicU64,
+        get_proposal_calls: AtomicU64,
+    }
+
+    impl CountingLookup {
+        fn new(head: u64) -> Self {
+            Self {
+                head,
+                get_frame_calls: AtomicU64::new(0),
+                get_latest_calls: AtomicU64::new(0),
+                get_proposal_calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl FrameLookup for CountingLookup {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+            self.get_latest_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(frame(self.head))
+        }
+        fn get_frame(&self, n: u64) -> Result<global::GlobalFrame, String> {
+            self.get_frame_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(frame(n))
+        }
+        fn get_global_proposal(&self, n: u64) -> Result<global::GlobalProposal, String> {
+            self.get_proposal_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(global::GlobalProposal {
+                state: Some(frame(n)),
+                parent_quorum_certificate: None,
+                prior_rank_timeout_certificate: None,
+                vote: None,
+            })
+        }
+    }
+
+    #[test]
+    fn proposal_only_catchup_populates_cache_and_handles_max_height() {
+        let cache = CachingFrameLookup::new(
+            CountingLookup::new(100), 16, std::time::Duration::from_secs(1),
+        );
+        cache.get_global_proposal(50).unwrap();
+        cache.get_global_proposal(50).unwrap();
+        assert_eq!(cache.inner.get_proposal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.inner.get_latest_calls.load(Ordering::SeqCst), 1);
+        cache.get_global_proposal(u64::MAX).unwrap();
+        cache.get_global_proposal(u64::MAX).unwrap();
+        assert_eq!(cache.inner.get_proposal_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn concurrent_cold_reads_share_store_loads() {
+        struct SlowLookup(CountingLookup);
+        impl FrameLookup for SlowLookup {
+            fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.0.get_latest_frame()
+            }
+            fn get_frame(&self, n: u64) -> Result<global::GlobalFrame, String> {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.0.get_frame(n)
+            }
+            fn get_global_proposal(&self, n: u64) -> Result<global::GlobalProposal, String> {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.0.get_global_proposal(n)
+            }
+        }
+        let cache = CachingFrameLookup::new(
+            SlowLookup(CountingLookup::new(100)), 16, std::time::Duration::from_secs(10),
+        );
+        let start = std::sync::Barrier::new(12);
+        std::thread::scope(|scope| {
+            for _ in 0..12 {
+                scope.spawn(|| {
+                    start.wait();
+                    cache.get_latest_frame().unwrap();
+                    cache.get_frame(42).unwrap();
+                    cache.get_global_proposal(50).unwrap();
+                });
+            }
+        });
+        assert_eq!(cache.inner.0.get_latest_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.inner.0.get_frame_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.inner.0.get_proposal_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn frames_cached_by_number_immutable() {
+        let cache = CachingFrameLookup::new(
+            CountingLookup::new(100),
+            8,
+            std::time::Duration::from_secs(1),
+        );
+        for _ in 0..5 {
+            let f = cache.get_frame(42).unwrap();
+            assert_eq!(f.header.unwrap().frame_number, 42);
+        }
+        // Only the first read hit the inner store.
+        assert_eq!(cache.inner.get_frame_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn latest_cached_under_ttl_then_refetched() {
+        let cache = CachingFrameLookup::new(
+            CountingLookup::new(100),
+            8,
+            std::time::Duration::from_millis(40),
+        );
+        cache.get_latest_frame().unwrap();
+        cache.get_latest_frame().unwrap();
+        assert_eq!(cache.inner.get_latest_calls.load(Ordering::SeqCst), 1, "within TTL → cached");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        cache.get_latest_frame().unwrap();
+        assert_eq!(cache.inner.get_latest_calls.load(Ordering::SeqCst), 2, "after TTL → refetch");
+    }
+
+    #[test]
+    fn eviction_drops_lowest_frame_number() {
+        let cache = CachingFrameLookup::new(
+            CountingLookup::new(100),
+            2,
+            std::time::Duration::from_secs(1),
+        );
+        cache.get_frame(10).unwrap();
+        cache.get_frame(11).unwrap();
+        cache.get_frame(12).unwrap(); // evicts 10 (lowest)
+        let before = cache.inner.get_frame_calls.load(Ordering::SeqCst);
+        cache.get_frame(11).unwrap(); // still cached
+        cache.get_frame(12).unwrap(); // still cached
+        assert_eq!(cache.inner.get_frame_calls.load(Ordering::SeqCst), before, "tip stays resident");
+        cache.get_frame(10).unwrap(); // re-reads (was evicted)
+        assert_eq!(cache.inner.get_frame_calls.load(Ordering::SeqCst), before + 1);
+    }
+
+    #[test]
+    fn settled_proposal_cached_but_head_not() {
+        let cache = CachingFrameLookup::new(
+            CountingLookup::new(100),
+            16,
+            std::time::Duration::from_secs(1),
+        );
+        // Prime the head so the settle-margin check has a head to compare to.
+        cache.get_latest_frame().unwrap();
+        // Settled (well below head=100): cached.
+        cache.get_global_proposal(50).unwrap();
+        cache.get_global_proposal(50).unwrap();
+        assert_eq!(cache.inner.get_proposal_calls.load(Ordering::SeqCst), 1, "settled proposal cached");
+        // Head (== 100, within the 4-rank settle margin): NOT cached.
+        cache.get_global_proposal(100).unwrap();
+        cache.get_global_proposal(100).unwrap();
+        assert_eq!(
+            cache.inner.get_proposal_calls.load(Ordering::SeqCst),
+            3,
+            "in-flux head proposal re-assembled each call (not pinned)"
+        );
+        // Genesis is always cacheable (fully static).
+        cache.get_global_proposal(0).unwrap();
+        let after_genesis = cache.inner.get_proposal_calls.load(Ordering::SeqCst);
+        cache.get_global_proposal(0).unwrap();
+        assert_eq!(cache.inner.get_proposal_calls.load(Ordering::SeqCst), after_genesis);
+    }
+}
+
+#[cfg(test)]
+mod app_shards_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use quil_types::store::ShardInfo;
+
+    struct NoFrames;
+    impl FrameLookup for NoFrames {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> { Err("unused".into()) }
+        fn get_frame(&self, _: u64) -> Result<global::GlobalFrame, String> { Err("unused".into()) }
+        fn get_global_proposal(&self, _: u64) -> Result<global::GlobalProposal, String> { Err("unused".into()) }
+    }
+
+    /// One shard; counts its reads, and holds each until released when gated.
+    struct OneShard {
+        reads: AtomicUsize,
+        gate: Option<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+    impl ShardsStore for OneShard {
+        fn range_app_shards(&self) -> quil_types::error::Result<Vec<ShardInfo>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                let _ = gate.lock().unwrap().recv();
+            }
+            Ok(vec![ShardInfo { shard_key: vec![0; 35], prefix: vec![1], size: Vec::new(), data_shards: 0, commitment: Vec::new() }])
+        }
+        fn get_app_shards(&self, _: &[u8], _: &[u32]) -> quil_types::error::Result<Vec<ShardInfo>> {
+            self.range_app_shards()
+        }
+        fn put_app_shard(&self, _: &dyn quil_types::store::Transaction, _: &ShardInfo) -> quil_types::error::Result<()> { Ok(()) }
+        fn delete_app_shard(&self, _: &dyn quil_types::store::Transaction, _: &[u8], _: &[u32]) -> quil_types::error::Result<()> { Ok(()) }
+    }
+
+    async fn ask(server: Arc<GlobalRpcServer>) -> Result<Vec<global::AppShardInfo>, Status> {
+        server
+            .get_app_shards(Request::new(global::GetAppShardsRequest { shard_key: vec![0; 35], prefix: vec![1] }))
+            .await
+            .map(|r| r.into_inner().info)
+    }
+
+    /// Reports `size` as the shard's size; the test moves it between calls.
+    fn sized(size: Arc<AtomicU64>) -> AppShardsProvider {
+        Arc::new(move |_, _| {
+            let size = size.load(Ordering::SeqCst);
+            Some((size.to_be_bytes().to_vec(), 1, std::array::from_fn(|_| vec![0; 64]), 3, 4))
+        })
+    }
+
+    // Every prover polls GetAppShards. Its shard rows change only when a
+    // GLOBAL frame commits, so they are read once per committed frame; sizes
+    // and frame progress move with every application frame and are read for
+    // every request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shard_rows_are_read_once_per_committed_frame_and_sizes_every_time() {
+        let store = Arc::new(OneShard { reads: AtomicUsize::new(0), gate: None });
+        let (committed, size) = (Arc::new(AtomicU64::new(5)), Arc::new(AtomicU64::new(10)));
+        let version = committed.clone();
+        let server = Arc::new(GlobalRpcServer::new(Arc::new(NoFrames))
+            .with_shards_store(store.clone())
+            .with_app_shards_provider(sized(size.clone()))
+            .with_app_shards_version(Arc::new(move || Some(version.load(Ordering::SeqCst)))));
+        for expected in [10u64, 11, 12] {
+            size.store(expected, Ordering::SeqCst);
+            assert_eq!(ask(server.clone()).await.unwrap()[0].size, expected.to_be_bytes().to_vec());
+        }
+        assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+        committed.store(6, Ordering::SeqCst);
+        ask(server.clone()).await.unwrap();
+        ask(server.clone()).await.unwrap();
+        assert_eq!(store.reads.load(Ordering::SeqCst), 2, "read again once the committed frame moves");
+
+        let unversioned = Arc::new(OneShard { reads: AtomicUsize::new(0), gate: None });
+        let server = Arc::new(GlobalRpcServer::new(Arc::new(NoFrames))
+            .with_shards_store(unversioned.clone())
+            .with_app_shards_provider(sized(size)));
+        ask(server.clone()).await.unwrap();
+        ask(server).await.unwrap();
+        assert_eq!(unversioned.reads.load(Ordering::SeqCst), 2, "no committed frame known: read every time");
+    }
+
+    // Post-split, each answer took minutes and every prover kept asking; each
+    // retry started another copy of the work until the archives' CPUs were
+    // spent and GLOBAL stopped proposing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_and_abandoned_callers_share_one_read() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store = Arc::new(OneShard { reads: AtomicUsize::new(0), gate: Some(std::sync::Mutex::new(release_rx)) });
+        let server = Arc::new(GlobalRpcServer::new(Arc::new(NoFrames))
+            .with_shards_store(store.clone())
+            .with_app_shards_provider(sized(Arc::new(AtomicU64::new(7))))
+            .with_app_shards_version(Arc::new(|| Some(9))));
+        let first = tokio::spawn(ask(server.clone()));
+        while store.reads.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let waiting: Vec<_> = (0..8).map(|_| tokio::spawn(ask(server.clone()))).collect();
+        release_tx.send(()).unwrap();
+        for caller in waiting {
+            let info = tokio::time::timeout(std::time::Duration::from_secs(5), caller)
+                .await.unwrap().unwrap().unwrap();
+            assert_eq!(info[0].size, 7u64.to_be_bytes().to_vec());
+        }
+        assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod forest_read_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_keeps_storage_slot_and_runtime_responsive() {
+        static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        // Dropping release_tx also releases the worker on assertion failure.
+        let caller = tokio::spawn(bounded_forest_read(&WORKERS, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await.unwrap().unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(bounded_forest_read(&WORKERS, || ()).await.unwrap_err().code(),
+            tonic::Code::ResourceExhausted);
+        release_tx.send(()).unwrap();
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), WORKERS.acquire())
+            .await.unwrap().unwrap();
+        drop(permit);
+        assert_eq!(bounded_forest_read(&WORKERS, || 42).await.unwrap(), 42);
+    }
+}
+
+#[cfg(test)]
+mod historical_proof_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EmptyLookup;
+    impl FrameLookup for EmptyLookup {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> { Err("unused".into()) }
+        fn get_frame(&self, _: u64) -> Result<global::GlobalFrame, String> { Err("unused".into()) }
+        fn get_global_proposal(&self, _: u64) -> Result<global::GlobalProposal, String> { Err("unused".into()) }
+    }
+
+    #[tokio::test]
+    async fn historical_proof_forwarding_is_bounded_one_hop_and_root_verified() {
+        let address = [9;32];
+        let tree = quil_execution::global_intrinsic::materialize::create_leaf_root_vertex_tree(
+            &[7;32], &[8;32], &[], 11, &[1;74], 1, 330,
+        ).unwrap();
+        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        let forest = quil_forest::Forest::in_memory();
+        let root = forest.commit_shard_phase_raw(&[0xff;32], quil_forest::Phase::VertexAdds, 0,
+            vec![(address.to_vec(), quil_tries::vertex_leaf_value(&blob).unwrap())]).unwrap();
+        let vertex: Vec<_> = [0xff;32].into_iter().chain(address).collect();
+        let bytes = quil_forest::MembershipProof { inputs:vec![forest.build_vertex_membership_proof(
+            &[0xff;32], quil_forest::Phase::VertexAdds, 0, &vertex, &blob,
+        ).unwrap()] }.to_bytes();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = {
+            let calls = calls.clone();
+            let bytes = bytes.clone();
+            Arc::new(move |_: [u8;32], _: [u8;32]| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let bytes = bytes.clone();
+                Box::pin(async move { Ok(Some(bytes)) }) as std::pin::Pin<Box<dyn std::future::Future<Output=quil_types::error::Result<Option<Vec<u8>>>> + Send>>
+            }) as quil_engine::storage_history::GlobalVertexProofSource
+        };
+        let server = GlobalRpcServer::new(Arc::new(EmptyLookup)).with_global_vertex_proof_source(Some(source));
+        let request = |root: Vec<u8>, address: Vec<u8>, allow_forward| Request::new(global::GetGlobalVertexProofRequest { root, address, allow_forward });
+        let missing = server.get_global_vertex_proof(request(root.to_vec(), address.to_vec(), false)).await.unwrap().into_inner();
+        assert!(!missing.found);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(server.get_global_vertex_proof(request(vec![0;31], address.to_vec(), true)).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let valid = server.get_global_vertex_proof(request(root.to_vec(), address.to_vec(), true)).await.unwrap().into_inner();
+        assert!(valid.found);
+        assert_eq!(valid.proof, bytes);
+        assert_eq!(server.get_global_vertex_proof(request(vec![0;32], address.to_vec(), true)).await.unwrap_err().code(), tonic::Code::DataLoss);
+        assert_eq!(server.get_global_vertex_proof(request(root.to_vec(), vec![0;32], true)).await.unwrap_err().code(), tonic::Code::DataLoss);
+        let held: Vec<_> = (0..4).map(|_| HISTORY_FORWARD_WORKERS.try_acquire().unwrap()).collect();
+        let before = calls.load(Ordering::SeqCst);
+        assert_eq!(server.get_global_vertex_proof(request(root.to_vec(), address.to_vec(), true)).await.unwrap_err().code(), tonic::Code::ResourceExhausted);
+        assert_eq!(calls.load(Ordering::SeqCst), before);
+        drop(held);
+        let unavailable = GlobalRpcServer::new(Arc::new(EmptyLookup)).with_global_vertex_proof_source(Some(
+            Arc::new(|_, _| Box::pin(async { Err(quil_types::error::QuilError::ExecutionUnavailable("pruned".into())) })),
+        ));
+        assert_eq!(unavailable.get_global_vertex_proof(request(root.to_vec(), address.to_vec(), true)).await.unwrap_err().code(), tonic::Code::Unavailable);
     }
 }
