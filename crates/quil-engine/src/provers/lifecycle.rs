@@ -761,6 +761,35 @@ impl ProverLifecycle {
         self.allocator.set_last_join_attempt(frame_number);
     }
 
+    /// Serialize discretionary replacement waves until the workers from the
+    /// previous wave are available. Per-cycle pairing cannot prevent the same
+    /// destination from funding another leave while its first source still
+    /// serves notice. Use chain state so this also survives restarts.
+    fn replacement_leave_pending(
+        &self,
+        prover: Option<&quil_types::consensus::ProverInfo>,
+        workers: &[crate::worker::WorkerInfo],
+        frame_number: u64,
+    ) -> bool {
+        use quil_types::consensus::EffectiveStatus;
+        let auto_bound: std::collections::HashSet<&Vec<u8>> = workers.iter()
+            .filter(|w| !w.manually_managed && !w.filter.is_empty())
+            .map(|w| &w.filter)
+            .collect();
+        if prover.is_some_and(|p| p.allocations.iter().any(|a| {
+            auto_bound.contains(&a.confirmation_filter)
+                && a.effective_status(frame_number) == EffectiveStatus::Leaving
+        })) {
+            return true;
+        }
+        // Before publication, the registry still calls the source Active.
+        // Keep the existing bounded retry window for a failed submission.
+        self.last_leave_attempt.read().map(|attempts| attempts.iter().any(|(filter, last)| {
+            auto_bound.contains(filter)
+                && frame_number.saturating_sub(*last) < LEAVE_COOLDOWN_FRAMES
+        })).unwrap_or(true)
+    }
+
     /// Drop filters whose last Leave proposal is within
     /// `LEAVE_COOLDOWN_FRAMES` of `frame_number`. Also opportunistically
     /// prunes expired entries from the cooldown map so it can't grow
@@ -1930,10 +1959,26 @@ impl ProverLifecycle {
                 }
                 proposer::releasable_member(&self.prover_address, filter, &members)
             };
+            // The pending-confirm bucket excludes confirmed leaves serving
+            // notice, so inspect effective allocation status instead. This
+            // only gates discretionary replacements; cleanup and confirmation
+            // below retain their own eligibility and security checks.
+            let replacement_pending = self.replacement_leave_pending(
+                prover_info.as_ref(), &workers, frame_number,
+            );
+            if replacement_pending && !proposal_descriptors.is_empty() {
+                info!(frame = frame_number,
+                    "replacement leaves deferred until pending departures release their workers");
+            }
+            let replacement_descriptors = if replacement_pending {
+                &[][..]
+            } else {
+                available_replacements.as_slice()
+            };
             let score_candidates: Vec<Vec<u8>> = if !proposal_descriptors.is_empty() {
                 proposer::plan_leaves_releasing(
                     &allocated_descriptors,
-                    &available_replacements,
+                    replacement_descriptors,
                     difficulty,
                     &world_bytes,
                     self.units,
@@ -3718,6 +3763,153 @@ mod proposal_loop_tests {
              halt-risk); got {:?}",
             actions
         );
+    }
+
+    // Exercise the public evaluator with the same candidate demand over
+    // multiple registry snapshots, rather than only testing one planner call.
+    fn pending_replacement_fixture(halt_risk: bool) -> (
+        Arc<ProverLifecycle>, Arc<ConfigurableRegistry>, Arc<ConfigurableWorkerManager>,
+        Vec<u8>, Vec<ProverAllocationInfo>,
+    ) {
+        let address = vec![0xCD; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut allocations = Vec::new();
+        let mut summaries = Vec::new();
+        for core in 1..=8 {
+            let filter = filter_bytes(0xA0 + core as u8);
+            wm.add(allocated_worker(core, filter.clone()));
+            allocations.push(alloc(filter.clone(), ProverStatus::Active, 10));
+            summaries.push(shard_summary(filter, 64));
+        }
+        // Tiny halt-risk destinations force the swap path, not score leaves.
+        // Healthy, large destinations force score replacement instead.
+        for byte in 0xC0..0xC4 {
+            let mut summary = shard_summary(filter_bytes(byte), if halt_risk { 1 } else { 8 });
+            summary.total_size = if halt_risk { 1 } else { 100_000_000 };
+            summaries.push(summary);
+        }
+        let mut members = vec![prover(address.clone(), allocations.clone())];
+        for byte in 0..63 { members.push(prover(vec![byte; 32], Vec::new())); }
+        reg.set_provers(members);
+        reg.set_summaries(summaries);
+        let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+        (lc, reg, wm, address, allocations)
+    }
+
+    fn proposed_leave_filters(actions: &[LifecycleAction]) -> Vec<Vec<u8>> {
+        actions.iter().filter_map(|action| match action {
+            LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+            _ => None,
+        }).flatten().collect()
+    }
+
+    #[test]
+    fn pending_replacement_leaves_do_not_fund_the_same_demand_again() {
+        for halt_risk in [false, true] {
+            let (lc, reg, wm, address, mut allocations) = pending_replacement_fixture(halt_risk);
+            lc.set_prover_root_verified_frame(500);
+            let first = proposed_leave_filters(&lc.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap());
+            assert!(!first.is_empty(), "control must propose replacements, halt_risk={halt_risk}");
+            assert!(first.len() < allocations.len());
+
+            // Before registry publication, the submitted wave is in flight.
+            lc.set_prover_root_verified_frame(504);
+            assert!(proposed_leave_filters(&lc.evaluate(504, 1, reg.as_ref(), wm.as_ref()).unwrap()).is_empty(),
+                "publication lag must not cause a second replacement wave");
+
+            for a in &mut allocations {
+                if first.contains(&a.confirmation_filter) {
+                    a.status = ProverStatus::Leaving;
+                    a.leave_frame_number = 500;
+                }
+            }
+            reg.set_prover(prover(address.clone(), allocations.clone()));
+            // Outlive the short publication cooldown: chain state must keep
+            // the reservation alive, even after a process restart.
+            let restarted = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            restarted.set_prover_root_verified_frame(530);
+            assert!(proposed_leave_filters(&restarted.evaluate(530, 1, reg.as_ref(), wm.as_ref()).unwrap()).is_empty(),
+                "registered pending leaves must prevent further shedding");
+
+            // Confirmed leaves serve notice through the next boundary. They
+            // are absent from the leave-confirm bucket but still occupy cores.
+            for a in &mut allocations {
+                if first.contains(&a.confirmation_filter) {
+                    a.leave_confirm_frame_number = 721;
+                }
+            }
+            reg.set_prover(prover(address.clone(), allocations.clone()));
+            restarted.set_prover_root_verified_frame(730);
+            assert!(proposed_leave_filters(&restarted.evaluate(730, 1, reg.as_ref(), wm.as_ref()).unwrap()).is_empty(),
+                "confirmed departures must remain reserved until the boundary");
+
+            // Reconciliation releases their workers at the departure boundary.
+            for core in 1..=8 {
+                if first.contains(&filter_bytes(0xA0 + core as u8)) { wm.add(idle_worker(core)); }
+            }
+            restarted.set_prover_root_verified_frame(1441);
+            let actions = restarted.evaluate(1441, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            assert!(count_proposed_joins(&actions) > 0, "freed cores must join destinations");
+            assert_eq!(count_proposed_leaves(&actions), 0, "join before shedding more holdings");
+        }
+    }
+
+    #[test]
+    fn failed_replacement_leaves_release_the_reservation() {
+        for registered in [false, true] {
+            let (lc, reg, wm, address, mut allocations) = pending_replacement_fixture(false);
+            lc.set_prover_root_verified_frame(500);
+            let first = proposed_leave_filters(&lc.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap());
+            assert!(!first.is_empty());
+            if registered {
+                for a in &mut allocations {
+                    if first.contains(&a.confirmation_filter) {
+                        // A rejected leave restores Active; it does not reject
+                        // the allocation itself.
+                        a.leave_frame_number = 500;
+                        a.leave_reject_frame_number = 510;
+                    }
+                }
+                reg.set_prover(prover(address.clone(), allocations));
+            }
+            lc.set_prover_root_verified_frame(530);
+            assert!(count_proposed_leaves(&lc.evaluate(530, 1, reg.as_ref(), wm.as_ref()).unwrap()) > 0,
+                "unpublished/rejected proposals must not reserve capacity forever");
+        }
+    }
+
+    #[test]
+    fn pending_replacement_leaves_preserve_cleanup_and_manual_independence() {
+        let (lc, reg, wm, address, mut allocations) = pending_replacement_fixture(false);
+        allocations[0].status = ProverStatus::Leaving;
+        allocations[0].leave_frame_number = 500;
+        let empty_filter = allocations[1].confirmation_filter.clone();
+        reg.set_prover(prover(address.clone(), allocations.clone()));
+        lc.set_local_shard_sizes(HashMap::from([(empty_filter.clone(), 0)]));
+        lc.set_prover_root_verified_frame(530);
+        let leaves = proposed_leave_filters(&lc.evaluate(530, 1, reg.as_ref(), wm.as_ref()).unwrap());
+        assert_eq!(leaves, vec![empty_filter], "independent empty-shard cleanup still runs");
+
+        // A manual worker's departure is not replacement capacity for the
+        // auto-managed pool and must not stop that pool's decisions.
+        let manual = WorkerInfo { manually_managed: true,
+            ..allocated_worker(1, allocations[0].confirmation_filter.clone()) };
+        wm.add(manual);
+        let restarted = make_lifecycle(address, wm.clone(), reg.clone());
+        restarted.set_prover_root_verified_frame(530);
+        assert!(count_proposed_leaves(&restarted.evaluate(530, 1, reg.as_ref(), wm.as_ref()).unwrap()) > 0);
+    }
+
+    #[test]
+    fn expired_replacement_leaves_do_not_block_the_remaining_workers() {
+        let (lc, reg, wm, address, mut allocations) = pending_replacement_fixture(false);
+        allocations[0].status = ProverStatus::Leaving;
+        allocations[0].leave_frame_number = 500;
+        reg.set_prover(prover(address, allocations));
+        lc.set_prover_root_verified_frame(1441);
+        assert!(count_proposed_leaves(&lc.evaluate(1441, 1, reg.as_ref(), wm.as_ref()).unwrap()) > 0,
+            "an unconfirmed leave past its epoch window must not reserve capacity forever");
     }
 
     /// Per-filter Leave cooldown: a filter we just proposed Leave on
