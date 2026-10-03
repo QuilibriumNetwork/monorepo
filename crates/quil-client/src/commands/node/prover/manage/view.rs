@@ -217,6 +217,7 @@ pub fn draw(f: &mut Frame, m: &mut Model) {
     let area = f.area();
     m.width = area.width;
     m.height = area.height;
+    update_message_lifetime(m);
 
     if area.width < 40 || area.height < 10 {
         let p = Paragraph::new("Terminal too small. Please resize.");
@@ -984,6 +985,34 @@ fn footer_lines(m: &Model) -> (Line<'static>, Line<'static>) {
     (help_line(m), status_line(m))
 }
 
+const MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn message_timestamp(time: Option<std::time::SystemTime>) -> String {
+    let Some(seconds) = time.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()) else {
+        return String::new();
+    };
+    format!("[{:02}:{:02}:{:02} UTC] ", seconds / 3600 % 24, seconds / 60 % 60, seconds % 60)
+}
+
+/// Expire completed action notices, while retaining an operation in progress
+/// or a refresh failure that is still unresolved. No extra timer task needed.
+fn update_message_lifetime(m: &mut Model) {
+    if m.status_message_key != m.status_msg {
+        m.status_message_key = m.status_msg.clone();
+        m.status_message_seen = Some(std::time::Instant::now());
+        m.status_message_time = Some(std::time::SystemTime::now());
+    }
+    if !m.action_in_flight && m.consecutive_failures == 0
+        && m.status_message_seen.is_some_and(|t| t.elapsed() >= MESSAGE_TTL)
+    {
+        m.status_msg.clear();
+        m.status_message_key.clear();
+        m.status_sticky = false;
+        m.status_message_seen = None;
+        m.status_message_time = None;
+    }
+}
+
 /// Operational refresh messages remain independent of action/filter prompts.
 fn shard_message(m: &Model) -> Option<Line<'static>> {
     let cached = m.cached_shard_info.is_some();
@@ -1001,12 +1030,13 @@ fn shard_message(m: &Model) -> Option<Line<'static>> {
     } else if let Some(error) = &m.shard_error {
         format!("{error}. Retrying automatically. {availability}")
     } else if let Some(shards) = &m.cached_shard_info {
+        if m.shard_last_success.is_some_and(|t| t.elapsed() >= MESSAGE_TTL) { return None; }
         let elapsed = m.shard_last_duration.map(|d| d.as_secs()).unwrap_or(0);
         format!("Shard data updated in {elapsed}s ({} shards).", shards.shards.len())
     } else {
         return None;
     };
-    Some(Line::from(Span::styled(message, Style::new().fg(
+    Some(Line::from(Span::styled(format!("{}{message}", message_timestamp(m.shard_message_time)), Style::new().fg(
         if m.shard_error.is_some() { Color::Yellow } else { HELP },
     ))))
 }
@@ -1056,13 +1086,13 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
 
 fn status_line(m: &Model) -> Line<'static> {
     if m.action_in_flight {
-        return Line::from(format!("{} {}", spinner(m), m.status_msg));
+        return Line::from(format!("{}{} {}", message_timestamp(m.status_message_time), spinner(m), m.status_msg));
     }
     if m.status_msg.is_empty() {
         return Line::from("");
     }
     let color = if m.status_is_error { ERROR } else { SUCCESS };
-    Line::from(Span::styled(m.status_msg.clone(), Style::new().fg(color)))
+    Line::from(Span::styled(format!("{}{}", message_timestamp(m.status_message_time), m.status_msg), Style::new().fg(color)))
 }
 
 /// `renderHelpLine` — key hints with applicable actions highlighted.
@@ -1442,6 +1472,32 @@ mod tests {
     use crate::commands::node::prover::epoch::ActionHint;
 
     #[test]
+    fn completed_notices_expire_but_unresolved_warnings_stay_visible() {
+        use std::time::{Duration, Instant, UNIX_EPOCH};
+        assert_eq!(message_timestamp(Some(UNIX_EPOCH + Duration::from_secs(3723))), "[01:02:03 UTC] ");
+        let mut m = Model::new();
+        m.status_msg = "Confirm completed".into();
+        m.status_sticky = true;
+        update_message_lifetime(&mut m);
+        assert!(m.status_message_time.is_some());
+        m.status_message_seen = Some(Instant::now() - Duration::from_secs(31));
+        update_message_lifetime(&mut m);
+        assert!(m.status_msg.is_empty());
+        assert!(!m.status_sticky);
+        m.cached_shard_info = Some(Default::default());
+        m.shard_last_success = Some(Instant::now() - Duration::from_secs(31));
+        assert!(shard_message(&m).is_none());
+        m.shard_error = Some("Query failed".into());
+        assert!(shard_message(&m).unwrap().to_string().contains("Query failed"));
+        m.status_msg = "Refresh failed: disconnected".into();
+        update_message_lifetime(&mut m);
+        m.consecutive_failures = 1;
+        m.status_message_seen = Some(Instant::now() - Duration::from_secs(31));
+        update_message_lifetime(&mut m);
+        assert!(m.status_msg.contains("disconnected"));
+    }
+
+    #[test]
     fn refresh_messages_preserve_action_status_and_explain_wait_retry_and_recovery() {
         use std::time::Instant;
         let mut m = Model::new();
@@ -1559,7 +1615,9 @@ mod tests {
                 assert!(footer.contains(key), "missing {key} at width {width}: {footer}");
             }
             let status = (0..width).map(|x| buffer[(x, 23)].symbol()).collect::<String>();
-            assert!(status.contains("status is visible"));
+            let screen = (0..24).map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join(" ");
+            assert!(screen.contains("status is visible"));
+            assert!(!status.trim().is_empty());
         }
     }
 

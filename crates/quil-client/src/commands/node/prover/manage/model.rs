@@ -302,6 +302,9 @@ pub struct Model {
     pub width: u16,
     pub height: u16,
     pub status_msg: String,
+    pub status_message_key: String,
+    pub status_message_seen: Option<std::time::Instant>,
+    pub status_message_time: Option<std::time::SystemTime>,
     pub status_is_error: bool,
     pub status_sticky: bool,
     pub action_in_flight: bool,
@@ -326,6 +329,7 @@ pub struct Model {
     // Aux-response cache (stabilizes panels across transient RPC blips).
     pub cached_node_info: Option<NodeInfoResponse>,
     pub shard_loading: bool,
+    pub shard_message_time: Option<std::time::SystemTime>,
     pub shard_fetch_started: Option<std::time::Instant>,
     pub shard_last_success: Option<std::time::Instant>,
     pub shard_last_duration: Option<std::time::Duration>,

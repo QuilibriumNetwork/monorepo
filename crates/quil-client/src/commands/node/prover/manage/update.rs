@@ -42,11 +42,13 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
         Msg::ShardLoading => {
             m.shard_loading = true;
+            m.shard_message_time = Some(std::time::SystemTime::now());
             m.shard_fetch_started = Some(Instant::now());
             vec![]
         }
         Msg::ShardRefresh(result) => {
             m.shard_loading = false;
+            m.shard_message_time = Some(std::time::SystemTime::now());
             let elapsed = m.shard_fetch_started.take().map(|started| started.elapsed());
             match result {
                 Ok(shards) => {
@@ -76,6 +78,10 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                 return vec![];
             }
             m.last_fetch_success = Some(Instant::now());
+            if m.consecutive_failures > 0 && m.status_msg.starts_with("Refresh failed: ") {
+                m.status_msg.clear();
+                m.status_sticky = false;
+            }
             m.consecutive_failures = 0;
             m.data_loaded = true;
             m.process_refresh_data(node_info, shard_info, worker_info);
