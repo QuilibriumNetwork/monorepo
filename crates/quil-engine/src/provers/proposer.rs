@@ -184,62 +184,6 @@ pub fn pomw_basis(difficulty: u64, world_state_bytes: u64, units: u64) -> BigInt
     canonical_pomw_basis(difficulty, world_state_bytes, units)
 }
 
-/// 53-bit precision integer square root, mirroring Go's
-/// `decimal.PowWithPrecision(1/2, 53)` used in
-/// `node/consensus/provers/proposer.go:367-373`. Pre-scales the input
-/// by 2^(2*53) before integer sqrt so the result carries 53 fractional
-/// bits — matching shopspring's effective working precision.
-///
-/// Used by `score_shards` to divide reward by `sqrt(shards)`. The
-/// integer-only Newton's method we previously used produced visibly
-/// different scores for `shards > 1`, which can flip the `bestScore *
-/// 67/100` threshold in `decide_joins` and cause split-brain
-/// confirm/reject decisions across nodes.
-fn shards_sqrt_53bit(shards: u64) -> BigInt {
-    if shards == 0 {
-        return BigInt::zero();
-    }
-    let scaled = BigInt::from(shards) << (2u32 * 53u32);
-    scaled.sqrt()
-}
-
-#[cfg(test)]
-mod sqrt_tests {
-    use super::*;
-    use num_traits::ToPrimitive;
-
-    /// 53-bit-precision sqrt mirrors Go's
-    /// `decimal.PowWithPrecision(1/2, 53)`. For perfect squares the
-    /// post-shift integer should equal sqrt(shards) within rounding.
-    #[test]
-    fn shards_sqrt_53bit_perfect_squares() {
-        for shards in [1u64, 4, 9, 16, 100, 1024, 10_000] {
-            let r = shards_sqrt_53bit(shards);
-            // r ≈ sqrt(shards) << 53; shift back to compare.
-            let approx = (&r >> 53u32).to_u64().unwrap_or(0);
-            let expected = (shards as f64).sqrt() as u64;
-            // Allow off-by-one rounding either direction.
-            assert!(
-                approx + 1 >= expected && expected + 1 >= approx,
-                "shards={shards} expected~{expected} got {approx}"
-            );
-        }
-    }
-
-    /// Sqrt monotonic and non-zero for non-zero input.
-    #[test]
-    fn shards_sqrt_53bit_monotonic() {
-        let a = shards_sqrt_53bit(4);
-        let b = shards_sqrt_53bit(16);
-        let c = shards_sqrt_53bit(64);
-        assert!(a < b);
-        assert!(b < c);
-        assert!(!a.is_zero());
-        // Zero in → zero out (degenerate path).
-        assert!(shards_sqrt_53bit(0).is_zero());
-    }
-}
-
 /// Returns `(filter, score)` ascending. Filters in `excluded` are
 /// dropped from the result.
 pub fn rank_allocated_by_score_ascending(
@@ -290,35 +234,9 @@ fn score_shards(
 
         let score = match strategy {
             Strategy::DataGreedy => BigInt::from(s.size),
-            Strategy::RewardGreedy => {
-                // factor = (sizeBytes * basis) / worldBytes
-                let factor = BigInt::from(s.size) * basis / world_bytes;
-
-                // ring divisor = 2^(Ring+1)
-                let divisor: u64 = 1u64.checked_shl((s.ring as u32) + 1).unwrap_or(0);
-                if divisor == 0 {
-                    scores.push(Scored { idx: i, score: BigInt::zero() });
-                    continue;
-                }
-
-                // shards sqrt with 53-bit fractional precision —
-                // matches Go's `decimal.PowWithPrecision(1/2, 53)` at
-                // `proposer.go:367-373`. The result has 53 fractional
-                // bits, so we shift `factor` left by 53 before dividing
-                // and the final score lands at integer scale.
-                let shards_sqrt = shards_sqrt_53bit(effective_shards);
-                if shards_sqrt.is_zero() {
-                    scores.push(Scored { idx: i, score: BigInt::zero() });
-                    continue;
-                }
-
-                // score = (factor << 53) / divisor / shards_sqrt / 8
-                let score = (factor << 53u32)
-                    / BigInt::from(divisor)
-                    / &shards_sqrt
-                    / BigInt::from(8);
-                score
-            }
+            Strategy::RewardGreedy => quil_execution::pricing::allocation_prover_reward(
+                basis, &BigInt::from(s.size), world_bytes, s.ring, effective_shards,
+            ),
         };
 
         scores.push(Scored { idx: i, score });
@@ -2108,5 +2026,28 @@ mod tests {
         assert!(reject.is_empty());
         assert_eq!(confirm.len(), 1);
         assert_eq!(confirm[0], vec![0xAA], "small shard should be confirmed for leave in DataGreedy");
+    }
+}
+
+#[cfg(test)]
+mod reward_arithmetic_tests {
+    use super::*;
+
+    #[test]
+    fn proposer_and_rpc_use_the_same_reward_arithmetic() {
+        for (shards, expected) in [(1, 100), (2, 70), (3, 57), (5, 44), (7, 37)] {
+            let shard = ShardDescriptor {
+                filter: vec![1], size: 100, ring: 0, shards,
+                active_on_ring: 8, total_active_joining: 8, active_count: 8,
+            };
+            let scored = score_shards(&[shard], &1600.into(), &100.into(), Strategy::RewardGreedy);
+            assert_eq!(scored[0].score, BigInt::from(expected));
+            assert_eq!(crate::shard_info::compute_shard_reward(&1600.into(), &100.into(), &100.into(), 0, shards), BigInt::from(expected));
+        }
+        let shard = ShardDescriptor {
+            filter: vec![1], size: 1, ring: 0, shards: 2,
+            active_on_ring: 8, total_active_joining: 8, active_count: 8,
+        };
+        assert_eq!(score_shards(&[shard], &229.into(), &10.into(), Strategy::RewardGreedy)[0].score, BigInt::from(1));
     }
 }
