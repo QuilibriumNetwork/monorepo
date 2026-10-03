@@ -22,16 +22,28 @@ impl fmt::Display for FerretError {
 
 impl Error for FerretError {}
 
-// Opaque pointer types
+// Opaque pointer types. Each name mirrors the C typedef it stands in for, so
+// the `extern "C"` block below can be diffed line-for-line against
+// emp_bridge.h; renaming them to Rust camel case would break that reading.
+#[allow(non_camel_case_types)]
 pub enum NetIO_t {}
+#[allow(non_camel_case_types)]
 pub enum BufferIO_t {}
+#[allow(non_camel_case_types)]
 pub enum FerretCOT_t {}
+#[allow(non_camel_case_types)]
 pub enum FerretCOT_Buffer_t {}
+#[allow(non_camel_case_types)]
 pub enum block_t {}
+#[allow(non_camel_case_types)]
 pub type NetIO_ptr = *mut NetIO_t;
+#[allow(non_camel_case_types)]
 pub type BufferIO_ptr = *mut BufferIO_t;
+#[allow(non_camel_case_types)]
 pub type FerretCOT_ptr = *mut FerretCOT_t;
+#[allow(non_camel_case_types)]
 pub type FerretCOT_Buffer_ptr = *mut FerretCOT_Buffer_t;
+#[allow(non_camel_case_types)]
 pub type block_ptr = *mut block_t;
 
 // Constants
