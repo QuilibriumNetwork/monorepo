@@ -485,7 +485,7 @@ pub struct ProverLifecycle {
     /// of every 60 frames. Splitting into two caches lets each writer
     /// own its source-of-truth without racing.
     local_shard_sizes: RwLock<HashMap<Vec<u8>, (u64, u64)>>,
-    /// Per-shard byte sizes from the most recent successful
+    /// Per-shard (byte size, data-shard count) pairs from the most recent successful
     /// `GetAppShards` archive fetch. Authoritative for shards we are
     /// NOT allocated to (the local cache would have 0 / missing
     /// entries for those). Refreshed every 60 frames or on first-
@@ -1265,6 +1265,8 @@ impl ProverLifecycle {
         for descriptor in &mut proposal_descriptors {
             descriptor.shards = shard_metrics[&descriptor.filter].1;
         }
+        // Missing reward metadata cannot establish a profitable destination.
+        proposal_descriptors.retain(|d| self.strategy != Strategy::RewardGreedy || d.shards > 0);
         let mut decide_all_descriptors =
             build_decide_descriptors(&summaries, &shard_sizes_snapshot);
         for descriptor in &mut decide_all_descriptors {
@@ -1284,7 +1286,8 @@ impl ProverLifecycle {
             }
         }
         let allocated_descriptors: Vec<ShardDescriptor> = held_descriptors.iter()
-            .filter(|d| active_filters.contains(&d.filter))
+            .filter(|d| active_filters.contains(&d.filter)
+                && (self.strategy != Strategy::RewardGreedy || d.shards > 0))
             .cloned()
             .collect();
 
@@ -2230,9 +2233,9 @@ pub(crate) fn has_live_allocation(summary: &ProverShardSummary) -> bool {
 /// merged parent looks split away until the sizes refresh (the old sizes
 /// still name its children), so it asks for the refresh like any other; a
 /// refresh that comes back without a filter settles it.
-fn unsized_live_filters(
+fn unsized_live_filters<V>(
     summaries: &[ProverShardSummary],
-    remote_sizes: &HashMap<Vec<u8>, u64>,
+    remote_sizes: &HashMap<Vec<u8>, V>,
 ) -> std::collections::HashSet<Vec<u8>> {
     summaries
         .iter()
@@ -3165,16 +3168,6 @@ mod proposal_loop_tests {
         out
     }
 
-    /// REPRODUCTION of the "one prover ⇒ many allocations" multi-coverage that
-    /// the static reassign/rekey/proposer reads could not explain (the field
-    /// data showed 45/49/45 provers on three DIFFERENT-branch deep shards,
-    /// |00∩01| = 45 — i.e. the same ~45 nodes each covering many distinct-branch
-    /// shards at once). This is NOT reassignment and NOT a bug in any single
-    /// path: it's the coverage model. A node runs `worker_count` data workers,
-    /// and `decide_joins` greedily proposes a join for EVERY under-covered shard
-    /// up to its free-worker count in a SINGLE cycle. Give one node enough idle
-    /// workers and enough halt-risk shards spread across different top-of-tree
-    /// branches, and it lays claim to all of them at once.
     #[test]
     fn confirmed_ring_protects_an_early_high_reward_holding() {
         let address = vec![0xCD; 32];
@@ -3266,6 +3259,16 @@ mod proposal_loop_tests {
         assert!(actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))), "genuine upgrades remain possible; actions={actions:?}");
     }
 
+    /// REPRODUCTION of the "one prover ⇒ many allocations" multi-coverage that
+    /// the static reassign/rekey/proposer reads could not explain (the field
+    /// data showed 45/49/45 provers on three DIFFERENT-branch deep shards,
+    /// |00∩01| = 45 — i.e. the same ~45 nodes each covering many distinct-branch
+    /// shards at once). This is NOT reassignment and NOT a bug in any single
+    /// path: it's the coverage model. A node runs `worker_count` data workers,
+    /// and `decide_joins` greedily proposes a join for EVERY under-covered shard
+    /// up to its free-worker count in a SINGLE cycle. Give one node enough idle
+    /// workers and enough halt-risk shards spread across different top-of-tree
+    /// branches, and it lays claim to all of them at once.
     #[test]
     fn one_prover_covers_many_distinct_branch_shards_in_one_cycle() {
         let address = vec![0xCDu8; 32];
