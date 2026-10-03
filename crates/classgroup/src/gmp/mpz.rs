@@ -6,7 +6,7 @@ use std::cmp::Ordering::{self, Equal, Greater, Less};
 use std::convert::From;
 use std::error::Error;
 use std::ffi::CString;
-use std::mem::{size_of, uninitialized};
+use std::mem::{size_of, MaybeUninit};
 use std::ops::{
     Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Div, DivAssign,
     Mul, MulAssign, Neg, Not, Rem, RemAssign, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
@@ -47,7 +47,7 @@ extern "C" {
     fn __gmpz_get_si(op: mpz_srcptr) -> c_ulong;
     fn __gmpz_get_d(op: mpz_srcptr) -> c_double;
     fn __gmpz_fits_slong_p(op: mpz_srcptr) -> c_long;
-    fn __gmpz_sizeinbase(op: mpz_srcptr, base: c_int) -> size_t;
+    pub(crate) fn __gmpz_sizeinbase(op: mpz_srcptr, base: c_int) -> size_t;
     fn __gmpz_cmp(op1: mpz_srcptr, op2: mpz_srcptr) -> c_int;
     fn __gmpz_cmp_ui(op1: mpz_srcptr, op2: c_ulong) -> c_int;
     fn __gmpz_add(rop: mpz_ptr, op1: mpz_srcptr, op2: mpz_srcptr);
@@ -55,7 +55,9 @@ extern "C" {
     fn __gmpz_add_ui(rop: mpz_ptr, op1: mpz_srcptr, op2: c_ulong);
     fn __gmpz_sub(rop: mpz_ptr, op1: mpz_srcptr, op2: mpz_srcptr);
     fn __gmpz_submul(rop: mpz_ptr, op1: mpz_srcptr, op2: mpz_srcptr);
-    fn __gmpz_cmpabs(by: mpz_ptr, l: mpz_srcptr);
+    // GMP: `int mpz_cmpabs (mpz_srcptr, mpz_srcptr)`. Returns a negative value
+    // when |op1| < |op2|, so the return type must be signed.
+    pub(crate) fn __gmpz_cmpabs(op1: mpz_srcptr, op2: mpz_srcptr) -> c_int;
     fn __gmpz_divexact(rop: mpz_ptr, op1: mpz_srcptr, op2: mpz_srcptr);
     fn __gmpz_sub_ui(rop: mpz_ptr, op1: mpz_srcptr, op2: c_ulong);
     fn __gmpz_ui_sub(rop: mpz_ptr, op1: c_ulong, op2: mpz_srcptr);
@@ -102,7 +104,10 @@ extern "C" {
         nails: size_t,
         op: *const c_void,
     );
-    fn __gmpz_export(
+    // GMP: `void *mpz_export (...)`. The return value is the destination used
+    // (either `rop` or a freshly allocated block); callers here ignore it, but
+    // `gmp_classgroup::ffi::export_obj` asserts on it, so it must be declared.
+    pub(crate) fn __gmpz_export(
         rop: *mut c_void,
         countp: *mut size_t,
         order: c_int,
@@ -110,7 +115,7 @@ extern "C" {
         endian: c_int,
         nails: size_t,
         op: mpz_srcptr,
-    );
+    ) -> *mut c_void;
     fn __gmpz_root(rop: mpz_ptr, op: mpz_srcptr, n: c_ulong) -> c_int;
     fn __gmpz_sqrt(rop: mpz_ptr, op: mpz_srcptr);
     fn __gmpz_millerrabin(n: mpz_srcptr, reps: c_int) -> c_int;
@@ -152,18 +157,24 @@ impl Mpz {
     #[inline]
     pub fn new() -> Mpz {
         unsafe {
-            let mut mpz = uninitialized();
-            __gmpz_init(&mut mpz);
-            Mpz { mpz: mpz }
+            let mut mpz = MaybeUninit::<mpz_struct>::uninit();
+            __gmpz_init(mpz.as_mut_ptr());
+            // `__gmpz_init` fully initialises the struct.
+            Mpz {
+                mpz: mpz.assume_init(),
+            }
         }
     }
 
     #[inline]
     pub fn new_reserve(n: usize) -> Mpz {
         unsafe {
-            let mut mpz = uninitialized();
-            __gmpz_init2(&mut mpz, n as c_ulong);
-            Mpz { mpz: mpz }
+            let mut mpz = MaybeUninit::<mpz_struct>::uninit();
+            __gmpz_init2(mpz.as_mut_ptr(), n as c_ulong);
+            // `__gmpz_init2` fully initialises the struct.
+            Mpz {
+                mpz: mpz.assume_init(),
+            }
         }
     }
 
@@ -207,10 +218,17 @@ impl Mpz {
         let s = CString::new(s.to_string()).map_err(|_| ParseMpzError { _priv: () })?;
         unsafe {
             assert!(base == 0 || (base >= 2 && base <= 62));
-            let mut mpz = uninitialized();
-            let r = __gmpz_init_set_str(&mut mpz, s.as_ptr(), base as c_int);
+            let mut mpz = MaybeUninit::<mpz_struct>::uninit();
+            let r = __gmpz_init_set_str(mpz.as_mut_ptr(), s.as_ptr(), base as c_int);
+            // GMP documents that `mpz_init_set_str` initialises `rop` on BOTH
+            // paths: "ROP is initialized even if an error occurs. (I.e., you
+            // have to call `mpz_clear` for it.)" So `assume_init` belongs here,
+            // before the branch — moving it into the success arm would leak the
+            // limb allocation on every malformed input, and dropping the
+            // `__gmpz_clear` below would do the same.
+            let mut mpz = mpz.assume_init();
             if r == 0 {
-                Ok(Mpz { mpz: mpz })
+                Ok(Mpz { mpz })
             } else {
                 __gmpz_clear(&mut mpz);
                 Err(ParseMpzError { _priv: () })
@@ -468,9 +486,12 @@ impl Mpz {
 
     pub fn one() -> Mpz {
         unsafe {
-            let mut mpz = uninitialized();
-            __gmpz_init_set_ui(&mut mpz, 1);
-            Mpz { mpz: mpz }
+            let mut mpz = MaybeUninit::<mpz_struct>::uninit();
+            __gmpz_init_set_ui(mpz.as_mut_ptr(), 1);
+            // `__gmpz_init_set_ui` fully initialises the struct.
+            Mpz {
+                mpz: mpz.assume_init(),
+            }
         }
     }
 
@@ -490,15 +511,15 @@ pub struct ParseMpzError {
 
 impl fmt::Display for ParseMpzError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.description().fmt(f)
+        // Was `self.description().fmt(f)`. `Error::description` is deprecated
+        // in favour of `Display`, so the message lives here now and
+        // `description`'s default impl (which returns this string via
+        // `to_string`) keeps working for any caller still using it.
+        f.write_str("invalid integer")
     }
 }
 
 impl Error for ParseMpzError {
-    fn description(&self) -> &'static str {
-        "invalid integer"
-    }
-
     fn cause(&self) -> Option<&'static Error> {
         None
     }
@@ -507,9 +528,12 @@ impl Error for ParseMpzError {
 impl Clone for Mpz {
     fn clone(&self) -> Mpz {
         unsafe {
-            let mut mpz = uninitialized();
-            __gmpz_init_set(&mut mpz, &self.mpz);
-            Mpz { mpz: mpz }
+            let mut mpz = MaybeUninit::<mpz_struct>::uninit();
+            __gmpz_init_set(mpz.as_mut_ptr(), &self.mpz);
+            // `__gmpz_init_set` fully initialises the struct.
+            Mpz {
+                mpz: mpz.assume_init(),
+            }
         }
     }
 }

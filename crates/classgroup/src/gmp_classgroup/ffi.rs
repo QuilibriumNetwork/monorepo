@@ -19,10 +19,19 @@
 //! this library requires.
 #![allow(unsafe_code)]
 pub use super::super::gmp::mpz::Mpz;
-use super::super::gmp::mpz::{mp_bitcnt_t, mp_limb_t};
+// `__gmpz_cmpabs`, `__gmpz_export` and `__gmpz_sizeinbase` are imported from
+// `gmp::mpz` rather than redeclared here. Declaring the same symbol twice with
+// different signatures is `clashing_extern_declarations`, and rustc is entitled
+// to assume either one; `__gmpz_cmpabs` in particular used to be declared here
+// as returning `usize`, which cannot represent the negative value GMP returns
+// when |op1| < |op2|.
+use super::super::gmp::mpz::{
+    __gmpz_cmpabs, __gmpz_export, __gmpz_sizeinbase, mp_bitcnt_t, mp_limb_t,
+};
 use libc::{c_int, c_long, c_ulong, c_void, size_t};
 // pub use c_ulong;
-use std::{mem, usize};
+use std::cmp::Ordering;
+use std::usize;
 // We use the unsafe versions to avoid unnecessary allocations.
 extern "C" {
     fn adapted_nudupl(a: *mut Mpz, b: *mut Mpz, c: *mut Mpz, times: c_ulong);
@@ -44,7 +53,6 @@ extern "C" {
     fn __gmpz_set(rop: *mut Mpz, op: *const Mpz);
     //fn __fmpz_set_mpz(rop: *mut Mpz, op: *const Mpz);
     //fn __fmpz_get_mpz(rop: *mut Mpz, op: *const Mpz);
-    fn __gmpz_cmpabs(rop: *const Mpz, op: *const Mpz) -> usize;
     //fn __gmpz_sgn(rop: *const Mpz) -> usize;
     fn __gmpz_mul_2exp(rop: *mut Mpz, op1: *const Mpz, op2: mp_bitcnt_t);
     fn __gmpz_sub(rop: *mut Mpz, op1: *const Mpz, op2: *const Mpz);
@@ -59,7 +67,6 @@ extern "C" {
         op: *const c_void,
     );
     fn __gmpz_tdiv_r(r: *mut Mpz, n: *const Mpz, d: *const Mpz);
-    fn __gmpz_sizeinbase(op: &Mpz, base: c_int) -> size_t;
     fn __gmpz_fdiv_q_ui(rop: *mut Mpz, op1: *const Mpz, op2: c_ulong) -> c_ulong;
     fn __gmpz_add(rop: *mut Mpz, op1: *const Mpz, op2: *const Mpz);
     fn __gmpz_add_ui(rop: *mut Mpz, op1: *const Mpz, op2: c_ulong);
@@ -68,15 +75,6 @@ extern "C" {
     fn __gmpz_cdiv_ui(n: &Mpz, d: c_ulong) -> c_ulong;
     fn __gmpz_fdiv_ui(n: &Mpz, d: c_ulong) -> c_ulong;
     fn __gmpz_tdiv_ui(n: &Mpz, d: c_ulong) -> c_ulong;
-    fn __gmpz_export(
-        rop: *mut c_void,
-        countp: *mut size_t,
-        order: c_int,
-        size: size_t,
-        endian: c_int,
-        nails: size_t,
-        op: &Mpz,
-    ) -> *mut c_void;
     fn __gmpz_powm(rop: *mut Mpz, base: *const Mpz, exp: *const Mpz, modulus: *const Mpz);
 }
 
@@ -196,7 +194,7 @@ pub fn three_gcd(rop: &mut Mpz, a: &Mpz, b: &Mpz, c: &Mpz) {
 
 #[inline]
 pub fn size_in_bits(obj: &Mpz) -> usize {
-    unsafe { __gmpz_sizeinbase(obj, 2) }
+    unsafe { __gmpz_sizeinbase(obj.inner(), 2) }
 }
 
 #[inline]
@@ -241,9 +239,13 @@ pub fn gmp_nudupl(a: &mut Mpz, b: &mut Mpz, c: &mut Mpz, times: u64) {
     }
 }
 
+/// Compares |`op1`| with |`op2`|, returning the `Ordering` between them.
+///
+/// GMP's `mpz_cmpabs` returns a signed `int` — negative when |op1| < |op2| —
+/// which is why this cannot return `usize`, as it once did.
 #[inline]
-pub fn mpz_cmpabs(rop: &Mpz, op1: &Mpz) -> usize {
-    unsafe { __gmpz_cmpabs(rop, op1) }
+pub fn mpz_cmpabs(op1: &Mpz, op2: &Mpz) -> Ordering {
+    unsafe { __gmpz_cmpabs(op1.inner(), op2.inner()).cmp(&0) }
 }
 
 //#[inline]
@@ -290,7 +292,7 @@ pub fn mpz_fdiv_q(q: &mut Mpz, n: &Mpz, d: &Mpz) {
 #[inline]
 #[cfg(none)]
 pub fn mpz_neg(rop: &mut Mpz) {
-    assert!(mem::size_of::<Mpz>() == mem::size_of::<MpzStruct>());
+    assert!(std::mem::size_of::<Mpz>() == std::mem::size_of::<MpzStruct>());
     unsafe {
         let ptr = rop as *mut _ as *mut MpzStruct;
         let v = (*ptr).mp_size;
@@ -317,9 +319,12 @@ pub fn export_obj(obj: &Mpz, v: &mut [u8]) -> Result<(), usize> {
         // Necessary ― this byte may not be fully overwritten
         *(ptr as *mut u8) = 0;
 
-        // SAFE as __gmpz_export will *always* initialize this.
-        let mut s: usize = mem::uninitialized();
-        let ptr2 = __gmpz_export(ptr, &mut s, 1, 1, 1, 0, obj);
+        // `__gmpz_export` always writes the word count through `countp`, and
+        // writes 0 when `obj` is zero, so this initial value is never observed.
+        // It is a plain `0` rather than `mem::uninitialized()` because handing
+        // an uninitialised scalar to safe code is UB the moment it exists.
+        let mut s: usize = 0;
+        let ptr2 = __gmpz_export(ptr, &mut s, 1, 1, 1, 0, obj.inner());
         assert_eq!(ptr, ptr2);
         if 0 == s {
             1
@@ -417,5 +422,102 @@ mod test {
     fn check_rem() {
         assert_eq!(mpz_crem_u16(&(-100i64).into(), 3), 1);
         assert_eq!(mpz_crem_u16(&(100i64).into(), 3), 2);
+    }
+
+    /// `mpz_cmpabs` must be able to report "less than".
+    ///
+    /// GMP's `mpz_cmpabs` returns a signed `int`, negative when |op1| < |op2|.
+    /// This function was previously declared as returning `usize`, so the
+    /// less-than case came back as a nonsensical large unsigned value and the
+    /// signature could not express the answer at all. Any regression to an
+    /// unsigned return type fails to compile against this test; any regression
+    /// to the wrong operand order fails it at runtime.
+    #[test]
+    fn cmpabs_orders_by_magnitude() {
+        let small: Mpz = 5i64.into();
+        let big: Mpz = 7i64.into();
+
+        assert_eq!(mpz_cmpabs(&small, &big), Ordering::Less);
+        assert_eq!(mpz_cmpabs(&big, &small), Ordering::Greater);
+        assert_eq!(mpz_cmpabs(&small, &small), Ordering::Equal);
+    }
+
+    /// The "abs" half of `mpz_cmpabs`: sign is ignored, magnitude is not.
+    #[test]
+    fn cmpabs_ignores_sign() {
+        let neg_nine: Mpz = (-9i64).into();
+        let pos_nine: Mpz = 9i64.into();
+        let neg_two: Mpz = (-2i64).into();
+
+        assert_eq!(mpz_cmpabs(&neg_nine, &pos_nine), Ordering::Equal);
+        assert_eq!(mpz_cmpabs(&pos_nine, &neg_nine), Ordering::Equal);
+
+        // -9 < -2 as signed values, but |-9| > |-2|.
+        assert_eq!(mpz_cmpabs(&neg_nine, &neg_two), Ordering::Greater);
+        assert_eq!(mpz_cmpabs(&neg_two, &neg_nine), Ordering::Less);
+    }
+
+    /// Magnitudes wider than one limb, where a truncated or half-read return
+    /// register would be most likely to show up.
+    #[test]
+    fn cmpabs_handles_multi_limb_values() {
+        let a = Mpz::from_str_radix("123456789012345678901234567890123456789", 10).unwrap();
+        let mut b = a.clone();
+        b.setbit(200);
+
+        assert_eq!(mpz_cmpabs(&a, &b), Ordering::Less);
+        assert_eq!(mpz_cmpabs(&b, &a), Ordering::Greater);
+        assert_eq!(mpz_cmpabs(&a, &a.clone()), Ordering::Equal);
+
+        let neg_b = {
+            let mut t = Mpz::zero();
+            mpz_neg(&mut t, &b);
+            t
+        };
+        assert_eq!(mpz_cmpabs(&neg_b, &b), Ordering::Equal);
+    }
+
+    /// `export_obj` reports the byte length it actually wrote.
+    ///
+    /// The count is written by `__gmpz_export` through `countp`. That local was
+    /// previously `mem::uninitialized()`; it is now `0`, which is also the value
+    /// GMP writes for a zero input — so the zero case below pins both the fix
+    /// and the documented GMP behaviour it relies on.
+    #[test]
+    fn export_obj_round_trips() {
+        let values = [
+            "1",
+            "255",
+            "256",
+            "65535",
+            "123456789012345678901234567890",
+            "-1",
+            "-255",
+            "-256",
+            "-123456789012345678901234567890",
+        ];
+
+        for value in &values {
+            let obj = Mpz::from_str_radix(value, 10).unwrap();
+            let byte_len = (size_in_bits(&obj) + 8) >> 3;
+
+            let mut buf = vec![0u8; byte_len];
+            export_obj(&obj, &mut buf).expect("buffer sized from size_in_bits should fit");
+
+            assert_eq!(import_obj(&buf), obj, "round trip failed for {}", value);
+        }
+    }
+
+    /// A buffer too small must report the size needed rather than write past it.
+    #[test]
+    fn export_obj_reports_required_size() {
+        let obj = Mpz::from_str_radix("65535", 10).unwrap();
+        let mut too_small = [0u8; 1];
+        let needed = export_obj(&obj, &mut too_small).unwrap_err();
+        assert!(
+            needed > 1,
+            "expected a required size larger than the buffer, got {}",
+            needed
+        );
     }
 }
