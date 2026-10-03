@@ -2,6 +2,7 @@
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
 use num_bigint::BigInt;
+use super::super::epoch::EffectiveStatus;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
