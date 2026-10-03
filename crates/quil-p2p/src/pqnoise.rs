@@ -312,7 +312,7 @@ mod tests {
                 })
         });
         let responder = tokio::spawn(async move {
-            let mut r = pq_handshake_responder(&mut b, &resp_seed, &resp_pub_c)
+            let r = pq_handshake_responder(&mut b, &resp_seed, &resp_pub_c)
                 .await
                 .unwrap();
             // The initiator's first transport message follows the identity

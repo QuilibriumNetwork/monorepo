@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 #[tokio::test]
 async fn wallet_scans_owned_unspent_coins_over_rpc() {
     use quil_types::store::*;
-    use quil_lattice_ct::confidential::{coin_tree::{CoinRecord, CoinTree}, memo::create_output};
+    use quil_lattice_ct::confidential::{coin_tree::CoinRecord, memo::create_output};
     struct Pages {
         network: [u8; 32], application: [u8; 32], root: Vec<u8>,
         coins: Vec<([u8; 32], Output, u64)>, fail_continuation: std::sync::atomic::AtomicBool,

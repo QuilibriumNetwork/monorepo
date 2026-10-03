@@ -57,7 +57,7 @@ pub fn canonical_witnesses(
     local_roots: &[RootRecord],
     index: &super::witness_index::LocalWitnessIndex,
 ) -> Result<Witnesses> {
-    use quil_lattice_ct::confidential::{coin_tree::CoinRecord, sharded_tree};
+    use quil_lattice_ct::confidential::sharded_tree;
     let context = quil_lattice_ct::confidential::transfer::parameter_context(network, application);
     let unavailable = |what: &str| QuilError::ExecutionUnavailable(format!("canonical witness: {what}"));
     let reported = super::global_accumulator::subtrees(global, application)?;
@@ -272,7 +272,7 @@ pub fn indexed_witnesses(
 
 #[cfg(test)]
 mod tests {
-    use super::super::state::create_coin;
+
     use super::*;
     use crate::hypergraph_state::vertex_adds_discriminator;
     use quil_lattice_ct::confidential::{

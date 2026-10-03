@@ -1,22 +1,14 @@
 //! Consumption adapter for a globally authorized mint, available only through
 //! an explicitly configured token engine.
 //! The caller must serialize staging/commit and own the entire application.
-use super::{
-    mint_authorization, roots,
-    state::{self, SnapshotLimits},
-    materialize,
-};
-use crate::{
-    domains,
-    hypergraph_state::{vertex_adds_discriminator, HypergraphState},
-};
-use quil_lattice_ct::confidential::{mint_claim::MintClaim, transfer::parameter_context};
+use super::mint_authorization;
+use crate::domains;
+use quil_lattice_ct::confidential::mint_claim::MintClaim;
 use quil_types::{
     error::{QuilError, Result},
     execution::FrameExecutionContext,
     store::ClockStore,
 };
-use std::collections::BTreeSet;
 
 fn invalid(message: &str) -> QuilError {
     QuilError::InvalidArgument(format!("mint claim: {message}"))

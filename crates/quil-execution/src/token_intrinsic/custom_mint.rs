@@ -6,9 +6,11 @@
 //! `MintWithPayment` policy (no fee basis) is permissionless. Paid payment
 //! mints and proof-basis (PoMW/verkle) mints are rejected explicitly. Like the
 //! legacy path, no supply cap is enforced here.
+#[cfg(test)]
+use super::{roots, state::{self, SnapshotLimits}};
+#[cfg(test)]
+use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use super::{
-    roots,
-    state::{self, SnapshotLimits},
     config::TokenMintStrategy,
     config_resolver::{MintVariant, StaticTokenConfigResolver, StaticTokenEntry},
     constants::MINTABLE,
@@ -26,8 +28,6 @@ use quil_lattice_ct::confidential::{
 use quil_types::error::{QuilError, Result};
 pub use super::signature::verify_authority_signature;
 use sha3::{Digest, Sha3_256};
-use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
-use std::collections::BTreeSet;
 
 fn invalid(message: &str) -> QuilError {
     QuilError::InvalidArgument(format!("custom mint: {message}"))

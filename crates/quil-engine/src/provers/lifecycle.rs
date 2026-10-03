@@ -2363,7 +2363,7 @@ fn compute_world_bytes_from_summaries(summaries: &[ProverShardSummary]) -> BigIn
 #[cfg(test)]
 mod buckets_tests {
     use super::*;
-    use quil_types::consensus::{ALLOCATION_GRACE_FRAMES, ProverAllocationInfo, ProverStatus};
+    use quil_types::consensus::{ProverAllocationInfo, ProverStatus};
 
     fn alloc(
         filter: u8,
@@ -2921,7 +2921,6 @@ mod shard_size_cache_tests {
 #[cfg(test)]
 mod proposal_loop_tests {
     use super::*;
-    use std::sync::Mutex;
 
     use quil_types::consensus::{
         ProverAllocationInfo, ProverInfo, ProverShardSummary, ProverStatus,
@@ -5259,7 +5258,6 @@ mod proposal_loop_tests {
 /// live counts, and the halt-risk bucket sees the right set.
 #[cfg(test)]
 mod halt_risk_descriptor_tests {
-    use super::*;
     use std::collections::HashMap;
     use num_bigint::BigInt;
     use quil_types::consensus::{ProverShardSummary, ProverStatus};

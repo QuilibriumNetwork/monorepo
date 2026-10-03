@@ -1,6 +1,6 @@
 //! Explicit token-suite policy for token-engine integration.
 //! There is no default policy and no fallback to the old confidential suite.
-use super::{custom_mint, pending_claim, shield, state::SnapshotLimits};
+use super::{custom_mint, state::SnapshotLimits};
 #[cfg(test)]
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use crate::{domains, hypergraph_state::HypergraphState, token_engine::*};

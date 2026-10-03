@@ -173,7 +173,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         cw_router: cw_router_for_recv,
         global_finalization: global_finalization_for_recv,
     } = args;
-    let mut archive_ingest_for_recv = archive_app_shard_ingest;
+    let archive_ingest_for_recv = archive_app_shard_ingest;
 
     // Global bitmasks for BlossomSub topic subscriptions.
     const GLOBAL_CONSENSUS: &[u8] = &[0x00];

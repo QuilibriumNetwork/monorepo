@@ -1,7 +1,9 @@
 //! Bounded QUIL reward witnesses checked against a canonical global frame.
+#[cfg(test)]
+use crate::hypergraph_state::vertex_adds_discriminator;
 use crate::{
     domains, global_schema,
-    hypergraph_state::{vertex_adds_discriminator, HypergraphState},
+    hypergraph_state::HypergraphState,
 };
 use quil_types::{
     error::{QuilError, Result},

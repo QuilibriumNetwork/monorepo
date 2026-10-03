@@ -3679,10 +3679,9 @@ fn check_leave_confirm_halt_risk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use num_bigint::BigInt;
     use quil_types::crypto::KeyType;
     use crate::global_schema::{
-        write_field, write_type, TYPE_HASH_PROVER, TYPE_HASH_ALLOCATION,
+        write_field, write_type,
     };
     use crate::global_intrinsic::addressed_signature::AddressedSignature;
 

@@ -3479,7 +3479,7 @@ mod tests {
 
     #[test]
     fn coin_scan_validates_contents_and_preserves_state_on_bad_pages() {
-        use quil_lattice_ct::confidential::coin_tree::{CoinRecord, CoinTree};
+        use quil_lattice_ct::confidential::coin_tree::CoinRecord;
         use quil_types::proto::node::{ListCoinsResponse, ConfidentialCoin};
         let keys = sntrup761::Sntrup761KeyPair::generate();
         let wallet = RecipientWallet::from_keys(

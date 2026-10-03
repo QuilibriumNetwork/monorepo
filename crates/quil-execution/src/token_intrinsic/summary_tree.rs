@@ -30,10 +30,12 @@
 //! Every member executes that refresh at the same frame. Until then, every
 //! read uses the flat record, and a rebuild (member-local: restart, sync,
 //! merge) keeps it flat.
+#[cfg(test)]
+use crate::hypergraph_state::vertex_adds_discriminator;
 use super::coin_blocks::{BLOCK_INDEX_BITS, SUBTREE_BITS};
 use super::roots::{BlockSummary, MAX_NONEMPTY_BLOCKS};
 use super::state::BLOCK_SUMMARY_ADDRESS;
-use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
+use crate::hypergraph_state::HypergraphState;
 use quil_lattice_ct::confidential::relation::membership::{MembershipKey, Node, NODE_BYTES};
 use quil_types::error::{QuilError, Result};
 use std::collections::{BTreeMap, BTreeSet};

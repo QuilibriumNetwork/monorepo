@@ -1,10 +1,7 @@
 //! QUIL reward-mint admission. Clock-backed admission resolves the
 //! cited global root; callers must serialize global reward/token mutation.
-use super::{
-    roots,
-    state::{self, SnapshotLimits},
-    materialize,
-};
+#[cfg(test)]
+use super::{roots, materialize, state::{self, SnapshotLimits}};
 use crate::{
     domains, global_schema,
     hypergraph_state::{vertex_adds_discriminator, HypergraphState},
@@ -15,7 +12,6 @@ use quil_lattice_ct::confidential::{
     transfer::parameter_context,
 };
 use quil_types::error::{QuilError, Result};
-use std::collections::BTreeSet;
 
 const _: [(); FALCON_PUBLIC_BYTES] = [(); quil_crypto::FALCON_PUBLIC_KEY_LEN];
 const _: [(); FALCON_SIGNATURE_BYTES] = [(); quil_crypto::FALCON_SIGNATURE_LEN];
@@ -757,7 +753,7 @@ mod tests {
         let receipt;
         {
             let _guard = crdt.lock_forest_writes();
-            let direct = verify_mint(
+            let _direct = verify_mint(
                 &f.state,
                 &s.network,
                 &s.application,
