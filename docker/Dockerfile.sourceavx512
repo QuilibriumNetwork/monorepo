@@ -1,4 +1,4 @@
-# syntax=docker.io/docker/dockerfile:1.7-labs
+# syntax=docker.io/docker/dockerfile:1.19
 # Build on ubuntu:22.04 (glibc 2.35) so the dynamically-linked binaries
 # run on Ubuntu 22.04 hosts as well as newer releases — glibc symbol
 # versions are stamped from the build environment, and binaries linked
@@ -7,7 +7,7 @@
 #
 # Build from the repository root, e.g.:
 #   docker build -f docker/Dockerfile.sourceavx512 --target=node --output node/build/amd64_avx512_linux .
-FROM --platform=${TARGETPLATFORM} ubuntu:22.04 AS base-avx512
+FROM ubuntu:22.04 AS base-avx512
 
 ENV PATH="${PATH}:/root/.cargo/bin/"
 
@@ -105,38 +105,24 @@ RUN git clone https://github.com/flintlib/flint.git && \
     rm -rf flint
 
 COPY docker/rustup-init.sh /opt/rustup-init.sh
-
-RUN /opt/rustup-init.sh -y --profile minimal
+COPY rust-toolchain.toml /opt/rust-toolchain.toml
+RUN TOOLCHAIN=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' /opt/rust-toolchain.toml) && \
+    test -n "$TOOLCHAIN" && \
+    /opt/rustup-init.sh -y --profile minimal --default-toolchain "$TOOLCHAIN"
 
 # -----------------------------------------------------------------------------
 # Stage: gen-avx512
-# Purpose: Build the AVX-512 EMP toolkit libraries that the Rust crypto crates
-#          link against. Only Rust/EMP sources are copied here so that source
-#          changes elsewhere don't bust the cache.
+# Purpose: Build EMP independently of Rust workspace source changes.
 # -----------------------------------------------------------------------------
 FROM base-avx512 AS gen-avx512
 
 ENV QUILIBRIUM_SIGNATURE_CHECK=false
-
+ENV CFLAGS="-march=skylake-avx512 -mtune=skylake-avx512"
 WORKDIR /opt/ceremonyclient
-
-# Rust workspace files (rarely change)
-COPY Cargo.toml Cargo.lock ./
-
-# Rust crate sources
-COPY crates crates
-
-# EMP toolkit sources
-COPY install-emp.sh .
+COPY docker/build-emp.sh /opt/build-emp.sh
 COPY emp-tool emp-tool
 COPY emp-ot emp-ot
-
-RUN bash install-emp.sh
-
-ENV CFLAGS="-march=skylake-avx512 -mtune=skylake-avx512"
-RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
-
-RUN cd emp-ot && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
+RUN bash /opt/build-emp.sh
 
 # -----------------------------------------------------------------------------
 # Stage: build-avx512
@@ -152,6 +138,8 @@ WORKDIR /opt/ceremonyclient
 COPY --exclude=node . .
 
 FROM build-avx512 AS build-node-avx512
+ARG TARGETOS
+ARG TARGETARCH
 
 # Build and install the node. It also runs itself as its confidential token
 # proof verifier worker, so it is the only binary.
@@ -162,7 +150,10 @@ WORKDIR /opt/ceremonyclient/node
 # suffix on the output directory is driven by the AVX512 env var; with it set
 # the binary lands at node/build/amd64_avx512_linux/node.
 ENV AVX512=1
-RUN ./build.sh && cp build/*/node /usr/bin/node
+RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=cargo-target-${TARGETOS}-${TARGETARCH}-avx512,target=/opt/ceremonyclient/target,sharing=locked \
+    CARGO_TIMINGS=1 ./build.sh && cp build/*/node /usr/bin/node
 
 FROM build-avx512 AS build-qclient-avx512
 ARG TARGETOS
@@ -176,12 +167,14 @@ WORKDIR /opt/ceremonyclient
 # compat data from node/execution/... (retro JSONs via include_bytes! +
 # mainnet_244200_seniority.json via build.rs). build-avx512 excludes node/, so
 # bring in just that data dir here.
+COPY ./node/build.sh /opt/ceremonyclient/node/build.sh
 COPY ./node/execution/intrinsics/global/compat /opt/ceremonyclient/node/execution/intrinsics/global/compat
 RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
-    --mount=type=cache,id=cargo-target-qclient,target=/opt/ceremonyclient/target \
-    cargo build --release -p quil-client --bin qclient && \
-    cp target/release/qclient /usr/bin/qclient
+    --mount=type=cache,id=cargo-target-${TARGETOS}-${TARGETARCH}-avx512,target=/opt/ceremonyclient/target,sharing=locked \
+    CARGO_TIMINGS=1 CRATE_NAME=quil-client BIN_NAME=qclient OUT_BIN_NAME=qclient \
+    OUT_BASE_DIR=crates/quil-client/build bash node/build.sh && \
+    cp crates/quil-client/build/*/qclient /usr/bin/qclient
 
 # Allows exporting single binary
 FROM scratch AS node
