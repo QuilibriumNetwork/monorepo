@@ -355,14 +355,12 @@ fn panel_title(text: String) -> Line<'static> {
 fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     let mut joining = BigInt::from(0);
     let mut active = BigInt::from(0);
-    let mut paused = BigInt::from(0);
-    let mut leaving = BigInt::from(0);
+    let paused = BigInt::from(0);
+    let leaving = BigInt::from(0);
     for a in sorted {
-        match a.status {
-            1 => joining += &a.estimated_reward,
-            2 => active += &a.estimated_reward,
-            3 => paused += &a.estimated_reward,
-            4 => leaving += &a.estimated_reward,
+        match a.reward_status(m.epoch_frame(), m.epoch_length) {
+            Some(EffectiveStatus::Joining) => joining += &a.estimated_reward,
+            Some(EffectiveStatus::Active) => active += &a.estimated_reward,
             _ => {}
         }
     }
@@ -635,12 +633,15 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
             .collect();
 
         if selected {
-            let joined = cells.join(" ");
-            let padded = format!("{:<width$}", joined, width = content_width);
-            lines.push(Line::from(Span::styled(
-                padded,
-                Style::new().fg(TEXT).bg(PRIMARY),
-            )));
+            let mut spans = Vec::new();
+            for (ci, cell) in cells.iter().enumerate() {
+                if ci > 0 { spans.push(Span::raw(" ")); }
+                let color = if ci == 9 && m.color_coding && a.worker_id < 0 { ERROR } else { TEXT };
+                spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
+            }
+            let used = cells.iter().map(String::len).sum::<usize>() + cells.len().saturating_sub(1);
+            spans.push(Span::raw(" ".repeat(content_width.saturating_sub(used))));
+            lines.push(Line::from(spans).style(Style::new().fg(TEXT).bg(PRIMARY)));
         } else {
             let mut spans: Vec<Span> = Vec::new();
             for (ci, cell) in cells.iter().enumerate() {
@@ -666,6 +667,9 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
                         Some(color) => Span::styled(cell.clone(), Style::new().fg(color)),
                         None => Span::raw(cell.clone()),
                     },
+                    9 if m.color_coding && a.worker_id < 0 => {
+                        Span::styled(cell.clone(), Style::new().fg(ERROR))
+                    }
                     11 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(status_color(&a.status_name)))
                     }
@@ -1747,6 +1751,51 @@ mod tests {
             leave_confirm_frame: 0,
             epoch: 0,
             last_active_frame: 0,
+        }
+    }
+
+    #[test]
+    fn reward_total_excludes_unstaffed_and_inactive_rows_and_counts_deferred_joins() {
+        let mut m = Model::new();
+        m.frame_number = 2160;
+        m.epoch_length = 720;
+        let mut joining = row("aa", 1, 1, 0, "", "");
+        joining.filter = vec![0xaa];
+        joining.status = 2;
+        joining.confirm_frame = 2160;
+        joining.epoch = 3;
+        joining.estimated_reward = BigInt::from(10000);
+        let mut unstaffed = joining.clone();
+        unstaffed.worker_id = -1;
+        unstaffed.estimated_reward = BigInt::from(20000);
+        let mut expired = joining.clone();
+        expired.confirm_frame = 0;
+        expired.epoch = 2;
+        expired.estimated_reward = BigInt::from(30000);
+        let mut paused = joining.clone();
+        paused.status = 3;
+        paused.estimated_reward = BigInt::from(40000);
+        let mut leaving = joining.clone();
+        leaving.status = 4;
+        leaving.estimated_reward = BigInt::from(50000);
+        let title = alloc_title(&m, &[joining, unstaffed, expired, paused, leaving]);
+        let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
+        let estimate = format_quil_daily_round(&BigInt::from(10000));
+        assert!(text.contains(&format!("Estimated Rewards [Q/d]: {estimate} = Joining {estimate} + Active 0 + Paused 0 + Leaving 0")), "{text}");
+    }
+
+    #[test]
+    fn unassigned_reward_is_red_even_on_the_selected_row() {
+        for selected in [false, true] {
+            let mut m = Model::new();
+            m.color_coding = true;
+            m.alloc_cursor = if selected { 0 } else { 1 };
+            let mut allocation = row("aa", 1, 1, -1, "", "");
+            allocation.estimated_reward = BigInt::from(123456);
+            let reward = fmt_reward(&allocation.estimated_reward);
+            let lines = render_alloc_panel(&mut m, &[allocation], Rect::new(0, 0, 240, 5));
+            let span = lines[1].spans.iter().find(|s| s.content.trim() == reward).expect("reward cell");
+            assert_eq!(span.style.fg, Some(ERROR));
         }
     }
 
