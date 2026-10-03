@@ -1885,7 +1885,7 @@ impl ProverLifecycle {
                 proposer::releasable_member(&self.prover_address, filter, &members)
             };
             let score_candidates: Vec<Vec<u8>> = if !proposal_descriptors.is_empty() {
-                proposer::plan_leaves_releasing(
+                proposer::plan_leaves_releasing_spread(
                     &allocated_descriptors,
                     &proposal_descriptors,
                     difficulty,
@@ -1895,6 +1895,7 @@ impl ProverLifecycle {
                     free_worker_ids.len(),
                     &min_hold_filters,
                     &releasable,
+                    Some(&self.prover_address),
                 )
             } else {
                 Vec::new()
