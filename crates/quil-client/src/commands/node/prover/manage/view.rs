@@ -263,9 +263,8 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
 
     // Titles share the top borders, leaving two more rows for table data.
     let sorted_allocs = m.sorted_allocations();
-    let title_style = Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD);
     let alloc_block = Block::default()
-        .title(alloc_title(m, &sorted_allocs).style(title_style))
+        .title(alloc_title(m, &sorted_allocs))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(if m.focus.is_alloc() { PRIMARY } else { DIM }));
@@ -276,7 +275,7 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
 
     let sorted_avail = m.sorted_available();
     let avail_block = Block::default()
-        .title(avail_title(m, &sorted_avail).style(title_style))
+        .title(avail_title(m, &sorted_avail))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(if !m.focus.is_alloc() { PRIMARY } else { DIM }));
@@ -309,7 +308,7 @@ fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, ar
     let title = if m.notice_lines > m.notice_visible {
         format!(" Notifications: {} {}/{} ", m.notice_minimum.label(), m.notice_offset + 1, m.notice_lines)
     } else { format!(" Notifications: {} ", m.notice_minimum.label()) };
-    let block = Block::default().title(title).borders(Borders::ALL)
+    let block = Block::default().title(panel_title(title)).borders(Borders::ALL)
         .border_type(BorderType::Rounded).border_style(Style::new().fg(DIM));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -348,6 +347,11 @@ fn header_line(m: &Model) -> Line<'static> {
     Line::from(s)
 }
 
+fn panel_title(text: String) -> Line<'static> {
+    Line::from(format!(" {} ", text.trim()))
+        .style(Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD))
+}
+
 fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     let mut joining = BigInt::from(0);
     let mut active = BigInt::from(0);
@@ -375,7 +379,7 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     if !m.alloc_selected.is_empty() {
         s += &format!(" [{} selected]", m.alloc_selected.len());
     }
-    Line::from(s)
+    panel_title(s)
 }
 
 fn avail_title(m: &Model, sorted: &[ShardRow]) -> Line<'static> {
@@ -383,7 +387,7 @@ fn avail_title(m: &Model, sorted: &[ShardRow]) -> Line<'static> {
     if !m.avail_selected.is_empty() {
         s += &format!(" [{} selected]", m.avail_selected.len());
     }
-    Line::from(s)
+    panel_title(s)
 }
 
 // ── Allocations panel ────────────────────────────────────────────────────
@@ -1532,6 +1536,10 @@ mod tests {
             for title in ["Allocations:", "Available Shards:", "Notifications:"] {
                 let row = rows.iter().find(|row| row.contains(title)).unwrap();
                 assert!(row.starts_with('╭') && row.ends_with('╮'), "title must share its panel border: {row}");
+                let y = rows.iter().position(|candidate| candidate == row).unwrap() as u16;
+                let cell = &buffer[(2, y)];
+                assert_eq!(cell.fg, PRIMARY, "panel titles share the primary color");
+                assert!(cell.modifier.contains(Modifier::BOLD), "panel titles share bold weight");
             }
             assert_eq!(rows.iter().position(|row| row.contains("Allocations:")), Some(1));
             assert_eq!(m.notice_visible, 3);
