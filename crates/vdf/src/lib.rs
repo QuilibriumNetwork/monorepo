@@ -272,7 +272,7 @@ pub fn wesolowski_solve_multi(
   ids: &Vec<Vec<u8>>,
   i: u32,
 ) -> Vec<u8> {
-  use classgroup::{gmp_classgroup::GmpClassGroup, BigNumExt, ClassGroup};
+  use classgroup::{gmp_classgroup::GmpClassGroup, ClassGroup};
   use crate::proof_of_time::serialize;
   use crate::proof_wesolowski::{commit_ids, hash_prime_fixed, worker_prove_id_bound};
 
@@ -354,7 +354,7 @@ pub fn wesolowski_verify_multi_sparse(
   present_ids: &Vec<Vec<u8>>,
   alleged_solutions: &Vec<Vec<u8>>,
 ) -> bool {
-  use classgroup::{gmp_classgroup::GmpClassGroup, BigNum, BigNumExt, ClassGroup};
+  use classgroup::{gmp_classgroup::GmpClassGroup, BigNum, ClassGroup};
   use crate::proof_wesolowski::{commit_ids, hash_prime_fixed, hash_to_exponent};
 
   // Basic shape checks. `present_ids` is parallel to the solutions; the
@@ -477,7 +477,8 @@ mod multiproof_bench {
                 .collect();
             assert!(
                 wesolowski_verify_multi(int_size_bits, challenge, difficulty, &id_set, &blobs),
-                "N={n} honest proofs must verify"
+                "N={} honest proofs must verify",
+                n
             );
             let iters = 20u32;
             let start = Instant::now();

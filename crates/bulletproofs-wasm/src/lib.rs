@@ -1,5 +1,5 @@
 use wasm_bindgen::prelude::*;
-use bulletproofs::{generate_input_commitments, generate_range_proof, verify_range_proof, sum_check, scalar_mult_point, scalar_mult, scalar_inverse, keygen, scalar_mult_hash_to_scalar, hash_to_scalar, scalar_addition, scalar_subtraction, scalar_to_point, alt_generator, point_addition, point_subtraction, sign_hidden, verify_hidden, sign_simple, verify_simple, RangeProofResult};
+use bulletproofs::{generate_input_commitments, generate_range_proof, verify_range_proof, sum_check, scalar_mult_point, scalar_mult, scalar_inverse, keygen, scalar_mult_hash_to_scalar, hash_to_scalar, scalar_addition, scalar_subtraction, scalar_to_point, alt_generator, point_addition, point_subtraction, sign_hidden, verify_hidden, sign_simple, verify_simple};
 
 // Bulletproofs wrapper functions
 
