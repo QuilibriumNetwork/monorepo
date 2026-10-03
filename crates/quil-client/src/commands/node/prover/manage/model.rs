@@ -148,6 +148,24 @@ pub struct AllocationRow {
 }
 
 impl AllocationRow {
+    /// Row estimates remain visible; only staffed active or joining rows
+    /// contribute to projected earnings in the panel total.
+    pub fn reward_status(&self, frame: u64, epoch_length: u64) -> Option<EffectiveStatus> {
+        if self.worker_id < 0 {
+            return None;
+        }
+        let status = compute_effective_status(&AllocationTiming {
+            raw_status: self.status,
+            filter: &self.filter,
+            join_frame: self.join_frame,
+            join_confirm_frame: self.confirm_frame,
+            leave_frame: self.leave_frame,
+            leave_confirm_frame: self.leave_confirm_frame,
+            epoch: self.epoch,
+        }, frame, epoch_length);
+        matches!(status, EffectiveStatus::Active | EffectiveStatus::Joining).then_some(status)
+    }
+
     /// The Mode cell — `m` when the row's worker is managed by hand, `a` when
     /// the node assigns it. Cell values are lower-case; headers carry the
     /// capital.
@@ -504,10 +522,8 @@ impl Model {
                 row.data_shards = info.data_shards;
                 row.materialized_frame = info.materialized_frame;
                 row.latest_frame = info.latest_frame;
-                if eff == EffectiveStatus::Active && wid >= 0 {
-                    row.estimated_reward =
-                        BigInt::from_bytes_be(Sign::Plus, &info.estimated_reward);
-                }
+                row.estimated_reward =
+                    BigInt::from_bytes_be(Sign::Plus, &info.estimated_reward);
             }
             allocs.push(row);
         }
@@ -1109,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn only_active_allocations_with_assigned_workers_show_rewards() {
+    fn row_estimates_survive_without_total_eligibility() {
         use quil_types::proto::node::WorkerInfo;
 
         let filter = vec![0xab];
@@ -1139,7 +1155,7 @@ mod tests {
         assert_eq!(expired_epoch.allocations[0].worker_id, -1);
         assert_eq!(
             expired_epoch.allocations[0].estimated_reward,
-            BigInt::from(0)
+            BigInt::from(42)
         );
 
         let mut unassigned = Model::new();
@@ -1150,19 +1166,66 @@ mod tests {
         );
         assert_eq!(unassigned.allocations[0].status_name, "active");
         assert_eq!(unassigned.allocations[0].worker_id, -1);
-        assert_eq!(unassigned.allocations[0].estimated_reward, BigInt::from(0));
+        assert_eq!(unassigned.allocations[0].estimated_reward, BigInt::from(42));
+        assert_eq!(unassigned.allocations[0].reward_status(2160, 720), None);
+        assert_eq!(expired_epoch.allocations[0].reward_status(2160, 720), None);
+        assert_eq!(active.allocations[0].reward_status(2160, 720), Some(EffectiveStatus::Active));
     }
 
     #[test]
-    fn assigned_inactive_allocations_keep_metadata_without_rewards() {
+    fn joining_allocations_show_projected_rewards_before_worker_assignment() {
+        use super::super::super::epoch::raw_status;
+        use quil_types::proto::node::WorkerInfo;
+
+        let filter = vec![0xab];
+        for (status, confirm_frame) in [
+            (raw_status::JOINING, 0),
+            (raw_status::ACTIVE, 2_160),
+        ] {
+            for assigned in [false, true] {
+                let mut alloc = allocation(filter.clone(), 3);
+                alloc.status = status;
+                alloc.join_confirm_frame_number = confirm_frame;
+                let workers = assigned.then(|| WorkerInfoResponse {
+                    worker_info: vec![WorkerInfo {
+                        core_id: 0,
+                        filter: filter.clone(),
+                        ..Default::default()
+                    }],
+                });
+                let mut model = Model::new();
+                model.process_refresh_data(
+                    Some(node_info(alloc)),
+                    Some(shard_info(filter.clone(), 42)),
+                    workers,
+                );
+                assert_eq!(model.allocations[0].status_name, "joining");
+                assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
+                assert_eq!(model.allocations[0].reward_status(2160, 720), assigned.then_some(EffectiveStatus::Joining));
+                // Expired joins disappear along with their cached estimate.
+                model.process_refresh_data(
+                    Some(node_info({
+                        let mut expired = allocation(filter.clone(), 1);
+                        expired.status = raw_status::JOINING;
+                        expired.join_frame_number = 720;
+                        expired
+                    })),
+                    None,
+                    None,
+                );
+                assert!(model.allocations.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn assigned_inactive_allocations_keep_estimates_but_do_not_contribute() {
         use super::super::super::epoch::raw_status;
         use quil_types::proto::node::WorkerInfo;
 
         let filter = vec![0xab];
         for (status, epoch, join_confirm_frame, label) in [
             (raw_status::ACTIVE, 2, 0, "re-confirm!"),
-            (raw_status::JOINING, 3, 0, "joining"),
-            (raw_status::ACTIVE, 3, 2_160, "joining"),
             (raw_status::PAUSED, 3, 0, "paused"),
             (raw_status::LEAVING, 3, 0, "leaving"),
         ] {
@@ -1191,7 +1254,8 @@ mod tests {
             let row = &model.allocations[0];
             assert_eq!(row.status_name, label);
             assert_eq!(row.worker_id, 0);
-            assert_eq!(row.estimated_reward, BigInt::from(0), "{label}");
+            assert_eq!(row.estimated_reward, BigInt::from(42), "{label}");
+            assert_eq!(row.reward_status(2160, 720), None, "{label}");
             assert_eq!(row.ring, 7);
             assert_eq!(row.active_provers, 9);
             assert_eq!(row.shard_size, BigInt::from(64));
@@ -1202,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_clears_rewards_when_worker_or_active_status_is_lost() {
+    fn refresh_keeps_estimates_but_updates_total_eligibility() {
         use quil_types::proto::node::WorkerInfo;
 
         let filter = vec![0xab];
@@ -1228,7 +1292,8 @@ mod tests {
             Some(WorkerInfoResponse { worker_info: vec![] }),
         );
         assert_eq!(model.allocations[0].worker_id, -1);
-        assert_eq!(model.allocations[0].estimated_reward, BigInt::from(0));
+        assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
+        assert_eq!(model.allocations[0].reward_status(2160, 720), None);
 
         model.process_refresh_data(
             Some(node_info(allocation(filter.clone(), 3))),
@@ -1237,14 +1302,15 @@ mod tests {
         );
         assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
 
-        // Cached shard and worker data must not preserve an expired reward.
+        // Cached row estimates must not contribute after expiry.
         model.process_refresh_data(
             Some(node_info(allocation(filter, 2))),
             None,
             None,
         );
         assert_eq!(model.allocations[0].status_name, "re-confirm!");
-        assert_eq!(model.allocations[0].estimated_reward, BigInt::from(0));
+        assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
+        assert_eq!(model.allocations[0].reward_status(2160, 720), None);
     }
 
 }
