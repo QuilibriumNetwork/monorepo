@@ -197,6 +197,46 @@ impl std::fmt::Debug for LifecycleAction {
     }
 }
 
+/// Allocations this prover holds on-chain that NOTHING is working — the
+/// "Leave regardless of score" set.
+///
+/// Candidates are `active` UNION `expired_epoch`. Including `expired_epoch` is
+/// what makes the sweep terminating rather than one-shot: being orphaned is
+/// precisely what makes an allocation expire, since no worker means no proofs
+/// and so a missed per-epoch re-confirm at the next boundary, after which the
+/// allocation leaves `active`. Sweeping `active` alone therefore gave an orphan
+/// a single epoch of eligibility and no way back, so an orphan that survived one
+/// boundary became permanently unsheddable. Observed in the wild as a node
+/// holding 35 allocations against 15 workers, the 20 unbound ones all reading
+/// `re-confirm!`, with no Leave ever proposed.
+///
+/// `expired_epoch` deliberately does NOT join `active` itself — that set is
+/// coverage accounting and an unconfirmed allocation genuinely does not count.
+/// This widens only who may be SHED.
+///
+/// Excluded: filters a worker is bound to (including in-flight joins, whose
+/// `worker.filter` is set at submit time), operator-pinned filters, and filters
+/// already mid-Leave.
+pub(crate) fn orphaned_allocation_filters(
+    active_filters: &[Vec<u8>],
+    expired_epoch_filters: &[Vec<u8>],
+    bound_filters: &std::collections::HashSet<Vec<u8>>,
+    manually_managed_filters: &std::collections::HashSet<Vec<u8>>,
+    pending_leave_filters: &std::collections::HashSet<Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    active_filters
+        .iter()
+        .chain(expired_epoch_filters.iter())
+        .filter(|f| seen.insert(f.as_slice()))
+        .filter(|f| !bound_filters.contains(*f))
+        .filter(|f| !manually_managed_filters.contains(*f))
+        .filter(|f| !pending_leave_filters.contains(*f))
+        .cloned()
+        .collect()
+}
+
+
 /// Allocations partitioned by their effective status at a given
 /// frame. Lifecycle's `evaluate` collects these once and dispatches
 /// each downstream subroutine against the appropriate slice. Pulling
@@ -484,14 +524,14 @@ pub struct ProverLifecycle {
     /// leaving the lifecycle with a near-empty score map for 59 out
     /// of every 60 frames. Splitting into two caches lets each writer
     /// own its source-of-truth without racing.
-    local_shard_sizes: RwLock<HashMap<Vec<u8>, u64>>,
-    /// Per-shard byte sizes from the most recent successful
+    local_shard_sizes: RwLock<HashMap<Vec<u8>, (u64, u64)>>,
+    /// Per-shard (byte size, data-shard count) pairs from the most recent successful
     /// `GetAppShards` archive fetch. Authoritative for shards we are
     /// NOT allocated to (the local cache would have 0 / missing
     /// entries for those). Refreshed every 60 frames or on first-
     /// success by the `shard_info_refresh` task; setting it flips the
     /// `shard_info_loaded` gate.
-    remote_shard_sizes: RwLock<HashMap<Vec<u8>, u64>>,
+    remote_shard_sizes: RwLock<HashMap<Vec<u8>, (u64, u64)>>,
     /// Shards the last archive refresh reported frozen by a recorded split
     /// or merge that has not applied yet. The chain refuses a whole join
     /// that names one, so they are not join candidates.
@@ -645,6 +685,11 @@ impl ProverLifecycle {
     /// `ProposeJoin` / `ProposeLeave` gate, the remote refresh task
     /// must succeed at least once via `set_remote_shard_sizes`.
     pub fn set_local_shard_sizes(&self, sizes: HashMap<Vec<u8>, u64>) {
+        self.set_local_shard_metrics(sizes.into_iter().map(|(f, n)| (f, (n, 1))).collect());
+    }
+
+    /// Replace byte sizes and data-shard counts together, from one local scan.
+    pub fn set_local_shard_metrics(&self, sizes: HashMap<Vec<u8>, (u64, u64)>) {
         if let Ok(mut guard) = self.local_shard_sizes.write() {
             *guard = sizes;
         }
@@ -660,6 +705,11 @@ impl ProverLifecycle {
     /// fresh fetch. The local cache is untouched, so partial remote
     /// refreshes do NOT lose local data for shards we hold.
     pub fn set_remote_shard_sizes(&self, sizes: HashMap<Vec<u8>, u64>) {
+        self.set_remote_shard_metrics(sizes.into_iter().map(|(f, n)| (f, (n, 1))).collect());
+    }
+
+    /// Replace byte sizes and data-shard counts together, from one archive response.
+    pub fn set_remote_shard_metrics(&self, sizes: HashMap<Vec<u8>, (u64, u64)>) {
         if let (Ok(mut lacking), Ok(mut settled)) =
             (self.unsized_live_shards.write(), self.settled_unsized_shards.write())
         {
@@ -699,6 +749,10 @@ impl ProverLifecycle {
     /// alloc cost is negligible. Returned by value so callers
     /// don't hold either lock during proposal building.
     pub fn merged_shard_sizes(&self) -> HashMap<Vec<u8>, u64> {
+        self.merged_shard_metrics().into_iter().map(|(f, (bytes, _))| (f, bytes)).collect()
+    }
+
+    fn merged_shard_metrics(&self) -> HashMap<Vec<u8>, (u64, u64)> {
         let mut merged = self
             .remote_shard_sizes
             .read()
@@ -745,6 +799,35 @@ impl ProverLifecycle {
     /// post-success cooldown semantics at `worker_allocator.go:224`.
     pub fn record_join_attempt(&self, frame_number: u64) {
         self.allocator.set_last_join_attempt(frame_number);
+    }
+
+    /// Serialize discretionary replacement waves until the workers from the
+    /// previous wave are available. Per-cycle pairing cannot prevent the same
+    /// destination from funding another leave while its first source still
+    /// serves notice. Use chain state so this also survives restarts.
+    fn replacement_leave_pending(
+        &self,
+        prover: Option<&quil_types::consensus::ProverInfo>,
+        workers: &[crate::worker::WorkerInfo],
+        frame_number: u64,
+    ) -> bool {
+        use quil_types::consensus::EffectiveStatus;
+        let auto_bound: std::collections::HashSet<&Vec<u8>> = workers.iter()
+            .filter(|w| !w.manually_managed && !w.filter.is_empty())
+            .map(|w| &w.filter)
+            .collect();
+        if prover.is_some_and(|p| p.allocations.iter().any(|a| {
+            auto_bound.contains(&a.confirmation_filter)
+                && a.effective_status(frame_number) == EffectiveStatus::Leaving
+        })) {
+            return true;
+        }
+        // Before publication, the registry still calls the source Active.
+        // Keep the existing bounded retry window for a failed submission.
+        self.last_leave_attempt.read().map(|attempts| attempts.iter().any(|(filter, last)| {
+            auto_bound.contains(filter)
+                && frame_number.saturating_sub(*last) < LEAVE_COOLDOWN_FRAMES
+        })).unwrap_or(true)
     }
 
     /// Drop filters whose last Leave proposal is within
@@ -917,63 +1000,93 @@ impl ProverLifecycle {
         }
         let surplus = total_active_count - total_capacity;
 
-        // Orphan active filters (no worker bound, not operator-pinned)
-        // are always the right answer to shed capacity-pressure: no
-        // worker does the work, so leaving them costs nothing. Pick
-        // them first; only fall back to lowest-scoring auto-bound when
-        // surplus exceeds the orphan count. This protects healthy
-        // bound filters from being evicted ahead of a stale orphan.
-        let mut picks: Vec<Vec<u8>> = active_filters
-            .iter()
-            .filter(|f| !bound_filters.contains(*f))
-            .filter(|f| !mm_filters.contains(*f))
-            .take(surplus)
-            .cloned()
-            .collect();
-
-        if picks.len() < surplus {
-            // Build the exclusion set: manually-managed pins + any
-            // shard whose post-leave Active count would land at or
-            // below the halt-risk threshold (`active_count <=
-            // HALT_RISK_PROVER_COUNT + 1`, matching `plan_leaves` and
-            // `decide_leaves`). Shedding a shard already at the
-            // threshold OR one our departure would push into it
-            // would immediately worsen the network's exposure.
-            // Operators dealing with chronic capacity pressure
-            // should reduce worker count or add manual pins, not
-            // auto-shed halt-risk-adjacent shards.
-            let mut excluded = mm_filters.clone();
-            for d in allocated_descriptors {
-                if d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT + 1 {
-                    excluded.insert(d.filter.clone());
-                }
-            }
-            let ranked = proposer::rank_allocated_by_score_ascending(
-                allocated_descriptors,
-                difficulty,
-                world_bytes,
-                self.units,
-                self.strategy,
-                &excluded,
-            );
-            // Lowest-scoring `surplus - orphan_count` auto-bound. A
-            // filter that's `Active` but absent from `allocated_descriptors`
-            // is, in practice, a size-0 shard (build_decide_descriptors
-            // skipped it). Mirroring Go's `worker_allocator.go:821-824` —
-            // where `if size == 0 { continue }` lands BEFORE
-            // `leaveProposalCandidates = append(...)` — we deliberately
-            // do NOT pick those here. The empty-allocated path in the
-            // main ProposeLeave block surfaces them.
-            for (f, _) in ranked {
-                if picks.len() == surplus {
-                    break;
-                }
-                if picks.contains(&f) {
-                    continue;
-                }
-                picks.push(f);
+        // Shed the worst-scoring allocations, bound or not.
+        //
+        // This used to shed orphans (Active, no worker bound) first and
+        // score-blind, on the reasoning that "no worker does the work,
+        // so leaving them costs nothing." It costs the difference in
+        // score. Which allocations hold a worker is decided by bind
+        // order in the allocator, not by value: a crashed worker, a
+        // reduced core count, or a join batch that outran the idle pool
+        // all leave whatever they held bound and push the rest out in
+        // arrival order. `WorkerAllocator::rebind_surplus_by_priority`
+        // exists to correct exactly that — it moves workers off the
+        // worst-ranked bound allocations onto the best-ranked orphans —
+        // and its doc comment states the contract this function is
+        // meant to honour: "the surplus-leave path sheds them,
+        // lowest-scoring first — the same order used here, so the
+        // shards left unbound are the ones it will propose leaving."
+        //
+        // Shedding orphans first broke that contract, and it also raced
+        // ahead of the correction: a leave marks the allocation
+        // `Leaving`, and the rebind only promotes a *steady*
+        // `Active`/`Paused` orphan, so once shed it can never be
+        // reclaimed. The score-blind rule therefore always won.
+        //
+        // Observed on mainnet 2026-09-09: 27 allocations against 15
+        // workers; of the 14 shed, four were on the best-paying ring the
+        // node held while five bound allocations two rings down were
+        // kept, and the allocator logged `no_eligible_orphan: 12 unbound
+        // allocation(s), none steady Active/Paused` on every reconcile.
+        //
+        // Ties break toward the unbound allocation, so an equal-scoring
+        // running worker is never stopped for nothing.
+        //
+        // Exclusion set: manually-managed pins + any shard whose
+        // post-leave Active count would land at or below the halt-risk
+        // threshold (`active_count <= HALT_RISK_PROVER_COUNT + 1`,
+        // matching `plan_leaves` and `decide_leaves`). Shedding a shard
+        // already at the threshold OR one our departure would push into
+        // it would immediately worsen the network's exposure. Operators
+        // dealing with chronic capacity pressure should reduce worker
+        // count or add manual pins, not auto-shed halt-risk-adjacent
+        // shards.
+        //
+        // The shield protects coverage we are actually providing, so it
+        // covers bound allocations only. An allocation with no worker
+        // runs nothing: it counts towards the shard's Active total
+        // on-chain while contributing no proofs, so our departure costs
+        // the shard no coverage it was really getting — and holding it
+        // is not free either. Nothing encodes the replica or registers
+        // leaf roots for the epoch, so the FrameHeader possession audit
+        // evicts us from that shard anyway, and meanwhile the slot is
+        // kept from a prover who could staff it. Shielding an
+        // allocation we cannot staff protects a number, not a shard.
+        // This also matches the pre-ranking behaviour, where orphans
+        // bypassed the shield entirely. It does not make a halt-risk
+        // orphan likely to be shed: few provers means a low ring, which
+        // scores high, so the ranking keeps it anyway — and
+        // `priority_key` gives it the top rebind tier.
+        let mut excluded = mm_filters.clone();
+        for d in allocated_descriptors {
+            if d.size > 0
+                && d.active_count <= proposer::HALT_RISK_PROVER_COUNT + 1
+                && bound_filters.contains(&d.filter)
+            {
+                excluded.insert(d.filter.clone());
             }
         }
+        let mut ranked = proposer::rank_allocated_by_score_ascending(
+            allocated_descriptors,
+            difficulty,
+            world_bytes,
+            self.units,
+            self.strategy,
+            &excluded,
+        );
+        ranked.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| bound_filters.contains(&a.0).cmp(&bound_filters.contains(&b.0)))
+        });
+        // A filter that's `Active` but absent from `allocated_descriptors`
+        // is, in practice, a size-0 shard (build_decide_descriptors
+        // skipped it). Mirroring Go's `worker_allocator.go:821-824` —
+        // where `if size == 0 { continue }` lands BEFORE
+        // `leaveProposalCandidates = append(...)` — we deliberately
+        // do NOT pick those here. The empty-allocated path in the
+        // main ProposeLeave block surfaces them.
+        let mut picks: Vec<Vec<u8>> =
+            ranked.into_iter().take(surplus).map(|(f, _)| f).collect();
         picks.truncate(MAX_PROPOSALS_PER_CYCLE);
         picks
     }
@@ -1127,6 +1240,10 @@ impl ProverLifecycle {
         let active_filters = buckets.active;
         let leaving_filters = buckets.leaving;
         let all_our_filters = buckets.all_ours;
+        // Cloned because the re-confirm path below consumes the original and
+        // the orphan-leave sweep needs it again: an ExpiredEpoch allocation is
+        // still on-chain Active, so it is a valid Leave target when nothing is
+        // working it.
         let expired_epoch_filters = buckets.expired_epoch;
         tracing::info!(
             frame = frame_number,
@@ -1141,6 +1258,7 @@ impl ProverLifecycle {
                 .map(|a| (a.epoch, a.status, a.confirmation_filter.len())).collect::<Vec<_>>()),
             "lifecycle allocation buckets"
         );
+        let expired_epoch_for_orphan_sweep = expired_epoch_filters.clone();
 
         // Build separate descriptor views.
         //
@@ -1163,7 +1281,9 @@ impl ProverLifecycle {
         // Merged view: remote sizes (authoritative for shards we're
         // not on) overlaid by local sizes (authoritative for shards
         // we hold data for). See `merged_shard_sizes` for the rule.
-        let shard_sizes_snapshot = self.merged_shard_sizes();
+        let shard_metrics = self.merged_shard_metrics();
+        let shard_sizes_snapshot: HashMap<Vec<u8>, u64> = shard_metrics.iter()
+            .map(|(f, (bytes, _))| (f.clone(), *bytes)).collect();
         // Live allocations on a filter an archive refresh has already come
         // back without, and that neither the local grid nor a recorded change
         // names, are left on a retired shard (a legacy merge moves only
@@ -1246,10 +1366,32 @@ impl ProverLifecycle {
                 proposal_descriptors.retain(|d| !frozen.contains(&d.filter));
             }
         }
-        let decide_all_descriptors =
+        for descriptor in &mut proposal_descriptors {
+            descriptor.shards = shard_metrics[&descriptor.filter].1;
+        }
+        // Missing reward metadata cannot establish a profitable destination.
+        proposal_descriptors.retain(|d| self.strategy != Strategy::RewardGreedy || d.shards > 0);
+        let mut decide_all_descriptors =
             build_decide_descriptors(&summaries, &shard_sizes_snapshot);
-        let allocated_descriptors: Vec<ShardDescriptor> = decide_all_descriptors.iter()
-            .filter(|d| active_filters.contains(&d.filter))
+        for descriptor in &mut decide_all_descriptors {
+            descriptor.shards = shard_metrics[&descriptor.filter].1;
+        }
+        // Leave economics use the allocation's confirmed reward ring, as the
+        // reward calculator does, rather than the last member's ring. Keep the
+        // generic descriptors for join confirmation policy.
+        let mut held_descriptors = decide_all_descriptors.clone();
+        if let Some(prover) = &prover_info {
+            for descriptor in &mut held_descriptors {
+                if let Some(allocation) = prover.allocations.iter()
+                    .find(|a| a.confirmation_filter == descriptor.filter && a.is_live(frame_number))
+                {
+                    descriptor.ring = allocation.ring;
+                }
+            }
+        }
+        let allocated_descriptors: Vec<ShardDescriptor> = held_descriptors.iter()
+            .filter(|d| active_filters.contains(&d.filter)
+                && (self.strategy != Strategy::RewardGreedy || d.shards > 0))
             .cloned()
             .collect();
 
@@ -1267,7 +1409,49 @@ impl ProverLifecycle {
         // pending frame) and registry confirmation, the worker has an
         // empty filter but a non-zero pending frame.
         let free_worker_ids: Vec<u32> = worker_view.free_auto().map(|w| w.core_id).collect();
-        let allow_proposals = !free_worker_ids.is_empty();
+
+        // ...but "free" is a statement about the worker, not about the
+        // slot. `free_auto` reads worker state only, so it cannot see a
+        // slot already owed to an allocation we hold that nothing has
+        // bound yet. After a restart every worker starts with an empty
+        // filter while the registry still holds every allocation from
+        // before, and those filters are only installed when the
+        // allocator's reconcile next runs. A join cycle that clears its
+        // readiness gates first sees a fully idle fleet, proposes a
+        // second full set of joins on top of the set we already own,
+        // and the reconcile then has nowhere to put the surplus.
+        //
+        // Observed on mainnet 2026-09-09: the first cycle to clear the
+        // gates after a restart logged `free_workers=15
+        // total_workers=15` while the prover held 13 Active
+        // allocations, proposed a 14-filter join, and 14 seconds later
+        // the allocator reported `orphan_count=35`. Twelve of those
+        // allocations never received a worker and were shed at the next
+        // epoch boundary — four of them on the best-paying ring the
+        // node held.
+        //
+        // `JOIN_FILTER_COOLDOWN_FRAMES` does not cover this: it guards
+        // against the *same* filter being proposed by overlapping
+        // cycles, and here a single cycle proposed fourteen filters it
+        // had never proposed before.
+        //
+        // Leaving allocations are excluded — they are departing and
+        // will not claim a slot. Everything else in `all_ours` will.
+        let worker_bound_filters: std::collections::HashSet<Vec<u8>> =
+            worker_view.filter_set().map(|w| w.filter.clone()).collect();
+        let departing_filters: std::collections::HashSet<&Vec<u8>> =
+            leaving_filters.iter().map(|(f, _)| f).collect();
+        let unbound_held_count = all_our_filters
+            .iter()
+            .filter(|f| !departing_filters.contains(f))
+            .filter(|f| !worker_bound_filters.contains(*f))
+            .count();
+        let assignable_worker_ids: Vec<u32> = free_worker_ids
+            .iter()
+            .copied()
+            .take(free_worker_ids.len().saturating_sub(unbound_held_count))
+            .collect();
+        let allow_proposals = !assignable_worker_ids.is_empty();
 
         // Go's canPropose (cooldown + readiness + halt). The
         // readiness snapshot was captured at the top of evaluate;
@@ -1535,6 +1719,8 @@ impl ProverLifecycle {
             info!(
                 frame = frame_number,
                 free_workers = free_worker_ids.len(),
+                assignable_workers = assignable_worker_ids.len(),
+                unbound_held = unbound_held_count,
                 total_workers = workers.len(),
                 candidates = proposal_descriptors.len(),
                 halt_risk_among_candidates = proposal_halt_risk,
@@ -1575,7 +1761,7 @@ impl ProverLifecycle {
                     difficulty,
                     &world_bytes,
                     self.units,
-                    &free_worker_ids,
+                    &assignable_worker_ids,
                     MAX_PROPOSALS_PER_CYCLE,
                     self.strategy,
                     Some(&self.prover_address),
@@ -1752,6 +1938,14 @@ impl ProverLifecycle {
             }
         }
 
+        // A worker or recent submission already reserves its destination even
+        // before the allocation appears in the registry. It cannot fund a leave.
+        let inflight = self.filters_with_inflight_join(frame_number);
+        let available_replacements: Vec<ShardDescriptor> = proposal_descriptors.iter()
+            .filter(|d| !inflight.contains(&d.filter)
+                && !workers.iter().any(|w| w.filter == d.filter))
+            .cloned().collect();
+
         // 3) ProposeLeave — score-driven (Go-aligned, mirrors
         //    worker_allocator.go:299-316) plus empty-allocated leaves
         //    (intentionally divergent from Go). The divergent branch
@@ -1772,10 +1966,14 @@ impl ProverLifecycle {
         // proposing swap leaves against a phantom halt-risk shard for
         // hours. Halt-risk swaps are still wanted — but only
         // off a trustworthy coverage view, i.e. when not halted.
+        // `expired_epoch` counts toward "we hold something worth evaluating"
+        // alongside `active`: a prover whose every allocation went ExpiredEpoch
+        // (all of them orphaned, e.g. after losing its workers) would otherwise
+        // skip the leave sweep entirely and never shed anything.
         if shard_info_ready
             && can_propose
             && !join_proposed_this_cycle
-            && !active_filters.is_empty()
+            && !(active_filters.is_empty() && expired_epoch_for_orphan_sweep.is_empty())
             && !self.halt_state.any_halted()
         {
             let manually_managed_filters: std::collections::HashSet<Vec<u8>> = workers
@@ -1791,7 +1989,9 @@ impl ProverLifecycle {
             // joins included, since `worker.filter` is set at submit
             // time before the alloc activates). An Active filter NOT
             // in this set is an orphan — the prover still owns the
-            // allocation but nothing is doing the work.
+            // allocation but nothing is doing the work. Used only to
+            // break score ties below; being an orphan is no longer by
+            // itself a reason to leave.
             let bound_filters: std::collections::HashSet<Vec<u8>> = workers
                 .iter()
                 .filter(|w| !w.filter.is_empty())
@@ -1810,19 +2010,134 @@ impl ProverLifecycle {
                 .cloned()
                 .collect();
 
-            // Orphan filters: Active allocations with no worker bound.
-            // Always propose leave regardless of shard score — there's
-            // no useful work to retain. Fixes the "extra allocation
-            // from earlier issues, shows as -1 in TUI" case where the
-            // allocation lingers on a healthy shard and plan_leaves /
-            // surplus-leave can't (or won't) pick it.
-            let orphan_filters: Vec<Vec<u8>> = active_filters
+            // Unrecoverable orphans: on-chain allocations with no worker
+            // bound that nothing can ever staff. Always propose leave
+            // regardless of shard score — there is no useful work to
+            // retain and no path back.
+            //
+            // ExpiredEpoch allocations MUST be candidates here, not just
+            // `active` ones. Being orphaned is precisely what makes an
+            // allocation expire: no worker means no proofs, so it misses the
+            // per-epoch re-confirm at the next boundary and drops out of
+            // `active`. Sweeping only `active` therefore gave the orphan path a
+            // one-epoch window and no way back — an orphan that survived a
+            // single boundary became permanently unsheddable, which is how a
+            // node ends up holding far more allocations than it has workers with
+            // no automatic way out. Observed in the wild: 35 allocations against
+            // 15 workers, the 20 unbound ones all reading `re-confirm!`, and
+            // zero Leave proposals for as long as they stayed that way.
+            //
+            // They stay OUT of `active` itself — that set is coverage
+            // accounting, and an unconfirmed allocation genuinely does not
+            // count. This only widens who may be shed.
+            //
+            // Ranking cannot rescue these, which is why they stay a
+            // score-blind sweep while Active orphans do not:
+            // `rebind_surplus_by_priority` promotes only a *steady*
+            // `Active`/`Paused` orphan, so an ExpiredEpoch one can
+            // neither be staffed nor score its way back into
+            // contention. Retaining a high-scoring one would rebuild
+            // the same deadlock this sweep exists to break. An Active
+            // orphan is recoverable, so it is ranked with everything
+            // else below instead of being shed on sight.
+            let unrecoverable_orphan_filters = orphaned_allocation_filters(
+                &[],
+                &expired_epoch_for_orphan_sweep,
+                &bound_filters,
+                &manually_managed_filters,
+                &pending_leave_filters,
+            );
+            // Over-capacity filters: allocations this prover cannot
+            // staff, worst-scoring first.
+            //
+            // This used to be "every Active allocation with no worker
+            // bound, leave it regardless of score." But which
+            // allocations hold a worker is decided by bind order in the
+            // allocator, not by score — a worker lost to a crash, a
+            // reduced core count, or a join batch that outran the idle
+            // pool all leave whatever they held bound and push the rest
+            // out in arrival order. `rebind_surplus_by_priority` exists
+            // to correct exactly that: it moves workers off the
+            // worst-ranked bound allocations onto the best-ranked
+            // orphans. It only promotes an orphan that is still
+            // *steady* `Active`/`Paused`, so proposing Leave the moment
+            // an allocation is unbound marks it `Leaving` and makes it
+            // permanently ineligible — the score-blind rule wins the
+            // race against the score-aware one, and the shed set ends
+            // up decided by bind order after all.
+            //
+            // Observed on mainnet 2026-09-09: of 27 allocations against
+            // 15 workers, the 14 shed included four on the best ring
+            // the node held while five bound allocations two rings down
+            // were kept, and the allocator logged `no_eligible_orphan:
+            // 12 unbound allocation(s), none steady Active/Paused` on
+            // every reconcile for hours.
+            //
+            // So shed by rank instead: only the count we cannot staff,
+            // taken worst-scoring first across the whole held set,
+            // bound or not. That is the same ordering the rebind path
+            // uses, which restores the invariant its doc comment
+            // already claims — "the shards left unbound are the ones it
+            // will propose leaving." Ties break toward the unbound one
+            // so an equal-scoring running worker is not stopped for
+            // nothing. With no over-capacity nothing is shed: an orphan
+            // that fits within worker capacity gets a worker on the
+            // next reconcile, and leaving it would throw away a live
+            // allocation to fix a transient. That still covers the
+            // original "extra allocation lingers, shows as -1 in the
+            // TUI" case — with slack it is bound, without slack it is
+            // shed if it really is among the worst.
+            let sheddable_filters: Vec<Vec<u8>> = active_filters
                 .iter()
-                .filter(|f| !bound_filters.contains(*f))
                 .filter(|f| !manually_managed_filters.contains(*f))
                 .filter(|f| !pending_leave_filters.contains(*f))
                 .cloned()
                 .collect();
+            // Capacity for auto-managed allocations is the worker count
+            // less the operator's pins, matching the set above.
+            let auto_worker_capacity = workers.iter().filter(|w| !w.manually_managed).count();
+            let overcapacity = sheddable_filters.len().saturating_sub(auto_worker_capacity);
+            let overcapacity_filters: Vec<Vec<u8>> = if overcapacity == 0 {
+                Vec::new()
+            } else {
+                let sheddable: std::collections::HashSet<&Vec<u8>> =
+                    sheddable_filters.iter().collect();
+                // Excluded from the ranking: anything not sheddable, and
+                // the halt-risk shield from `plan_leaves` — `active_count`
+                // includes us, so a shard at or below
+                // `HALT_RISK_PROVER_COUNT + 1` drops into halt risk the
+                // moment we go. As in `select_excess_active_filters`, the
+                // shield covers bound allocations only: an unbound one
+                // contributes no proofs, so our leaving costs the shard
+                // no coverage it was really getting, and holding it only
+                // waits for the possession audit to evict us.
+                let excluded: std::collections::HashSet<Vec<u8>> = allocated_descriptors
+                    .iter()
+                    .filter(|d| {
+                        !sheddable.contains(&d.filter)
+                            || (d.size > 0
+                                && d.active_count <= proposer::HALT_RISK_PROVER_COUNT + 1
+                                && bound_filters.contains(&d.filter))
+                    })
+                    .map(|d| d.filter.clone())
+                    .collect();
+                let mut ranked = proposer::rank_allocated_by_score_ascending(
+                    &allocated_descriptors,
+                    difficulty,
+                    &world_bytes,
+                    self.units,
+                    self.strategy,
+                    &excluded,
+                );
+                ranked.sort_by(|a, b| {
+                    a.1.cmp(&b.1).then_with(|| {
+                        bound_filters
+                            .contains(&a.0)
+                            .cmp(&bound_filters.contains(&b.0))
+                    })
+                });
+                ranked.into_iter().take(overcapacity).map(|(f, _)| f).collect()
+            };
 
             // SPLIT-PARENT filters — an Active filter that has been
             // SPLIT, i.e. some registered shard is a strict bit-path DESCENDANT of
@@ -1884,17 +2199,34 @@ impl ProverLifecycle {
                 }
                 proposer::releasable_member(&self.prover_address, filter, &members)
             };
+            // The pending-confirm bucket excludes confirmed leaves serving
+            // notice, so inspect effective allocation status instead. This
+            // only gates discretionary replacements; cleanup and confirmation
+            // below retain their own eligibility and security checks.
+            let replacement_pending = self.replacement_leave_pending(
+                prover_info.as_ref(), &workers, frame_number,
+            );
+            if replacement_pending && !proposal_descriptors.is_empty() {
+                info!(frame = frame_number,
+                    "replacement leaves deferred until pending departures release their workers");
+            }
+            let replacement_descriptors = if replacement_pending {
+                &[][..]
+            } else {
+                available_replacements.as_slice()
+            };
             let score_candidates: Vec<Vec<u8>> = if !proposal_descriptors.is_empty() {
-                proposer::plan_leaves_releasing(
+                proposer::plan_leaves_releasing_spread(
                     &allocated_descriptors,
-                    &proposal_descriptors,
+                    replacement_descriptors,
                     difficulty,
                     &world_bytes,
                     self.units,
                     self.strategy,
-                    free_worker_ids.len(),
+                    assignable_worker_ids.len(),
                     &min_hold_filters,
                     &releasable,
+                    Some(&self.prover_address),
                 )
             } else {
                 Vec::new()
@@ -1908,20 +2240,32 @@ impl ProverLifecycle {
                 }
             }
             let empty_shard_count = leave_candidates.len() - score_driven_count;
-            for f in &orphan_filters {
+            for f in &unrecoverable_orphan_filters {
                 if !leave_candidates.contains(f) {
                     leave_candidates.push(f.clone());
                 }
             }
-            let orphan_count =
+            let unrecoverable_orphan_count =
                 leave_candidates.len() - score_driven_count - empty_shard_count;
+            for f in &overcapacity_filters {
+                if !leave_candidates.contains(f) {
+                    leave_candidates.push(f.clone());
+                }
+            }
+            let overcapacity_count = leave_candidates.len()
+                - score_driven_count
+                - empty_shard_count
+                - unrecoverable_orphan_count;
             for f in &split_parent_filters {
                 if !leave_candidates.contains(f) {
                     leave_candidates.push(f.clone());
                 }
             }
-            let split_parent_count =
-                leave_candidates.len() - score_driven_count - empty_shard_count - orphan_count;
+            let split_parent_count = leave_candidates.len()
+                - score_driven_count
+                - empty_shard_count
+                - unrecoverable_orphan_count
+                - overcapacity_count;
             if split_parent_count > 0 {
                 tracing::info!(
                     split_parent_count,
@@ -1935,7 +2279,11 @@ impl ProverLifecycle {
                 }
             }
             let retired_count = leave_candidates.len()
-                - score_driven_count - empty_shard_count - orphan_count - split_parent_count;
+                - score_driven_count
+                - empty_shard_count
+                - unrecoverable_orphan_count
+                - overcapacity_count
+                - split_parent_count;
             if retired_count > 0 {
                 tracing::info!(
                     retired_count,
@@ -1979,10 +2327,12 @@ impl ProverLifecycle {
                     leave_proposals = leave_candidates.len(),
                     score_driven = score_driven_count,
                     empty_allocated = empty_shard_count,
-                    orphan = orphan_count,
+                    unrecoverable_orphans = unrecoverable_orphan_count,
+                    overcapacity = overcapacity_count,
+                    auto_worker_capacity,
                     cooldown_suppressed,
                     ?leave_summary,
-                    "proposing leaves (overcrowded + empty + orphan)"
+                    "proposing leaves (score-driven + empty + over-capacity)"
                 );
                 actions.push(LifecycleAction::ProposeLeave {
                     filters: leave_candidates,
@@ -2046,7 +2396,8 @@ impl ProverLifecycle {
             for f in &ready_leave_filters {
                 if manual_bound_filters.contains(f) {
                     manual_ready.push(f.clone());
-                } else if !bound_filters.contains(f) || settled_split_away(f) || retired.contains(f) {
+                } else if !bound_filters.contains(f) || settled_split_away(f) || retired.contains(f)
+                    || shard_sizes_snapshot.get(f) == Some(&0) {
                     orphan_ready.push(f.clone());
                 } else {
                     auto_ready.push(f.clone());
@@ -2054,8 +2405,9 @@ impl ProverLifecycle {
             }
 
             // Auto bucket: score-driven decide_leaves on auto-bound.
-            let (mut auto_reject, auto_confirm) = proposer::decide_leaves(
-                &decide_all_descriptors,
+            let (mut auto_reject, auto_confirm) = proposer::decide_leaves_against_replacements(
+                &held_descriptors,
+                &available_replacements,
                 &auto_ready,
                 difficulty,
                 &world_bytes,
@@ -2071,7 +2423,7 @@ impl ProverLifecycle {
             // no prover. While the demand
             // stands, confirm the leaves the shard can spare.
             let mut swap_demand =
-                proposer::halt_risk_swap_demand(&proposal_descriptors, free_worker_ids.len());
+                proposer::halt_risk_swap_demand(&available_replacements, assignable_worker_ids.len());
             let mut swap_confirm: Vec<Vec<u8>> = Vec::new();
             auto_reject.retain(|filter| {
                 if swap_demand == 0 {
@@ -2185,9 +2537,9 @@ pub(crate) fn has_live_allocation(summary: &ProverShardSummary) -> bool {
 /// merged parent looks split away until the sizes refresh (the old sizes
 /// still name its children), so it asks for the refresh like any other; a
 /// refresh that comes back without a filter settles it.
-fn unsized_live_filters(
+fn unsized_live_filters<V>(
     summaries: &[ProverShardSummary],
-    remote_sizes: &HashMap<Vec<u8>, u64>,
+    remote_sizes: &HashMap<Vec<u8>, V>,
 ) -> std::collections::HashSet<Vec<u8>> {
     summaries
         .iter()
@@ -3120,6 +3472,97 @@ mod proposal_loop_tests {
         out
     }
 
+    #[test]
+    fn confirmed_ring_protects_an_early_high_reward_holding() {
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let alternative = filter_bytes(0xA2);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut holding = alloc(held.clone(), ProverStatus::Active, 10);
+        holding.ring = 1;
+        reg.set_prover(prover(address.clone(), vec![holding]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 53), shard_summary(alternative.clone(), 8)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_remote_shard_metrics(HashMap::from([(held, (1_000_000, 100)), (alternative, (1_000_000, 100))]));
+        lc.set_prover_root_verified_frame(100);
+        let actions = lc.evaluate(100, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_leaves(&actions), 0, "our ring 1 earns as much as the alternative; actions={actions:?}");
+    }
+
+    #[test]
+    fn data_shard_counts_prevent_a_false_reward_upgrade() {
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let alternative = filter_bytes(0xA2);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), vec![alloc(held.clone(), ProverStatus::Active, 10)]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 8), shard_summary(alternative.clone(), 8)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_remote_shard_metrics(HashMap::from([(held, (1_000_000, 1)), (alternative, (100_000_000, 1_000_000))]));
+        lc.set_prover_root_verified_frame(100);
+        let actions = lc.evaluate(100, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_leaves(&actions), 0, "larger bytes do not imply higher per-worker rewards; actions={actions:?}");
+    }
+
+    #[test]
+    fn a_join_reserved_this_cycle_cannot_also_fund_a_leave() {
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let alternative = filter_bytes(0xA2);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        wm.add(idle_worker(2));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), vec![alloc(held.clone(), ProverStatus::Active, 10)]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 8), shard_summary(alternative.clone(), 8)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_remote_shard_metrics(HashMap::from([(held, (1_000_000, 1)), (alternative.clone(), (100_000_000, 1))]));
+        for frame in [100, 101] {
+            lc.set_prover_root_verified_frame(frame);
+            let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            if frame == 100 { assert_eq!(proposed_join_filters(&actions), vec![alternative.clone()]); }
+            assert_eq!(count_proposed_leaves(&actions), 0, "pending join already reserves the reward opportunity; actions={actions:?}");
+        }
+        // Without the reserved destination, a genuinely superior alternative
+        // must still justify leaving when no worker is free to take it.
+        wm.set_worker_filter(2, &filter_bytes(0xA3), true).unwrap();
+        let frame = 100 + JOIN_FILTER_COOLDOWN_FRAMES;
+        lc.set_prover_root_verified_frame(frame);
+        let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_leaves(&actions), 1, "expired reservation releases the destination; actions={actions:?}");
+    }
+
+    #[test]
+    fn a_favorable_pending_leave_is_rejected_at_its_window() {
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let better_held = filter_bytes(0xA2);
+        let available = filter_bytes(0xA3);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        wm.add(allocated_worker(2, better_held.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut leaving = alloc(held.clone(), ProverStatus::Leaving, 10);
+        leaving.ring = 1;
+        leaving.leave_frame_number = 10;
+        reg.set_prover(prover(address.clone(), vec![leaving, alloc(better_held.clone(), ProverStatus::Active, 10)]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 53), shard_summary(better_held.clone(), 59), shard_summary(available.clone(), 8)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_remote_shard_metrics(HashMap::from([(held.clone(), (1_000_000, 1)), (better_held, (100_000_000, 1)), (available.clone(), (100_000, 1))]));
+        lc.set_prover_root_verified_frame(720);
+        let actions = lc.evaluate(720, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(actions.iter().any(|a| matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held))), "keep a profitable holding despite a richer shard we already hold; actions={actions:?}");
+        assert!(!actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))));
+        // A genuinely better, unreserved destination still confirms the leave.
+        lc.set_remote_shard_metrics(HashMap::from([(held.clone(), (1_000_000, 1)), (available, (100_000_000, 1))]));
+        let actions = lc.evaluate(720, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))), "genuine upgrades remain possible; actions={actions:?}");
+    }
+
     /// REPRODUCTION of the "one prover ⇒ many allocations" multi-coverage that
     /// the static reassign/rekey/proposer reads could not explain (the field
     /// data showed 45/49/45 provers on three DIFFERENT-branch deep shards,
@@ -3581,6 +4024,153 @@ mod proposal_loop_tests {
         );
     }
 
+    // Exercise the public evaluator with the same candidate demand over
+    // multiple registry snapshots, rather than only testing one planner call.
+    fn pending_replacement_fixture(halt_risk: bool) -> (
+        Arc<ProverLifecycle>, Arc<ConfigurableRegistry>, Arc<ConfigurableWorkerManager>,
+        Vec<u8>, Vec<ProverAllocationInfo>,
+    ) {
+        let address = vec![0xCD; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut allocations = Vec::new();
+        let mut summaries = Vec::new();
+        for core in 1..=8 {
+            let filter = filter_bytes(0xA0 + core as u8);
+            wm.add(allocated_worker(core, filter.clone()));
+            allocations.push(alloc(filter.clone(), ProverStatus::Active, 10));
+            summaries.push(shard_summary(filter, 64));
+        }
+        // Tiny halt-risk destinations force the swap path, not score leaves.
+        // Healthy, large destinations force score replacement instead.
+        for byte in 0xC0..0xC4 {
+            let mut summary = shard_summary(filter_bytes(byte), if halt_risk { 1 } else { 8 });
+            summary.total_size = if halt_risk { 1 } else { 100_000_000 };
+            summaries.push(summary);
+        }
+        let mut members = vec![prover(address.clone(), allocations.clone())];
+        for byte in 0..63 { members.push(prover(vec![byte; 32], Vec::new())); }
+        reg.set_provers(members);
+        reg.set_summaries(summaries);
+        let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+        (lc, reg, wm, address, allocations)
+    }
+
+    fn proposed_leave_filters(actions: &[LifecycleAction]) -> Vec<Vec<u8>> {
+        actions.iter().filter_map(|action| match action {
+            LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+            _ => None,
+        }).flatten().collect()
+    }
+
+    #[test]
+    fn pending_replacement_leaves_do_not_fund_the_same_demand_again() {
+        for halt_risk in [false, true] {
+            let (lc, reg, wm, address, mut allocations) = pending_replacement_fixture(halt_risk);
+            lc.set_prover_root_verified_frame(500);
+            let first = proposed_leave_filters(&lc.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap());
+            assert!(!first.is_empty(), "control must propose replacements, halt_risk={halt_risk}");
+            assert!(first.len() < allocations.len());
+
+            // Before registry publication, the submitted wave is in flight.
+            lc.set_prover_root_verified_frame(504);
+            assert!(proposed_leave_filters(&lc.evaluate(504, 1, reg.as_ref(), wm.as_ref()).unwrap()).is_empty(),
+                "publication lag must not cause a second replacement wave");
+
+            for a in &mut allocations {
+                if first.contains(&a.confirmation_filter) {
+                    a.status = ProverStatus::Leaving;
+                    a.leave_frame_number = 500;
+                }
+            }
+            reg.set_prover(prover(address.clone(), allocations.clone()));
+            // Outlive the short publication cooldown: chain state must keep
+            // the reservation alive, even after a process restart.
+            let restarted = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            restarted.set_prover_root_verified_frame(530);
+            assert!(proposed_leave_filters(&restarted.evaluate(530, 1, reg.as_ref(), wm.as_ref()).unwrap()).is_empty(),
+                "registered pending leaves must prevent further shedding");
+
+            // Confirmed leaves serve notice through the next boundary. They
+            // are absent from the leave-confirm bucket but still occupy cores.
+            for a in &mut allocations {
+                if first.contains(&a.confirmation_filter) {
+                    a.leave_confirm_frame_number = 721;
+                }
+            }
+            reg.set_prover(prover(address.clone(), allocations.clone()));
+            restarted.set_prover_root_verified_frame(730);
+            assert!(proposed_leave_filters(&restarted.evaluate(730, 1, reg.as_ref(), wm.as_ref()).unwrap()).is_empty(),
+                "confirmed departures must remain reserved until the boundary");
+
+            // Reconciliation releases their workers at the departure boundary.
+            for core in 1..=8 {
+                if first.contains(&filter_bytes(0xA0 + core as u8)) { wm.add(idle_worker(core)); }
+            }
+            restarted.set_prover_root_verified_frame(1441);
+            let actions = restarted.evaluate(1441, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            assert!(count_proposed_joins(&actions) > 0, "freed cores must join destinations");
+            assert_eq!(count_proposed_leaves(&actions), 0, "join before shedding more holdings");
+        }
+    }
+
+    #[test]
+    fn failed_replacement_leaves_release_the_reservation() {
+        for registered in [false, true] {
+            let (lc, reg, wm, address, mut allocations) = pending_replacement_fixture(false);
+            lc.set_prover_root_verified_frame(500);
+            let first = proposed_leave_filters(&lc.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap());
+            assert!(!first.is_empty());
+            if registered {
+                for a in &mut allocations {
+                    if first.contains(&a.confirmation_filter) {
+                        // A rejected leave restores Active; it does not reject
+                        // the allocation itself.
+                        a.leave_frame_number = 500;
+                        a.leave_reject_frame_number = 510;
+                    }
+                }
+                reg.set_prover(prover(address.clone(), allocations));
+            }
+            lc.set_prover_root_verified_frame(530);
+            assert!(count_proposed_leaves(&lc.evaluate(530, 1, reg.as_ref(), wm.as_ref()).unwrap()) > 0,
+                "unpublished/rejected proposals must not reserve capacity forever");
+        }
+    }
+
+    #[test]
+    fn pending_replacement_leaves_preserve_cleanup_and_manual_independence() {
+        let (lc, reg, wm, address, mut allocations) = pending_replacement_fixture(false);
+        allocations[0].status = ProverStatus::Leaving;
+        allocations[0].leave_frame_number = 500;
+        let empty_filter = allocations[1].confirmation_filter.clone();
+        reg.set_prover(prover(address.clone(), allocations.clone()));
+        lc.set_local_shard_sizes(HashMap::from([(empty_filter.clone(), 0)]));
+        lc.set_prover_root_verified_frame(530);
+        let leaves = proposed_leave_filters(&lc.evaluate(530, 1, reg.as_ref(), wm.as_ref()).unwrap());
+        assert_eq!(leaves, vec![empty_filter], "independent empty-shard cleanup still runs");
+
+        // A manual worker's departure is not replacement capacity for the
+        // auto-managed pool and must not stop that pool's decisions.
+        let manual = WorkerInfo { manually_managed: true,
+            ..allocated_worker(1, allocations[0].confirmation_filter.clone()) };
+        wm.add(manual);
+        let restarted = make_lifecycle(address, wm.clone(), reg.clone());
+        restarted.set_prover_root_verified_frame(530);
+        assert!(count_proposed_leaves(&restarted.evaluate(530, 1, reg.as_ref(), wm.as_ref()).unwrap()) > 0);
+    }
+
+    #[test]
+    fn expired_replacement_leaves_do_not_block_the_remaining_workers() {
+        let (lc, reg, wm, address, mut allocations) = pending_replacement_fixture(false);
+        allocations[0].status = ProverStatus::Leaving;
+        allocations[0].leave_frame_number = 500;
+        reg.set_prover(prover(address, allocations));
+        lc.set_prover_root_verified_frame(1441);
+        assert!(count_proposed_leaves(&lc.evaluate(1441, 1, reg.as_ref(), wm.as_ref()).unwrap()) > 0,
+            "an unconfirmed leave past its epoch window must not reserve capacity forever");
+    }
+
     /// Per-filter Leave cooldown: a filter we just proposed Leave on
     /// must not be re-proposed until LEAVE_COOLDOWN_FRAMES have
     /// elapsed. Without the cooldown, every cycle within the
@@ -3961,35 +4551,88 @@ mod proposal_loop_tests {
         );
     }
 
-    /// User report: "extra allocation from earlier issues, in the TUI
-    /// it shows as -1 for the worker id, never leaves successfully".
-    /// An active allocation whose filter is not bound to any worker is
-    /// an orphan. plan_leaves alone can't fix it because if the orphan's
-    /// shard scores at-or-above 67% of the best alternative, plan_leaves
-    /// emits nothing for it. The orphan path proposes leave
-    /// unconditionally for unbound active filters.
+    /// The leave sweep must stay reachable when epoch expiry empties the
+    /// active bucket. The bound allocation can recover by re-confirming;
+    /// only the unbound allocation should receive a Leave proposal.
     #[test]
-    fn orphan_active_filter_gets_leave_proposed() {
+    fn all_expired_allocations_still_propose_leave_for_the_unbound_one() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let bound = filter_bytes(0xA1);
+        let orphan = filter_bytes(0xA2);
+        wm.add(allocated_worker(1, bound.clone()));
+        let mut allocations = vec![
+            alloc(bound.clone(), ProverStatus::Active, 10),
+            alloc(orphan.clone(), ProverStatus::Active, 10),
+        ];
+        for allocation in &mut allocations {
+            allocation.epoch = 5;
+        }
+        let frame = 6 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+        let buckets = AllocationBuckets::from_allocations(&allocations, frame);
+        assert!(buckets.active.is_empty());
+        assert_eq!(buckets.expired_epoch.len(), 2);
+        reg.set_prover(prover(address.clone(), allocations));
+        reg.set_summaries(vec![
+            shard_summary(bound.clone(), 10),
+            shard_summary(orphan.clone(), 10),
+        ]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(frame);
+        let actions = lifecycle.evaluate(frame, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let leaves: Vec<Vec<u8>> = actions.iter().filter_map(|action| match action {
+            LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+            _ => None,
+        }).flatten().collect();
+        assert_eq!(leaves, vec![orphan], "expired orphan must remain reachable; got {actions:?}");
+    }
+
+    /// Over-capacity sheds by score, not by which allocation happens to
+    /// hold a worker.
+    ///
+    /// User report: "extra allocation from earlier issues, in the TUI it
+    /// shows as -1 for the worker id, never leaves successfully". The
+    /// original fix shed every unbound Active filter unconditionally.
+    /// That threw away value: bind order is decided by the allocator's
+    /// arrival order, so the orphan is just as likely to be the best
+    /// allocation the prover holds. Here 0xA3 is unbound *and* the
+    /// highest-scoring of the three, so the worst-scoring 0xA1 goes
+    /// instead and `rebind_surplus_by_priority` moves its worker onto
+    /// 0xA3.
+    #[test]
+    fn overcapacity_sheds_the_worst_scoring_not_the_unbound() {
         let address = vec![0xCDu8; 32];
         let wm = Arc::new(ConfigurableWorkerManager::new());
         let reg = Arc::new(ConfigurableRegistry::new());
 
-        // One worker bound to 0xA1. Filter 0xA2 is an orphan — the
-        // allocation exists but no worker is doing the work.
+        // Two workers for three allocations. 0xA3 is the orphan.
         wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
 
         let allocs = vec![
             alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
             alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
         ];
         reg.set_prover(prover(address.clone(), allocs));
 
-        // Both allocated filters score similarly; no plan_leaves trigger.
-        // Unallocated alternatives present but not dominantly better.
+        // Same prover count on all three (so ring, and therefore the
+        // halt-risk shield, are identical) and score ordered purely by
+        // size: 0xA1 worst, 0xA3 best.
+        let sized = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
         reg.set_summaries(vec![
-            shard_summary(filter_bytes(0xA1), 1),
-            shard_summary(filter_bytes(0xA2), 1),
-            shard_summary(filter_bytes(0xB0), 1),
+            sized(filter_bytes(0xA1), 10, 1_000_000),
+            sized(filter_bytes(0xA2), 10, 5_000_000),
+            sized(filter_bytes(0xA3), 10, 9_000_000),
         ]);
 
         let lifecycle = make_lifecycle(
@@ -4009,13 +4652,178 @@ mod proposal_loop_tests {
             .flatten()
             .collect();
         assert!(
-            leave_filters.contains(&filter_bytes(0xA2)),
-            "expected ProposeLeave for orphan 0xA2 (no worker bound); got {:?}",
+            leave_filters.contains(&filter_bytes(0xA1)),
+            "expected ProposeLeave for the worst-scoring 0xA1; got {:?}",
             actions
         );
         assert!(
+            !leave_filters.contains(&filter_bytes(0xA3)),
+            "must NOT shed the best-scoring allocation just because it is \
+             unbound; got {:?}",
+            actions
+        );
+    }
+
+    /// Same shape, inverted: when the unbound allocation really is the
+    /// worst one, it is the one shed. Without this the test above would
+    /// pass for a rule that simply never sheds an orphan.
+    #[test]
+    fn overcapacity_sheds_the_unbound_when_it_is_the_worst() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        let sized = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            sized(filter_bytes(0xA1), 10, 9_000_000),
+            sized(filter_bytes(0xA2), 10, 5_000_000),
+            sized(filter_bytes(0xA3), 10, 1_000_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let leave_filters: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            leave_filters.contains(&filter_bytes(0xA3)),
+            "expected ProposeLeave for the worst-scoring (and unbound) 0xA3; \
+             got {:?}",
+            actions
+        );
+    }
+
+    /// An unbound allocation that fits inside worker capacity is a
+    /// transient — the allocator's next reconcile binds a worker to it.
+    /// Shedding it would throw away a live allocation to fix nothing.
+    #[test]
+    fn an_unbound_allocation_within_capacity_is_not_shed() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        // Three workers, two allocations: 0xA2 is unbound but there is
+        // an idle worker waiting for it.
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(idle_worker(2));
+        wm.add(idle_worker(3));
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        let sized = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            sized(filter_bytes(0xA1), 10, 1_000_000),
+            sized(filter_bytes(0xA2), 10, 1_000_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(
+            count_proposed_leaves(&actions),
+            0,
+            "an orphan inside capacity must wait for a rebind, not be shed; \
+             got {:?}",
+            actions
+        );
+    }
+
+    /// The halt-risk shield covers coverage we actually provide, so it
+    /// applies to bound allocations only. 0xA1 is the worst-scoring
+    /// allocation the prover holds and sits on a halt-risk shard, but a
+    /// worker is running it, so it is protected; 0xA3 is on an equally
+    /// thin shard with no worker, contributes no proofs, and goes.
+    #[test]
+    fn halt_risk_shield_covers_bound_allocations_only() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        let sized = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            sized(filter_bytes(0xA1), 3, 1_000),
+            sized(filter_bytes(0xA2), 10, 50_000_000),
+            sized(filter_bytes(0xA3), 3, 1_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let leave_filters: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
             !leave_filters.contains(&filter_bytes(0xA1)),
-            "must NOT leave the worker-bound filter 0xA1; got {:?}",
+            "a bound allocation on a halt-risk shard keeps the shield even as \
+             the worst scorer; got {:?}",
+            actions
+        );
+        assert!(
+            leave_filters.contains(&filter_bytes(0xA3)),
+            "an unbound allocation on a halt-risk shard provides no coverage \
+             and is sheddable; got {:?}",
             actions
         );
     }
@@ -4142,12 +4950,22 @@ mod proposal_loop_tests {
             info.status = ProverStatus::Leaving;
             info
         };
-        let decide = |me: &Vec<u8>, with_waiting_shard: bool| {
+        let decide = |me: &Vec<u8>, with_waiting_shard: bool, idle_slot_owed: Option<bool>| {
             let wm = Arc::new(ConfigurableWorkerManager::new());
             let reg = Arc::new(ConfigurableRegistry::new());
             wm.add(allocated_worker(1, healthy.clone()));
             reg.set_provers(leavers.iter().map(leaving).collect());
             let mut summaries = vec![shard_summary(healthy.clone(), 0)];
+            if let Some(owed) = idle_slot_owed {
+                wm.add(idle_worker(2));
+                if owed {
+                    let held = filter_bytes(0xA3);
+                    let mut ours = leaving(me);
+                    ours.allocations.push(alloc(held.clone(), ProverStatus::Active, 10));
+                    reg.set_prover(ours);
+                    summaries.push(shard_summary(held, 10));
+                }
+            }
             if with_waiting_shard {
                 summaries.push(shard_summary(waiting.clone(), 0));
             }
@@ -4168,9 +4986,11 @@ mod proposal_loop_tests {
         };
         let chosen = leavers.iter().find(|a| proposer::chosen_to_depart(a, &healthy, 0, &leavers)).unwrap();
         let spared = leavers.iter().find(|a| !proposer::chosen_to_depart(a, &healthy, 0, &leavers)).unwrap();
-        assert_eq!(decide(chosen, true), (true, false), "a leaver the shard can spare departs");
-        assert_eq!(decide(spared, true), (false, true), "the others stay");
-        assert_eq!(decide(chosen, false), (false, true), "no waiting shard, no swap");
+        assert_eq!(decide(chosen, true, None), (true, false), "a leaver the shard can spare departs");
+        assert_eq!(decide(spared, true, None), (false, true), "the others stay");
+        assert_eq!(decide(chosen, false, None), (false, true), "no waiting shard, no swap");
+        assert_eq!(decide(chosen, true, Some(false)), (false, true), "a free slot covers the waiting shard without a swap");
+        assert_eq!(decide(chosen, true, Some(true)), (true, false), "an idle worker owed to a held allocation cannot cover swap demand");
     }
 
     /// The propose side of the same swap: of six members of a healthy shard,
@@ -4272,6 +5092,110 @@ mod proposal_loop_tests {
         assert_eq!(
             proposed, 1,
             "expected at most 1 join (only 1 free worker); got {} in {:?}",
+            proposed, actions
+        );
+    }
+
+    /// A worker with an empty filter is not necessarily a free slot.
+    ///
+    /// After a restart every worker starts unbound while the registry
+    /// still holds every allocation from before; the allocator installs
+    /// the filters on its next reconcile. A join cycle that clears its
+    /// readiness gates first used to see a fully idle fleet and propose
+    /// a second full set of joins on top of the set already held.
+    ///
+    /// Mainnet 2026-09-09: `free_workers=15 total_workers=15` while
+    /// holding 13 Active allocations → a 14-filter join → 35 orphans 14
+    /// seconds later, 12 of which were shed at the next epoch boundary.
+    #[test]
+    fn join_budget_excludes_slots_owed_to_unbound_allocations() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        // Post-restart shape: every worker idle, every allocation still
+        // held. Three slots, three allocations already owed them.
+        wm.add(idle_worker(1));
+        wm.add(idle_worker(2));
+        wm.add(idle_worker(3));
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        let mut summaries = vec![
+            shard_summary(filter_bytes(0xA1), 1),
+            shard_summary(filter_bytes(0xA2), 1),
+            shard_summary(filter_bytes(0xA3), 1),
+        ];
+        for i in 0..10u8 {
+            summaries.push(shard_summary(filter_bytes(0x10 + i), 1));
+        }
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let proposed = count_proposed_joins(&actions);
+        assert_eq!(
+            proposed, 0,
+            "every idle worker is already owed to a held allocation, so the \
+             join budget is zero; got {} in {:?}",
+            proposed, actions
+        );
+    }
+
+    /// The control for the test above: the budget is a subtraction, not
+    /// a blanket "never join while an allocation is unbound." With two
+    /// slots more than allocations owed, exactly two joins go out.
+    #[test]
+    fn join_budget_is_free_workers_minus_unbound_allocations() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        for core in 1..=5u32 {
+            wm.add(idle_worker(core));
+        }
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        let mut summaries = vec![
+            shard_summary(filter_bytes(0xA1), 1),
+            shard_summary(filter_bytes(0xA2), 1),
+            shard_summary(filter_bytes(0xA3), 1),
+        ];
+        for i in 0..10u8 {
+            summaries.push(shard_summary(filter_bytes(0x10 + i), 1));
+        }
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let proposed = count_proposed_joins(&actions);
+        assert_eq!(
+            proposed, 2,
+            "5 idle workers less 3 allocations already owed a slot = 2; got \
+             {} in {:?}",
             proposed, actions
         );
     }
@@ -5425,5 +6349,138 @@ mod halt_risk_descriptor_tests {
         );
         assert_eq!(descriptors.len(), 1);
         assert_eq!(descriptors[0].filter, filter_real);
+    }
+}
+
+#[cfg(test)]
+mod orphan_leave_tests {
+    use super::*;
+    use quil_types::consensus::{EffectiveStatus, ProverAllocationInfo, ProverStatus};
+
+    fn set(filters: &[&[u8]]) -> std::collections::HashSet<Vec<u8>> {
+        filters.iter().map(|f| f.to_vec()).collect()
+    }
+
+    fn none() -> std::collections::HashSet<Vec<u8>> {
+        std::collections::HashSet::new()
+    }
+
+    /// An Active allocation held for `epoch`, i.e. one that reads ExpiredEpoch
+    /// once the chain passes that epoch.
+    fn active_alloc(filter: u8, epoch: u64) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            status: ProverStatus::Active,
+            confirmation_filter: vec![filter],
+            rejection_filter: Vec::new(),
+            join_frame_number: 0,
+            leave_frame_number: 0,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: 0,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: 0,
+            epoch,
+            ring: 0,
+            vertex_address: Vec::new(),
+        }
+    }
+
+    /// THE BUG THIS GUARDS. An orphan's own orphanhood is what expires it: no
+    /// worker means no proofs, so it misses the per-epoch re-confirm and leaves
+    /// the `active` bucket. Sweeping `active` alone gave the orphan sweep a
+    /// single epoch of reach, after which the allocation was stuck forever —
+    /// the state behind "35 allocations, 15 workers, 20 reading `re-confirm!`,
+    /// no Leave ever proposed".
+    #[test]
+    fn an_orphan_that_outlived_its_epoch_is_still_proposed_for_leave() {
+        let bound = vec![0x01u8];
+        let orphan = vec![0x02u8];
+
+        // Both allocations registered for epoch 5; the chain is now in epoch 6.
+        let allocs = vec![active_alloc(0x01, 5), active_alloc(0x02, 5)];
+        let frame = 6 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+        let buckets = AllocationBuckets::from_allocations(&allocs, frame);
+
+        // Precondition: expiry has emptied `active`, which is exactly why the
+        // old `active`-only sweep saw nothing to shed.
+        assert!(
+            buckets.active.is_empty(),
+            "an allocation past its registered epoch must not count for coverage",
+        );
+        assert_eq!(buckets.expired_epoch.len(), 2);
+
+        let orphans = orphaned_allocation_filters(
+            &buckets.active,
+            &buckets.expired_epoch,
+            &set(&[&bound]),
+            &none(),
+            &none(),
+        );
+        assert_eq!(orphans, vec![orphan], "only the unbound one is shed");
+    }
+
+    /// The sweep must not shed what is being worked. An ExpiredEpoch allocation
+    /// WITH a worker is recoverable by re-confirming, so it is not an orphan.
+    #[test]
+    fn an_expired_allocation_with_a_worker_is_not_an_orphan() {
+        let filter = vec![0x07u8];
+        let orphans = orphaned_allocation_filters(
+            &[],
+            &[filter.clone()],
+            &set(&[&filter]),
+            &none(),
+            &none(),
+        );
+        assert!(orphans.is_empty());
+    }
+
+    /// Operator pins and in-flight Leaves still win, on the expired path as
+    /// much as the active one — otherwise widening the sweep would start
+    /// re-publishing Leaves for allocations already on their way out.
+    #[test]
+    fn pinned_and_already_leaving_expired_allocations_are_left_alone() {
+        let pinned = vec![0x03u8];
+        let leaving = vec![0x04u8];
+        let shed = vec![0x05u8];
+        let expired = vec![pinned.clone(), leaving.clone(), shed.clone()];
+
+        let orphans = orphaned_allocation_filters(
+            &[],
+            &expired,
+            &none(),
+            &set(&[&pinned]),
+            &set(&[&leaving]),
+        );
+        assert_eq!(orphans, vec![shed]);
+    }
+
+    /// An allocation can be in both buckets across a boundary; it must be
+    /// proposed once, not twice — a duplicated filter would inflate the
+    /// per-cycle proposal budget and the orphan count in the log line.
+    #[test]
+    fn a_filter_in_both_buckets_is_proposed_once() {
+        let f = vec![0x09u8];
+        let orphans = orphaned_allocation_filters(
+            &[f.clone()],
+            &[f.clone()],
+            &none(),
+            &none(),
+            &none(),
+        );
+        assert_eq!(orphans, vec![f]);
+    }
+
+    /// Sanity on the status mapping the sweep depends on: an unbound
+    /// allocation stays on-chain Active, so a Leave is a valid thing to
+    /// propose for it. It is only the DERIVED status that reads expired.
+    #[test]
+    fn an_expired_allocation_is_still_on_chain_active() {
+        let a = active_alloc(0x01, 5);
+        let frame = 6 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+        assert_eq!(a.effective_status(frame), EffectiveStatus::ExpiredEpoch);
+        assert_eq!(a.status, ProverStatus::Active);
     }
 }
