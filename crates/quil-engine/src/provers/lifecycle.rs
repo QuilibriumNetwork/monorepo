@@ -484,14 +484,14 @@ pub struct ProverLifecycle {
     /// leaving the lifecycle with a near-empty score map for 59 out
     /// of every 60 frames. Splitting into two caches lets each writer
     /// own its source-of-truth without racing.
-    local_shard_sizes: RwLock<HashMap<Vec<u8>, u64>>,
+    local_shard_sizes: RwLock<HashMap<Vec<u8>, (u64, u64)>>,
     /// Per-shard byte sizes from the most recent successful
     /// `GetAppShards` archive fetch. Authoritative for shards we are
     /// NOT allocated to (the local cache would have 0 / missing
     /// entries for those). Refreshed every 60 frames or on first-
     /// success by the `shard_info_refresh` task; setting it flips the
     /// `shard_info_loaded` gate.
-    remote_shard_sizes: RwLock<HashMap<Vec<u8>, u64>>,
+    remote_shard_sizes: RwLock<HashMap<Vec<u8>, (u64, u64)>>,
     /// Shards the last archive refresh reported frozen by a recorded split
     /// or merge that has not applied yet. The chain refuses a whole join
     /// that names one, so they are not join candidates.
@@ -645,6 +645,11 @@ impl ProverLifecycle {
     /// `ProposeJoin` / `ProposeLeave` gate, the remote refresh task
     /// must succeed at least once via `set_remote_shard_sizes`.
     pub fn set_local_shard_sizes(&self, sizes: HashMap<Vec<u8>, u64>) {
+        self.set_local_shard_metrics(sizes.into_iter().map(|(f, n)| (f, (n, 1))).collect());
+    }
+
+    /// Replace byte sizes and data-shard counts together, from one local scan.
+    pub fn set_local_shard_metrics(&self, sizes: HashMap<Vec<u8>, (u64, u64)>) {
         if let Ok(mut guard) = self.local_shard_sizes.write() {
             *guard = sizes;
         }
@@ -660,6 +665,11 @@ impl ProverLifecycle {
     /// fresh fetch. The local cache is untouched, so partial remote
     /// refreshes do NOT lose local data for shards we hold.
     pub fn set_remote_shard_sizes(&self, sizes: HashMap<Vec<u8>, u64>) {
+        self.set_remote_shard_metrics(sizes.into_iter().map(|(f, n)| (f, (n, 1))).collect());
+    }
+
+    /// Replace byte sizes and data-shard counts together, from one archive response.
+    pub fn set_remote_shard_metrics(&self, sizes: HashMap<Vec<u8>, (u64, u64)>) {
         if let (Ok(mut lacking), Ok(mut settled)) =
             (self.unsized_live_shards.write(), self.settled_unsized_shards.write())
         {
@@ -699,6 +709,10 @@ impl ProverLifecycle {
     /// alloc cost is negligible. Returned by value so callers
     /// don't hold either lock during proposal building.
     pub fn merged_shard_sizes(&self) -> HashMap<Vec<u8>, u64> {
+        self.merged_shard_metrics().into_iter().map(|(f, (bytes, _))| (f, bytes)).collect()
+    }
+
+    fn merged_shard_metrics(&self) -> HashMap<Vec<u8>, (u64, u64)> {
         let mut merged = self
             .remote_shard_sizes
             .read()
@@ -1163,7 +1177,9 @@ impl ProverLifecycle {
         // Merged view: remote sizes (authoritative for shards we're
         // not on) overlaid by local sizes (authoritative for shards
         // we hold data for). See `merged_shard_sizes` for the rule.
-        let shard_sizes_snapshot = self.merged_shard_sizes();
+        let shard_metrics = self.merged_shard_metrics();
+        let shard_sizes_snapshot: HashMap<Vec<u8>, u64> = shard_metrics.iter()
+            .map(|(f, (bytes, _))| (f.clone(), *bytes)).collect();
         // Live allocations on a filter an archive refresh has already come
         // back without, and that neither the local grid nor a recorded change
         // names, are left on a retired shard (a legacy merge moves only
@@ -1246,9 +1262,28 @@ impl ProverLifecycle {
                 proposal_descriptors.retain(|d| !frozen.contains(&d.filter));
             }
         }
-        let decide_all_descriptors =
+        for descriptor in &mut proposal_descriptors {
+            descriptor.shards = shard_metrics[&descriptor.filter].1;
+        }
+        let mut decide_all_descriptors =
             build_decide_descriptors(&summaries, &shard_sizes_snapshot);
-        let allocated_descriptors: Vec<ShardDescriptor> = decide_all_descriptors.iter()
+        for descriptor in &mut decide_all_descriptors {
+            descriptor.shards = shard_metrics[&descriptor.filter].1;
+        }
+        // Leave economics use the allocation's confirmed reward ring, as the
+        // reward calculator does, rather than the last member's ring. Keep the
+        // generic descriptors for join confirmation policy.
+        let mut held_descriptors = decide_all_descriptors.clone();
+        if let Some(prover) = &prover_info {
+            for descriptor in &mut held_descriptors {
+                if let Some(allocation) = prover.allocations.iter()
+                    .find(|a| a.confirmation_filter == descriptor.filter && a.is_live(frame_number))
+                {
+                    descriptor.ring = allocation.ring;
+                }
+            }
+        }
+        let allocated_descriptors: Vec<ShardDescriptor> = held_descriptors.iter()
             .filter(|d| active_filters.contains(&d.filter))
             .cloned()
             .collect();
@@ -1752,6 +1787,14 @@ impl ProverLifecycle {
             }
         }
 
+        // A worker or recent submission already reserves its destination even
+        // before the allocation appears in the registry. It cannot fund a leave.
+        let inflight = self.filters_with_inflight_join(frame_number);
+        let available_replacements: Vec<ShardDescriptor> = proposal_descriptors.iter()
+            .filter(|d| !inflight.contains(&d.filter)
+                && !workers.iter().any(|w| w.filter == d.filter))
+            .cloned().collect();
+
         // 3) ProposeLeave — score-driven (Go-aligned, mirrors
         //    worker_allocator.go:299-316) plus empty-allocated leaves
         //    (intentionally divergent from Go). The divergent branch
@@ -1887,7 +1930,7 @@ impl ProverLifecycle {
             let score_candidates: Vec<Vec<u8>> = if !proposal_descriptors.is_empty() {
                 proposer::plan_leaves_releasing(
                     &allocated_descriptors,
-                    &proposal_descriptors,
+                    &available_replacements,
                     difficulty,
                     &world_bytes,
                     self.units,
@@ -2046,7 +2089,8 @@ impl ProverLifecycle {
             for f in &ready_leave_filters {
                 if manual_bound_filters.contains(f) {
                     manual_ready.push(f.clone());
-                } else if !bound_filters.contains(f) || settled_split_away(f) || retired.contains(f) {
+                } else if !bound_filters.contains(f) || settled_split_away(f) || retired.contains(f)
+                    || shard_sizes_snapshot.get(f) == Some(&0) {
                     orphan_ready.push(f.clone());
                 } else {
                     auto_ready.push(f.clone());
@@ -2054,8 +2098,9 @@ impl ProverLifecycle {
             }
 
             // Auto bucket: score-driven decide_leaves on auto-bound.
-            let (mut auto_reject, auto_confirm) = proposer::decide_leaves(
-                &decide_all_descriptors,
+            let (mut auto_reject, auto_confirm) = proposer::decide_leaves_against_replacements(
+                &held_descriptors,
+                &available_replacements,
                 &auto_ready,
                 difficulty,
                 &world_bytes,
@@ -2071,7 +2116,7 @@ impl ProverLifecycle {
             // no prover. While the demand
             // stands, confirm the leaves the shard can spare.
             let mut swap_demand =
-                proposer::halt_risk_swap_demand(&proposal_descriptors, free_worker_ids.len());
+                proposer::halt_risk_swap_demand(&available_replacements, free_worker_ids.len());
             let mut swap_confirm: Vec<Vec<u8>> = Vec::new();
             auto_reject.retain(|filter| {
                 if swap_demand == 0 {
@@ -3130,6 +3175,97 @@ mod proposal_loop_tests {
     /// up to its free-worker count in a SINGLE cycle. Give one node enough idle
     /// workers and enough halt-risk shards spread across different top-of-tree
     /// branches, and it lays claim to all of them at once.
+    #[test]
+    fn confirmed_ring_protects_an_early_high_reward_holding() {
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let alternative = filter_bytes(0xA2);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut holding = alloc(held.clone(), ProverStatus::Active, 10);
+        holding.ring = 1;
+        reg.set_prover(prover(address.clone(), vec![holding]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 53), shard_summary(alternative.clone(), 8)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_remote_shard_metrics(HashMap::from([(held, (1_000_000, 100)), (alternative, (1_000_000, 100))]));
+        lc.set_prover_root_verified_frame(100);
+        let actions = lc.evaluate(100, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_leaves(&actions), 0, "our ring 1 earns as much as the alternative; actions={actions:?}");
+    }
+
+    #[test]
+    fn data_shard_counts_prevent_a_false_reward_upgrade() {
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let alternative = filter_bytes(0xA2);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), vec![alloc(held.clone(), ProverStatus::Active, 10)]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 8), shard_summary(alternative.clone(), 8)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_remote_shard_metrics(HashMap::from([(held, (1_000_000, 1)), (alternative, (100_000_000, 1_000_000))]));
+        lc.set_prover_root_verified_frame(100);
+        let actions = lc.evaluate(100, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_leaves(&actions), 0, "larger bytes do not imply higher per-worker rewards; actions={actions:?}");
+    }
+
+    #[test]
+    fn a_join_reserved_this_cycle_cannot_also_fund_a_leave() {
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let alternative = filter_bytes(0xA2);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        wm.add(idle_worker(2));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), vec![alloc(held.clone(), ProverStatus::Active, 10)]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 8), shard_summary(alternative.clone(), 8)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_remote_shard_metrics(HashMap::from([(held, (1_000_000, 1)), (alternative.clone(), (100_000_000, 1))]));
+        for frame in [100, 101] {
+            lc.set_prover_root_verified_frame(frame);
+            let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            if frame == 100 { assert_eq!(proposed_join_filters(&actions), vec![alternative.clone()]); }
+            assert_eq!(count_proposed_leaves(&actions), 0, "pending join already reserves the reward opportunity; actions={actions:?}");
+        }
+        // Without the reserved destination, a genuinely superior alternative
+        // must still justify leaving when no worker is free to take it.
+        wm.set_worker_filter(2, &filter_bytes(0xA3), true).unwrap();
+        let frame = 100 + JOIN_FILTER_COOLDOWN_FRAMES;
+        lc.set_prover_root_verified_frame(frame);
+        let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_leaves(&actions), 1, "expired reservation releases the destination; actions={actions:?}");
+    }
+
+    #[test]
+    fn a_favorable_pending_leave_is_rejected_at_its_window() {
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let better_held = filter_bytes(0xA2);
+        let available = filter_bytes(0xA3);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        wm.add(allocated_worker(2, better_held.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut leaving = alloc(held.clone(), ProverStatus::Leaving, 10);
+        leaving.ring = 1;
+        leaving.leave_frame_number = 10;
+        reg.set_prover(prover(address.clone(), vec![leaving, alloc(better_held.clone(), ProverStatus::Active, 10)]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 53), shard_summary(better_held.clone(), 59), shard_summary(available.clone(), 8)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_remote_shard_metrics(HashMap::from([(held.clone(), (1_000_000, 1)), (better_held, (100_000_000, 1)), (available.clone(), (100_000, 1))]));
+        lc.set_prover_root_verified_frame(720);
+        let actions = lc.evaluate(720, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(actions.iter().any(|a| matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held))), "keep a profitable holding despite a richer shard we already hold; actions={actions:?}");
+        assert!(!actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))));
+        // A genuinely better, unreserved destination still confirms the leave.
+        lc.set_remote_shard_metrics(HashMap::from([(held.clone(), (1_000_000, 1)), (available, (100_000_000, 1))]));
+        let actions = lc.evaluate(720, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))), "genuine upgrades remain possible; actions={actions:?}");
+    }
+
     #[test]
     fn one_prover_covers_many_distinct_branch_shards_in_one_cycle() {
         let address = vec![0xCDu8; 32];

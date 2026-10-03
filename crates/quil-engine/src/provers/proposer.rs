@@ -934,6 +934,38 @@ pub fn decide_leaves(
     (reject, confirm)
 }
 
+/// Decide each held leave against destinations that can actually take its
+/// worker. Another holding (including a higher-reward one) is not a replacement.
+/// Keep unknown holdings until reward inputs arrive; explicit cleanup is the
+/// lifecycle caller's responsibility. Existing threshold and coverage checks
+/// remain in `decide_leaves`.
+#[allow(clippy::too_many_arguments)]
+pub fn decide_leaves_against_replacements(
+    held: &[ShardDescriptor],
+    available: &[ShardDescriptor],
+    pending: &[Vec<u8>],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut reject = Vec::new();
+    let mut confirm = Vec::new();
+    for filter in pending.iter().filter(|f| !f.is_empty()).take(100) {
+        let Some(holding) = held.iter().find(|d| &d.filter == filter) else {
+            reject.push(filter.clone());
+            continue;
+        };
+        let mut comparison = available.to_vec();
+        comparison.push(holding.clone());
+        let (r, c) = decide_leaves(&comparison, std::slice::from_ref(filter),
+            difficulty, world_bytes, units, strategy);
+        reject.extend(r);
+        confirm.extend(c);
+    }
+    (reject, confirm)
+}
+
 /// Default issuance units constant (matches Go's 8_000_000_000).
 pub const DEFAULT_UNITS: u64 = 8_000_000_000;
 
