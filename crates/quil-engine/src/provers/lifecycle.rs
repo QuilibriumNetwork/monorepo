@@ -197,6 +197,46 @@ impl std::fmt::Debug for LifecycleAction {
     }
 }
 
+/// Allocations this prover holds on-chain that NOTHING is working — the
+/// "Leave regardless of score" set.
+///
+/// Candidates are `active` UNION `expired_epoch`. Including `expired_epoch` is
+/// what makes the sweep terminating rather than one-shot: being orphaned is
+/// precisely what makes an allocation expire, since no worker means no proofs
+/// and so a missed per-epoch re-confirm at the next boundary, after which the
+/// allocation leaves `active`. Sweeping `active` alone therefore gave an orphan
+/// a single epoch of eligibility and no way back, so an orphan that survived one
+/// boundary became permanently unsheddable. Observed in the wild as a node
+/// holding 35 allocations against 15 workers, the 20 unbound ones all reading
+/// `re-confirm!`, with no Leave ever proposed.
+///
+/// `expired_epoch` deliberately does NOT join `active` itself — that set is
+/// coverage accounting and an unconfirmed allocation genuinely does not count.
+/// This widens only who may be SHED.
+///
+/// Excluded: filters a worker is bound to (including in-flight joins, whose
+/// `worker.filter` is set at submit time), operator-pinned filters, and filters
+/// already mid-Leave.
+pub(crate) fn orphaned_allocation_filters(
+    active_filters: &[Vec<u8>],
+    expired_epoch_filters: &[Vec<u8>],
+    bound_filters: &std::collections::HashSet<Vec<u8>>,
+    manually_managed_filters: &std::collections::HashSet<Vec<u8>>,
+    pending_leave_filters: &std::collections::HashSet<Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    active_filters
+        .iter()
+        .chain(expired_epoch_filters.iter())
+        .filter(|f| seen.insert(f.as_slice()))
+        .filter(|f| !bound_filters.contains(*f))
+        .filter(|f| !manually_managed_filters.contains(*f))
+        .filter(|f| !pending_leave_filters.contains(*f))
+        .cloned()
+        .collect()
+}
+
+
 /// Allocations partitioned by their effective status at a given
 /// frame. Lifecycle's `evaluate` collects these once and dispatches
 /// each downstream subroutine against the appropriate slice. Pulling
@@ -1127,6 +1167,10 @@ impl ProverLifecycle {
         let active_filters = buckets.active;
         let leaving_filters = buckets.leaving;
         let all_our_filters = buckets.all_ours;
+        // Cloned because the re-confirm path below consumes the original and
+        // the orphan-leave sweep needs it again: an ExpiredEpoch allocation is
+        // still on-chain Active, so it is a valid Leave target when nothing is
+        // working it.
         let expired_epoch_filters = buckets.expired_epoch;
         tracing::info!(
             frame = frame_number,
@@ -1141,6 +1185,7 @@ impl ProverLifecycle {
                 .map(|a| (a.epoch, a.status, a.confirmation_filter.len())).collect::<Vec<_>>()),
             "lifecycle allocation buckets"
         );
+        let expired_epoch_for_orphan_sweep = expired_epoch_filters.clone();
 
         // Build separate descriptor views.
         //
@@ -1772,10 +1817,14 @@ impl ProverLifecycle {
         // proposing swap leaves against a phantom halt-risk shard for
         // hours. Halt-risk swaps are still wanted — but only
         // off a trustworthy coverage view, i.e. when not halted.
+        // `expired_epoch` counts toward "we hold something worth evaluating"
+        // alongside `active`: a prover whose every allocation went ExpiredEpoch
+        // (all of them orphaned, e.g. after losing its workers) would otherwise
+        // skip the leave sweep entirely and never shed anything.
         if shard_info_ready
             && can_propose
             && !join_proposed_this_cycle
-            && !active_filters.is_empty()
+            && !(active_filters.is_empty() && expired_epoch_for_orphan_sweep.is_empty())
             && !self.halt_state.any_halted()
         {
             let manually_managed_filters: std::collections::HashSet<Vec<u8>> = workers
@@ -1810,19 +1859,35 @@ impl ProverLifecycle {
                 .cloned()
                 .collect();
 
-            // Orphan filters: Active allocations with no worker bound.
+            // Orphan filters: on-chain Active allocations with no worker bound.
             // Always propose leave regardless of shard score — there's
             // no useful work to retain. Fixes the "extra allocation
             // from earlier issues, shows as -1 in TUI" case where the
             // allocation lingers on a healthy shard and plan_leaves /
             // surplus-leave can't (or won't) pick it.
-            let orphan_filters: Vec<Vec<u8>> = active_filters
-                .iter()
-                .filter(|f| !bound_filters.contains(*f))
-                .filter(|f| !manually_managed_filters.contains(*f))
-                .filter(|f| !pending_leave_filters.contains(*f))
-                .cloned()
-                .collect();
+            //
+            // ExpiredEpoch allocations MUST be candidates here, not just
+            // `active` ones. Being orphaned is precisely what makes an
+            // allocation expire: no worker means no proofs, so it misses the
+            // per-epoch re-confirm at the next boundary and drops out of
+            // `active`. Sweeping only `active` therefore gave the orphan path a
+            // one-epoch window and no way back — an orphan that survived a
+            // single boundary became permanently unsheddable, which is how a
+            // node ends up holding far more allocations than it has workers with
+            // no automatic way out. Observed in the wild: 35 allocations against
+            // 15 workers, the 20 unbound ones all reading `re-confirm!`, and
+            // zero Leave proposals for as long as they stayed that way.
+            //
+            // They stay OUT of `active` itself — that set is coverage
+            // accounting, and an unconfirmed allocation genuinely does not
+            // count. This only widens who may be shed.
+            let orphan_filters = orphaned_allocation_filters(
+                &active_filters,
+                &expired_epoch_for_orphan_sweep,
+                &bound_filters,
+                &manually_managed_filters,
+                &pending_leave_filters,
+            );
 
             // SPLIT-PARENT filters — an Active filter that has been
             // SPLIT, i.e. some registered shard is a strict bit-path DESCENDANT of
@@ -3961,6 +4026,47 @@ mod proposal_loop_tests {
         );
     }
 
+    /// The leave sweep must stay reachable when epoch expiry empties the
+    /// active bucket. The bound allocation can recover by re-confirming;
+    /// only the unbound allocation should receive a Leave proposal.
+    #[test]
+    fn all_expired_allocations_still_propose_leave_for_the_unbound_one() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let bound = filter_bytes(0xA1);
+        let orphan = filter_bytes(0xA2);
+        wm.add(allocated_worker(1, bound.clone()));
+        let mut allocations = vec![
+            alloc(bound.clone(), ProverStatus::Active, 10),
+            alloc(orphan.clone(), ProverStatus::Active, 10),
+        ];
+        for allocation in &mut allocations {
+            allocation.epoch = 5;
+        }
+        let frame = 6 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+        let buckets = AllocationBuckets::from_allocations(&allocations, frame);
+        assert!(buckets.active.is_empty());
+        assert_eq!(buckets.expired_epoch.len(), 2);
+        reg.set_prover(prover(address.clone(), allocations));
+        reg.set_summaries(vec![
+            shard_summary(bound.clone(), 10),
+            shard_summary(orphan.clone(), 10),
+        ]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(frame);
+        let actions = lifecycle.evaluate(frame, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let leaves: Vec<Vec<u8>> = actions.iter().filter_map(|action| match action {
+            LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+            _ => None,
+        }).flatten().collect();
+        assert_eq!(leaves, vec![orphan], "expired orphan must remain reachable; got {actions:?}");
+    }
+
     /// User report: "extra allocation from earlier issues, in the TUI
     /// it shows as -1 for the worker id, never leaves successfully".
     /// An active allocation whose filter is not bound to any worker is
@@ -5425,5 +5531,138 @@ mod halt_risk_descriptor_tests {
         );
         assert_eq!(descriptors.len(), 1);
         assert_eq!(descriptors[0].filter, filter_real);
+    }
+}
+
+#[cfg(test)]
+mod orphan_leave_tests {
+    use super::*;
+    use quil_types::consensus::{EffectiveStatus, ProverAllocationInfo, ProverStatus};
+
+    fn set(filters: &[&[u8]]) -> std::collections::HashSet<Vec<u8>> {
+        filters.iter().map(|f| f.to_vec()).collect()
+    }
+
+    fn none() -> std::collections::HashSet<Vec<u8>> {
+        std::collections::HashSet::new()
+    }
+
+    /// An Active allocation held for `epoch`, i.e. one that reads ExpiredEpoch
+    /// once the chain passes that epoch.
+    fn active_alloc(filter: u8, epoch: u64) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            status: ProverStatus::Active,
+            confirmation_filter: vec![filter],
+            rejection_filter: Vec::new(),
+            join_frame_number: 0,
+            leave_frame_number: 0,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: 0,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: 0,
+            epoch,
+            ring: 0,
+            vertex_address: Vec::new(),
+        }
+    }
+
+    /// THE BUG THIS GUARDS. An orphan's own orphanhood is what expires it: no
+    /// worker means no proofs, so it misses the per-epoch re-confirm and leaves
+    /// the `active` bucket. Sweeping `active` alone gave the orphan sweep a
+    /// single epoch of reach, after which the allocation was stuck forever —
+    /// the state behind "35 allocations, 15 workers, 20 reading `re-confirm!`,
+    /// no Leave ever proposed".
+    #[test]
+    fn an_orphan_that_outlived_its_epoch_is_still_proposed_for_leave() {
+        let bound = vec![0x01u8];
+        let orphan = vec![0x02u8];
+
+        // Both allocations registered for epoch 5; the chain is now in epoch 6.
+        let allocs = vec![active_alloc(0x01, 5), active_alloc(0x02, 5)];
+        let frame = 6 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+        let buckets = AllocationBuckets::from_allocations(&allocs, frame);
+
+        // Precondition: expiry has emptied `active`, which is exactly why the
+        // old `active`-only sweep saw nothing to shed.
+        assert!(
+            buckets.active.is_empty(),
+            "an allocation past its registered epoch must not count for coverage",
+        );
+        assert_eq!(buckets.expired_epoch.len(), 2);
+
+        let orphans = orphaned_allocation_filters(
+            &buckets.active,
+            &buckets.expired_epoch,
+            &set(&[&bound]),
+            &none(),
+            &none(),
+        );
+        assert_eq!(orphans, vec![orphan], "only the unbound one is shed");
+    }
+
+    /// The sweep must not shed what is being worked. An ExpiredEpoch allocation
+    /// WITH a worker is recoverable by re-confirming, so it is not an orphan.
+    #[test]
+    fn an_expired_allocation_with_a_worker_is_not_an_orphan() {
+        let filter = vec![0x07u8];
+        let orphans = orphaned_allocation_filters(
+            &[],
+            &[filter.clone()],
+            &set(&[&filter]),
+            &none(),
+            &none(),
+        );
+        assert!(orphans.is_empty());
+    }
+
+    /// Operator pins and in-flight Leaves still win, on the expired path as
+    /// much as the active one — otherwise widening the sweep would start
+    /// re-publishing Leaves for allocations already on their way out.
+    #[test]
+    fn pinned_and_already_leaving_expired_allocations_are_left_alone() {
+        let pinned = vec![0x03u8];
+        let leaving = vec![0x04u8];
+        let shed = vec![0x05u8];
+        let expired = vec![pinned.clone(), leaving.clone(), shed.clone()];
+
+        let orphans = orphaned_allocation_filters(
+            &[],
+            &expired,
+            &none(),
+            &set(&[&pinned]),
+            &set(&[&leaving]),
+        );
+        assert_eq!(orphans, vec![shed]);
+    }
+
+    /// An allocation can be in both buckets across a boundary; it must be
+    /// proposed once, not twice — a duplicated filter would inflate the
+    /// per-cycle proposal budget and the orphan count in the log line.
+    #[test]
+    fn a_filter_in_both_buckets_is_proposed_once() {
+        let f = vec![0x09u8];
+        let orphans = orphaned_allocation_filters(
+            &[f.clone()],
+            &[f.clone()],
+            &none(),
+            &none(),
+            &none(),
+        );
+        assert_eq!(orphans, vec![f]);
+    }
+
+    /// Sanity on the status mapping the sweep depends on: an unbound
+    /// allocation stays on-chain Active, so a Leave is a valid thing to
+    /// propose for it. It is only the DERIVED status that reads expired.
+    #[test]
+    fn an_expired_allocation_is_still_on_chain_active() {
+        let a = active_alloc(0x01, 5);
+        let frame = 6 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+        assert_eq!(a.effective_status(frame), EffectiveStatus::ExpiredEpoch);
+        assert_eq!(a.status, ProverStatus::Active);
     }
 }
