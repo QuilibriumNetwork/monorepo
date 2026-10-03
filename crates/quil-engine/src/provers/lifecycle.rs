@@ -1215,7 +1215,18 @@ impl ProverLifecycle {
                 .map(|a| (a.epoch, a.status, a.confirmation_filter.len())).collect::<Vec<_>>()),
             "lifecycle allocation buckets"
         );
-        let expired_epoch_for_orphan_sweep = expired_epoch_filters.clone();
+        // A rejected leave may be epoch-expired until its renewal round-trip
+        // completes. Do not turn that recoverable transition into another leave,
+        // even if reconcile has not restored the worker yet. Bound the grace by
+        // the rejection epoch; genuinely abandoned allocations remain sweepable.
+        let recovery_filters: std::collections::HashSet<Vec<u8>> = prover_info
+            .as_ref()
+            .map(|p| p.allocations.iter()
+                .filter(|a| crate::worker_allocator::rejected_leave_recovery_pending(a, frame_number))
+                .map(|a| a.confirmation_filter.clone()).collect())
+            .unwrap_or_default();
+        let expired_epoch_for_orphan_sweep: Vec<Vec<u8>> = expired_epoch_filters.iter()
+            .filter(|f| !recovery_filters.contains(*f)).cloned().collect();
 
         // Build separate descriptor views.
         //
@@ -3388,6 +3399,33 @@ mod proposal_loop_tests {
     /// up to its free-worker count in a SINGLE cycle. Give one node enough idle
     /// workers and enough halt-risk shards spread across different top-of-tree
     /// branches, and it lays claim to all of them at once.
+    #[test]
+    fn rejected_leave_renews_before_orphan_cleanup_and_grace_is_bounded() {
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut recovering = alloc(held.clone(), ProverStatus::Active, 10);
+        recovering.epoch = 0;
+        recovering.leave_frame_number = 10;
+        recovering.leave_reject_frame_number = 721;
+        reg.set_prover(prover(address.clone(), vec![recovering]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        for frame in [725, 1439] {
+            lc.set_prover_root_verified_frame(frame);
+            let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            assert!(actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))));
+            assert_eq!(count_proposed_leaves(&actions), 0,
+                "renewal must not race orphan cleanup after rejecting a leave; actions={actions:?}");
+        }
+        lc.set_prover_root_verified_frame(1440);
+        let actions = lc.evaluate(1440, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_leaves(&actions), 1,
+            "a failed, unstaffed recovery remains eligible for bounded cleanup; actions={actions:?}");
+    }
+
     #[test]
     fn one_prover_covers_many_distinct_branch_shards_in_one_cycle() {
         let address = vec![0xCDu8; 32];
