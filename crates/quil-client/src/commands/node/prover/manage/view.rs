@@ -238,19 +238,17 @@ pub fn draw(f: &mut Frame, m: &mut Model) {
 fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let (actions, status) = footer_lines(m);
     let actions = wrap_actions(actions, area.width);
-    let actions_h = (actions.len() as u16).min(area.height.saturating_sub(12));
+    let actions_h = (actions.len() as u16).min(area.height.saturating_sub(10));
     // Content height depends only on terminal geometry, never message length.
-    let notice_h = area.height.saturating_sub(11 + actions_h).clamp(1, 3);
+    let notice_h = area.height.saturating_sub(9 + actions_h).clamp(1, 3);
     let status_h = notice_h + 2;
-    let panel_budget = area.height.saturating_sub(7 + actions_h + status_h);
+    let panel_budget = area.height.saturating_sub(5 + actions_h + status_h);
     let alloc_h = panel_budget / 2;
     let avail_h = panel_budget - alloc_h;
 
     let chunks = Layout::vertical([
         Constraint::Length(1),           // header
-        Constraint::Length(1),           // alloc title
         Constraint::Length(alloc_h + 2), // alloc panel (+ border)
-        Constraint::Length(1),           // avail title
         Constraint::Length(avail_h + 2), // avail panel (+ border)
         Constraint::Length(status_h),    // notifications
         Constraint::Length(actions_h),   // commands at the bottom
@@ -263,42 +261,34 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         chunks[0],
     );
 
-    // Allocations title + panel.
+    // Titles share the top borders, leaving two more rows for table data.
     let sorted_allocs = m.sorted_allocations();
-    f.render_widget(
-        Paragraph::new(alloc_title(m, &sorted_allocs))
-            .style(Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD)),
-        chunks[1],
-    );
+    let title_style = Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD);
     let alloc_block = Block::default()
+        .title(alloc_title(m, &sorted_allocs).style(title_style))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(if m.focus.is_alloc() { PRIMARY } else { DIM }));
-    let alloc_inner = alloc_block.inner(chunks[2]);
-    f.render_widget(alloc_block, chunks[2]);
+    let alloc_inner = alloc_block.inner(chunks[1]);
+    f.render_widget(alloc_block, chunks[1]);
     let alloc_lines = render_alloc_panel(m, &sorted_allocs, alloc_inner);
     f.render_widget(Paragraph::new(alloc_lines), alloc_inner);
 
-    // Available title + panel.
     let sorted_avail = m.sorted_available();
-    f.render_widget(
-        Paragraph::new(avail_title(m, &sorted_avail))
-            .style(Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD)),
-        chunks[3],
-    );
     let avail_block = Block::default()
+        .title(avail_title(m, &sorted_avail).style(title_style))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(if !m.focus.is_alloc() { PRIMARY } else { DIM }));
-    let avail_inner = avail_block.inner(chunks[4]);
-    f.render_widget(avail_block, chunks[4]);
+    let avail_inner = avail_block.inner(chunks[2]);
+    f.render_widget(avail_block, chunks[2]);
     let avail_lines = render_avail_panel(m, &sorted_avail, avail_inner);
     f.render_widget(Paragraph::new(avail_lines), avail_inner);
 
-    render_notifications(f, m, status, chunks[5]);
+    render_notifications(f, m, status, chunks[3]);
     f.render_widget(
         Paragraph::new(actions).style(Style::new().fg(HELP)),
-        chunks[6],
+        chunks[4],
     );
 }
 
@@ -1539,6 +1529,11 @@ mod tests {
             let rows = (0..30).map(|y| (0..80).map(|x| buffer[(x,y)].symbol()).collect::<String>()).collect::<Vec<_>>();
             notification_rows.push(rows.iter().position(|row| row.contains("Notifications:")).unwrap());
             available_rows.push(rows.iter().position(|row| row.contains("Available Shards:")).unwrap());
+            for title in ["Allocations:", "Available Shards:", "Notifications:"] {
+                let row = rows.iter().find(|row| row.contains(title)).unwrap();
+                assert!(row.starts_with('╭') && row.ends_with('╮'), "title must share its panel border: {row}");
+            }
+            assert_eq!(rows.iter().position(|row| row.contains("Allocations:")), Some(1));
             assert_eq!(m.notice_visible, 3);
             assert!(rows[29].contains("[q]"));
         }
