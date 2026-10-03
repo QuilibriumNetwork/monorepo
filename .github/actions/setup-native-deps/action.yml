@@ -16,6 +16,10 @@ outputs:
     description: FLINT install root (set FLINT_DIR to this value on macOS)
     value: ${{ steps.flint-paths.outputs.flint-dir }}
 
+  cache-key:
+    description: Native dependency/compiler fingerprint
+    value: ${{ steps.native-abi.outputs.key }}
+
 runs:
   using: composite
   steps:
@@ -67,8 +71,18 @@ runs:
       if: runner.os == 'macOS'
       shell: bash
       run: |
-        brew update
-        brew install gmp mpfr openssl@3 cmake autoconf automake libtool m4 pkg-config protobuf
+        # Missing packages still get installed; existing formulae stay at the
+        # runner image's versions, including keg-only openssl@3.
+        MISSING_FORMULAE=()
+        for formula in gmp mpfr openssl@3 cmake autoconf automake libtool m4 pkg-config protobuf; do
+          if ! brew list --versions "$formula" >/dev/null 2>&1; then
+            MISSING_FORMULAE+=("$formula")
+          fi
+        done
+        if (( ${#MISSING_FORMULAE[@]} )); then
+          brew install "${MISSING_FORMULAE[@]}"
+        fi
+        protoc --version
 
     # -------------------------------------------------------------
     # Resolve FLINT install paths per OS
@@ -85,24 +99,36 @@ runs:
           echo "flint-prefix=/usr/local" >> "$GITHUB_OUTPUT"
         fi
 
-    # actions/cache restores files as the unprivileged runner user. The
-    # /usr/local/{lib,include} subtrees default to root-owned on the
-    # runner, so a cache populated by `sudo make install` cannot be
-    # restored on the next run — tar fails with
-    # "Cannot mkdir / Cannot open: Permission denied" on
-    # /usr/local/lib/pkgconfig, /usr/local/include/flint, etc. Pre-chown
-    # the install subtrees so both the cache restore and our own
-    # install commands below can write without sudo.
-    #
-    # /usr/local/cmake is also chowned because emp-tool/emp-ot install
-    # their cmake config files there (DESTINATION cmake/ relative to
-    # CMAKE_INSTALL_PREFIX=/usr/local), not under lib/cmake/.
-    - name: Make /usr/local install dirs writable (linux)
-      if: runner.os == 'Linux'
+    # Restore/install only needs writable parents and our own native files.
+    # Recursively chowning all of /usr/local/lib walks unrelated runner tools.
+    # macOS needs the same preparation for cached EMP installations.
+    - name: Prepare native install directories
       shell: bash
       run: |
-        sudo mkdir -p /usr/local/lib/pkgconfig /usr/local/lib/cmake /usr/local/include /usr/local/cmake
-        sudo chown -R "$(id -u):$(id -g)" /usr/local/lib /usr/local/include /usr/local/cmake
+        NATIVE_OWNER="$(id -u):$(id -g)"
+        sudo mkdir -p /usr/local/lib/pkgconfig /usr/local/include /usr/local/cmake
+        sudo chown "$NATIVE_OWNER" /usr/local/lib /usr/local/lib/pkgconfig /usr/local/include /usr/local/cmake
+        for native_path in /usr/local/include/flint /usr/local/include/emp-tool /usr/local/include/emp-ot /usr/local/lib/libflint.* /usr/local/lib/libemp-tool.* /usr/local/lib/pkgconfig/flint.pc /usr/local/cmake; do
+          if [[ -e "$native_path" ]]; then
+            sudo chown -R "$NATIVE_OWNER" "$native_path"
+          fi
+        done
+
+    # Bind native artifacts to installed dependencies and the C++ compiler,
+    # as well as the build recipe below, before restoring either library.
+    - name: Fingerprint native dependencies
+      id: native-abi
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" == "macOS" ]]; then
+          NATIVE_DEPS="$(brew list --versions gmp mpfr openssl@3)"
+        else
+          NATIVE_DEPS="$(dpkg-query -W -f='${Package}=${Version}\n' libgmp-dev libmpfr-dev libssl-dev)"
+        fi
+        NATIVE_COMPILER="$(c++ --version)"
+        printf '%s\n%s\n' "$NATIVE_DEPS" "$NATIVE_COMPILER"
+        NATIVE_ABI="$(printf '%s\n%s\n' "$NATIVE_DEPS" "$NATIVE_COMPILER" | shasum -a 256 | cut -d ' ' -f 1)"
+        echo "key=$NATIVE_ABI" >> "$GITHUB_OUTPUT"
 
     # -------------------------------------------------------------
     # FLINT 3.0 — built from source, cached per OS/arch
@@ -115,7 +141,7 @@ runs:
           ${{ steps.flint-paths.outputs.flint-prefix }}/lib/libflint.*
           ${{ steps.flint-paths.outputs.flint-prefix }}/include/flint
           ${{ steps.flint-paths.outputs.flint-prefix }}/lib/pkgconfig/flint.pc
-        key: flint-3.0-${{ runner.os }}-${{ runner.arch }}-v1
+        key: flint-3.0-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-abi.outputs.key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
 
     - name: Build FLINT 3.0 (linux)
       if: runner.os == 'Linux' && steps.cache-flint.outputs.cache-hit != 'true'
@@ -174,9 +200,8 @@ runs:
           /usr/local/include/emp-tool
           /usr/local/include/emp-ot
           /usr/local/lib/libemp-tool.*
-          /usr/local/lib/cmake/emp-tool
-          /usr/local/lib/cmake/emp-ot
-        key: emp-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('emp-tool/**', 'emp-ot/**') }}
+          /usr/local/cmake
+        key: emp-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-abi.outputs.key }}-${{ hashFiles('emp-tool/**', 'emp-ot/**', '.github/actions/setup-native-deps/action.yml') }}
 
     - name: Build EMP-tool + EMP-OT
       if: steps.cache-emp.outputs.cache-hit != 'true'
@@ -188,12 +213,6 @@ runs:
         sed -i.bak 's|add_library(${NAME} SHARED ${sources})|add_library(${NAME} STATIC ${sources})|g' emp-tool/CMakeLists.txt
         rm -f emp-tool/CMakeLists.txt.bak
 
-        # On Linux /usr/local/{lib,include} were chowned to the runner
-        # user above, so cmake --install can write without sudo and the
-        # resulting files restore cleanly from the EMP cache on later
-        # runs. macOS still needs sudo to write under /usr/local.
-        if [[ "$RUNNER_OS" == "Linux" ]]; then SUDO=""; else SUDO="sudo"; fi
-
         # EMP defaults to the unversioned Homebrew openssl prefix. Pass
         # the installed formula explicitly, including when building EMP-OT.
         OPENSSL_CMAKE_ARGS=()
@@ -203,8 +222,8 @@ runs:
 
         cmake -S emp-tool -B emp-tool/build -DCMAKE_INSTALL_PREFIX=/usr/local "${OPENSSL_CMAKE_ARGS[@]}"
         cmake --build emp-tool/build -j
-        $SUDO cmake --install emp-tool/build
+        cmake --install emp-tool/build
 
         cmake -S emp-ot -B emp-ot/build -DCMAKE_INSTALL_PREFIX=/usr/local "${OPENSSL_CMAKE_ARGS[@]}"
         cmake --build emp-ot/build -j
-        $SUDO cmake --install emp-ot/build
+        cmake --install emp-ot/build
