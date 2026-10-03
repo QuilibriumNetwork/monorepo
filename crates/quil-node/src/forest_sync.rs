@@ -357,6 +357,8 @@ pub async fn sync_shard_phases_verified(
 /// TRUSTING the peer's head — used by the state-jump, which pins to a peer's
 /// generation rather than a header root. Returns the number of phases that
 /// carried data. `shard_id` is `addr_path_shard_id(app, prefix)`.
+// Retained unpinned sync adapter; current callers use pinned or cancellable variants.
+#[allow(dead_code)]
 pub async fn pull_shard_from_peer(
     addr: &str,
     falcon_signing_key: &[u8],

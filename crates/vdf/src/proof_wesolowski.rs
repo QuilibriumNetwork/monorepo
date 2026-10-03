@@ -445,6 +445,10 @@ where
   (y_i, pi_i)
 }
 
+// ID-bound proof aggregation: implemented and unit-testable, but no caller
+// in this workspace produces multi-worker parts yet. Kept so the scheme
+// stays reviewable alongside the single-prover path above.
+#[allow(dead_code)]
 pub struct Aggregated<V: ClassGroup, T: BigNum> {
   pub y_agg: V,              // ∏ y_i
   pub pi_agg: V,             // ∏ pi_i
@@ -453,6 +457,7 @@ pub struct Aggregated<V: ClassGroup, T: BigNum> {
   pub _phantom_b: std::marker::PhantomData<T>,
 }
 
+#[allow(dead_code)] // see the note on `Aggregated`
 pub fn aggregate_worker_parts<V, T>(parts: &[(V, V)], ids_commitment: [u8; 32]) -> Aggregated<V, T>
 where
   V: ClassGroup<BigNum = T> + Clone,
@@ -478,6 +483,7 @@ where
   }
 }
 
+#[allow(dead_code)] // see the note on `Aggregated`
 pub fn serialize_aggregated<V: ClassGroup>(agg: &Aggregated<V, V::BigNum>, int_size_bits: usize) -> Vec<u8> {
   super::proof_of_time::serialize(&[agg.pi_agg.clone()], &agg.y_agg, int_size_bits)
 }
@@ -494,6 +500,7 @@ pub fn serialize_aggregated<V: ClassGroup>(agg: &Aggregated<V, V::BigNum>, int_s
 ///   b = HashPrimeFixed(challenge, int_size_bits, t, commit_ids(ids))
 ///   r = 2^t mod b
 ///   S = sum_i HashToExponent(challenge, id_i)
+#[allow(dead_code)] // see the note on `Aggregated`
 pub fn verify_aggregated<TN, V>(
   challenge: &[u8],
   int_size_bits: u16,

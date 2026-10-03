@@ -328,6 +328,8 @@ pub fn fold_sparse(
 /// fold against a direct build.
 pub struct ShardedCoinTree {
     context: [u8; 32],
+    // Construction context retained alongside the precomputed tree nodes.
+    #[allow(dead_code)]
     key: MembershipKey,
     zeros: Vec<Node>,
     shape: Shape,
