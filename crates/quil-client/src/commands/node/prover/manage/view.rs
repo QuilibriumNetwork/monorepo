@@ -2,6 +2,7 @@
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
 use num_bigint::BigInt;
+use super::super::epoch::EffectiveStatus;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -235,14 +236,12 @@ fn header_line(m: &Model) -> Line<'static> {
 fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     let mut joining = BigInt::from(0);
     let mut active = BigInt::from(0);
-    let mut paused = BigInt::from(0);
-    let mut leaving = BigInt::from(0);
+    let paused = BigInt::from(0);
+    let leaving = BigInt::from(0);
     for a in sorted {
-        match a.status {
-            1 => joining += &a.estimated_reward,
-            2 => active += &a.estimated_reward,
-            3 => paused += &a.estimated_reward,
-            4 => leaving += &a.estimated_reward,
+        match a.reward_status(m.epoch_frame(), m.epoch_length) {
+            Some(EffectiveStatus::Joining) => joining += &a.estimated_reward,
+            Some(EffectiveStatus::Active) => active += &a.estimated_reward,
             _ => {}
         }
     }
@@ -483,12 +482,15 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
             .collect();
 
         if selected {
-            let joined = cells.join(" ");
-            let padded = format!("{:<width$}", joined, width = content_width);
-            lines.push(Line::from(Span::styled(
-                padded,
-                Style::new().fg(TEXT).bg(PRIMARY),
-            )));
+            let mut spans = Vec::new();
+            for (ci, cell) in cells.iter().enumerate() {
+                if ci > 0 { spans.push(Span::raw(" ")); }
+                let color = if ci == 9 && m.color_coding && a.worker_id < 0 { ERROR } else { TEXT };
+                spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
+            }
+            let used = cells.iter().map(String::len).sum::<usize>() + cells.len().saturating_sub(1);
+            spans.push(Span::raw(" ".repeat(content_width.saturating_sub(used))));
+            lines.push(Line::from(spans).style(Style::new().fg(TEXT).bg(PRIMARY)));
         } else {
             let mut spans: Vec<Span> = Vec::new();
             for (ci, cell) in cells.iter().enumerate() {
@@ -496,6 +498,9 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
                     spans.push(Span::raw(" "));
                 }
                 let span = match ci {
+                    9 if m.color_coding && a.worker_id < 0 => {
+                        Span::styled(cell.clone(), Style::new().fg(ERROR))
+                    }
                     3 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(ring_color(a.ring))),
                     8 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(materialization_state_color(materialization_state(a.materialized_frame, a.latest_frame)))),
                     11 if m.color_coding => {
