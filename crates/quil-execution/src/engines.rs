@@ -415,6 +415,7 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
         }
         // Staging failure must abort frame processing. Successful publication
         // clears the changeset so later requests do not reapply prior writes.
+        let _timing = crate::step_timing::section("stage changes");
         publish_execution_changes(self.state.as_deref(), checkpoint)?;
         Ok(ProcessMessageResult { messages: Vec::new(), state: Vec::new() })
     }

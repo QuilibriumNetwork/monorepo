@@ -47,6 +47,9 @@ use quil_types::store::{
 mod registry_budget;
 pub use registry_budget::{RegistryLimits, RegistryUsage};
 use registry_budget::{collect_legacy, RegistryBudget};
+#[path = "registry_rows.rs"]
+mod registry_rows;
+use registry_rows::RegistryRows;
 
 /// BN254 scalar field modulus, same as `iden3-crypto/ff.Modulus()`.
 /// Used for the modular-distance sort that picks "next prover" order.
@@ -86,6 +89,12 @@ pub struct InMemoryProverRegistry {
     /// Largest key + value, and largest value, among the rows it read.
     largest_row: usize,
     largest_value: usize,
+    /// The rows a refresh read, so a later change updates only what it
+    /// feeds. `None` after the legacy tree fallback. Shared until changed.
+    rows: Option<Arc<RegistryRows>>,
+    /// A cache was edited directly, so it may differ from its rows until the
+    /// next refresh.
+    diverged: bool,
     /// prover_address (32 bytes) → full ProverInfo with allocations
     prover_cache: HashMap<Vec<u8>, ProverInfo>,
     /// (member_address, leaf_id) → registered leaf-root record. `leaf_id` is
@@ -126,6 +135,8 @@ impl InMemoryProverRegistry {
             from_rows: false,
             largest_row: 0,
             largest_value: 0,
+            rows: None,
+            diverged: false,
             prover_cache: HashMap::new(),
             leaf_root_cache: HashMap::new(),
             filter_cache: HashMap::new(),
@@ -145,6 +156,8 @@ impl InMemoryProverRegistry {
         self.from_rows = false;
         self.largest_row = 0;
         self.largest_value = 0;
+        self.rows = None;
+        self.diverged = false;
         self.prover_cache.clear();
         self.leaf_root_cache.clear();
         self.filter_cache.clear();
@@ -215,13 +228,15 @@ impl InMemoryProverRegistry {
         // populates it too. One row per `(set, phase, shard, vk)` so
         // no dedup is required.
         let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut rows = RegistryRows::default();
         visit_registry_vertices(snapshot, "adds", &shard, limits.page(), |vk, data| {
             budget.input(vk.len(), data.len(), true)?;
             row(vk.len(), data.len());
+            rows.add(vk[32..].try_into().expect("64-byte registry key"), &data);
             leaves.push((vk, data));
             Ok(())
         })?;
-        let from_rows = !leaves.is_empty();
+        let from_rows = rows.has_adds();
 
         // Transitional bootstrap: stores from before the per-vertex
         // commit invariant have data only in the tree blob. Fall back
@@ -258,6 +273,7 @@ impl InMemoryProverRegistry {
         visit_registry_vertices(snapshot, "removes", &shard, limits.page(), |vk, data| {
             budget.input(vk.len(), data.len(), true)?;
             row(vk.len(), data.len());
+            rows.remove(vk[32..].try_into().expect("64-byte registry key"), data.len());
             removed_vks.insert(vk);
             Ok(())
         })?;
@@ -266,7 +282,14 @@ impl InMemoryProverRegistry {
         }
 
         let mut replacement = Self::new();
-        replacement.decode_vertices(&leaves, &mut budget)?;
+        if from_rows {
+            // The same rows, passes and charges as `decode_vertices`, indexed
+            // so a later change to some rows updates only what they feed.
+            replacement.compose_from_rows(&mut rows, &mut budget)?;
+            replacement.rows = Some(Arc::new(rows));
+        } else {
+            replacement.decode_vertices(&leaves, &mut budget)?;
+        }
         replacement.resource_usage = budget.usage;
         replacement.from_rows = from_rows;
         replacement.scanned = snapshot.scan_point().filter(|_| from_rows);
@@ -368,49 +391,78 @@ impl InMemoryProverRegistry {
                 continue;
             };
             budget.allocation(&prover_ref, &alloc)?;
-            // Find or synthesize the parent prover.
-            let prover_entry = self
-                .prover_cache
-                .entry(prover_ref.clone())
-                .or_insert_with(|| ProverInfo {
-                    public_key: retired_keys.get(&prover_ref).cloned().unwrap_or_default(),
-                    address: prover_ref.clone(),
-                    status: ProverStatus::Unknown,
-                    kick_frame_number: 0,
-                    allocations: Vec::new(),
-                    available_storage: 0,
-                    seniority: 0,
-                    delegate_address: Vec::new(),
-                });
-            let confirmation_filter = alloc.confirmation_filter.clone();
-            let is_active = alloc.status == ProverStatus::Active;
-            prover_entry.allocations.push(alloc);
-
-            // Update filter_cache and address_to_filters.
-            let filter_list = self
-                .filter_cache
-                .entry(confirmation_filter.clone())
-                .or_default();
-            // Binary search + insert to maintain sorted order.
-            match filter_list.binary_search_by(|a| a.as_slice().cmp(prover_ref.as_slice())) {
-                Ok(_) => {}
-                Err(idx) => filter_list.insert(idx, prover_ref.clone()),
-            }
-
-            if is_active {
-                let addr_filters = self
-                    .address_to_filters
-                    .entry(prover_ref.clone())
-                    .or_default();
-                if !addr_filters.iter().any(|f| f == &confirmation_filter) {
-                    addr_filters.push(confirmation_filter);
-                }
-            }
+            self.attach_allocation(&prover_ref, alloc, retired_keys.get(&prover_ref));
         }
         Ok(())
     }
 
+    /// Append `alloc` to its owner, synthesizing the owner's row (keyed by a
+    /// retired prover's public key) when it has none, and index its filter.
+    fn attach_allocation(&mut self, prover_ref: &[u8], alloc: ProverAllocationInfo, retired_key: Option<&Vec<u8>>) {
+        // Find or synthesize the parent prover.
+        let prover_entry = self
+            .prover_cache
+            .entry(prover_ref.to_vec())
+            .or_insert_with(|| ProverInfo {
+                public_key: retired_key.cloned().unwrap_or_default(),
+                address: prover_ref.to_vec(),
+                status: ProverStatus::Unknown,
+                kick_frame_number: 0,
+                allocations: Vec::new(),
+                available_storage: 0,
+                seniority: 0,
+                delegate_address: Vec::new(),
+            });
+        let confirmation_filter = alloc.confirmation_filter.clone();
+        let is_active = alloc.status == ProverStatus::Active;
+        prover_entry.allocations.push(alloc);
+
+        // Update filter_cache and address_to_filters.
+        let filter_list = self
+            .filter_cache
+            .entry(confirmation_filter.clone())
+            .or_default();
+        // Binary search + insert to maintain sorted order.
+        match filter_list.binary_search_by(|a| a.as_slice().cmp(prover_ref)) {
+            Ok(_) => {}
+            Err(idx) => filter_list.insert(idx, prover_ref.to_vec()),
+        }
+
+        if is_active {
+            let addr_filters = self
+                .address_to_filters
+                .entry(prover_ref.to_vec())
+                .or_default();
+            if !addr_filters.iter().any(|f| f == &confirmation_filter) {
+                addr_filters.push(confirmation_filter);
+            }
+        }
+    }
+
     pub fn resource_usage(&self) -> RegistryUsage { self.resource_usage }
+
+    /// Everything a refresh determines, in a fixed order (not the scan point).
+    #[cfg(test)]
+    fn content(&self) -> String {
+        fn sorted<K: Ord + Clone, V: Clone>(map: &HashMap<K, V>) -> Vec<(K, V)> {
+            let mut entries: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries
+        }
+        format!(
+            "{:?}",
+            (
+                sorted(&self.prover_cache),
+                sorted(&self.leaf_root_cache),
+                sorted(&self.filter_cache),
+                sorted(&self.address_to_filters),
+                (self.reward_vertex_count, self.prover_vertex_count, self.allocation_vertex_count,
+                    self.leaf_root_vertex_count, self.unknown_vertex_count),
+                self.resource_usage,
+                (self.largest_row, self.largest_value, self.from_rows),
+            ),
+        )
+    }
 
     // ------------------------------------------------------------------
     // Query API (mirrors `consensus.ProverRegistry` trait methods)
@@ -677,6 +729,7 @@ impl InMemoryProverRegistry {
                 touched += 1;
             }
         }
+        self.diverged |= touched > 0;
         touched
     }
 
@@ -981,9 +1034,12 @@ impl SharedProverRegistry {
         {
             return Err(QuilError::ExecutionUnavailable("registry publication binding mismatch".into()));
         }
-        let source = self.inner.try_write().map_err(|_| QuilError::ExecutionUnavailable(
+        // Readers of the canonical registry (leader selection, RPC) hold it
+        // briefly; wait them out rather than discard the executed frame.
+        let patience = quil_types::lock_patience::Patience::new();
+        let source = patience.write(&self.inner).ok_or_else(|| QuilError::ExecutionUnavailable(
             "canonical registry is busy or poisoned".into()))?;
-        let incoming = incoming.inner.try_write().map_err(|_| QuilError::ExecutionUnavailable(
+        let incoming = patience.write(&incoming.inner).ok_or_else(|| QuilError::ExecutionUnavailable(
             "private registry is busy or poisoned".into()))?;
         Ok(PreparedRegistryAdoption { source, incoming, adopted: false })
     }
@@ -1068,6 +1124,45 @@ impl SharedProverRegistry {
         let after = self.snapshot_local_prover();
         log_local_prover_diff(before.as_ref(), after.as_ref());
         Ok(())
+    }
+
+    /// Bring an execution branch's registry up to date with the registry rows
+    /// `overlay` wrote, updating only the records they feed. A full refresh
+    /// runs only when that cannot match one exactly (see
+    /// `InMemoryProverRegistry::update_rows`) or the writes cannot be listed.
+    pub(crate) fn update_written_rows(
+        &self,
+        store: &dyn HypergraphStore,
+        overlay: &quil_forest::ExecutionOverlay,
+    ) -> QuilResult<()> {
+        self.check_execution_store(store.backing_store_identity())?;
+        let Some((_, limits)) = self.execution_binding.as_ref() else {
+            return self.refresh_from_store(store);
+        };
+        let Some(written) = registry_rows::written_rows(overlay) else {
+            return self.refresh_from_store(store);
+        };
+        {
+            let mut guard = self.inner.write()
+                .map_err(|_| QuilError::ExecutionUnavailable("registry lock poisoned".into()))?;
+            // Rows from the legacy tree, or a cache edited directly: a refresh
+            // would differ even where no row changed.
+            if !guard.diverged && guard.rows.is_some() {
+                if written.is_empty() {
+                    return Ok(());
+                }
+                let snapshot = store.capture_tree_snapshot()?.ok_or_else(|| {
+                    QuilError::Store("prover registry requires a consistent store snapshot".into())
+                })?;
+                if guard
+                    .update_rows(snapshot.as_ref(), &written, *limits)
+                    .map_err(|error| QuilError::ExecutionUnavailable(format!("execution registry refresh: {error}")))?
+                {
+                    return Ok(());
+                }
+            }
+        }
+        self.refresh_from_store(store)
     }
 
     /// Read the LOCAL prover's `ProverInfo` (if any), keyed by the
@@ -1305,6 +1400,7 @@ impl SharedProverRegistry {
             for addr in &evicted {
                 guard.prover_cache.remove(addr);
             }
+            guard.diverged = true;
         }
 
         Ok(evicted)
@@ -4123,5 +4219,6 @@ mod tests {
     }
 
     include!("prover_registry_storage_tests.rs");
+    include!("registry_rows_tests.rs");
 
 }

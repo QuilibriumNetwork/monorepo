@@ -237,3 +237,63 @@ fn pacing_leader_holds_its_turn_and_others_give_it_up() {
     assert_eq!(paced_propose(true), Some(Sha256Digest([7; 32])));
     assert_eq!(paced_propose(false), None, "a declined turn without a retry nullifies the view");
 }
+
+/// Busy the way a voter publishing the previous frame is: it defers a number
+/// of checks, then answers.
+struct BusyVerifier {
+    busy_for: std::sync::atomic::AtomicU32,
+    answer: bool,
+    asked: std::sync::atomic::AtomicU32,
+}
+impl GlobalProposer for BusyVerifier {
+    fn propose(&self, _view: u64, _parent: Sha256Digest) -> Option<(Sha256Digest, Vec<u8>)> {
+        None
+    }
+    fn verify(&self, _: u64, _: Sha256Digest, _: Sha256Digest, _: Option<Vec<u8>>) -> bool {
+        unreachable!("the adapter checks through verify_or_defer")
+    }
+    fn verify_or_defer(
+        &self,
+        _: quil_cw_consensus::adapters::ProposalContext,
+        _: Sha256Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> Result<bool, Duration> {
+        use std::sync::atomic::Ordering;
+        assert_eq!(bytes.as_deref(), Some(&[9u8][..]), "every attempt sees the delivered body");
+        self.asked.fetch_add(1, Ordering::AcqRel);
+        if self.busy_for.load(Ordering::Acquire) > 0 {
+            self.busy_for.fetch_sub(1, Ordering::AcqRel);
+            return Err(Duration::from_millis(200));
+        }
+        Ok(self.answer)
+    }
+}
+
+fn busy_verify(busy_for: u32, answer: bool) -> (Option<bool>, u32) {
+    use commonware_consensus::{simplex::types::Context, Automaton as _};
+    let leader = FalconPrivateKey::random(commonware_utils::test_rng()).public_key();
+    deterministic::Runner::timed(Duration::from_secs(120)).start(|context| async move {
+        let verifier = Arc::new(BusyVerifier { busy_for: busy_for.into(), answer, asked: 0.into() });
+        let store = BlockStore::new();
+        let payload = Sha256Digest([9; 32]);
+        store.put(payload, vec![9]);
+        let mut automaton = quil_cw_consensus::adapters::FalconAutomaton::new(
+            context.child("automaton"), verifier.clone(), store);
+        let round = Round::new(Epoch::new(1), View::new(5));
+        let pending = automaton
+            .verify(Context { round, leader, parent: (View::new(4), Sha256Digest([1; 32])) }, payload)
+            .await;
+        let verdict = pending.await.ok();
+        (verdict, verifier.asked.load(std::sync::atomic::Ordering::Acquire))
+    })
+}
+
+#[test]
+fn a_busy_voter_answers_once_free_instead_of_nullifying() {
+    assert_eq!(busy_verify(5, true), (Some(true), 6), "deferred checks are asked again");
+    assert_eq!(busy_verify(0, false), (Some(false), 1), "a rejection is final");
+    assert_eq!(busy_verify(3, false), (Some(false), 4));
+    let (verdict, asked) = busy_verify(u32::MAX, true);
+    assert_eq!(verdict, Some(false), "a voter busy past its patience declines");
+    assert!(asked > 50 && asked < 200, "bounded by patience, asked {asked} times");
+}

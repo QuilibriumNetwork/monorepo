@@ -22,6 +22,77 @@ use crate::message_collector::MessageCollector;
 /// Expected length of a valid VDF output (258-byte Y + 258-byte proof).
 const VDF_OUTPUT_LEN: usize = 516;
 
+/// The global op kinds a collected bundle carries, for timing logs.
+pub(crate) fn message_kinds(raw: &[u8]) -> String {
+    let Ok(bundle) = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(raw) else {
+        return "undecodable".into();
+    };
+    let kinds: Vec<String> = bundle
+        .requests
+        .iter()
+        .flatten()
+        .map(|request| {
+            quil_execution::global_engine::peek_global_message_kind(&request.inner_bytes)
+                .map(|kind| format!("{kind:?}"))
+                .unwrap_or_else(|_| format!("0x{:08x}", request.inner_type_prefix))
+        })
+        .collect();
+    if kinds.is_empty() { "empty".into() } else { kinds.join("+") }
+}
+
+/// Refusals remembered for one validation context.
+const REJECTED_MESSAGES_KEPT: usize = 4096;
+
+/// What a proposal's message validation reads: the frame being proposed, the
+/// parent it builds on, and the GLOBAL frame committed in the validator's
+/// state (the parent's own height in an execution branch).
+type ValidationContext = (u64, Vec<u8>, u64);
+
+/// Messages validation refused under one [`ValidationContext`], shared by a
+/// node's leader and every execution-branch leader it makes. A proposal
+/// validates a private copy of the mempool and leaves the public pool as it
+/// is, so each proposal at one height validated the same refused messages
+/// again: after the split at 837360, 36 of them took most of every
+/// proposal's validation time.
+#[derive(Default)]
+struct RejectedMessages {
+    context: Option<ValidationContext>,
+    reasons: std::collections::HashMap<[u8; 32], String>,
+    #[cfg(test)]
+    reused: usize,
+}
+
+impl RejectedMessages {
+    /// Forget refusals made under any other context. `None` (the committed
+    /// frame could not be read) remembers nothing.
+    fn enter(&mut self, context: Option<ValidationContext>) {
+        if context.is_none() || self.context != context {
+            self.reasons.clear();
+        }
+        self.context = context;
+    }
+
+    fn refused(&mut self, hash: &[u8; 32]) -> Option<String> {
+        let reason = self.reasons.get(hash).cloned();
+        #[cfg(test)]
+        if reason.is_some() {
+            self.reused += 1;
+        }
+        reason
+    }
+
+    fn remember(&mut self, context: &Option<ValidationContext>, hash: [u8; 32], reason: String) {
+        if context.is_some() && self.context == *context && self.reasons.len() < REJECTED_MESSAGES_KEPT {
+            self.reasons.insert(hash, reason);
+        }
+    }
+}
+
+/// Longest a leader spends validating mempool messages for one proposal. The
+/// proof and execution must still fit the selected-parent deadline (60 s) and
+/// the frame cadence; the rest wait for a later frame.
+const MESSAGE_VALIDATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Global chain leader provider. Selects leaders based on the prover
 /// registry's ordered prover list, seeded by the parent frame's
 /// `parent_selector`. Produces frames by collecting messages, computing
@@ -56,6 +127,7 @@ pub struct GlobalLeaderProvider {
     /// re-proposed every rank until it ages out. `None` disables the gate
     /// (tests / nodes without an execution manager wired).
     message_validator: Option<Arc<quil_execution::ExecutionEngineManager>>,
+    rejected: Arc<std::sync::Mutex<RejectedMessages>>,
     /// Hypergraph CRDT used to compute the `prover_tree_commitment` the
     /// leader binds into the frame header (and the VDF challenge) at
     /// proving time. Mirrors Go's `rebuildShardCommitments`, which commits
@@ -78,6 +150,18 @@ impl GlobalLeaderProvider {
             && self.clock_store.backing_store_identity() == manager.crdt().backing_store_identity()
     }
 
+    /// Why the current validation context refused `raw`, if it did.
+    #[cfg(test)]
+    pub(crate) fn refused_message(&self, raw: &[u8]) -> Option<String> {
+        self.rejected.lock().unwrap().reasons.get(&<[u8; 32]>::from(Sha256::digest(raw))).cloned()
+    }
+
+    /// How many messages were dropped on a remembered refusal.
+    #[cfg(test)]
+    pub(crate) fn refusals_reused(&self) -> usize {
+        self.rejected.lock().unwrap().reused
+    }
+
     pub(crate) fn for_execution_branch(
         &self, branch: &quil_execution::ExecutionBranch, rank: u64,
         max_bytes: usize, max_items: usize, consumed: &[Vec<u8>],
@@ -87,13 +171,15 @@ impl GlobalLeaderProvider {
             collector.add_message(rank, bytes);
         }
         collector.mark_finalized(consumed);
-        Ok(Self::new(
+        let mut leader = Self::new(
             Arc::new(branch.registry().clone()), self.frame_prover.clone(),
             self.difficulty_adjuster.clone(), branch.clock_store().clone(), collector,
             self.local_prover_address.clone(), self.local_public_key.clone(),
             self.signer.clone(), self.inclusion_prover.clone(),
             Some(branch.manager().clone()), Some(branch.manager().crdt()),
-        ))
+        );
+        leader.rejected = self.rejected.clone();
+        Ok(leader)
     }
 
     pub fn new(
@@ -120,6 +206,7 @@ impl GlobalLeaderProvider {
             signer,
             inclusion_prover,
             message_validator,
+            rejected: Default::default(),
             hypergraph,
         }
     }
@@ -669,6 +756,23 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // First pass: hold in-lockstep shard proofs for tip coalescing
                 // (below); validate non-shard messages inline.
                 let mut in_lockstep_shard: Vec<Vec<u8>> = Vec::new();
+                // A proposal must fit its execution deadline. Messages left
+                // unvalidated once the budget is spent stay in the mempool for
+                // a later frame; on a loaded node, 30 prover messages took
+                // 160 s here and no leader could propose.
+                let validation_started = std::time::Instant::now();
+                let mut deferred = 0usize;
+                // Op kinds → (messages, total ms, slowest ms), logged when
+                // validation is slow, to tell one costly op from a slow store.
+                let mut validation_ms: std::collections::HashMap<String, (usize, u64, u64)> =
+                    std::collections::HashMap::new();
+                // A refusal stands while validation reads the same state.
+                let context = validator
+                    .crdt()
+                    .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                    .ok()
+                    .map(|committed| (frame_number, prior_state_id.to_vec(), committed));
+                self.rejected.lock().unwrap().enter(context.clone());
                 for raw in collected {
                     if crate::message_collector::bundle_has_shard_frame(&raw) {
                         // Strict lockstep: a shard proof rides ONLY if its ANCHOR
@@ -693,7 +797,24 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         }
                         continue;
                     }
-                    match validator.validate_message(frame_number, &global_addr, &raw) {
+                    let hash: [u8; 32] = Sha256::digest(&raw).into();
+                    if let Some(reason) = self.rejected.lock().unwrap().refused(&hash) {
+                        *drop_reasons
+                            .entry(format!("{} :: refused earlier: {}", msg_type(&raw), reason))
+                            .or_insert(0) += 1;
+                        invalid.push(raw);
+                        continue;
+                    }
+                    if validation_started.elapsed() >= MESSAGE_VALIDATION_BUDGET {
+                        deferred += 1;
+                        continue;
+                    }
+                    let started = std::time::Instant::now();
+                    let outcome = validator.validate_message(frame_number, &global_addr, &raw);
+                    let ms = started.elapsed().as_millis() as u64;
+                    let entry = validation_ms.entry(message_kinds(&raw)).or_insert((0, 0, 0));
+                    *entry = (entry.0 + 1, entry.1 + ms, entry.2.max(ms));
+                    match outcome {
                         Ok(()) => valid.push(raw),
                         Err(e) => {
                             // Normalize the reason (digit runs → '#') so per-epoch /
@@ -707,6 +828,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                             *drop_reasons
                                 .entry(format!("{} :: {}", msg_type(&raw), reason))
                                 .or_insert(0) += 1;
+                            self.rejected.lock().unwrap().remember(&context, hash, reason);
                             tracing::debug!(
                                 frame = frame_number,
                                 error = %e,
@@ -716,6 +838,20 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         }
                     }
                 }
+                if validation_started.elapsed() >= crate::stage_clock::SLOW_EXECUTION {
+                    let mut by_kind: Vec<_> = validation_ms.into_iter().collect();
+                    by_kind.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+                    tracing::warn!(
+                        frame = frame_number,
+                        total_ms = validation_started.elapsed().as_millis() as u64,
+                        by_kind = %by_kind
+                            .iter()
+                            .map(|(kind, (n, total, max))| format!("{n}× {kind}: {total} ms (max {max})"))
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                        "slow GLOBAL message validation",
+                    );
+                }
                 // Tip-per-shard coalescing. The lockstep gate admits a shard
                 // proof by its ANCHOR, NOT its count — a shard that produced several
                 // local frames all anchored to the same prior global frame passes them
@@ -724,6 +860,15 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // state roots subsume its ancestors, so only the HIGHEST LOCAL frame
                 // per shard address needs to ride the global frame. Coalesce to the
                 // tip → request set O(#shards).
+                if deferred > 0 {
+                    tracing::warn!(
+                        frame = frame_number,
+                        deferred,
+                        validated = valid.len() + invalid.len(),
+                        budget_ms = MESSAGE_VALIDATION_BUDGET.as_millis() as u64,
+                        "GLOBAL message validation budget spent; deferring the rest to a later frame",
+                    );
+                }
                 let (tips, superseded) = coalesce_shard_frames_to_tip(in_lockstep_shard);
                 let coalesced = superseded.len();
                 valid.extend(tips);
@@ -1346,6 +1491,42 @@ mod tests {
         CanonicalMessageBundle { requests: vec![Some(req)], timestamp: 0 }
             .to_canonical_bytes()
             .unwrap()
+    }
+
+    // Post-split, every proposal at one height validated the same 36 refused
+    // messages again.
+    #[test]
+    fn a_refusal_stands_until_the_height_parent_or_committed_frame_moves() {
+        let mut rejected = RejectedMessages::default();
+        let (bad, other) = ([1u8; 32], [2u8; 32]);
+        let at = |frame: u64, parent: u8, committed: u64| Some((frame, vec![parent; 32], committed));
+        rejected.enter(at(837364, 7, 837363));
+        rejected.remember(&at(837364, 7, 837363), bad, "invalid allocation status".into());
+        rejected.enter(at(837364, 7, 837363));
+        assert_eq!(rejected.refused(&bad).as_deref(), Some("invalid allocation status"));
+        assert_eq!(rejected.refused(&other), None);
+
+        // A refusal made under a context that has since changed is not kept.
+        rejected.remember(&at(837364, 7, 837362), other, "stale".into());
+        assert_eq!(rejected.refused(&other), None);
+
+        for moved in [at(837365, 7, 837363), at(837364, 8, 837363), at(837364, 7, 837364), None] {
+            rejected.enter(at(837364, 7, 837363));
+            rejected.remember(&at(837364, 7, 837363), bad, "refused".into());
+            rejected.enter(moved.clone());
+            assert_eq!(rejected.refused(&bad), None, "{moved:?}");
+        }
+        // Without a readable committed frame nothing is remembered.
+        rejected.remember(&None, bad, "refused".into());
+        assert_eq!(rejected.refused(&bad), None);
+
+        rejected.enter(at(1, 0, 0));
+        for n in 0..REJECTED_MESSAGES_KEPT + 10 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            rejected.remember(&at(1, 0, 0), hash, "refused".into());
+        }
+        assert_eq!(rejected.reasons.len(), REJECTED_MESSAGES_KEPT);
     }
 
     #[test]

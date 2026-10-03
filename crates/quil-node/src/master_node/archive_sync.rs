@@ -44,6 +44,19 @@ const RUNTIME_GAP_CHECK: std::time::Duration = std::time::Duration::from_secs(60
 /// below the head has been observed); older records are left to retention.
 const REGULAR_GAP_WINDOW: u64 = 2 * 1440;
 
+/// Frames below the head an archive's background fill looks for holes in: the
+/// last two epochs. An older hole is history no peer serves; scanning the whole
+/// chain had a lagging archive retry one every 3 s, from frame 257,487 up.
+fn archive_gap_window() -> u64 {
+    2 * quil_types::consensus::epoch_length_frames()
+}
+
+/// The frame-record holes an archive's background fill backfills.
+fn recent_record_gaps(clock: &quil_store::RocksClockStore) -> Vec<(u64, u64)> {
+    let head = clock.get_latest_frame_number().unwrap_or(0);
+    clock.find_global_frame_record_gaps_from(head.saturating_sub(archive_gap_window()))
+}
+
 /// Passes a regular spends on one hole before leaving it to retention.
 const REGULAR_GAP_ATTEMPTS: u32 = 5;
 
@@ -474,8 +487,8 @@ fn canonical_hole_frame(
     Ok(())
 }
 
-/// Scan the ENTIRE persisted frame-record range for internal gaps left by
-/// prior restarts and backfill each one. The reseed-anchored backfill
+/// Scan the last two epochs of frame records for internal gaps left
+/// by prior restarts and backfill each one. The reseed-anchored backfill
 /// (`run_record_only_backfill` called from bootstrap) only covers the single
 /// open range ABOVE the head (`[canonical_head+1, reseed-1]`); it does not see
 /// the many small 2-3 frame holes scattered BELOW the head that accumulate
@@ -491,12 +504,10 @@ async fn run_all_gap_backfill(
     seed: Vec<u8>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    // The gap scan walks the whole frame keyspace (key-only, no decode) — run
-    // it on a blocking thread so it never stalls the async runtime.
+    // Key-only and windowed, but still a keyspace walk: run it on a blocking
+    // thread so it never stalls the async runtime.
     let scan_cs = clock_store.clone();
-    let gaps = match tokio::task::spawn_blocking(move || {
-        scan_cs.find_global_frame_record_gaps()
-    })
+    let gaps = match tokio::task::spawn_blocking(move || recent_record_gaps(&scan_cs))
     .await
     {
         Ok(g) => g,
@@ -3458,6 +3469,24 @@ mod validation_tests {
     use super::*;
     use std::collections::HashSet;
 
+    // A lagging archive's fill retried one ancient hole every 3 s, from frame
+    // 257,487 up, while it fell further behind.
+    #[test]
+    fn an_archive_fills_only_holes_in_the_last_two_epochs() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let head = 10 * quil_types::consensus::epoch_length_frames();
+        let window = archive_gap_window();
+        for n in [1, 2, 5, head - window - 10, head - 100, head - 98, head] {
+            let frame = quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader { frame_number: n, ..Default::default() }),
+                requests: Vec::new(),
+            };
+            clock.put_global_frame(&frame, None).unwrap();
+        }
+        assert_eq!(recent_record_gaps(&clock), vec![(head - 99, head - 99), (head - 97, head - 1)]);
+    }
+
     #[test]
     fn a_stalled_execution_behind_the_canonical_head_is_detected() {
         assert!(execution_stalled_behind(0, 0, 390), "the live archive: frame 1 missing, head far ahead");
@@ -3639,12 +3668,13 @@ fn canonical_atomic_attempts(
     frame: &quil_types::proto::global::GlobalFrame,
 ) -> quil_engine::frame_materializer::CanonicalAttempt {
     use quil_engine::frame_materializer::{CanonicalAttempt, GlobalParentLimits};
-    let mut attempt = m.materialize_canonical_atomically(frame, GlobalParentLimits::default().branch);
+    let limits = GlobalParentLimits::default().branch.for_finalized_frame();
+    let mut attempt = m.materialize_canonical_atomically(frame, limits);
     for _ in 1..3 {
         if !matches!(attempt, CanonicalAttempt::Unavailable(_)) {
             break;
         }
-        attempt = m.materialize_canonical_atomically(frame, GlobalParentLimits::default().branch);
+        attempt = m.materialize_canonical_atomically(frame, limits);
     }
     attempt
 }

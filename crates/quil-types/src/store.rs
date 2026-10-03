@@ -369,6 +369,16 @@ pub trait ClockStore: Send + Sync {
         &self,
         filter: &[u8],
     ) -> Result<proto::global::AppShardFrame>;
+    /// The latest stored frame number of shard `filter`, without reading the
+    /// frame: an application frame can be megabytes, and status queries need
+    /// only its number. `None` when the shard has no frame.
+    fn get_latest_shard_clock_frame_number(&self, filter: &[u8]) -> Result<Option<u64>> {
+        match self.get_latest_shard_clock_frame(filter) {
+            Ok(frame) => Ok(frame.header.map(|header| header.frame_number)),
+            Err(crate::error::QuilError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
     fn get_shard_clock_frame(
         &self,
         filter: &[u8],

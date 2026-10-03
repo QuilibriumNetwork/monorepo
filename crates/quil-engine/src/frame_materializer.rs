@@ -793,6 +793,25 @@ impl FrameMaterializer {
             }
             self.execution_manager.preverify_bundles(&routed);
         }
+        // Where message execution goes when it runs slow: per op kind
+        // (messages, validate µs, process µs, slowest µs) and the execution
+        // sections the intrinsics mark. The epoch-boundary lifecycle wave
+        // spent 90-190 ms per message here against ~30 ms validating.
+        let execution_started = std::time::Instant::now();
+        let sections = quil_execution::step_timing::collect();
+        let mut execution_us: std::collections::HashMap<String, (usize, u64, u64, u64)> =
+            std::collections::HashMap::new();
+        let mut record_execution = |raw: &[u8], validate_us: u64, process_us: u64| {
+            let total = validate_us + process_us;
+            // Decoding a kind costs a copy of the bundle; only slow ones need it.
+            let kind = if total >= 10_000 {
+                crate::leader_provider::message_kinds(raw)
+            } else {
+                "under 10 ms".to_string()
+            };
+            let entry = execution_us.entry(kind).or_insert((0, 0, 0, 0));
+            *entry = (entry.0 + 1, entry.1 + validate_us, entry.2 + process_us, entry.3.max(total));
+        };
         for bundle in &frame.requests {
             // Per-bundle routing address. Default: the global engine
             // (0xff). At/after the fork, a DATA op (token transfer /
@@ -878,6 +897,7 @@ impl FrameMaterializer {
             // validate everything else here (sequentially, against the
             // mid-loop CRDT state those ops legitimately depend on).
             // `None` = valid; `Some(reason)` = rejected (with the reason).
+            let validate_started = std::time::Instant::now();
             let reject_reason: Option<String> = match fh_validation.get(&bundle_bytes) {
                 Some(&ok) => {
                     if !ok {
@@ -909,7 +929,9 @@ impl FrameMaterializer {
                     }
                 },
             };
+            let validate_us = validate_started.elapsed().as_micros() as u64;
             if let Some(reason) = reject_reason {
+                record_execution(&bundle_bytes, validate_us, 0);
                 skipped += 1;
                 outcomes.push(RequestOutcome {
                     status: RequestStatus::Rejected,
@@ -917,7 +939,8 @@ impl FrameMaterializer {
                 });
                 continue;
             }
-            match self.execution_manager.process_message_with_context(
+            let process_started = std::time::Instant::now();
+            let result = self.execution_manager.process_message_with_context(
                 quil_types::execution::FrameExecutionContext {
                     frame_number,
                     finalized_global_frame: frame_number.checked_sub(1),
@@ -928,7 +951,9 @@ impl FrameMaterializer {
                 &fee_multiplier,
                 &route_addr,
                 &bundle_bytes,
-            ) {
+            );
+            record_execution(&bundle_bytes, validate_us, process_started.elapsed().as_micros() as u64);
+            match result {
                 Ok(_) => {
                     processed += 1;
                     let fees = self.execution_manager.message_token_fees(&route_addr, &bundle_bytes);
@@ -955,6 +980,32 @@ impl FrameMaterializer {
                     });
                 }
             }
+        }
+        let sections = sections.finish();
+        if execution_started.elapsed() >= crate::stage_clock::SLOW_EXECUTION {
+            let ms = |us: u64| us / 1000;
+            let mut by_kind: Vec<_> = execution_us.into_iter().collect();
+            by_kind.sort_by(|a, b| (b.1 .1 + b.1 .2).cmp(&(a.1 .1 + a.1 .2)));
+            let mut sections = sections;
+            sections.sort_by(|a, b| b.2.cmp(&a.2));
+            warn!(
+                frame = frame_number,
+                tentative = self.tentative_execution,
+                total_ms = execution_started.elapsed().as_millis() as u64,
+                by_kind = %by_kind
+                    .iter()
+                    .map(|(kind, (n, validate, process, max))| format!(
+                        "{n}× {kind}: validate {} ms, process {} ms (max {})",
+                        ms(*validate), ms(*process), ms(*max)))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                sections = %sections
+                    .iter()
+                    .map(|(name, n, total)| format!("{name}: {n}× {} ms", total.as_millis()))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                "slow GLOBAL message execution",
+            );
         }
         // Persist the per-bundle outcomes for this frame (best-effort on the
         // canonical path; required for a complete tentative delta). Aligned by index to

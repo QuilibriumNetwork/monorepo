@@ -487,16 +487,13 @@ impl GlobalIntrinsic {
             TYPE_PROVER_JOIN => {
                 let op = ProverJoin::from_canonical_bytes(input)?;
                 let v = verify::validate_prover_join_structural(&op, frame_number)?;
-                // BLS48-581 G1 signature + proof-of-possession + merge
-                // target signatures — mirrors Go's
-                // `ProverJoin.Verify` at `global_prover_join.go:1095-1146`.
-                let sigs_ok = verify::verify_prover_join_signatures(
-                    &op,
-                    &v,
-                    self.key_manager.as_ref(),
-                    None, // no live hypergraph here for consumed-merge check
-                )?;
-                if !sigs_ok {
+                // Signature + proof-of-possession of the joining key, then the
+                // state gates, then the merge targets: a join refused for an
+                // allocation still active stops before paying one Ed448 check
+                // per merge target, which nothing caps. The verdict is the
+                // same in any order. Mirrors Go's `ProverJoin.Verify` at
+                // `global_prover_join.go:1095-1146`.
+                if !verify::verify_prover_join_key_signatures(&op, &v, self.key_manager.as_ref())? {
                     return Ok(false);
                 }
                 // Kicked-prover gate. When the validator caller
@@ -534,6 +531,14 @@ impl GlobalIntrinsic {
                             }))
                         },
                     )?;
+                }
+                if !verify::verify_prover_join_merge_signatures(
+                    &op,
+                    &v,
+                    self.key_manager.as_ref(),
+                    None, // no live hypergraph here for consumed-merge check
+                )? {
+                    return Ok(false);
                 }
                 // VDF proof-of-sequential-work was removed from joins.
                 // Once the structural, signature/PoP, not-kicked, and
@@ -1029,6 +1034,7 @@ impl GlobalIntrinsic {
                             // filters still apply.
                             if current_status == materialize::STATUS_JOINING {
                                 if let Some(store) = self.shards_store.as_ref() {
+                                    let _timing = crate::step_timing::section("confirm: grid admits joining filter");
                                     let grid = quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records());
                                     if !grid_admits_filter(&grid, filter)? {
                                         return Ok(());
@@ -1039,12 +1045,15 @@ impl GlobalIntrinsic {
                             // registered shard set; its provers bypass
                             // the halt-risk floor so they can drain onto
                             // the children (deep-split convergence).
-                            let shard_removed = self
-                                .shards_store
-                                .as_ref()
-                                .map(|s| !shard_filter_is_registered(
-                                    &quil_store::ShardMetadataBatch::new(s.clone(), state.pending_records()), filter))
-                                .unwrap_or(false);
+                            let shard_removed = {
+                                let _timing = crate::step_timing::section("confirm: shard still registered");
+                                self.shards_store
+                                    .as_ref()
+                                    .map(|s| !shard_filter_is_registered(
+                                        &quil_store::ShardMetadataBatch::new(s.clone(), state.pending_records()), filter))
+                                    .unwrap_or(false)
+                            };
+                            let _timing = crate::step_timing::section("confirm: halt-risk check and apply");
                             check_leave_confirm_halt_risk(
                                 filter,
                                 current_status,
@@ -1068,6 +1077,7 @@ impl GlobalIntrinsic {
                 // message (verify_prover_confirm), so they're authenticated as
                 // the signer's. Overwrite-in-place keyed (member, leaf_id).
                 if !op.leaf_roots.is_empty() {
+                    let _timing = crate::step_timing::section("confirm: leaf roots");
                     let member: [u8; 32] = op
                         .public_key_signature_bls48581
                         .as_ref()
@@ -1090,6 +1100,7 @@ impl GlobalIntrinsic {
                     // are registered for the shard they hold when it applies.
                     let targets = match self.shards_store.as_ref() {
                         Some(store) if frame_number >= super::leaf_root_registration::pre_registration_frame() => {
+                            let _timing = crate::step_timing::section("confirm: pending shard changes");
                             super::leaf_root_registration::pre_registration_targets(
                                 &store.all_pending_shard_changes()?,
                                 &op.filters,
@@ -1240,6 +1251,7 @@ impl GlobalIntrinsic {
 
         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
 
+        let load = crate::step_timing::section("filter op: load prover and allocation");
         // Load prover vertex data from CRDT.
         let prover_data = state.get(domain, &prover_address, va_disc)?
             .ok_or_else(|| QuilError::InvalidArgument("invoke_step: prover not found".into()))?;
@@ -1266,6 +1278,7 @@ impl GlobalIntrinsic {
             .ok_or_else(|| QuilError::InvalidArgument("invoke_step: allocation not found".into()))?;
 
         let mut alloc_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&alloc_data);
+        drop(load);
 
         // Defense-in-depth: re-run the op-specific signature verification
         // against the freshly loaded prover/alloc trees. The engine-side
@@ -1274,7 +1287,11 @@ impl GlobalIntrinsic {
         // loadable from state (intrinsic.rs:178-247). The materializer
         // is the last gate before state mutation — verify here so a
         // future validate-side bypass can't admit unsigned ops.
-        if !verify_sig(&prover_tree, Some(&alloc_tree))? {
+        let verified = {
+            let _timing = crate::step_timing::section("filter op: verify signature");
+            verify_sig(&prover_tree, Some(&alloc_tree))?
+        };
+        if !verified {
             return Err(QuilError::InvalidArgument(
                 "invoke_step: signature verification failed at materialize".into(),
             ));
@@ -1284,6 +1301,7 @@ impl GlobalIntrinsic {
         mutate(&mut alloc_tree, frame_number)?;
 
         // Serialize the modified allocation tree back to blob form.
+        let _timing = crate::step_timing::section("filter op: write allocation");
         let alloc_blob = crate::prover_registry::vertex_tree_to_blob(&alloc_tree);
         state.set(domain, &alloc_addr, va_disc, frame_number, alloc_blob)?;
 
@@ -1320,6 +1338,7 @@ impl GlobalIntrinsic {
         if prover_address.len() < 32 {
             return Err(QuilError::InvalidArgument("prover status: prover address too short".into()));
         }
+        let _timing = crate::step_timing::section("prover status");
         self.derive_prover_status(frame_number, &prover_address, filters, state, va_disc)
     }
 
@@ -1422,6 +1441,7 @@ impl GlobalIntrinsic {
                 prover_address: [0u8; 32],
                 filter_count: 0,
             };
+            let _timing = crate::step_timing::section("join: verify signatures");
             if !verify::verify_prover_join_signatures(
                 op,
                 &jv,
@@ -1442,6 +1462,7 @@ impl GlobalIntrinsic {
         // identical on every node. The freeze lifts automatically once
         // `apply_due_shard_changes` consumes the pending record at E+2.
         if let Some(store) = self.shards_store.as_ref() {
+            let _timing = crate::step_timing::section("join: pending changes and grid");
             let pending = quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records())
                 .all_pending_shard_changes()?;
             if !pending.is_empty() {
@@ -3762,6 +3783,76 @@ mod tests {
             gi.validate(105, &join, None, None).unwrap(),
             "join must validate on structural+BLS alone now that the VDF is gone",
         );
+    }
+
+    // A prover that rejoins while its allocation is still active is refused
+    // on every proposal; the refusal must not first pay one Ed448 check per
+    // merge target. Without the allocation, the merge targets still decide.
+    #[test]
+    fn join_refused_for_an_active_allocation_skips_merge_target_signatures() {
+        struct CountsEd448(std::sync::atomic::AtomicUsize);
+        impl KeyManager for CountsEd448 {
+            fn validate_signature(&self, key_type: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+                if key_type == KeyType::Ed448 {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+        }
+        let public_key = vec![0xBBu8; 897];
+        let filter = vec![0x01u8; 32];
+        let join = crate::global_intrinsic::ProverJoin {
+            filters: vec![filter.clone()],
+            frame_number: 100,
+            public_key_signature_bls48581: Some(crate::global_intrinsic::SignatureWithPop {
+                signature: vec![0xAAu8; 666],
+                public_key: Some(public_key.clone()),
+                pop_signature: vec![0xCCu8; 666],
+            }),
+            delegate_address: vec![],
+            merge_targets: (0..3)
+                .map(|n| crate::global_intrinsic::seniority_merge::SeniorityMerge {
+                    signature: vec![n; 114],
+                    key_type: 0,
+                    prover_public_key: vec![n; 57],
+                })
+                .collect(),
+            proof: vec![],
+        }
+        .to_canonical_bytes()
+        .unwrap();
+
+        let validate = |active: bool| {
+            let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new()),
+                Arc::new(quil_tries::ShaInclusionProver),
+            ));
+            if active {
+                let prover = crate::global_intrinsic::materialize::prover_address_from_pubkey(&public_key).unwrap();
+                let allocation = crate::global_intrinsic::materialize::create_allocation_vertex_tree(&prover, &filter, 90).unwrap();
+                let state = crate::hypergraph_state::HypergraphState::new(crdt.clone());
+                state.set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &crate::global_intrinsic::materialize::allocation_address(&public_key, &filter).unwrap(),
+                    &crate::hypergraph_state::vertex_adds_discriminator().unwrap(),
+                    90,
+                    crate::prover_registry::vertex_tree_to_blob(&allocation),
+                ).unwrap();
+                state.commit().unwrap();
+            }
+            let keys = Arc::new(CountsEd448(Default::default()));
+            let verdict = GlobalIntrinsic::new(keys.clone()).with_hypergraph(crdt).validate(105, &join, None, None);
+            (verdict, keys.0.load(std::sync::atomic::Ordering::SeqCst))
+        };
+
+        let (verdict, ed448_checks) = validate(true);
+        assert!(verdict.unwrap_err().to_string().contains("existing allocation still active"));
+        assert_eq!(ed448_checks, 0);
+
+        let (verdict, ed448_checks) = validate(false);
+        assert!(!verdict.unwrap(), "a bad merge target still refuses the join");
+        assert_eq!(ed448_checks, 1);
     }
 
     #[test]

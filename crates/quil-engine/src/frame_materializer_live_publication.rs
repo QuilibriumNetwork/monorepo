@@ -92,7 +92,14 @@ impl FrameMaterializer {
             .as_ref()
             .ok_or_else(|| unavailable("finalized frame has no header"))?
             .frame_number;
-        let result = self.materialize_atomically_inner(frame, limits, write_clock, authenticate)?;
+        // Holds the frame lock (and, for a finalization, the execution lease):
+        // votes and proposals on this node wait for it.
+        let mut timing = crate::stage_clock::StageClock::start_after(
+            if write_clock { "GLOBAL finalization publication" } else { "GLOBAL canonical publication" },
+            number,
+            crate::stage_clock::SLOW_EXECUTION,
+        );
+        let result = self.materialize_atomically_inner(frame, limits, write_clock, authenticate, &mut timing)?;
         // All execution barriers were released before these callbacks, including
         // on an authenticated replay after a previous commit or restart.
         if let Some(refresh) = &self.shard_admission_refresh {
@@ -103,6 +110,7 @@ impl FrameMaterializer {
         if let Some(current) = &self.current_frame {
             current.materialize(number);
         }
+        timing.mark("post-publication callbacks");
         Ok(result)
     }
 
@@ -113,21 +121,24 @@ impl FrameMaterializer {
         write_clock: bool,
         // False is allowed only for an exact, authenticated completed replay.
         authenticate: impl FnOnce(&MaterializerBranch) -> Result<bool>,
+        timing: &mut crate::stage_clock::StageClock,
     ) -> Result<Option<TentativeFrameResult>> {
-        let frame_guard = self
-            .frame_execution
-            .try_lock()
-            .map_err(|_| unavailable("canonical materializer is busy or poisoned"))?;
+        // A conflict here discards an executed frame; wait out brief holders.
+        let patience = quil_types::lock_patience::Patience::new();
+        let frame_guard = patience
+            .lock(&self.frame_execution)
+            .ok_or_else(|| unavailable("canonical materializer is busy or poisoned"))?;
         let (mut branch, mut publication) = self.capture_execution_branch_with(limits, |registry| {
             self.execution_manager
                 .capture_execution_branch_guarded_seeded(limits.execution, registry)
         })?;
+        timing.mark("capture branch");
         // Node-local coverage and diagnostic writers must not be overwritten by
         // metadata captured before their update. Keep their locks through adoption.
-        let mut coverage = self
-            .coverage_halt_durations
-            .try_lock()
-            .map_err(|_| unavailable("canonical coverage metadata is busy or poisoned"))?;
+        let patience = quil_types::lock_patience::Patience::new();
+        let mut coverage = patience
+            .lock(&self.coverage_halt_durations)
+            .ok_or_else(|| unavailable("canonical coverage metadata is busy or poisoned"))?;
         if *coverage
             != *branch
                 .materializer
@@ -137,13 +148,13 @@ impl FrameMaterializer {
         {
             return Err(unavailable("canonical coverage changed during capture"));
         }
-        let status = self
-            .prover_status
-            .try_lock()
-            .map_err(|_| unavailable("canonical prover status is busy or poisoned"))?;
+        let status = patience
+            .lock(&self.prover_status)
+            .ok_or_else(|| unavailable("canonical prover status is busy or poisoned"))?;
         if !authenticate(&branch)? {
             return Ok(None);
         }
+        timing.mark("authenticate");
         if write_clock {
             let clock = branch.execution.clock_store();
             let txn = clock.new_transaction(false)?;
@@ -151,6 +162,11 @@ impl FrameMaterializer {
             txn.commit()?;
         }
         let result = branch.materialize(frame)?;
+        timing.mark("execute frame");
+        branch.log_reads(
+            if write_clock { "GLOBAL finalization publication" } else { "GLOBAL canonical publication" },
+            result.frame_number,
+        );
         let number = result.frame_number;
         let epoch = branch
             .materializer
@@ -175,10 +191,9 @@ impl FrameMaterializer {
             .materializer
             .prover_root_verified_frame
             .load(Ordering::Relaxed);
-        let mut fork_target = self
-            .fork_target_root
-            .try_write()
-            .map_err(|_| unavailable("canonical fork diagnostics are busy or poisoned"))?;
+        let mut fork_target = quil_types::lock_patience::Patience::new()
+            .write(&self.fork_target_root)
+            .ok_or_else(|| unavailable("canonical fork diagnostics are busy or poisoned"))?;
         let mut snapshot = self.hypergraph.prepare_snapshot_publication(
             result.prover_root.to_vec(),
             // Forest versions represent the pre-state of the following frame.
@@ -198,6 +213,7 @@ impl FrameMaterializer {
             shards_store: self.execution_manager.shards_store(),
             prover_registry: self.prover_registry.clone(),
         };
+        timing.mark("prepare snapshot");
         publication.publish(&mut branch.execution, context, registry, |read_view| {
             *coverage = private_coverage;
             *fork_target = None;
@@ -209,6 +225,7 @@ impl FrameMaterializer {
             self.last_materialized_frame.store(number, Ordering::SeqCst);
             snapshot.adopt(read_view);
         })?;
+        timing.mark("publish");
         // Observer callbacks may read engines, roots, clocks and the cursor.
         // Release every internal barrier before invoking them.
         drop(snapshot);

@@ -578,6 +578,59 @@ pub fn reported_shard_size(
     }
 }
 
+/// [`reported_shard_size`] for one committed GLOBAL frame. An empty shard's
+/// size counts committed deliveries, GLOBAL records only a GLOBAL commit
+/// writes, and counting them reads every block the shard owns; at width 9
+/// that is up to 480 blocks per shard on every `GetAppShards`.
+#[derive(Default)]
+pub struct CommittedShardSizes {
+    kept: std::sync::Mutex<(u64, std::collections::HashMap<Vec<u8>, Vec<u8>>)>,
+}
+
+impl CommittedShardSizes {
+    /// The size to report for `(shard_key, prefix)` measured at `size`, at
+    /// the committed GLOBAL frame `committed`.
+    pub fn size(
+        &self,
+        crdt: &std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+        shard_key: &[u8],
+        prefix: &[u32],
+        size: Vec<u8>,
+        committed: u64,
+    ) -> Vec<u8> {
+        if size.iter().any(|byte| *byte != 0) {
+            return size;
+        }
+        let mut key = shard_key.to_vec();
+        key.extend(prefix.iter().flat_map(|part| part.to_be_bytes()));
+        self.kept_or(committed, key, || reported_shard_size(crdt, shard_key, prefix, size))
+    }
+
+    fn kept_or(&self, committed: u64, key: Vec<u8>, count: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
+        let mut kept = self.kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if kept.0 != committed {
+            *kept = (committed, std::collections::HashMap::new());
+        }
+        kept.1.entry(key).or_insert_with(count).clone()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn committed_shard_sizes_are_counted_once_per_committed_frame() {
+    let sizes = CommittedShardSizes::default();
+    let counted = std::cell::Cell::new(0);
+    let count = |n: u8| {
+        counted.set(counted.get() + 1);
+        vec![n]
+    };
+    assert_eq!(sizes.kept_or(7, vec![1], || count(1)), vec![1]);
+    assert_eq!(sizes.kept_or(7, vec![1], || count(2)), vec![1], "kept within the frame");
+    assert_eq!(sizes.kept_or(7, vec![2], || count(3)), vec![3], "per shard");
+    assert_eq!(sizes.kept_or(8, vec![1], || count(4)), vec![4], "recounted once the frame moves");
+    assert_eq!(counted.get(), 3);
+}
+
 /// Outputs and escrows committed into blocks the sub-shard owns, per GLOBAL
 /// state. `None` when the shard key or prefix cannot be read as a shard path,
 /// or the lookup fails: the shard then simply stays as empty as it measured.

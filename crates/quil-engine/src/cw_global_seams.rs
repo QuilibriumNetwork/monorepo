@@ -310,23 +310,33 @@ impl GlobalProposer for GlobalSeamProposer {
     }
 
     fn verify_with_context(&self, context: ProposalContext, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
+        self.verify_or_defer(context, digest, bytes).unwrap_or(false)
+    }
+
+    /// Defers only while this node's own execution is busy (publishing the
+    /// previous frame, proposing, or checking another proposal). Answering then
+    /// nullified valid proposals at once, and a view needs 4 of 5 votes.
+    fn verify_or_defer(&self, context: ProposalContext, digest: Digest, bytes: Option<Vec<u8>>) -> Result<bool, std::time::Duration> {
+        const DEFER: std::time::Duration = std::time::Duration::from_millis(200);
         let Some(executor) = self.selected_execution.as_ref() else {
-            return self.verify(context.view, context.parent, digest, bytes);
+            return Ok(self.verify(context.view, context.parent, digest, bytes));
         };
-        if !executor.accepts_context(context) || !executor.binds_clock(self.clock_store.as_ref()) { return false; }
-        let Some(bytes) = bytes.filter(|b| b.len() <= executor.max_frame_bytes()) else { return false };
-        let Ok(frame) = decode_global_frame(&bytes) else { return false };
-        let Some(header) = frame.header.as_ref() else { return false };
+        if !executor.accepts_context(context) || !executor.binds_clock(self.clock_store.as_ref()) { return Ok(false); }
+        if executor.busy() { return Err(DEFER); }
+        let Some(bytes) = bytes.filter(|b| b.len() <= executor.max_frame_bytes()) else { return Ok(false) };
+        let Ok(frame) = decode_global_frame(&bytes) else { return Ok(false) };
+        let Some(header) = frame.header.as_ref() else { return Ok(false) };
         if header.rank != context.view || header.parent_selector != context.parent.as_ref()
             || frame_digest(header) != Some(digest) || !self.verifier.validate(&frame).unwrap_or(false)
-            || !self.verifier.verify_global_requests_root(header, &frame.requests) { return false; }
-        let Some(number) = self.selected_parent_number(context.parent) else { return false };
-        let Some(blocks) = self.block_store.as_ref() else { return false };
+            || !self.verifier.verify_global_requests_root(header, &frame.requests) { return Ok(false); }
+        let Some(number) = self.selected_parent_number(context.parent) else { return Ok(false) };
+        let Some(blocks) = self.block_store.as_ref() else { return Ok(false) };
         let prepared = match executor.prepare(context, number, blocks, &self.verifier, false) {
             Ok(prepared) => prepared,
+            Err(_) if executor.busy() => return Err(DEFER),
             Err(error) => {
                 tracing::warn!(view = context.view, parent = number, %error, "selected GLOBAL verification parent unavailable");
-                return false;
+                return Ok(false);
             }
         };
         if !prepared.matches_child(header) {
@@ -342,16 +352,16 @@ impl GlobalProposer for GlobalSeamProposer {
                     cb(declared);
                 }
             }
-            return false;
+            return Ok(false);
         }
-        if prepared.check().is_err() { return false; }
+        if prepared.check().is_err() { return Ok(false); }
         for ancestor in prepared.ancestors() {
-            if !self.persist_candidate(ancestor) { return false; }
+            if !self.persist_candidate(ancestor) { return Ok(false); }
         }
-        if !self.persist_candidate(&frame) { return false; }
-        if prepared.check().is_err() { return false; }
+        if !self.persist_candidate(&frame) { return Ok(false); }
+        if prepared.check().is_err() { return Ok(false); }
         self.note_frame(digest, header.frame_number);
-        true
+        Ok(true)
     }
 
     fn propose_retry(&self) -> Option<std::time::Duration> {

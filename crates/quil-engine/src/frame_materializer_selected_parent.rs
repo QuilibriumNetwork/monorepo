@@ -31,8 +31,13 @@ impl Default for GlobalParentLimits {
                             max_delta_bytes: 64 << 20,
                             max_delta_entries: 500_000,
                             max_record_bytes: 16 << 20,
-                            max_read_bytes: 512 << 20,
-                            max_read_operations: 10_000_000,
+                            // Work caps, not memory: the 60 s deadline bounds
+                            // a hostile proposal, and a legitimate frame must
+                            // fit, since one nobody can execute cannot be built
+                            // on until it finalizes. The split at 837360 read
+                            // past 512 MB.
+                            max_read_bytes: 8 << 30,
+                            max_read_operations: 200_000_000,
                             max_cursors: 128,
                         },
                         max_metadata_entries: 100_000,
@@ -71,10 +76,27 @@ fn identity(header: &GlobalFrameHeader) -> Result<Digest> {
         .map_err(|_| unavailable("selected GLOBAL input has no identity"))
 }
 
-struct Admission(Arc<AtomicBool>);
+/// This node's single GLOBAL execution lease. While it is held, votes defer
+/// and a leader waits, so a long hold is logged with its holder.
+struct Admission {
+    active: Arc<AtomicBool>,
+    holder: &'static str,
+    frame: u64,
+    since: Instant,
+}
+impl Admission {
+    fn new(active: Arc<AtomicBool>, holder: &'static str, frame: u64) -> Self {
+        Self { active, holder, frame, since: Instant::now() }
+    }
+}
 impl Drop for Admission {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.active.store(false, Ordering::Release);
+        let held = self.since.elapsed();
+        if held >= crate::stage_clock::SLOW_EXECUTION {
+            tracing::warn!(holder = self.holder, frame = self.frame, held_ms = held.as_millis() as u64,
+                "GLOBAL execution lease held long");
+        }
     }
 }
 
@@ -304,7 +326,7 @@ impl GlobalParentExecutor {
     ) -> Result<Option<TentativeFrameResult>> {
         self.check_input_budget(frame)?;
         let parent_view = self.authenticate_finalization(frame, verifier)?;
-        let _admission = self.admit()?;
+        let _admission = self.admit(frame)?;
         self.publish_finalization(frame, verifier, Some(parent_view))
     }
 
@@ -322,7 +344,7 @@ impl GlobalParentExecutor {
         if let Err(error) = self.check_input_budget(frame) {
             return GlobalFinalizationAttempt::Unavailable { error, retryable: false };
         }
-        let Ok(_admission) = self.admit() else {
+        let Ok(_admission) = self.admit(frame) else {
             return GlobalFinalizationAttempt::Busy;
         };
         match self.publish_finalization(frame, verifier, Some(parent_view)) {
@@ -356,7 +378,7 @@ impl GlobalParentExecutor {
         if let Err(error) = self.check_input_budget(frame) {
             return GlobalFinalizationAttempt::Unavailable { error, retryable: false };
         }
-        let Ok(_admission) = self.admit() else {
+        let Ok(_admission) = self.admit(frame) else {
             return GlobalFinalizationAttempt::Busy;
         };
         match self.publish_finalization(frame, verifier, None) {
@@ -403,11 +425,12 @@ impl GlobalParentExecutor {
         self.epoch
     }
 
-    fn admit(&self) -> Result<Admission> {
+    fn admit(&self, frame: &GlobalFrame) -> Result<Admission> {
         self.active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| unavailable("GLOBAL execution is busy"))?;
-        Ok(Admission(self.active.clone()))
+        let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
+        Ok(Admission::new(self.active.clone(), "publication", number))
     }
 
     /// Certificate epoch/view, VDF/header and ordered request body. Returns
@@ -450,7 +473,7 @@ impl GlobalParentExecutor {
             .as_ref()
             .ok_or_else(|| unavailable("finalized GLOBAL frame has no header"))?;
         self.source
-            .materialize_atomically(frame, self.limits.branch, |branch| {
+            .materialize_atomically(frame, self.limits.branch.for_finalized_frame(), |branch| {
                 let cursor = branch.cursor()?;
                 let base = self.executed_base(branch, verifier)?;
                 if header.frame_number == cursor {
@@ -478,6 +501,13 @@ impl GlobalParentExecutor {
                 }
                 Ok(true)
             })
+    }
+
+    /// This node's own GLOBAL execution is in use: a proposal, verification or
+    /// publication holds the lease, or the canonical materializer holds the
+    /// frame lock. Either clears without anything from the network.
+    pub(crate) fn busy(&self) -> bool {
+        self.active.load(Ordering::Acquire) || self.source.frame_execution_busy()
     }
 
     pub(crate) fn binds_clock(&self, clock: &dyn ClockStore) -> bool {
@@ -537,8 +567,16 @@ impl GlobalParentExecutor {
         self.active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| unavailable("selected GLOBAL execution is busy"))?;
-        let admission = Admission(self.active.clone());
-        let mut timing = crate::stage_clock::StageClock::start("selected GLOBAL parent execution", number);
+        let admission = Admission::new(
+            self.active.clone(),
+            if for_proposal { "proposal" } else { "verification" },
+            number,
+        );
+        let mut timing = crate::stage_clock::StageClock::start_after(
+            "selected GLOBAL parent execution",
+            number,
+            crate::stage_clock::SLOW_EXECUTION,
+        );
         let started = Instant::now();
         let deadline = || {
             if started.elapsed() > self.limits.max_elapsed {
@@ -639,6 +677,7 @@ impl GlobalParentExecutor {
             consumed.extend(branch.materialize(frame)?.consumed_bundles);
         }
         timing.mark("execute ancestors");
+        branch.log_reads("selected GLOBAL parent execution", number);
         deadline()?;
         let state = ParentState::read(&branch)?;
         let leader = if for_proposal {

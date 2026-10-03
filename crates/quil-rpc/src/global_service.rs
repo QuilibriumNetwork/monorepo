@@ -288,9 +288,53 @@ pub trait ForestServer: Send + Sync {
     ) -> Option<Vec<(Vec<u8>, [u8; 32], u64)>>;
 }
 
+/// The committed GLOBAL frame the node's state is at, if known. Shard
+/// topology and pending changes are written only by GLOBAL commits, so rows
+/// read at one value stay current until it changes.
+pub type AppShardsVersion = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// Distinct requests whose shard rows are kept; prefixes are caller-chosen.
+const APP_SHARD_TOPOLOGY_ENTRIES: usize = 256;
+
+/// Callers waiting for the one shard-row read in progress.
+static APP_SHARDS_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One request's shard rows and whether a pending split or merge freezes each.
+type ShardTopology = Vec<(quil_types::store::ShardInfo, bool)>;
+type AppShardTopologies =
+    std::collections::HashMap<(Vec<u8>, Vec<u32>), (u64, Arc<ShardTopology>)>;
+
+/// The shard rows a `GetAppShards` request names: one application's when
+/// `shard_key` is a full 35-byte key, otherwise every application's.
+fn read_shard_topology(
+    store: &dyn ShardsStore,
+    shard_key: &[u8],
+    prefix: &[u32],
+) -> Result<ShardTopology, String> {
+    let shards = if shard_key.len() == 35 {
+        store.get_app_shards(shard_key, prefix).map_err(|e| format!("get_app_shards: {e}"))?
+    } else {
+        store.range_app_shards().map_err(|e| format!("range_app_shards: {e}"))?
+    };
+    let pending = store
+        .all_pending_shard_changes()
+        .map_err(|e| format!("all_pending_shard_changes: {e}"))?;
+    Ok(shards
+        .into_iter()
+        .map(|s| {
+            let frozen = frozen_by_pending_change(&s.shard_key, &s.prefix, &pending);
+            (s, frozen)
+        })
+        .collect())
+}
+
 /// gRPC GlobalService implementation. Serves frames from the clock
 /// store so other nodes can sync from us.
 pub struct GlobalRpcServer {
+    /// `GetAppShards` shard rows, read once per committed GLOBAL frame (see
+    /// [`AppShardsVersion`]): every prover polls them.
+    app_shard_topologies: Arc<tokio::sync::Mutex<AppShardTopologies>>,
+    app_shards_version: Option<AppShardsVersion>,
     frames: Arc<dyn FrameLookup>,
     submit_handler: Option<SubmitHandler>,
     consensus_delivery: Option<ConsensusDeliveryHandler>,
@@ -349,6 +393,8 @@ async fn bounded_forest_read<T: Send + 'static>(
 impl GlobalRpcServer {
     pub fn new(frames: Arc<dyn FrameLookup>) -> Self {
         Self {
+            app_shard_topologies: Arc::new(tokio::sync::Mutex::new(AppShardTopologies::new())),
+            app_shards_version: None,
             frames,
             submit_handler: None,
             consensus_delivery: None,
@@ -437,6 +483,13 @@ impl GlobalRpcServer {
 
     pub fn with_app_shards_provider(mut self, p: AppShardsProvider) -> Self {
         self.app_shards = Some(p);
+        self
+    }
+
+    /// Keep `GetAppShards` shard rows until the committed GLOBAL frame moves.
+    /// Without it they are read for every request.
+    pub fn with_app_shards_version(mut self, version: AppShardsVersion) -> Self {
+        self.app_shards_version = Some(version);
         self
     }
 
@@ -597,59 +650,89 @@ impl GlobalService for GlobalRpcServer {
         };
         let app_shards = self.app_shards.clone();
         let req = request.into_inner();
-        // The shards-store scan plus the per-shard CRDT root walk (the
-        // `app_shards` provider, which descends each shard's phase trees and
-        // reads root metadata) is heavy, synchronous, `.await`-free work. Run
-        // it on the blocking pool so it never holds an async worker on the
-        // dedicated peer-gRPC runtime — a burst of these (especially the
-        // `range_app_shards` path) would otherwise starve the accept loop,
-        // TLS handshakes, and light handlers, the empty-frames stall.
-        let info = tokio::task::spawn_blocking(move || -> Result<Vec<global::AppShardInfo>, String> {
-            let shards = if req.shard_key.len() == 35 {
-                shards_store
-                    .get_app_shards(&req.shard_key, &req.prefix)
-                    .map_err(|e| format!("get_app_shards: {e}"))?
-            } else {
-                shards_store
-                    .range_app_shards()
-                    .map_err(|e| format!("range_app_shards: {e}"))?
-            };
-            let include_shard_key = req.shard_key.len() != 35;
-            let pending = shards_store
-                .all_pending_shard_changes()
-                .map_err(|e| format!("all_pending_shard_changes: {e}"))?;
-            // `RocksShardsStore` only persists the prefix path bytes — it
-            // doesn't carry `size`, `data_shards`, or `commitment`. Fill
-            // those in by consulting the live CRDT via the provider. Without
-            // this, every entry would report `size=0` and the caller's
-            // `build_proposal_descriptors` filters it out → no ProposeJoin.
-            Ok(shards
-                .into_iter()
-                .map(|s| {
-                    let pending_change = frozen_by_pending_change(&s.shard_key, &s.prefix, &pending);
-                    let (size, data_shards, commitment, materialized_frame, latest_frame) = match &app_shards {
-                        Some(p) => match p(&s.shard_key, &s.prefix) {
-                            Some((sz, ds, cm, mat, latest)) => (sz, ds, cm.to_vec(), mat, latest),
-                            None => (Vec::new(), 0, (0..4).map(|_| vec![0u8; 64]).collect(), 0, 0),
-                        },
-                        None => (s.size, s.data_shards, s.commitment, 0, 0),
-                    };
-                    global::AppShardInfo {
-                        shard_key: if include_shard_key { s.shard_key } else { Vec::new() },
-                        prefix: s.prefix,
-                        size,
-                        data_shards,
-                        commitment,
-                        materialized_frame,
-                        latest_frame,
-                        pending_change,
+        let include_shard_key = req.shard_key.len() != 35;
+        let key = (req.shard_key, req.prefix);
+        let topologies = self.app_shard_topologies.clone();
+        let version = self.app_shards_version.clone();
+        // Detached so a caller that gives up still leaves its read behind: the
+        // blocking work cannot be cancelled, and the next caller must not
+        // start a second copy of it.
+        let task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            // Rows change only with a committed GLOBAL frame: one caller reads
+            // them per frame, and callers arriving meanwhile wait and share it.
+            let topology = {
+                APP_SHARDS_WAITING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut kept = topologies.lock_owned().await;
+                APP_SHARDS_WAITING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let version = version.as_ref().and_then(|version| version());
+                match (version, kept.get(&key)) {
+                    (Some(version), Some((at, rows))) if *at == version => rows.clone(),
+                    _ => {
+                        let (store, (shard_key, prefix)) = (shards_store, key.clone());
+                        let rows = Arc::new(
+                            tokio::task::spawn_blocking(move || read_shard_topology(store.as_ref(), &shard_key, &prefix))
+                                .await
+                                .map_err(|e| Status::internal(format!("get_app_shards task panicked: {e}")))?
+                                .map_err(Status::internal)?,
+                        );
+                        if let Some(version) = version {
+                            if kept.len() >= APP_SHARD_TOPOLOGY_ENTRIES {
+                                kept.retain(|_, (at, _)| *at == version);
+                                if kept.len() >= APP_SHARD_TOPOLOGY_ENTRIES {
+                                    kept.clear();
+                                }
+                            }
+                            kept.insert(key, (version, rows.clone()));
+                        }
+                        rows
                     }
-                })
-                .collect())
-        })
-        .await
-        .map_err(|e| Status::internal(format!("get_app_shards task panicked: {e}")))?
-        .map_err(Status::internal)?;
+                }
+            };
+            // Sizes, executed and latest frames move with every application
+            // frame: read now, from memory and per-shard indexes. `RocksShardsStore`
+            // persists only the prefix path; without the provider every entry
+            // would report `size=0` and `build_proposal_descriptors` would
+            // filter it out → no ProposeJoin.
+            let info = tokio::task::spawn_blocking(move || -> Vec<global::AppShardInfo> {
+                topology
+                    .iter()
+                    .map(|(s, pending_change)| {
+                        let (size, data_shards, commitment, materialized_frame, latest_frame) = match &app_shards {
+                            Some(p) => match p(&s.shard_key, &s.prefix) {
+                                Some((sz, ds, cm, mat, latest)) => (sz, ds, cm.to_vec(), mat, latest),
+                                None => (Vec::new(), 0, (0..4).map(|_| vec![0u8; 64]).collect(), 0, 0),
+                            },
+                            None => (s.size.clone(), s.data_shards, s.commitment.clone(), 0, 0),
+                        };
+                        global::AppShardInfo {
+                            shard_key: if include_shard_key { s.shard_key.clone() } else { Vec::new() },
+                            prefix: s.prefix.clone(),
+                            size,
+                            data_shards,
+                            commitment,
+                            materialized_frame,
+                            latest_frame,
+                            pending_change: *pending_change,
+                        }
+                    })
+                    .collect()
+            })
+            .await
+            .map_err(|e| Status::internal(format!("get_app_shards task panicked: {e}")))?;
+            if started.elapsed() >= std::time::Duration::from_secs(1) {
+                tracing::warn!(
+                    ms = started.elapsed().as_millis() as u64,
+                    shards = info.len(),
+                    waiting = APP_SHARDS_WAITING.load(std::sync::atomic::Ordering::Relaxed),
+                    "slow GetAppShards computation",
+                );
+            }
+            Result::<_, Status>::Ok(info)
+        });
+        let info = task
+            .await
+            .map_err(|e| Status::internal(format!("get_app_shards task failed: {e}")))??;
         Ok(Response::new(global::GetAppShardsResponse { info }))
     }
 
@@ -1227,6 +1310,112 @@ mod caching_lookup_tests {
         let after_genesis = cache.inner.get_proposal_calls.load(Ordering::SeqCst);
         cache.get_global_proposal(0).unwrap();
         assert_eq!(cache.inner.get_proposal_calls.load(Ordering::SeqCst), after_genesis);
+    }
+}
+
+#[cfg(test)]
+mod app_shards_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use quil_types::store::ShardInfo;
+
+    struct NoFrames;
+    impl FrameLookup for NoFrames {
+        fn get_latest_frame(&self) -> Result<global::GlobalFrame, String> { Err("unused".into()) }
+        fn get_frame(&self, _: u64) -> Result<global::GlobalFrame, String> { Err("unused".into()) }
+        fn get_global_proposal(&self, _: u64) -> Result<global::GlobalProposal, String> { Err("unused".into()) }
+    }
+
+    /// One shard; counts its reads, and holds each until released when gated.
+    struct OneShard {
+        reads: AtomicUsize,
+        gate: Option<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+    impl ShardsStore for OneShard {
+        fn range_app_shards(&self) -> quil_types::error::Result<Vec<ShardInfo>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                let _ = gate.lock().unwrap().recv();
+            }
+            Ok(vec![ShardInfo { shard_key: vec![0; 35], prefix: vec![1], size: Vec::new(), data_shards: 0, commitment: Vec::new() }])
+        }
+        fn get_app_shards(&self, _: &[u8], _: &[u32]) -> quil_types::error::Result<Vec<ShardInfo>> {
+            self.range_app_shards()
+        }
+        fn put_app_shard(&self, _: &dyn quil_types::store::Transaction, _: &ShardInfo) -> quil_types::error::Result<()> { Ok(()) }
+        fn delete_app_shard(&self, _: &dyn quil_types::store::Transaction, _: &[u8], _: &[u32]) -> quil_types::error::Result<()> { Ok(()) }
+    }
+
+    async fn ask(server: Arc<GlobalRpcServer>) -> Result<Vec<global::AppShardInfo>, Status> {
+        server
+            .get_app_shards(Request::new(global::GetAppShardsRequest { shard_key: vec![0; 35], prefix: vec![1] }))
+            .await
+            .map(|r| r.into_inner().info)
+    }
+
+    /// Reports `size` as the shard's size; the test moves it between calls.
+    fn sized(size: Arc<AtomicU64>) -> AppShardsProvider {
+        Arc::new(move |_, _| {
+            let size = size.load(Ordering::SeqCst);
+            Some((size.to_be_bytes().to_vec(), 1, std::array::from_fn(|_| vec![0; 64]), 3, 4))
+        })
+    }
+
+    // Every prover polls GetAppShards. Its shard rows change only when a
+    // GLOBAL frame commits, so they are read once per committed frame; sizes
+    // and frame progress move with every application frame and are read for
+    // every request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shard_rows_are_read_once_per_committed_frame_and_sizes_every_time() {
+        let store = Arc::new(OneShard { reads: AtomicUsize::new(0), gate: None });
+        let (committed, size) = (Arc::new(AtomicU64::new(5)), Arc::new(AtomicU64::new(10)));
+        let version = committed.clone();
+        let server = Arc::new(GlobalRpcServer::new(Arc::new(NoFrames))
+            .with_shards_store(store.clone())
+            .with_app_shards_provider(sized(size.clone()))
+            .with_app_shards_version(Arc::new(move || Some(version.load(Ordering::SeqCst)))));
+        for expected in [10u64, 11, 12] {
+            size.store(expected, Ordering::SeqCst);
+            assert_eq!(ask(server.clone()).await.unwrap()[0].size, expected.to_be_bytes().to_vec());
+        }
+        assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+        committed.store(6, Ordering::SeqCst);
+        ask(server.clone()).await.unwrap();
+        ask(server.clone()).await.unwrap();
+        assert_eq!(store.reads.load(Ordering::SeqCst), 2, "read again once the committed frame moves");
+
+        let unversioned = Arc::new(OneShard { reads: AtomicUsize::new(0), gate: None });
+        let server = Arc::new(GlobalRpcServer::new(Arc::new(NoFrames))
+            .with_shards_store(unversioned.clone())
+            .with_app_shards_provider(sized(size)));
+        ask(server.clone()).await.unwrap();
+        ask(server).await.unwrap();
+        assert_eq!(unversioned.reads.load(Ordering::SeqCst), 2, "no committed frame known: read every time");
+    }
+
+    // Post-split, each answer took minutes and every prover kept asking; each
+    // retry started another copy of the work until the archives' CPUs were
+    // spent and GLOBAL stopped proposing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_and_abandoned_callers_share_one_read() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store = Arc::new(OneShard { reads: AtomicUsize::new(0), gate: Some(std::sync::Mutex::new(release_rx)) });
+        let server = Arc::new(GlobalRpcServer::new(Arc::new(NoFrames))
+            .with_shards_store(store.clone())
+            .with_app_shards_provider(sized(Arc::new(AtomicU64::new(7))))
+            .with_app_shards_version(Arc::new(|| Some(9))));
+        let first = tokio::spawn(ask(server.clone()));
+        while store.reads.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let waiting: Vec<_> = (0..8).map(|_| tokio::spawn(ask(server.clone()))).collect();
+        release_tx.send(()).unwrap();
+        for caller in waiting {
+            let info = tokio::time::timeout(std::time::Duration::from_secs(5), caller)
+                .await.unwrap().unwrap().unwrap();
+            assert_eq!(info[0].size, 7u64.to_be_bytes().to_vec());
+        }
+        assert_eq!(store.reads.load(Ordering::SeqCst), 1);
     }
 }
 

@@ -427,7 +427,9 @@ impl ReadBudget {
     fn operation(&mut self, limits: OverlayLimits) -> Result<()> {
         ensure!(
             self.operations < limits.max_read_operations,
-            "overlay read operation limit"
+            "overlay read operation limit: {} reads allowed, {} bytes read",
+            limits.max_read_operations,
+            self.bytes
         );
         self.operations += 1;
         Ok(())
@@ -443,7 +445,13 @@ impl ReadBudget {
             .bytes
             .checked_add(size as u64)
             .ok_or_else(|| anyhow::anyhow!("overlay read size overflow"))?;
-        ensure!(bytes <= limits.max_read_bytes, "overlay read byte limit");
+        ensure!(
+            bytes <= limits.max_read_bytes,
+            "overlay read byte limit: {} bytes allowed, {} read in {} reads",
+            limits.max_read_bytes,
+            bytes,
+            self.operations
+        );
         self.bytes = bytes;
         Ok(())
     }
@@ -681,6 +689,25 @@ impl ExecutionOverlay {
             sequence: base.sequence,
             watched: base.watched?,
         })
+    }
+
+    /// Every key this branch put or deleted under `prefixes`; `None` when a
+    /// deleted range reaches into one of them, whose keys cannot be listed.
+    pub fn written_keys_under(&self, prefixes: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
+        let inner = self.lock_cleanup();
+        if inner.delta.ranges.iter().any(|(start, end)| crate::database::range_meets(prefixes, start, end)) {
+            return None;
+        }
+        let mut keys = Vec::new();
+        for prefix in prefixes {
+            keys.extend(
+                inner.delta.points
+                    .range::<[u8], _>((Bound::Included(prefix.as_slice()), Bound::Unbounded))
+                    .take_while(|(key, _)| key.starts_with(prefix))
+                    .map(|(key, _)| key.clone()),
+            );
+        }
+        Some(keys)
     }
 
     /// Sticky storage-failure evidence, independent of whether a caller
@@ -1472,6 +1499,33 @@ mod tests {
     /// A branch keeps its capture point, and its views their scan point, until
     /// a tentative write covers a watched key; a database that watches nothing
     /// has neither.
+    // A branch's registry is updated from the rows it wrote, so those keys
+    // must be listed exactly, and a range deletion over them reported.
+    #[test]
+    fn written_keys_are_listed_per_prefix_unless_a_range_covers_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(dir.path());
+        db.put([0x40, 0x01, 1], b"row").unwrap();
+        let prefixes = vec![vec![0x40, 0x01], vec![0x41]];
+        let overlay = ExecutionOverlay::capture(db.clone(), limits()).unwrap();
+        assert_eq!(overlay.written_keys_under(&prefixes), Some(vec![]));
+        overlay
+            .apply(&[
+                OverlayMutation::Put(vec![0x40, 0x01, 2], b"new".to_vec()),
+                OverlayMutation::Delete(vec![0x40, 0x01, 1]),
+                OverlayMutation::Put(vec![0x41, 7], b"other".to_vec()),
+                OverlayMutation::Put(vec![0x40, 0x02], b"outside".to_vec()),
+                OverlayMutation::DeleteRange(vec![0x30], vec![0x40, 0x01]),
+            ])
+            .unwrap();
+        assert_eq!(
+            overlay.written_keys_under(&prefixes),
+            Some(vec![vec![0x40, 0x01, 1], vec![0x40, 0x01, 2], vec![0x41, 7]])
+        );
+        overlay.apply(&[OverlayMutation::DeleteRange(vec![0x41, 0], vec![0x41, 5])]).unwrap();
+        assert_eq!(overlay.written_keys_under(&prefixes), None);
+    }
+
     #[test]
     fn capture_and_scan_points_hold_until_a_watched_key_is_written() {
         let dir = tempfile::tempdir().unwrap();
@@ -1751,7 +1805,11 @@ mod tests {
             },
         ).unwrap();
         assert_eq!(overlay.get(b"a").unwrap(), Some(b"value".to_vec()));
-        assert!(overlay.get(b"a").is_err());
+        // The refusal says how far over the cap the branch went.
+        assert_eq!(
+            overlay.get(b"a").unwrap_err().to_string(),
+            "overlay read byte limit: 6 bytes allowed, 12 read in 2 reads"
+        );
         assert_eq!(overlay.stats().read_bytes, 6);
         let overlay = ExecutionOverlay::capture(
             db,

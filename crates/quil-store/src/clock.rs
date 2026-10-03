@@ -1183,10 +1183,13 @@ impl store::ClockStore for RocksClockStore {
         Some(self.db.backing_store_identity())
     }
     fn prepare_execution_publication(&self) -> Result<Box<dyn store::ExecutionPublicationObserver + '_>> {
-        let writes = self.global_memory.writes.try_lock().map_err(|_| {
+        // Clock writers and readers hold these briefly; a conflict here
+        // discards an executed frame, so wait them out within a deadline.
+        let patience = quil_types::lock_patience::Patience::new();
+        let writes = patience.lock(&self.global_memory.writes).ok_or_else(|| {
             QuilError::ExecutionUnavailable("clock publication writer is busy or poisoned".into())
         })?;
-        let cache = self.global_memory.cache.try_write().map_err(|_| {
+        let cache = patience.write(&self.global_memory.cache).ok_or_else(|| {
             QuilError::ExecutionUnavailable("clock publication cache is busy or poisoned".into())
         })?;
         Ok(Box::new(ClockPublication { _writes: writes, cache }))
@@ -1727,6 +1730,12 @@ impl store::ClockStore for RocksClockStore {
             self.db.put(&latest_key, tc.rank.to_be_bytes()).map_err(|e| QuilError::Store(e.to_string()))?;
         }
         Ok(())
+    }
+    fn get_latest_shard_clock_frame_number(&self, filter: &[u8]) -> Result<Option<u64>> {
+        // The index only advances to a frame whose body is stored (see
+        // `commit_shard_clock_frame`), and retention never deletes canonical
+        // bodies, so it names the frame `get_latest_shard_clock_frame` reads.
+        self.read_u64_index_checked(&encoding::clock_shard_latest_index(filter))
     }
     fn get_latest_shard_clock_frame(&self, filter: &[u8]) -> Result<proto::global::AppShardFrame> {
         let idx_key = encoding::clock_shard_latest_index(filter);

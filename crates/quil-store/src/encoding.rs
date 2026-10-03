@@ -777,6 +777,12 @@ pub fn prover_registry_shard() -> quil_types::store::ShardKey {
 /// the prover shard's add and remove phases, legacy and versioned. Stores
 /// watch these so a registry scan can be reused while none was written.
 pub fn prover_registry_key_prefixes() -> Vec<Vec<u8>> {
+    prover_registry_row_prefixes().into_iter().map(|(_, prefix)| prefix).collect()
+}
+
+/// [`prover_registry_key_prefixes`] with each prefix's phase. A row's
+/// 32-byte vertex address follows its prefix (then, versioned, its version).
+pub fn prover_registry_row_prefixes() -> Vec<(&'static str, Vec<u8>)> {
     let shard = prover_registry_shard();
     let mut prefixes = Vec::new();
     for phase in ["adds", "removes"] {
@@ -785,7 +791,7 @@ pub fn prover_registry_key_prefixes() -> Vec<Vec<u8>> {
             hypergraph_vertex_data_v2_shard_prefix("vertex", phase, &shard),
         ] {
             prefix.extend_from_slice(&shard.l2);
-            prefixes.push(prefix);
+            prefixes.push((phase, prefix));
         }
     }
     prefixes

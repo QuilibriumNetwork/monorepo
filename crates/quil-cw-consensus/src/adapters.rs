@@ -172,6 +172,9 @@ impl BlockStore {
 /// Longest a pacing leader holds its turn before giving the view up.
 const PROPOSE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Longest a voter keeps asking to check a proposal it could not check yet.
+const VERIFY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub trait GlobalProposer: Send + Sync + 'static {
     /// Build the next frame on parent `parent_digest` for consensus `view`.
     /// Returns `(frame_identity_digest, canonical_frame_bytes)`, or `None` if
@@ -210,6 +213,19 @@ pub trait GlobalProposer: Send + Sync + 'static {
         bytes: Option<Vec<u8>>,
     ) -> bool {
         self.verify(context.view, context.parent, digest, bytes)
+    }
+
+    /// [`Self::verify_with_context`], or `Err(delay)` when this node could not
+    /// check the proposal yet for a reason of its own that clears (its execution
+    /// was busy). The adapter asks again after `delay` while the view lasts. Each
+    /// attempt is a complete check, so deferring never accepts more.
+    fn verify_or_defer(
+        &self,
+        context: ProposalContext,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> Result<bool, std::time::Duration> {
+        Ok(self.verify_with_context(context, digest, bytes))
     }
 }
 
@@ -343,7 +359,19 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
                 waited += 1;
             }
             let verified_bytes = bytes.clone();
-            let ok = proposer.verify_with_context(proposal_context, payload, bytes);
+            // A voter busy with its own execution (for example publishing the
+            // previous frame) answers once it is free, not with a nullify.
+            let mut deferred = std::time::Duration::ZERO;
+            let ok = loop {
+                match proposer.verify_or_defer(proposal_context, payload, bytes.clone()) {
+                    Ok(ok) => break ok,
+                    Err(delay) if deferred < VERIFY_PATIENCE && !tx.is_closed() => {
+                        ctx.sleep(delay).await;
+                        deferred += delay;
+                    }
+                    Err(_) => break false,
+                }
+            };
             // On success, seal the EXACT bytes the application validated, so a
             // racing peer candidate at the same digest can't replace them.
             if ok {

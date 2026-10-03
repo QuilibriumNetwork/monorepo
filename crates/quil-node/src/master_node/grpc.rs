@@ -946,10 +946,47 @@ pub(crate) fn spawn_all(
         })
     };
 
+    // Every read on the GLOBAL path slowed ~100x after the 837360 split;
+    // this shows whether the store itself was behind when that happens.
+    {
+        let db = db_arc.clone();
+        sup.spawn("rocksdb-health", move |token| async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                }
+                let health = db.health();
+                info!(
+                    level0_files = health.level0_files,
+                    pending_compaction_mb = health.pending_compaction_bytes >> 20,
+                    running_compactions = health.running_compactions,
+                    write_stopped = health.write_stopped,
+                    delayed_write_rate = health.delayed_write_rate,
+                    block_cache_mb = health.block_cache >> 20,
+                    block_cache_capacity_mb = health.block_cache_capacity >> 20,
+                    "rocksdb health"
+                );
+            }
+        });
+    }
+
+    // The committed GLOBAL frame: shard topology, pending changes and the
+    // deliveries an empty shard reports change only when it moves.
+    let committed_global_frame = {
+        let db = db_arc.clone();
+        move || -> Option<u64> {
+            db.get(&quil_store::encoding::global_materialized_cursor_key()).ok().flatten()
+                .filter(|v| v.len() == 8)
+                .map(|v| u64::from_be_bytes(v.as_slice().try_into().expect("8-byte cursor")))
+        }
+    };
     let app_shards_provider: quil_rpc::global_service::AppShardsProvider = {
         let crdt = crdt.clone();
         let db = db_arc.clone();
         let clock = clock_store.clone();
+        let sizes = Arc::new(quil_engine::shard_info::CommittedShardSizes::default());
+        let committed_global_frame = committed_global_frame.clone();
         Arc::new(move |shard_key: &[u8], prefix: &[u32]| {
             let info = quil_types::store::ShardInfo {
                 shard_key: shard_key.to_vec(),
@@ -964,11 +1001,15 @@ pub(crate) fn spawn_all(
                 .filter(|v| v.len() == 8)
                 .map(|v| u64::from_be_bytes(v.as_slice().try_into().expect("8-byte cursor")))
                 .unwrap_or(0);
-            let latest_frame = clock.get_latest_shard_clock_frame(&filter).ok()
-                .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+            // The number alone: decoding each shard's latest frame (megabytes
+            // with its proofs) was most of what this cost.
+            let latest_frame = clock.get_latest_shard_clock_frame_number(&filter).ok().flatten().unwrap_or(0);
             // A split's empty shards report committed deliveries, so the
             // regular nodes this answers staff them and outputs placed there land.
-            let size = quil_engine::shard_info::reported_shard_size(&crdt, shard_key, prefix, meta.size);
+            let size = match committed_global_frame() {
+                Some(committed) => sizes.size(&crdt, shard_key, prefix, meta.size, committed),
+                None => quil_engine::shard_info::reported_shard_size(&crdt, shard_key, prefix, meta.size),
+            };
             Some((size, meta.data_shards, meta.commitments, materialized_frame, latest_frame))
         })
     };
@@ -997,6 +1038,7 @@ pub(crate) fn spawn_all(
     .with_worker_snapshot(global_worker_snap)
     .with_global_shards_provider(global_shards_provider)
     .with_app_shards_provider(app_shards_provider)
+    .with_app_shards_version(Arc::new(committed_global_frame))
     .with_forest_server(Arc::new(CrdtForestServer(crdt.clone())))
     .with_archive_directory(archive_pool.clone())
     .with_global_vertex_proof_source(if !archive_mode && mtls_seed.is_some() {
