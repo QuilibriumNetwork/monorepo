@@ -237,9 +237,12 @@ pub fn draw(f: &mut Frame, m: &mut Model) {
 fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let (actions, status) = footer_lines(m);
     let actions = wrap_actions(actions, area.width);
-    let actions_h = actions.len().min(area.height.saturating_sub(8) as usize) as u16;
-    // Reserve every command line, plus header, titles, borders and status.
-    let panel_budget = area.height.saturating_sub(8 + actions_h);
+    let status = message_lines(m, status, area.width);
+    let footer_budget = area.height.saturating_sub(9);
+    let status_h = (status.len() as u16).min(footer_budget.max(1));
+    let actions_h = (actions.len() as u16).min(footer_budget.saturating_sub(status_h));
+    // Reserve both wrapped footers, plus header, titles and panel borders.
+    let panel_budget = area.height.saturating_sub(7 + actions_h + status_h);
     let alloc_h = panel_budget / 2;
     let avail_h = panel_budget - alloc_h;
 
@@ -250,7 +253,7 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         Constraint::Length(1),           // avail title
         Constraint::Length(avail_h + 2), // avail panel (+ border)
         Constraint::Length(actions_h),   // actions
-        Constraint::Length(1),           // status
+        Constraint::Length(status_h),    // status
     ])
     .split(area);
 
@@ -981,15 +984,81 @@ fn footer_lines(m: &Model) -> (Line<'static>, Line<'static>) {
     (help_line(m), status_line(m))
 }
 
+/// Operational refresh messages remain independent of action/filter prompts.
+fn shard_message(m: &Model) -> Option<Line<'static>> {
+    let cached = m.cached_shard_info.is_some();
+    let availability = if cached {
+        let age = m.shard_last_success.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        format!("Showing cached shard data ({age}s old).")
+    } else { "Shard data is not available yet.".to_owned() };
+    let message = if m.shard_loading {
+        let elapsed = m.shard_fetch_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        if let Some(error) = &m.shard_error {
+            format!("Retrying shard data ({elapsed}s; 60s limit). Last query: {error}. {availability}")
+        } else {
+            format!("Fetching shard data ({elapsed}s; 60s limit). The node may query archive peers. {availability} Node status continues updating.")
+        }
+    } else if let Some(error) = &m.shard_error {
+        format!("{error}. Retrying automatically. {availability}")
+    } else if let Some(shards) = &m.cached_shard_info {
+        let elapsed = m.shard_last_duration.map(|d| d.as_secs()).unwrap_or(0);
+        format!("Shard data updated in {elapsed}s ({} shards).", shards.shards.len())
+    } else {
+        return None;
+    };
+    Some(Line::from(Span::styled(message, Style::new().fg(
+        if m.shard_error.is_some() { Color::Yellow } else { HELP },
+    ))))
+}
+
+/// Wrap message words independently of the indivisible command hints above.
+fn wrap_message(message: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut line = Line::default();
+    for span in message.spans {
+        for word in span.content.split_whitespace() {
+            // Long RPC tokens must also fit a narrow terminal. Split only when
+            // a single word cannot fit; ordinary words wrap as whole units.
+            let mut part = String::new();
+            for ch in word.chars() {
+                if printed_width(&part) + printed_width(&ch.to_string()) > usize::from(width) {
+                    if !line.spans.is_empty() { lines.push(line); line = Line::default(); }
+                    lines.push(Line::from(Span::styled(std::mem::take(&mut part), span.style)));
+                }
+                part.push(ch);
+            }
+            if !line.spans.is_empty() && line.width() + 1 + printed_width(&part) > usize::from(width) {
+                lines.push(line); line = Line::default();
+            }
+            if !line.spans.is_empty() { line.spans.push(Span::raw(" ")); }
+            line.spans.push(Span::styled(part, span.style));
+        }
+    }
+    if !line.spans.is_empty() { lines.push(line); }
+    lines
+}
+
+fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let shards = shard_message(m);
+    let mut lines = Vec::new();
+    // Keep a fetch warning visible even when a persistent action message is
+    // also present, especially when a short terminal constrains the footer.
+    if m.shard_error.is_some() {
+        if let Some(shards) = shards.clone() { lines.extend(wrap_message(shards, width)); }
+    }
+    lines.extend(wrap_message(primary, width));
+    if m.shard_error.is_none() {
+        if let Some(shards) = shards { lines.extend(wrap_message(shards, width)); }
+    }
+    if lines.is_empty() { lines.push(Line::default()); }
+    lines
+}
+
 fn status_line(m: &Model) -> Line<'static> {
     if m.action_in_flight {
         return Line::from(format!("{} {}", spinner(m), m.status_msg));
     }
     if m.status_msg.is_empty() {
-        if let Some(error) = &m.shard_error {
-            let suffix = if m.cached_shard_info.is_some() { " (showing cached shards)" } else { "" };
-            return Line::from(Span::styled(format!("{error}{suffix}"), Style::new().fg(Color::Yellow)));
-        }
         return Line::from("");
     }
     let color = if m.status_is_error { ERROR } else { SUCCESS };
@@ -1371,6 +1440,59 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
 mod tests {
     use super::*;
     use crate::commands::node::prover::epoch::ActionHint;
+
+    #[test]
+    fn refresh_messages_preserve_action_status_and_explain_wait_retry_and_recovery() {
+        use std::time::Instant;
+        let mut m = Model::new();
+        m.status_msg = "Confirm sent. Awaiting registry...".into();
+        m.action_in_flight = true;
+        m.shard_loading = true;
+        m.shard_fetch_started = Some(Instant::now());
+        let text = |lines: Vec<Line<'static>>| lines.into_iter().map(|l| l.to_string()).collect::<Vec<_>>().join(" ");
+        let waiting = text(message_lines(&m, status_line(&m), 60));
+        assert!(waiting.contains("Confirm sent"));
+        assert!(waiting.contains("archive peers"));
+        assert!(waiting.contains("Node status continues updating"));
+        m.shard_error = Some("Shard query timed out".into());
+        let retry = text(message_lines(&m, status_line(&m), 60));
+        assert!(retry.contains("Retrying shard data"));
+        assert!(retry.contains("timed out"));
+        m.shard_loading = false;
+        assert!(text(message_lines(&m, status_line(&m), 60)).contains("Retrying automatically"));
+        m.shard_error = None;
+        m.cached_shard_info = Some(Default::default());
+        m.shard_last_duration = Some(std::time::Duration::from_secs(22));
+        let recovered = text(message_lines(&m, status_line(&m), 60));
+        assert!(recovered.contains("updated in 22s"));
+        assert!(!recovered.contains("timed out"));
+    }
+
+    #[test]
+    fn message_footer_wraps_words_and_long_rpc_tokens_without_losing_text() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let message = "Shard query timed out; retrying automatically while showing cached rows.";
+        let style = Style::new().fg(Color::Yellow);
+        let lines = wrap_message(Line::from(Span::styled(message, style)), 40);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| line.width() <= 40));
+        assert_eq!(lines.iter().map(ToString::to_string).collect::<Vec<_>>().join(" "), message);
+        let token = "x".repeat(105);
+        let lines = wrap_message(Line::from(token.clone()), 40);
+        assert!(lines.iter().all(|line| line.width() <= 40));
+        assert_eq!(lines.iter().map(ToString::to_string).collect::<String>(), token);
+        let mut m = Model::new();
+        m.status_msg = message.into();
+        m.status_is_error = true;
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut m)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..24).map(|y| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>();
+        let screen = rows.iter().map(|line| line.trim()).collect::<Vec<_>>().join(" ");
+        assert!(screen.contains(message));
+        assert!(rows[23].contains("cached rows"));
+        assert!(screen.contains("[q]"));
+    }
 
     #[test]
     fn missing_shard_data_is_loading_or_failed_instead_of_empty() {

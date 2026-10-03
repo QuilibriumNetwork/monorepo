@@ -42,13 +42,17 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
         Msg::ShardLoading => {
             m.shard_loading = true;
+            m.shard_fetch_started = Some(Instant::now());
             vec![]
         }
         Msg::ShardRefresh(result) => {
             m.shard_loading = false;
+            let elapsed = m.shard_fetch_started.take().map(|started| started.elapsed());
             match result {
                 Ok(shards) => {
                     m.shard_error = None;
+                    m.shard_last_success = Some(Instant::now());
+                    m.shard_last_duration = elapsed;
                     // Node status can arrive after shard data on initial load.
                     m.cached_shard_info = Some(shards.clone());
                     m.process_refresh_data(m.cached_node_info.clone(), Some(shards), None);

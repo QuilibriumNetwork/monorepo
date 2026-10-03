@@ -326,6 +326,9 @@ pub struct Model {
     // Aux-response cache (stabilizes panels across transient RPC blips).
     pub cached_node_info: Option<NodeInfoResponse>,
     pub shard_loading: bool,
+    pub shard_fetch_started: Option<std::time::Instant>,
+    pub shard_last_success: Option<std::time::Instant>,
+    pub shard_last_duration: Option<std::time::Duration>,
     pub shard_error: Option<String>,
     pub cached_shard_info: Option<GetShardInfoResponse>,
     pub cached_worker_info: Option<WorkerInfoResponse>,
