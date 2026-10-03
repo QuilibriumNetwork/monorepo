@@ -194,10 +194,17 @@ runs:
         # runs. macOS still needs sudo to write under /usr/local.
         if [[ "$RUNNER_OS" == "Linux" ]]; then SUDO=""; else SUDO="sudo"; fi
 
-        cmake -S emp-tool -B emp-tool/build -DCMAKE_INSTALL_PREFIX=/usr/local
+        # EMP defaults to the unversioned Homebrew openssl prefix. Pass
+        # the installed formula explicitly, including when building EMP-OT.
+        OPENSSL_CMAKE_ARGS=()
+        if [[ "$RUNNER_OS" == "macOS" ]]; then
+          OPENSSL_CMAKE_ARGS+=("-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)")
+        fi
+
+        cmake -S emp-tool -B emp-tool/build -DCMAKE_INSTALL_PREFIX=/usr/local "${OPENSSL_CMAKE_ARGS[@]}"
         cmake --build emp-tool/build -j
         $SUDO cmake --install emp-tool/build
 
-        cmake -S emp-ot -B emp-ot/build -DCMAKE_INSTALL_PREFIX=/usr/local
+        cmake -S emp-ot -B emp-ot/build -DCMAKE_INSTALL_PREFIX=/usr/local "${OPENSSL_CMAKE_ARGS[@]}"
         cmake --build emp-ot/build -j
         $SUDO cmake --install emp-ot/build
