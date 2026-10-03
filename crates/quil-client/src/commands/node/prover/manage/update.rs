@@ -40,6 +40,24 @@ pub enum Cmd {
 
 pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
+        Msg::ShardLoading => {
+            m.shard_loading = true;
+            vec![]
+        }
+        Msg::ShardRefresh(result) => {
+            m.shard_loading = false;
+            match result {
+                Ok(shards) => {
+                    m.shard_error = None;
+                    // Node status can arrive after shard data on initial load.
+                    m.cached_shard_info = Some(shards.clone());
+                    m.process_refresh_data(m.cached_node_info.clone(), Some(shards), None);
+                }
+                Err(error) => m.shard_error = Some(error),
+            }
+            vec![]
+        }
+
         Msg::DataRefresh {
             node_info,
             shard_info,
@@ -1112,6 +1130,59 @@ fn handle_join_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
 mod tests {
     use super::*;
     use quil_types::proto::node::{NodeInfoResponse, ShardAllocationInfo};
+
+    #[test]
+    fn shard_refresh_can_complete_before_node_status_and_survive_failures() {
+        use quil_types::proto::node::{GetShardInfoResponse, ShardRewardInfo};
+        let mut model = Model::new();
+        let shards = GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![0xab],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        apply_msg(&mut model, Msg::ShardLoading);
+        assert!(model.shard_loading);
+        apply_msg(&mut model, Msg::ShardRefresh(Ok(shards)));
+        assert!(!model.shard_loading);
+        apply_msg(
+            &mut model,
+            Msg::DataRefresh {
+                node_info: Some(NodeInfoResponse {
+                    last_received_frame: 720,
+                    ..Default::default()
+                }),
+                shard_info: None,
+                worker_info: None,
+                err: None,
+            },
+        );
+        assert_eq!(model.available.len(), 1);
+        apply_msg(&mut model, Msg::ShardRefresh(Err("timed out".into())));
+        assert_eq!(model.available.len(), 1, "retain usable cached rows");
+        assert_eq!(model.shard_error.as_deref(), Some("timed out"));
+        apply_msg(
+            &mut model,
+            Msg::DataRefresh {
+                node_info: Some(NodeInfoResponse {
+                    last_received_frame: 721,
+                    ..Default::default()
+                }),
+                shard_info: None,
+                worker_info: None,
+                err: None,
+            },
+        );
+        assert_eq!(model.last_received_frame, 721);
+        assert_eq!(model.shard_error.as_deref(), Some("timed out"));
+        apply_msg(
+            &mut model,
+            Msg::ShardRefresh(Ok(GetShardInfoResponse::default())),
+        );
+        assert!(model.shard_error.is_none());
+        assert!(model.available.is_empty());
+    }
 
     #[test]
     fn confirm_key_uses_the_same_epoch_window_as_the_hint() {

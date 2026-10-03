@@ -6,6 +6,8 @@ use quil_types::proto::node::{GetShardInfoResponse, NodeInfoResponse, WorkerInfo
 use super::model::FilterOutcome;
 
 pub enum Msg {
+    ShardLoading,
+    ShardRefresh(Result<GetShardInfoResponse, String>),
     /// `dataRefreshMsg` — result of a full RPC data fetch.
     DataRefresh {
         node_info: Option<NodeInfoResponse>,

@@ -324,6 +324,9 @@ pub struct Model {
     pub consecutive_failures: u32,
 
     // Aux-response cache (stabilizes panels across transient RPC blips).
+    pub cached_node_info: Option<NodeInfoResponse>,
+    pub shard_loading: bool,
+    pub shard_error: Option<String>,
     pub cached_shard_info: Option<GetShardInfoResponse>,
     pub cached_worker_info: Option<WorkerInfoResponse>,
 
@@ -381,6 +384,8 @@ impl Model {
         let Some(node_info) = node_info else {
             return;
         };
+
+        self.cached_node_info = Some(node_info.clone());
 
         // Aux cache: prefer fresh, fall back to cached.
         let shard_info = match shard_info {

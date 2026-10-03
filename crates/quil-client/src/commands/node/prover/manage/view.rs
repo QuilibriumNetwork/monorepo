@@ -808,7 +808,10 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
     let content_width = area.width as usize;
     let height = area.height as usize;
     if sorted.is_empty() {
-        if !m.data_loaded {
+        if let Some(error) = &m.shard_error {
+            return vec![Line::from(format!("  {error}"))];
+        }
+        if m.shard_loading || m.cached_shard_info.is_none() {
             return vec![Line::from(format!(
                 "  {} Loading available shards…",
                 spinner(m)
@@ -854,9 +857,15 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
             false,
         ));
     }
-    let mut lines = vec![Line::from(hdr_spans)];
+    let mut lines = Vec::new();
+    if let Some(error) = &m.shard_error {
+        lines.push(Line::from(Span::styled(
+            format!("{error} (showing cached shards)"), Style::new().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::from(hdr_spans));
 
-    let visible = height.saturating_sub(1).max(1);
+    let visible = height.saturating_sub(lines.len()).max(1);
     m.avail_offset = clamp_offset(m.avail_offset, m.avail_cursor, visible, sorted.len());
     let end = (m.avail_offset + visible).min(sorted.len());
 
@@ -977,6 +986,10 @@ fn status_line(m: &Model) -> Line<'static> {
         return Line::from(format!("{} {}", spinner(m), m.status_msg));
     }
     if m.status_msg.is_empty() {
+        if let Some(error) = &m.shard_error {
+            let suffix = if m.cached_shard_info.is_some() { " (showing cached shards)" } else { "" };
+            return Line::from(Span::styled(format!("{error}{suffix}"), Style::new().fg(Color::Yellow)));
+        }
         return Line::from("");
     }
     let color = if m.status_is_error { ERROR } else { SUCCESS };
@@ -1358,6 +1371,23 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
 mod tests {
     use super::*;
     use crate::commands::node::prover::epoch::ActionHint;
+
+    #[test]
+    fn missing_shard_data_is_loading_or_failed_instead_of_empty() {
+        let mut m = Model::new();
+        m.data_loaded = true;
+        let text = |lines: Vec<Line<'static>>| lines[0].spans.iter()
+            .map(|span| span.content.as_ref()).collect::<String>();
+        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5)))
+            .contains("Loading available shards"));
+        m.shard_error = Some("Shard data timed out after 60s; retrying".into());
+        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5)))
+            .contains("timed out"));
+        m.shard_error = None;
+        m.cached_shard_info = Some(Default::default());
+        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5)))
+            .contains("No available shards"));
+    }
 
     #[test]
     fn state_cells_use_lowercase_and_keep_their_colors() {
