@@ -46,7 +46,6 @@
     const int64_t THRESH = 1UL<<31;
     const int64_t EXP_THRESH = 31;
 
-
 extern "C" {
     //this normalization is based on Akashnil's entry to the previous round
     inline void normalize(form& f) {
@@ -237,7 +236,14 @@ extern "C" {
 
     // https://www.researchgate.net/publication/221451638_Computational_aspects_of_NUCOMP
     //based on the implementation from Bulaiden
-    inline void gmp_nudupl(form& f, ulong times) {
+    //
+    // `cutoff` requires a positive-definite form whose b^2 - 4ac is the
+    // intended discriminant. It stops the partial Euclidean algorithm at
+    // floor(|D|^(1/4)), where its remainders and cofactors already describe a
+    // nearly reduced square. With L = 0 (the original behaviour) Euclid runs
+    // to the gcd and fast_reduce must walk the oversized result back down.
+    inline void gmp_nudupl(form& f, ulong times, int cutoff) {
+        if (times == 0) return;
     mpz_t D, L;
     mpz_t G, dx, dy, By, Dy, x, y, bx, by, ax, ay, q, t, Q1, denom;
     form F, f_;
@@ -252,6 +258,17 @@ extern "C" {
     	fmpz_init(fby);
     	fmpz_init(fbx);
     	fmpz_init(fL);
+        if (cutoff) {
+            // Squaring preserves D = b^2 - 4ac, so one cutoff serves every
+            // iteration. floor(sqrt(floor(sqrt(x)))) == floor(x^(1/4)).
+            mpz_mul(D, f.b, f.b);
+            mpz_mul(t, f.a, f.c);
+            mpz_mul_ui(t, t, 4);
+            mpz_sub(D, D, t);
+            mpz_abs(D, D);
+            mpz_sqrt(L, D);
+            mpz_sqrt(L, L);
+        }
         while(times > 0){
     	    mpz_gcdext(G, y, NULL, f.b, f.a);
 
@@ -277,6 +294,10 @@ extern "C" {
     	    	mpz_mul(t, G, dx);
     	    	mpz_sub(f.c, f.c, t);
                 times--;
+                // For a well-formed form (a > 0, so by >= 1) this is only
+                // reachable with a cutoff. The textbook square is not
+                // necessarily reduced; reduce it like the partial-GCD path.
+                fast_reduce(f);
     	    	continue;
     	    }
 
@@ -336,18 +357,49 @@ extern "C" {
     	fmpz_clear(fL);
     }
 
-    void adapted_nudupl(mpz_t& a, mpz_t& b, mpz_t& c, ulong times) {
+    void adapted_nudupl(mpz_t& a, mpz_t& b, mpz_t& c, ulong times, int cutoff) {
         //initialise variables
         form newform;
         mpz_inits(newform.a, newform.b, newform.c, NULL);
         mpz_set(newform.a, a);
         mpz_set(newform.b, b);
         mpz_set(newform.c, c);
-        gmp_nudupl(newform, times);
+        gmp_nudupl(newform, times, cutoff);
+        // At |b| == a the reducer accepts both signs. For composite
+        // discriminants, partial and full Euclid can choose different signs,
+        // which changes serialized bytes despite representing the same form.
+        // Checking only the final form suffices: a reduced form is unique
+        // except at |b| == a (test_reduction already fixes the sign at
+        // a == c), so an intermediate sign difference cannot alter a later
+        // off-boundary square. For a prime discriminant the only reduced
+        // form on this boundary is the identity.
+        // The caller's coefficients still hold the input, so recover the exact
+        // original representative without retaining another copy on the fast path.
+        if (cutoff && mpz_cmpabs(newform.a, newform.b) == 0) {
+            mpz_set(newform.a, a);
+            mpz_set(newform.b, b);
+            mpz_set(newform.c, c);
+            gmp_nudupl(newform, times, 0);
+        }
         mpz_set(a, newform.a);
         mpz_set(b, newform.b);
         mpz_set(c, newform.c);
         mpz_clears(newform.a, newform.b, newform.c, NULL);
+    }
+
+    // Requires a positive-definite form: on other forms fast_reduce can loop
+    // forever or divide by zero.
+    void adapted_reduce(mpz_t& a, mpz_t& b, mpz_t& c) {
+        form f;
+        mpz_inits(f.a, f.b, f.c, NULL);
+        mpz_set(f.a, a);
+        mpz_set(f.b, b);
+        mpz_set(f.c, c);
+        fast_reduce(f);
+        mpz_set(a, f.a);
+        mpz_set(b, f.b);
+        mpz_set(c, f.c);
+        mpz_clears(f.a, f.b, f.c, NULL);
     }
 
 

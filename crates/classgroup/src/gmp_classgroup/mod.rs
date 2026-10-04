@@ -84,6 +84,24 @@ impl GmpClassGroup {
         self.assert_valid();
         rhs.assert_valid();
 
+        self.inner_compose(rhs, ctx);
+        self.inner_reduce_fast(ctx);
+    }
+
+    fn inner_reduce_fast(&mut self, ctx: &mut Ctx) {
+        ffi::gmp_reduce(&mut self.a, &mut self.b, &mut self.c);
+        // The native reducer permits b == -a. Rust's canonical convention is
+        // -a < b <= a, so normalize that boundary before serialization/hashing.
+        self.inner_normalize(ctx);
+    }
+
+    #[cfg(test)]
+    fn inner_multiply_general(&mut self, rhs: &Self, ctx: &mut Ctx) {
+        self.inner_compose(rhs, ctx);
+        self.inner_reduce(ctx);
+    }
+
+    fn inner_compose(&mut self, rhs: &Self, ctx: &mut Ctx) {
         // g = (b1 + b2) / 2
         ffi::mpz_add(&mut ctx.congruence_context.g, &self.b, &rhs.b);
         ffi::mpz_fdiv_q_ui_self(&mut ctx.congruence_context.g, 2);
@@ -179,8 +197,6 @@ impl GmpClassGroup {
         ffi::mpz_mul(&mut self.c, &ctx.k, &ctx.l);
         ffi::mpz_mul(&mut ctx.a, &ctx.j, &ctx.lambda);
         self.c -= &ctx.a;
-
-        self.inner_reduce(ctx);
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -271,7 +287,7 @@ impl GmpClassGroup {
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn inner_square_impl(&mut self, ctx: &mut Ctx) {
         self.assert_valid();
-        ffi::gmp_nudupl(&mut self.a, &mut self.b, &mut self.c, 1);
+        ffi::gmp_nudupl(&mut self.a, &mut self.b, &mut self.c, 1, true);
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -478,8 +494,8 @@ impl ClassGroup for GmpClassGroup {
     ///
     /// Panics if called within the scope of a call to `with_context`.
     fn repeated_square(&mut self, iterations: u64) {
-        Self::with_context(|ctx| {
-            ffi::gmp_nudupl(&mut self.a, &mut self.b, &mut self.c, iterations);
+        Self::with_context(|_| {
+            ffi::gmp_nudupl(&mut self.a, &mut self.b, &mut self.c, iterations, true);
         })
     }
 
@@ -552,6 +568,118 @@ pub fn do_compute(discriminant: Mpz, iterations: u64) -> GmpClassGroup {
 mod test {
     #![allow(unused_imports)]
     use super::*;
+
+    fn discriminants() -> Vec<Mpz> {
+        use std::str::FromStr;
+        vec![
+            (-23i64).into(),
+            (-47i64).into(),
+            (-167i64).into(),
+            (-685_537_176_559i64).into(),
+            Mpz::from_str("-20149392707186525162590355071292053575364559848351567085354700987844093330948936280039379742871107183330808146182415920691586415080574829617024503722195777232804427670557174581127121229242207584973924825787037130000131358603651587961876409377224876056238680407347843315752681629521613772380379341182886747008940959623895895000737071932595957989286658892888724991242968836440986789551081768017186919005412288127429935094766982059615711599441803409172888758437372755538407566562462485676644100997464269306675140005421720998149066720895066941777378563169387978299301916769407006303085854796535778826115224633447713584423").unwrap(),
+        ]
+    }
+
+    #[test]
+    fn native_squaring_matches_general_composition_bytes() {
+        for discriminant in discriminants() {
+            let mut native = GmpClassGroup::generator_for_discriminant(discriminant);
+            let mut general = native.clone();
+            for count in [0, 1, 2, 7, 8, 9, 63, 64, 65, 127] {
+                native.repeated_square(count);
+                GmpClassGroup::with_context(|ctx| {
+                    for _ in 0..count {
+                        let rhs = general.clone();
+                        general.inner_multiply_general(&rhs, ctx);
+                    }
+                });
+                assert_eq!(native, general, "repeated squaring batch {count}");
+                let mut actual = vec![0; 2 * ((native.discriminant.size_in_base(2) + 16) >> 4)];
+                let mut expected = actual.clone();
+                native.serialize(&mut actual).unwrap();
+                general.serialize(&mut expected).unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    /// The old native square can retain either sign at |b| == a. Preserve
+    /// its exact bytes even for composite discriminants and unreduced inputs.
+    #[test]
+    fn native_squaring_preserves_original_boundary_representatives() {
+        let cases = [
+            (form(4, -1, 6, -95), 1, form(5, -5, 6, -95)),
+            (form(4, -1, 7, -111), 1, form(3, 3, 10, -111)),
+            (form(4, 1, 7, -111), 1, form(3, -3, 10, -111)),
+            (form(12, 9, 3, -63), 1, form(1, 1, 16, -63)),
+            (form(4, -1, 7, -111), 2, form(1, -1, 28, -111)),
+            (form(4, -1, 7, -111), 7, form(1, -1, 28, -111)),
+        ];
+        for (mut actual, iterations, expected) in cases {
+            actual.repeated_square(iterations);
+            assert_eq!(actual, expected);
+            let mut actual_bytes = [0; 4];
+            let mut expected_bytes = [0; 4];
+            actual.serialize(&mut actual_bytes).unwrap();
+            expected.serialize(&mut expected_bytes).unwrap();
+            assert_eq!(actual_bytes, expected_bytes);
+        }
+    }
+
+    #[test]
+    fn native_composition_matches_rust_reduction() {
+        for discriminant in discriminants() {
+            let generator = GmpClassGroup::generator_for_discriminant(discriminant);
+            let mut powers = vec![generator.identity(), generator.clone()];
+            GmpClassGroup::with_context(|ctx| {
+                for _ in 0..18 {
+                    let mut next = powers.last().unwrap().clone();
+                    next.inner_multiply_general(&generator, ctx);
+                    powers.push(next);
+                }
+                for left in &powers {
+                    for right in &powers {
+                        let mut actual = left.clone();
+                        actual.inner_multiply(right, ctx);
+                        let mut expected = left.clone();
+                        expected.inner_multiply_general(right, ctx);
+                        assert_eq!(actual, expected);
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn native_reduction_matches_rust_at_canonical_boundaries() {
+        let forms = [
+            GmpClassGroup::from_ab_discriminant(1.into(), (-1).into(), (-23).into()),
+            GmpClassGroup::from_ab_discriminant(1.into(), (-1).into(), (-3).into()),
+            GmpClassGroup::from_ab_discriminant(2.into(), (-2).into(), (-4).into()),
+            GmpClassGroup::generator_for_discriminant(discriminants().pop().unwrap()),
+        ];
+        GmpClassGroup::with_context(|ctx| {
+            for form in &forms {
+                for shift in [-1000i64, -33, -1, 0, 1, 33, 1000] {
+                    // An integral change of variables preserves the discriminant
+                    // but forces normalization and highly unbalanced reduction.
+                    let r = Mpz::from(shift);
+                    let mut actual = form.clone();
+                    actual.b += &(&form.a * &r * &Mpz::from(2u64));
+                    actual.c += &(&form.b * &r + &form.a * &r * &r);
+                    let mut expected = actual.clone();
+                    actual.inner_reduce_fast(ctx);
+                    expected.inner_reduce(ctx);
+                    assert_eq!(actual, expected, "shift {shift}");
+                }
+            }
+        });
+    }
+
+    fn form(a: i64, b: i64, c: i64, discriminant: i64) -> GmpClassGroup {
+        GmpClassGroup { a: a.into(), b: b.into(), c: c.into(), discriminant: discriminant.into() }
+    }
+
     #[test]
     fn normalize() {
         let mut s = GmpClassGroup::new(
