@@ -237,11 +237,12 @@ extern "C" {
     // https://www.researchgate.net/publication/221451638_Computational_aspects_of_NUCOMP
     //based on the implementation from Bulaiden
     //
-    // `cutoff` requires a positive-definite form whose b^2 - 4ac is the
-    // intended discriminant. It stops the partial Euclidean algorithm at
-    // floor(|D|^(1/4)), where its remainders and cofactors already describe a
-    // nearly reduced square. With L = 0 (the original behaviour) Euclid runs
-    // to the gcd and fast_reduce must walk the oversized result back down.
+    // `cutoff` may be nonzero only for a positive-definite form whose
+    // b^2 - 4ac is the intended discriminant; the caller checks this. It stops
+    // the partial Euclidean algorithm at floor(|D|^(1/4)), where its remainders
+    // and cofactors already describe a nearly reduced square. With L = 0 (the
+    // original behaviour, kept for malformed forms) Euclid runs to the gcd and
+    // fast_reduce must walk the oversized result back down.
     inline void gmp_nudupl(form& f, ulong times, int cutoff) {
         if (times == 0) return;
     mpz_t D, L;
@@ -388,7 +389,7 @@ extern "C" {
     }
 
     // Requires a positive-definite form: on other forms fast_reduce can loop
-    // forever or divide by zero.
+    // forever or divide by zero. The Rust caller checks this.
     void adapted_reduce(mpz_t& a, mpz_t& b, mpz_t& c) {
         form f;
         mpz_inits(f.a, f.b, f.c, NULL);

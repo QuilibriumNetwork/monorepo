@@ -235,8 +235,10 @@ pub fn mpz_mul_ui(rop: &mut Mpz, op1: &Mpz, op2: u64) {
 //    unsafe { __gmpz_sgn(rop) }
 //}
 
-/// Square `times` times with native NUDUPL. `cutoff` enables the partial
-/// Euclid cutoff; `false` runs the original full-gcd path.
+/// Square `times` times with native NUDUPL. Pass `cutoff` only for a
+/// well-formed form (see `GmpClassGroup::is_well_formed`); otherwise this runs
+/// the original full-gcd path, preserving the fallback for callers that do not
+/// validate decoded forms.
 #[inline]
 pub fn gmp_nudupl(a: &mut Mpz, b: &mut Mpz, c: &mut Mpz, times: u64, cutoff: bool) {
     unsafe {
@@ -244,8 +246,8 @@ pub fn gmp_nudupl(a: &mut Mpz, b: &mut Mpz, c: &mut Mpz, times: u64, cutoff: boo
     }
 }
 
-/// Reduce with the native batched reducer. Only for positive-definite forms:
-/// on other forms it can loop forever or abort with a division by zero.
+/// Reduce with the native batched reducer. Only for well-formed forms: on
+/// other forms it can loop forever or abort with a division by zero.
 #[inline]
 pub fn gmp_reduce(a: &mut Mpz, b: &mut Mpz, c: &mut Mpz) {
     unsafe { adapted_reduce(a, b, c) }

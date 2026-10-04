@@ -18,6 +18,8 @@ use sha2::{digest::FixedOutput, Digest, Sha256};
 use std::{cmp::Eq, collections::HashMap, hash::Hash, mem, u64, usize};
 use std::convert::TryInto;
 
+type NativeBigNum = <GmpClassGroup as ClassGroup>::BigNum;
+
 #[derive(Debug, Clone)]
 pub struct WesolowskiVDF {
     int_size_bits: u16,
@@ -58,7 +60,7 @@ impl super::VDF for WesolowskiVDF {
         difficulty: u64,
         alleged_solution: &[u8],
     ) -> Result<(), super::InvalidProof> {
-        check_proof_of_time_wesolowski::<<GmpClassGroup as ClassGroup>::BigNum, GmpClassGroup>(
+        check_proof_of_time_wesolowski(
             challenge,
             alleged_solution,
             difficulty,
@@ -340,15 +342,12 @@ where
     serialize(&[proof], &powers[&(iterations as _)], int_size_bits.into())
 }
 
-pub fn check_proof_of_time_wesolowski<T: BigNum, V: ClassGroup<BigNum = T>>(
+pub fn check_proof_of_time_wesolowski(
     challenge: &[u8],
     proof_blob: &[u8],
     iterations: u64,
     int_size_bits: u16,
-) -> Result<(), ()>
-where
-    T: BigNumExt,
-{
+) -> Result<(), ()> {
     // SECURITY: a decoded proof/output form can be degenerate (e.g. `a == 0`) and
     // panic deep in the class-group arithmetic on a `Mpz` division. This verify is
     // on the synchronous consensus/frame-acceptance path with no upstream
@@ -356,8 +355,8 @@ where
     // the validating task / poison a lock. Verification is a pure function of the
     // inputs, so a caught panic is simply a verification failure.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        check_proof_of_time_wesolowski_inner::<T, V>(
-            challenge,
+        check_proof_of_time_wesolowski_inner(
+            super::create_discriminant(challenge, int_size_bits),
             proof_blob,
             iterations,
             int_size_bits,
@@ -366,17 +365,13 @@ where
     .unwrap_or(Err(()))
 }
 
-fn check_proof_of_time_wesolowski_inner<T: BigNum, V: ClassGroup<BigNum = T>>(
-    challenge: &[u8],
+fn check_proof_of_time_wesolowski_inner(
+    discriminant: NativeBigNum,
     proof_blob: &[u8],
     iterations: u64,
     int_size_bits: u16,
-) -> Result<(), ()>
-where
-    T: BigNumExt,
-{
-    let discriminant: T = super::create_discriminant::create_discriminant(challenge, int_size_bits);
-    let x = V::from_ab_discriminant(2.into(), 1.into(), discriminant.clone());
+) -> Result<(), ()> {
+    let x = GmpClassGroup::from_ab_discriminant(2.into(), 1.into(), discriminant.clone());
     if (usize::MAX - 16) < int_size_bits.into() {
         return Err(());
     }
@@ -385,8 +380,13 @@ where
         return Err(());
     }
     let (result_bytes, proof_bytes) = proof_blob.split_at(2 * int_size);
-    let proof = ClassGroup::from_bytes(proof_bytes, discriminant.clone());
-    let y = ClassGroup::from_bytes(result_bytes, discriminant);
+    let proof = GmpClassGroup::from_bytes(proof_bytes, discriminant.clone());
+    let y = GmpClassGroup::from_bytes(result_bytes, discriminant);
+    // An honest output and proof always decode to well-formed forms. Reject
+    // anything else before arithmetic; see `GmpClassGroup::is_well_formed`.
+    if !proof.is_well_formed() || !y.is_well_formed() {
+        return Err(());
+    }
 
     verify_proof(x, &y, proof, iterations, int_size_bits.into())
 }
@@ -538,4 +538,38 @@ where
   lhs *= &xrS;
 
   if &lhs == y_agg { Ok(()) } else { Err(()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use classgroup::{gmp_classgroup::GmpClassGroup, ClassGroup};
+
+    /// Bytes per coefficient, and per form, of a 2048-bit output.
+    const HALF: usize = 129;
+    const ELEMENT: usize = 2 * HALF;
+
+    /// Without the decode check, a zero `a` in the proof aborts the process
+    /// with SIGFPE, and a sign-flipped `a` used to drive the native reducer
+    /// into an endless loop.
+    #[test]
+    fn verify_rejects_malformed_forms_before_arithmetic() {
+        let output = crate::wesolowski_solve(2048, &[0; 32], 50_000);
+        let discriminant: super::NativeBigNum =
+            crate::create_discriminant(&[0; 32], 2048);
+        let decode = |bytes: &[u8]| GmpClassGroup::from_bytes(bytes, discriminant.clone());
+        for start in [0, ELEMENT] {
+            assert!(decode(&output[start..start + ELEMENT]).is_well_formed());
+            let mut zero_a = output.to_vec();
+            zero_a[start..start + HALF].fill(0);
+            let mut negative_a = output.to_vec();
+            negative_a[start] |= 0x80;
+            // b changes by two, so b² - D is no longer divisible by 4a.
+            let mut inexact = output.to_vec();
+            inexact[start + ELEMENT - 1] ^= 2;
+            for case in [zero_a, negative_a, inexact] {
+                assert!(!decode(&case[start..start + ELEMENT]).is_well_formed());
+                assert!(!crate::wesolowski_verify(2048, &[0; 32], 50_000, &case));
+            }
+        }
+    }
 }
