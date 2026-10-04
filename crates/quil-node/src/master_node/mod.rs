@@ -480,17 +480,24 @@ pub(crate) async fn start(
     // wedging `any_halted()` true and gating every leave/swap network-wide. The
     // inventory enumerates only the live grid (`range_app_shards`) with real sizes, so a
     // zero-data husk is skipped while a data-bearing shard nobody has joined still halts.
+    // One kept count of each shard's size for every reader in this node:
+    // counting an empty shard's committed deliveries reads every block it
+    // owns, and the coverage check, the poller, the merge trigger and the
+    // shard RPCs each counted all of them per frame.
+    let committed_shard_sizes = std::sync::Arc::new(quil_engine::shard_info::CommittedShardSizes::default());
     {
         let crdt_inv = crdt.clone();
         let shards_inv = shards_store.clone();
         let reg_inv = prover_registry.clone()
             as std::sync::Arc<dyn quil_types::consensus::ProverRegistry>;
+        let sizes_inv = committed_shard_sizes.clone();
         coverage_monitor.set_shard_inventory_provider(std::sync::Arc::new(move |frame: u64| {
             quil_engine::coverage::build_shard_inventory(
                 crdt_inv.clone(),
                 shards_inv.clone(),
                 reg_inv.as_ref(),
                 frame,
+                &sizes_inv,
             )
         }));
     }
@@ -1138,6 +1145,7 @@ pub(crate) async fn start(
     };
 
     archive_sync::spawn_all(&mut sup, archive_sync::ArchiveSyncArgs {
+        committed_shard_sizes: committed_shard_sizes.clone(),
         mtls_seed,
         network,
         genesis_seed: config.engine.genesis_seed.clone(),
@@ -1355,6 +1363,7 @@ pub(crate) async fn start(
     // 7. gRPC service
     // ---------------------------------------------------------------
     grpc::spawn_all(&mut sup, grpc::GrpcArgs {
+        committed_shard_sizes: committed_shard_sizes.clone(),
         worker_app_states: worker_app_states.clone(),
         shard_engines: shard_engines.clone(),
         remote_fee_workers: remote_worker_manager_for_halt.clone(),

@@ -659,16 +659,23 @@ impl GlobalService for GlobalRpcServer {
         // start a second copy of it.
         let task = tokio::spawn(async move {
             let started = std::time::Instant::now();
+            // Where a slow call's time went: waiting for the shared rows,
+            // reading them (None: kept from this frame), waiting for a blocking
+            // thread, and the per-shard reads by section.
+            let lock_wait;
+            let mut rows_read = None;
             // Rows change only with a committed GLOBAL frame: one caller reads
             // them per frame, and callers arriving meanwhile wait and share it.
             let topology = {
                 APP_SHARDS_WAITING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut kept = topologies.lock_owned().await;
                 APP_SHARDS_WAITING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                lock_wait = started.elapsed();
                 let version = version.as_ref().and_then(|version| version());
                 match (version, kept.get(&key)) {
                     (Some(version), Some((at, rows))) if *at == version => rows.clone(),
                     _ => {
+                        let read_started = std::time::Instant::now();
                         let (store, (shard_key, prefix)) = (shards_store, key.clone());
                         let rows = Arc::new(
                             tokio::task::spawn_blocking(move || read_shard_topology(store.as_ref(), &shard_key, &prefix))
@@ -676,6 +683,7 @@ impl GlobalService for GlobalRpcServer {
                                 .map_err(|e| Status::internal(format!("get_app_shards task panicked: {e}")))?
                                 .map_err(Status::internal)?,
                         );
+                        rows_read = Some(read_started.elapsed());
                         if let Some(version) = version {
                             if kept.len() >= APP_SHARD_TOPOLOGY_ENTRIES {
                                 kept.retain(|_, (at, _)| *at == version);
@@ -694,8 +702,11 @@ impl GlobalService for GlobalRpcServer {
             // persists only the prefix path; without the provider every entry
             // would report `size=0` and `build_proposal_descriptors` would
             // filter it out → no ProposeJoin.
-            let info = tokio::task::spawn_blocking(move || -> Vec<global::AppShardInfo> {
-                topology
+            let shard_reads_started = std::time::Instant::now();
+            let (info, shard_reads, sections) = tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let sections = quil_execution::step_timing::collect();
+                let info: Vec<global::AppShardInfo> = topology
                     .iter()
                     .map(|(s, pending_change)| {
                         let (size, data_shards, commitment, materialized_frame, latest_frame) = match &app_shards {
@@ -716,15 +727,30 @@ impl GlobalService for GlobalRpcServer {
                             pending_change: *pending_change,
                         }
                     })
-                    .collect()
+                    .collect();
+                (info, started.elapsed(), sections.finish())
             })
             .await
             .map_err(|e| Status::internal(format!("get_app_shards task panicked: {e}")))?;
+            let blocking_queue = shard_reads_started.elapsed().saturating_sub(shard_reads);
             if started.elapsed() >= std::time::Duration::from_secs(1) {
+                let ms = |d: std::time::Duration| d.as_millis() as u64;
+                let mut sections = sections;
+                sections.sort_by(|a, b| b.2.cmp(&a.2));
                 tracing::warn!(
-                    ms = started.elapsed().as_millis() as u64,
+                    ms = ms(started.elapsed()),
                     shards = info.len(),
                     waiting = APP_SHARDS_WAITING.load(std::sync::atomic::Ordering::Relaxed),
+                    lock_wait_ms = ms(lock_wait),
+                    rows_kept = rows_read.is_none(),
+                    rows_read_ms = rows_read.map_or(0, ms),
+                    blocking_queue_ms = ms(blocking_queue),
+                    shard_reads_ms = ms(shard_reads),
+                    sections = %sections
+                        .iter()
+                        .map(|(name, n, total)| format!("{name}: {n}× {} ms", total.as_millis()))
+                        .collect::<Vec<_>>()
+                        .join(" | "),
                     "slow GetAppShards computation",
                 );
             }

@@ -198,6 +198,14 @@ pub trait GlobalProposer: Send + Sync + 'static {
         None
     }
 
+    /// How long this node paces itself before it produces the proposal for
+    /// `context`. The adapter waits it out before calling
+    /// [`Self::propose_with_context`], so nothing the proposal holds (an
+    /// execution lease, a runtime thread) is held through the wait.
+    fn proposal_pacing(&self, _context: ProposalContext) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Build with all consensus coordinates. Ordinary frame implementations
     /// can use the default; session-aware handoff implementations must override
     /// it to validate the epoch and selected parent view before producing bytes.
@@ -308,6 +316,12 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
         let proposer = self.proposer.clone();
         let store = self.store.clone();
         self.context.child("propose").spawn(move |ctx| async move {
+            if let Some(pacing) = proposer.proposal_pacing(proposal_context) {
+                ctx.sleep(pacing).await;
+                if tx.is_closed() {
+                    return;
+                }
+            }
             // Bounded under `leader_timeout` (30s); simplex drops the receiver
             // when the view ends.
             let mut waited = std::time::Duration::ZERO;

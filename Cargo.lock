@@ -6261,6 +6261,7 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "ed448-rust",
+ "h2",
  "hex 0.4.3",
  "http",
  "hyper",

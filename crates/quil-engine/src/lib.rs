@@ -38,6 +38,7 @@ pub mod halt_state;
 pub mod message_collector;
 pub mod message_router;
 pub mod leader_provider;
+pub mod prover_op_tally;
 pub mod metrics;
 pub mod remote_worker;
 pub mod rewards;

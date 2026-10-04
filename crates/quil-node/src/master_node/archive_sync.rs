@@ -968,6 +968,8 @@ async fn run_state_jump(
 }
 
 pub(crate) struct ArchiveSyncArgs {
+    /// Kept shard sizes shared with every other reader in the node.
+    pub committed_shard_sizes: Arc<quil_engine::shard_info::CommittedShardSizes>,
     pub mtls_seed: Option<[u8; 57]>,
     pub network: u8,
     /// Testnet/localnet genesis seed (concatenated Falcon prover keys) — used by
@@ -1095,6 +1097,7 @@ fn sequenced_ingest_hook(
 
 pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncArgs) {
     let ArchiveSyncArgs {
+        committed_shard_sizes,
         mtls_seed,
         network,
         genesis_seed: _genesis_seed,
@@ -1289,6 +1292,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         let fm_for_poller = frame_materializer.clone();
         let shards_store_for_poller: Arc<dyn quil_types::store::ShardsStore> =
             shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
+        let sizes_for_poller = committed_shard_sizes.clone();
         let archive_mode_poller = archive_mode;
         // Non-archive nodes follow the chain over the `GLOBAL_FRAME` gossip mesh;
         // hand the poller the freshness signal so it sources frames from the
@@ -1543,11 +1547,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // because empty" from "real bytes." We walk the
                 // local hypergraph the same way the
                 // GetShardInfo RPC does (`local_app_shard_get_sizes`).
-                {
+                // Only the lifecycle below reads it, and an archive does not
+                // evaluate it here; the sizes cost an archive 8-26 s a frame
+                // on this task, between fetches (2026-10-04).
+                if !archive_mode_poller {
                     use std::collections::HashMap;
                     let get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(
                         crdt_for_poller.clone(),
                         shards_store_for_poller.clone(),
+                        sizes_for_poller.clone(),
                     );
                     let mut sizes_by_filter: HashMap<Vec<u8>, (u64, u64)> = HashMap::new();
                     if let Ok(shards) = shards_store_for_poller.range_app_shards() {
@@ -1729,6 +1737,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 if !sync_archive_mode {
                     if let Some(addr) = sync_pool.get_all().await.first() {
                         info!("starting initial prover tree sync");
+                        let registry_sync = sync_pl.begin_registry_sync();
                         // Initial bootstrap sync — no verified frame
                         // yet to pin against. Empty expected_root
                         // means "trust the archive's latest snapshot".
@@ -1754,7 +1763,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     let pr = sync_pr.clone();
                     let hs2 = sync_hg.clone();
                     match tokio::task::spawn_blocking(move || pr.refresh_from_store(hs2.as_ref())).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            if initial_sync_data_ok {
+                                sync_pl.note_registry_synced(registry_sync);
+                            }
+                        }
                         Ok(Err(error)) => {
                             initial_sync_data_ok = false;
                             warn!(%error, "prover registry refresh failed; lifecycle gate stays held");
@@ -2460,6 +2473,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     // available to later spawns.
                                     let crdt_for_merge = sync_crdt.clone();
                                     let shards_store_for_merge = sync_shards_store.clone();
+                                    let sizes_for_merge = committed_shard_sizes.clone();
                                     let registry_for_merge = sync_pr.clone();
                                     let finalization_for_worker = sync_finalization.clone();
                                     let ingest_for_worker = sync_ingest.clone();
@@ -2494,6 +2508,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             let pa = pa_for_worker.clone();
                                             let cs = cs_for_worker.clone();
                                             let crdt_for_merge = crdt_for_merge.clone();
+                                            let sizes_for_merge = sizes_for_merge.clone();
                                             let shards_store_for_merge = shards_store_for_merge.clone();
                                             let registry_for_merge = registry_for_merge.clone();
                                             let outcome = tokio::task::spawn_blocking(move || {
@@ -2525,6 +2540,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                                 shards_store_for_merge.clone(),
                                                                 registry_for_merge.as_ref(),
                                                                 frame_number,
+                                                                &sizes_for_merge,
                                                             );
                                                         cov.propose_merge_rebalance(
                                                             frame_number,
@@ -3178,6 +3194,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             // case we hit). Fall back to the latest-finalized
                             // commitment when no fork target is recorded yet
                             // (bootstrap / healthy node).
+                            // Numbered before the target is read: a sync counts
+                            // for what the lifecycle saw before it began.
+                            let registry_sync = sync_pl.begin_registry_sync();
                             let expected_root = sync_mat
                                 .as_ref()
                                 .and_then(|m| m.fork_target_root())
@@ -3216,7 +3235,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         let pr = sync_pr.clone();
                                         let hs3 = sync_hg.clone();
                                         match tokio::task::spawn_blocking(move || pr.refresh_from_store(hs3.as_ref())).await {
-                                            Ok(Ok(())) => {}
+                                            Ok(Ok(())) => sync_pl.note_registry_synced(registry_sync),
                                             Ok(Err(error)) => {
                                                 warn!(%error, "reconcile: prover registry refresh failed");
                                                 continue;

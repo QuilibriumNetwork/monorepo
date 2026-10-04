@@ -445,8 +445,45 @@ fn selected_parent_rejects_context_ancestry_body_and_state_substitution() {
             .executor
             .prepare(context, 1, &rig.blocks, &rig.verifier, false)
             .is_ok());
+        // That attempt authenticated the real parent; the next substitution
+        // must be read to be rejected.
+        rig.executor.forget_authenticated_ancestors();
     }
+    // Once authenticated, the parent is used as it is: a substituted body
+    // at its identity is never read.
+    assert!(rig.executor.prepare(context, 1, &rig.blocks, &rig.verifier, false).is_ok());
+    let mut bad = parent.clone();
+    bad.requests.clear();
+    let blocks = BlockStore::new();
+    blocks.put(context.parent, crate::consensus_wire::encode_global_frame(&bad).unwrap());
+    assert!(rig.executor.prepare(context, 1, &blocks, &rig.verifier, false).is_ok());
     assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
+}
+
+/// A leader waits out its interval pacing before preparing a proposal, so it
+/// does not hold the execution lease through it: the wait runs until the
+/// selected parent's timestamp, at most one interval.
+#[test]
+fn proposal_pacing_runs_until_the_parent_timestamp_and_no_longer_than_an_interval() {
+    use quil_cw_consensus::adapters::GlobalProposer as _;
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    let seam = rig.seam(&parent);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let pacing = |timestamp: i64| {
+        let mut paced = parent.clone();
+        paced.header.as_mut().unwrap().timestamp = timestamp;
+        rig.put(&paced);
+        seam.proposal_pacing(rig.context(&paced))
+    };
+    let wait = pacing(now_ms + 5_000).expect("a parent five seconds ahead");
+    assert!(wait > std::time::Duration::from_millis(4_000) && wait <= std::time::Duration::from_millis(5_000), "{wait:?}");
+    assert_eq!(pacing(now_ms + 60_000), Some(std::time::Duration::from_millis(10_000)), "one interval at most");
+    assert_eq!(pacing(now_ms - 1_000), None, "a parent in the past needs none");
+    assert_eq!(crate::leader_provider::proposal_pacing_wait(0, 5), std::time::Duration::ZERO);
 }
 
 /// A voter whose own execution is busy (a proposal, verification or

@@ -100,6 +100,9 @@ impl FrameMaterializer {
             crate::stage_clock::SLOW_EXECUTION,
         );
         let result = self.materialize_atomically_inner(frame, limits, write_clock, authenticate, &mut timing)?;
+        if let Some(published) = &result {
+            published.prover_ops.log(number);
+        }
         // All execution barriers were released before these callbacks, including
         // on an authenticated replay after a previous commit or restart.
         if let Some(refresh) = &self.shard_admission_refresh {

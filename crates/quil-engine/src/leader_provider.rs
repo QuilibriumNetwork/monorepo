@@ -40,6 +40,17 @@ pub(crate) fn message_kinds(raw: &[u8]) -> String {
     if kinds.is_empty() { "empty".into() } else { kinds.join("+") }
 }
 
+/// How long a leader waits at `now_ms` before producing on a parent recorded
+/// at `parent_timestamp_ms`: a header's timestamp is its production instant
+/// plus one `IDEAL_FRAME_TIME`, so waiting until it spaces production one
+/// interval apart. Capped at one interval; a parent in the past needs none.
+pub fn proposal_pacing_wait(parent_timestamp_ms: i64, now_ms: i64) -> std::time::Duration {
+    let wait = parent_timestamp_ms
+        .saturating_sub(now_ms)
+        .clamp(0, crate::difficulty::IDEAL_FRAME_TIME);
+    std::time::Duration::from_millis(wait as u64)
+}
+
 /// Refusals remembered for one validation context.
 const REJECTED_MESSAGES_KEPT: usize = 4096;
 
@@ -676,21 +687,24 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // never stall this node more than a single frame; if the parent
         // timestamp is already in the past we proceed immediately (we're
         // catching up, don't slow down).
+        //
+        // The consensus adapter waits this out before preparing the proposal
+        // (`GlobalProposer::proposal_pacing`), so a selected-parent leader
+        // does not hold its execution lease through it; this is the backstop,
+        // checked on the authenticated parent.
         {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64;
-            let target = prior_header.timestamp;
-            let wait_ms = (target - now_ms)
-                .clamp(0, crate::difficulty::IDEAL_FRAME_TIME);
-            if wait_ms > 0 {
+            let wait = proposal_pacing_wait(prior_header.timestamp, now_ms);
+            if !wait.is_zero() {
                 tracing::debug!(
                     frame = frame_number,
-                    wait_ms,
+                    wait_ms = wait.as_millis() as u64,
                     "pacing global proposal to mainnet interval",
                 );
-                std::thread::sleep(std::time::Duration::from_millis(wait_ms as u64));
+                std::thread::sleep(wait);
             }
         }
         // Timed from here: the pacing above is deliberate.

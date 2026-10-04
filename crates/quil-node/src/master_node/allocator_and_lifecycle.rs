@@ -207,6 +207,11 @@ pub(crate) fn init(
             "testnet/devnet: using shortened prover confirm window",
         );
     }
+    // A regular node's grid never flips: its registry shows a split's or
+    // merge's reassignment only once a prover-tree sync brings it in.
+    if !archive_mode {
+        lifecycle_inner.hold_gone_shard_leaves_for_sync();
+    }
     let prover_lifecycle = Arc::new(lifecycle_inner);
     // Wire the shards store so `evaluate` can discover shards that
     // have no allocations yet — calls `RangeAppShards` on the local

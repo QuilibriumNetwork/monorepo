@@ -238,6 +238,48 @@ fn pacing_leader_holds_its_turn_and_others_give_it_up() {
     assert_eq!(paced_propose(false), None, "a declined turn without a retry nullifies the view");
 }
 
+/// Builds at once when asked, but paces itself first.
+struct PacingProposer {
+    calls: std::sync::atomic::AtomicU32,
+}
+impl GlobalProposer for PacingProposer {
+    fn propose(&self, _view: u64, _parent: Sha256Digest) -> Option<(Sha256Digest, Vec<u8>)> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Some((Sha256Digest([8; 32]), vec![8]))
+    }
+    fn verify(&self, _: u64, _: Sha256Digest, _: Sha256Digest, _: Option<Vec<u8>>) -> bool {
+        false
+    }
+    fn proposal_pacing(&self, _context: quil_cw_consensus::adapters::ProposalContext) -> Option<Duration> {
+        Some(Duration::from_secs(5))
+    }
+}
+
+/// The pacing is waited out before the proposer is asked to build, so a
+/// proposal holds nothing (a selected-parent execution lease) through it.
+#[test]
+fn a_pacing_leader_is_asked_to_build_only_after_its_wait() {
+    use commonware_consensus::{simplex::types::Context, Automaton as _};
+    use commonware_runtime::Clock as _;
+    use std::sync::atomic::Ordering;
+    let leader = FalconPrivateKey::random(commonware_utils::test_rng()).public_key();
+    deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+        let proposer = Arc::new(PacingProposer { calls: 0.into() });
+        let mut automaton = quil_cw_consensus::adapters::FalconAutomaton::new(
+            context.child("automaton"), proposer.clone(), BlockStore::new());
+        let started = context.current();
+        let round = Round::new(Epoch::new(1), View::new(5));
+        let pending = automaton
+            .propose(Context { round, leader, parent: (View::new(4), Sha256Digest([1; 32])) })
+            .await;
+        context.sleep(Duration::from_secs(4)).await;
+        assert_eq!(proposer.calls.load(Ordering::Acquire), 0, "nothing is built while pacing");
+        assert_eq!(pending.await.ok(), Some(Sha256Digest([8; 32])));
+        assert!(context.current().duration_since(started).unwrap() >= Duration::from_secs(5));
+        assert_eq!(proposer.calls.load(Ordering::Acquire), 1);
+    });
+}
+
 /// Busy the way a voter publishing the previous frame is: it defers a number
 /// of checks, then answers.
 struct BusyVerifier {

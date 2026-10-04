@@ -127,6 +127,49 @@ pub struct GlobalParentExecutor {
     genesis: Digest,
     limits: GlobalParentLimits,
     active: Arc<AtomicBool>,
+    authenticated: std::sync::Mutex<AuthenticatedAncestors>,
+}
+
+/// Ancestors of an earlier preparation, by identity: each linked by parent
+/// selector down to the executed base and executed with a matching
+/// pre-state. A member just inside the execution window resolves ~30
+/// ancestors for every proposal it checks; reading and authenticating them
+/// again took 5-6 s of each 6-7 s verification on a lagging archive
+/// (2026-10-03). Only the read and the VDF/signature/request-root checks are
+/// skipped: the height, view and budget checks, the linkage and the
+/// pre-state checks still run on every use. A frame is kept only once all of
+/// those passed, since the VDF check alone does not cover every header field
+/// (a substituted parent selector passes it), and a kept substitute would
+/// refuse the real chain until evicted.
+#[derive(Default)]
+struct AuthenticatedAncestors {
+    frames: std::collections::VecDeque<(Digest, GlobalFrame, usize)>,
+    bytes: usize,
+}
+
+/// Twice the ancestor window, so a full window survives its successor.
+const AUTHENTICATED_ANCESTORS_KEPT: usize = 64;
+const AUTHENTICATED_ANCESTOR_BYTES: usize = 64 << 20;
+
+impl AuthenticatedAncestors {
+    fn get(&self, digest: &Digest) -> Option<GlobalFrame> {
+        self.frames.iter().find(|(kept, _, _)| kept == digest).map(|(_, frame, _)| frame.clone())
+    }
+
+    fn remember(&mut self, digest: Digest, frame: &GlobalFrame) {
+        let bytes = prost::Message::encoded_len(frame);
+        if bytes > AUTHENTICATED_ANCESTOR_BYTES || self.frames.iter().any(|(kept, _, _)| *kept == digest) {
+            return;
+        }
+        self.frames.push_back((digest, frame.clone(), bytes));
+        self.bytes += bytes;
+        while self.frames.len() > AUTHENTICATED_ANCESTORS_KEPT || self.bytes > AUTHENTICATED_ANCESTOR_BYTES {
+            match self.frames.pop_front() {
+                Some((_, _, evicted)) => self.bytes -= evicted,
+                None => break,
+            }
+        }
+    }
 }
 
 struct ExecutedGlobalBase {
@@ -506,6 +549,11 @@ impl GlobalParentExecutor {
     /// This node's own GLOBAL execution is in use: a proposal, verification or
     /// publication holds the lease, or the canonical materializer holds the
     /// frame lock. Either clears without anything from the network.
+    #[cfg(test)]
+    pub(crate) fn forget_authenticated_ancestors(&self) {
+        *self.authenticated.lock().unwrap() = AuthenticatedAncestors::default();
+    }
+
     pub(crate) fn busy(&self) -> bool {
         self.active.load(Ordering::Acquire) || self.source.frame_execution_busy()
     }
@@ -539,6 +587,7 @@ impl GlobalParentExecutor {
             genesis,
             limits,
             active: Arc::new(AtomicBool::new(false)),
+            authenticated: Default::default(),
         }
     }
 
@@ -677,6 +726,13 @@ impl GlobalParentExecutor {
             consumed.extend(branch.materialize(frame)?.consumed_bundles);
         }
         timing.mark("execute ancestors");
+        if let Ok(mut kept) = self.authenticated.lock() {
+            for frame in &ancestry {
+                if let Some(digest) = frame.header.as_ref().and_then(|h| identity(h).ok()) {
+                    kept.remember(digest, frame);
+                }
+            }
+        }
         branch.log_reads("selected GLOBAL parent execution", number);
         deadline()?;
         let state = ParentState::read(&branch)?;
@@ -735,20 +791,29 @@ impl GlobalParentExecutor {
         child_view: u64,
         verifier: &GlobalFrameVerifier,
     ) -> Result<GlobalFrame> {
-        let valid = |frame: &GlobalFrame| -> Result<bool> {
-            if self.check_input_budget(frame).is_err() {
-                return Ok(false);
+        // Where this ancestor sits: checked on every use.
+        let fits = |frame: &GlobalFrame| {
+            self.check_input_budget(frame).is_ok()
+                && frame.header.as_ref().is_some_and(|h| {
+                    h.frame_number == number
+                        && identity(h).ok() == Some(digest)
+                        && h.rank > 0
+                        && h.rank < child_view
+                        && parent_view.is_none_or(|view| h.rank == view)
+                })
+        };
+        if let Some(frame) = self.authenticated.lock().ok().and_then(|kept| kept.get(&digest)) {
+            if fits(&frame) {
+                return Ok(frame);
             }
-            let Some(h) = frame.header.as_ref() else {
-                return Ok(false);
-            };
-            Ok(h.frame_number == number
-                && identity(h).ok() == Some(digest)
-                && h.rank > 0
-                && h.rank < child_view
-                && parent_view.is_none_or(|view| h.rank == view)
+        }
+        let valid = |frame: &GlobalFrame| -> Result<bool> {
+            Ok(fits(frame)
                 && verifier.validate(frame)?
-                && verifier.verify_global_requests_root(h, &frame.requests))
+                && frame
+                    .header
+                    .as_ref()
+                    .is_some_and(|h| verifier.verify_global_requests_root(h, &frame.requests)))
         };
         match clock.get_global_clock_frame_candidate(number, digest.as_ref()) {
             Ok(frame) if valid(&frame)? => return Ok(frame),
@@ -770,5 +835,36 @@ impl GlobalParentExecutor {
             ));
         }
         Ok(frame)
+    }
+}
+
+#[cfg(test)]
+mod authenticated_ancestor_tests {
+    use super::*;
+
+    fn frame(number: u64, padding: usize) -> GlobalFrame {
+        GlobalFrame {
+            header: Some(GlobalFrameHeader { frame_number: number, output: vec![0; padding], ..Default::default() }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn authenticated_ancestors_are_kept_by_identity_within_their_bounds() {
+        let mut kept = AuthenticatedAncestors::default();
+        let digest = |n: u8| digest_from_identity([n; 32]);
+        kept.remember(digest(1), &frame(1, 8));
+        kept.remember(digest(1), &frame(99, 8));
+        assert_eq!(kept.get(&digest(1)).and_then(|f| f.header).map(|h| h.frame_number), Some(1), "first kept");
+        assert!(kept.get(&digest(2)).is_none());
+        for n in 2..=(AUTHENTICATED_ANCESTORS_KEPT as u8 + 1) {
+            kept.remember(digest(n), &frame(n as u64, 8));
+        }
+        assert_eq!(kept.frames.len(), AUTHENTICATED_ANCESTORS_KEPT);
+        assert!(kept.get(&digest(1)).is_none(), "the oldest goes first");
+        kept.remember(digest(200), &frame(200, AUTHENTICATED_ANCESTOR_BYTES + 1));
+        assert!(kept.get(&digest(200)).is_none(), "an oversized frame is not kept");
+        let bytes: usize = kept.frames.iter().map(|(_, _, bytes)| bytes).sum();
+        assert_eq!(kept.bytes, bytes);
     }
 }

@@ -596,6 +596,19 @@ pub struct ProverLifecycle {
     /// gate since they depend on local pending state, not shard sizes.
     shard_info_loaded: AtomicBool,
     pub(crate) confirmation_attempts: Arc<crate::confirmation_attempts::ConfirmationAttempts>,
+    /// Set on a node whose registry learns the chain's split and merge
+    /// reassignments only from prover-tree syncs: a regular node's own grid
+    /// never flips. A gone shard (split away or retired) it still holds
+    /// Active may just predate the sync that shows the allocation moved,
+    /// and the chain refuses a leave off a shard the reassignment emptied.
+    gone_shard_leaves_await_sync: AtomicBool,
+    /// Prover-tree syncs begun, and the latest begun sync that completed
+    /// with the registry refreshed from it.
+    registry_syncs_begun: AtomicU64,
+    registry_synced_through: AtomicU64,
+    /// Held gone shards, each with the syncs begun when first seen gone.
+    /// Its leave waits for a sync begun after that.
+    gone_shards_seen: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
 }
 
 impl ProverLifecycle {
@@ -633,6 +646,10 @@ impl ProverLifecycle {
             last_join_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
             confirmation_attempts: Arc::new(crate::confirmation_attempts::ConfirmationAttempts::default()),
+            gone_shard_leaves_await_sync: AtomicBool::new(false),
+            registry_syncs_begun: AtomicU64::new(0),
+            registry_synced_through: AtomicU64::new(0),
+            gone_shards_seen: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -778,6 +795,61 @@ impl ProverLifecycle {
     /// Mark initial sync as complete. Proposals are gated on this.
     pub fn set_sync_complete(&self) {
         self.initial_sync_complete.store(true, Ordering::Relaxed);
+    }
+
+    /// Hold leaves off gone shards (split away or retired) until a
+    /// prover-tree sync begun after the shard was first seen gone has
+    /// refreshed the registry. For nodes whose registry follows the chain's
+    /// splits and merges only through those syncs; see
+    /// `gone_shard_leaves_await_sync`.
+    pub fn hold_gone_shard_leaves_for_sync(&self) {
+        self.gone_shard_leaves_await_sync.store(true, Ordering::SeqCst);
+    }
+
+    /// A prover-tree sync is starting; pass the returned number to
+    /// [`Self::note_registry_synced`] once the registry is refreshed from it.
+    pub fn begin_registry_sync(&self) -> u64 {
+        self.registry_syncs_begun.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The registry now reflects the sync [`Self::begin_registry_sync`]
+    /// numbered `sync`.
+    pub fn note_registry_synced(&self, sync: u64) {
+        self.registry_synced_through.fetch_max(sync, Ordering::SeqCst);
+    }
+
+    /// The gone shards a leave may be proposed off now, and how many wait
+    /// for a sync. Forgets shards no longer passed in.
+    fn gone_shard_leaves_ready(
+        &self,
+        gone: &[Vec<u8>],
+        frame_number: u64,
+    ) -> (std::collections::HashSet<Vec<u8>>, usize) {
+        if !self.gone_shard_leaves_await_sync.load(Ordering::SeqCst) {
+            return (gone.iter().cloned().collect(), 0);
+        }
+        let begun = self.registry_syncs_begun.load(Ordering::SeqCst);
+        let synced = self.registry_synced_through.load(Ordering::SeqCst);
+        let Ok(mut seen) = self.gone_shards_seen.lock() else {
+            return (std::collections::HashSet::new(), gone.len());
+        };
+        seen.retain(|filter, _| gone.contains(filter));
+        let mut ready = std::collections::HashSet::new();
+        for filter in gone {
+            let first_seen = *seen.entry(filter.clone()).or_insert_with(|| {
+                info!(
+                    filter = %hex::encode(filter),
+                    frame = frame_number,
+                    "lifecycle: a held shard is gone; its leave waits for the next prover-tree sync to show whether the split or merge moved the allocation",
+                );
+                begun
+            });
+            if synced > first_seen {
+                ready.insert(filter.clone());
+            }
+        }
+        let waiting = seen.len() - ready.len();
+        (ready, waiting)
     }
 
     /// Mark VDF proof computation as in-progress / done.
@@ -1378,14 +1450,14 @@ impl ProverLifecycle {
             }
         }
         for descriptor in &mut proposal_descriptors {
-            descriptor.shards = shard_metrics[&descriptor.filter].1;
+            descriptor.shards = shard_metrics.get(&descriptor.filter).map_or(0, |(_, shards)| *shards);
         }
         // Missing reward metadata cannot establish a profitable destination.
         proposal_descriptors.retain(|d| self.strategy != Strategy::RewardGreedy || d.shards > 0);
         let mut decide_all_descriptors =
             build_decide_descriptors(&summaries, &shard_sizes_snapshot);
         for descriptor in &mut decide_all_descriptors {
-            descriptor.shards = shard_metrics[&descriptor.filter].1;
+            descriptor.shards = shard_metrics.get(&descriptor.filter).map_or(0, |(_, shards)| *shards);
         }
         // Leave economics use the allocation's confirmed reward ring, as the
         // reward calculator does, rather than the last member's ring. Keep the
@@ -2175,6 +2247,16 @@ impl ProverLifecycle {
                 .filter(|f| retired.contains(*f))
                 .cloned()
                 .collect();
+            let gone: Vec<Vec<u8>> = split_parent_filters
+                .iter()
+                .chain(&retired_filters)
+                .cloned()
+                .collect();
+            let (gone_ready, gone_waiting) = self.gone_shard_leaves_ready(&gone, frame_number);
+            let split_parent_filters: Vec<Vec<u8>> =
+                split_parent_filters.into_iter().filter(|f| gone_ready.contains(f)).collect();
+            let retired_filters: Vec<Vec<u8>> =
+                retired_filters.into_iter().filter(|f| gone_ready.contains(f)).collect();
 
             // Min-hold dwell: allocations confirmed within the last
             // `SCORE_LEAVE_MIN_HOLD_FRAMES` are exempt from pure-score
@@ -2226,7 +2308,7 @@ impl ProverLifecycle {
             } else {
                 available_replacements.as_slice()
             };
-            let score_candidates: Vec<Vec<u8>> = if !proposal_descriptors.is_empty() {
+            let leave_plan = if !proposal_descriptors.is_empty() {
                 proposer::plan_leaves_releasing_spread(
                     &allocated_descriptors,
                     replacement_descriptors,
@@ -2240,11 +2322,11 @@ impl ProverLifecycle {
                     Some(&self.prover_address),
                 )
             } else {
-                Vec::new()
+                proposer::LeavePlan::default()
             };
-            let score_driven_count = score_candidates.len();
+            let score_driven_count = leave_plan.filters.len();
 
-            let mut leave_candidates = score_candidates;
+            let mut leave_candidates = leave_plan.filters.clone();
             for f in &empty_allocated_filters {
                 if !leave_candidates.contains(f) {
                     leave_candidates.push(f.clone());
@@ -2327,6 +2409,28 @@ impl ProverLifecycle {
             if !leave_candidates.is_empty() {
                 self.allocator.set_last_join_attempt(frame_number);
                 self.record_leave_attempts(&leave_candidates, frame_number);
+                // Each proposed leave by the first cause that picked it, for
+                // counting how many leaves a node proposes and why (a new
+                // shard drew leaves off several healthy ones on every node).
+                let mut by_cause = [0usize; 7];
+                for f in &leave_candidates {
+                    let cause = if leave_plan.halt_risk_swaps.contains(f) {
+                        1
+                    } else if leave_plan.filters.contains(f) {
+                        0
+                    } else if empty_allocated_filters.contains(f) {
+                        2
+                    } else if unrecoverable_orphan_filters.contains(f) {
+                        3
+                    } else if overcapacity_filters.contains(f) {
+                        4
+                    } else if split_parent_filters.contains(f) {
+                        5
+                    } else {
+                        6
+                    };
+                    by_cause[cause] += 1;
+                }
                 let leave_summary: Vec<String> = leave_candidates
                     .iter()
                     .map(hex::encode)
@@ -2336,14 +2440,18 @@ impl ProverLifecycle {
                     allocated = allocated_descriptors.len(),
                     unallocated_candidates = proposal_descriptors.len(),
                     leave_proposals = leave_candidates.len(),
-                    score_driven = score_driven_count,
-                    empty_allocated = empty_shard_count,
-                    unrecoverable_orphans = unrecoverable_orphan_count,
-                    overcapacity = overcapacity_count,
+                    score = by_cause[0],
+                    halt_risk_swap = by_cause[1],
+                    empty = by_cause[2],
+                    unrecoverable_orphan = by_cause[3],
+                    overcapacity = by_cause[4],
+                    split_parent = by_cause[5],
+                    retired = by_cause[6],
                     auto_worker_capacity,
+                    gone_waiting,
                     cooldown_suppressed,
                     ?leave_summary,
-                    "proposing leaves (score-driven + empty + over-capacity)"
+                    "proposing leaves"
                 );
                 actions.push(LifecycleAction::ProposeLeave {
                     filters: leave_candidates,
@@ -5865,6 +5973,50 @@ mod proposal_loop_tests {
         assert!(!count_confirms(&actions).contains(&root), "{actions:?}");
     }
 
+    // Every joiner of a halt-risk shard confirms regardless of score, though
+    // the shard lacks only two provers and a larger shard here would fail
+    // them on score. Capping the bypass at the shortfall needs an agreed
+    // order of joiners, which a malicious joiner can grind its address into
+    // and then never confirm.
+    #[test]
+    fn every_joiner_of_a_halt_risk_shard_confirms_regardless_of_score() {
+        let waiting = filter_bytes(0xB0);
+        let large = filter_bytes(0xA2);
+        let joiners: Vec<Vec<u8>> = (0x10u8..0x16).map(|b| vec![b; 32]).collect();
+        let joiner = |address: &Vec<u8>| {
+            let mut info = prover(address.clone(), vec![alloc(waiting.clone(), ProverStatus::Joining, 50)]);
+            info.status = ProverStatus::Joining;
+            info
+        };
+        let decide = |me: &Vec<u8>| {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            let reg = Arc::new(ConfigurableRegistry::new());
+            wm.add(WorkerInfo {
+                core_id: 1, filter: waiting.clone(), available_storage: 0, total_storage: 0,
+                manually_managed: false, pending_filter_frame: 0, allocated: false,
+            });
+            reg.set_provers(joiners.iter().map(joiner).collect());
+            let mut counts = HashMap::new();
+            counts.insert(ProverStatus::Active, 2);
+            counts.insert(ProverStatus::Joining, joiners.len() as u32);
+            reg.set_summaries(vec![
+                ProverShardSummary { filter: waiting.clone(), status_counts: counts, total_size: 1_000 },
+                ProverShardSummary { filter: large.clone(), status_counts: HashMap::new(), total_size: 100_000_000 },
+            ]);
+            let lifecycle = make_lifecycle(
+                me.clone(),
+                wm.clone() as Arc<dyn WorkerManager>,
+                reg.clone() as Arc<dyn ProverRegistry>,
+            );
+            lifecycle.set_prover_root_verified_frame(800);
+            let actions = lifecycle.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            (count_confirms(&actions).contains(&waiting), count_reject_filters(&actions).contains(&waiting))
+        };
+        for me in &joiners {
+            assert_eq!(decide(me), (true, false), "joiner {:02x}", me[0]);
+        }
+    }
+
     fn put_grid(
         app: &[u8; 32],
         paths: &[&[bool]],
@@ -5937,6 +6089,48 @@ mod proposal_loop_tests {
         assert!(!leaves(stale_grid.clone(), &refreshed).contains(&parent), "the archive sizes hold it");
         assert!(!leaves(stale_grid.clone(), &stale_sizes).contains(&parent), "the sizes lack a live shard: wait for the refresh");
         assert!(leaves(stale_grid, &stale_sizes).contains(&parent), "a parent every view shows split, after a refresh, is left");
+    }
+
+    /// A regular node's registry shows a split's reassignment only after a
+    /// prover-tree sync, so a split-away parent it still holds Active may be
+    /// one the split already moved it off, and the chain refuses that leave.
+    /// The leave waits for a sync begun after the parent was seen gone. Once
+    /// the archive sizes omit it, the parent is also retired here (this
+    /// node's grid never listed it); that leave waits too.
+    #[test]
+    fn a_split_away_parent_is_left_only_after_a_sync_begun_since() {
+        let address = vec![0xCDu8; 32];
+        let app = [0x1Cu8; 32];
+        let parent = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let children = [false, true].map(|bit| quil_forest::encode_shard_bit_path(&app, &[false, bit])).to_vec();
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(allocated_worker(1, parent.clone()));
+        reg.set_prover(prover(address.clone(), vec![alloc(parent.clone(), ProverStatus::Active, 4)]));
+        reg.set_summaries(vec![shard_summary(parent.clone(), 8)]);
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.hold_gone_shard_leaves_for_sync();
+        lifecycle.set_prover_root_verified_frame(242);
+        lifecycle.set_shards_store(put_grid(&app, &[&[false, false], &[false, true]], None));
+        let sizes: HashMap<Vec<u8>, u64> = children.iter().map(|c| (c.clone(), 734u64)).collect();
+        let leaves = || {
+            lifecycle.set_remote_shard_sizes(sizes.clone());
+            let actions = lifecycle.evaluate(242, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            actions.iter().filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            }).flatten().collect::<Vec<_>>()
+        };
+
+        let running = lifecycle.begin_registry_sync();
+        assert!(!leaves().contains(&parent), "the refresh it asked for is pending");
+        assert!(!leaves().contains(&parent), "split away, but the registry may predate the reassignment");
+        lifecycle.note_registry_synced(running);
+        assert!(!leaves().contains(&parent), "a sync begun before the parent was seen split away does not count");
+        let later = lifecycle.begin_registry_sync();
+        assert!(!leaves().contains(&parent), "nor one still running");
+        lifecycle.note_registry_synced(later);
+        assert!(leaves().contains(&parent), "a registry synced since still holds it there: the split did not move it");
     }
 
     /// Mainnet's merged parents: a legacy merge moves only committee

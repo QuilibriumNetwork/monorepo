@@ -57,6 +57,7 @@ pub struct TentativeFrameResult {
     pub prover_root: [u8; 32],
     pub consumed_bundles: Vec<Vec<u8>>,
     pub checkpoint: GlobalExecutionCheckpoint,
+    pub prover_ops: crate::prover_op_tally::ProverOpTally,
 }
 
 /// No primary-store, notification or writable materializer handles are exposed.
@@ -225,6 +226,7 @@ impl MaterializerBranch {
             prover_root: root,
             consumed_bundles: result.finalized_bundles,
             checkpoint,
+            prover_ops: result.prover_ops,
         })
     }
 }

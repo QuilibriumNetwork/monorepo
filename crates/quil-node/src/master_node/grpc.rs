@@ -42,6 +42,8 @@ async fn fetch_remote_app_shards(
 }
 
 pub(crate) struct GrpcArgs {
+    /// Kept shard sizes shared with every other reader in the node.
+    pub committed_shard_sizes: Arc<quil_engine::shard_info::CommittedShardSizes>,
     /// Filter → covering thread worker's stores (wallet reads of app state).
     pub worker_app_states: super::worker_manager::WorkerAppStates,
     pub config: quil_config::Config,
@@ -601,6 +603,7 @@ pub(crate) fn spawn_all(
     args: GrpcArgs,
 ) -> anyhow::Result<()> {
     let GrpcArgs {
+        committed_shard_sizes,
         config,
         network,
         archive_mode,
@@ -985,7 +988,7 @@ pub(crate) fn spawn_all(
         let crdt = crdt.clone();
         let db = db_arc.clone();
         let clock = clock_store.clone();
-        let sizes = Arc::new(quil_engine::shard_info::CommittedShardSizes::default());
+        let sizes = committed_shard_sizes.clone();
         let committed_global_frame = committed_global_frame.clone();
         Arc::new(move |shard_key: &[u8], prefix: &[u32]| {
             let info = quil_types::store::ShardInfo {
@@ -995,20 +998,34 @@ pub(crate) fn spawn_all(
                 data_shards: 0,
                 commitment: Vec::new(),
             };
-            let meta = quil_engine::app_shard_metadata::get_app_shard_metadata(crdt.as_ref(), &info)?;
+            // Sections: a slow `GetAppShards` logs where its per-shard reads went.
+            use quil_execution::step_timing::section;
+            let meta = {
+                let _timed = section("metadata");
+                quil_engine::app_shard_metadata::get_app_shard_metadata(crdt.as_ref(), &info)?
+            };
             let filter = quil_forest::shard_prefix_to_filter(&shard_key.get(3..35)?, prefix);
-            let materialized_frame = db.get(&quil_store::encoding::consensus_materialized_cursor_key(&filter)).ok().flatten()
-                .filter(|v| v.len() == 8)
-                .map(|v| u64::from_be_bytes(v.as_slice().try_into().expect("8-byte cursor")))
-                .unwrap_or(0);
+            let materialized_frame = {
+                let _timed = section("materialized cursor");
+                db.get(&quil_store::encoding::consensus_materialized_cursor_key(&filter)).ok().flatten()
+                    .filter(|v| v.len() == 8)
+                    .map(|v| u64::from_be_bytes(v.as_slice().try_into().expect("8-byte cursor")))
+                    .unwrap_or(0)
+            };
             // The number alone: decoding each shard's latest frame (megabytes
             // with its proofs) was most of what this cost.
-            let latest_frame = clock.get_latest_shard_clock_frame_number(&filter).ok().flatten().unwrap_or(0);
+            let latest_frame = {
+                let _timed = section("latest frame number");
+                clock.get_latest_shard_clock_frame_number(&filter).ok().flatten().unwrap_or(0)
+            };
             // A split's empty shards report committed deliveries, so the
             // regular nodes this answers staff them and outputs placed there land.
-            let size = match committed_global_frame() {
-                Some(committed) => sizes.size(&crdt, shard_key, prefix, meta.size, committed),
-                None => quil_engine::shard_info::reported_shard_size(&crdt, shard_key, prefix, meta.size),
+            let size = {
+                let _timed = section("size");
+                match committed_global_frame() {
+                    Some(committed) => sizes.size(&crdt, shard_key, prefix, meta.size, committed),
+                    None => quil_engine::shard_info::reported_shard_size(&crdt, shard_key, prefix, meta.size),
+                }
             };
             Some((size, meta.data_shards, meta.commitments, materialized_frame, latest_frame))
         })
@@ -1560,6 +1577,7 @@ pub(crate) fn spawn_all(
         ed448_seed: Option<[u8; 57]>,
         archive_mode: bool,
         archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
+        sizes: Arc<quil_engine::shard_info::CommittedShardSizes>,
     }
     impl quil_types::consensus::ShardInfoProvider for LocalShardInfoProvider {
         fn get_shard_info(&self, include_all: bool)
@@ -1579,7 +1597,7 @@ pub(crate) fn spawn_all(
                 .filter(|pr| pr.address == self.self_address)
                 .flat_map(|pr| pr.allocations.iter().filter(|a| a.is_live(frame_number)).map(|a| a.confirmation_filter.clone()))
                 .collect();
-            let local_get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(self.crdt.clone(), self.shards_store.clone());
+            let local_get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(self.crdt.clone(), self.shards_store.clone(), self.sizes.clone());
             let local_result = quil_engine::shard_info::get_shard_info(
                 include_all, &self.self_address, &allocated_filters, difficulty, frame_number,
                 self.shards_store.as_ref(), self.registry.as_ref(), &local_get_sizes,
@@ -1805,6 +1823,7 @@ pub(crate) fn spawn_all(
     }
 
     node_rpc_builder = node_rpc_builder.with_shard_info_provider(Arc::new(LocalShardInfoProvider {
+        sizes: committed_shard_sizes.clone(),
         registry: prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
         clock_store: clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
         crdt: crdt.clone(),

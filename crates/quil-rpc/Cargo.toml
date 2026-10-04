@@ -49,6 +49,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio"] }
 tower = "0.5"
 http = "1"
 hyper = "1"
+h2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

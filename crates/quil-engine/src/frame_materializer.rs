@@ -253,6 +253,8 @@ pub struct MaterializeResult {
     /// feeds these to `MessageCollector::mark_finalized` so the consumed
     /// messages leave the mempool and aren't re-proposed.
     pub finalized_bundles: Vec<Vec<u8>>,
+    /// The prover lifecycle filters the frame's bundles carried.
+    pub prover_ops: crate::prover_op_tally::ProverOpTally,
 }
 
 impl FrameMaterializer {
@@ -428,6 +430,7 @@ impl FrameMaterializer {
                 prover_root_matched: true,
                 local_prover_root: Vec::new(),
                 finalized_bundles: Vec::new(),
+                prover_ops: Default::default(),
             });
         }
 
@@ -451,6 +454,7 @@ impl FrameMaterializer {
                 prover_root_matched: true,
                 local_prover_root: Vec::new(),
                 finalized_bundles: Vec::new(),
+                prover_ops: Default::default(),
             });
         }
 
@@ -577,6 +581,7 @@ impl FrameMaterializer {
                     self.hypergraph.current_forest_phase_root(&[0xff; 32], 0)?.to_vec()
                 } else { Vec::new() },
                 finalized_bundles: Vec::new(),
+                prover_ops: Default::default(),
             });
         }
 
@@ -799,6 +804,7 @@ impl FrameMaterializer {
         // spent 90-190 ms per message here against ~30 ms validating.
         let execution_started = std::time::Instant::now();
         let sections = quil_execution::step_timing::collect();
+        let mut prover_ops = crate::prover_op_tally::ProverOpTally::default();
         let mut execution_us: std::collections::HashMap<String, (usize, u64, u64, u64)> =
             std::collections::HashMap::new();
         let mut record_execution = |raw: &[u8], validate_us: u64, process_us: u64| {
@@ -875,6 +881,7 @@ impl FrameMaterializer {
                 Err(e) if e.is_execution_unavailable() => return Err(e),
                 Err(e) => {
                     skipped += 1;
+                    prover_ops.record(&bundle_bytes, false);
                     outcomes.push(RequestOutcome { status: RequestStatus::Skipped, error: format!("invalid fee cost: {e}") });
                     continue;
                 }
@@ -932,6 +939,7 @@ impl FrameMaterializer {
             let validate_us = validate_started.elapsed().as_micros() as u64;
             if let Some(reason) = reject_reason {
                 record_execution(&bundle_bytes, validate_us, 0);
+                prover_ops.record(&bundle_bytes, false);
                 skipped += 1;
                 outcomes.push(RequestOutcome {
                     status: RequestStatus::Rejected,
@@ -953,6 +961,7 @@ impl FrameMaterializer {
                 &bundle_bytes,
             );
             record_execution(&bundle_bytes, validate_us, process_started.elapsed().as_micros() as u64);
+            prover_ops.record(&bundle_bytes, result.is_ok());
             match result {
                 Ok(_) => {
                     processed += 1;
@@ -1445,6 +1454,11 @@ impl FrameMaterializer {
             prover_root_matched,
             "frame materialized"
         );
+        // A branch executes a frame once per proposal, vote and finalization;
+        // its publication logs the tally that counts.
+        if !self.tentative_execution {
+            prover_ops.log(frame_number);
+        }
 
         Ok(MaterializeResult {
             processed,
@@ -1452,6 +1466,7 @@ impl FrameMaterializer {
             prover_root_matched,
             local_prover_root: post_root,
             finalized_bundles,
+            prover_ops,
         })
     }
 
@@ -2489,6 +2504,7 @@ mod tests {
             prover_root_matched: true,
             local_prover_root: vec![0xAA; 64],
             finalized_bundles: Vec::new(),
+            prover_ops: Default::default(),
         };
         assert_eq!(r.processed, 5);
         assert_eq!(r.skipped, 1);

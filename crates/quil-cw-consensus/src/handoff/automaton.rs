@@ -134,6 +134,10 @@ impl GlobalProposer for HandoffProposer {
         }
     }
 
+    fn proposal_pacing(&self, context: ProposalContext) -> Option<std::time::Duration> {
+        self.inner.proposal_pacing(context)
+    }
+
     fn propose_with_context(&self, context: ProposalContext) -> Option<(Digest, Vec<u8>)> {
         let waited = {
             let waits = self.parent_waits.lock().unwrap();
