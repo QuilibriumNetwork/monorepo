@@ -20,6 +20,29 @@ use std::convert::TryInto;
 
 type NativeBigNum = <GmpClassGroup as ClassGroup>::BigNum;
 
+thread_local! {
+    static FRAME_DISCRIMINANT: std::cell::RefCell<Option<([u8; 32], NativeBigNum)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A proposer immediately verifies its own proof with the same challenge.
+/// Keep one 2048-bit frame discriminant per thread, keyed by all input bytes.
+/// Other sizes/challenge lengths bypass the cache so retained memory is bounded.
+fn frame_discriminant(challenge: &[u8], int_size_bits: u16) -> NativeBigNum {
+    if int_size_bits != 2048 || challenge.len() != 32 {
+        return super::create_discriminant(challenge, int_size_bits);
+    }
+    let key: [u8; 32] = challenge.try_into().unwrap();
+    FRAME_DISCRIMINANT.with(|cache| {
+        if let Some((prior, value)) = cache.borrow().as_ref() {
+            if *prior == key { return value.clone(); }
+        }
+        let value: NativeBigNum = super::create_discriminant(challenge, int_size_bits);
+        *cache.borrow_mut() = Some((key, value.clone()));
+        value
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct WesolowskiVDF {
     int_size_bits: u16,
@@ -49,7 +72,7 @@ impl super::VDF for WesolowskiVDF {
                 <GmpClassGroup as ClassGroup>::BigNum,
                 GmpClassGroup,
             >(
-                challenge, difficulty as usize, self.int_size_bits
+                frame_discriminant(challenge, self.int_size_bits), difficulty as usize, self.int_size_bits
             ))
         }
     }
@@ -318,7 +341,7 @@ pub fn verify_proof<T: BigNum, V: ClassGroup<BigNum = T>>(
 }
 
 pub fn create_proof_of_time_wesolowski<T: BigNumExt, V: ClassGroup<BigNum = T> + Eq + Hash>(
-    challenge: &[u8],
+    discriminant: T,
     iterations: usize,
     int_size_bits: u16,
 ) -> Vec<u8>
@@ -326,7 +349,6 @@ where
     for<'a, 'b> &'a V: std::ops::Mul<&'b V, Output = V>,
     for<'a, 'b> &'a V::BigNum: std::ops::Mul<&'b V::BigNum, Output = V::BigNum>,
 {
-    let discriminant = super::create_discriminant::create_discriminant(&challenge, int_size_bits);
     let x = V::from_ab_discriminant(2.into(), 1.into(), discriminant);
     assert!((iterations as u128) < (1u128 << 53));
     let (l, k, _) = approximate_parameters(iterations as f64);
@@ -356,7 +378,7 @@ pub fn check_proof_of_time_wesolowski(
     // inputs, so a caught panic is simply a verification failure.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         check_proof_of_time_wesolowski_inner(
-            super::create_discriminant(challenge, int_size_bits),
+            frame_discriminant(challenge, int_size_bits),
             proof_blob,
             iterations,
             int_size_bits,
@@ -547,6 +569,29 @@ mod tests {
     /// Bytes per coefficient, and per form, of a 2048-bit output.
     const HALF: usize = 129;
     const ELEMENT: usize = 2 * HALF;
+
+    #[test]
+    fn frame_discriminant_cache_matches_uncached_for_every_key() {
+        for (seed, bits, len) in [(0, 2048, 32), (1, 2048, 32), (1, 1024, 32), (1, 2048, 31), (0, 2048, 32)] {
+            let challenge = vec![seed; len];
+            let expected: super::NativeBigNum = crate::create_discriminant(&challenge, bits);
+            assert_eq!(super::frame_discriminant(&challenge, bits), expected);
+            assert_eq!(super::frame_discriminant(&challenge, bits), expected);
+        }
+    }
+
+    #[test]
+    fn cached_discriminant_still_checks_the_proof_and_difficulty() {
+        let output = crate::wesolowski_solve(2048, &[0; 32], 50_000);
+        assert!(crate::wesolowski_verify(2048, &[0; 32], 50_000, &output));
+        assert!(!crate::wesolowski_verify(2048, &[0; 32], 50_001, &output));
+        assert!(!crate::wesolowski_verify(2048, &[0; 32], 50_000, &output[..515]));
+        // Use a different valid class-group element as the proof, keeping
+        // decoding and arithmetic valid while making the relation false.
+        let mut invalid = output.to_vec();
+        invalid.copy_within(..ELEMENT, ELEMENT);
+        assert!(!crate::wesolowski_verify(2048, &[0; 32], 50_000, &invalid));
+    }
 
     /// Without the decode check, a zero `a` in the proof aborts the process
     /// with SIGFPE, and a sign-flipped `a` used to drive the native reducer

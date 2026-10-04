@@ -46,6 +46,21 @@
     const int64_t THRESH = 1UL<<31;
     const int64_t EXP_THRESH = 31;
 
+    // Each reducer invocation overwrites these values before reading them.
+    // Retain their limb allocations per thread rather than reallocating nine
+    // large integers for every square and proof multiplication.
+    struct reduction_scratch {
+        mpz_t faa, fab, fac, fba, fbb, fbc, fca, fcb, fcc;
+        reduction_scratch() {
+            mpz_inits(faa, fab, fac, fba, fbb, fbc, fca, fcb, fcc, NULL);
+        }
+        ~reduction_scratch() {
+            mpz_clears(faa, fab, fac, fba, fbb, fbc, fca, fcb, fcc, NULL);
+        }
+        reduction_scratch(const reduction_scratch&) = delete;
+        reduction_scratch& operator=(const reduction_scratch&) = delete;
+    };
+
 extern "C" {
     //this normalization is based on Akashnil's entry to the previous round
     inline void normalize(form& f) {
@@ -128,10 +143,16 @@ extern "C" {
 		int64_t a, b, c, a_, b_, c_;
 		int64_t aa, ab, ac, ba, bb, bc, ca, cb, cc;
 		long int a_exp, b_exp, c_exp, max_exp, min_exp;
-		mpz_t faa, fab, fac, fba, fbb, fbc, fca, fcb, fcc, a2, mu;
-
-		// Initialize all temporary variables
-		mpz_inits(faa, fab, fac, fba, fbb, fbc, fca, fcb, fcc, a2, mu, NULL);
+        thread_local reduction_scratch scratch;
+        auto& faa = scratch.faa;
+        auto& fab = scratch.fab;
+        auto& fac = scratch.fac;
+        auto& fba = scratch.fba;
+        auto& fbb = scratch.fbb;
+        auto& fbc = scratch.fbc;
+        auto& fca = scratch.fca;
+        auto& fcb = scratch.fcb;
+        auto& fcc = scratch.fcc;
 
 		while (!test_reduction(f)) {
 			a = mpz_get_si_2exp(&a_exp, f.a);
@@ -176,7 +197,7 @@ extern "C" {
 
 				a_ = c;
 				c_ = c * delta;
-				b_ = -b + (c_ << 1);
+				b_ = -b + c_ * 2;
 				gamma = b - c_;
 				c_ = a - delta * gamma;
 
@@ -200,9 +221,11 @@ extern "C" {
 			aa = u * u;
 			ab = u * w;
 			ac = w * w;
-			ba = u * v << 1;
+			// These bounded signed products may be negative; shifting a
+			// negative integer left is undefined in C++.
+			ba = u * v * 2;
 			bb = u * x + v * w;
-			bc = w * x << 1;
+			bc = w * x * 2;
 			ca = v * v;
 			cb = v * x;
 			cc = x * x;
@@ -230,8 +253,6 @@ extern "C" {
 			mpz_add(f.c, f.c, fcc);
 		}
 
-		// Clear all initialized GMP variables to avoid memory leaks
-		mpz_clears(faa, fab, fac, fba, fbb, fbc, fca, fcb, fcc, a2, mu, NULL);
 	}
 
     // https://www.researchgate.net/publication/221451638_Computational_aspects_of_NUCOMP
@@ -246,13 +267,10 @@ extern "C" {
     inline void gmp_nudupl(form& f, ulong times, int cutoff) {
         if (times == 0) return;
     mpz_t D, L;
-    mpz_t G, dx, dy, By, Dy, x, y, bx, by, ax, ay, q, t, Q1, denom;
-    form F, f_;
+    mpz_t G, dx, dy, By, Dy, x, y, bx, by, ax, ay, t, Q1;
     fmpz_t fy, fx, fby, fbx, fL;
-    	mpz_init(denom);
     	mpz_inits(D, L, NULL);
-    	mpz_inits(G, dx, dy, By, Dy, x, y, bx, by, ax, ay, q, t, Q1, denom, NULL);
-    	mpz_inits(F.a, F.b, F.c, NULL);
+        mpz_inits(G, dx, dy, By, Dy, x, y, bx, by, ax, ay, t, Q1, NULL);
 
     	fmpz_init(fy);
     	fmpz_init(fx);
@@ -346,10 +364,8 @@ extern "C" {
             fast_reduce(f);
         }
 
-    	mpz_clear(denom);
     	mpz_clears(D, L, NULL);
-    	mpz_clears(G, dx, dy, By, Dy, x, y, bx, by, ax, ay, q, t, Q1, denom, NULL);
-    	mpz_clears(F.a, F.b, F.c, NULL);
+        mpz_clears(G, dx, dy, By, Dy, x, y, bx, by, ax, ay, t, Q1, NULL);
 
     	fmpz_clear(fy);
     	fmpz_clear(fx);
