@@ -2759,7 +2759,7 @@ mod buckets_tests {
     /// overrides it, and the rest compute their frames from the 720 default, so
     /// without one lock they race.
     static EPOCH_LENGTH: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn epoch_length_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn epoch_length_guard() -> std::sync::MutexGuard<'static, ()> {
         EPOCH_LENGTH.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -6204,6 +6204,11 @@ mod proposal_loop_tests {
         // Lexicographic order: f1, f2, f3 — so the LAST one (f3) is rejected.
         assert_eq!(rejects[0], f3, "expected lexicographically-last filter rejected");
     }
+    mod scenarios {
+        use super::*;
+        include!("lifecycle_scenarios.rs");
+    }
+
 }
 
 /// End-to-end halt-risk descriptor build path: synthesize
