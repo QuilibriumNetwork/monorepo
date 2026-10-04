@@ -32,9 +32,6 @@ use crate::rewards::pomw_basis;
 /// Per-shard reward units (8 billion sub-units per QUIL).
 const QUIL_TOKEN_UNITS: u64 = 8_000_000_000;
 
-/// Ring size constant: each ring holds up to 8 provers.
-const MAX_RING_SIZE: u64 = 8;
-
 // ---------------------------------------------------------------------------
 // ShardEntry — internal intermediate representation
 // ---------------------------------------------------------------------------
@@ -202,16 +199,8 @@ pub fn isqrt_big(n: &BigInt) -> BigInt {
 
 /// Compute the per-prover per-frame reward estimate for a shard.
 ///
-/// Formula (matching `proof_of_meaningful_work.go` Materialize):
-/// ```text
-/// factor = shard_size * basis / world_bytes
-/// divisor = 2^(ring + 1)
-/// factor /= divisor
-/// factor /= sqrt(data_shards)   [when data_shards > 1]
-/// factor /= 8                   [constant max ring size]
-/// ```
-///
-/// Returns zero for degenerate inputs.
+/// Uses the canonical issuance arithmetic, including fractional square roots
+/// and final truncation. Membership/ring selection remains the caller's job.
 pub fn compute_shard_reward(
     basis: &BigInt,
     shard_size: &BigInt,
@@ -219,35 +208,9 @@ pub fn compute_shard_reward(
     ring: u8,
     data_shards: u64,
 ) -> BigInt {
-    if basis.is_zero() || world_bytes.is_zero() || data_shards == 0 {
-        return BigInt::zero();
-    }
-
-    // factor = shard_size * basis / world_bytes
-    let mut factor = shard_size * basis;
-    factor /= world_bytes;
-
-    // divisor = 2^(ring+1)
-    let ring_exp = (ring as u32) + 1;
-    if ring_exp >= 64 {
-        // Would overflow u64; reward is negligible.
-        return BigInt::zero();
-    }
-    let divisor: u64 = 1u64 << ring_exp;
-    factor /= BigInt::from(divisor);
-
-    // sqrt(data_shards) — matches sqrt(shardCount) in reward module.
-    if data_shards > 1 {
-        let sqrt_val = isqrt(data_shards);
-        if sqrt_val > 0 {
-            factor /= BigInt::from(sqrt_val);
-        }
-    }
-
-    // Divide by constant max ring size (partially filled rings still split by 8).
-    factor /= BigInt::from(MAX_RING_SIZE);
-
-    factor
+    quil_execution::pricing::allocation_prover_reward(
+        basis, shard_size, world_bytes, ring, data_shards,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,8 +1385,8 @@ mod tests {
 
     /// PARITY: the TUI per-prover estimate (`compute_shard_reward`) must equal
     /// the actually-minted per-prover share (`OptRewardIssuance::calculate / 8`)
-    /// for the same inputs. These are two independent implementations of the
-    /// PoMW formula in two modules; this guards them against drift.
+    /// for the same inputs. The two API paths must supply the same inputs and use the canonical
+    /// arithmetic, including non-square counts and issuance ring clamping.
     #[test]
     fn estimate_matches_minted_per_prover_share() {
         use crate::rewards::{pomw_basis, OptRewardIssuance};
@@ -1434,8 +1397,8 @@ mod tests {
         let units = 1_000_000u64;
         let size = 1u64 << 28;
         let basis = pomw_basis(difficulty, world, units);
-        for ring in [0u8, 1, 2] {
-            for shards in [1u64, 4, 16] {
+        for ring in [0u8, 1, 2, 62, 63, 255] {
+            for shards in [1u64, 2, 3, 4, 5, 7, 16, u64::MAX] {
                 let est = compute_shard_reward(
                     &basis,
                     &BigInt::from(size),
