@@ -1549,7 +1549,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         crdt_for_poller.clone(),
                         shards_store_for_poller.clone(),
                     );
-                    let mut sizes_by_filter: HashMap<Vec<u8>, u64> = HashMap::new();
+                    let mut sizes_by_filter: HashMap<Vec<u8>, (u64, u64)> = HashMap::new();
                     if let Ok(shards) = shards_store_for_poller.range_app_shards() {
                         // Dedupe to one entry per parent shard_key
                         // (range_app_shards returns one row per
@@ -1586,12 +1586,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         &s.shard_key[..]
                                     };
                                     let bp = quil_forest::shard_prefix_to_filter(l2, &entry.prefix);
-                                    sizes_by_filter.insert(bp, bytes);
+                                    sizes_by_filter.insert(bp, (bytes, entry.data_shards));
                                 }
                             }
                         }
                     }
-                    pl_for_poller.set_local_shard_sizes(sizes_by_filter);
+                    pl_for_poller.set_local_shard_metrics(sizes_by_filter);
                 }
 
                 // Skip lifecycle evaluation on archives — they don't
@@ -3418,7 +3418,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             let count = found.sizes.len();
                             let frozen = found.frozen.len();
                             lifecycle.set_frozen_shards(found.frozen);
-                            lifecycle.set_remote_shard_sizes(found.sizes);
+                            lifecycle.set_remote_shard_metrics(found.sizes.into_iter()
+                                .map(|(filter, bytes)| {
+                                    let shards = found.data_shards.get(&filter).copied().unwrap_or(0);
+                                    (filter, (bytes, shards))
+                                }).collect());
                             last_refresh_frame = now_frame.max(1);
                             // Archives publish admission topology from the
                             // serial materializer after each durable commit.
