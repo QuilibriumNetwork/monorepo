@@ -30,11 +30,15 @@ use commonware_utils::{
 };
 use rand_core::CryptoRng;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Generic Falcon signing scheme (protocol-agnostic core).
 #[derive(Clone, Debug)]
 pub struct Generic<N: Namespace> {
-    participants: Set<FalconPublicKey>,
+    // Voter rounds clone the scheme; retain one immutable committee per scheme.
+    participants: Arc<Set<FalconPublicKey>>,
+    // Preserve the const codec configuration accessor without dereferencing Arc.
+    participant_count: usize,
     signer: Option<(Participant, FalconPrivateKey)>,
     namespace: N,
 }
@@ -48,7 +52,8 @@ impl<N: Namespace> Generic<N> {
     ) -> Option<Self> {
         let index = participants.index(&private_key.public_key())?;
         Some(Self {
-            participants,
+            participant_count: participants.len(),
+            participants: Arc::new(participants),
             signer: Some((index, private_key)),
             namespace: N::derive(namespace),
         })
@@ -57,7 +62,8 @@ impl<N: Namespace> Generic<N> {
     /// Build a verify-only instance.
     pub fn verifier(namespace: &[u8], participants: Set<FalconPublicKey>) -> Self {
         Self {
-            participants,
+            participant_count: participants.len(),
+            participants: Arc::new(participants),
             signer: None,
             namespace: N::derive(namespace),
         }
@@ -204,7 +210,7 @@ impl<N: Namespace> Generic<N> {
         false
     }
     pub const fn certificate_codec_config(&self) -> usize {
-        self.participants.len()
+        self.participant_count
     }
     pub const fn certificate_codec_config_unbounded() -> usize {
         u32::MAX as usize
@@ -450,6 +456,44 @@ mod tests {
             subject(),
             &att,
             &Sequential
+        ));
+    }
+
+    #[test]
+    fn scheme_clones_share_committee_and_preserve_verification() {
+        let schemes = setup(4);
+        let cloned = schemes[0].clone();
+        assert!(std::ptr::eq(
+            schemes[0].participants(),
+            cloned.participants()
+        ));
+        let verifier = FalconCertScheme::verifier(
+            NAMESPACE,
+            schemes[0].participants().clone(),
+        );
+        let verifier_clone = verifier.clone();
+        assert!(std::ptr::eq(
+            verifier.participants(),
+            verifier_clone.participants()
+        ));
+        let attestations: Vec<_> = schemes[..3]
+            .iter()
+            .map(|scheme| scheme.sign::<Sha256Digest>(subject()).unwrap())
+            .collect();
+        let certificate = cloned.assemble::<_, N3f1>(attestations, &Sequential).unwrap();
+        drop(cloned);
+        drop(verifier);
+        drop(schemes);
+        assert!(verifier_clone.verify_certificate::<_, Sha256Digest, N3f1>(
+            &mut test_rng(), subject(), &certificate, &Sequential
+        ));
+        let other = TestSubject { message: bytes::Bytes::from_static(b"different") };
+        assert!(!verifier_clone.verify_certificate::<_, Sha256Digest, N3f1>(
+            &mut test_rng(), other, &certificate, &Sequential
+        ));
+        let different_committee = setup(4);
+        assert!(!different_committee[0].verify_certificate::<_, Sha256Digest, N3f1>(
+            &mut test_rng(), subject(), &certificate, &Sequential
         ));
     }
 
