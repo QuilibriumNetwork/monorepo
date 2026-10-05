@@ -354,27 +354,37 @@ fn panel_title(text: String) -> Line<'static> {
         .style(Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD))
 }
 
+/// Display signed changes without rounding a nonzero loss/gain to zero.
+fn fmt_reward_change(v: &BigInt) -> String {
+    match v.sign() {
+        num_bigint::Sign::Minus => format!("-{}", fmt_reward(&(-v))),
+        num_bigint::Sign::Plus => format!("+{}", fmt_reward(v)),
+        num_bigint::Sign::NoSign => "0".to_string(),
+    }
+}
+
 fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     let mut joining = BigInt::from(0);
     let mut active = BigInt::from(0);
-    let paused = BigInt::from(0);
-    let leaving = BigInt::from(0);
+    let mut paused = BigInt::from(0);
+    let mut leaving = BigInt::from(0);
     for a in sorted {
         match a.reward_status(m.epoch_frame(), m.epoch_length) {
             Some(EffectiveStatus::Joining) => joining += &a.estimated_reward,
             Some(EffectiveStatus::Active) => active += &a.estimated_reward,
+            Some(EffectiveStatus::Paused) => paused += &a.estimated_reward,
+            Some(EffectiveStatus::Leaving) => leaving += &a.estimated_reward,
             _ => {}
         }
     }
-    let total = &joining + &active + &paused + &leaving;
+    let current = &active + &leaving;
+    let change = &joining - &leaving;
     let mut s = format!(
-        " Allocations: {}  Estimated Rewards [Q/d]: {} = Joining {} + Active {} + Paused {} + Leaving {}",
+        "Allocations: {}  Rewards [Q/d]: Current {} | Paused {} | Planned change {}",
         sorted.len(),
-        format_quil_daily_round(&total),
-        format_quil_daily_round(&joining),
-        format_quil_daily_round(&active),
-        format_quil_daily_round(&paused),
-        format_quil_daily_round(&leaving),
+        fmt_reward(&current),
+        fmt_reward(&paused),
+        fmt_reward_change(&change),
     );
     if !m.alloc_selected.is_empty() {
         s += &format!(" [{} selected]", m.alloc_selected.len());
@@ -1414,6 +1424,10 @@ fn help_body() -> Vec<Line<'static>> {
             "Reward [Q/d]",
             "Estimated whole QUIL per day; `<1` is a trickle, not nothing",
         ),
+        kv("Current", "Staffed active + leaving reward estimates, not measured income"),
+        kv("Paused", "Staffed paused estimates available upon resume"),
+        kv("Planned change", "Staffed joining minus leaving; activation epochs may differ"),
+        note("Reward totals follow displayed rows; unassigned rows are excluded."),
         kv("Worker", "Core the allocation is bound to; -1 means none is bound"),
         kv("Status", "joining, active, paused, leaving, rejected, kicked;"),
         kv("", "expiredJoin / expiredLeave: confirm window missed;"),
@@ -1793,33 +1807,51 @@ mod tests {
     }
 
     #[test]
-    fn reward_total_excludes_unstaffed_and_inactive_rows_and_counts_deferred_joins() {
+    fn reward_totals_separate_current_paused_and_planned_changes() {
         let mut m = Model::new();
         m.frame_number = 2160;
         m.epoch_length = 720;
-        let mut joining = row("aa", 1, 1, 0, "", "");
-        joining.filter = vec![0xaa];
-        joining.status = 2;
+        let mut active = row("aa", 1, 1, 0, "", "");
+        active.filter = vec![0xaa];
+        active.status = 2;
+        active.epoch = 3;
+        active.estimated_reward = BigInt::from(10000);
+        let mut joining = active.clone();
+        // Raw Active does not earn yet when confirmation defers activation.
         joining.confirm_frame = 2160;
-        joining.epoch = 3;
-        joining.estimated_reward = BigInt::from(10000);
+        joining.estimated_reward = BigInt::from(20000);
         let mut unstaffed = joining.clone();
         unstaffed.worker_id = -1;
-        unstaffed.estimated_reward = BigInt::from(20000);
-        let mut expired = joining.clone();
-        expired.confirm_frame = 0;
+        unstaffed.estimated_reward = BigInt::from(900000);
+        let mut expired = active.clone();
         expired.epoch = 2;
-        expired.estimated_reward = BigInt::from(30000);
-        let mut paused = joining.clone();
+        expired.estimated_reward = BigInt::from(800000);
+        let mut paused = active.clone();
         paused.status = 3;
         paused.estimated_reward = BigInt::from(40000);
-        let mut leaving = joining.clone();
+        let mut leaving = active.clone();
         leaving.status = 4;
+        leaving.leave_frame = 2100;
+        leaving.leave_confirm_frame = 2160;
         leaving.estimated_reward = BigInt::from(50000);
-        let title = alloc_title(&m, &[joining, unstaffed, expired, paused, leaving]);
+        let mut unstaffed_leave = leaving.clone();
+        unstaffed_leave.worker_id = -1;
+        let mut ended = leaving.clone();
+        ended.leave_confirm_frame = 1400;
+        let title = alloc_title(&m, &[active, joining, unstaffed, expired, paused, leaving, unstaffed_leave, ended]);
         let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
-        let estimate = format_quil_daily_round(&BigInt::from(10000));
-        assert!(text.contains(&format!("Estimated Rewards [Q/d]: {estimate} = Joining {estimate} + Active 0 + Paused 0 + Leaving 0")), "{text}");
+        assert!(text.contains(&format!("Current {} | Paused {} | Planned change -{}",
+            fmt_reward(&BigInt::from(60000)), fmt_reward(&BigInt::from(40000)),
+            fmt_reward(&BigInt::from(30000)))), "{text}");
+    }
+
+    #[test]
+    fn planned_reward_change_preserves_sign_and_small_amounts() {
+        assert_eq!(fmt_reward_change(&BigInt::from(0)), "0");
+        assert_eq!(fmt_reward_change(&BigInt::from(1)), "+<1");
+        assert_eq!(fmt_reward_change(&BigInt::from(-1)), "-<1");
+        assert_eq!(fmt_reward_change(&BigInt::from(3_124_022)), "+270");
+        assert_eq!(fmt_reward_change(&BigInt::from(-3_124_022)), "-270");
     }
 
     #[test]

@@ -146,8 +146,8 @@ pub struct AllocationRow {
 }
 
 impl AllocationRow {
-    /// Row estimates remain visible; only staffed active or joining rows
-    /// contribute to projected earnings in the panel total.
+    /// Classify staffed live rows for current, paused and planned rewards.
+    /// Orphan estimates remain visible in their rows but do not enter totals.
     pub fn reward_status(&self, frame: u64, epoch_length: u64) -> Option<EffectiveStatus> {
         if self.worker_id < 0 {
             return None;
@@ -161,7 +161,7 @@ impl AllocationRow {
             leave_confirm_frame: self.leave_confirm_frame,
             epoch: self.epoch,
         }, frame, epoch_length);
-        matches!(status, EffectiveStatus::Active | EffectiveStatus::Joining).then_some(status)
+        matches!(status, EffectiveStatus::Active | EffectiveStatus::Joining | EffectiveStatus::Paused | EffectiveStatus::Leaving).then_some(status)
     }
 
     /// The Mode cell — `m` when the row's worker is managed by hand, `a` when
@@ -1343,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn assigned_inactive_allocations_keep_estimates_but_do_not_contribute() {
+    fn assigned_allocations_keep_estimates_and_classify_live_rewards() {
         use super::super::super::epoch::raw_status;
         use quil_types::proto::node::WorkerInfo;
 
@@ -1379,7 +1379,11 @@ mod tests {
             assert_eq!(row.status_name, label);
             assert_eq!(row.worker_id, 0);
             assert_eq!(row.estimated_reward, BigInt::from(42), "{label}");
-            assert_eq!(row.reward_status(2160, 720), None, "{label}");
+            assert_eq!(row.reward_status(2160, 720), match status {
+                raw_status::PAUSED => Some(EffectiveStatus::Paused),
+                raw_status::LEAVING => Some(EffectiveStatus::Leaving),
+                _ => None,
+            }, "{label}");
             assert_eq!(row.ring, 7);
             assert_eq!(row.active_provers, 9);
             assert_eq!(row.shard_size, BigInt::from(64));
