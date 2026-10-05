@@ -78,9 +78,19 @@ replacement demand before retry bookkeeping is committed.
 The plan compiler tests every ordered pair of action kinds, mixed-shard
 batches and duplicate worker assignments. Existing evaluator and sequence tests
 exercise its integration with real policy decisions. This does not provide an
-globally atomic registry/worker snapshot, cross-cycle submission serialization
-or persisted leaving-to-joining replacement pairs. Those remain necessary follow-ups before
-claiming a complete distributed lifecycle planner.
+globally atomic registry/worker snapshot or persisted leaving-to-joining
+replacement pairs. Those remain necessary follow-ups before claiming a complete
+distributed lifecycle planner.
+
+The pipeline reserves filters before spawning joins, leaves and rejections;
+confirmations use the same owner while preparing storage. A running operation
+blocks another operation kind on that filter, including across epoch boundaries.
+Unrelated filters can progress. Successful publication keeps the existing
+bounded retry fence within the epoch, but is not a registry acknowledgement.
+For chunked joins, later failure releases only unpublished filters. Encoder
+ownership remains inside the blocking task when its async waiter is cancelled.
+This does not persist submission ownership or reserve replacement workers across
+restart; those need the explicit replacement state machine.
 
 ## Further coverage
 
