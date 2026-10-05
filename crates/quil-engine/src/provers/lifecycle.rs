@@ -1518,15 +1518,12 @@ impl ProverLifecycle {
         // cycles, and here a single cycle proposed fourteen filters it
         // had never proposed before.
         //
-        // Leaving allocations are excluded — they are departing and
-        // will not claim a slot. Everything else in `all_ours` will.
+        // Departing allocations still owe service through their effective
+        // departure boundary, so their unbound slots are reserved too.
         let worker_bound_filters: std::collections::HashSet<Vec<u8>> =
             worker_view.filter_set().map(|w| w.filter.clone()).collect();
-        let departing_filters: std::collections::HashSet<&Vec<u8>> =
-            leaving_filters.iter().map(|(f, _)| f).collect();
         let unbound_held_count = all_our_filters
             .iter()
-            .filter(|f| !departing_filters.contains(f))
             .filter(|f| !worker_bound_filters.contains(*f))
             .count();
         let assignable_worker_ids: Vec<u32> = free_worker_ids
