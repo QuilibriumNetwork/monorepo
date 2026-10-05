@@ -52,6 +52,7 @@ hyper = "1"
 h2 = "0.4"
 
 [dev-dependencies]
+jmt = { version = "0.11", features = ["mocks"] }
 tempfile = "3"
 quil-store = { path = "../quil-store", features = ["test-utils"] }
 serde = { version = "1", features = ["derive"] }

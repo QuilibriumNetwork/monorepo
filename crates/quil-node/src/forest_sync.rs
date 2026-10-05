@@ -142,7 +142,15 @@ async fn fetch_sync_blob(
         if sync_blob_matches(phase as usize, leaf, &blob)? { return Ok(blob); }
     }
     let shard_bytes = shard.l1.iter().copied().chain(shard.l2).collect();
-    let blob = client.get_vertex_blob_at(shard_bytes, phase, vertex_id.clone(), source_version)
+    // Bound each parallel response by the authenticated payload length plus
+    // protobuf framing. An oversized peer response cannot multiply the 64 MiB
+    // chunk budget by the number of concurrent requests.
+    let (_, size) = quil_tries::split_vertex_leaf(leaf)
+        .ok_or_else(|| QuilError::InvalidArgument("malformed synced vertex leaf".into()))?;
+    let decode_limit = usize::try_from(size).ok().and_then(|n| n.checked_add(128))
+        .ok_or_else(|| QuilError::InvalidArgument("synced blob too large".into()))?;
+    let blob = client.clone().with_decoding_limit(decode_limit)
+        .get_vertex_blob_at(shard_bytes, phase, vertex_id.clone(), source_version)
         .await.map_err(|e| QuilError::Internal(format!("get_vertex_blob: {e}")))?
         .ok_or_else(|| QuilError::ExecutionUnavailable(format!(
             "peer did not serve blob {} at phase {phase}, version {source_version}", hex::encode(&vertex_id),
@@ -151,6 +159,20 @@ async fn fetch_sync_blob(
         return Err(QuilError::InvalidArgument("peer served a blob not bound to its authenticated leaf".into()));
     }
     Ok(blob)
+}
+
+const SYNC_FETCH_CONCURRENCY: usize = 8;
+
+/// Keep results in plan order even when network requests finish out of order.
+/// Dropping a failed batch cancels outstanding futures before any chunk write.
+async fn fetch_ordered_blobs<T, F, Fut>(items: impl IntoIterator<Item = T>, fetch: F)
+    -> Result<Vec<Vec<u8>>>
+where
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    use futures::{StreamExt, TryStreamExt};
+    futures::stream::iter(items).map(fetch).buffered(SYNC_FETCH_CONCURRENCY).try_collect().await
 }
 
 /// The tree head never advances without the data needed to read its new
@@ -169,6 +191,14 @@ async fn sync_phase_data(
 ) -> Result<[u8; 32]> {
     use quil_hypergraph::crdt::{sync_blob_matches, MAX_SYNC_CHUNK_BYTES, MAX_SYNC_CHUNK_LEAVES};
     let remote = RemoteTreeReader::new(client.clone(), handle.clone(), shard_id.to_vec(), phase);
+    // Every leaf is required when the full local tree is empty. Warm Merkle
+    // diffs and covered subtrees stay demand-driven, avoiding extra archive
+    // reads for identical or out-of-scope branches.
+    let remote = if bit_path.is_empty()
+        && is_empty_phase_root(&crdt.current_forest_phase_root(shard_id, phase as usize)?) {
+        info!(phase, concurrency = 8, "cold forest sync: bounded read-ahead enabled");
+        remote.with_cold_prefetch(source_version)
+    } else { remote };
     let c = crdt.clone();
     let sid = shard_id.to_vec();
     let mut plan = tokio::task::spawn_blocking(move || {
@@ -185,17 +215,17 @@ async fn sync_phase_data(
             info!(shard = %hex::encode(&shard_id[..shard_id.len().min(8)]), phase, installed, planned, "sync phase: installing");
             next_report *= 2;
         }
-        let mut blobs = Vec::new();
+        let mut chunk = Vec::new();
         let mut bytes = 0usize;
         for (key, leaf) in plan.remaining().iter().take(MAX_SYNC_CHUNK_LEAVES) {
             let Some(leaf) = leaf else {
                 // The prepared, root-checked GLOBAL diff proves absence. No
                 // readable blob is fetched for a removed local-only record.
-                blobs.push(Vec::new());
+                chunk.push((*key, None));
                 continue;
             };
-            // Size is authenticated in the leaf. Flush before fetching the
-            // next blob, so collecting a cold sync never retains all blobs.
+            // Size is authenticated in the leaf. Select the byte-bounded
+            // chunk before starting parallel fetches, including buffered results.
             let size = if sync_blob_matches(phase as usize, leaf, &[])? { 0 } else {
                 let (_, size) = quil_tries::split_vertex_leaf(leaf)
                     .ok_or_else(|| QuilError::InvalidArgument("malformed synced vertex leaf".into()))?;
@@ -204,11 +234,24 @@ async fn sync_phase_data(
             if size > MAX_SYNC_CHUNK_BYTES {
                 return Err(QuilError::ExecutionUnavailable("synced blob exceeds the transfer limit".into()));
             }
-            if !blobs.is_empty() && bytes + size > MAX_SYNC_CHUNK_BYTES { break; }
-            let blob = fetch_sync_blob(client, crdt, shard_id, phase, source_version, key, leaf).await?;
-            bytes += blob.len();
-            blobs.push(blob);
+            if !chunk.is_empty() && bytes + size > MAX_SYNC_CHUNK_BYTES { break; }
+            bytes += size;
+            chunk.push((*key, Some(leaf.clone())));
         }
+        let sync_client = client.clone();
+        let sync_crdt = crdt.clone();
+        let sync_shard = shard_id.to_vec();
+        let blobs = fetch_ordered_blobs(chunk, move |(key, leaf)| {
+            let mut client = sync_client.clone();
+            let crdt = sync_crdt.clone();
+            let shard = sync_shard.clone();
+            async move {
+                match leaf {
+                    Some(leaf) => fetch_sync_blob(&mut client, crdt.as_ref(), &shard, phase, source_version, &key, &leaf).await,
+                    None => Ok(Vec::new()),
+                }
+            }
+        }).await?;
         let c = crdt.clone();
         plan = tokio::task::spawn_blocking(move || {
             c.apply_sync_chunk(&mut plan, &blobs)?;
@@ -479,5 +522,47 @@ mod tests {
         let mut forged = EMPTY_PHASE_ROOT;
         forged[31] ^= 1;
         assert!(!is_empty_phase_root(&forged));
+    }
+}
+
+#[cfg(test)]
+mod parallel_blob_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    #[tokio::test]
+    async fn parallel_blobs_preserve_plan_order_and_bound_requests() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let blobs = fetch_ordered_blobs(0..32, |i| {
+            let active = active.clone();
+            let peak = peak.clone();
+            async move {
+                let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(n, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis((8 - i % 8) as u64)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(vec![i])
+            }
+        }).await.unwrap();
+        assert_eq!(blobs, (0..32).map(|i| vec![i]).collect::<Vec<_>>());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(peak.load(Ordering::SeqCst) > 1);
+        assert!(peak.load(Ordering::SeqCst) <= SYNC_FETCH_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn failed_blob_does_not_return_a_partial_chunk() {
+        let started = AtomicUsize::new(0);
+        let result = fetch_ordered_blobs(0..100, |i| {
+            let started = &started;
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                if i == 0 { return Err(QuilError::InvalidArgument("blob authentication failed".into())); }
+                futures::future::pending::<Result<Vec<u8>>>().await
+            }
+        }).await;
+        assert!(result.is_err());
+        assert!(started.load(Ordering::SeqCst) <= SYNC_FETCH_CONCURRENCY);
     }
 }

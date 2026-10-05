@@ -120,6 +120,14 @@ pub struct ArchiveClient {
 }
 
 impl ArchiveClient {
+    /// Apply a scoped response ceiling without changing the shared channel.
+    /// Clone the client first when other RPCs require a larger decode budget.
+    pub fn with_decoding_limit(mut self, bytes: usize) -> Self {
+        self.inner = self.inner.max_decoding_message_size(bytes);
+        self.app_shard = self.app_shard.max_decoding_message_size(bytes);
+        self
+    }
+
     /// Connect to an archive node at the given `host:port` over plaintext gRPC.
     /// Useful for local testing only — production archive nodes require mTLS.
     pub async fn connect_plaintext(addr: &str) -> Result<Self, ArchiveClientError> {
