@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -310,6 +310,9 @@ pub(crate) type WorkerAppStates =
     Arc<parking_lot::RwLock<std::collections::HashMap<Vec<u8>, WorkerAppState>>>;
 
 pub(crate) struct WorkerManagerArgs {
+    /// Peer id → PeerInfo; maps a committee key to the peer a resolver
+    /// message can be delivered to directly ([`CommitteePeers`]).
+    pub peer_info_cache: Arc<parking_lot::RwLock<HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>>,
     pub config: quil_config::Config,
     pub archive_mode: bool,
     pub p2p_handle: quil_p2p::node::P2PHandle,
@@ -364,6 +367,7 @@ pub(crate) fn init(
     args: WorkerManagerArgs,
 ) -> Arc<dyn quil_engine::worker::WorkerManager> {
     let WorkerManagerArgs {
+        peer_info_cache,
         config,
         archive_mode,
         p2p_handle,
@@ -789,6 +793,7 @@ pub(crate) fn init(
             // through `shard_engines` in the recv loop below.
             if let Some(mut master_rx) = thread_mgr.take_master_rx() {
                 let drain_p2p = p2p_handle.clone();
+                let drain_committee_peers = super::direct_delivery::CommitteePeers::new(peer_info_cache.clone());
                 let drain_registry = prover_registry.clone();
                 let drain_pubkey = bls_pubkey.clone();
                 let drain_clock = clock_store.clone();
@@ -966,7 +971,7 @@ pub(crate) fn init(
                                             Ok(())
                                         });
                                     }
-                                    WorkerToMaster::CwConsensus { core_id, filter, channel, bytes } => {
+                                    WorkerToMaster::CwConsensus { core_id, filter, channel, bytes, recipients } => {
                                         // Commonware-simplex message → one shard CW
                                         // gossip topic; channel tagged into the payload.
                                         if drain_halt.any_halted() {
@@ -998,9 +1003,18 @@ pub(crate) fn init(
                                             }
                                         }
                                         let p2p = drain_p2p.clone();
+                                        let committee_peers = drain_committee_peers.clone();
                                         drain_spawner.detach("shard-cw-publish", async move {
                                             let topic = quil_engine::bitmasks::shard_cw_bitmask(&filter);
-                                            let payload = quil_engine::bitmasks::shard_cw_frame_payload(channel, &bytes);
+                                            // A message for one member names it, so a copy the
+                                            // topic carries is dropped unread by the others.
+                                            let payload = quil_engine::bitmasks::shard_cw_frame_for(channel, &bytes, &recipients);
+                                            if !recipients.is_empty() {
+                                                if super::direct_delivery::deliver_direct(&p2p, &committee_peers, &recipients, &topic, &payload).await {
+                                                    return Ok(());
+                                                }
+                                                p2p.note_direct_fallback();
+                                            }
                                             for attempt in 1..=8u32 {
                                                 match p2p.publish(topic.clone(), payload.clone()).await {
                                                     Ok(()) => break,
@@ -1112,6 +1126,9 @@ pub(crate) fn init(
                                                     "failed to install shard CW topic subscription");
                                                 return Ok(());
                                             }
+                                            // This engine runs here: its committee may send it
+                                            // resolver messages directly.
+                                            p2p.allow_direct(cw_topic.clone()).await;
                                             let mut wait_logged = false;
                                             loop {
                                                 match p2p.subscribed_peer_count(cw_topic.clone()).await {
@@ -1167,6 +1184,9 @@ pub(crate) fn init(
                                         let filter_for_sub = filter.clone();
                                         let engines = drain_shard_engines.clone();
                                         drain_spawner.detach("shard-unsubscribe", async move {
+                                            if !engines.read().contains_key(&filter_for_sub) {
+                                                p2p.revoke_direct(quil_engine::bitmasks::shard_cw_bitmask(&filter_for_sub)).await;
+                                            }
                                             // Decided when this runs, not when the engine
                                             // left: a sibling or the same filter may have
                                             // registered since. A registration racing the
@@ -1335,6 +1355,7 @@ mod tests {
     use super::*;
     use quil_engine::test_support::TestWorkerManager;
     use quil_engine::worker::WorkerManager as _;
+
 
     /// Reopen a worker store a test just dropped. The one-shot staged-frame
     /// cleanup the builder starts holds its own handle until it finishes, so

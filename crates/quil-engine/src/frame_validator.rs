@@ -538,6 +538,11 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
     }
 }
 
+/// The latest GLOBAL frame number `clock` holds.
+fn latest_global_frame_number(clock: &dyn quil_types::store::ClockStore) -> Option<u64> {
+    clock.get_latest_global_clock_frame().ok()?.header.map(|header| header.frame_number)
+}
+
 /// Validates an `AppShardFrame` by:
 /// 1. Checking structural fields (non-empty address, exactly 4 state
 /// roots of length 32, 64 or 74).
@@ -602,6 +607,23 @@ impl BlsAppFrameValidator {
     pub fn with_global_anchor_source(mut self, source: crate::global_anchor::GlobalAnchorSource) -> Self {
         self.global_anchor_source = Some(source);
         self
+    }
+
+    /// The GLOBAL frame `frame` is anchored to, when this node's clock does
+    /// not hold it, with the latest GLOBAL frame it does hold (`None`: none
+    /// or no clock). `None` when the anchor is held or the frame has none.
+    pub fn missing_global_anchor(&self, frame: &AppShardFrame) -> Option<(u64, Option<u64>)> {
+        let wanted = frame.header.as_ref()?.global_frame_number;
+        if wanted == 0 {
+            return None;
+        }
+        let Some(clock) = self.clock_store.as_ref() else {
+            return Some((wanted, None));
+        };
+        if clock.get_global_clock_frame(wanted).is_ok() {
+            return None;
+        }
+        Some((wanted, latest_global_frame_number(clock.as_ref())))
     }
 
     fn storage_registration(
@@ -750,9 +772,17 @@ impl BlsAppFrameValidator {
             let (global_output, global_timestamp) = match global_anchor {
                 Some(o) => o,
                 None => {
-                    return Err(QuilError::Crypto(
-                        "storage frame: anchored global frame unavailable for ρ_N".into(),
-                    ));
+                    // Which frame, and how far this node is from it, tells a
+                    // GLOBAL view moments behind from a hole or a stalled one.
+                    let latest = self
+                        .clock_store
+                        .as_ref()
+                        .and_then(|cs| latest_global_frame_number(cs.as_ref()));
+                    return Err(QuilError::Crypto(format!(
+                        "storage frame: anchored global frame {} unavailable for ρ_N (latest local global frame: {})",
+                        header.global_frame_number,
+                        latest.map_or_else(|| "none".to_string(), |n| n.to_string()),
+                    )));
                 }
             };
             let rho_n = quil_crypto::porep::derive_storage_beacon(

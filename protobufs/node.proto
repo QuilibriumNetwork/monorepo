@@ -461,6 +461,21 @@ service DataIPCService {
   // roots for the master's ProverConfirm. Only that worker holds the shard's
   // data and proves from those replicas.
   rpc PrepareStorageConfirm(PrepareStorageConfirmRequest) returns (PrepareStorageConfirmResponse);
+  // A shard consensus message a committee member sent the master directly,
+  // for the shard this worker runs. `from` is the sender's committee key.
+  rpc DeliverShardConsensus(DeliverShardConsensusRequest) returns (DeliverShardConsensusResponse);
+}
+
+message DeliverShardConsensusRequest {
+  bytes filter = 1;
+  uint64 channel = 2;
+  bytes data = 3;
+  bytes from = 4;
+}
+
+message DeliverShardConsensusResponse {
+  // The worker runs this shard's engine and handed it the message.
+  bool accepted = 1;
 }
 
 message PrepareStorageConfirmRequest {

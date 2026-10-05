@@ -229,6 +229,16 @@ pub type ConsensusDeliveryHandler = Arc<
         + Sync,
 >;
 
+/// Delivers a standalone worker's shard resolver message to the committee
+/// members it names, directly over this node's peer connections:
+/// `(filter, channel, data, recipient committee keys)` → every recipient
+/// accepted it.
+pub type ShardDirectRelay = Arc<
+    dyn Fn(Vec<u8>, u64, Vec<u8>, Vec<Vec<u8>>) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Snapshot function for workers — called by `GetWorkerInfo`.
 pub type WorkerSnapshotFn =
     Arc<dyn Fn() -> Vec<global::GlobalGetWorkerInfoResponseItem> + Send + Sync>;
@@ -357,6 +367,8 @@ pub struct GlobalRpcServer {
     /// machine handshakes as a different peer_id and is denied. `None` ⇒ no gate
     /// (single-machine/thread mode, where there is no gRPC boundary).
     self_peer_id: Option<Vec<u8>>,
+    /// See [`ShardDirectRelay`]; `None` answers "not delivered".
+    shard_direct_relay: Option<ShardDirectRelay>,
     /// Authorizer for prover-gated RPCs (`GetGlobalProposal`): returns `true` iff
     /// the authenticated caller is the node's own identity OR resolves to an
     /// ACTIVE prover (Go `authenticateProverFromContext`). `None` ⇒ no gate.
@@ -407,8 +419,15 @@ impl GlobalRpcServer {
             archive_directory: None,
             message_broadcast: None,
             self_peer_id: None,
+            shard_direct_relay: None,
             prover_authorizer: None,
         }
+    }
+
+    /// Install the relay for `SendShardConsensusDirect`.
+    pub fn with_shard_direct_relay(mut self, relay: ShardDirectRelay) -> Self {
+        self.shard_direct_relay = Some(relay);
+        self
     }
 
     /// Install the prover authorizer for `GetGlobalProposal` (self OR active
@@ -901,6 +920,31 @@ impl GlobalService for GlobalRpcServer {
         }
     }
 
+    async fn send_shard_consensus_direct(
+        &self,
+        request: Request<global::SendShardConsensusDirectRequest>,
+    ) -> Result<Response<global::SendShardConsensusDirectResponse>, Status> {
+        // Strictly the node's own workers: this sends as the node. Unlike the
+        // other worker-privileged calls, no configured identity is no access.
+        let own = self.self_peer_id.as_ref().is_some_and(|me| {
+            request
+                .extensions()
+                .get::<crate::peer_auth_middleware::AuthenticatedPeer>()
+                .is_some_and(|auth| auth.peer_id.to_bytes() == *me)
+        });
+        if !own {
+            return Err(Status::permission_denied(
+                "SendShardConsensusDirect: caller is not this node's own identity",
+            ));
+        }
+        let req = request.into_inner();
+        let delivered = match &self.shard_direct_relay {
+            Some(relay) => relay(req.filter, req.channel, req.data, req.recipients).await,
+            None => false,
+        };
+        Ok(Response::new(global::SendShardConsensusDirectResponse { delivered }))
+    }
+
     async fn get_forest_node(
         &self,
         request: Request<global::GetForestNodeRequest>,
@@ -1155,6 +1199,49 @@ mod identity_gate_tests {
         // no authorizer configured → ungated
         let ungated = GlobalRpcServer::new(Arc::new(NoopLookup));
         assert!(ungated.require_prover(&tonic::Extensions::new()).is_ok());
+    }
+
+    /// The relay sends as the node, so only the node's own identity may use
+    /// it, and without a configured identity nobody may.
+    #[tokio::test]
+    async fn only_the_nodes_own_workers_may_relay_shard_consensus() {
+        let me = quil_p2p::PeerId::random();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay: ShardDirectRelay = {
+            let seen = seen.clone();
+            Arc::new(move |filter, channel, data, recipients| {
+                seen.lock().unwrap().push((filter, channel, data, recipients));
+                Box::pin(async { true })
+            })
+        };
+        let request = |caller: Option<quil_p2p::PeerId>| {
+            let mut request = Request::new(global::SendShardConsensusDirectRequest {
+                filter: vec![1; 32],
+                channel: 2,
+                data: b"response".to_vec(),
+                recipients: vec![vec![5; 897]],
+            });
+            if let Some(caller) = caller {
+                *request.extensions_mut() = auth_ext(caller);
+            }
+            request
+        };
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup))
+            .with_self_peer_id(me.to_bytes())
+            .with_shard_direct_relay(relay.clone());
+        for caller in [None, Some(quil_p2p::PeerId::random())] {
+            let denied = server.send_shard_consensus_direct(request(caller)).await.unwrap_err();
+            assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        }
+        let response = server.send_shard_consensus_direct(request(Some(me))).await.unwrap();
+        assert!(response.get_ref().delivered);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[(vec![1; 32], 2, b"response".to_vec(), vec![vec![5; 897]])]
+        );
+        let unconfigured = GlobalRpcServer::new(Arc::new(NoopLookup)).with_shard_direct_relay(relay);
+        let denied = unconfigured.send_shard_consensus_direct(request(Some(me))).await.unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied, "no identity configured: no access");
     }
 }
 

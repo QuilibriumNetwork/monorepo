@@ -100,6 +100,9 @@ pub enum WorkerToMaster {
         filter: Vec<u8>,
         channel: u64,
         bytes: Vec<u8>,
+        /// Committee keys a resolver message is addressed to (empty: the
+        /// whole topic); see `AppEngineEvent::CwOut`.
+        recipients: Vec<Vec<u8>>,
     },
     /// A shard worker has spun up an `AppConsensusEngine` for `filter`.
     /// The master uses this to populate a `filter → AppEngineHandle`
@@ -723,13 +726,14 @@ impl ThreadWorkerManager {
                                                                         }
                                                                     ).await;
                                                                 }
-                                                                crate::app_engine::AppEngineEvent::CwOut { filter, channel, bytes } => {
+                                                                crate::app_engine::AppEngineEvent::CwOut { filter, channel, bytes, recipients } => {
                                                                     let _ = master_tx_events.send(
                                                                         WorkerToMaster::CwConsensus {
                                                                             core_id,
                                                                             filter,
                                                                             channel,
                                                                             bytes,
+                                                                            recipients,
                                                                         }
                                                                     ).await;
                                                                 }

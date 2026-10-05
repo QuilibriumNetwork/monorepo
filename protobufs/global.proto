@@ -646,6 +646,20 @@ message SubmitGlobalConsensusRequest {
 
 message SubmitGlobalConsensusResponse {}
 
+message SendShardConsensusDirectRequest {
+  bytes filter = 1;
+  uint64 channel = 2;
+  // The simplex message, unframed.
+  bytes data = 3;
+  // The committee keys it is addressed to.
+  repeated bytes recipients = 4;
+}
+
+message SendShardConsensusDirectResponse {
+  // Every recipient accepted it; otherwise the worker sends it to the topic.
+  bool delivered = 1;
+}
+
 // Forest-sync RPCs (JMT commitment diff + readable vertex blobs). Restored to
 // match global_service.rs / archive_client.rs.
 message GetForestNodeRequest {
@@ -760,6 +774,10 @@ service GlobalService {
   rpc GetArchiveEndpoints(GetArchiveEndpointsRequest) returns (GetArchiveEndpointsResponse);
   rpc ResolveRoot(ResolveRootRequest) returns (ResolveRootResponse);
   rpc GetAppManifest(GetAppManifestRequest) returns (GetAppManifestResponse);
+  // A standalone worker's shard resolver message, delivered directly by its
+  // own master to the committee members it names over the master's peer
+  // connections. Only the node's own identity may call it.
+  rpc SendShardConsensusDirect(SendShardConsensusDirectRequest) returns (SendShardConsensusDirectResponse);
 }
 
 service AppShardService {

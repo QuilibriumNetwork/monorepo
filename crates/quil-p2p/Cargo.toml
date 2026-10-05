@@ -31,6 +31,7 @@ libp2p = { version = "0.56", features = [
     "autonat",
     "gossipsub",
     "macros",
+    "request-response",
 ] }
 # Enable gossipsub's own `metrics` feature (not enabled by the libp2p umbrella)
 # so `Behaviour::with_metrics` / `MetricsConfig` are available. Same version

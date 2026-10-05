@@ -230,6 +230,10 @@ pub enum AppEngineEvent {
         filter: Vec<u8>,
         channel: u64,
         bytes: Vec<u8>,
+        /// The committee keys it is addressed to, for the resolver channel
+        /// only (empty otherwise): a node may deliver it to just those
+        /// members, falling back to the topic.
+        recipients: Vec<Vec<u8>>,
     },
 }
 
@@ -282,6 +286,21 @@ pub struct AppEngineHandle {
 }
 
 impl AppEngineHandle {
+    /// A handle for `filter` whose messages arrive on the returned receiver.
+    #[cfg(test)]
+    pub(crate) fn for_test(filter: Vec<u8>) -> (Self, mpsc::Receiver<AppEngineMessage>) {
+        let (msg_tx, receiver) = mpsc::channel(16);
+        let handle = Self {
+            cancel: CancellationToken::new(),
+            materialized: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            filter,
+            msg_tx,
+            sizes: SharedAppEngineSizes::new(),
+            fee_snapshot: Arc::new(std::sync::Mutex::new(None)),
+        };
+        (handle, receiver)
+    }
+
     /// Request cooperative shutdown. The task owner must also await its join.
     pub fn stop(&self) {
         self.cancel.cancel();
@@ -1662,8 +1681,10 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
 /// `AppEngineEvent::CwOut` on the engine's event channel. The master publishes
 /// it on `shard_cw_bitmask` gossip (or the in-memory harness routes it to peers).
 /// `deliver` runs on the simplex thread → a plain channel send (no runtime
-/// needed). Recipients are dropped: the master fans out to the whole shard
-/// committee via gossip, a safe superset. For a single-prover shard nothing is
+/// needed). Votes, certificates and blocks go to the whole shard committee via
+/// gossip. Resolver messages keep their recipients (one member each): sent to
+/// the whole topic, every subscriber received every response, 163–171 Mbit/s
+/// on one regular node (2026-10-04). For a single-prover shard nothing is
 /// delivered anywhere (simplex handles its own messages internally).
 struct EngineCwTransport {
     filter: Vec<u8>,
@@ -1673,13 +1694,20 @@ impl crate::cw_app_seams::AppConsensusTransport for EngineCwTransport {
     fn deliver(
         &self,
         channel: u64,
-        _recipients: Vec<quil_cw_consensus::falcon_base::FalconPublicKey>,
+        recipients: Vec<quil_cw_consensus::falcon_base::FalconPublicKey>,
         bytes: Vec<u8>,
     ) {
+        let recipients = if channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
+            crate::resolver_traffic::ResolverTraffic::process().note_sent(&self.filter, &bytes);
+            recipients.iter().map(|key| key.as_ref().to_vec()).collect()
+        } else {
+            Vec::new()
+        };
         let _ = self.event_tx.send(AppEngineEvent::CwOut {
             filter: self.filter.clone(),
             channel,
             bytes,
+            recipients,
         });
     }
 }
@@ -6882,6 +6910,30 @@ pub(crate) fn validate_app_frame_panic_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Resolver messages carry the members they are addressed to; votes,
+    /// certificates and blocks go to the whole topic.
+    #[test]
+    fn only_resolver_messages_carry_their_recipients() {
+        use crate::cw_app_seams::AppConsensusTransport as _;
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let transport = EngineCwTransport { filter: vec![1; 32], event_tx };
+        let member = quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&[5; 897]).unwrap();
+        for (channel, expected) in [
+            (crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL, vec![vec![5u8; 897]]),
+            (0, Vec::new()),
+            (1, Vec::new()),
+            (crate::cw_app_seams::CW_APP_BLOCK_CHANNEL, Vec::new()),
+        ] {
+            transport.deliver(channel, vec![member.clone()], vec![channel as u8]);
+            match events.try_recv().unwrap() {
+                AppEngineEvent::CwOut { channel: sent, recipients, .. } => {
+                    assert_eq!((sent, recipients), (channel, expected));
+                }
+                _ => panic!("expected a CwOut"),
+            }
+        }
+    }
 
     /// Each confidential bundle is proposed by exactly one live shard, the
     /// same one whichever shard asks, and by one more for each fallback period

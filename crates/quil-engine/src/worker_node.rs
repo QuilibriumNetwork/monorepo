@@ -112,6 +112,8 @@ pub struct WorkerOnlyNode {
     fee_manager: Arc<dyn quil_types::consensus::DynamicFeeManager>,
     local_prover_address: Vec<u8>,
     local_bls_pubkey: Vec<u8>,
+    /// The tag naming this member as a shard CW transmission's addressee.
+    local_cw_tag: [u8; crate::bitmasks::SHARD_CW_ADDRESSEE_LEN],
     bls_signer_factory: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync>,
     reward_greedy: bool,
     /// Minimum Active prover count required before this worker's
@@ -199,7 +201,21 @@ pub struct WorkerOnlyNode {
     /// arrives — the periodic sync falls back to trust-the-peer only for
     /// that initial window.
     latest_prover_tree_anchor: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// The master's GlobalService, for resolver messages it delivers
+    /// directly ([`Self::relay_direct`]); reconnected after a failure.
+    master_relay: tokio::sync::Mutex<
+        Option<quil_types::proto::global::global_service_client::GlobalServiceClient<tonic::transport::Channel>>,
+    >,
+    /// When the master last answered that it lacks the relay (an older
+    /// build): resolver messages go to the topic for a while.
+    master_relay_unsupported: std::sync::Mutex<Option<std::time::Instant>>,
 }
+
+/// How long a master without the relay is not asked again.
+const MASTER_RELAY_RETRY_AFTER: Duration = Duration::from_secs(600);
+/// How long a relayed send may take: the master's own direct send times out
+/// after five seconds.
+const MASTER_RELAY_TIMEOUT: Duration = Duration::from_secs(8);
 
 impl WorkerOnlyNode {
     pub fn new(
@@ -225,6 +241,7 @@ impl WorkerOnlyNode {
             message_collector,
             fee_manager,
             local_prover_address,
+            local_cw_tag: crate::bitmasks::shard_cw_addressee_tag(&local_bls_pubkey),
             local_bls_pubkey,
             bls_signer_factory,
             reward_greedy,
@@ -251,6 +268,48 @@ impl WorkerOnlyNode {
             outgoing_history_source: None,
             sync_cooldown_until: std::sync::atomic::AtomicU64::new(0),
             latest_prover_tree_anchor: std::sync::Mutex::new(Vec::new()),
+            master_relay: tokio::sync::Mutex::new(None),
+            master_relay_unsupported: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Have the master deliver a resolver message directly to the committee
+    /// members it names. A standalone worker connects under a synthetic
+    /// identity no member can attribute to its committee key, but its master
+    /// holds the node's identity and its peer connections. False: send it to
+    /// the topic (no master channel, a master without the relay, a failure,
+    /// or a recipient the master could not reach).
+    async fn relay_direct(&self, filter: Vec<u8>, channel: u64, data: Vec<u8>, recipients: Vec<Vec<u8>>) -> bool {
+        let Some(factory) = self.config.channel_factory.clone() else { return false };
+        if self
+            .master_relay_unsupported
+            .lock()
+            .unwrap()
+            .is_some_and(|since| since.elapsed() < MASTER_RELAY_RETRY_AFTER)
+        {
+            return false;
+        }
+        let mut relay = self.master_relay.lock().await;
+        if relay.is_none() {
+            match tokio::time::timeout(MASTER_RELAY_TIMEOUT, factory()).await {
+                Ok(Ok(channel)) => {
+                    *relay = Some(quil_types::proto::global::global_service_client::GlobalServiceClient::new(channel));
+                }
+                _ => return false,
+            }
+        }
+        let Some(client) = relay.as_mut() else { return false };
+        let request = quil_types::proto::global::SendShardConsensusDirectRequest { filter, channel, data, recipients };
+        match tokio::time::timeout(MASTER_RELAY_TIMEOUT, client.send_shard_consensus_direct(request)).await {
+            Ok(Ok(response)) => response.into_inner().delivered,
+            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+                *self.master_relay_unsupported.lock().unwrap() = Some(std::time::Instant::now());
+                false
+            }
+            _ => {
+                *relay = None;
+                false
+            }
         }
     }
 
@@ -418,6 +477,21 @@ impl WorkerOnlyNode {
             });
         }
 
+        // Resolver traffic of this worker's shard, every 30 s.
+        {
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tick.tick() => crate::resolver_traffic::ResolverTraffic::process().log(),
+                    }
+                }
+            });
+        }
+
         // 1. Start parent process monitor (if parent PID given)
         if let Some(parent_pid) = self.config.parent_pid {
             let cancel = self.cancel.clone();
@@ -580,15 +654,32 @@ impl WorkerOnlyNode {
                                     }
                                     // Commonware-simplex message → one shard CW
                                     // gossip topic, channel tagged in the payload.
-                                    CwOut { filter, channel, bytes } => {
+                                    CwOut { filter, channel, bytes, recipients } => {
                                         if halted {
                                             continue;
                                         }
-                                        publish(
-                                            crate::bitmasks::shard_cw_bitmask(&filter),
-                                            crate::bitmasks::shard_cw_frame_payload(channel, &bytes),
-                                        )
-                                        .await;
+                                        if recipients.is_empty() {
+                                            publish(
+                                                crate::bitmasks::shard_cw_bitmask(&filter),
+                                                crate::bitmasks::shard_cw_frame_payload(channel, &bytes),
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                        // A resolver message: through the master to just
+                                        // its recipients, else the topic. Off the pump,
+                                        // which also carries votes, since a relayed send
+                                        // can wait out the master's timeout.
+                                        // Either way it names its recipient, so other
+                                        // members drop it unread.
+                                        let worker = worker_for_pump.clone();
+                                        let publish = publish.clone();
+                                        tokio::spawn(async move {
+                                            let payload = crate::bitmasks::shard_cw_frame_for(channel, &bytes, &recipients);
+                                            if !worker.relay_direct(filter.clone(), channel, bytes, recipients).await {
+                                                publish(crate::bitmasks::shard_cw_bitmask(&filter), payload).await;
+                                            }
+                                        });
                                     }
                                     // Recover existing lineage through bounded
                                     // replay, or authenticate a headless worker's
@@ -1180,7 +1271,7 @@ impl WorkerOnlyNode {
             // channel needs no key (self-describing), so an unresolved sender is
             // only fatal for votes/certs — a benign transient until the peer's
             // PeerInfo propagates. Mirrors the master's inbound CW routing.
-            if let Some((channel, cw_bytes)) = crate::bitmasks::shard_cw_split_payload(data) {
+            if let Some((channel, cw_bytes)) = crate::bitmasks::shard_cw_admit(filter, data, &self.local_cw_tag) {
                 let from_key = self
                     .peer_key_by_id
                     .lock()
@@ -1245,10 +1336,49 @@ struct DataIpcServiceImpl {
     worker: Arc<WorkerOnlyNode>,
 }
 
+/// Hand a directly received shard consensus message to `handle` when it is
+/// the engine for that shard. False: this worker does not run it.
+fn deliver_to_engine(
+    handle: Option<crate::app_engine::AppEngineHandle>,
+    request: quil_types::proto::node::DeliverShardConsensusRequest,
+) -> bool {
+    let Some(handle) = handle.filter(|handle| handle.filter == request.filter) else { return false };
+    if request.channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
+        crate::resolver_traffic::ResolverTraffic::process().note_received(
+            &request.filter,
+            &request.data,
+            crate::resolver_traffic::Addressed::Here,
+        );
+    }
+    handle.send(crate::app_engine::AppEngineMessage::CwIn {
+        channel: request.channel,
+        from: request.from,
+        data: request.data,
+    });
+    true
+}
+
 #[tonic::async_trait]
 impl quil_types::proto::node::data_ipc_service_server::DataIpcService
     for DataIpcServiceImpl
 {
+    /// A committee member's message the master received directly, for this
+    /// worker's shard. Handed to the engine exactly as the topic copy would
+    /// be; the engine checks `from` against the committee.
+    async fn deliver_shard_consensus(
+        &self,
+        request: tonic::Request<quil_types::proto::node::DeliverShardConsensusRequest>,
+    ) -> std::result::Result<tonic::Response<quil_types::proto::node::DeliverShardConsensusResponse>, tonic::Status> {
+        let handle = self
+            .worker
+            .engine_handle
+            .lock()
+            .map_err(|_| tonic::Status::unavailable("worker handle unavailable"))?
+            .clone();
+        let accepted = deliver_to_engine(handle, request.into_inner());
+        Ok(tonic::Response::new(quil_types::proto::node::DeliverShardConsensusResponse { accepted }))
+    }
+
     async fn get_app_fee_snapshot(
         &self, request: tonic::Request<quil_types::proto::node::GetAppFeeSnapshotRequest>,
     ) -> std::result::Result<tonic::Response<quil_types::proto::node::GetAppFeeSnapshotResponse>, tonic::Status> {
@@ -1647,6 +1777,29 @@ fn multiaddr_to_http_endpoint(ma: &str, default_port: u16) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The master's direct delivery reaches the engine only for the shard
+    /// this worker runs, carrying the sender's committee key.
+    #[test]
+    fn a_directly_delivered_message_reaches_only_this_shards_engine() {
+        let request = |filter: Vec<u8>| quil_types::proto::node::DeliverShardConsensusRequest {
+            filter,
+            channel: 2,
+            data: b"certificate".to_vec(),
+            from: vec![5; 897],
+        };
+        let (handle, mut engine) = crate::app_engine::AppEngineHandle::for_test(vec![1; 32]);
+        assert!(!deliver_to_engine(None, request(vec![1; 32])), "no engine");
+        assert!(!deliver_to_engine(Some(handle.clone()), request(vec![2; 32])), "another shard");
+        assert!(engine.try_recv().is_err());
+        assert!(deliver_to_engine(Some(handle), request(vec![1; 32])));
+        match engine.try_recv().unwrap() {
+            crate::app_engine::AppEngineMessage::CwIn { channel, from, data } => {
+                assert_eq!((channel, from, data), (2, vec![5; 897], b"certificate".to_vec()));
+            }
+            _ => panic!("expected CwIn"),
+        }
+    }
 
     #[tokio::test]
     async fn cluster_consensus_waits_for_subscription_and_peer() {

@@ -17,6 +17,7 @@ pub(crate) mod runtime_state;
 pub(crate) mod storage;
 pub(crate) mod remote_reads;
 pub(crate) mod worker_manager;
+pub(crate) mod direct_delivery;
 
 pub(crate) async fn start(
     mut sup: Supervisor<anyhow::Error>,
@@ -531,6 +532,7 @@ pub(crate) async fn start(
     let worker_manager: Arc<dyn quil_engine::worker::WorkerManager> = worker_manager::init(
         &mut sup,
         worker_manager::WorkerManagerArgs {
+            peer_info_cache: peer_info_cache.clone(),
             config: config.clone(),
             archive_mode,
             p2p_handle: p2p_handle.clone(),
@@ -1313,6 +1315,8 @@ pub(crate) async fn start(
     };
 
     message_loop::spawn(&mut sup, message_loop::MessageLoopArgs {
+        remote_workers: remote_worker_manager_for_halt.clone(),
+        local_cw_tag: quil_engine::bitmasks::shard_cw_addressee_tag(&bls_pubkey),
         clock_store: clock_store.clone(),
         exec_manager: exec_manager.clone(),
         crdt: crdt.clone(),

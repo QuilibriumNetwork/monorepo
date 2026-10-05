@@ -43,6 +43,12 @@ use crate::frame_validator::BlsAppFrameValidator;
 /// — the app analog of `cw_global_seams::CW_BLOCK_CHANNEL`.
 pub const CW_APP_BLOCK_CHANNEL: u64 = 3;
 
+/// The simplex resolver's channel: requests for missing certificates and their
+/// responses, each addressed to one committee member. The only channel whose
+/// recipients travel to the network layer ([`crate::app_engine::AppEngineEvent::CwOut`]),
+/// so it can be delivered directly instead of to the shard's whole topic.
+pub const CW_APP_RESOLVER_CHANNEL: u64 = 2;
+
 /// Build the full `AppShardFrame{header, requests}` from a produced consensus
 /// state. Supplied by `AppConsensusEngine` (it owns the per-frame `frame_requests`
 /// map the leader recorded); returns `None` if assembly fails.
@@ -468,6 +474,13 @@ pub struct AppSeamProposer {
     private_waits: Mutex<(u64, u32)>,
 }
 
+/// How far ahead of this node's latest GLOBAL frame a proposal's anchor may
+/// be and still be waited for rather than refused.
+const ANCHOR_DEFER_AHEAD: u64 = 2;
+
+/// Wait between checks of a proposal whose anchor is on its way.
+const ANCHOR_DEFER: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Proposal retries (250 ms apart) waiting for a selected parent to
 /// materialize before a leader builds on a private execution of it. Normally
 /// the parent finalizes and materializes moments after its notarization.
@@ -607,6 +620,30 @@ impl GlobalProposer for AppSeamProposer {
 
     fn verify(&self, view: u64, parent: Digest, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
         self.verify_with(self.requests_root_check.as_ref(), view, parent, digest, bytes)
+    }
+
+    /// Waits while the proposal's anchored GLOBAL frame is just ahead of this
+    /// node's latest: members build on a GLOBAL frame as soon as it
+    /// finalizes, and one that receives it moments later refused (nullified)
+    /// their proposals instead. The adapter asks again while the view lasts;
+    /// an anchor further ahead, or one below this node's head (a hole), is
+    /// checked and refused as before.
+    fn verify_or_defer(
+        &self,
+        context: ProposalContext,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> Result<bool, std::time::Duration> {
+        if let Some(frame) = bytes.as_deref().and_then(decode_app_frame) {
+            if let Some((wanted, Some(latest))) = self.validator.missing_global_anchor(&frame) {
+                if wanted > latest && wanted - latest <= ANCHOR_DEFER_AHEAD {
+                    tracing::debug!(view = context.view, wanted, latest,
+                        "cw app verify: anchored global frame not here yet; deferring the vote");
+                    return Err(ANCHOR_DEFER);
+                }
+            }
+        }
+        Ok(self.verify_with_context(context, digest, bytes))
     }
 }
 
@@ -1933,6 +1970,85 @@ mod tests {
         let mut wrong_shard = frame;
         wrong_shard.header.as_mut().unwrap().address = vec![2; 32];
         assert!(!proposer.verify(43, parent, digest, Some(encode_app_frame(&wrong_shard))));
+    }
+
+    /// A proposal anchored one or two GLOBAL frames past this node's latest
+    /// waits for the anchor rather than being refused; once it arrives the
+    /// proposal is checked as usual. Further ahead, or a hole below the head,
+    /// is refused, naming the frame and this node's latest.
+    #[test]
+    fn a_proposal_anchored_just_ahead_waits_for_its_global_frame() {
+        use quil_cw_consensus::adapters::{GlobalProposer as _, ProposalContext};
+        use quil_types::store::ClockStore as _;
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let put_global = |number: u64| {
+            let frame = quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: number,
+                    output: vec![number as u8; 516],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let txn = clock.new_transaction(false).unwrap();
+            clock.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+            txn.commit().unwrap();
+        };
+        for number in [5, 7, 8, 9, 10] {
+            put_global(number);
+        }
+        let filter = vec![1; 32];
+        let validator = Arc::new(
+            BlsAppFrameValidator::new(
+                Arc::new(crate::test_support::TestProverRegistry::default()),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            )
+            .with_clock_store(clock.clone()),
+        );
+        let proposer = AppSeamProposer::new(
+            Arc::new(NoProposal),
+            validator.clone(),
+            Arc::new(|_| unreachable!()),
+            filter.clone(),
+            Some(Arc::new(|_| true)),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        let proposal = |anchor: u64| {
+            let frame = AppShardFrame {
+                header: Some(quil_types::proto::global::FrameHeader {
+                    address: filter.clone(),
+                    frame_number: 7,
+                    rank: 43,
+                    parent_selector: vec![7; 32],
+                    state_roots: vec![vec![0; 32]; 4],
+                    global_frame_number: anchor,
+                    output: vec![3; 32],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let context = ProposalContext {
+                epoch: 0, view: 43, parent_view: 42, parent: digest_from_identity([7; 32]),
+            };
+            (frame.clone(), context, app_frame_digest(&frame).unwrap(), Some(encode_app_frame(&frame)))
+        };
+        for anchor in [11, 12] {
+            let (_, context, digest, bytes) = proposal(anchor);
+            assert_eq!(proposer.verify_or_defer(context, digest, bytes), Err(ANCHOR_DEFER), "anchor {anchor}");
+        }
+        for anchor in [13, 6] {
+            let (frame, context, digest, bytes) = proposal(anchor);
+            assert_eq!(proposer.verify_or_defer(context, digest, bytes), Ok(false), "anchor {anchor}");
+            let error = validator.validate_proposal(&frame).unwrap_err().to_string();
+            assert!(error.contains(&format!("anchored global frame {anchor} unavailable"))
+                && error.contains("latest local global frame: 10"), "{error}");
+        }
+        put_global(11);
+        let (frame, context, digest, bytes) = proposal(11);
+        assert_eq!(validator.missing_global_anchor(&frame), None);
+        assert!(proposer.verify_or_defer(context, digest, bytes).is_ok(), "checked once it arrives");
     }
 
     #[test]

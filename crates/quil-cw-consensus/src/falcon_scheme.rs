@@ -163,7 +163,7 @@ impl<N: Namespace> Generic<N> {
         entries.sort_by_key(|(signer, _)| *signer);
         let (signer, signatures): (Vec<Participant>, Vec<_>) = entries.into_iter().unzip();
         let signers = Signers::from(self.participants.len(), signer);
-        let signatures = signatures.into_iter().map(Lazy::from).collect();
+        let signatures = signatures.into_iter().map(Lazy::from).collect::<Vec<_>>().into();
         Some(Certificate { signers, signatures })
     }
 
@@ -189,7 +189,7 @@ impl<N: Namespace> Generic<N> {
         }
         let namespace = subject.namespace(&self.namespace);
         let message = subject.message();
-        for (signer, signature) in certificate.signers.iter().zip(&certificate.signatures) {
+        for (signer, signature) in certificate.signers.iter().zip(certificate.signatures.iter()) {
             let Some(public_key) = self.participants.key(signer) else {
                 return false;
             };
@@ -218,22 +218,26 @@ impl<N: Namespace> Generic<N> {
 }
 
 /// A Falcon quorum certificate: which participants signed + their signatures.
+///
+/// The signatures are shared by clones: Simplex keeps a certificate in its
+/// view state, its resolver and its reporter, for every view since the last
+/// finalization. The encoding is that of a `Vec`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Certificate {
     pub signers: Signers,
-    pub signatures: Vec<Lazy<FalconSignature>>,
+    pub signatures: std::sync::Arc<[Lazy<FalconSignature>]>,
 }
 
 impl Write for Certificate {
     fn write(&self, writer: &mut impl BufMut) {
         self.signers.write(writer);
-        self.signatures.write(writer);
+        (&self.signatures[..]).write(writer);
     }
 }
 
 impl EncodeSize for Certificate {
     fn encode_size(&self) -> usize {
-        self.signers.encode_size() + self.signatures.encode_size()
+        self.signers.encode_size() + (&self.signatures[..]).encode_size()
     }
 }
 
@@ -255,7 +259,7 @@ impl Read for Certificate {
                 "Signers and signatures counts differ",
             ));
         }
-        Ok(Self { signers, signatures })
+        Ok(Self { signers, signatures: signatures.into() })
     }
 }
 
@@ -438,6 +442,31 @@ mod tests {
 
     fn subject() -> TestSubject {
         TestSubject { message: bytes::Bytes::from_static(b"state_id|rank") }
+    }
+
+    /// A certificate encodes exactly as it did with a `Vec` of signatures:
+    /// signer bitmap, length, then each 666-byte signature. Clones share the
+    /// signatures, and a decoded certificate re-encodes byte for byte.
+    #[test]
+    fn certificate_encoding_is_unchanged_and_clones_share_signatures() {
+        use commonware_codec::{Encode, Read as _};
+        let schemes = setup(4);
+        let atts: Vec<_> = schemes[..3]
+            .iter()
+            .map(|s| s.sign::<Sha256Digest>(subject()).unwrap())
+            .collect();
+        let cert = schemes[0].assemble::<_, N3f1>(atts, &Sequential).unwrap();
+        let as_vec: Vec<Lazy<FalconSignature>> = cert.signatures.to_vec();
+        let mut expected = cert.signers.encode().to_vec();
+        expected.extend_from_slice(&as_vec.encode());
+        assert_eq!(cert.encode().to_vec(), expected);
+        assert_eq!(cert.encode_size(), expected.len());
+
+        let copy = cert.clone();
+        assert!(std::sync::Arc::ptr_eq(&copy.signatures, &cert.signatures));
+        let decoded = Certificate::read_cfg(&mut cert.encode(), &4).unwrap();
+        assert_eq!(decoded, cert);
+        assert_eq!(decoded.encode(), cert.encode());
     }
 
     #[test]

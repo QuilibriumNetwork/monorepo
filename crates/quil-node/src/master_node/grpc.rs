@@ -872,6 +872,7 @@ pub(crate) fn spawn_all(
                     bitmask: req.bitmask,
                     data: req.data,
                     from: auth.peer_id.to_bytes(),
+                    direct: false,
                 };
                 match tx.try_send(received) {
                     Ok(()) => Ok(()),
@@ -1068,6 +1069,27 @@ pub(crate) fn spawn_all(
     // node's Ed448 seed and thus authenticate as this same peer_id — may invoke
     // them. A remote machine handshakes as a different peer_id and is denied.
     .with_self_peer_id(peer_id.to_bytes())
+    // A standalone worker's resolver messages, delivered by this node to just
+    // the members they name (the worker's own connections cannot be
+    // attributed to its committee key).
+    .with_shard_direct_relay({
+        let p2p = p2p_handle.clone();
+        let peers = super::direct_delivery::CommitteePeers::new(peer_info_cache.clone());
+        Arc::new(move |filter: Vec<u8>, channel: u64, data: Vec<u8>, recipients: Vec<Vec<u8>>| {
+            let (p2p, peers) = (p2p.clone(), peers.clone());
+            Box::pin(async move {
+                let topic = quil_engine::bitmasks::shard_cw_bitmask(&filter);
+                let payload = quil_engine::bitmasks::shard_cw_frame_for(channel, &data, &recipients);
+                let delivered =
+                    super::direct_delivery::deliver_direct(&p2p, &peers, &recipients, &topic, &payload).await;
+                if !delivered {
+                    // The worker sends it to the topic itself.
+                    p2p.note_direct_fallback();
+                }
+                delivered
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        }) as quil_rpc::global_service::ShardDirectRelay
+    })
     // GetGlobalProposal: self OR an active prover (Go authenticateProverFromContext).
     .with_prover_authorizer(prover_authorizer.clone());
     // (The legacy KZG HyperSync serve side + its dedicated runtime were removed
