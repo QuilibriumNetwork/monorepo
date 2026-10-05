@@ -14,7 +14,7 @@ use ratatui::{
 use super::super::epoch::ThresholdUnit;
 use super::super::format_quil_daily_round;
 use super::model::*;
-use super::util::{filter_label, clamp_offset};
+use super::util::{center_trunc, filter_label, shared_filter_address, clamp_offset};
 
 // ── Colors (mirror lipgloss constants) ───────────────────────────────────
 
@@ -398,7 +398,7 @@ fn avail_title(m: &Model, sorted: &[ShardRow]) -> Line<'static> {
 fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
     match col {
         0 => alloc_marker(m, a).to_string(),
-        1 => filter_label(&a.filter_hex, fw),
+        1 => center_trunc(&a.filter_hex, fw),
         2 => a.active_provers.to_string(),
         3 => a.ring.to_string(),
         4 => fmt_mb(&a.shard_size),
@@ -626,12 +626,17 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
     m.alloc_offset = clamp_offset(m.alloc_offset, m.alloc_cursor, visible, sorted.len());
     let end = (m.alloc_offset + visible).min(sorted.len());
 
+    let shared_address = shared_filter_address(sorted.iter().map(|a| a.filter_hex.as_str()));
     for i in m.alloc_offset..end {
         let a = &sorted[i];
         let selected = i == m.alloc_cursor && m.focus.is_alloc();
 
         let cells: Vec<String> = (0..widths.len())
-            .map(|c| pad_cell(&alloc_cell(m, a, c, fw), widths[c], alloc_left_aligned(c)))
+            .map(|c| {
+                let cell = if c == 1 && shared_address { filter_label(&a.filter_hex, fw) }
+                    else { alloc_cell(m, a, c, fw) };
+                pad_cell(&cell, widths[c], alloc_left_aligned(c))
+            })
             .collect();
 
         if selected {
@@ -702,7 +707,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
 fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
     match col {
         0 => avail_marker(m, s).to_string(),
-        1 => filter_label(&s.filter_hex, fw),
+        1 => center_trunc(&s.filter_hex, fw),
         2 => s.active_provers.to_string(),
         3 => s.ring.to_string(),
         4 => fmt_mb(&s.shard_size),
@@ -892,13 +897,18 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
     m.avail_offset = clamp_offset(m.avail_offset, m.avail_cursor, visible, sorted.len());
     let end = (m.avail_offset + visible).min(sorted.len());
 
+    let shared_address = shared_filter_address(sorted.iter().map(|s| s.filter_hex.as_str()));
     for i in m.avail_offset..end {
         let s = &sorted[i];
         let selected = i == m.avail_cursor && !m.focus.is_alloc();
 
         if selected {
             let cells: Vec<String> = (0..widths.len())
-                .map(|c| pad_cell(&avail_cell(m, s, c, fw), widths[c], c == 1))
+                .map(|c| {
+                    let cell = if c == 1 && shared_address { filter_label(&s.filter_hex, fw) }
+                        else { avail_cell(m, s, c, fw) };
+                    pad_cell(&cell, widths[c], c == 1)
+                })
                 .collect();
             let padded = format!("{:<width$}", cells.join(" "), width = content_width);
             lines.push(Line::from(Span::styled(
@@ -913,7 +923,9 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
                 if c > 0 {
                     spans.push(Span::raw(" "));
                 }
-                let cell = pad_cell(&avail_cell(m, s, c, fw), widths[c], c == 1);
+                let cell = if c == 1 && shared_address { filter_label(&s.filter_hex, fw) }
+                    else { avail_cell(m, s, c, fw) };
+                let cell = pad_cell(&cell, widths[c], c == 1);
                 spans.push(match c {
                     3 if m.color_coding => Span::styled(cell, Style::new().fg(ring_color(s.ring))),
                     6 | 7 | 8 if m.color_coding => {
