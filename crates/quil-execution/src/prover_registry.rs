@@ -1604,6 +1604,30 @@ fn log_local_alloc_diff(prev: &ProverAllocationInfo, new: &ProverAllocationInfo)
 }
 
 impl ProverRegistryTrait for SharedProverRegistry {
+    fn get_lifecycle_view(
+        &self, address: &[u8], frame: u64,
+    ) -> QuilResult<quil_types::consensus::ProverLifecycleView> {
+        use quil_types::consensus::{LifecycleMembers, ProverLifecycleView};
+        let guard = self.inner.read()
+            .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+        let prover = guard.get_prover_info(address).cloned();
+        let summaries = guard.get_prover_shard_summaries(frame);
+        let filters: std::collections::BTreeSet<_> = prover.iter()
+            .flat_map(|p| p.allocations.iter())
+            .map(|a| a.confirmation_filter.clone())
+            .filter(|f| !f.is_empty()).collect();
+        let mut members = HashMap::new();
+        for filter in filters {
+            // Clone addresses, not complete peer records and cryptographic keys.
+            let active = guard.get_provers_by_status(&filter, ProverStatus::Active)
+                .into_iter().map(|p| p.address.clone()).collect();
+            let leaving = guard.get_provers_by_status(&filter, ProverStatus::Leaving)
+                .into_iter().map(|p| p.address.clone()).collect();
+            members.insert(filter, LifecycleMembers { active, leaving });
+        }
+        Ok(ProverLifecycleView { prover, summaries, members })
+    }
+
     fn as_any(&self) -> Option<&dyn std::any::Any> { Some(self) }
     fn get_prover_info(&self, address: &[u8]) -> QuilResult<Option<ProverInfo>> {
         Ok(self
@@ -3387,6 +3411,81 @@ mod tests {
         assert_eq!(sum.filter, filter);
         assert_eq!(sum.status_counts.get(&ProverStatus::Active).copied().unwrap_or(0), 1);
         assert_eq!(sum.status_counts.get(&ProverStatus::Joining).copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn lifecycle_views_remain_coherent_during_registry_replacement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let owner = [0xF0; 32];
+        let filter = vec![0xFC; 64];
+        let make_state = |status: u8, seniority: u64| {
+            let (_tmp, store) = temp_store();
+            let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+            let prover = build_sub_tree(vec![
+                type_hash_leaf("prover:Prover"),
+                field_leaf("prover:Prover", "PublicKey", vec![0xFE; 57]),
+                field_leaf("prover:Prover", "Status", vec![1]),
+                field_leaf("prover:Prover", "Seniority", seniority.to_be_bytes().to_vec()),
+            ]);
+            let allocation = build_sub_tree(vec![
+                type_hash_leaf("allocation:ProverAllocation"),
+                field_leaf("allocation:ProverAllocation", "Prover", owner.to_vec()),
+                field_leaf("allocation:ProverAllocation", "Status", vec![status]),
+                field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.clone()),
+            ]);
+            store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xF0), &prover).unwrap();
+            store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xF1), &allocation).unwrap();
+            let mut registry = InMemoryProverRegistry::new();
+            registry.refresh(store.as_ref()).unwrap();
+            registry
+        };
+        let active = make_state(1, 1);
+        let leaving = make_state(3, 2);
+        let shared = SharedProverRegistry::new();
+        let verify = |view: quil_types::consensus::ProverLifecycleView| {
+            let owner_info = view.prover.unwrap();
+            let members = &view.members[&filter];
+            let summary = view.summaries.iter().find(|s| s.filter == filter).unwrap();
+            match owner_info.seniority {
+                1 => {
+                    assert_eq!(members.active, vec![owner.to_vec()]);
+                    assert!(members.leaving.is_empty());
+                    assert_eq!(summary.status_counts.get(&ProverStatus::Active), Some(&1));
+                }
+                2 => {
+                    assert_eq!(members.leaving, vec![owner.to_vec()]);
+                    assert!(members.active.is_empty());
+                    assert_eq!(summary.status_counts.get(&ProverStatus::Leaving), Some(&1));
+                }
+                _ => panic!("unexpected registry generation"),
+            }
+        };
+        // Both sequential controls and the concurrent side use the same API.
+        *shared.inner.write().unwrap() = active.clone();
+        let retained = shared.get_lifecycle_view(&owner, 0).unwrap();
+        *shared.inner.write().unwrap() = leaving.clone();
+        verify(retained);
+        verify(shared.get_lifecycle_view(&owner, 0).unwrap());
+        let running = AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while running.load(Ordering::Relaxed) {
+                    *shared.inner.write().unwrap() = active.clone();
+                    std::thread::yield_now();
+                    *shared.inner.write().unwrap() = leaving.clone();
+                    std::thread::yield_now();
+                }
+            });
+            let reader = scope.spawn(|| {
+                for _ in 0..500 {
+                    verify(shared.get_lifecycle_view(&owner, 0).unwrap());
+                    std::thread::yield_now();
+                }
+            });
+            let result = reader.join();
+            running.store(false, Ordering::Relaxed);
+            result.unwrap();
+        });
     }
 
     #[test]
