@@ -22,7 +22,7 @@ use num_bigint::BigInt;
 use num_traits::{One, Zero};
 
 use quil_types::consensus::{
-    ProverInfo, ProverRegistry, ProverStatus, ShardDetail,
+    ProverInfo, ProverRegistry, ShardDetail,
 };
 use quil_types::error::Result;
 use quil_types::store::{ShardInfo, ShardsStore};
@@ -110,6 +110,8 @@ fn compute_shard_ring_info(total_active_joining: usize) -> ShardRingInfo {
     ri
 }
 
+/// Legacy count-only compatibility helper. Production shard-info uses
+/// `ProverRegistry::get_reward_ring_estimate` to match issuance membership.
 /// Determine the ring and on-ring count for a shard entry.
 ///
 /// - `total_candidates`: number of active+joining provers on the shard.
@@ -793,6 +795,7 @@ pub fn build_allocated_filters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quil_types::consensus::ProverStatus;
 
     // ---- isqrt ----
 

@@ -156,15 +156,17 @@ impl ProverRegistry for TestProverRegistry {
             .collect())
     }
 
-    fn get_active_provers(&self, _filter: &[u8], _frame_number: u64) -> Result<Vec<ProverInfo>> {
-        Ok(self
-            .provers
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|p| p.status == ProverStatus::Active)
-            .cloned()
-            .collect())
+    fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Result<Vec<ProverInfo>> {
+        let provers = self.provers.lock().unwrap();
+        // Match the trait's committee contract: serving Leaving allocations
+        // remain members, while Joining/Paused are not active proof producers.
+        let members = |floor: bool| provers.iter().filter(|p| p.allocations.iter().any(|a|
+            a.confirmation_filter == filter && (matches!(a.effective_status(frame_number),
+                quil_types::consensus::EffectiveStatus::Active | quil_types::consensus::EffectiveStatus::Leaving)
+                || (floor && a.status == ProverStatus::Active))))
+            .cloned().collect::<Vec<_>>();
+        let strict = members(false);
+        Ok(if strict.is_empty() && !filter.is_empty() { members(true) } else { strict })
     }
 
     fn get_prover_count(&self, _filter: &[u8]) -> Result<usize> {

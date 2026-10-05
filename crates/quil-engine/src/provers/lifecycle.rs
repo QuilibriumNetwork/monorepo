@@ -1470,6 +1470,7 @@ impl ProverLifecycle {
             descriptor.shards = shard_metrics.get(&descriptor.filter).map_or(0, |(_, shards)| *shards);
             if let Some(estimate) = reward_rings.get(&descriptor.filter) {
                 descriptor.ring = estimate.ring;
+                descriptor.active_on_ring = estimate.provers_on_ring as u64;
             }
         }
         // Missing reward metadata cannot establish a profitable destination.
@@ -1478,6 +1479,10 @@ impl ProverLifecycle {
             build_decide_descriptors(&summaries, &shard_sizes_snapshot);
         for descriptor in &mut decide_all_descriptors {
             descriptor.shards = shard_metrics.get(&descriptor.filter).map_or(0, |(_, shards)| *shards);
+            if let Some(estimate) = reward_rings.get(&descriptor.filter) {
+                descriptor.ring = estimate.ring;
+                descriptor.active_on_ring = estimate.provers_on_ring as u64;
+            }
         }
         // Use the same membership estimate as shard-info and issuance's
         // immutable ordering. A decoded ring zero may be an absent field.
