@@ -217,15 +217,6 @@ pub fn compute_shard_reward(
 // build_shard_entries — iterate shards and enrich with registry data
 // ---------------------------------------------------------------------------
 
-/// Sort key for ring assignment candidates. Mirrors Go's sort in
-/// `buildShardEntries`: joinFrame ASC, seniority DESC, address ASC.
-#[derive(Debug, Clone)]
-struct RingCandidate {
-    join_frame: u64,
-    seniority: u64,
-    address: Vec<u8>,
-}
-
 /// Build shard entries from raw shard data and a size-fetching function.
 ///
 /// This is the core of `GetShardInfo`: for each shard, fetch sub-shard
@@ -306,86 +297,21 @@ where
                 Err(_) => continue,
             };
 
-            // Build sorted ring candidates for TUI display.
-            //
-            // Includes Joining, Active, Paused, and Leaving (all
-            // "live" states — `is_live`). Expired Joining/Leaving and
-            // terminal states (Rejected, Kicked) are correctly
-            // excluded — those provers no longer hold the slot.
-            //
-            // Diverges intentionally from Go's `shard_info.go:221`
-            // and from the `is_allocated` rule (Active+Joining only).
-            // The strict Active+Joining filter is right for the
-            // *protocol's* ring-assignment math (a Leaving prover
-            // makes room for a fresh joiner who lands at the tail
-            // rank), but wrong for display: until the 360-frame
-            // leave-confirm window elapses, the leaving prover is
-            // still on whatever ring they were on and still earning
-            // that ring's reward. Filtering them out of the candidate
-            // list silently shifts every other prover's rank by one
-            // and makes `resolve_prover_ring` fall through to its
-            // "not in candidates" tail branch, returning the
-            // *post-leave* network's last-prover ring rather than
-            // the leaver's actual current rank.
-            let mut candidates: Vec<RingCandidate> = Vec::new();
-            for pr in &prs {
-                for alloc in &pr.allocations {
-                    if alloc.confirmation_filter != bp {
-                        continue;
-                    }
-                    if alloc.is_live(frame_number) {
-                        let jf = if alloc.join_frame_number == 0
-                            && alloc.join_confirm_frame_number != 0
-                        {
-                            alloc.join_confirm_frame_number
-                        } else {
-                            alloc.join_frame_number
-                        };
-                        candidates.push(RingCandidate {
-                            join_frame: jf,
-                            seniority: pr.seniority,
-                            address: pr.address.clone(),
-                        });
-                    }
-                    break;
-                }
-            }
-
-            // Sort: joinFrame ASC, seniority DESC, address ASC.
-            candidates.sort_by(|a, b| {
-                a.join_frame
-                    .cmp(&b.join_frame)
-                    .then_with(|| b.seniority.cmp(&a.seniority))
-                    .then_with(|| a.address.cmp(&b.address))
-            });
-
-            let candidate_addrs: Vec<Vec<u8>> =
-                candidates.iter().map(|c| c.address.clone()).collect();
-
-            // Derive is_alloc from the candidate list (the registry's
-            // authoritative per-shard prover view), not just from the
-            // caller-supplied allocated_filters byte set. This handles
-            // the case where the local prover_info's `confirmation_filter`
-            // doesn't byte-match the reconstructed `bp` — we may still be
-            // listed under this shard in the registry's filter cache. The
-            // ring math then correctly returns rank-based, and the
-            // TUI shelves the row in the upper "Allocations" panel.
-            let in_candidates = !self_address.is_empty()
-                && candidate_addrs.iter().any(|a| a.as_slice() == self_address);
+            // Keep the displayed membership count, but derive reward position
+            // from the shared issuance ordering and explicit projections.
+            let live: Vec<_> = prs.iter().filter(|p| p.allocations.iter()
+                .any(|a| a.confirmation_filter == bp && a.is_live(frame_number))).collect();
+            let in_candidates = live.iter().any(|p| p.address == self_address);
             let real_is_alloc = is_alloc || in_candidates;
-
-            let (ring, on_ring) = resolve_prover_ring(
-                candidates.len(),
-                real_is_alloc,
-                self_address,
-                &candidate_addrs,
-            );
+            let Ok(Some(estimate)) = prover_registry.get_reward_ring_estimate(
+                self_address, &bp, frame_number) else { continue; };
+            let (ring, on_ring) = (estimate.ring, estimate.provers_on_ring);
 
             entries.push(ShardEntry {
                 filter: bp,
                 size,
                 data_shards: shard.data_shards,
-                total_active: candidates.len(),
+                total_active: live.len(),
                 provers_on_ring: on_ring,
                 is_allocated: real_is_alloc,
                 ring,
@@ -409,7 +335,7 @@ where
 /// shards from the shards store, enriches each with prover registry
 /// data, and computes estimated rewards.
 ///
-/// Returns `(shard_details, difficulty, pomw_basis_value, frame_number)`.
+/// Returns `(shard_details, difficulty, pomw_basis_value, frame_number, world_bytes)`.
 ///
 /// # Arguments
 /// * `include_all` — when false, only return shards the local prover
@@ -430,7 +356,7 @@ pub fn get_shard_info<F>(
     shards_store: &dyn ShardsStore,
     prover_registry: &dyn ProverRegistry,
     get_sizes: &F,
-) -> Result<(Vec<ShardDetail>, u64, BigInt, u64)>
+) -> Result<(Vec<ShardDetail>, u64, BigInt, u64, BigInt)>
 where
     F: Fn(&[u8], &ShardInfo) -> Result<Vec<ShardSizeEntry>>,
 {
@@ -454,7 +380,7 @@ where
     );
 
     if world_bytes.is_zero() {
-        return Ok((Vec::new(), difficulty, BigInt::zero(), frame_number));
+        return Ok((Vec::new(), difficulty, BigInt::zero(), frame_number, world_bytes));
     }
 
     let basis = pomw_basis(difficulty, world_bytes.to_u64_saturating(), QUIL_TOKEN_UNITS);
@@ -483,7 +409,7 @@ where
         })
         .collect();
 
-    Ok((details, difficulty, basis, frame_number))
+    Ok((details, difficulty, basis, frame_number, world_bytes))
 }
 
 /// `get_sizes` closure for `get_shard_info` that reads sizes from the
@@ -1376,7 +1302,7 @@ mod tests {
         fn get_prover_info(&self, _: &[u8]) -> QResult<Option<ProverInfo>> { Ok(None) }
         fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<u8>> { Ok(vec![]) }
         fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<Vec<u8>>> { Ok(vec![]) }
-        fn get_active_provers(&self, _: &[u8], _: u64) -> QResult<Vec<ProverInfo>> { Ok(vec![]) }
+        fn get_active_provers(&self, filter: &[u8], _: u64) -> QResult<Vec<ProverInfo>> { self.get_provers(filter) }
         fn get_prover_count(&self, _: &[u8]) -> QResult<usize> { Ok(0) }
         fn get_provers(&self, filter: &[u8]) -> QResult<Vec<ProverInfo>> {
             // Single Active prover on every queried filter.
@@ -1465,7 +1391,7 @@ mod tests {
         let allocated_filters: HashSet<Vec<u8>> =
             std::iter::once(typed_key.l2.to_vec()).collect();
 
-        let (details, difficulty, basis, frame_number) = get_shard_info(
+        let (details, difficulty, basis, frame_number, _world) = get_shard_info(
             true,           // include_all
             &prover_addr,
             &allocated_filters,
@@ -1572,7 +1498,7 @@ mod tests {
         );
         let allocated_filters: HashSet<Vec<u8>> = HashSet::new();
 
-        let (details, _diff, basis, _frame) = get_shard_info(
+        let (details, _diff, basis, _frame, _world) = get_shard_info(
             true,
             &prover_addr,
             &allocated_filters,
@@ -1602,6 +1528,34 @@ mod tests {
             details.len(),
             unique_shard_keys.len()
         );
+    }
+
+    #[test]
+    fn owned_and_all_shards_share_the_full_world_reward_denominator() {
+        let store = E2EShardsStore::new();
+        for id in [1u8, 2] {
+            store.push(ShardInfo { shard_key: vec![id; 35], prefix: vec![],
+                size: vec![], data_shards: 1, commitment: vec![] });
+        }
+        let owner = vec![77; 32];
+        let registry = StubRegistry { prover_addr: owner.clone(), prover_pubkey: vec![88; 74] };
+        let allocated = HashSet::from([quil_forest::shard_prefix_to_filter(&[1; 32], &[])]);
+        let sizes = |key: &[u8], _: &ShardInfo| Ok(vec![ShardSizeEntry {
+            prefix: vec![], size: BigInt::from(u64::from(key[0]) * 1000).to_bytes_be().1,
+            data_shards: 1, materialized_frame: 0, latest_frame: 0,
+        }]);
+        let (owned, _, owned_basis, _, owned_world) = get_shard_info(false, &owner, &allocated,
+            10000, 123, &store, &registry, &sizes).unwrap();
+        let (all, _, all_basis, _, all_world) = get_shard_info(true, &owner, &allocated,
+            10000, 123, &store, &registry, &sizes).unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(all.len(), 2);
+        assert_eq!(owned_world, BigInt::from(3000));
+        assert_eq!(owned_world, all_world);
+        assert_eq!(owned_basis, all_basis);
+        assert_ne!(owned_world, owned[0].shard_size);
+        let same = all.iter().find(|s| s.filter == owned[0].filter).unwrap();
+        assert_eq!(owned[0].estimated_reward, same.estimated_reward);
     }
 
     /// PARITY: the TUI per-prover estimate (`compute_shard_reward`) must equal

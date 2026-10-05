@@ -1615,9 +1615,16 @@ impl ProverRegistryTrait for SharedProverRegistry {
         let filters: std::collections::BTreeSet<_> = prover.iter()
             .flat_map(|p| p.allocations.iter())
             .map(|a| a.confirmation_filter.clone())
+            .chain(summaries.iter().map(|s| s.filter.clone()))
             .filter(|f| !f.is_empty()).collect();
         let mut members = HashMap::new();
+        let mut reward_rings = HashMap::new();
         for filter in filters {
+            if let Some(estimate) = quil_types::reward_ring::estimate_reward_ring(
+                &guard.get_active_provers(&filter, frame), &guard.get_provers(&filter),
+                address, &filter, frame) {
+                reward_rings.insert(filter.clone(), estimate);
+            }
             // Clone addresses, not complete peer records and cryptographic keys.
             let active = guard.get_provers_by_status(&filter, ProverStatus::Active)
                 .into_iter().map(|p| p.address.clone()).collect();
@@ -1625,7 +1632,15 @@ impl ProverRegistryTrait for SharedProverRegistry {
                 .into_iter().map(|p| p.address.clone()).collect();
             members.insert(filter, LifecycleMembers { active, leaving });
         }
-        Ok(ProverLifecycleView { prover, summaries, members })
+        Ok(ProverLifecycleView { prover, summaries, members, reward_rings })
+    }
+
+    fn get_reward_ring_estimate(&self, address: &[u8], filter: &[u8], frame: u64)
+        -> QuilResult<Option<quil_types::reward_ring::RewardRingEstimate>> {
+        let guard = self.inner.read()
+            .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+        Ok(quil_types::reward_ring::estimate_reward_ring(
+            &guard.get_active_provers(filter, frame), &guard.get_provers(filter), address, filter, frame))
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> { Some(self) }

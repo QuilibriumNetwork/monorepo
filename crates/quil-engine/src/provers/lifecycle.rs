@@ -1261,6 +1261,7 @@ impl ProverLifecycle {
         let summaries = registry_view.summaries;
         let prover_info = registry_view.prover;
         let membership = registry_view.members;
+        let reward_rings = registry_view.reward_rings;
         let workers = worker_manager.range_workers()?;
         let worker_view = WorkerView::from_workers(workers.clone());
 
@@ -1467,6 +1468,9 @@ impl ProverLifecycle {
         }
         for descriptor in &mut proposal_descriptors {
             descriptor.shards = shard_metrics.get(&descriptor.filter).map_or(0, |(_, shards)| *shards);
+            if let Some(estimate) = reward_rings.get(&descriptor.filter) {
+                descriptor.ring = estimate.ring;
+            }
         }
         // Missing reward metadata cannot establish a profitable destination.
         proposal_descriptors.retain(|d| self.strategy != Strategy::RewardGreedy || d.shards > 0);
@@ -1475,28 +1479,32 @@ impl ProverLifecycle {
         for descriptor in &mut decide_all_descriptors {
             descriptor.shards = shard_metrics.get(&descriptor.filter).map_or(0, |(_, shards)| *shards);
         }
-        // Leave economics use the allocation's confirmed reward ring, as the
-        // reward calculator does, rather than the last member's ring. Keep the
-        // generic descriptors for join confirmation policy.
+        // Use the same membership estimate as shard-info and issuance's
+        // immutable ordering. A decoded ring zero may be an absent field.
         let mut held_descriptors = decide_all_descriptors.clone();
-        if let Some(prover) = &prover_info {
-            for descriptor in &mut held_descriptors {
-                if let Some(allocation) = prover.allocations.iter()
-                    .find(|a| a.confirmation_filter == descriptor.filter
-                        && (a.is_live(frame_number)
-                            || crate::worker_allocator::epoch_renewal_recovery_pending(a, frame_number)))
-                {
-                    descriptor.ring = allocation.ring;
-                }
-            }
-        }
+        held_descriptors.retain_mut(|descriptor| {
+            let allocation = prover_info.as_ref().and_then(|p| p.allocations.iter()
+                .find(|a| a.confirmation_filter == descriptor.filter
+                    && (a.is_live(frame_number)
+                        || crate::worker_allocator::epoch_renewal_recovery_pending(a, frame_number))));
+            if let Some(estimate) = reward_rings.get(&descriptor.filter) {
+                if allocation.is_some() && estimate.source == "new_join_projection" { return false; }
+                descriptor.ring = estimate.ring;
+            } else if allocation.is_some() { return false; }
+            true
+        });
         let allocated_descriptors: Vec<ShardDescriptor> = held_descriptors.iter()
             .filter(|d| active_filters.contains(&d.filter)
                 && (self.strategy != Strategy::RewardGreedy || d.shards > 0))
             .cloned()
             .collect();
 
-        let world_bytes = compute_world_bytes_from_summaries(&summaries);
+        // Count byte sizes once per current filter, excluding settled retired
+        // shards and split-away parents. Summary total_size is a prover count,
+        // not a byte-size denominator.
+        let world_bytes: BigInt = shard_metrics.iter()
+            .filter(|(filter, _)| !retired.contains(*filter) && !settled_split_away(filter))
+            .map(|(_, (size, _))| BigInt::from(*size)).sum();
 
         // A worker counts as free only when:
         //   * its filter slot is empty,
@@ -1606,7 +1614,7 @@ impl ProverLifecycle {
                 let allocation = prover_info.as_ref().and_then(|p| p.allocations.iter()
                     .find(|a| a.confirmation_filter == d.filter));
                 (d.filter.clone(), priority_evidence(d, summary, allocation,
-                    frame_number, difficulty, &world_bytes))
+                    frame_number, difficulty, &world_bytes, reward_rings.get(&d.filter)))
             }).collect();
             self.allocator.publish_allocation_priority_with_evidence(
                 frame_number, priority_entries, evidence);
@@ -2515,6 +2523,10 @@ impl ProverLifecycle {
                 } else if !bound_filters.contains(f) || settled_split_away(f) || retired.contains(f)
                     || shard_sizes_snapshot.get(f) == Some(&0) {
                     orphan_ready.push(f.clone());
+                } else if !held_descriptors.iter().any(|d| &d.filter == f) {
+                    // Unknown current rank cannot justify an economic departure.
+                    // Keep its worker and reject rather than confirm at score zero.
+                    retained_rejections.push(f.clone());
                 } else {
                     auto_ready.push(f.clone());
                 }
@@ -2636,7 +2648,7 @@ impl ProverLifecycle {
                             .map(|w| w.core_id).collect();
                         serde_json::json!({"filter": hex::encode(&d.filter), "workers": workers,
                             "inputs": priority_evidence(d, summary, allocation,
-                                frame_number, difficulty, &world_bytes)})
+                                frame_number, difficulty, &world_bytes, reward_rings.get(&d.filter))})
                     }).collect();
                     info!(frame = frame_number,
                         epoch = quil_types::consensus::epoch_for_frame(frame_number),
@@ -2667,6 +2679,7 @@ fn priority_evidence(
     frame_number: u64,
     difficulty: u64,
     world_bytes: &BigInt,
+    estimate: Option<&quil_types::reward_ring::RewardRingEstimate>,
 ) -> crate::worker_allocator::AllocationPriorityEvidence {
     let count = |status| summary.and_then(|s| s.status_counts.get(&status)).copied().unwrap_or(0);
     let holding = allocation.is_some_and(|a| a.is_live(frame_number)
@@ -2678,12 +2691,12 @@ fn priority_evidence(
         paused: count(ProverStatus::Paused),
         leaving: count(ProverStatus::Leaving),
         scoring_ring: descriptor.ring,
-        ring_source: if holding { "stored_allocation_or_decoder_default" } else { "summary_tail" },
+        ring_source: estimate.map(|r| r.source).unwrap_or(if holding { "unknown_membership_rank" } else { "summary_tail" }),
         size_bytes: descriptor.size,
         data_shards: descriptor.shards,
         difficulty,
         world_bytes_input: world_bytes.to_string(),
-        world_bytes_source: "registry_count_proxy",
+        world_bytes_source: "shard_size_snapshot",
         allocation_epoch: allocation.map(|a| a.epoch),
         stored_ring: allocation.map(|a| a.ring),
         allocation_status: allocation.map(|a| format!("{:?}", a.effective_status(frame_number))),
@@ -2918,12 +2931,6 @@ fn build_decide_descriptors(
     }).collect()
 }
 
-fn compute_world_bytes_from_summaries(summaries: &[ProverShardSummary]) -> BigInt {
-    let total: u64 = summaries.iter()
-        .map(|s| if s.total_size > 0 { s.total_size } else { 1 })
-        .sum();
-    BigInt::from(total.max(1))
-}
 
 #[cfg(test)]
 mod buckets_tests {
@@ -3698,14 +3705,14 @@ mod proposal_loop_tests {
         let descriptor = ShardDescriptor { filter, size: 1000, ring: 0, shards: 2,
             active_on_ring: 3, total_active_joining: 23, active_count: 3 };
         let evidence = priority_evidence(&descriptor, Some(&summary), Some(&allocation),
-            frame, 10, &30.into());
+            frame, 10, &30.into(), None);
         assert_eq!(evidence.active, 3);
         assert_eq!(evidence.joining, 20);
         assert_eq!(evidence.leaving, 7);
         assert_eq!(evidence.allocation_status.as_deref(), Some("Active"));
-        assert_eq!(evidence.ring_source, "stored_allocation_or_decoder_default");
-        assert_eq!(evidence.world_bytes_source, "registry_count_proxy");
-        let missing = priority_evidence(&descriptor, None, None, frame, 10, &30.into());
+        assert_eq!(evidence.ring_source, "unknown_membership_rank");
+        assert_eq!(evidence.world_bytes_source, "shard_size_snapshot");
+        let missing = priority_evidence(&descriptor, None, None, frame, 10, &30.into(), None);
         assert!(missing.stored_ring.is_none());
         assert!(missing.allocation_epoch.is_none());
         assert_eq!(missing.ring_source, "summary_tail");

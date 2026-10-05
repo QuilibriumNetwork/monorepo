@@ -1560,7 +1560,7 @@ pub fn materialize_frame_header_activity(
 
 /// Ring group size for reward distribution — matches Go's
 /// `ringGroupSize = 8` at `global_prover_shard_update.go:28`.
-pub const RING_GROUP_SIZE: u64 = 8;
+pub const RING_GROUP_SIZE: u64 = quil_types::reward_ring::REWARD_RING_GROUP_SIZE;
 
 /// Default shard leaf count when metadata reports zero.
 /// Matches Go's `defaultShardLeaves = 1`.

@@ -595,6 +595,7 @@ pub struct ProverLifecycleView {
     pub prover: Option<ProverInfo>,
     pub summaries: Vec<ProverShardSummary>,
     pub members: HashMap<Vec<u8>, LifecycleMembers>,
+    pub reward_rings: HashMap<Vec<u8>, crate::reward_ring::RewardRingEstimate>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -619,16 +620,31 @@ pub trait ProverRegistry: Send + Sync {
         let filters: std::collections::BTreeSet<_> = prover.iter()
             .flat_map(|p| p.allocations.iter())
             .map(|a| a.confirmation_filter.clone())
+            .chain(summaries.iter().map(|s| s.filter.clone()))
             .filter(|f| !f.is_empty()).collect();
         let mut members = HashMap::new();
+        let mut reward_rings = HashMap::new();
         for filter in filters {
+            if let Some(estimate) = self.get_reward_ring_estimate(address, &filter, frame)? {
+                reward_rings.insert(filter.clone(), estimate);
+            }
             let active = self.get_provers_by_status(&filter, ProverStatus::Active)?
                 .into_iter().map(|p| p.address).collect();
             let leaving = self.get_provers_by_status(&filter, ProverStatus::Leaving)?
                 .into_iter().map(|p| p.address).collect();
             members.insert(filter, LifecycleMembers { active, leaving });
         }
-        Ok(ProverLifecycleView { prover, summaries, members })
+        Ok(ProverLifecycleView { prover, summaries, members, reward_rings })
+    }
+    /// A current or explicitly projected reward position. Concurrent
+    /// registries override this to read committee and allocations atomically.
+    fn get_reward_ring_estimate(&self, address: &[u8], filter: &[u8], frame: u64)
+        -> Result<Option<crate::reward_ring::RewardRingEstimate>> {
+        let committee = self.get_active_provers(filter, frame)?;
+        let all = self.get_provers(filter)?;
+        Ok(crate::reward_ring::estimate_reward_ring(
+            &committee.iter().collect::<Vec<_>>(), &all.iter().collect::<Vec<_>>(),
+            address, filter, frame))
     }
     /// A member's registered storage leaf root for `leaf_id`, as
     /// `(leaf_root, num_blocks, epoch)`, or `None` if not registered. `leaf_id`
@@ -819,7 +835,7 @@ pub trait ShardInfoProvider: Send + Sync {
     fn get_shard_info(
         &self,
         include_all: bool,
-    ) -> Result<(Vec<ShardDetail>, u64, BigInt, u64)>;
+    ) -> Result<(Vec<ShardDetail>, u64, BigInt, u64, BigInt)>;
 }
 
 // ---------------------------------------------------------------------------

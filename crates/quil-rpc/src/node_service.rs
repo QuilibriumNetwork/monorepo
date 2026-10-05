@@ -1149,15 +1149,12 @@ impl NodeService for NodeRpcServer {
         })?;
 
         let req = request.into_inner();
-        let (details, difficulty, basis, frame_number) = provider
+        let (details, difficulty, basis, frame_number, world_bytes) = provider
             .get_shard_info(req.include_all)
             .map_err(|e| Status::internal(format!("get shard info: {e}")))?;
 
-        use num_bigint::BigInt;
-        let mut world_bytes = BigInt::from(0);
         let mut shards = Vec::with_capacity(details.len());
         for d in &details {
-            world_bytes += &d.shard_size;
             shards.push(node::ShardRewardInfo {
                 filter: d.filter.clone(),
                 active_provers: d.active_provers,

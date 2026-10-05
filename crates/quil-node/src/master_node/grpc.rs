@@ -1603,7 +1603,7 @@ pub(crate) fn spawn_all(
     }
     impl quil_types::consensus::ShardInfoProvider for LocalShardInfoProvider {
         fn get_shard_info(&self, include_all: bool)
-            -> quil_types::error::Result<(Vec<quil_types::consensus::ShardDetail>, u64, num_bigint::BigInt, u64)>
+            -> quil_types::error::Result<(Vec<quil_types::consensus::ShardDetail>, u64, num_bigint::BigInt, u64, num_bigint::BigInt)>
         {
             let cf = self.current_frame.effective();
             let (difficulty, frame_number) = match self.clock_store.get_latest_global_clock_frame() {
@@ -1632,7 +1632,7 @@ pub(crate) fn spawn_all(
                 })
                 .unwrap_or(0);
             let local_incomplete = match &local_result {
-                Ok((details, _diff, basis, _frame)) => {
+                Ok((details, _diff, basis, _frame, _world)) => {
                     let entries_below_shards = include_all && !self.archive_mode && details.len() < expected_shards;
                     basis.sign() == num_bigint::Sign::NoSign || entries_below_shards
                 }
