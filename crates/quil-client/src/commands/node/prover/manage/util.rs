@@ -18,6 +18,20 @@ pub fn center_trunc(h: &str, max_width: usize) -> String {
     format!("{}...{}", &h[..prefix], &h[h.len() - suffix..])
 }
 
+/// Keep a shard's variable-length bit-path suffix aligned after an
+/// abbreviated 32-byte address. Wide columns retain the complete filter.
+pub fn filter_label(h: &str, max_width: usize) -> String {
+    if h.len() <= max_width || h.len() <= 64 {
+        return center_trunc(h, max_width);
+    }
+    let suffix = &h[64..];
+    if suffix.len() + 3 <= max_width {
+        format!("...{suffix}")
+    } else {
+        center_trunc(h, max_width)
+    }
+}
+
 /// `truncHex` — shorten a hex string for short status messages.
 pub fn trunc_hex(h: &str) -> String {
     center_trunc(h, 20)
@@ -51,7 +65,17 @@ pub fn clamp_offset(mut offset: usize, cursor: usize, visible_rows: usize, total
 
 #[cfg(test)]
 mod tests {
-    use super::{center_trunc, clamp_offset};
+    use super::{center_trunc, filter_label, clamp_offset};
+
+    #[test]
+    fn compressed_filters_keep_complete_suffixes_at_the_same_start() {
+        let prefix = "ab".repeat(32);
+        assert_eq!(filter_label(&format!("{prefix}000123"), 18), "...000123");
+        assert_eq!(filter_label(&format!("{prefix}00012380"), 18), "...00012380");
+        let full = format!("{prefix}000123");
+        assert_eq!(filter_label(&full, full.len()), full);
+        assert!(filter_label(&full, 5).len() <= 5);
+    }
 
     #[test]
     fn center_trunc_elides_middle() {

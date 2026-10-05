@@ -14,11 +14,12 @@ use ratatui::{
 use super::super::epoch::ThresholdUnit;
 use super::super::format_quil_daily_round;
 use super::model::*;
-use super::util::{center_trunc, clamp_offset};
+use super::util::{filter_label, clamp_offset};
 
 // ── Colors (mirror lipgloss constants) ───────────────────────────────────
 
 const PRIMARY: Color = Color::Rgb(0xff, 0x00, 0x70);
+const CURSOR_BG: Color = Color::Rgb(0x28, 0x28, 0x28);
 const DIM: Color = Color::Rgb(0x55, 0x55, 0x55);
 const TEXT: Color = Color::Rgb(0xff, 0xff, 0xff);
 const SUCCESS: Color = Color::Rgb(0x00, 0xff, 0x00);
@@ -397,7 +398,7 @@ fn avail_title(m: &Model, sorted: &[ShardRow]) -> Line<'static> {
 fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
     match col {
         0 => alloc_marker(m, a).to_string(),
-        1 => center_trunc(&a.filter_hex, fw),
+        1 => filter_label(&a.filter_hex, fw),
         2 => a.active_provers.to_string(),
         3 => a.ring.to_string(),
         4 => fmt_mb(&a.shard_size),
@@ -642,7 +643,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
             }
             let used = cells.iter().map(String::len).sum::<usize>() + cells.len().saturating_sub(1);
             spans.push(Span::raw(" ".repeat(content_width.saturating_sub(used))));
-            lines.push(Line::from(spans).style(Style::new().fg(TEXT).bg(PRIMARY)));
+            lines.push(Line::from(spans).style(Style::new().fg(TEXT).bg(CURSOR_BG)));
         } else {
             let mut spans: Vec<Span> = Vec::new();
             for (ci, cell) in cells.iter().enumerate() {
@@ -701,7 +702,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
 fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
     match col {
         0 => avail_marker(m, s).to_string(),
-        1 => center_trunc(&s.filter_hex, fw),
+        1 => filter_label(&s.filter_hex, fw),
         2 => s.active_provers.to_string(),
         3 => s.ring.to_string(),
         4 => fmt_mb(&s.shard_size),
@@ -854,7 +855,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
             && filter_hi == i as i32;
         let style = if hi_sort {
             Style::new()
-                .bg(PRIMARY)
+                .bg(CURSOR_BG)
                 .fg(TEXT)
                 .add_modifier(Modifier::BOLD)
         } else if hi_filter {
@@ -902,7 +903,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
             let padded = format!("{:<width$}", cells.join(" "), width = content_width);
             lines.push(Line::from(Span::styled(
                 padded,
-                Style::new().fg(TEXT).bg(PRIMARY),
+                Style::new().fg(TEXT).bg(CURSOR_BG),
             )));
         } else {
             // Non-selected: size uses human-readable storage; ring colored.
@@ -1819,6 +1820,7 @@ mod tests {
             let lines = render_alloc_panel(&mut m, &[allocation], Rect::new(0, 0, 240, 5));
             let span = lines[1].spans.iter().find(|s| s.content.trim() == reward).expect("reward cell");
             assert_eq!(span.style.fg, Some(ERROR));
+            if selected { assert_eq!(lines[1].style.bg, Some(CURSOR_BG)); }
         }
     }
 
