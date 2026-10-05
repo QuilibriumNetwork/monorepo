@@ -795,7 +795,6 @@ pub fn build_allocated_filters(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_types::consensus::ProverStatus;
 
     // ---- isqrt ----
 
