@@ -480,6 +480,7 @@ pub struct ProverLifecycle {
     /// Serialize candidate construction and accepted-plan bookkeeping across
     /// the gossip and poller callers. No network work runs under this lock.
     evaluation_lock: std::sync::Mutex<()>,
+    leave_decisions: super::leave_decisions::LeaveDecisions,
     /// This node's prover address (32 bytes, Poseidon hash of BLS pubkey).
     pub prover_address: Vec<u8>,
     /// Whether a VDF computation is currently in progress. While set,
@@ -630,6 +631,7 @@ impl ProverLifecycle {
     ) -> Self {
         Self {
             evaluation_lock: std::sync::Mutex::new(()),
+            leave_decisions: super::leave_decisions::LeaveDecisions::default(),
             prover_address,
             proof_in_progress: AtomicBool::new(false),
             initial_sync_complete: AtomicBool::new(false),
@@ -866,6 +868,11 @@ impl ProverLifecycle {
     /// frame height.
     pub fn set_prover_root_verified_frame(&self, frame: u64) {
         self.prover_root_verified_frame.store(frame, Ordering::Relaxed);
+    }
+
+    /// Load durable rejection decisions before enabling lifecycle dispatch.
+    pub fn configure_leave_decision_store(&self, db: Arc<quil_store::RocksDb>) -> Result<()> {
+        self.leave_decisions.attach(db, &self.prover_address)
     }
 
     /// Record a successful `ProverJoin` submission at `frame_number`.
@@ -2545,8 +2552,13 @@ impl ProverLifecycle {
             let mut manual_ready: Vec<Vec<u8>> = Vec::new();
             let mut orphan_ready: Vec<Vec<u8>> = Vec::new();
             let mut auto_ready: Vec<Vec<u8>> = Vec::new();
+            let mut retained_rejections = Vec::new();
             for f in &ready_leave_filters {
-                if manual_bound_filters.contains(f) {
+                let leave_frame = leaving_filters.iter().find(|(filter, _)| filter == f)
+                    .map(|(_, frame)| *frame).expect("ready leave has a request");
+                if self.leave_decisions.rejected(f, leave_frame, frame_number)? {
+                    retained_rejections.push(f.clone());
+                } else if manual_bound_filters.contains(f) {
                     manual_ready.push(f.clone());
                 } else if !bound_filters.contains(f) || settled_split_away(f) || retired.contains(f)
                     || shard_sizes_snapshot.get(f) == Some(&0) {
@@ -2556,8 +2568,18 @@ impl ProverLifecycle {
                 }
             }
 
+            // Confirmed notice-period departures already provide future slots.
+            // Count only workers actually serving them, once per worker; local
+            // publication is not an authenticated confirmation.
+            let confirmed_departure_workers: std::collections::HashSet<u32> = workers.iter()
+                .filter(|w| !w.manually_managed && !w.filter.is_empty())
+                .filter(|w| prover_info.as_ref().is_some_and(|p| p.allocations.iter().any(|a|
+                    a.confirmation_filter == w.filter && a.leave_confirm_frame_number > 0
+                        && a.effective_status(frame_number) == quil_types::consensus::EffectiveStatus::Leaving)))
+                .map(|w| w.core_id).collect();
+
             // Auto bucket: score-driven decide_leaves on auto-bound.
-            let (mut auto_reject, auto_confirm) = proposer::decide_leaves_against_replacements(
+            let (mut auto_reject, auto_confirm) = proposer::decide_leaves_with_reserved_capacity(
                 &held_descriptors,
                 &available_replacements,
                 &auto_ready,
@@ -2565,6 +2587,7 @@ impl ProverLifecycle {
                 &world_bytes,
                 self.units,
                 self.strategy,
+                confirmed_departure_workers.len(),
             );
 
             // Halt-risk swap: `plan_leaves` sheds healthy allocations to
@@ -2574,8 +2597,17 @@ impl ProverLifecycle {
             // and rejected the same leaves each epoch while data shards had
             // no prover. While the demand
             // stands, confirm the leaves the shard can spare.
-            let mut swap_demand =
-                proposer::halt_risk_swap_demand(&available_replacements, assignable_worker_ids.len());
+            let mut swap_demand = proposer::halt_risk_swap_demand(
+                &available_replacements, assignable_worker_ids.len())
+                .saturating_sub(confirmed_departure_workers.len())
+                .saturating_sub(auto_confirm.len());
+            // Coverage may override reward, but spend the least valuable
+            // eligible holdings first rather than registry iteration order.
+            let ranked = proposer::rank_allocated_by_score_ascending(
+                &held_descriptors, difficulty, &world_bytes, self.units, self.strategy,
+                &std::collections::HashSet::new());
+            auto_reject.sort_by_key(|filter| ranked.iter().position(|(f, _)| f == filter)
+                .unwrap_or(usize::MAX));
             let mut swap_confirm: Vec<Vec<u8>> = Vec::new();
             auto_reject.retain(|filter| {
                 if swap_demand == 0 {
@@ -2590,6 +2622,13 @@ impl ProverLifecycle {
                 swap_demand -= 1;
                 false
             });
+
+            auto_reject.extend(retained_rejections);
+            info!(frame = frame_number, score = auto_confirm.len(),
+                halt_risk_swap = swap_confirm.len(), orphan = orphan_ready.len(),
+                manual = manual_ready.len(), reject = auto_reject.len(),
+                confirmed_departure_workers = confirmed_departure_workers.len(),
+                "lifecycle leave decision causes");
 
             // Manual + orphan: always confirm at window, no auto-reject.
             // Order: auto confirms, then swaps, then orphans, then
@@ -2630,6 +2669,11 @@ impl ProverLifecycle {
         match super::plan::LifecyclePlan::compile(frame_number, actions) {
             Ok(plan) => {
                 let actions = plan.into_actions();
+                let rejected: Vec<(Vec<u8>, u64)> = actions.iter().filter_map(|a| match a {
+                    LifecycleAction::RejectLeaves { filters, .. } => Some(filters), _ => None,
+                }).flatten().filter_map(|filter| leaving_filters.iter()
+                    .find(|(f, _)| f == filter).cloned()).collect();
+                self.leave_decisions.commit(&rejected, frame_number)?;
                 self.commit_plan_attempts(&actions, frame_number, forced_rejection);
                 Ok(actions)
             },
@@ -3711,13 +3755,17 @@ mod proposal_loop_tests {
         leaving.leave_frame_number = 10;
         reg.set_prover(prover(address.clone(), vec![leaving, alloc(better_held.clone(), ProverStatus::Active, 10)]));
         reg.set_summaries(vec![shard_summary(held.clone(), 53), shard_summary(better_held.clone(), 59), shard_summary(available.clone(), 8)]);
-        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
         lc.set_remote_shard_metrics(HashMap::from([(held.clone(), (1_000_000, 1)), (better_held, (100_000_000, 1)), (available.clone(), (100_000, 1))]));
         lc.set_prover_root_verified_frame(720);
         let actions = lc.evaluate(720, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
         assert!(actions.iter().any(|a| matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held))), "keep a profitable holding despite a richer shard we already hold; actions={actions:?}");
         assert!(!actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))));
         // A genuinely better, unreserved destination still confirms the leave.
+        // A fresh lifecycle without this request's saved rejection provides
+        // the upgrade control; an accepted rejection is now stable.
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_prover_root_verified_frame(720);
         lc.set_remote_shard_metrics(HashMap::from([(held.clone(), (1_000_000, 1)), (available, (100_000_000, 1))]));
         let actions = lc.evaluate(720, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
         assert!(actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))), "genuine upgrades remain possible; actions={actions:?}");
@@ -5199,6 +5247,82 @@ mod proposal_loop_tests {
             "orphan leave must NOT be rejected; got {:?}",
             actions
         );
+    }
+
+    #[test]
+    fn rejection_stays_fixed_after_archive_refresh_and_lifecycle_restart() {
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let waiting = filter_bytes(0xB0);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut leaving = alloc(held.clone(), ProverStatus::Leaving, 10);
+        leaving.leave_frame_number = 90;
+        let mut peers: Vec<_> = (1u8..=5).map(|id| prover(vec![id; 32], vec![alloc(held.clone(), ProverStatus::Active, 10)])).collect();
+        let mut ours = prover(address.clone(), vec![leaving]);
+        ours.status = ProverStatus::Leaving;
+        peers.push(ours);
+        reg.set_provers(peers);
+        reg.set_summaries(vec![shard_summary(held.clone(), 20)]);
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+        lc.configure_leave_decision_store(db.clone()).unwrap();
+        lc.set_prover_root_verified_frame(800);
+        let first = lc.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(first.iter().any(|a| matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held))));
+        reg.set_summaries(vec![shard_summary(held.clone(), 20), shard_summary(waiting.clone(), 0)]);
+        let restarted = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+        restarted.configure_leave_decision_store(db).unwrap();
+        restarted.set_remote_shard_metrics(HashMap::from([(held.clone(), (100, 1)), (waiting, (100, 1))]));
+        restarted.set_prover_root_verified_frame(900);
+        let after = restarted.evaluate(900, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(after.iter().any(|a| matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held))));
+        assert!(!after.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))));
+        // Same API with no saved decision must exercise the changed policy.
+        let control = make_lifecycle(address, wm.clone(), reg.clone());
+        control.set_remote_shard_metrics(restarted.merged_shard_metrics());
+        control.set_prover_root_verified_frame(900);
+        let unsaved = control.evaluate(900, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(unsaved.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))), "control must confirm: {unsaved:?}");
+    }
+
+    #[test]
+    fn confirmed_departure_covers_swap_demand_and_worst_holding_goes_first() {
+        let address = vec![0xCD; 32];
+        let valuable = filter_bytes(0xA1);
+        let weak = filter_bytes(0xA2);
+        let waiting = filter_bytes(0xB0);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, valuable.clone()));
+        wm.add(allocated_worker(2, weak.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut high = alloc(valuable.clone(), ProverStatus::Leaving, 10);
+        high.leave_frame_number = 90;
+        let mut low = alloc(weak.clone(), ProverStatus::Leaving, 10);
+        low.leave_frame_number = 90;
+        let mut peers: Vec<_> = (1u8..=5).map(|id| prover(vec![id; 32], vec![alloc(valuable.clone(), ProverStatus::Active, 10), alloc(weak.clone(), ProverStatus::Active, 10)])).collect();
+        let mut ours = prover(address.clone(), vec![high.clone(), low.clone()]);
+        ours.status = ProverStatus::Leaving;
+        peers.push(ours);
+        reg.set_provers(peers);
+        reg.set_summaries(vec![shard_summary(valuable.clone(), 20), shard_summary(weak.clone(), 20), shard_summary(waiting.clone(), 0)]);
+        let decide = |confirmed: bool| {
+            let mut low = low.clone();
+            if confirmed { low.leave_confirm_frame_number = 750; }
+            let mut ours = prover(address.clone(), vec![high.clone(), low]);
+            ours.status = ProverStatus::Leaving;
+            reg.set_prover(ours);
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.set_remote_shard_metrics(HashMap::from([(valuable.clone(), (100_000, 100)), (weak.clone(), (100, 1)), (waiting.clone(), (10, 1))]));
+            lc.set_prover_root_verified_frame(800);
+            lc.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap()
+        };
+        let initial = decide(false);
+        assert!(initial.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters == &vec![weak.clone()])), "{initial:?}");
+        assert!(initial.iter().any(|a| matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&valuable))));
+        let later = decide(true);
+        assert!(!later.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { .. })), "notice worker already funds the target: {later:?}");
     }
 
     // Every regular node sheds the same healthy shards to cover four

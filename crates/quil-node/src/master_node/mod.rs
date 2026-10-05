@@ -567,6 +567,7 @@ pub(crate) async fn start(
         frame_materializer,
     } = allocator_and_lifecycle::init(&mut sup, allocator_and_lifecycle::LifecycleInitArgs {
         config: config.clone(),
+        db: db_arc.clone(),
         network,
         archive_mode,
         worker_manager: worker_manager.clone(),
@@ -583,7 +584,7 @@ pub(crate) async fn start(
         crdt: crdt.clone(),
         hg_store: hg_store.clone(),
         message_collector: message_collector.clone(),
-    });
+    })?;
 
     // ---------------------------------------------------------------
     // 6. Message receive loop
