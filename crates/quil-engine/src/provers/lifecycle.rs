@@ -2697,6 +2697,8 @@ fn priority_evidence(
         leaving: count(ProverStatus::Leaving),
         scoring_ring: descriptor.ring,
         ring_source: estimate.map(|r| r.source).unwrap_or(if holding { "unknown_membership_rank" } else { "summary_tail" }),
+        ring_member_count: estimate.map(|r| r.member_count),
+        ring_target_frame: estimate.map(|r| r.target_frame),
         size_bytes: descriptor.size,
         data_shards: descriptor.shards,
         difficulty,

@@ -851,7 +851,7 @@ pub trait AppFrameValidator: Send + Sync {
 }
 
 #[cfg(test)]
-mod epoch_tests {
+pub(crate) mod epoch_tests {
     use super::*;
 
     /// The epoch length is process-global, and one test overrides it. Every
@@ -860,7 +860,7 @@ mod epoch_tests {
     /// force while another test assumes the default.
     static EPOCH_LENGTH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn epoch_length_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn epoch_length_guard() -> std::sync::MutexGuard<'static, ()> {
         EPOCH_LENGTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 

@@ -144,7 +144,7 @@ pub fn estimate_reward_ring(
     let total = members.len() + usize::from(rank == members.len());
     let group = REWARD_RING_GROUP_SIZE as usize;
     Some(RewardRingEstimate {
-        ring: (rank / group).min(u8::MAX as usize) as u8,
+        ring: (rank / group) as u8,
         provers_on_ring: (total - rank / group * group).min(group),
         member_count: total,
         source,
@@ -201,6 +201,7 @@ mod tests {
     }
     #[test]
     fn current_rank_uses_issuance_order_not_seniority_or_stored_default() {
+        let _epoch = crate::consensus::epoch_tests::epoch_length_guard();
         let mut ps: Vec<_> = (1..=9).map(|id| prover(id, 1)).collect();
         ps[8].seniority = u64::MAX;
         ps[8].allocations[0].ring = 0;
@@ -212,6 +213,7 @@ mod tests {
     }
     #[test]
     fn joining_member_does_not_shift_an_established_members_rank() {
+        let _epoch = crate::consensus::epoch_tests::epoch_length_guard();
         let mut ps: Vec<_> = (1..=9).map(|id| prover(id, 1)).collect();
         ps[0].allocations[0].status = ProverStatus::Joining;
         assert_eq!(estimate(&ps, 9, 10).unwrap().ring, 0);
@@ -223,6 +225,7 @@ mod tests {
     }
     #[test]
     fn notice_member_counts_until_effective_departure() {
+        let _epoch = crate::consensus::epoch_tests::epoch_length_guard();
         let mut ps: Vec<_> = (1..=9).map(|id| prover(id, 1)).collect();
         ps[0].allocations[0].status = ProverStatus::Leaving;
         ps[0].allocations[0].leave_confirm_frame_number = epoch_length_frames();
@@ -231,6 +234,7 @@ mod tests {
     }
     #[test]
     fn projected_join_excludes_confirmed_departure() {
+        let _epoch = crate::consensus::epoch_tests::epoch_length_guard();
         let mut ps: Vec<_> = (1..=9).map(|id| prover(id, 1)).collect();
         ps[0].allocations[0].status = ProverStatus::Leaving;
         ps[0].allocations[0].leave_confirm_frame_number = epoch_length_frames();
@@ -245,6 +249,7 @@ mod tests {
     }
     #[test]
     fn paused_and_expired_members_have_explicit_recovery_projections() {
+        let _epoch = crate::consensus::epoch_tests::epoch_length_guard();
         let mut ps = vec![prover(1, 1), prover(2, 2)];
         ps[1].allocations[0].status = ProverStatus::Paused;
         assert_eq!(estimate(&ps, 2, 10).unwrap().source, "resume_projection");
@@ -257,11 +262,13 @@ mod tests {
     }
     #[test]
     fn missing_live_member_is_unknown_not_ring_zero() {
+        let _epoch = crate::consensus::epoch_tests::epoch_length_guard();
         let ps = vec![prover(1, 1), prover(2, 2)];
         assert!(estimate_reward_ring(&[&ps[0]], &[&ps[0], &ps[1]], &[2; 32], &[1], 10).is_none());
     }
     #[test]
     fn legacy_floor_uses_the_actual_supplied_committee() {
+        let _epoch = crate::consensus::epoch_tests::epoch_length_guard();
         let mut p = prover(1, 1);
         p.allocations[0].epoch = 0;
         let e =
@@ -270,6 +277,7 @@ mod tests {
     }
     #[test]
     fn available_join_uses_tail_and_ignores_other_filters() {
+        let _epoch = crate::consensus::epoch_tests::epoch_length_guard();
         let ps: Vec<_> = (1..=8).map(|id| prover(id, 1)).collect();
         let mut unrelated = prover(0, 0);
         unrelated.allocations[0].confirmation_filter = vec![2];

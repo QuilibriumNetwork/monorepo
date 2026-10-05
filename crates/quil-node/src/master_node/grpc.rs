@@ -1620,8 +1620,10 @@ pub(crate) fn spawn_all(
                 .flat_map(|pr| pr.allocations.iter().filter(|a| a.is_live(frame_number)).map(|a| a.confirmation_filter.clone()))
                 .collect();
             let local_get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(self.crdt.clone(), self.shards_store.clone(), self.sizes.clone());
+            // Check full local coverage before filtering owned rows; otherwise
+            // one materialized holding can hide a partial world denominator.
             let local_result = quil_engine::shard_info::get_shard_info(
-                include_all, &self.self_address, &allocated_filters, difficulty, frame_number,
+                true, &self.self_address, &allocated_filters, difficulty, frame_number,
                 self.shards_store.as_ref(), self.registry.as_ref(), &local_get_sizes,
             );
             let expected_shards: usize = self.shards_store.range_app_shards()
@@ -1633,11 +1635,15 @@ pub(crate) fn spawn_all(
                 .unwrap_or(0);
             let local_incomplete = match &local_result {
                 Ok((details, _diff, basis, _frame, _world)) => {
-                    let entries_below_shards = include_all && !self.archive_mode && details.len() < expected_shards;
+                    let entries_below_shards = !self.archive_mode && details.len() < expected_shards;
                     basis.sign() == num_bigint::Sign::NoSign || entries_below_shards
                 }
                 Err(_) => true,
             };
+            let local_result = local_result.map(|(mut details, diff, basis, frame, world)| {
+                if !include_all { details.retain(|d| d.is_allocated); }
+                (details, diff, basis, frame, world)
+            });
             if !local_incomplete { return local_result; }
             // The :8340 transport decodes a FALCON signing key on both ends, so the
             // outbound dial MUST present the node's Falcon q-prover-key (1281 B),
