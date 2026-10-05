@@ -277,6 +277,34 @@ pub struct AllocationPriorityEntry {
     pub halt_risk: bool,
     /// Expected-reward score under the node's configured strategy.
     pub score: BigInt,
+    pub evidence: Option<AllocationPriorityEvidence>,
+}
+
+/// Inputs captured with a priority score, for explaining an actual worker move.
+/// Counts describe effective statuses at `frame_number`, not peer liveness.
+/// A stored ring may be a legacy decoder default; it is not proof of issuance.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AllocationPriorityEvidence {
+    pub frame_number: u64,
+    pub active: u32,
+    pub joining: u32,
+    pub paused: u32,
+    pub leaving: u32,
+    pub scoring_ring: u8,
+    pub ring_source: &'static str,
+    pub size_bytes: u64,
+    pub data_shards: u64,
+    pub difficulty: u64,
+    pub world_bytes_input: String,
+    pub world_bytes_source: &'static str,
+    pub allocation_epoch: Option<u64>,
+    pub stored_ring: Option<u8>,
+    pub allocation_status: Option<String>,
+    pub allocation_raw_status: Option<String>,
+    pub join_confirm_frame: Option<u64>,
+    pub leave_frame: Option<u64>,
+    pub leave_confirm_frame: Option<u64>,
+    pub leave_reject_frame: Option<u64>,
 }
 
 /// A whole-frame ranking of allocations, published by the lifecycle.
@@ -554,12 +582,21 @@ impl WorkerAllocator {
         frame_number: u64,
         entries: Vec<(Vec<u8>, bool, BigInt)>,
     ) {
-        let entries: HashMap<Vec<u8>, AllocationPriorityEntry> = entries
-            .into_iter()
-            .map(|(filter, halt_risk, score)| {
-                (filter, AllocationPriorityEntry { halt_risk, score })
-            })
-            .collect();
+        self.publish_allocation_priority_with_evidence(frame_number, entries, HashMap::new());
+    }
+
+    /// Publish scores and their original inputs under the same lock. Reading
+    /// counts again during reconcile could otherwise describe a different tree.
+    pub fn publish_allocation_priority_with_evidence(
+        &self,
+        frame_number: u64,
+        entries: Vec<(Vec<u8>, bool, BigInt)>,
+        mut evidence: HashMap<Vec<u8>, AllocationPriorityEvidence>,
+    ) {
+        let entries = entries.into_iter().map(|(filter, halt_risk, score)| {
+            let evidence = evidence.remove(&filter);
+            (filter, AllocationPriorityEntry { halt_risk, score, evidence })
+        }).collect();
         if let Ok(mut guard) = self.allocation_priority.write() {
             *guard = Some(AllocationPriority { frame_number, entries });
         }
@@ -1334,6 +1371,17 @@ impl WorkerAllocator {
         let challenger_count = challengers.len();
         let holder_count = holders.len();
 
+        // Retain every eligible alternative so operators can explain why a
+        // favorable holding was chosen instead of a lower displayed estimate.
+        let include_inputs = tracing::enabled!(tracing::Level::INFO)
+            && rebind_justified(&best_challenger, &worst_holder);
+        let candidate_inputs: Vec<_> = challengers.iter().filter(|_| include_inputs).map(|(tier, score, filter)|
+            serde_json::json!({"filter": hex::encode(filter), "tier": tier,
+                "score": score.to_string(), "ranking": priority.get(filter).and_then(|p| p.evidence.as_ref())})).collect();
+        let holder_inputs: Vec<_> = holders.iter().filter(|_| include_inputs).map(|(tier, score, core_id, filter)|
+            serde_json::json!({"filter": hex::encode(filter), "worker": core_id,
+                "tier": tier, "score": score.to_string(),
+                "ranking": priority.get(filter).and_then(|p| p.evidence.as_ref())})).collect();
         let mut rebound = 0usize;
         for ((c_tier, c_score, c_filter), (h_tier, h_score, core_id, h_filter)) in
             challengers.into_iter().zip(holders.into_iter())
@@ -1347,7 +1395,19 @@ impl WorkerAllocator {
                 // holder, no later pair can either.
                 break;
             }
+            if rebound == 0 {
+                info!(frame_number,
+                    current_epoch = quil_types::consensus::epoch_for_frame(frame_number),
+                    halt_risk_threshold = crate::provers::proposer::HALT_RISK_PROVER_COUNT,
+                    candidates = %serde_json::json!(candidate_inputs),
+                    holders = %serde_json::json!(holder_inputs),
+                    "worker rebind ranking inputs; registry coverage is not peer liveness");
+            }
             warn!(
+                source_status = ?alloc_by_filter.get(&h_filter).map(|a| a.effective_status(frame_number)),
+                source_epoch = ?alloc_by_filter.get(&h_filter).map(|a| a.epoch),
+                destination_status = ?alloc_by_filter.get(&c_filter).map(|a| a.effective_status(frame_number)),
+                destination_epoch = ?alloc_by_filter.get(&c_filter).map(|a| a.epoch),
                 core_id,
                 released_filter = hex::encode(&h_filter),
                 released_tier = h_tier,
@@ -2203,6 +2263,45 @@ mod tests {
             vec![filters[0].clone()],
             "an out-of-date ranking must not drive worker churn"
         );
+    }
+
+    #[test]
+    fn priority_evidence_retains_the_scoring_snapshot() {
+        let wm = Arc::new(MockWorkerManager::new());
+        let reg = Arc::new(TestProverRegistry::new());
+        let allocator = WorkerAllocator::new(wm, reg, vec![0xAA; 32]);
+        let filter = vec![0x01; 32];
+        let frame = 720;
+        let evidence = AllocationPriorityEvidence {
+            frame_number: frame, active: 3, joining: 20, paused: 1, leaving: 7,
+            scoring_ring: 0, ring_source: "stored_allocation_or_decoder_default",
+            size_bytes: 1000, data_shards: 2, difficulty: 100,
+            world_bytes_input: "123".into(), world_bytes_source: "registry_count_proxy",
+            allocation_epoch: Some(1), stored_ring: Some(0),
+            allocation_status: Some("Active".into()), allocation_raw_status: Some("Active".into()),
+            join_confirm_frame: Some(1), leave_frame: Some(0),
+            leave_confirm_frame: Some(0), leave_reject_frame: Some(0),
+        };
+        allocator.publish_allocation_priority_with_evidence(frame,
+            vec![(filter.clone(), true, 10.into())],
+            HashMap::from([(filter.clone(), evidence)]));
+        let PriorityState::Fresh(captured) = allocator.allocation_priority_state(frame + 1) else {
+            panic!("expected usable snapshot");
+        };
+        allocator.publish_allocation_priority(frame + 1,
+            vec![(filter.clone(), false, 20.into())]);
+        let old = serde_json::to_value(captured[&filter].evidence.as_ref().unwrap()).unwrap();
+        assert_eq!(old["frame_number"], frame);
+        assert_eq!(old["active"], 3);
+        assert_eq!(old["joining"], 20);
+        assert_eq!(old["leaving"], 7);
+        assert_eq!(old["stored_ring"], 0);
+        assert!(captured[&filter].halt_risk);
+        let PriorityState::Fresh(current) = allocator.allocation_priority_state(frame + 1) else {
+            panic!("expected replacement snapshot");
+        };
+        assert!(!current[&filter].halt_risk);
+        assert!(current[&filter].evidence.is_none(), "missing provenance must remain unknown");
     }
 
     #[test]

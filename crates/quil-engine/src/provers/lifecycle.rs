@@ -1624,8 +1624,15 @@ impl ProverLifecycle {
                     (filter, halt_risk, score)
                 })
                 .collect();
-            self.allocator
-                .publish_allocation_priority(frame_number, priority_entries);
+            let evidence = held_descriptors.iter().map(|d| {
+                let summary = summaries.iter().find(|s| s.filter == d.filter);
+                let allocation = prover_info.as_ref().and_then(|p| p.allocations.iter()
+                    .find(|a| a.confirmation_filter == d.filter));
+                (d.filter.clone(), priority_evidence(d, summary, allocation,
+                    frame_number, difficulty, &world_bytes))
+            }).collect();
+            self.allocator.publish_allocation_priority_with_evidence(
+                frame_number, priority_entries, evidence);
         }
         if !shard_info_ready {
             tracing::debug!(
@@ -2675,6 +2682,26 @@ impl ProverLifecycle {
                     .find(|(f, _)| f == filter).cloned()).collect();
                 self.leave_decisions.commit(&rejected, frame_number)?;
                 self.commit_plan_attempts(&actions, frame_number, forced_rejection);
+                if !actions.is_empty() && tracing::enabled!(tracing::Level::INFO) {
+                    let inputs: Vec<_> = held_descriptors.iter().map(|d| {
+                        let summary = summaries.iter().find(|s| s.filter == d.filter);
+                        let allocation = prover_info.as_ref().and_then(|p| p.allocations.iter()
+                            .find(|a| a.confirmation_filter == d.filter));
+                        let workers: Vec<_> = workers.iter().filter(|w| w.filter == d.filter)
+                            .map(|w| w.core_id).collect();
+                        serde_json::json!({"filter": hex::encode(&d.filter), "workers": workers,
+                            "inputs": priority_evidence(d, summary, allocation,
+                                frame_number, difficulty, &world_bytes)})
+                    }).collect();
+                    info!(frame = frame_number,
+                        epoch = quil_types::consensus::epoch_for_frame(frame_number),
+                        strategy = ?self.strategy,
+                        root_verified_frame_at_log = self.prover_root_verified_frame.load(Ordering::Relaxed),
+                        actions = ?actions,
+                        halt_risk_threshold = proposer::HALT_RISK_PROVER_COUNT,
+                        inputs = %serde_json::json!(inputs),
+                        "lifecycle plan prepared; submission and authenticated outcome still pending");
+                }
                 Ok(actions)
             },
             Err(error) => {
@@ -2683,6 +2710,43 @@ impl ProverLifecycle {
                 Err(error)
             }
         }
+    }
+}
+
+/// Preserve the exact scoring inputs, without treating a decoded ring zero
+/// as proof that the allocation occupies the first reward ring.
+fn priority_evidence(
+    descriptor: &ShardDescriptor,
+    summary: Option<&ProverShardSummary>,
+    allocation: Option<&quil_types::consensus::ProverAllocationInfo>,
+    frame_number: u64,
+    difficulty: u64,
+    world_bytes: &BigInt,
+) -> crate::worker_allocator::AllocationPriorityEvidence {
+    let count = |status| summary.and_then(|s| s.status_counts.get(&status)).copied().unwrap_or(0);
+    let holding = allocation.is_some_and(|a| a.is_live(frame_number)
+        || crate::worker_allocator::epoch_renewal_recovery_pending(a, frame_number));
+    crate::worker_allocator::AllocationPriorityEvidence {
+        frame_number,
+        active: count(ProverStatus::Active),
+        joining: count(ProverStatus::Joining),
+        paused: count(ProverStatus::Paused),
+        leaving: count(ProverStatus::Leaving),
+        scoring_ring: descriptor.ring,
+        ring_source: if holding { "stored_allocation_or_decoder_default" } else { "summary_tail" },
+        size_bytes: descriptor.size,
+        data_shards: descriptor.shards,
+        difficulty,
+        world_bytes_input: world_bytes.to_string(),
+        world_bytes_source: "registry_count_proxy",
+        allocation_epoch: allocation.map(|a| a.epoch),
+        stored_ring: allocation.map(|a| a.ring),
+        allocation_status: allocation.map(|a| format!("{:?}", a.effective_status(frame_number))),
+        allocation_raw_status: allocation.map(|a| format!("{:?}", a.status)),
+        join_confirm_frame: allocation.map(|a| a.join_confirm_frame_number),
+        leave_frame: allocation.map(|a| a.leave_frame_number),
+        leave_confirm_frame: allocation.map(|a| a.leave_confirm_frame_number),
+        leave_reject_frame: allocation.map(|a| a.leave_reject_frame_number),
     }
 }
 
@@ -3674,6 +3738,32 @@ mod proposal_loop_tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn decision_evidence_distinguishes_coverage_from_membership_and_ring_defaults() {
+        let frame = quil_types::consensus::epoch_length_frames();
+        let filter = filter_bytes(0xA1);
+        let mut allocation = alloc(filter.clone(), ProverStatus::Active, 1);
+        allocation.epoch = quil_types::consensus::epoch_for_frame(frame);
+        allocation.ring = 0;
+        let summary = ProverShardSummary { filter: filter.clone(), total_size: 30,
+            status_counts: HashMap::from([(ProverStatus::Active, 3),
+                (ProverStatus::Joining, 20), (ProverStatus::Leaving, 7)]) };
+        let descriptor = ShardDescriptor { filter, size: 1000, ring: 0, shards: 2,
+            active_on_ring: 3, total_active_joining: 23, active_count: 3 };
+        let evidence = priority_evidence(&descriptor, Some(&summary), Some(&allocation),
+            frame, 10, &30.into());
+        assert_eq!(evidence.active, 3);
+        assert_eq!(evidence.joining, 20);
+        assert_eq!(evidence.leaving, 7);
+        assert_eq!(evidence.allocation_status.as_deref(), Some("Active"));
+        assert_eq!(evidence.ring_source, "stored_allocation_or_decoder_default");
+        assert_eq!(evidence.world_bytes_source, "registry_count_proxy");
+        let missing = priority_evidence(&descriptor, None, None, frame, 10, &30.into());
+        assert!(missing.stored_ring.is_none());
+        assert!(missing.allocation_epoch.is_none());
+        assert_eq!(missing.ring_source, "summary_tail");
     }
 
     #[test]
