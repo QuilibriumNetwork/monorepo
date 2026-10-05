@@ -286,7 +286,7 @@ fn scenario_allocation_state_and_worker_matrix() {
                         // manual selections are consumed before automatic cores.
                         let expected = match status {
                             ProverStatus::Joining => frame < 1440,
-                            ProverStatus::Active => stored_epoch >= frame / 720,
+                            ProverStatus::Active => stored_epoch + 1 >= frame / 720,
                             ProverStatus::Paused => true,
                             ProverStatus::Leaving => frame < 1440,
                             _ => false,
@@ -403,7 +403,7 @@ fn scenario_seeded_recovery_histories() {
             }
             scenario.tick(frame);
             // The model never calls effective_status or the recovery helper.
-            let expected = (renewed && frame / 720 <= 2) || frame < 1440;
+            let expected = (renewed && frame / 720 <= 3) || frame < 1440;
             assert_eq!(
                 scenario.is_bound(&held),
                 expected,
@@ -412,6 +412,10 @@ fn scenario_seeded_recovery_histories() {
             );
             frame += 1 + next() % 100;
         }
+        // Registration for epoch 2 can reserve renewal capacity through
+        // epoch 3; without a subsequent registration it must yield in epoch 4.
+        scenario.tick(2880);
+        assert!(!scenario.is_bound(&held), "unrenewed capacity must be bounded; history={:?}", scenario.history);
     }
 }
 
