@@ -627,13 +627,14 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
     let end = (m.alloc_offset + visible).min(sorted.len());
 
     let shared_address = shared_filter_address(sorted.iter().map(|a| a.filter_hex.as_str()));
+    let longest_suffix = sorted.iter().map(|a| a.filter_hex.len().saturating_sub(64)).max().unwrap_or(0);
     for i in m.alloc_offset..end {
         let a = &sorted[i];
         let selected = i == m.alloc_cursor && m.focus.is_alloc();
 
         let cells: Vec<String> = (0..widths.len())
             .map(|c| {
-                let cell = if c == 1 && shared_address { filter_label(&a.filter_hex, fw) }
+                let cell = if c == 1 && shared_address { filter_label(&a.filter_hex, fw, longest_suffix) }
                     else { alloc_cell(m, a, c, fw) };
                 pad_cell(&cell, widths[c], alloc_left_aligned(c))
             })
@@ -898,6 +899,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
     let end = (m.avail_offset + visible).min(sorted.len());
 
     let shared_address = shared_filter_address(sorted.iter().map(|s| s.filter_hex.as_str()));
+    let longest_suffix = sorted.iter().map(|s| s.filter_hex.len().saturating_sub(64)).max().unwrap_or(0);
     for i in m.avail_offset..end {
         let s = &sorted[i];
         let selected = i == m.avail_cursor && !m.focus.is_alloc();
@@ -905,7 +907,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
         if selected {
             let cells: Vec<String> = (0..widths.len())
                 .map(|c| {
-                    let cell = if c == 1 && shared_address { filter_label(&s.filter_hex, fw) }
+                    let cell = if c == 1 && shared_address { filter_label(&s.filter_hex, fw, longest_suffix) }
                         else { avail_cell(m, s, c, fw) };
                     pad_cell(&cell, widths[c], c == 1)
                 })
@@ -923,7 +925,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
                 if c > 0 {
                     spans.push(Span::raw(" "));
                 }
-                let cell = if c == 1 && shared_address { filter_label(&s.filter_hex, fw) }
+                let cell = if c == 1 && shared_address { filter_label(&s.filter_hex, fw, longest_suffix) }
                     else { avail_cell(m, s, c, fw) };
                 let cell = pad_cell(&cell, widths[c], c == 1);
                 spans.push(match c {
