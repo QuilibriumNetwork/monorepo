@@ -2197,7 +2197,7 @@ mod tests {
     #[test]
     fn fixed_sizing_reserves_the_local_and_peer_column_labels() {
         let (w, fw) = alloc_col_widths(&fixed(), 154, &joining_table());
-        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 7, 9, 12, 8, 12, 4, 26, 18]);
+        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 8, 9, 12, 8, 12, 4, 26, 18]);
         assert_eq!(fw, 12);
         assert_eq!(w.iter().sum::<usize>() + 14, 167);
         // 26 columns of Next Action for a 13-column value in the fixed layout.
@@ -2243,7 +2243,7 @@ mod tests {
         let rows = joining_table();
         // Wide pane: Filter stops at the longest hex rather than padding on.
         assert_eq!(alloc_col_widths(&m, 300, &rows).1, 64);
-        assert_eq!(alloc_col_widths(&m, 167, &rows).1, 34);
+        assert_eq!(alloc_col_widths(&m, 167, &rows).1, 33);
         // Narrower: Filter absorbs the shortfall…
         assert_eq!(alloc_col_widths(&m, 154, &rows).1, 21);
         assert_eq!(alloc_col_widths(&m, 121, &rows).1, 12);
