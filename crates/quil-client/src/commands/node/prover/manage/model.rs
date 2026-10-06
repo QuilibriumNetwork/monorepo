@@ -11,18 +11,18 @@ use quil_types::proto::node::{
 };
 
 use super::super::epoch::{
-    alloc_confirm_window, compute_effective_status, epoch_for_frame, epoch_len, AllocationTiming,
-    ConfirmWindow, EffectiveStatus, WindowState,
+    action_hints, compute_effective_status, epoch_len, ActionHint, AllocationTiming, ConfirmWindow,
+    EffectiveStatus, ThresholdUnit, WindowState,
 };
 
 // ── Column metadata (shared between rendering and filtering) ─────────────
 
 pub const ALLOC_COL_NAMES: [&str; 15] = [
     "Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "Mat", "Lag", "State",
-    "Reward [Q/f]", "Worker", "Status", "Mode", "Next Action", "Default Action",
+    "Reward [Q/d]", "Worker", "Status", "Mode", "Next Action", "Default Action",
 ];
 pub const AVAIL_COL_NAMES: [&str; 10] =
-    ["Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "Mat", "Lag", "State", "Reward [Q/f]"];
+    ["Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "Mat", "Lag", "State", "Reward [Q/d]"];
 
 pub const ALLOC_FILTERABLE_COLS: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 pub const AVAIL_FILTERABLE_COLS: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -75,20 +75,20 @@ pub const PROVERS_WIDTH: usize = 7;
 pub const RING_WIDTH: usize = 5;
 pub const SIZE_WIDTH: usize = 10;
 pub const SHARDS_WIDTH: usize = 7;
-/// Available panel: cells carry a ` Q/f` suffix, so they need the extra room.
 pub const MAT_WIDTH: usize = 9;
 pub const LAG_WIDTH: usize = 6;
 pub const STATE_WIDTH: usize = 8;
-pub const REWARD_WIDTH: usize = 20;
-/// Allocations panel: bare `~<value>` cells.
-pub const ALLOC_REWARD_WIDTH: usize = 14;
+// Header width in both panels; the values are whole QUIL/day.
+pub const REWARD_WIDTH: usize = 12;
+pub const ALLOC_REWARD_WIDTH: usize = 12;
 pub const WORKER_WIDTH: usize = 7;
 pub const STATUS_WIDTH: usize = 12;
 pub const MODE_WIDTH: usize = 4;
-pub const NEXT_ACTION_WIDTH: usize = 30;
-pub const DEFAULT_ACTION_WIDTH: usize = 16;
+// Widest values: `(reject|confirm)@f<8 digits>` and `activate@f<8 digits>`.
+pub const NEXT_ACTION_WIDTH: usize = 26;
+pub const DEFAULT_ACTION_WIDTH: usize = 18;
 
-// 11 spaces between 12 columns, 2 external borders, 2-char sort indicator.
+// 14 spaces between 15 columns, 2 external borders, 1-char sort arrow.
 pub const ALLOC_FIXED_WIDTH: usize = SELECT_WIDTH
     + PROVERS_WIDTH
     + RING_WIDTH
@@ -102,17 +102,15 @@ pub const ALLOC_FIXED_WIDTH: usize = SELECT_WIDTH
     + DEFAULT_ACTION_WIDTH
     + 14
     + 2
-    + 2;
-// 6 spaces between 7 columns, 2 external borders, 2-char sort indicator.
+    + 1;
+// 9 spaces between 10 columns, 2 external borders, 1-char sort arrow.
 pub const AVAIL_FIXED_WIDTH: usize =
-    SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH + SIZE_WIDTH + SHARDS_WIDTH + MAT_WIDTH + LAG_WIDTH + STATE_WIDTH + REWARD_WIDTH + 9 + 2 + 2;
+    SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH + SIZE_WIDTH + SHARDS_WIDTH + MAT_WIDTH + LAG_WIDTH + STATE_WIDTH + REWARD_WIDTH + 9 + 2 + 1;
 
 /// Floor for the Filter column in either layout. Filter is what gives way
 /// when the pane cannot hold the table, being the only column whose content
 /// is already truncated for display.
 pub const MIN_FILTER_WIDTH: usize = 12;
-
-pub const ACTION_FRAME_DELAY: u64 = 360;
 
 // ── Rows ─────────────────────────────────────────────────────────────────
 
@@ -133,8 +131,8 @@ pub struct AllocationRow {
     pub join_frame: u64,
     pub leave_frame: u64,
     pub worker_id: i64, // core_id, -1 if no worker assigned
-    pub next_action: String,
-    pub default_action: String,
+    pub next_action: ActionHint,
+    pub default_action: ActionHint,
     pub manually_managed: bool,
     // Carried for struct parity with the Go `allocationRow`; not displayed.
     #[allow(dead_code)]
@@ -148,6 +146,24 @@ pub struct AllocationRow {
 }
 
 impl AllocationRow {
+    /// Classify staffed live rows for current, paused and planned rewards.
+    /// Orphan estimates remain visible in their rows but do not enter totals.
+    pub fn reward_status(&self, frame: u64, epoch_length: u64) -> Option<EffectiveStatus> {
+        if self.worker_id < 0 {
+            return None;
+        }
+        let status = compute_effective_status(&AllocationTiming {
+            raw_status: self.status,
+            filter: &self.filter,
+            join_frame: self.join_frame,
+            join_confirm_frame: self.confirm_frame,
+            leave_frame: self.leave_frame,
+            leave_confirm_frame: self.leave_confirm_frame,
+            epoch: self.epoch,
+        }, frame, epoch_length);
+        matches!(status, EffectiveStatus::Active | EffectiveStatus::Joining | EffectiveStatus::Paused | EffectiveStatus::Leaving).then_some(status)
+    }
+
     /// The Mode cell — `m` when the row's worker is managed by hand, `a` when
     /// the node assigns it. Cell values are lower-case; headers carry the
     /// capital.
@@ -303,13 +319,28 @@ pub struct Model {
     // UI.
     pub width: u16,
     pub height: u16,
+    pub notice_minimum: NoticeSeverity,
+    pub notice_offset: usize,
+    pub notice_lines: usize,
+    pub notice_visible: usize,
     pub status_msg: String,
+    pub status_message_key: String,
+    pub status_message_seen: Option<std::time::Instant>,
+    pub status_message_time: Option<std::time::SystemTime>,
     pub status_is_error: bool,
     pub status_sticky: bool,
     pub action_in_flight: bool,
     pub show_help: bool,
+    /// First help line drawn under the pinned title. The help outgrew a
+    /// terminal once it documented every key and every column, and a screen
+    /// that silently loses its bottom half is worse than a short one.
+    pub help_offset: usize,
+    /// Help lines the last frame produced, so scrolling can stop at the end
+    /// without the key handler having to know how the screen is built.
+    pub help_lines: usize,
     pub color_coding: bool,
     pub column_sizing: ColumnSizing,
+    pub threshold_unit: ThresholdUnit,
     pub spinner_frame: usize,
 
     // Load / staleness tracking.
@@ -318,12 +349,36 @@ pub struct Model {
     pub consecutive_failures: u32,
 
     // Aux-response cache (stabilizes panels across transient RPC blips).
+    pub cached_node_info: Option<NodeInfoResponse>,
+    pub shard_loading: bool,
+    pub shard_message_time: Option<std::time::SystemTime>,
+    pub shard_fetch_started: Option<std::time::Instant>,
+    pub shard_last_success: Option<std::time::Instant>,
+    pub shard_last_duration: Option<std::time::Duration>,
+    pub shard_error: Option<String>,
     pub cached_shard_info: Option<GetShardInfoResponse>,
     pub cached_worker_info: Option<WorkerInfoResponse>,
 
     // Broadcast accumulator for the await loop.
     pub broadcasted_filters: Vec<Vec<u8>>,
     pub broadcasted_statuses: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum NoticeSeverity {
+    Info,
+    #[default]
+    Warning,
+    Error,
+}
+
+impl NoticeSeverity {
+    pub fn next(self) -> Self {
+        match self { Self::Info => Self::Warning, Self::Warning => Self::Error, Self::Error => Self::Info }
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Info => "all", Self::Warning => "warnings+", Self::Error => "errors" }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -344,9 +399,9 @@ impl Model {
         Model {
             auto_managed: true,
             color_coding: true,
-            alloc_sort_col: 7, // Worker column
+            alloc_sort_col: 10, // Worker column
             alloc_sort_asc: true,
-            avail_sort_col: 6, // Reward column
+            avail_sort_col: 9, // Reward column
             avail_sort_asc: false,
             reachable: false,
             ..Default::default()
@@ -375,6 +430,8 @@ impl Model {
         let Some(node_info) = node_info else {
             return;
         };
+
+        self.cached_node_info = Some(node_info.clone());
 
         // Aux cache: prefer fresh, fall back to cached.
         let shard_info = match shard_info {
@@ -465,8 +522,7 @@ impl Model {
             allocated_filters.insert(filter_hex.clone());
             let status_name = eff.label().to_string();
 
-            let (next_action, default_action) =
-                action_hints(a, &t, eff, el, ef, next_boundary);
+            let (next_action, default_action) = action_hints(&t, eff, el, ef, next_boundary);
 
             let (wid, mm) = workers
                 .get(&filter_hex)
@@ -504,7 +560,8 @@ impl Model {
                 row.data_shards = info.data_shards;
                 row.materialized_frame = info.materialized_frame;
                 row.latest_frame = info.latest_frame;
-                row.estimated_reward = BigInt::from_bytes_be(Sign::Plus, &info.estimated_reward);
+                row.estimated_reward =
+                    BigInt::from_bytes_be(Sign::Plus, &info.estimated_reward);
             }
             allocs.push(row);
         }
@@ -533,8 +590,8 @@ impl Model {
                         epoch: 0,
                         last_active_frame: 0,
                         worker_id: w.core_id as i64,
-                        next_action: String::new(),
-                        default_action: String::new(),
+                        next_action: ActionHint::none(),
+                        default_action: ActionHint::none(),
                         manually_managed: w.manually_managed,
                     });
                 }
@@ -657,6 +714,8 @@ impl Model {
         }
         let asc = self.alloc_sort_asc;
         let sel = &self.alloc_selected;
+        let unit = self.threshold_unit;
+        let el = self.epoch_length;
         rows.sort_by(|a, b| {
             let ord = match col {
                 0 => sel.contains(&a.filter_key).cmp(&sel.contains(&b.filter_key)),
@@ -670,8 +729,15 @@ impl Model {
                 8 => materialization_state(a.materialized_frame, a.latest_frame).cmp(materialization_state(b.materialized_frame, b.latest_frame)),
                 9 => a.estimated_reward.cmp(&b.estimated_reward),
                 10 => a.worker_id.cmp(&b.worker_id), 11 => a.status.cmp(&b.status),
-                12 => a.manually_managed.cmp(&b.manually_managed), 13 => a.next_action.cmp(&b.next_action),
-                14 => a.default_action.cmp(&b.default_action),
+                12 => a.manually_managed.cmp(&b.manually_managed),
+                13 => a
+                    .next_action
+                    .render(unit, el)
+                    .cmp(&b.next_action.render(unit, el)),
+                14 => a
+                    .default_action
+                    .render(unit, el)
+                    .cmp(&b.default_action.render(unit, el)),
                 _ => std::cmp::Ordering::Equal,
             };
             if asc {
@@ -941,7 +1007,7 @@ pub fn alloc_row_numeric_val(row: &AllocationRow, col: usize) -> f64 {
             if row.estimated_reward.sign() == Sign::NoSign {
                 0.0
             } else {
-                bigint_to_f64(&row.estimated_reward) / 1e8
+                bigint_to_f64(&row.estimated_reward) * super::super::FRAMES_PER_DAY as f64 / 1e8
             }
         }
         10 => row.worker_id as f64,
@@ -971,7 +1037,7 @@ pub fn avail_row_numeric_val(row: &ShardRow, col: usize) -> f64 {
             if row.estimated_reward.sign() == Sign::NoSign {
                 0.0
             } else {
-                bigint_to_f64(&row.estimated_reward) / 1e8
+                bigint_to_f64(&row.estimated_reward) * super::super::FRAMES_PER_DAY as f64 / 1e8
             }
         }
         _ => 0.0,
@@ -984,7 +1050,140 @@ pub fn materialization_lag(materialized: u64, latest: u64) -> Option<u64> {
 
 pub fn materialization_state(materialized: u64, latest: u64) -> &'static str {
     match (materialized, latest) {
-        (0, 0) => "Unknown", (0, _) => "Unmat", (mat, head) if mat >= head => "Current", _ => "Lag",
+        (0, 0) => "unknown", (0, _) => "unmat", (mat, head) if mat >= head => "current", _ => "lag",
+    }
+}
+
+#[cfg(test)]
+mod readability_tests {
+    use super::*;
+    use crate::commands::node::prover::epoch::raw_status;
+
+    const EL: u64 = 720;
+
+    fn alloc(status: u32) -> ShardAllocationInfo {
+        ShardAllocationInfo {
+            filter: vec![0xFF],
+            status,
+            ..Default::default()
+        }
+    }
+
+    fn hints_in(
+        a: &ShardAllocationInfo,
+        current_frame: u64,
+        unit: ThresholdUnit,
+    ) -> (String, String) {
+        let t = timing(a);
+        let eff = compute_effective_status(&t, current_frame, EL);
+        let next_boundary = (current_frame / EL + 1) * EL;
+        let (n, d) = action_hints(&t, eff, EL, current_frame, next_boundary);
+        (n.render(unit, EL), d.render(unit, EL))
+    }
+
+    fn hints(a: &ShardAllocationInfo, current_frame: u64) -> (String, String) {
+        hints_in(a, current_frame, ThresholdUnit::Frames)
+    }
+
+    #[test]
+    fn a_pending_join_groups_both_verbs_under_one_threshold() {
+        let mut a = alloc(raw_status::JOINING);
+        a.join_frame_number = 1117 * EL + 10; // window is epoch 1118
+                                              // Still in epoch 1117: neither verb is available yet.
+        assert_eq!(
+            hints(&a, 1117 * EL + 100),
+            (
+                "(reject|confirm)@f804960".to_string(),
+                "expire@f805680".to_string()
+            )
+        );
+        // Inside epoch 1118: both are available, so the threshold drops.
+        assert_eq!(
+            hints(&a, 1118 * EL + 100),
+            ("(reject|confirm)".to_string(), "expire@f805680".to_string())
+        );
+    }
+
+    #[test]
+    fn every_threshold_reads_in_the_selected_unit() {
+        let mut a = alloc(raw_status::JOINING);
+        a.join_frame_number = 1117 * EL + 10;
+        assert_eq!(
+            hints_in(&a, 1117 * EL + 100, ThresholdUnit::Epochs),
+            (
+                "(reject|confirm)@e1118".to_string(),
+                "expire@e1119".to_string()
+            )
+        );
+        // An unbounded hint is unit-independent.
+        let free = ActionHint::text("(pause|leave)");
+        assert_eq!(free.render(ThresholdUnit::Epochs, EL), "(pause|leave)");
+        assert_eq!(free.render(ThresholdUnit::Frames, EL), "(pause|leave)");
+    }
+
+    #[test]
+    fn an_active_allocation_renews_at_the_next_epoch_boundary() {
+        let mut a = alloc(raw_status::ACTIVE);
+        a.epoch = 1118;
+        assert_eq!(
+            hints(&a, 1118 * EL + 100),
+            ("(pause|leave)".to_string(), "renew@f805680".to_string())
+        );
+    }
+
+    #[test]
+    fn a_stale_epoch_keeps_the_same_renewal_default() {
+        let mut a = alloc(raw_status::ACTIVE);
+        a.epoch = 1117; // missed epoch 1118
+        let t = timing(&a);
+        assert_eq!(
+            compute_effective_status(&t, 1118 * EL + 100, EL),
+            EffectiveStatus::ExpiredEpoch
+        );
+        assert_eq!(
+            hints(&a, 1118 * EL + 100),
+            ("(pause|leave)".to_string(), "renew@f805680".to_string())
+        );
+    }
+
+    #[test]
+    fn a_confirmed_join_activates_at_the_boundary_after_confirmation() {
+        let mut a = alloc(raw_status::ACTIVE);
+        a.epoch = 1118;
+        a.join_confirm_frame_number = 1118 * EL + 5; // activates in epoch 1119
+        assert_eq!(
+            hints(&a, 1118 * EL + 100),
+            ("(pause|leave)".to_string(), "activate@f805680".to_string())
+        );
+    }
+
+    #[test]
+    fn a_confirmed_leave_departs_and_offers_nothing_to_do() {
+        let mut a = alloc(raw_status::LEAVING);
+        a.leave_frame_number = 1117 * EL + 10;
+        a.leave_confirm_frame_number = 1118 * EL + 5; // departs in epoch 1119
+        assert_eq!(
+            hints(&a, 1118 * EL + 100),
+            (String::new(), "depart@f805680".to_string())
+        );
+    }
+
+    #[test]
+    fn a_paused_allocation_has_no_default_transition() {
+        let a = alloc(raw_status::PAUSED);
+        assert_eq!(
+            hints(&a, 1118 * EL + 100),
+            ("(resume|leave)".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn defaults_sort_allocations_by_worker_and_available_by_reward() {
+        let m = Model::new();
+        assert_eq!(ALLOC_COL_NAMES[m.alloc_sort_col as usize], "Worker");
+        assert!(m.alloc_sort_asc);
+        assert_eq!(AVAIL_COL_NAMES[m.avail_sort_col as usize], "Reward [Q/d]");
+        assert!(!m.avail_sort_asc);
     }
 }
 
@@ -1012,58 +1211,234 @@ fn timing(a: &ShardAllocationInfo) -> AllocationTiming<'_> {
     }
 }
 
-/// The `nextAction` / `defaultAction` hint pair for an allocation row
-/// (mirrors the switch in `processRefreshData`).
-fn action_hints(
-    a: &ShardAllocationInfo,
-    t: &AllocationTiming,
-    eff: EffectiveStatus,
-    el: u64,
-    ef: u64,
-    next_boundary: u64,
-) -> (String, String) {
-    if let Some(w) = alloc_confirm_window(t, el) {
-        return match w.state(ef, el) {
-            WindowState::Open => (
-                "reject | confirm now".to_string(),
-                format!("thru f{}", w.end_frame),
-            ),
-            WindowState::Pending => (
-                format!("reject | confirm@f{}", w.start_frame),
-                format!("epoch {}", w.confirm_epoch),
-            ),
-            WindowState::Missed => ("window missed".to_string(), "expired".to_string()),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allocation(filter: Vec<u8>, epoch: u64) -> ShardAllocationInfo {
+        ShardAllocationInfo {
+            filter,
+            status: super::super::super::epoch::raw_status::ACTIVE,
+            epoch,
+            ..Default::default()
+        }
+    }
+
+    fn shard_info(filter: Vec<u8>, reward: u8) -> GetShardInfoResponse {
+        use quil_types::proto::node::ShardRewardInfo;
+
+        GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter,
+                estimated_reward: vec![reward],
+                ..Default::default()
+            }],
+            frame_number: 2_160,
+            ..Default::default()
+        }
+    }
+
+    fn node_info(allocation: ShardAllocationInfo) -> NodeInfoResponse {
+        NodeInfoResponse {
+            shard_allocations: vec![allocation],
+            current_epoch: 3,
+            epoch_length_frames: 720,
+            last_received_frame: 2_160,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn row_estimates_survive_without_total_eligibility() {
+        use quil_types::proto::node::WorkerInfo;
+
+        let filter = vec![0xab];
+        let workers = WorkerInfoResponse {
+            worker_info: vec![WorkerInfo {
+                core_id: 4,
+                filter: filter.clone(),
+                ..Default::default()
+            }],
         };
+
+        let mut active = Model::new();
+        active.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            Some(shard_info(filter.clone(), 42)),
+            Some(workers),
+        );
+        assert_eq!(active.allocations[0].estimated_reward, BigInt::from(42));
+
+        let mut expired_epoch = Model::new();
+        expired_epoch.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 2))),
+            Some(shard_info(filter.clone(), 42)),
+            None,
+        );
+        assert_eq!(expired_epoch.allocations[0].status_name, "re-confirm!");
+        assert_eq!(expired_epoch.allocations[0].worker_id, -1);
+        assert_eq!(
+            expired_epoch.allocations[0].estimated_reward,
+            BigInt::from(42)
+        );
+
+        let mut unassigned = Model::new();
+        unassigned.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            Some(shard_info(filter, 42)),
+            None,
+        );
+        assert_eq!(unassigned.allocations[0].status_name, "active");
+        assert_eq!(unassigned.allocations[0].worker_id, -1);
+        assert_eq!(unassigned.allocations[0].estimated_reward, BigInt::from(42));
+        assert_eq!(unassigned.allocations[0].reward_status(2160, 720), None);
+        assert_eq!(expired_epoch.allocations[0].reward_status(2160, 720), None);
+        assert_eq!(active.allocations[0].reward_status(2160, 720), Some(EffectiveStatus::Active));
     }
-    match eff {
-        EffectiveStatus::Active => {
-            let default = if !a.filter.is_empty() {
-                format!("renew<f{}", next_boundary)
-            } else {
-                String::new()
-            };
-            ("pause | leave".to_string(), default)
-        }
-        EffectiveStatus::Paused => ("resume | leave".to_string(), String::new()),
-        EffectiveStatus::Joining => {
-            if a.join_confirm_frame_number > 0 {
-                let act_e = epoch_for_frame(a.join_confirm_frame_number, el) + 1;
-                ("confirmed".to_string(), format!("active@e{}", act_e))
-            } else {
-                (String::new(), String::new())
+
+    #[test]
+    fn joining_allocations_show_projected_rewards_before_worker_assignment() {
+        use super::super::super::epoch::raw_status;
+        use quil_types::proto::node::WorkerInfo;
+
+        let filter = vec![0xab];
+        for (status, confirm_frame) in [
+            (raw_status::JOINING, 0),
+            (raw_status::ACTIVE, 2_160),
+        ] {
+            for assigned in [false, true] {
+                let mut alloc = allocation(filter.clone(), 3);
+                alloc.status = status;
+                alloc.join_confirm_frame_number = confirm_frame;
+                let workers = assigned.then(|| WorkerInfoResponse {
+                    worker_info: vec![WorkerInfo {
+                        core_id: 0,
+                        filter: filter.clone(),
+                        ..Default::default()
+                    }],
+                });
+                let mut model = Model::new();
+                model.process_refresh_data(
+                    Some(node_info(alloc)),
+                    Some(shard_info(filter.clone(), 42)),
+                    workers,
+                );
+                assert_eq!(model.allocations[0].status_name, "joining");
+                assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
+                assert_eq!(model.allocations[0].reward_status(2160, 720), assigned.then_some(EffectiveStatus::Joining));
+                // Expired joins disappear along with their cached estimate.
+                model.process_refresh_data(
+                    Some(node_info({
+                        let mut expired = allocation(filter.clone(), 1);
+                        expired.status = raw_status::JOINING;
+                        expired.join_frame_number = 720;
+                        expired
+                    })),
+                    None,
+                    None,
+                );
+                assert!(model.allocations.is_empty());
             }
         }
-        EffectiveStatus::Leaving => {
-            if a.leave_confirm_frame_number > 0 {
-                let deact_e = epoch_for_frame(a.leave_confirm_frame_number, el) + 1;
-                ("leaving".to_string(), format!("departs@e{}", deact_e))
-            } else {
-                (String::new(), String::new())
-            }
-        }
-        EffectiveStatus::ExpiredEpoch => {
-            ("confirm now (renew)".to_string(), "re-confirm!".to_string())
-        }
-        _ => (String::new(), String::new()),
     }
+
+    #[test]
+    fn assigned_allocations_keep_estimates_and_classify_live_rewards() {
+        use super::super::super::epoch::raw_status;
+        use quil_types::proto::node::WorkerInfo;
+
+        let filter = vec![0xab];
+        for (status, epoch, join_confirm_frame, label) in [
+            (raw_status::ACTIVE, 2, 0, "re-confirm!"),
+            (raw_status::PAUSED, 3, 0, "paused"),
+            (raw_status::LEAVING, 3, 0, "leaving"),
+        ] {
+            let mut alloc = allocation(filter.clone(), epoch);
+            alloc.status = status;
+            alloc.join_confirm_frame_number = join_confirm_frame;
+            let mut info = shard_info(filter.clone(), 42);
+            info.shards[0].ring = 7;
+            info.shards[0].active_provers = 9;
+            info.shards[0].shard_size = vec![64];
+            info.shards[0].data_shards = 3;
+            info.shards[0].materialized_frame = 2_100;
+            info.shards[0].latest_frame = 2_160;
+            let mut model = Model::new();
+            model.process_refresh_data(
+                Some(node_info(alloc)),
+                Some(info),
+                Some(WorkerInfoResponse {
+                    worker_info: vec![WorkerInfo {
+                        core_id: 0,
+                        filter: filter.clone(),
+                        ..Default::default()
+                    }],
+                }),
+            );
+            let row = &model.allocations[0];
+            assert_eq!(row.status_name, label);
+            assert_eq!(row.worker_id, 0);
+            assert_eq!(row.estimated_reward, BigInt::from(42), "{label}");
+            assert_eq!(row.reward_status(2160, 720), match status {
+                raw_status::PAUSED => Some(EffectiveStatus::Paused),
+                raw_status::LEAVING => Some(EffectiveStatus::Leaving),
+                _ => None,
+            }, "{label}");
+            assert_eq!(row.ring, 7);
+            assert_eq!(row.active_provers, 9);
+            assert_eq!(row.shard_size, BigInt::from(64));
+            assert_eq!(row.data_shards, 3);
+            assert_eq!(row.materialized_frame, 2_100);
+            assert_eq!(row.latest_frame, 2_160);
+        }
+    }
+
+    #[test]
+    fn refresh_keeps_estimates_but_updates_total_eligibility() {
+        use quil_types::proto::node::WorkerInfo;
+
+        let filter = vec![0xab];
+        let workers = WorkerInfoResponse {
+            worker_info: vec![WorkerInfo {
+                core_id: 0,
+                filter: filter.clone(),
+                ..Default::default()
+            }],
+        };
+        let mut model = Model::new();
+        model.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            Some(shard_info(filter.clone(), 42)),
+            Some(workers.clone()),
+        );
+        assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
+
+        // A successful empty worker response replaces cached assignments.
+        model.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            None,
+            Some(WorkerInfoResponse { worker_info: vec![] }),
+        );
+        assert_eq!(model.allocations[0].worker_id, -1);
+        assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
+        assert_eq!(model.allocations[0].reward_status(2160, 720), None);
+
+        model.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            None,
+            Some(workers),
+        );
+        assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
+
+        // Cached row estimates must not contribute after expiry.
+        model.process_refresh_data(
+            Some(node_info(allocation(filter, 2))),
+            None,
+            None,
+        );
+        assert_eq!(model.allocations[0].status_name, "re-confirm!");
+        assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
+        assert_eq!(model.allocations[0].reward_status(2160, 720), None);
+    }
+
 }
