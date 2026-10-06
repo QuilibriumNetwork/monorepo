@@ -1030,26 +1030,53 @@ pub fn decide_leaves_against_replacements(
     units: u64,
     strategy: Strategy,
 ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    decide_leaves_with_reserved_capacity(held, available, pending, difficulty,
+        world_bytes, units, strategy, 0)
+}
+
+/// Confirmed departures already supply future capacity for replacement demand.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decide_leaves_with_reserved_capacity(
+    held: &[ShardDescriptor], available: &[ShardDescriptor], pending: &[Vec<u8>],
+    difficulty: u64, world_bytes: &BigInt, units: u64, strategy: Strategy,
+    reserved_capacity: usize,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let basis = pomw_basis(difficulty, world_bytes.try_into().unwrap_or(1), units);
-    let best = score_shards(available, &basis, world_bytes, strategy)
-        .into_iter().map(|s| s.score).max();
-    let threshold = best.map(|score|
-        score * BigInt::from(SCORE_DECIDE_THRESHOLD_PERCENT) / BigInt::from(100));
     let held_scores: HashMap<&[u8], (&ShardDescriptor, BigInt)> =
         score_shards(held, &basis, world_bytes, strategy).into_iter()
             .map(|s| (held[s.idx].filter.as_slice(), (&held[s.idx], s.score))).collect();
+    let pending: std::collections::HashSet<&Vec<u8>> = pending.iter()
+        .filter(|f| !f.is_empty()).take(100).collect();
+    let mut eligible: Vec<(&Vec<u8>, BigInt)> = pending.iter().filter_map(|filter| {
+        let (holding, score) = held_scores.get(filter.as_slice())?;
+        if (strategy == Strategy::RewardGreedy && holding.shards == 0)
+            || (holding.size > 0 && holding.active_count <= HALT_RISK_PROVER_COUNT + 1)
+        { return None; }
+        Some((*filter, score.clone()))
+    }).collect();
+    eligible.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+    let mut destinations = score_shards(available, &basis, world_bytes, strategy);
+    destinations.sort_by(|a, b| b.score.cmp(&a.score)
+        .then_with(|| available[a.idx].filter.cmp(&available[b.idx].filter)));
+    let mut seen_destinations = std::collections::HashSet::new();
+    destinations.retain(|s| seen_destinations.insert(available[s.idx].filter.clone()));
+    destinations.truncate(destinations.len().saturating_sub(reserved_capacity));
+    let mut confirmed = std::collections::HashSet::new();
+    // One destination supplies one future worker slot, never every holding
+    // below one global-best score. Spend scarce replacements on worst first.
+    for ((filter, score), destination) in eligible.into_iter().zip(destinations) {
+        let threshold = destination.score * BigInt::from(SCORE_DECIDE_THRESHOLD_PERCENT)
+            / BigInt::from(100);
+        if score >= threshold { break; }
+        confirmed.insert(filter.clone());
+    }
     let mut reject = Vec::new();
     let mut confirm = Vec::new();
-    for filter in pending.iter().filter(|f| !f.is_empty()).take(100) {
-        let keep = match held_scores.get(filter.as_slice()) {
-            None => true,
-            Some((holding, score)) => {
-                (strategy == Strategy::RewardGreedy && holding.shards == 0)
-                    || (holding.size > 0 && holding.active_count <= HALT_RISK_PROVER_COUNT + 1)
-                    || threshold.as_ref().map_or(true, |t| score >= t)
-            }
-        };
-        if keep { reject.push(filter.clone()); } else { confirm.push(filter.clone()); }
+    let mut ordered: Vec<&Vec<u8>> = pending.into_iter().collect();
+    ordered.sort();
+    for filter in ordered {
+        if confirmed.contains(filter) { confirm.push(filter.clone()); }
+        else { reject.push(filter.clone()); }
     }
     (reject, confirm)
 }
@@ -1317,6 +1344,22 @@ mod tests {
             total_active_joining: 16,
             active_count: 16,
         }
+    }
+
+    #[test]
+    fn one_destination_confirms_only_one_worst_pending_leave() {
+        let held = vec![make_shard(vec![1], 100, 0, 1), make_shard(vec![2], 10, 0, 1)];
+        let available = vec![make_shard(vec![3], 10_000, 0, 1)];
+        let pending = vec![vec![1], vec![2]];
+        let (reject, confirm) = decide_leaves_against_replacements(
+            &held, &available, &pending, 1, &BigInt::from(10_110), DEFAULT_UNITS, Strategy::RewardGreedy);
+        assert_eq!(confirm, vec![vec![2]]);
+        assert_eq!(reject, vec![vec![1]]);
+        // Existing global-best policy confirms both through the same API.
+        let mut all = held.clone();
+        all.extend(available);
+        let (_, old_confirm) = decide_leaves(&all, &pending, 1, &BigInt::from(10_110), DEFAULT_UNITS, Strategy::RewardGreedy);
+        assert_eq!(old_confirm.len(), 2);
     }
 
     #[test]

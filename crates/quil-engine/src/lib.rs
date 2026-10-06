@@ -444,6 +444,6 @@ pub mod bitmasks {
         }
     }
 }
-pub(crate) mod confirmation_attempts;
+pub(crate) mod submission_attempts;
 pub(crate) mod stage_clock;
 pub mod shard_drain;

@@ -693,19 +693,8 @@ fn recompute_shard_rings(
     if active_provers.is_empty() {
         return Ok(());
     }
-    let join_frame = |p: &ProverInfo| -> u64 {
-        p.allocations
-            .iter()
-            .find(|a| a.confirmation_filter == filter)
-            .map(|a| a.join_frame_number)
-            .unwrap_or(0)
-    };
-    let mut order: Vec<usize> = (0..active_provers.len()).collect();
-    order.sort_by(|&i, &j| {
-        join_frame(&active_provers[i])
-            .cmp(&join_frame(&active_provers[j]))
-            .then_with(|| active_provers[i].address.cmp(&active_provers[j].address))
-    });
+    let order = quil_types::reward_ring::reward_member_order(
+        &active_provers.iter().collect::<Vec<_>>(), filter);
 
     let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
     let va_disc = vertex_adds_discriminator()?;

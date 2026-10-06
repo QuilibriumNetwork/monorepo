@@ -647,12 +647,65 @@ pub const EVICTION_INACTIVITY_START_FRAME: u64 = 674_000;
 /// is deterministic across the fleet.
 pub const MIN_SHARD_CONSENSUS_PROVERS: u64 = 4;
 
+/// Registry inputs for one lifecycle evaluation. Membership lists use the
+/// same raw allocation statuses as `get_provers_by_status`; this is planning
+/// information, not committee authorization or storage-proof eligibility.
+#[derive(Debug, Clone)]
+pub struct ProverLifecycleView {
+    pub prover: Option<ProverInfo>,
+    pub summaries: Vec<ProverShardSummary>,
+    pub members: HashMap<Vec<u8>, LifecycleMembers>,
+    pub reward_rings: HashMap<Vec<u8>, crate::reward_ring::RewardRingEstimate>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LifecycleMembers {
+    pub active: Vec<Vec<u8>>,
+    pub leaving: Vec<Vec<u8>>,
+}
+
 /// Manages the prover trie: state transitions, lookups, eviction.
 pub trait ProverRegistry: Send + Sync {
     /// Identify a supported registry implementation before reconstructing an
     /// isolated execution context. Custom registries must opt in explicitly.
     fn as_any(&self) -> Option<&dyn std::any::Any> { None }
     fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>>;
+    /// Capture the inputs used by lifecycle planning. Concurrent production
+    /// registries must override this to capture all fields under one read lock.
+    /// The compatibility implementation retains sequential getter semantics
+    /// for immutable/test registries; it does not promise atomicity.
+    fn get_lifecycle_view(&self, address: &[u8], frame: u64) -> Result<ProverLifecycleView> {
+        let prover = self.get_prover_info(address)?;
+        let summaries = self.get_prover_shard_summaries(frame)?;
+        let filters: std::collections::BTreeSet<_> = prover.iter()
+            .flat_map(|p| p.allocations.iter())
+            .map(|a| a.confirmation_filter.clone())
+            .chain(summaries.iter().map(|s| s.filter.clone()))
+            .filter(|f| !f.is_empty()).collect();
+        let mut members = HashMap::new();
+        let mut reward_rings = HashMap::new();
+        for filter in filters {
+            if let Some(estimate) = self.get_reward_ring_estimate(address, &filter, frame)? {
+                reward_rings.insert(filter.clone(), estimate);
+            }
+            let active = self.get_provers_by_status(&filter, ProverStatus::Active)?
+                .into_iter().map(|p| p.address).collect();
+            let leaving = self.get_provers_by_status(&filter, ProverStatus::Leaving)?
+                .into_iter().map(|p| p.address).collect();
+            members.insert(filter, LifecycleMembers { active, leaving });
+        }
+        Ok(ProverLifecycleView { prover, summaries, members, reward_rings })
+    }
+    /// A current or explicitly projected reward position. Concurrent
+    /// registries override this to read committee and allocations atomically.
+    fn get_reward_ring_estimate(&self, address: &[u8], filter: &[u8], frame: u64)
+        -> Result<Option<crate::reward_ring::RewardRingEstimate>> {
+        let committee = self.get_active_provers(filter, frame)?;
+        let all = self.get_provers(filter)?;
+        Ok(crate::reward_ring::estimate_reward_ring(
+            &committee.iter().collect::<Vec<_>>(), &all.iter().collect::<Vec<_>>(),
+            address, filter, frame))
+    }
     /// A member's registered storage leaf root for `leaf_id`, as
     /// `(leaf_root, num_blocks, epoch)`, or `None` if not registered. `leaf_id`
     /// is the opening's `shard_id`. Default `None` (registries that don't track
@@ -826,6 +879,8 @@ pub trait RewardIssuance: Send + Sync {
 /// Shard detail for info queries.
 #[derive(Debug, Clone)]
 pub struct ShardDetail {
+    /// Whether the reward position is established or explicitly projected.
+    pub ring_known: bool,
     pub filter: Vec<u8>,
     pub shard_size: BigInt,
     pub active_provers: u32,
@@ -842,7 +897,7 @@ pub trait ShardInfoProvider: Send + Sync {
     fn get_shard_info(
         &self,
         include_all: bool,
-    ) -> Result<(Vec<ShardDetail>, u64, BigInt, u64)>;
+    ) -> Result<(Vec<ShardDetail>, u64, BigInt, u64, BigInt)>;
 }
 
 // ---------------------------------------------------------------------------
@@ -858,7 +913,7 @@ pub trait AppFrameValidator: Send + Sync {
 }
 
 #[cfg(test)]
-mod epoch_tests {
+pub(crate) mod epoch_tests {
     use super::*;
 
     /// The epoch length is process-global, and one test overrides it. Every
@@ -867,7 +922,7 @@ mod epoch_tests {
     /// force while another test assumes the default.
     static EPOCH_LENGTH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn epoch_length_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn epoch_length_guard() -> std::sync::MutexGuard<'static, ()> {
         EPOCH_LENGTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 

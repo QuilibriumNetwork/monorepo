@@ -149,6 +149,28 @@ impl InMemoryProverRegistry {
         }
     }
 
+    fn reward_ring_estimate(&self, address: &[u8], filter: &[u8], frame: u64)
+        -> Option<quil_types::reward_ring::RewardRingEstimate> {
+        let all = self.get_provers(filter);
+        let mut estimate = quil_types::reward_ring::estimate_reward_ring(
+            &self.get_active_provers(filter, frame), &all, address, filter, frame)?;
+        if estimate.source == "committed_allocation_ring" {
+            // A decoded zero cannot establish rank. Require the committed
+            // policy fields from the same registry rows. Pending joins and
+            // paused owners do not earn and cannot establish ring occupancy.
+            let rows = self.rows.as_ref()?;
+            let members: Option<Vec<_>> = all.iter().filter_map(|p| p.allocations.iter()
+                .find(|a| a.confirmation_filter == filter
+                    && matches!(a.effective_status(frame), EffectiveStatus::Active | EffectiveStatus::Leaving)))
+                .map(|a| rows.committed_ring(&a.vertex_address)).collect();
+            let own = all.iter().find(|p| p.address == address)?.allocations.iter()
+                .find(|a| a.confirmation_filter == filter)?;
+            estimate.ring = rows.committed_ring(&own.vertex_address)?;
+            estimate.provers_on_ring = members?.iter().filter(|&&r| r == estimate.ring).count();
+        }
+        Some(estimate)
+    }
+
     /// Clear all state explicitly. A failed refresh retains the previous cache.
     pub fn clear(&mut self) {
         self.resource_usage = RegistryUsage::default();
@@ -1604,6 +1626,42 @@ fn log_local_alloc_diff(prev: &ProverAllocationInfo, new: &ProverAllocationInfo)
 }
 
 impl ProverRegistryTrait for SharedProverRegistry {
+    fn get_lifecycle_view(
+        &self, address: &[u8], frame: u64,
+    ) -> QuilResult<quil_types::consensus::ProverLifecycleView> {
+        use quil_types::consensus::{LifecycleMembers, ProverLifecycleView};
+        let guard = self.inner.read()
+            .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+        let prover = guard.get_prover_info(address).cloned();
+        let summaries = guard.get_prover_shard_summaries(frame);
+        let filters: std::collections::BTreeSet<_> = prover.iter()
+            .flat_map(|p| p.allocations.iter())
+            .map(|a| a.confirmation_filter.clone())
+            .chain(summaries.iter().map(|s| s.filter.clone()))
+            .filter(|f| !f.is_empty()).collect();
+        let mut members = HashMap::new();
+        let mut reward_rings = HashMap::new();
+        for filter in filters {
+            if let Some(estimate) = guard.reward_ring_estimate(address, &filter, frame) {
+                reward_rings.insert(filter.clone(), estimate);
+            }
+            // Clone addresses, not complete peer records and cryptographic keys.
+            let active = guard.get_provers_by_status(&filter, ProverStatus::Active)
+                .into_iter().map(|p| p.address.clone()).collect();
+            let leaving = guard.get_provers_by_status(&filter, ProverStatus::Leaving)
+                .into_iter().map(|p| p.address.clone()).collect();
+            members.insert(filter, LifecycleMembers { active, leaving });
+        }
+        Ok(ProverLifecycleView { prover, summaries, members, reward_rings })
+    }
+
+    fn get_reward_ring_estimate(&self, address: &[u8], filter: &[u8], frame: u64)
+        -> QuilResult<Option<quil_types::reward_ring::RewardRingEstimate>> {
+        let guard = self.inner.read()
+            .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+        Ok(guard.reward_ring_estimate(address, filter, frame))
+    }
+
     fn as_any(&self) -> Option<&dyn std::any::Any> { Some(self) }
     fn get_prover_info(&self, address: &[u8]) -> QuilResult<Option<ProverInfo>> {
         Ok(self
@@ -2830,6 +2888,69 @@ mod tests {
     }
 
     #[test]
+    fn activated_reward_rings_require_committed_policy_fields() {
+        use quil_types::consensus::{CommitteeHandoffPolicy, LegacyHistory};
+        struct RestorePolicy(Option<CommitteeHandoffPolicy>);
+        impl Drop for RestorePolicy {
+            fn drop(&mut self) { quil_types::consensus::set_committee_handoff_policy(self.0); }
+        }
+        let _restore = RestorePolicy(quil_types::consensus::committee_handoff_policy());
+        quil_types::consensus::set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
+            activation_frame: 0, chain_id: [1; 32], legacy_history: LegacyHistory::Discard,
+            membership_boundary_frame: u64::MAX,
+        }));
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let filter = vec![0xCC; 32];
+        let shared = SharedProverRegistry::new();
+        let save_allocation = |id: u8, status: u8, ring: Option<u8>, key: Option<Vec<u8>>| {
+            let mut fields = vec![
+                type_hash_leaf("allocation:ProverAllocation"),
+                field_leaf("allocation:ProverAllocation", "Prover", vec![id; 32]),
+                field_leaf("allocation:ProverAllocation", "Status", vec![status]),
+                field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.clone()),
+            ];
+            if let Some(ring) = ring { fields.push(field_leaf("allocation:ProverAllocation", "Ring", vec![ring])); }
+            if let Some(key) = key {
+                fields.push(field_leaf("allocation:ProverAllocation", "RingEpoch", key.clone()));
+                fields.push(field_leaf("allocation:ProverAllocation", "RingSeniority", key));
+            }
+            store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(id + 16),
+                &build_sub_tree(fields)).unwrap();
+            shared.refresh_from_store(store.as_ref()).unwrap();
+        };
+        for id in [1u8, 2] {
+            store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(id),
+                &build_sub_tree(vec![type_hash_leaf("prover:Prover"),
+                    field_leaf("prover:Prover", "PublicKey", vec![id; 57]),
+                    field_leaf("prover:Prover", "Status", vec![1])])).unwrap();
+        }
+        // Both an absent ring and an old ring without its policy key are unknown.
+        save_allocation(1, 1, None, None);
+        save_allocation(2, 1, Some(0), None);
+        assert!(shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().is_none());
+        save_allocation(1, 1, Some(0), Some(vec![0; 8]));
+        assert!(shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().is_none(),
+            "a partial peer snapshot cannot establish ring occupancy");
+        for status in [0, 2] { // pending Joining and Paused do not earn
+            save_allocation(2, status, None, None);
+            let held = shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().unwrap();
+            assert_eq!((held.ring, held.provers_on_ring), (0, 1),
+                "a non-earning peer without a ring key must not hide the owner's committed rank");
+        }
+        save_allocation(2, 1, Some(0), Some(vec![0; 8]));
+        let estimate = shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().unwrap();
+        assert_eq!((estimate.ring, estimate.provers_on_ring), (0, 2), "real zero is valid");
+        let lifecycle = shared.get_lifecycle_view(&[1; 32], 0).unwrap();
+        assert_eq!(lifecycle.reward_rings[&filter].ring, 0);
+        save_allocation(2, 1, Some(1), Some(vec![0; 8]));
+        assert_eq!(shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().unwrap().provers_on_ring, 1);
+        save_allocation(2, 1, Some(1), Some(vec![0; 7]));
+        assert!(shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().is_none(),
+            "malformed fields must invalidate a previously known estimate");
+    }
+
+    #[test]
     fn decode_allocation_links_to_prover() {
         // Prover has address [0x11; 32]. Allocation's Prover field
         // points to that address; allocation is active under filter
@@ -3492,6 +3613,81 @@ mod tests {
         assert_eq!(sum.filter, filter);
         assert_eq!(sum.status_counts.get(&ProverStatus::Active).copied().unwrap_or(0), 1);
         assert_eq!(sum.status_counts.get(&ProverStatus::Joining).copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn lifecycle_views_remain_coherent_during_registry_replacement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let owner = [0xF0; 32];
+        let filter = vec![0xFC; 64];
+        let make_state = |status: u8, seniority: u64| {
+            let (_tmp, store) = temp_store();
+            let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+            let prover = build_sub_tree(vec![
+                type_hash_leaf("prover:Prover"),
+                field_leaf("prover:Prover", "PublicKey", vec![0xFE; 57]),
+                field_leaf("prover:Prover", "Status", vec![1]),
+                field_leaf("prover:Prover", "Seniority", seniority.to_be_bytes().to_vec()),
+            ]);
+            let allocation = build_sub_tree(vec![
+                type_hash_leaf("allocation:ProverAllocation"),
+                field_leaf("allocation:ProverAllocation", "Prover", owner.to_vec()),
+                field_leaf("allocation:ProverAllocation", "Status", vec![status]),
+                field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.clone()),
+            ]);
+            store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xF0), &prover).unwrap();
+            store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xF1), &allocation).unwrap();
+            let mut registry = InMemoryProverRegistry::new();
+            registry.refresh(store.as_ref()).unwrap();
+            registry
+        };
+        let active = make_state(1, 1);
+        let leaving = make_state(3, 2);
+        let shared = SharedProverRegistry::new();
+        let verify = |view: quil_types::consensus::ProverLifecycleView| {
+            let owner_info = view.prover.unwrap();
+            let members = &view.members[&filter];
+            let summary = view.summaries.iter().find(|s| s.filter == filter).unwrap();
+            match owner_info.seniority {
+                1 => {
+                    assert_eq!(members.active, vec![owner.to_vec()]);
+                    assert!(members.leaving.is_empty());
+                    assert_eq!(summary.status_counts.get(&ProverStatus::Active), Some(&1));
+                }
+                2 => {
+                    assert_eq!(members.leaving, vec![owner.to_vec()]);
+                    assert!(members.active.is_empty());
+                    assert_eq!(summary.status_counts.get(&ProverStatus::Leaving), Some(&1));
+                }
+                _ => panic!("unexpected registry generation"),
+            }
+        };
+        // Both sequential controls and the concurrent side use the same API.
+        *shared.inner.write().unwrap() = active.clone();
+        let retained = shared.get_lifecycle_view(&owner, 0).unwrap();
+        *shared.inner.write().unwrap() = leaving.clone();
+        verify(retained);
+        verify(shared.get_lifecycle_view(&owner, 0).unwrap());
+        let running = AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while running.load(Ordering::Relaxed) {
+                    *shared.inner.write().unwrap() = active.clone();
+                    std::thread::yield_now();
+                    *shared.inner.write().unwrap() = leaving.clone();
+                    std::thread::yield_now();
+                }
+            });
+            let reader = scope.spawn(|| {
+                for _ in 0..500 {
+                    verify(shared.get_lifecycle_view(&owner, 0).unwrap());
+                    std::thread::yield_now();
+                }
+            });
+            let result = reader.join();
+            running.store(false, Ordering::Relaxed);
+            result.unwrap();
+        });
     }
 
     #[test]

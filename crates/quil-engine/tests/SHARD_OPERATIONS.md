@@ -55,6 +55,43 @@ store-backed registry behavior remain covered by the execution and existing
 end-to-end suites. A restart recreates policy state, not the entire distributed
 network. The suite does not claim to enumerate every possible execution.
 
+## Per-shard lifecycle plans
+
+The evaluator compiles policy candidates into one frame-scoped intent per
+filter before dispatch. Capacity-driven join rejection overrides score-driven
+confirmation; departure and leave rejection defer renewal until registry
+observation establishes retention. Duplicate actions are removed without
+reordering ranked batches or separating join filters from worker IDs.
+Incompatible intents, mixed frames and conflicting join worker assignments
+reject the whole evaluation before publication and emit a warning.
+
+The production shared registry captures owner allocations, summaries and the
+Active/Leaving address census under one read lock. Planning uses that captured
+view rather than reading membership again later. Compatibility registries keep
+sequential getter semantics and must override the capture API if they support
+concurrent mutation. Workers are captured separately; this is not an atomic
+snapshot spanning the registry and worker manager. Evaluation and accepted-plan
+cooldown commitment are serialized across poller/gossip callers. A rejected
+plan consumes no proposal cooldown; selected joins are explicitly excluded from
+replacement demand before retry bookkeeping is committed.
+
+The plan compiler tests every ordered pair of action kinds, mixed-shard
+batches and duplicate worker assignments. Existing evaluator and sequence tests
+exercise its integration with real policy decisions. This does not provide an
+globally atomic registry/worker snapshot or persisted leaving-to-joining
+replacement pairs. Those remain necessary follow-ups before claiming a complete
+distributed lifecycle planner.
+
+The pipeline reserves filters before spawning joins, leaves and rejections;
+confirmations use the same owner while preparing storage. A running operation
+blocks another operation kind on that filter, including across epoch boundaries.
+Unrelated filters can progress. Successful publication keeps the existing
+bounded retry fence within the epoch, but is not a registry acknowledgement.
+For chunked joins, later failure releases only unpublished filters. Encoder
+ownership remains inside the blocking task when its async waiter is cancelled.
+This does not persist submission ownership or reserve replacement workers across
+restart; those need the explicit replacement state machine.
+
 ## Further coverage
 
 Extend the harness with observed counterexamples and independent expectations.
@@ -66,3 +103,19 @@ Replace process-global test epoch settings with instance-scoped configuration
 before introducing concurrently simulated networks with different epoch lengths.
 Counterfactual controls must fail when an important guard is removed. Preserve
 release optimization settings and never relax authentication to make a test pass.
+
+### Leave decision stability
+
+Accepted automatic leave rejections remain attached to the exact leave request
+through its decision epoch. Archive metadata changes cannot convert that request
+into a confirmation. The node restores this local decision journal before
+lifecycle dispatch; failed writes or WAL sync prevent plan commitment. A new
+leave request or decision epoch has its own decision. Protocol eligibility and
+notice timing remain authoritative.
+
+Score confirmations consume available destinations one-to-one, worst holding
+first. Coverage swaps subtract workers already serving confirmed departures and
+score confirmations selected in the current plan. These are capacity bounds,
+not persisted source-to-destination worker reservations; #686 retains that
+broader scope. Confirmation logs report policy cause counts without metric
+labels containing shard filters.

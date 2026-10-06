@@ -286,9 +286,9 @@ fn scenario_allocation_state_and_worker_matrix() {
                         // manual selections are consumed before automatic cores.
                         let expected = match status {
                             ProverStatus::Joining => frame < 1440,
-                            ProverStatus::Active => stored_epoch >= frame / 720,
+                            ProverStatus::Active => stored_epoch + 1 >= frame / 720,
                             ProverStatus::Paused => true,
-                            ProverStatus::Leaving => bound && frame < 1440,
+                            ProverStatus::Leaving => frame < 1440,
                             _ => false,
                         };
                         assert_eq!(
@@ -403,7 +403,7 @@ fn scenario_seeded_recovery_histories() {
             }
             scenario.tick(frame);
             // The model never calls effective_status or the recovery helper.
-            let expected = (renewed && frame / 720 <= 2) || frame < 1440;
+            let expected = (renewed && frame / 720 <= 3) || frame < 1440;
             assert_eq!(
                 scenario.is_bound(&held),
                 expected,
@@ -412,5 +412,35 @@ fn scenario_seeded_recovery_histories() {
             );
             frame += 1 + next() % 100;
         }
+        // Registration for epoch 2 can reserve renewal capacity through
+        // epoch 3; without a subsequent registration it must yield in epoch 4.
+        scenario.tick(2880);
+        assert!(!scenario.is_bound(&held), "unrenewed capacity must be bounded; history={:?}", scenario.history);
     }
+}
+
+#[test]
+fn unbound_notice_reserves_capacity_before_allocator_recovery() {
+    let _epoch = super::super::buckets_tests::epoch_length_guard();
+    let mut leaving = alloc(filter_bytes(0xA1), ProverStatus::Leaving, 100);
+    leaving.leave_frame_number = 100;
+    leaving.leave_confirm_frame_number = 721;
+    let scenario = Scenario::new(vec![leaving], vec![idle_worker(1)]);
+    scenario.registry.set_summaries(vec![
+        shard_summary(filter_bytes(0xA1), 50),
+        shard_summary(filter_bytes(0xC1), 1),
+    ]);
+    seed_sizes_from_registry(&scenario.lifecycle, scenario.registry.as_ref());
+    // Deliberately evaluate BEFORE allocator recovery, as a racing caller
+    // can see an idle fleet while notice-period allocations remain owed slots.
+    for frame in [722, 1439] {
+        scenario.lifecycle.set_prover_root_verified_frame(frame);
+        let actions = scenario.lifecycle.evaluate(frame, 50_000,
+            scenario.registry.as_ref(), scenario.workers.as_ref()).unwrap();
+        assert_eq!(count_proposed_joins(&actions), 0, "{actions:?}");
+    }
+    scenario.lifecycle.set_prover_root_verified_frame(1440);
+    let actions = scenario.lifecycle.evaluate(1440, 50_000,
+        scenario.registry.as_ref(), scenario.workers.as_ref()).unwrap();
+    assert!(count_proposed_joins(&actions) > 0, "departure must release capacity: {actions:?}");
 }
