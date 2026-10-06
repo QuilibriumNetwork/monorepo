@@ -262,17 +262,35 @@ fn render_scroll_hint(f: &mut Frame, area: Rect, offset: usize, total: usize, vi
     }
 }
 
-fn panel_heights(m: &Model, total: u16) -> [u16; 3] {
+fn base_panel_heights(total: u16) -> [u16; 3] {
     if total < 6 { return [total / 3 + total % 3, total / 3, total / 3]; }
     let notice = total.saturating_sub(5).min(3);
     let alloc = ((total - notice) / 2).max(3);
-    let mut heights = [alloc, total - notice - alloc, notice];
+    [alloc, total - notice - alloc, notice]
+}
+
+fn panel_heights(m: &Model, total: u16) -> [u16; 3] {
+    let mut heights = base_panel_heights(total);
+    if total < 6 { return heights; }
     let minimum = [3i32, 2, 1];
     for i in 0..2 {
         let movement = i32::from(m.panel_boundary_offsets[i]).clamp(minimum[i] - i32::from(heights[i]), i32::from(heights[i + 1]) - minimum[i + 1]);
         heights[i] = (i32::from(heights[i]) + movement) as u16;
         heights[i + 1] = (i32::from(heights[i + 1]) - movement) as u16;
     }
+    heights
+}
+
+/// Normalize clipped offsets after a terminal resize so the next key moves
+/// the visible boundary immediately, rather than walking an obsolete offset.
+fn sync_panel_heights(m: &mut Model, total: u16) -> [u16; 3] {
+    let base = base_panel_heights(total);
+    let heights = panel_heights(m, total);
+    m.panel_content_heights = heights;
+    m.panel_boundary_offsets = [
+        (i32::from(heights[0]) - i32::from(base[0])) as i16,
+        (i32::from(base[2]) - i32::from(heights[2])) as i16,
+    ];
     heights
 }
 
@@ -286,8 +304,7 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     }
     let actions_h = actions.len() as u16;
     // Content height depends only on terminal geometry and explicit resize keys.
-    let [alloc_h, avail_h, notice_h] = panel_heights(m, area.height.saturating_sub(7 + actions_h));
-    m.panel_content_heights = [alloc_h, avail_h, notice_h];
+    let [alloc_h, avail_h, notice_h] = sync_panel_heights(m, area.height.saturating_sub(7 + actions_h));
     let status_h = notice_h + 2;
 
     let chunks = Layout::vertical([
@@ -1690,6 +1707,16 @@ mod tests {
         assert_eq!(table_horizontal_offset(&mut m, 0, &[Line::from("x".repeat(50))], 30), 20);
         assert_eq!(table_horizontal_offset(&mut m, 0, &[Line::from("x")], 30), 0);
         assert_eq!(m.horizontal_limits[0], 0);
+    }
+
+    #[test]
+    fn a_boundary_moves_immediately_after_terminal_resize_clips_its_offset() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut m = Model::new(); m.panel_boundary_offsets = [100, -100];
+        let before = sync_panel_heights(&mut m, 13);
+        super::super::update::handle_key(&mut m, KeyEvent::new(KeyCode::Char('{'), KeyModifiers::NONE));
+        let after = sync_panel_heights(&mut m, 13);
+        assert_eq!(after, [before[0] - 1, before[1] + 1, before[2]]);
     }
 
     #[test]

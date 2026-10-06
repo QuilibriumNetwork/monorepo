@@ -1082,10 +1082,6 @@ pub fn reward_ring(info: &quil_types::proto::node::ShardRewardInfo) -> u32 {
     if info.ring_known == Some(false) { UNKNOWN_REWARD_RING } else { info.ring }
 }
 
-pub fn materialization_lag(materialized: u64, latest: u64) -> Option<u64> {
-    (latest > 0).then(|| latest.saturating_sub(materialized))
-}
-
 pub fn materialization_state(materialized: u64, latest: u64) -> &'static str {
     match (materialized, latest) {
         (_, 0) => "unknown", (0, _) => "unmat", (mat, head) if mat >= head => "current", _ => "lag",
@@ -1324,7 +1320,6 @@ mod tests {
         assert_eq!(alloc_row_numeric_val(&model.allocations[0], 3), 0.0);
         assert_eq!(alloc_row_numeric_val(&model.allocations[0], 9), 0.0);
         assert_eq!(materialization_state(0, 20), "unmat");
-        assert_eq!(materialization_lag(0, 20), Some(20));
         info.shards[0].ring_known = None;
         info.shards[0].ring = 2;
         model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))), Some(info), None);
