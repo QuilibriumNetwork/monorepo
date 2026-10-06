@@ -699,8 +699,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
                     3 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(ring_color(a.ring)))
                     }
-                    // Mat, Lag and State are three readings of one fact, so
-                    // they take one colour: whichever the State cell shows.
+                    // Local engine health and the provider gap are separate observations.
                     6 | 8 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(match local_execution_state(a.execution.as_ref()) {
                             "blocked" | "stopped" => ERROR, "running" => SUCCESS, _ => HELP,
@@ -1458,7 +1457,7 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Shards", "Data shards the filter covers"),
         kv("PeerMat", "Materialized height reported by the shard metadata provider"),
         kv("PeerLag", "Provider head minus provider materialized height"),
-        kv("PeerState", "Reading of Mat and Lag — current: materialized up to the head;"),
+        kv("PeerState", "Reading of PeerMat and PeerLag — current: materialized up to the head;"),
         kv("", "lag: behind it; unmat: nothing materialized; unknown: no head"),
         kv(
             "Reward [Q/d]",
@@ -2093,11 +2092,11 @@ mod tests {
     }
 
     #[test]
-    fn fixed_sizing_reproduces_the_historical_layout() {
+    fn fixed_sizing_reserves_the_local_and_peer_column_labels() {
         let (w, fw) = alloc_col_widths(&fixed(), 154, &joining_table());
-        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 6, 8, 12, 8, 12, 4, 26, 18]);
+        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 7, 9, 12, 8, 12, 4, 26, 18]);
         assert_eq!(fw, 12);
-        assert_eq!(w.iter().sum::<usize>() + 14, 165);
+        assert_eq!(w.iter().sum::<usize>() + 14, 167);
         // 26 columns of Next Action for a 13-column value in the fixed layout.
         assert_eq!(w[13], NEXT_ACTION_WIDTH);
     }
@@ -2141,9 +2140,9 @@ mod tests {
         let rows = joining_table();
         // Wide pane: Filter stops at the longest hex rather than padding on.
         assert_eq!(alloc_col_widths(&m, 300, &rows).1, 64);
-        assert_eq!(alloc_col_widths(&m, 167, &rows).1, 45);
+        assert_eq!(alloc_col_widths(&m, 167, &rows).1, 34);
         // Narrower: Filter absorbs the shortfall…
-        assert_eq!(alloc_col_widths(&m, 154, &rows).1, 32);
+        assert_eq!(alloc_col_widths(&m, 154, &rows).1, 21);
         assert_eq!(alloc_col_widths(&m, 121, &rows).1, 12);
         // …down to the floor, past which the row is clipped rather than shrunk.
         assert_eq!(alloc_col_widths(&m, 118, &rows).1, MIN_FILTER_WIDTH);
