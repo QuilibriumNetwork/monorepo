@@ -77,8 +77,8 @@ pub const RING_WIDTH: usize = 5;
 pub const SIZE_WIDTH: usize = 10;
 pub const SHARDS_WIDTH: usize = 7;
 pub const MAT_WIDTH: usize = 9;
-pub const LAG_WIDTH: usize = 6;
-pub const STATE_WIDTH: usize = 8;
+pub const LAG_WIDTH: usize = 7;
+pub const STATE_WIDTH: usize = 9;
 // Header width in both panels; the values are whole QUIL/day.
 pub const REWARD_WIDTH: usize = 12;
 pub const ALLOC_REWARD_WIDTH: usize = 12;
@@ -776,9 +776,9 @@ impl Model {
                 3 => a.ring.cmp(&b.ring),
                 4 => a.shard_size.cmp(&b.shard_size),
                 5 => a.data_shards.cmp(&b.data_shards),
-                6 => a.execution.as_ref().and_then(|s| s.materialized_frame).cmp(&b.execution.as_ref().and_then(|s| s.materialized_frame)),
+                6 => a.materialized_frame.cmp(&b.materialized_frame),
                 7 => materialization_lag(a.materialized_frame, a.latest_frame).cmp(&materialization_lag(b.materialized_frame, b.latest_frame)),
-                8 => local_execution_state(a.execution.as_ref()).cmp(local_execution_state(b.execution.as_ref())),
+                8 => materialization_state(a.materialized_frame, a.latest_frame).cmp(materialization_state(b.materialized_frame, b.latest_frame)),
                 9 => a.estimated_reward.cmp(&b.estimated_reward),
                 _ => std::cmp::Ordering::Equal,
             };

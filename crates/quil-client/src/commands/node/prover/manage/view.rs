@@ -968,12 +968,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
                 let cell = pad_cell(&cell, widths[c], c == 1);
                 spans.push(match c {
                     3 if m.color_coding => Span::styled(cell, Style::new().fg(ring_color(s.ring))),
-                    6 | 8 if m.color_coding => {
-                        Span::styled(cell.clone(), Style::new().fg(match local_execution_state(a.execution.as_ref()) {
-                            "blocked" | "stopped" => ERROR, "running" => SUCCESS, _ => HELP,
-                        }))
-                    }
-                    7 if m.color_coding => {
+                    6 | 7 | 8 if m.color_coding => {
                         let color = materialization_state_color(materialization_state(
                             s.materialized_frame,
                             s.latest_frame,
