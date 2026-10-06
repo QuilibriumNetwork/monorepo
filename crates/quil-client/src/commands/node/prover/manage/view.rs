@@ -450,7 +450,8 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         3 => fmt_ring(a.ring),
         4 => fmt_mb(&a.shard_size),
         5 => a.data_shards.to_string(),
-        6 => a.execution.as_ref().and_then(|s| s.materialized_frame).map(|h| h.to_string()).unwrap_or_else(|| "-".into()),
+        6 => if local_warning(a) { "0!".into() }
+            else { a.execution.as_ref().and_then(|s| s.materialized_frame).map(|h| h.to_string()).unwrap_or_else(|| "-".into()) },
         7 => if a.materialized_frame == 0 && a.latest_frame == 0 { "-".into() } else { a.latest_frame.to_string() },
         8 => local_execution_state(a.execution.as_ref()).into(),
         9 => if a.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&a.estimated_reward) },
@@ -1400,7 +1401,7 @@ fn help_body() -> Vec<Line<'static>> {
     vec![
         Line::from(""),
         sec("Worker progress"),
-        kv("LocalMat", "Local engine materialized height; - means unknown"),
+        kv("LocalMat", "Local height; - unknown; 0! warns a running host has no materialized frames"),
         kv("Execution", "Host state; running with zero LocalMat is warned, not healthy progress"),
         kv("PeerHead", "Provider shard head; remote metadata, not the local worker cursor"),
         kv("Details", "Selected allocation footer shows blocker and last advance; no observation timer"),
@@ -1609,6 +1610,7 @@ mod tests {
         assert!(allocation_detail(&worker).to_string().contains("Last advance: 22s ago"));
         worker.execution.as_mut().unwrap().materialized_frame = Some(0);
         assert!(local_warning(&worker));
+        assert_eq!(alloc_cell(&m, &worker, 6, 12), "0!");
         assert_eq!(local_color(&worker), Color::Yellow);
         assert!(allocation_detail(&worker).to_string().contains("Warning: no materialized frames"));
         worker.execution.as_mut().unwrap().state = "blocked".into();
