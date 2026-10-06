@@ -2173,7 +2173,7 @@ mod tests {
             w,
             vec![
                 6,  // "Select"
-                21, // Filter — what the pane has left
+                20, // Filter — what the pane has left
                 7,  // "Provers"
                 4,  // "Ring"
                 9,  // "Size_[MB]"
@@ -2189,7 +2189,7 @@ mod tests {
                 16, // "activate@f699840", wider than "Default_Action"
             ]
         );
-        assert_eq!(fw, 21);
+        assert_eq!(fw, 20);
         // 15 columns + 14 separators + 2 borders fill the pane exactly.
         assert_eq!(w.iter().sum::<usize>() + 14 + 2, 154);
     }
@@ -2245,7 +2245,7 @@ mod tests {
         assert_eq!(alloc_col_widths(&m, 300, &rows).1, 64);
         assert_eq!(alloc_col_widths(&m, 167, &rows).1, 33);
         // Narrower: Filter absorbs the shortfall…
-        assert_eq!(alloc_col_widths(&m, 154, &rows).1, 21);
+        assert_eq!(alloc_col_widths(&m, 154, &rows).1, 20);
         assert_eq!(alloc_col_widths(&m, 121, &rows).1, 12);
         // …down to the floor, past which the row is clipped rather than shrunk.
         assert_eq!(alloc_col_widths(&m, 118, &rows).1, MIN_FILTER_WIDTH);

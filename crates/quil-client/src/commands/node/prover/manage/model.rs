@@ -1020,7 +1020,7 @@ pub fn alloc_row_numeric_val(row: &AllocationRow, col: usize) -> f64 {
         4 => bigint_to_f64(&row.shard_size) / (1024.0 * 1024.0),
         5 => row.data_shards as f64,
         6 => row.execution.as_ref().and_then(|s| s.materialized_frame).map_or(f64::NAN, |h| h as f64),
-        7 => if !row.shard_info_known { f64::NAN } else { row.latest_frame as f64 },
+        7 => if row.materialized_frame == 0 && row.latest_frame == 0 { f64::NAN } else { row.latest_frame as f64 },
         9 => {
             if row.ring == UNKNOWN_REWARD_RING {
                 f64::NAN
