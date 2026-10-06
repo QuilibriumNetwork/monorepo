@@ -1817,6 +1817,14 @@ fn read_u64_be(node: &VectorCommitmentNode, class: &str, field: &str) -> u64 {
     u64::from_be_bytes(buf)
 }
 
+/// Whether a serialized vertex can be a prover or an allocation: its bytes
+/// contain one of their type hashes (stored verbatim as a leaf value).
+fn holds_scanned_type(blob: &[u8]) -> bool {
+    use crate::global_schema::{TYPE_HASH_ALLOCATION, TYPE_HASH_PROVER};
+    memchr::memmem::find(blob, &TYPE_HASH_ALLOCATION).is_some()
+        || memchr::memmem::find(blob, &TYPE_HASH_PROVER).is_some()
+}
+
 /// An allocation's recorded ring key, read the way `prover_rings::read_key`
 /// reads a rebuilt tree.
 fn decode_ring_key(node: &VectorCommitmentNode) -> Option<crate::global_intrinsic::prover_rings::RingKey> {
@@ -2027,6 +2035,13 @@ impl CommittedProverScan {
 
         let mut cb = |vk: Vec<u8>, data: Vec<u8>| {
             if vk.len() != 64 || removed.contains(&vk) {
+                return;
+            }
+            // Most of the shard is neither a prover nor an allocation (storage
+            // leaf-root registrations, rewards, authorization records). A type
+            // hash is stored as a raw leaf value, so a vertex whose bytes hold
+            // neither hash cannot be one: skip it without parsing its tree.
+            if !holds_scanned_type(&data) {
                 return;
             }
             let root = match deserialize_go_tree(&data) {
@@ -2992,6 +3007,75 @@ mod tests {
         let scan = CommittedProverScan::try_scan(&crdt).unwrap();
         assert!(scan.all_on_filter(&fb[0]).is_empty(), "a removed allocation stays removed");
         assert_eq!(scan.all_on_filter(&fa[0]), vec![(pk_a.clone(), addr_a.clone())]);
+    }
+
+    /// Cost of the committed prover scan over a shard dominated by other
+    /// vertices, against parsing every vertex (the scan before its prefilter).
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_committed_prover_scan() {
+        use crate::global_intrinsic::materialize::{allocation_address, create_allocation_vertex_tree, create_prover_vertex_tree, prover_address_from_pubkey};
+        use crate::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+        use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())) as Arc<dyn quil_types::store::HypergraphStore>,
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let state = HypergraphState::new(crdt.clone());
+        let va = vertex_adds_discriminator().unwrap();
+        let (provers, allocations_each, others) = (120usize, 40usize, 60_000usize);
+        for p in 0..provers {
+            let key = { let mut k = vec![0u8; 897]; k[..2].copy_from_slice(&(p as u16).to_be_bytes()); k };
+            let address = prover_address_from_pubkey(&key).unwrap();
+            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va, 1, vertex_tree_to_blob(&create_prover_vertex_tree(&key, 5).unwrap())).unwrap();
+            for a in 0..allocations_each {
+                let filter = { let mut f = vec![0x11u8; 32]; f.extend_from_slice(&[0, 7, a as u8]); f };
+                let tree = create_allocation_vertex_tree(&address, &filter, 9).unwrap();
+                state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &allocation_address(&key, &filter).unwrap(), &va, 1, vertex_tree_to_blob(&tree)).unwrap();
+            }
+        }
+        for o in 0..others {
+            let mut tree = quil_tries::VectorCommitmentTree::new();
+            for field in 0u8..8 {
+                tree.insert(&[field << 2], &[(o % 251) as u8; 40], &[], &num_bigint::BigInt::from(40)).unwrap();
+            }
+            let address: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest((o as u64).to_be_bytes()).into();
+            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va, 1, vertex_tree_to_blob(&tree)).unwrap();
+        }
+        state.commit().unwrap();
+        state.abort();
+        crdt.commit(1).unwrap();
+        let shard = ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+        for pass in ["cold", "warm"] {
+            let started = std::time::Instant::now();
+            let scan = CommittedProverScan::try_scan(&crdt).unwrap();
+            let scanned = started.elapsed();
+            let started = std::time::Instant::now();
+            let mut parsed = 0usize;
+            crdt.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut |_k, data| {
+                if deserialize_go_tree(&data).ok().flatten().is_some() { parsed += 1; }
+            }).unwrap();
+            eprintln!("{pass}: scan {:?} ({} allocations); parsing every vertex {:?} ({parsed})",
+                scanned, scan.allocations.len(), started.elapsed());
+        }
+    }
+
+    /// The scan's byte prefilter keeps every prover and allocation and lets
+    /// other vertices of the shard skip parsing.
+    #[test]
+    fn only_provers_and_allocations_pass_the_scan_prefilter() {
+        use crate::global_intrinsic::materialize::{create_allocation_vertex_tree, create_prover_vertex_tree};
+        let prover = create_prover_vertex_tree(&[7u8; 897], 5).unwrap();
+        let allocation = create_allocation_vertex_tree(&[1u8; 32], &[2u8; 35], 9).unwrap();
+        assert!(holds_scanned_type(&vertex_tree_to_blob(&prover)));
+        assert!(holds_scanned_type(&vertex_tree_to_blob(&allocation)));
+        let mut other = quil_tries::VectorCommitmentTree::new();
+        other.insert(&[0xFF; 32], &[0x42; 32], &[], &num_bigint::BigInt::from(32)).unwrap();
+        other.insert(&[0], b"some record", &[], &num_bigint::BigInt::from(11)).unwrap();
+        assert!(!holds_scanned_type(&vertex_tree_to_blob(&other)));
+        assert!(!holds_scanned_type(&[]));
     }
 
     #[test]

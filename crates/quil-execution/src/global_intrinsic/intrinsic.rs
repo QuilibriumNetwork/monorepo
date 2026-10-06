@@ -83,6 +83,39 @@ pub struct GlobalIntrinsic {
 
 }
 
+/// Where a committee session pass spent its time, logged when it is slow.
+struct SessionPassTiming {
+    frame: u64,
+    started: std::time::Instant,
+    last: std::time::Instant,
+    steps: Vec<(&'static str, u64)>,
+    filters: usize,
+    allocations: Option<usize>,
+}
+
+impl SessionPassTiming {
+    fn start(frame: u64) -> Self {
+        let now = std::time::Instant::now();
+        Self { frame, started: now, last: now, steps: Vec::new(), filters: 0, allocations: None }
+    }
+
+    fn lap(&mut self, step: &'static str) {
+        let now = std::time::Instant::now();
+        self.steps.push((step, now.duration_since(self.last).as_millis() as u64));
+        self.last = now;
+    }
+}
+
+impl Drop for SessionPassTiming {
+    fn drop(&mut self) {
+        let total = self.started.elapsed().as_millis() as u64;
+        if total >= 500 {
+            tracing::warn!(frame = self.frame, total_ms = total, filters = self.filters,
+                allocations = ?self.allocations, steps = ?self.steps, "committee session pass is slow");
+        }
+    }
+}
+
 /// The ring key of `address`'s allocation on `filter` in `scan`, or a key
 /// that ranks last when the allocation is not in it.
 fn ring_key_of(
@@ -2203,7 +2236,7 @@ impl GlobalIntrinsic {
         #[cfg(feature = "confidential-tokens")]
         crate::token_intrinsic::global_accumulator::verify_report(&op.address, &op.accumulator)?;
         #[cfg(feature = "confidential-tokens")]
-        crate::token_intrinsic::global_commit::verify_relay(op.frame_number, &op.spends)?;
+        crate::token_intrinsic::global_commit::verify_relay(frame_number, op.frame_number, &op.spends)?;
 
         // The authorized session's executed tip: a seal is accepted only once
         // it reaches the sealed checkpoint.
@@ -2318,7 +2351,7 @@ impl GlobalIntrinsic {
             // app-engine "no storage openings built" log), so no reward proof is
             // ever earned even though the shard carries committed data.
             tracing::warn!(
-                address = %hex::encode(&op.address[..op.address.len().min(8)]),
+                address = %hex::encode(&op.address),
                 frame_number = op.frame_number,
                 global_frame_number = op.global_frame_number,
                 state_size = state_size_u64,
@@ -3128,6 +3161,7 @@ impl GlobalIntrinsic {
         let (Some(store), Some(hg)) = (self.shards_store.as_ref(), self.hypergraph.as_ref()) else {
             return Ok(());
         };
+        let mut timing = SessionPassTiming::start(frame_number);
         let store = quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records());
         let mut filters: Vec<Vec<u8>> = store
             .range_app_shards()?
@@ -3137,6 +3171,8 @@ impl GlobalIntrinsic {
             .collect();
         filters.sort();
         filters.dedup();
+        timing.filters = filters.len();
+        timing.lap("grid filters");
         // Closing sessions that never sealed are fenced first, so a successor
         // they authorize is visible to the reconciliation below.
         let checkpoint = state.changeset_len();
@@ -3147,7 +3183,40 @@ impl GlobalIntrinsic {
             state.rollback_to(checkpoint);
             tracing::error!(frame = frame_number, %error, "committee handoff: fencing stalled sessions failed");
         }
+        timing.lap("fence stalled sources");
+        // The prover scan is this pass's main cost (a full read of the GLOBAL
+        // prover shard). Skip it when nothing below could use it: the flag day
+        // has run, no generation-zero registration is possible, membership is
+        // frozen mid-epoch (from `membership_boundary_frame`), and either first
+        // sessions wait for the boundary too (from
+        // `first_session_boundary_frame`) or every grid shard already has a
+        // session. In that state `reconcile_membership` decides nothing, so
+        // the outcome is identical.
+        let flag_day_pending = policy.legacy_history == quil_types::consensus::LegacyHistory::Discard
+            && !super::handoff::flag_day_applied(state)?;
+        let mid_epoch = !super::handoff::schedule::first_pass_of_epoch(frame_number);
+        let membership_frozen = frame_number >= policy.membership_boundary_frame && mid_epoch;
+        let first_sessions_frozen = frame_number >= policy.first_session_boundary_frame && mid_epoch;
+        let mut sessionless = false;
+        if !first_sessions_frozen {
+            for filter in &filters {
+                if super::handoff::head(state, filter)?.is_none() {
+                    sessionless = true;
+                    break;
+                }
+            }
+        }
+        timing.lap("session heads");
+        if !flag_day_pending
+            && policy.legacy_history != quil_types::consensus::LegacyHistory::Migrate
+            && membership_frozen
+            && (first_sessions_frozen || !sessionless)
+        {
+            return Ok(());
+        }
         let mut scan = crate::prover_registry::CommittedProverScan::try_scan(hg)?;
+        timing.allocations = Some(scan.allocations.len());
+        timing.lap("prover scan");
         // A flag day that discards legacy history prepares the prover tree
         // once, before any first session is authorized; until it succeeds no
         // session is.
@@ -3164,6 +3233,7 @@ impl GlobalIntrinsic {
                 }
                 Err(error) => return Err(error),
             }
+            timing.lap("flag day");
         }
         // Same rule as the topology gate: report, undo, and let the chain go on.
         // Legacy shards enter through generation zero first, so reconciliation
@@ -3176,6 +3246,7 @@ impl GlobalIntrinsic {
             state.rollback_to(checkpoint);
             tracing::error!(frame = frame_number, %error, "committee handoff: generation-zero migration failed");
         }
+        timing.lap("generation-zero migration");
         let checkpoint = state.changeset_len();
         if let Err(error) = super::handoff::schedule::reconcile_membership(
             state, frame_number, &policy, &filters, &scan)
@@ -3186,6 +3257,7 @@ impl GlobalIntrinsic {
             state.rollback_to(checkpoint);
             tracing::error!(frame = frame_number, %error, "committee handoff: membership reconciliation failed");
         }
+        timing.lap("membership reconciliation");
         Ok(())
     }
 

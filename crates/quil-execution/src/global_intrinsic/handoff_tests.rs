@@ -843,7 +843,7 @@ fn scan_of(assignments: &[(&[u8], &[FalconPrivateKey])]) -> crate::prover_regist
 }
 
 fn policy() -> quil_types::consensus::CommitteeHandoffPolicy {
-    quil_types::consensus::CommitteeHandoffPolicy { activation_frame: 2, chain_id: [0x11; 32], legacy_history: quil_types::consensus::LegacyHistory::Migrate, membership_boundary_frame: u64::MAX}
+    quil_types::consensus::CommitteeHandoffPolicy { activation_frame: 2, chain_id: [0x11; 32], legacy_history: quil_types::consensus::LegacyHistory::Migrate, membership_boundary_frame: u64::MAX, first_session_boundary_frame: u64::MAX}
 }
 
 #[test]
@@ -927,6 +927,27 @@ fn membership_successors_wait_for_the_epoch_boundary() {
                 "the boundary pass replaces the committee");
         }
     }
+}
+
+/// From `first_session_boundary_frame` a shard's first session is also
+/// authorized only at the first pass of an epoch.
+#[test]
+fn first_sessions_wait_for_the_epoch_boundary() {
+    let epoch = quil_types::consensus::epoch_length_frames();
+    let policy = quil_types::consensus::CommitteeHandoffPolicy { first_session_boundary_frame: 0, ..policy() };
+    let directory = tempfile::tempdir().unwrap();
+    let db = quil_store::RocksDb::open(directory.path()).unwrap();
+    let (_store, state) = make_state(&db);
+    commit(&state, 1);
+    let filter = vec![7u8; 32];
+    let filters = vec![filter.clone()];
+    let scan = scan_of(&[(&filter, &keys())]);
+    let mid = epoch + epoch / 2 - (epoch / 2) % schedule::SESSION_PASS_FRAMES;
+    assert!(!schedule::first_pass_of_epoch(mid));
+    assert_eq!(schedule::reconcile_membership(&state, mid, &policy, &filters, &scan).unwrap(), 0);
+    assert!(head(&state, &filter).unwrap().is_none());
+    assert_eq!(schedule::reconcile_membership(&state, 2 * epoch, &policy, &filters, &scan).unwrap(), 1,
+        "the boundary pass authorizes the first session");
 }
 
 #[test]

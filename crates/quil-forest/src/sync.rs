@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 
-use jmt::storage::{LeafNode, Node, NodeKey, TreeReader};
+use jmt::storage::{Child, Children, InternalNode, LeafNode, Nibble, Node, NodeKey, NodeType, TreeReader};
 use jmt::{storage::NibblePath, KeyHash, OwnedValue, ValueHash, Version};
 
 /// Which commitment authenticates a subtree sync. Unified shard headers carry
@@ -59,6 +59,101 @@ pub trait BatchTreeReader: TreeReader {
     fn get_values(&self, reads: &[(Version, KeyHash)]) -> anyhow::Result<Vec<Option<OwnedValue>>> {
         reads.iter().map(|(version, key)| self.get_value_option(*version, *key)).collect()
     }
+
+    /// Every leaf under `bit_path` at `version` (each key's newest value at
+    /// or below it), in key order, when the reader can list a subtree in bulk:
+    /// one sequential read at the source instead of a node-by-node walk.
+    /// `None` when it cannot. A listing is not authenticated by the reader;
+    /// [`diff_leaves_under_prefix`] checks it against the subtree's root.
+    fn leaves_under(&self, _version: Version, _bit_path: &[bool]) -> anyhow::Result<Option<Vec<(KeyHash, OwnedValue)>>> {
+        Ok(None)
+    }
+}
+
+/// The first and last key under `bit_path` (MSB-first).
+pub fn key_range_under(bit_path: &[bool]) -> ([u8; 32], [u8; 32]) {
+    let (mut first, mut last) = ([0u8; 32], [0xffu8; 32]);
+    for (i, &bit) in bit_path.iter().enumerate().take(256) {
+        let mask = 0x80u8 >> (i % 8);
+        if bit {
+            first[i / 8] |= mask;
+        } else {
+            last[i / 8] &= !mask;
+        }
+    }
+    (first, last)
+}
+
+/// Nibble `depth` of `key`, most significant first.
+fn nibble_at(key: &[u8; 32], depth: usize) -> u8 {
+    let byte = key[depth / 2];
+    if depth % 2 == 0 { byte >> 4 } else { byte & 0x0f }
+}
+
+/// The child a parent records for `leaves` (keys sorted, distinct, sharing
+/// their first `depth` nibbles): the leaf itself when alone, else the
+/// internal node over them. Hashes match the tree's; versions do not enter.
+fn rebuilt_child(leaves: &[(KeyHash, OwnedValue)], depth: usize) -> anyhow::Result<Child> {
+    if let [(key, value)] = leaves {
+        let leaf = LeafNode::new(*key, ValueHash::with::<sha2::Sha256>(value));
+        return Ok(Child::new(leaf.hash::<sha2::Sha256>(), 0, NodeType::Leaf));
+    }
+    let node = rebuilt_internal(leaves, depth)?;
+    Ok(Child::new(node.hash::<sha2::Sha256>(), 0, node.node_type()))
+}
+
+/// The internal node `depth` nibbles down over two or more `leaves`.
+fn rebuilt_internal(leaves: &[(KeyHash, OwnedValue)], depth: usize) -> anyhow::Result<InternalNode> {
+    anyhow::ensure!(depth < 64 && leaves.len() >= 2, "sync: listed leaves cannot form a subtree");
+    let mut children = Children::new();
+    let mut rest = leaves;
+    while let Some((key, _)) = rest.first() {
+        let nibble = nibble_at(&key.0, depth);
+        let n = rest.iter().take_while(|(k, _)| nibble_at(&k.0, depth) == nibble).count();
+        children.insert(Nibble::from(nibble), rebuilt_child(&rest[..n], depth + 1)?);
+        rest = &rest[n..];
+    }
+    Ok(InternalNode::new(children))
+}
+
+/// The commitment `leaves` give the subtree under `bit_path`, computed as
+/// [`subtree_root`] reads it from a tree holding exactly them below the
+/// prefix. Keys must be strictly increasing and under the prefix.
+fn listed_subtree_root(leaves: &[(KeyHash, OwnedValue)], bit_path: &[bool]) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(
+        leaves.windows(2).all(|pair| pair[0].0 .0 < pair[1].0 .0),
+        "sync: listed leaves are not in strictly increasing key order",
+    );
+    anyhow::ensure!(
+        leaves.iter().all(|(key, _)| key_has_bits(&key.0, bit_path)),
+        "sync: a listed leaf lies outside the subtree",
+    );
+    let full = bit_path.len() / 4;
+    let rem = bit_path.len() % 4;
+    Ok(match leaves {
+        [] => if rem == 0 { [0; 32] } else { PLACEHOLDER },
+        [(key, value)] => LeafNode::new(*key, ValueHash::with::<sha2::Sha256>(value)).hash::<sha2::Sha256>(),
+        _ if rem == 0 => rebuilt_internal(leaves, full)?.hash::<sha2::Sha256>(),
+        _ => rebuilt_internal(leaves, full)?
+            .subtree_hash::<sha2::Sha256>(bits_to_nibble(&bit_path[full * 4..]) << (4 - rem), 16 >> rem),
+    })
+}
+
+/// The source's whole subtree from one bulk listing, when the target holds
+/// none of it and the source can list it: checked leaf by leaf against the
+/// authenticated `subtree_root` before it is returned.
+fn listed_subtree<S: BatchTreeReader>(
+    source: &S,
+    version: Version,
+    bit_path: &[bool],
+    subtree_root: [u8; 32],
+) -> anyhow::Result<Option<Vec<(KeyHash, OwnedValue)>>> {
+    let Some(leaves) = source.leaves_under(version, bit_path)? else { return Ok(None) };
+    anyhow::ensure!(
+        listed_subtree_root(&leaves, bit_path)? == subtree_root,
+        "sync: listed leaves do not reconstruct the authenticated subtree",
+    );
+    Ok(Some(leaves))
 }
 
 /// Pairs of (source, target) nodes the walk expands per round: a remote
@@ -287,12 +382,15 @@ fn descend_nibbles<R: TreeReader>(
     Ok(Some((cur_key, cur_node)))
 }
 
+/// The hash of an empty tree or child range.
+const PLACEHOLDER: [u8; 32] = *b"SPARSE_MERKLE_PLACEHOLDER_HASH__";
+
 /// The Merkle hash of a node (matching the forest's `Sha256Jmt`).
 fn node_hash(node: &Node) -> [u8; 32] {
     match node {
         Node::Internal(int) => int.hash::<sha2::Sha256>(),
         Node::Leaf(leaf) => leaf.hash::<sha2::Sha256>(),
-        Node::Null => *b"SPARSE_MERKLE_PLACEHOLDER_HASH__",
+        Node::Null => PLACEHOLDER,
     }
 }
 
@@ -393,11 +491,27 @@ pub fn diff_leaves_under_prefix<S: BatchTreeReader, T: BatchTreeReader>(
         check_subtree([0; 32])?;
         return Ok((out, [0; 32]));
     }
+    // A target with nothing under the prefix takes the whole subtree: listed
+    // in bulk when the source can, rather than walked node by node.
+    let target_empty = match &t {
+        None | Some((_, Node::Null)) => true,
+        Some((_, Node::Leaf(leaf))) => !key_has_bits(&leaf.key_hash().0, bit_path),
+        Some((_, Node::Internal(int))) => rem != 0 && {
+            let start = bits_to_nibble(&bit_path[full * 4..]) << (4 - rem);
+            !int.children_sorted().any(|(n, _)| (start..start + (16 >> rem)).contains(&(n.as_usize() as u8)))
+        },
+    };
+    let bulk = target_empty && matches!(s_node, Node::Internal(_));
 
     // Nibble-aligned: the subtree IS the node at the prefix path. Diff it whole.
     if rem == 0 {
         let subtree_root = node_hash(&s_node);
         check_subtree(subtree_root)?;
+        if bulk {
+            if let Some(leaves) = listed_subtree(source, v_s, bit_path, subtree_root)? {
+                return Ok((leaves, subtree_root));
+            }
+        }
         let (t_key, t_node) = match t {
             Some((k, n)) => (k, Some(n)),
             None => (s_key.clone(), None),
@@ -420,6 +534,11 @@ pub fn diff_leaves_under_prefix<S: BatchTreeReader, T: BatchTreeReader>(
     // The shard commitment for this sub-range (authentic: `s_int` is authenticated).
     let subtree_root = s_int.subtree_hash::<sha2::Sha256>(start, width);
     check_subtree(subtree_root)?;
+    if bulk {
+        if let Some(leaves) = listed_subtree(source, v_s, bit_path, subtree_root)? {
+            return Ok((leaves, subtree_root));
+        }
+    }
     let t_children = children_map(&t);
     let mut children = Vec::new();
     for (nibble, s_child) in s_int.children_sorted() {
@@ -716,5 +835,79 @@ mod tests {
         assert!(counting.nodes.get() > 3000);
         let round_trips = counting.node_batches.get() + counting.value_batches.get();
         assert!(round_trips < 80, "{round_trips} round trips for {} nodes", counting.nodes.get());
+    }
+
+    /// A source that lists subtrees in bulk, optionally tampering with the
+    /// listing, and counts the node reads it answers.
+    struct Listing<'a> {
+        source: &'a MockTreeStore,
+        leaves: Vec<(KeyHash, OwnedValue)>,
+        tamper: fn(&mut Vec<(KeyHash, OwnedValue)>),
+        listed: std::cell::Cell<usize>,
+        nodes: std::cell::Cell<usize>,
+    }
+
+    impl TreeReader for Listing<'_> {
+        fn get_node_option(&self, key: &NodeKey) -> anyhow::Result<Option<Node>> {
+            self.nodes.set(self.nodes.get() + 1);
+            self.source.get_node_option(key)
+        }
+        fn get_value_option(&self, version: Version, key: KeyHash) -> anyhow::Result<Option<OwnedValue>> {
+            self.source.get_value_option(version, key)
+        }
+        fn get_rightmost_leaf(&self) -> anyhow::Result<Option<(NodeKey, LeafNode)>> { Ok(None) }
+    }
+
+    impl BatchTreeReader for Listing<'_> {
+        fn leaves_under(&self, _version: Version, bit_path: &[bool]) -> anyhow::Result<Option<Vec<(KeyHash, OwnedValue)>>> {
+            self.listed.set(self.listed.get() + 1);
+            let (first, last) = key_range_under(bit_path);
+            let mut leaves: Vec<_> = self.leaves.iter().filter(|(k, _)| k.0 >= first && k.0 <= last).cloned().collect();
+            (self.tamper)(&mut leaves);
+            Ok(Some(leaves))
+        }
+    }
+
+    #[test]
+    fn an_empty_target_takes_a_listed_subtree_checked_against_its_root() {
+        let source = MockTreeStore::new(true);
+        let mut kvs: Vec<(KeyHash, Vec<u8>)> = (0..600u64)
+            .map(|i| (KeyHash(<sha2::Sha256 as sha2::Digest>::digest(i.to_be_bytes()).into()), i.to_be_bytes().to_vec()))
+            .collect();
+        let root = commit(&source, 0, kvs.clone());
+        kvs.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        let empty = MockTreeStore::new(true);
+        let honest = |leaves: &mut Vec<(KeyHash, OwnedValue)>| { let _ = leaves; };
+        for bits in [vec![], vec![true, false, true, true], vec![false; 6], vec![true; 9], vec![false, true]] {
+            let (walked, walked_root) =
+                diff_leaves_under_prefix(&source, 0, &empty, 0, &bits, Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
+            let listing = Listing { source: &source, leaves: kvs.clone(), tamper: honest, listed: Default::default(), nodes: Default::default() };
+            let (listed, listed_root) =
+                diff_leaves_under_prefix(&listing, 0, &empty, 0, &bits, Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
+            assert_eq!(listed, walked, "bits {bits:?}: the listing yields exactly the walked leaves");
+            assert_eq!(listed_root, walked_root);
+            assert!(listed.len() < 2 || listing.listed.get() == 1, "bits {bits:?}: a subtree is listed in one call");
+            assert!(listing.nodes.get() <= 4, "bits {bits:?}: only the descent is read node by node, {} nodes", listing.nodes.get());
+        }
+
+        // A target holding part of the subtree diffs node by node.
+        let partial = MockTreeStore::new(true);
+        commit(&partial, 0, kvs[..10].to_vec());
+        let listing = Listing { source: &source, leaves: kvs.clone(), tamper: honest, listed: Default::default(), nodes: Default::default() };
+        let (rest, _) = diff_leaves_under_prefix(&listing, 0, &partial, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
+        assert_eq!((rest.len(), listing.listed.get()), (590, 0));
+
+        // A listing that drops, alters, adds or reorders a leaf is refused.
+        let tampers: [fn(&mut Vec<(KeyHash, OwnedValue)>); 4] = [
+            |leaves| { leaves.remove(3); },
+            |leaves| { leaves[5].1.push(0); },
+            |leaves| { let mut extra = leaves[0].0; extra.0[31] ^= 1; leaves.insert(0, (extra, vec![1])); leaves.sort_by(|a, b| a.0 .0.cmp(&b.0 .0)); },
+            |leaves| leaves.swap(1, 2),
+        ];
+        for tamper in tampers {
+            let listing = Listing { source: &source, leaves: kvs.clone(), tamper, listed: Default::default(), nodes: Default::default() };
+            let error = diff_leaves_under_prefix(&listing, 0, &empty, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap_err();
+            assert!(error.to_string().contains("listed leaves"), "{error}");
+        }
     }
 }

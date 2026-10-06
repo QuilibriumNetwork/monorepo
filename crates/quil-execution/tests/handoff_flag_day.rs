@@ -48,7 +48,7 @@ fn seed(state: &HypergraphState, n: u8, seniority: u64, filters: &[(&[u8], u64)]
         let class = "allocation:ProverAllocation";
         write_field(&mut allocation, class, "Status", &[1]).unwrap();
         write_field(&mut allocation, class, "JoinConfirmFrameNumber", &confirmed.to_be_bytes()).unwrap();
-        write_field(&mut allocation, class, "Epoch", &(ACTIVATION / EPOCH).to_be_bytes()).unwrap();
+        write_field(&mut allocation, class, "Epoch", &(ACTIVATION / EPOCH + 5).to_be_bytes()).unwrap();
         state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &allocation_address, &va, 1, vertex_tree_to_blob(&allocation)).unwrap();
         atoms.push((allocation_address, allocation));
     }
@@ -87,7 +87,7 @@ fn install_policy() {
     quil_types::consensus::set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
         activation_frame: ACTIVATION,
         chain_id: [0x51; 32],
-        legacy_history: LegacyHistory::Discard, membership_boundary_frame: u64::MAX
+        legacy_history: LegacyHistory::Discard, membership_boundary_frame: ACTIVATION, first_session_boundary_frame: u64::MAX,
     }));
 }
 
@@ -206,6 +206,31 @@ fn the_flag_day_keys_allocations_moves_off_grid_ones_and_seats_seniority_rings()
     let state = HypergraphState::new(crdt.clone());
     intrinsic.apply_due_shard_changes(ACTIVATION + 8, &state).unwrap();
     assert_eq!(status(&state, &twice, &left), Some(1));
+    state.commit().unwrap();
+    state.abort();
+    crdt.commit(ACTIVATION + 8).unwrap();
+
+    // A prover that becomes eligible mid-epoch waits for the next boundary:
+    // the mid-epoch pass (which skips the prover scan) schedules nothing.
+    let state = HypergraphState::new(crdt.clone());
+    let late = seed(&state, 8, 1, &[(&left, 0)]);
+    state.commit().unwrap();
+    state.abort();
+    crdt.commit(ACTIVATION + 9).unwrap();
+    let state = HypergraphState::new(crdt.clone());
+    intrinsic.apply_due_shard_changes(ACTIVATION + 16, &state).unwrap();
+    let current = handoff::head(&state, &left).unwrap().unwrap();
+    assert!(handoff::schedule::closing_request(&state, &current).unwrap().is_none(),
+        "membership is frozen within the epoch");
+    state.commit().unwrap();
+    state.abort();
+    crdt.commit(ACTIVATION + 16).unwrap();
+    let state = HypergraphState::new(crdt.clone());
+    intrinsic.apply_due_shard_changes(ACTIVATION + EPOCH, &state).unwrap();
+    let request = handoff::schedule::closing_request(&state, &current).unwrap()
+        .expect("the epoch's first pass schedules the successor");
+    let request = handoff::request(&state, &request).unwrap().unwrap();
+    assert!(request.targets[0].committee.members.contains(&late.key));
 }
 
 fn put_split(shards: &Arc<dyn ShardsStore>, db: &quil_store::RocksDb, parent: &[u8], children: Vec<Vec<u8>>, epoch: u64) {

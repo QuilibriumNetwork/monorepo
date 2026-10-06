@@ -432,7 +432,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     // Forest reads this node served to syncing peers (since
                     // start): cache hits take no storage slot.
                     let forest = quil_rpc::global_service::forest_read_stats();
-                    if forest.cache.hits + forest.cache.misses + forest.refused > 0 {
+                    if forest.cache.hits + forest.cache.misses + forest.refused + forest.listed > 0 {
                         info!(
                             cache_hits = forest.cache.hits,
                             cache_misses = forest.cache.misses,
@@ -440,6 +440,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             cache_entries = forest.cache.entries,
                             refused_busy = forest.refused,
                             queued = forest.queued,
+                            leaves_listed = forest.listed,
                             "forest reads served",
                         );
                     }

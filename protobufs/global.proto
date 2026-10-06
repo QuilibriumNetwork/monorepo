@@ -741,6 +741,46 @@ message GetForestValuesRequest {
 message GetForestValuesResponse {
   repeated ForestReadResult values = 1;
 }
+// Every leaf of a shard/phase tree with a key in [first, last] after `after`,
+// each at its newest value at or below `version`, in key order: a bootstrap
+// lists its whole subtree in a few sequential reads instead of walking it.
+// An owner's legacy (transparent) coins, ascending by address. Owner,
+// amount and origin are public; served from an archive's owner index.
+message ListLegacyCoinsRequest {
+  bytes domain = 1;
+  bytes owner = 2;   // 32 bytes
+  bytes after = 3;   // coin address cursor; empty starts
+}
+message LegacyCoin {
+  bytes address = 1;
+  bytes amount = 2;  // 16 bytes, little-endian
+  bytes origin = 3;
+  bool shielded = 4; // GLOBAL recorded it consumed by a shield
+}
+message ListLegacyCoinsResponse {
+  repeated LegacyCoin coins = 1;
+  bytes cursor = 2;
+  bool has_more = 3;
+}
+message GetForestLeavesRequest {
+  bytes shard_id = 1;
+  uint32 phase = 2;
+  uint64 version = 3;
+  // 32 bytes each.
+  bytes first = 4;
+  bytes last = 5;
+  // Continue after this key (32 bytes); empty starts at `first`.
+  bytes after = 6;
+}
+message ForestLeaf {
+  bytes key_hash = 1;
+  bytes value = 2;
+}
+message GetForestLeavesResponse {
+  repeated ForestLeaf leaves = 1;
+  // More leaves may follow the last one listed.
+  bool more = 2;
+}
 message VertexBlobKey {
   bytes id = 1;
   // Read as of this tree version (latest version at or below it).
@@ -847,6 +887,7 @@ service GlobalService {
   rpc GetForestNodes(GetForestNodesRequest) returns (GetForestNodesResponse);
   rpc GetForestValues(GetForestValuesRequest) returns (GetForestValuesResponse);
   rpc GetVertexBlobs(GetVertexBlobsRequest) returns (GetVertexBlobsResponse);
+  rpc GetForestLeaves(GetForestLeavesRequest) returns (GetForestLeavesResponse);
   rpc GetGlobalVertexProof(GetGlobalVertexProofRequest) returns (GetGlobalVertexProofResponse);
   rpc GetArchiveEndpoints(GetArchiveEndpointsRequest) returns (GetArchiveEndpointsResponse);
   rpc ResolveRoot(ResolveRootRequest) returns (ResolveRootResponse);
@@ -875,6 +916,9 @@ service AppShardService {
   // snapshot-pinned, address-ordered, cursor-continued. A node that does not
   // serve the application refuses rather than returning an empty page.
   rpc ListShardCoins (ListShardCoinsRequest) returns (ListShardCoinsResponse);
+  // Peer-to-peer legacy coin listing, answered only from the serving node's
+  // own owner index (never forwarded again).
+  rpc ListShardLegacyCoins (ListLegacyCoinsRequest) returns (ListLegacyCoinsResponse);
   // Peer-to-peer coin witnesses: the membership paths a wallet needs to SPEND
   // a coin. A forwarded scan shows a balance; without this the holder still
   // cannot move it from a node that does not cover the application.

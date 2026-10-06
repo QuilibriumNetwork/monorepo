@@ -294,6 +294,22 @@ pub trait ForestServer: Send + Sync {
     /// tree version the diff addressed (`None` means latest).
     fn serve_vertex_blob(&self, shard_key: &[u8], phase: u32, id: &[u8], version: Option<u64>)
         -> Option<Vec<u8>>;
+    /// Leaves of a shard/phase tree with keys in `[first, last]` after `after`,
+    /// each at its newest value at or below `version`, in key order, at most
+    /// [`MAX_FOREST_LEAVES`] and about [`MAX_FOREST_BATCH_BYTES`], and whether
+    /// more may follow. `None` when this server cannot list leaves.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_leaves(
+        &self,
+        _shard_id: &[u8],
+        _phase: u32,
+        _version: u64,
+        _first: &[u8; 32],
+        _last: &[u8; 32],
+        _after: Option<&[u8; 32]>,
+    ) -> Option<(Vec<([u8; 32], Vec<u8>)>, bool)> {
+        None
+    }
     /// Sync-by-hash: authenticated tree `root` → local `(version, global_frame)`
     /// for a `(shard_id, phase)` tree. None if never committed here or pruned.
     fn resolve_root(&self, shard_id: &[u8], phase: u32, root: [u8; 32]) -> Option<(u64, u64)>;
@@ -394,10 +410,17 @@ pub struct GlobalRpcServer {
 
 // Shared across peer-facing server instances. A cancelled RPC keeps its
 // permit inside the blocking closure until storage work actually finishes.
-// Sixteen concurrent storage reads; a batched request reads up to
-// `MAX_FOREST_BATCH_KEYS` keys under one slot, and cached nodes and values
-// (`forest_read_cache`) take no slot at all.
-static FOREST_READ_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+// `QUIL_FOREST_READ_SLOTS` concurrent storage reads (default 32); a batched
+// request reads up to `MAX_FOREST_BATCH_KEYS` keys under one slot, and cached
+// nodes and values (`forest_read_cache`) take no slot at all. Sixteen kept
+// an archive's disk below its queue depth while syncs waited on it.
+static FOREST_READ_WORKERS: std::sync::LazyLock<tokio::sync::Semaphore> = std::sync::LazyLock::new(|| {
+    let slots = std::env::var("QUIL_FOREST_READ_SLOTS").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| (1..=1024).contains(n))
+        .unwrap_or(32);
+    tokio::sync::Semaphore::new(slots)
+});
 static HISTORY_FORWARD_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 /// How long a forest read waits for a storage slot before the archive answers
@@ -413,6 +436,9 @@ const MAX_FOREST_READ_WAITERS: usize = 64;
 const FOREST_READ_SLOTS_PER_PEER: usize = 8;
 /// Keys one batched forest read may name.
 pub const MAX_FOREST_BATCH_KEYS: usize = 512;
+/// Leaves one leaf listing returns (vertex leaves are 40 bytes, so about
+/// 4.7 MB of keys and values).
+pub const MAX_FOREST_LEAVES: usize = 65_536;
 /// A batched response stops (answering a prefix) once it carries this many
 /// bytes; the client asks again for the rest.
 pub const MAX_FOREST_BATCH_BYTES: usize = 8 * 1024 * 1024;
@@ -420,6 +446,7 @@ pub const MAX_FOREST_BATCH_BYTES: usize = 8 * 1024 * 1024;
 static FOREST_READ_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static FOREST_READ_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FOREST_READ_QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FOREST_LEAVES_LISTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FOREST_READ_PEER_SLOTS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<Vec<u8>, usize>>> =
     std::sync::LazyLock::new(Default::default);
 
@@ -430,6 +457,8 @@ pub struct ForestReadStats {
     pub cache: crate::forest_read_cache::ForestReadCacheStats,
     pub refused: u64,
     pub queued: u64,
+    /// Leaves served by bootstrap listings (no per-node reads).
+    pub listed: u64,
 }
 
 pub fn forest_read_stats() -> ForestReadStats {
@@ -437,6 +466,7 @@ pub fn forest_read_stats() -> ForestReadStats {
         cache: crate::forest_read_cache::ForestReadCache::process().stats(),
         refused: FOREST_READ_REFUSED.load(std::sync::atomic::Ordering::Relaxed),
         queued: FOREST_READ_QUEUED.load(std::sync::atomic::Ordering::Relaxed),
+        listed: FOREST_LEAVES_LISTED.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 
@@ -483,7 +513,7 @@ async fn forest_read<T: Send + 'static>(
     read: impl FnOnce(&dyn ForestServer) -> Option<T> + Send + 'static,
 ) -> Result<Option<T>, Status> {
     let Some(server) = server else { return Ok(None) };
-    bounded_forest_read(&FOREST_READ_WORKERS, FOREST_READ_WAIT, peer, move || read(server.as_ref())).await
+    bounded_forest_read(&*FOREST_READ_WORKERS, FOREST_READ_WAIT, peer, move || read(server.as_ref())).await
 }
 
 /// Run `read` on a storage slot. A free slot is taken at once; otherwise the
@@ -1327,6 +1357,33 @@ impl GlobalService for GlobalRpcServer {
             }).await?.unwrap_or_else(|| vec![global::ForestReadResult::default(); unserved])
         };
         Ok(Response::new(global::GetForestValuesResponse { values }))
+    }
+
+    async fn get_forest_leaves(
+        &self,
+        request: Request<global::GetForestLeavesRequest>,
+    ) -> Result<Response<global::GetForestLeavesResponse>, Status> {
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        let key = |bytes: &[u8], name: &str| -> Result<[u8; 32], Status> {
+            bytes.try_into().map_err(|_| Status::invalid_argument(format!("{name} must be 32 bytes")))
+        };
+        let (first, last) = (key(&req.first, "first")?, key(&req.last, "last")?);
+        let after = if req.after.is_empty() { None } else { Some(key(&req.after, "after")?) };
+        let (shard_id, phase, version) = (req.shard_id, req.phase, req.version);
+        let listed = forest_read(self.forest_server.clone(), peer, move |s| {
+            s.serve_leaves(&shard_id, phase, version, &first, &last, after.as_ref())
+        }).await?;
+        let Some((leaves, more)) = listed else {
+            return Err(Status::unimplemented("this archive does not list forest leaves"));
+        };
+        FOREST_LEAVES_LISTED.fetch_add(leaves.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(Response::new(global::GetForestLeavesResponse {
+            leaves: leaves.into_iter()
+                .map(|(key_hash, value)| global::ForestLeaf { key_hash: key_hash.to_vec(), value })
+                .collect(),
+            more,
+        }))
     }
 
     async fn get_vertex_blobs(

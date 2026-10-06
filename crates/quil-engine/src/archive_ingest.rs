@@ -460,7 +460,7 @@ impl ArchiveAppShardIngest {
                 frame = next,
                 processed = materialized.processed,
                 skipped = materialized.skipped,
-                address = %hex::encode(&address[..address.len().min(8)]),
+                address = %hex::encode(address),
                 "archive materialized shard frame"
             );
         };
