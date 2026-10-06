@@ -1,4 +1,5 @@
 pub mod blossomsub_behaviour;
+pub mod direct;
 pub mod ed448_identity;
 pub mod falcon_identity;
 pub mod ed448_noise;
@@ -27,6 +28,7 @@ pub use falcon_identity::{
     peer_id_from_falcon_pubkey,
 };
 pub use node::{P2PHandle, P2PNode, ReceivedMessage};
+pub use direct::{DirectOutcome, DirectStatsSnapshot};
 pub use pqnoise_transport::{upgrade as pq_upgrade, PqNoiseError, PqOutput};
 pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{

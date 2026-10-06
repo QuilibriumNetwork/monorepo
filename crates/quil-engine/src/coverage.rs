@@ -508,8 +508,9 @@ pub fn build_shard_inventory(
     shards_store: std::sync::Arc<dyn quil_types::store::ShardsStore>,
     prover_registry: &dyn ProverRegistry,
     frame_number: u64,
+    sizes: &std::sync::Arc<crate::shard_info::CommittedShardSizes>,
 ) -> Vec<ShardCoverageEntry> {
-    let get_sizes = crate::shard_info::local_app_shard_get_sizes(crdt, shards_store.clone());
+    let get_sizes = crate::shard_info::local_app_shard_get_sizes(crdt, shards_store.clone(), sizes.clone());
     let mut out: Vec<ShardCoverageEntry> = Vec::new();
     let Ok(shards) = shards_store.range_app_shards() else {
         return out;

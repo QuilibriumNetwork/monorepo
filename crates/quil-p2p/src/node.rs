@@ -21,6 +21,8 @@ pub struct ReceivedMessage {
     pub bitmask: Vec<u8>,
     pub data: Vec<u8>,
     pub from: Vec<u8>,
+    /// Delivered point-to-point ([`crate::direct`]) rather than by gossip.
+    pub direct: bool,
 }
 
 /// The P2P node.
@@ -470,6 +472,16 @@ impl P2PNode {
                 let connection_limits =
                     libp2p::connection_limits::Behaviour::new(conn_limits);
 
+                let direct = libp2p::request_response::Behaviour::new(
+                    [(
+                        crate::direct::direct_protocol(network),
+                        libp2p::request_response::ProtocolSupport::Full,
+                    )],
+                    libp2p::request_response::Config::default()
+                        .with_request_timeout(crate::direct::DIRECT_REQUEST_TIMEOUT)
+                        .with_max_concurrent_streams(256),
+                );
+
                 Ok(NodeBehaviour {
                     connection_limits,
                     kademlia,
@@ -477,6 +489,7 @@ impl P2PNode {
                     identify,
                     blossomsub,
                     autonat,
+                    direct,
                 })
             })
             .map_err(|e| QuilError::P2p(format!("behaviour: {}", e)))?
@@ -564,8 +577,21 @@ impl P2PNode {
             crate::metrics::SwarmMetrics::register(reg.sub_registry_with_prefix("libp2p"))
         };
 
+        let direct_stats: std::sync::Arc<crate::direct::DirectStats> = Default::default();
+        let loop_direct_stats = direct_stats.clone();
         sup.spawn("p2p-swarm", move |cancel_token| async move {
             debug!("P2P swarm event loop started");
+            let direct_stats = loop_direct_stats;
+            // Direct delivery state: sends awaiting their outcome, peers that
+            // lack the protocol (until `UNSUPPORTED_RETRY_AFTER`), and the
+            // bitmasks this node takes direct messages on.
+            let mut direct_pending: std::collections::HashMap<
+                libp2p::request_response::OutboundRequestId,
+                oneshot::Sender<crate::direct::DirectOutcome>,
+            > = std::collections::HashMap::new();
+            let mut direct_unsupported: std::collections::HashMap<PeerId, std::time::Instant> =
+                std::collections::HashMap::new();
+            let mut direct_allowed: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             let mut bootstrapped = false;
             let mut discovery_timer = tokio::time::interval(Duration::from_secs(30));
             discovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -899,14 +925,64 @@ impl P2PNode {
                                         _ => {}
                                     }
                                 }
+                                NodeBehaviourEvent::Direct(event) => {
+                                    use crate::direct::DirectOutcome;
+                                    use libp2p::request_response::{Event, Message, OutboundFailure};
+                                    match event {
+                                        Event::Message { peer, message: Message::Request { request, channel, .. }, .. } => {
+                                            // Delivered as a gossip message on its bitmask would
+                                            // be, from the authenticated connection's peer.
+                                            let accepted = direct_allowed.contains(&request.bitmask)
+                                                && msg_tx.try_send(ReceivedMessage {
+                                                    bitmask: request.bitmask,
+                                                    data: request.data,
+                                                    from: peer.to_bytes(),
+                                                    direct: true,
+                                                }).is_ok();
+                                            let counter = if accepted { &direct_stats.received } else { &direct_stats.received_refused };
+                                            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            let _ = swarm.behaviour_mut().direct.send_response(channel, accepted);
+                                        }
+                                        Event::Message { message: Message::Response { request_id, response }, .. } => {
+                                            if let Some(ack) = direct_pending.remove(&request_id) {
+                                                let outcome = if response { DirectOutcome::Delivered } else { DirectOutcome::Refused };
+                                                direct_stats.note(outcome);
+                                                let _ = ack.send(outcome);
+                                            }
+                                        }
+                                        Event::OutboundFailure { peer, request_id, error, .. } => {
+                                            let outcome = match error {
+                                                OutboundFailure::UnsupportedProtocols => {
+                                                    direct_unsupported.insert(peer, std::time::Instant::now());
+                                                    DirectOutcome::Unsupported
+                                                }
+                                                OutboundFailure::DialFailure => DirectOutcome::NotConnected,
+                                                other => {
+                                                    debug!(%peer, error = %other, "direct send failed");
+                                                    DirectOutcome::Failed
+                                                }
+                                            };
+                                            if let Some(ack) = direct_pending.remove(&request_id) {
+                                                direct_stats.note(outcome);
+                                                let _ = ack.send(outcome);
+                                            }
+                                        }
+                                        Event::InboundFailure { peer, error, .. } => {
+                                            debug!(%peer, %error, "direct receive failed");
+                                        }
+                                        Event::ResponseSent { .. } => {}
+                                    }
+                                }
                                 NodeBehaviourEvent::Blossomsub(bss_event) => match bss_event {
                                     BlossomSubEvent::Message {
                                         message, ..
                                     } => {
+                                        // Moved, not copied: the event owns the message.
                                         let _ = msg_tx.try_send(ReceivedMessage {
-                                            bitmask: message.bitmask.clone(),
-                                            data: message.data.clone(),
-                                            from: message.from.clone(),
+                                            bitmask: message.bitmask,
+                                            data: message.data,
+                                            from: message.from,
+                                            direct: false,
                                         });
                                     }
                                     BlossomSubEvent::Subscribed { peer_id, bitmask } => {
@@ -983,6 +1059,39 @@ impl P2PNode {
                                     let _ = ack.send(result);
                                 }
                             }
+                            Some(P2PCommand::SendDirect { peer, bitmask, data, ack }) => {
+                                use crate::direct::DirectOutcome;
+                                let now = std::time::Instant::now();
+                                direct_unsupported.retain(|_, since| now.duration_since(*since) < crate::direct::UNSUPPORTED_RETRY_AFTER);
+                                // Only an existing connection: no dial, so a send
+                                // never waits on reaching a peer behind NAT.
+                                let refused = if direct_unsupported.contains_key(&peer) {
+                                    Some(DirectOutcome::Unsupported)
+                                } else if !swarm.is_connected(&peer) {
+                                    Some(DirectOutcome::NotConnected)
+                                } else {
+                                    None
+                                };
+                                match refused {
+                                    Some(outcome) => {
+                                        direct_stats.note(outcome);
+                                        let _ = ack.send(outcome);
+                                    }
+                                    None => {
+                                        let id = swarm.behaviour_mut().direct.send_request(
+                                            &peer,
+                                            crate::direct::DirectRequest { bitmask, data },
+                                        );
+                                        direct_pending.insert(id, ack);
+                                    }
+                                }
+                            }
+                            Some(P2PCommand::AllowDirect(bitmask)) => {
+                                direct_allowed.insert(bitmask);
+                            }
+                            Some(P2PCommand::RevokeDirect(bitmask)) => {
+                                direct_allowed.remove(&bitmask);
+                            }
                             Some(P2PCommand::BlacklistPeer(peer_id)) => {
                                 debug!(%peer_id, "blacklisting peer");
                                 swarm.behaviour_mut().blossomsub.blacklist_peer(peer_id);
@@ -1044,7 +1153,7 @@ impl P2PNode {
         });
 
         Ok((
-            P2PHandle { peer_id, cmd_tx, observed_addrs, peer_count, metrics_registry },
+            P2PHandle { peer_id, cmd_tx, observed_addrs, peer_count, metrics_registry, direct_stats },
             msg_rx,
         ))
     }
@@ -1061,6 +1170,7 @@ pub struct P2PHandle {
     /// P2P prometheus registry (`blossomsub_*` + `libp2p_*` families),
     /// rendered on demand via [`render_metrics`](Self::render_metrics).
     metrics_registry: crate::metrics::SharedRegistry,
+    direct_stats: std::sync::Arc<crate::direct::DirectStats>,
 }
 
 impl P2PHandle {
@@ -1369,6 +1479,41 @@ impl P2PHandle {
         let _ = self.cmd_tx.send(P2PCommand::Shutdown).await;
     }
 
+    /// Deliver `data` on `bitmask` to `peer` over an existing connection
+    /// ([`crate::direct`]). Anything but `Delivered` means the caller should
+    /// use gossip.
+    pub async fn send_direct(
+        &self,
+        peer: PeerId,
+        bitmask: Vec<u8>,
+        data: Vec<u8>,
+    ) -> crate::direct::DirectOutcome {
+        let (ack, outcome) = oneshot::channel();
+        if self.cmd_tx.send(P2PCommand::SendDirect { peer, bitmask, data, ack }).await.is_err() {
+            return crate::direct::DirectOutcome::Failed;
+        }
+        outcome.await.unwrap_or(crate::direct::DirectOutcome::Failed)
+    }
+
+    /// Accept direct messages on `bitmask` (delivered like its gossip).
+    pub async fn allow_direct(&self, bitmask: Vec<u8>) {
+        let _ = self.cmd_tx.send(P2PCommand::AllowDirect(bitmask)).await;
+    }
+
+    /// Stop accepting direct messages on `bitmask`.
+    pub async fn revoke_direct(&self, bitmask: Vec<u8>) {
+        let _ = self.cmd_tx.send(P2PCommand::RevokeDirect(bitmask)).await;
+    }
+
+    /// Record that a send went over gossip after its direct attempt.
+    pub fn note_direct_fallback(&self) {
+        self.direct_stats.fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn direct_stats(&self) -> crate::direct::DirectStatsSnapshot {
+        self.direct_stats.snapshot()
+    }
+
     /// Externally observed addresses (NAT-resolved) as reported by
     /// connected peers via the identify protocol.
     pub fn observed_addresses(&self) -> Vec<String> {
@@ -1407,6 +1552,7 @@ impl P2PHandle {
             metrics_registry: std::sync::Arc::new(std::sync::Mutex::new(
                 prometheus_client::registry::Registry::default(),
             )),
+            direct_stats: Default::default(),
         }
     }
 }
@@ -1437,6 +1583,17 @@ enum P2PCommand {
         ack: Option<oneshot::Sender<std::result::Result<(), String>>>,
     },
     BlacklistPeer(PeerId),
+    /// Deliver `data` on `bitmask` to one connected peer ([`crate::direct`]).
+    SendDirect {
+        peer: PeerId,
+        bitmask: Vec<u8>,
+        data: Vec<u8>,
+        ack: oneshot::Sender<crate::direct::DirectOutcome>,
+    },
+    /// Accept direct messages on `bitmask`.
+    AllowDirect(Vec<u8>),
+    /// Stop accepting direct messages on `bitmask`.
+    RevokeDirect(Vec<u8>),
     /// Read a peer's current score (computed + application override).
     GetPeerScore {
         peer: PeerId,
@@ -1478,6 +1635,8 @@ struct NodeBehaviour {
     identify: libp2p::identify::Behaviour,
     blossomsub: BlossomSubBehaviour,
     autonat: libp2p::autonat::Behaviour,
+    /// Point-to-point delivery to a connected peer; see [`crate::direct`].
+    direct: libp2p::request_response::Behaviour<crate::direct::DirectCodec>,
 }
 
 /// Compute the BlossomSub message ID: `[0x01, SHA256(data)...]` —

@@ -843,7 +843,7 @@ fn scan_of(assignments: &[(&[u8], &[FalconPrivateKey])]) -> crate::prover_regist
 }
 
 fn policy() -> quil_types::consensus::CommitteeHandoffPolicy {
-    quil_types::consensus::CommitteeHandoffPolicy { activation_frame: 2, chain_id: [0x11; 32] }
+    quil_types::consensus::CommitteeHandoffPolicy { activation_frame: 2, chain_id: [0x11; 32], legacy_history: quil_types::consensus::LegacyHistory::Migrate, membership_boundary_frame: u64::MAX, first_session_boundary_frame: u64::MAX}
 }
 
 #[test]
@@ -881,13 +881,73 @@ fn scheduler_authorizes_first_sessions_and_membership_successors_once() {
     assert_eq!(schedule::reconcile_membership(&state, 5, &policy(), &filters, &changed).unwrap(), 0,
         "a closing source is not scheduled twice");
     let request = request(&state, &request_id).unwrap().unwrap();
-    assert!(apply_submission(&state, 6, &submission(&request, 0, &old, 3)).unwrap());
+    let closing = submission(&request, 0, &old, 3);
+    assert!(!submission_settled(&state, &closing).unwrap());
+    assert!(apply_submission(&state, 6, &closing).unwrap());
+    assert!(submission_settled(&state, &closing).unwrap(), "a recorded seal is settled");
     commit(&state, 6);
     assert!(schedule::seal_submitted(&state, &first).unwrap());
     assert!(schedule::closing_request(&state, &first).is_err(), "a retired session has no parent");
     let second = head(&state, &filter).unwrap().unwrap();
     assert_eq!((second.generation, second.base_frame, second.members.clone()), (2, 3, members(&new)));
     assert_eq!(schedule::reconcile_membership(&state, 7, &policy(), &filters, &changed).unwrap(), 0);
+}
+
+/// From `membership_boundary_frame` a changed eligible set replaces a session
+/// only at the first pass of an epoch; before it, at any pass.
+#[test]
+fn membership_successors_wait_for_the_epoch_boundary() {
+    let epoch = quil_types::consensus::epoch_length_frames();
+    let pass = |frame: u64| frame - frame % schedule::SESSION_PASS_FRAMES;
+    for (rule_from, mid_epoch_schedules) in [(0u64, false), (u64::MAX, true)] {
+        let policy = quil_types::consensus::CommitteeHandoffPolicy {
+            membership_boundary_frame: rule_from,
+            ..policy()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(directory.path()).unwrap();
+        let (_store, state) = make_state(&db);
+        commit(&state, 1);
+        let filter = vec![7u8; 32];
+        let filters = vec![filter.clone()];
+        let old = keys();
+        assert_eq!(schedule::reconcile_membership(&state, 2, &policy, &filters, &scan_of(&[(&filter, &old)])).unwrap(), 1,
+            "a first session is authorized at any pass");
+        commit(&state, 2);
+        let mut new = keys();
+        new.push(old[0].clone());
+        let changed = scan_of(&[(&filter, &new)]);
+        let mid = pass(epoch + epoch / 2);
+        assert!(!schedule::first_pass_of_epoch(mid));
+        assert_eq!(schedule::reconcile_membership(&state, mid, &policy, &filters, &changed).unwrap(),
+            usize::from(mid_epoch_schedules));
+        if !mid_epoch_schedules {
+            assert!(schedule::first_pass_of_epoch(2 * epoch));
+            assert_eq!(schedule::reconcile_membership(&state, 2 * epoch, &policy, &filters, &changed).unwrap(), 1,
+                "the boundary pass replaces the committee");
+        }
+    }
+}
+
+/// From `first_session_boundary_frame` a shard's first session is also
+/// authorized only at the first pass of an epoch.
+#[test]
+fn first_sessions_wait_for_the_epoch_boundary() {
+    let epoch = quil_types::consensus::epoch_length_frames();
+    let policy = quil_types::consensus::CommitteeHandoffPolicy { first_session_boundary_frame: 0, ..policy() };
+    let directory = tempfile::tempdir().unwrap();
+    let db = quil_store::RocksDb::open(directory.path()).unwrap();
+    let (_store, state) = make_state(&db);
+    commit(&state, 1);
+    let filter = vec![7u8; 32];
+    let filters = vec![filter.clone()];
+    let scan = scan_of(&[(&filter, &keys())]);
+    let mid = epoch + epoch / 2 - (epoch / 2) % schedule::SESSION_PASS_FRAMES;
+    assert!(!schedule::first_pass_of_epoch(mid));
+    assert_eq!(schedule::reconcile_membership(&state, mid, &policy, &filters, &scan).unwrap(), 0);
+    assert!(head(&state, &filter).unwrap().is_none());
+    assert_eq!(schedule::reconcile_membership(&state, 2 * epoch, &policy, &filters, &scan).unwrap(), 1,
+        "the boundary pass authorizes the first session");
 }
 
 #[test]

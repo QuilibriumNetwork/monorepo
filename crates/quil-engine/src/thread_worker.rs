@@ -17,6 +17,10 @@ use quil_types::error::{QuilError, Result};
 
 use crate::worker::{WorkerInfo, WorkerManager};
 
+/// Archive shard recoveries this process runs at once (see the recovery
+/// spawn below).
+static SHARD_RECOVERY_TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 /// Message from master to worker.
 #[derive(Debug)]
 pub enum MasterToWorker {
@@ -100,6 +104,9 @@ pub enum WorkerToMaster {
         filter: Vec<u8>,
         channel: u64,
         bytes: Vec<u8>,
+        /// Committee keys a resolver message is addressed to (empty: the
+        /// whole topic); see `AppEngineEvent::CwOut`.
+        recipients: Vec<Vec<u8>>,
     },
     /// A shard worker has spun up an `AppConsensusEngine` for `filter`.
     /// The master uses this to populate a `filter → AppEngineHandle`
@@ -231,6 +238,9 @@ pub struct WorkerOwnedDeps {
     pub storage_history_source: Option<crate::storage_history::GlobalVertexProofSource>,
     /// Archive source of a predecessor's outgoing records for successor checks.
     pub outgoing_history_source: Option<crate::app_handoff::OutgoingHistorySource>,
+    /// Committees that certified legacy frames today's registry no longer
+    /// reproduces (see `historical_committee`).
+    pub historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
 }
 
 /// Thread-based worker manager. Core 0 is reserved for the master;
@@ -613,6 +623,8 @@ impl ThreadWorkerManager {
                                                         owned.as_ref().and_then(|o| o.storage_history_source.clone()),
                                                     ).with_outgoing_history_source(
                                                         owned.as_ref().and_then(|o| o.outgoing_history_source.clone()),
+                                                    ).with_historical_committee_source(
+                                                        owned.as_ref().and_then(|o| o.historical_committee_source.clone()),
                                                     );
 
                                                     // Tell the master a shard engine just came online.
@@ -723,13 +735,14 @@ impl ThreadWorkerManager {
                                                                         }
                                                                     ).await;
                                                                 }
-                                                                crate::app_engine::AppEngineEvent::CwOut { filter, channel, bytes } => {
+                                                                crate::app_engine::AppEngineEvent::CwOut { filter, channel, bytes, recipients } => {
                                                                     let _ = master_tx_events.send(
                                                                         WorkerToMaster::CwConsensus {
                                                                             core_id,
                                                                             filter,
                                                                             channel,
                                                                             bytes,
+                                                                            recipients,
                                                                         }
                                                                     ).await;
                                                                 }
@@ -761,6 +774,10 @@ impl ThreadWorkerManager {
                                                                     let release_sync = ReleaseSyncFlag(flag);
                                                                     tokio::spawn(async move {
                                                                         let _release_sync = release_sync;
+                                                                        // A node's workers share its archive identity and
+                                                                        // so its per-peer read slots: a few recover at a
+                                                                        // time rather than all failing busy together.
+                                                                        let _turn = SHARD_RECOVERY_TURNS.acquire().await;
                                                                         match crate::prover_tree_syncer::recover_shard_from_latest(
                                                                             syncer.as_ref(), &filter, local, &lb,
                                                                         ).await {

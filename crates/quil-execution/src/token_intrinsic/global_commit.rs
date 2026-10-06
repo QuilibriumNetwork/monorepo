@@ -26,6 +26,18 @@ use std::collections::BTreeSet;
 pub const ENTRY_VERSION: &[u8; 8] = b"QCT3SE\0\x01";
 /// Consume-once markers one operation may spend.
 pub const MAX_CONSUMPTIONS: usize = 16;
+
+/// Consumptions one entry may carry at GLOBAL frame `frame`: a shield's
+/// sources from the batch shield frame (one marker each), every other
+/// operation's [`MAX_CONSUMPTIONS`]. Before that frame a shield is held to the
+/// same limit as everything else, so earlier frames replay unchanged.
+pub fn max_consumptions(kind: u32, frame: u64) -> usize {
+    if kind == crate::token_engine::TYPE_LATTICE_SHIELD && frame >= batch_shield_frame() {
+        quil_lattice_ct::confidential::shield::MAX_SHIELD_SOURCES
+    } else {
+        MAX_CONSUMPTIONS
+    }
+}
 /// Outputs one operation may create.
 pub const MAX_OUTPUTS: usize = 16;
 /// Deliveries a block can ever receive: its local index space.
@@ -133,8 +145,9 @@ impl<'a> Reader<'a> {
 }
 
 impl SpendEntry {
-    fn validate(&self) -> Result<()> {
-        if self.consumptions.len() > MAX_CONSUMPTIONS || self.outputs.len() > MAX_OUTPUTS {
+    /// Structural bounds at GLOBAL frame `frame` (see [`max_consumptions`]).
+    fn validate_at(&self, frame: u64) -> Result<()> {
+        if self.consumptions.len() > max_consumptions(self.kind, frame) || self.outputs.len() > MAX_OUTPUTS {
             return Err(invalid("too many consumptions or outputs"));
         }
         if self.consumptions.iter().collect::<BTreeSet<_>>().len() != self.consumptions.len()
@@ -151,8 +164,11 @@ impl SpendEntry {
         Ok(())
     }
 
+    /// The executing shard encodes an entry only for an operation it admitted,
+    /// which is where the batch shield frame is enforced; here only the
+    /// largest bounds any frame allows apply.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        self.validate()?;
+        self.validate_at(u64::MAX)?;
         let mut bytes = ENTRY_VERSION.to_vec();
         bytes.extend_from_slice(&self.kind.to_be_bytes());
         bytes.extend_from_slice(&self.tx_id);
@@ -198,7 +214,13 @@ impl SpendEntry {
         Ok(bytes)
     }
 
+    /// An entry under the bounds of every frame before batch shields.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Self::decode_at(bytes, 0)
+    }
+
+    /// An entry relayed into GLOBAL frame `frame`, under that frame's bounds.
+    pub fn decode_at(bytes: &[u8], frame: u64) -> Result<Self> {
         let mut r = Reader(bytes);
         if r.take(8)? != ENTRY_VERSION {
             return Err(invalid("version"));
@@ -208,7 +230,7 @@ impl SpendEntry {
         let source_frame = u64::from_be_bytes(r.array()?);
         let context = r.array()?;
         let root_digest = if r.flag()? { Some(r.array()?) } else { None };
-        let consumptions = r.list(MAX_CONSUMPTIONS)?;
+        let consumptions = r.list(max_consumptions(kind, frame))?;
         let outputs = r.list(MAX_OUTPUTS)?;
         let escrow_create = if r.flag()? {
             Some(EscrowCreate {
@@ -235,7 +257,7 @@ impl SpendEntry {
             return Err(invalid("trailing bytes"));
         }
         let entry = Self { kind, tx_id, source_frame, context, root_digest, consumptions, outputs, escrow_create, escrow_claim, fee, settlement };
-        entry.validate()?;
+        entry.validate_at(frame)?;
         Ok(entry)
     }
 }
@@ -548,6 +570,58 @@ pub fn orphan_replacement_frame() -> u64 {
     })
 }
 
+// ---- batch shields -----------------------------------------------------------
+
+/// Batch shields (shield encoding version 3, up to
+/// `MAX_SHIELD_SOURCES` legacy coins), their larger spend entries, and the
+/// check that every shield source lies in the executing shard's range, from
+/// this GLOBAL frame: the first-session boundary (owner, 2026-10-06; see
+/// `BATCH_SHIELD.md`). Consensus-affecting for application shards and GLOBAL,
+/// which switch together. Fixed on mainnet; `QUIL_BATCH_SHIELD_FRAME`
+/// elsewhere, never by default.
+pub const MAINNET_BATCH_SHIELD_FRAME: u64 = 864_000;
+
+static BATCH_SHIELD_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static BATCH_SHIELD_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn batch_shield_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_BATCH_SHIELD_FRAME;
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's batch shield frame from its network, and return it.
+/// Called at startup before any frame is processed; the first call decides.
+pub fn init_batch_shield_frame(network: u8) -> u64 {
+    *BATCH_SHIELD_FRAME.get_or_init(|| {
+        batch_shield_frame_for(network, std::env::var("QUIL_BATCH_SHIELD_FRAME").ok().as_deref())
+    })
+}
+
+pub fn batch_shield_frame() -> u64 {
+    if let Some(frame) = BATCH_SHIELD_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *BATCH_SHIELD_FRAME.get_or_init(|| {
+        std::env::var("QUIL_BATCH_SHIELD_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the batch shield frame for the calling thread only (tests).
+pub fn set_batch_shield_frame_for_thread(frame: Option<u64>) {
+    BATCH_SHIELD_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// Whether batch shields are active for an operation whose frame is anchored
+/// at GLOBAL frame `anchor` (none known: not active).
+pub fn batch_shields_active(anchor: Option<u64>) -> bool {
+    anchor.is_some_and(|frame| frame >= batch_shield_frame())
+}
+
 // ---- relay records across the upgrade from the mainnet build ---------------
 
 /// The GLOBAL frame from which application shards relay this release's
@@ -804,7 +878,7 @@ pub fn commit_entry(
     entry: &SpendEntry,
     source_shard: quil_types::execution::ShardPath,
 ) -> Result<Outcome> {
-    entry.validate()?;
+    entry.validate_at(frame)?;
     let decision = decision_address(application, &entry.tx_id)?;
     if read(state, &decision, KIND_DECISION, &[&[0]])?.is_some() {
         return Ok(Outcome::AlreadyDecided);
@@ -940,16 +1014,17 @@ pub fn commit_entry(
     Ok(Outcome::Committed { fee: entry.fee, placements, escrow: escrow_placement })
 }
 
-/// Structural check of a header's spend relay: canonical, inside the header's
-/// window, and every entry a relayed operation type.
-pub fn verify_relay(header_frame: u64, relay: &[u8]) -> Result<Vec<(u64, Vec<SpendEntry>)>> {
+/// Structural check of a header's spend relay committed in GLOBAL frame
+/// `global_frame`: canonical, inside the header's window, and every entry a
+/// relayed operation type within that frame's bounds.
+pub fn verify_relay(global_frame: u64, header_frame: u64, relay: &[u8]) -> Result<Vec<(u64, Vec<SpendEntry>)>> {
     super::spend_relay::decode_relay(header_frame, relay)?
         .into_iter()
         .map(|(frame, entries)| {
             let entries = entries
                 .iter()
                 .map(|bytes| {
-                    let entry = SpendEntry::decode(bytes)?;
+                    let entry = SpendEntry::decode_at(bytes, global_frame)?;
                     if entry.source_frame != frame {
                         return Err(invalid("entry relayed under another source frame"));
                     }
@@ -980,7 +1055,7 @@ pub fn materialize_relay(state: &HypergraphState, frame: u64, filter: &[u8], hea
     };
     let mut fees = 0u128;
     let (mut committed, mut rejected) = (0usize, 0usize);
-    for (_, entries) in verify_relay(header_frame, relay)? {
+    for (_, entries) in verify_relay(frame, header_frame, relay)? {
         for entry in entries {
             match commit_entry(state, frame, &application, &entry, source_shard)? {
                 Outcome::Committed { fee, .. } => {
@@ -1389,4 +1464,66 @@ mod tests {
         assert_eq!(holds(&[false; 7]), 0);
     }
 
+
+    /// A shield entry may carry up to 96 consumptions from the batch shield
+    /// frame, still fitting the relay's entry; before it, and for every other
+    /// operation, the limit stays 16.
+    #[test]
+    fn shield_entries_grow_to_the_batch_limit_only_from_activation() {
+        use crate::token_engine::{TYPE_LATTICE_SHIELD, TYPE_LATTICE_TRANSACTION};
+        let entry = |kind: u32, consumptions: usize| SpendEntry {
+            kind,
+            tx_id: [1; 32],
+            source_frame: 5,
+            context: [2; 32],
+            root_digest: None,
+            consumptions: (0..consumptions).map(|i| { let mut c = [3u8; 32]; c[..8].copy_from_slice(&(i as u64).to_be_bytes()); c }).collect(),
+            outputs: (0..MAX_OUTPUTS).map(|i| [i as u8 + 100; 32]).collect(),
+            escrow_create: None,
+            escrow_claim: None,
+            fee: 7,
+            settlement: None,
+        };
+        let full = entry(TYPE_LATTICE_SHIELD, quil_lattice_ct::confidential::shield::MAX_SHIELD_SOURCES);
+        let bytes = full.encode().unwrap();
+        assert!(bytes.len() <= super::super::spend_relay::MAX_ENTRY_BYTES, "{} bytes", bytes.len());
+        assert!(super::super::spend_relay::encode_frame_entries(&[bytes.clone()]).is_ok());
+        assert!(entry(TYPE_LATTICE_SHIELD, 97).encode().is_err());
+        assert!(entry(TYPE_LATTICE_TRANSACTION, MAX_CONSUMPTIONS + 1).encode().is_err());
+
+        set_batch_shield_frame_for_thread(Some(1_000));
+        assert!(SpendEntry::decode_at(&bytes, 999).is_err(), "before activation a shield entry holds 16");
+        assert!(SpendEntry::decode(&bytes).is_err());
+        assert_eq!(SpendEntry::decode_at(&bytes, 1_000).unwrap(), full);
+        assert_eq!(max_consumptions(TYPE_LATTICE_TRANSACTION, 5_000), MAX_CONSUMPTIONS);
+        assert!(batch_shields_active(Some(1_000)) && !batch_shields_active(Some(999)) && !batch_shields_active(None));
+        set_batch_shield_frame_for_thread(None);
+        assert_eq!(batch_shield_frame_for(0, Some("5")), MAINNET_BATCH_SHIELD_FRAME, "fixed on mainnet");
+        assert_eq!(batch_shield_frame_for(1, Some("5")), 5);
+        assert_eq!(batch_shield_frame_for(1, None), u64::MAX);
+    }
+
+    /// A batch shield commits every source or none: one already-shielded
+    /// source rejects the whole batch and consumes nothing else.
+    #[test]
+    fn a_batch_shield_commits_all_of_its_sources_or_none() {
+        set_batch_shield_frame_for_thread(Some(100));
+        let state = mem_state();
+        let shield = |tx: u8, markers: std::ops::Range<u8>, out: u8| {
+            let markers: Vec<u8> = markers.collect();
+            let mut batch = entry(tx, &markers, &[out]);
+            batch.kind = crate::token_engine::TYPE_LATTICE_SHIELD;
+            batch
+        };
+        let first = shield(1, 10..50, 1);
+        assert!(commit_entry(&state, 99, &APP, &first, SHARD).is_err(), "40 sources before activation");
+        assert!(matches!(commit_entry(&state, 100, &APP, &first, SHARD).unwrap(), Outcome::Committed { .. }));
+        assert!((10..50).all(|m| is_consumed(&state, &APP, &[m; 32]).unwrap()));
+        // Overlapping one consumed source: rejected whole.
+        let overlapping = shield(2, 49..80, 2);
+        assert_eq!(commit_entry(&state, 101, &APP, &overlapping, SHARD).unwrap(), Outcome::Rejected("already consumed"));
+        assert!((50..80).all(|m| !is_consumed(&state, &APP, &[m; 32]).unwrap()));
+        assert!(matches!(commit_entry(&state, 102, &APP, &shield(3, 50..80, 3), SHARD).unwrap(), Outcome::Committed { .. }));
+        set_batch_shield_frame_for_thread(None);
+    }
 }

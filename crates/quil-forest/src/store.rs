@@ -80,7 +80,43 @@ impl MemTreeStore {
         self.stale.write().unwrap().clear();
         self.sizes.write().unwrap().clear();
     }
+
+    /// [`RocksTreeStore::leaves_between`] over the in-memory store.
+    pub fn leaves_between(
+        &self,
+        version: Version,
+        first: &[u8; 32],
+        last: &[u8; 32],
+        after: Option<&[u8; 32]>,
+        max_leaves: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<(KeyHash, OwnedValue)>, bool)> {
+        let values = self.values.read().unwrap();
+        let mut live: Vec<(KeyHash, OwnedValue)> = values
+            .iter()
+            .filter(|(key, _)| key.0 >= *first && key.0 <= *last && after.is_none_or(|after| key.0 > *after))
+            .filter_map(|(key, history)| {
+                let value = history.iter().rev().find(|(v, _)| *v <= version)?.1.clone()?;
+                Some((*key, value))
+            })
+            .collect();
+        live.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        let mut bytes = 0usize;
+        let mut leaves = Vec::new();
+        let total = live.len();
+        for (key, value) in live {
+            if !leaves.is_empty() && (leaves.len() >= max_leaves || bytes + value.len() > max_bytes) {
+                return Ok((leaves, true));
+            }
+            bytes += value.len();
+            leaves.push((key, value));
+        }
+        debug_assert_eq!(leaves.len(), total);
+        Ok((leaves, false))
+    }
 }
+
+impl crate::BatchTreeReader for MemTreeStore {}
 
 impl TreeReader for MemTreeStore {
     fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {
@@ -358,6 +394,77 @@ impl RocksTreeStore {
         Ok((it, hi))
     }
 
+    /// Every live leaf with a key in `[first, last]` after `after`, each at its
+    /// newest value at or below `version`, in key order: at most `max_leaves`,
+    /// stopping before `max_bytes` of values (never before the first). The
+    /// flag is whether more may follow the last leaf returned.
+    ///
+    /// One sequential sweep of the value column, which sorts by key and then
+    /// version, where a node walk reads keys scattered across versions.
+    pub fn leaves_between(
+        &self,
+        version: Version,
+        first: &[u8; 32],
+        last: &[u8; 32],
+        after: Option<&[u8; 32]>,
+        max_leaves: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<(KeyHash, OwnedValue)>, bool)> {
+        let at = |key: &[u8; 32], past_versions: bool| {
+            let mut k = self.prefix.clone();
+            k.push(TAG_VALUE);
+            k.extend_from_slice(key);
+            if past_versions {
+                k.extend_from_slice(&[0xff; 9]);
+            }
+            k
+        };
+        let (lo, hi) = (at(first, false), at(last, true));
+        let start = match after {
+            Some(after) => at(after, true).max(lo.clone()),
+            None => lo.clone(),
+        };
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.fill_cache(false);
+        ro.set_readahead_size(4 << 20);
+        let mut it = self.db.iterator(&lo, &hi, ro)?;
+        it.seek(&start)?;
+        let khs = self.prefix.len() + 1;
+        let mut leaves: Vec<(KeyHash, OwnedValue)> = Vec::new();
+        let mut bytes = 0usize;
+        // The key being read and its newest value at or below `version`.
+        let mut current: Option<([u8; 32], Option<OwnedValue>)> = None;
+        loop {
+            let entry = match it.key() {
+                Some(k) if it.valid() && k < hi.as_slice() => Some(k),
+                _ => None,
+            };
+            let next_key = entry.and_then(|k| (k.len() == khs + 40).then(|| <[u8; 32]>::try_from(&k[khs..khs + 32]).unwrap()));
+            if current.as_ref().is_some_and(|(key, _)| entry.is_none() || next_key.is_some_and(|next| next != *key)) {
+                if let Some((key, Some(value))) = current.take() {
+                    if !leaves.is_empty() && (leaves.len() >= max_leaves || bytes + value.len() > max_bytes) {
+                        return Ok((leaves, true));
+                    }
+                    bytes += value.len();
+                    leaves.push((KeyHash(key), value));
+                }
+            }
+            let Some(k) = entry else { break };
+            if let Some(key) = next_key {
+                let written = u64::from_be_bytes(k[khs + 32..khs + 40].try_into().unwrap());
+                let slot = current.get_or_insert((key, None));
+                if written <= version {
+                    slot.1 = match it.value() {
+                        Some([0x01, value @ ..]) => Some(value.to_vec()),
+                        _ => None,
+                    };
+                }
+            }
+            it.next()?;
+        }
+        Ok((leaves, false))
+    }
+
     /// One-time backfill of the `TAG_SIZE` Merkle-sum index over the whole tree at
     /// `version` — the FAST path for the boot seed.
     ///
@@ -633,6 +740,8 @@ impl SizeIndex for RocksTreeStore {
         Ok(())
     }
 }
+
+impl crate::BatchTreeReader for RocksTreeStore {}
 
 impl TreeReader for RocksTreeStore {
     fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {

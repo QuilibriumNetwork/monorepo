@@ -112,6 +112,8 @@ pub struct WorkerOnlyNode {
     fee_manager: Arc<dyn quil_types::consensus::DynamicFeeManager>,
     local_prover_address: Vec<u8>,
     local_bls_pubkey: Vec<u8>,
+    /// The tag naming this member as a shard CW transmission's addressee.
+    local_cw_tag: [u8; crate::bitmasks::SHARD_CW_ADDRESSEE_LEN],
     bls_signer_factory: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync>,
     reward_greedy: bool,
     /// Minimum Active prover count required before this worker's
@@ -199,6 +201,210 @@ pub struct WorkerOnlyNode {
     /// arrives — the periodic sync falls back to trust-the-peer only for
     /// that initial window.
     latest_prover_tree_anchor: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// The master's calls that act as the node: resolver messages it
+    /// delivers directly, and GLOBAL submissions it sends on.
+    master_relay: Arc<MasterRelay>,
+}
+
+/// How long a master without the relay is not asked again.
+const MASTER_RELAY_RETRY_AFTER: Duration = Duration::from_secs(600);
+/// How long a relayed send may take: the master's own direct send times out
+/// after five seconds.
+const MASTER_RELAY_TIMEOUT: Duration = Duration::from_secs(8);
+
+type MasterClient =
+    quil_types::proto::global::global_service_client::GlobalServiceClient<tonic::transport::Channel>;
+
+/// A standalone worker's channel to its master's `GlobalService` calls that
+/// act as the node. The worker connects under a synthetic identity: members
+/// cannot attribute its connections to its committee key, and it has no
+/// archive transport of its own; its master holds both. Reconnected after a
+/// failure.
+pub(crate) struct MasterRelay {
+    factory: Option<MasterChannelFactory>,
+    client: tokio::sync::Mutex<Option<MasterClient>>,
+    /// When the master last answered that it lacks the direct relay (an older
+    /// build): resolver messages go to the topic for a while.
+    direct_unsupported: std::sync::Mutex<Option<std::time::Instant>>,
+    /// When the master last answered that it cannot take GLOBAL submissions.
+    submit_unsupported: std::sync::Mutex<Option<std::time::Instant>>,
+    /// When a reward proof was last lost, for a warning at most once a minute.
+    proof_lost_warned: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// What became of a GLOBAL submission handed to the master.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MasterSubmission {
+    /// Queued for the archives.
+    Queued,
+    /// Held back by the master's coverage halt.
+    Held,
+    /// The master refused it as not a worker submission.
+    Refused,
+    /// Not delivered: no master channel, a master without the call, or a
+    /// failure.
+    Unavailable,
+}
+
+impl MasterRelay {
+    pub(crate) fn new(factory: Option<MasterChannelFactory>) -> Self {
+        Self {
+            factory,
+            client: tokio::sync::Mutex::new(None),
+            direct_unsupported: std::sync::Mutex::new(None),
+            submit_unsupported: std::sync::Mutex::new(None),
+            proof_lost_warned: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn recently(marker: &std::sync::Mutex<Option<std::time::Instant>>) -> bool {
+        marker.lock().unwrap().is_some_and(|since| since.elapsed() < MASTER_RELAY_RETRY_AFTER)
+    }
+
+    async fn client(&self) -> Option<MasterClient> {
+        let factory = self.factory.clone()?;
+        let mut client = self.client.lock().await;
+        if client.is_none() {
+            let Ok(Ok(channel)) = tokio::time::timeout(MASTER_RELAY_TIMEOUT, factory()).await else {
+                return None;
+            };
+            *client = Some(MasterClient::new(channel));
+        }
+        client.clone()
+    }
+
+    async fn reconnect(&self) {
+        *self.client.lock().await = None;
+    }
+
+    /// Have the master deliver a resolver message directly to the committee
+    /// members it names. False: send it to the topic (no master channel, a
+    /// master without the relay, a failure, or a recipient the master could
+    /// not reach).
+    async fn relay_direct(&self, filter: Vec<u8>, channel: u64, data: Vec<u8>, recipients: Vec<Vec<u8>>) -> bool {
+        if Self::recently(&self.direct_unsupported) {
+            return false;
+        }
+        let Some(mut client) = self.client().await else { return false };
+        let request = quil_types::proto::global::SendShardConsensusDirectRequest { filter, channel, data, recipients };
+        match tokio::time::timeout(MASTER_RELAY_TIMEOUT, client.send_shard_consensus_direct(request)).await {
+            Ok(Ok(response)) => response.into_inner().delivered,
+            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+                *self.direct_unsupported.lock().unwrap() = Some(std::time::Instant::now());
+                false
+            }
+            _ => {
+                self.reconnect().await;
+                false
+            }
+        }
+    }
+
+    /// Hand one canonical GLOBAL request (a certified shard frame header or a
+    /// committee-handoff submission) to the master to send on.
+    pub(crate) async fn submit(&self, core_id: u32, request: Vec<u8>) -> MasterSubmission {
+        if Self::recently(&self.submit_unsupported) {
+            return MasterSubmission::Unavailable;
+        }
+        let Some(mut client) = self.client().await else { return MasterSubmission::Unavailable };
+        let request = quil_types::proto::global::SubmitWorkerProverMessageRequest { core_id, request };
+        match tokio::time::timeout(MASTER_RELAY_TIMEOUT, client.submit_worker_prover_message(request)).await {
+            Ok(Ok(response)) if response.get_ref().accepted => MasterSubmission::Queued,
+            Ok(Ok(_)) => MasterSubmission::Held,
+            Ok(Err(status)) if status.code() == tonic::Code::InvalidArgument => MasterSubmission::Refused,
+            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+                *self.submit_unsupported.lock().unwrap() = Some(std::time::Instant::now());
+                MasterSubmission::Unavailable
+            }
+            _ => {
+                self.reconnect().await;
+                MasterSubmission::Unavailable
+            }
+        }
+    }
+
+    /// Historical legacy committees, rebuilt by the master (which holds the
+    /// GLOBAL verifier and archive access).
+    pub(crate) fn historical_committee_source(self: &Arc<Self>) -> crate::historical_committee::HistoricalCommitteeSource {
+        let relay = self.clone();
+        Arc::new(move |filter: Vec<u8>, anchor: u64| {
+            let relay = relay.clone();
+            Box::pin(async move {
+                let unavailable = |reason: String| quil_types::error::QuilError::ExecutionUnavailable(reason);
+                let mut client = relay.client().await.ok_or_else(|| unavailable("no master channel".into()))?;
+                let request = quil_types::proto::global::GetHistoricalCommitteesRequest { filter, anchor };
+                let response = tokio::time::timeout(
+                    crate::historical_committee::HISTORICAL_COMMITTEE_TIMEOUT,
+                    client.get_historical_committees(request),
+                )
+                .await
+                .map_err(|_| unavailable("master historical committees timed out".into()))?
+                .map_err(|status| unavailable(format!("master historical committees: {status}")))?;
+                Ok(response.into_inner().committees.into_iter().map(|c| c.members).collect())
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = quil_types::error::Result<Vec<Vec<Vec<u8>>>>> + Send>>
+        })
+    }
+
+    /// Whether to warn now about a lost reward proof (at most once a minute).
+    fn warn_proof_lost(&self) -> bool {
+        let mut last = self.proof_lost_warned.lock().unwrap();
+        if last.is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
+            return false;
+        }
+        *last = Some(std::time::Instant::now());
+        true
+    }
+}
+
+/// The engine's GLOBAL submission hook for a standalone worker: every
+/// request goes to the master, which sends it through its archive transport
+/// as it does its thread workers'. A finalized frame's header is the reward
+/// proof GLOBAL credits the shard's provers from; without this, a shard
+/// staffed only by standalone workers was never credited. Only a
+/// committee-handoff submission falls back to GLOBAL_PROVER gossip when the
+/// master cannot take it (its earlier path).
+fn worker_global_submissions(
+    relay: Arc<MasterRelay>,
+    publish: Option<PublishFn>,
+    core_id: u32,
+    halted: Arc<std::sync::atomic::AtomicBool>,
+) -> Arc<dyn Fn(Vec<u8>) + Send + Sync> {
+    let handoff_prefix = quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF.to_be_bytes();
+    Arc::new(move |canonical: Vec<u8>| {
+        if halted.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!(core_id, "holding back GLOBAL submission — coverage halt active");
+            return;
+        }
+        let (relay, publish) = (relay.clone(), publish.clone());
+        tokio::spawn(async move {
+            let handoff = canonical.starts_with(&handoff_prefix);
+            let outcome = relay.submit(core_id, canonical.clone()).await;
+            if outcome != MasterSubmission::Unavailable {
+                if outcome == MasterSubmission::Refused {
+                    warn!(core_id, handoff, "master refused this worker's GLOBAL submission");
+                }
+                return;
+            }
+            if !handoff {
+                if relay.warn_proof_lost() {
+                    warn!(core_id,
+                        "reward proof not submitted: the master did not take it (unreachable, or an older build without SubmitWorkerProverMessage)");
+                }
+                return;
+            }
+            let Some(publish) = publish else { return };
+            let bundle = quil_execution::message_envelope::CanonicalMessageRequest::wrap(canonical)
+                .and_then(|request| quil_execution::message_envelope::CanonicalMessageBundle {
+                    requests: vec![Some(request)],
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
+                }.to_canonical_bytes());
+            match bundle {
+                Ok(bytes) => publish(crate::bitmasks::GLOBAL_PROVER.to_vec(), bytes).await,
+                Err(error) => warn!(%error, "committee handoff submission could not be encoded"),
+            }
+        });
+    })
 }
 
 impl WorkerOnlyNode {
@@ -216,6 +422,7 @@ impl WorkerOnlyNode {
         min_active_provers_for_propose: u64,
     ) -> Self {
         let (engine_event_tx, engine_event_rx) = mpsc::unbounded_channel();
+        let channel_factory = config.channel_factory.clone();
         Self {
             config,
             cancel: CancellationToken::new(),
@@ -225,6 +432,7 @@ impl WorkerOnlyNode {
             message_collector,
             fee_manager,
             local_prover_address,
+            local_cw_tag: crate::bitmasks::shard_cw_addressee_tag(&local_bls_pubkey),
             local_bls_pubkey,
             bls_signer_factory,
             reward_greedy,
@@ -251,7 +459,14 @@ impl WorkerOnlyNode {
             outgoing_history_source: None,
             sync_cooldown_until: std::sync::atomic::AtomicU64::new(0),
             latest_prover_tree_anchor: std::sync::Mutex::new(Vec::new()),
+            master_relay: Arc::new(MasterRelay::new(channel_factory)),
         }
+    }
+
+    /// Have the master deliver a resolver message directly to the committee
+    /// members it names (see [`MasterRelay::relay_direct`]).
+    async fn relay_direct(&self, filter: Vec<u8>, channel: u64, data: Vec<u8>, recipients: Vec<Vec<u8>>) -> bool {
+        self.master_relay.relay_direct(filter, channel, data, recipients).await
     }
 
     /// Recover bounded historical registration proofs through the master.
@@ -413,6 +628,21 @@ impl WorkerOnlyNode {
                                 }
                             }
                         }
+                    }
+                }
+            });
+        }
+
+        // Resolver traffic of this worker's shard, every 30 s.
+        {
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tick.tick() => crate::resolver_traffic::ResolverTraffic::process().log(),
                     }
                 }
             });
@@ -580,15 +810,32 @@ impl WorkerOnlyNode {
                                     }
                                     // Commonware-simplex message → one shard CW
                                     // gossip topic, channel tagged in the payload.
-                                    CwOut { filter, channel, bytes } => {
+                                    CwOut { filter, channel, bytes, recipients } => {
                                         if halted {
                                             continue;
                                         }
-                                        publish(
-                                            crate::bitmasks::shard_cw_bitmask(&filter),
-                                            crate::bitmasks::shard_cw_frame_payload(channel, &bytes),
-                                        )
-                                        .await;
+                                        if recipients.is_empty() {
+                                            publish(
+                                                crate::bitmasks::shard_cw_bitmask(&filter),
+                                                crate::bitmasks::shard_cw_frame_payload(channel, &bytes),
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                        // A resolver message: through the master to just
+                                        // its recipients, else the topic. Off the pump,
+                                        // which also carries votes, since a relayed send
+                                        // can wait out the master's timeout.
+                                        // Either way it names its recipient, so other
+                                        // members drop it unread.
+                                        let worker = worker_for_pump.clone();
+                                        let publish = publish.clone();
+                                        tokio::spawn(async move {
+                                            let payload = crate::bitmasks::shard_cw_frame_for(channel, &bytes, &recipients);
+                                            if !worker.relay_direct(filter.clone(), channel, bytes, recipients).await {
+                                                publish(crate::bitmasks::shard_cw_bitmask(&filter), payload).await;
+                                            }
+                                        });
                                     }
                                     // Recover existing lineage through bounded
                                     // replay, or authenticate a headless worker's
@@ -646,16 +893,14 @@ impl WorkerOnlyNode {
                                         }
                                     }
                                     // Internal signals — no network publish.
+                                    // A finalized frame's reward proof goes
+                                    // to the master through the engine's
+                                    // GLOBAL submission hook
+                                    // (`worker_global_submissions`).
                                     EquivocationDetected { .. }
                                     | Halted { .. }
                                     | ParentSealed { .. }
-                                    | ShardFrameFinalized { .. } => {
-                                        // Proxy mode: master handles
-                                        // GLOBAL_PROVER publish via its
-                                        // own drain task; workers
-                                        // forwarding through PubSubProxy
-                                        // would double-publish.
-                                    }
+                                    | ShardFrameFinalized { .. } => {}
                                 }
                             }
                         }
@@ -727,28 +972,15 @@ impl WorkerOnlyNode {
             bls_signer: (self.bls_signer_factory)(),
             reward_greedy: self.reward_greedy,
             min_active_provers_for_propose: self.min_active_provers_for_propose,
-            // Cluster-mode worker: master mediates GLOBAL_PROVER via
-            // gRPC. App shard finalize → master path needs separate
-            // wiring. A closing committee's terminal certificate has no master
-            // path at all, so it alone goes out through the pubsub proxy.
-            coverage_publish: self.publish_fn.clone().map(|publish| {
-                Arc::new(move |canonical: Vec<u8>| {
-                    let prefix = quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF.to_be_bytes();
-                    if !canonical.starts_with(&prefix) {
-                        return;
-                    }
-                    let bundle = quil_execution::message_envelope::CanonicalMessageRequest::wrap(canonical)
-                        .and_then(|request| quil_execution::message_envelope::CanonicalMessageBundle {
-                            requests: vec![Some(request)],
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
-                        }.to_canonical_bytes());
-                    match bundle {
-                        Ok(bytes) => { tokio::spawn(publish(crate::bitmasks::GLOBAL_PROVER.to_vec(), bytes)); }
-                        Err(error) => warn!(%error, "committee handoff submission could not be encoded"),
-                    }
-                }) as Arc<dyn Fn(Vec<u8>) + Send + Sync>
-            }),
+            // Finalized frame headers (reward proofs) and closing seals go
+            // to the master, which sends them on through its archive
+            // transport (see `worker_global_submissions`).
+            coverage_publish: Some(worker_global_submissions(
+                self.master_relay.clone(),
+                self.publish_fn.clone(),
+                core_id as u32,
+                self.local_halted.clone(),
+            )),
             // Per-worker CRDT + execution manager + inclusion prover
             // for byte-for-byte header parity with Go: state_roots from
             // the worker's own hypergraph commit, requests_root from
@@ -811,7 +1043,10 @@ impl WorkerOnlyNode {
         );
         let engine = engine.with_storage_history_source(self.storage_history_source.clone())
             .with_outgoing_history_source(self.outgoing_history_source.clone())
-            .with_global_anchor_source(self.global_anchor_source.clone());
+            .with_global_anchor_source(self.global_anchor_source.clone())
+            .with_historical_committee_source(
+                self.config.channel_factory.is_some().then(|| self.master_relay.historical_committee_source()),
+            );
 
         let transport_handle = handle.clone();
         let engine_cancel = self.cancel.child_token();
@@ -1180,7 +1415,7 @@ impl WorkerOnlyNode {
             // channel needs no key (self-describing), so an unresolved sender is
             // only fatal for votes/certs — a benign transient until the peer's
             // PeerInfo propagates. Mirrors the master's inbound CW routing.
-            if let Some((channel, cw_bytes)) = crate::bitmasks::shard_cw_split_payload(data) {
+            if let Some((channel, cw_bytes)) = crate::bitmasks::shard_cw_admit(filter, data, &self.local_cw_tag) {
                 let from_key = self
                     .peer_key_by_id
                     .lock()
@@ -1245,10 +1480,49 @@ struct DataIpcServiceImpl {
     worker: Arc<WorkerOnlyNode>,
 }
 
+/// Hand a directly received shard consensus message to `handle` when it is
+/// the engine for that shard. False: this worker does not run it.
+fn deliver_to_engine(
+    handle: Option<crate::app_engine::AppEngineHandle>,
+    request: quil_types::proto::node::DeliverShardConsensusRequest,
+) -> bool {
+    let Some(handle) = handle.filter(|handle| handle.filter == request.filter) else { return false };
+    if request.channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
+        crate::resolver_traffic::ResolverTraffic::process().note_received(
+            &request.filter,
+            &request.data,
+            crate::resolver_traffic::Addressed::Here,
+        );
+    }
+    handle.send(crate::app_engine::AppEngineMessage::CwIn {
+        channel: request.channel,
+        from: request.from,
+        data: request.data,
+    });
+    true
+}
+
 #[tonic::async_trait]
 impl quil_types::proto::node::data_ipc_service_server::DataIpcService
     for DataIpcServiceImpl
 {
+    /// A committee member's message the master received directly, for this
+    /// worker's shard. Handed to the engine exactly as the topic copy would
+    /// be; the engine checks `from` against the committee.
+    async fn deliver_shard_consensus(
+        &self,
+        request: tonic::Request<quil_types::proto::node::DeliverShardConsensusRequest>,
+    ) -> std::result::Result<tonic::Response<quil_types::proto::node::DeliverShardConsensusResponse>, tonic::Status> {
+        let handle = self
+            .worker
+            .engine_handle
+            .lock()
+            .map_err(|_| tonic::Status::unavailable("worker handle unavailable"))?
+            .clone();
+        let accepted = deliver_to_engine(handle, request.into_inner());
+        Ok(tonic::Response::new(quil_types::proto::node::DeliverShardConsensusResponse { accepted }))
+    }
+
     async fn get_app_fee_snapshot(
         &self, request: tonic::Request<quil_types::proto::node::GetAppFeeSnapshotRequest>,
     ) -> std::result::Result<tonic::Response<quil_types::proto::node::GetAppFeeSnapshotResponse>, tonic::Status> {
@@ -1647,6 +1921,81 @@ fn multiaddr_to_http_endpoint(ma: &str, default_port: u16) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without a master to take them, a reward proof is not gossiped (regular
+    /// nodes hold no GLOBAL_PROVER subscription to publish on) while a closing
+    /// seal keeps its earlier gossip path; during a coverage halt nothing
+    /// leaves at all.
+    #[tokio::test]
+    async fn global_submissions_without_a_master_keep_only_the_seal_gossip() {
+        let published: Arc<std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>>> = Default::default();
+        let publish: PublishFn = {
+            let published = published.clone();
+            Arc::new(move |bitmask, data| {
+                published.lock().unwrap().push((bitmask, data));
+                Box::pin(async {})
+            })
+        };
+        let relay = Arc::new(MasterRelay::new(None));
+        let halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let submit = worker_global_submissions(relay.clone(), Some(publish), 4, halted.clone());
+        let header = quil_execution::global_intrinsic::frame_header::FrameHeader {
+            address: vec![9; 32],
+            frame_number: 12,
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let mut seal = quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF.to_be_bytes().to_vec();
+        seal.extend_from_slice(b"closing seal");
+        assert_eq!(relay.submit(4, header.clone()).await, MasterSubmission::Unavailable);
+
+        let settle = || async {
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+        };
+        halted.store(true, std::sync::atomic::Ordering::Relaxed);
+        submit(header.clone());
+        submit(seal.clone());
+        settle().await;
+        assert!(published.lock().unwrap().is_empty(), "nothing leaves during a halt");
+
+        halted.store(false, std::sync::atomic::Ordering::Relaxed);
+        submit(header);
+        submit(seal.clone());
+        settle().await;
+        let published = published.lock().unwrap();
+        assert_eq!(published.len(), 1, "only the seal is gossiped");
+        assert_eq!(published[0].0, crate::bitmasks::GLOBAL_PROVER.to_vec());
+        let bundle = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(&published[0].1).unwrap();
+        let requests: Vec<_> = bundle.requests.into_iter().flatten().collect();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].inner_bytes, seal);
+    }
+
+    /// The master's direct delivery reaches the engine only for the shard
+    /// this worker runs, carrying the sender's committee key.
+    #[test]
+    fn a_directly_delivered_message_reaches_only_this_shards_engine() {
+        let request = |filter: Vec<u8>| quil_types::proto::node::DeliverShardConsensusRequest {
+            filter,
+            channel: 2,
+            data: b"certificate".to_vec(),
+            from: vec![5; 897],
+        };
+        let (handle, mut engine) = crate::app_engine::AppEngineHandle::for_test(vec![1; 32]);
+        assert!(!deliver_to_engine(None, request(vec![1; 32])), "no engine");
+        assert!(!deliver_to_engine(Some(handle.clone()), request(vec![2; 32])), "another shard");
+        assert!(engine.try_recv().is_err());
+        assert!(deliver_to_engine(Some(handle), request(vec![1; 32])));
+        match engine.try_recv().unwrap() {
+            crate::app_engine::AppEngineMessage::CwIn { channel, from, data } => {
+                assert_eq!((channel, from, data), (2, vec![5; 897], b"certificate".to_vec()));
+            }
+            _ => panic!("expected CwIn"),
+        }
+    }
 
     #[tokio::test]
     async fn cluster_consensus_waits_for_subscription_and_peer() {

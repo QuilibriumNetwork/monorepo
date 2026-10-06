@@ -369,10 +369,13 @@ impl ExecutionPublicationGuard<'_> {
                 "canonical publication provider mismatch".into(),
             ));
         }
+        let mut timing = PublicationSteps::start();
         // A newly accepted registration must be visible after this frame, even
-        // if the branch's once-per-epoch maintenance refresh preceded it.
+        // if the branch's once-per-epoch maintenance refresh preceded it. Only
+        // the records the branch's registry rows feed are re-read.
         let refreshed = branch.overlay().delta_generation();
-        branch.registry.refresh_from_store(branch.store.as_ref())?;
+        branch.registry.update_written_rows(branch.store.as_ref(), branch.overlay())?;
+        timing.mark("update registry");
         let branch_engines = branch.manager.engines.try_read().map_err(|_| {
             QuilError::ExecutionUnavailable("private execution engines are busy or poisoned".into())
         })?;
@@ -393,6 +396,7 @@ impl ExecutionPublicationGuard<'_> {
             Some(self.limits.max_summary_rebuilds),
         )?;
         drop(branch_engines);
+        timing.mark("fork engines");
         // Resolve every fallible lock and allocation before the durable batch.
         let engines = prepared
             .engines
@@ -426,9 +430,11 @@ impl ExecutionPublicationGuard<'_> {
         let plan = branch.overlay().prepare_commit().map_err(|e| {
             QuilError::ExecutionUnavailable(format!("prepare canonical execution: {e}"))
         })?;
+        timing.mark("prepare adoption");
         let mut write = db.lock_writes().map_err(|e| {
             QuilError::ExecutionUnavailable(format!("canonical write barrier: {e}"))
         })?;
+        timing.mark("wait for write barrier");
         // The refreshed registry holds the published rows exactly when it read
         // the delta this plan commits and nothing else wrote them since capture.
         let registry_rows_published = plan.delta_generation() == refreshed
@@ -438,6 +444,7 @@ impl ExecutionPublicationGuard<'_> {
         plan.commit_locked(&mut write).map_err(|e| {
             QuilError::ExecutionUnavailable(format!("canonical execution commit: {e}"))
         })?;
+        timing.mark("synced commit");
         let published = db.latest_sequence_number();
         let snapshot = Arc::new(quil_store::RocksHypergraphSnapshot::from_database(
             db.clone(),
@@ -460,7 +467,43 @@ impl ExecutionPublicationGuard<'_> {
             cache.adopt();
         }
         adopt_frame(snapshot);
+        timing.mark("adopt");
         Ok(())
+    }
+}
+
+/// One publication's steps, logged together when it took a second or more:
+/// its caller holds the node's frame lock and GLOBAL execution lease.
+struct PublicationSteps {
+    started: std::time::Instant,
+    last: std::time::Instant,
+    steps: Vec<(&'static str, u128)>,
+}
+
+impl PublicationSteps {
+    fn start() -> Self {
+        let now = std::time::Instant::now();
+        Self { started: now, last: now, steps: Vec::new() }
+    }
+
+    fn mark(&mut self, step: &'static str) {
+        let now = std::time::Instant::now();
+        self.steps.push((step, now.duration_since(self.last).as_millis()));
+        self.last = now;
+    }
+}
+
+impl Drop for PublicationSteps {
+    fn drop(&mut self) {
+        let total = self.started.elapsed();
+        if total >= std::time::Duration::from_secs(1) {
+            tracing::warn!(
+                total_ms = total.as_millis() as u64,
+                steps = ?self.steps,
+                after_last_step_ms = self.last.elapsed().as_millis() as u64,
+                "slow execution publication"
+            );
+        }
     }
 }
 

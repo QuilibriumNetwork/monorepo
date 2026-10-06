@@ -24,11 +24,16 @@ const NAMESPACE: &[u8] = b"bounded-journal-host";
 struct Directory(std::path::PathBuf);
 impl Directory {
     fn new() -> Self {
+        // Tests run in parallel and the clock can be coarser than a
+        // nanosecond (microseconds on macOS), so two directories created at
+        // once got the same name and one test failed creating it.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let suffix = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("quil-host-{}-{suffix}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("quil-host-{}-{suffix}-{sequence}", std::process::id()));
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }

@@ -37,9 +37,11 @@ fn unavailable(message: &str) -> QuilError {
     QuilError::ExecutionUnavailable(message.into())
 }
 
-fn write<T>(lock: &RwLock<T>) -> Result<RwLockWriteGuard<'_, T>> {
-    lock.try_write()
-        .map_err(|_| unavailable("execution adoption metadata is busy or poisoned"))
+/// Readers hold these briefly; waiting them out keeps an executed frame
+/// from being discarded. One deadline covers every lock an adoption takes.
+fn write<'a, T>(patience: &quil_types::lock_patience::Patience, lock: &'a RwLock<T>) -> Result<RwLockWriteGuard<'a, T>> {
+    patience.write(lock)
+        .ok_or_else(|| unavailable("execution adoption metadata is busy or poisoned"))
 }
 
 fn take<T>(lock: RwLock<T>) -> Result<T> {
@@ -97,8 +99,10 @@ impl ExecutionCapture<'_> {
         };
         let source = self.source;
         // Forest readers commonly acquire version/prefix locks afterwards.
-        // Acquire this first and use try-locks throughout to avoid inversion.
-        let forest = write(&source.forest)?;
+        // Acquire this first and use bounded try-locks throughout to avoid
+        // inversion: no wait outlasts the deadline.
+        let patience = quil_types::lock_patience::Patience::new();
+        let forest = write(&patience, &source.forest)?;
         if !read(&source.pending)?.is_empty()
             || !read(&source.pending_blobs)?.is_empty()
             || !read(&source.pending_records)?.is_empty()
@@ -108,15 +112,15 @@ impl ExecutionCapture<'_> {
                 "canonical source has unfinished CRDT mutations",
             ));
         }
-        let roots = write(&source.prover_root_by_frame)?;
-        let world_sizes = write(&source.world_size_by_frame)?;
-        let phase_versions = write(&source.phase_versions)?;
-        let global_versions = write(&source.global_versions)?;
-        let prefixes = write(&source.app_shard_prefixes)?;
-        let bit_paths = write(&source.app_shard_bit_paths)?;
-        let shard_metadata = write(&source.shard_metadata)?;
-        let sizes = write(&source.sub_meta)?;
-        let covered = write(&source.covered_prefix)?;
+        let roots = write(&patience, &source.prover_root_by_frame)?;
+        let world_sizes = write(&patience, &source.world_size_by_frame)?;
+        let phase_versions = write(&patience, &source.phase_versions)?;
+        let global_versions = write(&patience, &source.global_versions)?;
+        let prefixes = write(&patience, &source.app_shard_prefixes)?;
+        let bit_paths = write(&patience, &source.app_shard_bit_paths)?;
+        let shard_metadata = write(&patience, &source.shard_metadata)?;
+        let sizes = write(&patience, &source.sub_meta)?;
+        let covered = write(&patience, &source.covered_prefix)?;
         if *covered != state.covered {
             return Err(unavailable(
                 "private execution changed node coverage policy",

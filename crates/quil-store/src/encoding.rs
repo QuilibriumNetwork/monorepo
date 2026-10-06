@@ -56,6 +56,9 @@ pub const CONSENSUS_HISTORY_RECOVERY: u8 = 0x04;
 pub const CONSENSUS_GLOBAL_EXECUTION_CHECKPOINT: u8 = 0x05;
 /// Present from before frame mutations until all materializer stages finish.
 pub const CONSENSUS_GLOBAL_EXECUTION_PENDING: u8 = 0x06;
+/// `[CONSENSUS, 0x07]` → 8-byte BE GLOBAL frame: this store discarded its
+/// application-shard frame history at the committee-handoff flag day.
+pub const CONSENSUS_APP_HISTORY_DISCARDED: u8 = 0x07;
 pub const MIGRATION: u8 = 0xF0;
 pub const WORKER: u8 = 0xFF;
 
@@ -777,6 +780,12 @@ pub fn prover_registry_shard() -> quil_types::store::ShardKey {
 /// the prover shard's add and remove phases, legacy and versioned. Stores
 /// watch these so a registry scan can be reused while none was written.
 pub fn prover_registry_key_prefixes() -> Vec<Vec<u8>> {
+    prover_registry_row_prefixes().into_iter().map(|(_, prefix)| prefix).collect()
+}
+
+/// [`prover_registry_key_prefixes`] with each prefix's phase. A row's
+/// 32-byte vertex address follows its prefix (then, versioned, its version).
+pub fn prover_registry_row_prefixes() -> Vec<(&'static str, Vec<u8>)> {
     let shard = prover_registry_shard();
     let mut prefixes = Vec::new();
     for phase in ["adds", "removes"] {
@@ -785,7 +794,7 @@ pub fn prover_registry_key_prefixes() -> Vec<Vec<u8>> {
             hypergraph_vertex_data_v2_shard_prefix("vertex", phase, &shard),
         ] {
             prefix.extend_from_slice(&shard.l2);
-            prefixes.push(prefix);
+            prefixes.push((phase, prefix));
         }
     }
     prefixes
@@ -943,6 +952,42 @@ pub fn consensus_materialized_cursor_key(filter: &[u8]) -> Vec<u8> {
 /// CRDT commit's own batch. See [`CONSENSUS_GLOBAL_MATERIALIZED_CURSOR`].
 pub fn global_materialized_cursor_key() -> Vec<u8> {
     vec![CONSENSUS, CONSENSUS_GLOBAL_MATERIALIZED_CURSOR]
+}
+
+pub fn app_history_discarded_key() -> Vec<u8> {
+    vec![CONSENSUS, CONSENSUS_APP_HISTORY_DISCARDED]
+}
+
+/// The key ranges that hold application-shard frame chains (as opposed to
+/// application state and GLOBAL frames), each `[start, end)`:
+/// - clock: shard frames, staged shard frames, prover-trie and total-distance
+///   rows, app and shard certified states, and the shard earliest, latest,
+///   certified-latest and parent indexes;
+/// - per-frame relay records: spends, accumulator reports and digests,
+///   settlements and fee totals (`0xF3..0xF8`; GLOBAL outcomes are `0xF2`,
+///   GLOBAL request candidates `0xF8`);
+/// - consensus: per-filter legacy state and liveness (a GLOBAL row has no
+///   filter and is kept), application materialized cursors and history
+///   recovery progress.
+pub fn app_frame_history_ranges() -> Vec<(Vec<u8>, Vec<u8>)> {
+    let clock = |from: u8, to: u8| (vec![CLOCK_FRAME, from], vec![CLOCK_FRAME, to]);
+    vec![
+        clock(CLOCK_SHARD_FRAME, CLOCK_SHARD_FRAME + 1),
+        clock(CLOCK_SHARD_STAGED, CLOCK_SHARD_STAGED + 1),
+        clock(CLOCK_SHARD_FRAME_FRECENCY, CLOCK_SHARD_FRAME_FRECENCY + 1),
+        clock(CLOCK_TOTAL_DISTANCE, CLOCK_TOTAL_DISTANCE + 1),
+        clock(CLOCK_APP_CERTIFIED_STATE, CLOCK_APP_CERTIFIED_STATE + 1),
+        clock(CLOCK_SHARD_CERTIFIED_STATE, CLOCK_SHARD_CERTIFIED_STATE + 1),
+        clock(INDEX_EARLIEST | CLOCK_SHARD_FRAME, (INDEX_EARLIEST | CLOCK_SHARD_FRAME) + 1),
+        clock(INDEX_LATEST | CLOCK_SHARD_FRAME, (INDEX_LATEST | CLOCK_SHARD_FRAME) + 1),
+        clock(INDEX_LATEST | CLOCK_APP_CERTIFIED_STATE, (INDEX_LATEST | CLOCK_APP_CERTIFIED_STATE) + 1),
+        clock(INDEX_PARENT | CLOCK_SHARD_FRAME, (INDEX_PARENT | CLOCK_SHARD_FRAME) + 1),
+        clock(CLOCK_SHARD_FRAME_SPENDS, CLOCK_GLOBAL_FRAME_REQUEST_CANDIDATE),
+        (vec![CONSENSUS, CONSENSUS_STATE, 0x00], vec![CONSENSUS, CONSENSUS_LIVENESS]),
+        (vec![CONSENSUS, CONSENSUS_LIVENESS, 0x00], vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR]),
+        (vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR], vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR + 1]),
+        (vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY], vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY + 1]),
+    ]
 }
 
 pub fn global_execution_checkpoint_key() -> Vec<u8> {

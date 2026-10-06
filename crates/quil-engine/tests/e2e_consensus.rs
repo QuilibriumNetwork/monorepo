@@ -322,6 +322,74 @@ async fn app_consensus_cw_multi_prover_finalizes() {
     assert_deterministic_app_chain(&harness, std::time::Duration::from_secs(90)).await;
 }
 
+/// A legacy shard whose committee changed restarts from the head the old
+/// committee certified (public issue #664): every member of the new committee
+/// holds that head, which its registry no longer reproduces the signers of.
+/// The new committee cannot resume a finalized floor from another committee's
+/// certificate, so it starts from the head as genesis, once the head
+/// validates under its historical committee, and certifies frames on top of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_new_legacy_committee_continues_from_the_head_its_predecessor_certified() {
+    use prost::Message;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let old = AppShardHarness::build_cw(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let head = loop {
+        let frames = old.workers[0].full_frames.lock().clone();
+        if let Some(frame) = frames.iter()
+            .map(|bytes| gpb::AppShardFrame::decode(bytes.as_slice()).unwrap())
+            .find(|frame| frame.header.as_ref().is_some_and(|header| header.frame_number == 1))
+        {
+            break frame;
+        }
+        assert!(std::time::Instant::now() < deadline, "the old committee never certified frame 1");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let committee = vec![old.workers[0].prover.bls_pubkey.clone()];
+    old.shutdown().await;
+    let head_header = head.header.clone().unwrap();
+    assert!(head_header.public_key_signature_bls48581.is_some(), "the head carries its certificate");
+
+    let new = AppShardHarness::build_cw_from_head(3, HeadSeed { frame: head, committee }).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let chains: Vec<std::collections::BTreeMap<u64, gpb::FrameHeader>> = new.workers.iter().map(|worker| {
+            worker.full_frames.lock().iter().map(|bytes| {
+                let header = gpb::AppShardFrame::decode(bytes.as_slice()).unwrap().header.unwrap();
+                (header.frame_number, header)
+            }).collect()
+        }).collect();
+        if chains.iter().all(|chain| chain.contains_key(&2) && chain.contains_key(&3)) {
+            for chain in &chains {
+                let mut parent = head_header.clone();
+                for n in 2..=3 {
+                    let header = &chain[&n];
+                    assert_eq!(
+                        header.parent_selector,
+                        quil_crypto::poseidon::hash_bytes_to_32(&parent.output).unwrap(),
+                        "frame {n} does not extend the adopted head's chain",
+                    );
+                    assert_eq!(header.output, chains[0][&n].output, "members finalized different frame {n}");
+                    parent = header.clone();
+                }
+            }
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline,
+            "the new committee did not finalize frames 2 and 3 on the adopted head: {:?}",
+            chains.iter().map(|chain| chain.keys().copied().collect::<Vec<_>>()).collect::<Vec<_>>());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    new.shutdown().await;
+}
+
 async fn assert_deterministic_app_chain(harness: &AppShardHarness, timeout: std::time::Duration) {
     use prost::Message;
     use std::collections::BTreeMap;
@@ -525,6 +593,7 @@ async fn worker_active_storage_attestation() {
         !att.openings.is_empty(),
         "carried StorageAttestation must contain member openings",
     );
+    harness.shutdown().await;
 }
 
 /// Full worker→archive coverage attribution flow:

@@ -86,6 +86,43 @@ pub fn pomw_basis(difficulty: u64, world_state_bytes: u64, units: u64) -> BigInt
     mul >> POMW_SCALE_BITS
 }
 
+/// PoMW reward for one allocation's ring, before dividing among its eight
+/// prover slots. This is the issuance arithmetic: retain 53 fractional bits
+/// for sqrt(data_shards), fuse divisions, and truncate only at the end.
+/// Rings above 62 retain issuance's historical clamp. Nonpositive sizes,
+/// basis or world size and zero data-shard counts have no reward.
+pub fn allocation_ring_reward(
+    basis: &BigInt,
+    state_size: &BigInt,
+    world_bytes: &BigInt,
+    ring: u8,
+    data_shards: u64,
+) -> BigInt {
+    if basis <= &BigInt::zero() || state_size <= &BigInt::zero()
+        || world_bytes <= &BigInt::zero() || data_shards == 0
+    {
+        return BigInt::zero();
+    }
+    let divisor = BigInt::from(1u64 << (u32::from(ring.min(62)) + 1));
+    let sqrt = (BigInt::from(data_shards) << (2 * POMW_SCALE_BITS)).sqrt();
+    let numerator = state_size * basis << POMW_SCALE_BITS;
+    numerator / (world_bytes * divisor * sqrt)
+}
+
+/// Project one prover slot's share using the same allocation arithmetic as
+/// issuance. Even a partially filled ring splits its reward by eight.
+/// Callers supply the confirmed ring for a holding or predicted ring for a
+/// candidate; this function does not infer membership or eligibility.
+pub fn allocation_prover_reward(
+    basis: &BigInt,
+    state_size: &BigInt,
+    world_bytes: &BigInt,
+    ring: u8,
+    data_shards: u64,
+) -> BigInt {
+    allocation_ring_reward(basis, state_size, world_bytes, ring, data_shards) / 8
+}
+
 /// Scaled baseline fee. Mirror of
 /// `node/consensus/reward/baseline_fee.go::GetBaselineFee`.
 ///
@@ -169,6 +206,39 @@ pub fn fee_budget_for_payload_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocation_reward_vectors_cover_fractional_roots_and_rounding() {
+        // Independent integer expectations: basis=1600, size=world gives
+        // floor(800/sqrt(shards)) ring units, then eight prover slots.
+        for (shards, ring_reward, prover_reward) in [
+            (1, 800, 100), (2, 565, 70), (3, 461, 57),
+            (4, 400, 50), (5, 357, 44), (7, 302, 37), (9, 266, 33),
+        ] {
+            assert_eq!(allocation_ring_reward(&1600.into(), &100.into(), &100.into(), 0, shards), ring_reward.into());
+            assert_eq!(allocation_prover_reward(&1600.into(), &100.into(), &100.into(), 0, shards), prover_reward.into());
+        }
+        // Dividing size*basis/world first loses a reward unit here.
+        assert_eq!(allocation_prover_reward(&229.into(), &1.into(), &10.into(), 0, 2), 1.into());
+    }
+
+    #[test]
+    fn allocation_reward_boundaries_and_monotonicity() {
+        for (basis, size, world, shards) in [(0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 0, 1), (1, 1, 1, 0), (-1, 1, 1, 1), (1, 1, -1, 1)] {
+            assert!(allocation_ring_reward(&basis.into(), &size.into(), &world.into(), 0, shards).is_zero());
+        }
+        let basis = BigInt::one() << 100;
+        // Preserve issuance's ring clamp, including unusual legacy inputs.
+        for ring in [62, 63, 255] {
+            assert_eq!(allocation_ring_reward(&basis, &1.into(), &1.into(), ring, 1), BigInt::one() << 37);
+        }
+        let mut previous = allocation_prover_reward(&basis, &100.into(), &1000.into(), 0, 1);
+        for count in 2..=256 {
+            let next = allocation_prover_reward(&basis, &100.into(), &1000.into(), 0, count);
+            assert!(next <= previous, "count={count}");
+            previous = next;
+        }
+    }
 
     #[test]
     fn payload_budget_covers_every_cost_at_the_same_snapshot() {

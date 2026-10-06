@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -74,6 +74,38 @@ pub(crate) fn mirror_shard_frame_to_clock_store(
         Err(_) => return, // non-frame traffic on this bitmask — ignore
     };
     let Some(header) = frame.header.as_ref() else { return };
+    // Committee-handoff flag day: from activation the master's copy of the
+    // legacy chains is discarded before the first session frame is mirrored
+    // (under one lock, so no session frame is mirrored into a store about to
+    // be discarded), and legacy frames are not mirrored any more.
+    static FLAG_DAY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _flag_day = match quil_types::consensus::committee_handoff_policy()
+        .filter(|policy| policy.legacy_history == quil_types::consensus::LegacyHistory::Discard)
+    {
+        Some(policy) => {
+            let global = clock_store.get_latest_global_clock_frame().ok()
+                .and_then(|frame| frame.header).map_or(0, |header| header.frame_number);
+            if global < policy.activation_frame {
+                None
+            } else {
+                if header.global_frame_number < policy.activation_frame {
+                    return;
+                }
+                let guard = FLAG_DAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if matches!(clock_store.app_frame_history_discarded(), Ok(None)) {
+                    match clock_store.discard_app_frame_history(global) {
+                        Ok(()) => tracing::info!(global, "committee-handoff flag day: master discarded its mirrored legacy app frames"),
+                        Err(error) => {
+                            warn!(%error, "mirrored legacy app frames could not be discarded; not mirroring");
+                            return;
+                        }
+                    }
+                }
+                Some(guard)
+            }
+        }
+        None => None,
+    };
     let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
         .map(|h| h.to_vec())
         .unwrap_or_default();
@@ -308,6 +340,12 @@ pub(crate) type WorkerAppStates =
     Arc<parking_lot::RwLock<std::collections::HashMap<Vec<u8>, WorkerAppState>>>;
 
 pub(crate) struct WorkerManagerArgs {
+    /// Rebuilds legacy committees from GLOBAL state; set once the archive
+    /// sync has its frame verifier.
+    pub historical_committees: Arc<std::sync::OnceLock<Arc<super::historical_committees::HistoricalCommittees>>>,
+    /// Peer id → PeerInfo; maps a committee key to the peer a resolver
+    /// message can be delivered to directly ([`CommitteePeers`]).
+    pub peer_info_cache: Arc<parking_lot::RwLock<HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>>,
     pub config: quil_config::Config,
     pub archive_mode: bool,
     pub p2p_handle: quil_p2p::node::P2PHandle,
@@ -362,6 +400,8 @@ pub(crate) fn init(
     args: WorkerManagerArgs,
 ) -> Arc<dyn quil_engine::worker::WorkerManager> {
     let WorkerManagerArgs {
+        historical_committees,
+        peer_info_cache,
         config,
         archive_mode,
         p2p_handle,
@@ -555,6 +595,7 @@ pub(crate) fn init(
             // For the per-worker step-4 app-shard catch-up syncer: the shared
             // archive pool + this node's Falcon key (the :8340 mTLS identity).
             let archive_pool_for_builder = archive_pool.clone();
+            let historical_committees_for_builder = historical_committees.clone();
             let falcon_sk_for_builder = file_key_manager
                 .get_private_key(quil_types::crypto::KeyType::Falcon512)
                 .ok();
@@ -720,6 +761,7 @@ pub(crate) fn init(
                         crate::storage_history::from_pool(archive_pool_for_builder.clone(), key)),
                     outgoing_history_source: falcon_sk_for_builder.clone().map(|key|
                         crate::storage_history::outgoing_history_from_pool(archive_pool_for_builder.clone(), key)),
+                    historical_committee_source: Some(historical_committee_source(historical_committees_for_builder.clone())),
                     clock_store,
                     hypergraph: crdt,
                     execution_engine: exec_manager,
@@ -787,6 +829,7 @@ pub(crate) fn init(
             // through `shard_engines` in the recv loop below.
             if let Some(mut master_rx) = thread_mgr.take_master_rx() {
                 let drain_p2p = p2p_handle.clone();
+                let drain_committee_peers = super::direct_delivery::CommitteePeers::new(peer_info_cache.clone());
                 let drain_registry = prover_registry.clone();
                 let drain_pubkey = bls_pubkey.clone();
                 let drain_clock = clock_store.clone();
@@ -833,43 +876,11 @@ pub(crate) fn init(
                                             );
                                             continue;
                                         }
-                                        // Decode for a positive log line so the operator
-                                        // can see each rewardable proof going out. The
-                                        // bytes are consumed by `wrap` below; decode a
-                                        // borrowed view first.
-                                        if let Ok(h) =
-                                            quil_execution::global_intrinsic::frame_header::FrameHeader::from_canonical_bytes(
-                                                &header_canonical_bytes,
-                                            )
-                                        {
-                                            info!(
-                                                core_id,
-                                                filter = %hex::encode(&filter),
-                                                frame = h.frame_number,
-                                                rank = h.rank,
-                                                prover = %hex::encode(&h.prover),
-                                                "submitting reward proof to GLOBAL_PROVER"
-                                            );
-                                        }
-                                        let req = match quil_execution::message_envelope::CanonicalMessageRequest::wrap(
-                                            header_canonical_bytes,
-                                        ) {
-                                            Ok(r) => r,
-                                            Err(e) => {
-                                                warn!(core_id, filter = %hex::encode(&filter), error = %e,
-                                                    "shard finalize: bad FrameHeader bytes — dropping coverage publish");
-                                                continue;
-                                            }
-                                        };
-                                        let timestamp = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis() as i64;
-                                        let bundle = quil_execution::message_envelope::CanonicalMessageBundle {
-                                            requests: vec![Some(req)],
-                                            timestamp,
-                                        };
-                                        match bundle.to_canonical_bytes() {
+                                        // A positive log line so the operator can see
+                                        // each rewardable proof going out (standalone
+                                        // workers' log the same through the master).
+                                        super::reward_proofs::log_reward_proof(core_id, "thread", &header_canonical_bytes);
+                                        match super::reward_proofs::prover_bundle(header_canonical_bytes) {
                                             Ok(bytes) => {
                                                 let cell = drain_transport_cell.clone();
                                                 let filter_owned = filter.clone();
@@ -964,7 +975,7 @@ pub(crate) fn init(
                                             Ok(())
                                         });
                                     }
-                                    WorkerToMaster::CwConsensus { core_id, filter, channel, bytes } => {
+                                    WorkerToMaster::CwConsensus { core_id, filter, channel, bytes, recipients } => {
                                         // Commonware-simplex message → one shard CW
                                         // gossip topic; channel tagged into the payload.
                                         if drain_halt.any_halted() {
@@ -996,9 +1007,18 @@ pub(crate) fn init(
                                             }
                                         }
                                         let p2p = drain_p2p.clone();
+                                        let committee_peers = drain_committee_peers.clone();
                                         drain_spawner.detach("shard-cw-publish", async move {
                                             let topic = quil_engine::bitmasks::shard_cw_bitmask(&filter);
-                                            let payload = quil_engine::bitmasks::shard_cw_frame_payload(channel, &bytes);
+                                            // A message for one member names it, so a copy the
+                                            // topic carries is dropped unread by the others.
+                                            let payload = quil_engine::bitmasks::shard_cw_frame_for(channel, &bytes, &recipients);
+                                            if !recipients.is_empty() {
+                                                if super::direct_delivery::deliver_direct(&p2p, &committee_peers, &recipients, &topic, &payload).await {
+                                                    return Ok(());
+                                                }
+                                                p2p.note_direct_fallback();
+                                            }
                                             for attempt in 1..=8u32 {
                                                 match p2p.publish(topic.clone(), payload.clone()).await {
                                                     Ok(()) => break,
@@ -1110,6 +1130,9 @@ pub(crate) fn init(
                                                     "failed to install shard CW topic subscription");
                                                 return Ok(());
                                             }
+                                            // This engine runs here: its committee may send it
+                                            // resolver messages directly.
+                                            p2p.allow_direct(cw_topic.clone()).await;
                                             let mut wait_logged = false;
                                             loop {
                                                 match p2p.subscribed_peer_count(cw_topic.clone()).await {
@@ -1165,6 +1188,9 @@ pub(crate) fn init(
                                         let filter_for_sub = filter.clone();
                                         let engines = drain_shard_engines.clone();
                                         drain_spawner.detach("shard-unsubscribe", async move {
+                                            if !engines.read().contains_key(&filter_for_sub) {
+                                                p2p.revoke_direct(quil_engine::bitmasks::shard_cw_bitmask(&filter_for_sub)).await;
+                                            }
                                             // Decided when this runs, not when the engine
                                             // left: a sibling or the same filter may have
                                             // registered since. A registration racing the
@@ -1333,6 +1359,7 @@ mod tests {
     use super::*;
     use quil_engine::test_support::TestWorkerManager;
     use quil_engine::worker::WorkerManager as _;
+
 
     /// Reopen a worker store a test just dropped. The one-shot staged-frame
     /// cleanup the builder starts holds its own handle until it finishes, so
@@ -1596,4 +1623,23 @@ mod tests {
             Some(&b"after the cutover"[..]),
         );
     }
+}
+
+/// A historical-committee source for engines that resolves the node's
+/// service when it is called: engines start before the archive sync has
+/// built it.
+pub(crate) fn historical_committee_source(
+    cell: Arc<std::sync::OnceLock<Arc<super::historical_committees::HistoricalCommittees>>>,
+) -> quil_engine::historical_committee::HistoricalCommitteeSource {
+    Arc::new(move |filter: Vec<u8>, anchor: u64| {
+        let service = cell.get().cloned();
+        Box::pin(async move {
+            match service {
+                Some(service) => service.committees(&filter, anchor).await,
+                None => Err(quil_types::error::QuilError::ExecutionUnavailable(
+                    "historical committees not ready".into(),
+                )),
+            }
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = quil_types::error::Result<Vec<Vec<Vec<u8>>>>> + Send>>
+    })
 }

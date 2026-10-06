@@ -1,4 +1,4 @@
-# syntax=docker.io/docker/dockerfile:1.7-labs
+# syntax=docker.io/docker/dockerfile:1.19
 # Build on ubuntu:22.04 (glibc 2.35) so the dynamically-linked binaries
 # run on Ubuntu 22.04 hosts as well as newer releases — glibc symbol
 # versions are stamped from the build environment, and binaries linked
@@ -7,7 +7,7 @@
 #
 # Build from the repository root, e.g.:
 #   docker build -f docker/Dockerfile.source --target=node --output node/build/amd64_linux .
-FROM --platform=${TARGETPLATFORM} ubuntu:22.04 AS base
+FROM ubuntu:22.04 AS base
 
 # Common environment variables
 ENV PATH="${PATH}:/root/.cargo/bin/"
@@ -105,18 +105,10 @@ RUN git clone --branch flint-3.0 --depth 1 https://github.com/flintlib/flint.git
 FROM base AS emp-builder
 
 WORKDIR /opt/ceremonyclient
-# Copy the necessary script and source directories
-COPY install-emp.sh .
+COPY docker/build-emp.sh /opt/build-emp.sh
 COPY emp-tool emp-tool
 COPY emp-ot emp-ot
-
-RUN bash install-emp.sh
-
-# Fix emp-tool to be static and install
-RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make -j$(nproc) && make install
-
-# Install emp-ot
-RUN cd emp-ot && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make -j$(nproc) && make install
+RUN bash /opt/build-emp.sh
 
 # -----------------------------------------------------------------------------
 # Stage: rust-base
@@ -125,7 +117,10 @@ RUN cd emp-ot && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr
 FROM base AS rust-base
 
 COPY docker/rustup-init.sh /opt/rustup-init.sh
-RUN /opt/rustup-init.sh -y --profile minimal
+COPY rust-toolchain.toml /opt/rust-toolchain.toml
+RUN TOOLCHAIN=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' /opt/rust-toolchain.toml) && \
+    test -n "$TOOLCHAIN" && \
+    /opt/rustup-init.sh -y --profile minimal --default-toolchain "$TOOLCHAIN"
 
 # -----------------------------------------------------------------------------
 # Stage: libs-context
@@ -186,6 +181,8 @@ COPY ./node /opt/ceremonyclient/node
 # confidential token proof verifier worker, so it is the only binary.
 # -----------------------------------------------------------------------------
 FROM build-context AS build-node
+ARG TARGETOS
+ARG TARGETARCH
 COPY ./node /opt/ceremonyclient/node
 WORKDIR /opt/ceremonyclient/node
 # build.sh compiles the Rust `quil-node` crate in release mode and installs it
@@ -195,15 +192,14 @@ WORKDIR /opt/ceremonyclient/node
 # && finds the binary on the real filesystem.
 RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
-    --mount=type=cache,id=cargo-target-node,target=/opt/ceremonyclient/target \
-    ./build.sh && cp build/*/node /usr/bin/node
+    --mount=type=cache,id=cargo-target-${TARGETOS}-${TARGETARCH}-standard,target=/opt/ceremonyclient/target,sharing=locked \
+    CARGO_TIMINGS=1 ./build.sh && cp build/*/node /usr/bin/node
 
 # -----------------------------------------------------------------------------
 # Stage: build-qclient
 # Builds the Rust `qclient` (crates/quil-client). Uses the same native-lib
-# toolchain and cargo caches as build-node; a dedicated target cache avoids
-# cargo fingerprint thrash against build-node's different `-p` set. The `cp`
-# runs inside the same RUN as the build because target/ is a cache mount.
+# toolchain, explicit host target and target cache as build-node so common
+# dependencies can be reused. The cache is locked while Cargo is running.
 # -----------------------------------------------------------------------------
 FROM build-context AS build-qclient
 ARG TARGETOS
@@ -213,12 +209,14 @@ WORKDIR /opt/ceremonyclient
 # compat data from node/execution/... (retro JSONs via include_bytes! +
 # mainnet_244200_seniority.json via build.rs). build-context excludes node/,
 # so bring in just that data dir here.
+COPY ./node/build.sh /opt/ceremonyclient/node/build.sh
 COPY ./node/execution/intrinsics/global/compat /opt/ceremonyclient/node/execution/intrinsics/global/compat
 RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
-    --mount=type=cache,id=cargo-target-qclient,target=/opt/ceremonyclient/target \
-    cargo build --release -p quil-client --bin qclient && \
-    cp target/release/qclient /usr/bin/qclient
+    --mount=type=cache,id=cargo-target-${TARGETOS}-${TARGETARCH}-standard,target=/opt/ceremonyclient/target,sharing=locked \
+    CARGO_TIMINGS=1 CRATE_NAME=quil-client BIN_NAME=qclient OUT_BIN_NAME=qclient \
+    OUT_BASE_DIR=crates/quil-client/build bash node/build.sh && \
+    cp crates/quil-client/build/*/qclient /usr/bin/qclient
 
 # -----------------------------------------------------------------------------
 # Stage: node-only

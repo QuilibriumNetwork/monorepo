@@ -369,6 +369,16 @@ pub trait ClockStore: Send + Sync {
         &self,
         filter: &[u8],
     ) -> Result<proto::global::AppShardFrame>;
+    /// The latest stored frame number of shard `filter`, without reading the
+    /// frame: an application frame can be megabytes, and status queries need
+    /// only its number. `None` when the shard has no frame.
+    fn get_latest_shard_clock_frame_number(&self, filter: &[u8]) -> Result<Option<u64>> {
+        match self.get_latest_shard_clock_frame(filter) {
+            Ok(frame) => Ok(frame.header.map(|header| header.frame_number)),
+            Err(crate::error::QuilError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
     fn get_shard_clock_frame(
         &self,
         filter: &[u8],
@@ -408,6 +418,22 @@ pub trait ClockStore: Send + Sync {
         max_frame: u64,
     ) -> Result<()>;
     fn reset_shard_clock_frames(&self, filter: &[u8]) -> Result<()>;
+
+    /// Committee-handoff flag day: discard every application-shard frame
+    /// chain this store holds (frames, their indexes and staged copies,
+    /// per-frame relay records, application cursors and legacy consensus
+    /// keys), keeping application state and every GLOBAL frame, and record
+    /// that it ran at `global_frame`. One write; idempotent.
+    fn discard_app_frame_history(&self, _global_frame: u64) -> Result<()> {
+        Err(crate::error::QuilError::Internal(
+            "this clock store cannot discard application frame history".into(),
+        ))
+    }
+
+    /// The GLOBAL frame [`Self::discard_app_frame_history`] ran at, if it has.
+    fn app_frame_history_discarded(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
 
     // Shard certified state
     fn get_latest_certified_app_shard_state(
@@ -756,8 +782,36 @@ pub struct CoinPageData {
     pub has_more: bool,
 }
 
+/// One legacy (transparent) coin of an owner. Owner, amount and origin are
+/// public; `shielded` is whether GLOBAL has recorded it consumed by a shield.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyCoinData {
+    pub address: [u8; 32],
+    pub amount: u128,
+    pub origin: [u8; 32],
+    pub shielded: bool,
+}
+
+/// One page of an owner's legacy coins, ascending by address.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LegacyCoinPageData {
+    pub coins: Vec<LegacyCoinData>,
+    pub cursor: Option<[u8; 32]>,
+    pub has_more: bool,
+}
+
+/// Legacy coins one page carries.
+pub const MAX_LEGACY_COINS_PER_PAGE: usize = 512;
+
 /// Node-side QCT3 wallet discovery, membership and mint-witness provider.
 pub trait CoinWitnessProvider: Send + Sync {
+    /// `owner`'s legacy coins in `domain` after `after`. `None` when this node
+    /// cannot list them (no complete owner index): the caller asks an
+    /// archive instead.
+    fn legacy_coins(&self, _domain: &[u8; 32], _owner: &[u8; 32], _after: Option<&[u8; 32]>) -> Result<Option<LegacyCoinPageData>> {
+        Ok(None)
+    }
+
     fn escrow_page(&self, _domain: &[u8; 32], _snapshot_id: Option<&[u8; 32]>, _after: Option<&[u8; 32]>) -> Result<Option<EscrowPageData>> {
         Ok(None)
     }

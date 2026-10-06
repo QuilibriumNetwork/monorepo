@@ -230,6 +230,10 @@ pub enum AppEngineEvent {
         filter: Vec<u8>,
         channel: u64,
         bytes: Vec<u8>,
+        /// The committee keys it is addressed to, for the resolver channel
+        /// only (empty otherwise): a node may deliver it to just those
+        /// members, falling back to the topic.
+        recipients: Vec<Vec<u8>>,
     },
 }
 
@@ -273,6 +277,7 @@ impl SharedAppEngineSizes {
 /// master holds one, and it can be shared across message routing tasks.
 #[derive(Clone, Debug)]
 pub struct AppEngineHandle {
+    cancel: CancellationToken,
     materialized: Arc<std::sync::atomic::AtomicU64>,
     pub filter: Vec<u8>,
     msg_tx: mpsc::Sender<AppEngineMessage>,
@@ -281,6 +286,26 @@ pub struct AppEngineHandle {
 }
 
 impl AppEngineHandle {
+    /// A handle for `filter` whose messages arrive on the returned receiver.
+    #[cfg(test)]
+    pub(crate) fn for_test(filter: Vec<u8>) -> (Self, mpsc::Receiver<AppEngineMessage>) {
+        let (msg_tx, receiver) = mpsc::channel(16);
+        let handle = Self {
+            cancel: CancellationToken::new(),
+            materialized: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            filter,
+            msg_tx,
+            sizes: SharedAppEngineSizes::new(),
+            fee_snapshot: Arc::new(std::sync::Mutex::new(None)),
+        };
+        (handle, receiver)
+    }
+
+    /// Request cooperative shutdown. The task owner must also await its join.
+    pub fn stop(&self) {
+        self.cancel.cancel();
+    }
+
     /// Send a message to the app engine (non-blocking, drops on full).
     pub fn send(&self, msg: AppEngineMessage) {
         let _ = self.msg_tx.try_send(msg);
@@ -1095,24 +1120,35 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 use sha3::{Digest, Sha3_256};
                 Sha3_256::digest(canon).into()
             }).collect();
+            let sources: Vec<Option<[u8; 32]>> = canonical_requests.iter()
+                .map(|canon| quil_execution::ExecutionEngineManager::shield_source(canon))
+                .collect();
             let now = std::time::Instant::now();
             let (waited, first_seen) = routing_waits(&self.routing_seen, &hashes, &operations, now);
-            let keep = routed_selection(&self.filter, &shards, &hashes, &operations, &waited, ROUTED_FALLBACK);
-            for ((((hash, ops), waited), keep), first) in hashes.iter().zip(&operations).zip(&waited).zip(&keep).zip(&first_seen) {
+            let keep = routed_selection(&self.filter, &shards, &hashes, &operations, &sources, &waited, ROUTED_FALLBACK);
+            for (((((hash, ops), source), waited), keep), first) in
+                hashes.iter().zip(&operations).zip(&sources).zip(&waited).zip(&keep).zip(&first_seen)
+            {
                 if *ops == 0 {
                     continue;
                 }
-                let designated = (!shards.is_empty()).then(|| {
-                    let index = u64::from_be_bytes(hash[..8].try_into().unwrap()) % shards.len() as u64;
-                    hex::encode(&shards[index as usize][shards[index as usize].len().min(32)..])
-                });
+                let designated = match source {
+                    Some(source) => shards.iter().position(|shard| shard_covers(shard, source)),
+                    None => (!shards.is_empty())
+                        .then(|| (u64::from_be_bytes(hash[..8].try_into().unwrap()) % shards.len() as u64) as usize),
+                }
+                .map(|index| hex::encode(&shards[index][shards[index].len().min(32)..]));
                 if *first && !*keep {
-                    // Once per bundle and shard: when this shard takes it.
-                    let admitted_after_s = routing_offset(&self.filter, &shards, hash)
-                        .map_or(ROUTED_FALLBACK.as_secs(), |offset| offset * ROUTED_FALLBACK.as_secs());
+                    // Once per bundle and shard: when this shard takes it. A
+                    // shield never comes here unless this shard holds its source.
+                    let admitted_after_s = match source {
+                        Some(_) => None,
+                        None => Some(routing_offset(&self.filter, &shards, hash)
+                            .map_or(ROUTED_FALLBACK.as_secs(), |offset| offset * ROUTED_FALLBACK.as_secs())),
+                    };
                     info!(frame = frame_number, bundle = %hex::encode(&hash[..4]), designated = ?designated,
-                        admitted_after_s, shards = shards.len(), listed = listed_count,
-                        "confidential bundle held for its designated shard");
+                        admitted_after_s = ?admitted_after_s, shield = source.is_some(), shards = shards.len(),
+                        listed = listed_count, "confidential bundle held for its designated shard");
                 }
                 if *keep {
                     info!(frame = frame_number, bundle = %hex::encode(&hash[..4]), shards = shards.len(),
@@ -1656,8 +1692,10 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
 /// `AppEngineEvent::CwOut` on the engine's event channel. The master publishes
 /// it on `shard_cw_bitmask` gossip (or the in-memory harness routes it to peers).
 /// `deliver` runs on the simplex thread → a plain channel send (no runtime
-/// needed). Recipients are dropped: the master fans out to the whole shard
-/// committee via gossip, a safe superset. For a single-prover shard nothing is
+/// needed). Votes, certificates and blocks go to the whole shard committee via
+/// gossip. Resolver messages keep their recipients (one member each): sent to
+/// the whole topic, every subscriber received every response, 163–171 Mbit/s
+/// on one regular node (2026-10-04). For a single-prover shard nothing is
 /// delivered anywhere (simplex handles its own messages internally).
 struct EngineCwTransport {
     filter: Vec<u8>,
@@ -1667,13 +1705,20 @@ impl crate::cw_app_seams::AppConsensusTransport for EngineCwTransport {
     fn deliver(
         &self,
         channel: u64,
-        _recipients: Vec<quil_cw_consensus::falcon_base::FalconPublicKey>,
+        recipients: Vec<quil_cw_consensus::falcon_base::FalconPublicKey>,
         bytes: Vec<u8>,
     ) {
+        let recipients = if channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
+            crate::resolver_traffic::ResolverTraffic::process().note_sent(&self.filter, &bytes);
+            recipients.iter().map(|key| key.as_ref().to_vec()).collect()
+        } else {
+            Vec::new()
+        };
         let _ = self.event_tx.send(AppEngineEvent::CwOut {
             filter: self.filter.clone(),
             channel,
             bytes,
+            recipients,
         });
     }
 }
@@ -1863,6 +1908,11 @@ const APP_CW_EPOCH: u64 = 0;
 /// Same-session restarts retain BOTH votes and the original genesis, even if
 /// the local finalized head advanced. This is local replay configuration, not
 /// a protocol for choosing a common checkpoint across changing committees.
+///
+/// `adopt_candidate`: the candidate head must become the genesis, because
+/// another committee certified it and this one cannot resume past it from an
+/// older genesis. A journal of an older genesis is then retired even when its
+/// committee and key match; one already anchored at the candidate is kept.
 fn prepare_app_cw_journal(
     journal_dir: &std::path::Path,
     peers: &[quil_cw_consensus::falcon_base::FalconPublicKey],
@@ -1870,6 +1920,7 @@ fn prepare_app_cw_journal(
     local_key: &[u8],
     candidate_anchor: [u8; 32],
     candidate_frame: u64,
+    adopt_candidate: bool,
 ) -> std::io::Result<([u8; 32], u64)> {
     use sha2::{Digest, Sha256};
     const VERSION: &[u8; 5] = b"QLAS\x01";
@@ -1910,7 +1961,9 @@ fn prepare_app_cw_journal(
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
                         "local shard head does not contain the persisted consensus genesis; synchronize before replay"));
                 }
-                return Ok((anchor, frame));
+                if !adopt_candidate || candidate_frame == frame {
+                    return Ok((anchor, frame));
+                }
             }
         }
     }
@@ -2064,6 +2117,9 @@ pub struct AppConsensusEngine {
     /// member that cannot re-derive its sealed history locally.
     outgoing_history_source: Option<crate::app_handoff::OutgoingHistorySource>,
     global_anchor_source: Option<crate::global_anchor::GlobalAnchorSource>,
+    /// Committees that certified legacy frames, when today's registry no
+    /// longer reproduces them (see `historical_committee`).
+    historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
 
     // Identity
     local_prover_address: Vec<u8>,
@@ -2107,6 +2163,8 @@ pub struct AppConsensusEngine {
     /// Republished until GLOBAL state records it; the sealed session is never
     /// restarted, since every later view could only nullify.
     sealed_session: Option<([u8; 32], Vec<u8>)>,
+    /// When this member last published its closing certificate.
+    seal_published_at: Option<std::time::Instant>,
     /// Self-clone of the inbound message sender, so `on_finalized` (running
     /// on the simplex thread) can inject `CwFinalizedFrame` into this run loop.
     self_msg_tx: mpsc::Sender<AppEngineMessage>,
@@ -2161,7 +2219,9 @@ impl AppConsensusEngine {
         let sizes = SharedAppEngineSizes::new();
         let fee_snapshot = Arc::new(std::sync::Mutex::new(None));
         let shard_mat_frame = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancel = CancellationToken::new();
         let handle = AppEngineHandle {
+            cancel: cancel.clone(),
             materialized: shard_mat_frame.clone(),
             fee_snapshot: fee_snapshot.clone(),
             filter: filter.clone(),
@@ -2221,13 +2281,14 @@ impl AppConsensusEngine {
             received_full_frames: HashMap::new(),
             pending_follower_clock: None,
             materialize_failures: HashMap::new(),
-            cancel: CancellationToken::new(),
+            cancel,
             msg_rx: Some(msg_rx),
             event_tx,
             app_frame_validator: None,
             storage_history_source: None,
             outgoing_history_source: None,
             global_anchor_source: None,
+            historical_committee_source: None,
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2240,6 +2301,7 @@ impl AppConsensusEngine {
             session_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             private_parents: None,
             sealed_session: None,
+            seal_published_at: None,
             self_msg_tx: msg_tx,
             sizes,
             fee_snapshot,
@@ -2571,6 +2633,34 @@ impl AppConsensusEngine {
         self
     }
 
+    /// Wire the source of historical legacy committees before the engine is
+    /// started.
+    pub fn with_historical_committee_source(
+        mut self,
+        source: Option<crate::historical_committee::HistoricalCommitteeSource>,
+    ) -> Self {
+        self.historical_committee_source = source;
+        self.app_frame_validator = None;
+        self
+    }
+
+    /// The newer certified head when the running legacy instance started from
+    /// an adopted head as genesis (`AppConsensusCwHandle::adopted_genesis`),
+    /// has finalized nothing since, and this member's head has moved past it:
+    /// the members did not share that head, and the ones behind caught up.
+    fn adopted_genesis_superseded(&self) -> Option<u64> {
+        let handle = self.cw_handle.as_ref()?;
+        let genesis = handle.adopted_genesis?;
+        if handle.finalized.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let head = self.clock_store.get_latest_shard_clock_frame(&self.filter).ok()?;
+        let header = head.header.as_ref()?;
+        let certified = header.public_key_signature_bls48581.as_ref()
+            .is_some_and(|signature| quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature).is_some());
+        (certified && header.frame_number > genesis).then_some(header.frame_number)
+    }
+
     /// Shared digest, storage and committee validator, independent of the
     /// currently running consensus host, for restart and follower replay.
     fn frame_validator(&mut self) -> Arc<BlsAppFrameValidator> {
@@ -2599,6 +2689,9 @@ impl AppConsensusEngine {
         }
         if let Some(source) = &self.global_anchor_source {
             validator = validator.with_global_anchor_source(source.clone());
+        }
+        if let Some(source) = &self.historical_committee_source {
+            validator = validator.with_historical_committee_source(source.clone());
         }
         let validator = Arc::new(validator);
         self.app_frame_validator = Some(validator.clone());
@@ -3008,6 +3101,11 @@ impl AppConsensusEngine {
             Err(error) => warn!(core_id = self.core_id, %error, "could not rewind shard state past a fenced checkpoint"),
             Ok(_) => {}
         }
+        // A node that starts past the committee-handoff flag day discards its
+        // legacy app history before restoring a cursor into it.
+        if let Err(error) = self.discard_legacy_history_if_due().await {
+            warn!(core_id = self.core_id, %error, "legacy app history could not be discarded at startup");
+        }
         let restored_cursor = match self.load_materialized_cursor() {
             Ok(cursor) => cursor,
             Err(error) => {
@@ -3325,6 +3423,9 @@ impl AppConsensusEngine {
                         self.try_materialize_follower_frames().await;
                     }
                     self.heal_disagreeing_pre_state();
+                    if let Err(error) = self.discard_legacy_history_if_due().await {
+                        warn!(core_id = self.core_id, %error, "legacy app history could not be discarded; will retry");
+                    }
                     // This timer also handles dynamic-committee rebuilds below.
                     // Keep *both* paths behind the transport barrier: otherwise
                     // a timer tick while CW is still waiting for a subscribed
@@ -3399,6 +3500,24 @@ impl AppConsensusEngine {
                                 Err(e) => {
                                     warn!(core_id = self.core_id, error = %e, "committee rebuild failed — will retry");
                                 }
+                            }
+                        } else if let Some(head) = self.adopted_genesis_superseded() {
+                            // Its members never agreed on the head it started
+                            // from; start again from the newer certified one.
+                            info!(
+                                core_id = self.core_id,
+                                filter = hex::encode(&self.filter),
+                                head,
+                                "legacy app consensus never finalized from its adopted genesis — restarting from the newer certified head"
+                            );
+                            if let Some(old) = self.cw_handle.take() {
+                                if let Err(e) = old.shutdown_and_join().await {
+                                    warn!(core_id = self.core_id, error = %e, "old app consensus host stopped with an error");
+                                }
+                            }
+                            match self.start_consensus_cw((bls_signer_factory)()).await {
+                                Ok(handle) => self.cw_handle = Some(handle),
+                                Err(e) => warn!(core_id = self.core_id, error = %e, "app consensus restart failed — will retry"),
                             }
                         }
                     }
@@ -3491,6 +3610,7 @@ impl AppConsensusEngine {
             publish(submission.1.clone());
         }
         self.sealed_session = Some(submission);
+        self.seal_published_at = Some(std::time::Instant::now());
         if let Some(old) = self.cw_handle.take() {
             if let Err(e) = old.shutdown_and_join().await {
                 warn!(core_id = self.core_id, error = %e, "sealed app consensus host stopped with an error");
@@ -3509,7 +3629,16 @@ impl AppConsensusEngine {
             self.adopt_registered_session(&global).await;
             return;
         };
-        if let Some((_, submission)) = self.sealed_session.as_ref() {
+        // Every member of the closing committee submits the seal; a copy
+        // already in flight needs no repeat until it has had time to land.
+        // Resubmissions are spaced a minute apart, staggered per member, so a
+        // committee's members do not flood GLOBAL in step while their views of
+        // it lag.
+        let resubmit_after = std::time::Duration::from_secs(
+            60 + u64::from(self.local_bls_pubkey.last().copied().unwrap_or(0) % 30),
+        );
+        let due = self.seal_published_at.is_none_or(|at| at.elapsed() >= resubmit_after);
+        if let (Some((_, submission)), true) = (self.sealed_session.as_ref(), due) {
             let view = quil_execution::global_intrinsic::handoff::CommittedView::capture(&global);
             let recorded = view.and_then(|view|
                 quil_execution::global_intrinsic::handoff::schedule::seal_submitted(&view, &session));
@@ -3517,6 +3646,7 @@ impl AppConsensusEngine {
                 if let Some(publish) = self.coverage_publish.as_ref() {
                     publish(submission.clone());
                 }
+                self.seal_published_at = Some(std::time::Instant::now());
             }
         }
         match crate::app_handoff::still_current(&global, &session) {
@@ -3539,26 +3669,124 @@ impl AppConsensusEngine {
     /// zero): stop it, so the retry path restarts it
     /// under that session, over the same journal, committee and namespace and
     /// inside the handoff automaton that drains and seals it.
+    ///
+    /// On a flag day (`quil_types::consensus::LegacyHistory::Discard`) the legacy instance stops at
+    /// activation whether or not the first session is authorized yet: GLOBAL
+    /// accepts no legacy frame from then on.
     async fn adopt_registered_session(&mut self, global: &Arc<quil_hypergraph::HypergraphCrdt>) {
-        if self.cw_handle.is_none() || quil_types::consensus::committee_handoff_policy().is_none() {
+        let Some(policy) = quil_types::consensus::committee_handoff_policy() else { return };
+        if self.cw_handle.is_none() {
             return;
         }
         let global_frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
             .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
-        match crate::app_handoff::resolve(global, &self.filter, global_frame) {
+        let stop = match crate::app_handoff::resolve(global, &self.filter, global_frame) {
             Ok(crate::app_handoff::SessionChoice::Session(session)) => {
                 info!(core_id = self.core_id, filter = hex::encode(&self.filter),
                     generation = session.generation, base_frame = session.base_frame,
                     "legacy app shard registered as a committee session; restarting its consensus under it");
-                if let Some(old) = self.cw_handle.take() {
-                    if let Err(e) = old.shutdown_and_join().await {
-                        warn!(core_id = self.core_id, error = %e, "legacy app consensus host stopped with an error");
-                    }
+                true
+            }
+            Ok(crate::app_handoff::SessionChoice::Pending(why))
+                if policy.legacy_history == quil_types::consensus::LegacyHistory::Discard =>
+            {
+                info!(core_id = self.core_id, filter = hex::encode(&self.filter), global_frame, why,
+                    "committee sessions activated: legacy app consensus stops; its history is discarded");
+                true
+            }
+            Ok(_) => false,
+            Err(error) => {
+                debug!(core_id = self.core_id, %error, "committee session registration unreadable");
+                false
+            }
+        };
+        if stop {
+            if let Some(old) = self.cw_handle.take() {
+                if let Err(e) = old.shutdown_and_join().await {
+                    warn!(core_id = self.core_id, error = %e, "legacy app consensus host stopped with an error");
                 }
             }
-            Ok(_) => {}
-            Err(error) => debug!(core_id = self.core_id, %error, "committee session registration unreadable"),
         }
+    }
+
+    /// Committee-handoff flag day (`LegacyHistory::Discard`): once this
+    /// node's GLOBAL chain reaches activation, discard the application frame
+    /// history this engine's store holds (`ClockStore::discard_app_frame_history`:
+    /// every shard's frames, per-frame records and cursors), keeping the
+    /// application state, before any session runs here. The store records
+    /// that it ran, so it runs once. A running legacy host stops first.
+    /// Returns whether it discarded.
+    async fn discard_legacy_history_if_due(&mut self) -> Result<bool> {
+        let Some(policy) = quil_types::consensus::committee_handoff_policy()
+            .filter(|policy| policy.legacy_history == quil_types::consensus::LegacyHistory::Discard)
+        else {
+            return Ok(false);
+        };
+        let global_frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
+            .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+        if global_frame < policy.activation_frame || self.clock_store.app_frame_history_discarded()?.is_some() {
+            return Ok(false);
+        }
+        if let Some(old) = self.cw_handle.take() {
+            if let Err(e) = old.shutdown_and_join().await {
+                warn!(core_id = self.core_id, error = %e, "legacy app consensus host stopped with an error");
+            }
+        }
+        self.clock_store.discard_app_frame_history(global_frame)?;
+        // What this engine holds of the discarded chain.
+        self.set_materialized_frame(0);
+        self.shard_frame_number = 0;
+        let _ = self.fee_manager.rewind_to_frame(&self.filter, 0);
+        self.frame_outflows.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.received_full_frames.clear();
+        self.pending_follower_clock = None;
+        self.finalized_requests_roots.clear();
+        self.materialize_failures.clear();
+        self.message_spillover.clear();
+        self.proposal_cache.clear();
+        self.pending_certified_parents.clear();
+        self.retry_parent_seals.clear();
+        self.pending_seal_rank = None;
+        self.frame_requests.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.frame_attestations.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if let Some(parents) = self.private_parents.as_ref() {
+            parents.clear();
+        }
+        if let Some(base) = self.cw_storage_base.as_ref() {
+            let directory = base.join("cw-app-consensus").join(format!("finalized-{}", hex::encode(&self.filter)));
+            if let Ok(records) = crate::cw_app_seams::FinalizedRecords::open(directory) {
+                records.discard_above(0);
+            }
+        }
+        forget_legacy_relay_boundaries();
+        info!(core_id = self.core_id, filter = hex::encode(&self.filter), global_frame,
+            "committee-handoff flag day: legacy app frame history discarded; application state kept");
+        Ok(true)
+    }
+
+    /// After this store discarded its legacy history, finalized records this
+    /// shard kept from a legacy instance (its own, or an earlier assignment's
+    /// left beside it) are not replayed into a session.
+    fn drop_discarded_finalized_records(&self) -> Result<()> {
+        let Some(policy) = quil_types::consensus::committee_handoff_policy() else { return Ok(()) };
+        if policy.legacy_history != quil_types::consensus::LegacyHistory::Discard
+            || self.clock_store.app_frame_history_discarded()?.is_none()
+        {
+            return Ok(());
+        }
+        let Some(base) = self.cw_storage_base.as_ref() else { return Ok(()) };
+        let directory = base.join("cw-app-consensus").join(format!("finalized-{}", hex::encode(&self.filter)));
+        if !directory.exists() {
+            return Ok(());
+        }
+        let records = crate::cw_app_seams::FinalizedRecords::open(directory)
+            .map_err(|e| QuilError::Internal(format!("open finalized app frames: {e}")))?;
+        let dropped = records.discard_anchored_before(policy.activation_frame);
+        if dropped > 0 {
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), dropped,
+                "dropped finalized app frames of the discarded legacy history");
+        }
+        Ok(())
     }
 
     /// Order-independent fingerprint of a committee member set.
@@ -3624,6 +3852,8 @@ impl AppConsensusEngine {
     ) -> Result<crate::cw_app_seams::AppConsensusCwHandle> {
         let filter = self.filter.clone();
         let app_address = self.app_address.clone();
+        self.discard_legacy_history_if_due().await?;
+        self.drop_discarded_finalized_records()?;
         self.rewind_past_fence()?;
 
         // Candidate anchor for a NEW local session. An existing journal reuses
@@ -3927,9 +4157,28 @@ impl AppConsensusEngine {
             None => cw_app_storage_dir,
         };
         let candidate_anchor = (genesis_id, genesis_frame_number);
+        // A legacy head another committee certified cannot be this committee's
+        // finalized floor. Once it validates under the committee that did
+        // certify it, the instance starts from it as genesis, and a journal of
+        // an older genesis is retired (see `cw_app_seams::restart_finalization`).
+        let adopt_head = match (session.as_ref(), recovered_head.as_ref()) {
+            (None, Some(frame)) => {
+                let mut namespace = b"appshard".to_vec();
+                namespace.extend_from_slice(&filter);
+                let foreign = frame.header.as_ref().is_some_and(|header| {
+                    header.frame_number > 0
+                        && matches!(
+                            crate::cw_app_seams::restart_finalization(header, &peers, &namespace, APP_CW_EPOCH, true),
+                            Ok(None)
+                        )
+                });
+                foreign && matches!(validate_app_frame_panic_safe(&self.frame_validator(), frame, false), Ok(true))
+            }
+            _ => false,
+        };
         if let Some(dir) = cw_app_storage_dir.as_ref().filter(|_| continues_legacy) {
             (genesis_id, genesis_frame_number) = prepare_app_cw_journal(
-                dir, &peers, &filter, &my_pk, genesis_id, genesis_frame_number,
+                dir, &peers, &filter, &my_pk, genesis_id, genesis_frame_number, adopt_head,
             ).map_err(|e| QuilError::Internal(format!("prepare app consensus journal: {e}")))?;
         }
         if (genesis_id, genesis_frame_number) != candidate_anchor {
@@ -6189,6 +6438,13 @@ fn routing_offset(filter: &[u8], shards: &[Vec<u8>], hash: &[u8; 32]) -> Option<
     shards.iter().position(|shard| shard.as_slice() == filter).map(|position| (position as u64 + count - designated) % count)
 }
 
+/// Whether `filter`'s range holds `address` (a data address of its
+/// application). An undecodable filter holds nothing.
+fn shard_covers(filter: &[u8], address: &[u8; 32]) -> bool {
+    quil_forest::decode_shard_filter_or_root(filter, 32)
+        .is_some_and(|(_, bits)| quil_types::execution::ShardPath::from_bits(&bits).covers(address))
+}
+
 /// Which collected bundles this shard proposes now: every bundle without a
 /// confidential operation, and each confidential one this shard is admitted
 /// to. A bundle's order over `shards` starts at its designated shard (its hash
@@ -6198,20 +6454,35 @@ fn routing_offset(filter: &[u8], shards: &[Vec<u8>], hash: &[u8; 32]) -> Option<
 /// shard missing from the list is admitted once the bundle has waited
 /// `fallback`. With no live shard list every bundle is this shard's, as
 /// before routing.
+///
+/// A bundle with a shield (`sources[i]`, its legacy source coin) is this
+/// shard's exactly when this shard's range holds that coin, whatever the
+/// list or the wait: the shield's source check reads the executing shard's
+/// own store, so any other shard refuses it ("source coin not found"). With
+/// hash routing a shield on a 30-shard application reached the one shard
+/// that could verify it about one time in thirty.
 fn routed_selection(
     filter: &[u8],
     shards: &[Vec<u8>],
     hashes: &[[u8; 32]],
     operations: &[usize],
+    sources: &[Option<[u8; 32]>],
     waited: &[std::time::Duration],
     fallback: std::time::Duration,
 ) -> Vec<bool> {
     hashes
         .iter()
         .zip(operations)
+        .zip(sources)
         .zip(waited)
-        .map(|((hash, ops), waited)| {
-            if *ops == 0 || shards.is_empty() {
+        .map(|(((hash, ops), source), waited)| {
+            if *ops == 0 {
+                return true;
+            }
+            if let Some(source) = source {
+                return shard_covers(filter, source);
+            }
+            if shards.is_empty() {
                 return true;
             }
             let admitted = 1 + waited.as_secs() / fallback.as_secs().max(1);
@@ -6257,9 +6528,23 @@ fn verification_budget_selection(operations: &[usize], capacity: usize) -> Vec<b
 ///
 /// Anchors rise along a shard's chain, so the boundary is remembered per shard
 /// and each side of it is read from the clock store at most once.
+/// `(filter, activation frame)` → (highest frame known to precede it, lowest
+/// frame known to relay), learned from stored frames by [`legacy_relay_frame`].
+static LEGACY_RELAY_BOUNDARY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(Vec<u8>, u64), (u64, u64)>>,
+> = std::sync::OnceLock::new();
+
+/// Forget every learned relay boundary: the frame chains they were learned
+/// from were discarded, and the frames now numbered alike are new.
+pub(crate) fn forget_legacy_relay_boundaries() {
+    if let Some(Ok(mut map)) = LEGACY_RELAY_BOUNDARY.get().map(|map| map.lock()) {
+        map.clear();
+    }
+}
+
 pub fn legacy_relay_frame(clock_store: &dyn ClockStore, filter: &[u8], frame_number: u64) -> bool {
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     let from = quil_execution::token_intrinsic::global_commit::relay_activation_frame();
     if from == 0 || frame_number == 0 {
         return false;
@@ -6267,10 +6552,7 @@ pub fn legacy_relay_frame(clock_store: &dyn ClockStore, filter: &[u8], frame_num
     if from == u64::MAX {
         return true;
     }
-    // (filter, activation frame) → (highest frame known to precede it, lowest
-    // frame known to relay).
-    static BOUNDARY: OnceLock<Mutex<HashMap<(Vec<u8>, u64), (u64, u64)>>> = OnceLock::new();
-    let boundary = BOUNDARY.get_or_init(|| Mutex::new(HashMap::new()));
+    let boundary = LEGACY_RELAY_BOUNDARY.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (filter.to_vec(), from);
     if let Some(&(legacy_through, relaying_from)) = boundary.lock().ok().and_then(|map| map.get(&key).copied()).as_ref() {
         if frame_number <= legacy_through {
@@ -6827,6 +7109,13 @@ async fn storage_history_retained(
     validator: &BlsAppFrameValidator,
     frame: &quil_types::proto::global::AppShardFrame,
 ) -> bool {
+    // Every certified frame taken from an archive or the local store passes
+    // here before it is validated: a legacy certificate today's registry no
+    // longer reproduces gets its historical committees first.
+    if let Err(error) = validator.prepare_historical_committee(frame).await {
+        warn!(frame = frame.header.as_ref().map_or(0, |header| header.frame_number), %error,
+            "historical committee of a certified legacy frame unavailable");
+    }
     match validator.prepare_storage_history(frame).await {
         Ok(()) => true,
         Err(error) => {
@@ -6875,6 +7164,30 @@ pub(crate) fn validate_app_frame_panic_safe(
 mod tests {
     use super::*;
 
+    /// Resolver messages carry the members they are addressed to; votes,
+    /// certificates and blocks go to the whole topic.
+    #[test]
+    fn only_resolver_messages_carry_their_recipients() {
+        use crate::cw_app_seams::AppConsensusTransport as _;
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let transport = EngineCwTransport { filter: vec![1; 32], event_tx };
+        let member = quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&[5; 897]).unwrap();
+        for (channel, expected) in [
+            (crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL, vec![vec![5u8; 897]]),
+            (0, Vec::new()),
+            (1, Vec::new()),
+            (crate::cw_app_seams::CW_APP_BLOCK_CHANNEL, Vec::new()),
+        ] {
+            transport.deliver(channel, vec![member.clone()], vec![channel as u8]);
+            match events.try_recv().unwrap() {
+                AppEngineEvent::CwOut { channel: sent, recipients, .. } => {
+                    assert_eq!((sent, recipients), (channel, expected));
+                }
+                _ => panic!("expected a CwOut"),
+            }
+        }
+    }
+
     /// Each confidential bundle is proposed by exactly one live shard, the
     /// same one whichever shard asks, and by one more for each fallback period
     /// it waits. Plain bundles, and every bundle when no shard list is known,
@@ -6892,11 +7205,12 @@ mod tests {
             Sha3_256::digest([n]).into()
         }).collect();
         let operations = vec![1; hashes.len()];
+        let none = vec![None; hashes.len()];
         let fresh = vec![Duration::ZERO; hashes.len()];
         let fallback = Duration::from_secs(30);
         let mut taken = vec![0; hashes.len()];
         for shard in &shards {
-            let keep = routed_selection(shard, &shards, &hashes, &operations, &fresh, fallback);
+            let keep = routed_selection(shard, &shards, &hashes, &operations, &none, &fresh, fallback);
             for (i, keep) in keep.iter().enumerate() {
                 taken[i] += usize::from(*keep);
             }
@@ -6908,23 +7222,66 @@ mod tests {
             let waited = vec![fallback * periods; hashes.len()];
             let mut taken = vec![0; hashes.len()];
             for shard in &shards {
-                for (i, keep) in routed_selection(shard, &shards, &hashes, &operations, &waited, fallback).iter().enumerate() {
+                for (i, keep) in routed_selection(shard, &shards, &hashes, &operations, &none, &waited, fallback).iter().enumerate() {
                     taken[i] += usize::from(*keep);
                 }
             }
             assert!(taken.iter().all(|n| *n == expected), "{periods} periods: {expected} shards");
         }
         let half = vec![fallback / 2; hashes.len()];
-        let early = routed_selection(&shards[0], &shards, &hashes, &operations, &half, fallback);
-        assert_eq!(early, routed_selection(&shards[0], &shards, &hashes, &operations, &fresh, fallback), "no helper before a full period");
+        let early = routed_selection(&shards[0], &shards, &hashes, &operations, &none, &half, fallback);
+        assert_eq!(early, routed_selection(&shards[0], &shards, &hashes, &operations, &none, &fresh, fallback), "no helper before a full period");
         // A shard missing from the list helps once the bundle has waited a period.
         let outsider = quil_forest::encode_shard_bit_path(&app, &[true, true, true]);
-        assert!(routed_selection(&outsider, &shards, &hashes, &operations, &fresh, fallback).iter().all(|k| !*k));
+        assert!(routed_selection(&outsider, &shards, &hashes, &operations, &none, &fresh, fallback).iter().all(|k| !*k));
         let late = vec![fallback; hashes.len()];
-        assert!(routed_selection(&outsider, &shards, &hashes, &operations, &late, fallback).iter().all(|k| *k));
+        assert!(routed_selection(&outsider, &shards, &hashes, &operations, &none, &late, fallback).iter().all(|k| *k));
         let plain = vec![0; hashes.len()];
-        assert!(routed_selection(&shards[0], &shards, &hashes, &plain, &fresh, fallback).iter().all(|k| *k));
-        assert!(routed_selection(&shards[0], &[], &hashes, &operations, &fresh, fallback).iter().all(|k| *k));
+        assert!(routed_selection(&shards[0], &shards, &hashes, &plain, &none, &fresh, fallback).iter().all(|k| *k));
+        assert!(routed_selection(&shards[0], &[], &hashes, &operations, &none, &fresh, fallback).iter().all(|k| *k));
+    }
+
+    /// A shield goes to the one shard whose range holds its legacy source
+    /// coin, also past every fallback and whatever the shard list says; other
+    /// bundles keep their hash routing.
+    #[test]
+    fn a_shield_goes_only_to_the_shard_holding_its_source() {
+        use std::time::Duration;
+        let app = [0x11u8; 32];
+        let shards: Vec<Vec<u8>> = [[false, false], [false, true], [true, false], [true, true]]
+            .iter()
+            .map(|bits| quil_forest::encode_shard_bit_path(&app, bits))
+            .collect();
+        let hashes: Vec<[u8; 32]> = (0..16u8).map(|n| {
+            use sha3::{Digest, Sha3_256};
+            Sha3_256::digest([n]).into()
+        }).collect();
+        let operations = vec![1; hashes.len()];
+        // Sources spread over the four ranges: top bits n % 4.
+        let sources: Vec<Option<[u8; 32]>> = (0..hashes.len())
+            .map(|n| { let mut a = [0x3f; 32]; a[0] = ((n % 4) as u8) << 6 | 0x3f; Some(a) })
+            .collect();
+        let fallback = Duration::from_secs(30);
+        for waited in [Duration::ZERO, fallback * 9] {
+            let waited = vec![waited; hashes.len()];
+            for (index, shard) in shards.iter().enumerate() {
+                let keep = routed_selection(shard, &shards, &hashes, &operations, &sources, &waited, fallback);
+                for (n, keep) in keep.iter().enumerate() {
+                    assert_eq!(*keep, n % 4 == index, "bundle {n} on shard {index}");
+                }
+            }
+            // A shard outside the list that holds the source takes it; with no
+            // list, only the covering shard does.
+            let child = quil_forest::encode_shard_bit_path(&app, &[true, true, false]);
+            let mut deep = [0u8; 32];
+            deep[0] = 0b1100_0000;
+            let one = [Some(deep)];
+            assert_eq!(routed_selection(&child, &shards, &hashes[..1], &operations[..1], &one, &waited[..1], fallback), vec![true]);
+            assert_eq!(routed_selection(&shards[0], &[], &hashes[..1], &operations[..1], &one, &waited[..1], fallback), vec![false]);
+        }
+        // The whole application holds every source.
+        assert!(routed_selection(&app, &shards, &hashes, &operations, &sources, &vec![Duration::ZERO; hashes.len()], fallback)
+            .iter().all(|k| *k));
     }
 
     /// The live shards are this application's filters with Active provers,
@@ -7297,7 +7654,7 @@ mod tests {
         let (msg_tx, receiver) = mpsc::channel(1);
         let materialized = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stored = Arc::new(std::sync::Mutex::new(None));
-        let handle = AppEngineHandle { filter: vec![7; 32], msg_tx,
+        let handle = AppEngineHandle { cancel: CancellationToken::new(), filter: vec![7; 32], msg_tx,
             sizes: SharedAppEngineSizes::new(), materialized: materialized.clone(), fee_snapshot: stored.clone() };
         assert!(handle.fee_snapshot().is_none());
         let snapshot = quil_execution::pricing::AppFeeSnapshot {
@@ -7522,16 +7879,16 @@ mod tests {
         // First call has no stored fingerprint → preserves the unknown journal,
         // then records committee A's fingerprint.
         repopulate();
-        prepare_app_cw_journal(&journal_dir, &committee_a, b"shard", b"signer", [1; 32], 10).unwrap();
+        prepare_app_cw_journal(&journal_dir, &committee_a, b"shard", b"signer", [1; 32], 10, false).unwrap();
         // Same committee → journal preserved (a moved head does NOT reset it).
         repopulate();
-        assert_eq!(prepare_app_cw_journal(&journal_dir, &committee_a, b"shard", b"signer", [2; 32], 20).unwrap(), ([1; 32], 10));
+        assert_eq!(prepare_app_cw_journal(&journal_dir, &committee_a, b"shard", b"signer", [2; 32], 20, false).unwrap(), ([1; 32], 10));
         assert!(file.exists(), "same committee must keep the journal");
         let descriptor_path = journal_dir.with_extension("cw-fp");
         let descriptor = std::fs::read(&descriptor_path).unwrap();
         // A regressed or conflicting local head must not silently rebase votes.
-        assert!(prepare_app_cw_journal(&journal_dir, &committee_a, b"shard", b"signer", [1; 32], 9).is_err());
-        assert!(prepare_app_cw_journal(&journal_dir, &committee_a, b"shard", b"signer", [2; 32], 10).is_err());
+        assert!(prepare_app_cw_journal(&journal_dir, &committee_a, b"shard", b"signer", [1; 32], 9, false).is_err());
+        assert!(prepare_app_cw_journal(&journal_dir, &committee_a, b"shard", b"signer", [2; 32], 10, false).is_err());
         assert_eq!(std::fs::read(&descriptor_path).unwrap(), descriptor);
         assert_eq!(std::fs::read(&file).unwrap(), b"votes");
         let mut trailing = descriptor.clone();
@@ -7540,13 +7897,13 @@ mod tests {
         unknown_version[4] = 2;
         for malformed in [trailing, descriptor[..20].to_vec(), unknown_version] {
             std::fs::write(&descriptor_path, &malformed).unwrap();
-            assert!(prepare_app_cw_journal(&journal_dir, &committee_a, b"shard", b"signer", [2; 32], 20).is_err());
+            assert!(prepare_app_cw_journal(&journal_dir, &committee_a, b"shard", b"signer", [2; 32], 20, false).is_err());
             assert_eq!(std::fs::read(&descriptor_path).unwrap(), malformed);
             assert_eq!(std::fs::read(&file).unwrap(), b"votes");
         }
         std::fs::write(&descriptor_path, descriptor).unwrap();
         // Changed committee → old journal archived and isolated.
-        prepare_app_cw_journal(&journal_dir, &committee_b, b"shard", b"signer", [2; 32], 20).unwrap();
+        prepare_app_cw_journal(&journal_dir, &committee_b, b"shard", b"signer", [2; 32], 20, false).unwrap();
         assert!(!file.exists(), "new session must not replay another committee's votes");
         let retired = journal_dir.with_extension("retired");
         assert_eq!(std::fs::read(retired.join("0/journal/journal-file")).unwrap(), b"votes");
@@ -7560,13 +7917,59 @@ mod tests {
             (&reversed, &b"other shard"[..], &b"other signer"[..]),
         ] {
             repopulate();
-            prepare_app_cw_journal(&journal_dir, members, filter, signer, [2; 32], 20).unwrap();
+            prepare_app_cw_journal(&journal_dir, members, filter, signer, [2; 32], 20, false).unwrap();
             assert!(!file.exists(), "signer, shard and ordered participants all bind the journal");
         }
         let blocked = base.join("blocked-parent");
         std::fs::write(&blocked, b"preserve me").unwrap();
         assert!(reset_stale_cw_journal(&blocked.join("journal"), &[1]).is_err());
         assert_eq!(std::fs::read(blocked).unwrap(), b"preserve me");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_adopted_head_retires_an_older_genesis_of_the_same_committee() {
+        use quil_cw_consensus::falcon_base::FalconPublicKey;
+        let pk = |b: u8| FalconPublicKey::from_bytes(&[b; 897]).unwrap();
+        let committee = vec![pk(0x01), pk(0x02), pk(0x03)];
+        let base = std::env::temp_dir().join(format!(
+            "quil-cwadopt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let journal_dir = base.join("cw-app-consensus").join("app-deadbeef");
+        let file = journal_dir.join("journal-file");
+        let repopulate = || {
+            std::fs::create_dir_all(&journal_dir).unwrap();
+            std::fs::write(&file, b"votes").unwrap();
+        };
+        let prepare = |anchor: u8, frame: u64, adopt: bool| {
+            prepare_app_cw_journal(&journal_dir, &committee, b"shard", b"signer", [anchor; 32], frame, adopt)
+        };
+
+        // The committee's instance began at frame 0; another committee then
+        // certified the head this member recovered.
+        repopulate();
+        assert_eq!(prepare(0, 0, false).unwrap(), ([0; 32], 0));
+        repopulate();
+        assert_eq!(prepare(5, 40, false).unwrap(), ([0; 32], 0), "a moved head keeps the genesis");
+        assert!(file.exists());
+        assert_eq!(prepare(5, 40, true).unwrap(), ([5; 32], 40), "an adopted head is the new genesis");
+        assert!(!file.exists(), "votes of the older genesis are not replayed");
+        let retired = journal_dir.with_extension("retired");
+        assert_eq!(std::fs::read(retired.join("1/journal/journal-file")).unwrap(), b"votes");
+
+        // Restarting on the same adopted head keeps its votes, and a head
+        // this committee then finalized past it resumes from it.
+        repopulate();
+        assert_eq!(prepare(5, 40, true).unwrap(), ([5; 32], 40));
+        assert_eq!(prepare(6, 41, false).unwrap(), ([5; 32], 40));
+        assert!(file.exists(), "the adopted instance's own votes are kept");
+        // Never a head below or beside the genesis already adopted.
+        assert!(prepare(4, 39, true).is_err());
+        assert!(prepare(4, 40, true).is_err());
+        assert!(file.exists());
 
         let _ = std::fs::remove_dir_all(&base);
     }

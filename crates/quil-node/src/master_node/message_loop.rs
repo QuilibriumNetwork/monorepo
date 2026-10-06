@@ -5,6 +5,12 @@ use tracing::{debug, info, warn};
 use quil_lifecycle::Supervisor;
 
 pub(crate) struct MessageLoopArgs {
+    /// Standalone workers, when this node runs them: direct shard consensus
+    /// messages for their shards are handed to them.
+    pub remote_workers: Arc<std::sync::OnceLock<Arc<quil_engine::remote_worker::RemoteWorkerManager>>>,
+    /// This node's committee key, as a shard CW addressee tag: a transmission
+    /// that names another member is dropped before it reaches a shard engine.
+    pub local_cw_tag: [u8; quil_engine::bitmasks::SHARD_CW_ADDRESSEE_LEN],
     pub clock_store: Arc<quil_store::RocksClockStore>,
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
     pub msg_rx: tokio::sync::mpsc::Receiver<quil_p2p::node::ReceivedMessage>,
@@ -129,11 +135,14 @@ pub(crate) fn gap_fetched_frame_message(filter: &[u8], data: Vec<u8>) -> quil_p2
         bitmask: quil_engine::bitmasks::shard_frame_bitmask(filter),
         data,
         from: Vec::new(),
+        direct: false,
     }
 }
 
 pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) {
     let MessageLoopArgs {
+        remote_workers: remote_workers_for_recv,
+        local_cw_tag,
         clock_store: clock_store_recv,
         exec_manager: exec_mgr_for_recv,
         mut msg_rx,
@@ -254,6 +263,14 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
             std::collections::HashMap::new();
         let mut status_timer = tokio::time::interval(std::time::Duration::from_secs(30));
         status_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Shard CW topics this node takes direct messages on for its
+        // standalone workers, kept in step with the shards they run, and
+        // those whose worker lacks `DeliverShardConsensus` (an older build).
+        let mut remote_direct_timer = tokio::time::interval(std::time::Duration::from_secs(5));
+        remote_direct_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut remote_direct_allowed: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let remote_direct_unsupported: Arc<parking_lot::Mutex<std::collections::HashSet<Vec<u8>>>> =
+            Default::default();
         // Track the highest frame number we've fully executed (through
         // the execution manager + lifecycle). New frames arriving via
         // gossip can be wildly out of order; only execute consecutive
@@ -281,12 +298,46 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
             quil_types::consensus::epoch_for_frame(last_executed_frame);
         loop {
             tokio::select! {
+                _ = remote_direct_timer.tick() => {
+                    if let Some(remote) = remote_workers_for_recv.get() {
+                        let served: std::collections::HashSet<Vec<u8>> = remote
+                            .served_filters()
+                            .iter()
+                            .map(|filter| quil_engine::bitmasks::shard_cw_bitmask(filter))
+                            .collect();
+                        let in_process: std::collections::HashSet<Vec<u8>> = shard_engines_for_recv
+                            .read()
+                            .keys()
+                            .map(|filter| quil_engine::bitmasks::shard_cw_bitmask(filter))
+                            .collect();
+                        let unsupported = remote_direct_unsupported.lock().clone();
+                        for topic in &served {
+                            if !unsupported.contains(topic) && remote_direct_allowed.insert(topic.clone()) {
+                                p2p_for_recv.allow_direct(topic.clone()).await;
+                            }
+                        }
+                        let released: Vec<Vec<u8>> = remote_direct_allowed
+                            .iter()
+                            .filter(|topic| !served.contains(*topic) || unsupported.contains(*topic))
+                            .cloned()
+                            .collect();
+                        for topic in released {
+                            remote_direct_allowed.remove(&topic);
+                            if !in_process.contains(&topic) {
+                                p2p_for_recv.revoke_direct(topic).await;
+                            }
+                        }
+                    }
+                }
                 _ = status_timer.tick() => {
                     if let Some(ingest) = archive_ingest_for_recv.as_ref() {
                         ingest.lock().unwrap_or_else(|p| p.into_inner()).retry_pending();
                     }
                     // Periodic allocation status snapshot.
                     let peer_count = p2p_for_recv.peer_count();
+                    // Resolver messages delivered point-to-point instead of to
+                    // the shard topic, cumulative since start.
+                    let direct = p2p_for_recv.direct_stats();
                     let latest_frame = clock_store_recv.get_latest_global_frame()
                         .ok()
                         .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
@@ -331,6 +382,14 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         consensus_msgs = consensus_msgs_received,
                         prover_msgs = prover_msgs_received,
                         router_drops,
+                        direct_delivered = direct.delivered,
+                        direct_fallbacks = direct.fallbacks,
+                        direct_refused = direct.refused,
+                        direct_not_connected = direct.not_connected,
+                        direct_unsupported = direct.unsupported,
+                        direct_failed = direct.failed,
+                        direct_received = direct.received,
+                        direct_received_refused = direct.received_refused,
                         rdrop_peer_info = router_drops_peer_info,
                         rdrop_prover = router_drops_prover,
                         rdrop_frame = router_drops_frame,
@@ -368,6 +427,23 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         },
                         "node status"
                     );
+                    // Resolver traffic of the shards this process runs.
+                    quil_engine::resolver_traffic::ResolverTraffic::process().log();
+                    // Forest reads this node served to syncing peers (since
+                    // start): cache hits take no storage slot.
+                    let forest = quil_rpc::global_service::forest_read_stats();
+                    if forest.cache.hits + forest.cache.misses + forest.refused + forest.listed > 0 {
+                        info!(
+                            cache_hits = forest.cache.hits,
+                            cache_misses = forest.cache.misses,
+                            cache_mb = forest.cache.bytes / (1024 * 1024),
+                            cache_entries = forest.cache.entries,
+                            refused_busy = forest.refused,
+                            queued = forest.queued,
+                            leaves_listed = forest.listed,
+                            "forest reads served",
+                        );
+                    }
                     // Memory snapshot. Logged separately so the size
                     // fields don't crowd `node status`; growth between
                     // ticks is the diagnosis signal.
@@ -444,7 +520,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     }
                 } => {
                     match msg {
-                        Some(received) => {
+                        Some(mut received) => {
                             // Explorer tap: record every inbound gossip
                             // message for the `GET /messages` endpoint.
                             // Only present when the explorer is enabled,
@@ -1076,7 +1152,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 //     predecessors — they're already past.
                                                 let frames_to_execute: Vec<(u64, quil_types::proto::global::GlobalFrame)> =
                                                 if archive_mode_recv || (network_for_recv != 99
-                                                    && quil_types::consensus::committee_handoff_policy().is_some()) {
+                                                    && quil_types::consensus::committee_handoff_active(frame_num)) {
                                                     // Archives have their serial materializer. Session-enabled
                                                     // regulars follow authenticated GLOBAL snapshots: their local
                                                     // shard metadata can lag a split/merge freeze, so replay
@@ -1369,24 +1445,29 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 // An application's submission topic is shared by
                                 // every shard of it: each of this node's engines
                                 // of that application gets the submission.
+                                // A message with one destination is moved to it, not
+                                // copied; nothing reads `received.data` once routed.
                                 let submitted = submission_engines(bm, &entries);
-                                for handle in &submitted {
-                                    handle.send(quil_engine::app_engine::AppEngineMessage::Prover(received.data.clone()));
+                                if let Some((last, others)) = submitted.split_last() {
+                                    for handle in others {
+                                        handle.send(quil_engine::app_engine::AppEngineMessage::Prover(received.data.clone()));
+                                    }
+                                    last.send(quil_engine::app_engine::AppEngineMessage::Prover(std::mem::take(&mut received.data)));
                                 }
                                 let mut routed = !submitted.is_empty();
                                 for (filter, handle) in entries.iter().filter(|_| submitted.is_empty()) {
                                     if bm == quil_engine::bitmasks::shard_consensus_bitmask(filter).as_slice() {
-                                        handle.send(quil_engine::app_engine::AppEngineMessage::Consensus(received.data.clone()));
+                                        handle.send(quil_engine::app_engine::AppEngineMessage::Consensus(std::mem::take(&mut received.data)));
                                         routed = true;
                                         break;
                                     }
                                     if bm == quil_engine::bitmasks::shard_frame_bitmask(filter).as_slice() {
-                                        handle.send(quil_engine::app_engine::AppEngineMessage::Frame(received.data.clone()));
+                                        handle.send(quil_engine::app_engine::AppEngineMessage::Frame(std::mem::take(&mut received.data)));
                                         routed = true;
                                         break;
                                     }
                                     if bm == quil_engine::bitmasks::shard_dispatch_bitmask(filter).as_slice() {
-                                        handle.send(quil_engine::app_engine::AppEngineMessage::Dispatch(received.data.clone()));
+                                        handle.send(quil_engine::app_engine::AppEngineMessage::Dispatch(std::mem::take(&mut received.data)));
                                         routed = true;
                                         break;
                                     }
@@ -1402,8 +1483,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                     // benign startup transient until the peer's PeerInfo
                                     // propagates.
                                     if bm == quil_engine::bitmasks::shard_cw_bitmask(filter).as_slice() {
+                                        // A transmission naming another member is dropped
+                                        // here, unread.
                                         if let Some((channel, cw_bytes)) =
-                                            quil_engine::bitmasks::shard_cw_split_payload(&received.data)
+                                            quil_engine::bitmasks::shard_cw_admit(filter, &received.data, &local_cw_tag)
                                         {
                                             let from_key = pic_for_recv
                                                 .read()
@@ -1421,6 +1504,51 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         }
                                         routed = true;
                                         break;
+                                    }
+                                }
+                                // A committee member's message sent to this node
+                                // directly, for a shard one of its standalone
+                                // workers runs: hand it to that worker.
+                                if !routed && received.direct {
+                                    if let Some(remote) = remote_workers_for_recv.get().cloned() {
+                                        let served = remote
+                                            .served_filters()
+                                            .into_iter()
+                                            .find(|filter| quil_engine::bitmasks::shard_cw_bitmask(filter).as_slice() == bm);
+                                        if let Some(filter) = served {
+                                            // The worker counts what it is handed.
+                                            let elsewhere = quil_engine::bitmasks::shard_cw_addressee(&received.data)
+                                                .is_some_and(|tag| tag != local_cw_tag);
+                                            if let Some((channel, cw_bytes)) =
+                                                quil_engine::bitmasks::shard_cw_split_payload(&received.data)
+                                                    .filter(|_| !elsewhere)
+                                            {
+                                                let from_key = pic_for_recv
+                                                    .read()
+                                                    .get(&received.from)
+                                                    .map(|pi| pi.public_key.clone())
+                                                    .unwrap_or_default();
+                                                let data = cw_bytes.to_vec();
+                                                let topic = bm.to_vec();
+                                                let p2p = p2p_for_recv.clone();
+                                                let unsupported = remote_direct_unsupported.clone();
+                                                spawner.detach("shard-cw-forward", async move {
+                                                    use quil_engine::remote_worker::RemoteDelivery;
+                                                    if remote.deliver_shard_consensus(&filter, channel, data, from_key).await
+                                                        == RemoteDelivery::Unsupported
+                                                    {
+                                                        // Senders fall back to the topic,
+                                                        // which the worker hears itself.
+                                                        warn!(filter = %hex::encode(&filter),
+                                                            "standalone worker lacks direct shard delivery; refusing direct messages for its shard");
+                                                        unsupported.lock().insert(topic.clone());
+                                                        p2p.revoke_direct(topic).await;
+                                                    }
+                                                    Ok(())
+                                                });
+                                            }
+                                            routed = true;
+                                        }
                                     }
                                 }
                                 if !routed {
