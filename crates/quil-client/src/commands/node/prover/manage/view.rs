@@ -34,6 +34,7 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 fn ring_color(ring: u32) -> Color {
     match ring {
+        UNKNOWN_REWARD_RING => HELP,
         0 => Color::Rgb(0x00, 0xff, 0x00),
         1 => Color::Rgb(0x88, 0xff, 0x00),
         2 => Color::Rgb(0xff, 0xff, 0x00),
@@ -1838,6 +1839,10 @@ mod tests {
         allocation.ring = UNKNOWN_REWARD_RING;
         for col in [3, 6, 7, 9] { assert_eq!(alloc_cell(&model, &allocation, col, 12), "-"); }
         assert_eq!(alloc_cell(&model, &allocation, 8, 12), "unknown");
+        assert_eq!(ring_color(UNKNOWN_REWARD_RING), HELP);
+        let mut available = shard("bb", 1, 1);
+        available.ring = UNKNOWN_REWARD_RING;
+        for col in [3, 6, 7, 9] { assert_eq!(avail_cell(&model, &available, col, 12), "-"); }
         let title = alloc_title(&model, &[allocation.clone()]);
         let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("Current ? | Paused 0 | Planned change 0"), "{text}");

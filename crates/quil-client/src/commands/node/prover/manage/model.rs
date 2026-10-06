@@ -1048,6 +1048,7 @@ pub fn avail_row_numeric_val(row: &ShardRow, col: usize) -> f64 {
     }
 }
 
+/// Internal display sentinel; it never leaves the client on the wire.
 pub const UNKNOWN_REWARD_RING: u32 = u32::MAX;
 
 pub fn reward_ring(info: &quil_types::proto::node::ShardRewardInfo) -> u32 {
@@ -1272,7 +1273,7 @@ mod tests {
         }
         info.shards[0].ring_known = Some(true);
         info.shards[0].latest_frame = 20;
-        model.process_refresh_data(None, Some(info.clone()), None);
+        model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))), Some(info.clone()), None);
         assert_eq!(model.allocations[0].ring, 0);
         assert_eq!(alloc_row_numeric_val(&model.allocations[0], 3), 0.0);
         assert_eq!(alloc_row_numeric_val(&model.allocations[0], 9), 0.0);
@@ -1280,7 +1281,7 @@ mod tests {
         assert_eq!(materialization_lag(0, 20), Some(20));
         info.shards[0].ring_known = None;
         info.shards[0].ring = 2;
-        model.process_refresh_data(None, Some(info), None);
+        model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))), Some(info), None);
         assert_eq!(model.allocations[0].ring, 2, "older servers remain compatible");
         assert_eq!(materialization_state(10, 0), "unknown");
     }
