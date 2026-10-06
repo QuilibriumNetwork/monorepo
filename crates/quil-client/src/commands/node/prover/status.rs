@@ -7,8 +7,8 @@ use num_bigint::{BigInt, Sign};
 use quil_types::proto::node::{GetNodeInfoRequest, GetWorkerInfoRequest, ShardAllocationInfo};
 
 use super::epoch::{
-    alloc_confirm_window, compute_effective_status, epoch_for_frame, epoch_len, AllocationTiming,
-    EffectiveStatus,
+    action_hints, compute_effective_status, epoch_for_frame, epoch_len, AllocationTiming,
+    ThresholdUnit,
 };
 use super::{format_storage, worker_by_filter, ProverCtx};
 
@@ -91,21 +91,14 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
             eff.label()
         );
 
-        if let Some(w) = alloc_confirm_window(&t, epoch_length) {
+        // Same vocabulary as the `manage` TUI's Next/Default Action columns.
+        let (next, default) = action_hints(&t, eff, epoch_length, current_frame, next_boundary);
+        if !next.is_empty() || !default.is_empty() {
+            let unit = ThresholdUnit::Frames;
             println!(
-                "      Action: {} | {}",
-                w.label("Confirm", current_frame, epoch_length),
-                w.label("Reject", current_frame, epoch_length)
-            );
-        } else if eff == EffectiveStatus::Active && !alloc.filter.is_empty() {
-            println!(
-                "      Re-confirm through epoch {} (renew before frame {})",
-                alloc.epoch, next_boundary
-            );
-        } else if eff == EffectiveStatus::ExpiredEpoch {
-            println!(
-                "      MISSED re-confirm (registered epoch {} < current {}) — confirm now to restore",
-                alloc.epoch, cur_epoch
+                "      Next Action: {}  Default Action: {}",
+                next.render(unit, epoch_length),
+                default.render(unit, epoch_length)
             );
         }
 

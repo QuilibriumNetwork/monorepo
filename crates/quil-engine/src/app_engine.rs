@@ -3112,6 +3112,7 @@ impl AppConsensusEngine {
                 return;
             }
         };
+        self.execution.restored(restored_cursor);
         self.set_materialized_frame(restored_cursor);
         if self.last_materialized_frame > 0 {
             info!(

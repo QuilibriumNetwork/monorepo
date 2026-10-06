@@ -6,7 +6,7 @@ use num_bigint::{BigInt, Sign};
 
 use quil_types::proto::node::GetShardInfoRequest;
 
-use super::{format_quil_daily, format_quil_reward, format_storage, worker_by_filter, ProverCtx};
+use super::{format_quil_daily_round, format_storage, worker_by_filter, ProverCtx};
 
 pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     let mut client = pc.connect().await?;
@@ -38,20 +38,19 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
         total += &reward;
 
         println!(
-            "  Filter: {}  Shards: {:<6} Provers: {:<4} Ring: {}  Reward: ~{} QUIL/frame{}",
+            "  Filter: {}  Shards: {:<6} Provers: {:<4} Ring: {}  Reward: {:<3} Q/d{}",
             filter_hex,
             shard.data_shards,
             shard.active_provers,
             shard.ring,
-            format_quil_reward(&reward),
+            format_quil_daily_round(&reward),
             worker_str
         );
     }
 
     println!(
-        "\nTotal estimated: ~{} QUIL/frame (~{} QUIL/day)",
-        format_quil_reward(&total),
-        format_quil_daily(&total)
+        "\nTotal estimated: {} Q/d",
+        format_quil_daily_round(&total)
     );
     println!(
         "Difficulty: {}  Frame: {}",

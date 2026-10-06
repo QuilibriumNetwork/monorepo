@@ -20,6 +20,13 @@ impl SharedWorkerExecution {
         s.observed_unix_ms = now_ms();
     }
 
+    pub fn restored(&self, height: u64) {
+        let mut s = self.0.lock().unwrap();
+        s.materialized_frame = Some(height);
+        s.last_advance_unix_ms = 0;
+        s.observed_unix_ms = now_ms();
+    }
+
     pub fn materialized(&self, height: u64) {
         let mut s = self.0.lock().unwrap();
         let now = now_ms();
@@ -41,7 +48,7 @@ mod tests {
     fn restoration_rewind_and_state_are_independent() {
         let s = SharedWorkerExecution::default();
         assert_eq!(s.snapshot().materialized_frame, None);
-        s.materialized(42);
+        s.restored(42);
         assert_eq!(s.snapshot().last_advance_unix_ms, 0);
         s.state("blocked", "checkpoint mismatch");
         s.materialized(43);

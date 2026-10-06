@@ -1739,3 +1739,25 @@ mod token_fee_quote_tests {
         assert_eq!(budget, 64 * quil_execution::pricing::NON_MAINNET_UNITS_PER_BYTE as u128 * 7);
     }
 }
+
+#[cfg(test)]
+mod worker_execution_tests {
+    use super::*;
+    use node::node_service_server::NodeService;
+    #[tokio::test]
+    async fn worker_rpc_preserves_zero_height_and_unsupported_telemetry() {
+        let observed = node::WorkerExecution {
+            state: "blocked".into(), blocker: "checkpoint mismatch".into(),
+            materialized_frame: Some(0), observed_unix_ms: 1234, ..Default::default()
+        };
+        let server = NodeRpcServer::new().with_workers_view(Arc::new(std::sync::RwLock::new(vec![
+            WorkerEntry { core_id: 1, filter: vec![1], available_storage: 0, total_storage: 0,
+                manually_managed: false, allocated: true, execution: Some(observed.clone()) },
+            WorkerEntry { core_id: 2, filter: vec![2], available_storage: 0, total_storage: 0,
+                manually_managed: false, allocated: true, execution: None },
+        ])));
+        let response = server.get_worker_info(Request::new(node::GetWorkerInfoRequest {})).await.unwrap().into_inner();
+        assert_eq!(response.worker_info[0].execution, Some(observed));
+        assert!(response.worker_info[1].execution.is_none());
+    }
+}
