@@ -523,6 +523,11 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             return vec![];
         }
         KeyCode::BackTab => { m.focus = m.focus.previous(); return vec![]; }
+        KeyCode::Left | KeyCode::Right => {
+            let i = m.focus.index();
+            if i < 2 { m.horizontal_offsets[i] = if ev.code == KeyCode::Left { m.horizontal_offsets[i].saturating_sub(8) } else { m.horizontal_offsets[i].saturating_add(8).min(m.horizontal_limits[i]) }; }
+            return vec![];
+        }
         KeyCode::Char('[') => { move_panel_boundary(m, true, false); return vec![]; }
         KeyCode::Char(']') => { move_panel_boundary(m, true, true); return vec![]; }
         KeyCode::Char('{') => { move_panel_boundary(m, false, false); return vec![]; }
@@ -1200,6 +1205,17 @@ mod tests {
         assert!(m.avail_selected.is_empty());
         handle_key(&mut m, key(KeyCode::Tab)); assert_eq!(m.focus, PanelFocus::Allocations);
         handle_key(&mut m, key(KeyCode::BackTab)); assert_eq!(m.focus, PanelFocus::Notifications);
+    }
+
+    #[test]
+    fn horizontal_navigation_is_bounded_and_notification_actions_stay_inert() {
+        let mut m = Model::new(); m.horizontal_limits = [12, 20];
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        handle_key(&mut m, key(KeyCode::Right)); assert_eq!(m.horizontal_offsets, [8, 0]);
+        handle_key(&mut m, key(KeyCode::Right)); assert_eq!(m.horizontal_offsets, [12, 0]);
+        handle_key(&mut m, key(KeyCode::Left)); assert_eq!(m.horizontal_offsets, [4, 0]);
+        m.focus = PanelFocus::Notifications;
+        handle_key(&mut m, key(KeyCode::Right)); assert_eq!(m.horizontal_offsets, [4, 0]);
     }
 
     #[test]

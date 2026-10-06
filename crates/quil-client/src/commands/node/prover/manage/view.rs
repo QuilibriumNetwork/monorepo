@@ -240,9 +240,31 @@ pub fn draw(f: &mut Frame, m: &mut Model) {
     render_main(f, m, area);
 }
 
+fn table_horizontal_offset(m: &mut Model, panel: usize, lines: &[Line<'_>], visible: u16) -> u16 {
+    let width = lines.iter().map(Line::width).max().unwrap_or(0);
+    m.horizontal_limits[panel] = width.saturating_sub(usize::from(visible)).min(usize::from(u16::MAX)) as u16;
+    m.horizontal_offsets[panel] = m.horizontal_offsets[panel].min(m.horizontal_limits[panel]);
+    m.horizontal_offsets[panel]
+}
+
+fn scroll_hint(offset: usize, total: usize, visible: usize, horizontal: u16, horizontal_limit: u16) -> String {
+    let above = offset;
+    let below = total.saturating_sub(offset + visible);
+    let right = horizontal_limit.saturating_sub(horizontal);
+    if above + below + usize::from(horizontal) + usize::from(right) == 0 { return String::new(); }
+    format!(" ↑{above} ↓{below} | ←{horizontal} →{right} ")
+}
+
+fn render_scroll_hint(f: &mut Frame, area: Rect, offset: usize, total: usize, visible: usize, horizontal: u16, horizontal_limit: u16) {
+    let hint = scroll_hint(offset, total, visible, horizontal, horizontal_limit);
+    if area.height >= 2 && area.width >= 4 && !hint.is_empty() {
+        f.render_widget(Paragraph::new(hint).style(Style::new().fg(HELP)), Rect::new(area.x + 1, area.y + area.height - 1, area.width - 2, 1));
+    }
+}
+
 fn panel_heights(m: &Model, total: u16) -> [u16; 3] {
     if total < 6 { return [total / 3 + total % 3, total / 3, total / 3]; }
-    let notice = (total / 5).clamp(1, 3);
+    let notice = total.saturating_sub(5).min(3);
     let alloc = ((total - notice) / 2).max(3);
     let mut heights = [alloc, total - notice - alloc, notice];
     let minimum = [3i32, 2, 1];
@@ -256,8 +278,13 @@ fn panel_heights(m: &Model, total: u16) -> [u16; 3] {
 
 fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let (actions, status) = footer_lines(m);
-    let actions = wrap_actions(actions, area.width);
-    let actions_h = (actions.len() as u16).min(area.height.saturating_sub(10));
+    let mut actions = wrap_actions(actions, area.width);
+    let max_actions = usize::from(area.height.saturating_sub(15).max(1));
+    if actions.len() > max_actions {
+        actions.truncate(max_actions);
+        actions[max_actions - 1] = Line::from("[h] all keys  [q] quit");
+    }
+    let actions_h = actions.len() as u16;
     // Content height depends only on terminal geometry and explicit resize keys.
     let [alloc_h, avail_h, notice_h] = panel_heights(m, area.height.saturating_sub(7 + actions_h));
     m.panel_content_heights = [alloc_h, avail_h, notice_h];
@@ -291,7 +318,12 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let alloc_inner = alloc_block.inner(chunks[1]);
     f.render_widget(alloc_block, chunks[1]);
     let alloc_lines = render_alloc_panel(m, &sorted_allocs, alloc_inner, Some(&alloc_widths));
-    f.render_widget(Paragraph::new(alloc_lines), alloc_inner);
+    let mut alloc_lines = alloc_lines;
+    let detail = if !sorted_allocs.is_empty() && alloc_inner.height >= 3 { alloc_lines.pop() } else { None };
+    let horizontal = table_horizontal_offset(m, 0, &alloc_lines, alloc_inner.width);
+    f.render_widget(Paragraph::new(alloc_lines).scroll((0, horizontal)), alloc_inner);
+    if let Some(detail) = detail { f.render_widget(Paragraph::new(detail), Rect::new(alloc_inner.x, alloc_inner.y + alloc_inner.height - 1, alloc_inner.width, 1)); }
+    render_scroll_hint(f, chunks[1], m.alloc_offset, sorted_allocs.len(), usize::from(alloc_inner.height.saturating_sub(2)), horizontal, m.horizontal_limits[0]);
 
     let avail_block = Block::default()
         .title(avail_title(m, &sorted_avail))
@@ -301,7 +333,9 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let avail_inner = avail_block.inner(chunks[2]);
     f.render_widget(avail_block, chunks[2]);
     let avail_lines = render_avail_panel(m, &sorted_avail, avail_inner, Some(&avail_widths));
-    f.render_widget(Paragraph::new(avail_lines), avail_inner);
+    let horizontal = table_horizontal_offset(m, 1, &avail_lines, avail_inner.width);
+    f.render_widget(Paragraph::new(avail_lines).scroll((0, horizontal)), avail_inner);
+    render_scroll_hint(f, chunks[2], m.avail_offset, sorted_avail.len(), usize::from(avail_inner.height.saturating_sub(1 + u16::from(m.shard_error.is_some()))), horizontal, m.horizontal_limits[1]);
 
     render_notifications(f, m, status, chunks[3]);
     f.render_widget(
@@ -333,6 +367,7 @@ fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, ar
     f.render_widget(block, area);
     f.render_widget(Paragraph::new(lines.into_iter().skip(m.notice_offset)
         .take(m.notice_visible).collect::<Vec<_>>()), inner);
+    render_scroll_hint(f, area, m.notice_offset, m.notice_lines, m.notice_visible, 0, 0);
 }
 
 // ── Header ───────────────────────────────────────────────────────────────
@@ -1266,10 +1301,11 @@ fn help_line(m: &Model) -> Line<'static> {
     let filters_active = m.has_active_filters();
 
     // (key, desc, action-tag)
-    let entries: [(&str, &str, &str); 22] = [
+    let entries: [(&str, &str, &str); 23] = [
         ("tab", "switch", ""),
         ("↑/k", "up", ""),
         ("↓/j", "down", ""),
+        ("←/→", "columns", ""),
         ("space", "toggle", ""),
         ("a", "all/none", ""),
         ("J", "join", "Join"),
@@ -1457,6 +1493,8 @@ fn help_body() -> Vec<Line<'static>> {
         sec("Navigation"),
         kv("↑ / k", "Move cursor up"),
         kv("↓ / j", "Move cursor down"),
+        kv("← / →", "Scroll table horizontally by eight columns"),
+        kv("Scroll hints", "Bottom border counts hidden rows ↑/↓ and columns ←/→"),
         kv(
             "Tab",
             "Cycle Allocations, Available Shards and Notifications; Shift+Tab reverses",
@@ -1642,6 +1680,17 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
 mod tests {
     use super::*;
     use crate::commands::node::prover::epoch::ActionHint;
+
+    #[test]
+    fn scroll_indicators_track_hidden_rows_and_columns() {
+        assert_eq!(scroll_hint(0, 3, 3, 0, 0), "");
+        assert_eq!(scroll_hint(2, 10, 3, 8, 20), " ↑2 ↓5 | ←8 →12 ");
+        assert_eq!(scroll_hint(7, 10, 3, 20, 20), " ↑7 ↓0 | ←20 →0 ");
+        let mut m = Model::new(); m.horizontal_offsets[0] = 20;
+        assert_eq!(table_horizontal_offset(&mut m, 0, &[Line::from("x".repeat(50))], 30), 20);
+        assert_eq!(table_horizontal_offset(&mut m, 0, &[Line::from("x")], 30), 0);
+        assert_eq!(m.horizontal_limits[0], 0);
+    }
 
     #[test]
     fn resized_panels_preserve_terminal_budget_and_minimum_rows() {

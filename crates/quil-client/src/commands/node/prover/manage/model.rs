@@ -266,6 +266,8 @@ pub struct Model {
     pub focus: PanelFocus,
     pub panel_boundary_offsets: [i16; 2],
     pub panel_content_heights: [u16; 3],
+    pub horizontal_offsets: [u16; 2],
+    pub horizontal_limits: [u16; 2],
     pub alloc_offset: usize,
     pub avail_offset: usize,
 
