@@ -317,3 +317,85 @@ async fn certified_storage_frame_recovers_an_aged_out_registration_without_skipp
         global_frame + 20
     );
 }
+
+/// A legacy certificate signed by a committee today's registry no longer
+/// reproduces is rejected, and accepted once the committee rebuilt from
+/// GLOBAL history is prepared; a rebuilt committee that did not sign it does
+/// not help, and the source is asked once per anchor.
+#[tokio::test]
+async fn a_legacy_certificate_verifies_under_its_rebuilt_historical_committee() {
+    quil_crypto::init();
+    let filter = [8; 32];
+    let global_frame = 4_000;
+    let output = vec![9; 516];
+    let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+    clock.seed_frame(GlobalFrame {
+        header: Some(GlobalFrameHeader { frame_number: global_frame, output: output.clone(), ..Default::default() }),
+        requests: vec![],
+    });
+    let prover = |signer: &quil_crypto::FalconSigner, address: u8| ProverInfo {
+        public_key: signer.public_key().to_vec(),
+        address: vec![address; 32],
+        status: ProverStatus::Active,
+        kick_frame_number: 0,
+        allocations: vec![],
+        available_storage: 0,
+        seniority: 0,
+        delegate_address: vec![],
+    };
+    let then = quil_crypto::FalconSigner::generate();
+    let now = quil_crypto::FalconSigner::generate();
+    // Today's registry: only a prover that joined later.
+    let registry = Arc::new(crate::test_support::TestProverRegistry::with_prover(prover(&now, 2)));
+    let mut frame = AppShardFrame {
+        header: Some(FrameHeader {
+            address: filter.to_vec(),
+            frame_number: 40,
+            rank: 40,
+            global_frame_number: global_frame,
+            timestamp: 1,
+            state_roots: vec![vec![0; 32]; 4],
+            prover: vec![1; 32],
+            ..Default::default()
+        }),
+        requests: vec![],
+        storage_attestation: None,
+    };
+    certify(&mut frame, &then, &output);
+    let validator = |source: Option<crate::historical_committee::HistoricalCommitteeSource>| {
+        let validator = BlsAppFrameValidator::new(
+            registry.clone(),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+        )
+        .with_clock_store(clock.clone());
+        match source {
+            Some(source) => validator.with_historical_committee_source(source),
+            None => validator,
+        }
+    };
+    let plain = validator(None);
+    plain.prepare_historical_committee(&frame).await.unwrap();
+    assert!(plain.validate(&frame).is_err(), "today's registry cannot reproduce the committee");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let source_for = |members: Vec<Vec<u8>>| -> crate::historical_committee::HistoricalCommitteeSource {
+        let calls = calls.clone();
+        Arc::new(move |requested_filter, anchor| {
+            assert_eq!(requested_filter, filter.to_vec());
+            assert_eq!(anchor, global_frame);
+            calls.fetch_add(1, Ordering::SeqCst);
+            let members = members.clone();
+            Box::pin(async move { Ok(vec![members]) })
+        })
+    };
+    let wrong = validator(Some(source_for(vec![now.public_key().to_vec()])));
+    wrong.prepare_historical_committee(&frame).await.unwrap();
+    assert!(wrong.validate(&frame).is_err(), "a committee that did not sign does not verify it");
+
+    let rebuilt = validator(Some(source_for(vec![then.public_key().to_vec()])));
+    rebuilt.prepare_historical_committee(&frame).await.unwrap();
+    rebuilt.prepare_historical_committee(&frame).await.unwrap();
+    assert!(rebuilt.validate(&frame).unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "once per validator and anchor");
+}

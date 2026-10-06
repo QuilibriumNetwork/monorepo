@@ -44,6 +44,68 @@ pub enum SubtreeSyncAnchor {
     SubtreeRoot([u8; 32]),
 }
 
+/// A tree reader that can answer many reads in one round trip. The diff walk
+/// asks for a whole chunk of differing children (and of transferring leaves'
+/// values) at once: a remote source turns each chunk into a few batched
+/// requests instead of one request per node, and a local reader reads them
+/// in turn.
+pub trait BatchTreeReader: TreeReader {
+    /// The node at each key, in order (`None` where absent).
+    fn get_nodes(&self, keys: &[NodeKey]) -> anyhow::Result<Vec<Option<Node>>> {
+        keys.iter().map(|key| self.get_node_option(key)).collect()
+    }
+
+    /// The value of each `(max_version, key)`, in order (`None` where absent).
+    fn get_values(&self, reads: &[(Version, KeyHash)]) -> anyhow::Result<Vec<Option<OwnedValue>>> {
+        reads.iter().map(|(version, key)| self.get_value_option(*version, *key)).collect()
+    }
+}
+
+/// Pairs of (source, target) nodes the walk expands per round: a remote
+/// source answers each round in a few batched requests.
+const WALK_CHUNK: usize = 256;
+
+/// A source node still to compare against the target's node at its path.
+struct WalkPair {
+    s_key: NodeKey,
+    s_node: Node,
+    t_key: NodeKey,
+    t_node: Option<Node>,
+}
+
+/// A source child to fetch: its key, the hash its parent committed for it,
+/// and the target's key at the same path when the target has a child there.
+struct ChildRead {
+    s_key: NodeKey,
+    hash: [u8; 32],
+    t_key: NodeKey,
+    t_present: bool,
+}
+
+/// Fetch `children` from both trees (one batched read each) as pairs to walk,
+/// authenticating every source child against its parent's hash.
+fn fetch_children<S: BatchTreeReader, T: BatchTreeReader>(
+    source: &S,
+    target: &T,
+    children: Vec<ChildRead>,
+) -> anyhow::Result<Vec<WalkPair>> {
+    let s_keys: Vec<NodeKey> = children.iter().map(|c| c.s_key.clone()).collect();
+    let s_nodes = source.get_nodes(&s_keys)?;
+    anyhow::ensure!(s_nodes.len() == children.len(), "sync: source answered a different number of nodes");
+    let t_keys: Vec<NodeKey> = children.iter().filter(|c| c.t_present).map(|c| c.t_key.clone()).collect();
+    let t_nodes = target.get_nodes(&t_keys)?;
+    anyhow::ensure!(t_nodes.len() == t_keys.len(), "sync: target answered a different number of nodes");
+    let mut t_nodes = t_nodes.into_iter();
+    let mut pairs = Vec::with_capacity(children.len());
+    for (child, s_node) in children.into_iter().zip(s_nodes) {
+        let s_node = s_node.ok_or_else(|| anyhow::anyhow!("sync: source is missing a child node"))?;
+        anyhow::ensure!(node_hash(&s_node) == child.hash, "sync: child does not hash into its parent");
+        let t_node = if child.t_present { t_nodes.next().flatten() } else { None };
+        pairs.push(WalkPair { s_key: child.s_key, s_node, t_key: child.t_key, t_node });
+    }
+    Ok(pairs)
+}
+
 fn authenticated_value<R: TreeReader>(
     reader: &R,
     version: Version,
@@ -60,7 +122,7 @@ fn authenticated_value<R: TreeReader>(
 /// what must transfer to bring `target` to `source`'s root. Subtrees whose hash
 /// already matches `target`'s are skipped without descending, so a
 /// network-backed `source` is only asked for the O(changed) nodes.
-pub fn diff_leaves<S: TreeReader, T: TreeReader>(
+pub fn diff_leaves<S: BatchTreeReader, T: BatchTreeReader>(
     source: &S,
     v_s: Version,
     target: &T,
@@ -71,71 +133,82 @@ pub fn diff_leaves<S: TreeReader, T: TreeReader>(
     let t_key = NodeKey::new(v_t, NibblePath::new(vec![]));
     if let Some(s_node) = source.get_node_option(&s_key)? {
         let t_node = target.get_node_option(&t_key)?;
-        walk(source, v_s, &s_key, s_node, target, &t_key, t_node, &mut out)?;
+        walk(source, target, vec![WalkPair { s_key, s_node, t_key, t_node }], &mut out)?;
     }
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn walk<S: TreeReader, T: TreeReader>(
+/// Walk `pairs` (and everything under them) depth first, a chunk of pairs per
+/// round, collecting the source leaves the target lacks or holds differently.
+/// Subtrees whose hash matches the target's are never read. Leaves are
+/// returned in key order, as a depth-first walk in nibble order visits them.
+fn walk<S: BatchTreeReader, T: BatchTreeReader>(
     source: &S,
-    v_s: Version,
-    s_key: &NodeKey,
-    s_node: Node,
     target: &T,
-    t_key: &NodeKey,
-    t_node: Option<Node>,
+    pairs: Vec<WalkPair>,
     out: &mut Vec<(KeyHash, OwnedValue)>,
 ) -> anyhow::Result<()> {
-    let s_int = match s_node {
-        Node::Null => return Ok(()),
-        Node::Leaf(leaf) => {
-            // We only reach a source leaf when its subtree hash differed from the
-            // target's (or the target had nothing here), so it must transfer.
-            if t_node.as_ref() == Some(&Node::Leaf(leaf.clone())) {
-                return Ok(());
+    let first = out.len();
+    let mut stack = pairs;
+    while !stack.is_empty() {
+        let chunk = stack.split_off(stack.len().saturating_sub(WALK_CHUNK));
+        let mut leaves: Vec<(Version, LeafNode)> = Vec::new();
+        let mut children: Vec<ChildRead> = Vec::new();
+        for pair in chunk {
+            let s_int = match pair.s_node {
+                Node::Null => continue,
+                Node::Leaf(leaf) => {
+                    // We only reach a source leaf when its subtree hash differed
+                    // from the target's (or the target had nothing here), so it
+                    // must transfer. Its value is read at the version that wrote
+                    // it, which every client syncing this tree asks for alike.
+                    if pair.t_node.as_ref() != Some(&Node::Leaf(leaf.clone())) {
+                        leaves.push((pair.s_key.version(), leaf));
+                    }
+                    continue;
+                }
+                Node::Internal(int) => int,
+            };
+            // Target's children at this node, indexed by nibble: (child hash, version).
+            let t_children: HashMap<u8, ([u8; 32], Version)> = match &pair.t_node {
+                Some(Node::Internal(t_int)) => t_int
+                    .children_sorted()
+                    .map(|(n, c)| (n.as_usize() as u8, (c.hash, c.version)))
+                    .collect(),
+                _ => HashMap::new(),
+            };
+            for (nibble, s_child) in s_int.children_sorted() {
+                let t_match = t_children.get(&(nibble.as_usize() as u8));
+                if t_match.is_some_and(|(t_hash, _)| *t_hash == s_child.hash) {
+                    continue; // identical subtree — transfer nothing below here
+                }
+                // Target has no child here: descend with an empty target so
+                // every source leaf below transfers. The placeholder key is
+                // never fetched.
+                let (t_key, t_present) = match t_match {
+                    Some((_, t_ver)) => (pair.t_key.gen_child_node_key(*t_ver, nibble), true),
+                    None => (pair.t_key.gen_child_node_key(pair.t_key.version(), nibble), false),
+                };
+                children.push(ChildRead {
+                    s_key: pair.s_key.gen_child_node_key(s_child.version, nibble),
+                    hash: s_child.hash,
+                    t_key,
+                    t_present,
+                });
             }
-            let value = authenticated_value(source, v_s, &leaf)?;
+        }
+        stack.extend(fetch_children(source, target, children)?);
+        let reads: Vec<(Version, KeyHash)> = leaves.iter().map(|(v, leaf)| (*v, leaf.key_hash())).collect();
+        let values = source.get_values(&reads)?;
+        anyhow::ensure!(values.len() == leaves.len(), "sync: source answered a different number of values");
+        for ((_, leaf), value) in leaves.into_iter().zip(values) {
+            let value = value.ok_or_else(|| anyhow::anyhow!("sync: source is missing a leaf value"))?;
+            let reconstructed = LeafNode::new(leaf.key_hash(), ValueHash::with::<sha2::Sha256>(&value));
+            anyhow::ensure!(reconstructed == leaf, "sync: value does not match its committed leaf");
             out.push((leaf.key_hash(), value));
-            return Ok(());
         }
-        Node::Internal(int) => int,
-    };
-    // Target's children at this node, indexed by nibble: (child hash, version).
-    let t_children: HashMap<u8, ([u8; 32], Version)> = match &t_node {
-        Some(Node::Internal(t_int)) => t_int
-            .children_sorted()
-            .map(|(n, c)| (n.as_usize() as u8, (c.hash, c.version)))
-            .collect(),
-        _ => HashMap::new(),
-    };
-    for (nibble, s_child) in s_int.children_sorted() {
-        let nib = nibble.as_usize() as u8;
-        let t_match = t_children.get(&nib);
-        if let Some((t_hash, _)) = t_match {
-            if *t_hash == s_child.hash {
-                continue; // identical subtree — transfer nothing below here
-            }
-        }
-        let s_child_key = s_key.gen_child_node_key(s_child.version, nibble);
-        let s_child_node = source.get_node(&s_child_key)?;
-        anyhow::ensure!(
-            node_hash(&s_child_node) == s_child.hash,
-            "sync: child does not hash into its parent"
-        );
-        let (t_child_key, t_child_node) = match t_match {
-            Some((_, t_ver)) => {
-                let k = t_key.gen_child_node_key(*t_ver, nibble);
-                let n = target.get_node_option(&k)?;
-                (k, n)
-            }
-            // Target has no child here: descend with an empty target so every
-            // source leaf below transfers. The placeholder key is never fetched
-            // (t_node is None ⇒ no further target children).
-            None => (t_key.gen_child_node_key(t_key.version(), nibble), None),
-        };
-        walk(source, v_s, &s_child_key, s_child_node, target, &t_child_key, t_child_node, out)?;
     }
+    out[first..].sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
     Ok(())
 }
 
@@ -273,7 +346,7 @@ pub(crate) fn subtree_root<R: TreeReader>(
 /// unified shard header and is independent of the peer's sibling subtrees.
 ///
 /// Returns `(leaves_to_transfer, source_subtree_root)`.
-pub fn diff_leaves_under_prefix<S: TreeReader, T: TreeReader>(
+pub fn diff_leaves_under_prefix<S: BatchTreeReader, T: BatchTreeReader>(
     source: &S,
     v_s: Version,
     target: &T,
@@ -312,7 +385,7 @@ pub fn diff_leaves_under_prefix<S: TreeReader, T: TreeReader>(
         let root = if under { node_hash(&s_node) } else { [0; 32] };
         check_subtree(root)?;
         if under && t.as_ref().map(|(_, n)| n) != Some(&s_node) {
-            out.push((leaf.key_hash(), authenticated_value(source, v_s, leaf)?));
+            out.push((leaf.key_hash(), authenticated_value(source, s_key.version(), leaf)?));
         }
         return Ok((out, root));
     }
@@ -329,7 +402,7 @@ pub fn diff_leaves_under_prefix<S: TreeReader, T: TreeReader>(
             Some((k, n)) => (k, Some(n)),
             None => (s_key.clone(), None),
         };
-        walk(source, v_s, &s_key, s_node, target, &t_key, t_node, &mut out)?;
+        walk(source, target, vec![WalkPair { s_key, s_node, t_key, t_node }], &mut out)?;
         return Ok((out, subtree_root));
     }
 
@@ -348,6 +421,7 @@ pub fn diff_leaves_under_prefix<S: TreeReader, T: TreeReader>(
     let subtree_root = s_int.subtree_hash::<sha2::Sha256>(start, width);
     check_subtree(subtree_root)?;
     let t_children = children_map(&t);
+    let mut children = Vec::new();
     for (nibble, s_child) in s_int.children_sorted() {
         let nib = nibble.as_usize() as u8;
         if nib < start || nib >= start + width {
@@ -359,22 +433,15 @@ pub fn diff_leaves_under_prefix<S: TreeReader, T: TreeReader>(
             }
         }
         let s_child_key = s_key.gen_child_node_key(s_child.version, nibble);
-        let s_child_node = source.get_node(&s_child_key)?;
-        anyhow::ensure!(
-            node_hash(&s_child_node) == s_child.hash,
-            "subtree sync: child does not hash into its parent"
-        );
-        let (t_child_key, t_child_node) = match (&t, t_children.get(&nib)) {
-            (Some((tk, _)), Some((_, tver))) => {
-                let k = tk.gen_child_node_key(*tver, nibble);
-                let n = target.get_node_option(&k)?;
-                (k, n)
-            }
-            (Some((tk, _)), None) => (tk.gen_child_node_key(tk.version(), nibble), None),
-            (None, _) => (s_child_key.clone(), None),
+        let (t_key, t_present) = match (&t, t_children.get(&nib)) {
+            (Some((tk, _)), Some((_, tver))) => (tk.gen_child_node_key(*tver, nibble), true),
+            (Some((tk, _)), None) => (tk.gen_child_node_key(tk.version(), nibble), false),
+            (None, _) => (s_child_key.clone(), false),
         };
-        walk(source, v_s, &s_child_key, s_child_node, target, &t_child_key, t_child_node, &mut out)?;
+        children.push(ChildRead { s_key: s_child_key, hash: s_child.hash, t_key, t_present });
     }
+    let pairs = fetch_children(source, target, children)?;
+    walk(source, target, pairs, &mut out)?;
     Ok((out, subtree_root))
 }
 
@@ -386,6 +453,8 @@ mod tests {
     use sha2::Sha256;
 
     type Jmt<'a> = JellyfishMerkleTree<'a, MockTreeStore, Sha256>;
+
+    impl BatchTreeReader for MockTreeStore {}
 
     fn kh(i: u64) -> KeyHash {
         // Spread keys across the trie so they occupy different subtrees.
@@ -491,6 +560,8 @@ mod tests {
         corrupt_child: bool,
     }
 
+    impl BatchTreeReader for CorruptReader<'_> {}
+
     impl TreeReader for CorruptReader<'_> {
         fn get_node_option(&self, key: &NodeKey) -> anyhow::Result<Option<Node>> {
             let node = self.source.get_node_option(key)?;
@@ -575,5 +646,75 @@ mod tests {
         commit(&a, 0, kvs.clone());
         commit(&b, 0, kvs);
         assert!(diff_leaves(&a, 0, &b, 0).unwrap().is_empty());
+    }
+
+    /// Counts the round trips a remote source would make.
+    struct Counting<'a> {
+        inner: &'a MockTreeStore,
+        node_batches: std::cell::Cell<usize>,
+        nodes: std::cell::Cell<usize>,
+        value_batches: std::cell::Cell<usize>,
+    }
+
+    impl TreeReader for Counting<'_> {
+        fn get_node_option(&self, key: &NodeKey) -> anyhow::Result<Option<Node>> {
+            self.node_batches.set(self.node_batches.get() + 1);
+            self.nodes.set(self.nodes.get() + 1);
+            self.inner.get_node_option(key)
+        }
+        fn get_value_option(&self, version: Version, key: KeyHash) -> anyhow::Result<Option<OwnedValue>> {
+            self.value_batches.set(self.value_batches.get() + 1);
+            self.inner.get_value_option(version, key)
+        }
+        fn get_rightmost_leaf(&self) -> anyhow::Result<Option<(NodeKey, LeafNode)>> {
+            self.inner.get_rightmost_leaf()
+        }
+    }
+
+    impl BatchTreeReader for Counting<'_> {
+        fn get_nodes(&self, keys: &[NodeKey]) -> anyhow::Result<Vec<Option<Node>>> {
+            self.node_batches.set(self.node_batches.get() + 1);
+            self.nodes.set(self.nodes.get() + keys.len());
+            keys.iter().map(|key| self.inner.get_node_option(key)).collect()
+        }
+        fn get_values(&self, reads: &[(Version, KeyHash)]) -> anyhow::Result<Vec<Option<OwnedValue>>> {
+            self.value_batches.set(self.value_batches.get() + 1);
+            reads.iter().map(|(version, key)| self.inner.get_value_option(*version, *key)).collect()
+        }
+    }
+
+    /// A cold walk of a few thousand leaves takes a few dozen round trips,
+    /// not one per node, and still returns every leaf in key order at the
+    /// version that wrote it (here, across several versions).
+    #[test]
+    fn a_cold_walk_reads_each_chunk_in_one_round_trip() {
+        let source = MockTreeStore::new(true);
+        let mut expected: std::collections::BTreeMap<[u8; 32], Vec<u8>> = Default::default();
+        for version in 0..3u64 {
+            let kvs: Vec<_> = (0..1000u64)
+                .map(|i| {
+                    let mut key = <sha2::Sha256 as sha2::Digest>::digest((version * 1000 + i).to_be_bytes());
+                    key[0] = key[0].wrapping_add(version as u8);
+                    (KeyHash(key.into()), vec![version as u8; 8])
+                })
+                .collect();
+            for (key, value) in &kvs {
+                expected.insert(key.0, value.clone());
+            }
+            commit(&source, version, kvs);
+        }
+        let empty = MockTreeStore::new(true);
+        let counting = Counting {
+            inner: &source,
+            node_batches: Default::default(),
+            nodes: Default::default(),
+            value_batches: Default::default(),
+        };
+        let out = diff_leaves(&counting, 2, &empty, 0).unwrap();
+        let expected: Vec<_> = expected.into_iter().map(|(k, v)| (KeyHash(k), v)).collect();
+        assert_eq!(out, expected, "every leaf, in key order, with its latest value");
+        assert!(counting.nodes.get() > 3000);
+        let round_trips = counting.node_batches.get() + counting.value_batches.get();
+        assert!(round_trips < 80, "{round_trips} round trips for {} nodes", counting.nodes.get());
     }
 }

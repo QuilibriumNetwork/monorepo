@@ -30,11 +30,22 @@ pub enum TreeStore {
     Mem(Arc<MemTreeStore>),
 }
 
+/// Bumped whenever a tree is wiped or its head dropped. A rebuilt tree
+/// reuses versions, so the same node key can then name different content;
+/// caches of served nodes key their entries by this.
+static TREE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current tree generation (see [`TREE_GENERATION`]).
+pub fn tree_generation() -> u64 {
+    TREE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 impl TreeStore {
     /// Wipe this tree back to empty (all nodes/values/stale/preimages/head).
     /// Used by the shard-scoped prover-tree reset; the next commit rebuilds
     /// from version 0.
     pub fn clear(&self) -> Result<()> {
+        TREE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         match self {
             TreeStore::Rocks(s) => s.clear(),
             TreeStore::Mem(s) => {
@@ -44,6 +55,8 @@ impl TreeStore {
         }
     }
 }
+
+impl crate::BatchTreeReader for TreeStore {}
 
 impl TreeReader for TreeStore {
     fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {
@@ -92,6 +105,8 @@ impl StagedForestSync {
         Ok(())
     }
 }
+
+impl crate::BatchTreeReader for UpdatedTree<'_> {}
 
 impl TreeReader for UpdatedTree<'_> {
     fn get_node_option(&self, key: &NodeKey) -> Result<Option<Node>> {
@@ -580,6 +595,7 @@ impl Forest {
     /// rebuilt from version 0 by its next commit. Returns the dropped version.
     pub fn drop_orphaned_phase_head(&self, shard_id: &[u8], phase: Phase) -> Result<Option<u64>> {
         let Some(head) = self.orphaned_phase_head(shard_id, phase)? else { return Ok(None) };
+        TREE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         if let Backend::Rocks { db, namespace } = &self.backend {
             db.delete(Self::head_version_key(namespace, shard_id, phase))?;
         }
