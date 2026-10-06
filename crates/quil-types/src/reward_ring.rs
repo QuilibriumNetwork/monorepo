@@ -57,6 +57,9 @@ pub fn estimate_reward_ring(
     filter: &[u8],
     frame: u64,
 ) -> Option<RewardRingEstimate> {
+    if crate::consensus::committee_handoff_active(frame) {
+        return committed_ring_estimate(all, owner, filter, frame);
+    }
     let committee: Vec<_> = committee
         .iter()
         .copied()
@@ -152,6 +155,29 @@ pub fn estimate_reward_ring(
     })
 }
 
+/// Match the activated rule's RPC view: held rings come from committed
+/// allocation fields; an unallocated prover is projected onto the tail.
+fn committed_ring_estimate(
+    all: &[&ProverInfo], owner: &[u8], filter: &[u8], frame: u64,
+) -> Option<RewardRingEstimate> {
+    let live: Vec<_> = all.iter().copied().filter(|p|
+        allocation(p, filter).is_some_and(|a| a.is_live(frame))).collect();
+    let own = live.iter().find(|p| p.address == owner)
+        .and_then(|p| allocation(p, filter));
+    let (ring, count, source) = if let Some(own) = own {
+        (own.ring, live.iter().filter(|p|
+            allocation(p, filter).is_some_and(|a| a.ring == own.ring)).count(),
+            "committed_allocation_ring")
+    } else {
+        let group = REWARD_RING_GROUP_SIZE as usize;
+        ((live.len() / group) as u8, live.len() % group + 1, "new_join_projection")
+    };
+    Some(RewardRingEstimate {
+        ring, provers_on_ring: count, member_count: live.len() + usize::from(own.is_none()),
+        source, target_frame: frame,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +224,18 @@ mod tests {
             })
             .collect();
         estimate_reward_ring(&committee, &all, &[owner; 32], &[1], frame)
+    }
+    #[test]
+    fn activated_rule_uses_committed_rings_and_tail_projection() {
+        let mut ps: Vec<_> = (1..=9).map(|id| prover(id, 1)).collect();
+        for p in &mut ps { p.allocations[0].ring = 0; }
+        ps[0].allocations[0].ring = 1;
+        let all: Vec<_> = ps.iter().collect();
+        let e = committed_ring_estimate(&all, &[1; 32], &[1], 10).unwrap();
+        assert_eq!((e.ring, e.provers_on_ring), (1, 1));
+        assert_eq!(e.source, "committed_allocation_ring");
+        let projected = committed_ring_estimate(&all, &[10; 32], &[1], 10).unwrap();
+        assert_eq!((projected.ring, projected.provers_on_ring), (1, 2));
     }
     #[test]
     fn current_rank_uses_issuance_order_not_seniority_or_stored_default() {

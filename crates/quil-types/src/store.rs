@@ -419,6 +419,22 @@ pub trait ClockStore: Send + Sync {
     ) -> Result<()>;
     fn reset_shard_clock_frames(&self, filter: &[u8]) -> Result<()>;
 
+    /// Committee-handoff flag day: discard every application-shard frame
+    /// chain this store holds (frames, their indexes and staged copies,
+    /// per-frame relay records, application cursors and legacy consensus
+    /// keys), keeping application state and every GLOBAL frame, and record
+    /// that it ran at `global_frame`. One write; idempotent.
+    fn discard_app_frame_history(&self, _global_frame: u64) -> Result<()> {
+        Err(crate::error::QuilError::Internal(
+            "this clock store cannot discard application frame history".into(),
+        ))
+    }
+
+    /// The GLOBAL frame [`Self::discard_app_frame_history`] ran at, if it has.
+    fn app_frame_history_discarded(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
     // Shard certified state
     fn get_latest_certified_app_shard_state(
         &self,

@@ -234,6 +234,9 @@ pub struct WorkerOwnedDeps {
     pub storage_history_source: Option<crate::storage_history::GlobalVertexProofSource>,
     /// Archive source of a predecessor's outgoing records for successor checks.
     pub outgoing_history_source: Option<crate::app_handoff::OutgoingHistorySource>,
+    /// Committees that certified legacy frames today's registry no longer
+    /// reproduces (see `historical_committee`).
+    pub historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
 }
 
 /// Thread-based worker manager. Core 0 is reserved for the master;
@@ -616,6 +619,8 @@ impl ThreadWorkerManager {
                                                         owned.as_ref().and_then(|o| o.storage_history_source.clone()),
                                                     ).with_outgoing_history_source(
                                                         owned.as_ref().and_then(|o| o.outgoing_history_source.clone()),
+                                                    ).with_historical_committee_source(
+                                                        owned.as_ref().and_then(|o| o.historical_committee_source.clone()),
                                                     );
 
                                                     // Tell the master a shard engine just came online.

@@ -82,6 +82,8 @@ impl MemTreeStore {
     }
 }
 
+impl crate::BatchTreeReader for MemTreeStore {}
+
 impl TreeReader for MemTreeStore {
     fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {
         Ok(self.nodes.read().unwrap().get(node_key).cloned())
@@ -633,6 +635,8 @@ impl SizeIndex for RocksTreeStore {
         Ok(())
     }
 }
+
+impl crate::BatchTreeReader for RocksTreeStore {}
 
 impl TreeReader for RocksTreeStore {
     fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {
