@@ -498,6 +498,7 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
         if paused_unknown { "?".into() } else { fmt_reward(&paused) },
         if change_unknown { "?".into() } else { fmt_reward_change(&change) },
     );
+    s += &format!("  {}", global_snapshot_label(sorted.iter().map(|a| a.global_head.as_ref())));
     if !m.alloc_selected.is_empty() {
         s += &format!(" [{} selected]", m.alloc_selected.len());
     }
@@ -505,7 +506,7 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
 }
 
 fn avail_title(m: &Model, sorted: &[ShardRow]) -> Line<'static> {
-    let mut s = format!(" Available Shards: {}", sorted.len());
+    let mut s = format!(" Available Shards: {}  {}", sorted.len(), global_snapshot_label(sorted.iter().map(|s| s.global_head.as_ref())));
     if !m.avail_selected.is_empty() {
         s += &format!(" [{} selected]", m.avail_selected.len());
     }
@@ -537,7 +538,7 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         6 => if local_warning(a) { "0!".into() }
             else { a.execution.as_ref().and_then(|s| s.materialized_frame).map(|h| h.to_string()).unwrap_or_else(|| "-".into()) },
         7 => if a.materialized_frame == 0 && a.latest_frame == 0 { "-".into() } else { a.latest_frame.to_string() },
-        8 => a.global_head.as_ref().map(|h| h.frame.to_string()).unwrap_or_else(|| "-".into()),
+        8 => fmt_global_head(a.global_head.as_ref()),
         9 => local_execution_state(a.execution.as_ref()).into(),
         10 => if a.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&a.estimated_reward) },
         11 => a.worker_id.to_string(),
@@ -734,18 +735,22 @@ fn local_color(a: &AllocationRow) -> Color {
     }
 }
 
-fn global_head_detail(head: Option<&quil_types::proto::node::GlobalAppFrameHead>) -> String {
-    match head {
-        Some(head) => format!("GLOBAL @f{} (gen {})", head.global_frame, head.generation),
-        None => "GLOBAL app head: unavailable".into(),
-    }
+fn fmt_global_head(head: Option<&quil_types::proto::node::GlobalAppFrameHead>) -> String {
+    head.map(|h| format!("{}@g{}", h.frame, h.generation)).unwrap_or_else(|| "-".into())
+}
+
+fn global_snapshot_label<'a>(heads: impl Iterator<Item = Option<&'a quil_types::proto::node::GlobalAppFrameHead>>) -> String {
+    let mut frames = heads.flatten().map(|h| h.global_frame);
+    let Some(frame) = frames.next() else { return "GLOBAL: unavailable".into(); };
+    if frames.all(|f| f == frame) { format!("GLOBAL @f{frame}") }
+    else { "GLOBAL: mixed snapshots".into() }
 }
 
 fn allocation_detail(a: &AllocationRow) -> Line<'static> {
     let Some(execution) = a.execution.as_ref() else {
-        return Line::from(Span::styled(format!("{} | Local execution details unavailable", global_head_detail(a.global_head.as_ref())), Style::new().fg(HELP)));
+        return Line::from(Span::styled("Local execution details unavailable", Style::new().fg(HELP)));
     };
-    let mut text = format!("{} | Last advance: {}", global_head_detail(a.global_head.as_ref()), if execution.last_advance_unix_ms == 0 {
+    let mut text = format!("Last advance: {}", if execution.last_advance_unix_ms == 0 {
         "not observed since start".into()
     } else { format!("{} ago", age(execution.last_advance_unix_ms)) });
     if !execution.blocker.is_empty() { text += &format!(" | Blocker: {}", execution.blocker); }
@@ -895,7 +900,7 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
         5 => s.data_shards.to_string(),
         6 => fmt_materialized(s.materialized_frame, s.latest_frame),
         7 => if s.materialized_frame == 0 && s.latest_frame == 0 { "-".into() } else { s.latest_frame.to_string() },
-        8 => s.global_head.as_ref().map(|h| h.frame.to_string()).unwrap_or_else(|| "-".into()),
+        8 => fmt_global_head(s.global_head.as_ref()),
         9 => { let state = materialization_state(s.materialized_frame, s.latest_frame); if matches!(state, "lag" | "unmat") { format!("{state}!") } else { state.to_string() } },
         _ => if s.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&s.estimated_reward) },
     }
@@ -1022,7 +1027,7 @@ fn available_detail(s: &ShardRow) -> Line<'static> {
         "current" => ("Provider materialization is current".into(), HELP),
         _ => ("Provider shard heights unavailable; health unknown".into(), HELP),
     };
-    Line::from(Span::styled(format!("{} | {message}", global_head_detail(s.global_head.as_ref())), Style::new().fg(color)))
+    Line::from(Span::styled(message, Style::new().fg(color)))
 }
 
 fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: Option<&[usize]>) -> Vec<Line<'static>> {
@@ -1558,7 +1563,7 @@ fn help_body() -> Vec<Line<'static>> {
         sec("Worker progress"),
         kv("LocalMat", "Local height; - unknown; 0! warns a running host has no materialized frames"),
         kv("Execution", "Host state; running with zero LocalMat is warned, not healthy progress"),
-        kv("GlobalHead", "App head committed in GLOBAL; - unavailable, 0 is a known genesis head"),
+        kv("GlobalHead", "Committed app head@generation; - unavailable, 0@gN is a known genesis head"),
         kv("PeerHead", "Provider shard head; remote metadata, not the local worker cursor"),
         kv("Details", "Selected allocation footer shows blocker and last advance; no observation timer"),
 
@@ -1645,11 +1650,11 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Size [MB]", "Shard size, in megabytes"),
         kv("Shards", "Data shards the filter covers"),
         kv("PeerMat", "Materialized height reported by the shard metadata provider"),
-        kv("GlobalHead", "App head committed in GLOBAL; - unavailable, 0 is a known genesis head"),
+        kv("GlobalHead", "Committed app head@generation; - unavailable, 0@gN is a known genesis head"),
         kv("PeerHead", "Provider shard head; remote metadata"),
         kv("PeerState", "Reading of PeerMat and PeerHead; lag!/unmat! flag provider warnings"),
         kv("Cursor", "Inactive cursor stays visible to bind the detail below to its row"),
-        kv("GLOBAL citation", "Selected-row detail: committed GLOBAL frame and session generation"),
+        kv("GLOBAL citation", "Panel header: snapshot frame cited by GlobalHead cells"),
         kv("", "Independent of LocalMat and peer metadata; absent on older servers"),
         kv("", "lag: behind it; unmat: nothing materialized; unknown: no head"),
         kv(
@@ -1907,23 +1912,26 @@ mod tests {
         allocation.latest_frame = 744;
         allocation.global_head = Some(quil_types::proto::node::GlobalAppFrameHead { frame: 742, global_frame: 1000, generation: 2 });
         allocation.execution = Some(quil_types::proto::node::WorkerExecution { materialized_frame: Some(744), ..Default::default() });
-        assert!(allocation_detail(&allocation).to_string().contains("GLOBAL @f1000 (gen 2)"));
+        assert!(!allocation_detail(&allocation).to_string().contains("GLOBAL"));
         let m = Model::new();
-        assert_eq!(alloc_cell(&m, &allocation, 8, 0), "742");
+        assert_eq!(alloc_cell(&m, &allocation, 8, 0), "742@g2");
         assert_eq!(alloc_cell(&m, &allocation, 7, 0), "744");
         let mut peer = shard("bb", 1, 1); peer.latest_frame = 900;
         peer.global_head = allocation.global_head.clone();
-        assert!(available_detail(&peer).to_string().contains("GLOBAL @f1000"));
-        assert_eq!(avail_cell(&m, &peer, 8, 0), "742");
+        assert!(!available_detail(&peer).to_string().contains("GLOBAL"));
+        assert_eq!(avail_cell(&m, &peer, 8, 0), "742@g2");
         assert_eq!(avail_cell(&m, &peer, 7, 0), "900");
         peer.global_head = None;
         assert_eq!(avail_cell(&m, &peer, 8, 0), "-");
         assert!(avail_row_numeric_val(&peer, 8).is_nan());
         peer.global_head = Some(Default::default());
-        assert_eq!(avail_cell(&m, &peer, 8, 0), "0");
+        assert_eq!(avail_cell(&m, &peer, 8, 0), "0@g0");
         assert_eq!(avail_row_numeric_val(&peer, 8), 0.0);
-        assert_eq!(global_head_detail(None), "GLOBAL app head: unavailable");
-        assert!(global_head_detail(Some(&quil_types::proto::node::GlobalAppFrameHead::default())).contains("GLOBAL @f0"));
+        assert_eq!(global_snapshot_label([allocation.global_head.as_ref()].into_iter()), "GLOBAL @f1000");
+        assert_eq!(global_snapshot_label([None].into_iter()), "GLOBAL: unavailable");
+        assert_eq!(global_snapshot_label([allocation.global_head.as_ref(), peer.global_head.as_ref()].into_iter()), "GLOBAL: mixed snapshots");
+        assert!(alloc_title(&m, &[allocation]).to_string().contains("GLOBAL @f1000"));
+        assert!(avail_title(&m, &[peer]).to_string().contains("GLOBAL @f0"));
     }
 
     #[test]
