@@ -1616,7 +1616,7 @@ mod tests {
     fn claimable_header_distinguishes_loading_missing_verified_and_stale() {
         let mut m = Model::new();
         assert_eq!(claimable_title(&m), "Claimable: loading");
-        super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Ok(Some((59358375, 862280)))));
+        super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Ok(Some((474867, 862280)))));
         assert_eq!(claimable_title(&m), "Claimable: 0.000059358375 QUIL @f862280");
         assert!(alloc_title(&m, &[]).to_string().contains("Claimable:"));
         m.reward_last_success = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
