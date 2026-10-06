@@ -42,6 +42,48 @@ pub use crate::snapshot::{GenerationHandle, SnapshotManager};
 
 /// `(set_type, phase_type)` string pair for each phase index (0..4), matching
 /// the store's keying and `quil_forest::PHASES` order.
+/// The CRDT's commit lock, counting releases: a view captured while holding
+/// it is current for as long as nobody has released it since, which lets new
+/// wallet scans share one snapshot until the next commit.
+#[derive(Default)]
+pub(crate) struct CommitLock {
+    inner: std::sync::Mutex<()>,
+    releases: AtomicU64,
+}
+
+/// A held [`CommitLock`]; its release is counted before the lock is free.
+pub(crate) struct CommitGuard<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+    releases: Option<&'a AtomicU64>,
+}
+
+impl Drop for CommitGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(releases) = self.releases {
+            releases.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl CommitLock {
+    /// Take the lock; its release counts as a commit.
+    pub(crate) fn lock(&self) -> std::result::Result<CommitGuard<'_>, ()> {
+        let guard = self.inner.lock().map_err(|_| ())?;
+        Ok(CommitGuard { _guard: guard, releases: Some(&self.releases) })
+    }
+
+    /// Take the lock to read only; its release is not counted.
+    fn lock_to_read(&self) -> std::result::Result<CommitGuard<'_>, ()> {
+        let guard = self.inner.lock().map_err(|_| ())?;
+        Ok(CommitGuard { _guard: guard, releases: None })
+    }
+
+    /// Counted releases so far.
+    fn releases(&self) -> u64 {
+        self.releases.load(Ordering::SeqCst)
+    }
+}
+
 const PHASE_STR: [(&str, &str); 4] = [
     ("vertex", "adds"),
     ("vertex", "removes"),
@@ -52,7 +94,9 @@ const PHASE_STR: [(&str, &str); 4] = [
 /// Bound the readable data held by one sync write batch. A large bootstrap
 /// commits several batches, each with its leaves and blobs in one transaction.
 pub const MAX_SYNC_CHUNK_BYTES: usize = 64 * 1024 * 1024;
-pub const MAX_SYNC_CHUNK_LEAVES: usize = 256;
+/// Four batched blob reads' worth, fetched in flight together: at 256 a
+/// multi-million-leaf bootstrap waited out one round trip per 256 leaves.
+pub const MAX_SYNC_CHUNK_LEAVES: usize = 1024;
 
 /// Committed phase roots and a database snapshot captured under the same commit
 /// lock. Metadata (cursor, outgoing history) must be read from this handle, not
@@ -359,7 +403,7 @@ pub struct HypergraphCrdt {
     /// Covered nibble prefix (address gating). Empty = accept all.
     covered_prefix: RwLock<Vec<i32>>,
     /// Serializes mutation batches, commits and coordinated forest updates.
-    commit_lock: std::sync::Mutex<()>,
+    commit_lock: CommitLock,
     /// UNIFIED-APP-TREE mode. When set,
     /// every app commits ALL its vertices into ONE L3 tree per phase keyed by the
     /// app address (leaves raw-key positioned), so a shard is the in-place subtree
@@ -489,7 +533,7 @@ impl HypergraphCrdt {
             snapshot_mgr: SnapshotManager::new(),
             local_vertex_observer: RwLock::new(None),
             covered_prefix: RwLock::new(Vec::new()),
-            commit_lock: std::sync::Mutex::new(()),
+            commit_lock: CommitLock::default(),
             unified_tree: AtomicBool::new(false),
         }
     }
@@ -3674,6 +3718,30 @@ impl HypergraphCrdt {
             .flatten()
     }
 
+    /// Forest-sync SERVER: leaves of a shard/phase tree in `[first, last]`
+    /// after `after` at `version`, in key order (see
+    /// [`quil_forest::Forest::serve_leaves`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn serve_forest_leaves(
+        &self,
+        shard_id: &[u8],
+        phase_idx: usize,
+        version: u64,
+        first: &[u8; 32],
+        last: &[u8; 32],
+        after: Option<&[u8; 32]>,
+        max_leaves: usize,
+        max_bytes: usize,
+    ) -> Option<(Vec<([u8; 32], Vec<u8>)>, bool)> {
+        if phase_idx >= 4 {
+            return None;
+        }
+        let (leaves, more) = self.forest.read().unwrap()
+            .serve_leaves(shard_id, PHASES[phase_idx], version, first, last, after, max_leaves, max_bytes)
+            .ok()?;
+        Some((leaves.into_iter().map(|(key, value)| (key.0, value)).collect(), more))
+    }
+
     pub fn invalidate_domain_shard_commit(&self, frame_number: u64, app_address: &[u8]) -> Result<()> {
         let _guard = self.commit_lock.lock().map_err(|_| QuilError::ExecutionUnavailable(
             "shard commit invalidation lock poisoned".into()))?;
@@ -3997,16 +4065,27 @@ impl HypergraphCrdt {
     /// historical root publication. A boot-time prover snapshot may remain the
     /// latest published generation while application coins keep changing.
     /// Continuations still use their exact retained identity, never a new view.
+    /// A scan started with no commit since the last capture shares that
+    /// snapshot (it is the current state), so an archive serving every wallet
+    /// no longer takes the commit lock and pins a store snapshot per scan.
     pub fn acquire_or_capture_scan_snapshot(&self, id: Option<&[u8; 32]>) -> Result<Option<GenerationHandle>> {
         if id.is_some() {
             return Ok(self.snapshot_mgr.acquire_scan(id));
         }
-        let _guard = self.commit_lock.lock().map_err(|_| {
+        if let Some(shared) = self.snapshot_mgr.current_scan(self.commit_lock.releases()) {
+            return Ok(Some(shared));
+        }
+        let _guard = self.commit_lock.lock_to_read().map_err(|_| {
             QuilError::ExecutionUnavailable("scan snapshot commit lock poisoned".into())
         })?;
+        // Another scan may have captured while this one waited for the lock.
+        let releases = self.commit_lock.releases();
+        if let Some(shared) = self.snapshot_mgr.current_scan(releases) {
+            return Ok(Some(shared));
+        }
         Ok(match self.store.capture_tree_snapshot()? {
-            Some(snapshot) => self.snapshot_mgr.publish_scan_only(
-                self.forest_version.load(Ordering::SeqCst), snapshot,
+            Some(snapshot) => self.snapshot_mgr.publish_current_scan(
+                self.forest_version.load(Ordering::SeqCst), snapshot, releases,
             ),
             None => None,
         })

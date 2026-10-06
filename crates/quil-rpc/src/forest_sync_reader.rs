@@ -136,6 +136,9 @@ pub struct RemoteTreeReader {
     /// Cleared when the archive lacks the batched calls (an older build):
     /// reads then go one key per request, still several in flight.
     batched: std::sync::atomic::AtomicBool,
+    /// Cleared when the archive cannot list leaves (an older build): an empty
+    /// subtree is then walked node by node.
+    listing: std::sync::atomic::AtomicBool,
 }
 
 impl RemoteTreeReader {
@@ -155,6 +158,7 @@ impl RemoteTreeReader {
             reads: std::sync::atomic::AtomicU64::new(0),
             started: std::time::Instant::now(),
             batched: std::sync::atomic::AtomicBool::new(true),
+            listing: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -251,6 +255,30 @@ impl RemoteTreeReader {
             .await
     }
 
+    /// Every leaf in `[first, last]` at `version`, page by page.
+    async fn listed(&self, version: u64, first: [u8; 32], last: [u8; 32])
+        -> std::result::Result<Vec<(KeyHash, OwnedValue)>, ArchiveClientError> {
+        let mut leaves: Vec<(KeyHash, OwnedValue)> = Vec::new();
+        let mut after: Option<[u8; 32]> = None;
+        loop {
+            let (page, more) = retry_forest_read(|| {
+                let (mut client, shard_id) = (self.client.clone(), self.shard_id.clone());
+                async move { client.get_forest_leaves(shard_id, self.phase, version, first, last, after).await }
+            }).await?;
+            // Each page must continue past the last: a listing that does not
+            // advance would never end. Its content is checked by the caller.
+            if page.first().is_some_and(|(key, _)| after.is_some_and(|after| *key <= after)) || (more && page.is_empty()) {
+                return Err(ArchiveClientError::MissingField("forest leaf listing did not advance"));
+            }
+            self.counted(page.len());
+            after = page.last().map(|(key, _)| *key).or(after);
+            leaves.extend(page.into_iter().map(|(key, value)| (KeyHash(key), value)));
+            if !more {
+                return Ok(leaves);
+            }
+        }
+    }
+
     async fn values(&self, reads: Vec<(u64, Vec<u8>)>) -> std::result::Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
         let (client, shard_id, phase) = (self.client.clone(), self.shard_id.clone(), self.phase);
         if self.batched.load(std::sync::atomic::Ordering::Relaxed) {
@@ -294,6 +322,22 @@ impl quil_forest::BatchTreeReader for RemoteTreeReader {
             .into_iter()
             .map(|bytes| bytes.map(|b| borsh::from_slice(&b)).transpose().map_err(Into::into))
             .collect()
+    }
+
+    fn leaves_under(&self, version: Version, bit_path: &[bool]) -> Result<Option<Vec<(KeyHash, OwnedValue)>>> {
+        if !self.listing.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let (first, last) = quil_forest::key_range_under(bit_path);
+        match self.handle.block_on(self.listed(version, first, last)) {
+            Ok(leaves) => Ok(Some(leaves)),
+            Err(e) if e.is_unimplemented() => {
+                self.listing.store(false, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!("archive cannot list forest leaves (older build); walking the tree");
+                Ok(None)
+            }
+            Err(e) => Err(anyhow::anyhow!("remote get_forest_leaves: {e}")),
+        }
     }
 
     fn get_values(&self, reads: &[(Version, KeyHash)]) -> Result<Vec<Option<OwnedValue>>> {

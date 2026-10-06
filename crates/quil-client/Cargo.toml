@@ -25,6 +25,7 @@ quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-keys = { path = "../quil-keys" }
 quil-crypto = { path = "../quil-crypto" }
+quil-forest = { path = "../quil-forest" }
 quil-execution = { path = "../quil-execution" }
 quil-p2p = { path = "../quil-p2p" }
 quil-rpc = { path = "../quil-rpc" }

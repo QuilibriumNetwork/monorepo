@@ -1231,7 +1231,7 @@ mod successor_tests {
         let tip_digest = put(5, 17, 1);
 
         // GLOBAL records frame 5 as the tip and registers generation 0 there.
-        let policy = CommitteeHandoffPolicy { activation_frame: 0, chain_id: [7; 32], legacy_history: quil_types::consensus::LegacyHistory::Migrate, membership_boundary_frame: u64::MAX};
+        let policy = CommitteeHandoffPolicy { activation_frame: 0, chain_id: [7; 32], legacy_history: quil_types::consensus::LegacyHistory::Migrate, membership_boundary_frame: u64::MAX, first_session_boundary_frame: u64::MAX};
         commit(1);
         let tip = legacy::LegacyTip {
             checkpoint: Checkpoint { frame: 5, view: 17, digest: tip_digest, state_roots: [[0; 32]; 4], history_root: [0; 32] },

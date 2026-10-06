@@ -155,6 +155,19 @@ impl quil_rpc::global_service::ForestServer for CrdtForestServer {
     fn serve_head(&self, shard_id: &[u8], phase: u32) -> Option<(u64, [u8; 32])> {
         self.0.serve_forest_head(shard_id, phase as usize)
     }
+    fn serve_leaves(
+        &self,
+        shard_id: &[u8],
+        phase: u32,
+        version: u64,
+        first: &[u8; 32],
+        last: &[u8; 32],
+        after: Option<&[u8; 32]>,
+    ) -> Option<(Vec<([u8; 32], Vec<u8>)>, bool)> {
+        use quil_rpc::global_service::{MAX_FOREST_BATCH_BYTES, MAX_FOREST_LEAVES};
+        self.0.serve_forest_leaves(shard_id, phase as usize, version, first, last, after,
+            MAX_FOREST_LEAVES, MAX_FOREST_BATCH_BYTES)
+    }
     fn serve_preimage(&self, shard_id: &[u8], phase: u32, key_hash: [u8; 32]) -> Option<Vec<u8>> {
         self.0.serve_forest_preimage(shard_id, phase as usize, key_hash)
     }
@@ -194,6 +207,10 @@ struct CrdtCoinWitness {
     network: u8,
     #[cfg(feature = "confidential-tokens")]
     witness_index: Arc<crate::witness_index::NodeWitnessIndex>,
+    /// QUIL's legacy coins by owner. Built only on an archive, which holds the
+    /// whole application; other nodes ask an archive.
+    #[cfg(feature = "confidential-tokens")]
+    legacy_index: Option<Arc<crate::legacy_index::LegacyOwnerIndex>>,
     /// The QUIL shard's latest certified global anchor seen by this node's
     /// shard engines (local or remote workers), bounding mint-claim citations.
     shard_anchor: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
@@ -452,6 +469,27 @@ impl CrdtCoinWitness {
 }
 
 impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
+    #[cfg(feature = "confidential-tokens")]
+    fn legacy_coins(&self, domain: &[u8; 32], owner: &[u8; 32], after: Option<&[u8; 32]>) -> quil_types::error::Result<Option<quil_types::store::LegacyCoinPageData>> {
+        use quil_execution::token_intrinsic::{global_commit, spent_check};
+        use quil_types::store::{LegacyCoinData, LegacyCoinPageData, MAX_LEGACY_COINS_PER_PAGE};
+        // Only QUIL held coins before the transparent migration.
+        if domain != &quil_execution::domains::QUIL_TOKEN {
+            return Ok(Some(LegacyCoinPageData::default()));
+        }
+        let Some(index) = self.legacy_index.as_ref() else { return Ok(None) };
+        let Some((coins, has_more)) = index.page(owner, after, MAX_LEGACY_COINS_PER_PAGE)? else { return Ok(None) };
+        // A shield consumes its source through a GLOBAL marker; the coin
+        // itself never changes.
+        let global = quil_execution::hypergraph_state::HypergraphState::new(self.crdt.clone());
+        let coins = coins.into_iter().map(|(address, amount, origin)| {
+            let marker = spent_check::key_image_spent_address(&address)?;
+            Ok(LegacyCoinData { address, amount, origin, shielded: global_commit::is_consumed(&global, domain, &marker)? })
+        }).collect::<quil_types::error::Result<Vec<_>>>()?;
+        let cursor = coins.last().map(|coin| coin.address);
+        Ok(Some(LegacyCoinPageData { coins, cursor, has_more }))
+    }
+
     fn mint_authorization_witness(&self, receipt: &[u8; 32]) -> quil_types::error::Result<quil_types::store::MintAuthorizationWitnessData> {
         let state = quil_execution::hypergraph_state::HypergraphState::new(self.crdt.clone());
         let anchor = (self.shard_anchor)();
@@ -1256,6 +1294,21 @@ pub(crate) fn spawn_all(
             network,
             #[cfg(feature = "confidential-tokens")]
             witness_index: crate::witness_index::NodeWitnessIndex::start(db_arc.clone(), crdt.clone(), network, spawner.clone()),
+            #[cfg(feature = "confidential-tokens")]
+            legacy_index: if archive_mode {
+                match crate::legacy_index::LegacyOwnerIndex::start(
+                    db_arc.clone(), hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+                    quil_execution::domains::QUIL_TOKEN, &spawner,
+                ) {
+                    Ok(index) => Some(index),
+                    Err(error) => {
+                        tracing::warn!(%error, "legacy owner index unavailable");
+                        None
+                    }
+                }
+            } else {
+                None
+            },
             shard_anchor: {
                 let engines = shard_engines.clone();
                 let remote_workers = remote_fee_workers.clone();
@@ -1347,6 +1400,13 @@ pub(crate) fn spawn_all(
                 Arc::new(move |domain, snapshot, after| {
                     let reader = reader.clone();
                     Box::pin(async move { reader.coin_page(domain, snapshot, after).await })
+                })
+            })
+            .with_remote_legacy_coins({
+                let reader = reader.clone();
+                Arc::new(move |domain, owner, after| {
+                    let reader = reader.clone();
+                    Box::pin(async move { reader.legacy_coins(domain, owner, after).await })
                 })
             })
             .with_remote_escrow_page({

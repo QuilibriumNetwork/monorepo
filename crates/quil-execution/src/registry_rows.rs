@@ -15,12 +15,20 @@ const VK_LEN: usize = 64;
 
 type LeafRootKey = (Vec<u8>, Vec<u8>, u64);
 
+/// An absent ring is an unassigned allocation, not decoded ring zero.
+#[derive(Clone, Copy)]
+pub(super) enum CommittedRing {
+    Unassigned,
+    Assigned(u8),
+    Invalid,
+}
+
 /// What one `adds` row contributes to each pass of a refresh.
 #[derive(Clone)]
 pub(super) struct DecodedRow {
     first: FirstPass,
-    /// Present only with the activated policy's committed ring key.
-    committed_ring: Option<u8>,
+    /// Assignment and validity of the activated policy's committed fields.
+    committed_ring: CommittedRing,
     /// Rows typed as allocations: the owner and allocation, `None` when the
     /// row does not decode. Counted in the second pass either way.
     allocation: Option<Option<(Vec<u8>, ProverAllocationInfo)>>,
@@ -42,10 +50,10 @@ enum FirstPass {
 fn decode_row(vk: &[u8], data: &[u8]) -> DecodedRow {
     let root = match deserialize_go_tree(data) {
         Ok(Some(root)) => root,
-        _ => return DecodedRow { first: FirstPass::Nothing, allocation: None, committed_ring: None },
+        _ => return DecodedRow { first: FirstPass::Nothing, allocation: None, committed_ring: CommittedRing::Invalid },
     };
     let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
-        return DecodedRow { first: FirstPass::Unknown, allocation: None, committed_ring: None };
+        return DecodedRow { first: FirstPass::Unknown, allocation: None, committed_ring: CommittedRing::Invalid };
     };
     let first = match class_for_type_hash(&type_hash) {
         Some("prover:Prover") => match decode_prover(vk, &root) {
@@ -61,13 +69,18 @@ fn decode_row(vk: &[u8], data: &[u8]) -> DecodedRow {
         _ => FirstPass::Unknown,
     };
     let allocation = (type_hash == TYPE_HASH_ALLOCATION).then(|| decode_allocation(vk, &root));
-    let committed_ring = allocation.as_ref().and_then(|decoded| decoded.as_ref()).and_then(|_| {
-        let ring = read_bytes(&root, "allocation:ProverAllocation", "Ring");
-        (ring.len() == 1
-            && read_bytes(&root, "allocation:ProverAllocation", "RingEpoch").len() == 8
-            && read_bytes(&root, "allocation:ProverAllocation", "RingSeniority").len() == 8)
-            .then(|| ring[0])
-    });
+    let field = |name| field_key("allocation:ProverAllocation", name)
+        .and_then(|key| root.find_leaf_value(&key));
+    let committed_ring = if allocation.as_ref().is_some_and(|decoded| decoded.is_some()) {
+        let key = (field("RingEpoch"), field("RingSeniority"));
+        let valid_key = matches!(&key, (Some(epoch), Some(seniority))
+            if epoch.len() == 8 && seniority.len() == 8);
+        match field("Ring") {
+            None if valid_key || matches!(key, (None, None)) => CommittedRing::Unassigned,
+            Some(ring) if ring.len() == 1 && valid_key => CommittedRing::Assigned(ring[0]),
+            _ => CommittedRing::Invalid,
+        }
+    } else { CommittedRing::Invalid };
     DecodedRow { first, allocation, committed_ring }
 }
 
@@ -99,8 +112,10 @@ pub(super) struct RegistryRows {
 }
 
 impl RegistryRows {
-    pub(super) fn committed_ring(&self, address: &[u8]) -> Option<u8> {
-        self.effective(&<[u8; 32]>::try_from(address).ok()?)?.committed_ring
+    pub(super) fn committed_ring(&self, address: &[u8]) -> CommittedRing {
+        <[u8; 32]>::try_from(address).ok()
+            .and_then(|address| self.effective(&address))
+            .map(|row| row.committed_ring).unwrap_or(CommittedRing::Invalid)
     }
 
     /// Record an `adds` row the refresh read (and charged).

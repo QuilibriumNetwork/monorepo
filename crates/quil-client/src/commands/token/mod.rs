@@ -15,6 +15,7 @@ use crate::context::{Context, GlobalArgs};
 use crate::rpc::ConnectOpts;
 
 mod account;
+mod legacy;
 #[cfg(feature = "confidential-tokens")]
 pub(crate) mod balance;
 #[cfg(feature = "confidential-tokens")]
@@ -64,6 +65,8 @@ pub enum TokenCommand {
     Balance,
     /// Lists all coins under control of the managing account.
     Coins,
+    /// Lists this identity's legacy (pre-2.1) coins and their unshielded total.
+    Legacy,
     /// Transfer a confidential amount to a recipient address (`confidential-address`).
     Transfer {
         /// Recipient QCT3 address.
@@ -92,6 +95,14 @@ pub enum TokenCommand {
         /// Fee in base units (default: node estimate for QUIL, zero for custom tokens).
         #[arg(long)]
         fee: Option<u128>,
+    },
+    /// Shield every unshielded legacy coin of this identity, in batches of up
+    /// to 96 legacy coins from one shard each (active from GLOBAL frame 864,000).
+    #[cfg(feature = "native-proof")]
+    ShieldAll {
+        /// Legacy coins per batch (1 to 96).
+        #[arg(long, default_value_t = 96)]
+        max_per_batch: usize,
     },
     /// Mint a custom token under its deployed policy.
     #[cfg(feature = "native-proof")]
@@ -451,6 +462,8 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 };
                 return wallet::run_mint(&tc, recipient.as_deref(), mint_fee, claim.as_deref()).await;
             }
+            TokenCommand::ShieldAll { max_per_batch } =>
+                return wallet::run_shield_all(&tc, &application, *max_per_batch).await,
             TokenCommand::Shield { source, amount, fee } =>
                 return wallet::run_shield(&tc, &application, source, *amount, operation_fee(&tc, &application, *fee, Shape { coins: 1, markers: 1, escrow: false }).await?).await,
             TokenCommand::Pay { destination, amount, context, fee } => {
@@ -488,6 +501,10 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
     }
     match &args.command {
         TokenCommand::Account => account::run(&tc),
+        TokenCommand::Legacy => {
+            let application: [u8; 32] = decoded.as_slice().try_into().expect("checked above");
+            legacy::run(tc, &application).await
+        }
         _ => anyhow::bail!("this build does not include support for this confidential token operation"),
     }
 }
