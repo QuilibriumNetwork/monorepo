@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::model::{
-    AwaitFilterEntry, ColumnFilter, ColumnSizing, FilterColKind, Model, PanelFocus, PendingAction,
+    AwaitFilterEntry, ColumnFilter, FilterColKind, Model, PanelFocus, PendingAction,
 };
 use super::msg::Msg;
 use super::super::epoch::{epoch_len, ConfirmWindow, WindowState};
@@ -506,13 +506,6 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             m.color_coding = !m.color_coding;
             return vec![];
         }
-        KeyCode::Char('w') => {
-            m.column_sizing = match m.column_sizing {
-                ColumnSizing::Dynamic => ColumnSizing::Fixed,
-                ColumnSizing::Fixed => ColumnSizing::Dynamic,
-            };
-            return vec![];
-        }
         KeyCode::Char('e') => {
             m.threshold_unit = m.threshold_unit.toggled();
             return vec![];
@@ -552,7 +545,6 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             else { cursor_down(m); }
             return vec![];
         }
-        KeyCode::Char('R') => return vec![Cmd::Fetch],
         _ => {}
     }
     if m.focus == PanelFocus::Notifications { return vec![]; }

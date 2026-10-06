@@ -20,7 +20,7 @@ use super::super::epoch::{
 
 pub const ALLOC_COL_NAMES: [&str; 16] = [
     "Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "LocalMat", "PeerHead", "GlobalHead", "Execution",
-    "Reward [Q/d]", "Worker", "Status", "Mode", "Next Action", "Default Action",
+    "Reward [Q/d]", "Worker", "Status", "Mode", "NextAction", "DefaultAction",
 ];
 pub const AVAIL_COL_NAMES: [&str; 11] =
     ["Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "PeerMat", "PeerHead", "GlobalHead", "PeerState", "Reward [Q/d]"];
@@ -52,7 +52,7 @@ pub fn avail_filter_col_kind(col: usize) -> FilterColKind {
     }
 }
 
-/// How the two tables size their columns. Toggled at runtime with `w`.
+/// How the two tables size their columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColumnSizing {
     /// Measure every column against the rows on screen: a column is as wide
@@ -254,7 +254,6 @@ pub struct Model {
     pub current_epoch: u64,
     pub last_received_frame: u64,
     pub difficulty: u64,
-    pub auto_managed: bool,
 
     // Verified GLOBAL reward witness, refreshed independently of shard queries.
     pub claimable_reward: Option<(u128, u64)>,
@@ -420,7 +419,6 @@ impl PanelFocus {
 impl Model {
     pub fn new() -> Self {
         Model {
-            auto_managed: true,
             color_coding: true,
             alloc_sort_col: 11, // Worker column
             alloc_sort_asc: true,
@@ -493,16 +491,11 @@ impl Model {
 
         // Worker maps: core_id + manually_managed by filter hex.
         let mut workers: HashMap<String, (u32, bool)> = HashMap::new();
-        let mut any_manual = false;
         if let Some(wi) = &worker_info {
             for w in &wi.worker_info {
                 workers.insert(hex::encode(&w.filter), (w.core_id, w.manually_managed));
-                if w.manually_managed {
-                    any_manual = true;
-                }
             }
         }
-        self.auto_managed = !any_manual;
 
         // Free workers (empty filter).
         let mut free_workers: Vec<u32> = Vec::new();
