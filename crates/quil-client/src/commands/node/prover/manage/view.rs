@@ -1344,6 +1344,19 @@ fn status_line(m: &Model) -> Line<'static> {
 }
 
 /// `renderHelpLine` — key hints with applicable actions highlighted.
+fn command_hint(key: &str, description: &str, style: Style) -> Span<'static> {
+    Span::styled(format!("[{key}] {description}"), style)
+}
+
+fn help_commands() -> Line<'static> {
+    let mut spans = Vec::new();
+    for (key, description) in [("↑/k", "up"), ("↓/j", "down"), ("Pg↑/↓", "page"), ("Home/End", "first/last"), ("h/esc", "close"), ("q", "quit")] {
+        if !spans.is_empty() { spans.push(Span::raw("  ")); }
+        spans.push(command_hint(key, description, Style::new().fg(HELP)));
+    }
+    Line::from(spans)
+}
+
 fn help_line(m: &Model) -> Line<'static> {
     let mut applicable: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !m.action_in_flight {
@@ -1392,7 +1405,6 @@ fn help_line(m: &Model) -> Line<'static> {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        let text = format!("[{key}] {desc}");
         let style = match *tag {
             "Filter" => {
                 if filters_active {
@@ -1426,7 +1438,7 @@ fn help_line(m: &Model) -> Line<'static> {
             t if applicable.contains(t) => Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
             _ => Style::new().fg(DIM),
         };
-        spans.push(Span::styled(text, style));
+        spans.push(command_hint(key, desc, style));
     }
     Line::from(spans)
 }
@@ -1495,11 +1507,11 @@ fn render_filter_edit_lines(m: &Model) -> (Line<'static>, Line<'static>) {
 fn render_help_screen(f: &mut Frame, m: &mut Model, area: Rect) {
     let body = help_body();
     m.help_lines = body.len();
-    let mut commands = wrap_actions(Line::from("[↑/k] up  [↓/j] down  [PgUp/PgDn] page  [Home/End] first/last  [h/Esc] close  [q] quit"), area.width);
+    let mut commands = wrap_actions(help_commands(), area.width);
     let footer_height = commands.len().min(usize::from(area.height.saturating_sub(2).max(1)));
     if commands.len() > footer_height {
         commands.truncate(footer_height);
-        commands[footer_height - 1] = Line::from("[h/Esc] close  [q] quit");
+        commands[footer_height - 1] = Line::from("[h/esc] close  [q] quit");
     }
     let body_height = usize::from(area.height).saturating_sub(1 + footer_height);
     m.help_visible = body_height;
@@ -2713,7 +2725,7 @@ mod tests {
         terminal.draw(|f| draw(f, &mut m)).unwrap();
         let bottom = |buffer: &ratatui::buffer::Buffer| (0..100).map(|x| buffer[(x, 23)].symbol()).collect::<String>();
         let before = bottom(terminal.backend().buffer());
-        assert!(before.contains("[h/Esc] close"));
+        assert!(before.contains("[h/esc] close"));
         super::super::update::handle_key(&mut m, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         terminal.draw(|f| draw(f, &mut m)).unwrap();
         assert_eq!(bottom(terminal.backend().buffer()), before);
