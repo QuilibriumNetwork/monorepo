@@ -455,7 +455,7 @@ impl RecipientWallet {
         Self::decode_reward_claim(public_key, response)
     }
 
-    fn decode_reward_claim(
+    pub(super) fn decode_reward_claim(
         public_key: [u8; 897],
         response: quil_types::proto::node::GetProverRewardWitnessResponse,
     ) -> anyhow::Result<(
@@ -1945,8 +1945,12 @@ pub(super) fn run(tc: &TokenCtx, application: &str, escrow: bool) -> anyhow::Res
 }
 
 pub(super) async fn run_balance(tc: &TokenCtx, application: &str, max_pages: usize, max_coins: usize) -> anyhow::Result<()> {
+    let application_id = identifier(application)?;
+    if application_id == quil_execution::domains::QUIL_TOKEN {
+        println!("{}", super::balance::claimable_rewards(tc).await);
+    }
     let network = quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
-    let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &identifier(application)?)?);
+    let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application_id)?);
     let client = tc.connect().await?;
     let coins = wallet.scan_unspent(&client, max_pages, max_coins).await?;
     let total = coins.iter().try_fold(0u128, |sum, coin| sum.checked_add(*coin.amount))
