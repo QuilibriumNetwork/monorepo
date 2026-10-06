@@ -268,6 +268,9 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
 
     // Titles share the top borders, leaving two more rows for table data.
     let sorted_allocs = m.sorted_allocations();
+    let sorted_avail = m.sorted_available();
+    let (alloc_widths, avail_widths) = shared_col_widths(m, area.width.saturating_sub(2) as usize, &sorted_allocs, &sorted_avail);
+    update_app_progress_warning(m);
     let alloc_block = Block::default()
         .title(alloc_title(m, &sorted_allocs))
         .borders(Borders::ALL)
@@ -275,10 +278,9 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         .border_style(Style::new().fg(if m.focus.is_alloc() { PRIMARY } else { DIM }));
     let alloc_inner = alloc_block.inner(chunks[1]);
     f.render_widget(alloc_block, chunks[1]);
-    let alloc_lines = render_alloc_panel(m, &sorted_allocs, alloc_inner);
+    let alloc_lines = render_alloc_panel(m, &sorted_allocs, alloc_inner, Some(&alloc_widths));
     f.render_widget(Paragraph::new(alloc_lines), alloc_inner);
 
-    let sorted_avail = m.sorted_available();
     let avail_block = Block::default()
         .title(avail_title(m, &sorted_avail))
         .borders(Borders::ALL)
@@ -286,7 +288,7 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         .border_style(Style::new().fg(if !m.focus.is_alloc() { PRIMARY } else { DIM }));
     let avail_inner = avail_block.inner(chunks[2]);
     f.render_widget(avail_block, chunks[2]);
-    let avail_lines = render_avail_panel(m, &sorted_avail, avail_inner);
+    let avail_lines = render_avail_panel(m, &sorted_avail, avail_inner, Some(&avail_widths));
     f.render_widget(Paragraph::new(avail_lines), avail_inner);
 
     render_notifications(f, m, status, chunks[3]);
@@ -484,6 +486,19 @@ fn alloc_header(m: &Model, idx: usize) -> String {
     )
 }
 
+/// Align shared columns through Reward; local and peer context use their own labels.
+fn shared_col_widths(m: &Model, content_width: usize, allocations: &[AllocationRow], available: &[ShardRow]) -> (Vec<usize>, Vec<usize>) {
+    let (mut alloc, _) = alloc_col_widths(m, content_width, allocations);
+    let (mut avail, _) = avail_col_widths(m, content_width, available);
+    for i in 0..AVAIL_COL_NAMES.len() {
+        if i != 1 { alloc[i] = alloc[i].max(avail[i]); }
+    }
+    let cap = alloc[1].max(avail[1]);
+    alloc[1] = filter_width(content_width, &alloc, alloc.len(), cap);
+    avail.copy_from_slice(&alloc[..AVAIL_COL_NAMES.len()]);
+    (alloc, avail)
+}
+
 fn alloc_col_widths(
     m: &Model,
     content_width: usize,
@@ -646,7 +661,7 @@ fn allocation_detail(a: &AllocationRow) -> Line<'static> {
     Line::from(Span::styled(text, Style::new().fg(local_color(a))))
 }
 
-fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Vec<Line<'static>> {
+fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, aligned: Option<&[usize]>) -> Vec<Line<'static>> {
     let content_width = area.width as usize;
     let height = area.height as usize;
     if sorted.is_empty() {
@@ -655,7 +670,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
         }
         return vec![Line::from("  No allocations")];
     }
-    let (widths, fw) = alloc_col_widths(m, content_width, sorted);
+    let (widths, fw) = aligned.map(|w| (w.to_vec(), w[1])).unwrap_or_else(|| alloc_col_widths(m, content_width, sorted));
     let filter_hi = m.active_filter_col_idx();
 
     // Header row.
@@ -786,9 +801,7 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
         4 => fmt_mb(&s.shard_size),
         5 => s.data_shards.to_string(),
         6 => fmt_materialized(s.materialized_frame, s.latest_frame),
-        7 => materialization_lag(s.materialized_frame, s.latest_frame)
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "-".to_string()),
+        7 => if s.materialized_frame == 0 && s.latest_frame == 0 { "-".into() } else { s.latest_frame.to_string() },
         8 => materialization_state(s.materialized_frame, s.latest_frame).to_string(),
         _ => if s.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&s.estimated_reward) },
     }
@@ -885,7 +898,7 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
         SIZE_WIDTH,
         shards_w,
         MAT_WIDTH,
-        LAG_WIDTH,
+        HEAD_WIDTH,
         STATE_WIDTH,
         reward_w,
     ];
@@ -906,7 +919,7 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
     (widths, fw)
 }
 
-fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Line<'static>> {
+fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: Option<&[usize]>) -> Vec<Line<'static>> {
     let content_width = area.width as usize;
     let height = area.height as usize;
     if sorted.is_empty() {
@@ -921,7 +934,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
         }
         return vec![Line::from("  No available shards")];
     }
-    let (widths, fw) = avail_col_widths(m, content_width, sorted);
+    let (widths, fw) = aligned.map(|w| (w.to_vec(), w[1])).unwrap_or_else(|| avail_col_widths(m, content_width, sorted));
     let filter_hi = m.active_filter_col_idx();
 
     let mut hdr_spans: Vec<Span> = Vec::new();
@@ -1173,6 +1186,22 @@ fn wrap_message(message: Line<'static>, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+/// Require fresh observations for every staffed earning allocation: missing data
+/// must not be reported as a demonstrated stall. Peer metadata is independent.
+fn update_app_progress_warning(m: &mut Model) {
+    let rows: Vec<_> = m.allocations.iter().filter(|a| matches!(a.reward_status(m.epoch_frame(), m.epoch_length), Some(EffectiveStatus::Active | EffectiveStatus::Leaving))).collect();
+    let known = m.reachable && !rows.is_empty() && rows.iter().all(|a| {
+        a.execution.as_ref().is_some_and(|e| e.materialized_frame.is_some() && matches!(local_execution_state(Some(e)), "starting" | "running" | "blocked" | "stopped"))
+    });
+    if !known { m.app_progress_observed_since = None; m.app_stall_time = None; return; }
+    let observed = m.app_progress_observed_since.get_or_insert_with(std::time::Instant::now);
+    let last = rows.iter().filter_map(|a| a.execution.as_ref()).map(|e| e.last_advance_unix_ms).max().unwrap_or(0);
+    let now = std::time::SystemTime::now();
+    let now_ms = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let stalled = if last == 0 { observed.elapsed().as_secs() >= 60 } else { now_ms.saturating_sub(last) >= 60_000 };
+    if stalled { m.app_stall_time.get_or_insert(now); } else { m.app_stall_time = None; }
+}
+
 fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'static>> {
     let primary_severity = if m.status_is_error { NoticeSeverity::Error } else { NoticeSeverity::Info };
     // Filter-editor prompts are controls rather than notifications.
@@ -1184,6 +1213,11 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
         shard_message(m).map(|line| wrap_message(line, width)).unwrap_or_default()
     } else { Vec::new() };
     let mut lines = Vec::new();
+    if m.notice_minimum <= NoticeSeverity::Warning {
+        if let Some(time) = m.app_stall_time {
+            lines.extend(wrap_message(Line::from(Span::styled(format!("{}No local app worker has advanced for at least 60s; check allocation blockers.", message_timestamp(Some(time))), Style::new().fg(Color::Yellow))), width));
+        }
+    }
     if shard_severity > primary_severity { lines.extend(shards); lines.extend(primary); }
     else { lines.extend(primary); lines.extend(shards); }
     if lines.is_empty() { lines.push(Line::default()); }
@@ -1405,7 +1439,7 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Execution", "Host state; running with zero LocalMat is warned, not healthy progress"),
         kv("PeerHead", "Provider shard head; remote metadata, not the local worker cursor"),
         kv("Details", "Selected allocation footer shows blocker and last advance; no observation timer"),
-        kv("PeerLag", "Metadata provider head minus cursor; not local worker lag"),
+
         kv("", "Selected row shows blocker, last advance, observation age and peer cursors"),
         kv("", "Observations older than 30s are stale; startup restoration is not an advance"),
         sec("Navigation"),
@@ -1486,8 +1520,8 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Size [MB]", "Shard size, in megabytes"),
         kv("Shards", "Data shards the filter covers"),
         kv("PeerMat", "Materialized height reported by the shard metadata provider"),
-        kv("PeerLag", "Provider head minus provider materialized height"),
-        kv("PeerState", "Reading of PeerMat and PeerLag — current: materialized up to the head;"),
+        kv("PeerHead", "Provider shard head; remote metadata"),
+        kv("PeerState", "Reading of PeerMat and PeerHead — current: materialized up to the head;"),
         kv("", "lag: behind it; unmat: nothing materialized; unknown: no head"),
         kv(
             "Reward [Q/d]",
@@ -1597,6 +1631,52 @@ mod tests {
     use crate::commands::node::prover::epoch::ActionHint;
 
     #[test]
+    fn shared_columns_align_with_different_data_and_filter_markers() {
+        let mut m = Model::new();
+        let allocations = [row("aabb0123456789", 1, 1, 7, "", "")];
+        let mut peer = shard("ccdd0123456789", 12345, 10000);
+        peer.latest_frame = 987654321;
+        let available = [peer];
+        for sizing in [ColumnSizing::Dynamic, ColumnSizing::Fixed] {
+            m.column_sizing = sizing;
+            let (a, v) = shared_col_widths(&m, 240, &allocations, &available);
+            assert_eq!(&a[..v.len()], v.as_slice());
+            assert!(a.iter().sum::<usize>() + a.len() - 1 <= 240);
+            let alloc = render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 240, 5), Some(&a))[0].to_string();
+            let avail = render_avail_panel(&mut m, &available, Rect::new(0, 0, 240, 5), Some(&v))[0].to_string();
+            for label in ["Filter", "Provers", "Ring", "Size", "Shards", "PeerHead", "Reward"] {
+                assert_eq!(alloc.find(label), avail.find(label), "{label}: {alloc} / {avail}");
+            }
+            assert!(!avail.contains("LocalMat"));
+            assert!(!avail.contains("Execution"));
+            assert_eq!(avail_cell(&m, &available[0], 7, v[1]), "987654321");
+        }
+    }
+
+    #[test]
+    fn app_stall_warning_respects_severity_and_clears_on_progress_or_missing_data() {
+        use quil_types::proto::node::WorkerExecution;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let mut m = Model::new(); m.frame_number = 2160; m.epoch_length = 720; m.reachable = true;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut worker = row("aa", 1, 1, 7, "", ""); worker.status = 2; worker.epoch = 3;
+        worker.execution = Some(WorkerExecution { state: "blocked".into(), materialized_frame: Some(744), observed_unix_ms: now, last_advance_unix_ms: now - 120_000, ..Default::default() });
+        m.allocations = vec![worker.clone(), worker];
+        update_app_progress_warning(&mut m);
+        let timestamp = m.app_stall_time.expect("known stalled workers warn");
+        update_app_progress_warning(&mut m); assert_eq!(m.app_stall_time, Some(timestamp));
+        m.notice_minimum = NoticeSeverity::Warning;
+        assert!(message_lines(&m, Line::default(), 240).iter().any(|l| l.to_string().contains("No local app worker")));
+        m.notice_minimum = NoticeSeverity::Error;
+        assert!(!message_lines(&m, Line::default(), 240).iter().any(|l| l.to_string().contains("No local app worker")));
+        m.allocations[1].execution.as_mut().unwrap().last_advance_unix_ms = now;
+        update_app_progress_warning(&mut m); assert!(m.app_stall_time.is_none());
+        m.allocations[1].execution = None;
+        update_app_progress_warning(&mut m); assert!(m.app_stall_time.is_none());
+        assert!(m.app_progress_observed_since.is_none());
+    }
+
+    #[test]
     fn worker_context_stays_in_allocation_panel_and_zero_frames_warns() {
         use quil_types::proto::node::WorkerExecution;
         let mut m = Model::new();
@@ -1622,7 +1702,7 @@ mod tests {
             assert!(!notices.contains("Worker") && !notices.contains("awaiting successor"));
         }
         let rows = m.allocations.clone();
-        let panel = render_alloc_panel(&mut m, &rows, Rect::new(0, 0, 154, 7));
+        let panel = render_alloc_panel(&mut m, &rows, Rect::new(0, 0, 154, 7), None);
         let details = panel.last().unwrap().to_string();
         assert!(details.contains("Blocker: awaiting successor"));
         assert!(!details.contains("observation") && !details.contains("Worker 7"));
@@ -1808,14 +1888,14 @@ mod tests {
         m.data_loaded = true;
         let text = |lines: Vec<Line<'static>>| lines[0].spans.iter()
             .map(|span| span.content.as_ref()).collect::<String>();
-        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5)))
+        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5), None))
             .contains("Loading available shards"));
         m.shard_error = Some("Shard data timed out after 60s; retrying".into());
-        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5)))
+        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5), None))
             .contains("timed out"));
         m.shard_error = None;
         m.cached_shard_info = Some(Default::default());
-        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5)))
+        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5), None))
             .contains("No available shards"));
     }
 
@@ -1958,8 +2038,8 @@ mod tests {
                 m.alloc_cursor = cursor;
                 m.avail_cursor = cursor;
                 for lines in [
-                    render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 240, 5)),
-                    render_avail_panel(&mut m, &available, Rect::new(0, 0, 240, 5)),
+                    render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 240, 5), None),
+                    render_avail_panel(&mut m, &available, Rect::new(0, 0, 240, 5), None),
                 ] {
                     let text: Vec<String> = lines.iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect()).collect();
                     assert_eq!(text[1].find("aabb"), text[2].find("aabb"));
@@ -2074,7 +2154,7 @@ mod tests {
             let mut allocation = row("aa", 1, 1, -1, "", "");
             allocation.estimated_reward = BigInt::from(123456);
             let reward = fmt_reward(&allocation.estimated_reward);
-            let lines = render_alloc_panel(&mut m, &[allocation], Rect::new(0, 0, 240, 5));
+            let lines = render_alloc_panel(&mut m, &[allocation], Rect::new(0, 0, 240, 5), None);
             let span = lines[1].spans.iter().find(|s| s.content.trim() == reward).expect("reward cell");
             assert_eq!(span.style.fg, Some(ERROR));
             if selected { assert_eq!(lines[1].style.bg, Some(CURSOR_BG)); }
