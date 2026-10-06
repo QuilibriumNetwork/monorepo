@@ -2897,6 +2897,7 @@ mod tests {
         let _restore = RestorePolicy(quil_types::consensus::committee_handoff_policy());
         quil_types::consensus::set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
             activation_frame: 0, chain_id: [1; 32], legacy_history: LegacyHistory::Discard,
+            membership_boundary_frame: u64::MAX,
         }));
         let (_tmp, store) = temp_store();
         let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
