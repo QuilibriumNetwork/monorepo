@@ -160,7 +160,11 @@ impl ProverRegistry for TestProverRegistry {
         let provers = self.provers.lock().unwrap();
         // Match the trait's committee contract: serving Leaving allocations
         // remain members, while Joining/Paused are not active proof producers.
-        let members = |floor: bool| provers.iter().filter(|p| p.allocations.iter().any(|a|
+        // Allocation-free Active fixtures retain the harness shorthand for
+        // an all-shard committee; an empty filter queries global membership.
+        let members = |floor: bool| provers.iter().filter(|p|
+            (p.status == ProverStatus::Active && (filter.is_empty() || p.allocations.is_empty()))
+            || p.allocations.iter().any(|a|
             a.confirmation_filter == filter && (matches!(a.effective_status(frame_number),
                 quil_types::consensus::EffectiveStatus::Active | quil_types::consensus::EffectiveStatus::Leaving)
                 || (floor && a.status == ProverStatus::Active))))
