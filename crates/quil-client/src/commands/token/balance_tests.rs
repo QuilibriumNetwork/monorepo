@@ -133,11 +133,13 @@ async fn claimable_rewards_are_read_without_coin_scan_and_check_membership() {
         .await
         .is_err());
     *provider.witness.lock().unwrap() = reward_witness(owner, 0);
-    let zero = read_claimable_rewards(client.clone(), &public)
-        .await
-        .unwrap();
-    assert_eq!(zero, Some((0, 42)));
-    assert!(format_claimable_rewards(Ok(zero)).contains("0.000000000000 QUIL"));
+    let zero = read_claimable_rewards(client.clone(), &public).await;
+    assert!(
+        zero.is_err(),
+        "mint witnesses cannot authenticate zero-valued claims"
+    );
+    assert!(format_claimable_rewards(zero).contains("unavailable"));
+    *provider.witness.lock().unwrap() = reward_witness(owner, 1);
     provider.witness.lock().unwrap().reward_root[0] ^= 1;
     assert!(read_claimable_rewards(client.clone(), &public)
         .await
