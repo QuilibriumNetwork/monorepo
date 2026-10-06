@@ -22,6 +22,7 @@ use super::util::{center_trunc, filter_label, shared_filter_address, clamp_offse
 
 const PRIMARY: Color = Color::Rgb(0xff, 0x00, 0x70);
 const CURSOR_BG: Color = Color::Rgb(0x28, 0x28, 0x28);
+const INACTIVE_CURSOR_BG: Color = Color::Rgb(0x18, 0x18, 0x18);
 const DIM: Color = Color::Rgb(0x55, 0x55, 0x55);
 const TEXT: Color = Color::Rgb(0xff, 0xff, 0xff);
 const SUCCESS: Color = Color::Rgb(0x00, 0xff, 0x00);
@@ -350,9 +351,13 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let avail_inner = avail_block.inner(chunks[2]);
     f.render_widget(avail_block, chunks[2]);
     let avail_lines = render_avail_panel(m, &sorted_avail, avail_inner, Some(&avail_widths));
+    let mut avail_lines = avail_lines;
+    let detail = if !sorted_avail.is_empty() && avail_inner.height >= 3 { avail_lines.pop() } else { None };
+    let detail_rows = u16::from(detail.is_some());
     let horizontal = table_horizontal_offset(m, 1, &avail_lines, avail_inner.width);
     f.render_widget(Paragraph::new(avail_lines).scroll((0, horizontal)), avail_inner);
-    render_scroll_hint(f, chunks[2], m.avail_offset, sorted_avail.len(), usize::from(avail_inner.height.saturating_sub(1 + u16::from(m.shard_error.is_some()))), horizontal, m.horizontal_limits[1]);
+    if let Some(detail) = detail { f.render_widget(Paragraph::new(detail), Rect::new(avail_inner.x, avail_inner.y + avail_inner.height - 1, avail_inner.width, 1)); }
+    render_scroll_hint(f, chunks[2], m.avail_offset, sorted_avail.len(), usize::from(avail_inner.height.saturating_sub(1 + detail_rows + u16::from(m.shard_error.is_some()))), horizontal, m.horizontal_limits[1]);
 
     render_notifications(f, m, status, chunks[3]);
     f.render_widget(
@@ -432,14 +437,27 @@ fn fmt_reward_change(v: &BigInt) -> String {
     }
 }
 
+/// Round to five decimals with integer arithmetic; preserve tiny positive amounts.
+fn fmt_claimable(value: u128) -> String {
+    const UNITS_PER_QUIL: u128 = 8_000_000_000;
+    const UNITS_PER_DECIMAL: u128 = UNITS_PER_QUIL / 100_000;
+    if value == 0 { return "0".into(); }
+    if value < UNITS_PER_DECIMAL { return "<0.00001".into(); }
+    let mut whole = value / UNITS_PER_QUIL;
+    let mut fraction = (value % UNITS_PER_QUIL + UNITS_PER_DECIMAL / 2) / UNITS_PER_DECIMAL;
+    if fraction == 100_000 { whole += 1; fraction = 0; }
+    if fraction == 0 { whole.to_string() }
+    else { format!("{whole}.{:05}", fraction).trim_end_matches('0').to_string() }
+}
+
 fn claimable_title(m: &Model) -> String {
     match m.claimable_reward {
-        Some((value, frame)) => format!("Claimable: {} QUIL @f{}{}",
-            crate::util::float_string_12(&BigInt::from(value), &crate::util::conversion_factor()),
+        Some((value, frame)) => format!("Claimable [Q]: {} @f{}{}",
+            fmt_claimable(value),
             frame,
             if m.reward_last_success.is_some_and(|t| t.elapsed().as_secs() >= 30) { " (stale)" } else { "" }),
-        None if m.reward_loaded => "Claimable: unavailable".into(),
-        None => "Claimable: loading".into(),
+        None if m.reward_loaded => "Claimable [Q]: unavailable".into(),
+        None => "Claimable [Q]: loading".into(),
     }
 }
 
@@ -782,7 +800,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
     let longest_suffix = sorted.iter().map(|a| a.filter_hex.len().saturating_sub(64)).max().unwrap_or(0);
     for i in m.alloc_offset..end {
         let a = &sorted[i];
-        let selected = i == m.alloc_cursor && m.focus.is_alloc();
+        let selected = i == m.alloc_cursor;
 
         let cells: Vec<String> = (0..widths.len())
             .map(|c| {
@@ -802,7 +820,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
             }
             let used = cells.iter().map(String::len).sum::<usize>() + cells.len().saturating_sub(1);
             spans.push(Span::raw(" ".repeat(content_width.saturating_sub(used))));
-            lines.push(Line::from(spans).style(Style::new().fg(TEXT).bg(CURSOR_BG)));
+            lines.push(Line::from(spans).style(Style::new().fg(TEXT).bg(if m.focus.is_alloc() { CURSOR_BG } else { INACTIVE_CURSOR_BG })));
         } else {
             let mut spans: Vec<Span> = Vec::new();
             for (ci, cell) in cells.iter().enumerate() {
@@ -866,7 +884,7 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
         5 => s.data_shards.to_string(),
         6 => fmt_materialized(s.materialized_frame, s.latest_frame),
         7 => if s.materialized_frame == 0 && s.latest_frame == 0 { "-".into() } else { s.latest_frame.to_string() },
-        8 => materialization_state(s.materialized_frame, s.latest_frame).to_string(),
+        8 => { let state = materialization_state(s.materialized_frame, s.latest_frame); if matches!(state, "lag" | "unmat") { format!("{state}!") } else { state.to_string() } },
         _ => if s.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&s.estimated_reward) },
     }
 }
@@ -983,6 +1001,16 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
     (widths, fw)
 }
 
+fn available_detail(s: &ShardRow) -> Line<'static> {
+    let (message, color) = match materialization_state(s.materialized_frame, s.latest_frame) {
+        "unmat" => ("Warning: provider has not materialized any app frames".into(), Color::Yellow),
+        "lag" => (format!("Warning: provider materialization trails its head by {} frames", s.latest_frame.saturating_sub(s.materialized_frame)), Color::Yellow),
+        "current" => ("Provider materialization is current".into(), HELP),
+        _ => ("Provider shard heights unavailable; health unknown".into(), HELP),
+    };
+    Line::from(Span::styled(message, Style::new().fg(color)))
+}
+
 fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: Option<&[usize]>) -> Vec<Line<'static>> {
     let content_width = area.width as usize;
     let height = area.height as usize;
@@ -1043,7 +1071,8 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
     }
     lines.push(Line::from(hdr_spans));
 
-    let visible = height.saturating_sub(lines.len()).max(1);
+    let detail_rows = usize::from(height >= 3);
+    let visible = height.saturating_sub(lines.len() + detail_rows).max(1);
     m.avail_offset = clamp_offset(m.avail_offset, m.avail_cursor, visible, sorted.len());
     let end = (m.avail_offset + visible).min(sorted.len());
 
@@ -1051,7 +1080,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
     let longest_suffix = sorted.iter().map(|s| s.filter_hex.len().saturating_sub(64)).max().unwrap_or(0);
     for i in m.avail_offset..end {
         let s = &sorted[i];
-        let selected = i == m.avail_cursor && m.focus == PanelFocus::Available;
+        let selected = i == m.avail_cursor;
 
         if selected {
             let cells: Vec<String> = (0..widths.len())
@@ -1061,11 +1090,15 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
                     pad_cell(&cell, widths[c], c == 1)
                 })
                 .collect();
-            let padded = format!("{:<width$}", cells.join(" "), width = content_width);
-            lines.push(Line::from(Span::styled(
-                padded,
-                Style::new().fg(TEXT).bg(CURSOR_BG),
-            )));
+            let mut spans = Vec::new();
+            for (c, cell) in cells.iter().enumerate() {
+                if c > 0 { spans.push(Span::raw(" ")); }
+                let color = if m.color_coding && matches!(c, 6..=8) { materialization_state_color(materialization_state(s.materialized_frame, s.latest_frame)) } else { TEXT };
+                spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
+            }
+            let used = cells.iter().map(|cell| printed_width(cell)).sum::<usize>() + cells.len().saturating_sub(1);
+            spans.push(Span::raw(" ".repeat(content_width.saturating_sub(used))));
+            lines.push(Line::from(spans).style(Style::new().fg(TEXT).bg(if m.focus == PanelFocus::Available { CURSOR_BG } else { INACTIVE_CURSOR_BG })));
         } else {
             // Non-selected: size uses human-readable storage; ring colored.
 
@@ -1091,6 +1124,10 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
             }
             lines.push(Line::from(spans));
         }
+    }
+    if detail_rows > 0 {
+        while lines.len() < height - 1 { lines.push(Line::default()); }
+        if let Some(s) = sorted.get(m.avail_cursor) { lines.push(available_detail(s)); }
     }
     lines
 }
@@ -1589,7 +1626,8 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Shards", "Data shards the filter covers"),
         kv("PeerMat", "Materialized height reported by the shard metadata provider"),
         kv("PeerHead", "Provider shard head; remote metadata"),
-        kv("PeerState", "Reading of PeerMat and PeerHead — current: materialized up to the head;"),
+        kv("PeerState", "Reading of PeerMat and PeerHead; lag!/unmat! flag provider warnings"),
+        kv("Cursor", "Inactive cursor stays visible to bind the detail below to its row"),
         kv("", "lag: behind it; unmat: nothing materialized; unknown: no head"),
         kv(
             "Reward [Q/d]",
@@ -1834,18 +1872,47 @@ mod tests {
     }
 
     #[test]
+    fn claimable_five_decimals_preserve_zero_tiny_values_and_rounding_carry() {
+        for (units, expected) in [(0, "0"), (1, "<0.00001"), (79_999, "<0.00001"), (80_000, "0.00001"), (119_999, "0.00001"), (120_000, "0.00002"), (474_867, "0.00006"), (40_000_000_000, "5"), (7_999_999_999, "1")] {
+            assert_eq!(fmt_claimable(units), expected);
+        }
+        assert!(fmt_claimable(u128::MAX).split('.').nth(1).is_none_or(|fraction| fraction.len() <= 5));
+    }
+
+    #[test]
+    fn inactive_cursors_bind_both_panel_details_and_keep_peer_warnings_visible() {
+        let mut m = Model::new(); m.focus = PanelFocus::Notifications;
+        let mut allocation = row("aa", 1, 1, 7, "", "");
+        allocation.execution = Some(quil_types::proto::node::WorkerExecution { state: "blocked".into(), blocker: "awaiting successor".into(), ..Default::default() });
+        let allocations = render_alloc_panel(&mut m, &[allocation], Rect::new(0, 0, 240, 5), None);
+        assert_eq!(allocations[1].style.bg, Some(INACTIVE_CURSOR_BG));
+        assert!(allocations.last().unwrap().to_string().contains("awaiting successor"));
+        let mut peer = shard("bb", 1, 1); peer.latest_frame = 20;
+        let peers = render_avail_panel(&mut m, &[peer.clone()], Rect::new(0, 0, 240, 5), None);
+        assert_eq!(peers[1].style.bg, Some(INACTIVE_CURSOR_BG));
+        assert!(peers[1].to_string().contains("unmat!"));
+        assert!(peers.last().unwrap().to_string().contains("Warning: provider has not materialized"));
+        peer.materialized_frame = 15;
+        assert!(available_detail(&peer).to_string().contains("by 5 frames"));
+        peer.materialized_frame = 20;
+        assert!(!available_detail(&peer).to_string().contains("Warning"));
+        peer.latest_frame = 0; peer.materialized_frame = 0;
+        assert!(available_detail(&peer).to_string().contains("health unknown"));
+    }
+
+    #[test]
     fn claimable_header_distinguishes_loading_missing_verified_and_stale() {
         let mut m = Model::new();
-        assert_eq!(claimable_title(&m), "Claimable: loading");
+        assert_eq!(claimable_title(&m), "Claimable [Q]: loading");
         super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Ok(Some((474867, 862280)))));
-        assert_eq!(claimable_title(&m), "Claimable: 0.000059358375 QUIL @f862280");
-        assert!(alloc_title(&m, &[]).to_string().contains("Claimable:"));
+        assert_eq!(claimable_title(&m), "Claimable [Q]: 0.00006 @f862280");
+        assert!(alloc_title(&m, &[]).to_string().contains("Claimable [Q]:"));
         m.reward_last_success = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
         assert!(claimable_title(&m).ends_with("(stale)"));
         super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Err("timeout".into())));
-        assert_eq!(claimable_title(&m), "Claimable: unavailable");
+        assert_eq!(claimable_title(&m), "Claimable [Q]: unavailable");
         super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Ok(None)));
-        assert_eq!(claimable_title(&m), "Claimable: unavailable");
+        assert_eq!(claimable_title(&m), "Claimable [Q]: unavailable");
     }
 
     #[test]
@@ -2040,7 +2107,7 @@ mod tests {
             s.materialized_frame = mat;
             s.latest_frame = head;
             assert_eq!(alloc_cell(&m, &a, 8, 12), "unknown");
-            assert_eq!(avail_cell(&m, &s, 8, 12), label);
+            assert_eq!(avail_cell(&m, &s, 8, 12), if matches!(label, "lag" | "unmat") { format!("{label}!") } else { label.to_string() });
             assert_eq!(materialization_state_color(label), color);
         }
     }
