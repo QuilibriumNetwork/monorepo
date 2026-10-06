@@ -415,20 +415,24 @@ fn header_line(m: &Model) -> Line<'static> {
 }
 
 fn worker_counts_line(m: &Model) -> Line<'static> {
-    let (active, automatic, manual) = match m.cached_worker_info.as_ref() {
+    let (automatic, manual) = match m.cached_worker_info.as_ref() {
         Some(info) => {
             let workers: std::collections::HashMap<_, _> = info.worker_info.iter()
                 .map(|w| (w.core_id, w.manually_managed)).collect();
             let manual = workers.values().filter(|&&manual| manual).count();
-            let active: std::collections::HashSet<_> = m.allocations.iter()
-                .filter(|a| a.reward_status(m.frame_number, m.epoch_length) == Some(EffectiveStatus::Active))
-                .map(|a| a.worker_id).collect();
-            (active.len().to_string(), (workers.len() - manual).to_string(), manual.to_string())
+            ((workers.len() - manual).to_string(), manual.to_string())
         }
-        None => ("?".into(), "?".into(), "?".into()),
+        None => ("?".into(), "?".into()),
     };
-    Line::from(format!(" Workers: Running {} | Allocated {} | Active {} | Auto {} | Manual {}",
-        m.running_workers, m.allocated_workers, active, automatic, manual))
+    Line::from(format!(" Workers: Running {} | Auto {} | Manual {}",
+        m.running_workers, automatic, manual))
+}
+
+fn active_allocation_count(m: &Model) -> String {
+    if m.cached_worker_info.is_none() { return "?".into(); }
+    m.allocations.iter()
+        .filter(|a| a.reward_status(m.frame_number, m.epoch_length) == Some(EffectiveStatus::Active))
+        .map(|a| a.worker_id).collect::<std::collections::HashSet<_>>().len().to_string()
 }
 
 fn panel_title(text: String) -> Line<'static> {
@@ -498,14 +502,18 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     let current = &active + &leaving;
     let change = &joining - &leaving;
     let mut s = format!(
-        "Allocations: {}  {}  Rewards [Q/d]: Current {} | Paused {} | Planned change {}",
-        sorted.len(),
+        "Allocations: {}/{} | Active {}  {}  Rewards [Q/d]: Current {} | Paused {} | Planned change {}",
+        m.allocated_workers, m.running_workers,
+        active_allocation_count(m),
         claimable_title(m),
         if current_unknown && !current_known { "?".into() }
         else { format!("{}{}", fmt_reward(&current), if current_unknown { "+" } else { "" }) },
         if paused_unknown { "?".into() } else { fmt_reward(&paused) },
         if change_unknown { "?".into() } else { fmt_reward_change(&change) },
     );
+    if sorted.len() != m.allocations.len() {
+        s += &format!("  Shown {}/{}", sorted.len(), m.allocations.len());
+    }
     s += &format!("  {}", global_snapshot_label(sorted.iter().map(|a| a.global_head.as_ref())));
     if !m.alloc_selected.is_empty() {
         s += &format!(" [{} selected]", m.alloc_selected.len());
@@ -1583,9 +1591,9 @@ fn help_body() -> Vec<Line<'static>> {
     vec![
         Line::from(""),
         sec("Worker progress"),
-        kv("Worker counts", "Running: reported workers; Allocated: workers assigned to shards"),
-        kv("", "Active: workers with Active allocations; execution may still be blocked"),
-        kv("", "Auto/Manual: individual modes across all workers, including idle workers"),
+        kv("Worker counts", "Running: reported workers; Auto/Manual: individual modes, including idle workers"),
+        kv("Allocations", "Assigned workers / running workers; denominator includes occupied workers"),
+        kv("Active", "Workers with Active allocations; execution may still be blocked; totals ignore filters"),
         kv("LocalMat", "Local height; - unknown; 0! warns of no materialized frames with colors off"),
         kv("Execution", "Host state; running with zero LocalMat is warned, not healthy progress"),
         kv("GlobalHead", "Committed app head@generation; - unavailable, 0@gN is a known genesis head"),
@@ -2525,12 +2533,16 @@ mod tests {
             WorkerInfo { core_id: 9, ..Default::default() },
             WorkerInfo { core_id: 7, ..Default::default() },
         ] });
-        assert_eq!(worker_counts_line(&m).to_string(), " Workers: Running 3 | Allocated 2 | Active 1 | Auto 2 | Manual 1");
+        assert_eq!(worker_counts_line(&m).to_string(), " Workers: Running 3 | Auto 2 | Manual 1");
+        assert!(alloc_title(&m, &m.allocations).to_string().contains("Allocations: 2/3 | Active 1"));
         m.alloc_col_filters.insert(1, ColumnFilter { text: "no matching allocation".into(), ..Default::default() });
         assert!(m.filtered_allocations().is_empty());
-        assert!(worker_counts_line(&m).to_string().contains("Active 1 | Auto 2 | Manual 1"));
+        assert!(worker_counts_line(&m).to_string().contains("Auto 2 | Manual 1"));
+        assert!(alloc_title(&m, &m.filtered_allocations()).to_string().contains("Allocations: 2/3 | Active 1"));
+        assert!(alloc_title(&m, &m.filtered_allocations()).to_string().contains("Shown 0/4"));
         m.cached_worker_info = None;
-        assert!(worker_counts_line(&m).to_string().contains("Active ? | Auto ? | Manual ?"));
+        assert!(worker_counts_line(&m).to_string().contains("Auto ? | Manual ?"));
+        assert!(alloc_title(&m, &[]).to_string().contains("Allocations: 2/3 | Active ?"));
     }
 
     #[test]
