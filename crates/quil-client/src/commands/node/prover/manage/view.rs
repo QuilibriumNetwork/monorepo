@@ -1913,7 +1913,7 @@ mod tests {
         });
         assert_eq!(alloc_cell(&model, &allocation, 6, 12), "0");
         assert_eq!(alloc_cell(&model, &allocation, 7, 12), "20");
-        assert_eq!(alloc_cell(&model, &allocation, 8, 12), "unmat");
+        assert_eq!(alloc_cell(&model, &allocation, 8, 12), "stale");
         assert_eq!(alloc_cell(&model, &allocation, 9, 12), "0");
     }
 
