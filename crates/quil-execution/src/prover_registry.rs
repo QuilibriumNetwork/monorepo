@@ -156,10 +156,12 @@ impl InMemoryProverRegistry {
             &self.get_active_provers(filter, frame), &all, address, filter, frame)?;
         if estimate.source == "committed_allocation_ring" {
             // A decoded zero cannot establish rank. Require the committed
-            // policy fields from the same registry rows, including occupancy.
+            // policy fields from the same registry rows. Pending joins and
+            // paused owners do not earn and cannot establish ring occupancy.
             let rows = self.rows.as_ref()?;
             let members: Option<Vec<_>> = all.iter().filter_map(|p| p.allocations.iter()
-                .find(|a| a.confirmation_filter == filter && a.is_live(frame)))
+                .find(|a| a.confirmation_filter == filter
+                    && matches!(a.effective_status(frame), EffectiveStatus::Active | EffectiveStatus::Leaving)))
                 .map(|a| rows.committed_ring(&a.vertex_address)).collect();
             let own = all.iter().find(|p| p.address == address)?.allocations.iter()
                 .find(|a| a.confirmation_filter == filter)?;
@@ -2900,11 +2902,11 @@ mod tests {
         let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
         let filter = vec![0xCC; 32];
         let shared = SharedProverRegistry::new();
-        let save_allocation = |id: u8, ring: Option<u8>, key: Option<Vec<u8>>| {
+        let save_allocation = |id: u8, status: u8, ring: Option<u8>, key: Option<Vec<u8>>| {
             let mut fields = vec![
                 type_hash_leaf("allocation:ProverAllocation"),
                 field_leaf("allocation:ProverAllocation", "Prover", vec![id; 32]),
-                field_leaf("allocation:ProverAllocation", "Status", vec![1]),
+                field_leaf("allocation:ProverAllocation", "Status", vec![status]),
                 field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.clone()),
             ];
             if let Some(ring) = ring { fields.push(field_leaf("allocation:ProverAllocation", "Ring", vec![ring])); }
@@ -2923,20 +2925,26 @@ mod tests {
                     field_leaf("prover:Prover", "Status", vec![1])])).unwrap();
         }
         // Both an absent ring and an old ring without its policy key are unknown.
-        save_allocation(1, None, None);
-        save_allocation(2, Some(0), None);
+        save_allocation(1, 1, None, None);
+        save_allocation(2, 1, Some(0), None);
         assert!(shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().is_none());
-        save_allocation(1, Some(0), Some(vec![0; 8]));
+        save_allocation(1, 1, Some(0), Some(vec![0; 8]));
         assert!(shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().is_none(),
             "a partial peer snapshot cannot establish ring occupancy");
-        save_allocation(2, Some(0), Some(vec![0; 8]));
+        for status in [0, 2] { // pending Joining and Paused do not earn
+            save_allocation(2, status, None, None);
+            let held = shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().unwrap();
+            assert_eq!((held.ring, held.provers_on_ring), (0, 1),
+                "a non-earning peer without a ring key must not hide the owner's committed rank");
+        }
+        save_allocation(2, 1, Some(0), Some(vec![0; 8]));
         let estimate = shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().unwrap();
         assert_eq!((estimate.ring, estimate.provers_on_ring), (0, 2), "real zero is valid");
         let lifecycle = shared.get_lifecycle_view(&[1; 32], 0).unwrap();
         assert_eq!(lifecycle.reward_rings[&filter].ring, 0);
-        save_allocation(2, Some(1), Some(vec![0; 8]));
+        save_allocation(2, 1, Some(1), Some(vec![0; 8]));
         assert_eq!(shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().unwrap().provers_on_ring, 1);
-        save_allocation(2, Some(1), Some(vec![0; 7]));
+        save_allocation(2, 1, Some(1), Some(vec![0; 7]));
         assert!(shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().is_none(),
             "malformed fields must invalidate a previously known estimate");
     }
