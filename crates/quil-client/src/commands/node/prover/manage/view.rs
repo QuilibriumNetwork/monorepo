@@ -166,7 +166,7 @@ fn printed_width(s: &str) -> usize {
 /// — the column stops looking like one column. Left is the only edge its
 /// values share. Filters likewise align on their prefix.
 fn alloc_left_aligned(col: usize) -> bool {
-    col == 1 || col == 13
+    col == 1 || col == 14
 }
 
 /// One cell padded to its column width, on the side its column aligns to.
@@ -526,7 +526,7 @@ fn fmt_materialized(materialized: u64, latest: u64) -> String {
 /// through here. `fw` is the Filter column's width, which is a budget rather
 /// than a measurement — pass 0 when measuring the other columns.
 fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
-    if !a.shard_info_known && matches!(col, 2..=5 | 7 | 9) { return "-".into(); }
+    if !a.shard_info_known && matches!(col, 2..=5 | 7 | 10) { return "-".into(); }
     match col {
         0 => alloc_marker(m, a).to_string(),
         1 => center_trunc(&a.filter_hex, fw),
@@ -537,12 +537,13 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         6 => if local_warning(a) { "0!".into() }
             else { a.execution.as_ref().and_then(|s| s.materialized_frame).map(|h| h.to_string()).unwrap_or_else(|| "-".into()) },
         7 => if a.materialized_frame == 0 && a.latest_frame == 0 { "-".into() } else { a.latest_frame.to_string() },
-        8 => local_execution_state(a.execution.as_ref()).into(),
-        9 => if a.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&a.estimated_reward) },
-        10 => a.worker_id.to_string(),
-        11 => a.status_name.clone(),
-        12 => a.mode().to_string(),
-        13 => a.next_action.render(m.threshold_unit, m.epoch_length),
+        8 => a.global_head.as_ref().map(|h| h.frame.to_string()).unwrap_or_else(|| "-".into()),
+        9 => local_execution_state(a.execution.as_ref()).into(),
+        10 => if a.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&a.estimated_reward) },
+        11 => a.worker_id.to_string(),
+        12 => a.status_name.clone(),
+        13 => a.mode().to_string(),
+        14 => a.next_action.render(m.threshold_unit, m.epoch_length),
         _ => a.default_action.render(m.threshold_unit, m.epoch_length),
     }
 }
@@ -642,10 +643,11 @@ fn alloc_widths_fixed(
         ALLOC_REWARD_WIDTH,
         sorted
             .iter()
-            .map(|a| printed_width(&alloc_cell(m, a, 9, 0))),
+            .map(|a| printed_width(&alloc_cell(m, a, 10, 0))),
     );
+    let global_head_w = fit(GLOBAL_HEAD_WIDTH, sorted.iter().map(|row| printed_width(&alloc_cell(m, row, 8, 0))));
     // Whatever the wide columns took comes out of the flexible Filter column.
-    let grown = (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH);
+    let grown = (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH);
     let mut fw = content_width.saturating_sub(ALLOC_FIXED_WIDTH + grown);
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
@@ -669,6 +671,7 @@ fn alloc_widths_fixed(
         shards_w,
         MAT_WIDTH,
         HEAD_WIDTH,
+        global_head_w,
         STATE_WIDTH,
         reward_w,
         WORKER_WIDTH,
@@ -733,21 +736,22 @@ fn local_color(a: &AllocationRow) -> Color {
 
 fn global_head_detail(head: Option<&quil_types::proto::node::GlobalAppFrameHead>) -> String {
     match head {
-        Some(head) => format!("GLOBAL app head: {} @f{} (gen {})", head.frame, head.global_frame, head.generation),
+        Some(head) => format!("GLOBAL @f{} (gen {})", head.global_frame, head.generation),
         None => "GLOBAL app head: unavailable".into(),
     }
 }
 
 fn allocation_detail(a: &AllocationRow) -> Line<'static> {
     let Some(execution) = a.execution.as_ref() else {
-        return Line::from(format!("{} | Local execution details unavailable", global_head_detail(a.global_head.as_ref())));
+        return Line::from(Span::styled(format!("{} | Local execution details unavailable", global_head_detail(a.global_head.as_ref())), Style::new().fg(HELP)));
     };
     let mut text = format!("{} | Last advance: {}", global_head_detail(a.global_head.as_ref()), if execution.last_advance_unix_ms == 0 {
         "not observed since start".into()
     } else { format!("{} ago", age(execution.last_advance_unix_ms)) });
     if !execution.blocker.is_empty() { text += &format!(" | Blocker: {}", execution.blocker); }
     if local_warning(a) { text += " | Warning: no materialized frames"; }
-    Line::from(Span::styled(text, Style::new().fg(local_color(a))))
+    let warning = !execution.blocker.is_empty() || local_warning(a) || matches!(local_execution_state(Some(execution)), "blocked" | "stopped");
+    Line::from(Span::styled(text, Style::new().fg(if warning { Color::Yellow } else { HELP })))
 }
 
 fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, aligned: Option<&[usize]>) -> Vec<Line<'static>> {
@@ -821,8 +825,8 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
             let mut spans = Vec::new();
             for (ci, cell) in cells.iter().enumerate() {
                 if ci > 0 { spans.push(Span::raw(" ")); }
-                let color = if m.color_coding && matches!(ci, 6 | 8) { local_color(a) }
-                    else if ci == 9 && m.color_coding && a.worker_id < 0 { ERROR } else { TEXT };
+                let color = if m.color_coding && matches!(ci, 6 | 9) { local_color(a) }
+                    else if ci == 10 && m.color_coding && a.worker_id < 0 { ERROR } else { TEXT };
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
             }
             let used = cells.iter().map(String::len).sum::<usize>() + cells.len().saturating_sub(1);
@@ -839,21 +843,21 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
                         Span::styled(cell.clone(), Style::new().fg(ring_color(a.ring)))
                     }
                     // Local engine health and the provider gap are separate observations.
-                    6 | 8 if m.color_coding => {
+                    6 | 9 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(local_color(a)))
                     }
-                    7 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(HELP)),
-                    10 if m.color_coding => match worker_color(a.worker_id) {
+                    7 | 8 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(HELP)),
+                    11 if m.color_coding => match worker_color(a.worker_id) {
                         Some(color) => Span::styled(cell.clone(), Style::new().fg(color)),
                         None => Span::raw(cell.clone()),
                     },
-                    9 if m.color_coding && a.worker_id < 0 => {
+                    10 if m.color_coding && a.worker_id < 0 => {
                         Span::styled(cell.clone(), Style::new().fg(ERROR))
                     }
-                    11 if m.color_coding => {
+                    12 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(status_color(&a.status_name)))
                     }
-                    12 if m.color_coding => {
+                    13 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(mode_color(a.mode())))
                     }
                     _ => Span::raw(cell.clone()),
@@ -891,7 +895,8 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
         5 => s.data_shards.to_string(),
         6 => fmt_materialized(s.materialized_frame, s.latest_frame),
         7 => if s.materialized_frame == 0 && s.latest_frame == 0 { "-".into() } else { s.latest_frame.to_string() },
-        8 => { let state = materialization_state(s.materialized_frame, s.latest_frame); if matches!(state, "lag" | "unmat") { format!("{state}!") } else { state.to_string() } },
+        8 => s.global_head.as_ref().map(|h| h.frame.to_string()).unwrap_or_else(|| "-".into()),
+        9 => { let state = materialization_state(s.materialized_frame, s.latest_frame); if matches!(state, "lag" | "unmat") { format!("{state}!") } else { state.to_string() } },
         _ => if s.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&s.estimated_reward) },
     }
 }
@@ -962,9 +967,10 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
         REWARD_WIDTH,
         sorted
             .iter()
-            .map(|s| printed_width(&avail_cell(m, s, 9, 0))),
+            .map(|s| printed_width(&avail_cell(m, s, 10, 0))),
     );
-    let grown = (shards_w - SHARDS_WIDTH) + (reward_w - REWARD_WIDTH);
+    let global_head_w = fit(GLOBAL_HEAD_WIDTH, sorted.iter().map(|row| printed_width(&avail_cell(m, row, 8, 0))));
+    let grown = (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - REWARD_WIDTH);
     let mut fw = content_width.saturating_sub(AVAIL_FIXED_WIDTH + grown);
     for &col in &AVAIL_FILTERABLE_COLS {
         if col == 1 {
@@ -988,6 +994,7 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
         shards_w,
         MAT_WIDTH,
         HEAD_WIDTH,
+        global_head_w,
         STATE_WIDTH,
         reward_w,
     ];
@@ -1100,7 +1107,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
             let mut spans = Vec::new();
             for (c, cell) in cells.iter().enumerate() {
                 if c > 0 { spans.push(Span::raw(" ")); }
-                let color = if m.color_coding && matches!(c, 6..=8) { materialization_state_color(materialization_state(s.materialized_frame, s.latest_frame)) } else { TEXT };
+                let color = if m.color_coding && matches!(c, 6 | 7 | 9) { materialization_state_color(materialization_state(s.materialized_frame, s.latest_frame)) } else { TEXT };
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
             }
             let used = cells.iter().map(|cell| printed_width(cell)).sum::<usize>() + cells.len().saturating_sub(1);
@@ -1119,7 +1126,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
                 let cell = pad_cell(&cell, widths[c], c == 1);
                 spans.push(match c {
                     3 if m.color_coding => Span::styled(cell, Style::new().fg(ring_color(s.ring))),
-                    6 | 7 | 8 if m.color_coding => {
+                    6 | 7 | 9 if m.color_coding => {
                         let color = materialization_state_color(materialization_state(
                             s.materialized_frame,
                             s.latest_frame,
@@ -1549,6 +1556,7 @@ fn help_body() -> Vec<Line<'static>> {
         sec("Worker progress"),
         kv("LocalMat", "Local height; - unknown; 0! warns a running host has no materialized frames"),
         kv("Execution", "Host state; running with zero LocalMat is warned, not healthy progress"),
+        kv("GlobalHead", "App head committed in GLOBAL; - unavailable, 0 is a known genesis head"),
         kv("PeerHead", "Provider shard head; remote metadata, not the local worker cursor"),
         kv("Details", "Selected allocation footer shows blocker and last advance; no observation timer"),
 
@@ -1635,10 +1643,11 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Size [MB]", "Shard size, in megabytes"),
         kv("Shards", "Data shards the filter covers"),
         kv("PeerMat", "Materialized height reported by the shard metadata provider"),
+        kv("GlobalHead", "App head committed in GLOBAL; - unavailable, 0 is a known genesis head"),
         kv("PeerHead", "Provider shard head; remote metadata"),
         kv("PeerState", "Reading of PeerMat and PeerHead; lag!/unmat! flag provider warnings"),
         kv("Cursor", "Inactive cursor stays visible to bind the detail below to its row"),
-        kv("GLOBAL app head", "Selected-row detail: executed app cursor at cited committed GLOBAL frame"),
+        kv("GLOBAL citation", "Selected-row detail: committed GLOBAL frame and session generation"),
         kv("", "Independent of LocalMat and peer metadata; absent on older servers"),
         kv("", "lag: behind it; unmat: nothing materialized; unknown: no head"),
         kv(
@@ -1795,7 +1804,7 @@ mod tests {
             assert!(a.iter().sum::<usize>() + a.len() - 1 <= 240);
             let alloc = render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 240, 5), Some(&a))[0].to_string();
             let avail = render_avail_panel(&mut m, &available, Rect::new(0, 0, 240, 5), Some(&v))[0].to_string();
-            for label in ["Filter", "Provers", "Ring", "Size", "Shards", "PeerHead", "Reward"] {
+            for label in ["Filter", "Provers", "Ring", "Size", "Shards", "PeerHead", "GlobalHead", "Reward"] {
                 assert_eq!(printed_width(&alloc[..alloc.find(label).unwrap()]), printed_width(&avail[..avail.find(label).unwrap()]), "{label}: {alloc} / {avail}");
             }
             assert!(!avail.contains("LocalMat"));
@@ -1896,12 +1905,56 @@ mod tests {
         allocation.latest_frame = 744;
         allocation.global_head = Some(quil_types::proto::node::GlobalAppFrameHead { frame: 742, global_frame: 1000, generation: 2 });
         allocation.execution = Some(quil_types::proto::node::WorkerExecution { materialized_frame: Some(744), ..Default::default() });
-        assert!(allocation_detail(&allocation).to_string().contains("GLOBAL app head: 742 @f1000 (gen 2)"));
+        assert!(allocation_detail(&allocation).to_string().contains("GLOBAL @f1000 (gen 2)"));
+        let m = Model::new();
+        assert_eq!(alloc_cell(&m, &allocation, 8, 0), "742");
+        assert_eq!(alloc_cell(&m, &allocation, 7, 0), "744");
         let mut peer = shard("bb", 1, 1); peer.latest_frame = 900;
         peer.global_head = allocation.global_head.clone();
-        assert!(available_detail(&peer).to_string().contains("GLOBAL app head: 742 @f1000"));
+        assert!(available_detail(&peer).to_string().contains("GLOBAL @f1000"));
+        assert_eq!(avail_cell(&m, &peer, 8, 0), "742");
+        assert_eq!(avail_cell(&m, &peer, 7, 0), "900");
+        peer.global_head = None;
+        assert_eq!(avail_cell(&m, &peer, 8, 0), "-");
+        assert!(avail_row_numeric_val(&peer, 8).is_nan());
+        peer.global_head = Some(Default::default());
+        assert_eq!(avail_cell(&m, &peer, 8, 0), "0");
+        assert_eq!(avail_row_numeric_val(&peer, 8), 0.0);
         assert_eq!(global_head_detail(None), "GLOBAL app head: unavailable");
-        assert!(global_head_detail(Some(&quil_types::proto::node::GlobalAppFrameHead::default())).contains("head: 0 @f0"));
+        assert!(global_head_detail(Some(&quil_types::proto::node::GlobalAppFrameHead::default())).contains("GLOBAL @f0"));
+    }
+
+    #[test]
+    fn panel_detail_warnings_use_the_same_color() {
+        let mut allocation = row("aa", 1, 1, 7, "", "");
+        allocation.execution = Some(quil_types::proto::node::WorkerExecution {
+            state: "blocked".into(), blocker: "awaiting successor".into(), ..Default::default()
+        });
+        let mut peer = shard("bb", 1, 1);
+        peer.materialized_frame = 18; peer.latest_frame = 22;
+        assert!(allocation_detail(&allocation).spans.iter().all(|s| s.style.fg == Some(Color::Yellow)));
+        assert!(available_detail(&peer).spans.iter().all(|s| s.style.fg == Some(Color::Yellow)));
+    }
+
+    #[test]
+    fn global_head_columns_sort_and_filter_without_confusing_unknown_and_zero() {
+        let mut m = Model::new();
+        for (id, head) in [("a", Some(742)), ("b", None), ("c", Some(0))] {
+            let mut a = row(id, 1, 1, 7, "", "");
+            a.global_head = head.map(|frame| quil_types::proto::node::GlobalAppFrameHead { frame, global_frame: 1000, generation: 2 });
+            let mut s = shard(id, 1, 1); s.global_head = a.global_head.clone();
+            m.allocations.push(a); m.available.push(s);
+        }
+        m.alloc_sort_col = 8; m.alloc_sort_asc = true;
+        m.avail_sort_col = 8; m.avail_sort_asc = true;
+        assert_eq!(m.sorted_allocations().iter().map(|r| r.filter_key.as_str()).collect::<Vec<_>>(), vec!["b", "c", "a"]);
+        assert_eq!(m.sorted_available().iter().map(|r| r.filter_key.as_str()).collect::<Vec<_>>(), vec!["b", "c", "a"]);
+        let filter = ColumnFilter { expr: "=0".into(), ..Default::default() };
+        m.alloc_col_filters.insert(8, filter.clone()); m.avail_col_filters.insert(8, filter);
+        assert_eq!(m.filtered_allocations()[0].filter_key, "c");
+        assert_eq!(m.filtered_allocations().len(), 1);
+        assert_eq!(m.filtered_available()[0].filter_key, "c");
+        assert_eq!(m.filtered_available().len(), 1);
     }
 
     #[test]
@@ -2107,12 +2160,12 @@ mod tests {
         });
         assert_eq!(alloc_cell(&m, &a, 6, 12), "93");
         assert_eq!(alloc_cell(&m, &a, 7, 12), "93");
-        assert_eq!(alloc_cell(&m, &a, 8, 12), "blocked");
+        assert_eq!(alloc_cell(&m, &a, 9, 12), "blocked");
         a.materialized_frame = 93;
-        assert_eq!(alloc_cell(&m, &a, 8, 12), "blocked");
+        assert_eq!(alloc_cell(&m, &a, 9, 12), "blocked");
         a.execution = None;
         assert_eq!(alloc_cell(&m, &a, 6, 12), "-");
-        assert_eq!(alloc_cell(&m, &a, 8, 12), "unknown");
+        assert_eq!(alloc_cell(&m, &a, 9, 12), "unknown");
     }
 
     #[test]
@@ -2131,8 +2184,8 @@ mod tests {
             let mut s = shard("01", 0, 0);
             s.materialized_frame = mat;
             s.latest_frame = head;
-            assert_eq!(alloc_cell(&m, &a, 8, 12), "unknown");
-            assert_eq!(avail_cell(&m, &s, 8, 12), if matches!(label, "lag" | "unmat") { format!("{label}!") } else { label.to_string() });
+            assert_eq!(alloc_cell(&m, &a, 9, 12), "unknown");
+            assert_eq!(avail_cell(&m, &s, 9, 12), if matches!(label, "lag" | "unmat") { format!("{label}!") } else { label.to_string() });
             assert_eq!(materialization_state_color(label), color);
         }
     }
@@ -2250,10 +2303,10 @@ mod tests {
         let model = Model::new();
         let mut allocation = row("aa", 0, 0, 1, "", "");
         allocation.shard_info_known = false;
-        for col in [2, 3, 4, 5, 6, 7, 9] {
+        for col in [2, 3, 4, 5, 6, 7, 10] {
             assert_eq!(alloc_cell(&model, &allocation, col, 12), "-");
         }
-        assert_eq!(alloc_cell(&model, &allocation, 8, 12), "unknown");
+        assert_eq!(alloc_cell(&model, &allocation, 9, 12), "unknown");
         allocation.shard_info_known = true;
         for col in [2, 5] { assert_eq!(alloc_cell(&model, &allocation, col, 12), "0"); }
         assert_eq!(alloc_cell(&model, &allocation, 4, 12), fmt_mb(&BigInt::from(0)));
@@ -2269,12 +2322,12 @@ mod tests {
         allocation.status = 2;
         allocation.epoch = 3;
         allocation.ring = UNKNOWN_REWARD_RING;
-        for col in [3, 6, 7, 9] { assert_eq!(alloc_cell(&model, &allocation, col, 12), "-"); }
-        assert_eq!(alloc_cell(&model, &allocation, 8, 12), "unknown");
+        for col in [3, 6, 7, 10] { assert_eq!(alloc_cell(&model, &allocation, col, 12), "-"); }
+        assert_eq!(alloc_cell(&model, &allocation, 9, 12), "unknown");
         assert_eq!(ring_color(UNKNOWN_REWARD_RING), HELP);
         let mut available = shard("bb", 1, 1);
         available.ring = UNKNOWN_REWARD_RING;
-        for col in [3, 6, 7, 9] { assert_eq!(avail_cell(&model, &available, col, 12), "-"); }
+        for col in [3, 6, 7, 10] { assert_eq!(avail_cell(&model, &available, col, 12), "-"); }
         let title = alloc_title(&model, &[allocation.clone()]);
         let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("Current ? | Paused 0 | Planned change 0"), "{text}");
@@ -2288,8 +2341,8 @@ mod tests {
         });
         assert_eq!(alloc_cell(&model, &allocation, 6, 12), "0");
         assert_eq!(alloc_cell(&model, &allocation, 7, 12), "20");
-        assert_eq!(alloc_cell(&model, &allocation, 8, 12), "stale");
-        assert_eq!(alloc_cell(&model, &allocation, 9, 12), "0");
+        assert_eq!(alloc_cell(&model, &allocation, 9, 12), "stale");
+        assert_eq!(alloc_cell(&model, &allocation, 10, 12), "0");
     }
 
     #[test]
@@ -2396,7 +2449,7 @@ mod tests {
         }
         // Reward stops carrying its unit, so the column fits its header.
         let (w, _) = avail_col_widths(&m, 154, &rows);
-        assert_eq!(w[9], printed_width(&avail_header(&m, 9)));
+        assert_eq!(w[10], printed_width(&avail_header(&m, 10)));
     }
 
     /// The table as reported: 15 joining allocations, sorted ascending on
@@ -2445,7 +2498,7 @@ mod tests {
     fn every_column_is_sized_to_its_own_content() {
         let m = Model::new(); // Dynamic, sorted ascending on Worker
         let rows = joining_table();
-        let (w, fw) = alloc_col_widths(&m, 154, &rows);
+        let (w, fw) = alloc_col_widths(&m, 165, &rows);
 
         assert_eq!(
             w,
@@ -2458,6 +2511,7 @@ mod tests {
                 8,  // "10076371", wider than "Shards"
                 8,  // "LocalMat"
                 8,  // "PeerHead"
+                10, // "GlobalHead"
                 9,  // "Execution"
                 12, // "Reward_[Q/d]"
                 7,  // "↑Worker", including the active sort arrow
@@ -2468,25 +2522,25 @@ mod tests {
             ]
         );
         assert_eq!(fw, 20);
-        // 15 columns + 14 separators + 2 borders fill the pane exactly.
-        assert_eq!(w.iter().sum::<usize>() + 14 + 2, 154);
+        // 16 columns + 15 separators + 2 borders fill the pane exactly.
+        assert_eq!(w.iter().sum::<usize>() + 15 + 2, 165);
     }
 
     #[test]
     fn fixed_sizing_reserves_the_local_and_peer_column_labels() {
-        let (w, fw) = alloc_col_widths(&fixed(), 154, &joining_table());
-        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 8, 9, 12, 8, 12, 4, 26, 18]);
+        let (w, fw) = alloc_col_widths(&fixed(), 165, &joining_table());
+        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 8, 10, 9, 12, 8, 12, 4, 26, 18]);
         assert_eq!(fw, 12);
-        assert_eq!(w.iter().sum::<usize>() + 14, 168);
+        assert_eq!(w.iter().sum::<usize>() + 15, 179);
         // 26 columns of Next Action for a 13-column value in the fixed layout.
-        assert_eq!(w[13], NEXT_ACTION_WIDTH);
+        assert_eq!(w[14], NEXT_ACTION_WIDTH);
     }
 
     #[test]
     fn no_cell_overflows_its_column() {
         for m in [Model::new(), fixed()] {
             let rows = joining_table();
-            let (w, fw) = alloc_col_widths(&m, 154, &rows);
+            let (w, fw) = alloc_col_widths(&m, 165, &rows);
             for (c, width) in w.iter().enumerate() {
                 for a in &rows {
                     let cell = alloc_cell(&m, a, c, fw);
@@ -2504,15 +2558,15 @@ mod tests {
     fn next_action_widens_when_a_confirm_window_opens() {
         let m = Model::new();
         let mut rows = joining_table();
-        let (before, before_fw) = alloc_col_widths(&m, 154, &rows);
+        let (before, before_fw) = alloc_col_widths(&m, 165, &rows);
         rows[3].next_action = ActionHint::text("(reject|confirm)");
-        let (after, after_fw) = alloc_col_widths(&m, 154, &rows);
+        let (after, after_fw) = alloc_col_widths(&m, 165, &rows);
 
-        assert_eq!(before[13], 13);
-        assert_eq!(after[13], 16);
+        assert_eq!(before[14], 13);
+        assert_eq!(after[14], 16);
         // Filter gives back exactly what Next Action took; the row still fits.
         assert_eq!(before_fw - after_fw, 3);
-        assert_eq!(after.iter().sum::<usize>() + 14 + 2, 154);
+        assert_eq!(after.iter().sum::<usize>() + 15 + 2, 165);
     }
 
     #[test]
@@ -2521,9 +2575,9 @@ mod tests {
         let rows = joining_table();
         // Wide pane: Filter stops at the longest hex rather than padding on.
         assert_eq!(alloc_col_widths(&m, 300, &rows).1, 64);
-        assert_eq!(alloc_col_widths(&m, 167, &rows).1, 33);
+        assert_eq!(alloc_col_widths(&m, 178, &rows).1, 33);
         // Narrower: Filter absorbs the shortfall…
-        assert_eq!(alloc_col_widths(&m, 154, &rows).1, 20);
+        assert_eq!(alloc_col_widths(&m, 165, &rows).1, 20);
         assert_eq!(alloc_col_widths(&m, 121, &rows).1, 12);
         // …down to the floor, past which the row is clipped rather than shrunk.
         assert_eq!(alloc_col_widths(&m, 118, &rows).1, MIN_FILTER_WIDTH);
@@ -2594,9 +2648,9 @@ mod tests {
     /// they only read as a list when they line up.
     #[test]
     fn filters_and_next_action_align_left() {
-        assert!(alloc_left_aligned(13));
+        assert!(alloc_left_aligned(14));
         assert!(alloc_left_aligned(1));
-        for c in (0..ALLOC_COL_NAMES.len()).filter(|c| *c != 13 && *c != 1) {
+        for c in (0..ALLOC_COL_NAMES.len()).filter(|c| *c != 14 && *c != 1) {
             assert!(
                 !alloc_left_aligned(c),
                 "column {c} should stay right-aligned"
@@ -2688,11 +2742,11 @@ mod tests {
         let mut allocation = joining_table().remove(0);
         allocation.estimated_reward = BigInt::from(10u64).pow(30);
         let (widths, _) = alloc_col_widths(&m, 300, &[allocation.clone()]);
-        assert!(widths[9] >= printed_width(&alloc_cell(&m, &allocation, 9, 0)));
+        assert!(widths[10] >= printed_width(&alloc_cell(&m, &allocation, 10, 0)));
         let mut available = shard("ab", 0, 0);
         available.estimated_reward = allocation.estimated_reward;
         let (widths, _) = avail_col_widths(&m, 300, &[available.clone()]);
-        assert!(widths[9] >= printed_width(&avail_cell(&m, &available, 9, 0)));
+        assert!(widths[10] >= printed_width(&avail_cell(&m, &available, 10, 0)));
     }
 
     #[test]
@@ -2704,7 +2758,7 @@ mod tests {
         assert_eq!(fmt_reward(&m.available[1].estimated_reward), "1");
         let sorted = m.sorted_available();
         assert_eq!(sorted[0].filter_key, "high");
-        m.avail_col_filters.insert(9, ColumnFilter {
+        m.avail_col_filters.insert(10, ColumnFilter {
             expr: ">0.9".into(),
             ..Default::default()
         });
@@ -2713,7 +2767,7 @@ mod tests {
         assert_eq!(filtered[0].filter_key, "high");
         let mut allocation = joining_table().remove(0);
         allocation.estimated_reward = BigInt::from(11_000);
-        assert!((alloc_row_numeric_val(&allocation, 9) - 0.9504).abs() < 1e-10);
+        assert!((alloc_row_numeric_val(&allocation, 10) - 0.9504).abs() < 1e-10);
     }
 
     #[test]
@@ -2744,9 +2798,9 @@ mod tests {
         m.allocations[0].next_action = ActionHint::at("(reject|confirm)", 2_160);
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty());
-        assert_eq!(alloc_cell(&m, &m.allocations[0], 13, 0), "(reject|confirm)@e3");
+        assert_eq!(alloc_cell(&m, &m.allocations[0], 14, 0), "(reject|confirm)@e3");
         assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty());
-        assert_eq!(alloc_cell(&m, &m.allocations[0], 13, 0), "(reject|confirm)@f2160");
+        assert_eq!(alloc_cell(&m, &m.allocations[0], 14, 0), "(reject|confirm)@f2160");
 
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         assert!(handle_key(&mut m, key(KeyCode::Char('h'))).is_empty());
