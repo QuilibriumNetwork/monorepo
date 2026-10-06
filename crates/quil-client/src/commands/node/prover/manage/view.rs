@@ -2199,7 +2199,7 @@ mod tests {
         let (w, fw) = alloc_col_widths(&fixed(), 154, &joining_table());
         assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 8, 9, 12, 8, 12, 4, 26, 18]);
         assert_eq!(fw, 12);
-        assert_eq!(w.iter().sum::<usize>() + 14, 167);
+        assert_eq!(w.iter().sum::<usize>() + 14, 168);
         // 26 columns of Next Action for a 13-column value in the fixed layout.
         assert_eq!(w[13], NEXT_ACTION_WIDTH);
     }
