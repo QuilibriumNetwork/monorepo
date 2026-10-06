@@ -1495,29 +1495,20 @@ fn render_filter_edit_lines(m: &Model) -> (Line<'static>, Line<'static>) {
 fn render_help_screen(f: &mut Frame, m: &mut Model, area: Rect) {
     let body = help_body();
     m.help_lines = body.len();
-    let body_height = (area.height as usize).saturating_sub(1);
+    let mut commands = wrap_actions(Line::from("[↑/k] up  [↓/j] down  [PgUp/PgDn] page  [Home/End] first/last  [h/Esc] close  [q] quit"), area.width);
+    let footer_height = commands.len().min(usize::from(area.height.saturating_sub(2).max(1)));
+    if commands.len() > footer_height {
+        commands.truncate(footer_height);
+        commands[footer_height - 1] = Line::from("[h/Esc] close  [q] quit");
+    }
+    let body_height = usize::from(area.height).saturating_sub(1 + footer_height);
+    m.help_visible = body_height;
     let max_offset = body.len().saturating_sub(body_height);
     m.help_offset = m.help_offset.min(max_offset);
-
-    let title = if max_offset == 0 {
-        " Shard Manager — Help".to_string()
-    } else {
-        format!(
-            " Shard Manager — Help    ↑/↓ scroll  ({}–{} of {})",
-            m.help_offset + 1,
-            (m.help_offset + body_height).min(body.len()),
-            body.len()
-        )
-    };
-    let mut out = vec![Line::from(Span::styled(
-        format!("{:<width$}", title, width = area.width as usize),
-        Style::new()
-            .fg(TEXT)
-            .bg(PRIMARY)
-            .add_modifier(Modifier::BOLD),
-    ))];
-    out.extend(body.into_iter().skip(m.help_offset).take(body_height));
-    f.render_widget(Paragraph::new(out), area);
+    let title = format!(" Shard Manager — Help  ({}–{} of {})", m.help_offset + 1, (m.help_offset + body_height).min(body.len()), body.len());
+    f.render_widget(Paragraph::new(Line::from(title)).style(Style::new().fg(TEXT).bg(PRIMARY).add_modifier(Modifier::BOLD)), Rect::new(area.x, area.y, area.width, area.height.min(1)));
+    f.render_widget(Paragraph::new(body.into_iter().skip(m.help_offset).take(body_height).collect::<Vec<_>>()), Rect::new(area.x, area.y + area.height.min(1), area.width, body_height as u16));
+    f.render_widget(Paragraph::new(commands).style(Style::new().fg(HELP)), Rect::new(area.x, area.y + area.height.saturating_sub(footer_height as u16), area.width, footer_height as u16));
 }
 
 /// Everything under the pinned title, in one place so a test can read it.
@@ -1675,7 +1666,6 @@ fn help_body() -> Vec<Line<'static>> {
         kv("h", "Open this help screen (↑/↓ or PgUp/PgDn scroll; h or esc closes)"),
         kv("q / Ctrl+C", "Quit"),
         Line::from(""),
-        Line::from(Span::styled("Press h to return", Style::new().fg(HELP))),
     ]
 }
 
@@ -2712,6 +2702,22 @@ mod tests {
         let mut allocation = joining_table().remove(0);
         allocation.estimated_reward = BigInt::from(11_000);
         assert!((alloc_row_numeric_val(&allocation, 9) - 0.9504).abs() < 1e-10);
+    }
+
+    #[test]
+    fn help_close_commands_stay_at_bottom_before_and_after_scrolling() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut m = Model::new(); m.show_help = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut m)).unwrap();
+        let bottom = |buffer: &ratatui::buffer::Buffer| (0..100).map(|x| buffer[(x, 23)].symbol()).collect::<String>();
+        let before = bottom(terminal.backend().buffer());
+        assert!(before.contains("[h/Esc] close"));
+        super::super::update::handle_key(&mut m, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        terminal.draw(|f| draw(f, &mut m)).unwrap();
+        assert_eq!(bottom(terminal.backend().buffer()), before);
+        assert_eq!(m.help_offset + m.help_visible, m.help_lines);
     }
 
     #[test]

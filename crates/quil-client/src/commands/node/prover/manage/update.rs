@@ -439,8 +439,8 @@ fn handle_help_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if is_quit(&ev) {
         return vec![Cmd::Quit];
     }
-    // One line is the pinned title; the rest is what a page covers.
-    let page = (m.height as usize).saturating_sub(1).max(1);
+    // Title and command footer stay fixed; page only the visible help body.
+    let page = m.help_visible.max(1);
     let max = m.help_lines.saturating_sub(page);
     match ev.code {
         KeyCode::Char('h') | KeyCode::Esc => {

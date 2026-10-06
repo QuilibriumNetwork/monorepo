@@ -355,6 +355,7 @@ pub struct Model {
     /// Help lines the last frame produced, so scrolling can stop at the end
     /// without the key handler having to know how the screen is built.
     pub help_lines: usize,
+    pub help_visible: usize,
     pub color_coding: bool,
     pub column_sizing: ColumnSizing,
     pub threshold_unit: ThresholdUnit,
