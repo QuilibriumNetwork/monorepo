@@ -85,7 +85,7 @@ fn verify(view: &CommittedView, frame: &AppShardFrame) -> quil_cw_consensus::han
 async fn session_seals_on_a_scheduled_change_and_resumes_under_its_successor() {
     common::init_tracing();
     quil_types::consensus::set_committee_handoff_policy(Some(
-        quil_types::consensus::CommitteeHandoffPolicy { activation_frame: 0, chain_id: [0x51; 32] },
+        quil_types::consensus::CommitteeHandoffPolicy { activation_frame: 0, chain_id: [0x51; 32], legacy_history: quil_types::consensus::LegacyHistory::Migrate },
     ));
     let filter = vec![0x55u8; 32];
     let provers: Vec<TestProver> = (0..4).map(|_| TestProver::generate()).collect();

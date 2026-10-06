@@ -968,6 +968,9 @@ async fn run_state_jump(
 }
 
 pub(crate) struct ArchiveSyncArgs {
+    /// Set here once the frame verifier exists (see `historical_committees`).
+    pub historical_committees: Arc<std::sync::OnceLock<Arc<super::historical_committees::HistoricalCommittees>>>,
+    pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
     /// Kept shard sizes shared with every other reader in the node.
     pub committed_shard_sizes: Arc<quil_engine::shard_info::CommittedShardSizes>,
     pub mtls_seed: Option<[u8; 57]>,
@@ -1069,6 +1072,9 @@ fn sequenced_ingest_hook(
             return Ok(false); // not built yet: execute nothing without it
         };
         let frame_number = frame.header.as_ref().map_or(0, |h| h.frame_number);
+        // The flag day's discard precedes the first GLOBAL frame from
+        // activation, so no session frame it sequences is ever discarded.
+        ingest.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).discard_legacy_history_at(frame_number)?;
         let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
         let bls = quil_crypto::FalconKeyConstructor;
         let mut through: std::collections::BTreeMap<Vec<u8>, u64> = std::collections::BTreeMap::new();
@@ -1077,7 +1083,7 @@ fn sequenced_ingest_hook(
             let op = conversions::frame_header_from_proto(header);
             let committee_frame = if op.global_frame_number > 0 { op.global_frame_number } else { frame_number };
             if prover_shard_update::verify_frame_header_session(
-                &state, &op, frame_prover.as_ref(), &bls, prover_registry.as_ref(), committee_frame,
+                &state, &op, frame_prover.as_ref(), &bls, prover_registry.as_ref(), committee_frame, frame_number,
             )
             .is_err()
             {
@@ -1097,6 +1103,8 @@ fn sequenced_ingest_hook(
 
 pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncArgs) {
     let ArchiveSyncArgs {
+        historical_committees,
+        inclusion_prover,
         committed_shard_sizes,
         mtls_seed,
         network,
@@ -1201,6 +1209,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 archive_frame_is_valid(frame, &addrs, &verifier)
             })
         };
+        let _ = historical_committees.set(Arc::new(super::historical_committees::HistoricalCommittees::new(
+            archive_pool.clone(),
+            seed.clone(),
+            clock_store.clone(),
+            frame_validate.clone(),
+            frame_verifier.clone(),
+            inclusion_prover.clone(),
+            cw_storage_dir.join("historical-prover-tree"),
+        )));
 
         // Far-behind recovery: spawn a one-shot state jump pinned to a single
         // peer frame N. It fires for ANY node whose gap to the network head
@@ -1424,11 +1441,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     .as_ref()
                     .map(|fm| fm.enqueue_catchup(frame.clone(), frame_num))
                     .unwrap_or(false);
-                // Session-enabled regulars follow authenticated GLOBAL state through sync.
-                // Replaying against incomplete local shard metadata can turn
-                // an archive's rejected join into local-only prover records.
+                // Session-enabled regulars follow authenticated GLOBAL state through sync
+                // from activation on. Replaying against incomplete local shard metadata can
+                // turn an archive's rejected join into local-only prover records.
                 if !signaled && (archive_mode_poller || network == 99
-                    || quil_types::consensus::committee_handoff_policy().is_none()) {
+                    || !quil_types::consensus::committee_handoff_active(frame_num)) {
                 // Process frame messages through execution pipeline
                 match quil_engine::frame_processor::process_global_frame(
                     &exec_mgr_for_poller,
@@ -1735,8 +1752,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // hypergraph store with the prover tree.
                 let mut initial_sync_data_ok = sync_archive_mode;
                 if !sync_archive_mode {
-                    if let Some(addr) = sync_pool.get_all().await.first() {
-                        info!("starting initial prover tree sync");
+                    let initial_peers = sync_pool.get_all().await;
+                    if !initial_peers.is_empty() {
+                        info!(archives = initial_peers.len(), "starting initial prover tree sync");
                         let registry_sync = sync_pl.begin_registry_sync();
                         // Initial bootstrap sync — no verified frame
                         // yet to pin against. Empty expected_root
@@ -1748,16 +1766,35 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         // L2 = [0xff; 32]). Empty expected root ⇒ trust the
                         // archive's latest snapshot (bootstrap; no verified frame
                         // yet). Pulls the commitment diff + the changed vertices'
-                        // blobs.
-                        match crate::forest_sync::sync_single_shard_verified(
-                            addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &[],
-                        ).await {
-                            Ok(_) => {
-                                initial_sync_data_ok = true;
+                        // blobs. Each archive is tried in turn, for a few
+                        // rounds: one busy or unreachable archive used to hold
+                        // the lifecycle gate until the next periodic sync.
+                        const INITIAL_SYNC_ROUNDS: usize = 3;
+                        'rounds: for round in 0..INITIAL_SYNC_ROUNDS {
+                            if round > 0 {
+                                tokio::select! {
+                                    _ = sync_token.cancelled() => break 'rounds,
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                                }
                             }
-                            Err(e) => {
-                                warn!(error = %e, "initial prover tree sync failed; lifecycle gate stays held");
+                            for addr in sync_pool.get_all().await.iter() {
+                                if sync_token.is_cancelled() { break 'rounds; }
+                                match crate::forest_sync::sync_single_shard_verified(
+                                    addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &[],
+                                ).await {
+                                    Ok(Some(_)) => {
+                                        initial_sync_data_ok = true;
+                                        break 'rounds;
+                                    }
+                                    Ok(None) => warn!(peer = %addr, round,
+                                        "initial prover tree sync: archive cannot serve the tree; trying the next"),
+                                    Err(e) => warn!(peer = %addr, round, error = %e,
+                                        "initial prover tree sync failed; trying the next archive"),
+                                }
                             }
+                        }
+                        if !initial_sync_data_ok {
+                            warn!("initial prover tree sync failed on every archive; lifecycle gate stays held");
                         }
                     // Refresh prover registry from synced data
                     let pr = sync_pr.clone();
@@ -1806,7 +1843,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             }
                         }).await;
                     }
-                    } // end of `if let Some(addr) { ... }`
+                    } // end of `if !initial_peers.is_empty() { ... }`
                 } // end of `if !sync_archive_mode { ... }`
                 // Only flip the lifecycle gate when we actually have
                 // prover-tree data to evaluate against. On a fresh

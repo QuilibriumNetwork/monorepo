@@ -97,7 +97,7 @@ fn only_the_audited_path_creates_generation_zero() {
     assert!(initialize(&state, 1, &legacy_signer(&[0x61; 32], &keys)).is_err(),
         "a trusted initialization cannot claim the legacy namespace");
     assert!(legacy::records_tips(&policy(), 0), "activation at 2 records from genesis");
-    let late = quil_types::consensus::CommitteeHandoffPolicy { activation_frame: 5_000, chain_id: [0x11; 32] };
+    let late = quil_types::consensus::CommitteeHandoffPolicy { activation_frame: 5_000, chain_id: [0x11; 32], legacy_history: quil_types::consensus::LegacyHistory::Migrate };
     assert!(!legacy::records_tips(&late, 5_000 - legacy::LEGACY_TIP_LEAD - 1));
     assert!(legacy::records_tips(&late, 5_000 - legacy::LEGACY_TIP_LEAD));
 }

@@ -83,6 +83,17 @@ pub struct GlobalIntrinsic {
 
 }
 
+/// The ring key of `address`'s allocation on `filter` in `scan`, or a key
+/// that ranks last when the allocation is not in it.
+fn ring_key_of(
+    scan: Option<&crate::prover_registry::CommittedProverScan>,
+    address: &[u8],
+    filter: &[u8],
+) -> super::prover_rings::RingKey {
+    scan.and_then(|scan| scan.ring_key(address, filter))
+        .unwrap_or(super::prover_rings::RingKey { cohort: u64::MAX, seniority: 0 })
+}
+
 impl GlobalIntrinsic {
     pub(crate) fn check_execution_capture(
         &self,
@@ -766,11 +777,12 @@ impl GlobalIntrinsic {
                         "FrameHeader: authenticated global state is required for session lookup".into()))?;
                     let state = HypergraphState::new(crdt.clone());
                     super::prover_shard_update::verify_frame_header_in_state(
-                        &state, &op, fp, bls, pr, committee_frame,
+                        &state, &op, fp, bls, pr, committee_frame, frame_number,
                     )?;
                     return Ok(true);
                 }
                 {
+                    super::handoff::frames::refuse_legacy_after_flag_day(frame_number)?;
                     if let Some(crdt) = self.hypergraph.as_ref() {
                         let state = HypergraphState::new(crdt.clone());
                         state.require_full_domain_coverage(&GLOBAL_INTRINSIC_ADDRESS)?;
@@ -1006,6 +1018,18 @@ impl GlobalIntrinsic {
                 let op = ProverConfirm::from_canonical_bytes(input)?;
                 // Confirm applies to each filter in the confirm message.
                 verify::validate_confirm_epoch(op.frame_number, frame_number)?;
+                // A join confirm records the prover's seniority for its rings
+                // (`prover_rings`): committed state plus this frame's earlier
+                // changes, as every node applies them in the same order.
+                let seniority = match op.public_key_signature_bls48581.as_ref() {
+                    Some(signature) if super::prover_rings::governs(frame_number) => state
+                        .get(&GLOBAL_INTRINSIC_ADDRESS[..], &signature.address, &va_disc)?
+                        .map(|blob| crate::prover_registry::rebuild_vertex_tree_from_blob(&blob))
+                        .and_then(|tree| read_field(&tree, "prover:Prover", "Seniority"))
+                        .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
+                        .map_or(0, u64::from_be_bytes),
+                    _ => 0,
+                };
                 // Validate timing window (360-720 frames) before materializing.
                 for filter in &op.filters {
                     self.invoke_filter_op(
@@ -1062,7 +1086,11 @@ impl GlobalIntrinsic {
                                 shard_removed,
                             )?;
 
-                            materialize::materialize_prover_confirm(alloc_tree, fn_)
+                            materialize::materialize_prover_confirm(alloc_tree, fn_)?;
+                            if current_status == materialize::STATUS_JOINING && super::prover_rings::governs(fn_) {
+                                super::prover_rings::write_key(alloc_tree, super::prover_rings::joined(fn_, seniority))?;
+                            }
+                            Ok(())
                         },
                     )?;
                 }
@@ -2161,7 +2189,7 @@ impl GlobalIntrinsic {
             frame_number
         };
         let (active_provers, bitmask_bytes, session) = super::prover_shard_update::verify_frame_header_session(
-            state, op, fp.as_ref(), bls.as_ref(), pr.as_ref(), committee_frame,
+            state, op, fp.as_ref(), bls.as_ref(), pr.as_ref(), committee_frame, frame_number,
         ).map_err(|e| QuilError::InvalidArgument(format!(
             "invoke_frame_header: frame header attestation invalid: {e}"
         )))?;
@@ -2816,8 +2844,9 @@ impl GlobalIntrinsic {
                     // materializer, and the same change is due again on every
                     // later frame. Undo the attempt, keep the change pending.
                     let checkpoint = state.changeset_len();
-                    match super::handoff::schedule::gate_topology_change(
-                        state, frame_number, &policy, &change, scan, even,
+                    let size = |filter: &[u8]| self.split_child_size(filter);
+                    match super::handoff::schedule::gate_topology_change_sized(
+                        state, frame_number, &policy, &change, scan, even, &size,
                     ) {
                         Ok(super::handoff::schedule::TopologyGate::Apply) => ready.push(change),
                         Ok(super::handoff::schedule::TopologyGate::Wait) => {}
@@ -3118,7 +3147,24 @@ impl GlobalIntrinsic {
             state.rollback_to(checkpoint);
             tracing::error!(frame = frame_number, %error, "committee handoff: fencing stalled sessions failed");
         }
-        let scan = crate::prover_registry::CommittedProverScan::try_scan(hg)?;
+        let mut scan = crate::prover_registry::CommittedProverScan::try_scan(hg)?;
+        // A flag day that discards legacy history prepares the prover tree
+        // once, before any first session is authorized; until it succeeds no
+        // session is.
+        if policy.legacy_history == quil_types::consensus::LegacyHistory::Discard
+            && !super::handoff::flag_day_applied(state)?
+        {
+            let checkpoint = state.changeset_len();
+            match self.apply_handoff_flag_day(frame_number, state, &store, &mut scan, &mut filters) {
+                Ok(()) => state.stage_records(store.into_records()),
+                Err(error) if matches!(error, QuilError::InvalidArgument(_)) => {
+                    state.rollback_to(checkpoint);
+                    tracing::error!(frame = frame_number, %error, "committee handoff: flag day failed; no session is authorized yet");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
         // Same rule as the topology gate: report, undo, and let the chain go on.
         // Legacy shards enter through generation zero first, so reconciliation
         // never gives one an empty-genesis first session.
@@ -3417,6 +3463,42 @@ impl GlobalIntrinsic {
                 // unified cutover flag day — a coordinated upgrade point where
                 // every node flips together (pre-cutover keeps the exact legacy
                 // `assign_child_index` mapping, so no fork on in-flight splits).
+                if super::prover_rings::governs(frame_number) {
+                    // Committee members follow the committees the split's
+                    // request authorized (`split_assignment_sized`, the most
+                    // senior together on the most valuable child); any other
+                    // allocation on the parent moves by the same rule, over the
+                    // children's sizes now. Each starts a new cohort.
+                    let targets = super::handoff::schedule::topology_targets(state, change)?.unwrap_or_default();
+                    let mut moves: Vec<(Vec<u8>, Vec<u8>, usize)> = Vec::new();
+                    let mut others: Vec<((Vec<u8>, Vec<u8>), Vec<u8>, super::prover_rings::RingKey)> = Vec::new();
+                    for (public_key, address) in provers {
+                        let child = targets
+                            .iter()
+                            .find(|target| target.members.contains(&public_key))
+                            .and_then(|target| change.children.iter().position(|child| *child == target.filter));
+                        match child {
+                            Some(index) => moves.push((public_key, address, index)),
+                            None => {
+                                let key = ring_key_of(scan, &address, &change.parent);
+                                others.push(((public_key, address.clone()), address, key));
+                            }
+                        }
+                    }
+                    let order = super::prover_rings::children_by_value(&change.children, |filter| self.split_child_size(filter));
+                    let ranked = others.iter().map(|(item, address, key)| (item.clone(), address.as_slice(), *key)).collect();
+                    for (group, index) in super::prover_rings::split_groups(ranked, k)?.into_iter().zip(order) {
+                        moves.extend(group.into_iter().map(|(public_key, address)| (public_key, address, index)));
+                    }
+                    for (public_key, address, index) in moves {
+                        let key = super::prover_rings::moved(ring_key_of(scan, &address, &change.parent), frame_number);
+                        self.rekey_allocation_with_key(
+                            state, va_disc, &vr_disc, &ha_disc, &public_key, &address,
+                            &change.parent, &change.children[index], frame_number, Some(key),
+                        )?;
+                    }
+                    return Ok(());
+                }
                 let even = frame_number
                     >= super::materialize::unified_tree_cutover_frame();
                 if even {
@@ -3437,18 +3519,207 @@ impl GlobalIntrinsic {
                 }
             }
             ShardChangeKind::Merge => {
+                let rings = super::prover_rings::governs(frame_number);
                 for child in &change.children {
                     let provers = enumerate(child)?;
                     for (public_key, address) in &provers {
-                        self.rekey_allocation(
+                        // A merged shard ranks its members as one new cohort.
+                        let key = rings.then(|| super::prover_rings::moved(ring_key_of(scan, address, child), frame_number));
+                        self.rekey_allocation_with_key(
                             state, va_disc, &vr_disc, &ha_disc, public_key, address,
-                            child, &change.parent, frame_number,
+                            child, &change.parent, frame_number, key,
                         )?;
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// The committee-handoff flag day ([`LegacyHistory::Discard`], owner
+    /// decision 2026-10-05), in the first session pass from activation:
+    ///
+    /// 1. Every live allocation without a ring key records one
+    ///    (`prover_rings::preexisting`: its join-confirm cohort and its
+    ///    prover's seniority now).
+    /// 2. An application with live allocations and no grid shard receives a
+    ///    root shard, so its provers have a shard to run a session on.
+    /// 3. Every live allocation on a filter outside the grid moves onto the
+    ///    grid shard covering it: the shard with the same bit path, else the
+    ///    deepest ancestor; under an allocation whose filter covers several
+    ///    grid shards, its prover goes to one of them by the split rule (the
+    ///    most senior together on the most valuable). A prover already
+    ///    holding the destination keeps that allocation and the off-grid one
+    ///    is retired. Moved allocations start a new cohort.
+    ///
+    /// `scan` and `filters` are updated in place, so this pass's first
+    /// sessions see the committees the flag day leaves.
+    ///
+    /// [`LegacyHistory::Discard`]: quil_types::consensus::LegacyHistory::Discard
+    fn apply_handoff_flag_day(
+        &self,
+        frame_number: u64,
+        state: &HypergraphState,
+        store: &quil_store::ShardMetadataBatch,
+        scan: &mut crate::prover_registry::CommittedProverScan,
+        filters: &mut Vec<Vec<u8>>,
+    ) -> Result<()> {
+        use quil_types::consensus::ProverStatus;
+        let hg = self.hypergraph.as_ref().ok_or_else(|| QuilError::InvalidArgument("flag day needs the hypergraph".into()))?;
+        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+        let va_disc = vertex_adds_discriminator()?;
+        let vr_disc = vertex_removes_discriminator()?;
+        let ha_disc = hyperedge_adds_discriminator()?;
+        let live = |status: &ProverStatus| !matches!(status, ProverStatus::Historic | ProverStatus::Kicked);
+        // The scan is committed state; a split or merge earlier in this pass
+        // may already have moved (and retired) an allocation it lists.
+        let live_now = |public_key: &[u8], filter: &[u8]| -> Result<bool> {
+            let address = materialize::allocation_address(public_key, filter)?;
+            Ok(state.get(domain, &address, &va_disc)?.filter(|blob| !blob.is_empty()).is_some_and(|blob| {
+                let tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+                read_field(&tree, "allocation:ProverAllocation", "Status")
+                    .and_then(|bytes| bytes.first().copied())
+                    .is_some_and(|byte| byte != materialize::STATUS_HISTORIC && byte != 4)
+            }))
+        };
+
+        // 1. Ring keys.
+        let unkeyed: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, super::prover_rings::RingKey)> = scan
+            .allocations_with_keys()
+            .filter(|(_, alloc, _, recorded)| !recorded && live(&alloc.status))
+            .filter_map(|(prover, alloc, key, _)| {
+                scan.public_key(prover).map(|pk| (prover.to_vec(), pk.to_vec(), alloc.confirmation_filter.clone(), key))
+            })
+            .collect();
+        for (prover, public_key, filter, key) in &unkeyed {
+            if !live_now(public_key, filter)? {
+                continue;
+            }
+            let address = materialize::allocation_address(public_key, filter)?;
+            let Some(blob) = state.get(domain, &address, &va_disc)?.filter(|b| !b.is_empty()) else { continue };
+            let mut tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+            super::prover_rings::write_key(&mut tree, *key)?;
+            state.set(domain, &address, &va_disc, frame_number, crate::prover_registry::vertex_tree_to_blob(&tree))?;
+            scan.recorded(prover, filter, *key);
+        }
+
+        // 2. Root shards for gridless applications.
+        let grid_key = |l2: &[u8]| -> Vec<u8> {
+            let mut key = quil_hypergraph::addressing::get_bloom_filter_indices(l2, 256, 3).to_vec();
+            key.extend_from_slice(l2);
+            key
+        };
+        let mut apps: Vec<[u8; 32]> = scan
+            .allocations_with_keys()
+            .filter(|(_, alloc, _, _)| live(&alloc.status) && alloc.confirmation_filter.len() >= 32)
+            .filter_map(|(_, alloc, _, _)| <[u8; 32]>::try_from(&alloc.confirmation_filter[..32]).ok())
+            .collect();
+        apps.sort();
+        apps.dedup();
+        for app in &apps {
+            if !filters.iter().any(|filter| filter.len() >= 32 && filter[..32] == app[..]) {
+                store.put_app_shard(store as &dyn quil_types::store::Transaction, &quil_types::store::ShardInfo {
+                    shard_key: grid_key(app),
+                    prefix: Vec::new(),
+                    size: Vec::new(),
+                    data_shards: 0,
+                    commitment: Vec::new(),
+                })?;
+                filters.push(app.to_vec());
+                tracing::info!(frame = frame_number, app = hex::encode(app),
+                    "committee handoff flag day: application without a grid shard receives its root shard");
+            }
+        }
+        filters.sort();
+        filters.dedup();
+
+        // 3. Off-grid allocations.
+        let bits_of = |filter: &[u8]| -> Option<([u8; 32], Vec<bool>)> {
+            let app = <[u8; 32]>::try_from(filter.get(..32)?).ok()?;
+            Some((app, hg.canonical_bits_for_filter(filter)?))
+        };
+        let grid: Vec<(Vec<u8>, [u8; 32], Vec<bool>)> = filters
+            .iter()
+            .filter_map(|filter| bits_of(filter).map(|(app, bits)| (filter.clone(), app, bits)))
+            .collect();
+        let mut off_grid: std::collections::BTreeMap<Vec<u8>, Vec<(Vec<u8>, Vec<u8>, super::prover_rings::RingKey)>> =
+            std::collections::BTreeMap::new();
+        for (prover, alloc, key, _) in scan.allocations_with_keys() {
+            if !live(&alloc.status) || alloc.confirmation_filter.len() < 32 || filters.contains(&alloc.confirmation_filter) {
+                continue;
+            }
+            if let Some(public_key) = scan.public_key(prover) {
+                if live_now(public_key, &alloc.confirmation_filter)? {
+                    off_grid.entry(alloc.confirmation_filter.clone()).or_default().push((public_key.to_vec(), prover.to_vec(), key));
+                }
+            }
+        }
+        let mut held: std::collections::HashSet<(Vec<u8>, Vec<u8>)> = scan
+            .allocations_with_keys()
+            .filter(|(_, alloc, _, _)| live(&alloc.status))
+            .map(|(prover, alloc, _, _)| (prover.to_vec(), alloc.confirmation_filter.clone()))
+            .collect();
+        for (from, provers) in off_grid {
+            let Some((app, bits)) = bits_of(&from) else { continue };
+            let same_app = grid.iter().filter(|(_, row_app, _)| *row_app == app);
+            let ancestor = same_app.clone()
+                .filter(|(_, _, row_bits)| bits.starts_with(row_bits))
+                .max_by_key(|(_, _, row_bits)| row_bits.len())
+                .map(|(filter, _, _)| filter.clone());
+            let assigned: Vec<((Vec<u8>, Vec<u8>, super::prover_rings::RingKey), Vec<u8>)> = match ancestor {
+                Some(to) => provers.into_iter().map(|p| (p, to.clone())).collect(),
+                None => {
+                    let children: Vec<Vec<u8>> = same_app
+                        .filter(|(_, _, row_bits)| row_bits.starts_with(&bits))
+                        .map(|(filter, _, _)| filter.clone())
+                        .collect();
+                    if children.is_empty() {
+                        tracing::warn!(frame = frame_number, filter = hex::encode(&from), provers = provers.len(),
+                            "committee handoff flag day: no grid shard overlaps an off-grid filter; its allocations stay");
+                        continue;
+                    }
+                    let order = super::prover_rings::children_by_value(&children, |filter| self.split_child_size(filter));
+                    let ranked = provers.iter().map(|p| (p.clone(), p.1.as_slice(), p.2)).collect();
+                    super::prover_rings::split_groups(ranked, children.len())?
+                        .into_iter()
+                        .zip(order)
+                        .flat_map(|(group, index)| group.into_iter().map(move |p| (p, index)))
+                        .map(|(p, index)| (p, children[index].clone()))
+                        .collect()
+                }
+            };
+            for ((public_key, prover, key), to) in assigned {
+                if held.contains(&(prover.clone(), to.clone())) {
+                    let address = materialize::allocation_address(&public_key, &from)?;
+                    if let Some(blob) = state.get(domain, &address, &va_disc)?.filter(|b| !b.is_empty()) {
+                        let historic = reassignment::set_allocation_status(&blob, materialize::STATUS_HISTORIC)?;
+                        state.set(domain, &address, &va_disc, frame_number, historic)?;
+                    }
+                    scan.retired(&prover, &from);
+                    continue;
+                }
+                let moved = super::prover_rings::moved(key, frame_number);
+                self.rekey_allocation_with_key(
+                    state, &va_disc, &vr_disc, &ha_disc, &public_key, &prover, &from, &to, frame_number, Some(moved),
+                )?;
+                scan.moved(&prover, &from, &to, moved);
+                held.insert((prover, to));
+            }
+            tracing::info!(frame = frame_number, from = hex::encode(&from),
+                "committee handoff flag day: off-grid allocations moved onto the grid");
+        }
+        super::handoff::record_flag_day(state, frame_number)
+    }
+
+    /// A split child's reward basis: its live state size in the unified app
+    /// tree (the forest's Merkle-sum index over committed state, which every
+    /// archive holds alike once sequenced ingest has run). 0 off the unified
+    /// tree or without a hypergraph.
+    fn split_child_size(&self, filter: &[u8]) -> u128 {
+        let Some(hg) = self.hypergraph.as_ref() else { return 0 };
+        let Some((app, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) else { return 0 };
+        let Ok(app) = <[u8; 32]>::try_from(app.as_slice()) else { return 0 };
+        u128::from(hg.unified_live_size_at_bits(&app, &bits).unwrap_or(0))
     }
 
     /// Re-key one allocation from `old_filter` to `new_filter`: write the new
@@ -3470,6 +3741,27 @@ impl GlobalIntrinsic {
         old_filter: &[u8],
         new_filter: &[u8],
         frame_number: u64,
+    ) -> Result<()> {
+        self.rekey_allocation_with_key(
+            state, va_disc, vr_disc, ha_disc, pubkey, prover_address, old_filter, new_filter, frame_number, None,
+        )
+    }
+
+    /// [`Self::rekey_allocation`], recording `ring_key` on the moved
+    /// allocation (`prover_rings::moved`) when given.
+    #[allow(clippy::too_many_arguments)]
+    fn rekey_allocation_with_key(
+        &self,
+        state: &HypergraphState,
+        va_disc: &[u8; 32],
+        vr_disc: &[u8; 32],
+        ha_disc: &[u8; 32],
+        pubkey: &[u8],
+        prover_address: &[u8],
+        old_filter: &[u8],
+        new_filter: &[u8],
+        frame_number: u64,
+        ring_key: Option<super::prover_rings::RingKey>,
     ) -> Result<()> {
         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
         let old_addr = materialize::allocation_address(pubkey, old_filter)?;
@@ -3495,8 +3787,12 @@ impl GlobalIntrinsic {
             moved = (new_addr != old_addr),
             "rekey: found old allocation → writing new (+deleting old if moved)"
         );
-        let new_blob = reassignment::rewrite_allocation_filter(&old_blob, new_filter)?;
-        let new_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&new_blob);
+        let mut new_blob = reassignment::rewrite_allocation_filter(&old_blob, new_filter)?;
+        let mut new_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&new_blob);
+        if let Some(key) = ring_key {
+            super::prover_rings::write_key(&mut new_tree, key)?;
+            new_blob = crate::prover_registry::vertex_tree_to_blob(&new_tree);
+        }
 
         // Write the new (or, on collision, in-place) allocation vertex.
         state.set(domain, &new_addr, va_disc, frame_number, new_blob)?;
