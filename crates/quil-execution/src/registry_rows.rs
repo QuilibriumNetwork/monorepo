@@ -19,6 +19,8 @@ type LeafRootKey = (Vec<u8>, Vec<u8>, u64);
 #[derive(Clone)]
 pub(super) struct DecodedRow {
     first: FirstPass,
+    /// Present only with the activated policy's committed ring key.
+    committed_ring: Option<u8>,
     /// Rows typed as allocations: the owner and allocation, `None` when the
     /// row does not decode. Counted in the second pass either way.
     allocation: Option<Option<(Vec<u8>, ProverAllocationInfo)>>,
@@ -40,10 +42,10 @@ enum FirstPass {
 fn decode_row(vk: &[u8], data: &[u8]) -> DecodedRow {
     let root = match deserialize_go_tree(data) {
         Ok(Some(root)) => root,
-        _ => return DecodedRow { first: FirstPass::Nothing, allocation: None },
+        _ => return DecodedRow { first: FirstPass::Nothing, allocation: None, committed_ring: None },
     };
     let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
-        return DecodedRow { first: FirstPass::Unknown, allocation: None };
+        return DecodedRow { first: FirstPass::Unknown, allocation: None, committed_ring: None };
     };
     let first = match class_for_type_hash(&type_hash) {
         Some("prover:Prover") => match decode_prover(vk, &root) {
@@ -59,7 +61,14 @@ fn decode_row(vk: &[u8], data: &[u8]) -> DecodedRow {
         _ => FirstPass::Unknown,
     };
     let allocation = (type_hash == TYPE_HASH_ALLOCATION).then(|| decode_allocation(vk, &root));
-    DecodedRow { first, allocation }
+    let committed_ring = allocation.as_ref().and_then(|decoded| decoded.as_ref()).and_then(|_| {
+        let ring = read_bytes(&root, "allocation:ProverAllocation", "Ring");
+        (ring.len() == 1
+            && read_bytes(&root, "allocation:ProverAllocation", "RingEpoch").len() == 8
+            && read_bytes(&root, "allocation:ProverAllocation", "RingSeniority").len() == 8)
+            .then(|| ring[0])
+    });
+    DecodedRow { first, allocation, committed_ring }
 }
 
 fn vertex_key(address: &[u8; 32]) -> Vec<u8> {
@@ -90,6 +99,10 @@ pub(super) struct RegistryRows {
 }
 
 impl RegistryRows {
+    pub(super) fn committed_ring(&self, address: &[u8]) -> Option<u8> {
+        self.effective(&<[u8; 32]>::try_from(address).ok()?)?.committed_ring
+    }
+
     /// Record an `adds` row the refresh read (and charged).
     pub(super) fn add(&mut self, address: [u8; 32], data: &[u8]) {
         self.note_size(data.len());

@@ -368,7 +368,18 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     let mut active = BigInt::from(0);
     let mut paused = BigInt::from(0);
     let mut leaving = BigInt::from(0);
+    let (mut current_unknown, mut paused_unknown, mut change_unknown) = (false, false, false);
     for a in sorted {
+        if a.ring == UNKNOWN_REWARD_RING {
+            match a.reward_status(m.epoch_frame(), m.epoch_length) {
+                Some(EffectiveStatus::Active) => current_unknown = true,
+                Some(EffectiveStatus::Leaving) => { current_unknown = true; change_unknown = true; },
+                Some(EffectiveStatus::Paused) => paused_unknown = true,
+                Some(EffectiveStatus::Joining) => change_unknown = true,
+                _ => {}
+            }
+            continue;
+        }
         match a.reward_status(m.epoch_frame(), m.epoch_length) {
             Some(EffectiveStatus::Joining) => joining += &a.estimated_reward,
             Some(EffectiveStatus::Active) => active += &a.estimated_reward,
@@ -382,9 +393,9 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     let mut s = format!(
         "Allocations: {}  Rewards [Q/d]: Current {} | Paused {} | Planned change {}",
         sorted.len(),
-        fmt_reward(&current),
-        fmt_reward(&paused),
-        fmt_reward_change(&change),
+        if current_unknown { "?".into() } else { fmt_reward(&current) },
+        if paused_unknown { "?".into() } else { fmt_reward(&paused) },
+        if change_unknown { "?".into() } else { fmt_reward_change(&change) },
     );
     if !m.alloc_selected.is_empty() {
         s += &format!(" [{} selected]", m.alloc_selected.len());
@@ -402,6 +413,14 @@ fn avail_title(m: &Model, sorted: &[ShardRow]) -> Line<'static> {
 
 // ── Allocations panel ────────────────────────────────────────────────────
 
+fn fmt_ring(ring: u32) -> String {
+    if ring == UNKNOWN_REWARD_RING { "-".into() } else { ring.to_string() }
+}
+
+fn fmt_materialized(materialized: u64, latest: u64) -> String {
+    if materialized == 0 && latest == 0 { "-".into() } else { materialized.to_string() }
+}
+
 /// The printed text of one allocations cell. Sizing and rendering both go
 /// through here. `fw` is the Filter column's width, which is a budget rather
 /// than a measurement — pass 0 when measuring the other columns.
@@ -410,15 +429,15 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         0 => alloc_marker(m, a).to_string(),
         1 => center_trunc(&a.filter_hex, fw),
         2 => a.active_provers.to_string(),
-        3 => a.ring.to_string(),
+        3 => fmt_ring(a.ring),
         4 => fmt_mb(&a.shard_size),
         5 => a.data_shards.to_string(),
-        6 => a.materialized_frame.to_string(),
+        6 => fmt_materialized(a.materialized_frame, a.latest_frame),
         7 => materialization_lag(a.materialized_frame, a.latest_frame)
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string()),
         8 => materialization_state(a.materialized_frame, a.latest_frame).to_string(),
-        9 => fmt_reward(&a.estimated_reward),
+        9 => if a.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&a.estimated_reward) },
         10 => a.worker_id.to_string(),
         11 => a.status_name.clone(),
         12 => a.mode().to_string(),
@@ -720,15 +739,15 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
         0 => avail_marker(m, s).to_string(),
         1 => center_trunc(&s.filter_hex, fw),
         2 => s.active_provers.to_string(),
-        3 => s.ring.to_string(),
+        3 => fmt_ring(s.ring),
         4 => fmt_mb(&s.shard_size),
         5 => s.data_shards.to_string(),
-        6 => s.materialized_frame.to_string(),
+        6 => fmt_materialized(s.materialized_frame, s.latest_frame),
         7 => materialization_lag(s.materialized_frame, s.latest_frame)
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string()),
         8 => materialization_state(s.materialized_frame, s.latest_frame).to_string(),
-        _ => fmt_reward(&s.estimated_reward),
+        _ => if s.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&s.estimated_reward) },
     }
 }
 
@@ -1426,6 +1445,7 @@ fn help_body() -> Vec<Line<'static>> {
         ),
         kv("Current", "Staffed active + leaving reward estimates, not measured income"),
         kv("Paused", "Staffed paused estimates available upon resume"),
+        kv("Unknown", "- fields and ? totals mean reward or height data is unavailable"),
         kv("Planned change", "Staffed joining minus leaving; activation epochs may differ"),
         note("Reward totals follow displayed rows; unassigned rows are excluded."),
         kv("Worker", "Core the allocation is bound to; -1 means none is bound"),
@@ -1804,6 +1824,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn unavailable_values_are_not_rendered_as_zero_rewards_or_heights() {
+        let mut model = Model::new();
+        model.frame_number = 2160;
+        model.epoch_length = 720;
+        let mut allocation = row("aa", 1, 1, 0, "", "");
+        allocation.filter = vec![0xaa];
+        allocation.status = 2;
+        allocation.epoch = 3;
+        allocation.ring = UNKNOWN_REWARD_RING;
+        for col in [3, 6, 7, 9] { assert_eq!(alloc_cell(&model, &allocation, col, 12), "-"); }
+        assert_eq!(alloc_cell(&model, &allocation, 8, 12), "unknown");
+        let title = alloc_title(&model, &[allocation.clone()]);
+        let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Current ? | Paused 0 | Planned change 0"), "{text}");
+        allocation.ring = 0;
+        allocation.latest_frame = 20;
+        assert_eq!(alloc_cell(&model, &allocation, 3, 12), "0");
+        assert_eq!(alloc_cell(&model, &allocation, 6, 12), "0");
+        assert_eq!(alloc_cell(&model, &allocation, 7, 12), "20");
+        assert_eq!(alloc_cell(&model, &allocation, 8, 12), "unmat");
+        assert_eq!(alloc_cell(&model, &allocation, 9, 12), "0");
     }
 
     #[test]

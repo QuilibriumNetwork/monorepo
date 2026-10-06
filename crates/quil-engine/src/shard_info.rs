@@ -53,7 +53,7 @@ pub struct ShardEntry {
     /// Whether the local prover is allocated to this shard.
     pub is_allocated: bool,
     /// Ring assignment (0-based).
-    pub ring: u8,
+    pub ring: Option<u8>,
     pub materialized_frame: u64,
     pub latest_frame: u64,
 }
@@ -305,9 +305,10 @@ where
                 .any(|a| a.confirmation_filter == bp && a.is_live(frame_number))).collect();
             let in_candidates = live.iter().any(|p| p.address == self_address);
             let real_is_alloc = is_alloc || in_candidates;
-            let Ok(Some(estimate)) = prover_registry.get_reward_ring_estimate(
-                self_address, &bp, frame_number) else { continue; };
-            let (ring, on_ring) = (estimate.ring, estimate.provers_on_ring);
+            let estimate = prover_registry.get_reward_ring_estimate(
+                self_address, &bp, frame_number).ok().flatten();
+            let ring = estimate.map(|e| e.ring);
+            let on_ring = estimate.map_or(0, |e| e.provers_on_ring);
 
             entries.push(ShardEntry {
                 filter: bp,
@@ -390,18 +391,14 @@ where
     let details: Vec<ShardDetail> = entries
         .iter()
         .map(|entry| {
-            let est = compute_shard_reward(
-                &basis,
-                &entry.size,
-                &world_bytes,
-                entry.ring,
-                entry.data_shards,
-            );
+            let est = entry.ring.map_or_else(BigInt::zero, |ring| compute_shard_reward(
+                &basis, &entry.size, &world_bytes, ring, entry.data_shards));
             ShardDetail {
                 filter: entry.filter.clone(),
                 shard_size: entry.size.clone(),
                 active_provers: entry.total_active as u32,
-                ring: entry.ring as u32,
+                ring: u32::from(entry.ring.unwrap_or(0)),
+                ring_known: entry.ring.is_some(),
                 estimated_reward: est,
                 is_allocated: entry.is_allocated,
                 data_shards: entry.data_shards,
@@ -1297,10 +1294,18 @@ mod tests {
     }
 
     struct StubRegistry {
+        ring_known: bool,
         prover_addr: Vec<u8>,
         prover_pubkey: Vec<u8>,
     }
     impl ProverRegistry for StubRegistry {
+        fn get_reward_ring_estimate(&self, owner: &[u8], filter: &[u8], frame: u64)
+            -> QResult<Option<quil_types::reward_ring::RewardRingEstimate>> {
+            if !self.ring_known { return Ok(None); }
+            let members = self.get_provers(filter)?;
+            let refs: Vec<_> = members.iter().collect();
+            Ok(quil_types::reward_ring::estimate_reward_ring(&refs, &refs, owner, filter, frame))
+        }
         fn get_prover_info(&self, _: &[u8]) -> QResult<Option<ProverInfo>> { Ok(None) }
         fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<u8>> { Ok(vec![]) }
         fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<Vec<u8>>> { Ok(vec![]) }
@@ -1375,7 +1380,7 @@ mod tests {
 
         // Stub a registry that returns 1 Active prover for any filter.
         let prover_addr = vec![0x77u8; 32];
-        let registry = StubRegistry {
+        let registry = StubRegistry { ring_known: true,
             prover_addr: prover_addr.clone(),
             prover_pubkey: vec![0xBBu8; 74],
         };
@@ -1489,7 +1494,7 @@ mod tests {
         }
 
         let prover_addr = vec![0x77u8; 32];
-        let registry = StubRegistry {
+        let registry = StubRegistry { ring_known: true,
             prover_addr: prover_addr.clone(),
             prover_pubkey: vec![0xBBu8; 74],
         };
@@ -1540,7 +1545,7 @@ mod tests {
                 size: vec![], data_shards: 1, commitment: vec![] });
         }
         let owner = vec![77; 32];
-        let registry = StubRegistry { prover_addr: owner.clone(), prover_pubkey: vec![88; 74] };
+        let registry = StubRegistry { ring_known: true, prover_addr: owner.clone(), prover_pubkey: vec![88; 74] };
         let allocated = HashSet::from([quil_forest::shard_prefix_to_filter(&[1; 32], &[])]);
         let sizes = |key: &[u8], _: &ShardInfo| Ok(vec![ShardSizeEntry {
             prefix: vec![], size: BigInt::from(u64::from(key[0]) * 1000).to_bytes_be().1,
@@ -1558,6 +1563,32 @@ mod tests {
         assert_ne!(owned_world, owned[0].shard_size);
         let same = all.iter().find(|s| s.filter == owned[0].filter).unwrap();
         assert_eq!(owned[0].estimated_reward, same.estimated_reward);
+    }
+
+    #[test]
+    fn unknown_ring_retains_shard_and_full_world_without_zero_ring_reward() {
+        let store = E2EShardsStore::new();
+        for id in [1u8, 2] {
+            store.push(ShardInfo { shard_key: vec![id; 35], prefix: vec![],
+                size: vec![], data_shards: 1, commitment: vec![] });
+        }
+        let owner = vec![77; 32];
+        let allocated = HashSet::from([quil_forest::shard_prefix_to_filter(&[1; 32], &[])]);
+        let sizes = |key: &[u8], _: &ShardInfo| Ok(vec![ShardSizeEntry {
+            prefix: vec![], size: BigInt::from(u64::from(key[0]) * 1000).to_bytes_be().1,
+            data_shards: 1, materialized_frame: 0, latest_frame: 0,
+        }]);
+        for known in [false, true] {
+            let registry = StubRegistry { ring_known: known,
+                prover_addr: owner.clone(), prover_pubkey: vec![88; 74] };
+            let (details, _, _, _, world) = get_shard_info(false, &owner, &allocated,
+                10000, 123, &store, &registry, &sizes).unwrap();
+            assert_eq!(world, BigInt::from(3000));
+            assert_eq!(details.len(), 1);
+            assert!(details[0].is_allocated);
+            assert_eq!(details[0].ring_known, known);
+            assert_eq!(details[0].estimated_reward.is_zero(), !known);
+        }
     }
 
     /// PARITY: the TUI per-prover estimate (`compute_shard_reward`) must equal

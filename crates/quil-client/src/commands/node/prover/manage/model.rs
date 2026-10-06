@@ -535,7 +535,7 @@ impl Model {
                 filter_hex: filter_hex.clone(),
                 status: a.status,
                 status_name,
-                ring: 0,
+                ring: UNKNOWN_REWARD_RING,
                 active_provers: 0,
                 shard_size: BigInt::from(0),
                 data_shards: 0,
@@ -554,7 +554,7 @@ impl Model {
                 manually_managed: mm,
             };
             if let Some(info) = reward_by_filter.get(&filter_hex) {
-                row.ring = info.ring;
+                row.ring = reward_ring(info);
                 row.active_provers = info.active_provers;
                 row.shard_size = BigInt::from_bytes_be(Sign::Plus, &info.shard_size);
                 row.data_shards = info.data_shards;
@@ -576,7 +576,7 @@ impl Model {
                         filter_hex: String::new(),
                         status: 0,
                         status_name: "idle".to_string(),
-                        ring: 0,
+                        ring: UNKNOWN_REWARD_RING,
                         active_provers: 0,
                         shard_size: BigInt::from(0),
                         data_shards: 0,
@@ -612,7 +612,7 @@ impl Model {
                     filter_key: filter_hex.clone(),
                     filter_hex,
                     active_provers: s.active_provers,
-                    ring: s.ring,
+                    ring: reward_ring(s),
                     shard_size: BigInt::from_bytes_be(Sign::Plus, &s.shard_size),
                     data_shards: s.data_shards,
                     materialized_frame: s.materialized_frame,
@@ -998,13 +998,15 @@ impl Model {
 pub fn alloc_row_numeric_val(row: &AllocationRow, col: usize) -> f64 {
     match col {
         2 => row.active_provers as f64,
-        3 => row.ring as f64,
+        3 => if row.ring == UNKNOWN_REWARD_RING { f64::NAN } else { row.ring as f64 },
         4 => bigint_to_f64(&row.shard_size) / (1024.0 * 1024.0),
         5 => row.data_shards as f64,
-        6 => row.materialized_frame as f64,
-        7 => materialization_lag(row.materialized_frame, row.latest_frame).unwrap_or(0) as f64,
+        6 => if row.materialized_frame == 0 && row.latest_frame == 0 { f64::NAN } else { row.materialized_frame as f64 },
+        7 => materialization_lag(row.materialized_frame, row.latest_frame).map_or(f64::NAN, |lag| lag as f64),
         9 => {
-            if row.estimated_reward.sign() == Sign::NoSign {
+            if row.ring == UNKNOWN_REWARD_RING {
+                f64::NAN
+            } else if row.estimated_reward.sign() == Sign::NoSign {
                 0.0
             } else {
                 bigint_to_f64(&row.estimated_reward) * super::super::FRAMES_PER_DAY as f64 / 1e8
@@ -1028,13 +1030,15 @@ pub fn alloc_row_text_val(row: &AllocationRow, col: usize) -> String {
 pub fn avail_row_numeric_val(row: &ShardRow, col: usize) -> f64 {
     match col {
         2 => row.active_provers as f64,
-        3 => row.ring as f64,
+        3 => if row.ring == UNKNOWN_REWARD_RING { f64::NAN } else { row.ring as f64 },
         4 => bigint_to_f64(&row.shard_size) / (1024.0 * 1024.0),
         5 => row.data_shards as f64,
-        6 => row.materialized_frame as f64,
-        7 => materialization_lag(row.materialized_frame, row.latest_frame).unwrap_or(0) as f64,
+        6 => if row.materialized_frame == 0 && row.latest_frame == 0 { f64::NAN } else { row.materialized_frame as f64 },
+        7 => materialization_lag(row.materialized_frame, row.latest_frame).map_or(f64::NAN, |lag| lag as f64),
         9 => {
-            if row.estimated_reward.sign() == Sign::NoSign {
+            if row.ring == UNKNOWN_REWARD_RING {
+                f64::NAN
+            } else if row.estimated_reward.sign() == Sign::NoSign {
                 0.0
             } else {
                 bigint_to_f64(&row.estimated_reward) * super::super::FRAMES_PER_DAY as f64 / 1e8
@@ -1044,13 +1048,19 @@ pub fn avail_row_numeric_val(row: &ShardRow, col: usize) -> f64 {
     }
 }
 
+pub const UNKNOWN_REWARD_RING: u32 = u32::MAX;
+
+pub fn reward_ring(info: &quil_types::proto::node::ShardRewardInfo) -> u32 {
+    if info.ring_known == Some(false) { UNKNOWN_REWARD_RING } else { info.ring }
+}
+
 pub fn materialization_lag(materialized: u64, latest: u64) -> Option<u64> {
     (latest > 0).then(|| latest.saturating_sub(materialized))
 }
 
 pub fn materialization_state(materialized: u64, latest: u64) -> &'static str {
     match (materialized, latest) {
-        (0, 0) => "unknown", (0, _) => "unmat", (mat, head) if mat >= head => "current", _ => "lag",
+        (_, 0) => "unknown", (0, _) => "unmat", (mat, head) if mat >= head => "current", _ => "lag",
     }
 }
 
@@ -1229,6 +1239,7 @@ mod tests {
 
         GetShardInfoResponse {
             shards: vec![ShardRewardInfo {
+                ring_known: Some(true),
                 filter,
                 estimated_reward: vec![reward],
                 ..Default::default()
@@ -1246,6 +1257,32 @@ mod tests {
             last_received_frame: 2_160,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn refresh_distinguishes_unknown_ring_from_real_zero() {
+        let filter = vec![0xab];
+        let mut model = Model::new();
+        let mut info = shard_info(filter.clone(), 0);
+        info.shards[0].ring_known = Some(false);
+        model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))), Some(info.clone()), None);
+        assert_eq!(model.allocations[0].ring, UNKNOWN_REWARD_RING);
+        for col in [3, 6, 7, 9] {
+            assert!(!super::super::filter::matches_numeric_expr(alloc_row_numeric_val(&model.allocations[0], col), "=0"));
+        }
+        info.shards[0].ring_known = Some(true);
+        info.shards[0].latest_frame = 20;
+        model.process_refresh_data(None, Some(info.clone()), None);
+        assert_eq!(model.allocations[0].ring, 0);
+        assert_eq!(alloc_row_numeric_val(&model.allocations[0], 3), 0.0);
+        assert_eq!(alloc_row_numeric_val(&model.allocations[0], 9), 0.0);
+        assert_eq!(materialization_state(0, 20), "unmat");
+        assert_eq!(materialization_lag(0, 20), Some(20));
+        info.shards[0].ring_known = None;
+        info.shards[0].ring = 2;
+        model.process_refresh_data(None, Some(info), None);
+        assert_eq!(model.allocations[0].ring, 2, "older servers remain compatible");
+        assert_eq!(materialization_state(10, 0), "unknown");
     }
 
     #[test]

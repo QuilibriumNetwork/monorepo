@@ -863,6 +863,8 @@ pub trait RewardIssuance: Send + Sync {
 /// Shard detail for info queries.
 #[derive(Debug, Clone)]
 pub struct ShardDetail {
+    /// Whether the reward position is established or explicitly projected.
+    pub ring_known: bool,
     pub filter: Vec<u8>,
     pub shard_size: BigInt,
     pub active_provers: u32,

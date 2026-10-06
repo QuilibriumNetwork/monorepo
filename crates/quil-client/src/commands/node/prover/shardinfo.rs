@@ -48,8 +48,8 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
             format_storage(shard_size_u64),
             shard.data_shards,
             shard.active_provers,
-            shard.ring,
-            format_quil_daily_round(&reward),
+            if shard.ring_known == Some(false) { "-".into() } else { shard.ring.to_string() },
+            if shard.ring_known == Some(false) { "-".into() } else { format_quil_daily_round(&reward) },
             suffix
         );
     }

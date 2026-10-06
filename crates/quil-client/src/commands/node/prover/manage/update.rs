@@ -1192,6 +1192,7 @@ mod tests {
         let mut model = Model::new();
         let shards = GetShardInfoResponse {
             shards: vec![ShardRewardInfo {
+                ring_known: Some(true),
                 filter: vec![0xab],
                 ..Default::default()
             }],
