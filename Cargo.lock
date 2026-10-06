@@ -3047,6 +3047,10 @@ name = "futures-timer"
 version = "3.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f288b0a4f20f9a56b5d1da57e2227c661b7b16168e2f72365f57b63326e29b24"
+dependencies = [
+ "gloo-timers",
+ "send_wrapper",
+]
 
 [[package]]
 name = "futures-util"
@@ -3156,6 +3160,18 @@ name = "glob"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2fabcfbdc87f4758337ca535fb41a6d701b65693ce38287d856d1674551ec9b"
+
+[[package]]
+name = "gloo-timers"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b995a66bb87bebce9a0f4a95aed01daca4872c050bfcb21653361c03bc35e5c"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "goblin"
@@ -4085,6 +4101,7 @@ dependencies = [
  "libp2p-noise",
  "libp2p-ping",
  "libp2p-quic",
+ "libp2p-request-response",
  "libp2p-swarm",
  "libp2p-tcp",
  "libp2p-upnp",
@@ -4184,8 +4201,6 @@ dependencies = [
 [[package]]
 name = "libp2p-gossipsub"
 version = "0.49.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a538e571cd38f504f761c61b8f79127489ea7a7d6f05c41ca15d31ffb5726326"
 dependencies = [
  "async-channel",
  "asynchronous-codec",
@@ -4205,10 +4220,14 @@ dependencies = [
  "prometheus-client 0.23.1",
  "quick-protobuf",
  "quick-protobuf-codec",
+ "quickcheck",
  "rand 0.8.5",
  "regex",
+ "serde",
  "sha2 0.10.9",
+ "tokio",
  "tracing",
+ "tracing-subscriber",
  "web-time",
 ]
 
@@ -6202,6 +6221,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
  "tonic",
  "tower 0.4.13",
  "tracing",
@@ -6260,11 +6280,14 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "ed448-rust",
+ "futures",
+ "h2",
  "hex 0.4.3",
  "http",
  "hyper",
  "hyper-util",
  "jmt",
+ "lru",
  "num-bigint 0.4.6",
  "parking_lot",
  "prost 0.13.5",
@@ -7175,6 +7198,12 @@ checksum = "61697e0a1c7e512e84a621326239844a24d8207b4669b41bc18b32ea5cbf988b"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "send_wrapper"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f638d531eccd6e23b980caf34876660d38e265409d8e99b397ab71eb3612fad0"
 
 [[package]]
 name = "serde"

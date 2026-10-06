@@ -72,6 +72,7 @@ impl DirectGlobalConsensusPublisher {
                         bitmask: bm,
                         data: d,
                         from: self_id,
+                        direct: false,
                     })
                     .await;
                 Ok(())

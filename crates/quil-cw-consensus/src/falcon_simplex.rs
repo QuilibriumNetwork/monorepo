@@ -26,9 +26,14 @@ use commonware_utils::{ordered::Set, Faults, Participant};
 use rand_core::CryptoRng;
 
 /// Falcon scheme bound to simplex's vote subject — instantiable in `simplex::Engine`.
+///
+/// Shared: Simplex keeps a clone of the scheme in every tracked view (it only
+/// asks it `me()`), and a session that does not finalize tracks every view
+/// since its last finalization. `Generic` shares its committee itself; this
+/// also keeps each clone from copying the signing key and namespace.
 #[derive(Clone, Debug)]
 pub struct SimplexFalconScheme {
-    generic: Generic<SimplexNamespace>,
+    generic: std::sync::Arc<Generic<SimplexNamespace>>,
 }
 
 impl SimplexFalconScheme {
@@ -38,12 +43,12 @@ impl SimplexFalconScheme {
         private_key: FalconPrivateKey,
     ) -> Option<Self> {
         Some(Self {
-            generic: Generic::signer(namespace, participants, private_key)?,
+            generic: std::sync::Arc::new(Generic::signer(namespace, participants, private_key)?),
         })
     }
     pub fn verifier(namespace: &[u8], participants: Set<FalconPublicKey>) -> Self {
         Self {
-            generic: Generic::verifier(namespace, participants),
+            generic: std::sync::Arc::new(Generic::verifier(namespace, participants)),
         }
     }
 
@@ -182,4 +187,28 @@ where
 #[allow(dead_code)]
 fn _instantiate_the_assertion() {
     _assert_simplex_compatible::<commonware_cryptography::sha256::Digest>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_math::algebra::Random;
+    use commonware_utils::{test_rng, TryCollect};
+
+    /// Simplex clones the scheme into every view it tracks; a clone must not
+    /// copy the committee or the signing key.
+    #[test]
+    fn clones_share_the_committee_and_key() {
+        let keys: Vec<_> = (0..4).map(|_| FalconPrivateKey::random(test_rng())).collect();
+        let participants: Set<FalconPublicKey> = keys
+            .iter()
+            .map(commonware_cryptography::Signer::public_key)
+            .try_collect()
+            .unwrap();
+        let scheme = SimplexFalconScheme::signer(b"app", participants, keys[2].clone()).unwrap();
+        let copy = scheme.clone();
+        assert!(std::sync::Arc::ptr_eq(&copy.generic, &scheme.generic));
+        assert_eq!(copy.me(), scheme.me());
+        assert_eq!(copy.participants().len(), 4);
+    }
 }

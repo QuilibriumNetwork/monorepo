@@ -132,6 +132,7 @@ pub struct InMemoryClockStore {
     // Distance / seniority.
     total_distance: Mutex<HashMap<(Vec<u8>, u64, Vec<u8>), BigInt>>,
     seniority_maps: Mutex<HashMap<Vec<u8>, HashMap<String, u64>>>,
+    app_history_discarded: Mutex<Option<u64>>,
 }
 
 impl InMemoryClockStore {
@@ -540,6 +541,20 @@ impl ClockStore for InMemoryClockStore {
             .unwrap()
             .retain(|(f, n), _| f != filter || *n < min_frame || *n > max_frame);
         Ok(())
+    }
+
+    fn discard_app_frame_history(&self, global_frame: u64) -> Result<()> {
+        self.shard_frames.lock().unwrap().clear();
+        self.latest_shard_frame_number.lock().unwrap().clear();
+        self.staged_shard_frames.lock().unwrap().clear();
+        self.app_shard_certified.lock().unwrap().clear();
+        self.total_distance.lock().unwrap().clear();
+        *self.app_history_discarded.lock().unwrap() = Some(global_frame);
+        Ok(())
+    }
+
+    fn app_frame_history_discarded(&self) -> Result<Option<u64>> {
+        Ok(*self.app_history_discarded.lock().unwrap())
     }
 
     fn reset_shard_clock_frames(&self, filter: &[u8]) -> Result<()> {

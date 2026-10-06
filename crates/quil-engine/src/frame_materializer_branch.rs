@@ -23,6 +23,24 @@ pub struct MaterializerBranchLimits {
     pub max_frame_items: usize,
 }
 
+impl MaterializerBranchLimits {
+    /// These limits without read caps, for executing a frame that is already
+    /// final. Reads hold no memory (the overlay keeps only a fixed bitmap of
+    /// touched prefixes) and the in-place fallback performs the same reads
+    /// uncapped, so a cap here only discards the attempt: the split at 837360
+    /// read past 512 MB and fell back after six. Write and metadata caps stay;
+    /// they bound memory.
+    pub fn for_finalized_frame(mut self) -> Self {
+        self.execution.state.overlay.max_read_bytes = u64::MAX;
+        self.execution.state.overlay.max_read_operations = u64::MAX;
+        self
+    }
+}
+
+/// A GLOBAL execution that reads at least this much logs its totals at info.
+const LOGGED_EXECUTION_READ_BYTES: u64 = 64 << 20;
+const LOGGED_EXECUTION_READ_OPERATIONS: u64 = 1_000_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaterializerMetadataUsage {
     pub entries: usize,
@@ -39,6 +57,7 @@ pub struct TentativeFrameResult {
     pub prover_root: [u8; 32],
     pub consumed_bundles: Vec<Vec<u8>>,
     pub checkpoint: GlobalExecutionCheckpoint,
+    pub prover_ops: crate::prover_op_tally::ProverOpTally,
 }
 
 /// No primary-store, notification or writable materializer handles are exposed.
@@ -71,6 +90,25 @@ impl Drop for FrameAttempt {
 impl MaterializerBranch {
     pub(super) fn execution(&self) -> &ExecutionBranch {
         &self.execution
+    }
+
+    /// Log what this branch has read executing up to `frame`, against its
+    /// read caps (`None`: uncapped).
+    pub(crate) fn log_reads(&self, what: &'static str, frame: u64) {
+        let stats = self.execution.overlay().stats();
+        let caps = self.limits.execution.state.overlay;
+        let read_cap_mb = (caps.max_read_bytes != u64::MAX).then_some(caps.max_read_bytes >> 20);
+        let read_cap_operations = (caps.max_read_operations != u64::MAX).then_some(caps.max_read_operations);
+        if stats.read_bytes >= LOGGED_EXECUTION_READ_BYTES
+            || stats.read_operations >= LOGGED_EXECUTION_READ_OPERATIONS
+        {
+            info!(what, frame, read_mb = stats.read_bytes >> 20, read_operations = stats.read_operations,
+                read_cap_mb = ?read_cap_mb, read_cap_operations = ?read_cap_operations,
+                "large GLOBAL execution read");
+        } else {
+            debug!(what, frame, read_bytes = stats.read_bytes, read_operations = stats.read_operations,
+                "GLOBAL execution read");
+        }
     }
 
     fn check_open(&self) -> Result<()> {
@@ -188,6 +226,7 @@ impl MaterializerBranch {
             prover_root: root,
             consumed_bundles: result.finalized_bundles,
             checkpoint,
+            prover_ops: result.prover_ops,
         })
     }
 }
@@ -207,6 +246,11 @@ fn read_cursor(store: &dyn HypergraphStore) -> Result<u64> {
 }
 
 impl FrameMaterializer {
+    /// Another materialization, publication or capture holds the frame lock.
+    pub(crate) fn frame_execution_busy(&self) -> bool {
+        matches!(self.frame_execution.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+    }
+
     /// Capture a complete materializer over one same-store checkpoint. The
     /// frame mutex excludes materialize/frozen-skip; CRDT/engine capture excludes
     /// commits and in-flight engine mutations. Cursor comparison rejects a

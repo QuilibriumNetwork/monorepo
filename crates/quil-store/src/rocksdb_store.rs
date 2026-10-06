@@ -85,6 +85,18 @@ pub struct RocksDb {
     db: quil_forest::CoordinatedDb,
 }
 
+/// Per-instance RocksDB read health. See [`RocksDb::health`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RocksDbHealth {
+    pub level0_files: u64,
+    pub pending_compaction_bytes: u64,
+    pub running_compactions: u64,
+    pub write_stopped: bool,
+    pub delayed_write_rate: u64,
+    pub block_cache: u64,
+    pub block_cache_capacity: u64,
+}
+
 /// Per-instance RocksDB memory accounting (bytes). See [`RocksDb::memory_usage`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RocksDbMemory {
@@ -261,6 +273,22 @@ impl RocksDb {
             block_cache_pinned: prop("rocksdb.block-cache-pinned-usage"),
             memtables: prop("rocksdb.cur-size-all-mem-tables"),
             table_readers: prop("rocksdb.estimate-table-readers-mem"),
+        }
+    }
+
+    /// Compaction and cache state that slows every read when it backs up:
+    /// each level-0 file is searched on every point read, and a block cache
+    /// smaller than the index blocks turns reads into disk seeks.
+    pub fn health(&self) -> RocksDbHealth {
+        let prop = |name: &str| self.db.property_int_value(name).ok().flatten().unwrap_or(0);
+        RocksDbHealth {
+            level0_files: prop("rocksdb.num-files-at-level0"),
+            pending_compaction_bytes: prop("rocksdb.estimate-pending-compaction-bytes"),
+            running_compactions: prop("rocksdb.num-running-compactions"),
+            write_stopped: prop("rocksdb.is-write-stopped") != 0,
+            delayed_write_rate: prop("rocksdb.actual-delayed-write-rate"),
+            block_cache: prop("rocksdb.block-cache-usage"),
+            block_cache_capacity: prop("rocksdb.block-cache-capacity"),
         }
     }
 

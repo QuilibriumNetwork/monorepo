@@ -77,12 +77,57 @@ macro_rules! byte_array_newtype {
     };
 }
 
-/// Falcon-512 signature (666 bytes).
+/// Falcon-512 signature (666 bytes), encoded as the bare 666 bytes.
+///
+/// Held on the heap and shared by clones. Simplex reserves vote slots by
+/// quorum and committee size for every tracked view, and copies each vote
+/// into several of them; with the 666 bytes inline every slot, used or not,
+/// cost the full signature, and every copy duplicated it.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 #[repr(transparent)]
-pub struct FalconSignature([u8; FALCON_SIGNATURE_LEN]);
+pub struct FalconSignature(Arc<[u8; FALCON_SIGNATURE_LEN]>);
 
-byte_array_newtype!(FalconSignature, FALCON_SIGNATURE_LEN);
+impl FalconSignature {
+    fn from_array(bytes: [u8; FALCON_SIGNATURE_LEN]) -> Self {
+        Self(Arc::new(bytes))
+    }
+}
+
+impl Write for FalconSignature {
+    fn write(&self, buf: &mut impl BufMut) {
+        self.0.write(buf);
+    }
+}
+impl Read for FalconSignature {
+    type Cfg = ();
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+        Ok(Self::from_array(<[u8; FALCON_SIGNATURE_LEN]>::read(buf)?))
+    }
+}
+impl FixedSize for FalconSignature {
+    const SIZE: usize = FALCON_SIGNATURE_LEN;
+}
+impl Span for FalconSignature {}
+impl Array for FalconSignature {}
+impl AsRef<[u8]> for FalconSignature {
+    fn as_ref(&self) -> &[u8] {
+        &self.0[..]
+    }
+}
+impl Deref for FalconSignature {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0[..]
+    }
+}
+impl core::fmt::Display for FalconSignature {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for b in self.0.iter() {
+            write!(f, "{:02x}", b)?;
+        }
+        Ok(())
+    }
+}
 impl commonware_cryptography::Signature for FalconSignature {}
 
 /// Falcon-512 public (verifying) key (897 bytes).
@@ -107,7 +152,7 @@ impl commonware_cryptography::Verifier for FalconPublicKey {
     fn verify(&self, namespace: &[u8], msg: &[u8], sig: &Self::Signature) -> bool {
         // Domain separation via the namespace prefix; empty FN-DSA context.
         let payload = union_unique(namespace, msg);
-        falcon_verify(&self.0, &sig.0, &payload, &[])
+        falcon_verify(&self.0, &sig.0[..], &payload, &[])
     }
 }
 
@@ -222,7 +267,7 @@ impl commonware_cryptography::Signer for FalconPrivateKey {
         let arr: [u8; FALCON_SIGNATURE_LEN] = sig
             .try_into()
             .expect("fn-dsa signature is FALCON_SIGNATURE_LEN");
-        let fsig = FalconSignature(arr);
+        let fsig = FalconSignature::from_array(arr);
         cache.map.insert(payload.clone(), fsig.clone());
         cache.order.push_back(payload);
         if cache.order.len() > SIG_CACHE_CAP {
@@ -275,6 +320,27 @@ mod tests {
         let c = sk.sign(ns, b"view-8-nullify");
         assert_ne!(a, c);
         assert!(sk.public_key().verify(ns, b"view-8-nullify", &c));
+    }
+
+    /// The signature encodes as exactly its 666 bytes, as it did when it was
+    /// held inline, and a vote slot no longer carries those bytes itself.
+    #[test]
+    fn a_signature_encodes_as_its_bytes_and_is_shared_by_clones() {
+        use commonware_codec::{DecodeExt, Encode};
+        let sk = FalconPrivateKey::random(test_rng());
+        let sig = sk.sign(b"d", b"m");
+        let encoded = sig.encode();
+        assert_eq!(encoded.len(), FALCON_SIGNATURE_LEN);
+        assert_eq!(&encoded[..], sig.as_ref());
+        let decoded = FalconSignature::decode(encoded).unwrap();
+        assert_eq!(decoded, sig);
+        let copy = sig.clone();
+        assert!(Arc::ptr_eq(&copy.0, &sig.0), "clones share one copy of the bytes");
+        assert!(std::mem::size_of::<FalconSignature>() <= 8);
+        assert!(
+            std::mem::size_of::<commonware_codec::types::lazy::Lazy<FalconSignature>>() <= 64,
+            "a lazily decoded signature (one per vote slot) stays small",
+        );
     }
 
     #[test]

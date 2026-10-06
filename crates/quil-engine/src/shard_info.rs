@@ -32,9 +32,6 @@ use crate::rewards::pomw_basis;
 /// Per-shard reward units (8 billion sub-units per QUIL).
 const QUIL_TOKEN_UNITS: u64 = 8_000_000_000;
 
-/// Ring size constant: each ring holds up to 8 provers.
-const MAX_RING_SIZE: u64 = 8;
-
 // ---------------------------------------------------------------------------
 // ShardEntry — internal intermediate representation
 // ---------------------------------------------------------------------------
@@ -202,16 +199,8 @@ pub fn isqrt_big(n: &BigInt) -> BigInt {
 
 /// Compute the per-prover per-frame reward estimate for a shard.
 ///
-/// Formula (matching `proof_of_meaningful_work.go` Materialize):
-/// ```text
-/// factor = shard_size * basis / world_bytes
-/// divisor = 2^(ring + 1)
-/// factor /= divisor
-/// factor /= sqrt(data_shards)   [when data_shards > 1]
-/// factor /= 8                   [constant max ring size]
-/// ```
-///
-/// Returns zero for degenerate inputs.
+/// Uses the canonical issuance arithmetic, including fractional square roots
+/// and final truncation. Membership/ring selection remains the caller's job.
 pub fn compute_shard_reward(
     basis: &BigInt,
     shard_size: &BigInt,
@@ -219,35 +208,9 @@ pub fn compute_shard_reward(
     ring: u8,
     data_shards: u64,
 ) -> BigInt {
-    if basis.is_zero() || world_bytes.is_zero() || data_shards == 0 {
-        return BigInt::zero();
-    }
-
-    // factor = shard_size * basis / world_bytes
-    let mut factor = shard_size * basis;
-    factor /= world_bytes;
-
-    // divisor = 2^(ring+1)
-    let ring_exp = (ring as u32) + 1;
-    if ring_exp >= 64 {
-        // Would overflow u64; reward is negligible.
-        return BigInt::zero();
-    }
-    let divisor: u64 = 1u64 << ring_exp;
-    factor /= BigInt::from(divisor);
-
-    // sqrt(data_shards) — matches sqrt(shardCount) in reward module.
-    if data_shards > 1 {
-        let sqrt_val = isqrt(data_shards);
-        if sqrt_val > 0 {
-            factor /= BigInt::from(sqrt_val);
-        }
-    }
-
-    // Divide by constant max ring size (partially filled rings still split by 8).
-    factor /= BigInt::from(MAX_RING_SIZE);
-
-    factor
+    quil_execution::pricing::allocation_prover_reward(
+        basis, shard_size, world_bytes, ring, data_shards,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +224,8 @@ struct RingCandidate {
     join_frame: u64,
     seniority: u64,
     address: Vec<u8>,
+    /// The ring the allocation records.
+    ring: u8,
 }
 
 /// Build shard entries from raw shard data and a size-fetching function.
@@ -382,6 +347,7 @@ where
                             join_frame: jf,
                             seniority: pr.seniority,
                             address: pr.address.clone(),
+                            ring: alloc.ring,
                         });
                     }
                     break;
@@ -411,12 +377,21 @@ where
                 && candidate_addrs.iter().any(|a| a.as_slice() == self_address);
             let real_is_alloc = is_alloc || in_candidates;
 
-            let (ring, on_ring) = resolve_prover_ring(
+            let (mut ring, mut on_ring) = resolve_prover_ring(
                 candidates.len(),
                 real_is_alloc,
                 self_address,
                 &candidate_addrs,
             );
+            // Under the seniority ring rule a member's ring is the one its
+            // allocation records (fixed when its committee formed), not a rank
+            // recomputed here.
+            if quil_execution::global_intrinsic::prover_rings::governs(frame_number) {
+                if let Some(own) = candidates.iter().find(|c| c.address.as_slice() == self_address) {
+                    ring = own.ring;
+                    on_ring = candidates.iter().filter(|c| c.ring == own.ring).count();
+                }
+            }
 
             entries.push(ShardEntry {
                 filter: bp,
@@ -525,12 +500,18 @@ where
 
 /// `get_sizes` closure for `get_shard_info` that reads sizes from the
 /// local hypergraph CRDT. Falls back to treating the parent shard as
-/// the only sub-shard when the layout is empty.
+/// the only sub-shard when the layout is empty. An empty shard's committed
+/// deliveries come from `sizes`: counting them for every shard took the
+/// archive poller 8-26 s per frame (2026-10-04).
 pub fn local_app_shard_get_sizes(
     crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
     shards_store: std::sync::Arc<dyn ShardsStore>,
+    sizes: std::sync::Arc<CommittedShardSizes>,
 ) -> impl Fn(&[u8], &ShardInfo) -> Result<Vec<ShardSizeEntry>> + Send + Sync {
     move |shard_key: &[u8], shard_info: &ShardInfo| -> Result<Vec<ShardSizeEntry>> {
+        let committed = crdt
+            .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+            .unwrap_or(0);
         let mut sub_shards = shards_store.get_app_shards(shard_key, &[])?;
         if sub_shards.is_empty() {
             sub_shards = vec![shard_info.clone()];
@@ -541,7 +522,7 @@ pub fn local_app_shard_get_sizes(
             if let Some(meta) = crate::app_shard_metadata::get_app_shard_metadata(&crdt, sub) {
                 out.push(ShardSizeEntry {
                     prefix: sub.prefix.clone(),
-                    size: reported_shard_size(&crdt, shard_key, &sub.prefix, meta.size),
+                    size: sizes.size(&crdt, shard_key, &sub.prefix, meta.size, committed),
                     data_shards: meta.data_shards,
                     materialized_frame: 0,
                     latest_frame: 0,
@@ -575,6 +556,272 @@ pub fn reported_shard_size(
     match committed_deliveries(crdt, shard_key, prefix).filter(|n| *n > 0) {
         Some(waiting) => waiting.saturating_mul(NOMINAL_DELIVERY_BYTES).to_be_bytes().to_vec(),
         None => size,
+    }
+}
+
+/// At most one background recount of a shard's size per this long.
+pub const RECOUNT_SPACING: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A kept size is recounted after this long even if the committed frame has
+/// not moved: a regular node's GLOBAL cursor need not advance.
+pub const MAX_KEPT_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// [`reported_shard_size`], kept per shard. An empty shard's size counts
+/// committed deliveries, GLOBAL records only a GLOBAL commit writes, and
+/// counting them reads every block the shard owns (up to 480 at width 9):
+/// about 650 ms a shard on a non-avx512 archive, ~30 s for the 48 empty
+/// shards after the 837360 split. Counted by the caller under one lock once
+/// per committed frame, that stalled a `GetAppShards` for as long and queued
+/// every other one behind it for up to 140 s (2026-10-03).
+///
+/// A shard is counted inline the first time it is asked for. After that a
+/// caller gets the last count at once and never waits on a count: once the
+/// committed GLOBAL frame moves, one background thread recounts it, at most
+/// every [`RECOUNT_SPACING`], and at least every [`MAX_KEPT_AGE`]. Reported
+/// sizes lag deliveries by up to that. One instance serves every reader in a
+/// node, so each shard is counted once for all of them; a caller that finds a
+/// shard's first count running waits for it instead of counting again (a
+/// restart's concurrent first callers each counted every shard).
+pub struct CommittedShardSizes {
+    kept: std::sync::Arc<Kept>,
+    recounts: std::sync::OnceLock<std::sync::mpsc::Sender<Recount>>,
+    spacing: std::time::Duration,
+}
+
+#[derive(Default)]
+struct Kept {
+    sizes: std::sync::Mutex<std::collections::HashMap<Vec<u8>, KeptSize>>,
+    /// Signalled when a first count lands or is abandoned.
+    first_counted: std::sync::Condvar,
+}
+
+impl Kept {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<Vec<u8>, KeptSize>> {
+        self.sizes.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct KeptSize {
+    committed: u64,
+    /// `None` while the shard's first count runs.
+    size: Option<Vec<u8>>,
+    counted: std::time::Instant,
+    recounting: bool,
+}
+
+struct Recount {
+    key: Vec<u8>,
+    committed: u64,
+    count: Box<dyn FnOnce() -> Vec<u8> + Send>,
+}
+
+impl Default for CommittedShardSizes {
+    fn default() -> Self {
+        Self::with_spacing(RECOUNT_SPACING)
+    }
+}
+
+impl CommittedShardSizes {
+    fn with_spacing(spacing: std::time::Duration) -> Self {
+        Self { kept: Default::default(), recounts: std::sync::OnceLock::new(), spacing }
+    }
+
+    /// The size to report for `(shard_key, prefix)` measured at `size`, at
+    /// the committed GLOBAL frame `committed`.
+    pub fn size(
+        &self,
+        crdt: &std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+        shard_key: &[u8],
+        prefix: &[u32],
+        size: Vec<u8>,
+        committed: u64,
+    ) -> Vec<u8> {
+        if size.iter().any(|byte| *byte != 0) {
+            return size;
+        }
+        let mut key = shard_key.to_vec();
+        key.extend(prefix.iter().flat_map(|part| part.to_be_bytes()));
+        let (crdt, shard_key, prefix) = (crdt.clone(), shard_key.to_vec(), prefix.to_vec());
+        self.kept_or(committed, key, move || reported_shard_size(&crdt, &shard_key, &prefix, size))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<Vec<u8>, KeptSize>> {
+        self.kept.lock()
+    }
+
+    fn kept_or(
+        &self,
+        committed: u64,
+        key: Vec<u8>,
+        count: impl FnOnce() -> Vec<u8> + Send + 'static,
+    ) -> Vec<u8> {
+        use quil_execution::step_timing::section;
+        let lock_wait = section("size: lock wait");
+        let mut kept = self.lock();
+        drop(lock_wait);
+        let first_count_wait = section("size: first count wait");
+        loop {
+            let Some(entry) = kept.get_mut(&key) else { break };
+            let Some(size) = entry.size.clone() else {
+                kept = self.kept.first_counted.wait(kept).unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
+            };
+            drop(first_count_wait);
+            let age = entry.counted.elapsed();
+            let due = (entry.committed != committed && age >= self.spacing) || age >= MAX_KEPT_AGE;
+            if due && !entry.recounting {
+                entry.recounting = true;
+                drop(kept);
+                self.recount(Recount { key, committed, count: Box::new(count) });
+            }
+            return size;
+        }
+        drop(first_count_wait);
+        kept.insert(
+            key.clone(),
+            KeptSize { committed, size: None, counted: std::time::Instant::now(), recounting: false },
+        );
+        drop(kept);
+        let counted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _timed = section("size: committed deliveries");
+            count()
+        }));
+        let mut kept = self.lock();
+        let size = match counted {
+            Ok(size) => {
+                if let Some(entry) = kept.get_mut(&key) {
+                    entry.size = Some(size.clone());
+                    entry.counted = std::time::Instant::now();
+                }
+                Ok(size)
+            }
+            // A waiter takes the count over.
+            Err(panic) => {
+                kept.remove(&key);
+                Err(panic)
+            }
+        };
+        drop(kept);
+        self.kept.first_counted.notify_all();
+        size.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    fn recount(&self, job: Recount) {
+        let key = job.key.clone();
+        let sent = self
+            .recounts
+            .get_or_init(|| {
+                let (sender, jobs) = std::sync::mpsc::channel::<Recount>();
+                let kept = self.kept.clone();
+                let spawned = std::thread::Builder::new().name("shard-size-recount".into()).spawn(move || {
+                    for job in jobs {
+                        let counted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.count)).ok();
+                        let mut kept = kept.lock();
+                        if let Some(entry) = kept.get_mut(&job.key) {
+                            entry.recounting = false;
+                            if let Some(size) = counted {
+                                entry.size = Some(size);
+                                entry.committed = job.committed;
+                                entry.counted = std::time::Instant::now();
+                            }
+                        }
+                    }
+                });
+                if let Err(error) = spawned {
+                    tracing::warn!(%error, "shard size recount thread not started; sizes stay as first counted");
+                }
+                sender
+            })
+            .send(job)
+            .is_ok();
+        if !sent {
+            if let Some(entry) = self.lock().get_mut(&key) {
+                entry.recounting = false;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod committed_shard_sizes_tests {
+    use super::CommittedShardSizes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn counter(counted: &Arc<AtomicUsize>, n: u8) -> impl FnOnce() -> Vec<u8> + Send + 'static {
+        let counted = counted.clone();
+        move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            vec![n]
+        }
+    }
+
+    #[test]
+    fn a_moved_frame_serves_the_last_count_while_one_recount_runs_behind() {
+        let sizes = CommittedShardSizes::with_spacing(std::time::Duration::ZERO);
+        let counted = Arc::new(AtomicUsize::new(0));
+        assert_eq!(sizes.kept_or(7, vec![1], counter(&counted, 1)), vec![1], "first count is inline");
+        assert_eq!(sizes.kept_or(7, vec![1], counter(&counted, 2)), vec![1], "kept within the frame");
+        assert_eq!(sizes.kept_or(7, vec![2], counter(&counted, 3)), vec![3], "per shard");
+        assert_eq!(counted.load(Ordering::SeqCst), 2);
+        assert_eq!(sizes.kept_or(8, vec![1], counter(&counted, 4)), vec![1], "the last count, at once");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sizes.kept_or(8, vec![1], counter(&counted, 5)) != vec![4] {
+            assert!(std::time::Instant::now() < deadline, "the recount never landed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(counted.load(Ordering::SeqCst), 3, "one recount; callers meanwhile did not count");
+    }
+
+    #[test]
+    fn concurrent_first_callers_share_one_count() {
+        let sizes = Arc::new(CommittedShardSizes::default());
+        let counted = Arc::new(AtomicUsize::new(0));
+        let callers: Vec<_> = (0..8)
+            .map(|_| {
+                let (sizes, counted) = (sizes.clone(), counted.clone());
+                std::thread::spawn(move || {
+                    sizes.kept_or(7, vec![1], move || {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        vec![9]
+                    })
+                })
+            })
+            .collect();
+        for caller in callers {
+            assert_eq!(caller.join().unwrap(), vec![9]);
+        }
+        assert_eq!(counted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_abandoned_first_count_is_taken_over() {
+        let sizes = Arc::new(CommittedShardSizes::default());
+        let first = {
+            let sizes = sizes.clone();
+            std::thread::spawn(move || {
+                sizes.kept_or(7, vec![1], || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    panic!("count failed")
+                })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let counted = Arc::new(AtomicUsize::new(0));
+        assert_eq!(sizes.kept_or(7, vec![1], counter(&counted, 3)), vec![3], "the waiter counts");
+        assert!(first.join().is_err());
+        assert_eq!(counted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn recounts_are_spaced() {
+        let sizes = CommittedShardSizes::with_spacing(std::time::Duration::from_secs(3600));
+        let counted = Arc::new(AtomicUsize::new(0));
+        assert_eq!(sizes.kept_or(7, vec![1], counter(&counted, 1)), vec![1]);
+        assert_eq!(sizes.kept_or(8, vec![1], counter(&counted, 2)), vec![1]);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(counted.load(Ordering::SeqCst), 1, "no recount inside the spacing");
     }
 }
 
@@ -1220,6 +1467,7 @@ mod tests {
         let get_sizes = local_app_shard_get_sizes(
             crdt.clone(),
             shards_store.clone() as Arc<dyn ShardsStoreTrait>,
+            Arc::new(CommittedShardSizes::default()),
         );
 
         // Mirror what `LocalShardInfoProvider` builds: we are the
@@ -1332,6 +1580,7 @@ mod tests {
         let get_sizes = local_app_shard_get_sizes(
             crdt.clone(),
             shards_store.clone() as Arc<dyn ShardsStoreTrait>,
+            Arc::new(CommittedShardSizes::default()),
         );
         let allocated_filters: HashSet<Vec<u8>> = HashSet::new();
 
@@ -1369,8 +1618,8 @@ mod tests {
 
     /// PARITY: the TUI per-prover estimate (`compute_shard_reward`) must equal
     /// the actually-minted per-prover share (`OptRewardIssuance::calculate / 8`)
-    /// for the same inputs. These are two independent implementations of the
-    /// PoMW formula in two modules; this guards them against drift.
+    /// for the same inputs. The two API paths must supply the same inputs and use the canonical
+    /// arithmetic, including non-square counts and issuance ring clamping.
     #[test]
     fn estimate_matches_minted_per_prover_share() {
         use crate::rewards::{pomw_basis, OptRewardIssuance};
@@ -1381,8 +1630,8 @@ mod tests {
         let units = 1_000_000u64;
         let size = 1u64 << 28;
         let basis = pomw_basis(difficulty, world, units);
-        for ring in [0u8, 1, 2] {
-            for shards in [1u64, 4, 16] {
+        for ring in [0u8, 1, 2, 62, 63, 255] {
+            for shards in [1u64, 2, 3, 4, 5, 7, 16, u64::MAX] {
                 let est = compute_shard_reward(
                     &basis,
                     &BigInt::from(size),

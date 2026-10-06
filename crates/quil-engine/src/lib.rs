@@ -38,6 +38,9 @@ pub mod halt_state;
 pub mod message_collector;
 pub mod message_router;
 pub mod leader_provider;
+pub mod prover_op_tally;
+pub mod historical_committee;
+pub mod resolver_traffic;
 pub mod metrics;
 pub mod remote_worker;
 pub mod rewards;
@@ -191,6 +194,51 @@ pub mod bitmasks {
     /// Set in the first payload byte of a transmission that carries a nonce.
     const SHARD_CW_NONCE_FLAG: u8 = 0x80;
 
+    /// First nonce byte of a transmission addressed to one committee member.
+    /// Its top bit is never set in a broadcast nonce: ours clear it, and the
+    /// time-based nonces of earlier releases (nanoseconds since 1970, XOR the
+    /// process id shifted 32 bits) cannot set it before the year 2262.
+    const SHARD_CW_ADDRESSED: u8 = 0xAD;
+
+    /// Length of the addressee tag in an addressed transmission's nonce.
+    pub const SHARD_CW_ADDRESSEE_LEN: usize = 4;
+
+    /// The tag naming committee member `key` (its raw Falcon public key) as
+    /// the one addressee of a transmission.
+    pub fn shard_cw_addressee_tag(key: &[u8]) -> [u8; SHARD_CW_ADDRESSEE_LEN] {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::new()
+            .chain_update(b"quilibrium shard cw addressee")
+            .chain_update(key)
+            .finalize();
+        let mut tag = [0u8; SHARD_CW_ADDRESSEE_LEN];
+        tag.copy_from_slice(&digest[..SHARD_CW_ADDRESSEE_LEN]);
+        tag
+    }
+
+    /// A fresh nonce with its top bit clear (see [`SHARD_CW_ADDRESSED`]).
+    fn shard_cw_nonce() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        // Distinct across restarts too: a replayed vote must not collide with
+        // the copy its previous process published less than five minutes ago.
+        let base = *BASE.get_or_init(|| {
+            let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64);
+            time ^ (u64::from(std::process::id()) << 32)
+        });
+        base.wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed)) & !(1u64 << 63)
+    }
+
+    fn shard_cw_frame(channel: u64, nonce: [u8; 8], cw_bytes: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(9 + cw_bytes.len());
+        v.push(SHARD_CW_NONCE_FLAG | (channel as u8 & !SHARD_CW_NONCE_FLAG));
+        v.extend_from_slice(&nonce);
+        v.extend_from_slice(cw_bytes);
+        v
+    }
+
     /// Frame a CW message for gossip:
     /// `[0x80 | channel] || nonce (8 bytes) || cw_bytes`.
     ///
@@ -206,22 +254,32 @@ pub mod bitmasks {
     /// Receivers strip the nonce; the consensus layer sees identical votes and
     /// ignores the repeats.
     pub fn shard_cw_frame_payload(channel: u64, cw_bytes: &[u8]) -> Vec<u8> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        // Distinct across restarts too: a replayed vote must not collide with
-        // the copy its previous process published less than five minutes ago.
-        let base = *BASE.get_or_init(|| {
-            let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as u64);
-            time ^ (u64::from(std::process::id()) << 32)
-        });
-        let nonce = base.wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed));
-        let mut v = Vec::with_capacity(9 + cw_bytes.len());
-        v.push(SHARD_CW_NONCE_FLAG | (channel as u8 & !SHARD_CW_NONCE_FLAG));
-        v.extend_from_slice(&nonce.to_be_bytes());
-        v.extend_from_slice(cw_bytes);
-        v
+        shard_cw_frame(channel, shard_cw_nonce().to_be_bytes(), cw_bytes)
+    }
+
+    /// Frame a CW message for `recipients` (raw committee keys). A message for
+    /// exactly one member names it in the nonce:
+    /// `0xAD || addressee tag (4 bytes) || counter (3 bytes)`.
+    ///
+    /// Resolver requests and responses are each meant for one member, but a
+    /// transmission the topic carries reaches every member. Commonware answers
+    /// any request it receives, so one request drew an answer from every member
+    /// holding the certificate, each answer went to every member, and members
+    /// could match another member's answer to their own request by its request
+    /// id (ids count from zero in every engine). Receivers drop a transmission
+    /// that names another member before it reaches consensus. Earlier releases
+    /// read the tag as an ordinary nonce and strip it.
+    pub fn shard_cw_frame_for(channel: u64, cw_bytes: &[u8], recipients: &[Vec<u8>]) -> Vec<u8> {
+        let [recipient] = recipients else {
+            return shard_cw_frame_payload(channel, cw_bytes);
+        };
+        let tag = shard_cw_addressee_tag(recipient);
+        let counter = shard_cw_nonce().to_be_bytes();
+        let mut nonce = [0u8; 8];
+        nonce[0] = SHARD_CW_ADDRESSED;
+        nonce[1..5].copy_from_slice(&tag);
+        nonce[5..].copy_from_slice(&counter[5..]);
+        shard_cw_frame(channel, nonce, cw_bytes)
     }
 
     /// Inverse of [`shard_cw_frame_payload`]: `(channel, cw_bytes)`, or `None`
@@ -233,6 +291,46 @@ pub mod bitmasks {
             return Some((u64::from(*first), rest));
         }
         Some((u64::from(first & !SHARD_CW_NONCE_FLAG), rest.get(8..)?))
+    }
+
+    /// The member a transmission is addressed to (see [`shard_cw_frame_for`]),
+    /// or `None` for a broadcast, an earlier release's framing, or a payload
+    /// too short to carry a nonce.
+    pub fn shard_cw_addressee(payload: &[u8]) -> Option<[u8; SHARD_CW_ADDRESSEE_LEN]> {
+        let (first, rest) = payload.split_first()?;
+        if first & SHARD_CW_NONCE_FLAG == 0 || rest.len() < 8 || rest[0] != SHARD_CW_ADDRESSED {
+            return None;
+        }
+        rest[1..1 + SHARD_CW_ADDRESSEE_LEN].try_into().ok()
+    }
+
+    /// Split an inbound CW transmission for the member tagged `local`, or
+    /// `None` when it is malformed or addressed to another member (counted).
+    /// Resolver traffic that is kept is counted by shard.
+    pub fn shard_cw_admit<'a>(
+        filter: &[u8],
+        payload: &'a [u8],
+        local: &[u8; SHARD_CW_ADDRESSEE_LEN],
+    ) -> Option<(u64, &'a [u8])> {
+        use crate::resolver_traffic::{Addressed, ResolverTraffic};
+        let (channel, cw_bytes) = shard_cw_split_payload(payload)?;
+        let addressee = shard_cw_addressee(payload);
+        let resolver = channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL;
+        match addressee {
+            Some(tag) if &tag != local => {
+                if resolver {
+                    ResolverTraffic::process().note_received(filter, cw_bytes, Addressed::Elsewhere);
+                }
+                None
+            }
+            addressee => {
+                if resolver {
+                    let addressed = if addressee.is_some() { Addressed::Here } else { Addressed::Untagged };
+                    ResolverTraffic::process().note_received(filter, cw_bytes, addressed);
+                }
+                Some((channel, cw_bytes))
+            }
+        }
     }
 
     #[cfg(test)]
@@ -278,6 +376,41 @@ pub mod bitmasks {
             assert_eq!(shard_cw_split_payload(&[3, 9, 9]), Some((3, [9u8, 9].as_slice())));
             assert_eq!(shard_cw_split_payload(&first[..5]), None);
             assert_eq!(shard_cw_split_payload(&[]), None);
+        }
+
+        /// A message for one member names it; the member keeps it, the others
+        /// drop it, and an earlier release (which only knows the nonce)
+        /// still reads the channel and the message.
+        #[test]
+        fn an_addressed_transmission_reaches_only_its_member() {
+            let (alice, bob) = (vec![1u8; 897], vec![2u8; 897]);
+            let (alice_tag, bob_tag) = (shard_cw_addressee_tag(&alice), shard_cw_addressee_tag(&bob));
+            assert_ne!(alice_tag, bob_tag);
+            let filter = [7u8; 32];
+            let request = b"resolver request bytes";
+            let framed = shard_cw_frame_for(2, request, std::slice::from_ref(&alice));
+            assert_eq!(shard_cw_addressee(&framed), Some(alice_tag));
+            assert_eq!(shard_cw_split_payload(&framed), Some((2, request.as_slice())));
+            assert_eq!(shard_cw_admit(&filter, &framed, &alice_tag), Some((2, request.as_slice())));
+            assert_eq!(shard_cw_admit(&filter, &framed, &bob_tag), None);
+            assert_ne!(framed, shard_cw_frame_for(2, request, std::slice::from_ref(&alice)), "still distinct per transmission");
+
+            // Broadcasts, several recipients and earlier framings name nobody.
+            for framed in [
+                shard_cw_frame_payload(2, request),
+                shard_cw_frame_for(2, request, &[]),
+                shard_cw_frame_for(2, request, &[alice.clone(), bob.clone()]),
+            ] {
+                assert_eq!(shard_cw_addressee(&framed), None);
+                assert_eq!(framed[1] & 0x80, 0, "a broadcast nonce never looks addressed");
+                assert_eq!(shard_cw_admit(&filter, &framed, &bob_tag), Some((2, request.as_slice())));
+            }
+            let mut legacy = vec![0x82u8];
+            legacy.extend_from_slice(&(1_780_000_000_000_000_000u64 ^ (4_194_303u64 << 32)).to_be_bytes());
+            legacy.extend_from_slice(request);
+            assert_eq!(shard_cw_addressee(&legacy), None);
+            assert_eq!(shard_cw_admit(&filter, &legacy, &bob_tag), Some((2, request.as_slice())));
+            assert_eq!(shard_cw_addressee(&[0x82, 0xAD, 1, 2]), None, "truncated");
         }
 
         /// A wallet addresses an application, not a shard. Every sub-shard of a

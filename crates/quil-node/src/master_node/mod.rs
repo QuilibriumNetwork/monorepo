@@ -17,6 +17,9 @@ pub(crate) mod runtime_state;
 pub(crate) mod storage;
 pub(crate) mod remote_reads;
 pub(crate) mod worker_manager;
+pub(crate) mod direct_delivery;
+pub(crate) mod reward_proofs;
+pub(crate) mod historical_committees;
 
 pub(crate) async fn start(
     mut sup: Supervisor<anyhow::Error>,
@@ -114,6 +117,10 @@ pub(crate) async fn start(
         proof_worker.as_ref(),
     )?;
     let inclusion_prover = engines.inclusion_prover.clone();
+    // Rebuilds legacy app committees from authenticated GLOBAL state; built by
+    // the archive sync (which holds the frame verifier), used by every engine.
+    let historical_committees: Arc<std::sync::OnceLock<Arc<historical_committees::HistoricalCommittees>>> =
+        Default::default();
     let crdt = engines.crdt.clone();
     let exec_manager = engines.exec_manager.clone();
     engines::bootstrap_genesis(network, config, &storage, &engines, &bls_pubkey)?;
@@ -260,6 +267,22 @@ pub(crate) async fn start(
     if let Ok(frame) = clock_store.get_latest_global_frame() {
         if let Some(h) = frame.header.as_ref() {
             current_frame.observe(h.frame_number);
+            // Committee-handoff flag day: a master starting past activation
+            // discards its legacy app frame chains before any worker, ingest
+            // or mirror runs (the running paths discard at the crossing).
+            if let Some(policy) = quil_types::consensus::committee_handoff_policy()
+                .filter(|p| p.legacy_history == quil_types::consensus::LegacyHistory::Discard)
+            {
+                if h.frame_number >= policy.activation_frame
+                    && matches!(quil_types::store::ClockStore::app_frame_history_discarded(clock_store.as_ref()), Ok(None))
+                {
+                    match quil_types::store::ClockStore::discard_app_frame_history(clock_store.as_ref(), h.frame_number) {
+                        Ok(()) => info!(global_frame = h.frame_number,
+                            "committee-handoff flag day: discarded legacy app frame history at startup"),
+                        Err(error) => warn!(%error, "legacy app frame history could not be discarded at startup"),
+                    }
+                }
+            }
         }
     }
     // PeerInfo cache populated by the GLOBAL_PEER_INFO recv path.
@@ -480,17 +503,24 @@ pub(crate) async fn start(
     // wedging `any_halted()` true and gating every leave/swap network-wide. The
     // inventory enumerates only the live grid (`range_app_shards`) with real sizes, so a
     // zero-data husk is skipped while a data-bearing shard nobody has joined still halts.
+    // One kept count of each shard's size for every reader in this node:
+    // counting an empty shard's committed deliveries reads every block it
+    // owns, and the coverage check, the poller, the merge trigger and the
+    // shard RPCs each counted all of them per frame.
+    let committed_shard_sizes = std::sync::Arc::new(quil_engine::shard_info::CommittedShardSizes::default());
     {
         let crdt_inv = crdt.clone();
         let shards_inv = shards_store.clone();
         let reg_inv = prover_registry.clone()
             as std::sync::Arc<dyn quil_types::consensus::ProverRegistry>;
+        let sizes_inv = committed_shard_sizes.clone();
         coverage_monitor.set_shard_inventory_provider(std::sync::Arc::new(move |frame: u64| {
             quil_engine::coverage::build_shard_inventory(
                 crdt_inv.clone(),
                 shards_inv.clone(),
                 reg_inv.as_ref(),
                 frame,
+                &sizes_inv,
             )
         }));
     }
@@ -524,6 +554,8 @@ pub(crate) async fn start(
     let worker_manager: Arc<dyn quil_engine::worker::WorkerManager> = worker_manager::init(
         &mut sup,
         worker_manager::WorkerManagerArgs {
+            historical_committees: historical_committees.clone(),
+            peer_info_cache: peer_info_cache.clone(),
             config: config.clone(),
             archive_mode,
             p2p_handle: p2p_handle.clone(),
@@ -1138,6 +1170,9 @@ pub(crate) async fn start(
     };
 
     archive_sync::spawn_all(&mut sup, archive_sync::ArchiveSyncArgs {
+        historical_committees: historical_committees.clone(),
+        inclusion_prover: inclusion_prover.clone(),
+        committed_shard_sizes: committed_shard_sizes.clone(),
         mtls_seed,
         network,
         genesis_seed: config.engine.genesis_seed.clone(),
@@ -1305,6 +1340,8 @@ pub(crate) async fn start(
     };
 
     message_loop::spawn(&mut sup, message_loop::MessageLoopArgs {
+        remote_workers: remote_worker_manager_for_halt.clone(),
+        local_cw_tag: quil_engine::bitmasks::shard_cw_addressee_tag(&bls_pubkey),
         clock_store: clock_store.clone(),
         exec_manager: exec_manager.clone(),
         crdt: crdt.clone(),
@@ -1355,6 +1392,9 @@ pub(crate) async fn start(
     // 7. gRPC service
     // ---------------------------------------------------------------
     grpc::spawn_all(&mut sup, grpc::GrpcArgs {
+        historical_committees: historical_committees.clone(),
+        halt_state: halt_state.clone(),
+        committed_shard_sizes: committed_shard_sizes.clone(),
         worker_app_states: worker_app_states.clone(),
         shard_engines: shard_engines.clone(),
         remote_fee_workers: remote_worker_manager_for_halt.clone(),

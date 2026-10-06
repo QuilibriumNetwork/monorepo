@@ -190,7 +190,7 @@ impl SnapshotManager {
         frame_number: u64,
     ) -> quil_types::error::Result<PreparedSnapshotPublication<'_>> {
         use quil_types::error::QuilError;
-        let mut inner = self.inner.try_write().map_err(|_| {
+        let mut inner = quil_types::lock_patience::Patience::new().write(&self.inner).ok_or_else(|| {
             QuilError::ExecutionUnavailable("snapshot publication is busy or poisoned".into())
         })?;
         if inner.closed {

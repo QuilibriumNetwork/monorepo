@@ -843,7 +843,7 @@ fn scan_of(assignments: &[(&[u8], &[FalconPrivateKey])]) -> crate::prover_regist
 }
 
 fn policy() -> quil_types::consensus::CommitteeHandoffPolicy {
-    quil_types::consensus::CommitteeHandoffPolicy { activation_frame: 2, chain_id: [0x11; 32] }
+    quil_types::consensus::CommitteeHandoffPolicy { activation_frame: 2, chain_id: [0x11; 32], legacy_history: quil_types::consensus::LegacyHistory::Migrate }
 }
 
 #[test]
