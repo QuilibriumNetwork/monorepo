@@ -19,7 +19,7 @@ pub(super) async fn claimable_rewards(tc: &TokenCtx) -> String {
     format_claimable_rewards(result)
 }
 
-async fn read_claimable_rewards(
+pub(crate) async fn read_claimable_rewards(
     client: NodeServiceClient<Channel>,
     public: &[u8],
 ) -> anyhow::Result<Option<(u128, u64)>> {

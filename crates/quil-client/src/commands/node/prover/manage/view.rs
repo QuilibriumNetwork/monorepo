@@ -366,6 +366,17 @@ fn fmt_reward_change(v: &BigInt) -> String {
     }
 }
 
+fn claimable_title(m: &Model) -> String {
+    match m.claimable_reward {
+        Some((value, frame)) => format!("Claimable: {} QUIL @f{}{}",
+            crate::util::float_string_12(&BigInt::from(value), &crate::util::conversion_factor()),
+            frame,
+            if m.reward_last_success.is_some_and(|t| t.elapsed().as_secs() >= 30) { " (stale)" } else { "" }),
+        None if m.reward_loaded => "Claimable: unavailable".into(),
+        None => "Claimable: loading".into(),
+    }
+}
+
 fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     let mut joining = BigInt::from(0);
     let mut active = BigInt::from(0);
@@ -394,8 +405,9 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     let current = &active + &leaving;
     let change = &joining - &leaving;
     let mut s = format!(
-        "Allocations: {}  Rewards [Q/d]: Current {} | Paused {} | Planned change {}",
+        "Allocations: {}  {}  Rewards [Q/d]: Current {} | Paused {} | Planned change {}",
         sorted.len(),
+        claimable_title(m),
         if current_unknown { "?".into() } else { fmt_reward(&current) },
         if paused_unknown { "?".into() } else { fmt_reward(&paused) },
         if change_unknown { "?".into() } else { fmt_reward_change(&change) },
@@ -1154,8 +1166,15 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
     else { lines.extend(primary); lines.extend(shards); }
     if m.focus.is_alloc() {
         if let Some(a) = m.sorted_allocations().get(m.alloc_cursor) {
-            lines.extend(wrap_message(Line::from(format!("Worker {}: {}; peer shard materialized/head {}/{} (provider metadata)",
-                a.worker_id, detail(a.execution.as_ref()), a.materialized_frame, a.latest_frame)), width));
+            let severity = match super::super::local_execution::local_execution_state(a.execution.as_ref()) {
+                "blocked" | "stopped" => NoticeSeverity::Error,
+                "stale" | "unknown" => NoticeSeverity::Warning,
+                _ => NoticeSeverity::Info,
+            };
+            if severity >= m.notice_minimum {
+                lines.extend(wrap_message(Line::from(format!("Worker {}: {}; peer shard materialized/head {}/{} (provider metadata)",
+                    a.worker_id, detail(a.execution.as_ref()), a.materialized_frame, a.latest_frame)), width));
+            }
         }
     }
     if lines.is_empty() { lines.push(Line::default()); }
@@ -1565,6 +1584,48 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
 mod tests {
     use super::*;
     use crate::commands::node::prover::epoch::ActionHint;
+
+    #[test]
+    fn selected_worker_details_respect_severity() {
+        use quil_types::proto::node::WorkerExecution;
+        let mut m = Model::new();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut worker = row("01", 2, 1, 7, "", "");
+        worker.execution = Some(WorkerExecution {
+            state: "running".into(), observed_unix_ms: now, materialized_frame: Some(124), ..Default::default()
+        });
+        m.allocations.push(worker);
+        let text = |m: &Model| message_lines(m, Line::default(), 150).iter().map(Line::to_string).collect::<Vec<_>>().join(" ");
+        m.notice_minimum = NoticeSeverity::Error;
+        assert!(!text(&m).contains("Worker 7"));
+        m.notice_minimum = NoticeSeverity::Warning;
+        assert!(!text(&m).contains("Worker 7"));
+        m.notice_minimum = NoticeSeverity::Info;
+        assert!(text(&m).contains("running"));
+        let execution = m.allocations[0].execution.as_mut().unwrap();
+        execution.state = "blocked".into(); execution.blocker = "checkpoint mismatch".into();
+        m.notice_minimum = NoticeSeverity::Error;
+        assert!(text(&m).contains("checkpoint mismatch"));
+        m.allocations[0].execution.as_mut().unwrap().observed_unix_ms = 1;
+        assert!(!text(&m).contains("Worker 7"));
+        m.notice_minimum = NoticeSeverity::Warning;
+        assert!(text(&m).contains("stale"));
+    }
+
+    #[test]
+    fn claimable_header_distinguishes_loading_missing_verified_and_stale() {
+        let mut m = Model::new();
+        assert_eq!(claimable_title(&m), "Claimable: loading");
+        super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Ok(Some((59358375, 862280)))));
+        assert_eq!(claimable_title(&m), "Claimable: 0.000059358375 QUIL @f862280");
+        assert!(alloc_title(&m, &[]).to_string().contains("Claimable:"));
+        m.reward_last_success = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        assert!(claimable_title(&m).ends_with("(stale)"));
+        super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Err("timeout".into())));
+        assert_eq!(claimable_title(&m), "Claimable: unavailable");
+        super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Ok(None)));
+        assert_eq!(claimable_title(&m), "Claimable: unavailable");
+    }
 
     #[test]
     fn severity_filter_hides_routine_updates_and_preserves_errors() {

@@ -253,6 +253,11 @@ pub struct Model {
     pub difficulty: u64,
     pub auto_managed: bool,
 
+    // Verified GLOBAL reward witness, refreshed independently of shard queries.
+    pub claimable_reward: Option<(u128, u64)>,
+    pub reward_loaded: bool,
+    pub reward_last_success: Option<std::time::Instant>,
+
     // Panel data.
     pub allocations: Vec<AllocationRow>,
     pub available: Vec<ShardRow>,

@@ -40,6 +40,12 @@ pub enum Cmd {
 
 pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
+        Msg::RewardRefresh(result) => {
+            m.reward_loaded = true;
+            m.claimable_reward = result.ok().flatten();
+            m.reward_last_success = m.claimable_reward.map(|_| Instant::now());
+            vec![]
+        }
         Msg::ShardLoading => {
             m.shard_loading = true;
             m.shard_message_time = Some(std::time::SystemTime::now());
