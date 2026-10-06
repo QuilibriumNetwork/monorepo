@@ -264,6 +264,8 @@ pub struct Model {
     pub alloc_cursor: usize,
     pub avail_cursor: usize,
     pub focus: PanelFocus,
+    pub panel_boundary_offsets: [i16; 2],
+    pub panel_content_heights: [u16; 3],
     pub alloc_offset: usize,
     pub avail_offset: usize,
 
@@ -397,9 +399,13 @@ pub enum PanelFocus {
     #[default]
     Allocations,
     Available,
+    Notifications,
 }
 
 impl PanelFocus {
+    pub fn index(self) -> usize { match self { Self::Allocations => 0, Self::Available => 1, Self::Notifications => 2 } }
+    pub fn next(self) -> Self { match self { Self::Allocations => Self::Available, Self::Available => Self::Notifications, Self::Notifications => Self::Allocations } }
+    pub fn previous(self) -> Self { match self { Self::Allocations => Self::Notifications, Self::Available => Self::Allocations, Self::Notifications => Self::Available } }
     pub fn is_alloc(self) -> bool {
         matches!(self, PanelFocus::Allocations)
     }

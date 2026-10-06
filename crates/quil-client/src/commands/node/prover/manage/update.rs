@@ -458,6 +458,20 @@ fn handle_help_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     vec![]
 }
 
+/// Move exactly one shared boundary; outer edges stay fixed.
+fn move_panel_boundary(m: &mut Model, upper: bool, down: bool) {
+    let focused = m.focus.index();
+    let boundary = if upper { focused.checked_sub(1) } else if focused < 2 { Some(focused) } else { None };
+    let Some(i) = boundary else { return };
+    let minimum = [3, 2, 1];
+    let donor = if down { i + 1 } else { i };
+    if m.panel_content_heights[donor] <= minimum[donor] { return; }
+    let movement = if down { 1 } else { -1 };
+    m.panel_boundary_offsets[i] = m.panel_boundary_offsets[i].saturating_add(movement);
+    m.panel_content_heights[i] = (i32::from(m.panel_content_heights[i]) + i32::from(movement)) as u16;
+    m.panel_content_heights[i + 1] = (i32::from(m.panel_content_heights[i + 1]) - i32::from(movement)) as u16;
+}
+
 fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if is_quit(&ev) {
         return vec![Cmd::Quit];
@@ -504,33 +518,39 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             return vec![];
         }
         KeyCode::Tab => {
-            m.focus = if m.focus.is_alloc() {
-                PanelFocus::Available
-            } else {
-                PanelFocus::Allocations
-            };
+            m.focus = m.focus.next();
             m.filter_edit_active = false;
             return vec![];
         }
+        KeyCode::BackTab => { m.focus = m.focus.previous(); return vec![]; }
+        KeyCode::Char('[') => { move_panel_boundary(m, true, false); return vec![]; }
+        KeyCode::Char(']') => { move_panel_boundary(m, true, true); return vec![]; }
+        KeyCode::Char('{') => { move_panel_boundary(m, false, false); return vec![]; }
+        KeyCode::Char('}') => { move_panel_boundary(m, false, true); return vec![]; }
         KeyCode::Char(' ') => {
+            if m.focus == PanelFocus::Notifications { return vec![]; }
             toggle_select(m);
             return vec![];
         }
         KeyCode::Char('a') => {
+            if m.focus == PanelFocus::Notifications { return vec![]; }
             select_all(m);
             return vec![];
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            cursor_up(m);
+            if m.focus == PanelFocus::Notifications { m.notice_offset = m.notice_offset.saturating_sub(1); }
+            else { cursor_up(m); }
             return vec![];
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            cursor_down(m);
+            if m.focus == PanelFocus::Notifications { m.notice_offset = (m.notice_offset + 1).min(m.notice_lines.saturating_sub(m.notice_visible)); }
+            else { cursor_down(m); }
             return vec![];
         }
         KeyCode::Char('R') => return vec![Cmd::Fetch],
         _ => {}
     }
+    if m.focus == PanelFocus::Notifications { return vec![]; }
     match c {
         Some('J') => action_join(m),
         Some('l') => action_leave(m),
@@ -1165,6 +1185,39 @@ fn handle_join_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
 mod tests {
     use super::*;
     use quil_types::proto::node::{NodeInfoResponse, ShardAllocationInfo};
+
+    #[test]
+    fn tab_cycles_three_panels_and_notifications_only_scroll() {
+        let mut m = Model::new(); m.notice_lines = 10; m.notice_visible = 3;
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        for focus in [PanelFocus::Available, PanelFocus::Notifications] {
+            assert!(handle_key(&mut m, key(KeyCode::Tab)).is_empty()); assert_eq!(m.focus, focus);
+        }
+        handle_key(&mut m, key(KeyCode::Down)); assert_eq!(m.notice_offset, 1);
+        handle_key(&mut m, key(KeyCode::Up)); assert_eq!(m.notice_offset, 0);
+        for c in [' ', 'a', 'J', 'l', 's', 'f'] { assert!(handle_key(&mut m, key(KeyCode::Char(c))).is_empty()); }
+        assert!(!m.sort_mode); assert!(!m.avail_filter_mode); assert!(!m.join_picker_active);
+        assert!(m.avail_selected.is_empty());
+        handle_key(&mut m, key(KeyCode::Tab)); assert_eq!(m.focus, PanelFocus::Allocations);
+        handle_key(&mut m, key(KeyCode::BackTab)); assert_eq!(m.focus, PanelFocus::Notifications);
+    }
+
+    #[test]
+    fn boundary_keys_move_only_neighboring_panels_and_preserve_outer_edges() {
+        let mut m = Model::new(); m.panel_content_heights = [10, 10, 3];
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        handle_key(&mut m, key('[')); assert_eq!(m.panel_boundary_offsets, [0, 0]);
+        handle_key(&mut m, key('}')); assert_eq!(m.panel_content_heights, [11, 9, 3]);
+        assert_eq!(m.panel_boundary_offsets, [1, 0]);
+        m.focus = PanelFocus::Available;
+        handle_key(&mut m, key('[')); assert_eq!(m.panel_content_heights, [10, 10, 3]);
+        handle_key(&mut m, key('}')); assert_eq!(m.panel_content_heights, [10, 11, 2]);
+        m.focus = PanelFocus::Notifications;
+        handle_key(&mut m, key('}')); assert_eq!(m.panel_content_heights, [10, 11, 2]);
+        handle_key(&mut m, key(']')); assert_eq!(m.panel_content_heights, [10, 12, 1]);
+        handle_key(&mut m, key(']')); assert_eq!(m.panel_content_heights, [10, 12, 1]);
+        assert_eq!(m.panel_content_heights.iter().sum::<u16>(), 23);
+    }
 
     #[test]
     fn notification_controls_cycle_severity_and_bound_scrolling() {

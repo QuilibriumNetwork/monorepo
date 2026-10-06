@@ -240,16 +240,28 @@ pub fn draw(f: &mut Frame, m: &mut Model) {
     render_main(f, m, area);
 }
 
+fn panel_heights(m: &Model, total: u16) -> [u16; 3] {
+    if total < 6 { return [total / 3 + total % 3, total / 3, total / 3]; }
+    let notice = (total / 5).clamp(1, 3);
+    let alloc = ((total - notice) / 2).max(3);
+    let mut heights = [alloc, total - notice - alloc, notice];
+    let minimum = [3i32, 2, 1];
+    for i in 0..2 {
+        let movement = i32::from(m.panel_boundary_offsets[i]).clamp(minimum[i] - i32::from(heights[i]), i32::from(heights[i + 1]) - minimum[i + 1]);
+        heights[i] = (i32::from(heights[i]) + movement) as u16;
+        heights[i + 1] = (i32::from(heights[i + 1]) - movement) as u16;
+    }
+    heights
+}
+
 fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let (actions, status) = footer_lines(m);
     let actions = wrap_actions(actions, area.width);
     let actions_h = (actions.len() as u16).min(area.height.saturating_sub(10));
-    // Content height depends only on terminal geometry, never message length.
-    let notice_h = area.height.saturating_sub(9 + actions_h).clamp(1, 3);
+    // Content height depends only on terminal geometry and explicit resize keys.
+    let [alloc_h, avail_h, notice_h] = panel_heights(m, area.height.saturating_sub(7 + actions_h));
+    m.panel_content_heights = [alloc_h, avail_h, notice_h];
     let status_h = notice_h + 2;
-    let panel_budget = area.height.saturating_sub(5 + actions_h + status_h);
-    let alloc_h = panel_budget / 2;
-    let avail_h = panel_budget - alloc_h;
 
     let chunks = Layout::vertical([
         Constraint::Length(1),           // header
@@ -285,7 +297,7 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         .title(avail_title(m, &sorted_avail))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if !m.focus.is_alloc() { PRIMARY } else { DIM }));
+        .border_style(Style::new().fg(if m.focus == PanelFocus::Available { PRIMARY } else { DIM }));
     let avail_inner = avail_block.inner(chunks[2]);
     f.render_widget(avail_block, chunks[2]);
     let avail_lines = render_avail_panel(m, &sorted_avail, avail_inner, Some(&avail_widths));
@@ -316,7 +328,7 @@ fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, ar
         format!(" Notifications: {} {}/{} ", m.notice_minimum.label(), m.notice_offset + 1, m.notice_lines)
     } else { format!(" Notifications: {} ", m.notice_minimum.label()) };
     let block = Block::default().title(panel_title(title)).borders(Borders::ALL)
-        .border_type(BorderType::Rounded).border_style(Style::new().fg(DIM));
+        .border_type(BorderType::Rounded).border_style(Style::new().fg(if m.focus == PanelFocus::Notifications { PRIMARY } else { DIM }));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(Paragraph::new(lines.into_iter().skip(m.notice_offset)
@@ -939,10 +951,10 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
 
     let mut hdr_spans: Vec<Span> = Vec::new();
     for i in 0..AVAIL_COL_NAMES.len() {
-        let hi_sort = m.sort_mode && !m.focus.is_alloc() && m.sort_highlight_col == i;
+        let hi_sort = m.sort_mode && m.focus == PanelFocus::Available && m.sort_highlight_col == i;
         let hi_filter = m.avail_filter_mode
             && !m.filter_edit_active
-            && !m.focus.is_alloc()
+            && m.focus == PanelFocus::Available
             && filter_hi == i as i32;
         let style = if hi_sort {
             Style::new()
@@ -987,7 +999,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
     let longest_suffix = sorted.iter().map(|s| s.filter_hex.len().saturating_sub(64)).max().unwrap_or(0);
     for i in m.avail_offset..end {
         let s = &sorted[i];
-        let selected = i == m.avail_cursor && !m.focus.is_alloc();
+        let selected = i == m.avail_cursor && m.focus == PanelFocus::Available;
 
         if selected {
             let cells: Vec<String> = (0..widths.len())
@@ -1247,7 +1259,7 @@ fn help_line(m: &Model) -> Line<'static> {
             if sorted.get(m.alloc_cursor).is_some_and(|r| r.worker_id >= 0) {
                 applicable.insert("ToggleManual".to_string());
             }
-        } else if !m.free_workers.is_empty() {
+        } else if m.focus == PanelFocus::Available && !m.free_workers.is_empty() {
             applicable.insert("Join".to_string());
         }
     }
@@ -1274,7 +1286,7 @@ fn help_line(m: &Model) -> Line<'static> {
         ("w", "widths", "ColumnSizing"),
         ("e", "frames/epochs", "ThresholdUnit"),
         ("v", "notice level", ""),
-        ("Pg↑/↓", "notices", ""),
+        ("[/] {/}", "upper/lower edge", ""),
         ("h", "help", ""),
         ("q", "quit", ""),
     ];
@@ -1440,22 +1452,23 @@ fn help_body() -> Vec<Line<'static>> {
         kv("PeerHead", "Provider shard head; remote metadata, not the local worker cursor"),
         kv("Details", "Selected allocation footer shows blocker and last advance; no observation timer"),
 
-        kv("", "Selected row shows blocker, last advance, observation age and peer cursors"),
+        kv("", "Selected allocation shows blocker and last advance; PeerHead is provider metadata"),
         kv("", "Observations older than 30s are stale; startup restoration is not an advance"),
         sec("Navigation"),
         kv("↑ / k", "Move cursor up"),
         kv("↓ / j", "Move cursor down"),
         kv(
             "Tab",
-            "Switch between Allocations and Available Shards panels",
+            "Cycle Allocations, Available Shards and Notifications; Shift+Tab reverses",
         ),
         kv("Space", "Toggle selection on cursor row (advances cursor)"),
-        kv("a", "Select all / deselect all rows in current panel"),
+        kv("a", "Select all / deselect all rows in current table"),
+        kv("Boundaries", "Top of Allocations and bottom of Notifications remain fixed"),
         Line::from(""),
         sec("Notifications"),
         kv("v", "Cycle minimum severity: warnings/errors (default), errors only, all"),
-        kv("PgUp / PgDn", "Scroll notification text; Home/End jump to first/last line"),
-        kv("", "Fixed three-row panel above commands; completed notices expire after 30s"),
+        kv("PgUp / PgDn", "When Notifications is focused, ↑/↓ scroll; Home/End jump to first/last line"),
+        kv("", "[ / ] moves upper boundary up/down; { / } moves lower boundary up/down"),
         sec("Actions — Allocations panel"),
         kv(
             "l",
@@ -1529,7 +1542,7 @@ fn help_body() -> Vec<Line<'static>> {
         ),
         kv("Current", "Staffed active + leaving reward estimates, not measured income"),
         kv("Paused", "Staffed paused estimates available upon resume"),
-        kv("Unknown", "- fields and ? totals mean shard, reward or height data is unavailable"),
+        kv("Unknown", "- fields are unavailable; Current sums known rewards with + for unknown rows"),
         kv("Planned change", "Staffed joining minus leaving; activation epochs may differ"),
         note("Reward totals follow displayed rows; unassigned rows are excluded."),
         kv("Worker", "Core the allocation is bound to; -1 means none is bound"),
@@ -1631,6 +1644,19 @@ mod tests {
     use crate::commands::node::prover::epoch::ActionHint;
 
     #[test]
+    fn resized_panels_preserve_terminal_budget_and_minimum_rows() {
+        let mut m = Model::new();
+        for offsets in [[0, 0], [8, -2], [-100, 100], [100, -100]] {
+            m.panel_boundary_offsets = offsets;
+            for total in [6, 12, 25, 60] {
+                let h = panel_heights(&m, total);
+                assert_eq!(h.iter().sum::<u16>(), total);
+                assert!(h[0] >= 3 && h[1] >= 2 && h[2] >= 1, "{offsets:?}: {h:?}");
+            }
+        }
+    }
+
+    #[test]
     fn shared_columns_align_with_different_data_and_filter_markers() {
         let mut m = Model::new();
         let allocations = [row("aabb0123456789", 1, 1, 7, "", "")];
@@ -1645,7 +1671,7 @@ mod tests {
             let alloc = render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 240, 5), Some(&a))[0].to_string();
             let avail = render_avail_panel(&mut m, &available, Rect::new(0, 0, 240, 5), Some(&v))[0].to_string();
             for label in ["Filter", "Provers", "Ring", "Size", "Shards", "PeerHead", "Reward"] {
-                assert_eq!(alloc.find(label), avail.find(label), "{label}: {alloc} / {avail}");
+                assert_eq!(printed_width(&alloc[..alloc.find(label).unwrap()]), printed_width(&avail[..avail.find(label).unwrap()]), "{label}: {alloc} / {avail}");
             }
             assert!(!avail.contains("LocalMat"));
             assert!(!avail.contains("Execution"));
