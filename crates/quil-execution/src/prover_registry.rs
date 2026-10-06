@@ -157,16 +157,26 @@ impl InMemoryProverRegistry {
         if estimate.source == "committed_allocation_ring" {
             // A decoded zero cannot establish rank. Require the committed
             // policy fields from the same registry rows. Pending joins and
-            // paused owners do not earn and cannot establish ring occupancy.
+            // paused owners and allocations without a ring assignment do not
+            // establish ring occupancy. Malformed assigned fields stay unknown.
             let rows = self.rows.as_ref()?;
             let members: Option<Vec<_>> = all.iter().filter_map(|p| p.allocations.iter()
                 .find(|a| a.confirmation_filter == filter
                     && matches!(a.effective_status(frame), EffectiveStatus::Active | EffectiveStatus::Leaving)))
-                .map(|a| rows.committed_ring(&a.vertex_address)).collect();
+                .filter_map(|a| match rows.committed_ring(&a.vertex_address) {
+                    registry_rows::CommittedRing::Assigned(ring) => Some(Some(ring)),
+                    registry_rows::CommittedRing::Unassigned => None,
+                    registry_rows::CommittedRing::Invalid => Some(None),
+                }).collect();
             let own = all.iter().find(|p| p.address == address)?.allocations.iter()
                 .find(|a| a.confirmation_filter == filter)?;
-            estimate.ring = rows.committed_ring(&own.vertex_address)?;
-            estimate.provers_on_ring = members?.iter().filter(|&&r| r == estimate.ring).count();
+            estimate.ring = match rows.committed_ring(&own.vertex_address) {
+                registry_rows::CommittedRing::Assigned(ring) => ring,
+                _ => return None,
+            };
+            let members = members?;
+            estimate.provers_on_ring = members.iter().filter(|&&r| r == estimate.ring).count();
+            estimate.member_count = members.len();
         }
         Some(estimate)
     }
@@ -2953,6 +2963,17 @@ mod tests {
             assert_eq!((held.ring, held.provers_on_ring), (0, 1),
                 "a non-earning peer without a ring key must not hide the owner's committed rank");
         }
+        for key in [None, Some(vec![0; 8])] {
+            save_allocation(2, 1, None, key);
+            let held = shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().unwrap();
+            assert_eq!((held.ring, held.provers_on_ring, held.member_count), (0, 1, 1),
+                "an active unassigned peer must not hide or dilute the owner's committed rank");
+            assert!(shared.get_reward_ring_estimate(&[2; 32], &filter, 0).unwrap().is_none(),
+                "an unassigned owner must remain unknown");
+        }
+        save_allocation(2, 1, None, Some(vec![0; 7]));
+        assert!(shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().is_none(),
+            "an absent ring must not conceal malformed policy fields");
         save_allocation(2, 1, Some(0), Some(vec![0; 8]));
         let estimate = shared.get_reward_ring_estimate(&[1; 32], &filter, 0).unwrap().unwrap();
         assert_eq!((estimate.ring, estimate.provers_on_ring), (0, 2), "real zero is valid");
