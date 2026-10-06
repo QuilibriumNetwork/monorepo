@@ -426,6 +426,7 @@ fn fmt_materialized(materialized: u64, latest: u64) -> String {
 /// through here. `fw` is the Filter column's width, which is a budget rather
 /// than a measurement — pass 0 when measuring the other columns.
 fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
+    if !a.shard_info_known && matches!(col, 2..=7 | 9) { return "-".into(); }
     match col {
         0 => alloc_marker(m, a).to_string(),
         1 => center_trunc(&a.filter_hex, fw),
@@ -1446,7 +1447,7 @@ fn help_body() -> Vec<Line<'static>> {
         ),
         kv("Current", "Staffed active + leaving reward estimates, not measured income"),
         kv("Paused", "Staffed paused estimates available upon resume"),
-        kv("Unknown", "- fields and ? totals mean reward or height data is unavailable"),
+        kv("Unknown", "- fields and ? totals mean shard, reward or height data is unavailable"),
         kv("Planned change", "Staffed joining minus leaving; activation epochs may differ"),
         note("Reward totals follow displayed rows; unassigned rows are excluded."),
         kv("Worker", "Core the allocation is bound to; -1 means none is bound"),
@@ -1779,6 +1780,7 @@ mod tests {
         dflt: &str,
     ) -> AllocationRow {
         AllocationRow {
+            shard_info_known: true,
             filter: Vec::new(),
             filter_key: hex.to_string(),
             filter_hex: hex.to_string(),
@@ -1825,6 +1827,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn missing_shard_rows_display_unknown_but_measured_zero_rows_remain_numeric() {
+        let model = Model::new();
+        let mut allocation = row("aa", 0, 0, 1, "", "");
+        allocation.shard_info_known = false;
+        for col in [2, 3, 4, 5, 6, 7, 9] {
+            assert_eq!(alloc_cell(&model, &allocation, col, 12), "-");
+        }
+        assert_eq!(alloc_cell(&model, &allocation, 8, 12), "unknown");
+        allocation.shard_info_known = true;
+        for col in [2, 5] { assert_eq!(alloc_cell(&model, &allocation, col, 12), "0"); }
+        assert_eq!(alloc_cell(&model, &allocation, 4, 12), fmt_mb(&BigInt::from(0)));
     }
 
     #[test]

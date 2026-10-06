@@ -116,6 +116,8 @@ pub const MIN_FILTER_WIDTH: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct AllocationRow {
+    /// A shard-info row was actually returned for this allocation.
+    pub shard_info_known: bool,
     pub filter: Vec<u8>,
     pub filter_key: String,
     pub filter_hex: String,
@@ -530,6 +532,7 @@ impl Model {
                 .unwrap_or((-1, false));
 
             let mut row = AllocationRow {
+                shard_info_known: false,
                 filter: a.filter.clone(),
                 filter_key: filter_hex.clone(),
                 filter_hex: filter_hex.clone(),
@@ -554,6 +557,7 @@ impl Model {
                 manually_managed: mm,
             };
             if let Some(info) = reward_by_filter.get(&filter_hex) {
+                row.shard_info_known = true;
                 row.ring = reward_ring(info);
                 row.active_provers = info.active_provers;
                 row.shard_size = BigInt::from_bytes_be(Sign::Plus, &info.shard_size);
@@ -571,6 +575,7 @@ impl Model {
             for w in &wi.worker_info {
                 if w.filter.is_empty() {
                     allocs.push(AllocationRow {
+                        shard_info_known: false,
                         filter: Vec::new(),
                         filter_key: format!("worker:{}", w.core_id),
                         filter_hex: String::new(),
@@ -996,6 +1001,7 @@ impl Model {
 // ── Row value accessors (for filtering + sorting) ────────────────────────
 
 pub fn alloc_row_numeric_val(row: &AllocationRow, col: usize) -> f64 {
+    if !row.shard_info_known && matches!(col, 2..=7 | 9) { return f64::NAN; }
     match col {
         2 => row.active_provers as f64,
         3 => if row.ring == UNKNOWN_REWARD_RING { f64::NAN } else { row.ring as f64 },
@@ -1257,6 +1263,25 @@ mod tests {
             epoch_length_frames: 720,
             last_received_frame: 2_160,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn absent_shard_metadata_does_not_match_measured_zero_filters() {
+        let filter = vec![0xab];
+        let mut model = Model::new();
+        model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))),
+            Some(GetShardInfoResponse::default()), None);
+        assert!(!model.allocations[0].shard_info_known);
+        for col in [2, 3, 4, 5, 6, 7, 9] {
+            assert!(!super::super::filter::matches_numeric_expr(
+                alloc_row_numeric_val(&model.allocations[0], col), "=0"));
+        }
+        model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))),
+            Some(shard_info(filter, 0)), None);
+        assert!(model.allocations[0].shard_info_known);
+        for col in [2, 3, 4, 5, 9] {
+            assert_eq!(alloc_row_numeric_val(&model.allocations[0], col), 0.0);
         }
     }
 
