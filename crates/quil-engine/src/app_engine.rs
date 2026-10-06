@@ -2152,6 +2152,8 @@ pub struct AppConsensusEngine {
     /// Republished until GLOBAL state records it; the sealed session is never
     /// restarted, since every later view could only nullify.
     sealed_session: Option<([u8; 32], Vec<u8>)>,
+    /// When this member last published its closing certificate.
+    seal_published_at: Option<std::time::Instant>,
     /// Self-clone of the inbound message sender, so `on_finalized` (running
     /// on the simplex thread) can inject `CwFinalizedFrame` into this run loop.
     self_msg_tx: mpsc::Sender<AppEngineMessage>,
@@ -2288,6 +2290,7 @@ impl AppConsensusEngine {
             session_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             private_parents: None,
             sealed_session: None,
+            seal_published_at: None,
             self_msg_tx: msg_tx,
             sizes,
             fee_snapshot,
@@ -3596,6 +3599,7 @@ impl AppConsensusEngine {
             publish(submission.1.clone());
         }
         self.sealed_session = Some(submission);
+        self.seal_published_at = Some(std::time::Instant::now());
         if let Some(old) = self.cw_handle.take() {
             if let Err(e) = old.shutdown_and_join().await {
                 warn!(core_id = self.core_id, error = %e, "sealed app consensus host stopped with an error");
@@ -3614,7 +3618,16 @@ impl AppConsensusEngine {
             self.adopt_registered_session(&global).await;
             return;
         };
-        if let Some((_, submission)) = self.sealed_session.as_ref() {
+        // Every member of the closing committee submits the seal; a copy
+        // already in flight needs no repeat until it has had time to land.
+        // Resubmissions are spaced a minute apart, staggered per member, so a
+        // committee's members do not flood GLOBAL in step while their views of
+        // it lag.
+        let resubmit_after = std::time::Duration::from_secs(
+            60 + u64::from(self.local_bls_pubkey.last().copied().unwrap_or(0) % 30),
+        );
+        let due = self.seal_published_at.is_none_or(|at| at.elapsed() >= resubmit_after);
+        if let (Some((_, submission)), true) = (self.sealed_session.as_ref(), due) {
             let view = quil_execution::global_intrinsic::handoff::CommittedView::capture(&global);
             let recorded = view.and_then(|view|
                 quil_execution::global_intrinsic::handoff::schedule::seal_submitted(&view, &session));
@@ -3622,6 +3635,7 @@ impl AppConsensusEngine {
                 if let Some(publish) = self.coverage_publish.as_ref() {
                     publish(submission.clone());
                 }
+                self.seal_published_at = Some(std::time::Instant::now());
             }
         }
         match crate::app_handoff::still_current(&global, &session) {

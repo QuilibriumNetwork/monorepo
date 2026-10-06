@@ -40,6 +40,33 @@ where
     retry_forest_read_within(BUSY_RETRY_FOR, request).await
 }
 
+/// [`ArchiveClient::get_forest_head`], retrying while the archive is busy.
+pub async fn forest_head(
+    client: &ArchiveClient,
+    shard_id: Vec<u8>,
+    phase: u32,
+) -> std::result::Result<Option<(u64, Vec<u8>)>, ArchiveClientError> {
+    retry_forest_read(|| {
+        let (mut client, shard_id) = (client.clone(), shard_id.clone());
+        async move { client.get_forest_head(shard_id, phase).await }
+    })
+    .await
+}
+
+/// [`ArchiveClient::resolve_root`], retrying while the archive is busy.
+pub async fn resolve_forest_root(
+    client: &ArchiveClient,
+    shard_id: Vec<u8>,
+    phase: u32,
+    root: Vec<u8>,
+) -> std::result::Result<Option<(u64, u64)>, ArchiveClientError> {
+    retry_forest_read(|| {
+        let (mut client, shard_id, root) = (client.clone(), shard_id.clone(), root.clone());
+        async move { client.resolve_root(shard_id, phase, root).await }
+    })
+    .await
+}
+
 async fn retry_forest_read_within<T, F, Fut>(
     busy_for: Duration,
     mut request: F,

@@ -999,6 +999,17 @@ pub fn record_session_rings(state: &HypergraphState, frame: u64, id: &[u8; 32], 
     write(state, frame, b"rings", id, rings)
 }
 
+/// Whether `submission` can no longer change anything: its request already
+/// activated, its source's seal is recorded, or the source was fenced.
+/// Proposers leave such copies out (every member of a closing committee
+/// submits, and resubmits until its own view shows the seal recorded).
+pub fn submission_settled(state: &impl Records, submission: &CertificateSubmission) -> Result<bool> {
+    let key = seal_key(&submission.seal.request, &submission.seal.session);
+    Ok(read(state, b"activated", &submission.seal.request)?.is_some()
+        || read(state, b"seal", &key)?.is_some()
+        || read(state, b"fence", &key)?.is_some())
+}
+
 /// Whether the committee-handoff flag day ([`LegacyHistory::Discard`]) has
 /// run: ring keys recorded, gridless applications given a root shard and
 /// off-grid allocations moved onto the grid.
