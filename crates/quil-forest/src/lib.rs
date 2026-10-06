@@ -45,7 +45,7 @@ pub use forest::{
     node_size_sum, rollup_phase_roots, subtree_leaf_count, subtree_size, Forest, Phase,
     ShardRoots, PHASES,
 };
-pub use sync::{diff_leaves, diff_leaves_under_prefix, BatchTreeReader, SubtreeSyncAnchor};
+pub use sync::{diff_leaves, diff_leaves_under_prefix, key_range_under, BatchTreeReader, SubtreeSyncAnchor};
 pub use forest::tree_generation;
 // Re-export so sync callers can name the diff's key type + the reader bound
 // without depending on jmt directly.

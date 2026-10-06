@@ -11,7 +11,7 @@ use quil_lattice_ct::confidential::{
     pending_create::PendingCreate,
     pending_claim::PendingClaim,
     relation::backend::native::NativeBudget,
-    shield::Shield,
+    shield::AnyShield,
     transfer::{CompileLimits, Transfer},
 };
 use quil_lattice_ct::confidential::relation::backend::{worker_client::WorkerVerifier, worker_request::WorkerRequest};
@@ -134,7 +134,7 @@ mod tests {
         assert!(policy.worker_request_shape(&quil, TYPE_LATTICE_MINT_CLAIM).is_none());
     }
     use quil_lattice_ct::confidential::{
-        shield::ShieldStatement,
+        shield::{Shield, ShieldStatement},
         transfer::{parameter_context, Output, MEMO_BYTES},
         AmountOpening, CommitmentKey,
     };
@@ -717,13 +717,15 @@ impl TokenPolicy {
                 }
                 self.check_fee(&application, s.fee)
             }
+            // Structural only: whether a batch is active at the executing
+            // frame is decided at execution.
             TYPE_LATTICE_SHIELD => {
-                let tx = Shield::decode(bytes, &self.network, &application)
+                let tx = AnyShield::decode(bytes, &self.network, &application)
                     .map_err(|_| invalid("invalid shield encoding or context"))?;
-                if tx.statement.outputs.len() > self.limits.max_outputs {
+                if tx.outputs().len() > self.limits.max_outputs {
                     return Err(invalid("shield exceeds configured dimensions"));
                 }
-                self.check_fee(&application, tx.statement.fee)
+                self.check_fee(&application, tx.fee())
             }
             TYPE_LATTICE_SETTLEMENT => {
                 let tx = quil_lattice_ct::confidential::settlement::Settlement::decode(bytes, &self.network, &application)

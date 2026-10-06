@@ -21,8 +21,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-/// Bytes of cached nodes and values.
-pub const FOREST_READ_CACHE_BYTES: usize = 128 * 1024 * 1024;
+/// Bytes of cached nodes and values, unless `QUIL_FOREST_READ_CACHE_MB` sets
+/// them. At 128 MiB an archive answered 2% of reads from it.
+pub const FOREST_READ_CACHE_BYTES: usize = 1024 * 1024 * 1024;
+
+fn cache_budget() -> usize {
+    std::env::var("QUIL_FOREST_READ_CACHE_MB").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(FOREST_READ_CACHE_BYTES, |mb| mb.saturating_mul(1024 * 1024))
+}
 /// How long an entry is served.
 pub const FOREST_READ_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 /// Entries larger than this are not cached.
@@ -124,7 +131,7 @@ impl ForestReadCache {
     /// The process-wide cache shared by every peer-facing server.
     pub(crate) fn process() -> &'static Self {
         static CACHE: LazyLock<ForestReadCache> =
-            LazyLock::new(|| ForestReadCache::new(FOREST_READ_CACHE_BYTES, FOREST_READ_CACHE_TTL));
+            LazyLock::new(|| ForestReadCache::new(cache_budget(), FOREST_READ_CACHE_TTL));
         &CACHE
     }
 

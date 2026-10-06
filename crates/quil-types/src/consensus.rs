@@ -261,6 +261,10 @@ pub struct CommitteeHandoffPolicy {
     /// eligible set changes mid-epoch (late re-confirms, leave rejects) wait
     /// for the next boundary, as the epoch-aligned lifecycle intends.
     pub membership_boundary_frame: u64,
+    /// From this GLOBAL frame a shard's FIRST session is also authorized only
+    /// at the first session pass of an epoch, so a mid-epoch pass decides
+    /// nothing and skips its prover scan.
+    pub first_session_boundary_frame: u64,
 }
 
 /// What a network with legacy app history does with it at activation.
@@ -287,6 +291,12 @@ pub const MAINNET_COMMITTEE_HANDOFF_FRAME: u64 = 861_840;
 /// change re-sealed every shard its prover sat on, every 8 frames, so no
 /// first session produced a frame.
 pub const MAINNET_MEMBERSHIP_BOUNDARY_FRAME: u64 = 862_560;
+
+/// Mainnet's first frame of epoch-boundary first sessions (epoch 1200).
+/// Owner decision 2026-10-06: with membership frozen mid-epoch, a pass still
+/// scanned the whole prover shard every 8 frames only to learn whether a
+/// shard without a session had gained members.
+pub const MAINNET_FIRST_SESSION_BOUNDARY_FRAME: u64 = 864_000;
 
 static COMMITTEE_HANDOFF_POLICY: std::sync::RwLock<Option<CommitteeHandoffPolicy>> =
     std::sync::RwLock::new(None);
@@ -343,6 +353,7 @@ fn committee_handoff_policy_for_network(
             chain_id: committee_handoff_chain_id(network),
             legacy_history: LegacyHistory::Discard,
             membership_boundary_frame: MAINNET_MEMBERSHIP_BOUNDARY_FRAME,
+            first_session_boundary_frame: MAINNET_FIRST_SESSION_BOUNDARY_FRAME,
         });
     }
     let activation_frame = env("QUIL_COMMITTEE_HANDOFF_FRAME")?.parse::<u64>().ok()?;
@@ -350,11 +361,15 @@ fn committee_handoff_policy_for_network(
     let membership_boundary_frame = env("QUIL_COMMITTEE_MEMBERSHIP_BOUNDARY_FRAME")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(activation_frame);
+    let first_session_boundary_frame = env("QUIL_COMMITTEE_FIRST_SESSION_BOUNDARY_FRAME")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
     Some(CommitteeHandoffPolicy {
         activation_frame,
         chain_id: committee_handoff_chain_id(network),
         legacy_history: if discard { LegacyHistory::Discard } else { LegacyHistory::Migrate },
         membership_boundary_frame,
+        first_session_boundary_frame,
     })
 }
 
@@ -1244,6 +1259,8 @@ mod committee_handoff_policy_tests {
         assert_eq!(mainnet.legacy_history, LegacyHistory::Discard);
         assert_eq!(mainnet.membership_boundary_frame, 862_560);
         assert_eq!(mainnet.membership_boundary_frame % 720, 0, "an epoch boundary");
+        assert_eq!(mainnet.first_session_boundary_frame, 864_000);
+        assert_eq!(mainnet.first_session_boundary_frame % 720, 0, "an epoch boundary");
         assert_eq!(mainnet.chain_id, committee_handoff_chain_id(0));
 
         assert_eq!(committee_handoff_policy_for_network(1, |_| None), None, "other networks opt in");

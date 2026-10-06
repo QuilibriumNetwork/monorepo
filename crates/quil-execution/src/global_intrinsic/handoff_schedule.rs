@@ -502,6 +502,11 @@ pub fn reconcile_membership(
             if reserved(state, filter)? || super::legacy::pending(state, filter)? {
                 continue;
             }
+            // Like a membership change, a first session waits for the epoch's
+            // first pass from `first_session_boundary_frame`.
+            if frame >= policy.first_session_boundary_frame && !first_pass_of_epoch(frame) {
+                continue;
+            }
             let genesis = quil_crypto::poseidon::hash_bytes_to_32(&[0u8; 32])?;
             initialize(
                 state,

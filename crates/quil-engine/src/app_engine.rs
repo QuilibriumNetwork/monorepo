@@ -1120,24 +1120,35 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 use sha3::{Digest, Sha3_256};
                 Sha3_256::digest(canon).into()
             }).collect();
+            let sources: Vec<Option<[u8; 32]>> = canonical_requests.iter()
+                .map(|canon| quil_execution::ExecutionEngineManager::shield_source(canon))
+                .collect();
             let now = std::time::Instant::now();
             let (waited, first_seen) = routing_waits(&self.routing_seen, &hashes, &operations, now);
-            let keep = routed_selection(&self.filter, &shards, &hashes, &operations, &waited, ROUTED_FALLBACK);
-            for ((((hash, ops), waited), keep), first) in hashes.iter().zip(&operations).zip(&waited).zip(&keep).zip(&first_seen) {
+            let keep = routed_selection(&self.filter, &shards, &hashes, &operations, &sources, &waited, ROUTED_FALLBACK);
+            for (((((hash, ops), source), waited), keep), first) in
+                hashes.iter().zip(&operations).zip(&sources).zip(&waited).zip(&keep).zip(&first_seen)
+            {
                 if *ops == 0 {
                     continue;
                 }
-                let designated = (!shards.is_empty()).then(|| {
-                    let index = u64::from_be_bytes(hash[..8].try_into().unwrap()) % shards.len() as u64;
-                    hex::encode(&shards[index as usize][shards[index as usize].len().min(32)..])
-                });
+                let designated = match source {
+                    Some(source) => shards.iter().position(|shard| shard_covers(shard, source)),
+                    None => (!shards.is_empty())
+                        .then(|| (u64::from_be_bytes(hash[..8].try_into().unwrap()) % shards.len() as u64) as usize),
+                }
+                .map(|index| hex::encode(&shards[index][shards[index].len().min(32)..]));
                 if *first && !*keep {
-                    // Once per bundle and shard: when this shard takes it.
-                    let admitted_after_s = routing_offset(&self.filter, &shards, hash)
-                        .map_or(ROUTED_FALLBACK.as_secs(), |offset| offset * ROUTED_FALLBACK.as_secs());
+                    // Once per bundle and shard: when this shard takes it. A
+                    // shield never comes here unless this shard holds its source.
+                    let admitted_after_s = match source {
+                        Some(_) => None,
+                        None => Some(routing_offset(&self.filter, &shards, hash)
+                            .map_or(ROUTED_FALLBACK.as_secs(), |offset| offset * ROUTED_FALLBACK.as_secs())),
+                    };
                     info!(frame = frame_number, bundle = %hex::encode(&hash[..4]), designated = ?designated,
-                        admitted_after_s, shards = shards.len(), listed = listed_count,
-                        "confidential bundle held for its designated shard");
+                        admitted_after_s = ?admitted_after_s, shield = source.is_some(), shards = shards.len(),
+                        listed = listed_count, "confidential bundle held for its designated shard");
                 }
                 if *keep {
                     info!(frame = frame_number, bundle = %hex::encode(&hash[..4]), shards = shards.len(),
@@ -6427,6 +6438,13 @@ fn routing_offset(filter: &[u8], shards: &[Vec<u8>], hash: &[u8; 32]) -> Option<
     shards.iter().position(|shard| shard.as_slice() == filter).map(|position| (position as u64 + count - designated) % count)
 }
 
+/// Whether `filter`'s range holds `address` (a data address of its
+/// application). An undecodable filter holds nothing.
+fn shard_covers(filter: &[u8], address: &[u8; 32]) -> bool {
+    quil_forest::decode_shard_filter_or_root(filter, 32)
+        .is_some_and(|(_, bits)| quil_types::execution::ShardPath::from_bits(&bits).covers(address))
+}
+
 /// Which collected bundles this shard proposes now: every bundle without a
 /// confidential operation, and each confidential one this shard is admitted
 /// to. A bundle's order over `shards` starts at its designated shard (its hash
@@ -6436,20 +6454,35 @@ fn routing_offset(filter: &[u8], shards: &[Vec<u8>], hash: &[u8; 32]) -> Option<
 /// shard missing from the list is admitted once the bundle has waited
 /// `fallback`. With no live shard list every bundle is this shard's, as
 /// before routing.
+///
+/// A bundle with a shield (`sources[i]`, its legacy source coin) is this
+/// shard's exactly when this shard's range holds that coin, whatever the
+/// list or the wait: the shield's source check reads the executing shard's
+/// own store, so any other shard refuses it ("source coin not found"). With
+/// hash routing a shield on a 30-shard application reached the one shard
+/// that could verify it about one time in thirty.
 fn routed_selection(
     filter: &[u8],
     shards: &[Vec<u8>],
     hashes: &[[u8; 32]],
     operations: &[usize],
+    sources: &[Option<[u8; 32]>],
     waited: &[std::time::Duration],
     fallback: std::time::Duration,
 ) -> Vec<bool> {
     hashes
         .iter()
         .zip(operations)
+        .zip(sources)
         .zip(waited)
-        .map(|((hash, ops), waited)| {
-            if *ops == 0 || shards.is_empty() {
+        .map(|(((hash, ops), source), waited)| {
+            if *ops == 0 {
+                return true;
+            }
+            if let Some(source) = source {
+                return shard_covers(filter, source);
+            }
+            if shards.is_empty() {
                 return true;
             }
             let admitted = 1 + waited.as_secs() / fallback.as_secs().max(1);
@@ -7172,11 +7205,12 @@ mod tests {
             Sha3_256::digest([n]).into()
         }).collect();
         let operations = vec![1; hashes.len()];
+        let none = vec![None; hashes.len()];
         let fresh = vec![Duration::ZERO; hashes.len()];
         let fallback = Duration::from_secs(30);
         let mut taken = vec![0; hashes.len()];
         for shard in &shards {
-            let keep = routed_selection(shard, &shards, &hashes, &operations, &fresh, fallback);
+            let keep = routed_selection(shard, &shards, &hashes, &operations, &none, &fresh, fallback);
             for (i, keep) in keep.iter().enumerate() {
                 taken[i] += usize::from(*keep);
             }
@@ -7188,23 +7222,66 @@ mod tests {
             let waited = vec![fallback * periods; hashes.len()];
             let mut taken = vec![0; hashes.len()];
             for shard in &shards {
-                for (i, keep) in routed_selection(shard, &shards, &hashes, &operations, &waited, fallback).iter().enumerate() {
+                for (i, keep) in routed_selection(shard, &shards, &hashes, &operations, &none, &waited, fallback).iter().enumerate() {
                     taken[i] += usize::from(*keep);
                 }
             }
             assert!(taken.iter().all(|n| *n == expected), "{periods} periods: {expected} shards");
         }
         let half = vec![fallback / 2; hashes.len()];
-        let early = routed_selection(&shards[0], &shards, &hashes, &operations, &half, fallback);
-        assert_eq!(early, routed_selection(&shards[0], &shards, &hashes, &operations, &fresh, fallback), "no helper before a full period");
+        let early = routed_selection(&shards[0], &shards, &hashes, &operations, &none, &half, fallback);
+        assert_eq!(early, routed_selection(&shards[0], &shards, &hashes, &operations, &none, &fresh, fallback), "no helper before a full period");
         // A shard missing from the list helps once the bundle has waited a period.
         let outsider = quil_forest::encode_shard_bit_path(&app, &[true, true, true]);
-        assert!(routed_selection(&outsider, &shards, &hashes, &operations, &fresh, fallback).iter().all(|k| !*k));
+        assert!(routed_selection(&outsider, &shards, &hashes, &operations, &none, &fresh, fallback).iter().all(|k| !*k));
         let late = vec![fallback; hashes.len()];
-        assert!(routed_selection(&outsider, &shards, &hashes, &operations, &late, fallback).iter().all(|k| *k));
+        assert!(routed_selection(&outsider, &shards, &hashes, &operations, &none, &late, fallback).iter().all(|k| *k));
         let plain = vec![0; hashes.len()];
-        assert!(routed_selection(&shards[0], &shards, &hashes, &plain, &fresh, fallback).iter().all(|k| *k));
-        assert!(routed_selection(&shards[0], &[], &hashes, &operations, &fresh, fallback).iter().all(|k| *k));
+        assert!(routed_selection(&shards[0], &shards, &hashes, &plain, &none, &fresh, fallback).iter().all(|k| *k));
+        assert!(routed_selection(&shards[0], &[], &hashes, &operations, &none, &fresh, fallback).iter().all(|k| *k));
+    }
+
+    /// A shield goes to the one shard whose range holds its legacy source
+    /// coin, also past every fallback and whatever the shard list says; other
+    /// bundles keep their hash routing.
+    #[test]
+    fn a_shield_goes_only_to_the_shard_holding_its_source() {
+        use std::time::Duration;
+        let app = [0x11u8; 32];
+        let shards: Vec<Vec<u8>> = [[false, false], [false, true], [true, false], [true, true]]
+            .iter()
+            .map(|bits| quil_forest::encode_shard_bit_path(&app, bits))
+            .collect();
+        let hashes: Vec<[u8; 32]> = (0..16u8).map(|n| {
+            use sha3::{Digest, Sha3_256};
+            Sha3_256::digest([n]).into()
+        }).collect();
+        let operations = vec![1; hashes.len()];
+        // Sources spread over the four ranges: top bits n % 4.
+        let sources: Vec<Option<[u8; 32]>> = (0..hashes.len())
+            .map(|n| { let mut a = [0x3f; 32]; a[0] = ((n % 4) as u8) << 6 | 0x3f; Some(a) })
+            .collect();
+        let fallback = Duration::from_secs(30);
+        for waited in [Duration::ZERO, fallback * 9] {
+            let waited = vec![waited; hashes.len()];
+            for (index, shard) in shards.iter().enumerate() {
+                let keep = routed_selection(shard, &shards, &hashes, &operations, &sources, &waited, fallback);
+                for (n, keep) in keep.iter().enumerate() {
+                    assert_eq!(*keep, n % 4 == index, "bundle {n} on shard {index}");
+                }
+            }
+            // A shard outside the list that holds the source takes it; with no
+            // list, only the covering shard does.
+            let child = quil_forest::encode_shard_bit_path(&app, &[true, true, false]);
+            let mut deep = [0u8; 32];
+            deep[0] = 0b1100_0000;
+            let one = [Some(deep)];
+            assert_eq!(routed_selection(&child, &shards, &hashes[..1], &operations[..1], &one, &waited[..1], fallback), vec![true]);
+            assert_eq!(routed_selection(&shards[0], &[], &hashes[..1], &operations[..1], &one, &waited[..1], fallback), vec![false]);
+        }
+        // The whole application holds every source.
+        assert!(routed_selection(&app, &shards, &hashes, &operations, &sources, &vec![Duration::ZERO; hashes.len()], fallback)
+            .iter().all(|k| *k));
     }
 
     /// The live shards are this application's filters with Active provers,

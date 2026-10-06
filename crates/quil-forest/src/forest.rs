@@ -54,6 +54,22 @@ impl TreeStore {
             }
         }
     }
+
+    /// See [`RocksTreeStore::leaves_between`].
+    pub fn leaves_between(
+        &self,
+        version: Version,
+        first: &[u8; 32],
+        last: &[u8; 32],
+        after: Option<&[u8; 32]>,
+        max_leaves: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<(KeyHash, OwnedValue)>, bool)> {
+        match self {
+            TreeStore::Rocks(s) => s.leaves_between(version, first, last, after, max_leaves, max_bytes),
+            TreeStore::Mem(s) => s.leaves_between(version, first, last, after, max_leaves, max_bytes),
+        }
+    }
 }
 
 impl crate::BatchTreeReader for TreeStore {}
@@ -903,6 +919,26 @@ impl Forest {
             )),
             None => Ok(None),
         }
+    }
+
+    /// SERVER side of forest sync: the leaves of a shard/phase tree with keys in
+    /// `[first, last]` after `after`, each at its newest value at or below
+    /// `version`, in key order (see [`RocksTreeStore::leaves_between`]). A
+    /// bootstrap lists its whole subtree this way instead of walking it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn serve_leaves(
+        &self,
+        shard_id: &[u8],
+        phase: Phase,
+        version: u64,
+        first: &[u8; 32],
+        last: &[u8; 32],
+        after: Option<&[u8; 32]>,
+        max_leaves: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<(KeyHash, OwnedValue)>, bool)> {
+        self.store(&TreeId::shard_phase(shard_id, phase))
+            .leaves_between(version, first, last, after, max_leaves, max_bytes)
     }
 
     /// SERVER side of forest sync: serve a leaf value of a shard/phase tree by its
@@ -2392,5 +2428,65 @@ mod tests {
         // A read pinned at version 1 still resolves (its nodes were retained).
         let got = jmt_tree.get(KeyHash::with::<Sha256>(3u32.to_be_bytes()), 1).unwrap();
         assert_eq!(got, Some(vec![1u8 ^ 3u8; 40]));
+    }
+
+    /// A bootstrap's leaf listing reads each key's newest value at or below
+    /// the requested version, skips removed keys and keys outside the range,
+    /// and pages without losing or repeating a leaf.
+    #[test]
+    fn leaf_listing_reads_one_version_in_key_order_across_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let forest = Forest::new(open_db(dir.path()));
+        let shard = b"L".to_vec();
+        let tree = TreeId::shard_phase(&shard, Phase::VertexAdds);
+        let store = RocksTreeStore::new(forest.db().unwrap().clone(), &tree);
+        let key = |i: u8| { let mut k = [0u8; 32]; k[0] = i; k[31] = i; KeyHash(k) };
+        let write = |version: u64, writes: Vec<(KeyHash, Option<Vec<u8>>)>| {
+            let (_, batch) = Sha256Jmt::new(&store).put_value_set(writes, version).unwrap();
+            store.apply_update(&batch).unwrap();
+        };
+        write(0, (0..40u8).map(|i| (key(i), Some(vec![i; 40]))).collect());
+        // Version 1 rewrites the even keys, removes key 7 and adds key 200.
+        let mut changes: Vec<_> = (0..40u8).step_by(2).map(|i| (key(i), Some(vec![i ^ 0xff; 40]))).collect();
+        changes.push((key(7), None));
+        changes.push((key(200), Some(vec![9; 40])));
+        write(1, changes);
+        // Version 2 (above every read below) rewrites key 3.
+        write(2, vec![(key(3), Some(vec![3; 8]))]);
+
+        let all = |version: u64, first: &[u8; 32], last: &[u8; 32], page: usize| {
+            let mut out = Vec::new();
+            let mut after = None;
+            loop {
+                let (leaves, more) = forest
+                    .serve_leaves(&shard, Phase::VertexAdds, version, first, last, after.as_ref(), page, usize::MAX)
+                    .unwrap();
+                assert!(leaves.len() <= page);
+                after = leaves.last().map(|(k, _): &(KeyHash, OwnedValue)| k.0).or(after);
+                out.extend(leaves);
+                if !more { return out; }
+            }
+        };
+        let everything = ([0u8; 32], [0xffu8; 32]);
+        let at0 = all(0, &everything.0, &everything.1, 7);
+        assert_eq!(at0, (0..40u8).map(|i| (key(i), vec![i; 40])).collect::<Vec<_>>());
+        let at1 = all(1, &everything.0, &everything.1, 3);
+        let mut expected: Vec<_> = (0..40u8).filter(|i| *i != 7)
+            .map(|i| (key(i), if i % 2 == 0 { vec![i ^ 0xff; 40] } else { vec![i; 40] }))
+            .collect();
+        expected.push((key(200), vec![9; 40]));
+        assert_eq!(at1, expected, "newest value at or below the version; removed keys omitted");
+        // Every leaf read at version 1 is the tree's own value there.
+        for (k, v) in &at1 {
+            assert_eq!(store.get_value_option(1, *k).unwrap().as_ref(), Some(v));
+        }
+        // A key range bounds the listing at both ends.
+        let (first, last) = (key(10).0, key(12).0);
+        assert_eq!(all(1, &first, &last, 100).iter().map(|(k, _)| k.0[0]).collect::<Vec<_>>(), vec![10, 11, 12]);
+        // A byte budget stops a page early, but never before its first leaf.
+        let (leaves, more) = forest.serve_leaves(&shard, Phase::VertexAdds, 1, &everything.0, &everything.1, None, 100, 100).unwrap();
+        assert_eq!((leaves.len(), more), (2, true));
+        let (leaves, _) = forest.serve_leaves(&shard, Phase::VertexAdds, 1, &everything.0, &everything.1, None, 100, 1).unwrap();
+        assert_eq!(leaves.len(), 1);
     }
 }

@@ -965,7 +965,7 @@ pub fn materialize_prover_shard_update_with_fees(
     // that was eligible, so `credited < participants` flags a partial payout.
     let participants: usize = ctx.participants_by_ring.values().map(|p| p.len()).sum();
     tracing::info!(
-        shard = %hex::encode(&frame_header.address[..frame_header.address.len().min(8)]),
+        shard = %hex::encode(&frame_header.address),
         frame = current_frame_number,
         credited_provers,
         participants,

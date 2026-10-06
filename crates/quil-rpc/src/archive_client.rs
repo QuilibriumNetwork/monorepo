@@ -376,6 +376,42 @@ impl ArchiveClient {
         Ok(resp.blobs.into_iter().map(|b| b.found.then_some(b.data)).collect())
     }
 
+    /// Forest sync, listed: leaves of one shard/phase tree with keys in
+    /// `[first, last]` after `after`, each at its newest value at or below
+    /// `version`, in key order, and whether more may follow.
+    pub async fn get_forest_leaves(
+        &mut self,
+        shard_id: Vec<u8>,
+        phase: u32,
+        version: u64,
+        first: [u8; 32],
+        last: [u8; 32],
+        after: Option<[u8; 32]>,
+    ) -> Result<(Vec<([u8; 32], Vec<u8>)>, bool), ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_forest_leaves(quil_types::proto::global::GetForestLeavesRequest {
+                shard_id,
+                phase,
+                version,
+                first: first.to_vec(),
+                last: last.to_vec(),
+                after: after.map(|key| key.to_vec()).unwrap_or_default(),
+            })
+            .await?
+            .into_inner();
+        let leaves = resp
+            .leaves
+            .into_iter()
+            .map(|leaf| {
+                <[u8; 32]>::try_from(leaf.key_hash.as_slice())
+                    .map(|key| (key, leaf.value))
+                    .map_err(|_| ArchiveClientError::MissingField("forest leaf key must be 32 bytes"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((leaves, resp.more))
+    }
+
     /// Forest sync: fetch a leaf value by `key_hash` (32 bytes) at `version`.
     pub async fn get_forest_value(
         &mut self,
@@ -499,6 +535,19 @@ impl ArchiveClient {
         Ok(self
             .app_shard
             .list_shard_coins(quil_types::proto::global::ListShardCoinsRequest { domain, snapshot_id, after })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn list_shard_legacy_coins(
+        &mut self,
+        domain: Vec<u8>,
+        owner: Vec<u8>,
+        after: Vec<u8>,
+    ) -> Result<quil_types::proto::global::ListLegacyCoinsResponse, ArchiveClientError> {
+        Ok(self
+            .app_shard
+            .list_shard_legacy_coins(quil_types::proto::global::ListLegacyCoinsRequest { domain, owner, after })
             .await?
             .into_inner())
     }

@@ -269,6 +269,21 @@ impl ExecutionEngineManager {
         { let _ = (address, bundle_bytes); 0 }
     }
 
+    /// The legacy coin the first shield of a canonical bundle consumes. Only
+    /// the shard holding that coin can verify the shield (its source check
+    /// reads the shard's own store), so the bundle is routed there.
+    pub fn shield_source(bundle_bytes: &[u8]) -> Option<[u8; 32]> {
+        #[cfg(feature = "native-proof")]
+        {
+            let bundle = crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes).ok()?;
+            return bundle.requests.into_iter().flatten()
+                .filter(|request| request.inner_type_prefix == crate::token_engine::TYPE_LATTICE_SHIELD)
+                .find_map(|request| quil_lattice_ct::confidential::shield::source_address(&request.inner_bytes));
+        }
+        #[cfg(not(feature = "native-proof"))]
+        { let _ = bundle_bytes; None }
+    }
+
     /// Whether the global commit has decided every request of a canonical
     /// bundle, so no shard needs to execute it again. Only globally committed
     /// operations are ever decided, so a bundle holding anything else never

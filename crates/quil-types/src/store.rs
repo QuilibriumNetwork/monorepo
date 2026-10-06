@@ -782,8 +782,36 @@ pub struct CoinPageData {
     pub has_more: bool,
 }
 
+/// One legacy (transparent) coin of an owner. Owner, amount and origin are
+/// public; `shielded` is whether GLOBAL has recorded it consumed by a shield.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyCoinData {
+    pub address: [u8; 32],
+    pub amount: u128,
+    pub origin: [u8; 32],
+    pub shielded: bool,
+}
+
+/// One page of an owner's legacy coins, ascending by address.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LegacyCoinPageData {
+    pub coins: Vec<LegacyCoinData>,
+    pub cursor: Option<[u8; 32]>,
+    pub has_more: bool,
+}
+
+/// Legacy coins one page carries.
+pub const MAX_LEGACY_COINS_PER_PAGE: usize = 512;
+
 /// Node-side QCT3 wallet discovery, membership and mint-witness provider.
 pub trait CoinWitnessProvider: Send + Sync {
+    /// `owner`'s legacy coins in `domain` after `after`. `None` when this node
+    /// cannot list them (no complete owner index): the caller asks an
+    /// archive instead.
+    fn legacy_coins(&self, _domain: &[u8; 32], _owner: &[u8; 32], _after: Option<&[u8; 32]>) -> Result<Option<LegacyCoinPageData>> {
+        Ok(None)
+    }
+
     fn escrow_page(&self, _domain: &[u8; 32], _snapshot_id: Option<&[u8; 32]>, _after: Option<&[u8; 32]>) -> Result<Option<EscrowPageData>> {
         Ok(None)
     }
