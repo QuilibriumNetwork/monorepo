@@ -1906,6 +1906,11 @@ mod tests {
         allocation.ring = 0;
         allocation.latest_frame = 20;
         assert_eq!(alloc_cell(&model, &allocation, 3, 12), "0");
+        assert_eq!(alloc_cell(&model, &allocation, 6, 12), "-");
+        // A remote head does not establish the local worker's cursor.
+        allocation.execution = Some(quil_types::proto::node::WorkerExecution {
+            materialized_frame: Some(0), ..Default::default()
+        });
         assert_eq!(alloc_cell(&model, &allocation, 6, 12), "0");
         assert_eq!(alloc_cell(&model, &allocation, 7, 12), "20");
         assert_eq!(alloc_cell(&model, &allocation, 8, 12), "unmat");
