@@ -1678,6 +1678,11 @@ pub(crate) fn spawn_all(
         sizes: Arc<quil_engine::shard_info::CommittedShardSizes>,
     }
     impl quil_types::consensus::ShardInfoProvider for LocalShardInfoProvider {
+        fn get_global_app_heads(&self, filters: &[Vec<u8>])
+            -> quil_types::error::Result<Vec<Option<quil_types::proto::node::GlobalAppFrameHead>>> {
+            committed_global_app_heads(&self.crdt, filters)
+        }
+
         fn get_shard_info(&self, include_all: bool)
             -> quil_types::error::Result<(Vec<quil_types::consensus::ShardDetail>, u64, num_bigint::BigInt, u64, num_bigint::BigInt)>
         {
@@ -2483,6 +2488,23 @@ pub(crate) fn spawn_all(
     Ok(())
 }
 
+/// Keep shard diagnostics on a single durable GLOBAL snapshot, never the
+/// volatile clock or an archive provider's reported materialization cursor.
+fn committed_global_app_heads(crdt: &Arc<quil_hypergraph::HypergraphCrdt>, filters: &[Vec<u8>])
+    -> quil_types::error::Result<Vec<Option<quil_types::proto::node::GlobalAppFrameHead>>> {
+    use quil_execution::global_intrinsic::handoff::{self, CommittedView};
+    let view = CommittedView::capture(crdt)?;
+    filters.iter().map(|filter| {
+        let Some(session) = handoff::head(&view, filter)? else { return Ok(None) };
+        let tip = handoff::session_tip(&view, &session.id()?)?;
+        Ok(Some(quil_types::proto::node::GlobalAppFrameHead {
+            frame: tip.map_or(session.base_frame, |tip| tip.frame),
+            global_frame: view.frame(),
+            generation: session.generation,
+        }))
+    }).collect()
+}
+
 #[cfg(test)]
 mod coverage_tests {
     use super::shard_paths_cover_application;
@@ -2883,5 +2905,49 @@ mod forest_sync_wire_tests {
         }
         let after = quil_rpc::global_service::forest_read_stats();
         assert!(after.cache.hits > before.cache.hits, "the second node's walk is answered from the cache");
+    }
+}
+
+#[cfg(test)]
+mod committed_app_head_tests {
+    use super::*;
+    use quil_execution::{hypergraph_state::HypergraphState, global_intrinsic::handoff};
+    use quil_types::crypto::Signer as _;
+
+    #[test]
+    fn app_heads_ignore_uncommitted_tips_and_require_a_committed_cursor() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::new(db.inner()));
+        let state = HypergraphState::new(crdt.clone());
+        let filter = vec![1; 32];
+        assert!(committed_global_app_heads(&crdt, &[filter.clone()]).is_err());
+        let signer = quil_crypto::FalconSigner::generate();
+        let session = quil_cw_consensus::handoff::Session {
+            chain_id: [0x11; 32], filter: filter.clone(), generation: 1,
+            genesis: [0x33; 32], base_frame: 0, authorization: [0x22; 32],
+            members: vec![signer.public_key().to_vec()],
+        };
+        handoff::initialize(&state, 100, &session).unwrap();
+        let commit = |frame| {
+            state.commit().unwrap(); state.abort();
+            crdt.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        };
+        commit(100);
+        let read = || committed_global_app_heads(&crdt, &[filter.clone(), vec![2; 32]]).unwrap();
+        let heads = read();
+        assert_eq!(heads[0].as_ref().map(|h| (h.frame, h.global_frame)), Some((0, 100)));
+        assert!(heads[1].is_none());
+        handoff::record_session_tip(&state, 101, &session.id().unwrap(), &quil_cw_consensus::handoff::Checkpoint {
+            frame: 744, view: 1110, digest: [0x44; 32], state_roots: [[0; 32]; 4], history_root: [0; 32],
+        }).unwrap();
+        assert_eq!(read()[0].as_ref().unwrap().frame, 0);
+        commit(101);
+        assert_eq!(read()[0].as_ref().map(|h| (h.frame, h.global_frame)), Some((744, 101)));
+        crdt.set_covered_prefix(&[63; 43]).unwrap();
+        assert!(committed_global_app_heads(&crdt, &[filter]).is_err());
     }
 }

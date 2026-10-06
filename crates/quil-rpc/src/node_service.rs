@@ -1155,8 +1155,10 @@ impl NodeService for NodeRpcServer {
             .get_shard_info(req.include_all)
             .map_err(|e| Status::internal(format!("get shard info: {e}")))?;
 
+        let filters: Vec<_> = details.iter().map(|d| d.filter.clone()).collect();
+        let global_heads = provider.get_global_app_heads(&filters).unwrap_or_default();
         let mut shards = Vec::with_capacity(details.len());
-        for d in &details {
+        for (i, d) in details.iter().enumerate() {
             shards.push(node::ShardRewardInfo {
                 filter: d.filter.clone(),
                 active_provers: d.active_provers,
@@ -1168,6 +1170,7 @@ impl NodeService for NodeRpcServer {
                 data_shards: d.data_shards,
                 materialized_frame: d.materialized_frame,
                 latest_frame: d.latest_frame,
+                global_head: global_heads.get(i).cloned().flatten(),
             });
         }
 
@@ -1768,6 +1771,9 @@ mod shard_world_size_tests {
 
     struct Provider;
     impl ShardInfoProvider for Provider {
+        fn get_global_app_heads(&self, filters: &[Vec<u8>]) -> quil_types::error::Result<Vec<Option<node::GlobalAppFrameHead>>> {
+            Ok(filters.iter().map(|f| if f == &[1] { Some(node::GlobalAppFrameHead { frame: 0, global_frame: 12, generation: 2 }) } else { None }).collect())
+        }
         fn get_shard_info(&self, include_all: bool)
             -> quil_types::error::Result<(Vec<ShardDetail>, u64, BigInt, u64, BigInt)> {
             let count = if include_all { 2 } else { 1 };
@@ -1788,6 +1794,9 @@ mod shard_world_size_tests {
             })).await.unwrap().into_inner();
             assert_eq!(response.shards.len(), if include_all { 2 } else { 1 });
             assert_eq!(response.shards[0].ring_known, Some(true));
+            let response = <node::GetShardInfoResponse as prost::Message>::decode(prost::Message::encode_to_vec(&response).as_slice()).unwrap();
+            assert_eq!(response.shards[0].global_head.as_ref().map(|head| (head.frame, head.global_frame, head.generation)), Some((0, 12, 2)));
+            if include_all { assert!(response.shards[1].global_head.is_none()); }
             if include_all { assert_eq!(response.shards[1].ring_known, Some(false)); }
             assert_eq!(BigInt::from_signed_bytes_be(&response.world_state_bytes), BigInt::from(3000));
         }

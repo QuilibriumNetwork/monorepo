@@ -117,6 +117,7 @@ pub const MIN_FILTER_WIDTH: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct AllocationRow {
+    pub global_head: Option<quil_types::proto::node::GlobalAppFrameHead>,
     pub execution: Option<quil_types::proto::node::WorkerExecution>,
     /// A shard-info row was actually returned for this allocation.
     pub shard_info_known: bool,
@@ -182,6 +183,7 @@ impl AllocationRow {
 
 #[derive(Debug, Clone)]
 pub struct ShardRow {
+    pub global_head: Option<quil_types::proto::node::GlobalAppFrameHead>,
     pub filter: Vec<u8>,
     pub filter_key: String,
     pub filter_hex: String,
@@ -551,6 +553,7 @@ impl Model {
             let execution = worker_info.as_ref().and_then(|wi| wi.worker_info.iter().find(|w|
                 w.core_id as i64 == wid && w.filter == a.filter)).and_then(|w| w.execution.clone());
             let mut row = AllocationRow {
+                global_head: None,
                 execution,
                 shard_info_known: false,
                 filter: a.filter.clone(),
@@ -577,6 +580,7 @@ impl Model {
                 manually_managed: mm,
             };
             if let Some(info) = reward_by_filter.get(&filter_hex) {
+                row.global_head = info.global_head.clone();
                 row.shard_info_known = true;
                 row.ring = reward_ring(info);
                 row.active_provers = info.active_provers;
@@ -595,6 +599,7 @@ impl Model {
             for w in &wi.worker_info {
                 if w.filter.is_empty() {
                     allocs.push(AllocationRow {
+                        global_head: None,
                         execution: None,
                         shard_info_known: false,
                         filter: Vec::new(),
@@ -634,6 +639,7 @@ impl Model {
                     continue;
                 }
                 avail.push(ShardRow {
+                    global_head: s.global_head.clone(),
                     filter: s.filter.clone(),
                     filter_key: filter_hex.clone(),
                     filter_hex,

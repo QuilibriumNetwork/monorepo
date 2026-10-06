@@ -731,11 +731,18 @@ fn local_color(a: &AllocationRow) -> Color {
     }
 }
 
+fn global_head_detail(head: Option<&quil_types::proto::node::GlobalAppFrameHead>) -> String {
+    match head {
+        Some(head) => format!("GLOBAL app head: {} @f{} (gen {})", head.frame, head.global_frame, head.generation),
+        None => "GLOBAL app head: unavailable".into(),
+    }
+}
+
 fn allocation_detail(a: &AllocationRow) -> Line<'static> {
     let Some(execution) = a.execution.as_ref() else {
-        return Line::from("Local execution details unavailable");
+        return Line::from(format!("{} | Local execution details unavailable", global_head_detail(a.global_head.as_ref())));
     };
-    let mut text = format!("Last advance: {}", if execution.last_advance_unix_ms == 0 {
+    let mut text = format!("{} | Last advance: {}", global_head_detail(a.global_head.as_ref()), if execution.last_advance_unix_ms == 0 {
         "not observed since start".into()
     } else { format!("{} ago", age(execution.last_advance_unix_ms)) });
     if !execution.blocker.is_empty() { text += &format!(" | Blocker: {}", execution.blocker); }
@@ -1008,7 +1015,7 @@ fn available_detail(s: &ShardRow) -> Line<'static> {
         "current" => ("Provider materialization is current".into(), HELP),
         _ => ("Provider shard heights unavailable; health unknown".into(), HELP),
     };
-    Line::from(Span::styled(message, Style::new().fg(color)))
+    Line::from(Span::styled(format!("{} | {message}", global_head_detail(s.global_head.as_ref())), Style::new().fg(color)))
 }
 
 fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: Option<&[usize]>) -> Vec<Line<'static>> {
@@ -1628,6 +1635,8 @@ fn help_body() -> Vec<Line<'static>> {
         kv("PeerHead", "Provider shard head; remote metadata"),
         kv("PeerState", "Reading of PeerMat and PeerHead; lag!/unmat! flag provider warnings"),
         kv("Cursor", "Inactive cursor stays visible to bind the detail below to its row"),
+        kv("GLOBAL app head", "Selected-row detail: executed app cursor at cited committed GLOBAL frame"),
+        kv("", "Independent of LocalMat and peer metadata; absent on older servers"),
         kv("", "lag: behind it; unmat: nothing materialized; unknown: no head"),
         kv(
             "Reward [Q/d]",
@@ -1877,6 +1886,20 @@ mod tests {
             assert_eq!(fmt_claimable(units), expected);
         }
         assert!(fmt_claimable(u128::MAX).split('.').nth(1).is_none_or(|fraction| fraction.len() <= 5));
+    }
+
+    #[test]
+    fn global_app_cursor_stays_distinct_from_peer_and_local_heights() {
+        let mut allocation = row("aa", 1, 1, 7, "", "");
+        allocation.latest_frame = 744;
+        allocation.global_head = Some(quil_types::proto::node::GlobalAppFrameHead { frame: 742, global_frame: 1000, generation: 2 });
+        allocation.execution = Some(quil_types::proto::node::WorkerExecution { materialized_frame: Some(744), ..Default::default() });
+        assert!(allocation_detail(&allocation).to_string().contains("GLOBAL app head: 742 @f1000 (gen 2)"));
+        let mut peer = shard("bb", 1, 1); peer.latest_frame = 900;
+        peer.global_head = allocation.global_head.clone();
+        assert!(available_detail(&peer).to_string().contains("GLOBAL app head: 742 @f1000"));
+        assert_eq!(global_head_detail(None), "GLOBAL app head: unavailable");
+        assert!(global_head_detail(Some(&quil_types::proto::node::GlobalAppFrameHead::default())).contains("head: 0 @f0"));
     }
 
     #[test]
@@ -2169,6 +2192,7 @@ mod tests {
         dflt: &str,
     ) -> AllocationRow {
         AllocationRow {
+            global_head: None,
             execution: None,
             shard_info_known: true,
             filter: Vec::new(),
@@ -2332,6 +2356,7 @@ mod tests {
 
     fn shard(hex: &str, size: u64, reward: u64) -> ShardRow {
         ShardRow {
+            global_head: None,
             filter: Vec::new(),
             filter_key: hex.to_string(),
             filter_hex: hex.to_string(),
