@@ -87,7 +87,7 @@ fn install_policy() {
     quil_types::consensus::set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
         activation_frame: ACTIVATION,
         chain_id: [0x51; 32],
-        legacy_history: LegacyHistory::Discard,
+        legacy_history: LegacyHistory::Discard, membership_boundary_frame: u64::MAX
     }));
 }
 

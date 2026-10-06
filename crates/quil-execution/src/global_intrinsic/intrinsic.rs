@@ -3118,7 +3118,7 @@ impl GlobalIntrinsic {
     /// boundaries, so most passes change nothing, while a shard formed by a
     /// split or a first join is not left without a session for a whole epoch.
     fn reconcile_committee_sessions(&self, frame_number: u64, state: &HypergraphState) -> Result<()> {
-        const CADENCE_FRAMES: u64 = 8;
+        const CADENCE_FRAMES: u64 = super::handoff::schedule::SESSION_PASS_FRAMES;
         let Some(policy) = quil_types::consensus::committee_handoff_policy() else {
             return Ok(());
         };

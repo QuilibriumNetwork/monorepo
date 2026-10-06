@@ -128,7 +128,7 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
     quil_types::consensus::set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
         activation_frame: 0,
         chain_id: [0x51; 32],
-        legacy_history: LegacyHistory::Discard,
+        legacy_history: LegacyHistory::Discard, membership_boundary_frame: u64::MAX
     }));
     let discarded = until(Duration::from_secs(60), || {
         harness.workers.iter().all(|w| {

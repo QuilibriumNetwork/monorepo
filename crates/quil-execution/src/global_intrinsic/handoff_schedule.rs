@@ -469,6 +469,16 @@ pub fn fence_stalled_sources(state: &HypergraphState, frame: u64, filters: &[Vec
 /// already holds legacy-certified history (a recorded legacy tip) is skipped:
 /// it enters through generation zero (`legacy::migrate`, which runs before this
 /// in the maintenance pass), never from the empty genesis.
+/// GLOBAL frames between session passes (`reconcile_committee_sessions`).
+pub const SESSION_PASS_FRAMES: u64 = 8;
+
+/// Whether `frame`'s pass is the first of its epoch: from the policy's
+/// `membership_boundary_frame`, the only pass that schedules membership
+/// successors.
+pub fn first_pass_of_epoch(frame: u64) -> bool {
+    frame % quil_types::consensus::epoch_length_frames() < SESSION_PASS_FRAMES
+}
+
 pub fn reconcile_membership(
     state: &HypergraphState,
     frame: u64,
@@ -511,6 +521,13 @@ pub fn reconcile_membership(
             continue;
         };
         if current.members == members || status(state, &current.id()?)? != Status::Active {
+            continue;
+        }
+        // The committee is frozen for the epoch: an eligible set that changes
+        // within it (a late re-confirm, a leave reject) waits for the next
+        // boundary. Mid-epoch, every such change re-sealed every shard its
+        // prover sat on, every pass, and no session ever produced a frame.
+        if frame >= policy.membership_boundary_frame && !first_pass_of_epoch(frame) {
             continue;
         }
         if current.chain_id != policy.chain_id {

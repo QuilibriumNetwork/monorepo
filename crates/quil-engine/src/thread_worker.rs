@@ -17,6 +17,10 @@ use quil_types::error::{QuilError, Result};
 
 use crate::worker::{WorkerInfo, WorkerManager};
 
+/// Archive shard recoveries this process runs at once (see the recovery
+/// spawn below).
+static SHARD_RECOVERY_TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 /// Message from master to worker.
 #[derive(Debug)]
 pub enum MasterToWorker {
@@ -770,6 +774,10 @@ impl ThreadWorkerManager {
                                                                     let release_sync = ReleaseSyncFlag(flag);
                                                                     tokio::spawn(async move {
                                                                         let _release_sync = release_sync;
+                                                                        // A node's workers share its archive identity and
+                                                                        // so its per-peer read slots: a few recover at a
+                                                                        // time rather than all failing busy together.
+                                                                        let _turn = SHARD_RECOVERY_TURNS.acquire().await;
                                                                         match crate::prover_tree_syncer::recover_shard_from_latest(
                                                                             syncer.as_ref(), &filter, local, &lb,
                                                                         ).await {

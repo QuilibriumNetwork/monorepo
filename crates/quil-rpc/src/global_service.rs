@@ -407,8 +407,10 @@ const FOREST_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Reads waiting for a slot beyond which further reads are refused at once.
 const MAX_FOREST_READ_WAITERS: usize = 64;
 /// Storage slots one authenticated peer may hold at once, so a single syncing
-/// client cannot occupy all of them.
-const FOREST_READ_SLOTS_PER_PEER: usize = 4;
+/// client cannot occupy all of them. A node's workers all reach the archive
+/// under its identity, so this is shared by every worker bootstrapping at
+/// once (4 starved a node of 15 after the committee-handoff flag day).
+const FOREST_READ_SLOTS_PER_PEER: usize = 8;
 /// Keys one batched forest read may name.
 pub const MAX_FOREST_BATCH_KEYS: usize = 512;
 /// A batched response stops (answering a prefix) once it carries this many

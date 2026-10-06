@@ -65,13 +65,13 @@ trait PhaseSourceLookup {
 #[async_trait::async_trait]
 impl PhaseSourceLookup for ArchiveClient {
     async fn head(&mut self, shard: &[u8], phase: u32) -> Result<Option<(u64, Vec<u8>)>> {
-        self.get_forest_head(shard.to_vec(), phase).await
+        quil_rpc::forest_sync_reader::forest_head(self, shard.to_vec(), phase).await
             .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))
     }
 
     async fn resolve(&mut self, shard: &[u8], phase: u32, root: &[u8; 32])
         -> Result<Option<(u64, u64)>> {
-        self.resolve_root(shard.to_vec(), phase, root.to_vec()).await
+        quil_rpc::forest_sync_reader::resolve_forest_root(self, shard.to_vec(), phase, root.to_vec()).await
             .map_err(|e| QuilError::Internal(format!("resolve_root: {e}")))
     }
 }
@@ -547,8 +547,7 @@ pub async fn pull_shard_from_peer(
     let handle = tokio::runtime::Handle::current();
     let mut synced = 0usize;
     for phase in 0u32..4 {
-        let head = client
-            .get_forest_head(shard_id.to_vec(), phase)
+        let head = quil_rpc::forest_sync_reader::forest_head(&client, shard_id.to_vec(), phase)
             .await
             .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))?;
         let Some((v_s, root_s)) = head else { continue };
