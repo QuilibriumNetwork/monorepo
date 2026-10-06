@@ -63,6 +63,7 @@ pub struct WorkerEntry {
     pub total_storage: u64,
     pub manually_managed: bool,
     pub allocated: bool,
+    pub execution: Option<node::WorkerExecution>,
 }
 
 /// gRPC NodeService implementation with live node state.
@@ -582,6 +583,7 @@ impl NodeService for NodeRpcServer {
                 available_storage: w.available_storage,
                 total_storage: w.total_storage,
                 manually_managed: w.manually_managed,
+                execution: w.execution.clone(),
             })
             .collect();
 

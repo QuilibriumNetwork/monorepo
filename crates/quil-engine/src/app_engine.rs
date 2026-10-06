@@ -282,10 +282,13 @@ pub struct AppEngineHandle {
     pub filter: Vec<u8>,
     msg_tx: mpsc::Sender<AppEngineMessage>,
     sizes: SharedAppEngineSizes,
+    execution: crate::worker_execution::SharedWorkerExecution,
     fee_snapshot: Arc<std::sync::Mutex<Option<quil_execution::pricing::AppFeeSnapshot>>>,
 }
 
 impl AppEngineHandle {
+    pub fn execution(&self) -> quil_types::proto::node::WorkerExecution { self.execution.snapshot() }
+    pub fn execution_state(&self, state: &str, blocker: &str) { self.execution.state(state, blocker); }
     /// A handle for `filter` whose messages arrive on the returned receiver.
     #[cfg(test)]
     pub(crate) fn for_test(filter: Vec<u8>) -> (Self, mpsc::Receiver<AppEngineMessage>) {
@@ -296,6 +299,7 @@ impl AppEngineHandle {
             filter,
             msg_tx,
             sizes: SharedAppEngineSizes::new(),
+            execution: Default::default(),
             fee_snapshot: Arc::new(std::sync::Mutex::new(None)),
         };
         (handle, receiver)
@@ -2046,6 +2050,7 @@ pub struct AppConsensusEngine {
     /// bypass of the pre-state check. A lagging voter catches up via shard sync,
     /// then votes.
     shard_mat_frame: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    execution: crate::worker_execution::SharedWorkerExecution,
     /// Shared with the CW proposer/verifier: whether this member has staged the
     /// covered sub-shard's committed data into its own CRDT. Gates propose/vote
     /// (see [`crate::cw_app_seams::AppSeamProposer`]) so a joining member neither
@@ -2209,7 +2214,10 @@ impl AppConsensusEngine {
         let fee_snapshot = Arc::new(std::sync::Mutex::new(None));
         let shard_mat_frame = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let cancel = CancellationToken::new();
+        let execution = crate::worker_execution::SharedWorkerExecution::default();
+        execution.state("starting", "waiting for transport");
         let handle = AppEngineHandle {
+            execution: execution.clone(),
             cancel: cancel.clone(),
             materialized: shard_mat_frame.clone(),
             fee_snapshot: fee_snapshot.clone(),
@@ -2260,6 +2268,7 @@ impl AppConsensusEngine {
             pending_seal_rank: None,
             last_materialized_frame: 0,
             shard_mat_frame,
+            execution,
             data_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inherit_pending: std::sync::atomic::AtomicBool::new(false),
             pre_state_mismatches: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2511,6 +2520,7 @@ impl AppConsensusEngine {
 
     fn set_materialized_frame(&mut self, n: u64) {
         let prev = self.last_materialized_frame;
+        self.execution.materialized(n);
         self.last_materialized_frame = n;
         if let Some(parents) = self.private_parents.as_ref() {
             parents.retire_through(n);
@@ -3532,6 +3542,7 @@ impl AppConsensusEngine {
             // see per-shard internal growth. Cheap mutex lock, runs
             // at message cadence (not per-tick), which is fine for
             // a 30 s diagnostic log.
+            self.execution.observe();
             self.publish_sizes();
         }
         if let Some(old) = self.cw_handle.take() {
@@ -3836,6 +3847,25 @@ impl AppConsensusEngine {
     }
 
     async fn start_consensus_cw(
+        &mut self,
+        signer: Box<dyn quil_types::crypto::Signer>,
+    ) -> Result<crate::cw_app_seams::AppConsensusCwHandle> {
+        let result = self.start_consensus_cw_observed(signer).await;
+        match &result {
+            Ok(_) => self.execution.state("running", ""),
+            Err(error) => {
+                let text = error.to_string();
+                let blocker = if text.contains("sealed checkpoint") { "checkpoint mismatch" }
+                    else if text.contains("awaiting its successor") { "awaiting successor" }
+                    else if text.contains("bootstrap") || text.contains("authenticated GLOBAL") { "state unavailable" }
+                    else { "consensus startup unavailable" };
+                self.execution.state("blocked", blocker);
+            }
+        }
+        result
+    }
+
+    async fn start_consensus_cw_observed(
         &mut self,
         bls_signer: Box<dyn quil_types::crypto::Signer>,
     ) -> Result<crate::cw_app_seams::AppConsensusCwHandle> {
@@ -7577,7 +7607,7 @@ mod tests {
         let (msg_tx, receiver) = mpsc::channel(1);
         let materialized = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stored = Arc::new(std::sync::Mutex::new(None));
-        let handle = AppEngineHandle { cancel: CancellationToken::new(), filter: vec![7; 32], msg_tx,
+        let handle = AppEngineHandle { execution: Default::default(), cancel: CancellationToken::new(), filter: vec![7; 32], msg_tx,
             sizes: SharedAppEngineSizes::new(), materialized: materialized.clone(), fee_snapshot: stored.clone() };
         assert!(handle.fee_snapshot().is_none());
         let snapshot = quil_execution::pricing::AppFeeSnapshot {

@@ -1,6 +1,8 @@
 //! Rendering for the `prover manage` TUI. Port of the bubbletea `View`
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
+use super::super::local_execution::{local_execution_state, age, detail};
+
 use num_bigint::BigInt;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -291,7 +293,11 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         11 => a.status_name.clone(),
         12 => a.mode().to_string(),
         13 => a.next_action.clone(),
-        _ => a.default_action.clone(),
+        14 => a.default_action.clone(),
+        15 => a.execution.as_ref().and_then(|s| s.materialized_frame).map(|h| h.to_string()).unwrap_or_else(|| "-".into()),
+        16 => local_execution_state(a.execution.as_ref()).into(),
+        17 => a.execution.as_ref().map(|s| age(s.last_advance_unix_ms)).unwrap_or_else(|| "-".into()),
+        _ => String::new(),
     }
 }
 
@@ -375,7 +381,8 @@ fn alloc_widths_fixed(
     );
     // Whatever the wide columns took comes out of the flexible Filter column.
     let grown = (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH);
-    let mut fw = content_width.saturating_sub(ALLOC_FIXED_WIDTH + grown);
+    let local_widths: Vec<usize> = (15..18).map(|c| col_width(&alloc_header(m, c), sorted.iter().map(|a| alloc_cell(m, a, c, 0).len()))).collect();
+    let mut fw = content_width.saturating_sub(ALLOC_FIXED_WIDTH + grown + local_widths.iter().sum::<usize>());
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
             continue;
@@ -399,6 +406,7 @@ fn alloc_widths_fixed(
         NEXT_ACTION_WIDTH,
         DEFAULT_ACTION_WIDTH,
     ];
+    widths.extend(local_widths);
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
             continue;
@@ -759,6 +767,12 @@ fn status_line(m: &Model) -> Line<'static> {
         return Line::from(format!("{} {}", spinner(m), m.status_msg));
     }
     if m.status_msg.is_empty() {
+        if m.focus.is_alloc() {
+            if let Some(a) = m.sorted_allocations().get(m.alloc_cursor) {
+                return Line::from(format!("Worker {}: {}; peer shard materialized/head {}/{}",
+                    a.worker_id, detail(a.execution.as_ref()), a.materialized_frame, a.latest_frame));
+            }
+        }
         return Line::from("");
     }
     let color = if m.status_is_error { ERROR } else { SUCCESS };
@@ -907,6 +921,12 @@ fn render_help_screen(f: &mut Frame, m: &Model, area: Rect) {
             Style::new().fg(TEXT).bg(PRIMARY).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
+        sec("Worker progress"),
+        kv("LocalMat", "Local engine materialized height; - means unknown"),
+        kv("Execution", "Observed host state; running does not establish rewards"),
+        kv("Advance", "Age of last height increase; restored cursor is not an increase"),
+        kv("PeerMat/Lag", "Metadata provider's shard cursor/gap, not local worker progress"),
+        kv("", "Observations older than 30s are stale; selected row shows blocker and age"),
         sec("Navigation"),
         kv("↑ / k", "Move cursor up"),
         kv("↓ / j", "Move cursor down"),
@@ -1025,6 +1045,7 @@ mod tests {
         dflt: &str,
     ) -> AllocationRow {
         AllocationRow {
+            execution: None,
             filter: Vec::new(),
             filter_key: hex.to_string(),
             filter_hex: hex.to_string(),

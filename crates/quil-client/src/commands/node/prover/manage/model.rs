@@ -3,6 +3,7 @@
 //! struct, data-refresh processing, and the filter/sort derivations.
 
 use std::collections::{HashMap, HashSet};
+use super::super::local_execution::local_execution_state;
 
 use num_bigint::{BigInt, Sign};
 
@@ -17,12 +18,12 @@ use super::super::epoch::{
 
 // ── Column metadata (shared between rendering and filtering) ─────────────
 
-pub const ALLOC_COL_NAMES: [&str; 15] = [
-    "Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "Mat", "Lag", "State",
-    "Reward [Q/f]", "Worker", "Status", "Mode", "Next Action", "Default Action",
+pub const ALLOC_COL_NAMES: [&str; 18] = [
+    "Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "PeerMat", "PeerLag", "PeerState",
+    "Reward [Q/f]", "Worker", "Status", "Mode", "Next Action", "Default Action", "LocalMat", "Execution", "Advance",
 ];
 pub const AVAIL_COL_NAMES: [&str; 10] =
-    ["Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "Mat", "Lag", "State", "Reward [Q/f]"];
+    ["Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "PeerMat", "PeerLag", "PeerState", "Reward [Q/f]"];
 
 pub const ALLOC_FILTERABLE_COLS: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 pub const AVAIL_FILTERABLE_COLS: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -100,7 +101,7 @@ pub const ALLOC_FIXED_WIDTH: usize = SELECT_WIDTH
     + MODE_WIDTH
     + NEXT_ACTION_WIDTH
     + DEFAULT_ACTION_WIDTH
-    + 14
+    + 17
     + 2
     + 2;
 // 6 spaces between 7 columns, 2 external borders, 2-char sort indicator.
@@ -118,6 +119,7 @@ pub const ACTION_FRAME_DELAY: u64 = 360;
 
 #[derive(Debug, Clone)]
 pub struct AllocationRow {
+    pub execution: Option<quil_types::proto::node::WorkerExecution>,
     pub filter: Vec<u8>,
     pub filter_key: String,
     pub filter_hex: String,
@@ -473,7 +475,10 @@ impl Model {
                 .map(|(id, m)| (*id as i64, *m))
                 .unwrap_or((-1, false));
 
+            let execution = worker_info.as_ref().and_then(|wi| wi.worker_info.iter().find(|w|
+                w.core_id as i64 == wid && w.filter == a.filter)).and_then(|w| w.execution.clone());
             let mut row = AllocationRow {
+                execution,
                 filter: a.filter.clone(),
                 filter_key: filter_hex.clone(),
                 filter_hex: filter_hex.clone(),
@@ -514,6 +519,7 @@ impl Model {
             for w in &wi.worker_info {
                 if w.filter.is_empty() {
                     allocs.push(AllocationRow {
+                execution: None,
                         filter: Vec::new(),
                         filter_key: format!("worker:{}", w.core_id),
                         filter_hex: String::new(),
@@ -669,6 +675,9 @@ impl Model {
                 7 => materialization_lag(a.materialized_frame, a.latest_frame).cmp(&materialization_lag(b.materialized_frame, b.latest_frame)),
                 8 => materialization_state(a.materialized_frame, a.latest_frame).cmp(materialization_state(b.materialized_frame, b.latest_frame)),
                 9 => a.estimated_reward.cmp(&b.estimated_reward),
+                15 => a.execution.as_ref().and_then(|s| s.materialized_frame).cmp(&b.execution.as_ref().and_then(|s| s.materialized_frame)),
+                16 => local_execution_state(a.execution.as_ref()).cmp(local_execution_state(b.execution.as_ref())),
+                17 => a.execution.as_ref().map(|s| s.last_advance_unix_ms).cmp(&b.execution.as_ref().map(|s| s.last_advance_unix_ms)),
                 10 => a.worker_id.cmp(&b.worker_id), 11 => a.status.cmp(&b.status),
                 12 => a.manually_managed.cmp(&b.manually_managed), 13 => a.next_action.cmp(&b.next_action),
                 14 => a.default_action.cmp(&b.default_action),

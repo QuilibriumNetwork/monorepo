@@ -1601,11 +1601,13 @@ pub(crate) fn spawn_all(
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
+                let execution = wm.worker_execution();
                 let entries: Vec<quil_rpc::WorkerEntry> =
                     quil_engine::worker::WorkerView::snapshot(wm.as_ref())
                         .all
                         .into_iter()
                         .map(|w| quil_rpc::WorkerEntry {
+                            execution: execution.iter().find(|(id, filter, _)| *id == w.core_id && *filter == w.filter).map(|(_, _, s)| s.clone()),
                             core_id: w.core_id,
                             filter: w.filter.clone(),
                             available_storage: w.available_storage,

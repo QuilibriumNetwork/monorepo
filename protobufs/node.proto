@@ -99,6 +99,17 @@ message WorkerInfo {
   uint64 available_storage = 3;
   uint64 total_storage = 4;
   bool manually_managed = 5;
+  // Absent on older nodes and worker implementations without local telemetry.
+  WorkerExecution execution = 6;
+}
+
+// Local engine observations; independent of allocation and remote shard data.
+message WorkerExecution {
+  string state = 1;
+  string blocker = 2;
+  optional uint64 materialized_frame = 3;
+  uint64 last_advance_unix_ms = 4;
+  uint64 observed_unix_ms = 5;
 }
 
 message WorkerInfoResponse {
