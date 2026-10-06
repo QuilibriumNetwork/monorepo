@@ -1802,7 +1802,6 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 ).await {
                                     Ok(Some(_)) => {
                                         return true;
-                                        break 'rounds;
                                     }
                                     Ok(None) => warn!(peer = %addr, round,
                                         "initial prover tree sync: archive cannot serve the tree; trying the next"),
