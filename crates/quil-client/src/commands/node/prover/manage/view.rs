@@ -1,7 +1,7 @@
 //! Rendering for the `prover manage` TUI. Port of the bubbletea `View`
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
-use super::super::local_execution::{local_execution_state, detail};
+use super::super::local_execution::{local_execution_state, age};
 
 use num_bigint::BigInt;
 use super::super::epoch::EffectiveStatus;
@@ -383,6 +383,7 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     let mut paused = BigInt::from(0);
     let mut leaving = BigInt::from(0);
     let (mut current_unknown, mut paused_unknown, mut change_unknown) = (false, false, false);
+    let mut current_known = false;
     for a in sorted {
         if a.ring == UNKNOWN_REWARD_RING {
             match a.reward_status(m.epoch_frame(), m.epoch_length) {
@@ -396,9 +397,9 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
         }
         match a.reward_status(m.epoch_frame(), m.epoch_length) {
             Some(EffectiveStatus::Joining) => joining += &a.estimated_reward,
-            Some(EffectiveStatus::Active) => active += &a.estimated_reward,
+            Some(EffectiveStatus::Active) => { current_known = true; active += &a.estimated_reward; },
             Some(EffectiveStatus::Paused) => paused += &a.estimated_reward,
-            Some(EffectiveStatus::Leaving) => leaving += &a.estimated_reward,
+            Some(EffectiveStatus::Leaving) => { current_known = true; leaving += &a.estimated_reward; },
             _ => {}
         }
     }
@@ -408,7 +409,8 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
         "Allocations: {}  {}  Rewards [Q/d]: Current {} | Paused {} | Planned change {}",
         sorted.len(),
         claimable_title(m),
-        if current_unknown { "?".into() } else { fmt_reward(&current) },
+        if current_unknown && !current_known { "?".into() }
+        else { format!("{}{}", fmt_reward(&current), if current_unknown { "+" } else { "" }) },
         if paused_unknown { "?".into() } else { fmt_reward(&paused) },
         if change_unknown { "?".into() } else { fmt_reward_change(&change) },
     );
@@ -449,9 +451,7 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         4 => fmt_mb(&a.shard_size),
         5 => a.data_shards.to_string(),
         6 => a.execution.as_ref().and_then(|s| s.materialized_frame).map(|h| h.to_string()).unwrap_or_else(|| "-".into()),
-        7 => materialization_lag(a.materialized_frame, a.latest_frame)
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "-".to_string()),
+        7 => if a.materialized_frame == 0 && a.latest_frame == 0 { "-".into() } else { a.latest_frame.to_string() },
         8 => local_execution_state(a.execution.as_ref()).into(),
         9 => if a.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&a.estimated_reward) },
         10 => a.worker_id.to_string(),
@@ -570,7 +570,7 @@ fn alloc_widths_fixed(
         SIZE_WIDTH,
         shards_w,
         MAT_WIDTH,
-        LAG_WIDTH,
+        HEAD_WIDTH,
         STATE_WIDTH,
         reward_w,
         WORKER_WIDTH,
@@ -617,6 +617,32 @@ fn filter_width(content_width: usize, widths: &[usize], n: usize, cap: usize) ->
     content_width
         .saturating_sub(others + (n - 1) + 2)
         .clamp(MIN_FILTER_WIDTH, cap)
+}
+
+fn local_warning(a: &AllocationRow) -> bool {
+    local_execution_state(a.execution.as_ref()) == "running"
+        && a.execution.as_ref().and_then(|s| s.materialized_frame) == Some(0)
+}
+
+fn local_color(a: &AllocationRow) -> Color {
+    match local_execution_state(a.execution.as_ref()) {
+        "blocked" | "stopped" => ERROR,
+        "running" if local_warning(a) => Color::Yellow,
+        "running" => SUCCESS,
+        _ => HELP,
+    }
+}
+
+fn allocation_detail(a: &AllocationRow) -> Line<'static> {
+    let Some(execution) = a.execution.as_ref() else {
+        return Line::from("Local execution details unavailable");
+    };
+    let mut text = format!("Last advance: {}", if execution.last_advance_unix_ms == 0 {
+        "not observed since start".into()
+    } else { format!("{} ago", age(execution.last_advance_unix_ms)) });
+    if !execution.blocker.is_empty() { text += &format!(" | Blocker: {}", execution.blocker); }
+    if local_warning(a) { text += " | Warning: no materialized frames"; }
+    Line::from(Span::styled(text, Style::new().fg(local_color(a))))
 }
 
 fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Vec<Line<'static>> {
@@ -667,7 +693,8 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
     }
     let mut lines = vec![Line::from(hdr_spans)];
 
-    let visible = height.saturating_sub(1).max(1);
+    let detail_rows = usize::from(height >= 3);
+    let visible = height.saturating_sub(1 + detail_rows).max(1);
     m.alloc_offset = clamp_offset(m.alloc_offset, m.alloc_cursor, visible, sorted.len());
     let end = (m.alloc_offset + visible).min(sorted.len());
 
@@ -689,7 +716,8 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
             let mut spans = Vec::new();
             for (ci, cell) in cells.iter().enumerate() {
                 if ci > 0 { spans.push(Span::raw(" ")); }
-                let color = if ci == 9 && m.color_coding && a.worker_id < 0 { ERROR } else { TEXT };
+                let color = if m.color_coding && matches!(ci, 6 | 8) { local_color(a) }
+                    else if ci == 9 && m.color_coding && a.worker_id < 0 { ERROR } else { TEXT };
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
             }
             let used = cells.iter().map(String::len).sum::<usize>() + cells.len().saturating_sub(1);
@@ -701,25 +729,15 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
                 if ci > 0 {
                     spans.push(Span::raw(" "));
                 }
-                let mat_color = || {
-                    materialization_state_color(materialization_state(
-                        a.materialized_frame,
-                        a.latest_frame,
-                    ))
-                };
                 let span = match ci {
                     3 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(ring_color(a.ring)))
                     }
                     // Local engine health and the provider gap are separate observations.
                     6 | 8 if m.color_coding => {
-                        Span::styled(cell.clone(), Style::new().fg(match local_execution_state(a.execution.as_ref()) {
-                            "blocked" | "stopped" => ERROR, "running" => SUCCESS, _ => HELP,
-                        }))
+                        Span::styled(cell.clone(), Style::new().fg(local_color(a)))
                     }
-                    7 if m.color_coding => {
-                        Span::styled(cell.clone(), Style::new().fg(mat_color()))
-                    }
+                    7 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(HELP)),
                     10 if m.color_coding => match worker_color(a.worker_id) {
                         Some(color) => Span::styled(cell.clone(), Style::new().fg(color)),
                         None => Span::raw(cell.clone()),
@@ -739,6 +757,10 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
             }
             lines.push(Line::from(spans));
         }
+    }
+    if detail_rows > 0 {
+        while lines.len() < height - 1 { lines.push(Line::default()); }
+        if let Some(a) = sorted.get(m.alloc_cursor) { lines.push(allocation_detail(a)); }
     }
     lines
 }
@@ -1070,9 +1092,8 @@ fn footer_lines(m: &Model) -> (Line<'static>, Line<'static>) {
 const MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn message_timestamp(time: Option<std::time::SystemTime>) -> String {
-    let Some(seconds) = time.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()) else {
-        return String::new();
-    };
+    let seconds = time.unwrap_or_else(std::time::SystemTime::now)
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     format!("[{:02}:{:02}:{:02} UTC] ", seconds / 3600 % 24, seconds / 60 % 60, seconds % 60)
 }
 
@@ -1164,19 +1185,6 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
     let mut lines = Vec::new();
     if shard_severity > primary_severity { lines.extend(shards); lines.extend(primary); }
     else { lines.extend(primary); lines.extend(shards); }
-    if m.focus.is_alloc() {
-        if let Some(a) = m.sorted_allocations().get(m.alloc_cursor) {
-            let severity = match super::super::local_execution::local_execution_state(a.execution.as_ref()) {
-                "blocked" | "stopped" => NoticeSeverity::Error,
-                "stale" | "unknown" => NoticeSeverity::Warning,
-                _ => NoticeSeverity::Info,
-            };
-            if severity >= m.notice_minimum {
-                lines.extend(wrap_message(Line::from(format!("Worker {}: {}; peer shard materialized/head {}/{} (provider metadata)",
-                    a.worker_id, detail(a.execution.as_ref()), a.materialized_frame, a.latest_frame)), width));
-            }
-        }
-    }
     if lines.is_empty() { lines.push(Line::default()); }
     lines
 }
@@ -1393,7 +1401,9 @@ fn help_body() -> Vec<Line<'static>> {
         Line::from(""),
         sec("Worker progress"),
         kv("LocalMat", "Local engine materialized height; - means unknown"),
-        kv("Execution", "Observed host state; running does not establish rewards"),
+        kv("Execution", "Host state; running with zero LocalMat is warned, not healthy progress"),
+        kv("PeerHead", "Provider shard head; remote metadata, not the local worker cursor"),
+        kv("Details", "Selected allocation footer shows blocker and last advance; no observation timer"),
         kv("PeerLag", "Metadata provider head minus cursor; not local worker lag"),
         kv("", "Selected row shows blocker, last advance, observation age and peer cursors"),
         kv("", "Observations older than 30s are stale; startup restoration is not an advance"),
@@ -1586,30 +1596,57 @@ mod tests {
     use crate::commands::node::prover::epoch::ActionHint;
 
     #[test]
-    fn selected_worker_details_respect_severity() {
+    fn worker_context_stays_in_allocation_panel_and_zero_frames_warns() {
         use quil_types::proto::node::WorkerExecution;
         let mut m = Model::new();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
         let mut worker = row("01", 2, 1, 7, "", "");
-        worker.execution = Some(WorkerExecution {
-            state: "running".into(), observed_unix_ms: now, materialized_frame: Some(124), ..Default::default()
-        });
+        worker.execution = Some(WorkerExecution { state: "running".into(), observed_unix_ms: now,
+            materialized_frame: Some(124), last_advance_unix_ms: now - 22_000, ..Default::default() });
+        worker.latest_frame = 125;
+        assert!(!local_warning(&worker));
+        assert_eq!(alloc_cell(&m, &worker, 7, 12), "125");
+        assert!(allocation_detail(&worker).to_string().contains("Last advance: 22s ago"));
+        worker.execution.as_mut().unwrap().materialized_frame = Some(0);
+        assert!(local_warning(&worker));
+        assert_eq!(local_color(&worker), Color::Yellow);
+        assert!(allocation_detail(&worker).to_string().contains("Warning: no materialized frames"));
+        worker.execution.as_mut().unwrap().state = "blocked".into();
+        worker.execution.as_mut().unwrap().blocker = "awaiting successor".into();
         m.allocations.push(worker);
-        let text = |m: &Model| message_lines(m, Line::default(), 150).iter().map(Line::to_string).collect::<Vec<_>>().join(" ");
-        m.notice_minimum = NoticeSeverity::Error;
-        assert!(!text(&m).contains("Worker 7"));
-        m.notice_minimum = NoticeSeverity::Warning;
-        assert!(!text(&m).contains("Worker 7"));
-        m.notice_minimum = NoticeSeverity::Info;
-        assert!(text(&m).contains("running"));
-        let execution = m.allocations[0].execution.as_mut().unwrap();
-        execution.state = "blocked".into(); execution.blocker = "checkpoint mismatch".into();
-        m.notice_minimum = NoticeSeverity::Error;
-        assert!(text(&m).contains("checkpoint mismatch"));
-        m.allocations[0].execution.as_mut().unwrap().observed_unix_ms = 1;
-        assert!(!text(&m).contains("Worker 7"));
-        m.notice_minimum = NoticeSeverity::Warning;
-        assert!(text(&m).contains("stale"));
+        for minimum in [NoticeSeverity::Info, NoticeSeverity::Warning, NoticeSeverity::Error] {
+            m.notice_minimum = minimum;
+            let notices = message_lines(&m, Line::default(), 150).iter().map(Line::to_string).collect::<String>();
+            assert!(!notices.contains("Worker") && !notices.contains("awaiting successor"));
+        }
+        let rows = m.allocations.clone();
+        let panel = render_alloc_panel(&mut m, &rows, Rect::new(0, 0, 154, 7));
+        let details = panel.last().unwrap().to_string();
+        assert!(details.contains("Blocker: awaiting successor"));
+        assert!(!details.contains("observation") && !details.contains("Worker 7"));
+    }
+
+    #[test]
+    fn current_reward_total_retains_known_subtotal_when_other_rows_are_unknown() {
+        let mut m = Model::new(); m.frame_number = 2160; m.epoch_length = 720;
+        let mut known = row("aa", 1, 1, 7, "", "");
+        known.status = 2; known.epoch = 3; known.estimated_reward = BigInt::from(10000);
+        let mut unknown = known.clone(); unknown.ring = UNKNOWN_REWARD_RING;
+        let title = alloc_title(&m, &[known.clone(), unknown.clone()]).to_string();
+        assert!(title.contains(&format!("Current {}+ |", fmt_reward(&known.estimated_reward))), "{title}");
+        assert!(alloc_title(&m, &[unknown]).to_string().contains("Current ? |"));
+        known.estimated_reward = BigInt::from(0);
+        let mut unknown = known.clone(); unknown.ring = UNKNOWN_REWARD_RING;
+        assert!(alloc_title(&m, &[known, unknown]).to_string().contains("Current 0+ |"));
+    }
+
+    #[test]
+    fn all_actual_notices_have_utc_timestamps() {
+        let mut m = Model::new(); m.status_msg = "Action failed".into(); m.status_is_error = true;
+        let action = status_line(&m).to_string();
+        assert!(action.starts_with('[') && action.contains(" UTC] Action failed"));
+        m.shard_error = Some("timed out".into());
+        assert!(shard_message(&m).unwrap().to_string().contains(" UTC] Shard query timed out"));
     }
 
     #[test]
@@ -1793,7 +1830,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(alloc_cell(&m, &a, 6, 12), "93");
-        assert_eq!(alloc_cell(&m, &a, 7, 12), "2");
+        assert_eq!(alloc_cell(&m, &a, 7, 12), "93");
         assert_eq!(alloc_cell(&m, &a, 8, 12), "blocked");
         a.materialized_frame = 93;
         assert_eq!(alloc_cell(&m, &a, 8, 12), "blocked");
@@ -2142,7 +2179,7 @@ mod tests {
                 9,  // "Size_[MB]"
                 8,  // "10076371", wider than "Shards"
                 8,  // "LocalMat"
-                7,  // "PeerLag"
+                8,  // "PeerHead"
                 9,  // "Execution"
                 12, // "Reward_[Q/d]"
                 7,  // "↑Worker", including the active sort arrow

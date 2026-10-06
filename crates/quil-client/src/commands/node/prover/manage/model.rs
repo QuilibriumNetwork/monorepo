@@ -19,7 +19,7 @@ use super::super::epoch::{
 // ── Column metadata (shared between rendering and filtering) ─────────────
 
 pub const ALLOC_COL_NAMES: [&str; 15] = [
-    "Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "LocalMat", "PeerLag", "Execution",
+    "Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "LocalMat", "PeerHead", "Execution",
     "Reward [Q/d]", "Worker", "Status", "Mode", "Next Action", "Default Action",
 ];
 pub const AVAIL_COL_NAMES: [&str; 10] =
@@ -78,6 +78,7 @@ pub const SIZE_WIDTH: usize = 10;
 pub const SHARDS_WIDTH: usize = 7;
 pub const MAT_WIDTH: usize = 9;
 pub const LAG_WIDTH: usize = 7;
+pub const HEAD_WIDTH: usize = 8;
 pub const STATE_WIDTH: usize = 9;
 // Header width in both panels; the values are whole QUIL/day.
 pub const REWARD_WIDTH: usize = 12;
@@ -95,7 +96,7 @@ pub const ALLOC_FIXED_WIDTH: usize = SELECT_WIDTH
     + RING_WIDTH
     + SIZE_WIDTH
     + SHARDS_WIDTH
-    + MAT_WIDTH + LAG_WIDTH + STATE_WIDTH + ALLOC_REWARD_WIDTH
+    + MAT_WIDTH + HEAD_WIDTH + STATE_WIDTH + ALLOC_REWARD_WIDTH
     + WORKER_WIDTH
     + STATUS_WIDTH
     + MODE_WIDTH
@@ -741,7 +742,7 @@ impl Model {
                 4 => a.shard_size.cmp(&b.shard_size),
                 5 => a.data_shards.cmp(&b.data_shards),
                 6 => a.execution.as_ref().and_then(|s| s.materialized_frame).cmp(&b.execution.as_ref().and_then(|s| s.materialized_frame)),
-                7 => materialization_lag(a.materialized_frame, a.latest_frame).cmp(&materialization_lag(b.materialized_frame, b.latest_frame)),
+                7 => a.latest_frame.cmp(&b.latest_frame),
                 8 => local_execution_state(a.execution.as_ref()).cmp(local_execution_state(b.execution.as_ref())),
                 9 => a.estimated_reward.cmp(&b.estimated_reward),
                 10 => a.worker_id.cmp(&b.worker_id), 11 => a.status.cmp(&b.status),
@@ -782,7 +783,7 @@ impl Model {
                 4 => a.shard_size.cmp(&b.shard_size),
                 5 => a.data_shards.cmp(&b.data_shards),
                 6 => a.materialized_frame.cmp(&b.materialized_frame),
-                7 => materialization_lag(a.materialized_frame, a.latest_frame).cmp(&materialization_lag(b.materialized_frame, b.latest_frame)),
+                7 => a.latest_frame.cmp(&b.latest_frame),
                 8 => materialization_state(a.materialized_frame, a.latest_frame).cmp(materialization_state(b.materialized_frame, b.latest_frame)),
                 9 => a.estimated_reward.cmp(&b.estimated_reward),
                 _ => std::cmp::Ordering::Equal,
@@ -1019,7 +1020,7 @@ pub fn alloc_row_numeric_val(row: &AllocationRow, col: usize) -> f64 {
         4 => bigint_to_f64(&row.shard_size) / (1024.0 * 1024.0),
         5 => row.data_shards as f64,
         6 => row.execution.as_ref().and_then(|s| s.materialized_frame).map_or(f64::NAN, |h| h as f64),
-        7 => materialization_lag(row.materialized_frame, row.latest_frame).map_or(f64::NAN, |lag| lag as f64),
+        7 => if !row.shard_info_known { f64::NAN } else { row.latest_frame as f64 },
         9 => {
             if row.ring == UNKNOWN_REWARD_RING {
                 f64::NAN
