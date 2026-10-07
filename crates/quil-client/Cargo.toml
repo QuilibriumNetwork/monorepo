@@ -55,6 +55,8 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 
 [dev-dependencies]
+quil-forest = { path = "../quil-forest" }
+quil-tries = { path = "../quil-tries" }
 quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 quil-store = { path = "../quil-store" }

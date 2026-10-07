@@ -5819,6 +5819,7 @@ dependencies = [
  "quil-p2p",
  "quil-rpc",
  "quil-store",
+ "quil-tries",
  "quil-types",
  "rand 0.8.5",
  "ratatui",

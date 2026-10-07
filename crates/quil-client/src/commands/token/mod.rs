@@ -17,6 +17,8 @@ use crate::rpc::ConnectOpts;
 mod account;
 mod legacy;
 #[cfg(feature = "confidential-tokens")]
+mod balance;
+#[cfg(feature = "confidential-tokens")]
 mod wallet;
 
 /// Flags shared by every `token` subcommand (Go `TokenCmd` persistent
