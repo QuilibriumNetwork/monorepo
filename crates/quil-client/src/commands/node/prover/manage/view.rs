@@ -6,7 +6,7 @@ use super::super::local_execution::{local_execution_state, age};
 use num_bigint::BigInt;
 use super::super::epoch::EffectiveStatus;
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
@@ -18,15 +18,17 @@ use super::super::format_quil_daily_round;
 use super::model::*;
 use super::util::{center_trunc, filter_label, shared_filter_address, clamp_offset};
 
-// ── Colors (mirror lipgloss constants) ───────────────────────────────────
+// ── Colors: red is reserved for execution failures and errors ───────────────────────────────────
 
-const PRIMARY: Color = Color::Rgb(0xff, 0x00, 0x70);
+const PRIMARY: Color = Color::Rgb(0x80, 0xb8, 0xd8);
+const HEADER_BG: Color = Color::Rgb(0x24, 0x36, 0x48);
 const CURSOR_BG: Color = Color::Rgb(0x28, 0x28, 0x28);
 const INACTIVE_CURSOR_BG: Color = Color::Rgb(0x18, 0x18, 0x18);
 const DIM: Color = Color::Rgb(0x55, 0x55, 0x55);
 const TEXT: Color = Color::Rgb(0xff, 0xff, 0xff);
-const SUCCESS: Color = Color::Rgb(0x00, 0xff, 0x00);
-const ERROR: Color = Color::Rgb(0xff, 0x00, 0x00);
+const SUCCESS: Color = Color::Rgb(0x85, 0xc7, 0x94);
+const ERROR: Color = Color::Rgb(0xf0, 0x80, 0x80);
+const WARNING: Color = Color::Yellow;
 const HELP: Color = Color::Rgb(0x88, 0x88, 0x88);
 const FILTER: Color = Color::Rgb(0xff, 0xaa, 0x00);
 /// The sort-direction arrow, so the sorted column is findable at a glance.
@@ -36,28 +38,30 @@ const SORT: Color = Color::Rgb(0x55, 0xaa, 0xff);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn ring_color(ring: u32) -> Color {
+    // Rank is an economic position, never an execution-health alarm.
     match ring {
         UNKNOWN_REWARD_RING => HELP,
-        0 => Color::Rgb(0x00, 0xff, 0x00),
-        1 => Color::Rgb(0x88, 0xff, 0x00),
-        2 => Color::Rgb(0xff, 0xff, 0x00),
-        3 => Color::Rgb(0xff, 0x88, 0x00),
-        _ => Color::Rgb(0xff, 0x00, 0x00),
+        0 => SUCCESS,
+        1 => Color::Rgb(0x80, 0xc8, 0xc0),
+        2 => PRIMARY,
+        3 => Color::Rgb(0xa0, 0xa8, 0xd8),
+        _ => Color::Rgb(0xb8, 0xa0, 0xc8),
     }
 }
 
 fn status_color(name: &str) -> Color {
     match name.to_lowercase().as_str() {
-        "active" => Color::Rgb(0x00, 0xff, 0x00),
-        "joining" => Color::Rgb(0x88, 0xff, 0x88),
-        "leaving" => Color::Rgb(0xff, 0x88, 0x00),
-        _ => Color::Rgb(0xff, 0x44, 0x44),
+        "active" => SUCCESS,
+        "joining" => PRIMARY,
+        "leaving" | "paused" | "re-confirm!" | "expiredjoin" | "expiredleave" => WARNING,
+        "rejected" | "kicked" => ERROR,
+        _ => HELP,
     }
 }
 fn materialization_state_color(state: &str) -> Color {
     match state {
         "current" => SUCCESS,
-        "lag" | "unmat" => ERROR,
+        "lag" | "unmat" => WARNING,
         _ => HELP,
     }
 }
@@ -71,11 +75,8 @@ fn worker_color(worker_id: i64) -> Option<Color> {
 }
 
 fn mode_color(mode: &str) -> Color {
-    if mode == "m" {
-        Color::Rgb(0xff, 0x88, 0x00)
-    } else {
-        Color::Rgb(0x00, 0xff, 0x00)
-    }
+    // Both worker-management modes are normal operator choices.
+    if mode == "m" { PRIMARY } else { HELP }
 }
 
 /// Sort-direction arrow prefixed to the sorted column's header.
@@ -227,6 +228,10 @@ pub fn draw(f: &mut Frame, m: &mut Model) {
         render_join_picker(f, m, area);
         return;
     }
+    if m.column_picker_active {
+        render_column_picker(f, m, area);
+        return;
+    }
     if m.show_help {
         render_help_screen(f, m, area);
         return;
@@ -252,7 +257,7 @@ fn scroll_hint(offset: usize, total: usize, visible: usize, horizontal: u16, hor
 fn render_scroll_hint(f: &mut Frame, area: Rect, offset: usize, total: usize, visible: usize, horizontal: u16, horizontal_limit: u16) {
     let hint = scroll_hint(offset, total, visible, horizontal, horizontal_limit);
     if area.height >= 2 && area.width >= 4 && !hint.is_empty() {
-        f.render_widget(Paragraph::new(hint).style(Style::new().fg(HELP)), Rect::new(area.x + 1, area.y + area.height - 1, area.width - 2, 1));
+        f.render_widget(Paragraph::new(hint).alignment(Alignment::Right).style(Style::new().fg(HELP)), Rect::new(area.x + 1, area.y + area.height - 1, area.width - 2, 1));
     }
 }
 
@@ -291,13 +296,17 @@ fn sync_panel_heights(m: &mut Model, total: u16) -> [u16; 3] {
 fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let (actions, status) = footer_lines(m);
     let mut actions = wrap_actions(actions, area.width);
+    if !m.filter_edit_active && !m.is_filter_mode_active() && !m.sort_mode {
+        actions.extend(wrap_actions(worker_commands_line(m), area.width));
+    }
     let max_actions = usize::from(area.height.saturating_sub(15).max(1));
     if actions.len() > max_actions {
         actions.truncate(max_actions);
-        actions[max_actions - 1] = Line::from("[h] all keys  [q] quit");
+        actions[max_actions - 1] = Line::from("‹h› all keys  ‹q› quit");
     }
     let actions_h = actions.len() as u16;
-    let header_height = if m.data_loaded { 2 } else { 1 };
+    let header = header_lines(m, area.width);
+    let header_height = header.len() as u16;
     // Content height depends only on terminal geometry and explicit resize keys.
     let [alloc_h, avail_h, notice_h] = sync_panel_heights(m, area.height.saturating_sub(6 + header_height + actions_h));
     let status_h = notice_h + 2;
@@ -313,30 +322,45 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
 
     // Header.
     f.render_widget(
-        Paragraph::new(if m.data_loaded { vec![header_line(m), worker_counts_line(m)] } else { vec![header_line(m)] })
-            .style(Style::new().fg(TEXT).bg(PRIMARY)),
+        Paragraph::new(header)
+            .style(Style::new().fg(TEXT).bg(HEADER_BG)),
         chunks[0],
     );
 
-    // Titles share the top borders, leaving two more rows for table data.
+    // First heading line shares the border; continuation KPIs stay above the table.
     let sorted_allocs = m.sorted_allocations();
     let sorted_avail = m.sorted_available();
     let (alloc_widths, avail_widths) = shared_col_widths(m, area.width.saturating_sub(2) as usize, &sorted_allocs, &sorted_avail);
     update_app_progress_warning(m);
+    let alloc_heading = alloc_heading_lines(m, &sorted_allocs, chunks[1].width.saturating_sub(4));
     let alloc_block = Block::default()
-        .title(alloc_title(m, &sorted_allocs))
+        .title(panel_title(alloc_heading[0].to_string()))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(if m.focus.is_alloc() { PRIMARY } else { DIM }));
     let alloc_inner = alloc_block.inner(chunks[1]);
     f.render_widget(alloc_block, chunks[1]);
+    // Keep room for the table header and a data row on small panels.
+    let heading_count = alloc_heading.len();
+    let continuation_h = heading_count.saturating_sub(1)
+        .min(usize::from(alloc_inner.height.saturating_sub(2))) as u16;
+    if continuation_h > 0 {
+        let mut continuation = alloc_heading.into_iter().skip(1).take(usize::from(continuation_h)).collect::<Vec<_>>();
+        if heading_count > usize::from(continuation_h) + 1 {
+            continuation[usize::from(continuation_h) - 1] = Line::from("… enlarge panel for remaining KPIs");
+        }
+        f.render_widget(Paragraph::new(continuation).style(Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD)),
+            Rect::new(alloc_inner.x, alloc_inner.y, alloc_inner.width, continuation_h));
+    }
+    let alloc_inner = Rect::new(alloc_inner.x, alloc_inner.y + continuation_h,
+        alloc_inner.width, alloc_inner.height.saturating_sub(continuation_h));
     let alloc_lines = render_alloc_panel(m, &sorted_allocs, alloc_inner, Some(&alloc_widths));
     let mut alloc_lines = alloc_lines;
     let detail = if !sorted_allocs.is_empty() && alloc_inner.height >= 3 { alloc_lines.pop() } else { None };
     let horizontal = table_horizontal_offset(m, 0, &alloc_lines, alloc_inner.width);
     f.render_widget(Paragraph::new(alloc_lines).scroll((0, horizontal)), alloc_inner);
     if let Some(detail) = detail { f.render_widget(Paragraph::new(detail), Rect::new(alloc_inner.x, alloc_inner.y + alloc_inner.height - 1, alloc_inner.width, 1)); }
-    render_scroll_hint(f, chunks[1], m.alloc_offset, sorted_allocs.len(), usize::from(alloc_inner.height.saturating_sub(2)), horizontal, m.horizontal_limits[0]);
+    render_scroll_hint(f, chunks[1], m.alloc_offset, sorted_allocs.len(), usize::from(alloc_inner.height.saturating_sub(1 + u16::from(alloc_inner.height >= 3))), horizontal, m.horizontal_limits[0]);
 
     let avail_block = Block::default()
         .title(avail_title(m, &sorted_avail))
@@ -389,29 +413,80 @@ fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, ar
 
 // ── Header ───────────────────────────────────────────────────────────────
 
-fn header_line(m: &Model) -> Line<'static> {
-    if !m.data_loaded {
-        return Line::from(format!(" {} Connecting to node…", spinner(m)));
+/// Pack complete KPI blocks, never splitting their internal pipe-separated fields.
+fn header_lines(m: &Model, width: u16) -> Vec<Line<'static>> {
+    pack_kpis(header_kpis(m), width)
+}
+
+fn pack_kpis(blocks: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut line = Line::default();
+    for block in blocks {
+        if !line.spans.is_empty() && line.width() + 3 + block.width() > usize::from(width) {
+            lines.push(line); line = Line::default();
+        }
+        if !line.spans.is_empty() { line.spans.push(Span::raw(" · ")); }
+        line.spans.extend(block.spans);
     }
-    let reach = if m.reachable { "OK" } else { "UNREACHABLE" };
-    let mut s = format!(
-        " Peer ID: {}  Seniority: {}  Frame: {}  Epoch: {}  [{}]",
-        m.peer_id,
-        m.seniority,
-        m.frame_number,
-        super::super::epoch::epoch_for_frame(m.frame_number, m.epoch_length),
-        reach,
-    );
+    lines.push(line);
+    lines
+}
+
+fn header_kpis(m: &Model) -> Vec<Line<'static>> {
+    if !m.data_loaded { return vec![Line::from(format!("{} Connecting to node…", spinner(m)))]; }
+    let rpc = if m.consecutive_failures > 0 { "retrying" }
+        else if m.last_fetch_success.is_none() { "unknown" }
+        else if rpc_status_is_fresh(m) { "connected" } else { "stale" };
+    let mut blocks = vec![
+        Line::from(format!("Peer ID: {}", m.peer_id)),
+        Line::from(format!("Seniority: {}", m.seniority)),
+        Line::from(format!("Frame: {}", m.last_received_frame)),
+        Line::from(format!("Epoch: {}", super::super::epoch::epoch_for_frame(m.last_received_frame, m.epoch_length))),
+        Line::from(format!("RPC: {rpc}")),
+    ];
     if m.consecutive_failures > 0 {
         if let Some(t) = m.last_fetch_success {
-            s += &format!(
-                "  (stale: last update {}s ago, {} retries failed)",
-                t.elapsed().as_secs(),
-                m.consecutive_failures
-            );
+            blocks.push(Line::from(format!("Status age: {}s | Failed retries {}", t.elapsed().as_secs(), m.consecutive_failures)));
         }
     }
-    Line::from(s)
+    blocks.push(worker_counts_line(m));
+    blocks
+}
+
+/// Only operator actions have shortcuts; automatic defaults keep their names.
+fn next_action_text(m: &Model, hint: &super::super::epoch::ActionHint) -> String {
+    let mut hint = hint.clone();
+    if m.compact_actions {
+        for (name, key) in [("reject", "R"), ("confirm", "Y"), ("pause", "P"), ("resume", "U"), ("leave", "L")] {
+            hint.label = hint.label.replace(name, key);
+        }
+    }
+    hint.render(m.threshold_unit, m.epoch_length)
+}
+
+#[cfg(test)]
+fn header_line(m: &Model) -> Line<'static> {
+    header_lines(m, u16::MAX).remove(0)
+}
+
+// Require three polls before establishing a new stall notice, with a 60s floor.
+// This measures lack of observed head advancement, not the frame's timestamp.
+const GLOBAL_ALARM_SECS: u64 = 60;
+
+fn rpc_status_is_fresh(m: &Model) -> bool {
+    m.consecutive_failures == 0 && m.last_fetch_success.is_some_and(|t| t.elapsed().as_secs() < m.refresh_seconds * 2 + 30)
+}
+
+fn global_alarm_active(m: &Model) -> bool {
+    let Some(last) = m.global_last_advance else { return false; };
+    if !rpc_status_is_fresh(m) { return false; }
+    // A cadence change cannot retract an already established stall.
+    // Head advancement clears this latch in observe_global_head.
+    if m.global_alarm_time.is_some() { return true; }
+    let secs = last.elapsed().as_secs();
+    // A changed cadence must first observe enough of its own polling window.
+    let window = m.refresh_changed_at.map_or(secs, |t| secs.min(t.elapsed().as_secs()));
+    window >= GLOBAL_ALARM_SECS.max(m.refresh_seconds * 3)
 }
 
 fn worker_counts_line(m: &Model) -> Line<'static> {
@@ -424,7 +499,7 @@ fn worker_counts_line(m: &Model) -> Line<'static> {
         }
         None => ("?".into(), "?".into()),
     };
-    Line::from(format!(" Workers: Running {} | Auto {} | Manual {}",
+    Line::from(format!("Local workers: Running {} | Auto {} | Manual {}",
         m.running_workers, automatic, manual))
 }
 
@@ -467,13 +542,13 @@ fn claimable_title(m: &Model) -> String {
         Some((value, frame)) => format!("Claimable [Q]: {} @f{}{}",
             fmt_claimable(value),
             frame,
-            if m.reward_last_success.is_some_and(|t| t.elapsed().as_secs() >= 30) { " (stale)" } else { "" }),
+            if m.reward_last_success.is_some_and(|t| t.elapsed().as_secs() >= m.refresh_seconds * 2 + 30) { " (stale)" } else { "" }),
         None if m.reward_loaded => "Claimable [Q]: unavailable".into(),
         None => "Claimable [Q]: loading".into(),
     }
 }
 
-fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
+fn alloc_kpis(m: &Model, sorted: &[AllocationRow]) -> Vec<String> {
     let mut joining = BigInt::from(0);
     let mut active = BigInt::from(0);
     let mut paused = BigInt::from(0);
@@ -501,30 +576,38 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     }
     let current = &active + &leaving;
     let change = &joining - &leaving;
-    let mut s = format!(
-        "Allocations: {}/{} | Active {}  {}  Rewards [Q/d]: Current {} | Paused {} | Planned change {}",
-        m.allocated_workers, m.running_workers,
-        active_allocation_count(m),
+    let mut blocks = vec![
+        format!("Allocations: {}/{} | Active {}", m.allocated_workers, m.running_workers, active_allocation_count(m)),
         claimable_title(m),
-        if current_unknown && !current_known { "?".into() }
-        else { format!("{}{}", fmt_reward(&current), if current_unknown { "+" } else { "" }) },
-        if paused_unknown { "?".into() } else { fmt_reward(&paused) },
-        if change_unknown { "?".into() } else { fmt_reward_change(&change) },
-    );
+        format!("Reward [Q/d]: Now {} | Paused {} | Δ {}",
+            if current_unknown && !current_known { "?".into() }
+            else { format!("{}{}", fmt_reward(&current), if current_unknown { "+" } else { "" }) },
+            if paused_unknown { "?".into() } else { fmt_reward(&paused) },
+            if change_unknown { "?".into() } else { fmt_reward_change(&change) }),
+        global_snapshot_label(sorted.iter().map(|a| a.global_head.as_ref())),
+    ];
     if sorted.len() != m.allocations.len() {
-        s += &format!("  Shown {}/{}", sorted.len(), m.allocations.len());
+        blocks.push(format!("Shown {}/{}", sorted.len(), m.allocations.len()));
     }
-    s += &format!("  {}", global_snapshot_label(sorted.iter().map(|a| a.global_head.as_ref())));
     if !m.alloc_selected.is_empty() {
-        s += &format!(" [{} selected]", m.alloc_selected.len());
+        blocks.push(format!("Selected {}", m.alloc_selected.len()));
     }
-    panel_title(s)
+    blocks
+}
+
+#[cfg(test)]
+fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
+    panel_title(alloc_kpis(m, sorted).join(" · "))
+}
+
+fn alloc_heading_lines(m: &Model, sorted: &[AllocationRow], width: u16) -> Vec<Line<'static>> {
+    pack_kpis(alloc_kpis(m, sorted).into_iter().map(Line::from).collect(), width)
 }
 
 fn avail_title(m: &Model, sorted: &[ShardRow]) -> Line<'static> {
-    let mut s = format!(" Available Shards: {}  {}", sorted.len(), global_snapshot_label(sorted.iter().map(|s| s.global_head.as_ref())));
+    let mut s = format!(" Available Shards: {} · {}", sorted.len(), global_snapshot_label(sorted.iter().map(|s| s.global_head.as_ref())));
     if !m.avail_selected.is_empty() {
-        s += &format!(" [{} selected]", m.avail_selected.len());
+        s += &format!(" · Selected {}", m.avail_selected.len());
     }
     panel_title(s)
 }
@@ -551,16 +634,16 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         3 => fmt_ring(a.ring),
         4 => fmt_mb(&a.shard_size),
         5 => a.data_shards.to_string(),
-        6 => if local_warning(a) { "0!".into() }
+        6 => if local_warning(m, a) { "0!".into() }
             else { a.execution.as_ref().and_then(|s| s.materialized_frame).map(|h| h.to_string()).unwrap_or_else(|| "-".into()) },
         7 => if a.materialized_frame == 0 && a.latest_frame == 0 { "-".into() } else { a.latest_frame.to_string() },
         8 => fmt_global_head(a.global_head.as_ref()),
-        9 => local_execution_state(a.execution.as_ref()).into(),
+        9 => m.execution_state(a.execution.as_ref()).into(),
         10 => if a.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&a.estimated_reward) },
         11 => a.worker_id.to_string(),
         12 => a.status_name.clone(),
         13 => a.mode().to_string(),
-        14 => a.next_action.render(m.threshold_unit, m.epoch_length),
+        14 => next_action_text(m, &a.next_action),
         _ => a.default_action.render(m.threshold_unit, m.epoch_length),
     }
 }
@@ -613,7 +696,7 @@ fn shared_col_widths(m: &Model, content_width: usize, allocations: &[AllocationR
         if i != 1 { alloc[i] = alloc[i].max(avail[i]); }
     }
     let cap = alloc[1].max(avail[1]);
-    alloc[1] = filter_width(content_width, &alloc, alloc.len(), cap);
+    alloc[1] = filter_width(content_width, &alloc, alloc.iter().filter(|&&w| w > 0).count(), cap);
     avail.copy_from_slice(&alloc[..AVAIL_COL_NAMES.len()]);
     (alloc, avail)
 }
@@ -623,10 +706,17 @@ fn alloc_col_widths(
     content_width: usize,
     sorted: &[AllocationRow],
 ) -> (Vec<usize>, usize) {
-    match m.column_sizing {
+    let (mut widths, fw) = match m.column_sizing {
         ColumnSizing::Dynamic => alloc_widths_measured(m, content_width, sorted),
         ColumnSizing::Fixed => alloc_widths_fixed(m, content_width, sorted),
-    }
+    };
+    if (0..widths.len()).all(|col| m.column_visible(col)) { return (widths, fw); }
+    for (col, width) in widths.iter_mut().enumerate() { if !m.column_visible(col) { *width = 0; } }
+    let cap = if m.column_sizing == ColumnSizing::Fixed { FILTER_WIDTH }
+        else { filter_cap(&alloc_header(m, 1), sorted.iter().map(|a| printed_width(&a.filter_hex))) };
+    widths[1] = filter_width(content_width, &widths, widths.iter().filter(|&&w| w > 0).count(), cap);
+    let fw = widths[1];
+    (widths, fw)
 }
 
 /// Every column takes its header or its widest cell, whichever is longer, one
@@ -756,15 +846,15 @@ fn filter_width(content_width: usize, widths: &[usize], n: usize, cap: usize) ->
         .clamp(MIN_FILTER_WIDTH, cap)
 }
 
-fn local_warning(a: &AllocationRow) -> bool {
-    local_execution_state(a.execution.as_ref()) == "running"
+fn local_warning(m: &Model, a: &AllocationRow) -> bool {
+    m.execution_state(a.execution.as_ref()) == "running"
         && a.execution.as_ref().and_then(|s| s.materialized_frame) == Some(0)
 }
 
-fn local_color(a: &AllocationRow) -> Color {
-    match local_execution_state(a.execution.as_ref()) {
+fn local_color(m: &Model, a: &AllocationRow) -> Color {
+    match m.execution_state(a.execution.as_ref()) {
         "blocked" | "stopped" => ERROR,
-        "running" if local_warning(a) => Color::Yellow,
+        "running" if local_warning(m, a) => Color::Yellow,
         "running" => SUCCESS,
         _ => HELP,
     }
@@ -781,7 +871,7 @@ fn global_snapshot_label<'a>(heads: impl Iterator<Item = Option<&'a quil_types::
     else { "Global: mixed snapshots".into() }
 }
 
-fn allocation_detail(a: &AllocationRow) -> Line<'static> {
+fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
     let Some(execution) = a.execution.as_ref() else {
         return Line::from(Span::styled("Local execution details unavailable", Style::new().fg(HELP)));
     };
@@ -789,9 +879,18 @@ fn allocation_detail(a: &AllocationRow) -> Line<'static> {
         "not observed since start".into()
     } else { format!("{} ago", age(execution.last_advance_unix_ms)) });
     if !execution.blocker.is_empty() { text += &format!(" | Blocker: {}", execution.blocker); }
-    if local_warning(a) { text += " | Warning: no materialized frames"; }
-    let warning = !execution.blocker.is_empty() || local_warning(a) || matches!(local_execution_state(Some(execution)), "blocked" | "stopped");
-    Line::from(Span::styled(text, Style::new().fg(if warning { Color::Yellow } else { HELP })))
+    if local_warning(m, a) { text += " | Warning: no materialized frames"; }
+    let state = m.execution_state(Some(execution));
+    if matches!(state, "cached" | "stale") {
+        text += &format!(" | {state}: observation {} ago", age(execution.observed_unix_ms));
+        if let Some((received, _)) = m.worker_snapshot_received {
+            text += &format!(" | snapshot {}s ago", received.elapsed().as_secs());
+        }
+    }
+    let color = if matches!(state, "cached" | "stale") { HELP }
+        else if matches!(state, "blocked" | "stopped") { ERROR }
+        else if !execution.blocker.is_empty() || local_warning(m, a) { WARNING } else { HELP };
+    Line::from(Span::styled(text, Style::new().fg(color)))
 }
 
 fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, aligned: Option<&[usize]>) -> Vec<Line<'static>> {
@@ -809,6 +908,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
     // Header row.
     let mut hdr_spans: Vec<Span> = Vec::new();
     for i in 0..ALLOC_COL_NAMES.len() {
+        if !m.column_visible(i) { continue; }
         let hi_sort = m.sort_mode && m.focus.is_alloc() && m.sort_highlight_col == i;
         let hi_filter = m.alloc_filter_mode
             && !m.filter_edit_active
@@ -816,7 +916,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
             && filter_hi == i as i32;
         let style = if hi_sort {
             Style::new()
-                .bg(PRIMARY)
+                .bg(HEADER_BG)
                 .fg(TEXT)
                 .add_modifier(Modifier::BOLD)
         } else if hi_filter {
@@ -864,34 +964,31 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
         if selected {
             let mut spans = Vec::new();
             for (ci, cell) in cells.iter().enumerate() {
+                if !m.column_visible(ci) { continue; }
                 if ci > 0 { spans.push(Span::raw(" ")); }
-                let color = if m.color_coding && matches!(ci, 6 | 9) { local_color(a) }
+                let color = if m.color_coding && matches!(ci, 6 | 9) { local_color(m, a) }
                     else if ci == 10 && m.color_coding && a.worker_id < 0 { ERROR }
                     else if ci == 12 && m.color_coding { status_color(&a.status_name) } else { TEXT };
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
             }
-            let used = cells.iter().map(String::len).sum::<usize>() + cells.len().saturating_sub(1);
+            let used = cells.iter().enumerate().filter(|(col, _)| m.column_visible(*col)).map(|(_, cell)| printed_width(cell)).sum::<usize>()
+                + widths.iter().filter(|&&w| w > 0).count().saturating_sub(1);
             spans.push(Span::raw(" ".repeat(content_width.saturating_sub(used))));
             lines.push(Line::from(spans).style(Style::new().fg(TEXT).bg(if m.focus.is_alloc() { CURSOR_BG } else { INACTIVE_CURSOR_BG })));
         } else {
             let mut spans: Vec<Span> = Vec::new();
             for (ci, cell) in cells.iter().enumerate() {
+                if !m.column_visible(ci) { continue; }
                 if ci > 0 {
                     spans.push(Span::raw(" "));
                 }
-                let mat_color = || {
-                    materialization_state_color(materialization_state(
-                        a.materialized_frame,
-                        a.latest_frame,
-                    ))
-                };
                 let span = match ci {
                     3 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(ring_color(a.ring)))
                     }
                     // Local engine health and the provider gap are separate observations.
                     6 | 9 if m.color_coding => {
-                        Span::styled(cell.clone(), Style::new().fg(local_color(a)))
+                        Span::styled(cell.clone(), Style::new().fg(local_color(m, a)))
                     }
                     7 | 8 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(HELP)),
                     11 if m.color_coding => match worker_color(a.worker_id) {
@@ -916,7 +1013,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
     }
     if detail_rows > 0 {
         while lines.len() < height - 1 { lines.push(Line::default()); }
-        if let Some(a) = sorted.get(m.alloc_cursor) { lines.push(allocation_detail(a)); }
+        if let Some(a) = sorted.get(m.alloc_cursor) { lines.push(allocation_detail(m, a)); }
     }
     lines
 }
@@ -971,10 +1068,17 @@ fn avail_header(m: &Model, idx: usize) -> String {
 }
 
 fn avail_col_widths(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (Vec<usize>, usize) {
-    match m.column_sizing {
+    let (mut widths, fw) = match m.column_sizing {
         ColumnSizing::Dynamic => avail_widths_measured(m, content_width, sorted),
         ColumnSizing::Fixed => avail_widths_fixed(m, content_width, sorted),
-    }
+    };
+    if (0..widths.len()).all(|col| m.column_visible(col)) { return (widths, fw); }
+    for (col, width) in widths.iter_mut().enumerate() { if !m.column_visible(col) { *width = 0; } }
+    let cap = if m.column_sizing == ColumnSizing::Fixed { FILTER_WIDTH }
+        else { filter_cap(&avail_header(m, 1), sorted.iter().map(|a| printed_width(&a.filter_hex))) };
+    widths[1] = filter_width(content_width, &widths, widths.iter().filter(|&&w| w > 0).count(), cap);
+    let fw = widths[1];
+    (widths, fw)
 }
 
 /// Same rule as the allocations panel.
@@ -1094,6 +1198,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
 
     let mut hdr_spans: Vec<Span> = Vec::new();
     for i in 0..AVAIL_COL_NAMES.len() {
+        if !m.column_visible(i) { continue; }
         let hi_sort = m.sort_mode && m.focus == PanelFocus::Available && m.sort_highlight_col == i;
         let hi_filter = m.avail_filter_mode
             && !m.filter_edit_active
@@ -1155,11 +1260,13 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
                 .collect();
             let mut spans = Vec::new();
             for (c, cell) in cells.iter().enumerate() {
+                if !m.column_visible(c) { continue; }
                 if c > 0 { spans.push(Span::raw(" ")); }
                 let color = if m.color_coding && matches!(c, 6 | 9) { materialization_state_color(materialization_state(s.materialized_frame, s.latest_frame)) } else { TEXT };
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
             }
-            let used = cells.iter().map(|cell| printed_width(cell)).sum::<usize>() + cells.len().saturating_sub(1);
+            let used = cells.iter().enumerate().filter(|(col, _)| m.column_visible(*col)).map(|(_, cell)| printed_width(cell)).sum::<usize>()
+                + widths.iter().filter(|&&w| w > 0).count().saturating_sub(1);
             spans.push(Span::raw(" ".repeat(content_width.saturating_sub(used))));
             lines.push(Line::from(spans).style(Style::new().fg(TEXT).bg(if m.focus == PanelFocus::Available { CURSOR_BG } else { INACTIVE_CURSOR_BG })));
         } else {
@@ -1167,6 +1274,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
 
             let mut spans: Vec<Span> = Vec::new();
             for c in 0..widths.len() {
+                if !m.column_visible(c) { continue; }
                 if c > 0 {
                     spans.push(Span::raw(" "));
                 }
@@ -1241,7 +1349,7 @@ fn footer_lines(m: &Model) -> (Line<'static>, Line<'static>) {
         };
         let actions = Line::from(Span::styled(
             format!(
-                "Filter [{col_name}]: [←/→] column  [enter] edit  [del] clear  [x] disable all  [esc] close"
+                "Filter [{col_name}]: ‹←/→› column  ‹enter› edit  ‹del› clear  ‹x› disable all  ‹esc› close"
             ),
             Style::new().fg(FILTER).add_modifier(Modifier::BOLD),
         ));
@@ -1250,7 +1358,7 @@ fn footer_lines(m: &Model) -> (Line<'static>, Line<'static>) {
     if m.sort_mode && m.sort_order_mode {
         return (
             Line::from(Span::styled(
-                "Sort order: [enter/a] ascending (default)  [d] descending  [esc] cancel",
+                "Sort order: ‹enter/a› ascending (default)  ‹d› descending  ‹esc› cancel",
                 Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -1259,7 +1367,7 @@ fn footer_lines(m: &Model) -> (Line<'static>, Line<'static>) {
     if m.sort_mode {
         return (
             Line::from(Span::styled(
-                "Sort: [←/→] Move column  [enter] apply  [esc] cancel",
+                "Sort: ‹←/→› Move column  ‹enter› apply  ‹esc› cancel",
                 Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -1279,6 +1387,16 @@ fn message_timestamp(time: Option<std::time::SystemTime>) -> String {
 /// Expire completed action notices, while retaining an operation in progress
 /// or a refresh failure that is still unresolved. No extra timer task needed.
 fn update_message_lifetime(m: &mut Model) {
+    if global_alarm_active(m) {
+        m.global_alarm_time.get_or_insert_with(std::time::SystemTime::now);
+    } else {
+        m.global_alarm_time = None;
+    }
+    if rpc_status_is_fresh(m) && m.reported_app_stall_counts(std::time::Instant::now()).is_some() {
+        m.reported_app_stall_time.get_or_insert_with(std::time::SystemTime::now);
+    } else {
+        m.reported_app_stall_time = None;
+    }
     if m.status_message_key != m.status_msg {
         m.status_message_key = m.status_msg.clone();
         m.status_message_seen = Some(std::time::Instant::now());
@@ -1307,17 +1425,17 @@ fn shard_severity(m: &Model) -> NoticeSeverity {
 fn shard_message(m: &Model) -> Option<Line<'static>> {
     let elapsed = m.shard_fetch_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
     let message = if let Some(error) = &m.shard_error {
-        let reason = if error.contains("timed out") { "Shard query timed out".to_owned() }
+        let reason = if error.contains("timed out") { "Shard fetch timed out".to_owned() }
             else { let mut text: String = error.chars().take(90).collect();
                 if error.chars().count() > 90 { text.push('…'); } text };
-        format!("{reason}; retrying.{}", if m.cached_shard_info.is_some() { " Cached rows retained." } else { "" })
+        format!("{reason}; retrying{}.", if m.cached_shard_info.is_some() { " (cached rows)" } else { "" })
     } else if m.shard_loading {
-        if elapsed >= 15 { format!("Shard query slow ({elapsed}s); still waiting.") }
-        else { format!("Fetching shard data ({elapsed}s).") }
+        if elapsed >= 15 { format!("Shard fetch slow ({elapsed}s).") }
+        else { format!("Fetching shards ({elapsed}s).") }
     } else if let Some(shards) = &m.cached_shard_info {
         if m.shard_last_success.is_some_and(|t| t.elapsed() >= MESSAGE_TTL) { return None; }
         let elapsed = m.shard_last_duration.map(|d| d.as_secs()).unwrap_or(0);
-        format!("Shard data updated ({} shards, {elapsed}s).", shards.shards.len())
+        format!("Shards updated: {} ({elapsed}s).", shards.shards.len())
     } else { return None; };
     let color = match shard_severity(m) { NoticeSeverity::Info => HELP,
         NoticeSeverity::Warning => Color::Yellow, NoticeSeverity::Error => ERROR };
@@ -1370,7 +1488,7 @@ fn update_app_progress_warning(m: &mut Model) {
 fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'static>> {
     let primary_severity = if m.status_is_error { NoticeSeverity::Error } else { NoticeSeverity::Info };
     // Filter-editor prompts are controls rather than notifications.
-    let primary = if m.filter_edit_active || primary_severity >= m.notice_minimum {
+    let primary = if m.filter_edit_active || m.operation_confirmation.is_some() || primary_severity >= m.notice_minimum {
         wrap_message(primary, width)
     } else { Vec::new() };
     let shard_severity = shard_severity(m);
@@ -1378,9 +1496,17 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
         shard_message(m).map(|line| wrap_message(line, width)).unwrap_or_default()
     } else { Vec::new() };
     let mut lines = Vec::new();
+    if global_alarm_active(m) {
+        lines.extend(wrap_message(Line::from(Span::styled(format!("{}Global head unchanged for over 60s.", message_timestamp(m.global_alarm_time)), Style::new().fg(ERROR))), width));
+    }
     if m.notice_minimum <= NoticeSeverity::Warning {
+        if rpc_status_is_fresh(m) {
+            if let Some((stalled, known)) = m.reported_app_stall_counts(std::time::Instant::now()) {
+                lines.extend(wrap_message(Line::from(Span::styled(format!("{}Reported app heads: {stalled}/{known} shards unchanged for over 60s.", message_timestamp(m.reported_app_stall_time)), Style::new().fg(Color::Yellow))), width));
+            }
+        }
         if let Some(time) = m.app_stall_time {
-            lines.extend(wrap_message(Line::from(Span::styled(format!("{}No local app worker has advanced for at least 60s; check allocation blockers.", message_timestamp(Some(time))), Style::new().fg(Color::Yellow))), width));
+            lines.extend(wrap_message(Line::from(Span::styled(format!("{}No local app frames advanced for over 60s.", message_timestamp(Some(time))), Style::new().fg(Color::Yellow))), width));
         }
     }
     if shard_severity > primary_severity { lines.extend(shards); lines.extend(primary); }
@@ -1390,19 +1516,23 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
 }
 
 fn status_line(m: &Model) -> Line<'static> {
+    if let Some((command, targets)) = &m.operation_confirmation {
+        let label = match command { 'l' => "Leave", 'r' => "Reject", 'p' => "Pause", _ => "Change worker mode" };
+        return Line::from(Span::styled(format!("{label} for {} allocation(s)? Enter confirms; Esc cancels.", targets.len()), Style::new().fg(WARNING)));
+    }
     if m.action_in_flight {
         return Line::from(format!("{}{} {}", message_timestamp(m.status_message_time), spinner(m), m.status_msg));
     }
     if m.status_msg.is_empty() {
         return Line::from("");
     }
-    let color = if m.status_is_error { ERROR } else { SUCCESS };
+    let color = if m.operation_confirmation.is_some() { WARNING } else if m.status_is_error { ERROR } else { SUCCESS };
     Line::from(Span::styled(format!("{}{}", message_timestamp(m.status_message_time), m.status_msg), Style::new().fg(color)))
 }
 
 /// `renderHelpLine` — key hints with applicable actions highlighted.
 fn command_hint(key: &str, description: &str, style: Style) -> Span<'static> {
-    Span::styled(format!("[{key}] {description}"), style)
+    Span::styled(format!("‹{key}› {description}"), style)
 }
 
 fn help_commands() -> Line<'static> {
@@ -1414,7 +1544,10 @@ fn help_commands() -> Line<'static> {
     Line::from(spans)
 }
 
-fn help_line(m: &Model) -> Line<'static> {
+fn help_line(m: &Model) -> Line<'static> { legend_line(m, false) }
+fn worker_commands_line(m: &Model) -> Line<'static> { legend_line(m, true) }
+
+fn legend_line(m: &Model, workers: bool) -> Line<'static> {
     let mut applicable: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !m.action_in_flight {
         if m.focus.is_alloc() {
@@ -1425,41 +1558,45 @@ fn help_line(m: &Model) -> Line<'static> {
             if sorted.get(m.alloc_cursor).is_some_and(|r| r.worker_id >= 0) {
                 applicable.insert("ToggleManual".to_string());
             }
-        } else if m.focus == PanelFocus::Available && !m.free_workers.is_empty() {
+        } else if m.focus == PanelFocus::Available && !m.manual_free_workers().is_empty() {
             applicable.insert("Join".to_string());
         }
     }
     let filters_active = m.has_active_filters();
 
+    let actions_label = if m.compact_actions { "action keys" } else { "action names" };
+    let refresh_label = format!("refresh {}s", m.refresh_seconds);
     // (key, desc, action-tag)
-    let entries: [(&str, &str, &str); 21] = [
+    let entries: [(&str, &str, &str); 24] = [
         ("tab", "switch", ""),
         ("↑/k", "up", ""),
         ("↓/j", "down", ""),
-        ("←/→", "columns", ""),
+        ("←/→", "pan", ""),
+        ("b", "columns", ""),
+        ("n", actions_label, ""),
         ("space", "toggle", ""),
         ("a", "all/none", ""),
-        ("J", "join", "Join"),
-        ("l", "leave", "Leave"),
-        ("c", "confirm", "Confirm"),
-        ("r", "reject", "Reject"),
-        ("p", "pause", "Pause"),
-        ("u", "resume", "Resume"),
-        ("M", "mode", "ToggleManual"),
+        ("Ctrl+G", "join", "Join"),
+        ("Ctrl+L", "leave", "Leave"),
+        ("Ctrl+Y", "confirm", "Confirm"),
+        ("Ctrl+R", "reject", "Reject"),
+        ("Ctrl+P", "pause", "Pause"),
+        ("Ctrl+U", "resume", "Resume"),
+        ("Ctrl+O", "mode", "ToggleManual"),
         ("s", "sort", ""),
         ("f", "filter", "Filter"),
         ("C", "colors", "ColorCoding"),
         ("e", "frames/epochs", "ThresholdUnit"),
         ("v", "notice level", ""),
+        ("t", refresh_label.as_str(), ""),
         ("[/] {/}", "upper/lower edge", ""),
         ("h", "help", ""),
         ("q", "quit", ""),
     ];
-    let mut spans: Vec<Span> = Vec::new();
-    for (i, (key, desc, tag)) in entries.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
+    let mut spans = vec![Span::styled(if workers { "Workers (Ctrl+):" } else { "UI:" }, Style::new().fg(HELP))];
+    for (key, desc, tag) in &entries {
+        if key.starts_with("Ctrl+") != workers { continue; }
+        spans.push(Span::raw("  "));
         let style = match *tag {
             "Filter" => {
                 if filters_active {
@@ -1482,18 +1619,11 @@ fn help_line(m: &Model) -> Line<'static> {
                     Style::new().fg(HELP)
                 }
             }
-            "ThresholdUnit" => {
-                if m.threshold_unit == ThresholdUnit::Epochs {
-                    Style::new().fg(SUCCESS)
-                } else {
-                    Style::new().fg(HELP)
-                }
-            }
             "" => Style::new().fg(HELP),
             t if applicable.contains(t) => Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
             _ => Style::new().fg(DIM),
         };
-        spans.push(command_hint(key, desc, style));
+        spans.push(command_hint(key.strip_prefix("Ctrl+").unwrap_or(key), desc, style));
     }
     Line::from(spans)
 }
@@ -1536,7 +1666,7 @@ fn render_filter_edit_lines(m: &Model) -> (Line<'static>, Line<'static>) {
             }
         }
         let status = Line::from(Span::styled(
-            "[←/→] column  [space] toggle  [a] all/none  [enter] apply  [esc] cancel",
+            "‹←/→› column  ‹space› toggle  ‹a› all/none  ‹enter› apply  ‹esc› cancel",
             Style::new().fg(HELP),
         ));
         return (Line::from(spans), status);
@@ -1547,9 +1677,9 @@ fn render_filter_edit_lines(m: &Model) -> (Line<'static>, Line<'static>) {
         Style::new().fg(FILTER).add_modifier(Modifier::BOLD),
     ));
     let hint = if kind == FilterColKind::Numeric {
-        "Numeric: >N  >=N  <N  <=N  =N  or  N1,N2,...    [enter] apply  [esc] cancel"
+        "Numeric: >N  >=N  <N  <=N  =N  or  N1,N2,...    ‹enter› apply  ‹esc› cancel"
     } else {
-        "[enter] apply  [esc] cancel"
+        "‹enter› apply  ‹esc› cancel"
     };
     (
         actions,
@@ -1566,14 +1696,14 @@ fn render_help_screen(f: &mut Frame, m: &mut Model, area: Rect) {
     let footer_height = commands.len().min(usize::from(area.height.saturating_sub(3).max(1)));
     if commands.len() > footer_height {
         commands.truncate(footer_height);
-        commands[footer_height - 1] = Line::from("[h/esc] close  [q] quit");
+        commands[footer_height - 1] = Line::from("‹h/esc› close  ‹q› quit");
     }
     let body_height = usize::from(area.height).saturating_sub(2 + footer_height);
     m.help_visible = body_height;
     let max_offset = body.len().saturating_sub(body_height);
     m.help_offset = m.help_offset.min(max_offset);
     let title = format!(" Shard Manager — Help  ({}–{} of {})", m.help_offset + 1, (m.help_offset + body_height).min(body.len()), body.len());
-    f.render_widget(Paragraph::new(Line::from(title)).style(Style::new().fg(TEXT).bg(PRIMARY).add_modifier(Modifier::BOLD)), Rect::new(area.x, area.y, area.width, area.height.min(1)));
+    f.render_widget(Paragraph::new(Line::from(title)).style(Style::new().fg(TEXT).bg(HEADER_BG).add_modifier(Modifier::BOLD)), Rect::new(area.x, area.y, area.width, area.height.min(1)));
     f.render_widget(Paragraph::new(body.into_iter().skip(m.help_offset).take(body_height).collect::<Vec<_>>()), Rect::new(area.x, area.y + area.height.min(1), area.width, body_height as u16));
     let separator_y = area.y + area.height.saturating_sub(footer_height as u16 + 1);
     f.render_widget(Paragraph::new("─".repeat(usize::from(area.width))).style(Style::new().fg(HELP)), Rect::new(area.x, separator_y, area.width, 1));
@@ -1603,7 +1733,18 @@ fn help_body() -> Vec<Line<'static>> {
 
     vec![
         Line::from(""),
+        sec("Global progress"),
+        kv("Local app notice", "No local materialized frame advanced for 60s across staffed earning allocations; any local advance clears it"),
+        kv("Reported app heads", "Warn for any staffed shard with unchanged PeerHead across 3+ fresh snapshots spanning max(60s, 3 polls), including unallocated shards. Unknown/unstaffed rows and failed/stale fetches cannot establish a stall; this is reported progress, not proof of a network halt"),
+        kv("RPC", "Connected means fresh local status responses; it does not establish peer or shard health"),
+        kv("Global notice", "After max(60s, 3 polls) without received-head advance; timestamp survives refresh changes. Clears on advance or stale RPC"),
+        kv("Auto mode", "Worker commands disabled except mode switching; use Ctrl+O, then Enter to switch to manual. Join needs a free manual worker"),
+        kv("n", "Toggle NextAction names / Ctrl command keys; default actions remain named"),
+        kv("t", "Cycle refresh 5/15/30/60s (default 15); startup and post-action fetches are immediate"),
+        kv("RPC stale", "No status for 2 polling intervals + 30s, or refresh failure; cached data cannot establish stall"),
+        kv("Colors", "Green: current; blue/purple: rank or normal mode; yellow: delay; red: blocked/error"),
         sec("Worker progress"),
+        kv("KPI separators", "Middle dot separates KPIs; pipe separates fields within a KPI"),
         kv("Worker counts", "Running: reported workers; Auto/Manual: individual modes, including idle workers"),
         kv("Allocations", "Assigned workers / running workers; denominator includes occupied workers"),
         kv("Active", "Workers with Active allocations; execution may still be blocked; totals ignore filters"),
@@ -1614,8 +1755,12 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Details", "Selected allocation footer shows blocker and last advance; no observation timer"),
 
         kv("", "Selected allocation shows blocker and last advance; PeerHead is provider metadata"),
-        kv("", "Observations older than 30s are stale; startup restoration is not an advance"),
+        kv("Freshness", "stale: node observation already >30s old at receipt; cached: no worker result for >2 polls +30s. Poll delays do not age the received state"),
+        kv("", "Startup restoration is not an advance; cached worker state is not proof of ongoing execution"),
         sec("Navigation"),
+        kv("b", "Choose visible columns: ↑/↓ selects, Space toggles; Enter/Esc closes"),
+        kv("Columns", "Shared choices apply to both panels; Select and Filter stay visible; per TUI session"),
+        kv("Compact preset", "In column chooser, c hides Provers/Size/Shards; a restores all columns"),
         kv("↑ / k", "Move cursor up"),
         kv("↓ / j", "Move cursor down"),
         kv("← / →", "Scroll table horizontally by eight columns"),
@@ -1633,28 +1778,30 @@ fn help_body() -> Vec<Line<'static>> {
         kv("PgUp / PgDn", "When Notifications is focused, ↑/↓ scroll; Home/End jump to first/last line"),
         kv("", "[ / ] moves upper boundary up/down; { / } moves lower boundary up/down"),
         sec("Actions — Allocations panel"),
+        note("Operational commands require Ctrl. Leave/Reject/Pause/Mode ask Enter or Esc."),
+        note("Ctrl+C quits; Ctrl+J/M alias Enter; Ctrl+S/Q may be terminal flow control."),
         kv(
-            "l",
+            "Ctrl+L",
             "Leave  — request to leave an Active allocation (status 2)",
         ),
         kv(
-            "c",
+            "Ctrl+Y",
             "Confirm — confirm a pending Join/Leave once the window opens",
         ),
-        kv("r", "Reject  — reject a pending Join/Leave"),
-        kv("p", "Pause   — pause an Active allocation (status 2)"),
-        kv("u", "Resume  — resume a Paused allocation (status 3)"),
-        kv("M", "Toggle manual / auto worker management on cursor row"),
+        kv("Ctrl+R", "Reject  — reject a pending Join/Leave"),
+        kv("Ctrl+P", "Pause   — pause an Active allocation (status 2)"),
+        kv("Ctrl+U", "Resume  — resume a Paused allocation (status 3)"),
+        kv("Ctrl+O", "Toggle manual / auto worker management on cursor row"),
         note("Multi-select with Space or 'a' to batch Leave/Confirm/Reject/Pause/Resume."),
         Line::from(""),
         sec("Actions — Available Shards panel"),
-        kv("J", "Join    — open worker picker for selected shard(s)"),
+        kv("Ctrl+G", "Join    — open worker picker for selected shard(s)"),
         note("At least one free (unassigned) worker must exist to join."),
         Line::from(""),
-        sec("Worker picker  (opens on J)"),
+        sec("Worker picker  (opens on Ctrl+G)"),
         kv("↑ / k, ↓ / j", "Move cursor between free workers"),
         kv("Space", "Toggle a worker into the manual-management set"),
-        kv("enter / J", "Join the shard(s); selected workers are set to Manual"),
+        kv("enter", "Join the shard(s); selected workers are set to Manual"),
         kv("esc", "Cancel the join"),
         Line::from(""),
         sec("Sort mode  (press s)"),
@@ -1692,7 +1839,7 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Select", "[x] marks the row for a batch action (Space, or `a` for all)"),
         kv("Filter", "Shard filter, in hex; shortened from the middle when narrow"),
         kv("Provers", "Provers currently active on the shard"),
-        kv("Ring", "Prover ring the shard sits in; colour runs 0 green to 4+ red"),
+        kv("Ring", "Committed rank: green at 0, blue/purple at higher rings; not an execution alarm"),
         kv("Size [MB]", "Shard size, in megabytes"),
         kv("Shards", "Data shards the filter covers"),
         kv("PeerMat", "Materialized height reported by the shard metadata provider"),
@@ -1709,14 +1856,14 @@ fn help_body() -> Vec<Line<'static>> {
         ),
         kv("Current", "Staffed active + leaving reward estimates, not measured income"),
         kv("Paused", "Staffed paused estimates available upon resume"),
-        kv("Unknown", "- fields are unavailable; Current sums known rewards with + for unknown rows"),
-        kv("Planned change", "Staffed joining minus leaving; activation epochs may differ"),
+        kv("Unknown", "- fields unavailable; Now sums known rewards with + for unknown rows"),
+        kv("Reward Δ", "Staffed joining minus leaving; activation epochs may differ"),
         note("Reward totals follow displayed rows; unassigned rows are excluded."),
         kv("Worker", "Core the allocation is bound to; -1 means none is bound"),
         kv("Status", "joining, active, paused, leaving, rejected, kicked;"),
         kv("", "expiredJoin / expiredLeave: confirm window missed;"),
         kv("", "re-confirm!: the allocation's epoch is stale but recoverable"),
-        kv("Mode", "Worker management — a: automatic, m: manual (toggle with M)"),
+        kv("Mode", "Worker management — a: automatic, m: manual (toggle with Ctrl+O)"),
         kv("NextAction", "What you can do now, and the threshold it applies from"),
         kv(
             "DefaultAction",
@@ -1741,6 +1888,25 @@ fn help_body() -> Vec<Line<'static>> {
     ]
 }
 
+fn render_column_picker(f: &mut Frame, m: &mut Model, area: Rect) {
+    let names = if m.focus.is_alloc() { &ALLOC_COL_NAMES[..] } else { &AVAIL_COL_NAMES[..] };
+    let commands = wrap_actions(Line::from("‹↑/↓› column  ‹space› toggle  ‹c› compact  ‹a› show all  ‹enter/esc› close"), area.width);
+    let height = commands.len().min(usize::from(area.height.saturating_sub(1))) as u16;
+    let visible = usize::from(area.height.saturating_sub(2 + height)).max(1);
+    m.column_picker_offset = clamp_offset(m.column_picker_offset, m.column_picker_cursor, visible, names.len());
+    let mut body = vec![Line::from("Shared columns apply to both panels; selection and identity stay visible.")];
+    for (col, name) in names.iter().enumerate().skip(m.column_picker_offset).take(visible) {
+        let text = format!("{} {} {name}{}", if col == m.column_picker_cursor { "▶" } else { " " },
+            if m.column_visible(col) { "[x]" } else { "[ ]" }, if col < 2 { " (required)" } else { "" });
+        body.push(Line::from(Span::styled(text, if col == m.column_picker_cursor {
+            Style::new().fg(TEXT).bg(CURSOR_BG)
+        } else { Style::new().fg(HELP) })));
+    }
+    f.render_widget(Paragraph::new("Column visibility").style(Style::new().fg(TEXT).bg(HEADER_BG)), Rect::new(area.x, area.y, area.width, 1));
+    f.render_widget(Paragraph::new(body), Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1 + height)));
+    f.render_widget(Paragraph::new(commands), Rect::new(area.x, area.y + area.height - height, area.width, height));
+}
+
 // ── Join worker picker ───────────────────────────────────────────────────
 
 fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
@@ -1748,17 +1914,17 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
         Line::from(Span::styled(
             format!(
                 "{:<width$}",
-                " Select workers to mark as manually managed",
+                " Select free manual workers",
                 width = area.width as usize
             ),
             Style::new()
                 .fg(TEXT)
-                .bg(PRIMARY)
+                .bg(HEADER_BG)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(format!(
-            "  Joining {} shard(s). Select which free workers to set to Manual mode:",
+            "  Joining {} shard(s). Select at least one free manual worker:",
             m.join_picker_filters.len()
         )),
         Line::from(""),
@@ -1788,7 +1954,7 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
         if i == m.join_picker_cursor {
             lines.push(Line::from(Span::styled(
                 text,
-                Style::new().fg(TEXT).bg(PRIMARY),
+                Style::new().fg(TEXT).bg(HEADER_BG),
             )));
         } else {
             lines.push(Line::from(text));
@@ -1796,7 +1962,7 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  space: toggle  J/enter: confirm join  esc: cancel",
+        "  space: toggle  enter: confirm join  esc: cancel",
         Style::new().fg(HELP),
     )));
     f.render_widget(Paragraph::new(lines), area);
@@ -1806,6 +1972,259 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
 mod tests {
     use super::*;
     use crate::commands::node::prover::epoch::ActionHint;
+
+    #[test]
+    fn hidden_shared_columns_disappear_from_both_panels_and_reclaim_width() {
+        let mut m = Model::new();
+        let mut a = row("aabb", 123456, 5, 7, "", "");
+        a.shard_size = BigInt::from(987_654_321u64) * 1024 * 1024;
+        let mut peer = shard("ccdd", 123456, 5);
+        peer.shard_size = a.shard_size.clone();
+        for sizing in [ColumnSizing::Dynamic, ColumnSizing::Fixed] {
+            m.column_sizing = sizing;
+            m.hidden_columns.clear();
+            let before = alloc_col_widths(&m, 180, &[a.clone()]).0;
+            let shown = render_alloc_panel(&mut m, &[a.clone()], Rect::new(0, 0, 500, 5), None);
+            assert!(shown[1].to_string().contains(&fmt_mb(&a.shard_size)));
+            m.hidden_columns.extend([2, 4, 5]);
+            let (aw, bw) = shared_col_widths(&m, 180, &[a.clone()], &[peer.clone()]);
+            for col in [2, 4, 5] { assert_eq!(aw[col], 0); assert_eq!(bw[col], 0); }
+            assert!(aw[1] >= before[1]);
+            for cursor in [0, 1] {
+                m.alloc_cursor = cursor; m.avail_cursor = cursor;
+                let alloc = render_alloc_panel(&mut m, &[a.clone(), a.clone()], Rect::new(0, 0, 500, 5), Some(&aw));
+                let avail = render_avail_panel(&mut m, &[peer.clone(), peer.clone()], Rect::new(0, 0, 500, 5), Some(&bw));
+                for header in [&alloc[0], &avail[0]] {
+                    let text = header.to_string();
+                    assert!(!text.contains("Provers") && !text.contains("Size") && !text.contains("Shards"));
+                    assert!(text.contains("Filter") && text.contains("Ring"));
+                }
+                for line in alloc.iter().chain(avail.iter()).skip(1) {
+                    assert!(!line.to_string().contains(&fmt_mb(&a.shard_size)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_heading_wraps_complete_kpis_and_keeps_citations() {
+        let mut m = Model::new();
+        m.running_workers = 15; m.allocated_workers = 15;
+        m.claimable_reward = Some((8_000_000_000, 123456));
+        let blocks = alloc_kpis(&m, &[]);
+        for width in [40, 80, 120, 300] {
+            let lines = alloc_heading_lines(&m, &[], width);
+            assert!(lines.iter().all(|l| l.width() <= usize::from(width)));
+            for block in &blocks {
+                assert!(lines.iter().any(|l| l.to_string().contains(block)), "split KPI {block} at {width}");
+            }
+        }
+        assert_eq!(alloc_heading_lines(&m, &[], 300).len(), 1);
+        assert!(alloc_heading_lines(&m, &[], 80).len() > 1);
+        assert!(alloc_title(&m, &[]).to_string().contains("Claimable [Q]: 1 @f123456"));
+    }
+
+    #[test]
+    fn wrapped_allocation_heading_stays_visible_when_table_pans() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut m = Model::new(); m.data_loaded = true;
+        m.claimable_reward = Some((8_000_000_000, 123456));
+        m.allocations = joining_table();
+        let mut terminal = Terminal::new(TestBackend::new(80, 42)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, m: &mut Model| {
+            terminal.draw(|f| draw(f, m)).unwrap();
+            let b = terminal.backend().buffer();
+            (0..42).map(|y| (0..80).map(|x| b[(x,y)].symbol()).collect::<String>()).collect::<Vec<_>>()
+        };
+        let before = render(&mut terminal, &mut m);
+        let table = before.iter().position(|l| l.contains("Select Filter")).unwrap();
+        assert!(before[..table].iter().any(|l| l.contains("Reward [Q/d]: Now")));
+        m.horizontal_offsets[0] = 30;
+        let after = render(&mut terminal, &mut m);
+        assert_eq!(&before[..table], &after[..table]);
+        assert_ne!(before[table], after[table]);
+        assert!(after[..table].iter().any(|l| l.contains("Claimable [Q]: 1 @f123456")));
+    }
+
+    #[test]
+    fn all_header_kpis_wrap_as_complete_blocks() {
+        let mut m = Model::new(); m.data_loaded = true; m.peer_id = "p".repeat(52);
+        m.running_workers = 15;
+        let blocks = header_kpis(&m);
+        for width in [40, 80, 120, 300] {
+            let lines = header_lines(&m, width);
+            for block in &blocks {
+                assert!(lines.iter().any(|line| line.to_string().contains(&block.to_string())),
+                    "split block at width {width}: {block}");
+            }
+        }
+    }
+
+    #[test]
+    fn header_identifies_rpc_connection_independently_of_reported_reachability() {
+        use std::time::{Duration, Instant};
+        let mut m = Model::new(); m.data_loaded = true; m.reachable = false;
+        m.last_fetch_success = Some(Instant::now());
+        assert!(header_line(&m).to_string().contains("RPC: connected"));
+        m.consecutive_failures = 1; m.reachable = true;
+        assert!(header_line(&m).to_string().contains("RPC: retrying"));
+        m.consecutive_failures = 0;
+        m.last_fetch_success = Some(Instant::now() - Duration::from_secs(60));
+        assert!(header_line(&m).to_string().contains("RPC: stale"));
+    }
+
+    #[test]
+    fn panel_headers_separate_kpis_from_fields_with_distinct_delimiters() {
+        let m = Model::new();
+        let title = alloc_title(&m, &[]).to_string();
+        assert!(title.contains("| Active") && title.contains(" · Claimable"));
+        assert!(title.contains(" · Reward [Q/d]:") && title.contains("| Paused"));
+        assert!(title.contains(" · Global:"));
+        assert!(!title.contains("  "));
+        assert!(avail_title(&m, &[]).to_string().contains(" · Global:"));
+    }
+
+    #[test]
+    fn worker_counts_share_the_header_until_width_requires_a_second_line() {
+        let mut m = Model::new(); m.data_loaded = true; m.running_workers = 15;
+        let required = header_line(&m).width() as u16;
+        let one = header_lines(&m, required);
+        assert_eq!(one.len(), 1);
+        assert!(one[0].to_string().contains("Local workers: Running 15"));
+        let two = header_lines(&m, required - 1);
+        assert_eq!(two.len(), 2);
+        assert!(two[1].to_string().contains("Local workers: Running 15"));
+        assert!(!two[0].to_string().contains("Local workers:"));
+        m.data_loaded = false;
+        assert_eq!(header_lines(&m, 40).len(), 1);
+    }
+
+    #[test]
+    fn legends_separate_ui_from_worker_commands_and_share_one_modifier_prefix() {
+        let m = Model::new();
+        let ui = help_line(&m).to_string();
+        let workers = worker_commands_line(&m).to_string();
+        assert!(ui.starts_with("UI:"));
+        assert!(ui.contains("‹t› refresh 15s") && ui.contains("‹[/] {/}›"));
+        assert!(!ui.contains("Ctrl+"));
+        assert!(workers.starts_with("Workers (Ctrl+):"));
+        assert_eq!(workers.matches("Ctrl+").count(), 1);
+        assert!(workers.contains("‹G› join") && workers.contains("‹O› mode"));
+        assert!(!workers.contains("refresh"));
+    }
+
+    #[test]
+    fn global_alarm_requires_fresh_rpc_and_survives_notice_filters_and_monochrome() {
+        use std::time::{Duration, Instant};
+        let mut m = Model::new();
+        m.data_loaded = true;
+        m.last_fetch_success = Some(Instant::now());
+        for secs in [0, 29, 30, 59, 60] {
+            m.global_last_advance = Some(Instant::now() - Duration::from_secs(secs));
+            assert_eq!(global_alarm_active(&m), secs >= 60);
+        }
+        m.notice_minimum = NoticeSeverity::Error;
+        m.color_coding = false;
+        assert!(!header_line(&m).to_string().contains("ALARM"));
+        assert!(!header_line(&m).to_string().contains("GLOBAL"));
+        assert!(!header_line(&m).to_string().contains("Poll"));
+        update_message_lifetime(&mut m);
+        let stamp = m.global_alarm_time.unwrap();
+        update_message_lifetime(&mut m);
+        assert_eq!(m.global_alarm_time, Some(stamp));
+        assert!(message_lines(&m, Line::default(), 300).iter().any(|l| l.to_string().starts_with(&format!("{}Global head unchanged", message_timestamp(Some(stamp))))));
+        assert!(message_lines(&m, Line::default(), 40).iter().any(|l| l.to_string().contains("Global head unchanged")));
+        m.consecutive_failures = 1;
+        assert!(!global_alarm_active(&m));
+        update_message_lifetime(&mut m);
+        assert!(m.global_alarm_time.is_none());
+        m.consecutive_failures = 0;
+        m.last_fetch_success = Some(Instant::now() - Duration::from_secs(60));
+        assert!(!global_alarm_active(&m));
+        m.last_fetch_success = Some(Instant::now());
+        m.observe_global_head(1, Instant::now());
+        assert!(!global_alarm_active(&m));
+    }
+
+    #[test]
+    fn established_global_notice_survives_refresh_changes_until_recovery() {
+        use std::time::{Duration, Instant};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut m = Model::new();
+        m.last_fetch_success = Some(Instant::now());
+        m.global_observed_head = 100;
+        m.global_last_advance = Some(Instant::now() - Duration::from_secs(75));
+        m.notice_minimum = NoticeSeverity::Info;
+        m.status_msg = "Action completed".into();
+        m.shard_error = Some("Shard fetch timed out".into());
+        update_message_lifetime(&mut m);
+        let stamp = m.global_alarm_time.unwrap();
+        for interval in [30, 60, 5, 15] {
+            super::super::update::handle_key(&mut m, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+            assert_eq!(m.refresh_seconds, interval);
+            update_message_lifetime(&mut m);
+            assert_eq!(m.global_alarm_time, Some(stamp));
+            let notices = message_lines(&m, status_line(&m), 300).iter().map(ToString::to_string).collect::<Vec<_>>().join(" ");
+            assert!(notices.contains(&format!("{}Global head unchanged", message_timestamp(Some(stamp)))));
+            assert!(!notices.contains("ALARM:"));
+            assert!(notices.contains("Global head unchanged for over 60s."));
+            assert!(notices.contains("Action completed") && notices.contains("Shard fetch timed out"));
+        }
+        m.observe_global_head(100, Instant::now());
+        assert_eq!(m.global_alarm_time, Some(stamp));
+        m.observe_global_head(101, Instant::now());
+        assert!(m.global_alarm_time.is_none() && !global_alarm_active(&m));
+        m.global_alarm_time = Some(stamp);
+        m.consecutive_failures = 1;
+        update_message_lifetime(&mut m);
+        assert!(m.global_alarm_time.is_none());
+        assert!(!message_lines(&m, Line::default(), 300).iter().any(|l| l.to_string().contains("Global head unchanged")));
+    }
+
+    #[test]
+    fn slow_polling_allows_multiple_observations_before_global_alarm() {
+        use std::time::{Duration, Instant};
+        let mut m = Model::new();
+        m.refresh_seconds = 60;
+        m.last_fetch_success = Some(Instant::now());
+        m.global_last_advance = Some(Instant::now() - Duration::from_secs(60));
+        assert!(!global_alarm_active(&m));
+
+        m.global_last_advance = Some(Instant::now() - Duration::from_secs(120));
+        assert!(!global_alarm_active(&m));
+        m.global_last_advance = Some(Instant::now() - Duration::from_secs(180));
+        assert!(global_alarm_active(&m));
+        m.refresh_seconds = 5;
+        m.refresh_changed_at = Some(Instant::now());
+        assert!(!global_alarm_active(&m));
+    }
+
+    #[test]
+    fn ordinary_ranks_modes_and_peer_delays_are_distinct_from_blocked_execution() {
+        for ring in [0, 1, 2, 3, 4, 100, UNKNOWN_REWARD_RING] {
+            assert_ne!(ring_color(ring), ERROR);
+        }
+        for status in ["active", "joining", "leaving", "paused", "re-confirm!"] {
+            assert_ne!(status_color(status), ERROR);
+        }
+        assert_ne!(mode_color("m"), ERROR);
+        assert_ne!(mode_color("a"), ERROR);
+        assert_eq!(materialization_state_color("lag"), WARNING);
+        let mut a = row("a", 1, 1, 1, "", "");
+        a.execution = Some(quil_types::proto::node::WorkerExecution { state: "blocked".into(),
+            observed_unix_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+            ..Default::default() });
+        assert_eq!(local_color(&Model::new(), &a), ERROR);
+    }
+
+    #[test]
+    fn confirmation_is_visible_even_with_errors_only_notifications() {
+        let mut m = Model::new();
+        m.notice_minimum = NoticeSeverity::Error;
+        m.operation_confirmation = Some(('p', vec![]));
+        let text = message_lines(&m, Line::from("Enter confirms; Esc cancels"), 80);
+        assert!(text.iter().any(|l| l.to_string().contains("Enter confirms")));
+    }
 
     #[test]
     fn scroll_indicators_track_hidden_rows_and_columns() {
@@ -1865,6 +2284,31 @@ mod tests {
     }
 
     #[test]
+    fn reported_app_notice_has_independent_scope_timestamp_and_freshness() {
+        use std::time::{Duration, Instant};
+        use quil_types::proto::node::ShardRewardInfo;
+        let now = Instant::now(); let mut m = Model::new();
+        m.last_fetch_success = Some(now);
+        let shards = quil_types::proto::node::GetShardInfoResponse { shards: vec![ShardRewardInfo {
+            filter: vec![1], active_provers: 1, latest_frame: 10, ..Default::default()
+        }], ..Default::default() };
+        for ago in [60, 30, 0] { m.observe_reported_app_heads(&shards, now - Duration::from_secs(ago)); }
+        update_message_lifetime(&mut m);
+        let timestamp = m.reported_app_stall_time.expect("known shard stalls independently of local allocations");
+        let text = message_lines(&m, Line::default(), 300).iter().map(ToString::to_string).collect::<Vec<_>>().join(" ");
+        assert!(text.contains(&format!("{}Reported app heads: 1/1 shards unchanged for over 60s.", message_timestamp(Some(timestamp)))));
+        assert!(!text.contains("No local app frames advanced"));
+        for interval in [30, 60, 5, 15] {
+            m.refresh_seconds = interval; update_message_lifetime(&mut m);
+            assert_eq!(m.reported_app_stall_time, Some(timestamp));
+        }
+        m.notice_minimum = NoticeSeverity::Error;
+        assert!(!message_lines(&m, Line::default(), 300).iter().any(|l| l.to_string().contains("Reported app heads")));
+        m.shard_error = Some("fetch failed".into()); update_message_lifetime(&mut m);
+        assert!(m.reported_app_stall_time.is_none());
+    }
+
+    #[test]
     fn app_stall_warning_respects_severity_and_clears_on_progress_or_missing_data() {
         use quil_types::proto::node::WorkerExecution;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -1877,9 +2321,9 @@ mod tests {
         let timestamp = m.app_stall_time.expect("known stalled workers warn");
         update_app_progress_warning(&mut m); assert_eq!(m.app_stall_time, Some(timestamp));
         m.notice_minimum = NoticeSeverity::Warning;
-        assert!(message_lines(&m, Line::default(), 240).iter().any(|l| l.to_string().contains("No local app worker")));
+        assert!(message_lines(&m, Line::default(), 240).iter().any(|l| l.to_string().contains("No local app frames advanced")));
         m.notice_minimum = NoticeSeverity::Error;
-        assert!(!message_lines(&m, Line::default(), 240).iter().any(|l| l.to_string().contains("No local app worker")));
+        assert!(!message_lines(&m, Line::default(), 240).iter().any(|l| l.to_string().contains("No local app frames advanced")));
         m.allocations[1].execution.as_mut().unwrap().last_advance_unix_ms = now;
         update_app_progress_warning(&mut m); assert!(m.app_stall_time.is_none());
         m.allocations[1].execution = None;
@@ -1896,14 +2340,14 @@ mod tests {
         worker.execution = Some(WorkerExecution { state: "running".into(), observed_unix_ms: now,
             materialized_frame: Some(124), last_advance_unix_ms: now - 22_000, ..Default::default() });
         worker.latest_frame = 125;
-        assert!(!local_warning(&worker));
+        assert!(!local_warning(&m, &worker));
         assert_eq!(alloc_cell(&m, &worker, 7, 12), "125");
-        assert!(allocation_detail(&worker).to_string().contains("Last advance: 22s ago"));
+        assert!(allocation_detail(&m, &worker).to_string().contains("Last advance: 22s ago"));
         worker.execution.as_mut().unwrap().materialized_frame = Some(0);
-        assert!(local_warning(&worker));
+        assert!(local_warning(&m, &worker));
         assert_eq!(alloc_cell(&m, &worker, 6, 12), "0!");
-        assert_eq!(local_color(&worker), Color::Yellow);
-        assert!(allocation_detail(&worker).to_string().contains("Warning: no materialized frames"));
+        assert_eq!(local_color(&m, &worker), Color::Yellow);
+        assert!(allocation_detail(&m, &worker).to_string().contains("Warning: no materialized frames"));
         worker.execution.as_mut().unwrap().state = "blocked".into();
         worker.execution.as_mut().unwrap().blocker = "awaiting successor".into();
         m.allocations.push(worker);
@@ -1926,11 +2370,11 @@ mod tests {
         known.status = 2; known.epoch = 3; known.estimated_reward = BigInt::from(10000);
         let mut unknown = known.clone(); unknown.ring = UNKNOWN_REWARD_RING;
         let title = alloc_title(&m, &[known.clone(), unknown.clone()]).to_string();
-        assert!(title.contains(&format!("Current {}+ |", fmt_reward(&known.estimated_reward))), "{title}");
-        assert!(alloc_title(&m, &[unknown]).to_string().contains("Current ? |"));
+        assert!(title.contains(&format!("Now {}+ |", fmt_reward(&known.estimated_reward))), "{title}");
+        assert!(alloc_title(&m, &[unknown]).to_string().contains("Now ? |"));
         known.estimated_reward = BigInt::from(0);
         let mut unknown = known.clone(); unknown.ring = UNKNOWN_REWARD_RING;
-        assert!(alloc_title(&m, &[known, unknown]).to_string().contains("Current 0+ |"));
+        assert!(alloc_title(&m, &[known, unknown]).to_string().contains("Now 0+ |"));
     }
 
     #[test]
@@ -1939,7 +2383,7 @@ mod tests {
         let action = status_line(&m).to_string();
         assert!(action.starts_with('[') && action.contains(" UTC] Action failed"));
         m.shard_error = Some("timed out".into());
-        assert!(shard_message(&m).unwrap().to_string().contains(" UTC] Shard query timed out"));
+        assert!(shard_message(&m).unwrap().to_string().contains(" UTC] Shard fetch timed out"));
     }
 
     #[test]
@@ -1956,7 +2400,7 @@ mod tests {
         allocation.latest_frame = 744;
         allocation.global_head = Some(quil_types::proto::node::GlobalAppFrameHead { frame: 742, global_frame: 1000, generation: 2 });
         allocation.execution = Some(quil_types::proto::node::WorkerExecution { materialized_frame: Some(744), ..Default::default() });
-        assert!(!allocation_detail(&allocation).to_string().contains("Global"));
+        assert!(!allocation_detail(&Model::new(), &allocation).to_string().contains("Global"));
         let m = Model::new();
         assert_eq!(alloc_cell(&m, &allocation, 8, 0), "742@g2");
         assert_eq!(alloc_cell(&m, &allocation, 7, 0), "744");
@@ -1979,14 +2423,16 @@ mod tests {
     }
 
     #[test]
-    fn panel_detail_warnings_use_the_same_color() {
+    fn panel_details_distinguish_blocked_execution_from_peer_delay() {
         let mut allocation = row("aa", 1, 1, 7, "", "");
         allocation.execution = Some(quil_types::proto::node::WorkerExecution {
-            state: "blocked".into(), blocker: "awaiting successor".into(), ..Default::default()
+            state: "blocked".into(), blocker: "awaiting successor".into(),
+            observed_unix_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+            ..Default::default()
         });
         let mut peer = shard("bb", 1, 1);
         peer.materialized_frame = 18; peer.latest_frame = 22;
-        assert!(allocation_detail(&allocation).spans.iter().all(|s| s.style.fg == Some(Color::Yellow)));
+        assert!(allocation_detail(&Model::new(), &allocation).spans.iter().all(|s| s.style.fg == Some(ERROR)));
         assert!(available_detail(&peer).spans.iter().all(|s| s.style.fg == Some(Color::Yellow)));
     }
 
@@ -2024,7 +2470,7 @@ mod tests {
         assert_eq!(peers[1].style.bg, Some(INACTIVE_CURSOR_BG));
         assert!(peers[1].to_string().contains("unmat"));
         assert!(!peers[1].to_string().contains("unmat!"));
-        assert_eq!(peers[1].spans[18].style.fg, Some(ERROR));
+        assert_eq!(peers[1].spans[18].style.fg, Some(WARNING));
         assert!(peers.last().unwrap().to_string().contains("Warning: provider has not materialized"));
         peer.materialized_frame = 15;
         assert!(available_detail(&peer).to_string().contains("by 5 frames"));
@@ -2041,7 +2487,7 @@ mod tests {
         super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Ok(Some((474867, 862280)))));
         assert_eq!(claimable_title(&m), "Claimable [Q]: 0.00006 @f862280");
         assert!(alloc_title(&m, &[]).to_string().contains("Claimable [Q]:"));
-        m.reward_last_success = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        m.reward_last_success = Some(std::time::Instant::now() - std::time::Duration::from_secs(m.refresh_seconds * 2 + 31));
         assert!(claimable_title(&m).ends_with("(stale)"));
         super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Err("timeout".into())));
         assert_eq!(claimable_title(&m), "Claimable [Q]: unavailable");
@@ -2066,7 +2512,7 @@ mod tests {
         m.cached_shard_info = Some(Default::default());
         assert!(text(&m).is_empty(), "cache-preserving failures are warnings");
         m.notice_minimum = NoticeSeverity::Warning;
-        assert!(text(&m).contains("Cached rows retained"));
+        assert!(text(&m).contains("cached rows"));
         m.status_is_error = true;
         m.status_msg = "Action failed".into();
         m.notice_minimum = NoticeSeverity::Error;
@@ -2099,7 +2545,7 @@ mod tests {
             }
             assert_eq!(rows.iter().position(|row| row.contains("Allocations:")), Some(1));
             assert_eq!(m.notice_visible, 3);
-            assert!(rows[29].contains("[q]"));
+            assert!(rows.iter().any(|row| row.contains("‹q›")));
         }
         assert!(notification_rows.iter().all(|y| *y == notification_rows[0]));
         assert!(available_rows.iter().all(|y| *y == available_rows[0]));
@@ -2143,7 +2589,7 @@ mod tests {
         let text = |lines: Vec<Line<'static>>| lines.into_iter().map(|l| l.to_string()).collect::<Vec<_>>().join(" ");
         let waiting = text(message_lines(&m, status_line(&m), 60));
         assert!(waiting.contains("Confirm sent"));
-        assert!(waiting.contains("Fetching shard data"));
+        assert!(waiting.contains("Fetching shards"));
         assert!(!waiting.contains("archive peers"));
         m.shard_error = Some("Shard query timed out".into());
         let retry = text(message_lines(&m, status_line(&m), 60));
@@ -2155,7 +2601,7 @@ mod tests {
         m.cached_shard_info = Some(Default::default());
         m.shard_last_duration = Some(std::time::Duration::from_secs(22));
         let recovered = text(message_lines(&m, status_line(&m), 60));
-        assert!(recovered.contains("0 shards, 22s"));
+        assert!(recovered.contains("Shards updated: 0 (22s)"));
         assert!(!recovered.contains("timed out"));
     }
 
@@ -2182,7 +2628,7 @@ mod tests {
         let screen = rows.iter().map(|line| line.trim().trim_matches('│').trim()).collect::<Vec<_>>().join(" ");
         assert!(screen.contains(message));
         assert!(screen.contains("Notifications"));
-        assert!(screen.contains("[q]"));
+        assert!(screen.contains("‹q›"));
     }
 
     #[test]
@@ -2229,8 +2675,8 @@ mod tests {
         let m = Model::new();
         for (mat, head, label, color) in [
             (0, 0, "unknown", HELP),
-            (0, 10, "unmat", ERROR),
-            (5, 10, "lag", ERROR),
+            (0, 10, "unmat", WARNING),
+            (5, 10, "lag", WARNING),
             (10, 10, "current", SUCCESS),
             (11, 10, "current", SUCCESS),
         ] {
@@ -2253,8 +2699,10 @@ mod tests {
             let mut m = Model::new();
             m.status_msg = "status is visible".to_owned();
             m.notice_minimum = NoticeSeverity::Info;
-            let lines = wrap_actions(help_line(&m), width);
-            for hint in help_line(&m).spans.into_iter().filter(|span| !span.content.trim().is_empty()) {
+            let mut lines = wrap_actions(help_line(&m), width);
+            lines.extend(wrap_actions(worker_commands_line(&m), width));
+            let legends = [help_line(&m), worker_commands_line(&m)];
+            for hint in legends.into_iter().flat_map(|line| line.spans).filter(|span| !span.content.trim().is_empty()) {
                 assert!(lines.iter().any(|line| line.spans.iter().any(|span| span == &hint)),
                     "split command hint at width {width}: {}", hint.content);
             }
@@ -2262,20 +2710,19 @@ mod tests {
             if width == 40 {
                 assert!(lines.len() > 1);
             }
-            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(width, 42)).unwrap();
             terminal.draw(|f| draw(f, &mut m)).unwrap();
             let buffer = terminal.backend().buffer();
-            let footer_start = 24 - lines.len() as u16;
-            let footer = (footer_start..24).map(|y| {
+            let footer_start = 42 - lines.len() as u16;
+            let footer = (footer_start..42).map(|y| {
                 (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>()
             }).collect::<Vec<_>>().join(" ");
-            for key in ["[tab]", "[J]", "[C]", "[e]", "[h]", "[q]"] {
+            for key in ["‹tab›", "‹G›", "‹C›", "‹e›", "‹h›", "‹q›"] {
                 assert!(footer.contains(key), "missing {key} at width {width}: {footer}");
             }
-            let status = (0..width).map(|x| buffer[(x, 23)].symbol()).collect::<String>();
-            let screen = (0..24).map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join(" ");
+            let screen = (0..42).map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join(" ");
             assert!(screen.contains("status is visible"));
-            assert!(status.contains("[q]"));
+            assert!(screen.contains("‹q›"));
         }
     }
 
@@ -2283,11 +2730,11 @@ mod tests {
     fn mode_footer_keeps_multiword_labels_and_styles_together() {
         let style = Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD);
         let lines = wrap_actions(Line::from(Span::styled(
-            "Sort: [←/→] Move column  [enter] apply  [esc] cancel", style,
+            "Sort: ‹←/→› Move column  ‹enter› apply  ‹esc› cancel", style,
         )), 25);
         assert_eq!(lines.len(), 3);
         for (line, expected) in lines.iter().zip([
-            "Sort: [←/→] Move column", "[enter] apply", "[esc] cancel",
+            "Sort: ‹←/→› Move column", "‹enter› apply", "‹esc› cancel",
         ]) {
             assert_eq!(line.spans, vec![Span::styled(expected, style)]);
         }
@@ -2386,7 +2833,7 @@ mod tests {
         for col in [3, 6, 7, 10] { assert_eq!(avail_cell(&model, &available, col, 12), "-"); }
         let title = alloc_title(&model, &[allocation.clone()]);
         let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("Current ? | Paused 0 | Planned change 0"), "{text}");
+        assert!(text.contains("Now ? | Paused 0 | Δ 0"), "{text}");
         allocation.ring = 0;
         allocation.latest_frame = 20;
         assert_eq!(alloc_cell(&model, &allocation, 3, 12), "0");
@@ -2435,7 +2882,7 @@ mod tests {
         ended.leave_confirm_frame = 1400;
         let title = alloc_title(&m, &[active, joining, unstaffed, expired, paused, leaving, unstaffed_leave, ended]);
         let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains(&format!("Current {} | Paused {} | Planned change -{}",
+        assert!(text.contains(&format!("Now {} | Paused {} | Δ -{}",
             fmt_reward(&BigInt::from(60000)), fmt_reward(&BigInt::from(40000)),
             fmt_reward(&BigInt::from(30000)))), "{text}");
     }
@@ -2546,7 +2993,7 @@ mod tests {
             WorkerInfo { core_id: 9, ..Default::default() },
             WorkerInfo { core_id: 7, ..Default::default() },
         ] });
-        assert_eq!(worker_counts_line(&m).to_string(), " Workers: Running 3 | Auto 2 | Manual 1");
+        assert_eq!(worker_counts_line(&m).to_string(), "Local workers: Running 3 | Auto 2 | Manual 1");
         assert!(alloc_title(&m, &m.allocations).to_string().contains("Allocations: 2/3 | Active 1"));
         m.alloc_col_filters.insert(1, ColumnFilter { text: "no matching allocation".into(), ..Default::default() });
         assert!(m.filtered_allocations().is_empty());
@@ -2757,12 +3204,12 @@ mod tests {
     #[test]
     fn padding_shares_the_highlight_style() {
         let base = Style::new()
-            .bg(PRIMARY)
+            .bg(HEADER_BG)
             .fg(TEXT)
             .add_modifier(Modifier::BOLD);
         for left in [false, true] {
             let spans = header_spans("Mode", 8, base, true, false, left);
-            assert!(spans.iter().all(|s| s.style.bg == Some(PRIMARY)));
+            assert!(spans.iter().all(|s| s.style.bg == Some(HEADER_BG)));
             assert_eq!(joined(&spans).trim(), "Mode");
         }
     }
@@ -2840,8 +3287,8 @@ mod tests {
     fn every_key_has_a_help_entry() {
         let keys = documented_keys();
         for key in [
-            "l", "c", "r", "p", "u", "M", "J", "s", "f", "C", "e", "h", "a", "x", "d",
-            "Tab", "Space", "enter", "esc", "q / Ctrl+C",
+            "Ctrl+L", "Ctrl+Y", "Ctrl+R", "Ctrl+P", "Ctrl+U", "Ctrl+O", "Ctrl+G", "s", "f", "C", "e", "h", "a", "x", "d",
+            "Tab", "Space", "enter", "esc", "q / Ctrl+C", "t", "b",
         ] {
             assert!(
                 keys.iter().any(|k| k == key),
@@ -2906,7 +3353,7 @@ mod tests {
         let separator = |buffer: &ratatui::buffer::Buffer| (0..100).map(|x| buffer[(x, 22)].symbol()).collect::<String>();
         assert_eq!(separator(terminal.backend().buffer()), "─".repeat(100));
         assert_eq!(m.help_visible, 21);
-        assert!(before.contains("[h/esc] close"));
+        assert!(before.contains("‹h/esc› close"));
         super::super::update::handle_key(&mut m, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         terminal.draw(|f| draw(f, &mut m)).unwrap();
         assert_eq!(bottom(terminal.backend().buffer()), before);
@@ -2950,4 +3397,22 @@ mod tests {
         assert_eq!(m.help_offset, 0);
     }
 
+}
+
+#[cfg(test)]
+mod compact_action_tests {
+    use super::*;
+    use super::super::super::epoch::{ActionHint, ThresholdUnit};
+    #[test]
+    fn shortcut_labels_preserve_thresholds_and_automatic_actions() {
+        let mut m = Model::new();
+        m.threshold_unit = ThresholdUnit::Frames;
+        let hint = ActionHint::at("(reject|confirm)", 123);
+        assert_eq!(next_action_text(&m, &hint), "(reject|confirm)@f123");
+        m.compact_actions = true;
+        assert_eq!(next_action_text(&m, &hint), "(R|Y)@f123");
+        assert_eq!(next_action_text(&m, &ActionHint::text("(pause|leave)")), "(P|L)");
+        assert_eq!(next_action_text(&m, &ActionHint::at("renew", 123)), "renew@f123");
+        assert_eq!(hint.label, "(reject|confirm)");
+    }
 }
