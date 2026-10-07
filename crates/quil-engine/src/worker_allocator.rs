@@ -406,15 +406,6 @@ pub struct WorkerAllocator {
     /// Go's `estimateSeniorityFromConfig` return value. `u64::MAX`
     /// sentinel means "not yet computed"; lifecycle treats that as 0.
     config_seniority_estimate: std::sync::atomic::AtomicU64,
-    /// Self-leave confirm window, kept in lockstep with
-    /// `ProverLifecycle::confirm_window_frames` (default 360; testnet
-    /// overrides to a shorter value). A Leaving allocation is still
-    /// participating until its leave confirms at `leave_frame +
-    /// confirm_window`, so on recovery (e.g. after a store wipe) we
-    /// reestablish a worker for it while it is within this window, and
-    /// stop past it (the lifecycle confirms the leave instead). Must
-    /// match the lifecycle value or the bind/confirm handoff would gap.
-    confirm_window_frames: std::sync::atomic::AtomicU64,
     /// Latest lifecycle-published allocation ranking, consulted when
     /// this node holds more allocations than it has worker slots.
     /// `None` until the first `publish_allocation_priority`.
@@ -471,9 +462,6 @@ impl WorkerAllocator {
                 std::sync::atomic::AtomicU64::new(0),
             ],
             config_seniority_estimate: std::sync::atomic::AtomicU64::new(u64::MAX),
-            confirm_window_frames: std::sync::atomic::AtomicU64::new(
-                crate::provers::lifecycle::DEFAULT_CONFIRM_WINDOW_FRAMES,
-            ),
             allocation_priority: RwLock::new(None),
             session_authority: RwLock::new(None),
             last_rebind_frame: std::sync::atomic::AtomicU64::new(0),
@@ -481,19 +469,6 @@ impl WorkerAllocator {
             last_rebind_outcome_frame: std::sync::atomic::AtomicU64::new(0),
             worker_reset_v3_done: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    /// Override the self-leave confirm window. Call alongside
-    /// `ProverLifecycle::set_confirm_window_frames` so the recovery
-    /// reestablish cutoff matches when leaves actually confirm.
-    pub fn set_confirm_window_frames(&self, frames: u64) {
-        self.confirm_window_frames
-            .store(frames, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn confirm_window_frames(&self) -> u64 {
-        self.confirm_window_frames
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Cached config-derived seniority estimate. Computed once at
@@ -856,7 +831,7 @@ impl WorkerAllocator {
                     // though the allocation is Leaving or terminal.
                     let mut desired_allocated = retained || matches!(
                         alloc.status,
-                        ProverStatus::Active | ProverStatus::Paused
+                        ProverStatus::Active | ProverStatus::Paused | ProverStatus::Leaving
                     );
 
                     match alloc.status {
@@ -1095,26 +1070,10 @@ impl WorkerAllocator {
                 | EffectiveStatus::Joining => {}
                 EffectiveStatus::ExpiredEpoch
                     if rejected_leave_recovery_pending(alloc, frame_number) => {}
-                EffectiveStatus::Leaving => {
-                    // A Leaving allocation is still participating in its
-                    // shard until the leave confirms (at `leave_frame +
-                    // confirm_window`). On recovery (e.g. after a store
-                    // wipe) the worker is idle, so reestablish it here so
-                    // the shard keeps producing while the leave is still
-                    // in flight. Once we're past the confirm window, the
-                    // lifecycle's `ready_leave_filters` confirms the leave
-                    // (ConfirmLeaves) — don't bind a worker we're about to
-                    // release. (frame >= leave + window is guaranteed for
-                    // EffectiveStatus::Leaving only when window < 720; the
-                    // 720 grace fallback still applies via ExpiredLeaving.)
-                    if frame_number
-                        >= alloc
-                            .leave_frame_number
-                            .saturating_add(self.confirm_window_frames())
-                    {
-                        continue;
-                    }
-                }
+                // Both proposed and confirmed leaves serve until their
+                // protocol departure boundary; confirmation does not free
+                // the worker or change the frozen committee mid-epoch.
+                EffectiveStatus::Leaving => {}
                 _ => continue,
             }
             if assigned_filters.contains(&alloc.confirmation_filter) {
@@ -1123,17 +1082,26 @@ impl WorkerAllocator {
             bind_candidates.push(alloc);
         }
 
-        // Best-first when we have a ranking; registry order otherwise
-        // (an unranked run must behave exactly as before).
-        if let Some(priority) = priority.as_ref() {
-            bind_candidates.sort_by(|a, b| {
-                let ka = priority_key(priority, &a.confirmation_filter);
-                let kb = priority_key(priority, &b.confirmation_filter);
-                kb.0.cmp(&ka.0)
-                    .then_with(|| kb.1.cmp(&ka.1))
-                    .then_with(|| a.confirmation_filter.cmp(&b.confirmation_filter))
-            });
-        }
+        // Serving allocations take precedence over joins that have not
+        // activated. A notice-period member must not lose its recovery slot
+        // to a pending join merely because the latter scores higher.
+        bind_candidates.sort_by(|a, b| {
+            use quil_types::consensus::EffectiveStatus;
+            let pending = |a: &quil_types::consensus::ProverAllocationInfo| {
+                a.effective_status(frame_number) == EffectiveStatus::Joining
+            };
+            pending(a).cmp(&pending(b)).then_with(|| {
+                if let Some(priority) = priority.as_ref() {
+                    let ka = priority_key(priority, &a.confirmation_filter);
+                    let kb = priority_key(priority, &b.confirmation_filter);
+                    kb.0.cmp(&ka.0)
+                        .then_with(|| kb.1.cmp(&ka.1))
+                        .then_with(|| a.confirmation_filter.cmp(&b.confirmation_filter))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+        });
 
         for alloc in bind_candidates {
             // Prefer a manually-pending (user-picked) worker before
@@ -1777,69 +1745,66 @@ mod tests {
     }
 
     #[test]
-    fn recovery_reestablishes_active_and_leaving_within_window() {
-        // Store-wipe recovery: workers are idle but the registry (synced
-        // from the network) still holds our allocations. on_new_frame must
-        // rebind a worker to each Active allocation AND each Leaving
-        // allocation still within the confirm window (still participating),
-        // but NOT a Leaving allocation past the window (the lifecycle
-        // confirms that leave instead of us reassigning a doomed worker).
-        let wm = Arc::new(MockWorkerManager::new());
-        for c in 0..3u32 {
-            wm.allocate_worker(c, &[]).unwrap(); // 3 idle workers
+    fn leaving_workers_serve_until_protocol_departure() {
+        let e = EPOCH_LENGTH_FRAMES;
+        for confirmed in [false, true] {
+            for recovered in [false, true] {
+                let wm = Arc::new(MockWorkerManager::new());
+                let filter = vec![0x02; 32];
+                wm.allocate_worker(1, if recovered { &[] } else { &filter }).unwrap();
+                if !recovered {
+                    wm.set_allocated(1, true).unwrap();
+                }
+                let mut leaving = make_alloc(filter.clone());
+                leaving.status = ProverStatus::Leaving;
+                leaving.leave_frame_number = e + 1;
+                leaving.leave_confirm_frame_number = if confirmed { 2 * e + 10 } else { 0 };
+                let prover = ProverInfo {
+                    public_key: vec![0xBB; 585], address: vec![0xAA; 32],
+                    status: ProverStatus::Active, kick_frame_number: 0,
+                    allocations: vec![leaving], available_storage: 0,
+                    seniority: 100, delegate_address: vec![],
+                };
+                let allocator = WorkerAllocator::new(wm.clone(),
+                    Arc::new(TestProverRegistry::with_prover(prover)), vec![0xAA; 32]);
+                for frame in [2 * e + 20, 3 * e - 1] {
+                    allocator.on_new_frame(frame).unwrap();
+                    let worker = wm.range_workers().unwrap().remove(0);
+                    assert_eq!(worker.filter, filter, "confirmed={confirmed}, recovered={recovered}, frame={frame}");
+                    assert!(worker.allocated, "notice-period worker must run consensus");
+                }
+                allocator.on_new_frame(3 * e).unwrap();
+                let worker = wm.range_workers().unwrap().remove(0);
+                assert!(worker.filter.is_empty(), "depart exactly at epoch boundary");
+                assert!(!worker.allocated);
+            }
         }
+    }
 
-        let window = crate::provers::lifecycle::DEFAULT_CONFIRM_WINDOW_FRAMES; // 360
-        let frame = 10_000u64;
-
-        let mut active = make_alloc(vec![0x01; 32]); // status Active, leave_frame 0
-        // Confirmed for the current epoch so always-on epoch expiry keeps it
-        // Active (eval frame 10_000 is well past the first epoch boundary).
-        active.epoch = quil_types::consensus::epoch_for_frame(frame);
-
-        let mut leaving_in = make_alloc(vec![0x02; 32]);
-        leaving_in.status = ProverStatus::Leaving;
-        leaving_in.leave_frame_number = frame - 10; // 10 frames in — within window
-
-        let mut leaving_out = make_alloc(vec![0x03; 32]);
-        leaving_out.status = ProverStatus::Leaving;
-        leaving_out.leave_frame_number = frame - window - 5; // past confirm window
-
+    #[test]
+    fn recovery_reserves_scarce_worker_for_notice_before_pending_join() {
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[]).unwrap();
+        let e = EPOCH_LENGTH_FRAMES;
+        let mut joining = make_alloc(vec![0x01; 32]);
+        joining.status = ProverStatus::Joining;
+        joining.join_frame_number = 2 * e + 1;
+        let mut leaving = make_alloc(vec![0x02; 32]);
+        leaving.status = ProverStatus::Leaving;
+        leaving.leave_frame_number = e + 1;
+        leaving.leave_confirm_frame_number = 2 * e + 10;
         let prover = ProverInfo {
-            public_key: vec![0xBB; 585],
-            address: vec![0xAA; 32],
-            status: ProverStatus::Active,
-            kick_frame_number: 0,
-            allocations: vec![active, leaving_in, leaving_out],
-            available_storage: 0,
-            seniority: 100,
-            delegate_address: vec![],
+            public_key: vec![0xBB; 585], address: vec![0xAA; 32],
+            status: ProverStatus::Active, kick_frame_number: 0,
+            allocations: vec![joining, leaving.clone()], available_storage: 0,
+            seniority: 100, delegate_address: vec![],
         };
-
-        let reg = Arc::new(TestProverRegistry::with_prover(prover));
-        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
-        alloc.on_new_frame(frame).unwrap();
-
-        let assigned: Vec<Vec<u8>> = wm
-            .range_workers()
-            .unwrap()
-            .iter()
-            .filter(|w| !w.filter.is_empty())
-            .map(|w| w.filter.clone())
-            .collect();
-        assert!(
-            assigned.contains(&vec![0x01; 32]),
-            "Active allocation must be reestablished"
-        );
-        assert!(
-            assigned.contains(&vec![0x02; 32]),
-            "Leaving allocation within the confirm window must be reestablished"
-        );
-        assert!(
-            !assigned.contains(&vec![0x03; 32]),
-            "Leaving allocation past the confirm window must NOT be reestablished \
-             (the lifecycle confirms the leave instead)"
-        );
+        let allocator = WorkerAllocator::new(wm.clone(),
+            Arc::new(TestProverRegistry::with_prover(prover)), vec![0xAA; 32]);
+        allocator.on_new_frame(2 * e + 20).unwrap();
+        let worker = wm.range_workers().unwrap().remove(0);
+        assert_eq!(worker.filter, leaving.confirmation_filter);
+        assert!(worker.allocated);
     }
 
     /// The production worker manager, counting consensus starts.

@@ -288,7 +288,7 @@ fn scenario_allocation_state_and_worker_matrix() {
                             ProverStatus::Joining => frame < 1440,
                             ProverStatus::Active => stored_epoch >= frame / 720,
                             ProverStatus::Paused => true,
-                            ProverStatus::Leaving => bound && frame < 1440,
+                            ProverStatus::Leaving => frame < 1440,
                             _ => false,
                         };
                         assert_eq!(
@@ -413,4 +413,30 @@ fn scenario_seeded_recovery_histories() {
             frame += 1 + next() % 100;
         }
     }
+}
+
+#[test]
+fn unbound_notice_reserves_capacity_before_allocator_recovery() {
+    let _epoch = super::super::buckets_tests::epoch_length_guard();
+    let mut leaving = alloc(filter_bytes(0xA1), ProverStatus::Leaving, 100);
+    leaving.leave_frame_number = 100;
+    leaving.leave_confirm_frame_number = 721;
+    let scenario = Scenario::new(vec![leaving], vec![idle_worker(1)]);
+    scenario.registry.set_summaries(vec![
+        shard_summary(filter_bytes(0xA1), 50),
+        shard_summary(filter_bytes(0xC1), 1),
+    ]);
+    seed_sizes_from_registry(&scenario.lifecycle, scenario.registry.as_ref());
+    // Deliberately evaluate BEFORE allocator recovery, as a racing caller
+    // can see an idle fleet while notice-period allocations remain owed slots.
+    for frame in [722, 1439] {
+        scenario.lifecycle.set_prover_root_verified_frame(frame);
+        let actions = scenario.lifecycle.evaluate(frame, 50_000,
+            scenario.registry.as_ref(), scenario.workers.as_ref()).unwrap();
+        assert_eq!(count_proposed_joins(&actions), 0, "{actions:?}");
+    }
+    scenario.lifecycle.set_prover_root_verified_frame(1440);
+    let actions = scenario.lifecycle.evaluate(1440, 50_000,
+        scenario.registry.as_ref(), scenario.workers.as_ref()).unwrap();
+    assert!(count_proposed_joins(&actions) > 0, "departure must release capacity: {actions:?}");
 }
