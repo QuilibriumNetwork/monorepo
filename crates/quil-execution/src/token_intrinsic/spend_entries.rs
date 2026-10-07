@@ -23,7 +23,7 @@ use quil_lattice_ct::confidential::{
     pending_claim::{ClaimBranch, PendingClaim},
     pending_create::PendingCreate,
     settlement::Settlement,
-    shield::Shield,
+    shield::AnyShield,
     transfer::{parameter_context, Output, Transfer, TransferStatement},
     MAX_PRIVATE_COINS,
 };
@@ -105,7 +105,7 @@ pub fn operation_outputs(network: &[u8; 32], application: &[u8; 32], tp: u32, by
             change.to_vec()
         }
         TYPE_LATTICE_PENDING_CLAIM => PendingClaim::decode(bytes, network, application).map_err(decode)?.statement.outputs,
-        TYPE_LATTICE_SHIELD => Shield::decode(bytes, network, application).map_err(decode)?.statement.outputs,
+        TYPE_LATTICE_SHIELD => AnyShield::decode(bytes, network, application).map_err(decode)?.outputs().to_vec(),
         TYPE_LATTICE_MINT_CLAIM => MintClaim::decode(bytes, network, application).map_err(decode)?.outputs,
         TYPE_LATTICE_MINT if application != &domains::QUIL_TOKEN => {
             CustomMint::decode(bytes, network, application).map_err(decode)?.statement.outputs
@@ -188,11 +188,14 @@ pub fn spend_entry(network: &[u8; 32], application: &[u8; 32], tp: u32, bytes: &
             entry.fee = s.fee;
         }
         TYPE_LATTICE_SHIELD => {
-            let tx = Shield::decode(bytes, network, application).map_err(decode)?;
-            let s = &tx.statement;
-            entry.consumptions = vec![spent_check::key_image_spent_address(&s.transparent_address)?];
-            entry.outputs = output_addresses(&context, frame, &s.outputs)?;
-            entry.fee = s.fee;
+            // One consumption marker per legacy source: a batch commits all of
+            // them or none.
+            let tx = AnyShield::decode(bytes, network, application).map_err(decode)?;
+            entry.consumptions = tx.sources().iter()
+                .map(|source| spent_check::key_image_spent_address(&source.address))
+                .collect::<Result<Vec<_>>>()?;
+            entry.outputs = output_addresses(&context, frame, tx.outputs())?;
+            entry.fee = tx.fee();
         }
         TYPE_LATTICE_MINT_CLAIM => {
             let claim = MintClaim::decode(bytes, network, application).map_err(decode)?;

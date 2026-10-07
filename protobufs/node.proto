@@ -372,6 +372,7 @@ service NodeService {
     returns (GetCoinWitnessesResponse);
   rpc ListEscrows(ListCoinsRequest) returns (ListEscrowsResponse);
   rpc ListCoins(ListCoinsRequest) returns (ListCoinsResponse);
+  rpc ListLegacyCoins(quilibrium.node.global.pb.ListLegacyCoinsRequest) returns (quilibrium.node.global.pb.ListLegacyCoinsResponse);
   rpc GetProverRewardWitness(GetProverRewardWitnessRequest) returns (GetProverRewardWitnessResponse);
   rpc GetMintAuthorizationWitness(GetMintAuthorizationWitnessRequest) returns (GetMintAuthorizationWitnessResponse);
 }
