@@ -2664,11 +2664,10 @@ impl HypergraphCrdt {
         } else {
             let version = base_version.map_or(Some(0), |v| v.checked_add(1))
                 .ok_or_else(|| QuilError::Internal("sync version overflow".into()))?;
-            // Drop the prepared batch without publishing it. The complete
-            // result, including any GLOBAL removals, must match before writes.
-            forest.stage_synced_phase(shard_id, PHASES[phase_idx], version,
-                leaves.iter().map(|(key, value)| (quil_forest::KeyHash(*key), value.clone())),
-                bit_path, Some(target_root))
+            // Verify the complete result, including GLOBAL removals, without
+            // building a whole-tree database batch before bounded installation.
+            forest.preview_synced_phase(shard_id, PHASES[phase_idx], version,
+                &leaves, bit_path, target_root)
                 .map_err(|e| QuilError::Internal(format!("sync phase {phase_idx} reconstruction: {e}")))?;
         }
         Ok(ForestSyncPlan {
