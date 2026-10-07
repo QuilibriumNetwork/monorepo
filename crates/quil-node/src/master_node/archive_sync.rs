@@ -7,6 +7,30 @@ use quil_keys::KeyManager as _;
 
 use quil_lifecycle::Supervisor;
 
+/// Keep the authenticated frame paired with its root while an asynchronous
+/// registry sync runs. A later received header can belong to another root.
+struct RegistrySyncAnchor {
+    root: Vec<u8>,
+    cursor: Option<u64>,
+}
+
+impl RegistrySyncAnchor {
+    fn capture(
+        clock: &dyn quil_types::store::ClockStore,
+        fork_target: Option<Vec<u8>>,
+    ) -> Self {
+        let header = clock.get_latest_global_clock_frame().ok().and_then(|frame| frame.header);
+        let root = fork_target.filter(|root| !root.is_empty())
+            .or_else(|| header.as_ref().map(|header| header.prover_tree_commitment.clone()))
+            .unwrap_or_default();
+        // A fork target without a matching authenticated header provides no
+        // frame citation. Empty-root bootstrap likewise authenticates none.
+        let cursor = header.filter(|header| !root.is_empty() && header.prover_tree_commitment == root)
+            .map(|header| header.frame_number.saturating_sub(1));
+        Self { root, cursor }
+    }
+}
+
 /// Reuse an authenticated startup jump before considering the fallback pull.
 /// A dropped sender means the jump task failed; it must not enable lifecycle.
 async fn bootstrap_prover_sync<F, Fut>(
@@ -3252,17 +3276,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             // Numbered before the target is read: a sync counts
                             // for what the lifecycle saw before it began.
                             let registry_sync = sync_pl.begin_registry_sync();
-                            let expected_root = sync_mat
-                                .as_ref()
-                                .and_then(|m| m.fork_target_root())
-                                .filter(|r| !r.is_empty())
-                                .or_else(|| {
-                                    sync_cs
-                                        .get_latest_global_frame()
-                                        .ok()
-                                        .and_then(|f| f.header.map(|h| h.prover_tree_commitment))
-                                })
-                                .unwrap_or_default();
+                            let anchor = RegistrySyncAnchor::capture(
+                                sync_cs.as_ref(),
+                                sync_mat.as_ref().and_then(|m| m.fork_target_root()),
+                            );
+                            if let Some(frame) = anchor.cursor {
+                                info!(registry_sync, frame = frame.saturating_add(1),
+                                    root = hex::encode(&anchor.root),
+                                    "prover registry reconcile pinned snapshot");
+                            }
+                            let expected_root = anchor.root;
                             let reconcile_peers = sync_pool.get_all().await;
                             let mut reconcile_converged = false;
                             for addr in reconcile_peers.iter() {
@@ -3321,11 +3344,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         if conv.is_some() && !expected_root.is_empty() && sync_mat.is_none()
                                             && quil_types::consensus::committee_handoff_policy().is_some()
                                         {
-                                            let verified = sync_cs.get_latest_global_frame().ok()
-                                                .and_then(|f| f.header)
-                                                .filter(|h| h.prover_tree_commitment == expected_root)
-                                                .map(|h| h.frame_number.saturating_sub(1));
-                                            if let Some(frame) = verified {
+                                            // The root verified by this sync belongs to the
+                                            // captured header, even if gossip advanced during it.
+                                            if let Some(frame) = anchor.cursor {
                                                 if let Err(e) = sync_cs.put_global_materialized_cursor(frame) {
                                                     warn!(error = %e, frame, "could not record the authenticated GLOBAL cursor");
                                                 }
@@ -3608,6 +3629,52 @@ mod bootstrap_sync_tests {
 mod validation_tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn registry_sync_anchor_survives_a_received_head_change() {
+        use quil_types::store::ClockStore;
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let put = |number, root: Vec<u8>| {
+            let txn = clock.new_transaction(false).unwrap();
+            clock.put_global_clock_frame(&GlobalFrame {
+                header: Some(GlobalFrameHeader {
+                    frame_number: number, prover_tree_commitment: root, ..Default::default()
+                }), ..Default::default()
+            }, txn.as_ref()).unwrap();
+            txn.commit().unwrap();
+        };
+        put(424, vec![1; 32]);
+        let anchor = RegistrySyncAnchor::capture(&clock, None);
+        put(425, vec![2; 32]);
+        assert_eq!(anchor.root, vec![1; 32]);
+        assert_eq!(anchor.cursor, Some(423));
+        // The old completion-time lookup lost the citation for this root.
+        assert_eq!(RegistrySyncAnchor::capture(&clock, Some(anchor.root)).cursor, None);
+        assert_eq!(RegistrySyncAnchor::capture(&clock, None).cursor, Some(424));
+    }
+
+    #[test]
+    fn registry_sync_fork_and_bootstrap_targets_require_a_matching_header() {
+        use quil_types::store::ClockStore;
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let empty = RegistrySyncAnchor::capture(&clock, None);
+        assert!(empty.root.is_empty());
+        assert_eq!(empty.cursor, None);
+        let txn = clock.new_transaction(false).unwrap();
+        clock.put_global_clock_frame(&GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 50, prover_tree_commitment: vec![1; 32], ..Default::default()
+            }), ..Default::default()
+        }, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(RegistrySyncAnchor::capture(&clock, Some(vec![2; 32])).cursor, None);
+        assert_eq!(RegistrySyncAnchor::capture(&clock, Some(vec![1; 32])).cursor, Some(49));
+        assert_eq!(RegistrySyncAnchor::capture(&clock, Some(Vec::new())).cursor, Some(49));
+    }
 
     // A lagging archive's fill retried one ancient hole every 3 s, from frame
     // 257,487 up, while it fell further behind.
