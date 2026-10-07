@@ -589,6 +589,17 @@ pub struct WorkerRig {
     /// The worker's own shard CRDT, where its state, cursor and outgoing
     /// history commit (session harnesses only).
     pub shard: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// The worker's clock store, over the same database as `shard`
+    /// (session harnesses only).
+    pub clock: Option<Arc<dyn ClockStore>>,
+}
+
+/// A certified head every worker already holds and has materialized.
+#[derive(Clone)]
+pub struct HeadSeed {
+    pub frame: gpb::AppShardFrame,
+    /// The committee that certified it, absent from the workers' registry.
+    pub committee: Vec<Vec<u8>>,
 }
 
 pub struct AppShardHarness {
@@ -674,7 +685,7 @@ impl AppShardHarness {
         provers: Vec<TestProver>,
         registry: Arc<dyn ProverRegistry>,
     ) -> Self {
-        Self::build_inner(provers, registry, None, false, None, None)
+        Self::build_inner(provers, registry, None, false, None, None, None)
     }
 
     /// Build `n` workers driving the shard with commonware-simplex + Falcon
@@ -687,7 +698,34 @@ impl AppShardHarness {
         let all_prover_infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
         let registry =
             Arc::new(TestProverRegistry::with_provers(all_prover_infos)) as Arc<dyn ProverRegistry>;
-        Self::build_inner(provers, registry, None, true, None, None)
+        Self::build_inner(provers, registry, None, true, None, None, None)
+    }
+
+    /// `n` CW workers of a fresh committee that each recover `head.frame`, as
+    /// from an archive, before consensus starts. `head.committee` certified it
+    /// and only a historical committee source still knows it.
+    pub async fn build_cw_from_head(n: usize, head: HeadSeed) -> Self {
+        assert!(n >= 1, "need at least one worker");
+        let provers: Vec<TestProver> = (0..n).map(|_| TestProver::generate()).collect();
+        let all_prover_infos: Vec<_> = provers.iter().map(|p| p.to_prover_info(1)).collect();
+        let registry =
+            Arc::new(TestProverRegistry::with_provers(all_prover_infos)) as Arc<dyn ProverRegistry>;
+        let frame = head.frame.clone();
+        let harness = Self::build_inner(provers, registry, None, true, None, None, Some(head));
+        for worker in &harness.workers {
+            let (reply, replayed) = tokio::sync::oneshot::channel();
+            worker.handle.send(quil_engine::app_engine::AppEngineMessage::ReplayArchiveFrame {
+                frame: frame.clone(),
+                child: None,
+                reply,
+            });
+            let through = replayed.await.expect("replay answered").expect("the head replays");
+            assert_eq!(Some(through), frame.header.as_ref().map(|header| header.frame_number));
+        }
+        for worker in &harness.workers {
+            worker.handle.set_cw_transport_ready();
+        }
+        harness
     }
 
     /// Active-path PoRep variant: every worker gets a shared committed CRDT, an
@@ -701,7 +739,7 @@ impl AppShardHarness {
         registry: Arc<dyn ProverRegistry>,
         storage: StorageHarness,
     ) -> Self {
-        Self::build_inner(provers, registry, Some(storage), false, None, None)
+        Self::build_inner(provers, registry, Some(storage), false, None, None, None)
     }
 
     /// CW workers that run GLOBALLY AUTHORIZED committee sessions: every worker
@@ -713,7 +751,7 @@ impl AppShardHarness {
         registry: Arc<dyn ProverRegistry>,
         global: Arc<quil_hypergraph::HypergraphCrdt>,
     ) -> Self {
-        Self::build_inner(provers, registry, None, true, Some(global), None)
+        Self::build_inner(provers, registry, None, true, Some(global), None, None)
     }
 
     /// [`Self::build_cw_sessions`] with application state `seed` committed
@@ -724,7 +762,7 @@ impl AppShardHarness {
         global: Arc<quil_hypergraph::HypergraphCrdt>,
         seed: fn(&quil_hypergraph::HypergraphCrdt),
     ) -> Self {
-        Self::build_inner(provers, registry, None, true, Some(global), Some(seed))
+        Self::build_inner(provers, registry, None, true, Some(global), Some(seed), None)
     }
 
     fn build_inner(
@@ -734,6 +772,7 @@ impl AppShardHarness {
         app_cw: bool,
         session_global: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
         seed: Option<fn(&quil_hypergraph::HypergraphCrdt)>,
+        head: Option<HeadSeed>,
     ) -> Self {
         let n = provers.len();
         assert!(n >= 1, "need at least one worker");
@@ -844,10 +883,22 @@ impl AppShardHarness {
             let fee_manager: Arc<dyn quil_types::consensus::DynamicFeeManager> =
                 Arc::new(quil_engine::InMemoryDynamicFeeManager::new(32));
 
+            let execution_engine = Arc::new(match (session_global.as_ref(), hypergraph_dep.as_ref()) {
+                (Some(_), Some(crdt)) => build_test_exec_manager_on(
+                    crdt.clone(),
+                    Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
+                    false,
+                ),
+                _ => build_test_exec_manager(
+                    Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
+                    /* include_global */ false,
+                ),
+            });
+
             let bls_signer = prover.signer_clone();
             let deps = quil_engine::app_engine::AppEngineDeps {
             delivery_frame_source: None,
-                clock_store: member_clock.unwrap_or_else(|| clock_store as Arc<dyn ClockStore>),
+                clock_store: member_clock.clone().unwrap_or_else(|| clock_store as Arc<dyn ClockStore>),
                 global_anchor_store: None,
                 global_hypergraph: session_global.clone(),
                 storage_source_hypergraph: None, topology: None,
@@ -869,17 +920,7 @@ impl AppShardHarness {
                 // Empty buffer → 64-byte zero requests_root, so the
                 // existing wave of tests that send no messages still
                 // works.
-                execution_engine: Some(Arc::new(match (session_global.as_ref(), hypergraph_dep.as_ref()) {
-                    (Some(_), Some(crdt)) => build_test_exec_manager_on(
-                        crdt.clone(),
-                        Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
-                        false,
-                    ),
-                    _ => build_test_exec_manager(
-                        Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
-                        /* include_global */ false,
-                    ),
-                })),
+                execution_engine: Some(execution_engine),
                 inclusion_prover: Some(
                     Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>
                 ),
@@ -895,6 +936,18 @@ impl AppShardHarness {
                 deps,
                 event_tx,
             );
+            let engine = match head.as_ref() {
+                Some(head) => {
+                    let committee = head.committee.clone();
+                    let source: quil_engine::historical_committee::HistoricalCommitteeSource =
+                        Arc::new(move |_filter, _anchor| {
+                            let committee = committee.clone();
+                            Box::pin(async move { Ok(vec![committee]) })
+                        });
+                    engine.with_historical_committee_source(Some(source))
+                }
+                None => engine,
+            };
 
             workers.push(WorkerRig {
                 prover,
@@ -903,6 +956,7 @@ impl AppShardHarness {
                 full_frames: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(Vec::new())),
                 shard: session_global.as_ref().and(hypergraph_dep.clone()),
+                clock: member_clock.clone(),
             });
             pendings.push(Pending {
                 engine,
@@ -1036,8 +1090,11 @@ impl AppShardHarness {
         // Production releases this barrier only after BlossomSub observes a
         // connected topic subscriber; make the equivalent condition explicit
         // here rather than letting tests bypass the startup contract.
-        for handle in &all_handles {
-            handle.set_cw_transport_ready();
+        // A seeded head is recovered first (see `build_cw_from_head`).
+        if head.is_none() {
+            for handle in &all_handles {
+                handle.set_cw_transport_ready();
+            }
         }
 
         Self { filter, workers, tasks }
