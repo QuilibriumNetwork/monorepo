@@ -477,6 +477,9 @@ impl LifecycleReadiness {
 
 /// Tracks the lifecycle state for this node's prover.
 pub struct ProverLifecycle {
+    /// Serialize candidate construction and accepted-plan bookkeeping across
+    /// the gossip and poller callers. No network work runs under this lock.
+    evaluation_lock: std::sync::Mutex<()>,
     /// This node's prover address (32 bytes, Poseidon hash of BLS pubkey).
     pub prover_address: Vec<u8>,
     /// Whether a VDF computation is currently in progress. While set,
@@ -626,6 +629,7 @@ impl ProverLifecycle {
         strategy: Strategy,
     ) -> Self {
         Self {
+            evaluation_lock: std::sync::Mutex::new(()),
             prover_address,
             proof_in_progress: AtomicBool::new(false),
             initial_sync_complete: AtomicBool::new(false),
@@ -976,6 +980,29 @@ impl ProverLifecycle {
         }
     }
 
+    /// Commit retry bookkeeping only after the complete plan was accepted.
+    /// Publication and registry acknowledgement remain distinct steps.
+    fn commit_plan_attempts(&self, actions: &[LifecycleAction], frame: u64, forced_rejection: bool) {
+        for action in actions {
+            match action {
+                LifecycleAction::ProposeJoin { filters, .. } => {
+                    self.record_join_filter_attempts(filters, frame);
+                }
+                LifecycleAction::ProposeLeave { filters, .. } => {
+                    self.allocator.set_last_join_attempt(frame);
+                    self.record_leave_attempts(filters, frame);
+                }
+                LifecycleAction::RejectJoins { .. } if forced_rejection => {
+                    self.allocator.set_last_reject_attempt(frame);
+                }
+                LifecycleAction::ProposeSeniorityMerge { .. } => {
+                    self.allocator.set_last_seniority_merge_attempt(frame);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Port of Go's `selectExcessPendingFilters` at
     /// `worker_allocator.go:1319-1385`. Returns filters that should be
     /// force-rejected because the number of non-expired pending joins
@@ -1222,6 +1249,9 @@ impl ProverLifecycle {
             return Ok(Vec::new());
         }
 
+        let _evaluation = self.evaluation_lock.lock().map_err(|_|
+            quil_types::error::QuilError::Internal("lifecycle evaluation lock poisoned".into()))?;
+
         // `CurrentFrame` is advanced upstream by the BlossomSub
         // recv path / archive poller / materializer — every
         // reachable production caller of `evaluate` has already
@@ -1243,8 +1273,10 @@ impl ProverLifecycle {
         }
 
         // Gather inputs
-        let summaries = registry.get_prover_shard_summaries(frame_number)?;
-        let prover_info = registry.get_prover_info(&self.prover_address)?;
+        let registry_view = registry.get_lifecycle_view(&self.prover_address, frame_number)?;
+        let summaries = registry_view.summaries;
+        let prover_info = registry_view.prover;
+        let membership = registry_view.members;
         let workers = worker_manager.range_workers()?;
         let worker_view = WorkerView::from_workers(workers.clone());
 
@@ -1597,6 +1629,7 @@ impl ProverLifecycle {
 
         let mut actions: Vec<LifecycleAction> = Vec::new();
         let mut join_proposed_this_cycle = false;
+        let mut forced_rejection = false;
 
         // PoRep epoch rotation: any Active allocation whose recorded storage
         // epoch is not registered ahead must confirm leaf roots for the next
@@ -1650,7 +1683,6 @@ impl ProverLifecycle {
                 // Record attempt eagerly so duplicate evaluates within
                 // the cooldown don't re-emit; the pipeline will log if
                 // the actual submission fails.
-                self.allocator.set_last_seniority_merge_attempt(frame_number);
                 actions.push(LifecycleAction::ProposeSeniorityMerge { frame_number });
             }
         }
@@ -1691,7 +1723,7 @@ impl ProverLifecycle {
                     reason = "pending join count exceeds remaining worker capacity",
                     "forced rejection of excess pending joins"
                 );
-                self.allocator.set_last_reject_attempt(frame_number);
+                forced_rejection = true;
                 actions.push(LifecycleAction::RejectJoins { filters, frame_number });
             } else {
                 tracing::debug!(
@@ -1720,7 +1752,6 @@ impl ProverLifecycle {
                         && frame_number - last_join
                             >= crate::worker_allocator::JOIN_COOLDOWN_FRAMES);
                 if cooldown_ok {
-                    self.allocator.set_last_join_attempt(frame_number);
                     let mm_count = workers
                         .iter()
                         .filter(|w| w.manually_managed && !w.filter.is_empty())
@@ -1869,10 +1900,8 @@ impl ProverLifecycle {
                     let worker_ids: Vec<u32> = proposals.iter().map(|p| p.worker_id).collect();
                     let filters: Vec<Vec<u8>> = proposals.into_iter().map(|p| p.filter).collect();
 
-                    // Stamp the per-filter Join cooldown before
-                    // emitting the action so the next cycle sees
-                    // these filters as in-flight and excludes them.
-                    self.record_join_filter_attempts(&filters, frame_number);
+                    // The accepted plan commits per-filter cooldowns. Keep
+                    // this cycle's candidates explicit until compilation.
 
                     info!(
                         filters = filters.len(),
@@ -2028,7 +2057,12 @@ impl ProverLifecycle {
 
         // A worker or recent submission already reserves its destination even
         // before the allocation appears in the registry. It cannot fund a leave.
-        let inflight = self.filters_with_inflight_join(frame_number);
+        let mut inflight = self.filters_with_inflight_join(frame_number);
+        for action in &actions {
+            if let LifecycleAction::ProposeJoin { filters, .. } = action {
+                inflight.extend(filters.iter().cloned());
+            }
+        }
         let available_replacements: Vec<ShardDescriptor> = proposal_descriptors.iter()
             .filter(|d| !inflight.contains(&d.filter)
                 && !workers.iter().any(|w| w.filter == d.filter))
@@ -2289,13 +2323,9 @@ impl ProverLifecycle {
             // A halt-risk swap sheds only an allocation whose shard would
             // release this node; see `proposer::releasable_member`.
             let releasable = |filter: &[u8]| {
-                let mut members = Vec::new();
-                for status in [ProverStatus::Active, ProverStatus::Leaving] {
-                    if let Ok(provers) = registry.get_provers_by_status(filter, status) {
-                        members.extend(provers.into_iter().map(|p| p.address));
-                    }
-                }
-                proposer::releasable_member(&self.prover_address, filter, &members)
+                let members = membership.get(filter).cloned().unwrap_or_default();
+                let addresses: Vec<_> = members.active.into_iter().chain(members.leaving).collect();
+                proposer::releasable_member(&self.prover_address, filter, &addresses)
             };
             // The pending-confirm bucket excludes confirmed leaves serving
             // notice, so inspect effective allocation status instead. This
@@ -2412,8 +2442,6 @@ impl ProverLifecycle {
             }
 
             if !leave_candidates.is_empty() {
-                self.allocator.set_last_join_attempt(frame_number);
-                self.record_leave_attempts(&leave_candidates, frame_number);
                 // Each proposed leave by the first cause that picked it, for
                 // counting how many leaves a node proposes and why (a new
                 // shard drew leaves off several healthy ones on every node).
@@ -2553,15 +2581,9 @@ impl ProverLifecycle {
                 if swap_demand == 0 {
                     return true;
                 }
-                let addresses = |status| {
-                    registry
-                        .get_provers_by_status(filter, status)
-                        .map(|provers| provers.into_iter().map(|p| p.address).collect::<Vec<_>>())
-                        .unwrap_or_default()
-                };
-                let active = addresses(ProverStatus::Active).len();
-                let leaving = addresses(ProverStatus::Leaving);
-                if !proposer::chosen_to_depart(&self.prover_address, filter, active, &leaving) {
+                let members = membership.get(filter).cloned().unwrap_or_default();
+                if !proposer::chosen_to_depart(&self.prover_address, filter,
+                    members.active.len(), &members.leaving) {
                     return true;
                 }
                 swap_confirm.push(filter.clone());
@@ -2606,7 +2628,11 @@ impl ProverLifecycle {
         // intent per shard before asynchronous dispatch. Unexpected conflicts
         // fail closed for this cycle; no partial batch is published.
         match super::plan::LifecyclePlan::compile(frame_number, actions) {
-            Ok(plan) => Ok(plan.into_actions()),
+            Ok(plan) => {
+                let actions = plan.into_actions();
+                self.commit_plan_attempts(&actions, frame_number, forced_rejection);
+                Ok(actions)
+            },
             Err(error) => {
                 tracing::warn!(frame = frame_number, %error,
                     "lifecycle plan rejected before dispatch");
@@ -3695,6 +3721,38 @@ mod proposal_loop_tests {
         lc.set_remote_shard_metrics(HashMap::from([(held.clone(), (1_000_000, 1)), (available, (100_000_000, 1))]));
         let actions = lc.evaluate(720, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
         assert!(actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))), "genuine upgrades remain possible; actions={actions:?}");
+    }
+
+    #[test]
+    fn rejected_plan_does_not_consume_retry_cooldowns() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut active = alloc(held.clone(), ProverStatus::Active, 10);
+        active.epoch = 1;
+        // Inconsistent observation: the same filter is also a pending join.
+        // The complete plan must reject this instead of publishing a leave
+        // alongside a join decision. Then a corrected observation must retry
+        // immediately, not wait on attempts that were never dispatched.
+        reg.set_prover(prover(address.clone(), vec![active.clone(),
+            alloc(held.clone(), ProverStatus::Joining, 10)]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+        lc.set_remote_shard_metrics(HashMap::from([(held.clone(), (0, 0))]));
+        lc.set_prover_root_verified_frame(725);
+        assert!(lc.evaluate(725, 50_000, reg.as_ref(), wm.as_ref()).is_err());
+        assert_eq!(lc.allocator.last_join_attempt(), 0);
+        assert_eq!(lc.allocator.last_reject_attempt(), 0);
+        assert!(lc.last_leave_attempt.read().unwrap().is_empty());
+        assert!(lc.last_join_attempt.read().unwrap().is_empty());
+        reg.set_prover(prover(address, vec![active]));
+        let actions = lc.evaluate(725, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_leaves(&actions), 1, "{actions:?}");
+        assert_eq!(lc.allocator.last_join_attempt(), 725);
+        assert_eq!(lc.last_leave_attempt.read().unwrap().get(&held), Some(&725));
     }
 
     #[test]

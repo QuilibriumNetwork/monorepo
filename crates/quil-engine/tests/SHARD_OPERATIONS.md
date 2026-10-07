@@ -65,11 +65,21 @@ reordering ranked batches or separating join filters from worker IDs.
 Incompatible intents, mixed frames and conflicting join worker assignments
 reject the whole evaluation before publication and emit a warning.
 
+The production shared registry captures owner allocations, summaries and the
+Active/Leaving address census under one read lock. Planning uses that captured
+view rather than reading membership again later. Compatibility registries keep
+sequential getter semantics and must override the capture API if they support
+concurrent mutation. Workers are captured separately; this is not an atomic
+snapshot spanning the registry and worker manager. Evaluation and accepted-plan
+cooldown commitment are serialized across poller/gossip callers. A rejected
+plan consumes no proposal cooldown; selected joins are explicitly excluded from
+replacement demand before retry bookkeeping is committed.
+
 The plan compiler tests every ordered pair of action kinds, mixed-shard
 batches and duplicate worker assignments. Existing evaluator and sequence tests
 exercise its integration with real policy decisions. This does not provide an
-atomic registry snapshot, cross-cycle submission serialization or persisted
-leaving-to-joining replacement pairs. Those remain necessary follow-ups before
+globally atomic registry/worker snapshot, cross-cycle submission serialization
+or persisted leaving-to-joining replacement pairs. Those remain necessary follow-ups before
 claiming a complete distributed lifecycle planner.
 
 ## Further coverage

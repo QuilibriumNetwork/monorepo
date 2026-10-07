@@ -662,12 +662,49 @@ pub const EVICTION_INACTIVITY_START_FRAME: u64 = 674_000;
 /// is deterministic across the fleet.
 pub const MIN_SHARD_CONSENSUS_PROVERS: u64 = 4;
 
+/// Registry inputs for one lifecycle evaluation. Membership lists use the
+/// same raw allocation statuses as `get_provers_by_status`; this is planning
+/// information, not committee authorization or storage-proof eligibility.
+#[derive(Debug, Clone)]
+pub struct ProverLifecycleView {
+    pub prover: Option<ProverInfo>,
+    pub summaries: Vec<ProverShardSummary>,
+    pub members: HashMap<Vec<u8>, LifecycleMembers>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LifecycleMembers {
+    pub active: Vec<Vec<u8>>,
+    pub leaving: Vec<Vec<u8>>,
+}
+
 /// Manages the prover trie: state transitions, lookups, eviction.
 pub trait ProverRegistry: Send + Sync {
     /// Identify a supported registry implementation before reconstructing an
     /// isolated execution context. Custom registries must opt in explicitly.
     fn as_any(&self) -> Option<&dyn std::any::Any> { None }
     fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>>;
+    /// Capture the inputs used by lifecycle planning. Concurrent production
+    /// registries must override this to capture all fields under one read lock.
+    /// The compatibility implementation retains sequential getter semantics
+    /// for immutable/test registries; it does not promise atomicity.
+    fn get_lifecycle_view(&self, address: &[u8], frame: u64) -> Result<ProverLifecycleView> {
+        let prover = self.get_prover_info(address)?;
+        let summaries = self.get_prover_shard_summaries(frame)?;
+        let filters: std::collections::BTreeSet<_> = prover.iter()
+            .flat_map(|p| p.allocations.iter())
+            .map(|a| a.confirmation_filter.clone())
+            .filter(|f| !f.is_empty()).collect();
+        let mut members = HashMap::new();
+        for filter in filters {
+            let active = self.get_provers_by_status(&filter, ProverStatus::Active)?
+                .into_iter().map(|p| p.address).collect();
+            let leaving = self.get_provers_by_status(&filter, ProverStatus::Leaving)?
+                .into_iter().map(|p| p.address).collect();
+            members.insert(filter, LifecycleMembers { active, leaving });
+        }
+        Ok(ProverLifecycleView { prover, summaries, members })
+    }
     /// A member's registered storage leaf root for `leaf_id`, as
     /// `(leaf_root, num_blocks, epoch)`, or `None` if not registered. `leaf_id`
     /// is the opening's `shard_id`. Default `None` (registries that don't track
