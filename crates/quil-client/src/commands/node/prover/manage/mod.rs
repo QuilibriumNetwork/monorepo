@@ -76,7 +76,9 @@ async fn event_loop(
 
     // Kick off the initial fetch + auto-refresh + spinner tickers.
     spawn_action(&client, &km, &tx, &refresh_state, Cmd::Fetch);
-    let mut refresh = tokio::time::interval(Duration::from_secs(8));
+    let mut polling_seconds = model.refresh_seconds;
+    let mut refresh = tokio::time::interval(Duration::from_secs(polling_seconds));
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     refresh.tick().await; // consume the immediate first tick
     let mut spin = tokio::time::interval(Duration::from_millis(120));
 
@@ -108,6 +110,13 @@ async fn event_loop(
                 Vec::new()
             }
         };
+
+        if model.refresh_seconds != polling_seconds {
+            polling_seconds = model.refresh_seconds;
+            let period = Duration::from_secs(polling_seconds);
+            refresh = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        }
 
         for cmd in cmds {
             if matches!(cmd, Cmd::Quit) {

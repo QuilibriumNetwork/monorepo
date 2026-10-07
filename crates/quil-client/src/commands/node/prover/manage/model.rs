@@ -253,6 +253,15 @@ pub struct Model {
     pub epoch_length: u64,
     pub current_epoch: u64,
     pub last_received_frame: u64,
+    /// Automatic polling cadence, changed by the refresh toggle.
+    pub refresh_seconds: u64,
+    pub compact_actions: bool,
+    pub refresh_changed_at: Option<std::time::Instant>,
+    /// Monotonic observation of the received GLOBAL head, independent of RPC success.
+    pub global_observed_head: u64,
+    pub global_last_advance: Option<std::time::Instant>,
+    /// Disruptive command and exact selected allocation identities/statuses.
+    pub operation_confirmation: Option<(char, Vec<(String, u32, i64, bool)>)>,
     pub difficulty: u64,
 
     // Verified GLOBAL reward witness, refreshed independently of shard queries.
@@ -358,6 +367,10 @@ pub struct Model {
     pub help_visible: usize,
     pub color_coding: bool,
     pub column_sizing: ColumnSizing,
+    pub hidden_columns: HashSet<usize>,
+    pub column_picker_active: bool,
+    pub column_picker_cursor: usize,
+    pub column_picker_offset: usize,
     pub threshold_unit: ThresholdUnit,
     pub spinner_frame: usize,
 
@@ -420,6 +433,7 @@ impl Model {
     pub fn new() -> Self {
         Model {
             color_coding: true,
+            refresh_seconds: 15,
             alloc_sort_col: 11, // Worker column
             alloc_sort_asc: true,
             avail_sort_col: 10, // Reward column
@@ -435,6 +449,14 @@ impl Model {
             self.last_received_frame
         } else {
             self.frame_number
+        }
+    }
+
+    /// Track only fresh node responses; shard-cache refreshes cannot reset this clock.
+    pub fn observe_global_head(&mut self, head: u64, now: std::time::Instant) {
+        if self.global_last_advance.is_none() || head > self.global_observed_head {
+            self.global_observed_head = head;
+            self.global_last_advance = Some(now);
         }
     }
 
@@ -859,12 +881,17 @@ impl Model {
 
     /// `applicableAllocActions` — action names valid for the current
     /// allocation selection (intersection across all selected rows).
+    pub fn manual_free_workers(&self) -> Vec<u32> {
+        self.free_workers.iter().copied().filter(|id| self.allocations.iter()
+            .any(|r| r.worker_id == i64::from(*id) && r.status == 0 && r.manually_managed)).collect()
+    }
+
     pub fn applicable_alloc_actions(&self) -> HashSet<String> {
         if self.action_in_flight {
             return HashSet::new();
         }
         let rows = self.selected_alloc_rows();
-        if rows.is_empty() {
+        if rows.is_empty() || rows.iter().any(|r| !r.manually_managed) {
             return HashSet::new();
         }
         let ef = self.epoch_frame();
@@ -903,10 +930,10 @@ impl Model {
     /// `applicableActionsLabel` — human-readable list for status messages.
     pub fn applicable_actions_label(&self) -> String {
         if self.focus == PanelFocus::Available {
-            if !self.free_workers.is_empty() {
+            if !self.manual_free_workers().is_empty() {
                 return "Join".to_string();
             }
-            return "none (no free workers)".to_string();
+            return "none (no free manual workers)".to_string();
         }
         let actions = self.applicable_alloc_actions();
         if actions.is_empty() {
@@ -923,12 +950,17 @@ impl Model {
 
     // ── Filter mode helpers ──────────────────────────────────────────────
 
-    pub fn active_panel_filter_cols(&self) -> &'static [usize] {
-        if self.focus.is_alloc() {
-            &ALLOC_FILTERABLE_COLS
-        } else {
-            &AVAIL_FILTERABLE_COLS
-        }
+    pub fn active_panel_filter_cols(&self) -> Vec<usize> {
+        let cols: &[usize] = if self.focus.is_alloc() { &ALLOC_FILTERABLE_COLS } else { &AVAIL_FILTERABLE_COLS };
+        cols.iter().copied().filter(|&col| self.column_visible(col)).collect()
+    }
+
+    pub fn column_visible(&self, col: usize) -> bool {
+        col < 2 || !self.hidden_columns.contains(&col)
+    }
+
+    pub fn active_visible_columns(&self) -> Vec<usize> {
+        (0..self.active_panel_col_count()).filter(|&col| self.column_visible(col)).collect()
     }
 
     pub fn is_filter_mode_active(&self) -> bool {

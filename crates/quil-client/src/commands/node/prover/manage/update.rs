@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::model::{
     AwaitFilterEntry, ColumnFilter, FilterColKind, Model, PanelFocus, PendingAction,
@@ -83,6 +83,9 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                 m.status_sticky = true;
                 return vec![];
             }
+            if let Some(node) = &node_info {
+                m.observe_global_head(node.last_received_frame, Instant::now());
+            }
             m.last_fetch_success = Some(Instant::now());
             if m.consecutive_failures > 0 && m.status_msg.starts_with("Refresh failed: ") {
                 m.status_msg.clear();
@@ -91,7 +94,7 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             m.consecutive_failures = 0;
             m.data_loaded = true;
             m.process_refresh_data(node_info, shard_info, worker_info);
-            if !m.action_in_flight && !m.status_sticky {
+            if !m.action_in_flight && !m.status_sticky && m.operation_confirmation.is_none() {
                 m.status_msg.clear();
                 m.status_is_error = false;
             }
@@ -412,6 +415,50 @@ fn is_quit(ev: &KeyEvent) -> bool {
 }
 
 pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
+    if ev.kind != KeyEventKind::Press { return vec![]; }
+    if m.column_picker_active { return handle_column_picker_key(m, ev); }
+    if m.operation_confirmation.is_some() {
+        if is_quit(&ev) { return vec![Cmd::Quit]; }
+        if ev.code == KeyCode::Esc {
+            m.operation_confirmation = None;
+            m.status_msg.clear();
+        } else if ev.code == KeyCode::Enter {
+            let (command, targets) = m.operation_confirmation.take().unwrap();
+            if targets != operation_targets(m, command) {
+                m.status_msg = "Allocation selection or state changed; request the action again.".into();
+                m.status_is_error = true;
+                m.status_sticky = true;
+                return vec![];
+            }
+            m.status_msg.clear();
+            return dispatch_operation(m, command);
+        }
+        return vec![];
+    }
+    if m.filter_edit_active && ev.code == KeyCode::Char('h') && ev.modifiers == KeyModifiers::CONTROL {
+        return handle_filter_edit_key(m, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    }
+    // Modifier chords never fall through into ordinary navigation or text input.
+    if ev.modifiers.contains(KeyModifiers::CONTROL) && !is_quit(&ev) {
+        if ev.modifiers != KeyModifiers::CONTROL || m.join_picker_active || m.show_help
+            || m.filter_edit_active || m.is_filter_mode_active() || m.sort_mode
+            || m.focus == PanelFocus::Notifications || m.action_in_flight { return vec![]; }
+        if let KeyCode::Char(command @ ('g' | 'l' | 'y' | 'r' | 'p' | 'u' | 'o')) = ev.code {
+            if command != 'g' && command != 'o' && !manual_actions_allowed(m) { return vec![]; }
+            if matches!(command, 'l' | 'r' | 'p' | 'o') {
+                if !m.focus.is_alloc() { return wrong_panel(m, "Allocation action"); }
+                let targets = operation_targets(m, command);
+                if targets.is_empty() { return vec![]; }
+                let label = match command { 'l' => "Leave", 'r' => "Reject", 'p' => "Pause", _ => "Change worker mode" };
+                m.status_msg = format!("{label} for {} allocation(s)? Enter confirms; Esc cancels.", targets.len());
+                m.status_is_error = false;
+                m.operation_confirmation = Some((command, targets));
+                return vec![];
+            }
+            return dispatch_operation(m, command);
+        }
+        return vec![];
+    }
     if m.join_picker_active {
         return handle_join_picker_key(m, ev);
     }
@@ -478,6 +525,22 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     }
     let c = ch(&ev);
     match ev.code {
+        KeyCode::Char('b') => {
+            if m.focus == PanelFocus::Notifications { return vec![]; }
+            m.column_picker_active = true;
+            m.column_picker_cursor = 2;
+            m.column_picker_offset = 0;
+            return vec![];
+        }
+        KeyCode::Char('n') => {
+            m.compact_actions = !m.compact_actions;
+            return vec![];
+        }
+        KeyCode::Char('t') => {
+            m.refresh_seconds = match m.refresh_seconds { 5 => 15, 15 => 30, 30 => 60, _ => 5 };
+            m.refresh_changed_at = Some(Instant::now());
+            return vec![];
+        }
         KeyCode::Char('v') => {
             m.notice_minimum = m.notice_minimum.next();
             m.notice_offset = 0;
@@ -553,13 +616,6 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     }
     if m.focus == PanelFocus::Notifications { return vec![]; }
     match c {
-        Some('J') => action_join(m),
-        Some('l') => action_leave(m),
-        Some('c') => action_confirm(m),
-        Some('r') => action_reject(m),
-        Some('p') => action_pause(m),
-        Some('u') => action_resume(m),
-        Some('M') => action_toggle_manual(m),
         Some('s') => {
             m.sort_mode = true;
             m.sort_order_mode = false;
@@ -578,6 +634,56 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             vec![]
         }
         _ => vec![],
+    }
+}
+
+fn handle_column_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
+    if is_quit(&ev) { return vec![Cmd::Quit]; }
+    if ev.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) { return vec![]; }
+    match ev.code {
+        KeyCode::Up | KeyCode::Char('k') => m.column_picker_cursor = m.column_picker_cursor.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => m.column_picker_cursor = (m.column_picker_cursor + 1).min(m.active_panel_col_count() - 1),
+        KeyCode::Char(' ') if m.column_picker_cursor >= 2 => {
+            if !m.hidden_columns.remove(&m.column_picker_cursor) { m.hidden_columns.insert(m.column_picker_cursor); }
+        }
+        KeyCode::Char('c') => m.hidden_columns.extend([2, 4, 5]),
+        KeyCode::Char('a') => m.hidden_columns.clear(),
+        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('b') => m.column_picker_active = false,
+        _ => {}
+    }
+    vec![]
+}
+
+fn operation_targets(m: &Model, command: char) -> Vec<(String, u32, i64, bool)> {
+    let rows = if command == 'o' {
+        m.sorted_allocations().get(m.alloc_cursor).cloned().into_iter().collect()
+    } else { m.selected_alloc_rows() };
+    let mut targets: Vec<_> = rows.into_iter().filter(|row| match command {
+        'l' | 'p' => row.status == 2,
+        'r' => row.status == 1 || row.status == 4,
+        'o' => row.worker_id >= 0,
+        _ => false,
+    }).map(|row| (row.filter_key, row.status, row.worker_id, row.manually_managed)).collect();
+    targets.sort();
+    targets
+}
+
+fn manual_actions_allowed(m: &mut Model) -> bool {
+    if m.focus.is_alloc() && m.selected_alloc_rows().iter().any(|r| !r.manually_managed) {
+        m.status_msg = "Worker commands require manual mode for every selected allocation; use Ctrl+O to change mode.".into();
+        m.status_is_error = true;
+        m.status_sticky = true;
+        return false;
+    }
+    true
+}
+
+fn dispatch_operation(m: &mut Model, command: char) -> Vec<Cmd> {
+    if command != 'g' && command != 'o' && !manual_actions_allowed(m) { return vec![]; }
+    match command {
+        'g' => action_join(m), 'l' => action_leave(m), 'y' => action_confirm(m),
+        'r' => action_reject(m), 'p' => action_pause(m), 'u' => action_resume(m),
+        'o' => action_toggle_manual(m), _ => vec![],
     }
 }
 
@@ -676,8 +782,8 @@ fn action_join(m: &mut Model) -> Vec<Cmd> {
         m.status_is_error = true;
         return vec![];
     }
-    if m.free_workers.is_empty() {
-        m.status_msg = "Join requires at least one free worker".into();
+    if m.manual_free_workers().is_empty() {
+        m.status_msg = "Join requires at least one free manual worker; switch an idle worker with Ctrl+O".into();
         m.status_is_error = true;
         return vec![];
     }
@@ -688,7 +794,7 @@ fn action_join(m: &mut Model) -> Vec<Cmd> {
     m.join_picker_active = true;
     m.join_picker_cursor = 0;
     m.join_picker_offset = 0;
-    m.join_picker_workers = m.free_workers.clone();
+    m.join_picker_workers = m.manual_free_workers();
     m.join_picker_selected.clear();
     m.join_picker_filters = rows.iter().map(|r| r.filter.clone()).collect();
     vec![]
@@ -887,13 +993,15 @@ fn start_batch_action(
 // ── Sort mode ────────────────────────────────────────────────────────────
 
 fn handle_sort_mode_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
-    let num_cols = m.active_panel_col_count();
+    let cols = m.active_visible_columns();
+    let index = cols.iter().position(|&col| col == m.sort_highlight_col).unwrap_or(0);
+    let num_cols = cols.len();
     match ev.code {
         KeyCode::Right => {
-            m.sort_highlight_col = (m.sort_highlight_col + 1) % num_cols;
+            m.sort_highlight_col = cols[(index + 1) % num_cols];
         }
         KeyCode::Left => {
-            m.sort_highlight_col = (m.sort_highlight_col + num_cols - 1) % num_cols;
+            m.sort_highlight_col = cols[(index + num_cols - 1) % num_cols];
         }
         KeyCode::Enter => {
             m.sort_order_mode = true;
@@ -1150,8 +1258,14 @@ fn handle_join_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
                 }
             }
         }
-        KeyCode::Enter | KeyCode::Char('J') => {
+        KeyCode::Enter => {
             let worker_ids: Vec<u32> = m.join_picker_selected.iter().copied().collect();
+            let free = m.manual_free_workers();
+            if worker_ids.is_empty() || worker_ids.iter().any(|id| !free.contains(id)) {
+                m.status_msg = "Select a free manual worker; worker state may have changed. Esc cancels.".into();
+                m.status_is_error = true;
+                return vec![];
+            }
             m.join_picker_active = false;
             m.action_in_flight = true;
             m.status_msg = format!(
@@ -1186,6 +1300,154 @@ fn handle_join_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
 mod tests {
     use super::*;
     use quil_types::proto::node::{NodeInfoResponse, ShardAllocationInfo};
+
+    fn operational_model(status: u32) -> Model {
+        let mut m = Model::new();
+        m.process_refresh_data(Some(NodeInfoResponse {
+            shard_allocations: vec![ShardAllocationInfo { filter: vec![1], status, ..Default::default() }],
+            ..Default::default()
+        }), None, None);
+        m.allocations[0].manually_managed = true;
+        m
+    }
+
+    #[test]
+    fn column_picker_hides_shared_fields_and_preserves_required_identity_columns() {
+        let mut m = Model::new();
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        assert!(handle_key(&mut m, key(KeyCode::Char('b'))).is_empty());
+        assert!(m.column_picker_active);
+        handle_key(&mut m, key(KeyCode::Char('c')));
+        for col in [2, 4, 5] { assert!(!m.column_visible(col)); }
+        m.column_picker_cursor = 1;
+        handle_key(&mut m, key(KeyCode::Char(' ')));
+        assert!(m.column_visible(0) && m.column_visible(1));
+        handle_key(&mut m, key(KeyCode::Esc));
+        handle_key(&mut m, key(KeyCode::Char('s')));
+        handle_key(&mut m, key(KeyCode::Right)); assert_eq!(m.sort_highlight_col, 1);
+        handle_key(&mut m, key(KeyCode::Right)); assert_eq!(m.sort_highlight_col, 3);
+        handle_key(&mut m, key(KeyCode::Esc));
+        assert!(!m.active_panel_filter_cols().contains(&2));
+        m.focus = PanelFocus::Available;
+        assert!(!m.active_panel_filter_cols().contains(&4));
+        handle_key(&mut m, key(KeyCode::Char('b')));
+        handle_key(&mut m, key(KeyCode::Char('a')));
+        assert!(m.hidden_columns.is_empty());
+        assert!(!m.action_in_flight);
+    }
+
+    #[test]
+    fn auto_workers_reject_lifecycle_commands_and_mixed_selections() {
+        for (status, keys) in [(1, vec!['y', 'r']), (2, vec!['l', 'p']), (3, vec!['u']), (4, vec!['y', 'r'])] {
+            let mut m = operational_model(status);
+            m.allocations[0].manually_managed = false;
+            m.allocations[0].worker_id = 1;
+            for c in keys {
+                assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)).is_empty());
+                assert!(!m.action_in_flight && m.operation_confirmation.is_none());
+                assert!(m.applicable_alloc_actions().is_empty());
+            }
+            handle_key(&mut m, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+            assert!(m.operation_confirmation.is_some());
+            assert!(matches!(handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).as_slice(), [Cmd::ToggleManual { manual: true, .. }]));
+        }
+        let mut m = operational_model(2);
+        let mut auto = m.allocations[0].clone();
+        auto.filter_key = "auto".into(); auto.manually_managed = false;
+        m.allocations.push(auto);
+        m.alloc_selected.extend([m.allocations[0].filter_key.clone(), "auto".into()]);
+        assert!(dispatch_operation(&mut m, 'p').is_empty());
+        assert!(!m.action_in_flight);
+    }
+
+    #[test]
+    fn joining_requires_free_manual_workers_and_rechecks_mode() {
+        let mut m = operational_model(2);
+        m.allocations[0].status = 0;
+        m.allocations[0].worker_id = 2;
+        m.free_workers = vec![2];
+        assert_eq!(m.manual_free_workers(), vec![2]);
+        m.join_picker_active = true;
+        m.join_picker_selected.insert(2);
+        m.allocations[0].manually_managed = false;
+        assert!(handle_join_picker_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert!(!m.action_in_flight && m.join_picker_active);
+        assert!(m.manual_free_workers().is_empty());
+    }
+
+    #[test]
+    fn refresh_toggle_cycles_without_operational_side_effects() {
+        let mut m = Model::new();
+        assert_eq!(m.refresh_seconds, 15);
+        for expected in [30, 60, 5, 15] {
+            assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)).is_empty());
+            assert_eq!(m.refresh_seconds, expected);
+            assert!(!m.action_in_flight);
+            assert!(m.refresh_changed_at.is_some());
+        }
+    }
+
+    #[test]
+    fn operational_keys_require_control_and_disruptive_actions_require_confirmation() {
+        let mut m = operational_model(2);
+        for command in ['J', 'l', 'c', 'r', 'p', 'u', 'M'] {
+            assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Char(command), KeyModifiers::NONE)).is_empty());
+            assert!(!m.action_in_flight && m.operation_confirmation.is_none());
+        }
+        let ctrl_pause = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert!(handle_key(&mut m, ctrl_pause).is_empty());
+        assert!(m.operation_confirmation.is_some());
+        assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)).is_empty());
+        assert_eq!(m.alloc_cursor, 0);
+        handle_key(&mut m, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(m.operation_confirmation.is_none() && !m.action_in_flight);
+        handle_key(&mut m, ctrl_pause);
+        let cmds = handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::Lifecycle { action, filters, .. } if action == "Pause" && filters == &vec![vec![1]])));
+    }
+
+    #[test]
+    fn confirmation_rejects_changed_targets_and_repeated_keys() {
+        let mut m = operational_model(2);
+        let mut ev = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        ev.kind = KeyEventKind::Repeat;
+        assert!(handle_key(&mut m, ev).is_empty());
+        assert!(m.operation_confirmation.is_none());
+        ev.kind = KeyEventKind::Press;
+        handle_key(&mut m, ev);
+        m.allocations[0].filter_key = "changed".into();
+        assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert!(m.status_is_error && !m.action_in_flight);
+    }
+
+    #[test]
+    fn control_shortcuts_do_not_leak_into_navigation_or_editors() {
+        let mut m = operational_model(2);
+        m.filter_edit_active = true;
+        for c in ['g', 'l', 'y', 'r', 'p', 'u', 'o'] {
+            assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)).is_empty());
+        }
+        assert!(m.filter_edit_input.is_empty() && m.operation_confirmation.is_none());
+        m.filter_edit_active = false;
+        handle_key(&mut m, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert!(!m.show_help);
+        assert!(matches!(handle_key(&mut m, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)).as_slice(), [Cmd::Quit]));
+    }
+
+    #[test]
+    fn global_age_tracks_fresh_advances_not_shard_cache_or_rpc_success() {
+        let mut m = Model::new();
+        let before = Instant::now() - Duration::from_secs(65);
+        m.observe_global_head(10, before);
+        m.observe_global_head(10, Instant::now());
+        m.observe_global_head(9, Instant::now());
+        assert_eq!(m.global_last_advance, Some(before));
+        m.process_refresh_data(Some(NodeInfoResponse { last_received_frame: 10, ..Default::default() }), None, None);
+        assert_eq!(m.global_last_advance, Some(before));
+        let now = Instant::now();
+        m.observe_global_head(11, now);
+        assert_eq!(m.global_last_advance, Some(now));
+    }
 
     #[test]
     fn tab_cycles_three_panels_and_notifications_only_scroll() {
@@ -1350,7 +1612,8 @@ mod tests {
                         assert_eq!(model.allocations[0].next_action.label, "(reject|confirm)");
                         assert_eq!(model.allocations[0].next_action.at_frame, None);
                     }
-                    let cmds = handle_key(&mut model, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+                    for row in &mut model.allocations { row.manually_managed = true; }
+                    let cmds = handle_key(&mut model, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
                     let sent = cmds.iter().any(|cmd| matches!(cmd,
                         Cmd::Lifecycle { action, filters, .. } if action == "Confirm" && filters == &vec![filter.clone()]
                     ));
