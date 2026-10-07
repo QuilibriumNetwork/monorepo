@@ -229,9 +229,41 @@ impl JournalContext {
         Self { inner, files }
     }
 
-    /// Hold the owning runtime on its host thread until canceled actors and
-    /// detached filesystem operations have released their runtime references.
+    /// Hold the owning runtime until all child contexts and blobs are dropped.
+    /// A zero task count alone precedes destruction of the task guard's own
+    /// Files reference and may also precede cancellation of an unpolled child.
     pub(crate) async fn wait_idle(&self) {
+        let started = tokio::time::Instant::now();
+        let mut report_at = Duration::from_secs(5);
+        loop {
+            let active_tasks = self.files.tasks.load(Ordering::Acquire);
+            let references = Arc::strong_count(&self.files);
+            // Files has no weak references. Once only this context owns it,
+            // no other task can acquire another runtime-owning reference.
+            if active_tasks == 0 && references == 1 {
+                return;
+            }
+            if started.elapsed() >= report_at {
+                tracing::info!(
+                    active_tasks,
+                    retained_references = references - 1,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "consensus runtime waiting for context release"
+                );
+                report_at += Duration::from_secs(5);
+            }
+            // Dropping an idle context or blob does not decrement the task
+            // counter or notify its waiters. Recheck ownership as well.
+            tokio::select! {
+                _ = self.files.idle.notified() => {},
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+            }
+        }
+    }
+
+    /// Wait for operations without requiring callers to release idle handles.
+    #[cfg(test)]
+    async fn wait_tasks_idle(&self) {
         loop {
             let wake = self.files.idle.notified();
             if self.files.tasks.load(Ordering::Acquire) == 0 {
@@ -407,9 +439,15 @@ impl Spawner for JournalContext {
     {
         let files = self.files;
         let task = Task::new(files.clone());
-        self.inner.spawn(move |inner| async move {
-            let _task = task;
-            f(Self { inner, files }).await
+        self.inner.spawn(move |inner| {
+            // Keep these fields together even before the task's first poll.
+            // JournalContext drops inner before files, so observing the last
+            // Files reference released also observes this Context released.
+            let context = Self { inner, files };
+            async move {
+                let _task = task;
+                f(context).await
+            }
         })
     }
     async fn stop(self, value: i32, timeout: Option<Duration>) -> Result<(), Error> {
@@ -539,6 +577,25 @@ mod tests {
             "/dev/fd"
         };
         std::fs::read_dir(path).unwrap().count()
+    }
+
+    #[test]
+    fn shutdown_waits_for_context_release_after_tasks_are_idle() {
+        Directory::new().runner().start(|context| async move {
+            let context = JournalContext::new(context);
+            let retained = context.child("retained");
+            assert_eq!(context.files.tasks.load(Ordering::Acquire), 0);
+            let idle = context.wait_idle();
+            tokio::pin!(idle);
+            tokio::select! {
+                _ = &mut idle => panic!("shutdown released a runtime still owned by a child"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            drop(retained);
+            tokio::time::timeout(Duration::from_secs(1), idle)
+                .await
+                .expect("shutdown must finish after the last child releases its context");
+        });
     }
 
     #[test]
@@ -672,17 +729,17 @@ mod tests {
             let _ = write.await;
             assert_eq!(context.files.tasks.load(Ordering::Acquire), 1);
             drop(gate);
-            context.wait_idle().await;
+            context.wait_tasks_idle().await;
             assert_eq!(read(&blob, 4).await, b"kept");
             let observer = blob.start_sync().await;
             observer.abort();
             drop(observer);
-            context.wait_idle().await;
+            context.wait_tasks_idle().await;
             let task = context.child("canceled").spawn(|ctx| async move {
                 ctx.sleep(Duration::from_secs(3600)).await;
             });
             task.abort();
-            context.wait_idle().await;
+            context.wait_tasks_idle().await;
             drop(blob);
             let (reopened, len) = context.open("test", b"one").await.unwrap();
             assert_eq!(len, 4);

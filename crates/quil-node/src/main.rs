@@ -1101,12 +1101,9 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     // already released its snapshots before returning, so a forced exit
     // costs only a WAL replay on restart.
     {
-        let code: i32 = match &reason {
-            // POSIX: signal-driven exit is 128 + signal number.
-            ShutdownReason::CtrlC => 130,
-            ShutdownReason::Terminated => 143,
-            _ => 1,
-        };
+        // Forced teardown is a failure even when a signal requested the stop.
+        // Only a completed, handled shutdown below returns success.
+        let code = 1;
         const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
         let _ = std::thread::Builder::new()
             .name("shutdown-watchdog".into())
@@ -1123,14 +1120,16 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     }
 
     let result = match reason {
-        // POSIX convention: signal-driven exit is 128 + signal number.
+        // These signals were handled and the supervisor finished draining.
+        // Returning 128 + signal would report an ordinary unsuccessful exit
+        // to service managers rather than successful cooperative shutdown.
         ShutdownReason::CtrlC => {
             info!("shut down via ctrl-c");
-            Ok(ExitCode::from(130))
+            Ok(ExitCode::SUCCESS)
         }
         ShutdownReason::Terminated => {
             info!("shut down via SIGTERM");
-            Ok(ExitCode::from(143))
+            Ok(ExitCode::SUCCESS)
         }
         ShutdownReason::TaskExited(name) => {
             error!(task = %name, "supervised task exited unexpectedly");
