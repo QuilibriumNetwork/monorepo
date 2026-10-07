@@ -12,6 +12,7 @@ pub(crate) struct LifecycleHandles {
 
 pub(crate) struct LifecycleInitArgs {
     pub config: quil_config::Config,
+    pub db: Arc<quil_store::RocksDb>,
     pub network: u8,
     pub archive_mode: bool,
     pub worker_manager: Arc<dyn quil_engine::worker::WorkerManager>,
@@ -33,9 +34,10 @@ pub(crate) struct LifecycleInitArgs {
 pub(crate) fn init(
     sup: &mut Supervisor<anyhow::Error>,
     args: LifecycleInitArgs,
-) -> LifecycleHandles {
+) -> anyhow::Result<LifecycleHandles> {
     let LifecycleInitArgs {
         config,
+        db,
         network,
         archive_mode,
         worker_manager,
@@ -208,6 +210,7 @@ pub(crate) fn init(
     if !archive_mode {
         lifecycle_inner.hold_gone_shard_leaves_for_sync();
     }
+    lifecycle_inner.configure_leave_decision_store(db)?;
     let prover_lifecycle = Arc::new(lifecycle_inner);
     // Wire the shards store so `evaluate` can discover shards that
     // have no allocations yet — calls `RangeAppShards` on the local
@@ -323,9 +326,9 @@ pub(crate) fn init(
             None
         };
 
-    LifecycleHandles {
+    Ok(LifecycleHandles {
         worker_allocator,
         prover_lifecycle,
         frame_materializer,
-    }
+    })
 }

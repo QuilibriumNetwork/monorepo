@@ -103,3 +103,19 @@ Replace process-global test epoch settings with instance-scoped configuration
 before introducing concurrently simulated networks with different epoch lengths.
 Counterfactual controls must fail when an important guard is removed. Preserve
 release optimization settings and never relax authentication to make a test pass.
+
+### Leave decision stability
+
+Accepted automatic leave rejections remain attached to the exact leave request
+through its decision epoch. Archive metadata changes cannot convert that request
+into a confirmation. The node restores this local decision journal before
+lifecycle dispatch; failed writes or WAL sync prevent plan commitment. A new
+leave request or decision epoch has its own decision. Protocol eligibility and
+notice timing remain authoritative.
+
+Score confirmations consume available destinations one-to-one, worst holding
+first. Coverage swaps subtract workers already serving confirmed departures and
+score confirmations selected in the current plan. These are capacity bounds,
+not persisted source-to-destination worker reservations; #686 retains that
+broader scope. Confirmation logs report policy cause counts without metric
+labels containing shard filters.
