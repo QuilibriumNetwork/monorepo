@@ -909,6 +909,12 @@ pub struct ShardDetail {
 
 /// Provides shard-level info.
 pub trait ShardInfoProvider: Send + Sync {
+    /// One committed GLOBAL cursor per filter, from a single snapshot.
+    /// Missing coverage/session data stays unavailable; zero is a real cursor.
+    fn get_global_app_heads(&self, filters: &[Vec<u8>]) -> Result<Vec<Option<proto::node::GlobalAppFrameHead>>> {
+        Ok(vec![None; filters.len()])
+    }
+
     fn get_shard_info(
         &self,
         include_all: bool,

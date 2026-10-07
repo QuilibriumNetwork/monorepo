@@ -1,6 +1,8 @@
 //! Rendering for the `prover manage` TUI. Port of the bubbletea `View`
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
+use super::super::local_execution::{local_execution_state, age};
+
 use num_bigint::BigInt;
 use super::super::epoch::EffectiveStatus;
 use ratatui::{
@@ -20,6 +22,7 @@ use super::util::{center_trunc, filter_label, shared_filter_address, clamp_offse
 
 const PRIMARY: Color = Color::Rgb(0xff, 0x00, 0x70);
 const CURSOR_BG: Color = Color::Rgb(0x28, 0x28, 0x28);
+const INACTIVE_CURSOR_BG: Color = Color::Rgb(0x18, 0x18, 0x18);
 const DIM: Color = Color::Rgb(0x55, 0x55, 0x55);
 const TEXT: Color = Color::Rgb(0xff, 0xff, 0xff);
 const SUCCESS: Color = Color::Rgb(0x00, 0xff, 0x00);
@@ -102,23 +105,16 @@ fn fmt_mb(v: &BigInt) -> String {
 /// Sizing and rendering share it, so a column is never measured against a
 /// different string than it draws.
 ///
-/// `compact` underscores the spaces inside a name. Measured columns sit one
-/// space apart, which leaves `Next Action Default Action` with no way to see
-/// where one header ends; `Next_Action Default_Action` reads unambiguously.
-/// The fixed layout has slack between columns and keeps the spaces.
+/// Column names use the same casing and unit labels in both sizing modes.
 fn header_text(
     name: &str,
     idx: usize,
     sort_col: i32,
     asc: bool,
     filtered: bool,
-    compact: bool,
+    _compact: bool,
 ) -> String {
-    let mut s = if compact {
-        name.replace(' ', "_")
-    } else {
-        name.to_string()
-    };
+    let mut s = name.to_string();
     if filtered {
         s.push('*');
     }
@@ -163,7 +159,7 @@ fn printed_width(s: &str) -> usize {
 /// — the column stops looking like one column. Left is the only edge its
 /// values share. Filters likewise align on their prefix.
 fn alloc_left_aligned(col: usize) -> bool {
-    col == 1 || col == 13
+    col == 1 || col == 14
 }
 
 /// One cell padded to its column width, on the side its column aligns to.
@@ -238,19 +234,76 @@ pub fn draw(f: &mut Frame, m: &mut Model) {
     render_main(f, m, area);
 }
 
+fn table_horizontal_offset(m: &mut Model, panel: usize, lines: &[Line<'_>], visible: u16) -> u16 {
+    let width = lines.iter().map(Line::width).max().unwrap_or(0);
+    m.horizontal_limits[panel] = width.saturating_sub(usize::from(visible)).min(usize::from(u16::MAX)) as u16;
+    m.horizontal_offsets[panel] = m.horizontal_offsets[panel].min(m.horizontal_limits[panel]);
+    m.horizontal_offsets[panel]
+}
+
+fn scroll_hint(offset: usize, total: usize, visible: usize, horizontal: u16, horizontal_limit: u16) -> String {
+    let above = offset;
+    let below = total.saturating_sub(offset + visible);
+    let right = horizontal_limit.saturating_sub(horizontal);
+    if above + below + usize::from(horizontal) + usize::from(right) == 0 { return String::new(); }
+    format!(" ↑{above} ↓{below} | ←{horizontal} →{right} ")
+}
+
+fn render_scroll_hint(f: &mut Frame, area: Rect, offset: usize, total: usize, visible: usize, horizontal: u16, horizontal_limit: u16) {
+    let hint = scroll_hint(offset, total, visible, horizontal, horizontal_limit);
+    if area.height >= 2 && area.width >= 4 && !hint.is_empty() {
+        f.render_widget(Paragraph::new(hint).style(Style::new().fg(HELP)), Rect::new(area.x + 1, area.y + area.height - 1, area.width - 2, 1));
+    }
+}
+
+fn base_panel_heights(total: u16) -> [u16; 3] {
+    if total < 6 { return [total / 3 + total % 3, total / 3, total / 3]; }
+    let notice = total.saturating_sub(5).min(3);
+    let alloc = ((total - notice) / 2).max(3);
+    [alloc, total - notice - alloc, notice]
+}
+
+fn panel_heights(m: &Model, total: u16) -> [u16; 3] {
+    let mut heights = base_panel_heights(total);
+    if total < 6 { return heights; }
+    let minimum = [3i32, 2, 1];
+    for i in 0..2 {
+        let movement = i32::from(m.panel_boundary_offsets[i]).clamp(minimum[i] - i32::from(heights[i]), i32::from(heights[i + 1]) - minimum[i + 1]);
+        heights[i] = (i32::from(heights[i]) + movement) as u16;
+        heights[i + 1] = (i32::from(heights[i + 1]) - movement) as u16;
+    }
+    heights
+}
+
+/// Normalize clipped offsets after a terminal resize so the next key moves
+/// the visible boundary immediately, rather than walking an obsolete offset.
+fn sync_panel_heights(m: &mut Model, total: u16) -> [u16; 3] {
+    let base = base_panel_heights(total);
+    let heights = panel_heights(m, total);
+    m.panel_content_heights = heights;
+    m.panel_boundary_offsets = [
+        (i32::from(heights[0]) - i32::from(base[0])) as i16,
+        (i32::from(base[2]) - i32::from(heights[2])) as i16,
+    ];
+    heights
+}
+
 fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     let (actions, status) = footer_lines(m);
-    let actions = wrap_actions(actions, area.width);
-    let actions_h = (actions.len() as u16).min(area.height.saturating_sub(10));
-    // Content height depends only on terminal geometry, never message length.
-    let notice_h = area.height.saturating_sub(9 + actions_h).clamp(1, 3);
+    let mut actions = wrap_actions(actions, area.width);
+    let max_actions = usize::from(area.height.saturating_sub(15).max(1));
+    if actions.len() > max_actions {
+        actions.truncate(max_actions);
+        actions[max_actions - 1] = Line::from("[h] all keys  [q] quit");
+    }
+    let actions_h = actions.len() as u16;
+    let header_height = if m.data_loaded { 2 } else { 1 };
+    // Content height depends only on terminal geometry and explicit resize keys.
+    let [alloc_h, avail_h, notice_h] = sync_panel_heights(m, area.height.saturating_sub(6 + header_height + actions_h));
     let status_h = notice_h + 2;
-    let panel_budget = area.height.saturating_sub(5 + actions_h + status_h);
-    let alloc_h = panel_budget / 2;
-    let avail_h = panel_budget - alloc_h;
 
     let chunks = Layout::vertical([
-        Constraint::Length(1),           // header
+        Constraint::Length(header_height), // identity and worker counts
         Constraint::Length(alloc_h + 2), // alloc panel (+ border)
         Constraint::Length(avail_h + 2), // avail panel (+ border)
         Constraint::Length(status_h),    // notifications
@@ -260,12 +313,16 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
 
     // Header.
     f.render_widget(
-        Paragraph::new(header_line(m)).style(Style::new().fg(TEXT).bg(PRIMARY)),
+        Paragraph::new(if m.data_loaded { vec![header_line(m), worker_counts_line(m)] } else { vec![header_line(m)] })
+            .style(Style::new().fg(TEXT).bg(PRIMARY)),
         chunks[0],
     );
 
     // Titles share the top borders, leaving two more rows for table data.
     let sorted_allocs = m.sorted_allocations();
+    let sorted_avail = m.sorted_available();
+    let (alloc_widths, avail_widths) = shared_col_widths(m, area.width.saturating_sub(2) as usize, &sorted_allocs, &sorted_avail);
+    update_app_progress_warning(m);
     let alloc_block = Block::default()
         .title(alloc_title(m, &sorted_allocs))
         .borders(Borders::ALL)
@@ -273,19 +330,29 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         .border_style(Style::new().fg(if m.focus.is_alloc() { PRIMARY } else { DIM }));
     let alloc_inner = alloc_block.inner(chunks[1]);
     f.render_widget(alloc_block, chunks[1]);
-    let alloc_lines = render_alloc_panel(m, &sorted_allocs, alloc_inner);
-    f.render_widget(Paragraph::new(alloc_lines), alloc_inner);
+    let alloc_lines = render_alloc_panel(m, &sorted_allocs, alloc_inner, Some(&alloc_widths));
+    let mut alloc_lines = alloc_lines;
+    let detail = if !sorted_allocs.is_empty() && alloc_inner.height >= 3 { alloc_lines.pop() } else { None };
+    let horizontal = table_horizontal_offset(m, 0, &alloc_lines, alloc_inner.width);
+    f.render_widget(Paragraph::new(alloc_lines).scroll((0, horizontal)), alloc_inner);
+    if let Some(detail) = detail { f.render_widget(Paragraph::new(detail), Rect::new(alloc_inner.x, alloc_inner.y + alloc_inner.height - 1, alloc_inner.width, 1)); }
+    render_scroll_hint(f, chunks[1], m.alloc_offset, sorted_allocs.len(), usize::from(alloc_inner.height.saturating_sub(2)), horizontal, m.horizontal_limits[0]);
 
-    let sorted_avail = m.sorted_available();
     let avail_block = Block::default()
         .title(avail_title(m, &sorted_avail))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if !m.focus.is_alloc() { PRIMARY } else { DIM }));
+        .border_style(Style::new().fg(if m.focus == PanelFocus::Available { PRIMARY } else { DIM }));
     let avail_inner = avail_block.inner(chunks[2]);
     f.render_widget(avail_block, chunks[2]);
-    let avail_lines = render_avail_panel(m, &sorted_avail, avail_inner);
-    f.render_widget(Paragraph::new(avail_lines), avail_inner);
+    let avail_lines = render_avail_panel(m, &sorted_avail, avail_inner, Some(&avail_widths));
+    let mut avail_lines = avail_lines;
+    let detail = if !sorted_avail.is_empty() && avail_inner.height >= 3 { avail_lines.pop() } else { None };
+    let detail_rows = u16::from(detail.is_some());
+    let horizontal = table_horizontal_offset(m, 1, &avail_lines, avail_inner.width);
+    f.render_widget(Paragraph::new(avail_lines).scroll((0, horizontal)), avail_inner);
+    if let Some(detail) = detail { f.render_widget(Paragraph::new(detail), Rect::new(avail_inner.x, avail_inner.y + avail_inner.height - 1, avail_inner.width, 1)); }
+    render_scroll_hint(f, chunks[2], m.avail_offset, sorted_avail.len(), usize::from(avail_inner.height.saturating_sub(1 + detail_rows + u16::from(m.shard_error.is_some()))), horizontal, m.horizontal_limits[1]);
 
     render_notifications(f, m, status, chunks[3]);
     f.render_widget(
@@ -312,11 +379,12 @@ fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, ar
         format!(" Notifications: {} {}/{} ", m.notice_minimum.label(), m.notice_offset + 1, m.notice_lines)
     } else { format!(" Notifications: {} ", m.notice_minimum.label()) };
     let block = Block::default().title(panel_title(title)).borders(Borders::ALL)
-        .border_type(BorderType::Rounded).border_style(Style::new().fg(DIM));
+        .border_type(BorderType::Rounded).border_style(Style::new().fg(if m.focus == PanelFocus::Notifications { PRIMARY } else { DIM }));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(Paragraph::new(lines.into_iter().skip(m.notice_offset)
         .take(m.notice_visible).collect::<Vec<_>>()), inner);
+    render_scroll_hint(f, area, m.notice_offset, m.notice_lines, m.notice_visible, 0, 0);
 }
 
 // ── Header ───────────────────────────────────────────────────────────────
@@ -326,14 +394,10 @@ fn header_line(m: &Model) -> Line<'static> {
         return Line::from(format!(" {} Connecting to node…", spinner(m)));
     }
     let reach = if m.reachable { "OK" } else { "UNREACHABLE" };
-    let worker_mode = if m.auto_managed { "Auto" } else { "Manual" };
     let mut s = format!(
-        " Peer ID: {}  Seniority: {}  Workers: {}/{} ({})  Frame: {}  Epoch: {}  [{}]",
+        " Peer ID: {}  Seniority: {}  Frame: {}  Epoch: {}  [{}]",
         m.peer_id,
         m.seniority,
-        m.allocated_workers,
-        m.running_workers,
-        worker_mode,
         m.frame_number,
         super::super::epoch::epoch_for_frame(m.frame_number, m.epoch_length),
         reach,
@@ -350,6 +414,27 @@ fn header_line(m: &Model) -> Line<'static> {
     Line::from(s)
 }
 
+fn worker_counts_line(m: &Model) -> Line<'static> {
+    let (automatic, manual) = match m.cached_worker_info.as_ref() {
+        Some(info) => {
+            let workers: std::collections::HashMap<_, _> = info.worker_info.iter()
+                .map(|w| (w.core_id, w.manually_managed)).collect();
+            let manual = workers.values().filter(|&&manual| manual).count();
+            ((workers.len() - manual).to_string(), manual.to_string())
+        }
+        None => ("?".into(), "?".into()),
+    };
+    Line::from(format!(" Workers: Running {} | Auto {} | Manual {}",
+        m.running_workers, automatic, manual))
+}
+
+fn active_allocation_count(m: &Model) -> String {
+    if m.cached_worker_info.is_none() { return "?".into(); }
+    m.allocations.iter()
+        .filter(|a| a.reward_status(m.frame_number, m.epoch_length) == Some(EffectiveStatus::Active))
+        .map(|a| a.worker_id).collect::<std::collections::HashSet<_>>().len().to_string()
+}
+
 fn panel_title(text: String) -> Line<'static> {
     Line::from(format!(" {} ", text.trim()))
         .style(Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD))
@@ -364,12 +449,37 @@ fn fmt_reward_change(v: &BigInt) -> String {
     }
 }
 
+/// Round to five decimals with integer arithmetic; preserve tiny positive amounts.
+fn fmt_claimable(value: u128) -> String {
+    const UNITS_PER_QUIL: u128 = 8_000_000_000;
+    const UNITS_PER_DECIMAL: u128 = UNITS_PER_QUIL / 100_000;
+    if value == 0 { return "0".into(); }
+    if value < UNITS_PER_DECIMAL { return "<0.00001".into(); }
+    let mut whole = value / UNITS_PER_QUIL;
+    let mut fraction = (value % UNITS_PER_QUIL + UNITS_PER_DECIMAL / 2) / UNITS_PER_DECIMAL;
+    if fraction == 100_000 { whole += 1; fraction = 0; }
+    if fraction == 0 { whole.to_string() }
+    else { format!("{whole}.{:05}", fraction).trim_end_matches('0').to_string() }
+}
+
+fn claimable_title(m: &Model) -> String {
+    match m.claimable_reward {
+        Some((value, frame)) => format!("Claimable [Q]: {} @f{}{}",
+            fmt_claimable(value),
+            frame,
+            if m.reward_last_success.is_some_and(|t| t.elapsed().as_secs() >= 30) { " (stale)" } else { "" }),
+        None if m.reward_loaded => "Claimable [Q]: unavailable".into(),
+        None => "Claimable [Q]: loading".into(),
+    }
+}
+
 fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     let mut joining = BigInt::from(0);
     let mut active = BigInt::from(0);
     let mut paused = BigInt::from(0);
     let mut leaving = BigInt::from(0);
     let (mut current_unknown, mut paused_unknown, mut change_unknown) = (false, false, false);
+    let mut current_known = false;
     for a in sorted {
         if a.ring == UNKNOWN_REWARD_RING {
             match a.reward_status(m.epoch_frame(), m.epoch_length) {
@@ -383,21 +493,28 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
         }
         match a.reward_status(m.epoch_frame(), m.epoch_length) {
             Some(EffectiveStatus::Joining) => joining += &a.estimated_reward,
-            Some(EffectiveStatus::Active) => active += &a.estimated_reward,
+            Some(EffectiveStatus::Active) => { current_known = true; active += &a.estimated_reward; },
             Some(EffectiveStatus::Paused) => paused += &a.estimated_reward,
-            Some(EffectiveStatus::Leaving) => leaving += &a.estimated_reward,
+            Some(EffectiveStatus::Leaving) => { current_known = true; leaving += &a.estimated_reward; },
             _ => {}
         }
     }
     let current = &active + &leaving;
     let change = &joining - &leaving;
     let mut s = format!(
-        "Allocations: {}  Rewards [Q/d]: Current {} | Paused {} | Planned change {}",
-        sorted.len(),
-        if current_unknown { "?".into() } else { fmt_reward(&current) },
+        "Allocations: {}/{} | Active {}  {}  Rewards [Q/d]: Current {} | Paused {} | Planned change {}",
+        m.allocated_workers, m.running_workers,
+        active_allocation_count(m),
+        claimable_title(m),
+        if current_unknown && !current_known { "?".into() }
+        else { format!("{}{}", fmt_reward(&current), if current_unknown { "+" } else { "" }) },
         if paused_unknown { "?".into() } else { fmt_reward(&paused) },
         if change_unknown { "?".into() } else { fmt_reward_change(&change) },
     );
+    if sorted.len() != m.allocations.len() {
+        s += &format!("  Shown {}/{}", sorted.len(), m.allocations.len());
+    }
+    s += &format!("  {}", global_snapshot_label(sorted.iter().map(|a| a.global_head.as_ref())));
     if !m.alloc_selected.is_empty() {
         s += &format!(" [{} selected]", m.alloc_selected.len());
     }
@@ -405,7 +522,7 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
 }
 
 fn avail_title(m: &Model, sorted: &[ShardRow]) -> Line<'static> {
-    let mut s = format!(" Available Shards: {}", sorted.len());
+    let mut s = format!(" Available Shards: {}  {}", sorted.len(), global_snapshot_label(sorted.iter().map(|s| s.global_head.as_ref())));
     if !m.avail_selected.is_empty() {
         s += &format!(" [{} selected]", m.avail_selected.len());
     }
@@ -426,7 +543,7 @@ fn fmt_materialized(materialized: u64, latest: u64) -> String {
 /// through here. `fw` is the Filter column's width, which is a budget rather
 /// than a measurement — pass 0 when measuring the other columns.
 fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
-    if !a.shard_info_known && matches!(col, 2..=7 | 9) { return "-".into(); }
+    if !a.shard_info_known && matches!(col, 2..=5 | 7 | 10) { return "-".into(); }
     match col {
         0 => alloc_marker(m, a).to_string(),
         1 => center_trunc(&a.filter_hex, fw),
@@ -434,18 +551,36 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         3 => fmt_ring(a.ring),
         4 => fmt_mb(&a.shard_size),
         5 => a.data_shards.to_string(),
-        6 => fmt_materialized(a.materialized_frame, a.latest_frame),
-        7 => materialization_lag(a.materialized_frame, a.latest_frame)
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "-".to_string()),
-        8 => materialization_state(a.materialized_frame, a.latest_frame).to_string(),
-        9 => if a.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&a.estimated_reward) },
-        10 => a.worker_id.to_string(),
-        11 => a.status_name.clone(),
-        12 => a.mode().to_string(),
-        13 => a.next_action.render(m.threshold_unit, m.epoch_length),
+        6 => if local_warning(a) { "0!".into() }
+            else { a.execution.as_ref().and_then(|s| s.materialized_frame).map(|h| h.to_string()).unwrap_or_else(|| "-".into()) },
+        7 => if a.materialized_frame == 0 && a.latest_frame == 0 { "-".into() } else { a.latest_frame.to_string() },
+        8 => fmt_global_head(a.global_head.as_ref()),
+        9 => local_execution_state(a.execution.as_ref()).into(),
+        10 => if a.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&a.estimated_reward) },
+        11 => a.worker_id.to_string(),
+        12 => a.status_name.clone(),
+        13 => a.mode().to_string(),
+        14 => a.next_action.render(m.threshold_unit, m.epoch_length),
         _ => a.default_action.render(m.threshold_unit, m.epoch_length),
     }
+}
+
+/// Keep a marker position even when warning colors replace the exclamation mark.
+fn warning_slot(text: &str, color_coding: bool) -> String {
+    match text.strip_suffix('!') {
+        Some(value) => format!("{value}{}", if color_coding { ' ' } else { '!' }),
+        None => format!("{text} "),
+    }
+}
+
+fn alloc_display_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
+    let text = alloc_cell(m, a, col, fw);
+    if matches!(col, 6 | 12) { warning_slot(&text, m.color_coding) } else { text }
+}
+
+fn avail_display_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
+    let text = avail_cell(m, s, col, fw);
+    if col == 9 { warning_slot(&text, m.color_coding) } else { text }
 }
 
 fn alloc_marker(m: &Model, a: &AllocationRow) -> &'static str {
@@ -457,7 +592,7 @@ fn alloc_marker(m: &Model, a: &AllocationRow) -> &'static str {
 }
 
 fn alloc_header(m: &Model, idx: usize) -> String {
-    header_text(
+    let text = header_text(
         ALLOC_COL_NAMES[idx],
         idx,
         m.alloc_sort_col,
@@ -466,7 +601,21 @@ fn alloc_header(m: &Model, idx: usize) -> String {
             .get(&idx)
             .is_some_and(|cf| cf.is_active()),
         m.column_sizing == ColumnSizing::Dynamic,
-    )
+    );
+    if matches!(idx, 6 | 12) { warning_slot(&text, true) } else { text }
+}
+
+/// Align shared columns through Reward; local and peer context use their own labels.
+fn shared_col_widths(m: &Model, content_width: usize, allocations: &[AllocationRow], available: &[ShardRow]) -> (Vec<usize>, Vec<usize>) {
+    let (mut alloc, _) = alloc_col_widths(m, content_width, allocations);
+    let (mut avail, _) = avail_col_widths(m, content_width, available);
+    for i in 0..AVAIL_COL_NAMES.len() {
+        if i != 1 { alloc[i] = alloc[i].max(avail[i]); }
+    }
+    let cap = alloc[1].max(avail[1]);
+    alloc[1] = filter_width(content_width, &alloc, alloc.len(), cap);
+    avail.copy_from_slice(&alloc[..AVAIL_COL_NAMES.len()]);
+    (alloc, avail)
 }
 
 fn alloc_col_widths(
@@ -499,7 +648,7 @@ fn alloc_widths_measured(
                 &alloc_header(m, c),
                 sorted
                     .iter()
-                    .map(|a| printed_width(&alloc_cell(m, a, c, 0))),
+                    .map(|a| printed_width(&alloc_display_cell(m, a, c, 0))),
             )
         })
         .collect();
@@ -524,16 +673,17 @@ fn alloc_widths_fixed(
         SHARDS_WIDTH,
         sorted
             .iter()
-            .map(|a| printed_width(&alloc_cell(m, a, 5, 0))),
+            .map(|a| printed_width(&alloc_display_cell(m, a, 5, 0))),
     );
     let reward_w = fit(
         ALLOC_REWARD_WIDTH,
         sorted
             .iter()
-            .map(|a| printed_width(&alloc_cell(m, a, 9, 0))),
+            .map(|a| printed_width(&alloc_display_cell(m, a, 10, 0))),
     );
+    let global_head_w = fit(GLOBAL_HEAD_WIDTH, sorted.iter().map(|row| printed_width(&alloc_display_cell(m, row, 8, 0))));
     // Whatever the wide columns took comes out of the flexible Filter column.
-    let grown = (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH);
+    let grown = (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH);
     let mut fw = content_width.saturating_sub(ALLOC_FIXED_WIDTH + grown);
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
@@ -556,7 +706,8 @@ fn alloc_widths_fixed(
         SIZE_WIDTH,
         shards_w,
         MAT_WIDTH,
-        LAG_WIDTH,
+        HEAD_WIDTH,
+        global_head_w,
         STATE_WIDTH,
         reward_w,
         WORKER_WIDTH,
@@ -605,7 +756,45 @@ fn filter_width(content_width: usize, widths: &[usize], n: usize, cap: usize) ->
         .clamp(MIN_FILTER_WIDTH, cap)
 }
 
-fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Vec<Line<'static>> {
+fn local_warning(a: &AllocationRow) -> bool {
+    local_execution_state(a.execution.as_ref()) == "running"
+        && a.execution.as_ref().and_then(|s| s.materialized_frame) == Some(0)
+}
+
+fn local_color(a: &AllocationRow) -> Color {
+    match local_execution_state(a.execution.as_ref()) {
+        "blocked" | "stopped" => ERROR,
+        "running" if local_warning(a) => Color::Yellow,
+        "running" => SUCCESS,
+        _ => HELP,
+    }
+}
+
+fn fmt_global_head(head: Option<&quil_types::proto::node::GlobalAppFrameHead>) -> String {
+    head.map(|h| format!("{}@g{}", h.frame, h.generation)).unwrap_or_else(|| "-".into())
+}
+
+fn global_snapshot_label<'a>(heads: impl Iterator<Item = Option<&'a quil_types::proto::node::GlobalAppFrameHead>>) -> String {
+    let mut frames = heads.flatten().map(|h| h.global_frame);
+    let Some(frame) = frames.next() else { return "Global: unavailable".into(); };
+    if frames.all(|f| f == frame) { format!("Global: @f{frame}") }
+    else { "Global: mixed snapshots".into() }
+}
+
+fn allocation_detail(a: &AllocationRow) -> Line<'static> {
+    let Some(execution) = a.execution.as_ref() else {
+        return Line::from(Span::styled("Local execution details unavailable", Style::new().fg(HELP)));
+    };
+    let mut text = format!("Last advance: {}", if execution.last_advance_unix_ms == 0 {
+        "not observed since start".into()
+    } else { format!("{} ago", age(execution.last_advance_unix_ms)) });
+    if !execution.blocker.is_empty() { text += &format!(" | Blocker: {}", execution.blocker); }
+    if local_warning(a) { text += " | Warning: no materialized frames"; }
+    let warning = !execution.blocker.is_empty() || local_warning(a) || matches!(local_execution_state(Some(execution)), "blocked" | "stopped");
+    Line::from(Span::styled(text, Style::new().fg(if warning { Color::Yellow } else { HELP })))
+}
+
+fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, aligned: Option<&[usize]>) -> Vec<Line<'static>> {
     let content_width = area.width as usize;
     let height = area.height as usize;
     if sorted.is_empty() {
@@ -614,7 +803,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
         }
         return vec![Line::from("  No allocations")];
     }
-    let (widths, fw) = alloc_col_widths(m, content_width, sorted);
+    let (widths, fw) = aligned.map(|w| (w.to_vec(), w[1])).unwrap_or_else(|| alloc_col_widths(m, content_width, sorted));
     let filter_hi = m.active_filter_col_idx();
 
     // Header row.
@@ -653,7 +842,8 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
     }
     let mut lines = vec![Line::from(hdr_spans)];
 
-    let visible = height.saturating_sub(1).max(1);
+    let detail_rows = usize::from(height >= 3);
+    let visible = height.saturating_sub(1 + detail_rows).max(1);
     m.alloc_offset = clamp_offset(m.alloc_offset, m.alloc_cursor, visible, sorted.len());
     let end = (m.alloc_offset + visible).min(sorted.len());
 
@@ -661,12 +851,12 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
     let longest_suffix = sorted.iter().map(|a| a.filter_hex.len().saturating_sub(64)).max().unwrap_or(0);
     for i in m.alloc_offset..end {
         let a = &sorted[i];
-        let selected = i == m.alloc_cursor && m.focus.is_alloc();
+        let selected = i == m.alloc_cursor;
 
         let cells: Vec<String> = (0..widths.len())
             .map(|c| {
                 let cell = if c == 1 && shared_address { filter_label(&a.filter_hex, fw, longest_suffix) }
-                    else { alloc_cell(m, a, c, fw) };
+                    else { alloc_display_cell(m, a, c, fw) };
                 pad_cell(&cell, widths[c], alloc_left_aligned(c))
             })
             .collect();
@@ -675,12 +865,14 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
             let mut spans = Vec::new();
             for (ci, cell) in cells.iter().enumerate() {
                 if ci > 0 { spans.push(Span::raw(" ")); }
-                let color = if ci == 9 && m.color_coding && a.worker_id < 0 { ERROR } else { TEXT };
+                let color = if m.color_coding && matches!(ci, 6 | 9) { local_color(a) }
+                    else if ci == 10 && m.color_coding && a.worker_id < 0 { ERROR }
+                    else if ci == 12 && m.color_coding { status_color(&a.status_name) } else { TEXT };
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
             }
             let used = cells.iter().map(String::len).sum::<usize>() + cells.len().saturating_sub(1);
             spans.push(Span::raw(" ".repeat(content_width.saturating_sub(used))));
-            lines.push(Line::from(spans).style(Style::new().fg(TEXT).bg(CURSOR_BG)));
+            lines.push(Line::from(spans).style(Style::new().fg(TEXT).bg(if m.focus.is_alloc() { CURSOR_BG } else { INACTIVE_CURSOR_BG })));
         } else {
             let mut spans: Vec<Span> = Vec::new();
             for (ci, cell) in cells.iter().enumerate() {
@@ -697,22 +889,22 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
                     3 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(ring_color(a.ring)))
                     }
-                    // Mat, Lag and State are three readings of one fact, so
-                    // they take one colour: whichever the State cell shows.
-                    6 | 7 | 8 if m.color_coding => {
-                        Span::styled(cell.clone(), Style::new().fg(mat_color()))
+                    // Local engine health and the provider gap are separate observations.
+                    6 | 9 if m.color_coding => {
+                        Span::styled(cell.clone(), Style::new().fg(local_color(a)))
                     }
-                    10 if m.color_coding => match worker_color(a.worker_id) {
+                    7 | 8 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(HELP)),
+                    11 if m.color_coding => match worker_color(a.worker_id) {
                         Some(color) => Span::styled(cell.clone(), Style::new().fg(color)),
                         None => Span::raw(cell.clone()),
                     },
-                    9 if m.color_coding && a.worker_id < 0 => {
+                    10 if m.color_coding && a.worker_id < 0 => {
                         Span::styled(cell.clone(), Style::new().fg(ERROR))
                     }
-                    11 if m.color_coding => {
+                    12 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(status_color(&a.status_name)))
                     }
-                    12 if m.color_coding => {
+                    13 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(mode_color(a.mode())))
                     }
                     _ => Span::raw(cell.clone()),
@@ -721,6 +913,10 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect) -> Ve
             }
             lines.push(Line::from(spans));
         }
+    }
+    if detail_rows > 0 {
+        while lines.len() < height - 1 { lines.push(Line::default()); }
+        if let Some(a) = sorted.get(m.alloc_cursor) { lines.push(allocation_detail(a)); }
     }
     lines
 }
@@ -745,10 +941,9 @@ fn avail_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
         4 => fmt_mb(&s.shard_size),
         5 => s.data_shards.to_string(),
         6 => fmt_materialized(s.materialized_frame, s.latest_frame),
-        7 => materialization_lag(s.materialized_frame, s.latest_frame)
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "-".to_string()),
-        8 => materialization_state(s.materialized_frame, s.latest_frame).to_string(),
+        7 => if s.materialized_frame == 0 && s.latest_frame == 0 { "-".into() } else { s.latest_frame.to_string() },
+        8 => fmt_global_head(s.global_head.as_ref()),
+        9 => { let state = materialization_state(s.materialized_frame, s.latest_frame); if matches!(state, "lag" | "unmat") { format!("{state}!") } else { state.to_string() } },
         _ => if s.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&s.estimated_reward) },
     }
 }
@@ -762,7 +957,7 @@ fn avail_marker(m: &Model, s: &ShardRow) -> &'static str {
 }
 
 fn avail_header(m: &Model, idx: usize) -> String {
-    header_text(
+    let text = header_text(
         AVAIL_COL_NAMES[idx],
         idx,
         m.avail_sort_col,
@@ -771,7 +966,8 @@ fn avail_header(m: &Model, idx: usize) -> String {
             .get(&idx)
             .is_some_and(|cf| cf.is_active()),
         m.column_sizing == ColumnSizing::Dynamic,
-    )
+    );
+    if idx == 9 { warning_slot(&text, true) } else { text }
 }
 
 fn avail_col_widths(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (Vec<usize>, usize) {
@@ -794,7 +990,7 @@ fn avail_widths_measured(
                 &avail_header(m, c),
                 sorted
                     .iter()
-                    .map(|s| printed_width(&avail_cell(m, s, c, 0))),
+                    .map(|s| printed_width(&avail_display_cell(m, s, c, 0))),
             )
         })
         .collect();
@@ -813,15 +1009,17 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
         SHARDS_WIDTH,
         sorted
             .iter()
-            .map(|s| printed_width(&avail_cell(m, s, 5, 0))),
+            .map(|s| printed_width(&avail_display_cell(m, s, 5, 0))),
     );
     let reward_w = fit(
         REWARD_WIDTH,
         sorted
             .iter()
-            .map(|s| printed_width(&avail_cell(m, s, 9, 0))),
+            .map(|s| printed_width(&avail_display_cell(m, s, 10, 0))),
     );
-    let grown = (shards_w - SHARDS_WIDTH) + (reward_w - REWARD_WIDTH);
+    let global_head_w = fit(GLOBAL_HEAD_WIDTH, sorted.iter().map(|row| printed_width(&avail_display_cell(m, row, 8, 0))));
+    let state_w = STATE_WIDTH.max(printed_width(&avail_header(m, 9)));
+    let grown = (state_w - STATE_WIDTH) + (global_head_w - GLOBAL_HEAD_WIDTH) + (shards_w - SHARDS_WIDTH) + (reward_w - REWARD_WIDTH);
     let mut fw = content_width.saturating_sub(AVAIL_FIXED_WIDTH + grown);
     for &col in &AVAIL_FILTERABLE_COLS {
         if col == 1 {
@@ -844,8 +1042,9 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
         SIZE_WIDTH,
         shards_w,
         MAT_WIDTH,
-        LAG_WIDTH,
-        STATE_WIDTH,
+        HEAD_WIDTH,
+        global_head_w,
+        state_w,
         reward_w,
     ];
     for &col in &AVAIL_FILTERABLE_COLS {
@@ -865,7 +1064,17 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
     (widths, fw)
 }
 
-fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Line<'static>> {
+fn available_detail(s: &ShardRow) -> Line<'static> {
+    let (message, color) = match materialization_state(s.materialized_frame, s.latest_frame) {
+        "unmat" => ("Warning: provider has not materialized any app frames".into(), Color::Yellow),
+        "lag" => (format!("Warning: provider materialization trails its head by {} frames", s.latest_frame.saturating_sub(s.materialized_frame)), Color::Yellow),
+        "current" => ("Provider materialization is current".into(), HELP),
+        _ => ("Provider shard heights unavailable; health unknown".into(), HELP),
+    };
+    Line::from(Span::styled(message, Style::new().fg(color)))
+}
+
+fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: Option<&[usize]>) -> Vec<Line<'static>> {
     let content_width = area.width as usize;
     let height = area.height as usize;
     if sorted.is_empty() {
@@ -880,15 +1089,15 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
         }
         return vec![Line::from("  No available shards")];
     }
-    let (widths, fw) = avail_col_widths(m, content_width, sorted);
+    let (widths, fw) = aligned.map(|w| (w.to_vec(), w[1])).unwrap_or_else(|| avail_col_widths(m, content_width, sorted));
     let filter_hi = m.active_filter_col_idx();
 
     let mut hdr_spans: Vec<Span> = Vec::new();
     for i in 0..AVAIL_COL_NAMES.len() {
-        let hi_sort = m.sort_mode && !m.focus.is_alloc() && m.sort_highlight_col == i;
+        let hi_sort = m.sort_mode && m.focus == PanelFocus::Available && m.sort_highlight_col == i;
         let hi_filter = m.avail_filter_mode
             && !m.filter_edit_active
-            && !m.focus.is_alloc()
+            && m.focus == PanelFocus::Available
             && filter_hi == i as i32;
         let style = if hi_sort {
             Style::new()
@@ -925,7 +1134,8 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
     }
     lines.push(Line::from(hdr_spans));
 
-    let visible = height.saturating_sub(lines.len()).max(1);
+    let detail_rows = usize::from(height >= 3);
+    let visible = height.saturating_sub(lines.len() + detail_rows).max(1);
     m.avail_offset = clamp_offset(m.avail_offset, m.avail_cursor, visible, sorted.len());
     let end = (m.avail_offset + visible).min(sorted.len());
 
@@ -933,21 +1143,25 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
     let longest_suffix = sorted.iter().map(|s| s.filter_hex.len().saturating_sub(64)).max().unwrap_or(0);
     for i in m.avail_offset..end {
         let s = &sorted[i];
-        let selected = i == m.avail_cursor && !m.focus.is_alloc();
+        let selected = i == m.avail_cursor;
 
         if selected {
             let cells: Vec<String> = (0..widths.len())
                 .map(|c| {
                     let cell = if c == 1 && shared_address { filter_label(&s.filter_hex, fw, longest_suffix) }
-                        else { avail_cell(m, s, c, fw) };
+                        else { avail_display_cell(m, s, c, fw) };
                     pad_cell(&cell, widths[c], c == 1)
                 })
                 .collect();
-            let padded = format!("{:<width$}", cells.join(" "), width = content_width);
-            lines.push(Line::from(Span::styled(
-                padded,
-                Style::new().fg(TEXT).bg(CURSOR_BG),
-            )));
+            let mut spans = Vec::new();
+            for (c, cell) in cells.iter().enumerate() {
+                if c > 0 { spans.push(Span::raw(" ")); }
+                let color = if m.color_coding && matches!(c, 6 | 9) { materialization_state_color(materialization_state(s.materialized_frame, s.latest_frame)) } else { TEXT };
+                spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
+            }
+            let used = cells.iter().map(|cell| printed_width(cell)).sum::<usize>() + cells.len().saturating_sub(1);
+            spans.push(Span::raw(" ".repeat(content_width.saturating_sub(used))));
+            lines.push(Line::from(spans).style(Style::new().fg(TEXT).bg(if m.focus == PanelFocus::Available { CURSOR_BG } else { INACTIVE_CURSOR_BG })));
         } else {
             // Non-selected: size uses human-readable storage; ring colored.
 
@@ -957,11 +1171,12 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
                     spans.push(Span::raw(" "));
                 }
                 let cell = if c == 1 && shared_address { filter_label(&s.filter_hex, fw, longest_suffix) }
-                    else { avail_cell(m, s, c, fw) };
+                    else { avail_display_cell(m, s, c, fw) };
                 let cell = pad_cell(&cell, widths[c], c == 1);
                 spans.push(match c {
                     3 if m.color_coding => Span::styled(cell, Style::new().fg(ring_color(s.ring))),
-                    6 | 7 | 8 if m.color_coding => {
+                    7 | 8 if m.color_coding => Span::styled(cell, Style::new().fg(HELP)),
+                    6 | 9 if m.color_coding => {
                         let color = materialization_state_color(materialization_state(
                             s.materialized_frame,
                             s.latest_frame,
@@ -973,6 +1188,10 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect) -> Vec<Lin
             }
             lines.push(Line::from(spans));
         }
+    }
+    if detail_rows > 0 {
+        while lines.len() < height - 1 { lines.push(Line::default()); }
+        if let Some(s) = sorted.get(m.avail_cursor) { lines.push(available_detail(s)); }
     }
     lines
 }
@@ -1052,9 +1271,8 @@ fn footer_lines(m: &Model) -> (Line<'static>, Line<'static>) {
 const MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn message_timestamp(time: Option<std::time::SystemTime>) -> String {
-    let Some(seconds) = time.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()) else {
-        return String::new();
-    };
+    let seconds = time.unwrap_or_else(std::time::SystemTime::now)
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     format!("[{:02}:{:02}:{:02} UTC] ", seconds / 3600 % 24, seconds / 60 % 60, seconds % 60)
 }
 
@@ -1133,6 +1351,22 @@ fn wrap_message(message: Line<'static>, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+/// Require fresh observations for every staffed earning allocation: missing data
+/// must not be reported as a demonstrated stall. Peer metadata is independent.
+fn update_app_progress_warning(m: &mut Model) {
+    let rows: Vec<_> = m.allocations.iter().filter(|a| matches!(a.reward_status(m.epoch_frame(), m.epoch_length), Some(EffectiveStatus::Active | EffectiveStatus::Leaving))).collect();
+    let known = m.reachable && !rows.is_empty() && rows.iter().all(|a| {
+        a.execution.as_ref().is_some_and(|e| e.materialized_frame.is_some() && matches!(local_execution_state(Some(e)), "starting" | "running" | "blocked" | "stopped"))
+    });
+    if !known { m.app_progress_observed_since = None; m.app_stall_time = None; return; }
+    let observed = m.app_progress_observed_since.get_or_insert_with(std::time::Instant::now);
+    let last = rows.iter().filter_map(|a| a.execution.as_ref()).map(|e| e.last_advance_unix_ms).max().unwrap_or(0);
+    let now = std::time::SystemTime::now();
+    let now_ms = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let stalled = if last == 0 { observed.elapsed().as_secs() >= 60 } else { now_ms.saturating_sub(last) >= 60_000 };
+    if stalled { m.app_stall_time.get_or_insert(now); } else { m.app_stall_time = None; }
+}
+
 fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'static>> {
     let primary_severity = if m.status_is_error { NoticeSeverity::Error } else { NoticeSeverity::Info };
     // Filter-editor prompts are controls rather than notifications.
@@ -1144,6 +1378,11 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
         shard_message(m).map(|line| wrap_message(line, width)).unwrap_or_default()
     } else { Vec::new() };
     let mut lines = Vec::new();
+    if m.notice_minimum <= NoticeSeverity::Warning {
+        if let Some(time) = m.app_stall_time {
+            lines.extend(wrap_message(Line::from(Span::styled(format!("{}No local app worker has advanced for at least 60s; check allocation blockers.", message_timestamp(Some(time))), Style::new().fg(Color::Yellow))), width));
+        }
+    }
     if shard_severity > primary_severity { lines.extend(shards); lines.extend(primary); }
     else { lines.extend(primary); lines.extend(shards); }
     if lines.is_empty() { lines.push(Line::default()); }
@@ -1162,6 +1401,19 @@ fn status_line(m: &Model) -> Line<'static> {
 }
 
 /// `renderHelpLine` — key hints with applicable actions highlighted.
+fn command_hint(key: &str, description: &str, style: Style) -> Span<'static> {
+    Span::styled(format!("[{key}] {description}"), style)
+}
+
+fn help_commands() -> Line<'static> {
+    let mut spans = Vec::new();
+    for (key, description) in [("↑/k", "up"), ("↓/j", "down"), ("Pg↑/↓", "page"), ("Home/End", "first/last"), ("h/esc", "close"), ("q", "quit")] {
+        if !spans.is_empty() { spans.push(Span::raw("  ")); }
+        spans.push(command_hint(key, description, Style::new().fg(HELP)));
+    }
+    Line::from(spans)
+}
+
 fn help_line(m: &Model) -> Line<'static> {
     let mut applicable: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !m.action_in_flight {
@@ -1173,17 +1425,18 @@ fn help_line(m: &Model) -> Line<'static> {
             if sorted.get(m.alloc_cursor).is_some_and(|r| r.worker_id >= 0) {
                 applicable.insert("ToggleManual".to_string());
             }
-        } else if !m.free_workers.is_empty() {
+        } else if m.focus == PanelFocus::Available && !m.free_workers.is_empty() {
             applicable.insert("Join".to_string());
         }
     }
     let filters_active = m.has_active_filters();
 
     // (key, desc, action-tag)
-    let entries: [(&str, &str, &str); 22] = [
+    let entries: [(&str, &str, &str); 21] = [
         ("tab", "switch", ""),
         ("↑/k", "up", ""),
         ("↓/j", "down", ""),
+        ("←/→", "columns", ""),
         ("space", "toggle", ""),
         ("a", "all/none", ""),
         ("J", "join", "Join"),
@@ -1193,14 +1446,12 @@ fn help_line(m: &Model) -> Line<'static> {
         ("p", "pause", "Pause"),
         ("u", "resume", "Resume"),
         ("M", "mode", "ToggleManual"),
-        ("R", "refresh", ""),
         ("s", "sort", ""),
         ("f", "filter", "Filter"),
         ("C", "colors", "ColorCoding"),
-        ("w", "widths", "ColumnSizing"),
         ("e", "frames/epochs", "ThresholdUnit"),
         ("v", "notice level", ""),
-        ("Pg↑/↓", "notices", ""),
+        ("[/] {/}", "upper/lower edge", ""),
         ("h", "help", ""),
         ("q", "quit", ""),
     ];
@@ -1209,7 +1460,6 @@ fn help_line(m: &Model) -> Line<'static> {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        let text = format!("[{key}] {desc}");
         let style = match *tag {
             "Filter" => {
                 if filters_active {
@@ -1225,8 +1475,8 @@ fn help_line(m: &Model) -> Line<'static> {
                     Style::new().fg(HELP)
                 }
             }
-            "ColumnSizing" => {
-                if m.column_sizing == ColumnSizing::Dynamic {
+            "ThresholdUnit" => {
+                if m.threshold_unit == ThresholdUnit::Epochs {
                     Style::new().fg(SUCCESS)
                 } else {
                     Style::new().fg(HELP)
@@ -1243,7 +1493,7 @@ fn help_line(m: &Model) -> Line<'static> {
             t if applicable.contains(t) => Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
             _ => Style::new().fg(DIM),
         };
-        spans.push(Span::styled(text, style));
+        spans.push(command_hint(key, desc, style));
     }
     Line::from(spans)
 }
@@ -1312,29 +1562,22 @@ fn render_filter_edit_lines(m: &Model) -> (Line<'static>, Line<'static>) {
 fn render_help_screen(f: &mut Frame, m: &mut Model, area: Rect) {
     let body = help_body();
     m.help_lines = body.len();
-    let body_height = (area.height as usize).saturating_sub(1);
+    let mut commands = wrap_actions(help_commands(), area.width);
+    let footer_height = commands.len().min(usize::from(area.height.saturating_sub(3).max(1)));
+    if commands.len() > footer_height {
+        commands.truncate(footer_height);
+        commands[footer_height - 1] = Line::from("[h/esc] close  [q] quit");
+    }
+    let body_height = usize::from(area.height).saturating_sub(2 + footer_height);
+    m.help_visible = body_height;
     let max_offset = body.len().saturating_sub(body_height);
     m.help_offset = m.help_offset.min(max_offset);
-
-    let title = if max_offset == 0 {
-        " Shard Manager — Help".to_string()
-    } else {
-        format!(
-            " Shard Manager — Help    ↑/↓ scroll  ({}–{} of {})",
-            m.help_offset + 1,
-            (m.help_offset + body_height).min(body.len()),
-            body.len()
-        )
-    };
-    let mut out = vec![Line::from(Span::styled(
-        format!("{:<width$}", title, width = area.width as usize),
-        Style::new()
-            .fg(TEXT)
-            .bg(PRIMARY)
-            .add_modifier(Modifier::BOLD),
-    ))];
-    out.extend(body.into_iter().skip(m.help_offset).take(body_height));
-    f.render_widget(Paragraph::new(out), area);
+    let title = format!(" Shard Manager — Help  ({}–{} of {})", m.help_offset + 1, (m.help_offset + body_height).min(body.len()), body.len());
+    f.render_widget(Paragraph::new(Line::from(title)).style(Style::new().fg(TEXT).bg(PRIMARY).add_modifier(Modifier::BOLD)), Rect::new(area.x, area.y, area.width, area.height.min(1)));
+    f.render_widget(Paragraph::new(body.into_iter().skip(m.help_offset).take(body_height).collect::<Vec<_>>()), Rect::new(area.x, area.y + area.height.min(1), area.width, body_height as u16));
+    let separator_y = area.y + area.height.saturating_sub(footer_height as u16 + 1);
+    f.render_widget(Paragraph::new("─".repeat(usize::from(area.width))).style(Style::new().fg(HELP)), Rect::new(area.x, separator_y, area.width, 1));
+    f.render_widget(Paragraph::new(commands).style(Style::new().fg(HELP)), Rect::new(area.x, area.y + area.height.saturating_sub(footer_height as u16), area.width, footer_height as u16));
 }
 
 /// Everything under the pinned title, in one place so a test can read it.
@@ -1360,20 +1603,35 @@ fn help_body() -> Vec<Line<'static>> {
 
     vec![
         Line::from(""),
+        sec("Worker progress"),
+        kv("Worker counts", "Running: reported workers; Auto/Manual: individual modes, including idle workers"),
+        kv("Allocations", "Assigned workers / running workers; denominator includes occupied workers"),
+        kv("Active", "Workers with Active allocations; execution may still be blocked; totals ignore filters"),
+        kv("LocalMat", "Local height; - unknown; 0! warns of no materialized frames with colors off"),
+        kv("Execution", "Host state; running with zero LocalMat is warned, not healthy progress"),
+        kv("GlobalHead", "Committed app head@generation; - unavailable, 0@gN is a known genesis head"),
+        kv("PeerHead", "Provider shard head; remote metadata, not the local worker cursor"),
+        kv("Details", "Selected allocation footer shows blocker and last advance; no observation timer"),
+
+        kv("", "Selected allocation shows blocker and last advance; PeerHead is provider metadata"),
+        kv("", "Observations older than 30s are stale; startup restoration is not an advance"),
         sec("Navigation"),
         kv("↑ / k", "Move cursor up"),
         kv("↓ / j", "Move cursor down"),
+        kv("← / →", "Scroll table horizontally by eight columns"),
+        kv("Scroll hints", "Bottom border counts hidden rows ↑/↓ and columns ←/→"),
         kv(
             "Tab",
-            "Switch between Allocations and Available Shards panels",
+            "Cycle Allocations, Available Shards and Notifications; Shift+Tab reverses",
         ),
         kv("Space", "Toggle selection on cursor row (advances cursor)"),
-        kv("a", "Select all / deselect all rows in current panel"),
+        kv("a", "Select all / deselect all rows in current table"),
+        kv("Boundaries", "Top of Allocations and bottom of Notifications remain fixed"),
         Line::from(""),
         sec("Notifications"),
         kv("v", "Cycle minimum severity: warnings/errors (default), errors only, all"),
-        kv("PgUp / PgDn", "Scroll notification text; Home/End jump to first/last line"),
-        kv("", "Fixed three-row panel above commands; completed notices expire after 30s"),
+        kv("PgUp / PgDn", "When Notifications is focused, ↑/↓ scroll; Home/End jump to first/last line"),
+        kv("", "[ / ] moves upper boundary up/down; { / } moves lower boundary up/down"),
         sec("Actions — Allocations panel"),
         kv(
             "l",
@@ -1437,9 +1695,13 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Ring", "Prover ring the shard sits in; colour runs 0 green to 4+ red"),
         kv("Size [MB]", "Shard size, in megabytes"),
         kv("Shards", "Data shards the filter covers"),
-        kv("Mat", "Highest frame this shard has materialized locally"),
-        kv("Lag", "Frames behind the head: head − Mat; `-` when no head is known"),
-        kv("State", "Reading of Mat and Lag — current: materialized up to the head;"),
+        kv("PeerMat", "Materialized height reported by the shard metadata provider"),
+        kv("GlobalHead", "Committed app head@generation; - unavailable, 0@gN is a known genesis head"),
+        kv("PeerHead", "Provider shard head; remote metadata"),
+        kv("PeerState", "Provider status; lag/unmat warns, with ! shown when colors are off"),
+        kv("Cursor", "Inactive cursor stays visible to bind the detail below to its row"),
+        kv("Global citation", "Panel header: snapshot frame cited by GlobalHead cells"),
+        kv("", "Independent of LocalMat and peer metadata; absent on older servers"),
         kv("", "lag: behind it; unmat: nothing materialized; unknown: no head"),
         kv(
             "Reward [Q/d]",
@@ -1447,7 +1709,7 @@ fn help_body() -> Vec<Line<'static>> {
         ),
         kv("Current", "Staffed active + leaving reward estimates, not measured income"),
         kv("Paused", "Staffed paused estimates available upon resume"),
-        kv("Unknown", "- fields and ? totals mean shard, reward or height data is unavailable"),
+        kv("Unknown", "- fields are unavailable; Current sums known rewards with + for unknown rows"),
         kv("Planned change", "Staffed joining minus leaving; activation epochs may differ"),
         note("Reward totals follow displayed rows; unassigned rows are excluded."),
         kv("Worker", "Core the allocation is bound to; -1 means none is bound"),
@@ -1455,9 +1717,9 @@ fn help_body() -> Vec<Line<'static>> {
         kv("", "expiredJoin / expiredLeave: confirm window missed;"),
         kv("", "re-confirm!: the allocation's epoch is stale but recoverable"),
         kv("Mode", "Worker management — a: automatic, m: manual (toggle with M)"),
-        kv("Next Action", "What you can do now, and the threshold it applies from"),
+        kv("NextAction", "What you can do now, and the threshold it applies from"),
         kv(
-            "Default Action",
+            "DefaultAction",
             "What the network does if you do nothing, and when",
         ),
         note("Thresholds read f<frame> or e<epoch>; press e to switch. Q/d is whole"),
@@ -1465,12 +1727,10 @@ fn help_body() -> Vec<Line<'static>> {
         note("minus the ones that only exist once a shard is allocated to you."),
         Line::from(""),
         sec("General"),
-        kv("R", "Force data refresh"),
         kv(
             "C",
             "Toggle color-coding of Ring, Mat/Lag/State, Worker, Status and Mode",
         ),
-        kv("w", "Column widths: sized to content (default) or fixed"),
         kv(
             "e",
             "Show Next/Default Action thresholds as frames (f…) or epochs (e…)",
@@ -1478,7 +1738,6 @@ fn help_body() -> Vec<Line<'static>> {
         kv("h", "Open this help screen (↑/↓ or PgUp/PgDn scroll; h or esc closes)"),
         kv("q / Ctrl+C", "Quit"),
         Line::from(""),
-        Line::from(Span::styled("Press h to return", Style::new().fg(HELP))),
     ]
 }
 
@@ -1547,6 +1806,248 @@ fn render_join_picker(f: &mut Frame, m: &mut Model, area: Rect) {
 mod tests {
     use super::*;
     use crate::commands::node::prover::epoch::ActionHint;
+
+    #[test]
+    fn scroll_indicators_track_hidden_rows_and_columns() {
+        assert_eq!(scroll_hint(0, 3, 3, 0, 0), "");
+        assert_eq!(scroll_hint(2, 10, 3, 8, 20), " ↑2 ↓5 | ←8 →12 ");
+        assert_eq!(scroll_hint(7, 10, 3, 20, 20), " ↑7 ↓0 | ←20 →0 ");
+        let mut m = Model::new(); m.horizontal_offsets[0] = 20;
+        assert_eq!(table_horizontal_offset(&mut m, 0, &[Line::from("x".repeat(50))], 30), 20);
+        assert_eq!(table_horizontal_offset(&mut m, 0, &[Line::from("x")], 30), 0);
+        assert_eq!(m.horizontal_limits[0], 0);
+    }
+
+    #[test]
+    fn a_boundary_moves_immediately_after_terminal_resize_clips_its_offset() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut m = Model::new(); m.panel_boundary_offsets = [100, -100];
+        let before = sync_panel_heights(&mut m, 13);
+        super::super::update::handle_key(&mut m, KeyEvent::new(KeyCode::Char('{'), KeyModifiers::NONE));
+        let after = sync_panel_heights(&mut m, 13);
+        assert_eq!(after, [before[0] - 1, before[1] + 1, before[2]]);
+    }
+
+    #[test]
+    fn resized_panels_preserve_terminal_budget_and_minimum_rows() {
+        let mut m = Model::new();
+        for offsets in [[0, 0], [8, -2], [-100, 100], [100, -100]] {
+            m.panel_boundary_offsets = offsets;
+            for total in [6, 12, 25, 60] {
+                let h = panel_heights(&m, total);
+                assert_eq!(h.iter().sum::<u16>(), total);
+                assert!(h[0] >= 3 && h[1] >= 2 && h[2] >= 1, "{offsets:?}: {h:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_columns_align_with_different_data_and_filter_markers() {
+        let mut m = Model::new();
+        let allocations = [row("aabb0123456789", 1, 1, 7, "", "")];
+        let mut peer = shard("ccdd0123456789", 12345, 10000);
+        peer.latest_frame = 987654321;
+        let available = [peer];
+        for sizing in [ColumnSizing::Dynamic, ColumnSizing::Fixed] {
+            m.column_sizing = sizing;
+            let (a, v) = shared_col_widths(&m, 240, &allocations, &available);
+            assert_eq!(&a[..v.len()], v.as_slice());
+            assert!(a.iter().sum::<usize>() + a.len() - 1 <= 240);
+            let alloc = render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 240, 5), Some(&a))[0].to_string();
+            let avail = render_avail_panel(&mut m, &available, Rect::new(0, 0, 240, 5), Some(&v))[0].to_string();
+            for label in ["Filter", "Provers", "Ring", "Size", "Shards", "PeerHead", "GlobalHead", "Reward"] {
+                assert_eq!(printed_width(&alloc[..alloc.find(label).unwrap()]), printed_width(&avail[..avail.find(label).unwrap()]), "{label}: {alloc} / {avail}");
+            }
+            assert!(!avail.contains("LocalMat"));
+            assert!(!avail.contains("Execution"));
+            assert_eq!(avail_cell(&m, &available[0], 7, v[1]), "987654321");
+        }
+    }
+
+    #[test]
+    fn app_stall_warning_respects_severity_and_clears_on_progress_or_missing_data() {
+        use quil_types::proto::node::WorkerExecution;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let mut m = Model::new(); m.frame_number = 2160; m.epoch_length = 720; m.reachable = true;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut worker = row("aa", 1, 1, 7, "", ""); worker.status = 2; worker.epoch = 3;
+        worker.execution = Some(WorkerExecution { state: "blocked".into(), materialized_frame: Some(744), observed_unix_ms: now, last_advance_unix_ms: now - 120_000, ..Default::default() });
+        m.allocations = vec![worker.clone(), worker];
+        update_app_progress_warning(&mut m);
+        let timestamp = m.app_stall_time.expect("known stalled workers warn");
+        update_app_progress_warning(&mut m); assert_eq!(m.app_stall_time, Some(timestamp));
+        m.notice_minimum = NoticeSeverity::Warning;
+        assert!(message_lines(&m, Line::default(), 240).iter().any(|l| l.to_string().contains("No local app worker")));
+        m.notice_minimum = NoticeSeverity::Error;
+        assert!(!message_lines(&m, Line::default(), 240).iter().any(|l| l.to_string().contains("No local app worker")));
+        m.allocations[1].execution.as_mut().unwrap().last_advance_unix_ms = now;
+        update_app_progress_warning(&mut m); assert!(m.app_stall_time.is_none());
+        m.allocations[1].execution = None;
+        update_app_progress_warning(&mut m); assert!(m.app_stall_time.is_none());
+        assert!(m.app_progress_observed_since.is_none());
+    }
+
+    #[test]
+    fn worker_context_stays_in_allocation_panel_and_zero_frames_warns() {
+        use quil_types::proto::node::WorkerExecution;
+        let mut m = Model::new();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut worker = row("01", 2, 1, 7, "", "");
+        worker.execution = Some(WorkerExecution { state: "running".into(), observed_unix_ms: now,
+            materialized_frame: Some(124), last_advance_unix_ms: now - 22_000, ..Default::default() });
+        worker.latest_frame = 125;
+        assert!(!local_warning(&worker));
+        assert_eq!(alloc_cell(&m, &worker, 7, 12), "125");
+        assert!(allocation_detail(&worker).to_string().contains("Last advance: 22s ago"));
+        worker.execution.as_mut().unwrap().materialized_frame = Some(0);
+        assert!(local_warning(&worker));
+        assert_eq!(alloc_cell(&m, &worker, 6, 12), "0!");
+        assert_eq!(local_color(&worker), Color::Yellow);
+        assert!(allocation_detail(&worker).to_string().contains("Warning: no materialized frames"));
+        worker.execution.as_mut().unwrap().state = "blocked".into();
+        worker.execution.as_mut().unwrap().blocker = "awaiting successor".into();
+        m.allocations.push(worker);
+        for minimum in [NoticeSeverity::Info, NoticeSeverity::Warning, NoticeSeverity::Error] {
+            m.notice_minimum = minimum;
+            let notices = message_lines(&m, Line::default(), 150).iter().map(Line::to_string).collect::<String>();
+            assert!(!notices.contains("Worker") && !notices.contains("awaiting successor"));
+        }
+        let rows = m.allocations.clone();
+        let panel = render_alloc_panel(&mut m, &rows, Rect::new(0, 0, 154, 7), None);
+        let details = panel.last().unwrap().to_string();
+        assert!(details.contains("Blocker: awaiting successor"));
+        assert!(!details.contains("observation") && !details.contains("Worker 7"));
+    }
+
+    #[test]
+    fn current_reward_total_retains_known_subtotal_when_other_rows_are_unknown() {
+        let mut m = Model::new(); m.frame_number = 2160; m.epoch_length = 720;
+        let mut known = row("aa", 1, 1, 7, "", "");
+        known.status = 2; known.epoch = 3; known.estimated_reward = BigInt::from(10000);
+        let mut unknown = known.clone(); unknown.ring = UNKNOWN_REWARD_RING;
+        let title = alloc_title(&m, &[known.clone(), unknown.clone()]).to_string();
+        assert!(title.contains(&format!("Current {}+ |", fmt_reward(&known.estimated_reward))), "{title}");
+        assert!(alloc_title(&m, &[unknown]).to_string().contains("Current ? |"));
+        known.estimated_reward = BigInt::from(0);
+        let mut unknown = known.clone(); unknown.ring = UNKNOWN_REWARD_RING;
+        assert!(alloc_title(&m, &[known, unknown]).to_string().contains("Current 0+ |"));
+    }
+
+    #[test]
+    fn all_actual_notices_have_utc_timestamps() {
+        let mut m = Model::new(); m.status_msg = "Action failed".into(); m.status_is_error = true;
+        let action = status_line(&m).to_string();
+        assert!(action.starts_with('[') && action.contains(" UTC] Action failed"));
+        m.shard_error = Some("timed out".into());
+        assert!(shard_message(&m).unwrap().to_string().contains(" UTC] Shard query timed out"));
+    }
+
+    #[test]
+    fn claimable_five_decimals_preserve_zero_tiny_values_and_rounding_carry() {
+        for (units, expected) in [(0, "0"), (1, "<0.00001"), (79_999, "<0.00001"), (80_000, "0.00001"), (119_999, "0.00001"), (120_000, "0.00002"), (474_867, "0.00006"), (40_000_000_000, "5"), (7_999_999_999, "1")] {
+            assert_eq!(fmt_claimable(units), expected);
+        }
+        assert!(fmt_claimable(u128::MAX).split('.').nth(1).is_none_or(|fraction| fraction.len() <= 5));
+    }
+
+    #[test]
+    fn global_app_cursor_stays_distinct_from_peer_and_local_heights() {
+        let mut allocation = row("aa", 1, 1, 7, "", "");
+        allocation.latest_frame = 744;
+        allocation.global_head = Some(quil_types::proto::node::GlobalAppFrameHead { frame: 742, global_frame: 1000, generation: 2 });
+        allocation.execution = Some(quil_types::proto::node::WorkerExecution { materialized_frame: Some(744), ..Default::default() });
+        assert!(!allocation_detail(&allocation).to_string().contains("Global"));
+        let m = Model::new();
+        assert_eq!(alloc_cell(&m, &allocation, 8, 0), "742@g2");
+        assert_eq!(alloc_cell(&m, &allocation, 7, 0), "744");
+        let mut peer = shard("bb", 1, 1); peer.latest_frame = 900;
+        peer.global_head = allocation.global_head.clone();
+        assert!(!available_detail(&peer).to_string().contains("Global"));
+        assert_eq!(avail_cell(&m, &peer, 8, 0), "742@g2");
+        assert_eq!(avail_cell(&m, &peer, 7, 0), "900");
+        peer.global_head = None;
+        assert_eq!(avail_cell(&m, &peer, 8, 0), "-");
+        assert!(avail_row_numeric_val(&peer, 8).is_nan());
+        peer.global_head = Some(Default::default());
+        assert_eq!(avail_cell(&m, &peer, 8, 0), "0@g0");
+        assert_eq!(avail_row_numeric_val(&peer, 8), 0.0);
+        assert_eq!(global_snapshot_label([allocation.global_head.as_ref()].into_iter()), "Global: @f1000");
+        assert_eq!(global_snapshot_label([None].into_iter()), "Global: unavailable");
+        assert_eq!(global_snapshot_label([allocation.global_head.as_ref(), peer.global_head.as_ref()].into_iter()), "Global: mixed snapshots");
+        assert!(alloc_title(&m, &[allocation]).to_string().contains("Global: @f1000"));
+        assert!(avail_title(&m, &[peer]).to_string().contains("Global: @f0"));
+    }
+
+    #[test]
+    fn panel_detail_warnings_use_the_same_color() {
+        let mut allocation = row("aa", 1, 1, 7, "", "");
+        allocation.execution = Some(quil_types::proto::node::WorkerExecution {
+            state: "blocked".into(), blocker: "awaiting successor".into(), ..Default::default()
+        });
+        let mut peer = shard("bb", 1, 1);
+        peer.materialized_frame = 18; peer.latest_frame = 22;
+        assert!(allocation_detail(&allocation).spans.iter().all(|s| s.style.fg == Some(Color::Yellow)));
+        assert!(available_detail(&peer).spans.iter().all(|s| s.style.fg == Some(Color::Yellow)));
+    }
+
+    #[test]
+    fn global_head_columns_sort_and_filter_without_confusing_unknown_and_zero() {
+        let mut m = Model::new();
+        for (id, head) in [("a", Some(742)), ("b", None), ("c", Some(0))] {
+            let mut a = row(id, 1, 1, 7, "", "");
+            a.global_head = head.map(|frame| quil_types::proto::node::GlobalAppFrameHead { frame, global_frame: 1000, generation: 2 });
+            let mut s = shard(id, 1, 1); s.global_head = a.global_head.clone();
+            m.allocations.push(a); m.available.push(s);
+        }
+        m.alloc_sort_col = 8; m.alloc_sort_asc = true;
+        m.avail_sort_col = 8; m.avail_sort_asc = true;
+        assert_eq!(m.sorted_allocations().iter().map(|r| r.filter_key.as_str()).collect::<Vec<_>>(), vec!["b", "c", "a"]);
+        assert_eq!(m.sorted_available().iter().map(|r| r.filter_key.as_str()).collect::<Vec<_>>(), vec!["b", "c", "a"]);
+        let filter = ColumnFilter { expr: "=0".into(), ..Default::default() };
+        m.alloc_col_filters.insert(8, filter.clone()); m.avail_col_filters.insert(8, filter);
+        assert_eq!(m.filtered_allocations()[0].filter_key, "c");
+        assert_eq!(m.filtered_allocations().len(), 1);
+        assert_eq!(m.filtered_available()[0].filter_key, "c");
+        assert_eq!(m.filtered_available().len(), 1);
+    }
+
+    #[test]
+    fn inactive_cursors_bind_both_panel_details_and_keep_peer_warnings_visible() {
+        let mut m = Model::new(); m.focus = PanelFocus::Notifications;
+        let mut allocation = row("aa", 1, 1, 7, "", "");
+        allocation.execution = Some(quil_types::proto::node::WorkerExecution { state: "blocked".into(), blocker: "awaiting successor".into(), ..Default::default() });
+        let allocations = render_alloc_panel(&mut m, &[allocation], Rect::new(0, 0, 240, 5), None);
+        assert_eq!(allocations[1].style.bg, Some(INACTIVE_CURSOR_BG));
+        assert!(allocations.last().unwrap().to_string().contains("awaiting successor"));
+        let mut peer = shard("bb", 1, 1); peer.latest_frame = 20;
+        let peers = render_avail_panel(&mut m, &[peer.clone()], Rect::new(0, 0, 240, 5), None);
+        assert_eq!(peers[1].style.bg, Some(INACTIVE_CURSOR_BG));
+        assert!(peers[1].to_string().contains("unmat"));
+        assert!(!peers[1].to_string().contains("unmat!"));
+        assert_eq!(peers[1].spans[18].style.fg, Some(ERROR));
+        assert!(peers.last().unwrap().to_string().contains("Warning: provider has not materialized"));
+        peer.materialized_frame = 15;
+        assert!(available_detail(&peer).to_string().contains("by 5 frames"));
+        peer.materialized_frame = 20;
+        assert!(!available_detail(&peer).to_string().contains("Warning"));
+        peer.latest_frame = 0; peer.materialized_frame = 0;
+        assert!(available_detail(&peer).to_string().contains("health unknown"));
+    }
+
+    #[test]
+    fn claimable_header_distinguishes_loading_missing_verified_and_stale() {
+        let mut m = Model::new();
+        assert_eq!(claimable_title(&m), "Claimable [Q]: loading");
+        super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Ok(Some((474867, 862280)))));
+        assert_eq!(claimable_title(&m), "Claimable [Q]: 0.00006 @f862280");
+        assert!(alloc_title(&m, &[]).to_string().contains("Claimable [Q]:"));
+        m.reward_last_success = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        assert!(claimable_title(&m).ends_with("(stale)"));
+        super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Err("timeout".into())));
+        assert_eq!(claimable_title(&m), "Claimable [Q]: unavailable");
+        super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Ok(None)));
+        assert_eq!(claimable_title(&m), "Claimable [Q]: unavailable");
+    }
 
     #[test]
     fn severity_filter_hides_routine_updates_and_preserves_errors() {
@@ -1690,15 +2191,37 @@ mod tests {
         m.data_loaded = true;
         let text = |lines: Vec<Line<'static>>| lines[0].spans.iter()
             .map(|span| span.content.as_ref()).collect::<String>();
-        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5)))
+        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5), None))
             .contains("Loading available shards"));
         m.shard_error = Some("Shard data timed out after 60s; retrying".into());
-        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5)))
+        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5), None))
             .contains("timed out"));
         m.shard_error = None;
         m.cached_shard_info = Some(Default::default());
-        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5)))
+        assert!(text(render_avail_panel(&mut m, &[], Rect::new(0, 0, 100, 5), None))
             .contains("No available shards"));
+    }
+
+    #[test]
+    fn local_worker_state_is_independent_of_remote_shard_cursor() {
+        let m = Model::new();
+        let mut a = row("01", 1, 1, 4, "", "");
+        a.materialized_frame = 91;
+        a.latest_frame = 93;
+        a.execution = Some(quil_types::proto::node::WorkerExecution {
+            state: "blocked".into(), blocker: "checkpoint mismatch".into(),
+            materialized_frame: Some(93),
+            observed_unix_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+            ..Default::default()
+        });
+        assert_eq!(alloc_cell(&m, &a, 6, 12), "93");
+        assert_eq!(alloc_cell(&m, &a, 7, 12), "93");
+        assert_eq!(alloc_cell(&m, &a, 9, 12), "blocked");
+        a.materialized_frame = 93;
+        assert_eq!(alloc_cell(&m, &a, 9, 12), "blocked");
+        a.execution = None;
+        assert_eq!(alloc_cell(&m, &a, 6, 12), "-");
+        assert_eq!(alloc_cell(&m, &a, 9, 12), "unknown");
     }
 
     #[test]
@@ -1717,8 +2240,8 @@ mod tests {
             let mut s = shard("01", 0, 0);
             s.materialized_frame = mat;
             s.latest_frame = head;
-            assert_eq!(alloc_cell(&m, &a, 8, 12), label);
-            assert_eq!(avail_cell(&m, &s, 8, 12), label);
+            assert_eq!(alloc_cell(&m, &a, 9, 12), "unknown");
+            assert_eq!(avail_cell(&m, &s, 9, 12), if matches!(label, "lag" | "unmat") { format!("{label}!") } else { label.to_string() });
             assert_eq!(materialization_state_color(label), color);
         }
     }
@@ -1780,6 +2303,8 @@ mod tests {
         dflt: &str,
     ) -> AllocationRow {
         AllocationRow {
+            global_head: None,
+            execution: None,
             shard_info_known: true,
             filter: Vec::new(),
             filter_key: hex.to_string(),
@@ -1817,8 +2342,8 @@ mod tests {
                 m.alloc_cursor = cursor;
                 m.avail_cursor = cursor;
                 for lines in [
-                    render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 240, 5)),
-                    render_avail_panel(&mut m, &available, Rect::new(0, 0, 240, 5)),
+                    render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 240, 5), None),
+                    render_avail_panel(&mut m, &available, Rect::new(0, 0, 240, 5), None),
                 ] {
                     let text: Vec<String> = lines.iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect()).collect();
                     assert_eq!(text[1].find("aabb"), text[2].find("aabb"));
@@ -1834,10 +2359,10 @@ mod tests {
         let model = Model::new();
         let mut allocation = row("aa", 0, 0, 1, "", "");
         allocation.shard_info_known = false;
-        for col in [2, 3, 4, 5, 6, 7, 9] {
+        for col in [2, 3, 4, 5, 6, 7, 10] {
             assert_eq!(alloc_cell(&model, &allocation, col, 12), "-");
         }
-        assert_eq!(alloc_cell(&model, &allocation, 8, 12), "unknown");
+        assert_eq!(alloc_cell(&model, &allocation, 9, 12), "unknown");
         allocation.shard_info_known = true;
         for col in [2, 5] { assert_eq!(alloc_cell(&model, &allocation, col, 12), "0"); }
         assert_eq!(alloc_cell(&model, &allocation, 4, 12), fmt_mb(&BigInt::from(0)));
@@ -1853,22 +2378,27 @@ mod tests {
         allocation.status = 2;
         allocation.epoch = 3;
         allocation.ring = UNKNOWN_REWARD_RING;
-        for col in [3, 6, 7, 9] { assert_eq!(alloc_cell(&model, &allocation, col, 12), "-"); }
-        assert_eq!(alloc_cell(&model, &allocation, 8, 12), "unknown");
+        for col in [3, 6, 7, 10] { assert_eq!(alloc_cell(&model, &allocation, col, 12), "-"); }
+        assert_eq!(alloc_cell(&model, &allocation, 9, 12), "unknown");
         assert_eq!(ring_color(UNKNOWN_REWARD_RING), HELP);
         let mut available = shard("bb", 1, 1);
         available.ring = UNKNOWN_REWARD_RING;
-        for col in [3, 6, 7, 9] { assert_eq!(avail_cell(&model, &available, col, 12), "-"); }
+        for col in [3, 6, 7, 10] { assert_eq!(avail_cell(&model, &available, col, 12), "-"); }
         let title = alloc_title(&model, &[allocation.clone()]);
         let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("Current ? | Paused 0 | Planned change 0"), "{text}");
         allocation.ring = 0;
         allocation.latest_frame = 20;
         assert_eq!(alloc_cell(&model, &allocation, 3, 12), "0");
+        assert_eq!(alloc_cell(&model, &allocation, 6, 12), "-");
+        // A remote head does not establish the local worker's cursor.
+        allocation.execution = Some(quil_types::proto::node::WorkerExecution {
+            materialized_frame: Some(0), ..Default::default()
+        });
         assert_eq!(alloc_cell(&model, &allocation, 6, 12), "0");
         assert_eq!(alloc_cell(&model, &allocation, 7, 12), "20");
-        assert_eq!(alloc_cell(&model, &allocation, 8, 12), "unmat");
-        assert_eq!(alloc_cell(&model, &allocation, 9, 12), "0");
+        assert_eq!(alloc_cell(&model, &allocation, 9, 12), "stale");
+        assert_eq!(alloc_cell(&model, &allocation, 10, 12), "0");
     }
 
     #[test]
@@ -1928,7 +2458,7 @@ mod tests {
             let mut allocation = row("aa", 1, 1, -1, "", "");
             allocation.estimated_reward = BigInt::from(123456);
             let reward = fmt_reward(&allocation.estimated_reward);
-            let lines = render_alloc_panel(&mut m, &[allocation], Rect::new(0, 0, 240, 5));
+            let lines = render_alloc_panel(&mut m, &[allocation], Rect::new(0, 0, 240, 5), None);
             let span = lines[1].spans.iter().find(|s| s.content.trim() == reward).expect("reward cell");
             assert_eq!(span.style.fg, Some(ERROR));
             if selected { assert_eq!(lines[1].style.bg, Some(CURSOR_BG)); }
@@ -1937,6 +2467,7 @@ mod tests {
 
     fn shard(hex: &str, size: u64, reward: u64) -> ShardRow {
         ShardRow {
+            global_head: None,
             filter: Vec::new(),
             filter_key: hex.to_string(),
             filter_hex: hex.to_string(),
@@ -1974,7 +2505,7 @@ mod tests {
         }
         // Reward stops carrying its unit, so the column fits its header.
         let (w, _) = avail_col_widths(&m, 154, &rows);
-        assert_eq!(w[9], printed_width(&avail_header(&m, 9)));
+        assert_eq!(w[10], printed_width(&avail_header(&m, 10)));
     }
 
     /// The table as reported: 15 joining allocations, sorted ascending on
@@ -2002,20 +2533,88 @@ mod tests {
     }
 
     #[test]
-    fn header_text_decorates_and_underscores() {
+    fn worker_header_separates_assignment_activity_and_individual_modes() {
+        use quil_types::proto::node::{WorkerInfo, WorkerInfoResponse};
+        let mut m = Model::new(); m.data_loaded = true; m.running_workers = 3; m.allocated_workers = 2;
+        let mut active = row("01", 1, 1, 7, "", ""); active.status = 2;
+        let mut paused = active.clone(); paused.worker_id = 8; paused.status = 3;
+        let mut orphan = active.clone(); orphan.worker_id = -1;
+        m.allocations = vec![active.clone(), active, paused, orphan];
+        m.cached_worker_info = Some(WorkerInfoResponse { worker_info: vec![
+            WorkerInfo { core_id: 7, ..Default::default() },
+            WorkerInfo { core_id: 8, manually_managed: true, ..Default::default() },
+            WorkerInfo { core_id: 9, ..Default::default() },
+            WorkerInfo { core_id: 7, ..Default::default() },
+        ] });
+        assert_eq!(worker_counts_line(&m).to_string(), " Workers: Running 3 | Auto 2 | Manual 1");
+        assert!(alloc_title(&m, &m.allocations).to_string().contains("Allocations: 2/3 | Active 1"));
+        m.alloc_col_filters.insert(1, ColumnFilter { text: "no matching allocation".into(), ..Default::default() });
+        assert!(m.filtered_allocations().is_empty());
+        assert!(worker_counts_line(&m).to_string().contains("Auto 2 | Manual 1"));
+        assert!(alloc_title(&m, &m.filtered_allocations()).to_string().contains("Allocations: 2/3 | Active 1"));
+        assert!(alloc_title(&m, &m.filtered_allocations()).to_string().contains("Shown 0/4"));
+        m.cached_worker_info = None;
+        assert!(worker_counts_line(&m).to_string().contains("Auto ? | Manual ?"));
+        assert!(alloc_title(&m, &[]).to_string().contains("Allocations: 2/3 | Active ?"));
+    }
+
+    #[test]
+    fn warning_markers_keep_rendered_values_aligned_when_colors_toggle() {
+        use quil_types::proto::node::WorkerExecution;
+        let mut m = Model::new();
+        let mut a = row("01", 2, 1, 7, "", "");
+        a.execution = Some(WorkerExecution { state: "running".into(), materialized_frame: Some(0),
+            observed_unix_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64, ..Default::default() });
+        a.status_name = "re-confirm!".into();
+        let mut normal = a.clone(); normal.worker_id = 8;
+        normal.execution.as_mut().unwrap().state = "blocked".into();
+        let allocations = vec![a, normal];
+        let mut peer = shard("02", 1, 1); peer.materialized_frame = 44; peer.latest_frame = 47;
+        let available = vec![peer.clone(), peer];
+        let cell = |line: &Line<'_>, widths: &[usize], col: usize| -> String {
+            line.to_string().chars().skip(widths[..col].iter().sum::<usize>() + col).take(widths[col]).collect()
+        };
+        m.color_coding = false;
+        let (aw, _) = alloc_col_widths(&m, 300, &allocations);
+        let (vw, _) = avail_col_widths(&m, 300, &available);
+        let plain_a = render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 300, 8), None);
+        let plain_v = render_avail_panel(&mut m, &available, Rect::new(0, 0, 300, 8), None);
+        assert_eq!(cell(&plain_a[1], &aw, 6).trim(), "0!");
+        assert_eq!(cell(&plain_a[2], &aw, 6).trim(), "0");
+        assert_eq!(cell(&plain_a[1], &aw, 6).find('0'), cell(&plain_a[2], &aw, 6).find('0'));
+        m.color_coding = true;
+        assert_eq!(alloc_col_widths(&m, 300, &allocations).0, aw);
+        assert_eq!(avail_col_widths(&m, 300, &available).0, vw);
+        let colored_a = render_alloc_panel(&mut m, &allocations, Rect::new(0, 0, 300, 8), None);
+        let colored_v = render_avail_panel(&mut m, &available, Rect::new(0, 0, 300, 8), None);
+        for row in 1..=2 {
+            for col in [6, 12] {
+                assert_eq!(cell(&plain_a[row], &aw, col).replace('!', " "), cell(&colored_a[row], &aw, col));
+            }
+            assert_eq!(cell(&plain_v[row], &vw, 9).trim(), "lag!");
+            assert_eq!(cell(&plain_v[row], &vw, 9).replace('!', " "), cell(&colored_v[row], &vw, 9));
+        }
+        assert_eq!(colored_a[1].spans[24].style.fg, Some(status_color("re-confirm!")));
+        for row in 1..=2 {
+            assert_eq!(colored_a[row].spans[14].style.fg, colored_v[row].spans[14].style.fg);
+            assert_ne!(colored_v[row].spans[12].style.fg, colored_v[row].spans[14].style.fg);
+        }
+    }
+
+    #[test]
+    fn header_text_decorates_consistently_across_sizing_modes() {
         assert_eq!(header_text("Worker", 7, 7, true, false, false), "↑Worker");
         assert_eq!(header_text("Worker", 7, 7, false, false, false), "↓Worker");
         assert_eq!(header_text("Ring", 3, 7, true, true, false), "Ring*");
         assert_eq!(header_text("Ring", 3, 3, true, true, false), "↑Ring*");
-        // Measured columns sit one space apart, so the spaces inside a name
-        // become underscores to keep the pairs readable.
+        // Column labels and unit spacing stay identical across sizing modes.
         assert_eq!(
-            header_text("Default Action", 11, 7, true, false, true),
-            "Default_Action"
+            header_text("DefaultAction", 11, 7, true, false, true),
+            "DefaultAction"
         );
         assert_eq!(
-            header_text("Default Action", 11, 7, true, false, false),
-            "Default Action"
+            header_text("DefaultAction", 11, 7, true, false, false),
+            "DefaultAction"
         );
     }
 
@@ -2023,48 +2622,49 @@ mod tests {
     fn every_column_is_sized_to_its_own_content() {
         let m = Model::new(); // Dynamic, sorted ascending on Worker
         let rows = joining_table();
-        let (w, fw) = alloc_col_widths(&m, 154, &rows);
+        let (w, fw) = alloc_col_widths(&m, 165, &rows);
 
         assert_eq!(
             w,
             vec![
                 6,  // "Select"
-                32, // Filter — what the pane has left
+                18, // Filter — what the pane has left
                 7,  // "Provers"
                 4,  // "Ring"
-                9,  // "Size_[MB]"
+                9,  // "Size [MB]"
                 8,  // "10076371", wider than "Shards"
-                3,  // "Mat"
-                3,  // "Lag"
-                7,  // "unknown", wider than "State"
-                12, // "Reward_[Q/d]"
+                9,  // "LocalMat" plus marker position
+                8,  // "PeerHead"
+                10, // "GlobalHead"
+                9,  // "Execution"
+                12, // "Reward [Q/d]"
                 7,  // "↑Worker", including the active sort arrow
-                7,  // "joining", wider than "Status"
+                8,  // "joining" plus marker position, wider than "Status"
                 4,  // "Mode"
-                13, // "(pause|leave)", wider than "Next_Action"
-                16, // "activate@f699840", wider than "Default_Action"
+                13, // "(pause|leave)", wider than "NextAction"
+                16, // "activate@f699840", wider than "DefaultAction"
             ]
         );
-        assert_eq!(fw, 32);
-        // 15 columns + 14 separators + 2 borders fill the pane exactly.
-        assert_eq!(w.iter().sum::<usize>() + 14 + 2, 154);
+        assert_eq!(fw, 18);
+        // 16 columns + 15 separators + 2 borders fill the pane exactly.
+        assert_eq!(w.iter().sum::<usize>() + 15 + 2, 165);
     }
 
     #[test]
-    fn fixed_sizing_reproduces_the_historical_layout() {
-        let (w, fw) = alloc_col_widths(&fixed(), 154, &joining_table());
-        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 6, 8, 12, 8, 12, 4, 26, 18]);
+    fn fixed_sizing_reserves_the_local_and_peer_column_labels() {
+        let (w, fw) = alloc_col_widths(&fixed(), 165, &joining_table());
+        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 8, 10, 9, 12, 8, 12, 4, 26, 18]);
         assert_eq!(fw, 12);
-        assert_eq!(w.iter().sum::<usize>() + 14, 165);
+        assert_eq!(w.iter().sum::<usize>() + 15, 179);
         // 26 columns of Next Action for a 13-column value in the fixed layout.
-        assert_eq!(w[13], NEXT_ACTION_WIDTH);
+        assert_eq!(w[14], NEXT_ACTION_WIDTH);
     }
 
     #[test]
     fn no_cell_overflows_its_column() {
         for m in [Model::new(), fixed()] {
             let rows = joining_table();
-            let (w, fw) = alloc_col_widths(&m, 154, &rows);
+            let (w, fw) = alloc_col_widths(&m, 165, &rows);
             for (c, width) in w.iter().enumerate() {
                 for a in &rows {
                     let cell = alloc_cell(&m, a, c, fw);
@@ -2082,15 +2682,15 @@ mod tests {
     fn next_action_widens_when_a_confirm_window_opens() {
         let m = Model::new();
         let mut rows = joining_table();
-        let (before, before_fw) = alloc_col_widths(&m, 154, &rows);
+        let (before, before_fw) = alloc_col_widths(&m, 165, &rows);
         rows[3].next_action = ActionHint::text("(reject|confirm)");
-        let (after, after_fw) = alloc_col_widths(&m, 154, &rows);
+        let (after, after_fw) = alloc_col_widths(&m, 165, &rows);
 
-        assert_eq!(before[13], 13);
-        assert_eq!(after[13], 16);
+        assert_eq!(before[14], 13);
+        assert_eq!(after[14], 16);
         // Filter gives back exactly what Next Action took; the row still fits.
         assert_eq!(before_fw - after_fw, 3);
-        assert_eq!(after.iter().sum::<usize>() + 14 + 2, 154);
+        assert_eq!(after.iter().sum::<usize>() + 15 + 2, 165);
     }
 
     #[test]
@@ -2099,9 +2699,9 @@ mod tests {
         let rows = joining_table();
         // Wide pane: Filter stops at the longest hex rather than padding on.
         assert_eq!(alloc_col_widths(&m, 300, &rows).1, 64);
-        assert_eq!(alloc_col_widths(&m, 167, &rows).1, 45);
+        assert_eq!(alloc_col_widths(&m, 178, &rows).1, 31);
         // Narrower: Filter absorbs the shortfall…
-        assert_eq!(alloc_col_widths(&m, 154, &rows).1, 32);
+        assert_eq!(alloc_col_widths(&m, 165, &rows).1, 18);
         assert_eq!(alloc_col_widths(&m, 121, &rows).1, 12);
         // …down to the floor, past which the row is clipped rather than shrunk.
         assert_eq!(alloc_col_widths(&m, 118, &rows).1, MIN_FILTER_WIDTH);
@@ -2172,9 +2772,9 @@ mod tests {
     /// they only read as a list when they line up.
     #[test]
     fn filters_and_next_action_align_left() {
-        assert!(alloc_left_aligned(13));
+        assert!(alloc_left_aligned(14));
         assert!(alloc_left_aligned(1));
-        for c in (0..ALLOC_COL_NAMES.len()).filter(|c| *c != 13 && *c != 1) {
+        for c in (0..ALLOC_COL_NAMES.len()).filter(|c| *c != 14 && *c != 1) {
             assert!(
                 !alloc_left_aligned(c),
                 "column {c} should stay right-aligned"
@@ -2240,7 +2840,7 @@ mod tests {
     fn every_key_has_a_help_entry() {
         let keys = documented_keys();
         for key in [
-            "l", "c", "r", "p", "u", "M", "J", "s", "f", "R", "C", "w", "e", "h", "a", "x", "d",
+            "l", "c", "r", "p", "u", "M", "J", "s", "f", "C", "e", "h", "a", "x", "d",
             "Tab", "Space", "enter", "esc", "q / Ctrl+C",
         ] {
             assert!(
@@ -2266,11 +2866,11 @@ mod tests {
         let mut allocation = joining_table().remove(0);
         allocation.estimated_reward = BigInt::from(10u64).pow(30);
         let (widths, _) = alloc_col_widths(&m, 300, &[allocation.clone()]);
-        assert!(widths[9] >= printed_width(&alloc_cell(&m, &allocation, 9, 0)));
+        assert!(widths[10] >= printed_width(&alloc_cell(&m, &allocation, 10, 0)));
         let mut available = shard("ab", 0, 0);
         available.estimated_reward = allocation.estimated_reward;
         let (widths, _) = avail_col_widths(&m, 300, &[available.clone()]);
-        assert!(widths[9] >= printed_width(&avail_cell(&m, &available, 9, 0)));
+        assert!(widths[10] >= printed_width(&avail_cell(&m, &available, 10, 0)));
     }
 
     #[test]
@@ -2282,7 +2882,7 @@ mod tests {
         assert_eq!(fmt_reward(&m.available[1].estimated_reward), "1");
         let sorted = m.sorted_available();
         assert_eq!(sorted[0].filter_key, "high");
-        m.avail_col_filters.insert(9, ColumnFilter {
+        m.avail_col_filters.insert(10, ColumnFilter {
             expr: ">0.9".into(),
             ..Default::default()
         });
@@ -2291,7 +2891,27 @@ mod tests {
         assert_eq!(filtered[0].filter_key, "high");
         let mut allocation = joining_table().remove(0);
         allocation.estimated_reward = BigInt::from(11_000);
-        assert!((alloc_row_numeric_val(&allocation, 9) - 0.9504).abs() < 1e-10);
+        assert!((alloc_row_numeric_val(&allocation, 10) - 0.9504).abs() < 1e-10);
+    }
+
+    #[test]
+    fn help_close_commands_stay_at_bottom_before_and_after_scrolling() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut m = Model::new(); m.show_help = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut m)).unwrap();
+        let bottom = |buffer: &ratatui::buffer::Buffer| (0..100).map(|x| buffer[(x, 23)].symbol()).collect::<String>();
+        let before = bottom(terminal.backend().buffer());
+        let separator = |buffer: &ratatui::buffer::Buffer| (0..100).map(|x| buffer[(x, 22)].symbol()).collect::<String>();
+        assert_eq!(separator(terminal.backend().buffer()), "─".repeat(100));
+        assert_eq!(m.help_visible, 21);
+        assert!(before.contains("[h/esc] close"));
+        super::super::update::handle_key(&mut m, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        terminal.draw(|f| draw(f, &mut m)).unwrap();
+        assert_eq!(bottom(terminal.backend().buffer()), before);
+        assert_eq!(separator(terminal.backend().buffer()), "─".repeat(100));
+        assert_eq!(m.help_offset + m.help_visible, m.help_lines);
     }
 
     #[test]
@@ -2306,9 +2926,9 @@ mod tests {
         m.allocations[0].next_action = ActionHint::at("(reject|confirm)", 2_160);
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty());
-        assert_eq!(alloc_cell(&m, &m.allocations[0], 13, 0), "(reject|confirm)@e3");
+        assert_eq!(alloc_cell(&m, &m.allocations[0], 14, 0), "(reject|confirm)@e3");
         assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty());
-        assert_eq!(alloc_cell(&m, &m.allocations[0], 13, 0), "(reject|confirm)@f2160");
+        assert_eq!(alloc_cell(&m, &m.allocations[0], 14, 0), "(reject|confirm)@f2160");
 
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         assert!(handle_key(&mut m, key(KeyCode::Char('h'))).is_empty());

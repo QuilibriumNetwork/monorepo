@@ -144,6 +144,7 @@ struct WorkerState {
     cancel: CancellationToken,
     tx: mpsc::Sender<MasterToWorker>,
     handle: Option<JoinHandle<()>>,
+    execution_handle: Arc<Mutex<Option<crate::app_engine::AppEngineHandle>>>,
 }
 
 /// Shared state that worker threads need for consensus.
@@ -386,6 +387,8 @@ impl ThreadWorkerManager {
         let master_tx = self.master_tx.clone();
         let cancel_clone = cancel.clone();
         let consensus_deps = self.consensus_deps.lock().unwrap().clone();
+        let execution_handle = Arc::new(Mutex::new(None::<crate::app_engine::AppEngineHandle>));
+        let execution_slot = execution_handle.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("worker-{}", core_id))
@@ -478,6 +481,8 @@ impl ThreadWorkerManager {
                             cmd = rx.recv() => {
                                 match cmd {
                                     Some(MasterToWorker::Respawn { filter, start_consensus }) => {
+                                        // Retire telemetry before replacing the engine generation.
+                                        *execution_slot.lock().unwrap() = None;
                                         // Stop existing engine if any
                                         if let Some(cancel) = engine_cancel.take() {
                                             cancel.cancel();
@@ -519,6 +524,7 @@ impl ThreadWorkerManager {
                                             let master_tx_clone = master_tx.clone();
                                             let filter_clone = filter.clone();
                                             let deps = consensus_deps.clone();
+                                            let execution_slot = execution_slot.clone();
                                             let owned = worker_owned.clone();
                                             let application = filter[..filter.len().min(32)].to_vec();
                                             let mempool = match retained_mempool.take() {
@@ -619,6 +625,7 @@ impl ThreadWorkerManager {
                                                         engine_deps,
                                                         event_tx,
                                                     );
+                                                    *execution_slot.lock().unwrap() = Some(app_handle.clone());
                                                     let engine = engine.with_storage_history_source(
                                                         owned.as_ref().and_then(|o| o.storage_history_source.clone()),
                                                     ).with_outgoing_history_source(
@@ -814,6 +821,7 @@ impl ThreadWorkerManager {
                                                             info!(core_id, "app engine exited");
                                                         }
                                                     }
+                                                    app_handle.execution_state("stopped", "engine exited");
                                                     // Tell the master to evict the routing entry +
                                                     // unsubscribe from per-shard bitmasks.
                                                     let _ = master_tx_clone.send(
@@ -891,6 +899,7 @@ impl ThreadWorkerManager {
             cancel,
             tx,
             handle: Some(handle),
+            execution_handle,
         })
     }
 }
@@ -978,6 +987,15 @@ impl WorkerManager for ThreadWorkerManager {
         Ok(workers.keys().copied().collect())
     }
 
+    fn worker_execution(&self) -> Vec<(u32, Vec<u8>, quil_types::proto::node::WorkerExecution)> {
+        self.workers.lock().unwrap().values().filter_map(|w| {
+            let slot = w.execution_handle.lock().unwrap();
+            let h = slot.as_ref()?;
+            // A queued rebind must never attribute the previous engine to the new filter.
+            (h.filter == w.filter).then(|| (w.core_id, w.filter.clone(), h.execution()))
+        }).collect()
+    }
+
     fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
         let workers = self.workers.lock().unwrap();
         Ok(workers
@@ -1043,6 +1061,7 @@ fn snapshot_state(w: &WorkerState) -> WorkerState {
         // Don't move/clone the join handle — it's tied to the live
         // worker thread and the snapshot is a read-only view.
         handle: None,
+        execution_handle: w.execution_handle.clone(),
     }
 }
 

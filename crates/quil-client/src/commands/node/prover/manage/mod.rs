@@ -124,11 +124,12 @@ async fn event_loop(
 struct RefreshState {
     node: Arc<Semaphore>,
     shards: Arc<Semaphore>,
+    rewards: Arc<Semaphore>,
 }
 
 impl Default for RefreshState {
     fn default() -> Self {
-        Self { node: Arc::new(Semaphore::new(1)), shards: Arc::new(Semaphore::new(1)) }
+        Self { node: Arc::new(Semaphore::new(1)), shards: Arc::new(Semaphore::new(1)), rewards: Arc::new(Semaphore::new(1)) }
     }
 }
 
@@ -164,6 +165,7 @@ fn spawn_action(
         Cmd::Quit => {}
         Cmd::Fetch => {
             spawn_refresh(&refresh.node, &tx, None, actions::fetch_data(client.clone()));
+            spawn_refresh(&refresh.rewards, &tx, None, actions::fetch_rewards(client.clone(), km));
             spawn_refresh(&refresh.shards, &tx, Some(Msg::ShardLoading), actions::fetch_shards(client));
         }
         Cmd::Join(filters) => {

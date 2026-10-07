@@ -26,6 +26,7 @@ mod shardinfo;
 mod shards;
 pub(crate) mod sign;
 mod status;
+mod local_execution;
 
 #[derive(Debug, Subcommand)]
 pub enum ProverCommand {

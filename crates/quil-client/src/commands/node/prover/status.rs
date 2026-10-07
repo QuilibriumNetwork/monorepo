@@ -145,6 +145,7 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
                     format_storage(w.available_storage),
                     format_storage(w.total_storage)
                 );
+                println!("    {}", super::local_execution::detail(w.execution.as_ref()));
             }
         }
     }

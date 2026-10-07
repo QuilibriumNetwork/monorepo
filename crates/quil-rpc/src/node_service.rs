@@ -143,6 +143,7 @@ pub struct WorkerEntry {
     pub total_storage: u64,
     pub manually_managed: bool,
     pub allocated: bool,
+    pub execution: Option<node::WorkerExecution>,
 }
 
 /// gRPC NodeService implementation with live node state.
@@ -698,6 +699,7 @@ impl NodeService for NodeRpcServer {
                 available_storage: w.available_storage,
                 total_storage: w.total_storage,
                 manually_managed: w.manually_managed,
+                execution: w.execution.clone(),
             })
             .collect();
 
@@ -1283,8 +1285,10 @@ impl NodeService for NodeRpcServer {
             .get_shard_info(req.include_all)
             .map_err(|e| Status::internal(format!("get shard info: {e}")))?;
 
+        let filters: Vec<_> = details.iter().map(|d| d.filter.clone()).collect();
+        let global_heads = provider.get_global_app_heads(&filters).unwrap_or_default();
         let mut shards = Vec::with_capacity(details.len());
-        for d in &details {
+        for (i, d) in details.iter().enumerate() {
             shards.push(node::ShardRewardInfo {
                 filter: d.filter.clone(),
                 active_provers: d.active_provers,
@@ -1296,6 +1300,7 @@ impl NodeService for NodeRpcServer {
                 data_shards: d.data_shards,
                 materialized_frame: d.materialized_frame,
                 latest_frame: d.latest_frame,
+                global_head: global_heads.get(i).cloned().flatten(),
             });
         }
 
@@ -1867,6 +1872,28 @@ mod token_fee_quote_tests {
 }
 
 #[cfg(test)]
+mod worker_execution_tests {
+    use super::*;
+    use node::node_service_server::NodeService;
+    #[tokio::test]
+    async fn worker_rpc_preserves_zero_height_and_unsupported_telemetry() {
+        let observed = node::WorkerExecution {
+            state: "blocked".into(), blocker: "checkpoint mismatch".into(),
+            materialized_frame: Some(0), observed_unix_ms: 1234, ..Default::default()
+        };
+        let server = NodeRpcServer::new().with_workers_view(Arc::new(std::sync::RwLock::new(vec![
+            WorkerEntry { core_id: 1, filter: vec![1], available_storage: 0, total_storage: 0,
+                manually_managed: false, allocated: true, execution: Some(observed.clone()) },
+            WorkerEntry { core_id: 2, filter: vec![2], available_storage: 0, total_storage: 0,
+                manually_managed: false, allocated: true, execution: None },
+        ])));
+        let response = server.get_worker_info(Request::new(node::GetWorkerInfoRequest {})).await.unwrap().into_inner();
+        assert_eq!(response.worker_info[0].execution, Some(observed));
+        assert!(response.worker_info[1].execution.is_none());
+    }
+}
+
+#[cfg(test)]
 mod shard_world_size_tests {
     use super::*;
     use num_bigint::BigInt;
@@ -1874,6 +1901,9 @@ mod shard_world_size_tests {
 
     struct Provider;
     impl ShardInfoProvider for Provider {
+        fn get_global_app_heads(&self, filters: &[Vec<u8>]) -> quil_types::error::Result<Vec<Option<node::GlobalAppFrameHead>>> {
+            Ok(filters.iter().map(|f| if f == &[1] { Some(node::GlobalAppFrameHead { frame: 0, global_frame: 12, generation: 2 }) } else { None }).collect())
+        }
         fn get_shard_info(&self, include_all: bool)
             -> quil_types::error::Result<(Vec<ShardDetail>, u64, BigInt, u64, BigInt)> {
             let count = if include_all { 2 } else { 1 };
@@ -1894,6 +1924,9 @@ mod shard_world_size_tests {
             })).await.unwrap().into_inner();
             assert_eq!(response.shards.len(), if include_all { 2 } else { 1 });
             assert_eq!(response.shards[0].ring_known, Some(true));
+            let response = <node::GetShardInfoResponse as prost::Message>::decode(prost::Message::encode_to_vec(&response).as_slice()).unwrap();
+            assert_eq!(response.shards[0].global_head.as_ref().map(|head| (head.frame, head.global_frame, head.generation)), Some((0, 12, 2)));
+            if include_all { assert!(response.shards[1].global_head.is_none()); }
             if include_all { assert_eq!(response.shards[1].ring_known, Some(false)); }
             assert_eq!(BigInt::from_signed_bytes_be(&response.world_state_bytes), BigInt::from(3000));
         }

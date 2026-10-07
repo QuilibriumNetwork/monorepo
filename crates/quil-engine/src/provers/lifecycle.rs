@@ -1482,7 +1482,6 @@ impl ProverLifecycle {
             if let Some(estimate) = reward_rings.get(&descriptor.filter) {
                 descriptor.ring = estimate.ring;
                 descriptor.active_on_ring = estimate.provers_on_ring as u64;
-
             }
         }
         // Use the same membership estimate as shard-info and issuance's

@@ -3,6 +3,7 @@
 //! struct, data-refresh processing, and the filter/sort derivations.
 
 use std::collections::{HashMap, HashSet};
+use super::super::local_execution::local_execution_state;
 
 use num_bigint::{BigInt, Sign};
 
@@ -17,15 +18,15 @@ use super::super::epoch::{
 
 // ── Column metadata (shared between rendering and filtering) ─────────────
 
-pub const ALLOC_COL_NAMES: [&str; 15] = [
-    "Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "Mat", "Lag", "State",
-    "Reward [Q/d]", "Worker", "Status", "Mode", "Next Action", "Default Action",
+pub const ALLOC_COL_NAMES: [&str; 16] = [
+    "Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "LocalMat", "PeerHead", "GlobalHead", "Execution",
+    "Reward [Q/d]", "Worker", "Status", "Mode", "NextAction", "DefaultAction",
 ];
-pub const AVAIL_COL_NAMES: [&str; 10] =
-    ["Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "Mat", "Lag", "State", "Reward [Q/d]"];
+pub const AVAIL_COL_NAMES: [&str; 11] =
+    ["Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "PeerMat", "PeerHead", "GlobalHead", "PeerState", "Reward [Q/d]"];
 
-pub const ALLOC_FILTERABLE_COLS: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-pub const AVAIL_FILTERABLE_COLS: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+pub const ALLOC_FILTERABLE_COLS: [usize; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+pub const AVAIL_FILTERABLE_COLS: [usize; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterColKind {
@@ -38,7 +39,7 @@ pub enum FilterColKind {
 pub fn alloc_filter_col_kind(col: usize) -> FilterColKind {
     match col {
         1 => FilterColKind::Text,
-        8 | 11 | 12 => FilterColKind::Select,
+        9 | 12 | 13 => FilterColKind::Select,
         _ => FilterColKind::Numeric,
     }
 }
@@ -46,12 +47,12 @@ pub fn alloc_filter_col_kind(col: usize) -> FilterColKind {
 /// Filter kind per absolute column index (available panel).
 pub fn avail_filter_col_kind(col: usize) -> FilterColKind {
     match col {
-        1 | 8 => FilterColKind::Text,
+        1 | 9 => FilterColKind::Text,
         _ => FilterColKind::Numeric,
     }
 }
 
-/// How the two tables size their columns. Toggled at runtime with `w`.
+/// How the two tables size their columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColumnSizing {
     /// Measure every column against the rows on screen: a column is as wide
@@ -76,8 +77,9 @@ pub const RING_WIDTH: usize = 5;
 pub const SIZE_WIDTH: usize = 10;
 pub const SHARDS_WIDTH: usize = 7;
 pub const MAT_WIDTH: usize = 9;
-pub const LAG_WIDTH: usize = 6;
-pub const STATE_WIDTH: usize = 8;
+pub const HEAD_WIDTH: usize = 8;
+pub const GLOBAL_HEAD_WIDTH: usize = 10;
+pub const STATE_WIDTH: usize = 9;
 // Header width in both panels; the values are whole QUIL/day.
 pub const REWARD_WIDTH: usize = 12;
 pub const ALLOC_REWARD_WIDTH: usize = 12;
@@ -88,24 +90,24 @@ pub const MODE_WIDTH: usize = 4;
 pub const NEXT_ACTION_WIDTH: usize = 26;
 pub const DEFAULT_ACTION_WIDTH: usize = 18;
 
-// 14 spaces between 15 columns, 2 external borders, 1-char sort arrow.
+// 15 spaces between 16 columns, 2 external borders, 1-char sort arrow.
 pub const ALLOC_FIXED_WIDTH: usize = SELECT_WIDTH
     + PROVERS_WIDTH
     + RING_WIDTH
     + SIZE_WIDTH
     + SHARDS_WIDTH
-    + MAT_WIDTH + LAG_WIDTH + STATE_WIDTH + ALLOC_REWARD_WIDTH
+    + MAT_WIDTH + HEAD_WIDTH + GLOBAL_HEAD_WIDTH + STATE_WIDTH + ALLOC_REWARD_WIDTH
     + WORKER_WIDTH
     + STATUS_WIDTH
     + MODE_WIDTH
     + NEXT_ACTION_WIDTH
     + DEFAULT_ACTION_WIDTH
-    + 14
+    + 15
     + 2
     + 1;
-// 9 spaces between 10 columns, 2 external borders, 1-char sort arrow.
+// 10 spaces between 11 columns, 2 external borders, 1-char sort arrow.
 pub const AVAIL_FIXED_WIDTH: usize =
-    SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH + SIZE_WIDTH + SHARDS_WIDTH + MAT_WIDTH + LAG_WIDTH + STATE_WIDTH + REWARD_WIDTH + 9 + 2 + 1;
+    SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH + SIZE_WIDTH + SHARDS_WIDTH + MAT_WIDTH + HEAD_WIDTH + GLOBAL_HEAD_WIDTH + STATE_WIDTH + REWARD_WIDTH + 10 + 2 + 1;
 
 /// Floor for the Filter column in either layout. Filter is what gives way
 /// when the pane cannot hold the table, being the only column whose content
@@ -116,6 +118,8 @@ pub const MIN_FILTER_WIDTH: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct AllocationRow {
+    pub global_head: Option<quil_types::proto::node::GlobalAppFrameHead>,
+    pub execution: Option<quil_types::proto::node::WorkerExecution>,
     /// A shard-info row was actually returned for this allocation.
     pub shard_info_known: bool,
     pub filter: Vec<u8>,
@@ -180,6 +184,7 @@ impl AllocationRow {
 
 #[derive(Debug, Clone)]
 pub struct ShardRow {
+    pub global_head: Option<quil_types::proto::node::GlobalAppFrameHead>,
     pub filter: Vec<u8>,
     pub filter_key: String,
     pub filter_hex: String,
@@ -249,7 +254,11 @@ pub struct Model {
     pub current_epoch: u64,
     pub last_received_frame: u64,
     pub difficulty: u64,
-    pub auto_managed: bool,
+
+    // Verified GLOBAL reward witness, refreshed independently of shard queries.
+    pub claimable_reward: Option<(u128, u64)>,
+    pub reward_loaded: bool,
+    pub reward_last_success: Option<std::time::Instant>,
 
     // Panel data.
     pub allocations: Vec<AllocationRow>,
@@ -257,6 +266,10 @@ pub struct Model {
     pub alloc_cursor: usize,
     pub avail_cursor: usize,
     pub focus: PanelFocus,
+    pub panel_boundary_offsets: [i16; 2],
+    pub panel_content_heights: [u16; 3],
+    pub horizontal_offsets: [u16; 2],
+    pub horizontal_limits: [u16; 2],
     pub alloc_offset: usize,
     pub avail_offset: usize,
 
@@ -325,6 +338,8 @@ pub struct Model {
     pub notice_offset: usize,
     pub notice_lines: usize,
     pub notice_visible: usize,
+    pub app_progress_observed_since: Option<std::time::Instant>,
+    pub app_stall_time: Option<std::time::SystemTime>,
     pub status_msg: String,
     pub status_message_key: String,
     pub status_message_seen: Option<std::time::Instant>,
@@ -340,6 +355,7 @@ pub struct Model {
     /// Help lines the last frame produced, so scrolling can stop at the end
     /// without the key handler having to know how the screen is built.
     pub help_lines: usize,
+    pub help_visible: usize,
     pub color_coding: bool,
     pub column_sizing: ColumnSizing,
     pub threshold_unit: ThresholdUnit,
@@ -388,9 +404,13 @@ pub enum PanelFocus {
     #[default]
     Allocations,
     Available,
+    Notifications,
 }
 
 impl PanelFocus {
+    pub fn index(self) -> usize { match self { Self::Allocations => 0, Self::Available => 1, Self::Notifications => 2 } }
+    pub fn next(self) -> Self { match self { Self::Allocations => Self::Available, Self::Available => Self::Notifications, Self::Notifications => Self::Allocations } }
+    pub fn previous(self) -> Self { match self { Self::Allocations => Self::Notifications, Self::Available => Self::Allocations, Self::Notifications => Self::Available } }
     pub fn is_alloc(self) -> bool {
         matches!(self, PanelFocus::Allocations)
     }
@@ -399,11 +419,10 @@ impl PanelFocus {
 impl Model {
     pub fn new() -> Self {
         Model {
-            auto_managed: true,
             color_coding: true,
-            alloc_sort_col: 10, // Worker column
+            alloc_sort_col: 11, // Worker column
             alloc_sort_asc: true,
-            avail_sort_col: 9, // Reward column
+            avail_sort_col: 10, // Reward column
             avail_sort_asc: false,
             reachable: false,
             ..Default::default()
@@ -472,16 +491,11 @@ impl Model {
 
         // Worker maps: core_id + manually_managed by filter hex.
         let mut workers: HashMap<String, (u32, bool)> = HashMap::new();
-        let mut any_manual = false;
         if let Some(wi) = &worker_info {
             for w in &wi.worker_info {
                 workers.insert(hex::encode(&w.filter), (w.core_id, w.manually_managed));
-                if w.manually_managed {
-                    any_manual = true;
-                }
             }
         }
-        self.auto_managed = !any_manual;
 
         // Free workers (empty filter).
         let mut free_workers: Vec<u32> = Vec::new();
@@ -531,7 +545,11 @@ impl Model {
                 .map(|(id, m)| (*id as i64, *m))
                 .unwrap_or((-1, false));
 
+            let execution = worker_info.as_ref().and_then(|wi| wi.worker_info.iter().find(|w|
+                w.core_id as i64 == wid && w.filter == a.filter)).and_then(|w| w.execution.clone());
             let mut row = AllocationRow {
+                global_head: None,
+                execution,
                 shard_info_known: false,
                 filter: a.filter.clone(),
                 filter_key: filter_hex.clone(),
@@ -557,6 +575,7 @@ impl Model {
                 manually_managed: mm,
             };
             if let Some(info) = reward_by_filter.get(&filter_hex) {
+                row.global_head = info.global_head.clone();
                 row.shard_info_known = true;
                 row.ring = reward_ring(info);
                 row.active_provers = info.active_provers;
@@ -575,6 +594,8 @@ impl Model {
             for w in &wi.worker_info {
                 if w.filter.is_empty() {
                     allocs.push(AllocationRow {
+                        global_head: None,
+                        execution: None,
                         shard_info_known: false,
                         filter: Vec::new(),
                         filter_key: format!("worker:{}", w.core_id),
@@ -613,6 +634,7 @@ impl Model {
                     continue;
                 }
                 avail.push(ShardRow {
+                    global_head: s.global_head.clone(),
                     filter: s.filter.clone(),
                     filter_key: filter_hex.clone(),
                     filter_hex,
@@ -729,17 +751,18 @@ impl Model {
                 3 => a.ring.cmp(&b.ring),
                 4 => a.shard_size.cmp(&b.shard_size),
                 5 => a.data_shards.cmp(&b.data_shards),
-                6 => a.materialized_frame.cmp(&b.materialized_frame),
-                7 => materialization_lag(a.materialized_frame, a.latest_frame).cmp(&materialization_lag(b.materialized_frame, b.latest_frame)),
-                8 => materialization_state(a.materialized_frame, a.latest_frame).cmp(materialization_state(b.materialized_frame, b.latest_frame)),
-                9 => a.estimated_reward.cmp(&b.estimated_reward),
-                10 => a.worker_id.cmp(&b.worker_id), 11 => a.status.cmp(&b.status),
-                12 => a.manually_managed.cmp(&b.manually_managed),
-                13 => a
+                6 => a.execution.as_ref().and_then(|s| s.materialized_frame).cmp(&b.execution.as_ref().and_then(|s| s.materialized_frame)),
+                7 => a.latest_frame.cmp(&b.latest_frame),
+                8 => a.global_head.as_ref().map(|h| h.frame).cmp(&b.global_head.as_ref().map(|h| h.frame)),
+                9 => local_execution_state(a.execution.as_ref()).cmp(local_execution_state(b.execution.as_ref())),
+                10 => a.estimated_reward.cmp(&b.estimated_reward),
+                11 => a.worker_id.cmp(&b.worker_id), 12 => a.status.cmp(&b.status),
+                13 => a.manually_managed.cmp(&b.manually_managed),
+                14 => a
                     .next_action
                     .render(unit, el)
                     .cmp(&b.next_action.render(unit, el)),
-                14 => a
+                15 => a
                     .default_action
                     .render(unit, el)
                     .cmp(&b.default_action.render(unit, el)),
@@ -771,9 +794,10 @@ impl Model {
                 4 => a.shard_size.cmp(&b.shard_size),
                 5 => a.data_shards.cmp(&b.data_shards),
                 6 => a.materialized_frame.cmp(&b.materialized_frame),
-                7 => materialization_lag(a.materialized_frame, a.latest_frame).cmp(&materialization_lag(b.materialized_frame, b.latest_frame)),
-                8 => materialization_state(a.materialized_frame, a.latest_frame).cmp(materialization_state(b.materialized_frame, b.latest_frame)),
-                9 => a.estimated_reward.cmp(&b.estimated_reward),
+                7 => a.latest_frame.cmp(&b.latest_frame),
+                8 => a.global_head.as_ref().map(|h| h.frame).cmp(&b.global_head.as_ref().map(|h| h.frame)),
+                9 => materialization_state(a.materialized_frame, a.latest_frame).cmp(materialization_state(b.materialized_frame, b.latest_frame)),
+                10 => a.estimated_reward.cmp(&b.estimated_reward),
                 _ => std::cmp::Ordering::Equal,
             };
             if asc {
@@ -991,9 +1015,9 @@ impl Model {
 
     pub fn active_panel_col_count(&self) -> usize {
         if self.focus.is_alloc() {
-            14
+            ALLOC_COL_NAMES.len()
         } else {
-            10
+            AVAIL_COL_NAMES.len()
         }
     }
 }
@@ -1001,15 +1025,16 @@ impl Model {
 // ── Row value accessors (for filtering + sorting) ────────────────────────
 
 pub fn alloc_row_numeric_val(row: &AllocationRow, col: usize) -> f64 {
-    if !row.shard_info_known && matches!(col, 2..=7 | 9) { return f64::NAN; }
+    if !row.shard_info_known && matches!(col, 2..=5 | 7 | 10) { return f64::NAN; }
     match col {
         2 => row.active_provers as f64,
         3 => if row.ring == UNKNOWN_REWARD_RING { f64::NAN } else { row.ring as f64 },
         4 => bigint_to_f64(&row.shard_size) / (1024.0 * 1024.0),
         5 => row.data_shards as f64,
-        6 => if row.materialized_frame == 0 && row.latest_frame == 0 { f64::NAN } else { row.materialized_frame as f64 },
-        7 => materialization_lag(row.materialized_frame, row.latest_frame).map_or(f64::NAN, |lag| lag as f64),
-        9 => {
+        6 => row.execution.as_ref().and_then(|s| s.materialized_frame).map_or(f64::NAN, |h| h as f64),
+        7 => if row.materialized_frame == 0 && row.latest_frame == 0 { f64::NAN } else { row.latest_frame as f64 },
+        8 => row.global_head.as_ref().map_or(f64::NAN, |h| h.frame as f64),
+        10 => {
             if row.ring == UNKNOWN_REWARD_RING {
                 f64::NAN
             } else if row.estimated_reward.sign() == Sign::NoSign {
@@ -1018,7 +1043,7 @@ pub fn alloc_row_numeric_val(row: &AllocationRow, col: usize) -> f64 {
                 bigint_to_f64(&row.estimated_reward) * super::super::FRAMES_PER_DAY as f64 / 1e8
             }
         }
-        10 => row.worker_id as f64,
+        11 => row.worker_id as f64,
         _ => 0.0,
     }
 }
@@ -1026,9 +1051,9 @@ pub fn alloc_row_numeric_val(row: &AllocationRow, col: usize) -> f64 {
 pub fn alloc_row_text_val(row: &AllocationRow, col: usize) -> String {
     match col {
         1 => row.filter_hex.clone(),
-        8 => materialization_state(row.materialized_frame, row.latest_frame).to_string(),
-        11 => row.status_name.clone(),
-        12 => row.mode().to_string(),
+        9 => local_execution_state(row.execution.as_ref()).to_string(),
+        12 => row.status_name.clone(),
+        13 => row.mode().to_string(),
         _ => String::new(),
     }
 }
@@ -1040,8 +1065,9 @@ pub fn avail_row_numeric_val(row: &ShardRow, col: usize) -> f64 {
         4 => bigint_to_f64(&row.shard_size) / (1024.0 * 1024.0),
         5 => row.data_shards as f64,
         6 => if row.materialized_frame == 0 && row.latest_frame == 0 { f64::NAN } else { row.materialized_frame as f64 },
-        7 => materialization_lag(row.materialized_frame, row.latest_frame).map_or(f64::NAN, |lag| lag as f64),
-        9 => {
+        7 => if row.materialized_frame == 0 && row.latest_frame == 0 { f64::NAN } else { row.latest_frame as f64 },
+        8 => row.global_head.as_ref().map_or(f64::NAN, |h| h.frame as f64),
+        10 => {
             if row.ring == UNKNOWN_REWARD_RING {
                 f64::NAN
             } else if row.estimated_reward.sign() == Sign::NoSign {
@@ -1059,10 +1085,6 @@ pub const UNKNOWN_REWARD_RING: u32 = u32::MAX;
 
 pub fn reward_ring(info: &quil_types::proto::node::ShardRewardInfo) -> u32 {
     if info.ring_known == Some(false) { UNKNOWN_REWARD_RING } else { info.ring }
-}
-
-pub fn materialization_lag(materialized: u64, latest: u64) -> Option<u64> {
-    (latest > 0).then(|| latest.saturating_sub(materialized))
 }
 
 pub fn materialization_state(materialized: u64, latest: u64) -> &'static str {
@@ -1273,14 +1295,14 @@ mod tests {
         model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))),
             Some(GetShardInfoResponse::default()), None);
         assert!(!model.allocations[0].shard_info_known);
-        for col in [2, 3, 4, 5, 6, 7, 9] {
+        for col in [2, 3, 4, 5, 6, 7, 10] {
             assert!(!super::super::filter::matches_numeric_expr(
                 alloc_row_numeric_val(&model.allocations[0], col), "=0"));
         }
         model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))),
             Some(shard_info(filter, 0)), None);
         assert!(model.allocations[0].shard_info_known);
-        for col in [2, 3, 4, 5, 9] {
+        for col in [2, 3, 4, 5, 10] {
             assert_eq!(alloc_row_numeric_val(&model.allocations[0], col), 0.0);
         }
     }
@@ -1293,7 +1315,7 @@ mod tests {
         info.shards[0].ring_known = Some(false);
         model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))), Some(info.clone()), None);
         assert_eq!(model.allocations[0].ring, UNKNOWN_REWARD_RING);
-        for col in [3, 6, 7, 9] {
+        for col in [3, 6, 7, 10] {
             assert!(!super::super::filter::matches_numeric_expr(alloc_row_numeric_val(&model.allocations[0], col), "=0"));
         }
         info.shards[0].ring_known = Some(true);
@@ -1301,9 +1323,8 @@ mod tests {
         model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))), Some(info.clone()), None);
         assert_eq!(model.allocations[0].ring, 0);
         assert_eq!(alloc_row_numeric_val(&model.allocations[0], 3), 0.0);
-        assert_eq!(alloc_row_numeric_val(&model.allocations[0], 9), 0.0);
+        assert_eq!(alloc_row_numeric_val(&model.allocations[0], 10), 0.0);
         assert_eq!(materialization_state(0, 20), "unmat");
-        assert_eq!(materialization_lag(0, 20), Some(20));
         info.shards[0].ring_known = None;
         info.shards[0].ring = 2;
         model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))), Some(info), None);
