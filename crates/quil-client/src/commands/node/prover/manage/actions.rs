@@ -45,6 +45,22 @@ fn status_name(status: u32) -> String {
     }
 }
 
+/// Fetch an authenticated GLOBAL reward witness without waiting on coin scans.
+pub async fn fetch_rewards(client: Client, km: Arc<FileKeyManager>) -> Msg {
+    #[cfg(feature = "confidential-tokens")]
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let public = km.get_public_key_bytes_by_id("q-prover-key")?;
+        crate::commands::token::balance::read_claimable_rewards(client, &public).await
+    }).await.unwrap_or_else(|_| Err(anyhow::anyhow!("reward query timed out")))
+        .map_err(|e| e.to_string());
+    #[cfg(not(feature = "confidential-tokens"))]
+    let result = {
+        let _ = (client, km);
+        Err("reward witness support unavailable".into())
+    };
+    Msg::RewardRefresh(result)
+}
+
 // ── Data fetch ───────────────────────────────────────────────────────────
 
 /// `fetchRPCData` — GetNodeInfo (required), GetShardInfo + GetWorkerInfo
@@ -72,7 +88,9 @@ async fn fetch_rpc_data(
 
     let shard_info = match tokio::time::timeout(
         RPC_TIMEOUT,
-        client.get_shard_info(tonic::Request::new(GetShardInfoRequest { include_all: true })),
+        client.get_shard_info(tonic::Request::new(GetShardInfoRequest {
+            include_all: true,
+        })),
     )
     .await
     {
@@ -93,22 +111,59 @@ async fn fetch_rpc_data(
     Ok((node_info, shard_info, worker_info))
 }
 
-/// `fetchData` — full refresh.
+/// Fetch fast node/worker status independently of archive-backed shard sizes.
 pub async fn fetch_data(mut client: Client) -> Msg {
-    match fetch_rpc_data(&mut client).await {
-        Ok((node_info, shard_info, worker_info)) => Msg::DataRefresh {
-            node_info: Some(node_info),
-            shard_info,
-            worker_info,
-            err: None,
-        },
-        Err(e) => Msg::DataRefresh {
-            node_info: None,
-            shard_info: None,
-            worker_info: None,
-            err: Some(e),
-        },
+    let node_info = match tokio::time::timeout(
+        RPC_TIMEOUT,
+        client.get_node_info(tonic::Request::new(GetNodeInfoRequest::default())),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r.into_inner(),
+        result => {
+            return Msg::DataRefresh {
+                node_info: None,
+                shard_info: None,
+                worker_info: None,
+                err: Some(match result {
+                    Ok(Err(e)) => format!("GetNodeInfo: {e}"),
+                    _ => "GetNodeInfo: timed out".into(),
+                }),
+            }
+        }
+    };
+    let worker_info = match tokio::time::timeout(
+        RPC_TIMEOUT,
+        client.get_worker_info(tonic::Request::new(GetWorkerInfoRequest::default())),
+    )
+    .await
+    {
+        Ok(Ok(r)) => Some(r.into_inner()),
+        _ => None,
+    };
+    Msg::DataRefresh {
+        node_info: Some(node_info),
+        shard_info: None,
+        worker_info,
+        err: None,
     }
+}
+
+/// Archive fallback can exceed the fast status deadline. Keep it bounded,
+/// report failure explicitly, and allow node status to refresh meanwhile.
+pub async fn fetch_shards(mut client: Client) -> Msg {
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        client.get_shard_info(tonic::Request::new(GetShardInfoRequest {
+            include_all: true,
+        })),
+    )
+    .await;
+    Msg::ShardRefresh(match result {
+        Ok(Ok(r)) => Ok(r.into_inner()),
+        Ok(Err(e)) => Err(format!("Shard data unavailable: {e}")),
+        Err(_) => Err("Shard data timed out after 60s; retrying".into()),
+    })
 }
 
 /// `getFrameNumber` — current frame from GetShardInfo (the sign frame).

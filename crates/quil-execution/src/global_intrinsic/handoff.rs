@@ -299,6 +299,108 @@ impl CertificateSubmission {
     }
 }
 
+/// Headers a seal submission may carry: its source's app frames from the one
+/// after GLOBAL's executed tip through the sealed checkpoint.
+pub const MAX_DRAIN_HEADERS: usize = 8;
+
+/// A closing certificate and the drain headers GLOBAL needs to accept it.
+///
+/// A seal is accepted only once GLOBAL has executed its source through the
+/// sealed checkpoint. A running session's frames are carried by later ones
+/// when a header misses its lockstep window, but a sealed session produces no
+/// later frame: if its last headers miss their window GLOBAL never executes
+/// them, the seal is refused until the fence (#699). The seal therefore brings
+/// them: canonical app frame headers (`frame_header::FrameHeader` bytes) of the
+/// source, consecutive, from GLOBAL's executed tip + 1 through the checkpoint.
+/// GLOBAL executes them outside the window, without storage audit or rewards,
+/// from [`seal_drain_frame`].
+///
+/// Encoding: a [`CertificateSubmission`], then, when there are drain headers,
+/// `count(u8) ‖ count × bytes`. Without them the bytes are exactly a
+/// [`CertificateSubmission`]'s, which is what GLOBAL records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealSubmission {
+    pub submission: CertificateSubmission,
+    pub drain: Vec<Vec<u8>>,
+}
+
+impl SealSubmission {
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = self.submission.to_canonical_bytes()?;
+        if !self.drain.is_empty() {
+            if self.drain.len() > MAX_DRAIN_HEADERS {
+                return Err(invalid("too many drain headers"));
+            }
+            out.push(self.drain.len() as u8);
+            for header in &self.drain {
+                put_bytes(&mut out, header)?;
+            }
+        }
+        if out.len() > MAX_RECORD_BYTES {
+            return Err(invalid("certificate submission exceeds size limit"));
+        }
+        Ok(out)
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut c = Cursor::new(bytes)?;
+        c.magic(&TYPE_COMMITTEE_HANDOFF.to_be_bytes())?;
+        let seal = Seal::decode(&c.bytes(MAX_RECORD_BYTES)?)?;
+        let certificate = c.bytes(MAX_RECORD_BYTES)?;
+        let mut drain = Vec::new();
+        if !c.is_finished() {
+            let count = usize::from(c.u8()?);
+            if count == 0 || count > MAX_DRAIN_HEADERS {
+                return Err(invalid("drain header count out of range"));
+            }
+            for _ in 0..count {
+                drain.push(c.bytes(MAX_RECORD_BYTES)?);
+            }
+        }
+        c.finish()?;
+        Ok(Self { submission: CertificateSubmission { seal, certificate }, drain })
+    }
+}
+
+/// From this GLOBAL frame a seal submission may carry drain headers
+/// ([`SealSubmission`]); before it one that does is refused, as an older
+/// build would. Consensus-affecting for GLOBAL. Fixed on mainnet;
+/// `QUIL_SEAL_DRAIN_FRAME` elsewhere, never by default.
+pub const MAINNET_SEAL_DRAIN_FRAME: u64 = 865_440;
+
+static SEAL_DRAIN_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SEAL_DRAIN_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn seal_drain_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SEAL_DRAIN_FRAME;
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's seal drain frame from its network, and return it.
+/// Called at startup before any frame is processed; the first call decides.
+pub fn init_seal_drain_frame(network: u8) -> u64 {
+    *SEAL_DRAIN_FRAME.get_or_init(|| seal_drain_frame_for(network, std::env::var("QUIL_SEAL_DRAIN_FRAME").ok().as_deref()))
+}
+
+pub fn seal_drain_frame() -> u64 {
+    if let Some(frame) = SEAL_DRAIN_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *SEAL_DRAIN_FRAME.get_or_init(|| {
+        std::env::var("QUIL_SEAL_DRAIN_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the seal drain frame for the calling thread only (tests).
+pub fn set_seal_drain_frame_for_thread(frame: Option<u64>) {
+    SEAL_DRAIN_OVERRIDE.with(|cell| cell.set(frame));
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Active,
@@ -564,7 +666,8 @@ pub fn initialize(state: &HypergraphState, frame: u64, initial: &Session) -> Res
         // An explicit empty origin identifies trusted initialization. Missing
         // origin records must not silently downgrade a successor to genesis.
         write(state, frame, b"origin", &id, &[])?;
-        set_status(state, frame, &id, 0, None)
+        set_status(state, frame, &id, 0, None)?;
+        record_member_rings(state, frame, &id, initial, &[], false)
     })
 }
 
@@ -756,6 +859,18 @@ pub fn verify_submission(
     frame: u64,
     submission: &CertificateSubmission,
 ) -> Result<Request> {
+    verify_submission_at(state, frame, submission, session_tip(state, &submission.seal.session)?)
+}
+
+/// [`verify_submission`] against `executed`, the source's executed tip once
+/// the submission's drain headers would be executed (the recorded tip when it
+/// carries none): validation checks a drain without writing it.
+pub fn verify_submission_at(
+    state: &impl Records,
+    frame: u64,
+    submission: &CertificateSubmission,
+    executed: Option<Checkpoint>,
+) -> Result<Request> {
     let request = request(state, &submission.seal.request)?
         .ok_or_else(|| invalid("closing certificate has no authorized request"))?;
     if frame <= request.frame {
@@ -797,7 +912,7 @@ pub fn verify_submission(
     // GLOBAL already executed. Such a seal is refused for good; the fence
     // closes the session at its tip.
     let checkpoint = &submission.seal.checkpoint;
-    let drained = match session_tip(state, &submission.seal.session)? {
+    let drained = match executed {
         Some(tip) if tip.frame > checkpoint.frame => {
             return Err(invalid("sealed checkpoint is below the source's executed frames"));
         }
@@ -918,6 +1033,11 @@ fn activate(state: &HypergraphState, frame: u64, request: &Request) -> Result<bo
             write(state, frame, b"origin", &id, &request_id)?;
             write(state, frame, b"genesis-output", &id, &output)?;
             set_status(state, frame, &id, 0, None)?;
+            // A membership successor keeps its cohorts; a shard a split or
+            // merge creates ranks its members by seniority alone.
+            let sources: Vec<Vec<u8>> = request.sources.iter().map(|s| s.filter.clone()).collect();
+            let one_cohort = !sources.iter().all(|filter| *filter == next.filter);
+            record_member_rings(state, frame, &id, &next, &sources, one_cohort)?;
         }
         write(state, frame, b"activated", &request_id, &authorization)?;
         Ok(true)
@@ -991,6 +1111,118 @@ pub fn record_session_rings(state: &HypergraphState, frame: u64, id: &[u8; 32], 
         return Err(invalid("session rings already recorded"));
     }
     write(state, frame, b"rings", id, rings)
+}
+
+/// Whether `submission` can no longer change anything: its request already
+/// activated, its source's seal is recorded, or the source was fenced.
+/// Proposers leave such copies out (every member of a closing committee
+/// submits, and resubmits until its own view shows the seal recorded).
+pub fn submission_settled(state: &impl Records, submission: &CertificateSubmission) -> Result<bool> {
+    let key = seal_key(&submission.seal.request, &submission.seal.session);
+    Ok(read(state, b"activated", &submission.seal.request)?.is_some()
+        || read(state, b"seal", &key)?.is_some()
+        || read(state, b"fence", &key)?.is_some())
+}
+
+/// Whether the committee-handoff flag day ([`LegacyHistory::Discard`]) has
+/// run: ring keys recorded, gridless applications given a root shard and
+/// off-grid allocations moved onto the grid.
+///
+/// [`LegacyHistory::Discard`]: quil_types::consensus::LegacyHistory::Discard
+pub fn flag_day_applied(state: &impl Records) -> Result<bool> {
+    Ok(read(state, b"flag-day", b"legacy-discarded")?.is_some())
+}
+
+/// Record that the flag day ran at `frame`.
+pub fn record_flag_day(state: &HypergraphState, frame: u64) -> Result<()> {
+    write(state, frame, b"flag-day", b"legacy-discarded", &frame.to_be_bytes())
+}
+
+/// A member's prover address and ring key, read from its allocation on the
+/// session's filter or, before a split or merge moves it, on one of the
+/// sources'. A member without an allocation ranks last.
+fn member_ring_key(
+    state: &HypergraphState,
+    member: &[u8],
+    filters: &[&[u8]],
+) -> Result<(Vec<u8>, super::prover_rings::RingKey)> {
+    use crate::global_schema::read_field;
+    let va_disc = vertex_adds_discriminator()?;
+    for filter in filters {
+        let address = super::materialize::allocation_address(member, filter)?;
+        let Some(blob) = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc)? else { continue };
+        if blob.is_empty() {
+            continue;
+        }
+        let allocation = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+        let Some(prover) = read_field(&allocation, "allocation:ProverAllocation", "Prover") else { continue };
+        if let Some(key) = super::prover_rings::read_key(&allocation) {
+            return Ok((prover, key));
+        }
+        let u64_of = |tree: &quil_tries::VectorCommitmentTree, class: &str, field: &str| {
+            read_field(tree, class, field)
+                .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
+                .map_or(0, u64::from_be_bytes)
+        };
+        let seniority = state
+            .get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover, &va_disc)?
+            .map(|blob| crate::prover_registry::rebuild_vertex_tree_from_blob(&blob))
+            .map_or(0, |tree| u64_of(&tree, "prover:Prover", "Seniority"));
+        let confirmed = u64_of(&allocation, "allocation:ProverAllocation", "JoinConfirmFrameNumber");
+        return Ok((prover, super::prover_rings::preexisting(confirmed, seniority)));
+    }
+    Ok((member.to_vec(), super::prover_rings::RingKey { cohort: u64::MAX, seniority: 0 }))
+}
+
+/// Under the seniority ring rule, a new session's rings are fixed when it is
+/// created (`prover_rings`), from its members' allocations on its filter or on
+/// `sources`' filters. A session a split or merge creates (`one_cohort`)
+/// ranks its members by seniority alone. Each member's allocation also records
+/// its ring, so a split's reassignment carries it to the child.
+fn record_member_rings(
+    state: &HypergraphState,
+    frame: u64,
+    id: &[u8; 32],
+    created: &Session,
+    sources: &[Vec<u8>],
+    one_cohort: bool,
+) -> Result<()> {
+    if !super::prover_rings::governs(frame) {
+        return Ok(());
+    }
+    let mut filters: Vec<&[u8]> = vec![created.filter.as_slice()];
+    filters.extend(sources.iter().map(Vec::as_slice).filter(|f| *f != created.filter.as_slice()));
+    let keyed = created
+        .members
+        .iter()
+        .map(|member| member_ring_key(state, member, &filters))
+        .collect::<Result<Vec<_>>>()?;
+    let ranked: Vec<(&[u8], super::prover_rings::RingKey)> =
+        keyed.iter().map(|(address, key)| (address.as_slice(), *key)).collect();
+    let rings = super::prover_rings::assign(&ranked, one_cohort);
+    record_session_rings(state, frame, id, &rings)?;
+    let va_disc = vertex_adds_discriminator()?;
+    for (member, ring) in created.members.iter().zip(&rings) {
+        for filter in &filters {
+            let address = super::materialize::allocation_address(member, filter)?;
+            let Some(blob) = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc)? else { continue };
+            if blob.is_empty() {
+                continue;
+            }
+            let mut allocation = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+            if crate::global_schema::read_field(&allocation, "allocation:ProverAllocation", "Ring").as_deref()
+                != Some(&[*ring][..])
+            {
+                crate::global_schema::write_field(&mut allocation, "allocation:ProverAllocation", "Ring", &[*ring])?;
+                state.set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc, frame,
+                    crate::prover_registry::vertex_tree_to_blob(&allocation),
+                )?;
+            }
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[path = "handoff_history.rs"]

@@ -349,6 +349,54 @@ fn selected_parent_proposal_and_vote_use_executed_state_without_publishing_it() 
     );
 }
 
+// After the split at 837360 each proposal for 837364 validated the same 36
+// refused messages again: proposals validate a private copy of the mempool,
+// and the public pool keeps what they refuse.
+#[test]
+fn a_refusal_in_one_proposal_spares_the_next_on_the_same_parent() {
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let context = rig.context(&parent);
+    let confirm = quil_execution::global_intrinsic::ProverConfirm {
+        filter: Vec::new(),
+        // Signed far outside the inclusion epoch.
+        frame_number: 10_000_000,
+        public_key_signature_bls48581: Some(quil_execution::global_intrinsic::AddressedSignature {
+            signature: vec![0; quil_execution::global_intrinsic::AddressedSignature::SIG_LEN_SINGLE],
+            address: vec![9; 32],
+        }),
+        filters: vec![vec![1; 32]],
+        leaf_roots: Vec::new(),
+    };
+    let bundle = quil_types::proto::global::MessageBundle {
+        requests: vec![quil_types::proto::global::MessageRequest {
+            request: Some(quil_types::proto::global::message_request::Request::Confirm(
+                quil_execution::global_intrinsic::conversions::prover_confirm_to_proto(&confirm),
+            )),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let once = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&bundle).unwrap();
+    let decoded = crate::consensus_wire::decode_message_bundle(&once).unwrap();
+    let raw = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&decoded).unwrap();
+    assert_eq!(raw, once, "a canonical bundle reaches validation");
+    assert!(rig.collector.add_message(1, raw.clone()));
+    for proposal in 0..2 {
+        let lease = rig
+            .executor
+            .prepare(context, 1, &rig.blocks, &rig.verifier, true)
+            .unwrap();
+        let state = lease.prove(&[]).unwrap();
+        assert!(state.state.messages.is_empty());
+        let reason = rig.leader.refused_message(&raw).expect("the branch's refusal is the node's");
+        assert!(reason.contains("inclusion epoch"), "{reason}");
+        assert_eq!(rig.leader.refusals_reused(), proposal, "validated only by the first proposal");
+    }
+    assert_eq!(rig.collector.total_pending(), 1, "the public pool keeps it");
+}
+
 #[test]
 fn selected_parent_rejects_context_ancestry_body_and_state_substitution() {
     let rig = Rig::new();
@@ -397,8 +445,81 @@ fn selected_parent_rejects_context_ancestry_body_and_state_substitution() {
             .executor
             .prepare(context, 1, &rig.blocks, &rig.verifier, false)
             .is_ok());
+        // That attempt authenticated the real parent; the next substitution
+        // must be read to be rejected.
+        rig.executor.forget_authenticated_ancestors();
     }
+    // Once authenticated, the parent is used as it is: a substituted body
+    // at its identity is never read.
+    assert!(rig.executor.prepare(context, 1, &rig.blocks, &rig.verifier, false).is_ok());
+    let mut bad = parent.clone();
+    bad.requests.clear();
+    let blocks = BlockStore::new();
+    blocks.put(context.parent, crate::consensus_wire::encode_global_frame(&bad).unwrap());
+    assert!(rig.executor.prepare(context, 1, &blocks, &rig.verifier, false).is_ok());
     assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
+}
+
+/// A leader waits out its interval pacing before preparing a proposal, so it
+/// does not hold the execution lease through it: the wait runs until the
+/// selected parent's timestamp, at most one interval.
+#[test]
+fn proposal_pacing_runs_until_the_parent_timestamp_and_no_longer_than_an_interval() {
+    use quil_cw_consensus::adapters::GlobalProposer as _;
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    let seam = rig.seam(&parent);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let pacing = |timestamp: i64| {
+        let mut paced = parent.clone();
+        paced.header.as_mut().unwrap().timestamp = timestamp;
+        rig.put(&paced);
+        seam.proposal_pacing(rig.context(&paced))
+    };
+    let wait = pacing(now_ms + 5_000).expect("a parent five seconds ahead");
+    assert!(wait > std::time::Duration::from_millis(4_000) && wait <= std::time::Duration::from_millis(5_000), "{wait:?}");
+    assert_eq!(pacing(now_ms + 60_000), Some(std::time::Duration::from_millis(10_000)), "one interval at most");
+    assert_eq!(pacing(now_ms - 1_000), None, "a parent in the past needs none");
+    assert_eq!(crate::leader_provider::proposal_pacing_wait(0, 5), std::time::Duration::ZERO);
+}
+
+/// A voter whose own execution is busy (a proposal, verification or
+/// publication holds the lease, or the materializer holds the frame lock)
+/// defers instead of rejecting, then votes on the same proposal once free.
+/// A proposal that fails its checks is still rejected at once.
+#[test]
+fn a_busy_voter_defers_and_then_votes_on_the_same_proposal() {
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&parent).unwrap();
+    let context = rig.context(&parent);
+    let child = state_frame(&expected.source, 2, context.view, context.parent);
+    let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
+    let seam = rig.seam(&parent);
+
+    let lease = rig.executor.prepare(context, 1, &rig.blocks, &rig.verifier, false).unwrap();
+    assert!(rig.executor.busy());
+    assert!(seam.verify_or_defer(context, id(&child), Some(encoded.clone())).is_err());
+    assert!(!seam.verify_with_context(context, id(&child), Some(encoded.clone())), "no deferral: no vote");
+    drop(lease);
+
+    let frame_lock = rig.source.frame_execution.lock().unwrap();
+    assert!(rig.executor.busy());
+    assert!(seam.verify_or_defer(context, id(&child), Some(encoded.clone())).is_err());
+    drop(frame_lock);
+
+    assert!(!rig.executor.busy());
+    let mut bad = child.clone();
+    bad.header.as_mut().unwrap().frame_number += 1;
+    let bad_bytes = crate::consensus_wire::encode_global_frame(&bad).unwrap();
+    assert_eq!(seam.verify_or_defer(context, id(&bad), Some(bad_bytes)), Ok(false));
+    assert_eq!(seam.verify_or_defer(context, id(&child), Some(encoded)), Ok(true));
+    assert!(!rig.executor.busy(), "a vote releases the lease");
 }
 
 #[test]

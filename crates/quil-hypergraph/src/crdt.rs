@@ -42,6 +42,48 @@ pub use crate::snapshot::{GenerationHandle, SnapshotManager};
 
 /// `(set_type, phase_type)` string pair for each phase index (0..4), matching
 /// the store's keying and `quil_forest::PHASES` order.
+/// The CRDT's commit lock, counting releases: a view captured while holding
+/// it is current for as long as nobody has released it since, which lets new
+/// wallet scans share one snapshot until the next commit.
+#[derive(Default)]
+pub(crate) struct CommitLock {
+    inner: std::sync::Mutex<()>,
+    releases: AtomicU64,
+}
+
+/// A held [`CommitLock`]; its release is counted before the lock is free.
+pub(crate) struct CommitGuard<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+    releases: Option<&'a AtomicU64>,
+}
+
+impl Drop for CommitGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(releases) = self.releases {
+            releases.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl CommitLock {
+    /// Take the lock; its release counts as a commit.
+    pub(crate) fn lock(&self) -> std::result::Result<CommitGuard<'_>, ()> {
+        let guard = self.inner.lock().map_err(|_| ())?;
+        Ok(CommitGuard { _guard: guard, releases: Some(&self.releases) })
+    }
+
+    /// Take the lock to read only; its release is not counted.
+    fn lock_to_read(&self) -> std::result::Result<CommitGuard<'_>, ()> {
+        let guard = self.inner.lock().map_err(|_| ())?;
+        Ok(CommitGuard { _guard: guard, releases: None })
+    }
+
+    /// Counted releases so far.
+    fn releases(&self) -> u64 {
+        self.releases.load(Ordering::SeqCst)
+    }
+}
+
 const PHASE_STR: [(&str, &str); 4] = [
     ("vertex", "adds"),
     ("vertex", "removes"),
@@ -52,7 +94,9 @@ const PHASE_STR: [(&str, &str); 4] = [
 /// Bound the readable data held by one sync write batch. A large bootstrap
 /// commits several batches, each with its leaves and blobs in one transaction.
 pub const MAX_SYNC_CHUNK_BYTES: usize = 64 * 1024 * 1024;
-pub const MAX_SYNC_CHUNK_LEAVES: usize = 256;
+/// Four batched blob reads' worth, fetched in flight together: at 256 a
+/// multi-million-leaf bootstrap waited out one round trip per 256 leaves.
+pub const MAX_SYNC_CHUNK_LEAVES: usize = 1024;
 
 /// Committed phase roots and a database snapshot captured under the same commit
 /// lock. Metadata (cursor, outgoing history) must be read from this handle, not
@@ -77,11 +121,29 @@ pub struct ForestSyncPlan {
     // versions remain available; the new version stores an absent/empty blob.
     leaves: Vec<([u8; 32], Option<Vec<u8>>)>,
     next: usize,
+    /// A pinned GLOBAL add phase: leaves absent from the source are removed.
+    removals: bool,
 }
 
 impl ForestSyncPlan {
     pub fn remaining(&self) -> &[([u8; 32], Option<Vec<u8>>)] { &self.leaves[self.next..] }
     pub fn target_root(&self) -> [u8; 32] { self.target_root }
+}
+
+/// The local tree moved under a sync in progress (see
+/// [`HypergraphCrdt::rebase_phase_sync`]).
+pub const SYNC_PHASE_ADVANCED: &str = "sync phase advanced";
+/// Local writes were staged but not yet committed when a chunk was installed.
+pub const SYNC_STAGED_WRITES: &str = "sync phase has staged local writes";
+
+/// Whether `error` reports that the local tree moved under a sync.
+pub fn sync_phase_advanced(error: &QuilError) -> bool {
+    matches!(error, QuilError::ExecutionUnavailable(m) if m.starts_with(SYNC_PHASE_ADVANCED))
+}
+
+/// Whether `error` reports staged, uncommitted local writes in the way.
+pub fn sync_staged_writes(error: &QuilError) -> bool {
+    matches!(error, QuilError::ExecutionUnavailable(m) if m.starts_with(SYNC_STAGED_WRITES))
 }
 
 /// Tombstones carry the removed blob's size, but store an empty blob. The
@@ -341,7 +403,7 @@ pub struct HypergraphCrdt {
     /// Covered nibble prefix (address gating). Empty = accept all.
     covered_prefix: RwLock<Vec<i32>>,
     /// Serializes mutation batches, commits and coordinated forest updates.
-    commit_lock: std::sync::Mutex<()>,
+    commit_lock: CommitLock,
     /// UNIFIED-APP-TREE mode. When set,
     /// every app commits ALL its vertices into ONE L3 tree per phase keyed by the
     /// app address (leaves raw-key positioned), so a shard is the in-place subtree
@@ -471,7 +533,7 @@ impl HypergraphCrdt {
             snapshot_mgr: SnapshotManager::new(),
             local_vertex_observer: RwLock::new(None),
             covered_prefix: RwLock::new(Vec::new()),
-            commit_lock: std::sync::Mutex::new(()),
+            commit_lock: CommitLock::default(),
             unified_tree: AtomicBool::new(false),
         }
     }
@@ -2541,7 +2603,7 @@ impl HypergraphCrdt {
     /// Authenticate and preview a sync before downloading its readable blobs.
     /// Remote reads and reconstruction do not hold the materializer's write
     /// lock. Each later chunk rechecks the local version under that lock.
-    pub fn prepare_phase_sync<S: quil_forest::TreeReader>(
+    pub fn prepare_phase_sync<S: quil_forest::BatchTreeReader>(
         &self,
         source: &S,
         source_version: u64,
@@ -2602,18 +2664,79 @@ impl HypergraphCrdt {
         } else {
             let version = base_version.map_or(Some(0), |v| v.checked_add(1))
                 .ok_or_else(|| QuilError::Internal("sync version overflow".into()))?;
-            // Drop the prepared batch without publishing it. The complete
-            // result, including any GLOBAL removals, must match before writes.
-            forest.stage_synced_phase(shard_id, PHASES[phase_idx], version,
-                leaves.iter().map(|(key, value)| (quil_forest::KeyHash(*key), value.clone())),
-                bit_path, Some(target_root))
+            // Verify the complete result, including GLOBAL removals, without
+            // building a whole-tree database batch before bounded installation.
+            forest.preview_synced_phase(shard_id, PHASES[phase_idx], version,
+                &leaves, bit_path, target_root)
                 .map_err(|e| QuilError::Internal(format!("sync phase {phase_idx} reconstruction: {e}")))?;
         }
         Ok(ForestSyncPlan {
             store: self.store.clone(), shard_id: shard_id.to_vec(), phase_idx,
             bit_path: bit_path.to_vec(), base_version, target_root, repair_existing,
             leaves, next: 0,
+            removals: phase_idx % 2 == 0 && shard_id == [0xff; 32] && bit_path.is_empty() && anchor.is_some(),
         })
+    }
+
+    /// Bring a sync up to date after the local tree moved under it, without
+    /// reading the source again. A regular node commits GLOBAL frame messages
+    /// itself every few minutes, and a cold prover-tree download takes longer
+    /// than that, so the download used to be thrown away each time.
+    ///
+    /// The source tree is fixed, and every key outside the plan held the
+    /// source's value at the plan's base version (only planned keys are ever
+    /// written by the sync). So a key the local commits changed is put back to
+    /// its base value unless the plan targets it, and every planned key not
+    /// already at its target (including one a local commit overwrote) is
+    /// installed again. A key the local commits created that the source lacks
+    /// can be removed only where the plan removes keys; elsewhere the sync
+    /// fails as before. The final root check still decides. Returns the
+    /// leaves left to install.
+    pub fn rebase_phase_sync(&self, plan: &mut ForestSyncPlan) -> Result<usize> {
+        use quil_forest::TreeReader as _;
+        if !Arc::ptr_eq(&self.store, &plan.store) {
+            return Err(QuilError::InvalidArgument("sync plan belongs to another store".into()));
+        }
+        let forest = self.forest.read().unwrap();
+        let current = self.resolve_phase_version_with(&forest, &plan.shard_id, plan.phase_idx);
+        let (Some(base), Some(now)) = (plan.base_version, current) else {
+            return Err(QuilError::ExecutionUnavailable(format!(
+                "{SYNC_PHASE_ADVANCED} from an empty tree; retry"
+            )));
+        };
+        if now == base {
+            return Ok(plan.remaining().len());
+        }
+        let reader = forest.shard_phase_reader(&plan.shard_id, PHASES[plan.phase_idx]);
+        let (changed, _) = quil_forest::diff_leaves_under_prefix(&reader, now, &reader, base, &plan.bit_path, None)
+            .map_err(|e| QuilError::Internal(format!("local sync rebase diff: {e}")))?;
+        let mut target: std::collections::BTreeMap<[u8; 32], Option<Vec<u8>>> =
+            std::mem::take(&mut plan.leaves).into_iter().collect();
+        for (key, _) in changed {
+            if target.contains_key(&key.0) {
+                continue;
+            }
+            let at_base = reader.get_value_option(base, key)
+                .map_err(|e| QuilError::Internal(format!("local sync rebase read: {e}")))?;
+            if at_base.is_none() && !plan.removals {
+                return Err(QuilError::ExecutionUnavailable(format!(
+                    "{SYNC_PHASE_ADVANCED} with a key the source lacks; retry"
+                )));
+            }
+            target.insert(key.0, at_base);
+        }
+        let mut remaining = Vec::new();
+        for (key, want) in target {
+            let have = reader.get_value_option(now, quil_forest::KeyHash(key))
+                .map_err(|e| QuilError::Internal(format!("local sync rebase read: {e}")))?;
+            if have != want {
+                remaining.push((key, want));
+            }
+        }
+        plan.leaves = remaining;
+        plan.next = 0;
+        plan.base_version = Some(now);
+        Ok(plan.leaves.len())
     }
 
     /// Install the next leaves and their verified blobs in one transaction.
@@ -2643,12 +2766,12 @@ impl HypergraphCrdt {
         let forest = self.forest.read().unwrap();
         let current = self.resolve_phase_version_with(&forest, &plan.shard_id, plan.phase_idx);
         if current != plan.base_version {
-            return Err(QuilError::ExecutionUnavailable("sync phase advanced during download; retry".into()));
+            return Err(QuilError::ExecutionUnavailable(format!("{SYNC_PHASE_ADVANCED} during download; retry")));
         }
         let app: [u8; 32] = plan.shard_id[..32].try_into().unwrap();
         let shard = ShardKey { l1: crate::addressing::get_bloom_filter_indices(&app, 256, 3), l2: app };
         if self.pending.read().unwrap().get(&(shard.clone(), plan.phase_idx)).is_some_and(|m| !m.is_empty()) {
-            return Err(QuilError::ExecutionUnavailable("sync phase has staged local writes; retry".into()));
+            return Err(QuilError::ExecutionUnavailable(format!("{SYNC_STAGED_WRITES}; retry")));
         }
         let version = current.map_or(Some(0), |v| v.checked_add(1))
             .ok_or_else(|| QuilError::Internal("sync version overflow".into()))?;
@@ -2694,7 +2817,7 @@ impl HypergraphCrdt {
         let forest = self.forest.read().unwrap();
         let current = self.resolve_phase_version_with(&forest, &plan.shard_id, plan.phase_idx);
         if current != plan.base_version {
-            return Err(QuilError::ExecutionUnavailable("sync phase advanced before completion; retry".into()));
+            return Err(QuilError::ExecutionUnavailable(format!("{SYNC_PHASE_ADVANCED} before completion; retry")));
         }
         let root = forest.app_subtree_root(&plan.shard_id, PHASES[plan.phase_idx], current.unwrap_or(0), &plan.bit_path)
             .map_err(|e| QuilError::Internal(format!("synced root: {e}")))?;
@@ -2857,7 +2980,7 @@ impl HypergraphCrdt {
     /// apply: if a commit advanced this phase in between, the diff's leaves are
     /// stale and the apply is aborted for the caller to retry — so an expensive
     /// full-tree diff can never block the global-frame materializer.
-    pub fn sync_shard_phase_from<S: quil_forest::TreeReader>(
+    pub fn sync_shard_phase_from<S: quil_forest::BatchTreeReader>(
         &self,
         source: &S,
         source_version: u64,
@@ -2938,7 +3061,7 @@ impl HypergraphCrdt {
     /// thus stores only its subtree yet holds a commitment that composes to the
     /// global app root — never pulling the whole app. Empty `bit_path` ==
     /// [`sync_shard_phase_from`] over the whole app tree.
-    pub fn sync_shard_subtree_phase_from<S: quil_forest::TreeReader>(
+    pub fn sync_shard_subtree_phase_from<S: quil_forest::BatchTreeReader>(
         &self,
         source: &S,
         source_version: u64,
@@ -3248,8 +3371,7 @@ impl HypergraphCrdt {
         if phase_idx >= 4 {
             return None;
         }
-        let (set, phase) = PHASE_STR[phase_idx];
-        if let Some(indexed) = self.store.get_root_version(set, phase, shard_id, &root).ok().flatten() {
+        if let Some(indexed) = self.indexed_root_version(shard_id, phase_idx, &root) {
             return Some(indexed);
         }
         if !self.unified_tree() || shard_id.len() <= 32 {
@@ -3281,7 +3403,34 @@ impl HypergraphCrdt {
     /// `root` — committed here or indexed after a verified sync — so a proof
     /// against it can be served.
     pub fn global_root_available(&self, root: &[u8; 32]) -> Result<bool> {
-        Ok(self.store.get_root_version("vertex", "adds", &[0xff; 32], root)?.is_some())
+        Ok(self.indexed_root_version(&[0xff; 32], 0, root).is_some())
+    }
+
+    /// The indexed `(version, global_frame)` of `root`, only while the tree at
+    /// that version still has that root. An index entry outlives its tree when
+    /// a reset clears the tree without clearing the index (mainnet's prover-tree
+    /// resets at 747,000, 754,000 and 759,000 ran on builds that kept it), and
+    /// a rebuilt tree may reuse the version for a different root. Answering
+    /// with such an entry named a version no sync could read ("missing source
+    /// for the pinned header root"); the caller is told the root is
+    /// unavailable instead.
+    fn indexed_root_version(&self, shard_id: &[u8], phase_idx: usize, root: &[u8; 32]) -> Option<(u64, u64)> {
+        let (set, phase) = PHASE_STR.get(phase_idx)?;
+        let (version, frame) = self.store.get_root_version(set, phase, shard_id, root).ok().flatten()?;
+        let forest = self.forest.read().ok()?;
+        match forest.shard_phase_root(shard_id, PHASES[phase_idx], version) {
+            Ok(Some(found)) if found == *root => Some((version, frame)),
+            _ => {
+                tracing::debug!(
+                    shard = %hex::encode(&shard_id[..shard_id.len().min(8)]),
+                    phase = phase_idx,
+                    version,
+                    root = %hex::encode(root),
+                    "root index names a version whose tree no longer has that root; unavailable",
+                );
+                None
+            }
+        }
     }
 
     /// Prove one GLOBAL vertex against a retained root, using the blob from
@@ -3566,6 +3715,30 @@ impl HypergraphCrdt {
             .serve_value(shard_id, PHASES[phase_idx], version, key_hash)
             .ok()
             .flatten()
+    }
+
+    /// Forest-sync SERVER: leaves of a shard/phase tree in `[first, last]`
+    /// after `after` at `version`, in key order (see
+    /// [`quil_forest::Forest::serve_leaves`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn serve_forest_leaves(
+        &self,
+        shard_id: &[u8],
+        phase_idx: usize,
+        version: u64,
+        first: &[u8; 32],
+        last: &[u8; 32],
+        after: Option<&[u8; 32]>,
+        max_leaves: usize,
+        max_bytes: usize,
+    ) -> Option<(Vec<([u8; 32], Vec<u8>)>, bool)> {
+        if phase_idx >= 4 {
+            return None;
+        }
+        let (leaves, more) = self.forest.read().unwrap()
+            .serve_leaves(shard_id, PHASES[phase_idx], version, first, last, after, max_leaves, max_bytes)
+            .ok()?;
+        Some((leaves.into_iter().map(|(key, value)| (key.0, value)).collect(), more))
     }
 
     pub fn invalidate_domain_shard_commit(&self, frame_number: u64, app_address: &[u8]) -> Result<()> {
@@ -3891,16 +4064,27 @@ impl HypergraphCrdt {
     /// historical root publication. A boot-time prover snapshot may remain the
     /// latest published generation while application coins keep changing.
     /// Continuations still use their exact retained identity, never a new view.
+    /// A scan started with no commit since the last capture shares that
+    /// snapshot (it is the current state), so an archive serving every wallet
+    /// no longer takes the commit lock and pins a store snapshot per scan.
     pub fn acquire_or_capture_scan_snapshot(&self, id: Option<&[u8; 32]>) -> Result<Option<GenerationHandle>> {
         if id.is_some() {
             return Ok(self.snapshot_mgr.acquire_scan(id));
         }
-        let _guard = self.commit_lock.lock().map_err(|_| {
+        if let Some(shared) = self.snapshot_mgr.current_scan(self.commit_lock.releases()) {
+            return Ok(Some(shared));
+        }
+        let _guard = self.commit_lock.lock_to_read().map_err(|_| {
             QuilError::ExecutionUnavailable("scan snapshot commit lock poisoned".into())
         })?;
+        // Another scan may have captured while this one waited for the lock.
+        let releases = self.commit_lock.releases();
+        if let Some(shared) = self.snapshot_mgr.current_scan(releases) {
+            return Ok(Some(shared));
+        }
         Ok(match self.store.capture_tree_snapshot()? {
-            Some(snapshot) => self.snapshot_mgr.publish_scan_only(
-                self.forest_version.load(Ordering::SeqCst), snapshot,
+            Some(snapshot) => self.snapshot_mgr.publish_current_scan(
+                self.forest_version.load(Ordering::SeqCst), snapshot, releases,
             ),
             None => None,
         })

@@ -30,6 +30,10 @@ pub trait WorkerManager: Send + Sync {
     fn deallocate_worker(&self, core_id: u32) -> Result<()>;
     fn check_workers_connected(&self) -> Result<Vec<u32>>;
     fn range_workers(&self) -> Result<Vec<WorkerInfo>>;
+    /// Filter-bound local execution observations; unsupported managers return none.
+    fn worker_execution(&self) -> Vec<(u32, Vec<u8>, quil_types::proto::node::WorkerExecution)> {
+        Vec::new()
+    }
     fn respawn_worker(&self, core_id: u32, filter: &[u8]) -> Result<()>;
 
     /// Record the frame at which a join proposal was submitted for this

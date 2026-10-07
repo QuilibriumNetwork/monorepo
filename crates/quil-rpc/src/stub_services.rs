@@ -255,6 +255,16 @@ impl AppShardService for AppShardRpcServer {
         }))
     }
 
+    async fn list_shard_legacy_coins(
+        &self,
+        request: Request<global::ListLegacyCoinsRequest>,
+    ) -> Result<Response<global::ListLegacyCoinsResponse>, Status> {
+        let (domain, owner, after) = crate::node_service::legacy_coins_request(request.into_inner())?;
+        let page = self.reads.legacy_coins_local(domain, owner, after).await?
+            .ok_or_else(|| Status::unavailable("this node keeps no complete legacy coin index"))?;
+        Ok(Response::new(crate::node_service::legacy_coins_response(page, after)?))
+    }
+
     async fn list_shard_escrows(
         &self,
         request: Request<global::ListShardCoinsRequest>,

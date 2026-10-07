@@ -387,41 +387,18 @@ impl RocksHypergraphStore {
     where
         F: FnMut(Vec<u8>, Vec<u8>),
     {
-        use std::collections::{HashMap, HashSet};
-        // v2 (versioned): accumulate the max-version blob per vertex_key. Keys
-        // interleave across variable-length vertex keys, so use a map rather
-        // than assume per-key contiguity.
+        use std::collections::HashSet;
+        // v2 (versioned): the newest blob of each vertex.
         let v2_prefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix(
             set_type, phase_type, shard_key,
         );
-        let mut latest: HashMap<Vec<u8>, (u64, Vec<u8>)> = HashMap::new();
-        for entry in self
-            .db
-            .iterator(rocksdb::IteratorMode::From(&v2_prefix, rocksdb::Direction::Forward))
-        {
-            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
-            if !k.starts_with(&v2_prefix) {
-                break;
-            }
-            if k.len() < v2_prefix.len() + 8 {
-                continue;
-            }
-            let vk = k[v2_prefix.len()..k.len() - 8].to_vec();
-            let ver = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
-            match latest.get_mut(&vk) {
-                Some((mv, mb)) if ver > *mv => {
-                    *mv = ver;
-                    *mb = v.into_vec();
-                }
-                Some(_) => {}
-                None => {
-                    latest.insert(vk, (ver, v.into_vec()));
-                }
-            }
-        }
+        let latest = match self.newest_v2_blobs(&v2_prefix)? {
+            Some(latest) => latest,
+            None => self.newest_v2_blobs_general(&v2_prefix)?,
+        };
         let mut count = 0usize;
         let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(latest.len());
-        for (vk, (_ver, blob)) in latest {
+        for (vk, blob) in latest {
             seen.insert(vk.clone());
             callback(vk, blob);
             count += 1;
@@ -449,6 +426,7 @@ impl RocksHypergraphStore {
         }
         Ok(count)
     }
+
 
     /// Greatest MVCC version of any blob in the **v2** keyspace of one
     /// `(set, phase, shard)`, or `None` when it holds none. Reads are of the
@@ -1292,6 +1270,84 @@ mod tests {
     use super::*;
     use crate::rocksdb_store::RocksDb;
     use tempfile::TempDir;
+
+    /// The vertex walk against the general walk over a shard whose vertices
+    /// carry many versions, as frequently rewritten allocations do.
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_vertex_walk_over_versions() {
+        let db = RocksDb::open_in_memory().unwrap();
+        let store = RocksHypergraphStore::new(db.inner());
+        let shard = ShardKey { l1: [1, 2, 3], l2: [0xff; 32] };
+        let blob = vec![7u8; 600];
+        for (vertices, versions) in [(20_000usize, 1u64), (5_000, 100)] {
+            let shard = ShardKey { l1: [versions as u8, 0, 0], ..shard };
+            for n in 0..vertices {
+                let vertex = [(n as u64).to_be_bytes().repeat(8)].concat();
+                for version in 0..versions {
+                    let key = crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard, &vertex, version);
+                    db.inner().put(key, &blob).unwrap();
+                }
+            }
+            let prefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "adds", &shard);
+            let started = std::time::Instant::now();
+            let general = store.newest_v2_blobs_general(&prefix).unwrap().len();
+            let general_time = started.elapsed();
+            let started = std::time::Instant::now();
+            let fast = store.newest_v2_blobs(&prefix).unwrap().unwrap().len();
+            eprintln!("{vertices} vertices x {versions} versions: general {general_time:?} ({general}), newest-only {:?} ({fast})",
+                started.elapsed());
+        }
+    }
+
+    /// The vertex walk yields each vertex's newest version, the same set the
+    /// general map-based walk yields, whether a vertex has one version or
+    /// hundreds, and falls back to that walk when key lengths differ.
+    #[test]
+    fn the_vertex_walk_yields_each_vertex_newest_version() {
+        let db = RocksDb::open_in_memory().unwrap();
+        let store = RocksHypergraphStore::new(db.inner());
+        let shard = ShardKey { l1: [1, 2, 3], l2: [0xff; 32] };
+        let put = |vertex: &[u8], version: u64, blob: &[u8]| {
+            let key = crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard, vertex, version);
+            db.inner().put(key, blob).unwrap();
+        };
+        let collect = |store: &RocksHypergraphStore| {
+            let mut seen = Vec::new();
+            store.for_each_vertex_underlying("vertex", "adds", &shard, |vk, blob| seen.push((vk, blob))).unwrap();
+            seen.sort();
+            seen
+        };
+        let vertex = |n: u8| [[n; 32], [n.wrapping_add(1); 32]].concat();
+        for n in 0u8..40 {
+            let versions = match n % 4 { 0 => 1, 1 => 3, 2 => 4, _ => 300 };
+            for version in 0..versions {
+                put(&vertex(n), 1000 + version * 7, format!("{n}-{version}").as_bytes());
+            }
+        }
+        let prefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "adds", &shard);
+        let fast = store.newest_v2_blobs(&prefix).unwrap().expect("uniform key lengths");
+        let mut general = store.newest_v2_blobs_general(&prefix).unwrap();
+        general.sort();
+        let mut fast_sorted = fast.clone();
+        fast_sorted.sort();
+        assert_eq!(fast_sorted, general);
+        assert_eq!(fast.len(), 40);
+        let walked = collect(&store);
+        assert_eq!(walked.len(), 40);
+        for (vk, blob) in &walked {
+            let n = vk[0];
+            let versions = match n % 4 { 0 => 1, 1 => 3, 2 => 4, _ => 300 };
+            assert_eq!(blob, &format!("{n}-{}", versions - 1).into_bytes(), "vertex {n}");
+        }
+
+        // A key of another length: the general walk, same answer.
+        put(&[9u8; 40], 5, b"odd");
+        assert!(store.newest_v2_blobs(&prefix).unwrap().is_none());
+        let walked = collect(&store);
+        assert_eq!(walked.len(), 41);
+        assert!(walked.contains(&(vec![9u8; 40], b"odd".to_vec())));
+    }
 
     #[test]
     fn committed_shard_checkpoint_excludes_staging_and_survives_failed_commit_and_reopen() {

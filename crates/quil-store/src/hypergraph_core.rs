@@ -3,6 +3,99 @@
 macro_rules! impl_hypergraph_storage {
     ($store:ty, $txn:ty) => {
         impl $store {
+            /// The newest blob of every vertex under a v2 shard prefix, when every
+            /// vertex key there has one length: keys are `prefix ‖ vertex ‖ version
+            /// (8, BE)`, so a vertex's versions are adjacent and ascending. Only the
+            /// newest blob is kept, and a vertex with many versions is left by seeking
+            /// to its newest instead of reading each (allocations are rewritten often,
+            /// and the walk otherwise read every retained version). `None` when key
+            /// lengths differ, where versions can interleave; see
+            /// [`Self::newest_v2_blobs_general`]. Shared by both backends: on the
+            /// execution overlay every cursor step is a fresh seek, so the per-version
+            /// walk cost one counted read per retained version (9M on mainnet's GLOBAL
+            /// prover shard by 865,000).
+            fn newest_v2_blobs(&self, prefix: &[u8]) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
+                const READ_BEFORE_SEEK: usize = 4;
+                let mut it = self.db.raw_iterator();
+                it.seek(prefix);
+                let mut out = Vec::new();
+                let mut key_len: Option<usize> = None;
+                while let Some(key) = it.key() {
+                    if !key.starts_with(prefix) {
+                        break;
+                    }
+                    if key.len() < prefix.len() + 8 {
+                        it.next();
+                        continue;
+                    }
+                    if *key_len.get_or_insert(key.len()) != key.len() {
+                        return Ok(None);
+                    }
+                    let len = key.len();
+                    let vertex_prefix = key[..len - 8].to_vec();
+                    let mut newest = Vec::new();
+                    let mut read = 0usize;
+                    loop {
+                        newest.clear();
+                        newest.extend_from_slice(it.value().unwrap_or_default());
+                        read += 1;
+                        it.next();
+                        let same = it.key().is_some_and(|k| k.len() == len && k.starts_with(&vertex_prefix));
+                        if !same {
+                            break;
+                        }
+                        if read >= READ_BEFORE_SEEK {
+                            let mut last = vertex_prefix.clone();
+                            last.extend_from_slice(&[0xFF; 8]);
+                            it.seek_for_prev(&last);
+                            if !it.key().is_some_and(|k| k.len() == len && k.starts_with(&vertex_prefix)) {
+                                return Ok(None);
+                            }
+                            newest.clear();
+                            newest.extend_from_slice(it.value().unwrap_or_default());
+                            it.next();
+                            break;
+                        }
+                    }
+                    out.push((vertex_prefix[prefix.len()..].to_vec(), newest));
+                }
+                it.status().map_err(|e| QuilError::Store(e.to_string()))?;
+                Ok(Some(out))
+            }
+
+            /// [`Self::newest_v2_blobs`] for any key lengths: the max-version blob per
+            /// vertex, accumulated in a map because keys of different lengths can
+            /// interleave.
+            fn newest_v2_blobs_general(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+                use std::collections::HashMap;
+                let mut latest: HashMap<Vec<u8>, (u64, Vec<u8>)> = HashMap::new();
+                for entry in self
+                    .db
+                    .iterator(rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward))
+                {
+                    let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
+                    if k.len() < prefix.len() + 8 {
+                        continue;
+                    }
+                    let vk = k[prefix.len()..k.len() - 8].to_vec();
+                    let ver = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
+                    match latest.get_mut(&vk) {
+                        Some((mv, mb)) if ver > *mv => {
+                            *mv = ver;
+                            *mb = v.into_vec();
+                        }
+                        Some(_) => {}
+                        None => {
+                            latest.insert(vk, (ver, v.into_vec()));
+                        }
+                    }
+                }
+                Ok(latest.into_iter().map(|(vk, (_, blob))| (vk, blob)).collect())
+            }
+
             /// Load a previously stored tree blob, or `Ok(None)` if no blob exists
             /// for the given key.
             pub fn load_tree_blob(
@@ -617,41 +710,19 @@ macro_rules! impl_hypergraph_storage {
                 shard_key: &ShardKey,
                 callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
             ) -> Result<usize> {
-                use std::collections::{HashMap, HashSet};
-                // v2 (versioned) keyspace: keep the LATEST version per vertex_key. Keys
-                // may interleave across variable-length vertex keys, so accumulate into a
-                // map rather than assume per-key contiguity.
+                use std::collections::HashSet;
+                // v2 (versioned) keyspace: the newest version of each vertex, seeking
+                // past older ones (the map walk when key lengths differ).
                 let v2_prefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix(
                     set_type, phase_type, shard_key,
                 );
-                let mut latest: HashMap<Vec<u8>, (u64, Vec<u8>)> = HashMap::new();
-                for entry in self.db.iterator(rocksdb::IteratorMode::From(
-                    &v2_prefix,
-                    rocksdb::Direction::Forward,
-                )) {
-                    let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
-                    if !k.starts_with(&v2_prefix) {
-                        break;
-                    }
-                    if k.len() < v2_prefix.len() + 8 {
-                        continue;
-                    }
-                    let vk = k[v2_prefix.len()..k.len() - 8].to_vec();
-                    let ver = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
-                    match latest.get_mut(&vk) {
-                        Some((mv, mb)) if ver > *mv => {
-                            *mv = ver;
-                            *mb = v.into_vec();
-                        }
-                        Some(_) => {}
-                        None => {
-                            latest.insert(vk, (ver, v.into_vec()));
-                        }
-                    }
-                }
+                let latest = match self.newest_v2_blobs(&v2_prefix)? {
+                    Some(latest) => latest,
+                    None => self.newest_v2_blobs_general(&v2_prefix)?,
+                };
                 let mut count = 0usize;
                 let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(latest.len());
-                for (vk, (_ver, blob)) in latest {
+                for (vk, blob) in latest {
                     seen.insert(vk.clone());
                     callback(vk, blob);
                     count += 1;

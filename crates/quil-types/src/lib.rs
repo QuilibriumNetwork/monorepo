@@ -6,4 +6,6 @@ pub mod consensus;
 pub mod execution;
 pub mod p2p;
 pub mod lifecycle;
+pub mod lock_patience;
 pub mod error;
+pub mod reward_ring;

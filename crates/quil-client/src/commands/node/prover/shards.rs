@@ -6,7 +6,7 @@ use num_bigint::{BigInt, Sign};
 
 use quil_types::proto::node::GetShardInfoRequest;
 
-use super::{format_quil_daily, format_quil_reward, format_storage, worker_by_filter, ProverCtx};
+use super::{format_quil_daily_round, format_storage, worker_by_filter, ProverCtx};
 
 pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     let mut client = pc.connect().await?;
@@ -27,6 +27,7 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     println!("Shard Rewards ({} shards):", resp.shards.len());
 
     let mut total = BigInt::from(0);
+    let mut unknown = 0;
     for shard in &resp.shards {
         let filter_hex = hex::encode(&shard.filter);
         let worker_str = workers
@@ -35,24 +36,25 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
             .unwrap_or_default();
 
         let reward = BigInt::from_bytes_be(Sign::Plus, &shard.estimated_reward);
-        total += &reward;
+        if shard.ring_known == Some(false) { unknown += 1; } else { total += &reward; }
 
         println!(
-            "  Filter: {}  Shards: {:<6} Provers: {:<4} Ring: {}  Reward: ~{} QUIL/frame{}",
+            "  Filter: {}  Shards: {:<6} Provers: {:<4} Ring: {}  Reward: {:<3} Q/d{}",
             filter_hex,
             shard.data_shards,
             shard.active_provers,
-            shard.ring,
-            format_quil_reward(&reward),
+            if shard.ring_known == Some(false) { "-".into() } else { shard.ring.to_string() },
+            if shard.ring_known == Some(false) { "-".into() } else { format_quil_daily_round(&reward) },
             worker_str
         );
     }
 
     println!(
-        "\nTotal estimated: ~{} QUIL/frame (~{} QUIL/day)",
-        format_quil_reward(&total),
-        format_quil_daily(&total)
+        "\n{} estimated: {} Q/d",
+        if unknown > 0 { "Known" } else { "Total" },
+        format_quil_daily_round(&total)
     );
+    if unknown > 0 { println!("Unknown reward estimates: {unknown}"); }
     println!(
         "Difficulty: {}  Frame: {}",
         resp.difficulty, resp.frame_number

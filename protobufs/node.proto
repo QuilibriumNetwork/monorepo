@@ -99,6 +99,17 @@ message WorkerInfo {
   uint64 available_storage = 3;
   uint64 total_storage = 4;
   bool manually_managed = 5;
+  // Absent on older nodes and worker implementations without local telemetry.
+  WorkerExecution execution = 6;
+}
+
+// Local engine observations; independent of allocation and remote shard data.
+message WorkerExecution {
+  string state = 1;
+  string blocker = 2;
+  optional uint64 materialized_frame = 3;
+  uint64 last_advance_unix_ms = 4;
+  uint64 observed_unix_ms = 5;
 }
 
 message WorkerInfoResponse {
@@ -272,6 +283,13 @@ message CreateTraversalProofResponse {
   bytes proof = 1;  // serialized TraversalProof (via ToBytes())
 }
 
+// A shard cursor from this node's committed GLOBAL state, independent of peer metadata.
+message GlobalAppFrameHead {
+  uint64 frame = 1;
+  uint64 global_frame = 2;
+  uint64 generation = 3;
+}
+
 message ShardRewardInfo {
   bytes filter = 1;
   uint32 active_provers = 2;
@@ -282,6 +300,9 @@ message ShardRewardInfo {
   uint64 data_shards = 7;
   uint64 materialized_frame = 8;
   uint64 latest_frame = 9;
+  // Absent on older servers; false means ring/reward are unavailable.
+  optional bool ring_known = 10;
+  GlobalAppFrameHead global_head = 11;
 }
 
 message GetShardInfoRequest {
@@ -372,6 +393,7 @@ service NodeService {
     returns (GetCoinWitnessesResponse);
   rpc ListEscrows(ListCoinsRequest) returns (ListEscrowsResponse);
   rpc ListCoins(ListCoinsRequest) returns (ListCoinsResponse);
+  rpc ListLegacyCoins(quilibrium.node.global.pb.ListLegacyCoinsRequest) returns (quilibrium.node.global.pb.ListLegacyCoinsResponse);
   rpc GetProverRewardWitness(GetProverRewardWitnessRequest) returns (GetProverRewardWitnessResponse);
   rpc GetMintAuthorizationWitness(GetMintAuthorizationWitnessRequest) returns (GetMintAuthorizationWitnessResponse);
 }
@@ -461,6 +483,21 @@ service DataIPCService {
   // roots for the master's ProverConfirm. Only that worker holds the shard's
   // data and proves from those replicas.
   rpc PrepareStorageConfirm(PrepareStorageConfirmRequest) returns (PrepareStorageConfirmResponse);
+  // A shard consensus message a committee member sent the master directly,
+  // for the shard this worker runs. `from` is the sender's committee key.
+  rpc DeliverShardConsensus(DeliverShardConsensusRequest) returns (DeliverShardConsensusResponse);
+}
+
+message DeliverShardConsensusRequest {
+  bytes filter = 1;
+  uint64 channel = 2;
+  bytes data = 3;
+  bytes from = 4;
+}
+
+message DeliverShardConsensusResponse {
+  // The worker runs this shard's engine and handed it the message.
+  bool accepted = 1;
 }
 
 message PrepareStorageConfirmRequest {

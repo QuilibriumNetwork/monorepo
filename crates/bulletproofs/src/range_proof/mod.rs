@@ -83,8 +83,7 @@ impl RangeProof {
     /// extern crate merlin;
     /// use merlin::Transcript;
     ///
-    /// extern crate ed448_bulletproofs;
-    /// use ed448_bulletproofs::{BulletproofGens, PedersenGens, RangeProof, curve_adapter::Scalar};
+    /// use bulletproofs::{BulletproofGens, PedersenGens, RangeProof, curve_adapter::Scalar};
     ///
     /// # fn main() {
     /// // Generators for Pedersen commitments.  These can be selected
@@ -96,7 +95,7 @@ impl RangeProof {
     /// let bp_gens = BulletproofGens::new(64, 1);
     ///
     /// // A secret value we want to prove lies in the range [0, 2^32)
-    /// let secret_value = 1037568891u64;
+    /// let secret_value = Scalar::from(1037568891u64);
     ///
     /// // The API takes a blinding factor for the commitment.
     /// let blinding = Scalar::random(&mut thread_rng());
@@ -110,7 +109,7 @@ impl RangeProof {
     ///     &bp_gens,
     ///     &pc_gens,
     ///     &mut prover_transcript,
-    ///     secret_value,
+    ///     &secret_value,
     ///     &blinding,
     ///     32,
     /// ).expect("A real program could handle errors");
@@ -178,8 +177,7 @@ impl RangeProof {
     /// extern crate merlin;
     /// use merlin::Transcript;
     ///
-    /// extern crate ed448_bulletproofs;
-    /// use ed448_bulletproofs::{BulletproofGens, PedersenGens, RangeProof, curve_adapter::Scalar};
+    /// use bulletproofs::{BulletproofGens, PedersenGens, RangeProof, curve_adapter::Scalar};
     ///
     /// # fn main() {
     /// // Generators for Pedersen commitments.  These can be selected
@@ -191,7 +189,8 @@ impl RangeProof {
     /// let bp_gens = BulletproofGens::new(64, 16);
     ///
     /// // Four secret values we want to prove lie in the range [0, 2^32)
-    /// let secrets = [4242344947u64, 3718732727u64, 2255562556u64, 2526146994u64];
+    /// let secrets = [4242344947u64, 3718732727u64, 2255562556u64, 2526146994u64]
+    ///     .map(Scalar::from);
     ///
     /// // The API takes blinding factors for the commitments.
     /// let blindings: Vec<_> = (0..4).map(|_| Scalar::random(&mut thread_rng())).collect();

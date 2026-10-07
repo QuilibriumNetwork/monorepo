@@ -72,9 +72,48 @@ pub fn split_assignment(
     frame: u64,
     even: bool,
 ) -> Vec<Vec<Vec<u8>>> {
+    split_assignment_sized(scan, change, frame, even, &|_| 0)
+}
+
+/// [`split_assignment`] with each child's reward basis (`size`, its state
+/// size now). Under the seniority ring rule the most senior provers move
+/// together onto the most valuable child (`prover_rings::split_groups`).
+pub fn split_assignment_sized(
+    scan: &CommittedProverScan,
+    change: &PendingShardChange,
+    frame: u64,
+    even: bool,
+    size: &dyn Fn(&[u8]) -> u128,
+) -> Vec<Vec<Vec<u8>>> {
     let k = change.children.len();
     let mut children = vec![Vec::new(); k];
     if k == 0 {
+        return children;
+    }
+    if super::super::prover_rings::governs(frame) {
+        let provers: Vec<(Vec<u8>, Vec<u8>)> = scan
+            .active_on_filter(&change.parent, frame)
+            .into_iter()
+            .filter(|(public_key, _)| FalconPublicKey::from_bytes(public_key).is_some())
+            .collect();
+        let keyed: Vec<(Vec<u8>, &[u8], super::super::prover_rings::RingKey)> = provers
+            .iter()
+            .map(|(public_key, address)| {
+                let key = scan.ring_key(address, &change.parent).unwrap_or(
+                    super::super::prover_rings::RingKey { cohort: u64::MAX, seniority: 0 },
+                );
+                (public_key.clone(), address.as_slice(), key)
+            })
+            .collect();
+        let order = super::super::prover_rings::children_by_value(&change.children, size);
+        let Ok(groups) = super::super::prover_rings::split_groups(keyed, k) else { return children };
+        for (group, index) in groups.into_iter().zip(order) {
+            children[index] = group;
+        }
+        for members in &mut children {
+            members.sort();
+            members.dedup();
+        }
         return children;
     }
     let mut provers = scan.active_on_filter(&change.parent, frame);
@@ -198,6 +237,24 @@ pub fn gate_topology_change(
     scan: Option<&CommittedProverScan>,
     even: bool,
 ) -> Result<TopologyGate> {
+    let ready = scan.map(|scan| move || Ok(scan));
+    gate_topology_change_sized(state, frame, policy, change, ready.as_ref().map(|f| f as _), even, &|_| 0)
+}
+
+/// [`gate_topology_change`] with each split child's reward basis (`size`),
+/// which orders the children a split's provers move to. `scan` builds the
+/// committed prover scan, and is called only once the change gets past the
+/// record and session checks: the scan reads all of GLOBAL's committed provers,
+/// and a change waiting on its sources is due, and gated, on every frame.
+pub fn gate_topology_change_sized<'s>(
+    state: &HypergraphState,
+    frame: u64,
+    policy: &CommitteeHandoffPolicy,
+    change: &PendingShardChange,
+    scan: Option<&dyn Fn() -> Result<&'s CommittedProverScan>>,
+    even: bool,
+    size: &dyn Fn(&[u8]) -> u128,
+) -> Result<TopologyGate> {
     if frame < policy.activation_frame {
         return Ok(TopologyGate::Apply);
     }
@@ -269,9 +326,10 @@ pub fn gate_topology_change(
             return Ok(TopologyGate::Wait);
         }
     }
+    let scan = scan()?;
     let targets: Vec<DesiredCommittee> = match change.kind {
         ShardChangeKind::Split => {
-            let assigned = split_assignment(scan, change, frame, even);
+            let assigned = split_assignment_sized(scan, change, frame, even, size);
             new.into_iter().map(|filter| {
                 let members = change.children.iter().position(|child| *child == filter)
                     .map(|index| assigned[index].clone()).unwrap_or_default();
@@ -312,6 +370,16 @@ pub fn gate_topology_change(
         "committee handoff: topology change waits for its source seals"
     );
     Ok(TopologyGate::Wait)
+}
+
+/// The committees a topology change's request authorized, once scheduled:
+/// the split's or merge's allocations follow them when the change applies.
+pub fn topology_targets(state: &impl Records, change: &PendingShardChange) -> Result<Option<Vec<DesiredCommittee>>> {
+    let Some(bytes) = read(state, b"topology", &topology_key(change))? else { return Ok(None) };
+    let id = request_id(bytes)?;
+    Ok(super::request(state, &id)?.map(|request| {
+        request.targets.into_iter().map(|target| target.committee).collect()
+    }))
 }
 
 /// Epochs a closing session may take to seal before GLOBAL fences it.
@@ -406,6 +474,16 @@ pub fn fence_stalled_sources(state: &HypergraphState, frame: u64, filters: &[Vec
 /// already holds legacy-certified history (a recorded legacy tip) is skipped:
 /// it enters through generation zero (`legacy::migrate`, which runs before this
 /// in the maintenance pass), never from the empty genesis.
+/// GLOBAL frames between session passes (`reconcile_committee_sessions`).
+pub const SESSION_PASS_FRAMES: u64 = 8;
+
+/// Whether `frame`'s pass is the first of its epoch: from the policy's
+/// `membership_boundary_frame`, the only pass that schedules membership
+/// successors.
+pub fn first_pass_of_epoch(frame: u64) -> bool {
+    frame % quil_types::consensus::epoch_length_frames() < SESSION_PASS_FRAMES
+}
+
 pub fn reconcile_membership(
     state: &HypergraphState,
     frame: u64,
@@ -429,6 +507,11 @@ pub fn reconcile_membership(
             if reserved(state, filter)? || super::legacy::pending(state, filter)? {
                 continue;
             }
+            // Like a membership change, a first session waits for the epoch's
+            // first pass from `first_session_boundary_frame`.
+            if frame >= policy.first_session_boundary_frame && !first_pass_of_epoch(frame) {
+                continue;
+            }
             let genesis = quil_crypto::poseidon::hash_bytes_to_32(&[0u8; 32])?;
             initialize(
                 state,
@@ -448,6 +531,13 @@ pub fn reconcile_membership(
             continue;
         };
         if current.members == members || status(state, &current.id()?)? != Status::Active {
+            continue;
+        }
+        // The committee is frozen for the epoch: an eligible set that changes
+        // within it (a late re-confirm, a leave reject) waits for the next
+        // boundary. Mid-epoch, every such change re-sealed every shard its
+        // prover sat on, every pass, and no session ever produced a frame.
+        if frame >= policy.membership_boundary_frame && !first_pass_of_epoch(frame) {
             continue;
         }
         if current.chain_id != policy.chain_id {

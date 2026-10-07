@@ -35,6 +35,8 @@ mod dht_node;
 mod worker_node;
 #[cfg(feature = "confidential-tokens")]
 mod witness_index;
+#[cfg(feature = "confidential-tokens")]
+mod legacy_index;
 
 #[cfg(feature = "native-proof")]
 mod proof_worker;
@@ -56,7 +58,6 @@ mod query_shards;
 mod adopt_prover_root;
 mod unified_consolidation;
 mod legacy_migration;
-mod coin_rescale;
 mod coin_receipt_repair;
 
 mod master_node;
@@ -267,14 +268,6 @@ struct Args {
     /// consensus-safe; run once at the flag frame. Empty path uses config.db.path.
     #[arg(long)]
     migrate_legacy: Option<PathBuf>,
-
-    /// Archive-only CORRECTIVE pass for a DB migrated by the OLD byte-shifted
-    /// decode (every transparent coin ×256): in place, `÷256` each coin amount
-    /// and re-key to its corrected content address, then rebuild the forest +
-    /// receipt. No verenc re-decrypt, no backup. Bails loudly if the data isn't
-    /// uniformly inflated. Empty path uses config.db.path. Run once.
-    #[arg(long)]
-    fix_coin_scale: Option<PathBuf>,
 
     /// Archive-only: recompute the coin-conservation receipt from the migrated
     /// TRANSPARENT coin set and rewrite it, then exit. Use when a legacy
@@ -753,6 +746,16 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         relay_activation_frame = %if relay_from == u64::MAX { "never (release frame unset)".to_string() } else { relay_from.to_string() },
         "application shard relay records"
     );
+    let seal_drain_from = quil_execution::global_intrinsic::handoff::init_seal_drain_frame(args.network);
+    info!(
+        seal_drain_frame = %if seal_drain_from == u64::MAX { "never".to_string() } else { seal_drain_from.to_string() },
+        "committee handoff seals carrying their drain headers"
+    );
+    let batch_shields_from = quil_execution::token_intrinsic::global_commit::init_batch_shield_frame(args.network);
+    info!(
+        batch_shield_frame = %if batch_shields_from == u64::MAX { "never".to_string() } else { batch_shields_from.to_string() },
+        "batch shields and shield source coverage"
+    );
     if let Some(frame) = quil_execution::global_intrinsic::leaf_root_registration::init_pre_registration_frame(args.network) {
         tracing::warn!(pre_registration_frame = frame, "QUIL_PRE_REGISTRATION_FRAME override active (test networks only)");
     }
@@ -1015,16 +1018,6 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         };
     }
 
-    if let Some(ref target_path) = args.fix_coin_scale {
-        return match coin_rescale::run_fix_coin_scale(target_path, &config) {
-            Ok(()) => Ok(ExitCode::SUCCESS),
-            Err(e) => {
-                eprintln!("{e}");
-                Ok(ExitCode::FAILURE)
-            }
-        };
-    }
-
     if let Some(ref target_path) = args.repair_receipt {
         return match coin_receipt_repair::run_repair_receipt(target_path, &config) {
             Ok(()) => Ok(ExitCode::SUCCESS),
@@ -1113,12 +1106,9 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     // already released its snapshots before returning, so a forced exit
     // costs only a WAL replay on restart.
     {
-        let code: i32 = match &reason {
-            // POSIX: signal-driven exit is 128 + signal number.
-            ShutdownReason::CtrlC => 130,
-            ShutdownReason::Terminated => 143,
-            _ => 1,
-        };
+        // Forced teardown is a failure even when a signal requested the stop.
+        // Only a completed, handled shutdown below returns success.
+        let code = 1;
         const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
         let _ = std::thread::Builder::new()
             .name("shutdown-watchdog".into())
@@ -1135,14 +1125,16 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     }
 
     let result = match reason {
-        // POSIX convention: signal-driven exit is 128 + signal number.
+        // These signals were handled and the supervisor finished draining.
+        // Returning 128 + signal would report an ordinary unsuccessful exit
+        // to service managers rather than successful cooperative shutdown.
         ShutdownReason::CtrlC => {
             info!("shut down via ctrl-c");
-            Ok(ExitCode::from(130))
+            Ok(ExitCode::SUCCESS)
         }
         ShutdownReason::Terminated => {
             info!("shut down via SIGTERM");
-            Ok(ExitCode::from(143))
+            Ok(ExitCode::SUCCESS)
         }
         ShutdownReason::TaskExited(name) => {
             error!(task = %name, "supervised task exited unexpectedly");

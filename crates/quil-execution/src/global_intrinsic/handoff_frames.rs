@@ -99,6 +99,24 @@ pub fn verify(
     }))
 }
 
+/// Under a committee-handoff flag day (`LegacyHistory::Discard`) the legacy
+/// verifier accepts nothing GLOBAL executes from activation on, whether or
+/// not the application ever received a session: legacy history was
+/// discarded, and every shard runs an authorized session from there.
+pub fn refuse_legacy_after_flag_day(global_frame: u64) -> Result<()> {
+    match quil_types::consensus::committee_handoff_policy() {
+        Some(policy)
+            if policy.legacy_history == quil_types::consensus::LegacyHistory::Discard
+                && global_frame >= policy.activation_frame =>
+        {
+            Err(QuilError::InvalidSignature(
+                "legacy app certificates are not accepted after the committee-handoff flag day".into(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// [`require_unregistered`], except that legacy history (see
 /// [`super::legacy::is_legacy_history`]) keeps its legacy certificates.
 pub fn require_legacy_allowed(state: &impl Records, filter: &[u8], frame: u64) -> Result<()> {

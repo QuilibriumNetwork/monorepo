@@ -188,7 +188,7 @@ pub async fn migrate_in_place(tip_kind: Tip) {
     common::init_tracing();
     // Mainnet today: no committee-handoff policy.
     quil_types::consensus::set_committee_handoff_policy(None);
-    let policy = CommitteeHandoffPolicy { activation_frame: 0, chain_id: [0x51; 32] };
+    let policy = CommitteeHandoffPolicy { activation_frame: 0, chain_id: [0x51; 32], legacy_history: quil_types::consensus::LegacyHistory::Migrate, membership_boundary_frame: u64::MAX, first_session_boundary_frame: u64::MAX};
     let filter = APP.to_vec();
     let provers: Vec<TestProver> = (0..4).map(|_| TestProver::generate()).collect();
     let committee = members(&provers);

@@ -53,6 +53,67 @@ pub enum ArchiveClientError {
     TlsInit(String),
 }
 
+/// The endpoint answered with this node's own identity: the mainnet archive
+/// address list names every archive, this one included.
+#[derive(Debug, Error)]
+#[error("archive endpoint is this node")]
+pub struct OwnEndpoint;
+
+impl ArchiveClientError {
+    /// The connection reached this node itself.
+    pub fn is_own_endpoint(&self) -> bool {
+        causes(self).any(|cause| cause.downcast_ref::<OwnEndpoint>().is_some())
+    }
+
+    /// The request failed in the transport (the connection was closed, reset
+    /// or went away), not with a status the archive sent. An archive closes
+    /// connections a client leaves idle; such a request can go again at once
+    /// on a fresh connection.
+    /// The archive answered that its forest reads are busy.
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Self::Rpc(status) if status.code() == tonic::Code::ResourceExhausted)
+    }
+
+    /// The archive lacks the call (an older build).
+    pub fn is_unimplemented(&self) -> bool {
+        matches!(self, Self::Rpc(status) if status.code() == tonic::Code::Unimplemented)
+    }
+
+    pub fn is_transport_failure(&self) -> bool {
+        causes(self).any(|cause| {
+            cause.downcast_ref::<hyper::Error>().is_some()
+                || cause.downcast_ref::<h2::Error>().is_some()
+                || cause.downcast_ref::<std::io::Error>().is_some()
+        })
+    }
+}
+
+/// `error` and every cause beneath it.
+fn causes<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(error), |error| error.source())
+}
+
+/// The causes beneath `error`, outermost first, separated by " -> ". A
+/// transport failure reaches callers as "h2 protocol error: http2 error"; the
+/// reason (a keepalive timeout, a reset or GOAWAY, an oversized frame) is only
+/// in the source chain. Repeats of the text above are skipped.
+pub fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut causes: Vec<String> = Vec::new();
+    let mut above = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if text != above && !above.contains(&text) {
+            causes.push(text.clone());
+        }
+        above = text;
+        source = cause.source();
+    }
+    causes.join(" -> ")
+}
+
 /// A connected gRPC client for an archive node's `GlobalService`.
 ///
 /// `Clone` is cheap: the inner tonic client shares one multiplexed h2
@@ -105,6 +166,20 @@ impl ArchiveClient {
         falcon_signing_key: &[u8],
     ) -> Result<Self, ArchiveClientError> {
         Self::connect_pq(addr, QuilPqNoiseConnector::new(falcon_signing_key.to_vec())).await
+    }
+
+    /// [`Self::connect_mtls`] to another archive: an endpoint answering with
+    /// this node's identity fails with [`ArchiveClientError::is_own_endpoint`].
+    pub async fn connect_archive(
+        addr: &str,
+        falcon_signing_key: &[u8],
+    ) -> Result<Self, ArchiveClientError> {
+        let own = quil_p2p::Keypair::falcon_from_bytes(falcon_signing_key)
+            .map_err(|error| ArchiveClientError::TlsInit(format!("own identity: {error}")))?
+            .public()
+            .to_peer_id();
+        let connector = QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).refusing_peer(own);
+        Self::connect_pq(addr, connector).await
     }
 
     /// Connect only to this worker's own master, which holds the same Falcon
@@ -244,6 +319,99 @@ impl ArchiveClient {
         Ok(resp.found.then_some(resp.node))
     }
 
+    /// Forest sync, batched: many JMT nodes of one shard/phase tree in one
+    /// request. The answer covers a prefix of `node_keys`, in order (the
+    /// archive stops at its size budget); `None` per absent node.
+    pub async fn get_forest_nodes(
+        &mut self,
+        shard_id: Vec<u8>,
+        phase: u32,
+        node_keys: Vec<Vec<u8>>,
+    ) -> Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_forest_nodes(quil_types::proto::global::GetForestNodesRequest { shard_id, phase, node_keys })
+            .await?
+            .into_inner();
+        Ok(resp.nodes.into_iter().map(|n| n.found.then_some(n.data)).collect())
+    }
+
+    /// Forest sync, batched: leaf values `(version, key_hash)` of one
+    /// shard/phase tree. A prefix of the keys, in order, as for nodes.
+    pub async fn get_forest_values(
+        &mut self,
+        shard_id: Vec<u8>,
+        phase: u32,
+        keys: Vec<(u64, Vec<u8>)>,
+    ) -> Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
+        let keys = keys
+            .into_iter()
+            .map(|(version, key_hash)| quil_types::proto::global::ForestValueKey { version, key_hash })
+            .collect();
+        let resp = self
+            .inner
+            .get_forest_values(quil_types::proto::global::GetForestValuesRequest { shard_id, phase, keys })
+            .await?
+            .into_inner();
+        Ok(resp.values.into_iter().map(|v| v.found.then_some(v.data)).collect())
+    }
+
+    /// Forest sync, batched: vertex blobs `(id, version)` under one app
+    /// ShardKey, each read as of its tree version. A prefix, in order.
+    pub async fn get_vertex_blobs(
+        &mut self,
+        shard_key: Vec<u8>,
+        phase: u32,
+        blobs: Vec<(Vec<u8>, u64)>,
+    ) -> Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
+        let blobs = blobs
+            .into_iter()
+            .map(|(id, version)| quil_types::proto::global::VertexBlobKey { id, version })
+            .collect();
+        let resp = self
+            .inner
+            .get_vertex_blobs(quil_types::proto::global::GetVertexBlobsRequest { shard_key, phase, blobs })
+            .await?
+            .into_inner();
+        Ok(resp.blobs.into_iter().map(|b| b.found.then_some(b.data)).collect())
+    }
+
+    /// Forest sync, listed: leaves of one shard/phase tree with keys in
+    /// `[first, last]` after `after`, each at its newest value at or below
+    /// `version`, in key order, and whether more may follow.
+    pub async fn get_forest_leaves(
+        &mut self,
+        shard_id: Vec<u8>,
+        phase: u32,
+        version: u64,
+        first: [u8; 32],
+        last: [u8; 32],
+        after: Option<[u8; 32]>,
+    ) -> Result<(Vec<([u8; 32], Vec<u8>)>, bool), ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_forest_leaves(quil_types::proto::global::GetForestLeavesRequest {
+                shard_id,
+                phase,
+                version,
+                first: first.to_vec(),
+                last: last.to_vec(),
+                after: after.map(|key| key.to_vec()).unwrap_or_default(),
+            })
+            .await?
+            .into_inner();
+        let leaves = resp
+            .leaves
+            .into_iter()
+            .map(|leaf| {
+                <[u8; 32]>::try_from(leaf.key_hash.as_slice())
+                    .map(|key| (key, leaf.value))
+                    .map_err(|_| ArchiveClientError::MissingField("forest leaf key must be 32 bytes"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((leaves, resp.more))
+    }
+
     /// Forest sync: fetch a leaf value by `key_hash` (32 bytes) at `version`.
     pub async fn get_forest_value(
         &mut self,
@@ -367,6 +535,19 @@ impl ArchiveClient {
         Ok(self
             .app_shard
             .list_shard_coins(quil_types::proto::global::ListShardCoinsRequest { domain, snapshot_id, after })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn list_shard_legacy_coins(
+        &mut self,
+        domain: Vec<u8>,
+        owner: Vec<u8>,
+        after: Vec<u8>,
+    ) -> Result<quil_types::proto::global::ListLegacyCoinsResponse, ArchiveClientError> {
+        Ok(self
+            .app_shard
+            .list_shard_legacy_coins(quil_types::proto::global::ListLegacyCoinsRequest { domain, owner, after })
             .await?
             .into_inner())
     }
@@ -738,15 +919,22 @@ pub struct QuilPqNoiseConnector {
     /// network identity presented in the PQNoise handshake.
     falcon_signing_key: Arc<Vec<u8>>,
     expected_peer: Option<quil_p2p::PeerId>,
+    refused_peer: Option<quil_p2p::PeerId>,
 }
 
 impl QuilPqNoiseConnector {
     pub fn new(falcon_signing_key: Vec<u8>) -> Self {
-        Self { falcon_signing_key: Arc::new(falcon_signing_key), expected_peer: None }
+        Self { falcon_signing_key: Arc::new(falcon_signing_key), expected_peer: None, refused_peer: None }
     }
 
     pub fn with_expected_peer(mut self, peer: quil_p2p::PeerId) -> Self {
         self.expected_peer = Some(peer);
+        self
+    }
+
+    /// Fail with [`OwnEndpoint`] when the server is `peer`.
+    pub fn refusing_peer(mut self, peer: quil_p2p::PeerId) -> Self {
+        self.refused_peer = Some(peer);
         self
     }
 }
@@ -763,6 +951,7 @@ impl Service<Uri> for QuilPqNoiseConnector {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let falcon_signing_key = self.falcon_signing_key.clone();
         let expected_peer = self.expected_peer;
+        let refused_peer = self.refused_peer;
         Box::pin(async move {
             let host = uri
                 .host()
@@ -775,6 +964,9 @@ impl Service<Uri> for QuilPqNoiseConnector {
             if expected_peer.is_some_and(|expected| peer != expected) {
                 return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
                     "PQNoise server identity does not match the configured master").into());
+            }
+            if refused_peer == Some(peer) {
+                return Err(Box::new(OwnEndpoint) as Box<dyn std::error::Error + Send + Sync>);
             }
             Ok(TokioIo::new(stream))
         })
@@ -809,6 +1001,23 @@ fn key_der_to_owned(key: PrivateKeyDer<'_>) -> PrivateKeyDer<'static> {
 // handshake succeeded, demonstrating the bypass); it now guards against that
 // regression.
 // =====================================================================
+#[cfg(test)]
+mod error_chain_tests {
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    struct Layer(&'static str, #[source] Option<Box<Layer>>);
+
+    #[test]
+    fn the_chain_names_every_distinct_cause_below_the_error() {
+        let error = Layer("rpc error: h2 protocol error: http2 error", Some(Box::new(Layer(
+            "http2 error",
+            Some(Box::new(Layer("keep-alive timed out", None))),
+        ))));
+        assert_eq!(super::error_chain(&error), "keep-alive timed out");
+        assert_eq!(super::error_chain(&Layer("alone", None)), "");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,5 +1171,39 @@ mod pinned_master_tests {
             }
             assert_eq!(server.await.unwrap().peer_id(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn an_archive_answering_with_this_nodes_identity_is_recognized() {
+        for own in [true, false] {
+            let key = quil_p2p::generate_falcon_signing_key();
+            let server_key = if own { key.clone() } else { quil_p2p::generate_falcon_signing_key() };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let stream = crate::pqnoise_channel::pq_server_handshake(tcp, &server_key).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                drop(stream);
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                ArchiveClient::connect_archive(&address.to_string(), &key),
+            )
+            .await;
+            let recognized = matches!(&result, Ok(Err(error)) if error.is_own_endpoint());
+            assert_eq!(recognized, own, "own={own}");
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn a_closed_connection_is_a_transport_failure_and_a_status_is_not() {
+        let closed = tonic::Status::from_error(Box::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection closed",
+        )));
+        assert!(ArchiveClientError::Rpc(closed).is_transport_failure());
+        assert!(!ArchiveClientError::Rpc(tonic::Status::not_found("frame 7 not found")).is_transport_failure());
     }
 }

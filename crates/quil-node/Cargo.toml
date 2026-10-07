@@ -100,8 +100,10 @@ tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_mall
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
 [dev-dependencies]
+toml = "0.9"
 tempfile = "3"
 flate2 = "1"
 
 [build-dependencies]
 sha2 = "0.10"
+toml = "0.9"

@@ -37,7 +37,7 @@ pub struct ExecutionFork {
 pub struct ExecutionCapture<'a> {
     source: &'a HypergraphCrdt,
     _forest: MutexGuard<'a, ()>,
-    _commit: MutexGuard<'a, ()>,
+    _commit: crate::crdt::CommitGuard<'a>,
 }
 
 fn read<T>(lock: &RwLock<T>) -> Result<RwLockReadGuard<'_, T>> {
@@ -318,7 +318,7 @@ impl ExecutionCapture<'_> {
                 snapshot_mgr: SnapshotManager::new(),
                 local_vertex_observer: RwLock::new(None),
                 covered_prefix: RwLock::new(covered.to_vec()),
-                commit_lock: std::sync::Mutex::new(()),
+                commit_lock: Default::default(),
                 unified_tree: AtomicBool::new(source.unified_tree.load(Ordering::Acquire)),
             });
             Ok(ExecutionFork {

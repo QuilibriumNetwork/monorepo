@@ -57,6 +57,7 @@ members = [
     "crates/quil-explorer",
     "crates/libp2p-identity",
     "crates/libp2p-tls",
+    "crates/libp2p-gossipsub",
     "crates/devnet",
     "crates/devnet/proxy",
 ]
@@ -82,6 +83,15 @@ libp2p-autonat = { path = "crates/libp2p-autonat" }
 # set `provider.kx_groups = [SNTRUP761]`, so QUIC (libp2p-quic → quinn → rustls)
 # negotiates NTRU instead of X25519. See `crates/libp2p-tls/src/sntrup761_kx.rs`.
 libp2p-tls = { path = "crates/libp2p-tls" }
+# libp2p-gossipsub: vendored 0.49.4 to cut per-message copies and cache only
+# what this node can validate and forward. An inbound message is no longer
+# cloned (metrics, transform, IDONTWANT sizing) before the duplicate check, so
+# a mesh duplicate costs one decode; messages on topics we do not subscribe to
+# are not cached (they were never validated, so they sat in the cache until
+# the history window rolled over); signature verification encodes the signed
+# bytes from borrowed fields instead of cloning the message twice. Wire format
+# and validation are unchanged. Local changes are marked `QUILIBRIUM:`.
+libp2p-gossipsub = { path = "crates/libp2p-gossipsub" }
 
 [profile.release]
 # rpath = false is important to make Go bindings work

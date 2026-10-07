@@ -17,6 +17,10 @@ use quil_types::error::{QuilError, Result};
 
 use crate::worker::{WorkerInfo, WorkerManager};
 
+/// Archive shard recoveries this process runs at once (see the recovery
+/// spawn below).
+static SHARD_RECOVERY_TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 /// Message from master to worker.
 #[derive(Debug)]
 pub enum MasterToWorker {
@@ -100,6 +104,9 @@ pub enum WorkerToMaster {
         filter: Vec<u8>,
         channel: u64,
         bytes: Vec<u8>,
+        /// Committee keys a resolver message is addressed to (empty: the
+        /// whole topic); see `AppEngineEvent::CwOut`.
+        recipients: Vec<Vec<u8>>,
     },
     /// A shard worker has spun up an `AppConsensusEngine` for `filter`.
     /// The master uses this to populate a `filter → AppEngineHandle`
@@ -137,6 +144,7 @@ struct WorkerState {
     cancel: CancellationToken,
     tx: mpsc::Sender<MasterToWorker>,
     handle: Option<JoinHandle<()>>,
+    execution_handle: Arc<Mutex<Option<crate::app_engine::AppEngineHandle>>>,
 }
 
 /// Shared state that worker threads need for consensus.
@@ -231,6 +239,9 @@ pub struct WorkerOwnedDeps {
     pub storage_history_source: Option<crate::storage_history::GlobalVertexProofSource>,
     /// Archive source of a predecessor's outgoing records for successor checks.
     pub outgoing_history_source: Option<crate::app_handoff::OutgoingHistorySource>,
+    /// Committees that certified legacy frames today's registry no longer
+    /// reproduces (see `historical_committee`).
+    pub historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
 }
 
 /// Thread-based worker manager. Core 0 is reserved for the master;
@@ -376,6 +387,8 @@ impl ThreadWorkerManager {
         let master_tx = self.master_tx.clone();
         let cancel_clone = cancel.clone();
         let consensus_deps = self.consensus_deps.lock().unwrap().clone();
+        let execution_handle = Arc::new(Mutex::new(None::<crate::app_engine::AppEngineHandle>));
+        let execution_slot = execution_handle.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("worker-{}", core_id))
@@ -468,6 +481,8 @@ impl ThreadWorkerManager {
                             cmd = rx.recv() => {
                                 match cmd {
                                     Some(MasterToWorker::Respawn { filter, start_consensus }) => {
+                                        // Retire telemetry before replacing the engine generation.
+                                        *execution_slot.lock().unwrap() = None;
                                         // Stop existing engine if any
                                         if let Some(cancel) = engine_cancel.take() {
                                             cancel.cancel();
@@ -509,6 +524,7 @@ impl ThreadWorkerManager {
                                             let master_tx_clone = master_tx.clone();
                                             let filter_clone = filter.clone();
                                             let deps = consensus_deps.clone();
+                                            let execution_slot = execution_slot.clone();
                                             let owned = worker_owned.clone();
                                             let application = filter[..filter.len().min(32)].to_vec();
                                             let mempool = match retained_mempool.take() {
@@ -609,10 +625,13 @@ impl ThreadWorkerManager {
                                                         engine_deps,
                                                         event_tx,
                                                     );
+                                                    *execution_slot.lock().unwrap() = Some(app_handle.clone());
                                                     let engine = engine.with_storage_history_source(
                                                         owned.as_ref().and_then(|o| o.storage_history_source.clone()),
                                                     ).with_outgoing_history_source(
                                                         owned.as_ref().and_then(|o| o.outgoing_history_source.clone()),
+                                                    ).with_historical_committee_source(
+                                                        owned.as_ref().and_then(|o| o.historical_committee_source.clone()),
                                                     );
 
                                                     // Tell the master a shard engine just came online.
@@ -723,13 +742,14 @@ impl ThreadWorkerManager {
                                                                         }
                                                                     ).await;
                                                                 }
-                                                                crate::app_engine::AppEngineEvent::CwOut { filter, channel, bytes } => {
+                                                                crate::app_engine::AppEngineEvent::CwOut { filter, channel, bytes, recipients } => {
                                                                     let _ = master_tx_events.send(
                                                                         WorkerToMaster::CwConsensus {
                                                                             core_id,
                                                                             filter,
                                                                             channel,
                                                                             bytes,
+                                                                            recipients,
                                                                         }
                                                                     ).await;
                                                                 }
@@ -761,6 +781,10 @@ impl ThreadWorkerManager {
                                                                     let release_sync = ReleaseSyncFlag(flag);
                                                                     tokio::spawn(async move {
                                                                         let _release_sync = release_sync;
+                                                                        // A node's workers share its archive identity and
+                                                                        // so its per-peer read slots: a few recover at a
+                                                                        // time rather than all failing busy together.
+                                                                        let _turn = SHARD_RECOVERY_TURNS.acquire().await;
                                                                         match crate::prover_tree_syncer::recover_shard_from_latest(
                                                                             syncer.as_ref(), &filter, local, &lb,
                                                                         ).await {
@@ -797,6 +821,7 @@ impl ThreadWorkerManager {
                                                             info!(core_id, "app engine exited");
                                                         }
                                                     }
+                                                    app_handle.execution_state("stopped", "engine exited");
                                                     // Tell the master to evict the routing entry +
                                                     // unsubscribe from per-shard bitmasks.
                                                     let _ = master_tx_clone.send(
@@ -874,6 +899,7 @@ impl ThreadWorkerManager {
             cancel,
             tx,
             handle: Some(handle),
+            execution_handle,
         })
     }
 }
@@ -961,6 +987,15 @@ impl WorkerManager for ThreadWorkerManager {
         Ok(workers.keys().copied().collect())
     }
 
+    fn worker_execution(&self) -> Vec<(u32, Vec<u8>, quil_types::proto::node::WorkerExecution)> {
+        self.workers.lock().unwrap().values().filter_map(|w| {
+            let slot = w.execution_handle.lock().unwrap();
+            let h = slot.as_ref()?;
+            // A queued rebind must never attribute the previous engine to the new filter.
+            (h.filter == w.filter).then(|| (w.core_id, w.filter.clone(), h.execution()))
+        }).collect()
+    }
+
     fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
         let workers = self.workers.lock().unwrap();
         Ok(workers
@@ -1026,6 +1061,7 @@ fn snapshot_state(w: &WorkerState) -> WorkerState {
         // Don't move/clone the join handle — it's tied to the live
         // worker thread and the snapshot is a read-only view.
         handle: None,
+        execution_handle: w.execution_handle.clone(),
     }
 }
 

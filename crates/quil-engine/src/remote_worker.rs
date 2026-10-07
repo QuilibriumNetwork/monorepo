@@ -80,6 +80,17 @@ pub struct RemoteWorkerManager {
     client_tls: Option<tonic::transport::ClientTlsConfig>,
 }
 
+/// What became of a shard consensus message handed to a standalone worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteDelivery {
+    Accepted,
+    /// The worker no longer runs that shard's engine.
+    Refused,
+    /// The worker's build lacks `DeliverShardConsensus`.
+    Unsupported,
+    Failed,
+}
+
 /// Events from remote workers to the master.
 #[derive(Debug)]
 pub enum RemoteWorkerEvent {
@@ -292,6 +303,47 @@ impl RemoteWorkerManager {
 
     fn runs(worker: &RemoteWorkerState, filter: &[u8]) -> bool {
         !filter.is_empty() && worker.wants_consensus && worker.filter.as_slice() == filter
+    }
+
+    /// Filters a standalone worker is running consensus for.
+    pub fn served_filters(&self) -> Vec<Vec<u8>> {
+        self.workers
+            .lock()
+            .map(|workers| {
+                workers.values().filter(|w| Self::runs(w, &w.filter)).map(|w| w.filter.clone()).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Hand the standalone worker running `filter` a shard consensus message
+    /// a committee member (`from`, its committee key) sent this node
+    /// directly.
+    pub async fn deliver_shard_consensus(
+        &self,
+        filter: &[u8],
+        channel: u64,
+        data: Vec<u8>,
+        from: Vec<u8>,
+    ) -> RemoteDelivery {
+        let connection = self.workers.lock().ok().and_then(|workers| {
+            workers.values().find(|w| Self::runs(w, filter)).and_then(|w| w.channel.clone())
+        });
+        let Some(connection) = connection else { return RemoteDelivery::Failed };
+        let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(connection)
+            .max_decoding_message_size(16 << 20)
+            .max_encoding_message_size(16 << 20);
+        let request = quil_types::proto::node::DeliverShardConsensusRequest {
+            filter: filter.to_vec(),
+            channel,
+            data,
+            from,
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.deliver_shard_consensus(request)).await {
+            Ok(Ok(response)) if response.get_ref().accepted => RemoteDelivery::Accepted,
+            Ok(Ok(_)) => RemoteDelivery::Refused,
+            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => RemoteDelivery::Unsupported,
+            _ => RemoteDelivery::Failed,
+        }
     }
 
     /// Leaf roots for `filter`'s next-epoch replicas, encoded by the standalone
@@ -736,6 +788,10 @@ mod fee_relay_tests {
     }
     #[tonic::async_trait]
     impl node::data_ipc_service_server::DataIpcService for SnapshotServer {
+        async fn deliver_shard_consensus(&self, _: tonic::Request<node::DeliverShardConsensusRequest>)
+            -> std::result::Result<tonic::Response<node::DeliverShardConsensusResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("test server"))
+        }
         async fn get_app_fee_snapshot(&self, request: tonic::Request<node::GetAppFeeSnapshotRequest>)
             -> std::result::Result<tonic::Response<node::GetAppFeeSnapshotResponse>, tonic::Status> {
             let mode = self.mode.load(Ordering::SeqCst);
@@ -760,8 +816,45 @@ mod fee_relay_tests {
         }
     }
 
+    /// A shard a worker runs consensus for is served, and a direct message
+    /// for it reaches that worker; a worker build without the delivery RPC is
+    /// told apart, so the master stops taking direct messages for it.
     #[tokio::test]
-    #[ignore = "requires a loopback RPC listener; run via Taskfile"]
+    async fn direct_shard_consensus_goes_to_the_worker_running_the_shard() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = SnapshotServer {
+            mode: Arc::new(AtomicU8::new(0)),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(server))
+                .serve_with_incoming_shutdown(Incoming(listener), async { let _ = stopped.await; }).await.unwrap();
+        });
+        let manager = RemoteWorkerManager::new(vec![(1, endpoint)], String::new(), None);
+        manager.connect_all().await;
+        manager.set_worker_filter(1, &[7; 32], false).unwrap();
+        assert!(manager.served_filters().is_empty(), "a Joining allocation runs no consensus yet");
+        manager.set_worker_filter(1, &[7; 32], true).unwrap();
+        assert_eq!(manager.served_filters(), vec![vec![7; 32]]);
+        assert_eq!(
+            manager.deliver_shard_consensus(&[7; 32], 2, b"x".to_vec(), vec![5; 897]).await,
+            RemoteDelivery::Unsupported,
+            "this test worker lacks the RPC, like an older build"
+        );
+        assert_eq!(
+            manager.deliver_shard_consensus(&[8; 32], 2, b"x".to_vec(), vec![5; 897]).await,
+            RemoteDelivery::Failed,
+            "no worker runs that shard"
+        );
+        stop.send(()).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serving).await;
+    }
+
+    #[tokio::test]
     async fn app_fee_relay_transport_bounds_and_binding_races() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
