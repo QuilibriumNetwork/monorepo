@@ -1,9 +1,9 @@
 use base64::prelude::*;
-use std::{collections::HashMap, io::Read};
+use std::collections::HashMap;
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
-use ed448_goldilocks_plus::{elliptic_curve::{group::GroupEncoding, Field, Group}, subtle::ConstantTimeEq, EdwardsPoint, Scalar};
+use ed448_goldilocks_plus::{elliptic_curve::{group::GroupEncoding, Group}, subtle::ConstantTimeEq, EdwardsPoint, Scalar};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
