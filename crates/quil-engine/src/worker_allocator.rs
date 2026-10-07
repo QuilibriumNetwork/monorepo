@@ -235,17 +235,13 @@ pub const PENDING_FILTER_GRACE_FRAMES: u64 = 720;
 /// acting on stale reward data.
 pub const PRIORITY_SNAPSHOT_MAX_AGE_FRAMES: u64 = 60;
 
-/// Minimum frames between two reconciles that perform a priority
-/// rebind. Churn safeguard: a rebind stops a running app-shard
-/// consensus engine, so bursts are spaced out even when the ranking
-/// keeps recommending them.
-pub const REBIND_COOLDOWN_FRAMES: u64 = 30;
+/// Minimum frames between detailed reviews of a priority replacement that
+/// cannot proceed while its source allocation still owns the worker.
+pub const SURPLUS_REVIEW_INTERVAL_FRAMES: u64 = 30;
 
-/// Maximum number of rebinds performed in a single reconcile. Bounds
-/// the blast radius of one bad snapshot while still letting a node that
-/// just lost workers converge on its best shards in a few cycles rather
-/// than a few hundred frames.
-pub const MAX_REBINDS_PER_RECONCILE: usize = 4;
+/// Bound the number of deferred replacement pairs reported in one review.
+/// The complete candidate and holder inventories are logged once.
+pub const MAX_DEFERRED_REPLACEMENTS_PER_REVIEW: usize = 4;
 
 /// How often the rebind path repeats an unchanged outcome in the log.
 /// Roughly ten minutes of frames — often enough that a fresh log window
@@ -277,6 +273,34 @@ pub struct AllocationPriorityEntry {
     pub halt_risk: bool,
     /// Expected-reward score under the node's configured strategy.
     pub score: BigInt,
+    pub evidence: Option<AllocationPriorityEvidence>,
+}
+
+/// Inputs captured with a priority score, for explaining an actual worker move.
+/// Counts describe effective statuses at `frame_number`, not peer liveness.
+/// A stored ring may be a legacy decoder default; it is not proof of issuance.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AllocationPriorityEvidence {
+    pub frame_number: u64,
+    pub active: u32,
+    pub joining: u32,
+    pub paused: u32,
+    pub leaving: u32,
+    pub scoring_ring: u8,
+    pub ring_source: &'static str,
+    pub size_bytes: u64,
+    pub data_shards: u64,
+    pub difficulty: u64,
+    pub world_bytes_input: String,
+    pub world_bytes_source: &'static str,
+    pub allocation_epoch: Option<u64>,
+    pub stored_ring: Option<u8>,
+    pub allocation_status: Option<String>,
+    pub allocation_raw_status: Option<String>,
+    pub join_confirm_frame: Option<u64>,
+    pub leave_frame: Option<u64>,
+    pub leave_confirm_frame: Option<u64>,
+    pub leave_reject_frame: Option<u64>,
 }
 
 /// A whole-frame ranking of allocations, published by the lifecycle.
@@ -304,13 +328,10 @@ fn priority_key(
     }
 }
 
-/// Whether `challenger` is worth taking a worker away from `holder`.
-///
-/// A tier upgrade always qualifies — covering a halt-risk shard beats
-/// any reward gap. Within a tier the challenger must clear
-/// `REBIND_MARGIN_PERCENT` of the holder's score, which is what stops
-/// the swap from being reversible on the next drift of either score.
-fn rebind_justified(challenger: &(u8, BigInt), holder: &(u8, BigInt)) -> bool {
+/// Whether a priority gap warrants a diagnostic replacement review.
+/// This never authorizes transferring a serving worker: a tier or score
+/// improvement cannot change the source shard's committee membership.
+fn replacement_priority_gap(challenger: &(u8, BigInt), holder: &(u8, BigInt)) -> bool {
     if challenger.0 != holder.0 {
         return challenger.0 > holder.0;
     }
@@ -334,8 +355,8 @@ enum PriorityState {
 /// "no rebinding happened" is diagnosable without a debug build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RebindOutcome {
-    /// Workers were moved onto better-ranked allocations.
-    Rebound = 1,
+    /// Better-ranked allocations exist, but serving workers are retained.
+    ServiceRetained = 1,
     /// No ranking published yet: the lifecycle publishes from `evaluate`,
     /// which returns early while any readiness gate is closed — so this
     /// covers cold start, an unfinished prover-tree sync, an unverified
@@ -343,7 +364,7 @@ enum RebindOutcome {
     NoRanking = 2,
     /// Ranking too old to act on.
     RankingStale = 3,
-    /// Within `REBIND_COOLDOWN_FRAMES` of the last rebind.
+    /// Within `SURPLUS_REVIEW_INTERVAL_FRAMES` of the last rebind.
     Cooldown = 4,
     /// No unbound allocation is eligible — all orphans are mid-transition
     /// (`Joining`/`Leaving`) or epoch-stale rather than steady `Active`.
@@ -359,7 +380,7 @@ enum RebindOutcome {
 impl RebindOutcome {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Rebound => "rebound",
+            Self::ServiceRetained => "service_retained",
             Self::NoRanking => "no_ranking_published",
             Self::RankingStale => "ranking_stale",
             Self::Cooldown => "cooldown",
@@ -424,9 +445,9 @@ pub struct WorkerAllocator {
     /// this node holds more allocations than it has worker slots.
     /// `None` until the first `publish_allocation_priority`.
     allocation_priority: RwLock<Option<AllocationPriority>>,
-    /// Frame of the last reconcile that rebound a worker. Gates
-    /// `REBIND_COOLDOWN_FRAMES`.
-    last_rebind_frame: std::sync::atomic::AtomicU64,
+    /// Frame of the last detailed deferred-replacement review. Gates
+    /// `SURPLUS_REVIEW_INTERVAL_FRAMES`.
+    last_priority_review_frame: std::sync::atomic::AtomicU64,
     /// Last logged `RebindOutcome` (as its discriminant) and the frame
     /// it was logged at, for the rate limiter in `log_rebind_outcome`.
     last_rebind_outcome: std::sync::atomic::AtomicU64,
@@ -478,7 +499,7 @@ impl WorkerAllocator {
             config_seniority_estimate: std::sync::atomic::AtomicU64::new(u64::MAX),
             allocation_priority: RwLock::new(None),
             session_authority: RwLock::new(None),
-            last_rebind_frame: std::sync::atomic::AtomicU64::new(0),
+            last_priority_review_frame: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome_frame: std::sync::atomic::AtomicU64::new(0),
             worker_reset_v3_done: std::sync::atomic::AtomicBool::new(false),
@@ -554,12 +575,21 @@ impl WorkerAllocator {
         frame_number: u64,
         entries: Vec<(Vec<u8>, bool, BigInt)>,
     ) {
-        let entries: HashMap<Vec<u8>, AllocationPriorityEntry> = entries
-            .into_iter()
-            .map(|(filter, halt_risk, score)| {
-                (filter, AllocationPriorityEntry { halt_risk, score })
-            })
-            .collect();
+        self.publish_allocation_priority_with_evidence(frame_number, entries, HashMap::new());
+    }
+
+    /// Publish scores and their original inputs under the same lock. Reading
+    /// counts again during reconcile could otherwise describe a different tree.
+    pub fn publish_allocation_priority_with_evidence(
+        &self,
+        frame_number: u64,
+        entries: Vec<(Vec<u8>, bool, BigInt)>,
+        mut evidence: HashMap<Vec<u8>, AllocationPriorityEvidence>,
+    ) {
+        let entries = entries.into_iter().map(|(filter, halt_risk, score)| {
+            let evidence = evidence.remove(&filter);
+            (filter, AllocationPriorityEntry { halt_risk, score, evidence })
+        }).collect();
         if let Ok(mut guard) = self.allocation_priority.write() {
             *guard = Some(AllocationPriority { frame_number, entries });
         }
@@ -1084,8 +1114,6 @@ impl WorkerAllocator {
                 | EffectiveStatus::Joining => {}
                 EffectiveStatus::ExpiredEpoch
                     if epoch_renewal_recovery_pending(alloc, frame_number) => {}
-                EffectiveStatus::ExpiredEpoch
-                    if rejected_leave_recovery_pending(alloc, frame_number) => {}
                 // Both proposed and confirmed leaves serve until their
                 // protocol departure boundary; confirmation does not free
                 // the worker or change the frozen committee mid-epoch.
@@ -1195,7 +1223,7 @@ impl WorkerAllocator {
             // the workers back for the best allocations.
             match &priority_state {
                 PriorityState::Fresh(entries) => {
-                    self.rebind_surplus_by_priority(
+                    self.review_surplus_priority(
                         frame_number,
                         &orphan_filters,
                         &alloc_by_filter,
@@ -1224,25 +1252,12 @@ impl WorkerAllocator {
         Ok(())
     }
 
-    /// Move workers from lower-ranked bound allocations onto
-    /// higher-ranked unbound ones.
-    ///
-    /// Only runs when this prover holds more allocations than it has
-    /// workers; with slack, the bind pass above has already placed
-    /// everything and `orphans` is empty. Confined to steady-state
-    /// bindings: manually-managed workers are the operator's, an
-    /// in-flight join has its own timeout, and a `Joining`/`Leaving`
-    /// allocation is mid-transition and resolves on its own. An
-    /// orphan must be `Active`/`Paused` to be promoted — taking a
-    /// running shard's worker to give it to a shard we have not
-    /// joined yet trades work for none.
-    ///
-    /// Rebinding does not touch consensus-visible state: the surplus
-    /// allocations stay on-chain either way and the lifecycle's
-    /// surplus-leave path sheds them, lowest-scoring first — the same
-    /// order used here, so the shards left unbound are the ones it
-    /// will propose leaving.
-    fn rebind_surplus_by_priority(
+    /// Explain a surplus priority gap without stopping a serving worker.
+    /// Moving a worker does not remove its source allocation from the on-chain
+    /// committee. The lifecycle must first arrange a protocol departure; only
+    /// then may the ordinary free-worker binding pass select another holding.
+    /// Paused allocations retain their worker too, so a resume can be served.
+    fn review_surplus_priority(
         &self,
         frame_number: u64,
         orphans: &[(Vec<u8>, ProverStatus)],
@@ -1252,14 +1267,14 @@ impl WorkerAllocator {
         use quil_types::consensus::EffectiveStatus;
         use std::sync::atomic::Ordering;
 
-        let last_rebind = self.last_rebind_frame.load(Ordering::Relaxed);
-        if last_rebind > 0 && frame_number.abs_diff(last_rebind) < REBIND_COOLDOWN_FRAMES {
+        let last_review = self.last_priority_review_frame.load(Ordering::Relaxed);
+        if last_review > 0 && frame_number.abs_diff(last_review) < SURPLUS_REVIEW_INTERVAL_FRAMES {
             self.log_rebind_outcome(
                 frame_number,
                 RebindOutcome::Cooldown,
                 &format!(
-                    "last rebind at frame {last_rebind}, {} of                      {REBIND_COOLDOWN_FRAMES} cooldown frames elapsed",
-                    frame_number.abs_diff(last_rebind)
+                    "last priority review at frame {last_review}, {} of                      {SURPLUS_REVIEW_INTERVAL_FRAMES} review interval frames elapsed",
+                    frame_number.abs_diff(last_review)
                 ),
             );
             return Ok(());
@@ -1336,45 +1351,63 @@ impl WorkerAllocator {
         let challenger_count = challengers.len();
         let holder_count = holders.len();
 
-        let mut rebound = 0usize;
+        // Retain every eligible alternative so operators can explain why a
+        // favorable holding was chosen instead of a lower displayed estimate.
+        let include_inputs = tracing::enabled!(tracing::Level::INFO)
+            && replacement_priority_gap(&best_challenger, &worst_holder);
+        let candidate_inputs: Vec<_> = challengers.iter().filter(|_| include_inputs).map(|(tier, score, filter)|
+            serde_json::json!({"filter": hex::encode(filter), "tier": tier,
+                "score": score.to_string(), "ranking": priority.get(filter).and_then(|p| p.evidence.as_ref())})).collect();
+        let holder_inputs: Vec<_> = holders.iter().filter(|_| include_inputs).map(|(tier, score, core_id, filter)|
+            serde_json::json!({"filter": hex::encode(filter), "worker": core_id,
+                "tier": tier, "score": score.to_string(),
+                "ranking": priority.get(filter).and_then(|p| p.evidence.as_ref())})).collect();
+        let mut deferred = 0usize;
         for ((c_tier, c_score, c_filter), (h_tier, h_score, core_id, h_filter)) in
             challengers.into_iter().zip(holders.into_iter())
         {
-            if rebound == MAX_REBINDS_PER_RECONCILE {
+            if deferred == MAX_DEFERRED_REPLACEMENTS_PER_REVIEW {
                 break;
             }
-            if !rebind_justified(&(c_tier, c_score.clone()), &(h_tier, h_score.clone())) {
+            if !replacement_priority_gap(&(c_tier, c_score.clone()), &(h_tier, h_score.clone())) {
                 // Both lists are sorted, so once the best remaining
                 // challenger cannot displace the worst remaining
                 // holder, no later pair can either.
                 break;
             }
+            if deferred == 0 {
+                info!(frame_number,
+                    current_epoch = quil_types::consensus::epoch_for_frame(frame_number),
+                    halt_risk_threshold = crate::provers::proposer::HALT_RISK_PROVER_COUNT,
+                    candidates = %serde_json::json!(candidate_inputs),
+                    holders = %serde_json::json!(holder_inputs),
+                    "deferred worker replacement inputs; registry coverage is not peer liveness");
+            }
             warn!(
+                source_status = ?alloc_by_filter.get(&h_filter).map(|a| a.effective_status(frame_number)),
+                source_epoch = ?alloc_by_filter.get(&h_filter).map(|a| a.epoch),
+                destination_status = ?alloc_by_filter.get(&c_filter).map(|a| a.effective_status(frame_number)),
+                destination_epoch = ?alloc_by_filter.get(&c_filter).map(|a| a.epoch),
                 core_id,
-                released_filter = hex::encode(&h_filter),
-                released_tier = h_tier,
-                released_score = %h_score,
-                bound_filter = hex::encode(&c_filter),
-                bound_tier = c_tier,
-                bound_score = %c_score,
+                retained_filter = hex::encode(&h_filter),
+                retained_tier = h_tier,
+                retained_score = %h_score,
+                candidate_filter = hex::encode(&c_filter),
+                candidate_tier = c_tier,
+                candidate_score = %c_score,
                 frame_number,
-                "rebinding worker to a higher-ranked allocation — this node holds \
-                 more allocations than workers, so the scarce workers run the \
-                 shards the lifecycle would keep. The released allocation stays \
-                 on-chain until the surplus-leave path sheds it."
+                "priority replacement deferred: the source allocation retains its worker until effective departure"
             );
-            self.worker_manager.deallocate_worker(core_id)?;
-            self.worker_manager.set_worker_filter(core_id, &c_filter, true)?;
-            rebound += 1;
+            deferred += 1;
         }
 
-        if rebound > 0 {
-            self.last_rebind_frame.store(frame_number, Ordering::Relaxed);
+        if deferred > 0 {
+            self.last_priority_review_frame.store(frame_number, Ordering::Relaxed);
             self.log_rebind_outcome(
                 frame_number,
-                RebindOutcome::Rebound,
+                RebindOutcome::ServiceRetained,
                 &format!(
-                    "{rebound} worker(s) moved; {challenger_count} unbound                      candidate(s) against {holder_count} evictable worker(s)"
+                    "{deferred} replacement(s) deferred; {challenger_count} unbound                      candidate(s) against {holder_count} serving worker(s)"
                 ),
             );
         } else {
@@ -1382,7 +1415,7 @@ impl WorkerAllocator {
                 frame_number,
                 RebindOutcome::BelowMargin,
                 &format!(
-                    "best unbound (tier {}, score {}) does not clear                      {REBIND_MARGIN_PERCENT}% of worst bound (tier {}, score                      {}); {challenger_count} candidate(s), {holder_count}                      evictable worker(s)",
+                    "best unbound (tier {}, score {}) does not clear                      {REBIND_MARGIN_PERCENT}% of worst bound (tier {}, score                      {}); {challenger_count} candidate(s), {holder_count}                      serving worker(s)",
                     best_challenger.0,
                     best_challenger.1,
                     worst_holder.0,
@@ -2088,11 +2121,9 @@ mod tests {
     }
 
     #[test]
-    fn lost_workers_keep_the_most_profitable_allocations() {
-        // Incident shape: the node had three workers, two died, and the
-        // survivor happens to hold the worst allocation. The two better
-        // allocations are orphaned. The survivor must be moved onto the
-        // best of them.
+    fn worker_loss_does_not_interrupt_the_surviving_allocation() {
+        // Losing two workers does not authorize stopping the survivor's
+        // consensus participation, even if orphaned holdings score better.
         let wm = Arc::new(MockWorkerManager::new());
         let frame = 10_000u64;
         let filters = vec![vec![0x01; 32], vec![0x02; 32], vec![0x03; 32]];
@@ -2115,9 +2146,57 @@ mod tests {
 
         assert_eq!(
             bound_filters(&wm),
-            vec![filters[2].clone()],
-            "the surviving worker must be moved onto the best allocation"
+            vec![filters[0].clone()],
+            "a better score must not interrupt the surviving allocation"
         );
+    }
+
+    #[test]
+    fn halt_risk_priority_never_preempts_serving_or_paused_allocations() {
+        for status in [ProverStatus::Active, ProverStatus::Paused, ProverStatus::Leaving] {
+            let frame = 10_000;
+            let filters = vec![vec![0x01; 32], vec![0x02; 32]];
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.allocate_worker(1, &filters[0]).unwrap();
+            let mut prover = prover_with_active(&filters, frame);
+            prover.allocations[0].status = status;
+            prover.allocations[0].leave_frame_number = frame;
+            let registry = Arc::new(TestProverRegistry::with_prover(prover));
+            let allocator = WorkerAllocator::new(wm.clone(), registry, vec![0xAA; 32]);
+            allocator.publish_allocation_priority(frame, vec![
+                (filters[0].clone(), false, 1.into()),
+                (filters[1].clone(), true, 9_000.into()),
+            ]);
+            allocator.on_new_frame(frame).unwrap();
+            assert_eq!(bound_filters(&wm), vec![filters[0].clone()], "{status:?}");
+        }
+    }
+
+    #[test]
+    fn replacement_binds_after_the_notice_period_actually_ends() {
+        let frame = 10_000;
+        let filters = vec![vec![0x01; 32], vec![0x02; 32]];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &filters[0]).unwrap();
+        let mut prover = prover_with_active(&filters, frame);
+        prover.allocations[0].status = ProverStatus::Leaving;
+        prover.allocations[0].leave_frame_number = frame - 720;
+        prover.allocations[0].leave_confirm_frame_number = frame;
+        prover.allocations[1].epoch = u64::MAX;
+        let registry = Arc::new(TestProverRegistry::with_prover(prover));
+        let allocator = WorkerAllocator::new(wm.clone(), registry, vec![0xAA; 32]);
+        allocator.publish_allocation_priority(frame, vec![
+            (filters[0].clone(), false, 1.into()),
+            (filters[1].clone(), true, 9_000.into()),
+        ]);
+        allocator.on_new_frame(frame).unwrap();
+        assert_eq!(bound_filters(&wm), vec![filters[0].clone()]);
+        let departure = (quil_types::consensus::epoch_for_frame(frame) + 1)
+            * quil_types::consensus::epoch_length_frames();
+        allocator.on_new_frame(departure - 1).unwrap();
+        assert_eq!(bound_filters(&wm), vec![filters[0].clone()]);
+        allocator.on_new_frame(departure).unwrap();
+        assert_eq!(bound_filters(&wm), vec![filters[1].clone()]);
     }
 
     #[test]
@@ -2208,6 +2287,45 @@ mod tests {
     }
 
     #[test]
+    fn priority_evidence_retains_the_scoring_snapshot() {
+        let wm = Arc::new(MockWorkerManager::new());
+        let reg = Arc::new(TestProverRegistry::new());
+        let allocator = WorkerAllocator::new(wm, reg, vec![0xAA; 32]);
+        let filter = vec![0x01; 32];
+        let frame = 720;
+        let evidence = AllocationPriorityEvidence {
+            frame_number: frame, active: 3, joining: 20, paused: 1, leaving: 7,
+            scoring_ring: 0, ring_source: "stored_allocation_or_decoder_default",
+            size_bytes: 1000, data_shards: 2, difficulty: 100,
+            world_bytes_input: "123".into(), world_bytes_source: "registry_count_proxy",
+            allocation_epoch: Some(1), stored_ring: Some(0),
+            allocation_status: Some("Active".into()), allocation_raw_status: Some("Active".into()),
+            join_confirm_frame: Some(1), leave_frame: Some(0),
+            leave_confirm_frame: Some(0), leave_reject_frame: Some(0),
+        };
+        allocator.publish_allocation_priority_with_evidence(frame,
+            vec![(filter.clone(), true, 10.into())],
+            HashMap::from([(filter.clone(), evidence)]));
+        let PriorityState::Fresh(captured) = allocator.allocation_priority_state(frame + 1) else {
+            panic!("expected usable snapshot");
+        };
+        allocator.publish_allocation_priority(frame + 1,
+            vec![(filter.clone(), false, 20.into())]);
+        let old = serde_json::to_value(captured[&filter].evidence.as_ref().unwrap()).unwrap();
+        assert_eq!(old["frame_number"], frame);
+        assert_eq!(old["active"], 3);
+        assert_eq!(old["joining"], 20);
+        assert_eq!(old["leaving"], 7);
+        assert_eq!(old["stored_ring"], 0);
+        assert!(captured[&filter].halt_risk);
+        let PriorityState::Fresh(current) = allocator.allocation_priority_state(frame + 1) else {
+            panic!("expected replacement snapshot");
+        };
+        assert!(!current[&filter].halt_risk);
+        assert!(current[&filter].evidence.is_none(), "missing provenance must remain unknown");
+    }
+
+    #[test]
     fn priority_state_distinguishes_missing_from_stale() {
         let wm = Arc::new(MockWorkerManager::new());
         let reg = Arc::new(TestProverRegistry::new());
@@ -2243,7 +2361,7 @@ mod tests {
     }
 
     #[test]
-    fn rebind_respects_its_cooldown() {
+    fn deferred_replacement_review_respects_its_interval() {
         let wm = Arc::new(MockWorkerManager::new());
         let frame = 10_000u64;
         let filters = vec![vec![0x01; 32], vec![0x02; 32], vec![0x03; 32]];
@@ -2266,7 +2384,8 @@ mod tests {
 
         publish(frame);
         alloc.on_new_frame(frame).unwrap();
-        assert_eq!(bound_filters(&wm), vec![filters[2].clone()]);
+        assert_eq!(bound_filters(&wm), vec![filters[0].clone()]);
+        assert_eq!(alloc.last_priority_review_frame.load(std::sync::atomic::Ordering::Relaxed), frame);
 
         // Immediately after, pretend the best shard collapsed so the
         // ranking now prefers a different one. The cooldown must hold.
@@ -2281,12 +2400,14 @@ mod tests {
         alloc.on_new_frame(frame + 1).unwrap();
         assert_eq!(
             bound_filters(&wm),
-            vec![filters[2].clone()],
-            "a second rebind within REBIND_COOLDOWN_FRAMES must be deferred"
+            vec![filters[0].clone()],
+            "a second rebind within SURPLUS_REVIEW_INTERVAL_FRAMES must be deferred"
         );
 
-        // Past the cooldown it takes effect.
-        let later = frame + REBIND_COOLDOWN_FRAMES + 1;
+        assert_eq!(alloc.last_priority_review_frame.load(std::sync::atomic::Ordering::Relaxed), frame);
+
+        // A later review still must not move the serving worker.
+        let later = frame + SURPLUS_REVIEW_INTERVAL_FRAMES + 1;
         alloc.publish_allocation_priority(
             later,
             vec![
@@ -2296,7 +2417,8 @@ mod tests {
             ],
         );
         alloc.on_new_frame(later).unwrap();
-        assert_eq!(bound_filters(&wm), vec![filters[1].clone()]);
+        assert_eq!(bound_filters(&wm), vec![filters[0].clone()]);
+        assert_eq!(alloc.last_priority_review_frame.load(std::sync::atomic::Ordering::Relaxed), later);
     }
 
     #[test]

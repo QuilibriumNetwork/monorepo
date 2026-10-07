@@ -1108,35 +1108,12 @@ impl ProverLifecycle {
 
         // Shed the worst-scoring allocations, bound or not.
         //
-        // This used to shed orphans (Active, no worker bound) first and
-        // score-blind, on the reasoning that "no worker does the work,
-        // so leaving them costs nothing." It costs the difference in
-        // score. Which allocations hold a worker is decided by bind
-        // order in the allocator, not by value: a crashed worker, a
-        // reduced core count, or a join batch that outran the idle pool
-        // all leave whatever they held bound and push the rest out in
-        // arrival order. `WorkerAllocator::rebind_surplus_by_priority`
-        // exists to correct exactly that — it moves workers off the
-        // worst-ranked bound allocations onto the best-ranked orphans —
-        // and its doc comment states the contract this function is
-        // meant to honour: "the surplus-leave path sheds them,
-        // lowest-scoring first — the same order used here, so the
-        // shards left unbound are the ones it will propose leaving."
-        //
-        // Shedding orphans first broke that contract, and it also raced
-        // ahead of the correction: a leave marks the allocation
-        // `Leaving`, and the rebind only promotes a *steady*
-        // `Active`/`Paused` orphan, so once shed it can never be
-        // reclaimed. The score-blind rule therefore always won.
-        //
-        // Observed on mainnet 2026-09-09: 27 allocations against 15
-        // workers; of the 14 shed, four were on the best-paying ring the
-        // node held while five bound allocations two rings down were
-        // kept, and the allocator logged `no_eligible_orphan: 12 unbound
-        // allocation(s), none steady Active/Paused` on every reconcile.
-        //
-        // Ties break toward the unbound allocation, so an equal-scoring
-        // running worker is never stopped for nothing.
+        // Rank all holdings rather than shedding unbound allocations first:
+        // worker loss or delayed joins can leave a valuable holding unbound.
+        // This chooses protocol leave proposals; priority review cannot move
+        // a serving worker before its source allocation actually departs.
+        // Ties prefer the unbound holding so equal value does not interrupt
+        // an allocation whose worker is already serving it.
         //
         // Exclusion set: manually-managed pins + any shard whose
         // post-leave Active count would land at or below the halt-risk
@@ -1624,8 +1601,15 @@ impl ProverLifecycle {
                     (filter, halt_risk, score)
                 })
                 .collect();
-            self.allocator
-                .publish_allocation_priority(frame_number, priority_entries);
+            let evidence = held_descriptors.iter().map(|d| {
+                let summary = summaries.iter().find(|s| s.filter == d.filter);
+                let allocation = prover_info.as_ref().and_then(|p| p.allocations.iter()
+                    .find(|a| a.confirmation_filter == d.filter));
+                (d.filter.clone(), priority_evidence(d, summary, allocation,
+                    frame_number, difficulty, &world_bytes))
+            }).collect();
+            self.allocator.publish_allocation_priority_with_evidence(
+                frame_number, priority_entries, evidence);
         }
         if !shard_info_ready {
             tracing::debug!(
@@ -2162,7 +2146,7 @@ impl ProverLifecycle {
             //
             // Ranking cannot rescue these, which is why they stay a
             // score-blind sweep while Active orphans do not:
-            // `rebind_surplus_by_priority` promotes only a *steady*
+            // Priority binding promotes only a *steady*
             // `Active`/`Paused` orphan, so an ExpiredEpoch one can
             // neither be staffed nor score its way back into
             // contention. Retaining a high-scoring one would rebuild
@@ -2179,43 +2163,11 @@ impl ProverLifecycle {
             // Over-capacity filters: allocations this prover cannot
             // staff, worst-scoring first.
             //
-            // This used to be "every Active allocation with no worker
-            // bound, leave it regardless of score." But which
-            // allocations hold a worker is decided by bind order in the
-            // allocator, not by score — a worker lost to a crash, a
-            // reduced core count, or a join batch that outran the idle
-            // pool all leave whatever they held bound and push the rest
-            // out in arrival order. `rebind_surplus_by_priority` exists
-            // to correct exactly that: it moves workers off the
-            // worst-ranked bound allocations onto the best-ranked
-            // orphans. It only promotes an orphan that is still
-            // *steady* `Active`/`Paused`, so proposing Leave the moment
-            // an allocation is unbound marks it `Leaving` and makes it
-            // permanently ineligible — the score-blind rule wins the
-            // race against the score-aware one, and the shed set ends
-            // up decided by bind order after all.
-            //
-            // Observed on mainnet 2026-09-09: of 27 allocations against
-            // 15 workers, the 14 shed included four on the best ring
-            // the node held while five bound allocations two rings down
-            // were kept, and the allocator logged `no_eligible_orphan:
-            // 12 unbound allocation(s), none steady Active/Paused` on
-            // every reconcile for hours.
-            //
-            // So shed by rank instead: only the count we cannot staff,
-            // taken worst-scoring first across the whole held set,
-            // bound or not. That is the same ordering the rebind path
-            // uses, which restores the invariant its doc comment
-            // already claims — "the shards left unbound are the ones it
-            // will propose leaving." Ties break toward the unbound one
-            // so an equal-scoring running worker is not stopped for
-            // nothing. With no over-capacity nothing is shed: an orphan
-            // that fits within worker capacity gets a worker on the
-            // next reconcile, and leaving it would throw away a live
-            // allocation to fix a transient. That still covers the
-            // original "extra allocation lingers, shows as -1 in the
-            // TUI" case — with slack it is bound, without slack it is
-            // shed if it really is among the worst.
+            // Rank the whole held set, including unbound allocations: a
+            // crash or delayed join can leave the valuable holding unstaffed.
+            // Propose a protocol departure for the worst surplus holdings;
+            // priority review never frees a serving worker prematurely.
+            // With enough capacity, an unbound allocation waits for binding.
             let sheddable_filters: Vec<Vec<u8>> = active_filters
                 .iter()
                 .filter(|f| !manually_managed_filters.contains(*f))
@@ -2675,6 +2627,26 @@ impl ProverLifecycle {
                     .find(|(f, _)| f == filter).cloned()).collect();
                 self.leave_decisions.commit(&rejected, frame_number)?;
                 self.commit_plan_attempts(&actions, frame_number, forced_rejection);
+                if !actions.is_empty() && tracing::enabled!(tracing::Level::INFO) {
+                    let inputs: Vec<_> = held_descriptors.iter().map(|d| {
+                        let summary = summaries.iter().find(|s| s.filter == d.filter);
+                        let allocation = prover_info.as_ref().and_then(|p| p.allocations.iter()
+                            .find(|a| a.confirmation_filter == d.filter));
+                        let workers: Vec<_> = workers.iter().filter(|w| w.filter == d.filter)
+                            .map(|w| w.core_id).collect();
+                        serde_json::json!({"filter": hex::encode(&d.filter), "workers": workers,
+                            "inputs": priority_evidence(d, summary, allocation,
+                                frame_number, difficulty, &world_bytes)})
+                    }).collect();
+                    info!(frame = frame_number,
+                        epoch = quil_types::consensus::epoch_for_frame(frame_number),
+                        strategy = ?self.strategy,
+                        root_verified_frame_at_log = self.prover_root_verified_frame.load(Ordering::Relaxed),
+                        actions = ?actions,
+                        halt_risk_threshold = proposer::HALT_RISK_PROVER_COUNT,
+                        inputs = %serde_json::json!(inputs),
+                        "lifecycle plan prepared; submission and authenticated outcome still pending");
+                }
                 Ok(actions)
             },
             Err(error) => {
@@ -2683,6 +2655,43 @@ impl ProverLifecycle {
                 Err(error)
             }
         }
+    }
+}
+
+/// Preserve the exact scoring inputs, without treating a decoded ring zero
+/// as proof that the allocation occupies the first reward ring.
+fn priority_evidence(
+    descriptor: &ShardDescriptor,
+    summary: Option<&ProverShardSummary>,
+    allocation: Option<&quil_types::consensus::ProverAllocationInfo>,
+    frame_number: u64,
+    difficulty: u64,
+    world_bytes: &BigInt,
+) -> crate::worker_allocator::AllocationPriorityEvidence {
+    let count = |status| summary.and_then(|s| s.status_counts.get(&status)).copied().unwrap_or(0);
+    let holding = allocation.is_some_and(|a| a.is_live(frame_number)
+        || crate::worker_allocator::epoch_renewal_recovery_pending(a, frame_number));
+    crate::worker_allocator::AllocationPriorityEvidence {
+        frame_number,
+        active: count(ProverStatus::Active),
+        joining: count(ProverStatus::Joining),
+        paused: count(ProverStatus::Paused),
+        leaving: count(ProverStatus::Leaving),
+        scoring_ring: descriptor.ring,
+        ring_source: if holding { "stored_allocation_or_decoder_default" } else { "summary_tail" },
+        size_bytes: descriptor.size,
+        data_shards: descriptor.shards,
+        difficulty,
+        world_bytes_input: world_bytes.to_string(),
+        world_bytes_source: "registry_count_proxy",
+        allocation_epoch: allocation.map(|a| a.epoch),
+        stored_ring: allocation.map(|a| a.ring),
+        allocation_status: allocation.map(|a| format!("{:?}", a.effective_status(frame_number))),
+        allocation_raw_status: allocation.map(|a| format!("{:?}", a.status)),
+        join_confirm_frame: allocation.map(|a| a.join_confirm_frame_number),
+        leave_frame: allocation.map(|a| a.leave_frame_number),
+        leave_confirm_frame: allocation.map(|a| a.leave_confirm_frame_number),
+        leave_reject_frame: allocation.map(|a| a.leave_reject_frame_number),
     }
 }
 
@@ -3674,6 +3683,32 @@ mod proposal_loop_tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn decision_evidence_distinguishes_coverage_from_membership_and_ring_defaults() {
+        let frame = quil_types::consensus::epoch_length_frames();
+        let filter = filter_bytes(0xA1);
+        let mut allocation = alloc(filter.clone(), ProverStatus::Active, 1);
+        allocation.epoch = quil_types::consensus::epoch_for_frame(frame);
+        allocation.ring = 0;
+        let summary = ProverShardSummary { filter: filter.clone(), total_size: 30,
+            status_counts: HashMap::from([(ProverStatus::Active, 3),
+                (ProverStatus::Joining, 20), (ProverStatus::Leaving, 7)]) };
+        let descriptor = ShardDescriptor { filter, size: 1000, ring: 0, shards: 2,
+            active_on_ring: 3, total_active_joining: 23, active_count: 3 };
+        let evidence = priority_evidence(&descriptor, Some(&summary), Some(&allocation),
+            frame, 10, &30.into());
+        assert_eq!(evidence.active, 3);
+        assert_eq!(evidence.joining, 20);
+        assert_eq!(evidence.leaving, 7);
+        assert_eq!(evidence.allocation_status.as_deref(), Some("Active"));
+        assert_eq!(evidence.ring_source, "stored_allocation_or_decoder_default");
+        assert_eq!(evidence.world_bytes_source, "registry_count_proxy");
+        let missing = priority_evidence(&descriptor, None, None, frame, 10, &30.into());
+        assert!(missing.stored_ring.is_none());
+        assert!(missing.allocation_epoch.is_none());
+        assert_eq!(missing.ring_source, "summary_tail");
     }
 
     #[test]
@@ -4933,7 +4968,7 @@ mod proposal_loop_tests {
     /// arrival order, so the orphan is just as likely to be the best
     /// allocation the prover holds. Here 0xA3 is unbound *and* the
     /// highest-scoring of the three, so the worst-scoring 0xA1 goes
-    /// instead and `rebind_surplus_by_priority` moves its worker onto
+    /// instead; its worker becomes available after effective departure for
     /// 0xA3.
     #[test]
     fn overcapacity_sheds_the_worst_scoring_not_the_unbound() {
@@ -5091,7 +5126,7 @@ mod proposal_loop_tests {
         assert_eq!(
             count_proposed_leaves(&actions),
             0,
-            "an orphan inside capacity must wait for a rebind, not be shed; \
+            "an orphan inside capacity must wait for a free worker, not be shed; \
              got {:?}",
             actions
         );
