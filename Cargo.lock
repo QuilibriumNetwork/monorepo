@@ -5812,6 +5812,7 @@ dependencies = [
  "quil-config",
  "quil-crypto",
  "quil-execution",
+ "quil-forest",
  "quil-hypergraph",
  "quil-keys",
  "quil-lattice-ct",
