@@ -598,7 +598,7 @@ pub struct ProverLifecycle {
     /// leave-confirm / seniority-merge paths run regardless of this
     /// gate since they depend on local pending state, not shard sizes.
     shard_info_loaded: AtomicBool,
-    pub(crate) confirmation_attempts: Arc<crate::confirmation_attempts::ConfirmationAttempts>,
+    pub(crate) submission_attempts: Arc<crate::submission_attempts::SubmissionAttempts>,
     /// Set on a node whose registry learns the chain's split and merge
     /// reassignments only from prover-tree syncs: a regular node's own grid
     /// never flips. A gone shard (split away or retired) it still holds
@@ -649,7 +649,7 @@ impl ProverLifecycle {
             last_leave_attempt: RwLock::new(HashMap::new()),
             last_join_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
-            confirmation_attempts: Arc::new(crate::confirmation_attempts::ConfirmationAttempts::default()),
+            submission_attempts: Arc::new(crate::submission_attempts::SubmissionAttempts::default()),
             gone_shard_leaves_await_sync: AtomicBool::new(false),
             registry_syncs_begun: AtomicU64::new(0),
             registry_synced_through: AtomicU64::new(0),
