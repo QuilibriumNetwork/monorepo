@@ -71,19 +71,63 @@ impl GmpClassGroup {
         (self.a, self.b)
     }
 
-    /// True if the form's `a` coefficient is zero — a DEGENERATE, invalid form
-    /// that a real proof never contains. Callers decoding untrusted proof bytes
-    /// must reject such a form BEFORE any arithmetic: `pow`/reduce divide by
-    /// `2·a` in raw GMP FFI, and `2·a == 0` is a C-level divide-by-zero (SIGFPE
-    /// abort) that `catch_unwind` cannot trap.
-    pub fn a_is_zero(&self) -> bool {
-        self.a == Mpz::from(0u64)
+    /// True for a positive-definite form whose coefficients have exactly the
+    /// stored discriminant: `a > 0` and `b² - 4ac == D < 0`. Every honest
+    /// proof and output decodes to one, and squares and products of such forms
+    /// are again such forms.
+    ///
+    /// Callers decoding untrusted proof bytes must reject other forms BEFORE
+    /// any arithmetic: raw GMP/C code can divide by zero on them (a SIGFPE
+    /// abort that `catch_unwind` cannot trap) or never finish reducing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called within a call to `Self::with_context`.
+    pub fn is_well_formed(&self) -> bool {
+        Self::with_context(|ctx| self.inner_is_well_formed(ctx))
+    }
+
+    /// Only well-formed forms take the native fast paths (batched reduction
+    /// and the NUDUPL cutoff). Malformed forms keep the original arithmetic,
+    /// preserving the fallback for callers that do not validate decoded forms.
+    fn inner_is_well_formed(&self, ctx: &mut Ctx) -> bool {
+        if self.a <= Mpz::zero() || self.discriminant >= Mpz::zero() {
+            return false;
+        }
+        // b² == D + 4ac, in reducer scratch that is always overwritten before use.
+        ffi::mpz_mul(&mut ctx.r, &self.b, &self.b);
+        ffi::mpz_mul(&mut ctx.denom, &self.a, &self.c);
+        ffi::mpz_mul_2exp(&mut ctx.ra, &ctx.denom, 2);
+        ffi::mpz_add(&mut ctx.old_a, &self.discriminant, &ctx.ra);
+        ctx.old_a == ctx.r
     }
 
     fn inner_multiply(&mut self, rhs: &Self, ctx: &mut Ctx) {
         self.assert_valid();
         rhs.assert_valid();
 
+        self.inner_compose(rhs, ctx);
+        self.inner_reduce_fast(ctx);
+    }
+
+    fn inner_reduce_fast(&mut self, ctx: &mut Ctx) {
+        if !self.inner_is_well_formed(ctx) {
+            self.inner_reduce(ctx);
+            return;
+        }
+        ffi::gmp_reduce(&mut self.a, &mut self.b, &mut self.c);
+        // The native reducer permits b == -a. Rust's canonical convention is
+        // -a < b <= a, so normalize that boundary before serialization/hashing.
+        self.inner_normalize(ctx);
+    }
+
+    #[cfg(test)]
+    fn inner_multiply_general(&mut self, rhs: &Self, ctx: &mut Ctx) {
+        self.inner_compose(rhs, ctx);
+        self.inner_reduce(ctx);
+    }
+
+    fn inner_compose(&mut self, rhs: &Self, ctx: &mut Ctx) {
         // g = (b1 + b2) / 2
         ffi::mpz_add(&mut ctx.congruence_context.g, &self.b, &rhs.b);
         ffi::mpz_fdiv_q_ui_self(&mut ctx.congruence_context.g, 2);
@@ -179,8 +223,6 @@ impl GmpClassGroup {
         ffi::mpz_mul(&mut self.c, &ctx.k, &ctx.l);
         ffi::mpz_mul(&mut ctx.a, &ctx.j, &ctx.lambda);
         self.c -= &ctx.a;
-
-        self.inner_reduce(ctx);
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -271,7 +313,8 @@ impl GmpClassGroup {
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn inner_square_impl(&mut self, ctx: &mut Ctx) {
         self.assert_valid();
-        ffi::gmp_nudupl(&mut self.a, &mut self.b, &mut self.c, 1);
+        let cutoff = self.inner_is_well_formed(ctx);
+        ffi::gmp_nudupl(&mut self.a, &mut self.b, &mut self.c, 1, cutoff);
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -479,7 +522,10 @@ impl ClassGroup for GmpClassGroup {
     /// Panics if called within the scope of a call to `with_context`.
     fn repeated_square(&mut self, iterations: u64) {
         Self::with_context(|ctx| {
-            ffi::gmp_nudupl(&mut self.a, &mut self.b, &mut self.c, iterations);
+            // Squaring a well-formed form keeps it well-formed, so one check
+            // covers the whole batch.
+            let cutoff = self.inner_is_well_formed(ctx);
+            ffi::gmp_nudupl(&mut self.a, &mut self.b, &mut self.c, iterations, cutoff);
         })
     }
 
@@ -552,6 +598,175 @@ pub fn do_compute(discriminant: Mpz, iterations: u64) -> GmpClassGroup {
 mod test {
     #![allow(unused_imports)]
     use super::*;
+
+    fn discriminants() -> Vec<Mpz> {
+        use std::str::FromStr;
+        vec![
+            (-23i64).into(),
+            (-47i64).into(),
+            (-167i64).into(),
+            (-685_537_176_559i64).into(),
+            Mpz::from_str("-20149392707186525162590355071292053575364559848351567085354700987844093330948936280039379742871107183330808146182415920691586415080574829617024503722195777232804427670557174581127121229242207584973924825787037130000131358603651587961876409377224876056238680407347843315752681629521613772380379341182886747008940959623895895000737071932595957989286658892888724991242968836440986789551081768017186919005412288127429935094766982059615711599441803409172888758437372755538407566562462485676644100997464269306675140005421720998149066720895066941777378563169387978299301916769407006303085854796535778826115224633447713584423").unwrap(),
+        ]
+    }
+
+    #[test]
+    fn native_squaring_matches_general_composition_bytes() {
+        for discriminant in discriminants() {
+            let mut native = GmpClassGroup::generator_for_discriminant(discriminant);
+            assert!(native.is_well_formed(), "must exercise the NUDUPL cutoff");
+            let mut general = native.clone();
+            for count in [0, 1, 2, 7, 8, 9, 63, 64, 65, 127] {
+                native.repeated_square(count);
+                GmpClassGroup::with_context(|ctx| {
+                    for _ in 0..count {
+                        let rhs = general.clone();
+                        general.inner_multiply_general(&rhs, ctx);
+                    }
+                });
+                assert_eq!(native, general, "repeated squaring batch {count}");
+                let mut actual = vec![0; 2 * ((native.discriminant.size_in_base(2) + 16) >> 4)];
+                let mut expected = actual.clone();
+                native.serialize(&mut actual).unwrap();
+                general.serialize(&mut expected).unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    /// The old native square can retain either sign at |b| == a. Preserve
+    /// its exact bytes even for composite discriminants and unreduced inputs.
+    #[test]
+    fn native_squaring_preserves_original_boundary_representatives() {
+        let cases = [
+            (form(4, -1, 6, -95), 1, form(5, -5, 6, -95)),
+            (form(4, -1, 7, -111), 1, form(3, 3, 10, -111)),
+            (form(4, 1, 7, -111), 1, form(3, -3, 10, -111)),
+            (form(12, 9, 3, -63), 1, form(1, 1, 16, -63)),
+            (form(4, -1, 7, -111), 2, form(1, -1, 28, -111)),
+            (form(4, -1, 7, -111), 7, form(1, -1, 28, -111)),
+        ];
+        for (mut actual, iterations, expected) in cases {
+            assert!(actual.is_well_formed());
+            actual.repeated_square(iterations);
+            assert_eq!(actual, expected);
+            let mut actual_bytes = [0; 4];
+            let mut expected_bytes = [0; 4];
+            actual.serialize(&mut actual_bytes).unwrap();
+            expected.serialize(&mut expected_bytes).unwrap();
+            assert_eq!(actual_bytes, expected_bytes);
+        }
+    }
+
+    #[test]
+    fn native_composition_matches_rust_reduction() {
+        for discriminant in discriminants() {
+            let generator = GmpClassGroup::generator_for_discriminant(discriminant);
+            assert!(generator.is_well_formed(), "must exercise the native reducer");
+            let mut powers = vec![generator.identity(), generator.clone()];
+            GmpClassGroup::with_context(|ctx| {
+                for _ in 0..18 {
+                    let mut next = powers.last().unwrap().clone();
+                    next.inner_multiply_general(&generator, ctx);
+                    powers.push(next);
+                }
+                for left in &powers {
+                    for right in &powers {
+                        let mut actual = left.clone();
+                        actual.inner_multiply(right, ctx);
+                        let mut expected = left.clone();
+                        expected.inner_multiply_general(right, ctx);
+                        assert_eq!(actual, expected);
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn native_reduction_matches_rust_at_canonical_boundaries() {
+        let forms = [
+            GmpClassGroup::from_ab_discriminant(1.into(), (-1).into(), (-23).into()),
+            GmpClassGroup::from_ab_discriminant(1.into(), (-1).into(), (-3).into()),
+            GmpClassGroup::from_ab_discriminant(2.into(), (-2).into(), (-4).into()),
+            GmpClassGroup::generator_for_discriminant(discriminants().pop().unwrap()),
+        ];
+        GmpClassGroup::with_context(|ctx| {
+            for form in &forms {
+                for shift in [-1000i64, -33, -1, 0, 1, 33, 1000] {
+                    // An integral change of variables preserves the discriminant
+                    // but forces normalization and highly unbalanced reduction.
+                    let r = Mpz::from(shift);
+                    let mut actual = form.clone();
+                    actual.b += &(&form.a * &r * &Mpz::from(2u64));
+                    actual.c += &(&form.b * &r + &form.a * &r * &r);
+                    assert!(actual.inner_is_well_formed(ctx), "must exercise the native reducer");
+                    let mut expected = actual.clone();
+                    actual.inner_reduce_fast(ctx);
+                    expected.inner_reduce(ctx);
+                    assert_eq!(actual, expected, "shift {shift}");
+                }
+            }
+        });
+    }
+
+    fn form(a: i64, b: i64, c: i64, discriminant: i64) -> GmpClassGroup {
+        GmpClassGroup { a: a.into(), b: b.into(), c: c.into(), discriminant: discriminant.into() }
+    }
+
+    /// Runs `f` on another thread, failing instead of hanging if it never returns.
+    fn finishes<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(f()).unwrap());
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("class-group operation panicked or never finished")
+    }
+
+    #[test]
+    fn well_formed_requires_positive_a_and_the_exact_discriminant() {
+        let generator = GmpClassGroup::generator_for_discriminant((-23i64).into());
+        assert!(generator.is_well_formed());
+        assert!(generator.identity().is_well_formed());
+        assert!(form(2, 1, 3, -23).is_well_formed());
+        assert!(!form(-2, 1, -3, -23).is_well_formed(), "negative definite");
+        assert!(!form(1, -4, 3, 4).is_well_formed(), "indefinite");
+        assert!(!form(2, 1, 4, -23).is_well_formed(), "b^2 - 4ac is -31");
+        assert!(!form(0, 1, 0, -23).is_well_formed(), "degenerate");
+    }
+
+    // Malformed proof bytes must get the original arithmetic. The stored
+    // discriminants match each form, keeping debug assertions satisfied.
+    #[test]
+    fn malformed_forms_keep_the_rust_reduction_path() {
+        let cases = [
+            form(-1, 1, -6, -23),
+            form(1, 0, -1, 4),
+            form(-1, 0, 1, 4),
+            // Positive a and c but indefinite: the native reducer divides by zero.
+            form(1, -4, 3, 4),
+        ];
+        for case in cases {
+            let mut actual = case.clone();
+            let mut expected = case.clone();
+            GmpClassGroup::with_context(|ctx| {
+                actual.inner_reduce_fast(ctx);
+                expected.inner_reduce(ctx);
+            });
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn malformed_forms_keep_the_full_gcd_squaring() {
+        // With the |D|^(1/4) cutoff this squaring never terminates; the
+        // original full-gcd NUDUPL returns (-23, -1, 4).
+        let squared = finishes(|| {
+            let mut f = form(-12, -9, 6, 369);
+            f.repeated_square(1);
+            f
+        });
+        assert_eq!(squared, form(-23, -1, 4, 369));
+    }
     #[test]
     fn normalize() {
         let mut s = GmpClassGroup::new(
