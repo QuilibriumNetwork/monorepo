@@ -7,6 +7,30 @@ use quil_keys::KeyManager as _;
 
 use quil_lifecycle::Supervisor;
 
+/// Reuse an authenticated startup jump before considering the fallback pull.
+/// A dropped sender means the jump task failed; it must not enable lifecycle.
+async fn bootstrap_prover_sync<F, Fut>(
+    jump: tokio::sync::oneshot::Receiver<Option<u64>>,
+    cancel: &tokio_util::sync::CancellationToken,
+    fallback: F,
+) -> Option<bool>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let completed = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return None,
+        result = jump => result.ok().flatten(),
+    };
+    if let Some(frame) = completed {
+        info!(frame, "initial prover sync: reusing authenticated startup state jump");
+        Some(true)
+    } else {
+        Some(fallback().await)
+    }
+}
+
 /// Whether the archive shard-info refresh is due: first load, every
 /// `REFRESH_CADENCE_FRAMES` (60, ~10 min on mainnet), and a couple of frames
 /// after each epoch boundary. Splits and merges flip at epoch boundaries;
@@ -1236,6 +1260,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         // `poller_startup_barrier` before reading its cursor, so it always sees
         // the POST-jump head and never replays (re-materializes) below the
         // synced frame. The barrier lifts whether the jump did work or no-op'd.
+        let (bootstrap_tx, bootstrap_rx) = tokio::sync::oneshot::channel();
         let poller_startup_barrier: Option<tokio::sync::oneshot::Receiver<()>> = {
             let (sj_tx, sj_rx) = tokio::sync::oneshot::channel::<()>();
             let sj_pool = archive_pool.clone();
@@ -1264,7 +1289,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             spawner.detach("state-jump", {
                 let seed = seed.clone();
                 async move {
-                if let Some(n) = run_state_jump(
+                let jumped = run_state_jump(
                     sj_pool,
                     seed.clone(),
                     sj_cs,
@@ -1282,10 +1307,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     true,
                     tokio_util::sync::CancellationToken::new(),
                 )
-                .await
-                {
+                .await;
+                if let Some(n) = jumped {
                     info!(target = n, "state-jump: fast-forwarded to peer head");
                 }
+                // Notify the registry task only after all jump verification,
+                // data installation, cursor storage and registry refresh finish.
+                let _ = bootstrap_tx.send(jumped);
                 // Lift the barrier regardless of outcome so the poller proceeds.
                 let _ = sj_tx.send(());
                 Ok(())
@@ -1752,23 +1780,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // hypergraph store with the prover tree.
                 let mut initial_sync_data_ok = sync_archive_mode;
                 if !sync_archive_mode {
-                    let initial_peers = sync_pool.get_all().await;
-                    if !initial_peers.is_empty() {
+                    let registry_sync = sync_pl.begin_registry_sync();
+                    let synced = bootstrap_prover_sync(bootstrap_rx, &sync_token, || async {
+                        let initial_peers = sync_pool.get_all().await;
+                        if initial_peers.is_empty() { return false; }
                         info!(archives = initial_peers.len(), "starting initial prover tree sync");
-                        let registry_sync = sync_pl.begin_registry_sync();
-                        // Initial bootstrap sync — no verified frame
-                        // yet to pin against. Empty expected_root
-                        // means "trust the archive's latest snapshot".
-                        // Subsequent periodic syncs DO pin against the
-                        // most-recent verified frame's
-                        // prover_tree_commitment.
-                        // Forest sync of the global prover shard (single-shard,
-                        // L2 = [0xff; 32]). Empty expected root ⇒ trust the
-                        // archive's latest snapshot (bootstrap; no verified frame
-                        // yet). Pulls the commitment diff + the changed vertices'
-                        // blobs. Each archive is tried in turn, for a few
-                        // rounds: one busy or unreachable archive used to hold
-                        // the lifecycle gate until the next periodic sync.
+                        // Reuse an authenticated startup jump when available;
+                        // otherwise retain upstream's bounded multi-archive retries.
                         const INITIAL_SYNC_ROUNDS: usize = 3;
                         'rounds: for round in 0..INITIAL_SYNC_ROUNDS {
                             if round > 0 {
@@ -1783,8 +1801,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &[],
                                 ).await {
                                     Ok(Some(_)) => {
-                                        initial_sync_data_ok = true;
-                                        break 'rounds;
+                                        return true;
                                     }
                                     Ok(None) => warn!(peer = %addr, round,
                                         "initial prover tree sync: archive cannot serve the tree; trying the next"),
@@ -1793,9 +1810,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 }
                             }
                         }
-                        if !initial_sync_data_ok {
-                            warn!("initial prover tree sync failed on every archive; lifecycle gate stays held");
-                        }
+                        warn!("initial prover tree sync failed on every archive; lifecycle gate stays held");
+                        false
+                    }).await;
+                    let Some(synced) = synced else { return Ok(()); };
+                    initial_sync_data_ok = synced;
                     // Refresh prover registry from synced data
                     let pr = sync_pr.clone();
                     let hs2 = sync_hg.clone();
@@ -1843,7 +1862,6 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             }
                         }).await;
                     }
-                    } // end of `if !initial_peers.is_empty() { ... }`
                 } // end of `if !sync_archive_mode { ... }`
                 // Only flip the lifecycle gate when we actually have
                 // prover-tree data to evaluate against. On a fresh
@@ -3521,6 +3539,68 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         }
     } else {
         warn!("no Ed448 seed available — archive poller disabled (production archives require mTLS)");
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_sync_tests {
+    use super::bootstrap_prover_sync;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn authenticated_jump_skips_fallback_download() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(Some(42)).unwrap();
+        let calls = AtomicUsize::new(0);
+        assert_eq!(bootstrap_prover_sync(rx, &CancellationToken::new(), || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            false
+        }).await, Some(true));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_jump_blocks_fallback_until_no_jump_is_known() {
+        let (tx, rx) = oneshot::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let task = tokio::spawn(async move {
+            bootstrap_prover_sync(rx, &CancellationToken::new(), || async {
+                seen.fetch_add(1, Ordering::SeqCst);
+                true
+            }).await
+        });
+        // A scheduler barrier lets the task reach its pending receive.
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        tx.send(None).unwrap();
+        assert_eq!(task.await.unwrap(), Some(true));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_jump_task_uses_fallback_and_preserves_failure() {
+        let (tx, rx) = oneshot::channel();
+        drop(tx);
+        let calls = AtomicUsize::new(0);
+        assert_eq!(bootstrap_prover_sync(rx, &CancellationToken::new(), || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            false
+        }).await, Some(false));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_download_or_enable_lifecycle() {
+        let (_tx, rx) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(bootstrap_prover_sync(rx, &cancel, || async {
+            panic!("cancelled bootstrap must not download")
+        }).await, None);
     }
 }
 
