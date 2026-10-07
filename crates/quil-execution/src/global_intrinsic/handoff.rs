@@ -362,6 +362,42 @@ impl SealSubmission {
     }
 }
 
+/// Log a seal submission GLOBAL refused, once per seal until its reason
+/// changes or five minutes pass: every closing member resubmits about once a
+/// minute, and the refusal was otherwise invisible (#699). `executed` is the
+/// source frame GLOBAL has executed through.
+pub fn note_refused_seal(frame: u64, sealed: &SealSubmission, executed: Option<u64>, error: &QuilError) {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+    type Logged = HashMap<([u8; 32], [u8; 32]), (Instant, String)>;
+    static LOGGED: LazyLock<Mutex<Logged>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    const QUIET: Duration = Duration::from_secs(300);
+    let seal = &sealed.submission.seal;
+    let reason = error.to_string();
+    let now = Instant::now();
+    {
+        let Ok(mut logged) = LOGGED.lock() else { return };
+        logged.retain(|_, (at, _)| now.duration_since(*at) < QUIET);
+        let key = (seal.session, seal.request);
+        if logged.get(&key).is_some_and(|(_, previous)| *previous == reason) {
+            return;
+        }
+        logged.insert(key, (now, reason.clone()));
+    }
+    tracing::info!(
+        frame,
+        session = %hex::encode(seal.session),
+        request = %hex::encode(seal.request),
+        checkpoint = seal.checkpoint.frame,
+        global_executed = ?executed,
+        drain_headers = sealed.drain.len(),
+        drain_active = frame >= seal_drain_frame(),
+        error = %reason,
+        "committee handoff: seal submission refused",
+    );
+}
+
 /// From this GLOBAL frame a seal submission may carry drain headers
 /// ([`SealSubmission`]); before it one that does is refused, as an older
 /// build would. Consensus-affecting for GLOBAL. Fixed on mainnet;

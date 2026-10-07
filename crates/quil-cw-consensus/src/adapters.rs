@@ -453,22 +453,112 @@ impl<Sk: FrameSink> Relay for FalconRelay<Sk> {
 // Reporter adapter
 // ---------------------------------------------------------------------------
 
+/// Views over which [`Liveness`] counts distinct voters.
+const LIVENESS_VIEWS: u64 = 16;
+
+/// What one consensus instance has seen, for operators: how far its views
+/// advanced, which of them ended in a certificate, and how many members voted
+/// recently. A session that starts but never produces a frame shows here
+/// whether views move, and whether enough members vote to certify any.
+#[derive(Default)]
+pub struct Liveness {
+    inner: std::sync::Mutex<LivenessState>,
+}
+
+#[derive(Default)]
+struct LivenessState {
+    snapshot: LivenessSnapshot,
+    /// Signers seen per recent view.
+    voters: std::collections::BTreeMap<u64, std::collections::BTreeSet<u32>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LivenessSnapshot {
+    /// Highest view any vote or certificate named.
+    pub view: u64,
+    pub notarized: u64,
+    pub nullified: u64,
+    pub finalized: u64,
+    /// Distinct members that voted in the last [`LIVENESS_VIEWS`] views.
+    pub voters: usize,
+    pub notarize_votes: u64,
+    pub nullify_votes: u64,
+    pub finalize_votes: u64,
+}
+
+impl Liveness {
+    fn vote(&self, view: u64, signer: u32, count: impl FnOnce(&mut LivenessSnapshot)) {
+        let Ok(mut state) = self.inner.lock() else { return };
+        count(&mut state.snapshot);
+        state.snapshot.view = state.snapshot.view.max(view);
+        let floor = state.snapshot.view.saturating_sub(LIVENESS_VIEWS);
+        if view > floor {
+            state.voters.entry(view).or_default().insert(signer);
+        }
+        state.voters.retain(|recent, _| *recent > floor);
+    }
+
+    fn certificate(&self, view: u64, record: impl FnOnce(&mut LivenessSnapshot)) {
+        let Ok(mut state) = self.inner.lock() else { return };
+        record(&mut state.snapshot);
+        state.snapshot.view = state.snapshot.view.max(view);
+    }
+
+    pub fn snapshot(&self) -> LivenessSnapshot {
+        let Ok(state) = self.inner.lock() else { return LivenessSnapshot::default() };
+        let mut snapshot = state.snapshot;
+        snapshot.voters = state.voters.values().flatten().collect::<std::collections::BTreeSet<_>>().len();
+        snapshot
+    }
+
+    fn observe(&self, activity: &FalconActivity) {
+        use commonware_consensus::simplex::types::Attributable as _;
+        use commonware_consensus::Viewable as _;
+        let signer = |participant: commonware_utils::Participant| usize::from(participant) as u32;
+        match activity {
+            Activity::Notarize(vote) => self.vote(vote.view().get(), signer(vote.signer()), |s| s.notarize_votes += 1),
+            Activity::Nullify(vote) => self.vote(vote.view().get(), signer(vote.signer()), |s| s.nullify_votes += 1),
+            Activity::Finalize(vote) => self.vote(vote.view().get(), signer(vote.signer()), |s| s.finalize_votes += 1),
+            Activity::Notarization(cert) => {
+                let view = cert.view().get();
+                self.certificate(view, |s| s.notarized = s.notarized.max(view));
+            }
+            Activity::Nullification(cert) => {
+                let view = cert.view().get();
+                self.certificate(view, |s| s.nullified = s.nullified.max(view));
+            }
+            Activity::Finalization(cert) => {
+                let view = cert.view().get();
+                self.certificate(view, |s| s.finalized = s.finalized.max(view));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// `Reporter` over a [`FrameFinalizer`]; maps simplex activities to the
 /// candidate-write / commit / equivocation hooks.
 pub struct FalconReporter<Fin: FrameFinalizer> {
     finalizer: Arc<Fin>,
     store: BlockStore,
+    liveness: Option<Arc<Liveness>>,
 }
 
 impl<Fin: FrameFinalizer> Clone for FalconReporter<Fin> {
     fn clone(&self) -> Self {
-        Self { finalizer: self.finalizer.clone(), store: self.store.clone() }
+        Self { finalizer: self.finalizer.clone(), store: self.store.clone(), liveness: self.liveness.clone() }
     }
 }
 
 impl<Fin: FrameFinalizer> FalconReporter<Fin> {
     pub fn new(finalizer: Arc<Fin>, store: BlockStore) -> Self {
-        Self { finalizer, store }
+        Self { finalizer, store, liveness: None }
+    }
+
+    /// Also record every vote and certificate in `liveness`.
+    pub fn with_liveness(mut self, liveness: Option<Arc<Liveness>>) -> Self {
+        self.liveness = liveness;
+        self
     }
 }
 
@@ -476,6 +566,9 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
     type Activity = FalconActivity;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
+        if let Some(liveness) = self.liveness.as_ref() {
+            liveness.observe(&activity);
+        }
         match activity {
             Activity::Notarization(n) => {
                 let digest = n.proposal.payload;

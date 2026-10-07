@@ -53,6 +53,8 @@ pub struct GlobalEngineParams {
     /// Must be `>= skip_timeout`.
     pub activity_timeout: u64,
     pub skip_timeout: u64,
+    /// Records votes and certificates for operators ([`crate::adapters::Liveness`]).
+    pub liveness: Option<Arc<crate::adapters::Liveness>>,
 }
 
 impl GlobalEngineParams {
@@ -77,6 +79,7 @@ impl GlobalEngineParams {
             fetch_timeout: Duration::from_secs(5),
             activity_timeout: 10,
             skip_timeout: 5,
+            liveness: None,
         }
     }
 
@@ -145,7 +148,7 @@ where
 {
     let automaton = FalconAutomaton::new(context.child("automaton"), proposer, store.clone());
     let relay = FalconRelay::new(sink, store.clone());
-    let reporter = FalconReporter::new(finalizer, store);
+    let reporter = FalconReporter::new(finalizer, store).with_liveness(params.liveness.clone());
 
     let cfg = Config {
         scheme,

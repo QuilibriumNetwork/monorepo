@@ -88,6 +88,11 @@ pub enum AppEngineMessage {
     OriginAnchors {
         reply: tokio::sync::oneshot::Sender<Vec<(Vec<u8>, [[u8; 32]; 4])>>,
     },
+    /// The frame GLOBAL has executed this shard's current session through
+    /// (`app_handoff::committed_tip`).
+    CommittedTip {
+        reply: tokio::sync::oneshot::Sender<Option<u64>>,
+    },
     /// A bounded archive fetch supplies one missing finalized frame. Validate
     /// and replay it on the engine actor so derived history advances with data.
     ReplayArchiveFrame {
@@ -335,6 +340,15 @@ impl AppEngineHandle {
                 .await.map_err(|_| QuilError::ExecutionUnavailable("shard engine stopped before origin lookup".into()))?;
             receive.await.map_err(|_| QuilError::ExecutionUnavailable("origin lookup was cancelled".into()))
         }).await.map_err(|_| QuilError::ExecutionUnavailable("origin lookup timed out".into()))?
+    }
+
+    /// `None` when unknown (no committee sessions, or the engine is busy).
+    pub(crate) async fn committed_tip(&self) -> Option<u64> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            self.msg_tx.send(AppEngineMessage::CommittedTip { reply }).await.ok()?;
+            receive.await.ok().flatten()
+        }).await.ok().flatten()
     }
 
     pub(crate) async fn complete_archive_sync(
@@ -2162,6 +2176,10 @@ pub struct AppConsensusEngine {
     /// Shared with the session's parent reader and the leader (request-free
     /// frames while the session closes).
     session_closing: Arc<std::sync::atomic::AtomicBool>,
+    /// The running session's votes and certificates, and when they were last
+    /// logged ([`Self::log_session_liveness`]).
+    session_liveness: Option<Arc<quil_cw_consensus::adapters::Liveness>>,
+    session_liveness_logged: Option<std::time::Instant>,
     /// Executes an unfinalized selected parent for the running consensus host.
     private_parents: Option<Arc<AppParentExecutor>>,
     /// A finalized terminal seal: `(session id, canonical CommitteeHandoff)`.
@@ -2308,6 +2326,8 @@ impl AppConsensusEngine {
             cw_committee_fp: None,
             cw_session: None,
             session_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_liveness: None,
+            session_liveness_logged: None,
             private_parents: None,
             sealed_session: None,
             seal_published_at: None,
@@ -3293,6 +3313,14 @@ impl AppConsensusEngine {
                             };
                             let _ = reply.send(anchors);
                         }
+                        Some(AppEngineMessage::CommittedTip { reply }) => {
+                            let tip = self.global_hypergraph.as_ref()
+                                .filter(|_| quil_types::consensus::committee_handoff_policy().is_some())
+                                .and_then(|global| crate::app_handoff::committed_tip(global, &self.filter)
+                                    .inspect_err(|error| debug!(core_id = self.core_id, %error, "committed session tip unavailable"))
+                                    .ok().flatten());
+                            let _ = reply.send(tip);
+                        }
                         Some(AppEngineMessage::ValidateShardSyncAnchor { anchor, predecessor, reply }) => {
                             let valid = match self.validate_archive_sync_anchor(&anchor, predecessor.as_ref()).await {
                                 Ok(_) => true,
@@ -3443,6 +3471,7 @@ impl AppConsensusEngine {
                     // peer can instantiate simplex and emit the very startup
                     // messages that the barrier is meant to prevent.
                     self.maintain_committee_session().await;
+                    self.log_session_liveness();
                     if self.cw_handle.as_ref().is_some_and(|h| h.is_dead()) {
                         error!(core_id = self.core_id, filter = hex::encode(&self.filter),
                             "app consensus host died; rebuilding it");
@@ -3641,7 +3670,7 @@ impl AppConsensusEngine {
                 if drained.executed < drained.checkpoint {
                     info!(core_id = self.core_id, filter = hex::encode(&self.filter),
                         global_executed = drained.executed, checkpoint = drained.checkpoint,
-                        drain_headers = drained.attached,
+                        drain_headers = drained.attached, drain = drained.reason,
                         "closing certificate waits for GLOBAL to execute the session through its checkpoint");
                 }
                 publish(drained.bytes);
@@ -3652,6 +3681,32 @@ impl AppConsensusEngine {
             }
             None => publish(base.to_vec()),
         }
+    }
+
+    /// Once a minute, what the running session's consensus has seen: whether
+    /// views advance, which end in a certificate, how many members voted
+    /// recently against the quorum, and whether this member's data is staged.
+    /// Views that never move, or voters below quorum, mean too few members are
+    /// live or connected; views that move with every one nullified mean
+    /// proposals are declined (`committee session parent unavailable`) or
+    /// refused.
+    fn log_session_liveness(&mut self) {
+        let (Some(liveness), Some(session)) = (self.session_liveness.as_ref(), self.cw_session.as_ref()) else {
+            return;
+        };
+        if self.session_liveness_logged.is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        self.session_liveness_logged = Some(std::time::Instant::now());
+        let seen = liveness.snapshot();
+        let members = session.members.len();
+        info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = session.generation,
+            base = session.base_frame, members, quorum = members - members.saturating_sub(1) / 3,
+            voters = seen.voters, view = seen.view, notarized = seen.notarized, nullified = seen.nullified,
+            finalized = seen.finalized, notarize_votes = seen.notarize_votes, nullify_votes = seen.nullify_votes,
+            finalize_votes = seen.finalize_votes, materialized = self.last_materialized_frame,
+            data_ready = self.data_ready.load(std::sync::atomic::Ordering::Acquire),
+            "app session liveness");
     }
 
     /// Timer-driven session upkeep: republish an unrecorded closing certificate,
@@ -3980,7 +4035,7 @@ impl AppConsensusEngine {
             // accepting it on state-root equality.
             if let Some(manager) = self.execution_engine.clone() {
                 let view = quil_execution::global_intrinsic::handoff::CommittedView::capture(global)?;
-                for (source, checkpoint) in quil_execution::global_intrinsic::handoff::origins(&view, &session.id()?)? {
+                for (source, checkpoint) in crate::app_handoff::effective_origins(&view, session)?.origins {
                     if source.filter != session.filter || self.last_materialized_frame != checkpoint.frame {
                         continue;
                     }
@@ -4390,9 +4445,11 @@ impl AppConsensusEngine {
                 let source = crate::app_handoff::ParentSource::new(
                     session.clone(), global, shard, self.clock_store.clone(), self.session_closing.clone(),
                 )?;
+                source.require_staged_data(self.data_ready.clone());
                 let msg_tx = self.self_msg_tx.clone();
                 let read_private_parent = self.private_parents.clone().map(|parents| {
                     let source = source.clone();
+                    let filter = hex::encode(&self.filter);
                     let last_reported = Arc::new(std::sync::atomic::AtomicU64::new(0));
                     Arc::new(move |context: quil_cw_consensus::adapters::ProposalContext| {
                         parents
@@ -4411,12 +4468,14 @@ impl AppConsensusEngine {
                                     .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                                     .is_ok()
                                 {
-                                    tracing::info!(view = context.view, parent_view = context.parent_view, %error,
+                                    tracing::info!(%filter, view = context.view, parent_view = context.parent_view, %error,
                                         "unfinalized session parent not executable privately");
                                 }
                             })
                     }) as quil_cw_consensus::handoff::automaton::ParentReader
                 });
+                let liveness = Arc::new(quil_cw_consensus::adapters::Liveness::default());
+                self.session_liveness = Some(liveness.clone());
                 Some(crate::cw_app_seams::SessionHost {
                     session: session.clone(),
                     read_parent: source.reader(),
@@ -4424,6 +4483,7 @@ impl AppConsensusEngine {
                     on_sealed: Arc::new(move |seal, cert| {
                         msg_tx.try_send(AppEngineMessage::CwSealed { seal, cert }).is_ok()
                     }),
+                    liveness,
                 })
             }
             None => None,

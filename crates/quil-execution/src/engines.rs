@@ -299,16 +299,23 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
             if inner_tp == crate::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF {
                 let state = self.state.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable(
                     "handoff validation requires authenticated global state".into()))?;
-                let sealed = crate::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(inner_bytes)?;
-                match self.intrinsic.as_ref() {
-                    Some(intrinsic) => intrinsic.verify_seal_submission(frame_number, &sealed, state.as_ref())?,
+                use crate::global_intrinsic::handoff;
+                let sealed = handoff::SealSubmission::from_canonical_bytes(inner_bytes)?;
+                let verified = match self.intrinsic.as_ref() {
+                    Some(intrinsic) => intrinsic.verify_seal_submission(frame_number, &sealed, state.as_ref()),
                     None if sealed.drain.is_empty() => {
-                        crate::global_intrinsic::handoff::verify_submission(state.as_ref(), frame_number, &sealed.submission)?;
+                        handoff::verify_submission(state.as_ref(), frame_number, &sealed.submission).map(|_| ())
                     }
-                    None => return Err(QuilError::ExecutionUnavailable(
-                        "seal drain headers need the global intrinsic".into())),
+                    None => Err(QuilError::ExecutionUnavailable("seal drain headers need the global intrinsic".into())),
+                };
+                if let Err(error) = &verified {
+                    if matches!(error, QuilError::InvalidArgument(_)) {
+                        let executed = handoff::session_tip(state.as_ref(), &sealed.submission.seal.session)
+                            .ok().flatten().map(|tip| tip.frame);
+                        handoff::note_refused_seal(frame_number, &sealed, executed, error);
+                    }
                 }
-                return Ok(());
+                return verified;
             }
             if !crate::global_engine::is_global_type_prefix(inner_tp) {
                 return Ok(()); // not a global op, skip

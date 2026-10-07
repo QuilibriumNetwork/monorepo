@@ -50,7 +50,9 @@ pub trait ProverTreeSyncer: Send + Sync {
 
 pub(crate) enum ShardSyncResult {
     Anchored { anchor: AppShardFrame, predecessor: Option<AppShardFrame> },
-    Inherited,
+    /// `pinned`: the origins' sealed state, verified against their roots;
+    /// otherwise the archive's current subtree, unauthenticated.
+    Inherited { pinned: bool },
     NotReady,
 }
 
@@ -69,6 +71,12 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     /// frame of its own syncs against (`app_handoff::origin_anchors`).
     async fn origin_anchors(&self) -> Result<Vec<(Vec<u8>, [[u8; 32]; 4])>> {
         Ok(Vec::new())
+    }
+    /// The frame GLOBAL has executed the shard's current session through
+    /// (`app_handoff::committed_tip`): replay targets at least this, and an
+    /// archive below it is behind, not a sign the worker is up to date.
+    async fn committed_tip(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -90,13 +98,19 @@ impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
     async fn origin_anchors(&self) -> Result<Vec<(Vec<u8>, [[u8; 32]; 4])>> {
         crate::app_engine::AppEngineHandle::origin_anchors(self).await
     }
+    async fn committed_tip(&self) -> Option<u64> {
+        crate::app_engine::AppEngineHandle::committed_tip(self).await
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ShardRecoveryProgress {
-    Replayed { materialized: u64, archive_tip: u64 },
+    /// `archive_tip`: the highest tip an archive reported (`None`: none had a
+    /// frame of the shard). `committed_tip`: GLOBAL's executed frame of the
+    /// session. Materialized below the committed tip is not up to date.
+    Replayed { materialized: u64, archive_tip: Option<u64>, committed_tip: Option<u64> },
     Anchored { frame: u64 },
-    Inherited,
+    Inherited { pinned: bool },
     NotReady,
 }
 
@@ -110,10 +124,13 @@ pub(crate) async fn recover_shard_from_latest(
     target: &dyn ShardRecoveryTarget,
 ) -> Result<ShardRecoveryProgress> {
     if let Some(local) = local {
-        let (materialized, archive_tip) = replay_shard_from_latest(
-            syncer, filter, local, target.materialized(), |frame, child| target.replay(frame, child),
+        let committed_tip = target.committed_tip().await;
+        let replay = replay_shard_from_latest(
+            syncer, filter, local, target.materialized(), committed_tip, |frame, child| target.replay(frame, child),
         ).await?;
-        return Ok(ShardRecoveryProgress::Replayed { materialized, archive_tip });
+        return Ok(ShardRecoveryProgress::Replayed {
+            materialized: replay.materialized, archive_tip: replay.archive_tip, committed_tip,
+        });
     }
     let anchors = target.origin_anchors().await.unwrap_or_else(|error| {
         tracing::warn!(filter = %hex::encode(filter), %error, "origin anchors unavailable; bootstrap unpinned");
@@ -125,45 +142,121 @@ pub(crate) async fn recover_shard_from_latest(
             target.install(anchor, predecessor).await?;
             Ok(ShardRecoveryProgress::Anchored { frame })
         }
-        ShardSyncResult::Inherited => { target.inherited(); Ok(ShardRecoveryProgress::Inherited) }
+        ShardSyncResult::Inherited { pinned } => { target.inherited(); Ok(ShardRecoveryProgress::Inherited { pinned }) }
         ShardSyncResult::NotReady => Ok(ShardRecoveryProgress::NotReady),
+    }
+}
+
+/// Archives asked for a shard's tip when the first answer is behind GLOBAL's
+/// committed session tip, and attempts per frame: each request goes to the
+/// next archive in the pool.
+const TIP_PROBES: usize = 3;
+const FRAME_ATTEMPTS: usize = 3;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ShardReplay {
+    pub materialized: u64,
+    /// The highest tip an archive reported; `None` when none had a frame.
+    pub archive_tip: Option<u64>,
+    pub target: u64,
+}
+
+/// A frame of `filter` from the first of `attempts` archive requests that has
+/// it. `Ok(None)` when every archive answered without it.
+async fn fetch_shard_frame(
+    syncer: &dyn ProverTreeSyncer,
+    filter: &[u8],
+    number: u64,
+    attempts: usize,
+) -> Result<Option<AppShardFrame>> {
+    let mut failure = None;
+    let mut answered = false;
+    for _ in 0..attempts.max(1) {
+        match syncer.get_app_shard_frame(filter, number).await {
+            Ok(Some(frame)) => return Ok(Some(frame)),
+            Ok(None) => answered = true,
+            Err(error) => failure = Some(error),
+        }
+    }
+    match failure {
+        Some(error) if !answered => Err(error),
+        _ => Ok(None),
     }
 }
 
 /// Repair a materialized worker by replaying a bounded number of certified
 /// frames through its owning engine. Tree-only fast-forward loses fee, spend,
 /// settlement and accumulator history and can race normal materialization.
+///
+/// The target is the highest archive tip, and at least `committed` (GLOBAL's
+/// executed frame of the session): an archive can answer with an old tip, or
+/// none, while it or another holds the frames, so one archive's answer alone
+/// never ends recovery below what GLOBAL has executed. Every frame is still
+/// authenticated by `replay`.
 pub(crate) async fn replay_shard_from_latest<F, Fut>(
     syncer: &dyn ProverTreeSyncer,
     filter: &[u8],
     local: AppShardFrame,
     mut materialized: u64,
+    committed: Option<u64>,
     mut replay: F,
-) -> Result<(u64, u64)>
+) -> Result<ShardReplay>
 where
     F: FnMut(AppShardFrame, Option<AppShardFrame>) -> Fut,
     Fut: std::future::Future<Output = Result<u64>>,
 {
     use prost::Message;
     use quil_types::error::QuilError;
-    let remote = syncer.get_app_shard_frame(filter, 0).await?;
     let height = |frame: &AppShardFrame| frame.header.as_ref().map_or(0, |h| h.frame_number);
+    let committed = committed.unwrap_or(0);
+    let mut remote: Option<AppShardFrame> = None;
+    let mut failure = None;
+    for probe in 0..TIP_PROBES {
+        if probe > 0 && remote.as_ref().map_or(0, height).max(height(&local)) >= committed {
+            break;
+        }
+        match syncer.get_app_shard_frame(filter, 0).await {
+            Ok(Some(frame)) if frame.header.as_ref().is_some_and(|h| h.address == filter) => {
+                if remote.as_ref().is_none_or(|best| height(&frame) > height(best)) {
+                    remote = Some(frame);
+                }
+            }
+            Ok(Some(_)) if probe == 0 && committed == 0 => {
+                return Err(QuilError::InvalidArgument("wrong-shard archive replay tip".into()));
+            }
+            Ok(_) => {}
+            Err(error) => failure = Some(error),
+        }
+    }
+    if remote.is_none() {
+        if let Some(error) = failure.filter(|_| committed <= height(&local)) {
+            return Err(error);
+        }
+    }
+    let archive_tip = remote.as_ref().map(height);
     let tip = match remote {
         Some(remote) if height(&remote) >= height(&local) => remote,
         _ => local,
     };
-    let target = height(&tip);
     if tip.header.as_ref().is_none_or(|h| h.address != filter) {
         return Err(QuilError::InvalidArgument("wrong-shard archive replay tip".into()));
+    }
+    let tip_height = height(&tip);
+    let target = tip_height.max(committed);
+    if archive_tip.unwrap_or(0) < committed && materialized < committed {
+        tracing::info!(filter = %hex::encode(filter), materialized, ?archive_tip, committed_tip = committed,
+            "archive shard tip is behind GLOBAL's committed session tip; replaying by frame number");
     }
     for _ in 0..32 {
         if materialized >= target { break; }
         let next = materialized + 1;
-        let frame = if next == target {
+        let frame = if next == tip_height {
             tip.clone()
         } else {
-            syncer.get_app_shard_frame(filter, next).await?.ok_or_else(|| {
-                QuilError::ExecutionUnavailable(format!("archive replay is missing shard frame {next}"))
+            fetch_shard_frame(syncer, filter, next, FRAME_ATTEMPTS).await?.ok_or_else(|| {
+                QuilError::ExecutionUnavailable(format!(
+                    "archive replay is missing shard frame {next} (archive tip {archive_tip:?}, committed {committed})"
+                ))
             })?
         };
         if frame.header.as_ref().is_none_or(|h| h.address != filter || h.frame_number != next)
@@ -177,10 +270,10 @@ where
             .is_none_or(|signature| signature.signature.is_empty());
         let child = if !uncertified {
             None
-        } else if next + 1 == target {
+        } else if next + 1 == tip_height {
             Some(tip.clone())
         } else {
-            syncer.get_app_shard_frame(filter, next + 1).await?
+            fetch_shard_frame(syncer, filter, next + 1, FRAME_ATTEMPTS).await?
         };
         let advanced = replay(frame, child).await?;
         if advanced < next {
@@ -188,7 +281,7 @@ where
         }
         materialized = advanced;
     }
-    Ok((materialized, target))
+    Ok(ShardReplay { materialized, archive_tip, target })
 }
 
 /// A stale worker must discover the archive tip even when it has a local
@@ -222,28 +315,41 @@ where
         if !origin_anchors.is_empty() {
             let mut pinned = true;
             for (source, roots) in origin_anchors {
-                let roots: Vec<Vec<u8>> = roots.iter().map(|root| root.to_vec()).collect();
-                match syncer.sync_shard_tree(source, &roots).await {
-                    Ok(true) => {}
-                    Ok(false) => { pinned = false; break; }
-                    Err(error) => {
-                        tracing::warn!(filter = %hex::encode(filter), source = %hex::encode(source), %error,
-                            "origin's sealed state could not be synced");
-                        pinned = false;
-                        break;
-                    }
-                }
+                let pinned_roots: Vec<Vec<u8>> = roots.iter().map(|root| root.to_vec()).collect();
+                let failure = match syncer.sync_shard_tree(source, &pinned_roots).await {
+                    Ok(true) => continue,
+                    Ok(false) => "the archive does not hold it or the synced roots differ".to_string(),
+                    Err(error) => error.to_string(),
+                };
+                tracing::warn!(filter = %hex::encode(filter), source = %hex::encode(source),
+                    sealed_roots = ?roots.iter().map(hex::encode).collect::<Vec<_>>(), %failure,
+                    "origin's sealed state could not be synced");
+                pinned = false;
+                break;
             }
             if pinned {
                 tracing::info!(filter = %hex::encode(filter), origins = origin_anchors.len(),
                     "shard bootstrapped from its origins' sealed state");
-                return Ok(ShardSyncResult::Inherited);
+                return Ok(ShardSyncResult::Inherited { pinned: true });
+            }
+            // A same-filter origin's sealed roots are what this shard's
+            // successor requires at startup (`successor_state_matches`): an
+            // unpinned copy is refused there unless it equals them, and the
+            // worker installed it, reported success and was refused again
+            // every few seconds. Wait for an archive that holds the state.
+            if origin_anchors.iter().any(|(source, _)| source.as_slice() == filter) {
+                tracing::warn!(filter = %hex::encode(filter),
+                    "the predecessor's sealed state is not available from the archive; not inheriting unpinned state its successor would refuse");
+                return Ok(ShardSyncResult::NotReady);
             }
             tracing::warn!(filter = %hex::encode(filter),
                 "origins' sealed state is not available from the archive; inheriting the covered subtree unpinned");
+        } else {
+            tracing::info!(filter = %hex::encode(filter),
+                "no certified origin state for this shard; inheriting the covered subtree unpinned");
         }
         return Ok(if syncer.sync_shard_tree(filter, &[]).await? {
-            ShardSyncResult::Inherited
+            ShardSyncResult::Inherited { pinned: false }
         } else { ShardSyncResult::NotReady });
     };
     let header = anchor.header.as_ref().ok_or_else(|| QuilError::InvalidArgument("archive anchor has no header".into()))?;
@@ -323,7 +429,7 @@ mod tests {
         let archive = Archive { latest:Some(frame(500)), calls:calls.clone() };
         let target = Target { calls:calls.clone(), cursor:129.into(), valid:false, install_ok:false };
         let result = recover_shard_from_latest(&archive, &[5;32], Some(frame(130)), &target).await.unwrap();
-        assert_eq!(result, ShardRecoveryProgress::Replayed { materialized:161, archive_tip:500 });
+        assert_eq!(result, ShardRecoveryProgress::Replayed { materialized:161, archive_tip:Some(500), committed_tip:None });
         let calls = calls.lock().unwrap();
         assert_eq!(calls.iter().filter(|s| s.starts_with("replay ")).count(), 32);
         assert!(!calls.iter().any(|s| s.starts_with("sync ") || s.starts_with("install ")));
@@ -384,13 +490,13 @@ mod tests {
         let archive = Archive { latest: Some(frame(600)), calls: calls.clone() };
         let replayed = Arc::new(Mutex::new(Vec::new()));
         let seen = replayed.clone();
-        let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 129,
+        let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 129, None,
             move |frame, _child| {
                 let height = frame.header.unwrap().frame_number;
                 seen.lock().unwrap().push(height);
                 async move { Ok(height) }
             }).await.unwrap();
-        assert_eq!(result, (161, 600));
+        assert_eq!(result, ShardReplay { materialized: 161, archive_tip: Some(600), target: 600 });
         assert_eq!(*replayed.lock().unwrap(), (130..=161).collect::<Vec<_>>());
         assert_eq!(calls.lock().unwrap().len(), 33);
         assert!(calls.lock().unwrap().iter().all(|call| call.starts_with("fetch ")));
@@ -419,13 +525,13 @@ mod tests {
     async fn archive_replay_hands_an_uncertified_frame_its_certified_child() {
         let replayed = Arc::new(Mutex::new(Vec::new()));
         let seen = replayed.clone();
-        let result = replay_shard_from_latest(&BareArchive, &[5; 32], frame(130), 130,
+        let result = replay_shard_from_latest(&BareArchive, &[5; 32], frame(130), 130, None,
             move |frame, child| {
                 let height = frame.header.unwrap().frame_number;
                 seen.lock().unwrap().push((height, child.map(|child| child.header.unwrap().frame_number)));
                 async move { Ok(height) }
             }).await.unwrap();
-        assert_eq!(result, (134, 134));
+        assert_eq!(result, ShardReplay { materialized: 134, archive_tip: Some(134), target: 134 });
         assert_eq!(*replayed.lock().unwrap(), vec![(131, None), (132, Some(133)), (133, None), (134, None)]);
     }
 
@@ -433,7 +539,7 @@ mod tests {
     async fn archive_replay_stops_on_engine_rejection_and_never_skips_the_gap() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = Archive { latest: Some(frame(600)), calls: calls.clone() };
-        assert!(replay_shard_from_latest(&archive, &[5; 32], frame(130), 129,
+        assert!(replay_shard_from_latest(&archive, &[5; 32], frame(130), 129, None,
             |_, _| async { Err(quil_types::error::QuilError::InvalidSignature("rejected certificate".into())) }
         ).await.is_err());
         assert_eq!(*calls.lock().unwrap(), ["fetch 0", "fetch 130"]);
@@ -480,20 +586,78 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = FramelessArchive { calls: calls.clone(), refuse: None };
         let result = sync_shard_from_latest(&archive, &child, None, &anchors, never).await.unwrap();
-        assert!(matches!(result, ShardSyncResult::Inherited));
+        assert!(matches!(result, ShardSyncResult::Inherited { pinned: true }));
         assert_eq!(*calls.lock().unwrap(), [(1, Some(0x51)), (2, Some(0x61))], "pinned, never unpinned");
 
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = FramelessArchive { calls: calls.clone(), refuse: Some(right) };
         let result = sync_shard_from_latest(&archive, &child, None, &anchors, never).await.unwrap();
-        assert!(matches!(result, ShardSyncResult::Inherited));
+        assert!(matches!(result, ShardSyncResult::Inherited { pinned: false }));
         assert_eq!(*calls.lock().unwrap(), [(1, Some(0x51)), (2, Some(0x61)), (5, None)], "falls back when an origin is unavailable");
 
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = FramelessArchive { calls: calls.clone(), refuse: None };
         let result = sync_shard_from_latest(&archive, &child, None, &[], never).await.unwrap();
-        assert!(matches!(result, ShardSyncResult::Inherited));
+        assert!(matches!(result, ShardSyncResult::Inherited { pinned: false }));
         assert_eq!(*calls.lock().unwrap(), [(5, None)], "no certified origin: unpinned");
+    }
+
+    /// A successor of a same-filter predecessor must start from exactly the
+    /// predecessor's sealed state (`successor_state_matches`). When no archive
+    /// serves it, an unpinned copy would be installed, reported as success and
+    /// refused at startup, over and over: recovery waits instead.
+    #[tokio::test]
+    async fn an_unavailable_same_filter_seal_is_never_replaced_by_unpinned_state() {
+        let filter = vec![5; 32];
+        let anchors = vec![(filter.clone(), [[0x71; 32]; 4])];
+        let never = |_: AppShardFrame, _: Option<AppShardFrame>| async { panic!("no frame to validate") };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = FramelessArchive { calls: calls.clone(), refuse: Some(filter.clone()) };
+        let result = sync_shard_from_latest(&archive, &filter, None, &anchors, never).await.unwrap();
+        assert!(matches!(result, ShardSyncResult::NotReady));
+        assert_eq!(*calls.lock().unwrap(), [(5, Some(0x71))], "pinned only");
+    }
+
+    /// Serves frames through 140, reports `tip` as its latest (`None`: no
+    /// latest frame indexed) and records each request.
+    struct BehindArchive {
+        tip: Option<u64>,
+        calls: Arc<Mutex<Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl ProverTreeSyncer for BehindArchive {
+        async fn sync_prover_tree(&self, _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+        async fn get_app_shard_frame(&self, _: &[u8], number: u64) -> Result<Option<AppShardFrame>> {
+            self.calls.lock().unwrap().push(number);
+            Ok(match number {
+                0 => self.tip.map(frame),
+                n if n <= 140 => Some(frame(n)),
+                _ => None,
+            })
+        }
+        async fn sync_shard_tree(&self, _: &[u8], _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+    }
+
+    /// An archive whose latest is at or below the worker's head, or that has
+    /// none, is not proof the worker is current: GLOBAL's committed session
+    /// tip is the target, the tip is probed on further archives, and frames
+    /// are requested by number. Past what any archive holds it stops with the
+    /// missing frame named, never reporting the worker up to date.
+    #[tokio::test]
+    async fn replay_targets_the_committed_tip_when_archives_report_an_old_one() {
+        for tip in [Some(130), None] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let archive = BehindArchive { tip, calls: calls.clone() };
+            let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(137),
+                |frame, _| async move { Ok(frame.header.unwrap().frame_number) }).await.unwrap();
+            assert_eq!(result, ShardReplay { materialized: 137, archive_tip: tip, target: 137 });
+            assert_eq!(calls.lock().unwrap()[..TIP_PROBES], [0; TIP_PROBES], "the tip is asked of more archives");
+        }
+        let archive = BehindArchive { tip: Some(130), calls: Arc::new(Mutex::new(Vec::new())) };
+        let missing = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(150),
+            |frame, _| async move { Ok(frame.header.unwrap().frame_number) }).await.unwrap_err();
+        assert!(missing.to_string().contains("missing shard frame 141"), "{missing}");
     }
 
     #[tokio::test]

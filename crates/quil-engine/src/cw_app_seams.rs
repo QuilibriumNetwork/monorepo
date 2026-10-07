@@ -92,6 +92,8 @@ pub struct SessionHost {
     /// materialized, from its private execution (see `AppParentExecutor`).
     pub read_private_parent: Option<ParentReader>,
     pub on_sealed: AppSealedSink,
+    /// Records the session's votes and certificates for operators.
+    pub liveness: Arc<quil_cw_consensus::adapters::Liveness>,
 }
 
 /// Build the full `AppShardFrame` from a produced consensus state + the leader's
@@ -1395,6 +1397,7 @@ pub fn activate_app_consensus_cw(
     }
     let mut params = GlobalEngineParams::new(partition, epoch, genesis_digest)
         .with_leader_timeout_secs(leader_timeout_secs);
+    params.liveness = session.as_ref().map(|host| host.liveness.clone());
     let mut adopted_genesis = None;
     // Populate the persisted head BEFORE the host can replay its journal. These
     // bytes are candidates, not proof that this process validated historical
