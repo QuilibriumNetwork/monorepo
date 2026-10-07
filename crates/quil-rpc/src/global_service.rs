@@ -239,6 +239,16 @@ pub type ShardDirectRelay = Arc<
         + Sync,
 >;
 
+/// Sends one of a standalone worker's GLOBAL requests (a certified shard
+/// `FrameHeader` or a committee-handoff submission) on through this node's
+/// archive transport: `(core_id, canonical request)` → queued (`Ok(false)`:
+/// held back by a coverage halt; `Err`: not a request a worker may submit).
+pub type WorkerProverSubmitter = Arc<
+    dyn Fn(u32, Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Snapshot function for workers — called by `GetWorkerInfo`.
 pub type WorkerSnapshotFn =
     Arc<dyn Fn() -> Vec<global::GlobalGetWorkerInfoResponseItem> + Send + Sync>;
@@ -284,6 +294,22 @@ pub trait ForestServer: Send + Sync {
     /// tree version the diff addressed (`None` means latest).
     fn serve_vertex_blob(&self, shard_key: &[u8], phase: u32, id: &[u8], version: Option<u64>)
         -> Option<Vec<u8>>;
+    /// Leaves of a shard/phase tree with keys in `[first, last]` after `after`,
+    /// each at its newest value at or below `version`, in key order, at most
+    /// [`MAX_FOREST_LEAVES`] and about [`MAX_FOREST_BATCH_BYTES`], and whether
+    /// more may follow. `None` when this server cannot list leaves.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_leaves(
+        &self,
+        _shard_id: &[u8],
+        _phase: u32,
+        _version: u64,
+        _first: &[u8; 32],
+        _last: &[u8; 32],
+        _after: Option<&[u8; 32]>,
+    ) -> Option<(Vec<([u8; 32], Vec<u8>)>, bool)> {
+        None
+    }
     /// Sync-by-hash: authenticated tree `root` → local `(version, global_frame)`
     /// for a `(shard_id, phase)` tree. None if never committed here or pruned.
     fn resolve_root(&self, shard_id: &[u8], phase: u32, root: [u8; 32]) -> Option<(u64, u64)>;
@@ -369,6 +395,11 @@ pub struct GlobalRpcServer {
     self_peer_id: Option<Vec<u8>>,
     /// See [`ShardDirectRelay`]; `None` answers "not delivered".
     shard_direct_relay: Option<ShardDirectRelay>,
+    /// See [`WorkerProverSubmitter`]; `None` answers "unimplemented".
+    worker_prover_submitter: Option<WorkerProverSubmitter>,
+    /// Rebuilds legacy committees for the node's own workers; `None` answers
+    /// "unimplemented".
+    historical_committees: Option<quil_engine::historical_committee::HistoricalCommitteeSource>,
     /// Authorizer for prover-gated RPCs (`GetGlobalProposal`): returns `true` iff
     /// the authenticated caller is the node's own identity OR resolves to an
     /// ACTIVE prover (Go `authenticateProverFromContext`). `None` ⇒ no gate.
@@ -379,27 +410,173 @@ pub struct GlobalRpcServer {
 
 // Shared across peer-facing server instances. A cancelled RPC keeps its
 // permit inside the blocking closure until storage work actually finishes.
-static FOREST_READ_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+// `QUIL_FOREST_READ_SLOTS` concurrent storage reads (default 32); a batched
+// request reads up to `MAX_FOREST_BATCH_KEYS` keys under one slot, and cached
+// nodes and values (`forest_read_cache`) take no slot at all. Sixteen kept
+// an archive's disk below its queue depth while syncs waited on it.
+static FOREST_READ_WORKERS: std::sync::LazyLock<tokio::sync::Semaphore> = std::sync::LazyLock::new(|| {
+    let slots = std::env::var("QUIL_FOREST_READ_SLOTS").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| (1..=1024).contains(n))
+        .unwrap_or(32);
+    tokio::sync::Semaphore::new(slots)
+});
 static HISTORY_FORWARD_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// How long a forest read waits for a storage slot before the archive answers
+/// busy. A syncing client retries; a long queue would only hold its
+/// connection open.
+const FOREST_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Reads waiting for a slot beyond which further reads are refused at once.
+const MAX_FOREST_READ_WAITERS: usize = 64;
+/// Storage slots one authenticated peer may hold at once, so a single syncing
+/// client cannot occupy all of them. A node's workers all reach the archive
+/// under its identity, so this is shared by every worker bootstrapping at
+/// once (4 starved a node of 15 after the committee-handoff flag day).
+const FOREST_READ_SLOTS_PER_PEER: usize = 8;
+/// Keys one batched forest read may name.
+pub const MAX_FOREST_BATCH_KEYS: usize = 512;
+/// Leaves one leaf listing returns (vertex leaves are 40 bytes, so about
+/// 4.7 MB of keys and values).
+pub const MAX_FOREST_LEAVES: usize = 65_536;
+/// A batched response stops (answering a prefix) once it carries this many
+/// bytes; the client asks again for the rest.
+pub const MAX_FOREST_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+static FOREST_READ_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FOREST_READ_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FOREST_READ_QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FOREST_LEAVES_LISTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FOREST_READ_PEER_SLOTS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<Vec<u8>, usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Forest reads this process has served, refused and queued, and its read
+/// cache, since start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForestReadStats {
+    pub cache: crate::forest_read_cache::ForestReadCacheStats,
+    pub refused: u64,
+    pub queued: u64,
+    /// Leaves served by bootstrap listings (no per-node reads).
+    pub listed: u64,
+}
+
+pub fn forest_read_stats() -> ForestReadStats {
+    ForestReadStats {
+        cache: crate::forest_read_cache::ForestReadCache::process().stats(),
+        refused: FOREST_READ_REFUSED.load(std::sync::atomic::Ordering::Relaxed),
+        queued: FOREST_READ_QUEUED.load(std::sync::atomic::Ordering::Relaxed),
+        listed: FOREST_LEAVES_LISTED.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// The authenticated caller, for the per-peer slot limit.
+fn forest_reader(extensions: &tonic::Extensions) -> Option<Vec<u8>> {
+    extensions
+        .get::<crate::peer_auth_middleware::AuthenticatedPeer>()
+        .map(|auth| auth.peer_id.to_bytes())
+}
+
+/// One of a peer's storage slots, released on drop.
+struct PeerSlot(Option<Vec<u8>>);
+
+impl PeerSlot {
+    fn take(peer: Option<Vec<u8>>, limit: usize) -> Result<Self, Status> {
+        let Some(peer) = peer else { return Ok(Self(None)) };
+        let mut slots = FOREST_READ_PEER_SLOTS.lock();
+        let held = slots.entry(peer.clone()).or_insert(0);
+        if *held >= limit {
+            FOREST_READ_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(Status::resource_exhausted("forest reads for this peer at their limit; retry later"));
+        }
+        *held += 1;
+        Ok(Self(Some(peer)))
+    }
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let Some(peer) = self.0.take() else { return };
+        let mut slots = FOREST_READ_PEER_SLOTS.lock();
+        if let Some(held) = slots.get_mut(&peer) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                slots.remove(&peer);
+            }
+        }
+    }
+}
 
 async fn forest_read<T: Send + 'static>(
     server: Option<Arc<dyn ForestServer>>,
+    peer: Option<Vec<u8>>,
     read: impl FnOnce(&dyn ForestServer) -> Option<T> + Send + 'static,
 ) -> Result<Option<T>, Status> {
     let Some(server) = server else { return Ok(None) };
-    bounded_forest_read(&FOREST_READ_WORKERS, move || read(server.as_ref())).await
+    bounded_forest_read(&*FOREST_READ_WORKERS, FOREST_READ_WAIT, peer, move || read(server.as_ref())).await
 }
 
+/// Run `read` on a storage slot. A free slot is taken at once; otherwise the
+/// read waits up to `wait` in a bounded queue, and is refused as busy past
+/// that or when the queue is full. A peer holds at most
+/// `FOREST_READ_SLOTS_PER_PEER` slots, queued or running.
 async fn bounded_forest_read<T: Send + 'static>(
     workers: &'static tokio::sync::Semaphore,
+    wait: std::time::Duration,
+    peer: Option<Vec<u8>>,
     read: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Status> {
-    let permit = workers.try_acquire()
-        .map_err(|_| Status::resource_exhausted("forest read workers busy; retry later"))?;
+    use std::sync::atomic::Ordering;
+    let busy = || {
+        FOREST_READ_REFUSED.fetch_add(1, Ordering::Relaxed);
+        Status::resource_exhausted("forest read workers busy; retry later")
+    };
+    let peer_slot = PeerSlot::take(peer, FOREST_READ_SLOTS_PER_PEER)?;
+    let permit = match workers.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) if wait.is_zero() => return Err(busy()),
+        Err(_) => {
+            if FOREST_READ_WAITERS.fetch_add(1, Ordering::Relaxed) >= MAX_FOREST_READ_WAITERS {
+                FOREST_READ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+                return Err(busy());
+            }
+            FOREST_READ_QUEUED.fetch_add(1, Ordering::Relaxed);
+            let acquired = tokio::time::timeout(wait, workers.acquire()).await;
+            FOREST_READ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+            match acquired {
+                Ok(Ok(permit)) => permit,
+                _ => return Err(busy()),
+            }
+        }
+    };
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _peer_slot = peer_slot;
         read()
     }).await.map_err(|e| Status::internal(format!("forest read task failed: {e}")))
+}
+
+/// Answer a batched read: each key from `hits` when cached, else through
+/// `read` (which may cache it), stopping after `MAX_FOREST_BATCH_BYTES`.
+fn answer_batch<K>(
+    keys: Vec<K>,
+    hits: Vec<Option<Arc<Vec<u8>>>>,
+    mut read: impl FnMut(&K) -> Option<Vec<u8>>,
+) -> Vec<global::ForestReadResult> {
+    let mut out = Vec::with_capacity(keys.len());
+    let mut bytes = 0usize;
+    for (key, hit) in keys.iter().zip(hits) {
+        if !out.is_empty() && bytes >= MAX_FOREST_BATCH_BYTES {
+            break;
+        }
+        let data = match hit {
+            Some(data) => Some(data.as_ref().clone()),
+            None => read(key),
+        };
+        bytes += data.as_ref().map_or(0, Vec::len);
+        out.push(global::ForestReadResult { found: data.is_some(), data: data.unwrap_or_default() });
+    }
+    out
 }
 
 impl GlobalRpcServer {
@@ -420,8 +597,22 @@ impl GlobalRpcServer {
             message_broadcast: None,
             self_peer_id: None,
             shard_direct_relay: None,
+            worker_prover_submitter: None,
+            historical_committees: None,
             prover_authorizer: None,
         }
+    }
+
+    /// Install the source for `GetHistoricalCommittees`.
+    pub fn with_historical_committees(mut self, source: quil_engine::historical_committee::HistoricalCommitteeSource) -> Self {
+        self.historical_committees = Some(source);
+        self
+    }
+
+    /// Install the submitter for `SubmitWorkerProverMessage`.
+    pub fn with_worker_prover_submitter(mut self, submitter: WorkerProverSubmitter) -> Self {
+        self.worker_prover_submitter = Some(submitter);
+        self
     }
 
     /// Install the relay for `SendShardConsensusDirect`.
@@ -439,6 +630,16 @@ impl GlobalRpcServer {
     ) -> Self {
         self.prover_authorizer = Some(f);
         self
+    }
+
+    /// Strictly the node's own workers, for calls that act as the node (they
+    /// send under its identity). Unlike the other worker-privileged calls, no
+    /// configured identity is no access.
+    fn is_own_identity(&self, ext: &tonic::Extensions) -> bool {
+        self.self_peer_id.as_ref().is_some_and(|me| {
+            ext.get::<crate::peer_auth_middleware::AuthenticatedPeer>()
+                .is_some_and(|auth| auth.peer_id.to_bytes() == *me)
+        })
     }
 
     /// Guard a prover-gated RPC (`GetGlobalProposal`): the authenticated caller
@@ -566,10 +767,11 @@ impl GlobalService for GlobalRpcServer {
         request: Request<global::GetGlobalVertexProofRequest>,
     ) -> Result<Response<global::GetGlobalVertexProofResponse>, Status> {
         use quil_engine::storage_history::verify_global_vertex_proof;
+        let peer = forest_reader(request.extensions());
         let req = request.into_inner();
         let root: [u8; 32] = req.root.as_slice().try_into().map_err(|_| Status::invalid_argument("GLOBAL root must be 32 bytes"))?;
         let address: [u8; 32] = req.address.as_slice().try_into().map_err(|_| Status::invalid_argument("GLOBAL address must be 32 bytes"))?;
-        let mut proof = forest_read(self.forest_server.clone(), move |s| s.global_vertex_proof(root, address)).await?;
+        let mut proof = forest_read(self.forest_server.clone(), peer, move |s| s.global_vertex_proof(root, address)).await?;
         if proof.is_none() && req.allow_forward {
             if let Some(source) = self.global_vertex_proof_source.as_ref() {
                 let _permit = HISTORY_FORWARD_WORKERS.try_acquire().map_err(|_| Status::resource_exhausted("history forwarding busy"))?;
@@ -924,15 +1126,7 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::SendShardConsensusDirectRequest>,
     ) -> Result<Response<global::SendShardConsensusDirectResponse>, Status> {
-        // Strictly the node's own workers: this sends as the node. Unlike the
-        // other worker-privileged calls, no configured identity is no access.
-        let own = self.self_peer_id.as_ref().is_some_and(|me| {
-            request
-                .extensions()
-                .get::<crate::peer_auth_middleware::AuthenticatedPeer>()
-                .is_some_and(|auth| auth.peer_id.to_bytes() == *me)
-        });
-        if !own {
+        if !self.is_own_identity(request.extensions()) {
             return Err(Status::permission_denied(
                 "SendShardConsensusDirect: caller is not this node's own identity",
             ));
@@ -945,12 +1139,71 @@ impl GlobalService for GlobalRpcServer {
         Ok(Response::new(global::SendShardConsensusDirectResponse { delivered }))
     }
 
+    async fn get_historical_committees(
+        &self,
+        request: Request<global::GetHistoricalCommitteesRequest>,
+    ) -> Result<Response<global::GetHistoricalCommitteesResponse>, Status> {
+        if !self.is_own_identity(request.extensions()) {
+            return Err(Status::permission_denied(
+                "GetHistoricalCommittees: caller is not this node's own identity",
+            ));
+        }
+        let Some(source) = &self.historical_committees else {
+            return Err(Status::unimplemented("GetHistoricalCommittees: not available"));
+        };
+        let req = request.into_inner();
+        let committees = source(req.filter, req.anchor)
+            .await
+            .map_err(|e| Status::unavailable(e.to_string()))?;
+        Ok(Response::new(global::GetHistoricalCommitteesResponse {
+            committees: committees
+                .into_iter()
+                .map(|members| global::HistoricalCommittee { members })
+                .collect(),
+        }))
+    }
+
+    async fn submit_worker_prover_message(
+        &self,
+        request: Request<global::SubmitWorkerProverMessageRequest>,
+    ) -> Result<Response<global::SubmitWorkerProverMessageResponse>, Status> {
+        if !self.is_own_identity(request.extensions()) {
+            return Err(Status::permission_denied(
+                "SubmitWorkerProverMessage: caller is not this node's own identity",
+            ));
+        }
+        let Some(submitter) = &self.worker_prover_submitter else {
+            return Err(Status::unimplemented("SubmitWorkerProverMessage: no prover transport"));
+        };
+        let req = request.into_inner();
+        match submitter(req.core_id, req.request).await {
+            Ok(accepted) => Ok(Response::new(global::SubmitWorkerProverMessageResponse { accepted })),
+            Err(error) => Err(Status::invalid_argument(error)),
+        }
+    }
+
     async fn get_forest_node(
         &self,
         request: Request<global::GetForestNodeRequest>,
     ) -> Result<Response<global::GetForestNodeResponse>, Status> {
+        use crate::forest_read_cache::{CacheKey, ForestReadCache, Origin};
+        let peer = forest_reader(request.extensions());
         let req = request.into_inner();
-        let node = forest_read(self.forest_server.clone(), move |s| s.serve_node(&req.shard_id, req.phase, &req.node_key)).await?;
+        let Some(origin) = self.forest_server.as_ref().map(Origin::of) else {
+            return Ok(Response::new(global::GetForestNodeResponse { found: false, node: Vec::new() }));
+        };
+        let cache = ForestReadCache::process();
+        let key = CacheKey::node(origin, &req.shard_id, req.phase, &req.node_key);
+        let node = match cache.get(&key) {
+            Some(node) => Some(node.as_ref().clone()),
+            None => forest_read(self.forest_server.clone(), peer, move |s| {
+                let node = s.serve_node(&req.shard_id, req.phase, &req.node_key);
+                if let Some(node) = &node {
+                    cache.put(key, node.clone());
+                }
+                node
+            }).await?,
+        };
         Ok(Response::new(global::GetForestNodeResponse {
             found: node.is_some(),
             node: node.unwrap_or_default(),
@@ -961,13 +1214,14 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::GetForestValueRequest>,
     ) -> Result<Response<global::GetForestValueResponse>, Status> {
+        let peer = forest_reader(request.extensions());
         let req = request.into_inner();
         let key_hash: [u8; 32] = req
             .key_hash
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("key_hash must be 32 bytes"))?;
-        let value = forest_read(self.forest_server.clone(), move |s| s.serve_value(&req.shard_id, req.phase, req.version, key_hash)).await?;
+        let value = forest_read(self.forest_server.clone(), peer, move |s| s.serve_value(&req.shard_id, req.phase, req.version, key_hash)).await?;
         Ok(Response::new(global::GetForestValueResponse {
             found: value.is_some(),
             value: value.unwrap_or_default(),
@@ -978,8 +1232,9 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::GetForestHeadRequest>,
     ) -> Result<Response<global::GetForestHeadResponse>, Status> {
+        let peer = forest_reader(request.extensions());
         let req = request.into_inner();
-        let head = forest_read(self.forest_server.clone(), move |s| s.serve_head(&req.shard_id, req.phase)).await?;
+        let head = forest_read(self.forest_server.clone(), peer, move |s| s.serve_head(&req.shard_id, req.phase)).await?;
         Ok(Response::new(match head {
             Some((version, root)) => global::GetForestHeadResponse {
                 found: true,
@@ -994,13 +1249,14 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::GetForestPreimageRequest>,
     ) -> Result<Response<global::GetForestPreimageResponse>, Status> {
+        let peer = forest_reader(request.extensions());
         let req = request.into_inner();
         let key_hash: [u8; 32] = req
             .key_hash
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("key_hash must be 32 bytes"))?;
-        let raw = forest_read(self.forest_server.clone(), move |s| s.serve_preimage(&req.shard_id, req.phase, key_hash)).await?;
+        let raw = forest_read(self.forest_server.clone(), peer, move |s| s.serve_preimage(&req.shard_id, req.phase, key_hash)).await?;
         Ok(Response::new(global::GetForestPreimageResponse {
             found: raw.is_some(),
             raw_key: raw.unwrap_or_default(),
@@ -1011,26 +1267,155 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::GetVertexBlobRequest>,
     ) -> Result<Response<global::GetVertexBlobResponse>, Status> {
+        let peer = forest_reader(request.extensions());
         let req = request.into_inner();
         let version = (req.exact_version || req.version != 0).then_some(req.version);
-        let blob = forest_read(self.forest_server.clone(), move |s| s.serve_vertex_blob(&req.shard_key, req.phase, &req.id, version)).await?;
+        let blob = forest_read(self.forest_server.clone(), peer, move |s| s.serve_vertex_blob(&req.shard_key, req.phase, &req.id, version)).await?;
         Ok(Response::new(global::GetVertexBlobResponse {
             found: blob.is_some(),
             blob: blob.unwrap_or_default(),
         }))
     }
 
+    async fn get_forest_nodes(
+        &self,
+        request: Request<global::GetForestNodesRequest>,
+    ) -> Result<Response<global::GetForestNodesResponse>, Status> {
+        use crate::forest_read_cache::{CacheKey, ForestReadCache, Origin};
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        if req.node_keys.len() > MAX_FOREST_BATCH_KEYS {
+            return Err(Status::invalid_argument(format!("at most {MAX_FOREST_BATCH_KEYS} keys per request")));
+        }
+        let Some(origin) = self.forest_server.as_ref().map(Origin::of) else {
+            let nodes = vec![global::ForestReadResult::default(); req.node_keys.len()];
+            return Ok(Response::new(global::GetForestNodesResponse { nodes }));
+        };
+        let cache = ForestReadCache::process();
+        let hits: Vec<_> = req.node_keys.iter()
+            .map(|key| cache.get(&CacheKey::node(origin, &req.shard_id, req.phase, key)))
+            .collect();
+        let (shard_id, phase, keys) = (req.shard_id, req.phase, req.node_keys);
+        let nodes = if hits.iter().all(Option::is_some) {
+            answer_batch(keys, hits, |_| None)
+        } else {
+            let unserved = keys.len();
+            forest_read(self.forest_server.clone(), peer, move |s| {
+                Some(answer_batch(keys, hits, |key| {
+                    let node = s.serve_node(&shard_id, phase, key);
+                    if let Some(node) = &node {
+                        cache.put(CacheKey::node(origin, &shard_id, phase, key), node.clone());
+                    }
+                    node
+                }))
+            }).await?.unwrap_or_else(|| vec![global::ForestReadResult::default(); unserved])
+        };
+        Ok(Response::new(global::GetForestNodesResponse { nodes }))
+    }
+
+    async fn get_forest_values(
+        &self,
+        request: Request<global::GetForestValuesRequest>,
+    ) -> Result<Response<global::GetForestValuesResponse>, Status> {
+        use crate::forest_read_cache::{CacheKey, ForestReadCache, Origin};
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        if req.keys.len() > MAX_FOREST_BATCH_KEYS {
+            return Err(Status::invalid_argument(format!("at most {MAX_FOREST_BATCH_KEYS} keys per request")));
+        }
+        let keys = req.keys.into_iter()
+            .map(|key| {
+                <[u8; 32]>::try_from(key.key_hash.as_slice())
+                    .map(|hash| (key.version, hash))
+                    .map_err(|_| Status::invalid_argument("key_hash must be 32 bytes"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(origin) = self.forest_server.as_ref().map(Origin::of) else {
+            let values = vec![global::ForestReadResult::default(); keys.len()];
+            return Ok(Response::new(global::GetForestValuesResponse { values }));
+        };
+        let cache = ForestReadCache::process();
+        let hits: Vec<_> = keys.iter()
+            .map(|(version, hash)| cache.get(&CacheKey::value(origin, &req.shard_id, req.phase, *version, hash)))
+            .collect();
+        let (shard_id, phase) = (req.shard_id, req.phase);
+        let values = if hits.iter().all(Option::is_some) {
+            answer_batch(keys, hits, |_| None)
+        } else {
+            let unserved = keys.len();
+            forest_read(self.forest_server.clone(), peer, move |s| {
+                // A value read above the tree's head could change when that
+                // version commits, so only reads at or below it are kept.
+                let head = s.serve_head(&shard_id, phase).map(|(version, _)| version);
+                Some(answer_batch(keys, hits, |(version, hash)| {
+                    let value = s.serve_value(&shard_id, phase, *version, *hash);
+                    if let Some(value) = value.as_ref().filter(|_| head.is_some_and(|head| *version <= head)) {
+                        cache.put(CacheKey::value(origin, &shard_id, phase, *version, hash), value.clone());
+                    }
+                    value
+                }))
+            }).await?.unwrap_or_else(|| vec![global::ForestReadResult::default(); unserved])
+        };
+        Ok(Response::new(global::GetForestValuesResponse { values }))
+    }
+
+    async fn get_forest_leaves(
+        &self,
+        request: Request<global::GetForestLeavesRequest>,
+    ) -> Result<Response<global::GetForestLeavesResponse>, Status> {
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        let key = |bytes: &[u8], name: &str| -> Result<[u8; 32], Status> {
+            bytes.try_into().map_err(|_| Status::invalid_argument(format!("{name} must be 32 bytes")))
+        };
+        let (first, last) = (key(&req.first, "first")?, key(&req.last, "last")?);
+        let after = if req.after.is_empty() { None } else { Some(key(&req.after, "after")?) };
+        let (shard_id, phase, version) = (req.shard_id, req.phase, req.version);
+        let listed = forest_read(self.forest_server.clone(), peer, move |s| {
+            s.serve_leaves(&shard_id, phase, version, &first, &last, after.as_ref())
+        }).await?;
+        let Some((leaves, more)) = listed else {
+            return Err(Status::unimplemented("this archive does not list forest leaves"));
+        };
+        FOREST_LEAVES_LISTED.fetch_add(leaves.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(Response::new(global::GetForestLeavesResponse {
+            leaves: leaves.into_iter()
+                .map(|(key_hash, value)| global::ForestLeaf { key_hash: key_hash.to_vec(), value })
+                .collect(),
+            more,
+        }))
+    }
+
+    async fn get_vertex_blobs(
+        &self,
+        request: Request<global::GetVertexBlobsRequest>,
+    ) -> Result<Response<global::GetVertexBlobsResponse>, Status> {
+        let peer = forest_reader(request.extensions());
+        let req = request.into_inner();
+        if req.blobs.len() > MAX_FOREST_BATCH_KEYS {
+            return Err(Status::invalid_argument(format!("at most {MAX_FOREST_BATCH_KEYS} keys per request")));
+        }
+        let unserved = req.blobs.len();
+        let hits = vec![None; req.blobs.len()];
+        let (shard_key, phase, keys) = (req.shard_key, req.phase, req.blobs);
+        let blobs = forest_read(self.forest_server.clone(), peer, move |s| {
+            Some(answer_batch(keys, hits, |key| s.serve_vertex_blob(&shard_key, phase, &key.id, Some(key.version))))
+        }).await?.unwrap_or_else(|| vec![global::ForestReadResult::default(); unserved]);
+        Ok(Response::new(global::GetVertexBlobsResponse { blobs }))
+    }
+
     async fn resolve_root(
         &self,
         request: Request<global::ResolveRootRequest>,
     ) -> Result<Response<global::ResolveRootResponse>, Status> {
+        let peer = forest_reader(request.extensions());
         let req = request.into_inner();
         let root: [u8; 32] = req
             .root
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("root must be 32 bytes"))?;
-        let resolved = forest_read(self.forest_server.clone(), move |s| s.resolve_root(&req.shard_id, req.phase, root)).await?;
+        let resolved = forest_read(self.forest_server.clone(), peer, move |s| s.resolve_root(&req.shard_id, req.phase, root)).await?;
         Ok(Response::new(match resolved {
             Some((version, global_frame)) => global::ResolveRootResponse {
                 found: true,
@@ -1045,13 +1430,14 @@ impl GlobalService for GlobalRpcServer {
         &self,
         request: Request<global::GetAppManifestRequest>,
     ) -> Result<Response<global::GetAppManifestResponse>, Status> {
+        let peer = forest_reader(request.extensions());
         let req = request.into_inner();
         let app_root: [u8; 32] = req
             .app_root
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("app_root must be 32 bytes"))?;
-        let manifest = forest_read(self.forest_server.clone(), move |s| s.serve_app_manifest(&req.app_address, req.phase, app_root)).await?;
+        let manifest = forest_read(self.forest_server.clone(), peer, move |s| s.serve_app_manifest(&req.app_address, req.phase, app_root)).await?;
         Ok(Response::new(match manifest {
             Some(entries) => global::GetAppManifestResponse {
                 found: true,
@@ -1241,6 +1627,87 @@ mod identity_gate_tests {
         );
         let unconfigured = GlobalRpcServer::new(Arc::new(NoopLookup)).with_shard_direct_relay(relay);
         let denied = unconfigured.send_shard_consensus_direct(request(Some(me))).await.unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied, "no identity configured: no access");
+    }
+
+    /// Historical committees go only to the node's own workers.
+    #[tokio::test]
+    async fn only_the_nodes_own_workers_may_ask_for_historical_committees() {
+        let me = quil_p2p::PeerId::random();
+        let source: quil_engine::historical_committee::HistoricalCommitteeSource =
+            Arc::new(|filter, anchor| Box::pin(async move { Ok(vec![vec![filter, anchor.to_be_bytes().to_vec()]]) }));
+        let request = |caller: Option<quil_p2p::PeerId>| {
+            let mut request = Request::new(global::GetHistoricalCommitteesRequest { filter: b"shard".to_vec(), anchor: 9 });
+            if let Some(caller) = caller {
+                *request.extensions_mut() = auth_ext(caller);
+            }
+            request
+        };
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup))
+            .with_self_peer_id(me.to_bytes())
+            .with_historical_committees(source);
+        for caller in [None, Some(quil_p2p::PeerId::random())] {
+            let denied = server.get_historical_committees(request(caller)).await.unwrap_err();
+            assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        }
+        let answer = server.get_historical_committees(request(Some(me))).await.unwrap().into_inner();
+        assert_eq!(answer.committees.len(), 1);
+        assert_eq!(answer.committees[0].members, vec![b"shard".to_vec(), 9u64.to_be_bytes().to_vec()]);
+        let without = GlobalRpcServer::new(Arc::new(NoopLookup)).with_self_peer_id(me.to_bytes());
+        assert_eq!(without.get_historical_committees(request(Some(me))).await.unwrap_err().code(), tonic::Code::Unimplemented);
+    }
+
+    /// A worker's GLOBAL submission goes out as the node, so only the node's
+    /// own identity may hand one in; the node's answer (queued, held back, or
+    /// refused) reaches the worker, and a node without a transport says so.
+    #[tokio::test]
+    async fn only_the_nodes_own_workers_may_submit_prover_messages() {
+        let me = quil_p2p::PeerId::random();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let submitter: WorkerProverSubmitter = {
+            let seen = seen.clone();
+            Arc::new(move |core_id, request: Vec<u8>| {
+                seen.lock().unwrap().push((core_id, request.clone()));
+                Box::pin(async move {
+                    match request.as_slice() {
+                        b"halted" => Ok(false),
+                        b"junk" => Err("not a worker submission".to_string()),
+                        _ => Ok(true),
+                    }
+                })
+            })
+        };
+        let request = |caller: Option<quil_p2p::PeerId>, body: &[u8]| {
+            let mut request = Request::new(global::SubmitWorkerProverMessageRequest {
+                core_id: 3,
+                request: body.to_vec(),
+            });
+            if let Some(caller) = caller {
+                *request.extensions_mut() = auth_ext(caller);
+            }
+            request
+        };
+        let server = GlobalRpcServer::new(Arc::new(NoopLookup))
+            .with_self_peer_id(me.to_bytes())
+            .with_worker_prover_submitter(submitter.clone());
+        for caller in [None, Some(quil_p2p::PeerId::random())] {
+            let denied = server.submit_worker_prover_message(request(caller, b"header")).await.unwrap_err();
+            assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        }
+        assert!(seen.lock().unwrap().is_empty(), "a stranger's submission never reaches the transport");
+        let queued = server.submit_worker_prover_message(request(Some(me), b"header")).await.unwrap();
+        assert!(queued.get_ref().accepted);
+        let held = server.submit_worker_prover_message(request(Some(me), b"halted")).await.unwrap();
+        assert!(!held.get_ref().accepted);
+        let refused = server.submit_worker_prover_message(request(Some(me), b"junk")).await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert_eq!(seen.lock().unwrap()[0], (3, b"header".to_vec()));
+
+        let without = GlobalRpcServer::new(Arc::new(NoopLookup)).with_self_peer_id(me.to_bytes());
+        let missing = without.submit_worker_prover_message(request(Some(me), b"header")).await.unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::Unimplemented);
+        let unconfigured = GlobalRpcServer::new(Arc::new(NoopLookup)).with_worker_prover_submitter(submitter);
+        let denied = unconfigured.submit_worker_prover_message(request(Some(me), b"header")).await.unwrap_err();
         assert_eq!(denied.code(), tonic::Code::PermissionDenied, "no identity configured: no access");
     }
 }
@@ -1542,7 +2009,7 @@ mod forest_read_tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         // Dropping release_tx also releases the worker on assertion failure.
-        let caller = tokio::spawn(bounded_forest_read(&WORKERS, move || {
+        let caller = tokio::spawn(bounded_forest_read(&WORKERS, std::time::Duration::ZERO, None, move || {
             let _ = started_tx.send(());
             let _ = release_rx.recv();
         }));
@@ -1550,13 +2017,65 @@ mod forest_read_tests {
             .await.unwrap().unwrap();
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
-        assert_eq!(bounded_forest_read(&WORKERS, || ()).await.unwrap_err().code(),
+        assert_eq!(bounded_forest_read(&WORKERS, std::time::Duration::ZERO, None, || ()).await.unwrap_err().code(),
             tonic::Code::ResourceExhausted);
         release_tx.send(()).unwrap();
         let permit = tokio::time::timeout(std::time::Duration::from_secs(5), WORKERS.acquire())
             .await.unwrap().unwrap();
         drop(permit);
-        assert_eq!(bounded_forest_read(&WORKERS, || 42).await.unwrap(), 42);
+        assert_eq!(bounded_forest_read(&WORKERS, std::time::Duration::ZERO, None, || 42).await.unwrap(), 42);
+    }
+
+    /// A read waits briefly for a slot instead of being refused at once, and
+    /// one peer holds at most its share of the slots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reads_queue_briefly_and_each_peer_holds_a_bounded_share() {
+        static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = tokio::spawn(bounded_forest_read(&WORKERS, std::time::Duration::ZERO, None, move || {
+            let _ = release_rx.recv();
+        }));
+        while WORKERS.available_permits() > 0 {
+            tokio::task::yield_now().await;
+        }
+        let queued = tokio::spawn(bounded_forest_read(&WORKERS, std::time::Duration::from_secs(5), None, || 7));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release_tx.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        assert_eq!(queued.await.unwrap().unwrap(), 7, "a queued read runs once a slot frees");
+        let timed_out = bounded_forest_read(&WORKERS, std::time::Duration::from_millis(1), None, || ());
+        let held = WORKERS.try_acquire().unwrap();
+        assert_eq!(timed_out.await.unwrap_err().code(), tonic::Code::ResourceExhausted);
+        drop(held);
+
+        let peer = b"one syncing peer".to_vec();
+        let slots: Vec<_> = (0..FOREST_READ_SLOTS_PER_PEER)
+            .map(|_| PeerSlot::take(Some(peer.clone()), FOREST_READ_SLOTS_PER_PEER).unwrap())
+            .collect();
+        assert_eq!(
+            PeerSlot::take(Some(peer.clone()), FOREST_READ_SLOTS_PER_PEER).err().unwrap().code(),
+            tonic::Code::ResourceExhausted,
+        );
+        assert!(PeerSlot::take(Some(b"another peer".to_vec()), FOREST_READ_SLOTS_PER_PEER).is_ok());
+        drop(slots);
+        assert!(PeerSlot::take(Some(peer), FOREST_READ_SLOTS_PER_PEER).is_ok(), "released on drop");
+    }
+
+    /// A batch answers a prefix in order, stopping at the byte budget, with
+    /// cached entries served as found.
+    #[test]
+    fn a_batch_answers_a_prefix_within_its_byte_budget() {
+        let keys: Vec<u32> = (0..5).collect();
+        let hits = vec![None, Some(Arc::new(vec![1u8; 3])), None, None, None];
+        let out = answer_batch(keys, hits, |key| match key {
+            2 => None,
+            _ => Some(vec![0u8; MAX_FOREST_BATCH_BYTES / 2]),
+        });
+        assert_eq!(out.len(), 4, "the fifth key is past the budget");
+        assert!(out[0].found && out[1].found && !out[2].found && out[3].found);
+        assert_eq!(out[1].data, vec![1u8; 3]);
+        let one = answer_batch(vec![0u32], vec![None], |_| Some(vec![0u8; MAX_FOREST_BATCH_BYTES * 2]));
+        assert_eq!(one.len(), 1, "a single oversized entry is still answered");
     }
 }
 

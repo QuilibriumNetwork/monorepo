@@ -17,6 +17,7 @@ testing-stubs = []
 
 [dependencies]
 rayon = "1"
+memchr = "2"
 quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-crypto = { path = "../quil-crypto" }

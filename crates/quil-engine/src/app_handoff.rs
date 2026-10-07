@@ -579,9 +579,13 @@ pub fn successor_state_matches(
         }
         if cursor == checkpoint.frame {
             if local.roots != checkpoint.state_roots {
-                return Err(QuilError::Consensus(
-                    "local state differs from the predecessor's sealed checkpoint".into(),
-                ));
+                // This member does not hold the state its predecessor sealed
+                // (it never held the range, or holds another version). As a
+                // recoverable gap it requests the shard sync, which installs
+                // the state from an archive pinned to the sealed roots
+                // (`origin_anchors`); as a consensus error it retried the same
+                // comparison forever.
+                return Err(unavailable("local state differs from the predecessor's sealed checkpoint"));
             }
             // A shard that never materialized a frame has no cursor record; its
             // history is the chain's starting value, as the parent reader has it.
@@ -880,6 +884,15 @@ mod successor_tests {
         behind.commit_with_frame_cursor_and_records(2, &cursor_key, &outflow_records(&filter, 2)).unwrap();
         let error = successor_state_matches(&global, &behind, &clock, &successor).unwrap_err();
         assert!(error.to_string().contains("not been recovered through its seal"), "{error}");
+
+        // At the sealed frame with other state: recoverable by a sync pinned to
+        // the sealed roots, so it requests one instead of refusing for good.
+        let other = crdt();
+        other.add_vertex(&quil_hypergraph::Location { app_address: [0x01; 32], data_address: [9; 32] }, &[9; 64]).unwrap();
+        other.commit_with_frame_cursor_and_records(3, &cursor_key, &outflow_records(&filter, 3)).unwrap();
+        let error = successor_state_matches(&global, &other, &clock, &successor).unwrap_err();
+        assert!(matches!(error, QuilError::ExecutionUnavailable(_)) && error.to_string().contains("sealed checkpoint"),
+            "{error}");
     }
 
     /// A predecessor GLOBAL fenced after its closing timeout has no certified
@@ -1218,7 +1231,7 @@ mod successor_tests {
         let tip_digest = put(5, 17, 1);
 
         // GLOBAL records frame 5 as the tip and registers generation 0 there.
-        let policy = CommitteeHandoffPolicy { activation_frame: 0, chain_id: [7; 32] };
+        let policy = CommitteeHandoffPolicy { activation_frame: 0, chain_id: [7; 32], legacy_history: quil_types::consensus::LegacyHistory::Migrate, membership_boundary_frame: u64::MAX, first_session_boundary_frame: u64::MAX};
         commit(1);
         let tip = legacy::LegacyTip {
             checkpoint: Checkpoint { frame: 5, view: 17, digest: tip_digest, state_roots: [[0; 32]; 4], history_root: [0; 32] },

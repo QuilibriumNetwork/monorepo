@@ -23,7 +23,7 @@ use quil_lattice_ct::confidential::{
     pending_create::PendingCreate,
     relation::membership::IDENTITY_BYTES,
     settlement::Settlement,
-    shield::Shield,
+    shield::AnyShield,
     transfer::{parameter_context, Output, Transfer, MEMO_BYTES},
     AmountCommitment, COMMITMENT_BYTES,
 };
@@ -125,9 +125,10 @@ pub fn shape(bytes: &[u8]) -> Result<([u8; 32], Shape)> {
             let s = PendingClaim::decode(bytes, &network, &application).map_err(|_| invalid())?.statement;
             Shape { coins: s.outputs.len(), markers: 1, escrow: false }
         }
+        // One consumed marker per legacy source.
         0x0516 => {
-            let s = Shield::decode(bytes, &network, &application).map_err(|_| invalid())?.statement;
-            Shape { coins: s.outputs.len(), markers: 1, escrow: false }
+            let s = AnyShield::decode(bytes, &network, &application).map_err(|_| invalid())?;
+            Shape { coins: s.outputs().len(), markers: s.sources().len(), escrow: false }
         }
         0x0517 => {
             let c = MintClaim::decode(bytes, &network, &application).map_err(|_| invalid())?;
@@ -184,5 +185,32 @@ mod tests {
             2 * coin + 4 * marker + escrow
         );
         assert_eq!(shape_growth(&context, Shape { coins: 0, markers: 0, escrow: false }).unwrap(), 0);
+    }
+
+    /// A batch shield pays one consumed marker per source, beside its coins.
+    #[test]
+    fn a_batch_shield_is_priced_per_source() {
+        use quil_lattice_ct::confidential::{
+            shield::{BatchShield, BatchShieldStatement, ShieldSource},
+            AmountOpening, CommitmentKey,
+        };
+        let (network, application) = ([1; 32], [2; 32]);
+        let context = parameter_context(&network, &application);
+        let opening = AmountOpening::from_seed(&context, &[3; 32]);
+        let mut proof = vec![0; 64];
+        proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+        let sources: Vec<ShieldSource> = (1..=5u8).map(|i| ShieldSource { address: [i; 32], amount: 100 }).collect();
+        let bytes = BatchShield {
+            statement: BatchShieldStatement {
+                network, application, owner_public_key: [4; 57], sources, fee: 1,
+                outputs: vec![Output { commitment: CommitmentKey::derive(&context).commit(499, &opening), owner: [6; IDENTITY_BYTES], memo: [7; MEMO_BYTES] }],
+            },
+            signature: [8; 114],
+            proof,
+        }.encode().unwrap();
+        let (priced_context, priced) = shape(&bytes).unwrap();
+        assert_eq!(priced_context, context);
+        assert_eq!(priced, Shape { coins: 1, markers: 5, escrow: false });
+        assert_eq!(state_growth(&bytes).unwrap(), coin_bytes(&context).unwrap() + 5 * marker_bytes().unwrap());
     }
 }

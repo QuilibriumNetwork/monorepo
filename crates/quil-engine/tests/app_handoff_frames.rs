@@ -433,6 +433,7 @@ async fn historical_certificate_reaches_archive_and_global_admission_after_commi
         &quil_crypto::FalconKeyConstructor,
         fixture.registry.as_ref(),
         5,
+        5,
     )
     .unwrap();
     assert_eq!(

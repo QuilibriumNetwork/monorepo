@@ -126,8 +126,7 @@ impl ProdProverTreeSyncer {
             let mut heads: Vec<(Vec<u8>, Vec<bool>, Option<(u64, [u8; 32])>)> =
                 Vec::with_capacity(sub_shards.len());
             for (shard_id, bits) in &sub_shards {
-                let h = client
-                    .get_forest_head(shard_id.clone(), phase)
+                let h = quil_rpc::forest_sync_reader::forest_head(&client, shard_id.clone(), phase)
                     .await
                     .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))?;
                 let h32 = h.map(|(v, r)| {
@@ -201,7 +200,7 @@ impl ProdProverTreeSyncer {
                 continue;
             }
             let source_version = if let Some(root) = pinned {
-                match client.resolve_root(filter.to_vec(), phase, root.to_vec()).await {
+                match quil_rpc::forest_sync_reader::resolve_forest_root(&client, filter.to_vec(), phase, root.to_vec()).await {
                     Ok(Some((version, _))) => version,
                     Ok(None) => {
                         warn!(phase, peer = %addr, filter = %hex::encode(filter),
@@ -213,7 +212,7 @@ impl ProdProverTreeSyncer {
             } else {
                 // No header exists for a brand-new child shard. Bootstrap must
                 // actually pull its inherited subtree; no anchor is not empty state.
-                match client.get_forest_head(app.to_vec(), phase).await
+                match quil_rpc::forest_sync_reader::forest_head(&client, app.to_vec(), phase).await
                     .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))? {
                     Some((version, _)) => version,
                     None => {

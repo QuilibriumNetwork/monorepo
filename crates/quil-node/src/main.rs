@@ -35,6 +35,8 @@ mod dht_node;
 mod worker_node;
 #[cfg(feature = "confidential-tokens")]
 mod witness_index;
+#[cfg(feature = "confidential-tokens")]
+mod legacy_index;
 
 #[cfg(feature = "native-proof")]
 mod proof_worker;
@@ -56,7 +58,6 @@ mod query_shards;
 mod adopt_prover_root;
 mod unified_consolidation;
 mod legacy_migration;
-mod coin_rescale;
 mod coin_receipt_repair;
 
 mod master_node;
@@ -267,14 +268,6 @@ struct Args {
     /// consensus-safe; run once at the flag frame. Empty path uses config.db.path.
     #[arg(long)]
     migrate_legacy: Option<PathBuf>,
-
-    /// Archive-only CORRECTIVE pass for a DB migrated by the OLD byte-shifted
-    /// decode (every transparent coin ×256): in place, `÷256` each coin amount
-    /// and re-key to its corrected content address, then rebuild the forest +
-    /// receipt. No verenc re-decrypt, no backup. Bails loudly if the data isn't
-    /// uniformly inflated. Empty path uses config.db.path. Run once.
-    #[arg(long)]
-    fix_coin_scale: Option<PathBuf>,
 
     /// Archive-only: recompute the coin-conservation receipt from the migrated
     /// TRANSPARENT coin set and rewrite it, then exit. Use when a legacy
@@ -753,6 +746,11 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         relay_activation_frame = %if relay_from == u64::MAX { "never (release frame unset)".to_string() } else { relay_from.to_string() },
         "application shard relay records"
     );
+    let batch_shields_from = quil_execution::token_intrinsic::global_commit::init_batch_shield_frame(args.network);
+    info!(
+        batch_shield_frame = %if batch_shields_from == u64::MAX { "never".to_string() } else { batch_shields_from.to_string() },
+        "batch shields and shield source coverage"
+    );
     if let Some(frame) = quil_execution::global_intrinsic::leaf_root_registration::init_pre_registration_frame(args.network) {
         tracing::warn!(pre_registration_frame = frame, "QUIL_PRE_REGISTRATION_FRAME override active (test networks only)");
     }
@@ -1007,16 +1005,6 @@ async fn node_main() -> anyhow::Result<ExitCode> {
 
     if let Some(ref dest_path) = args.migrate_legacy {
         return match legacy_migration::run_migrate_legacy(dest_path, &config) {
-            Ok(()) => Ok(ExitCode::SUCCESS),
-            Err(e) => {
-                eprintln!("{e}");
-                Ok(ExitCode::FAILURE)
-            }
-        };
-    }
-
-    if let Some(ref target_path) = args.fix_coin_scale {
-        return match coin_rescale::run_fix_coin_scale(target_path, &config) {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");

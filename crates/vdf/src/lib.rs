@@ -415,12 +415,11 @@ pub fn wesolowski_verify_multi_sparse(
       let (y_bytes, pi_bytes) = blob.split_at(element_len);
       let y_i  = GmpClassGroup::from_bytes(y_bytes, disc.clone());
       let pi_i = GmpClassGroup::from_bytes(pi_bytes, disc.clone());
-      // Reject DEGENERATE (a==0) forms decoded from the attacker's proof blob
-      // BEFORE any arithmetic: `pow`/reduce divide by `2·a` in raw GMP FFI, and
-      // `2·a == 0` is a C-level divide-by-zero abort that `catch_unwind` cannot
-      // trap (the live residual of the prior class-group SIGABRT class on the
-      // multiproof frame-header verify path). A valid proof never has a==0.
-      if y_i.a_is_zero() || pi_i.a_is_zero() {
+      // Reject malformed forms decoded from the attacker's proof blob BEFORE
+      // any arithmetic: raw GMP/C code can divide by zero on them (a SIGFPE
+      // abort that `catch_unwind` cannot trap) or never finish reducing. A
+      // valid proof always decodes to well-formed forms.
+      if !y_i.is_well_formed() || !pi_i.is_well_formed() {
           return false;
       }
       let h_i = hash_to_exponent::<<GmpClassGroup as ClassGroup>::BigNum>(
@@ -438,6 +437,29 @@ pub fn wesolowski_verify_multi_sparse(
       }
   }
   true
+}
+
+#[cfg(test)]
+mod multiproof_tests {
+    /// Malformed forms in any member's blob are rejected before arithmetic.
+    #[test]
+    fn verify_multi_rejects_malformed_forms() {
+        let ids = vec![vec![1u8; 32], vec![2u8; 32]];
+        let challenge = [9u8; 32];
+        let blobs: Vec<Vec<u8>> = (0..2)
+            .map(|i| super::wesolowski_solve_multi(2048, &challenge, 64, &ids, i))
+            .collect();
+        let verify = |blobs: &Vec<Vec<u8>>| super::wesolowski_verify_multi(2048, &challenge, 64, &ids, blobs);
+        assert!(verify(&blobs));
+        for start in [0, 258] {
+            let mut zero_a = blobs.clone();
+            zero_a[1][start..start + 129].fill(0);
+            let mut negative_a = blobs.clone();
+            negative_a[1][start] |= 0x80;
+            assert!(!verify(&zero_a));
+            assert!(!verify(&negative_a));
+        }
+    }
 }
 
 #[cfg(test)]
