@@ -224,6 +224,8 @@ struct RingCandidate {
     join_frame: u64,
     seniority: u64,
     address: Vec<u8>,
+    /// The ring the allocation records.
+    ring: u8,
 }
 
 /// Build shard entries from raw shard data and a size-fetching function.
@@ -345,6 +347,7 @@ where
                             join_frame: jf,
                             seniority: pr.seniority,
                             address: pr.address.clone(),
+                            ring: alloc.ring,
                         });
                     }
                     break;
@@ -374,12 +377,21 @@ where
                 && candidate_addrs.iter().any(|a| a.as_slice() == self_address);
             let real_is_alloc = is_alloc || in_candidates;
 
-            let (ring, on_ring) = resolve_prover_ring(
+            let (mut ring, mut on_ring) = resolve_prover_ring(
                 candidates.len(),
                 real_is_alloc,
                 self_address,
                 &candidate_addrs,
             );
+            // Under the seniority ring rule a member's ring is the one its
+            // allocation records (fixed when its committee formed), not a rank
+            // recomputed here.
+            if quil_execution::global_intrinsic::prover_rings::governs(frame_number) {
+                if let Some(own) = candidates.iter().find(|c| c.address.as_slice() == self_address) {
+                    ring = own.ring;
+                    on_ring = candidates.iter().filter(|c| c.ring == own.ring).count();
+                }
+            }
 
             entries.push(ShardEntry {
                 filter: bp,

@@ -145,6 +145,13 @@ impl AppParentExecutor {
         let _ = self.blocks.set(blocks);
     }
 
+    /// Drop any prepared parent: the frame history it extends was discarded.
+    pub(crate) fn clear(&self) {
+        if let Ok(mut prepared) = self.prepared.lock() {
+            *prepared = None;
+        }
+    }
+
     /// Release a prepared parent that canonical materialization has reached.
     pub(crate) fn retire_through(&self, materialized: u64) {
         if let Ok(mut prepared) = self.prepared.lock() {

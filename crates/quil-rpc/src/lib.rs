@@ -1,5 +1,6 @@
 pub mod archive_client;
 pub mod dispatch_service;
+pub mod forest_read_cache;
 pub mod forest_sync_reader;
 pub mod frame_sync;
 pub mod mixnet_service;

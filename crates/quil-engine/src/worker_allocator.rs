@@ -1084,6 +1084,8 @@ impl WorkerAllocator {
                 | EffectiveStatus::Joining => {}
                 EffectiveStatus::ExpiredEpoch
                     if epoch_renewal_recovery_pending(alloc, frame_number) => {}
+                EffectiveStatus::ExpiredEpoch
+                    if rejected_leave_recovery_pending(alloc, frame_number) => {}
                 // Both proposed and confirmed leaves serve until their
                 // protocol departure boundary; confirmation does not free
                 // the worker or change the frozen committee mid-epoch.

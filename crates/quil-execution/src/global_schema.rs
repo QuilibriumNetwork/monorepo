@@ -101,6 +101,16 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // shift up). Deliberately NOT sorted by live seniority, whose per-frame
             // drift is what forked the prover-tree root before the ring was stored.
             FieldTag { name: "Ring",                    order: 15, size: 1,  rdf_type: RdfType::Uint },
+            // order 16 — not in the Go schema: the cohort this allocation ranks
+            // in for its ring: the epoch its join confirm activated it, or the
+            // epoch a split, merge or the committee-handoff flag day moved it to
+            // its shard. Earlier cohorts rank first. Absent on allocations made
+            // before the seniority ring rule (`prover_rings`).
+            FieldTag { name: "RingEpoch",               order: 16, size: 8,  rdf_type: RdfType::Uint },
+            // order 17 — the prover's seniority when its join confirm
+            // materialized (or at the flag day, for allocations already
+            // confirmed). Ranks a cohort, most senior first; never updated.
+            FieldTag { name: "RingSeniority",           order: 17, size: 8,  rdf_type: RdfType::Uint },
         ],
     },
     ClassDef {
@@ -195,12 +205,12 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
     },
 ];
 
-/// The schema's max `order` across all classes — now 14 (allocation's new
-/// `Epoch` field). Still within the single-byte band (`≤ 63`), so `order_to_key`
-/// returns `order << 2` exactly as before: every existing field key is
-/// unchanged, no allocation vertex is re-keyed. Used to decide the
-/// `order_to_key` encoding width.
-pub const GLOBAL_MAX_ORDER: u16 = 14;
+/// The schema's max `order` across all classes — now 17 (allocation's
+/// `RingEpoch`/`RingSeniority`). Still within the single-byte band (`≤ 63`),
+/// so `order_to_key` returns `order << 2` exactly as before: every existing
+/// field key is unchanged, no allocation vertex is re-keyed. Used to decide
+/// the `order_to_key` encoding width.
+pub const GLOBAL_MAX_ORDER: u16 = 17;
 
 /// Encoding boundaries from `types/schema/order_encoding.go`.
 pub const MAX_ORDER_SINGLE_BYTE: u16 = 63;

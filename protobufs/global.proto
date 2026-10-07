@@ -660,6 +660,36 @@ message SendShardConsensusDirectResponse {
   bool delivered = 1;
 }
 
+message SubmitWorkerProverMessageRequest {
+  // The standalone worker's core, for the node's log.
+  uint32 core_id = 1;
+  // One canonical GLOBAL request: a certified app-shard FrameHeader (a reward
+  // proof) or a committee-handoff submission. The node wraps it in a bundle.
+  bytes request = 2;
+}
+
+message GetHistoricalCommitteesRequest {
+  // The legacy app shard's filter.
+  bytes filter = 1;
+  // The GLOBAL frame its certificate's committee is read at.
+  uint64 anchor = 2;
+}
+
+message HistoricalCommittee {
+  repeated bytes members = 1;
+}
+
+message GetHistoricalCommitteesResponse {
+  // The distinct committees the GLOBAL prover tree gave around the anchor.
+  repeated HistoricalCommittee committees = 1;
+}
+
+message SubmitWorkerProverMessageResponse {
+  // The node queued it for submission; false while a coverage halt holds
+  // reward proofs back.
+  bool accepted = 1;
+}
+
 // Forest-sync RPCs (JMT commitment diff + readable vertex blobs). Restored to
 // match global_service.rs / archive_client.rs.
 message GetForestNodeRequest {
@@ -680,6 +710,89 @@ message GetForestValueRequest {
 message GetForestValueResponse {
   bool found = 1;
   bytes value = 2;
+}
+
+// Batched forest reads: one request carries many keys and the archive reads
+// them under one storage slot. A response answers a PREFIX of the requested
+// keys in order (it stops early at the archive's size budget); the client asks
+// again for the rest.
+message ForestReadResult {
+  bool found = 1;
+  bytes data = 2;
+}
+message GetForestNodesRequest {
+  bytes shard_id = 1;
+  uint32 phase = 2;
+  // borsh(NodeKey) each.
+  repeated bytes node_keys = 3;
+}
+message GetForestNodesResponse {
+  repeated ForestReadResult nodes = 1;
+}
+message ForestValueKey {
+  uint64 version = 1;
+  bytes key_hash = 2;
+}
+message GetForestValuesRequest {
+  bytes shard_id = 1;
+  uint32 phase = 2;
+  repeated ForestValueKey keys = 3;
+}
+message GetForestValuesResponse {
+  repeated ForestReadResult values = 1;
+}
+// Every leaf of a shard/phase tree with a key in [first, last] after `after`,
+// each at its newest value at or below `version`, in key order: a bootstrap
+// lists its whole subtree in a few sequential reads instead of walking it.
+// An owner's legacy (transparent) coins, ascending by address. Owner,
+// amount and origin are public; served from an archive's owner index.
+message ListLegacyCoinsRequest {
+  bytes domain = 1;
+  bytes owner = 2;   // 32 bytes
+  bytes after = 3;   // coin address cursor; empty starts
+}
+message LegacyCoin {
+  bytes address = 1;
+  bytes amount = 2;  // 16 bytes, little-endian
+  bytes origin = 3;
+  bool shielded = 4; // GLOBAL recorded it consumed by a shield
+}
+message ListLegacyCoinsResponse {
+  repeated LegacyCoin coins = 1;
+  bytes cursor = 2;
+  bool has_more = 3;
+}
+message GetForestLeavesRequest {
+  bytes shard_id = 1;
+  uint32 phase = 2;
+  uint64 version = 3;
+  // 32 bytes each.
+  bytes first = 4;
+  bytes last = 5;
+  // Continue after this key (32 bytes); empty starts at `first`.
+  bytes after = 6;
+}
+message ForestLeaf {
+  bytes key_hash = 1;
+  bytes value = 2;
+}
+message GetForestLeavesResponse {
+  repeated ForestLeaf leaves = 1;
+  // More leaves may follow the last one listed.
+  bool more = 2;
+}
+message VertexBlobKey {
+  bytes id = 1;
+  // Read as of this tree version (latest version at or below it).
+  uint64 version = 2;
+}
+message GetVertexBlobsRequest {
+  bytes shard_key = 1;
+  uint32 phase = 2;
+  repeated VertexBlobKey blobs = 3;
+}
+message GetVertexBlobsResponse {
+  repeated ForestReadResult blobs = 1;
 }
 message GetForestHeadRequest {
   bytes shard_id = 1;
@@ -770,6 +883,11 @@ service GlobalService {
   rpc GetForestHead(GetForestHeadRequest) returns (GetForestHeadResponse);
   rpc GetForestPreimage(GetForestPreimageRequest) returns (GetForestPreimageResponse);
   rpc GetVertexBlob(GetVertexBlobRequest) returns (GetVertexBlobResponse);
+  // Batched forms of GetForestNode / GetForestValue / GetVertexBlob.
+  rpc GetForestNodes(GetForestNodesRequest) returns (GetForestNodesResponse);
+  rpc GetForestValues(GetForestValuesRequest) returns (GetForestValuesResponse);
+  rpc GetVertexBlobs(GetVertexBlobsRequest) returns (GetVertexBlobsResponse);
+  rpc GetForestLeaves(GetForestLeavesRequest) returns (GetForestLeavesResponse);
   rpc GetGlobalVertexProof(GetGlobalVertexProofRequest) returns (GetGlobalVertexProofResponse);
   rpc GetArchiveEndpoints(GetArchiveEndpointsRequest) returns (GetArchiveEndpointsResponse);
   rpc ResolveRoot(ResolveRootRequest) returns (ResolveRootResponse);
@@ -778,6 +896,15 @@ service GlobalService {
   // own master to the committee members it names over the master's peer
   // connections. Only the node's own identity may call it.
   rpc SendShardConsensusDirect(SendShardConsensusDirectRequest) returns (SendShardConsensusDirectResponse);
+  // A standalone worker's GLOBAL submission (finalized shard frame headers,
+  // committee-handoff seals), sent on by its own master through the master's
+  // archive transport exactly as it sends its thread workers'. Only the node's
+  // own identity may call it.
+  rpc SubmitWorkerProverMessage(SubmitWorkerProverMessageRequest) returns (SubmitWorkerProverMessageResponse);
+  // The committees that could have certified a legacy app frame anchored at
+  // a GLOBAL frame, rebuilt by the node from authenticated GLOBAL state, for
+  // its own standalone workers. Only the node's own identity may call it.
+  rpc GetHistoricalCommittees(GetHistoricalCommitteesRequest) returns (GetHistoricalCommitteesResponse);
 }
 
 service AppShardService {
@@ -789,6 +916,9 @@ service AppShardService {
   // snapshot-pinned, address-ordered, cursor-continued. A node that does not
   // serve the application refuses rather than returning an empty page.
   rpc ListShardCoins (ListShardCoinsRequest) returns (ListShardCoinsResponse);
+  // Peer-to-peer legacy coin listing, answered only from the serving node's
+  // own owner index (never forwarded again).
+  rpc ListShardLegacyCoins (ListLegacyCoinsRequest) returns (ListLegacyCoinsResponse);
   // Peer-to-peer coin witnesses: the membership paths a wallet needs to SPEND
   // a coin. A forwarded scan shows a balance; without this the holder still
   // cannot move it from a node that does not cover the application.

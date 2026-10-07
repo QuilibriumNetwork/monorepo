@@ -39,6 +39,7 @@ pub mod proof_types;
 pub mod prover_filter_ops;
 pub mod prover_join;
 pub mod prover_ops;
+pub mod prover_rings;
 pub mod prover_shard_update;
 pub mod prover_update_materialize;
 pub mod prover_verify;

@@ -69,6 +69,16 @@ impl ArchiveClientError {
     /// or went away), not with a status the archive sent. An archive closes
     /// connections a client leaves idle; such a request can go again at once
     /// on a fresh connection.
+    /// The archive answered that its forest reads are busy.
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Self::Rpc(status) if status.code() == tonic::Code::ResourceExhausted)
+    }
+
+    /// The archive lacks the call (an older build).
+    pub fn is_unimplemented(&self) -> bool {
+        matches!(self, Self::Rpc(status) if status.code() == tonic::Code::Unimplemented)
+    }
+
     pub fn is_transport_failure(&self) -> bool {
         causes(self).any(|cause| {
             cause.downcast_ref::<hyper::Error>().is_some()
@@ -309,6 +319,99 @@ impl ArchiveClient {
         Ok(resp.found.then_some(resp.node))
     }
 
+    /// Forest sync, batched: many JMT nodes of one shard/phase tree in one
+    /// request. The answer covers a prefix of `node_keys`, in order (the
+    /// archive stops at its size budget); `None` per absent node.
+    pub async fn get_forest_nodes(
+        &mut self,
+        shard_id: Vec<u8>,
+        phase: u32,
+        node_keys: Vec<Vec<u8>>,
+    ) -> Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_forest_nodes(quil_types::proto::global::GetForestNodesRequest { shard_id, phase, node_keys })
+            .await?
+            .into_inner();
+        Ok(resp.nodes.into_iter().map(|n| n.found.then_some(n.data)).collect())
+    }
+
+    /// Forest sync, batched: leaf values `(version, key_hash)` of one
+    /// shard/phase tree. A prefix of the keys, in order, as for nodes.
+    pub async fn get_forest_values(
+        &mut self,
+        shard_id: Vec<u8>,
+        phase: u32,
+        keys: Vec<(u64, Vec<u8>)>,
+    ) -> Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
+        let keys = keys
+            .into_iter()
+            .map(|(version, key_hash)| quil_types::proto::global::ForestValueKey { version, key_hash })
+            .collect();
+        let resp = self
+            .inner
+            .get_forest_values(quil_types::proto::global::GetForestValuesRequest { shard_id, phase, keys })
+            .await?
+            .into_inner();
+        Ok(resp.values.into_iter().map(|v| v.found.then_some(v.data)).collect())
+    }
+
+    /// Forest sync, batched: vertex blobs `(id, version)` under one app
+    /// ShardKey, each read as of its tree version. A prefix, in order.
+    pub async fn get_vertex_blobs(
+        &mut self,
+        shard_key: Vec<u8>,
+        phase: u32,
+        blobs: Vec<(Vec<u8>, u64)>,
+    ) -> Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
+        let blobs = blobs
+            .into_iter()
+            .map(|(id, version)| quil_types::proto::global::VertexBlobKey { id, version })
+            .collect();
+        let resp = self
+            .inner
+            .get_vertex_blobs(quil_types::proto::global::GetVertexBlobsRequest { shard_key, phase, blobs })
+            .await?
+            .into_inner();
+        Ok(resp.blobs.into_iter().map(|b| b.found.then_some(b.data)).collect())
+    }
+
+    /// Forest sync, listed: leaves of one shard/phase tree with keys in
+    /// `[first, last]` after `after`, each at its newest value at or below
+    /// `version`, in key order, and whether more may follow.
+    pub async fn get_forest_leaves(
+        &mut self,
+        shard_id: Vec<u8>,
+        phase: u32,
+        version: u64,
+        first: [u8; 32],
+        last: [u8; 32],
+        after: Option<[u8; 32]>,
+    ) -> Result<(Vec<([u8; 32], Vec<u8>)>, bool), ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_forest_leaves(quil_types::proto::global::GetForestLeavesRequest {
+                shard_id,
+                phase,
+                version,
+                first: first.to_vec(),
+                last: last.to_vec(),
+                after: after.map(|key| key.to_vec()).unwrap_or_default(),
+            })
+            .await?
+            .into_inner();
+        let leaves = resp
+            .leaves
+            .into_iter()
+            .map(|leaf| {
+                <[u8; 32]>::try_from(leaf.key_hash.as_slice())
+                    .map(|key| (key, leaf.value))
+                    .map_err(|_| ArchiveClientError::MissingField("forest leaf key must be 32 bytes"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((leaves, resp.more))
+    }
+
     /// Forest sync: fetch a leaf value by `key_hash` (32 bytes) at `version`.
     pub async fn get_forest_value(
         &mut self,
@@ -432,6 +535,19 @@ impl ArchiveClient {
         Ok(self
             .app_shard
             .list_shard_coins(quil_types::proto::global::ListShardCoinsRequest { domain, snapshot_id, after })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn list_shard_legacy_coins(
+        &mut self,
+        domain: Vec<u8>,
+        owner: Vec<u8>,
+        after: Vec<u8>,
+    ) -> Result<quil_types::proto::global::ListLegacyCoinsResponse, ArchiveClientError> {
+        Ok(self
+            .app_shard
+            .list_shard_legacy_coins(quil_types::proto::global::ListLegacyCoinsRequest { domain, owner, after })
             .await?
             .into_inner())
     }

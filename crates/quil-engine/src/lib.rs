@@ -39,6 +39,7 @@ pub mod message_collector;
 pub mod message_router;
 pub mod leader_provider;
 pub mod prover_op_tally;
+pub mod historical_committee;
 pub mod resolver_traffic;
 pub mod metrics;
 pub mod remote_worker;

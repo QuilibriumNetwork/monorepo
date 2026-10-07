@@ -156,6 +156,30 @@ impl ArchiveAppShardIngest {
 
     /// Retry missing frames and deferred execution even if gossip goes quiet.
     /// Sequenced ingest is driven by GLOBAL execution instead.
+    /// Committee-handoff flag day (`LegacyHistory::Discard`): before the
+    /// GLOBAL frame `global_frame` executes, once it reaches activation,
+    /// discard every application frame chain this archive holds (frames,
+    /// per-frame records and cursors; application state kept) and what this
+    /// ingest remembers of them. Runs once per store. Returns whether it did.
+    pub fn discard_legacy_history_at(&mut self, global_frame: u64) -> quil_types::error::Result<bool> {
+        let Some(policy) = quil_types::consensus::committee_handoff_policy()
+            .filter(|policy| policy.legacy_history == quil_types::consensus::LegacyHistory::Discard)
+        else {
+            return Ok(false);
+        };
+        if global_frame < policy.activation_frame || self.clock_store.app_frame_history_discarded()?.is_some() {
+            return Ok(false);
+        }
+        self.clock_store.discard_app_frame_history(global_frame)?;
+        self.last_materialized.clear();
+        self.buffered.clear();
+        self.held.clear();
+        self.requested.clear();
+        crate::app_engine::forget_legacy_relay_boundaries();
+        tracing::info!(global_frame, "committee-handoff flag day: archive discarded its legacy app frame history");
+        Ok(true)
+    }
+
     pub fn retry_pending(&mut self) {
         if self.sequenced {
             return;
@@ -436,7 +460,7 @@ impl ArchiveAppShardIngest {
                 frame = next,
                 processed = materialized.processed,
                 skipped = materialized.skipped,
-                address = %hex::encode(&address[..address.len().min(8)]),
+                address = %hex::encode(address),
                 "archive materialized shard frame"
             );
         };

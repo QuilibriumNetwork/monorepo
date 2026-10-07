@@ -387,6 +387,24 @@ impl FinalizedRecords {
         }
     }
 
+    /// Drop records of frames anchored before GLOBAL frame `activation`: a
+    /// committee-handoff flag day discarded that history, and every session
+    /// frame anchors at or after it. Returns how many were dropped.
+    pub(crate) fn discard_anchored_before(&self, activation: u64) -> usize {
+        let Ok(records) = self.load_above(0) else { return 0 };
+        let mut dropped = 0;
+        for (number, bytes, cert, _) in records {
+            let anchored = decode_app_frame(&bytes).and_then(|frame| frame.header).map_or(0, |h| h.global_frame_number);
+            if anchored < activation {
+                let path = if cert.is_some() { self.path(number) } else { self.implied_path(number) };
+                if std::fs::remove_file(path).is_ok() {
+                    dropped += 1;
+                }
+            }
+        }
+        dropped
+    }
+
     /// Drop records at or below a materialized frame.
     fn prune_through(&self, frame_number: u64) {
         let Ok(entries) = std::fs::read_dir(&self.directory) else { return };
@@ -878,6 +896,9 @@ pub struct AppSeamFinalizer {
     // Only consensus-validated finalization certificates enter this queue.
     // Repeated reports for the same digest coalesce; bytes stay in BlockStore.
     pending: Mutex<HashMap<Digest, (u64, Vec<u8>)>>,
+    /// Set once this instance's engine reports a finalization (replayed
+    /// records are not reports): its members agreed on its genesis.
+    reported: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppSeamFinalizer {
@@ -889,7 +910,12 @@ impl AppSeamFinalizer {
     ) -> Self {
         Self { on_notarized, on_finalized, store, filter, on_sealed: None, sealed_bodies: None,
             finalized_records: None, materialized: None, delivered: std::sync::atomic::AtomicU64::new(0),
-            pending: Mutex::new(HashMap::new()) }
+            pending: Mutex::new(HashMap::new()), reported: Default::default() }
+    }
+
+    /// Whether the engine has reported a finalization (see `reported`).
+    pub fn reported(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.reported.clone()
     }
 
     pub fn with_sealed_bodies(mut self, bodies: Arc<SealedBodies>) -> Self {
@@ -1085,6 +1111,7 @@ impl FrameFinalizer for AppSeamFinalizer {
         // Read bytes + verification status together from BlockStore when
         // delivering, including after a delayed body arrives. A certificate by
         // itself never upgrades an unverified candidate into verified data.
+        self.reported.store(true, std::sync::atomic::Ordering::Release);
         self.pending.lock().unwrap().entry(digest).or_insert_with(|| (view, cert.unwrap_or_default()));
         self.retry_pending();
     }
@@ -1147,6 +1174,53 @@ fn build_committee_in_namespace(
     Some((committee.scheme, committee.peers))
 }
 
+/// What a restarting instance resumes from at its recovered `header`, which
+/// the caller has validated under the committee that certified it (a
+/// historical one if need be): this committee's finalization of it, the
+/// Simplex floor at its actual view.
+///
+/// `Ok(None)` only for a legacy instance whose genesis is this head
+/// (`head_is_genesis`) when this committee did not certify it: the instance
+/// starts from the head as genesis. A legacy committee follows the registry
+/// and has no handoff to carry a finalized floor across a membership change,
+/// so its members restart from the head they share (public issue #664). An
+/// authorized session changes committee only through its handoff, and a head
+/// its own committee cannot authenticate stops it.
+pub fn restart_finalization(
+    header: &quil_types::proto::global::FrameHeader,
+    peers: &[FalconPublicKey],
+    namespace: &[u8],
+    epoch: u64,
+    head_is_genesis: bool,
+) -> quil_types::error::Result<Option<quil_cw_consensus::app_cert::VerifiedFinalization>> {
+    use quil_types::error::QuilError;
+    let certificate = header.public_key_signature_bls48581.as_ref()
+        .and_then(|signature| quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature));
+    let keys: Vec<Vec<u8>> = peers.iter().map(|key| key.as_ref().to_vec()).collect();
+    let identity = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?;
+    let verified = certificate.and_then(|certificate| {
+        quil_cw_consensus::app_cert::verify_finalization_details(certificate, &keys, namespace, identity)
+    });
+    let Some(verified) = verified else {
+        if head_is_genesis {
+            return Ok(None);
+        }
+        return Err(QuilError::ExecutionUnavailable(match certificate {
+            None => "app restart needs a finalized certificate or an authenticated committee handoff",
+            Some(_) => "app restart certificate does not authenticate under this committee; a handoff is required",
+        }.into()));
+    };
+    if verified.finalization.proposal.round.epoch().get() != epoch {
+        return Err(QuilError::ExecutionUnavailable(
+            "app restart head was certified in another committee generation".into()));
+    }
+    if verified.finalization.proposal.round.view().get() != header.rank {
+        return Err(QuilError::ExecutionUnavailable(
+            "app restart head rank disagrees with its certified view".into()));
+    }
+    Ok(Some(verified))
+}
+
 /// The engine's handle to a running simplex-backed app-shard consensus. On each
 /// inbound CW‑tagged shard‑consensus message the node demuxes the channel id:
 /// - channels 0/1/2 (vote/cert/resolver) → `inbound[channel].send(...)`;
@@ -1163,6 +1237,12 @@ pub struct AppConsensusCwHandle {
     /// instance (the engine drops + the runtime thread returns) — used to REBUILD
     /// the committee when the shard's active-prover set changes.
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// `Some(frame)`: a legacy instance that started from its recovered head
+    /// as genesis because another committee certified that head (see
+    /// [`restart_finalization`]).
+    pub adopted_genesis: Option<u64>,
+    /// Set once this instance finalizes anything.
+    pub finalized: Arc<std::sync::atomic::AtomicBool>,
     thread: std::thread::JoinHandle<()>,
     outbound_task: tokio::task::JoinHandle<()>,
 }
@@ -1304,6 +1384,7 @@ pub fn activate_app_consensus_cw(
         finalizer = finalizer.with_finalized_records(records, cursor);
     }
     let finalizer = Arc::new(finalizer);
+    let finalized = finalizer.reported();
     // Frames an earlier instance finalized but the engine never materialized
     // go to the engine again, in order, before anything new is finalized.
     let replayed = finalizer.replay_finalized_records()
@@ -1314,6 +1395,7 @@ pub fn activate_app_consensus_cw(
     }
     let mut params = GlobalEngineParams::new(partition, epoch, genesis_digest)
         .with_leader_timeout_secs(leader_timeout_secs);
+    let mut adopted_genesis = None;
     // Populate the persisted head BEFORE the host can replay its journal. These
     // bytes are candidates, not proof that this process validated historical
     // pre-state. Intermediate and unfinalized journal bodies still need recovery.
@@ -1338,10 +1420,6 @@ pub fn activate_app_consensus_cw(
                 return Err(quil_types::error::QuilError::ExecutionUnavailable(
                     "app restart head failed frame validation".into()));
             }
-            let certificate = header.public_key_signature_bls48581.as_ref()
-                .and_then(|signature| quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature))
-                .ok_or_else(|| quil_types::error::QuilError::ExecutionUnavailable(
-                    "app restart needs a finalized certificate or an authenticated committee handoff".into()))?;
             let namespace = match session.as_ref() {
                 Some(host) => host.session.namespace()?,
                 None => {
@@ -1350,28 +1428,32 @@ pub fn activate_app_consensus_cw(
                     namespace
                 }
             };
-            let keys: Vec<Vec<u8>> = peers.iter().map(|key| key.as_ref().to_vec()).collect();
             let identity = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?;
-            let verified = quil_cw_consensus::app_cert::verify_finalization_details(
-                certificate, &keys, &namespace, identity,
-            ).ok_or_else(|| quil_types::error::QuilError::ExecutionUnavailable(
-                "app restart certificate does not authenticate under this committee; a handoff is required".into()))?;
-            let certified_view = verified.finalization.proposal.round.view().get();
-            if verified.finalization.proposal.round.epoch().get() != epoch {
-                return Err(quil_types::error::QuilError::ExecutionUnavailable(
-                    "app restart head was certified in another committee generation".into()));
+            // Only a legacy instance whose genesis IS this head may start from
+            // it without this committee's certificate.
+            let head_is_genesis = session.is_none()
+                && header.frame_number == genesis_frame_number
+                && genesis_digest == digest_from_identity(identity);
+            match restart_finalization(header, &peers, &namespace, epoch, head_is_genesis)? {
+                Some(verified) => {
+                    let certified_view = verified.finalization.proposal.round.view().get();
+                    params = params.with_finalized_floor(verified.finalization)
+                        .map_err(|error| quil_types::error::QuilError::ExecutionUnavailable(error.into()))?;
+                    tracing::info!(
+                        filter = %hex::encode(&proposer.filter), frame = header.frame_number,
+                        view = certified_view, epoch,
+                        "resuming app consensus from certified floor",
+                    );
+                }
+                None => {
+                    adopted_genesis = Some(header.frame_number);
+                    tracing::info!(
+                        filter = %hex::encode(&proposer.filter), frame = header.frame_number,
+                        members = peers.len(),
+                        "starting legacy app consensus from its head as genesis: another committee certified it",
+                    );
+                }
             }
-            if certified_view != header.rank {
-                return Err(quil_types::error::QuilError::ExecutionUnavailable(
-                    "app restart head rank disagrees with its certified view".into()));
-            }
-            params = params.with_finalized_floor(verified.finalization)
-                .map_err(|error| quil_types::error::QuilError::ExecutionUnavailable(error.into()))?;
-            tracing::info!(
-                filter = %hex::encode(&proposer.filter), frame = header.frame_number,
-                view = certified_view, epoch,
-                "resuming app consensus from certified floor",
-            );
         }
     }
 
@@ -1470,6 +1552,8 @@ pub fn activate_app_consensus_cw(
         inbound,
         ingest_block,
         shutdown,
+        adopted_genesis,
+        finalized,
         thread,
         outbound_task,
     })
@@ -1503,6 +1587,8 @@ mod tests {
             inbound: std::array::from_fn(|_| tokio::sync::mpsc::unbounded_channel().0),
             ingest_block: Arc::new(|_| {}),
             shutdown,
+            adopted_genesis: None,
+            finalized: Default::default(),
             thread,
             outbound_task: tokio::spawn(std::future::pending()),
         };
@@ -1514,6 +1600,75 @@ mod tests {
         assert!(stopped.load(Ordering::Acquire));
     }
 
+    /// Certify `header` (its output digest at its rank) by `signer` alone.
+    fn certify_head(header: &mut quil_types::proto::global::FrameHeader, signer: &quil_crypto::FalconSigner, namespace: &[u8]) {
+        use quil_cw_consensus::{
+            _consensus::{
+                simplex::{scheme::Namespace, types::{Finalization, Proposal, Subject}},
+                types::{Epoch, Round, View},
+            },
+            _crypto::{sha256::Digest, Signer as _},
+            _utils::{ordered::Set, N3f1},
+            app_cert::{encode_finalization, wrap_cert_for_header},
+            falcon_base::FalconPrivateKey,
+            falcon_scheme::Generic,
+            falcon_simplex::SimplexFalconScheme,
+        };
+        let key = FalconPrivateKey::from_bytes(signer.private_key(), signer.public_key()).unwrap();
+        let participants: Set<_> = vec![key.public_key()].try_into().unwrap();
+        let scheme = Generic::<Namespace>::signer(namespace, participants, key).unwrap();
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(0), View::new(header.rank)),
+            View::new(header.rank - 1),
+            Digest(quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap()),
+        );
+        let vote = scheme.sign::<SimplexFalconScheme, Digest>(Subject::Finalize { proposal: &proposal }).unwrap();
+        let certificate = scheme.assemble::<SimplexFalconScheme, _, N3f1>(vec![vote]).unwrap();
+        header.public_key_signature_bls48581 = Some(quil_types::proto::keys::Bls48581AggregateSignature {
+            signature: wrap_cert_for_header(&encode_finalization(&Finalization { proposal, certificate })),
+            bitmask: vec![1],
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn a_head_another_committee_certified_is_only_a_legacy_instances_genesis() {
+        let then = quil_crypto::FalconSigner::generate();
+        let now = quil_crypto::FalconSigner::generate();
+        let committee = |signer: &quil_crypto::FalconSigner| {
+            vec![FalconPublicKey::from_bytes(signer.public_key()).unwrap()]
+        };
+        let namespace = [b"appshard".as_slice(), &[7; 32]].concat();
+        let mut head = quil_types::proto::global::FrameHeader {
+            address: vec![7; 32], frame_number: 40, rank: 900, output: vec![4; 516], ..Default::default()
+        };
+        certify_head(&mut head, &then, &namespace);
+
+        // The committee that certified it resumes from its finalization.
+        for head_is_genesis in [false, true] {
+            let verified = restart_finalization(&head, &committee(&then), &namespace, 0, head_is_genesis)
+                .unwrap().expect("its own committee's floor");
+            assert_eq!(verified.finalization.proposal.round.view().get(), 900);
+        }
+        // Another committee starts from it only as the instance's genesis.
+        assert!(restart_finalization(&head, &committee(&now), &namespace, 0, true).unwrap().is_none());
+        let Err(refused) = restart_finalization(&head, &committee(&now), &namespace, 0, false) else { panic!("accepted") };
+        assert!(refused.to_string().contains("a handoff is required"), "{refused}");
+        // Another namespace (an authorized session's) never authenticates it.
+        let session = [b"appsession".as_slice(), &[7; 32]].concat();
+        assert!(restart_finalization(&head, &committee(&then), &session, 0, false).is_err());
+        // Its own committee still refuses a head relabeled to another view or
+        // a floor in another generation.
+        let relabeled = quil_types::proto::global::FrameHeader { rank: 901, ..head.clone() };
+        assert!(restart_finalization(&relabeled, &committee(&then), &namespace, 0, true).is_err());
+        assert!(restart_finalization(&head, &committee(&then), &namespace, 1, true).is_err());
+        // A head without a certificate has no floor to offer.
+        let bare = quil_types::proto::global::FrameHeader { public_key_signature_bls48581: None, ..head.clone() };
+        assert!(restart_finalization(&bare, &committee(&then), &namespace, 0, true).unwrap().is_none());
+        let Err(refused) = restart_finalization(&bare, &committee(&then), &namespace, 0, false) else { panic!("accepted") };
+        assert!(refused.to_string().contains("needs a finalized certificate"), "{refused}");
+    }
+
     #[tokio::test]
     async fn a_host_that_returns_unasked_is_dead() {
         use std::sync::atomic::AtomicBool;
@@ -1522,6 +1677,8 @@ mod tests {
             inbound: std::array::from_fn(|_| tokio::sync::mpsc::unbounded_channel().0),
             ingest_block: Arc::new(|_| {}),
             shutdown: Arc::new(AtomicBool::new(false)),
+            adopted_genesis: None,
+            finalized: Default::default(),
             thread: std::thread::spawn(move || { let _ = exit_rx.recv(); }),
             outbound_task: tokio::spawn(std::future::pending()),
         };
