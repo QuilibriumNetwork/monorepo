@@ -2602,22 +2602,17 @@ impl ProverLifecycle {
             }
         }
 
-        // Every action is dispatched asynchronously. A renewal must not race
-        // a departure chosen in this same cycle, even for a current Active row.
-        let departing: std::collections::HashSet<Vec<u8>> = actions.iter()
-            .filter_map(|action| match action {
-                LifecycleAction::ProposeLeave { filters, .. }
-                | LifecycleAction::ConfirmLeaves { filters, .. } => Some(filters),
-                _ => None,
-            }).flatten().cloned().collect();
-        actions.retain_mut(|action| match action {
-            LifecycleAction::ReconfirmEpoch { filters, .. } => {
-                filters.retain(|filter| !departing.contains(filter));
-                !filters.is_empty()
+        // Compile independent policy candidates into a single compatible
+        // intent per shard before asynchronous dispatch. Unexpected conflicts
+        // fail closed for this cycle; no partial batch is published.
+        match super::plan::LifecyclePlan::compile(frame_number, actions) {
+            Ok(plan) => Ok(plan.into_actions()),
+            Err(error) => {
+                tracing::warn!(frame = frame_number, %error,
+                    "lifecycle plan rejected before dispatch");
+                Err(error)
             }
-            _ => true,
-        });
-        Ok(actions)
+        }
     }
 }
 

@@ -55,6 +55,23 @@ store-backed registry behavior remain covered by the execution and existing
 end-to-end suites. A restart recreates policy state, not the entire distributed
 network. The suite does not claim to enumerate every possible execution.
 
+## Per-shard lifecycle plans
+
+The evaluator compiles policy candidates into one frame-scoped intent per
+filter before dispatch. Capacity-driven join rejection overrides score-driven
+confirmation; departure and leave rejection defer renewal until registry
+observation establishes retention. Duplicate actions are removed without
+reordering ranked batches or separating join filters from worker IDs.
+Incompatible intents, mixed frames and conflicting join worker assignments
+reject the whole evaluation before publication and emit a warning.
+
+The plan compiler tests every ordered pair of action kinds, mixed-shard
+batches and duplicate worker assignments. Existing evaluator and sequence tests
+exercise its integration with real policy decisions. This does not provide an
+atomic registry snapshot, cross-cycle submission serialization or persisted
+leaving-to-joining replacement pairs. Those remain necessary follow-ups before
+claiming a complete distributed lifecycle planner.
+
 ## Further coverage
 
 Extend the harness with observed counterexamples and independent expectations.
