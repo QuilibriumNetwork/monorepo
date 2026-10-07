@@ -696,6 +696,65 @@ mod tests {
         assert!(s.get_global_frame(2).is_err(), "raw transaction must invalidate cached frames");
     }
 
+    /// The committee-handoff flag day discards every application frame chain
+    /// and keeps GLOBAL frames, GLOBAL cursors and application state.
+    #[test]
+    fn discarding_app_frame_history_keeps_global_frames_and_state() {
+        use store::ClockStore;
+        let s = test_db();
+        let app = vec![0x55u8; 32];
+        let child = [app.clone(), vec![0x01]].concat();
+        for filter in [&app, &child] {
+            for n in [1u64, 2, 300_000] {
+                let frame = global::AppShardFrame {
+                    header: Some(global::FrameHeader {
+                        address: filter.to_vec(), frame_number: n, output: vec![n as u8; 516], ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let selector = vec![n as u8; 32];
+                let txn = s.new_transaction(false).unwrap();
+                s.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).unwrap();
+                txn.commit().unwrap();
+                let txn = s.new_transaction(false).unwrap();
+                s.commit_shard_clock_frame(filter, n, &selector, txn.as_ref(), true).unwrap();
+                txn.commit().unwrap();
+                s.put_shard_frame_fee_total(filter, n, 7).unwrap();
+                s.put_shard_frame_settlements(filter, n, &[1, 2]).unwrap();
+            }
+            s.db.put(encoding::consensus_materialized_cursor_key(filter), 300_000u64.to_be_bytes()).unwrap();
+            s.db.put(encoding::consensus_liveness_key(filter), [1]).unwrap();
+        }
+        s.put_global_frame(&cached_frame(9), None).unwrap();
+        s.db.put(encoding::global_materialized_cursor_key(), 9u64.to_be_bytes()).unwrap();
+        s.db.put(encoding::consensus_liveness_key(&[]), [1]).unwrap();
+        let state_key = [encoding::HYPERGRAPH_SHARD, 0x30, 0x01].to_vec();
+        s.db.put(&state_key, [1]).unwrap();
+        assert_eq!(s.app_frame_history_discarded().unwrap(), None);
+
+        s.discard_app_frame_history(861_840).unwrap();
+        for filter in [&app, &child] {
+            assert!(s.get_latest_shard_clock_frame(filter).is_err());
+            for n in [1u64, 2, 300_000] {
+                assert!(s.get_shard_clock_frame(filter, n, false).is_err());
+                assert_eq!(s.get_shard_frame_fee_total(filter, n).unwrap(), None);
+                assert_eq!(s.get_shard_frame_settlements(filter, n).unwrap(), None);
+            }
+            assert!(s.db.get(encoding::consensus_materialized_cursor_key(filter)).unwrap().is_none());
+            assert!(s.db.get(encoding::consensus_liveness_key(filter)).unwrap().is_none());
+        }
+        let mut staged = s.db.raw_iterator();
+        staged.seek([encoding::CLOCK_FRAME, encoding::CLOCK_SHARD_STAGED]);
+        assert!(staged.key().is_none_or(|key| !key.starts_with(&[encoding::CLOCK_FRAME, encoding::CLOCK_SHARD_STAGED])));
+        assert_eq!(s.get_global_frame(9).unwrap(), cached_frame(9));
+        assert!(s.db.get(encoding::global_materialized_cursor_key()).unwrap().is_some());
+        assert!(s.db.get(encoding::consensus_liveness_key(&[])).unwrap().is_some(), "a GLOBAL row has no filter");
+        assert!(s.db.get(&state_key).unwrap().is_some());
+        assert_eq!(s.app_frame_history_discarded().unwrap(), Some(861_840));
+        s.discard_app_frame_history(861_848).unwrap();
+        assert_eq!(s.app_frame_history_discarded().unwrap(), Some(861_848));
+    }
+
     /// Holes between stored GLOBAL frame records, over the whole range or from
     /// a height, which a regular's periodic scan uses.
     #[test]
@@ -1183,10 +1242,13 @@ impl store::ClockStore for RocksClockStore {
         Some(self.db.backing_store_identity())
     }
     fn prepare_execution_publication(&self) -> Result<Box<dyn store::ExecutionPublicationObserver + '_>> {
-        let writes = self.global_memory.writes.try_lock().map_err(|_| {
+        // Clock writers and readers hold these briefly; a conflict here
+        // discards an executed frame, so wait them out within a deadline.
+        let patience = quil_types::lock_patience::Patience::new();
+        let writes = patience.lock(&self.global_memory.writes).ok_or_else(|| {
             QuilError::ExecutionUnavailable("clock publication writer is busy or poisoned".into())
         })?;
-        let cache = self.global_memory.cache.try_write().map_err(|_| {
+        let cache = patience.write(&self.global_memory.cache).ok_or_else(|| {
             QuilError::ExecutionUnavailable("clock publication cache is busy or poisoned".into())
         })?;
         Ok(Box::new(ClockPublication { _writes: writes, cache }))
@@ -1728,6 +1790,12 @@ impl store::ClockStore for RocksClockStore {
         }
         Ok(())
     }
+    fn get_latest_shard_clock_frame_number(&self, filter: &[u8]) -> Result<Option<u64>> {
+        // The index only advances to a frame whose body is stored (see
+        // `commit_shard_clock_frame`), and retention never deletes canonical
+        // bodies, so it names the frame `get_latest_shard_clock_frame` reads.
+        self.read_u64_index_checked(&encoding::clock_shard_latest_index(filter))
+    }
     fn get_latest_shard_clock_frame(&self, filter: &[u8]) -> Result<proto::global::AppShardFrame> {
         let idx_key = encoding::clock_shard_latest_index(filter);
         let fn_ = self.read_u64_index(&idx_key).ok_or_else(|| QuilError::NotFound("no shard frame".into()))?;
@@ -1882,6 +1950,17 @@ impl store::ClockStore for RocksClockStore {
             batch.delete_range(&td_lo, &td_hi);
         }
         self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn discard_app_frame_history(&self, global_frame: u64) -> Result<()> {
+        let mut batch = rocksdb::WriteBatch::default();
+        for (start, end) in encoding::app_frame_history_ranges() {
+            batch.delete_range(&start, &end);
+        }
+        batch.put(encoding::app_history_discarded_key(), global_frame.to_be_bytes());
+        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn app_frame_history_discarded(&self) -> Result<Option<u64>> {
+        self.read_u64_index_checked(&encoding::app_history_discarded_key())
     }
     fn reset_shard_clock_frames(&self, filter: &[u8]) -> Result<()> {
         let lo = encoding::clock_shard_frame_key(filter, 0);

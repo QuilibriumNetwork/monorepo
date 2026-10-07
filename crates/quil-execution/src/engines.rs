@@ -299,8 +299,15 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
             if inner_tp == crate::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF {
                 let state = self.state.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable(
                     "handoff validation requires authenticated global state".into()))?;
-                let submission = crate::global_intrinsic::handoff::CertificateSubmission::from_canonical_bytes(inner_bytes)?;
-                crate::global_intrinsic::handoff::verify_submission(state.as_ref(), frame_number, &submission)?;
+                let sealed = crate::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(inner_bytes)?;
+                match self.intrinsic.as_ref() {
+                    Some(intrinsic) => intrinsic.verify_seal_submission(frame_number, &sealed, state.as_ref())?,
+                    None if sealed.drain.is_empty() => {
+                        crate::global_intrinsic::handoff::verify_submission(state.as_ref(), frame_number, &sealed.submission)?;
+                    }
+                    None => return Err(QuilError::ExecutionUnavailable(
+                        "seal drain headers need the global intrinsic".into())),
+                }
                 return Ok(());
             }
             if !crate::global_engine::is_global_type_prefix(inner_tp) {
@@ -415,6 +422,7 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
         }
         // Staging failure must abort frame processing. Successful publication
         // clears the changeset so later requests do not reapply prior writes.
+        let _timing = crate::step_timing::section("stage changes");
         publish_execution_changes(self.state.as_deref(), checkpoint)?;
         Ok(ProcessMessageResult { messages: Vec::new(), state: Vec::new() })
     }

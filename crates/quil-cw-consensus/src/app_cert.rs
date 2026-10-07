@@ -104,7 +104,7 @@ pub fn identify_signers(bytes: &[u8], namespace: &[u8], candidates: &[Vec<u8>]) 
         .filter_map(|bytes| FalconPublicKey::from_bytes(bytes).map(|key| (key, bytes)))
         .collect();
     let mut found = Vec::new();
-    for (signer, signature) in f.certificate.signers.iter().zip(&f.certificate.signatures) {
+    for (signer, signature) in f.certificate.signers.iter().zip(f.certificate.signatures.iter()) {
         let Some(signature) = signature.get() else { continue };
         if let Some((_, bytes)) = keys.iter().find(|(key, _)| key.verify(namespace, &message, signature)) {
             found.push((signer.get(), (*bytes).clone()));

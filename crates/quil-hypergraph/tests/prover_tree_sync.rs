@@ -37,6 +37,8 @@ struct InProcTreeReader {
     phase: usize,
 }
 
+impl quil_forest::BatchTreeReader for InProcTreeReader {}
+
 impl TreeReader for InProcTreeReader {
     fn get_node_option(&self, node_key: &NodeKey) -> anyhow::Result<Option<Node>> {
         let key_bytes = borsh::to_vec(node_key)?;
@@ -589,4 +591,94 @@ fn resync_when_already_converged_is_stable() {
 
     let second = sync_prover_phase0(&follower, leader.clone());
     assert_eq!(second, leader_root, "re-sync of a converged follower leaves the root unchanged");
+}
+
+/// A local commit landing mid-download rebases the sync instead of throwing
+/// the download away: a key the commit created is removed again (GLOBAL), a
+/// key it changed outside the plan goes back to the certified value, and a
+/// planned key it overwrote after installation is installed again.
+#[test]
+fn a_local_commit_mid_download_rebases_the_sync() {
+    use quil_forest::SubtreeSyncAnchor;
+    use quil_hypergraph::crdt::sync_phase_advanced;
+    let location = |key| Location { app_address: GLOBAL_APP, data_address: [key; 32] };
+    let source = fresh_crdt();
+    for key in [0x10u8, 0x20, 0x30, 0x40] {
+        source.add_vertex(&location(key), &[key; 48]).unwrap();
+    }
+    source.commit(5).unwrap();
+    let (version, root) = source.serve_forest_head(&GLOBAL_APP, 0).unwrap();
+    let reader = InProcTreeReader { source, shard_id: GLOBAL_APP.to_vec(), phase: 0 };
+
+    let target = fresh_crdt();
+    // 0x10 and 0x40 already match; 0x20 and 0x30 must transfer.
+    target.add_vertex(&location(0x10), &[0x10; 48]).unwrap();
+    target.add_vertex(&location(0x40), &[0x40; 48]).unwrap();
+    target.commit(1).unwrap();
+    // The one-time data audit of existing local state, so the sync below
+    // plans only what differs.
+    {
+        let self_reader = InProcTreeReader { source: target.clone(), shard_id: GLOBAL_APP.to_vec(), phase: 0 };
+        let (v, r) = target.serve_forest_head(&GLOBAL_APP, 0).unwrap();
+        let mut audit = target
+            .prepare_phase_sync(&self_reader, v, &GLOBAL_APP, 0, &[], Some(SubtreeSyncAnchor::AppRoot(r)))
+            .unwrap();
+        let blobs: Vec<_> = audit.remaining().iter()
+            .map(|(key, _)| target.get_vertex_data_checked(&location(key[0])).unwrap().unwrap())
+            .collect();
+        target.apply_sync_chunk(&mut audit, &blobs).unwrap();
+        target.finish_phase_sync(&audit).unwrap();
+    }
+    let mut plan = target
+        .prepare_phase_sync(&reader, version, &GLOBAL_APP, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root)))
+        .unwrap();
+    assert_eq!(plan.remaining().len(), 2);
+    target.apply_sync_chunk(&mut plan, &[vec![0x20; 48]]).unwrap();
+
+    // The node commits frames of its own while the rest downloads: it
+    // overwrites the installed 0x20, changes the unplanned 0x40 and creates 0x50.
+    target.add_vertex(&location(0x20), b"local frame write").unwrap();
+    target.add_vertex(&location(0x40), b"local frame write").unwrap();
+    target.add_vertex(&location(0x50), b"local frame write").unwrap();
+    target.commit(2).unwrap();
+    let advanced = target.apply_sync_chunk(&mut plan, &[vec![0x30; 48]]).unwrap_err();
+    assert!(sync_phase_advanced(&advanced), "{advanced}");
+
+    let left = target.rebase_phase_sync(&mut plan).unwrap();
+    assert_eq!(left, 4, "0x20 again, 0x30, 0x40 back, 0x50 removed");
+    while let Some((key, value)) = plan.remaining().first() {
+        let blob = if value.is_some() { vec![key[0]; 48] } else { Vec::new() };
+        target.apply_sync_chunk(&mut plan, &[blob]).unwrap();
+    }
+    assert_eq!(target.finish_phase_sync(&plan).unwrap(), root);
+    for key in [0x10u8, 0x20, 0x30, 0x40] {
+        assert_eq!(target.get_vertex_data_checked(&location(key)).unwrap(), Some(vec![key; 48]));
+    }
+    assert!(target.get_vertex_data_checked(&location(0x50)).unwrap().is_none());
+}
+
+/// Outside a pinned GLOBAL add phase a sync never removes keys, so a local
+/// commit creating a key the source lacks cannot be rebased onto.
+#[test]
+fn a_rebase_cannot_remove_application_keys() {
+    use quil_forest::SubtreeSyncAnchor;
+    use quil_hypergraph::crdt::sync_phase_advanced;
+    let app = [0x71; 32];
+    let location = |key| Location { app_address: app, data_address: [key; 32] };
+    let source = fresh_crdt();
+    source.add_vertex(&location(0x10), &[0x10; 48]).unwrap();
+    source.add_vertex(&location(0x20), &[0x20; 48]).unwrap();
+    source.commit(5).unwrap();
+    let (version, root) = source.serve_forest_head(&app, 0).unwrap();
+    let reader = InProcTreeReader { source, shard_id: app.to_vec(), phase: 0 };
+    let target = fresh_crdt();
+    target.add_vertex(&location(0x10), &[0x10; 48]).unwrap();
+    target.commit(1).unwrap();
+    let mut plan = target
+        .prepare_phase_sync(&reader, version, &app, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root)))
+        .unwrap();
+    target.add_vertex(&location(0x60), b"local").unwrap();
+    target.commit(2).unwrap();
+    let error = target.rebase_phase_sync(&mut plan).unwrap_err();
+    assert!(sync_phase_advanced(&error), "{error}");
 }

@@ -17,7 +17,7 @@ pub mod migration;
 pub mod disk_monitor;
 pub mod testing;
 
-pub use rocksdb_store::{RocksDb, RocksDbMemory, RocksTransaction, RocksIterator, StoreFormat, detect_store_format};
+pub use rocksdb_store::{RocksDb, RocksDbHealth, RocksDbMemory, RocksTransaction, RocksIterator, StoreFormat, detect_store_format};
 pub use clock::{CandidatePrune, RocksClockStore, StagedFrameCleanup};
 pub use clock_overlay::OverlayClockStore;
 pub use token::RocksTokenStore;

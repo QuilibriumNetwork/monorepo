@@ -197,7 +197,7 @@ impl RecipientWallet {
                 anyhow::ensure!(domain == quil_execution::domains::QUIL_TOKEN, "custom-token mint claim is not supported");
                 MintClaim::decode(&bytes, &self.network, &domain).map(|_| ())
             }
-            TYPE_LATTICE_SHIELD => Shield::decode(&bytes, &self.network, &domain).map(|_| ()),
+            TYPE_LATTICE_SHIELD => quil_lattice_ct::confidential::shield::AnyShield::decode(&bytes, &self.network, &domain).map(|_| ()),
             TYPE_LATTICE_TRANSACTION => Transfer::decode(&bytes, &self.network, &domain).map(|_| ()),
             TYPE_LATTICE_PENDING => PendingCreate::decode(&bytes, &self.network, &domain).map(|_| ()),
             TYPE_LATTICE_PENDING_CLAIM => PendingClaim::decode(&bytes, &self.network, &domain).map(|_| ()),
@@ -455,7 +455,7 @@ impl RecipientWallet {
         Self::decode_reward_claim(public_key, response)
     }
 
-    fn decode_reward_claim(
+    pub(super) fn decode_reward_claim(
         public_key: [u8; 897],
         response: quil_types::proto::node::GetProverRewardWitnessResponse,
     ) -> anyhow::Result<(
@@ -902,6 +902,90 @@ impl RecipientWallet {
                 native::verify_owned(public, &shield.proof, budget)
                     .map_err(|e| anyhow::anyhow!("shield verification: {e:?}"))?,
                 "generated shield failed public verification"
+            );
+            Ok(bytes)
+        })
+        .await?
+    }
+
+    /// A batch shield's statement, the owner's signature over it and the
+    /// private relation: many legacy coins of one owner, one proof over their
+    /// total. `sources` must ascend by address.
+    pub(super) fn prepare_batch_shield(
+        &self,
+        sources: Vec<quil_lattice_ct::confidential::shield::ShieldSource>,
+        signer: &dyn quil_types::crypto::Signer,
+        recipients: &[(RecipientAddress, u128)],
+        fee: u128,
+        max_outputs: usize,
+    ) -> anyhow::Result<(
+        quil_lattice_ct::confidential::shield::BatchShieldStatement,
+        [u8; 114],
+        quil_lattice_ct::confidential::relation::CompiledAmountRelation,
+    )> {
+        use quil_lattice_ct::confidential::{memo::create_output, shield::BatchShieldStatement, MAX_PRIVATE_COINS};
+        anyhow::ensure!(signer.key_type() == quil_types::crypto::KeyType::Ed448, "transparent sources require an Ed448 owner");
+        let public = signer.public_key().try_into()
+            .map_err(|_| anyhow::anyhow!("invalid source owner public key length"))?;
+        anyhow::ensure!(
+            !recipients.is_empty() && recipients.len() <= max_outputs.min(MAX_PRIVATE_COINS),
+            "shield outputs exceed configured limits"
+        );
+        anyhow::ensure!(recipients.iter().all(|(a, _)| a.context() == &self.context),
+            "recipient belongs to a different network or application");
+        let total = sources.iter().try_fold(0u128, |sum, source| sum.checked_add(source.amount))
+            .ok_or_else(|| anyhow::anyhow!("legacy sources overflow u128"))?;
+        let spent = recipients.iter().try_fold(fee, |sum, (_, a)| sum.checked_add(*a));
+        anyhow::ensure!(spent == Some(total), "sources must equal outputs plus fee");
+        let created = recipients.iter()
+            .map(|(a, amount)| create_output(&self.context, a, *amount))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("shield output: {e:?}"))?;
+        let statement = BatchShieldStatement {
+            network: self.network,
+            application: self.application,
+            owner_public_key: public,
+            sources,
+            fee,
+            outputs: created.iter().map(|o| o.output.clone()).collect(),
+        };
+        let context = statement.context_bytes().map_err(|e| anyhow::anyhow!("batch shield context: {e:?}"))?;
+        let signature: [u8; 114] = signer.sign(&context)?.try_into()
+            .map_err(|_| anyhow::anyhow!("invalid source owner signature length"))?;
+        anyhow::ensure!(quil_crypto::ed448_verify(&public, &context, &signature), "source owner signature did not verify");
+        let openings: Vec<_> = recipients.iter().zip(&created).map(|((_, a), o)| (*a, &o.opening)).collect();
+        let relation = statement.private_relation(&openings, max_outputs)
+            .map_err(|e| anyhow::anyhow!("batch shield relation: {e:?}"))?;
+        Ok((statement, signature, relation))
+    }
+
+    /// [`Self::create_shield`] for a batch: prove off the async runtime and
+    /// verify the public statement before returning wire bytes.
+    #[cfg(feature = "native-proof")]
+    pub(super) async fn create_batch_shield(
+        self: std::sync::Arc<Self>,
+        sources: Vec<quil_lattice_ct::confidential::shield::ShieldSource>,
+        signer: std::sync::Arc<dyn quil_types::crypto::Signer>,
+        recipients: Vec<(RecipientAddress, u128)>,
+        fee: u128,
+        max_outputs: usize,
+        budget: quil_lattice_ct::confidential::relation::backend::native::NativeBudget,
+    ) -> anyhow::Result<Vec<u8>> {
+        use quil_lattice_ct::confidential::{relation::backend::native, shield::BatchShield};
+        let permit = PROVING.acquire().await?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let (statement, signature, relation) =
+                self.prepare_batch_shield(sources, signer.as_ref(), &recipients, fee, max_outputs)?;
+            let proof = native::prove(&relation, budget).map_err(|e| anyhow::anyhow!("batch shield proving: {e:?}"))?;
+            drop(relation);
+            let shield = BatchShield { statement, signature, proof };
+            let bytes = shield.encode().map_err(|e| anyhow::anyhow!("batch shield encoding: {e:?}"))?;
+            let public = shield.statement.public_relation(max_outputs)
+                .map_err(|e| anyhow::anyhow!("public batch shield relation: {e:?}"))?;
+            anyhow::ensure!(
+                native::verify_owned(public, &shield.proof, budget).map_err(|e| anyhow::anyhow!("batch shield verification: {e:?}"))?,
+                "generated batch shield failed public verification"
             );
             Ok(bytes)
         })
@@ -1945,8 +2029,12 @@ pub(super) fn run(tc: &TokenCtx, application: &str, escrow: bool) -> anyhow::Res
 }
 
 pub(super) async fn run_balance(tc: &TokenCtx, application: &str, max_pages: usize, max_coins: usize) -> anyhow::Result<()> {
+    let application_id = identifier(application)?;
+    if application_id == quil_execution::domains::QUIL_TOKEN {
+        println!("{}", super::balance::claimable_rewards(tc).await);
+    }
     let network = quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
-    let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &identifier(application)?)?);
+    let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application_id)?);
     let client = tc.connect().await?;
     let coins = wallet.scan_unspent(&client, max_pages, max_coins).await?;
     let total = coins.iter().try_fold(0u128, |sum, coin| sum.checked_add(*coin.amount))
@@ -2670,6 +2758,124 @@ pub(super) async fn run_shield(tc: &TokenCtx, application: &str, source: &str, a
     let bytes = wallet.clone().create_shield(source, amount, owner, vec![(wallet.address().clone(), shielded)], fee, 1, native_budget()).await?;
     submit_operation(tc, &wallet, &mut client, bytes).await?;
     println!("Confidential shield submitted. Finalized inclusion is not yet confirmed.");
+    Ok(())
+}
+
+/// Groups of at most `max` legacy coins, each group inside one shard of
+/// `shards` (bit paths): a shard verifies only sources in its own range, so a
+/// batch never spans two. A coin goes to the deepest shard covering it. Coins
+/// no shard covers are returned apart. Groups ascend by address.
+pub(super) fn shield_batches(
+    mut coins: Vec<([u8; 32], u128)>,
+    shards: &[Vec<bool>],
+    max: usize,
+) -> (Vec<Vec<quil_lattice_ct::confidential::shield::ShieldSource>>, Vec<[u8; 32]>) {
+    use quil_lattice_ct::confidential::shield::ShieldSource;
+    let covers = |path: &[bool], address: &[u8; 32]| path.iter().enumerate()
+        .all(|(i, bit)| (address[i / 8] & (0x80 >> (i % 8)) != 0) == *bit);
+    coins.sort();
+    coins.dedup_by_key(|(address, _)| *address);
+    let mut groups: std::collections::BTreeMap<Vec<bool>, Vec<ShieldSource>> = std::collections::BTreeMap::new();
+    let mut uncovered = Vec::new();
+    for (address, amount) in coins {
+        match shards.iter().filter(|path| covers(path, &address)).max_by_key(|path| path.len()) {
+            Some(path) => groups.entry(path.clone()).or_default().push(ShieldSource { address, amount }),
+            None => uncovered.push(address),
+        }
+    }
+    let batches = groups.into_values()
+        .flat_map(|group| group.chunks(max.max(1)).map(<[ShieldSource]>::to_vec).collect::<Vec<_>>())
+        .collect();
+    (batches, uncovered)
+}
+
+/// The bit paths of `application`'s live shards (any active prover).
+#[cfg(feature = "native-proof")]
+async fn live_shard_paths(
+    client: &mut quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+    application: &[u8; 32],
+) -> anyhow::Result<Vec<Vec<bool>>> {
+    let shards = client.get_shard_info(quil_types::proto::node::GetShardInfoRequest { include_all: true }).await
+        .map_err(|e| anyhow::anyhow!("shard list: {}", e.message()))?.into_inner().shards;
+    Ok(shards.iter()
+        .filter(|shard| shard.filter.starts_with(application) && shard.active_provers > 0)
+        .filter_map(|shard| quil_forest::decode_shard_filter_or_root(&shard.filter, 32).map(|(_, bits)| bits))
+        .collect())
+}
+
+/// Legacy coins this wallet submitted in a batch shield within the last hour:
+/// a resumed run leaves them for their batch to commit.
+#[cfg(feature = "native-proof")]
+fn recently_shielded(tc: &TokenCtx) -> std::collections::BTreeSet<[u8; 32]> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    std::fs::read_to_string(tc.config_dir.join("legacy-shield-journal.txt")).unwrap_or_default().lines()
+        .filter_map(|line| {
+            let (at, address) = line.split_once(' ')?;
+            let at: u64 = at.parse().ok()?;
+            let address: [u8; 32] = hex::decode(address).ok()?.try_into().ok()?;
+            (now.saturating_sub(at) < 3_600).then_some(address)
+        })
+        .collect()
+}
+
+#[cfg(feature = "native-proof")]
+fn record_shielded(tc: &TokenCtx, sources: &[quil_lattice_ct::confidential::shield::ShieldSource]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut file = std::fs::OpenOptions::new().create(true).append(true)
+        .open(tc.config_dir.join("legacy-shield-journal.txt"))?;
+    for source in sources {
+        writeln!(file, "{now} {}", hex::encode(source.address))?;
+    }
+    Ok(())
+}
+
+/// Shield every unshielded legacy coin of this identity in batches of at most
+/// `max_per_batch`, one shard per batch, each into one coin of this wallet.
+#[cfg(feature = "native-proof")]
+pub(super) async fn run_shield_all(tc: &TokenCtx, application: &str, max_per_batch: usize) -> anyhow::Result<()> {
+    use quil_execution::token_intrinsic::cost::Shape;
+    use quil_lattice_ct::confidential::shield::MAX_SHIELD_SOURCES;
+    anyhow::ensure!((1..=MAX_SHIELD_SOURCES).contains(&max_per_batch),
+        "a batch holds 1 to {MAX_SHIELD_SOURCES} legacy coins");
+    let application = identifier(application)?;
+    anyhow::ensure!(application == quil_execution::domains::QUIL_TOKEN, "only QUIL has legacy coins");
+    let network = quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
+    let owner = legacy_owner_signer(tc)?;
+    let mut client = tc.connect().await?;
+    let pending = recently_shielded(tc);
+    let coins: Vec<([u8; 32], u128)> = super::legacy::list(tc, &client, &application).await?.into_iter()
+        .filter(|(address, _, shielded)| !shielded && !pending.contains(address))
+        .map(|(address, amount, _)| (address, amount))
+        .collect();
+    if coins.is_empty() {
+        println!("No unshielded legacy coins to shield{}.",
+            if pending.is_empty() { "" } else { " (some submitted within the last hour are awaiting their batch)" });
+        return Ok(());
+    }
+    let shards = live_shard_paths(&mut client, &application).await?;
+    let (batches, uncovered) = shield_batches(coins, &shards, max_per_batch);
+    if !uncovered.is_empty() {
+        println!("{} legacy coins lie in no live shard and are left for a later run.", uncovered.len());
+    }
+    let count = batches.len();
+    for (index, sources) in batches.into_iter().enumerate() {
+        let total = sources.iter().try_fold(0u128, |sum, source| sum.checked_add(source.amount))
+            .ok_or_else(|| anyhow::anyhow!("legacy sources overflow u128"))?;
+        let fee = quoted_quil_fee(tc, None, Shape { coins: 1, markers: sources.len(), escrow: false }, false).await?;
+        if fee >= total {
+            println!("Batch {}/{count}: {} legacy coins worth {total} base units do not cover the fee {fee}; skipped.",
+                index + 1, sources.len());
+            continue;
+        }
+        let bytes = wallet.clone().create_batch_shield(sources.clone(), owner.clone(),
+            vec![(wallet.address().clone(), total - fee)], fee, 1, native_budget()).await?;
+        submit_operation(tc, &wallet, &mut client, bytes).await?;
+        record_shielded(tc, &sources)?;
+        println!("Batch {}/{count}: {} legacy coins, {} base units shielded (fee {fee}). Submitted; finalized inclusion is not yet confirmed.",
+            index + 1, sources.len(), total - fee);
+    }
     Ok(())
 }
 
@@ -3735,5 +3941,32 @@ mod tests {
         assert!(wallet
             .decode_witnesses(&[(address, &other)], response)
             .is_err());
+    }
+
+    /// Batches never span shards: each coin goes to the deepest live shard
+    /// covering it, groups are cut at the batch size, and coins no shard
+    /// covers are set aside.
+    #[test]
+    fn shield_batches_stay_inside_one_shard_each() {
+        let coin = |top: u8, n: u8| { let mut a = [n; 32]; a[0] = top; (a, u128::from(n) + 1) };
+        let coins = vec![
+            coin(0x10, 1), coin(0x20, 2), coin(0x30, 3), // under 0
+            coin(0x90, 4), coin(0xa0, 5),                // under 10
+            coin(0xc0, 6), coin(0xd0, 7), coin(0xd0, 7), // under 11 (one repeated)
+        ];
+        // A split-away parent ([true]) still listed beside its children.
+        let shards = vec![vec![false], vec![true], vec![true, false], vec![true, true]];
+        let (batches, uncovered) = shield_batches(coins.clone(), &shards, 2);
+        assert!(uncovered.is_empty());
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![2, 1, 2, 2], "three under 0 cut at 2; the children of 1 apart");
+        for batch in &batches {
+            let top = batch[0].address[0] & 0xc0;
+            assert!(batch.iter().all(|s| if top < 0x80 { s.address[0] < 0x80 } else { s.address[0] & 0xc0 == top }));
+            assert!(batch.windows(2).all(|p| p[0].address < p[1].address));
+        }
+        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 7, "the repeated coin once");
+        let (only_low, left) = shield_batches(coins, &[vec![false]], 96);
+        assert_eq!((only_low.len(), left.len()), (1, 4));
     }
 }

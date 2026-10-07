@@ -359,6 +359,55 @@ impl PeerCoinReader {
         None
     }
 
+    /// One page of `owner`'s legacy coins from an archive: only an archive
+    /// keeps the owner index. The legacy set never changes, so a cursor means
+    /// the same on every archive and no endpoint is pinned.
+    pub async fn legacy_coins(
+        &self,
+        domain: [u8; 32],
+        owner: [u8; 32],
+        after: Option<[u8; 32]>,
+    ) -> Option<quil_types::store::LegacyCoinPageData> {
+        let (budget, delay) = self.read_retry;
+        retry_within(budget, delay, || self.legacy_coins_once(domain, owner, after)).await
+    }
+
+    async fn legacy_coins_once(
+        &self,
+        domain: [u8; 32],
+        owner: [u8; 32],
+        after: Option<[u8; 32]>,
+    ) -> Option<quil_types::store::LegacyCoinPageData> {
+        for endpoint in self.archive_pool.get_all().await.into_iter().take(MAX_ATTEMPTS) {
+            let Ok(mut client) = quil_rpc::ArchiveClient::connect_mtls(&endpoint, &self.falcon_key).await else {
+                continue;
+            };
+            let page = match client.list_shard_legacy_coins(
+                domain.to_vec(), owner.to_vec(), after.map(|a| a.to_vec()).unwrap_or_default(),
+            ).await {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::debug!(%endpoint, %error, "remote legacy coins: archive declined");
+                    continue;
+                }
+            };
+            let decoded = (|| Some(quil_types::store::LegacyCoinPageData {
+                coins: page.coins.into_iter().map(|coin| Some(quil_types::store::LegacyCoinData {
+                    address: coin.address.try_into().ok()?,
+                    amount: u128::from_le_bytes(coin.amount.try_into().ok()?),
+                    origin: coin.origin.try_into().ok()?,
+                    shielded: coin.shielded,
+                })).collect::<Option<Vec<_>>>()?,
+                cursor: if page.cursor.is_empty() { None } else { Some(page.cursor.try_into().ok()?) },
+                has_more: page.has_more,
+            }))();
+            if decoded.is_some() {
+                return decoded;
+            }
+        }
+        None
+    }
+
     pub async fn escrow_page(
         &self,
         domain: [u8; 32],

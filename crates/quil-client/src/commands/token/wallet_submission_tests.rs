@@ -5,7 +5,6 @@ use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use std::sync::{Arc, Mutex};
 
 #[tokio::test]
-#[ignore = "requires a loopback RPC listener"]
 async fn wallet_scans_owned_unspent_coins_over_rpc() {
     use quil_types::store::*;
     use quil_lattice_ct::confidential::{coin_tree::{CoinRecord, CoinTree}, memo::create_output};
@@ -94,7 +93,6 @@ async fn wallet_scans_owned_unspent_coins_over_rpc() {
 }
 
 #[tokio::test]
-#[ignore = "requires a loopback RPC listener"]
 async fn wallet_fetches_content_bound_escrow_over_rpc() {
     use quil_execution::token_intrinsic::escrow::StoredEscrow;
     use quil_lattice_ct::confidential::{memo::create_escrow_recovery, pending_claim::EscrowPolicy};
@@ -195,7 +193,6 @@ async fn wallet_fetches_content_bound_escrow_over_rpc() {
 }
 
 #[tokio::test]
-#[ignore = "requires a loopback RPC listener"]
 async fn wallet_submits_over_authenticated_rpc() {
     use quil_lattice_ct::confidential::{
         memo::create_output,

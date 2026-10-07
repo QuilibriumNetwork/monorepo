@@ -22,6 +22,88 @@ use crate::message_collector::MessageCollector;
 /// Expected length of a valid VDF output (258-byte Y + 258-byte proof).
 const VDF_OUTPUT_LEN: usize = 516;
 
+/// The global op kinds a collected bundle carries, for timing logs.
+pub(crate) fn message_kinds(raw: &[u8]) -> String {
+    let Ok(bundle) = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(raw) else {
+        return "undecodable".into();
+    };
+    let kinds: Vec<String> = bundle
+        .requests
+        .iter()
+        .flatten()
+        .map(|request| {
+            quil_execution::global_engine::peek_global_message_kind(&request.inner_bytes)
+                .map(|kind| format!("{kind:?}"))
+                .unwrap_or_else(|_| format!("0x{:08x}", request.inner_type_prefix))
+        })
+        .collect();
+    if kinds.is_empty() { "empty".into() } else { kinds.join("+") }
+}
+
+/// How long a leader waits at `now_ms` before producing on a parent recorded
+/// at `parent_timestamp_ms`: a header's timestamp is its production instant
+/// plus one `IDEAL_FRAME_TIME`, so waiting until it spaces production one
+/// interval apart. Capped at one interval; a parent in the past needs none.
+pub fn proposal_pacing_wait(parent_timestamp_ms: i64, now_ms: i64) -> std::time::Duration {
+    let wait = parent_timestamp_ms
+        .saturating_sub(now_ms)
+        .clamp(0, crate::difficulty::IDEAL_FRAME_TIME);
+    std::time::Duration::from_millis(wait as u64)
+}
+
+/// Refusals remembered for one validation context.
+const REJECTED_MESSAGES_KEPT: usize = 4096;
+
+/// What a proposal's message validation reads: the frame being proposed, the
+/// parent it builds on, and the GLOBAL frame committed in the validator's
+/// state (the parent's own height in an execution branch).
+type ValidationContext = (u64, Vec<u8>, u64);
+
+/// Messages validation refused under one [`ValidationContext`], shared by a
+/// node's leader and every execution-branch leader it makes. A proposal
+/// validates a private copy of the mempool and leaves the public pool as it
+/// is, so each proposal at one height validated the same refused messages
+/// again: after the split at 837360, 36 of them took most of every
+/// proposal's validation time.
+#[derive(Default)]
+struct RejectedMessages {
+    context: Option<ValidationContext>,
+    reasons: std::collections::HashMap<[u8; 32], String>,
+    #[cfg(test)]
+    reused: usize,
+}
+
+impl RejectedMessages {
+    /// Forget refusals made under any other context. `None` (the committed
+    /// frame could not be read) remembers nothing.
+    fn enter(&mut self, context: Option<ValidationContext>) {
+        if context.is_none() || self.context != context {
+            self.reasons.clear();
+        }
+        self.context = context;
+    }
+
+    fn refused(&mut self, hash: &[u8; 32]) -> Option<String> {
+        let reason = self.reasons.get(hash).cloned();
+        #[cfg(test)]
+        if reason.is_some() {
+            self.reused += 1;
+        }
+        reason
+    }
+
+    fn remember(&mut self, context: &Option<ValidationContext>, hash: [u8; 32], reason: String) {
+        if context.is_some() && self.context == *context && self.reasons.len() < REJECTED_MESSAGES_KEPT {
+            self.reasons.insert(hash, reason);
+        }
+    }
+}
+
+/// Longest a leader spends validating mempool messages for one proposal. The
+/// proof and execution must still fit the selected-parent deadline (60 s) and
+/// the frame cadence; the rest wait for a later frame.
+const MESSAGE_VALIDATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Global chain leader provider. Selects leaders based on the prover
 /// registry's ordered prover list, seeded by the parent frame's
 /// `parent_selector`. Produces frames by collecting messages, computing
@@ -56,6 +138,7 @@ pub struct GlobalLeaderProvider {
     /// re-proposed every rank until it ages out. `None` disables the gate
     /// (tests / nodes without an execution manager wired).
     message_validator: Option<Arc<quil_execution::ExecutionEngineManager>>,
+    rejected: Arc<std::sync::Mutex<RejectedMessages>>,
     /// Hypergraph CRDT used to compute the `prover_tree_commitment` the
     /// leader binds into the frame header (and the VDF challenge) at
     /// proving time. Mirrors Go's `rebuildShardCommitments`, which commits
@@ -78,6 +161,18 @@ impl GlobalLeaderProvider {
             && self.clock_store.backing_store_identity() == manager.crdt().backing_store_identity()
     }
 
+    /// Why the current validation context refused `raw`, if it did.
+    #[cfg(test)]
+    pub(crate) fn refused_message(&self, raw: &[u8]) -> Option<String> {
+        self.rejected.lock().unwrap().reasons.get(&<[u8; 32]>::from(Sha256::digest(raw))).cloned()
+    }
+
+    /// How many messages were dropped on a remembered refusal.
+    #[cfg(test)]
+    pub(crate) fn refusals_reused(&self) -> usize {
+        self.rejected.lock().unwrap().reused
+    }
+
     pub(crate) fn for_execution_branch(
         &self, branch: &quil_execution::ExecutionBranch, rank: u64,
         max_bytes: usize, max_items: usize, consumed: &[Vec<u8>],
@@ -87,13 +182,15 @@ impl GlobalLeaderProvider {
             collector.add_message(rank, bytes);
         }
         collector.mark_finalized(consumed);
-        Ok(Self::new(
+        let mut leader = Self::new(
             Arc::new(branch.registry().clone()), self.frame_prover.clone(),
             self.difficulty_adjuster.clone(), branch.clock_store().clone(), collector,
             self.local_prover_address.clone(), self.local_public_key.clone(),
             self.signer.clone(), self.inclusion_prover.clone(),
             Some(branch.manager().clone()), Some(branch.manager().crdt()),
-        ))
+        );
+        leader.rejected = self.rejected.clone();
+        Ok(leader)
     }
 
     pub fn new(
@@ -120,6 +217,7 @@ impl GlobalLeaderProvider {
             signer,
             inclusion_prover,
             message_validator,
+            rejected: Default::default(),
             hypergraph,
         }
     }
@@ -589,21 +687,24 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // never stall this node more than a single frame; if the parent
         // timestamp is already in the past we proceed immediately (we're
         // catching up, don't slow down).
+        //
+        // The consensus adapter waits this out before preparing the proposal
+        // (`GlobalProposer::proposal_pacing`), so a selected-parent leader
+        // does not hold its execution lease through it; this is the backstop,
+        // checked on the authenticated parent.
         {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64;
-            let target = prior_header.timestamp;
-            let wait_ms = (target - now_ms)
-                .clamp(0, crate::difficulty::IDEAL_FRAME_TIME);
-            if wait_ms > 0 {
+            let wait = proposal_pacing_wait(prior_header.timestamp, now_ms);
+            if !wait.is_zero() {
                 tracing::debug!(
                     frame = frame_number,
-                    wait_ms,
+                    wait_ms = wait.as_millis() as u64,
                     "pacing global proposal to mainnet interval",
                 );
-                std::thread::sleep(std::time::Duration::from_millis(wait_ms as u64));
+                std::thread::sleep(wait);
             }
         }
         // Timed from here: the pacing above is deliberate.
@@ -645,6 +746,23 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             tracing::warn!(frame = frame_number, rejected = malformed.len(), "discarding non-canonical GLOBAL proposal inputs");
             self.message_collector.remove(&malformed);
         }
+        // Committee-handoff seals: every member of a closing committee submits
+        // the same seal and resubmits until its own view shows it recorded.
+        // One copy per seal rides a proposal; copies of a seal GLOBAL already
+        // recorded leave the mempool (each would re-verify a certificate to
+        // change nothing).
+        let collected = {
+            let view = self.message_validator.as_ref().and_then(|validator| {
+                quil_execution::global_intrinsic::handoff::CommittedView::capture(&validator.crdt()).ok()
+            });
+            let (kept, settled) = reduce_handoff_bundles(collected, view.as_ref());
+            if !settled.is_empty() {
+                tracing::debug!(frame = frame_number, settled = settled.len(),
+                    "dropping committee-handoff seals GLOBAL already recorded");
+                self.message_collector.remove(&settled);
+            }
+            kept
+        };
         let messages = match self.message_validator.as_ref() {
             Some(validator) => {
                 // The collector holds GLOBAL messages, validated against the
@@ -669,6 +787,23 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // First pass: hold in-lockstep shard proofs for tip coalescing
                 // (below); validate non-shard messages inline.
                 let mut in_lockstep_shard: Vec<Vec<u8>> = Vec::new();
+                // A proposal must fit its execution deadline. Messages left
+                // unvalidated once the budget is spent stay in the mempool for
+                // a later frame; on a loaded node, 30 prover messages took
+                // 160 s here and no leader could propose.
+                let validation_started = std::time::Instant::now();
+                let mut deferred = 0usize;
+                // Op kinds → (messages, total ms, slowest ms), logged when
+                // validation is slow, to tell one costly op from a slow store.
+                let mut validation_ms: std::collections::HashMap<String, (usize, u64, u64)> =
+                    std::collections::HashMap::new();
+                // A refusal stands while validation reads the same state.
+                let context = validator
+                    .crdt()
+                    .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                    .ok()
+                    .map(|committed| (frame_number, prior_state_id.to_vec(), committed));
+                self.rejected.lock().unwrap().enter(context.clone());
                 for raw in collected {
                     if crate::message_collector::bundle_has_shard_frame(&raw) {
                         // Strict lockstep: a shard proof rides ONLY if its ANCHOR
@@ -693,7 +828,24 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         }
                         continue;
                     }
-                    match validator.validate_message(frame_number, &global_addr, &raw) {
+                    let hash: [u8; 32] = Sha256::digest(&raw).into();
+                    if let Some(reason) = self.rejected.lock().unwrap().refused(&hash) {
+                        *drop_reasons
+                            .entry(format!("{} :: refused earlier: {}", msg_type(&raw), reason))
+                            .or_insert(0) += 1;
+                        invalid.push(raw);
+                        continue;
+                    }
+                    if validation_started.elapsed() >= MESSAGE_VALIDATION_BUDGET {
+                        deferred += 1;
+                        continue;
+                    }
+                    let started = std::time::Instant::now();
+                    let outcome = validator.validate_message(frame_number, &global_addr, &raw);
+                    let ms = started.elapsed().as_millis() as u64;
+                    let entry = validation_ms.entry(message_kinds(&raw)).or_insert((0, 0, 0));
+                    *entry = (entry.0 + 1, entry.1 + ms, entry.2.max(ms));
+                    match outcome {
                         Ok(()) => valid.push(raw),
                         Err(e) => {
                             // Normalize the reason (digit runs → '#') so per-epoch /
@@ -707,6 +859,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                             *drop_reasons
                                 .entry(format!("{} :: {}", msg_type(&raw), reason))
                                 .or_insert(0) += 1;
+                            self.rejected.lock().unwrap().remember(&context, hash, reason);
                             tracing::debug!(
                                 frame = frame_number,
                                 error = %e,
@@ -716,6 +869,20 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         }
                     }
                 }
+                if validation_started.elapsed() >= crate::stage_clock::SLOW_EXECUTION {
+                    let mut by_kind: Vec<_> = validation_ms.into_iter().collect();
+                    by_kind.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+                    tracing::warn!(
+                        frame = frame_number,
+                        total_ms = validation_started.elapsed().as_millis() as u64,
+                        by_kind = %by_kind
+                            .iter()
+                            .map(|(kind, (n, total, max))| format!("{n}× {kind}: {total} ms (max {max})"))
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                        "slow GLOBAL message validation",
+                    );
+                }
                 // Tip-per-shard coalescing. The lockstep gate admits a shard
                 // proof by its ANCHOR, NOT its count — a shard that produced several
                 // local frames all anchored to the same prior global frame passes them
@@ -724,6 +891,15 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // state roots subsume its ancestors, so only the HIGHEST LOCAL frame
                 // per shard address needs to ride the global frame. Coalesce to the
                 // tip → request set O(#shards).
+                if deferred > 0 {
+                    tracing::warn!(
+                        frame = frame_number,
+                        deferred,
+                        validated = valid.len() + invalid.len(),
+                        budget_ms = MESSAGE_VALIDATION_BUDGET.as_millis() as u64,
+                        "GLOBAL message validation budget spent; deferring the rest to a later frame",
+                    );
+                }
                 let (tips, superseded) = coalesce_shard_frames_to_tip(in_lockstep_shard);
                 let coalesced = superseded.len();
                 valid.extend(tips);
@@ -970,8 +1146,144 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
 // via the consensus bootstrap tests on real stores. The unit tests
 // below cover `get_next_leaders` (leader selection) and the pure
 // helper functions, which need only a `ProverRegistry`.
+
+/// The committee-handoff submissions a bundle carries, when it carries
+/// nothing else (`None` otherwise, or when it does not decode).
+fn handoff_only_submissions(
+    raw: &[u8],
+) -> Option<Vec<quil_execution::global_intrinsic::handoff::SealSubmission>> {
+    use quil_execution::global_intrinsic::handoff::{SealSubmission, TYPE_COMMITTEE_HANDOFF};
+    let bundle = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(raw).ok()?;
+    if bundle.requests.is_empty() {
+        return None;
+    }
+    bundle
+        .requests
+        .iter()
+        .map(|request| match request {
+            Some(request) if request.inner_type_prefix == TYPE_COMMITTEE_HANDOFF => {
+                SealSubmission::from_canonical_bytes(&request.inner_bytes).ok()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `collected` with at most one bundle per committee-handoff seal (request,
+/// source session); other bundles pass unchanged, in collection order. Of a
+/// seal's copies the one carrying the most drain headers rides (they all end
+/// at its checkpoint, and GLOBAL passes over headers it already executed), so
+/// a copy without the headers GLOBAL lacks cannot crowd out one that brings
+/// them (#699); ties go to the earliest. Also returns the handoff-only bundles
+/// whose every seal `view` shows settled (`handoff::submission_settled`),
+/// which leave the mempool. Other copies are held back but stay in the
+/// mempool until settled.
+pub(crate) fn reduce_handoff_bundles(
+    collected: Vec<Vec<u8>>,
+    view: Option<&quil_execution::global_intrinsic::handoff::CommittedView>,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    type Key = ([u8; 32], [u8; 32]);
+    let mut settled = Vec::new();
+    // (bundle, its seals and their drain lengths), unsettled handoff-only ones.
+    let mut candidates: Vec<(Vec<u8>, Option<Vec<(Key, usize)>>)> = Vec::with_capacity(collected.len());
+    for raw in collected {
+        let Some(submissions) = handoff_only_submissions(&raw) else {
+            candidates.push((raw, None));
+            continue;
+        };
+        let done = view.is_some_and(|view| {
+            submissions.iter().all(|sealed| {
+                quil_execution::global_intrinsic::handoff::submission_settled(view, &sealed.submission).unwrap_or(false)
+            })
+        });
+        if done {
+            settled.push(raw);
+            continue;
+        }
+        let keys = submissions.iter()
+            .map(|sealed| ((sealed.submission.seal.request, sealed.submission.seal.session), sealed.drain.len()))
+            .collect();
+        candidates.push((raw, Some(keys)));
+    }
+    // The bundle each seal rides in: the first with the longest drain.
+    let mut best: std::collections::HashMap<Key, (usize, usize)> = std::collections::HashMap::new();
+    for (index, (_, keys)) in candidates.iter().enumerate() {
+        for (key, drain) in keys.iter().flatten() {
+            let entry = best.entry(*key).or_insert((index, *drain));
+            if *drain > entry.1 {
+                *entry = (index, *drain);
+            }
+        }
+    }
+    let mut seen: std::collections::HashSet<Key> = std::collections::HashSet::new();
+    let mut kept = Vec::with_capacity(candidates.len());
+    for (index, (raw, keys)) in candidates.into_iter().enumerate() {
+        let Some(keys) = keys else {
+            kept.push(raw);
+            continue;
+        };
+        let rides = keys.iter().any(|(key, _)| best.get(key).is_some_and(|(chosen, _)| *chosen == index));
+        if !rides || keys.iter().all(|(key, _)| seen.contains(key)) {
+            continue;
+        }
+        seen.extend(keys.iter().map(|(key, _)| *key));
+        kept.push(raw);
+    }
+    (kept, settled)
+}
+
 #[cfg(test)]
 mod tests {
+    /// Every member of a closing committee submits the same seal, in bundles
+    /// that differ only by timestamp: one rides a proposal, the rest wait.
+    #[test]
+    fn a_proposal_carries_one_copy_of_each_committee_handoff_seal() {
+        use quil_cw_consensus::handoff::{Checkpoint, Seal};
+        use quil_execution::global_intrinsic::handoff::{CertificateSubmission, TYPE_COMMITTEE_HANDOFF};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let bundle = |request: u8, timestamp: i64| {
+            let submission = CertificateSubmission {
+                seal: Seal {
+                    request: [request; 32],
+                    session: [7; 32],
+                    view: 1,
+                    checkpoint: Checkpoint { frame: 0, view: 0, digest: [0; 32], state_roots: [[0; 32]; 4], history_root: [0; 32] },
+                },
+                certificate: vec![request; 40],
+            };
+            CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest {
+                    inner_type_prefix: TYPE_COMMITTEE_HANDOFF,
+                    inner_bytes: submission.to_canonical_bytes().unwrap(),
+                })],
+                timestamp,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let other = b"not a bundle".to_vec();
+        let collected = vec![bundle(1, 10), bundle(1, 11), other.clone(), bundle(2, 12), bundle(1, 13), bundle(2, 14)];
+        let (kept, settled) = reduce_handoff_bundles(collected, None);
+        assert_eq!(kept, vec![bundle(1, 10), other.clone(), bundle(2, 12)]);
+        assert!(settled.is_empty(), "nothing is settled without a view");
+
+        // A copy that brings the drain headers GLOBAL lacks rides instead of
+        // an earlier one without them (#699).
+        let drained = |request: u8, timestamp: i64, headers: usize| {
+            let raw = bundle(request, timestamp);
+            let mut decoded = CanonicalMessageBundle::from_canonical_bytes(&raw).unwrap();
+            let request = decoded.requests[0].as_mut().unwrap();
+            let submission = CertificateSubmission::from_canonical_bytes(&request.inner_bytes).unwrap();
+            request.inner_bytes = quil_execution::global_intrinsic::handoff::SealSubmission {
+                submission, drain: vec![vec![9; 16]; headers],
+            }.to_canonical_bytes().unwrap();
+            decoded.to_canonical_bytes().unwrap()
+        };
+        let collected = vec![bundle(1, 10), drained(1, 11, 1), other.clone(), drained(1, 12, 2), bundle(2, 13), drained(1, 14, 2)];
+        let (kept, _) = reduce_handoff_bundles(collected, None);
+        assert_eq!(kept, vec![other, drained(1, 12, 2), bundle(2, 13)], "the longest drain, the earliest of equals");
+    }
+
     use super::*;
     use quil_types::consensus::{ProverInfo, ProverStatus};
     use quil_types::proto::global::GlobalFrameHeader;
@@ -1346,6 +1658,42 @@ mod tests {
         CanonicalMessageBundle { requests: vec![Some(req)], timestamp: 0 }
             .to_canonical_bytes()
             .unwrap()
+    }
+
+    // Post-split, every proposal at one height validated the same 36 refused
+    // messages again.
+    #[test]
+    fn a_refusal_stands_until_the_height_parent_or_committed_frame_moves() {
+        let mut rejected = RejectedMessages::default();
+        let (bad, other) = ([1u8; 32], [2u8; 32]);
+        let at = |frame: u64, parent: u8, committed: u64| Some((frame, vec![parent; 32], committed));
+        rejected.enter(at(837364, 7, 837363));
+        rejected.remember(&at(837364, 7, 837363), bad, "invalid allocation status".into());
+        rejected.enter(at(837364, 7, 837363));
+        assert_eq!(rejected.refused(&bad).as_deref(), Some("invalid allocation status"));
+        assert_eq!(rejected.refused(&other), None);
+
+        // A refusal made under a context that has since changed is not kept.
+        rejected.remember(&at(837364, 7, 837362), other, "stale".into());
+        assert_eq!(rejected.refused(&other), None);
+
+        for moved in [at(837365, 7, 837363), at(837364, 8, 837363), at(837364, 7, 837364), None] {
+            rejected.enter(at(837364, 7, 837363));
+            rejected.remember(&at(837364, 7, 837363), bad, "refused".into());
+            rejected.enter(moved.clone());
+            assert_eq!(rejected.refused(&bad), None, "{moved:?}");
+        }
+        // Without a readable committed frame nothing is remembered.
+        rejected.remember(&None, bad, "refused".into());
+        assert_eq!(rejected.refused(&bad), None);
+
+        rejected.enter(at(1, 0, 0));
+        for n in 0..REJECTED_MESSAGES_KEPT + 10 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            rejected.remember(&at(1, 0, 0), hash, "refused".into());
+        }
+        assert_eq!(rejected.reasons.len(), REJECTED_MESSAGES_KEPT);
     }
 
     #[test]

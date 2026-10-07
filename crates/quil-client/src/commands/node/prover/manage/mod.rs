@@ -22,14 +22,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use crossterm::execute;
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::{mpsc::{self, UnboundedSender}, Semaphore};
 use tonic::transport::Channel;
 
 use quil_keys::FileKeyManager;
@@ -64,12 +64,18 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     res
 }
 
-async fn event_loop(terminal: &mut Term, client: Client, km: Arc<FileKeyManager>) -> anyhow::Result<()> {
+async fn event_loop(
+    terminal: &mut Term,
+    client: Client,
+    km: Arc<FileKeyManager>,
+) -> anyhow::Result<()> {
     let mut model = Model::new();
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
 
+    let refresh_state = RefreshState::default();
+
     // Kick off the initial fetch + auto-refresh + spinner tickers.
-    spawn_action(&client, &km, &tx, Cmd::Fetch);
+    spawn_action(&client, &km, &tx, &refresh_state, Cmd::Fetch);
     let mut refresh = tokio::time::interval(Duration::from_secs(8));
     refresh.tick().await; // consume the immediate first tick
     let mut spin = tokio::time::interval(Duration::from_millis(120));
@@ -94,7 +100,7 @@ async fn event_loop(terminal: &mut Term, client: Client, km: Arc<FileKeyManager>
                 apply_msg(&mut model, msg)
             }
             _ = refresh.tick() => {
-                spawn_action(&client, &km, &tx, Cmd::Fetch);
+                spawn_action(&client, &km, &tx, &refresh_state, Cmd::Fetch);
                 Vec::new()
             }
             _ = spin.tick() => {
@@ -107,7 +113,7 @@ async fn event_loop(terminal: &mut Term, client: Client, km: Arc<FileKeyManager>
             if matches!(cmd, Cmd::Quit) {
                 return Ok(());
             }
-            spawn_action(&client, &km, &tx, cmd);
+            spawn_action(&client, &km, &tx, &refresh_state, cmd);
         }
 
         terminal.draw(|f| view::draw(f, &mut model))?;
@@ -115,18 +121,52 @@ async fn event_loop(terminal: &mut Term, client: Client, km: Arc<FileKeyManager>
     Ok(())
 }
 
-/// Execute a [`Cmd`] by spawning the matching async task (or timer); each
-/// posts its resulting [`Msg`] back onto the channel.
-fn spawn_action(client: &Client, km: &Arc<FileKeyManager>, tx: &UnboundedSender<Msg>, cmd: Cmd) {
+struct RefreshState {
+    node: Arc<Semaphore>,
+    shards: Arc<Semaphore>,
+    rewards: Arc<Semaphore>,
+}
+
+impl Default for RefreshState {
+    fn default() -> Self {
+        Self { node: Arc::new(Semaphore::new(1)), shards: Arc::new(Semaphore::new(1)), rewards: Arc::new(Semaphore::new(1)) }
+    }
+}
+
+/// Each refresh stream has one in-flight request, including manual refreshes.
+/// The owned permit also releases on cancellation or task failure.
+fn spawn_refresh(
+    gate: &Arc<Semaphore>,
+    tx: &UnboundedSender<Msg>,
+    loading: Option<Msg>,
+    fetch: impl std::future::Future<Output = Msg> + Send + 'static,
+) {
+    let Ok(permit) = gate.clone().try_acquire_owned() else { return; };
+    let tx = tx.clone();
+    if let Some(loading) = loading { let _ = tx.send(loading); }
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _ = tx.send(fetch.await);
+    });
+}
+
+/// Execute a command by spawning its asynchronous action.
+fn spawn_action(
+    client: &Client,
+    km: &Arc<FileKeyManager>,
+    tx: &UnboundedSender<Msg>,
+    refresh: &RefreshState,
+    cmd: Cmd,
+) {
     let client = client.clone();
     let km = km.clone();
     let tx = tx.clone();
     match cmd {
         Cmd::Quit => {}
         Cmd::Fetch => {
-            tokio::spawn(async move {
-                let _ = tx.send(actions::fetch_data(client).await);
-            });
+            spawn_refresh(&refresh.node, &tx, None, actions::fetch_data(client.clone()));
+            spawn_refresh(&refresh.rewards, &tx, None, actions::fetch_rewards(client.clone(), km));
+            spawn_refresh(&refresh.shards, &tx, Some(Msg::ShardLoading), actions::fetch_shards(client));
         }
         Cmd::Join(filters) => {
             tokio::spawn(async move {
@@ -165,5 +205,34 @@ fn spawn_action(client: &Client, km: &Arc<FileKeyManager>, tx: &UnboundedSender<
                 let _ = tx.send(Msg::AwaitCheck);
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn slow_shards_do_not_block_status_or_spawn_duplicate_queries() {
+        let state = RefreshState::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        spawn_refresh(&state.shards, &tx, Some(Msg::ShardLoading), async move {
+            wait.await.unwrap();
+            Msg::ShardRefresh(Err("test failure".into()))
+        });
+        spawn_refresh(&state.shards, &tx, None, async { panic!("duplicate shard query") });
+        spawn_refresh(&state.node, &tx, None, async {
+            Msg::DataRefresh { node_info: None, shard_info: None, worker_info: None, err: None }
+        });
+        assert!(matches!(rx.recv().await, Some(Msg::ShardLoading)));
+        assert!(matches!(rx.recv().await, Some(Msg::DataRefresh { .. })));
+        assert!(rx.try_recv().is_err());
+        release.send(()).unwrap();
+        assert!(matches!(rx.recv().await, Some(Msg::ShardRefresh(Err(_)))));
+        spawn_refresh(&state.shards, &tx, None, async {
+            Msg::ShardRefresh(Ok(Default::default()))
+        });
+        assert!(matches!(rx.recv().await, Some(Msg::ShardRefresh(Ok(_)))));
     }
 }

@@ -159,7 +159,7 @@ impl ProverPipeline {
         self: &Arc<Self>, filters: Vec<Vec<u8>>, frame_number: u64,
         needs_storage: bool, prune_replicas: bool,
     ) {
-        let Some(attempt) = self.lifecycle.confirmation_attempts.begin(&filters, frame_number) else {
+        let Some(attempt) = self.lifecycle.submission_attempts.begin(&filters, frame_number) else {
             tracing::info!(frame = frame_number, filters = filters.len(), needs_storage,
                 "confirmation dispatch skipped: an attempt for this filter/epoch is already recorded");
             return;
@@ -222,6 +222,25 @@ impl ProverPipeline {
     /// to handle the (slow) VDF + sign + submit work so the caller's
     /// frame-processing loop continues.
     pub fn dispatch(self: &Arc<Self>, action: LifecycleAction) {
+        // Confirmations acquire the same reservation inside their preparation
+        // helper, where ownership also follows blocking encoders. Other shard
+        // operations reserve before spawning so another evaluation cannot race.
+        let mut reservation = match &action {
+            LifecycleAction::ProposeJoin { filters, frame_number, .. }
+            | LifecycleAction::RejectJoins { filters, frame_number }
+            | LifecycleAction::ProposeLeave { filters, frame_number }
+            | LifecycleAction::RejectLeaves { filters, frame_number } => {
+                match self.lifecycle.submission_attempts.begin(filters, *frame_number) {
+                    Some(attempt) => Some(attempt),
+                    None => {
+                        info!(frame = *frame_number, filters = filters.len(),
+                            "shard submission deferred: another operation owns a filter");
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
         match action {
             LifecycleAction::Noop => {}
             LifecycleAction::ProposeJoin { filters, worker_ids, frame_number } => {
@@ -262,14 +281,20 @@ impl ProverPipeline {
                             .collect()
                     };
                     let chunk_count = chunks.len();
+                    let mut attempt = reservation.take().expect("join reservation acquired");
                     for (idx, chunk) in chunks.into_iter().enumerate() {
+                        let submitted_filters = chunk.clone();
                         match tokio::time::timeout(
                             SUBMIT_JOIN_TIMEOUT,
                             me.submit_join(chunk, &worker_ids, frame_number),
                         )
                         .await
                         {
-                            Ok(Ok(())) => {}
+                            Ok(Ok(())) => {
+                                let published = me.current_frame.as_ref()
+                                    .map(|f| f.effective()).unwrap_or(frame_number);
+                                attempt.published_subset(&submitted_filters, published);
+                            }
                             Ok(Err(e)) => {
                                 warn!(frame = frame_number, chunk = idx, chunk_count, %e, "ProposeJoin submission failed");
                                 break;
@@ -295,12 +320,16 @@ impl ProverPipeline {
             LifecycleAction::RejectJoins { filters, frame_number } => {
                 let me = self.clone();
                 // TODO
+                let attempt = reservation.take().expect("shard reservation acquired");
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         NON_VDF_SUBMIT_TIMEOUT,
                         me.submit_reject(filters, frame_number),
                     ).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            attempt.published(me.current_frame.as_ref()
+                                .map(|f| f.effective()).unwrap_or(frame_number));
+                        }
                         Ok(Err(e)) => {
                             warn!(frame = frame_number, %e, "RejectJoins submission failed");
                         }
@@ -317,12 +346,16 @@ impl ProverPipeline {
             LifecycleAction::ProposeLeave { filters, frame_number } => {
                 let me = self.clone();
                 // TODO
+                let attempt = reservation.take().expect("shard reservation acquired");
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         NON_VDF_SUBMIT_TIMEOUT,
                         me.submit_leave(filters, frame_number),
                     ).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            attempt.published(me.current_frame.as_ref()
+                                .map(|f| f.effective()).unwrap_or(frame_number));
+                        }
                         Ok(Err(e)) => {
                             warn!(frame = frame_number, %e, "ProposeLeave submission failed");
                         }
@@ -345,12 +378,16 @@ impl ProverPipeline {
             LifecycleAction::RejectLeaves { filters, frame_number } => {
                 let me = self.clone();
                 // TODO
+                let attempt = reservation.take().expect("shard reservation acquired");
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         NON_VDF_SUBMIT_TIMEOUT,
                         me.submit_reject(filters, frame_number),
                     ).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            attempt.published(me.current_frame.as_ref()
+                                .map(|f| f.effective()).unwrap_or(frame_number));
+                        }
                         Ok(Err(e)) => {
                             warn!(frame = frame_number, %e, "RejectLeaves submission failed");
                         }
