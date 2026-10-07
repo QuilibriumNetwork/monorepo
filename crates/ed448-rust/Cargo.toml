@@ -53,3 +53,8 @@ features = ["getrandom"]
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "docsrs"]
 features = ["docinclude"] # Activate `docinclude` during docs.rs build.
+
+# Maintained fork of https://github.com/lolo32/ed448-rust.
+# Scope cosmetic warnings here; retain soundness diagnostics.
+[lints.rust]
+unused_imports = "allow"

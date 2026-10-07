@@ -139,7 +139,7 @@ extern "C" {
 // This is based on Akashnil's integer approximation reduce
 	inline void fast_reduce(form& f) {
 		int64_t u, v, w, x, u_, v_, w_, x_;
-		int64_t delta, gamma, sgn;
+		int64_t delta, gamma;
 		int64_t a, b, c, a_, b_, c_;
 		int64_t aa, ab, ac, ba, bb, bc, ca, cb, cc;
 		long int a_exp, b_exp, c_exp, max_exp, min_exp;
