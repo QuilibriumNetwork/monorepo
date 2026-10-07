@@ -1279,19 +1279,17 @@ impl NodeService for NodeRpcServer {
         })?;
 
         let req = request.into_inner();
-        let (details, difficulty, basis, frame_number) = provider
+        let (details, difficulty, basis, frame_number, world_bytes) = provider
             .get_shard_info(req.include_all)
             .map_err(|e| Status::internal(format!("get shard info: {e}")))?;
 
-        use num_bigint::BigInt;
-        let mut world_bytes = BigInt::from(0);
         let mut shards = Vec::with_capacity(details.len());
         for d in &details {
-            world_bytes += &d.shard_size;
             shards.push(node::ShardRewardInfo {
                 filter: d.filter.clone(),
                 active_provers: d.active_provers,
                 ring: d.ring,
+                ring_known: Some(d.ring_known),
                 shard_size: d.shard_size.to_signed_bytes_be(),
                 estimated_reward: d.estimated_reward.to_signed_bytes_be(),
                 is_allocated: d.is_allocated,
@@ -1865,6 +1863,40 @@ mod token_fee_quote_tests {
         let quote = server.get_token_fee_quote(request(64)).await.unwrap().into_inner();
         let budget = u128::from_be_bytes(quote.fee_budget.try_into().unwrap());
         assert_eq!(budget, 64 * quil_execution::pricing::NON_MAINNET_UNITS_PER_BYTE as u128 * 7);
+    }
+}
+
+#[cfg(test)]
+mod shard_world_size_tests {
+    use super::*;
+    use num_bigint::BigInt;
+    use quil_types::consensus::ShardDetail;
+
+    struct Provider;
+    impl ShardInfoProvider for Provider {
+        fn get_shard_info(&self, include_all: bool)
+            -> quil_types::error::Result<(Vec<ShardDetail>, u64, BigInt, u64, BigInt)> {
+            let count = if include_all { 2 } else { 1 };
+            let details = (1..=count).map(|id| ShardDetail {
+                filter: vec![id], shard_size: BigInt::from(1000 * u32::from(id)),
+                active_provers: 8, ring: 0, ring_known: id == 1, estimated_reward: BigInt::from(7),
+                is_allocated: id == 1, data_shards: 1, materialized_frame: 10, latest_frame: 10,
+            }).collect();
+            Ok((details, 10000, BigInt::from(100), 10, BigInt::from(3000)))
+        }
+    }
+    #[tokio::test]
+    async fn owned_response_does_not_replace_world_size_with_row_subtotal() {
+        let server = NodeRpcServer::new().with_shard_info_provider(Arc::new(Provider));
+        for include_all in [false, true] {
+            let response = server.get_shard_info(Request::new(node::GetShardInfoRequest {
+                include_all,
+            })).await.unwrap().into_inner();
+            assert_eq!(response.shards.len(), if include_all { 2 } else { 1 });
+            assert_eq!(response.shards[0].ring_known, Some(true));
+            if include_all { assert_eq!(response.shards[1].ring_known, Some(false)); }
+            assert_eq!(BigInt::from_signed_bytes_be(&response.world_state_bytes), BigInt::from(3000));
+        }
     }
 }
 

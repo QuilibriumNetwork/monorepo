@@ -282,6 +282,8 @@ message ShardRewardInfo {
   uint64 data_shards = 7;
   uint64 materialized_frame = 8;
   uint64 latest_frame = 9;
+  // Absent on older servers; false means ring/reward are unavailable.
+  optional bool ring_known = 10;
 }
 
 message GetShardInfoRequest {

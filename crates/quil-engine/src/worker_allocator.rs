@@ -288,6 +288,8 @@ pub struct AllocationPriorityEvidence {
     pub leaving: u32,
     pub scoring_ring: u8,
     pub ring_source: &'static str,
+    pub ring_member_count: Option<usize>,
+    pub ring_target_frame: Option<u64>,
     pub size_bytes: u64,
     pub data_shards: u64,
     pub difficulty: u64,
@@ -2295,7 +2297,8 @@ mod tests {
         let frame = 720;
         let evidence = AllocationPriorityEvidence {
             frame_number: frame, active: 3, joining: 20, paused: 1, leaving: 7,
-            scoring_ring: 0, ring_source: "stored_allocation_or_decoder_default",
+            scoring_ring: 0, ring_source: "current_committee",
+            ring_member_count: Some(3), ring_target_frame: Some(frame),
             size_bytes: 1000, data_shards: 2, difficulty: 100,
             world_bytes_input: "123".into(), world_bytes_source: "registry_count_proxy",
             allocation_epoch: Some(1), stored_ring: Some(0),
