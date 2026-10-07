@@ -879,6 +879,12 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
                 if ci > 0 {
                     spans.push(Span::raw(" "));
                 }
+                let mat_color = || {
+                    materialization_state_color(materialization_state(
+                        a.materialized_frame,
+                        a.latest_frame,
+                    ))
+                };
                 let span = match ci {
                     3 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(ring_color(a.ring)))
@@ -1464,6 +1470,13 @@ fn help_line(m: &Model) -> Line<'static> {
             }
             "ColorCoding" => {
                 if m.color_coding {
+                    Style::new().fg(SUCCESS)
+                } else {
+                    Style::new().fg(HELP)
+                }
+            }
+            "ThresholdUnit" => {
+                if m.threshold_unit == ThresholdUnit::Epochs {
                     Style::new().fg(SUCCESS)
                 } else {
                     Style::new().fg(HELP)

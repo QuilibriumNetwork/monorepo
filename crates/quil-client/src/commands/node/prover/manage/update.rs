@@ -510,6 +510,10 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             m.threshold_unit = m.threshold_unit.toggled();
             return vec![];
         }
+        KeyCode::Char('e') => {
+            m.threshold_unit = m.threshold_unit.toggled();
+            return vec![];
+        }
         KeyCode::Tab => {
             m.focus = m.focus.next();
             m.filter_edit_active = false;
