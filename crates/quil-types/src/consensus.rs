@@ -254,7 +254,49 @@ pub struct CommitteeHandoffPolicy {
     pub activation_frame: u64,
     /// Bound into every session ID, and through it every signing namespace.
     pub chain_id: [u8; 32],
+    /// How shards with legacy-certified history enter sessions.
+    pub legacy_history: LegacyHistory,
+    /// From this GLOBAL frame, a session's membership successor is scheduled
+    /// only at an epoch boundary (the first session pass of an epoch): the
+    /// eligible set changes mid-epoch (late re-confirms, leave rejects) wait
+    /// for the next boundary, as the epoch-aligned lifecycle intends.
+    pub membership_boundary_frame: u64,
+    /// From this GLOBAL frame a shard's FIRST session is also authorized only
+    /// at the first session pass of an epoch, so a mid-epoch pass decides
+    /// nothing and skips its prover scan.
+    pub first_session_boundary_frame: u64,
 }
+
+/// What a network with legacy app history does with it at activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegacyHistory {
+    /// Generation zero: GLOBAL records legacy tips from `LEGACY_TIP_LEAD`
+    /// frames before activation, and each legacy committee seals its shard
+    /// into its first session in place.
+    Migrate,
+    /// Flag day: at activation every node discards the legacy app frame
+    /// chains (members and archives alike) and keeps the application state;
+    /// every shard's first session starts at frame 0 over that state. No tips
+    /// are recorded and no legacy frame is accepted from activation on.
+    Discard,
+}
+
+/// Mainnet's committee-handoff activation: the GLOBAL frame whose maintenance
+/// pass authorizes the first sessions, an epoch boundary (1197 × 720). Owner
+/// decision 2026-10-05: a flag day that discards legacy app history.
+pub const MAINNET_COMMITTEE_HANDOFF_FRAME: u64 = 861_840;
+
+/// Mainnet's first frame of epoch-boundary membership successors (epoch
+/// 1198). Owner decision 2026-10-06: after activation, every eligible-set
+/// change re-sealed every shard its prover sat on, every 8 frames, so no
+/// first session produced a frame.
+pub const MAINNET_MEMBERSHIP_BOUNDARY_FRAME: u64 = 862_560;
+
+/// Mainnet's first frame of epoch-boundary first sessions (epoch 1200).
+/// Owner decision 2026-10-06: with membership frozen mid-epoch, a pass still
+/// scanned the whole prover shard every 8 frames only to learn whether a
+/// shard without a session had gained members.
+pub const MAINNET_FIRST_SESSION_BOUNDARY_FRAME: u64 = 864_000;
 
 static COMMITTEE_HANDOFF_POLICY: std::sync::RwLock<Option<CommitteeHandoffPolicy>> =
     std::sync::RwLock::new(None);
@@ -269,6 +311,13 @@ pub fn committee_handoff_policy() -> Option<CommitteeHandoffPolicy> {
     *COMMITTEE_HANDOFF_POLICY.read().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether committee sessions govern GLOBAL frame `frame`: a policy is
+/// installed and `frame` is at or past its activation. Before activation a
+/// network with a policy still runs its legacy committees.
+pub fn committee_handoff_active(frame: u64) -> bool {
+    committee_handoff_policy().is_some_and(|policy| frame >= policy.activation_frame)
+}
+
 /// Chain identifier sessions bind on `network`: a fixed label and the network id.
 pub fn committee_handoff_chain_id(network: u8) -> [u8; 32] {
     let mut id = [0u8; 32];
@@ -279,23 +328,49 @@ pub fn committee_handoff_chain_id(network: u8) -> [u8; 32] {
 }
 
 /// Pin the committee-handoff policy from the network id at node startup, like
-/// [`init_epoch_length_for_network`]. Mainnet (`network == 0`) stays on legacy
-/// committees until its activation frame and chain id are decided. Other
-/// networks opt in with `QUIL_COMMITTEE_HANDOFF_FRAME` (the activation frame,
-/// `0` for a network started from an empty genesis), env-gated like
+/// [`init_epoch_length_for_network`]. Mainnet (`network == 0`) activates at
+/// [`MAINNET_COMMITTEE_HANDOFF_FRAME`] and discards its legacy app history
+/// there; the environment cannot change either. Other networks opt in with
+/// `QUIL_COMMITTEE_HANDOFF_FRAME` (the activation frame, `0` for a network
+/// started from an empty genesis), env-gated like
 /// `QUIL_UNIFIED_TREE_CUTOVER_FRAME`: every node of that network must set the
 /// same value. A network with legacy app history migrates it in place through
 /// generation zero, and must set a frame at least `LEGACY_TIP_LEAD` after its
-/// nodes adopt this release, so every live shard has a recorded tip first.
+/// nodes adopt this release, so every live shard has a recorded tip first;
+/// `QUIL_COMMITTEE_HANDOFF_DISCARD_LEGACY=1` selects mainnet's flag day
+/// instead.
 pub fn init_committee_handoff_for_network(network: u8) {
-    let activation_frame = std::env::var("QUIL_COMMITTEE_HANDOFF_FRAME")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|_| network != 0);
-    set_committee_handoff_policy(activation_frame.map(|activation_frame| CommitteeHandoffPolicy {
+    set_committee_handoff_policy(committee_handoff_policy_for_network(network, |name| std::env::var(name).ok()));
+}
+
+fn committee_handoff_policy_for_network(
+    network: u8,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<CommitteeHandoffPolicy> {
+    if network == 0 {
+        return Some(CommitteeHandoffPolicy {
+            activation_frame: MAINNET_COMMITTEE_HANDOFF_FRAME,
+            chain_id: committee_handoff_chain_id(network),
+            legacy_history: LegacyHistory::Discard,
+            membership_boundary_frame: MAINNET_MEMBERSHIP_BOUNDARY_FRAME,
+            first_session_boundary_frame: MAINNET_FIRST_SESSION_BOUNDARY_FRAME,
+        });
+    }
+    let activation_frame = env("QUIL_COMMITTEE_HANDOFF_FRAME")?.parse::<u64>().ok()?;
+    let discard = env("QUIL_COMMITTEE_HANDOFF_DISCARD_LEGACY").is_some_and(|value| value == "1");
+    let membership_boundary_frame = env("QUIL_COMMITTEE_MEMBERSHIP_BOUNDARY_FRAME")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(activation_frame);
+    let first_session_boundary_frame = env("QUIL_COMMITTEE_FIRST_SESSION_BOUNDARY_FRAME")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    Some(CommitteeHandoffPolicy {
         activation_frame,
         chain_id: committee_handoff_chain_id(network),
-    }));
+        legacy_history: if discard { LegacyHistory::Discard } else { LegacyHistory::Migrate },
+        membership_boundary_frame,
+        first_session_boundary_frame,
+    })
 }
 
 /// The storage epoch a frame belongs to.
@@ -1109,5 +1184,41 @@ mod epoch_tests {
         set_epoch_length_frames(0);
         assert_eq!(epoch_length_frames(), EPOCH_LENGTH_FRAMES);
         assert_eq!(epoch_for_frame(720), 1);
+    }
+}
+
+#[cfg(test)]
+mod committee_handoff_policy_tests {
+    use super::*;
+
+    #[test]
+    fn mainnet_activates_its_flag_day_whatever_the_environment_says() {
+        let env = |name: &str| match name {
+            "QUIL_COMMITTEE_HANDOFF_FRAME" => Some("5".to_string()),
+            "QUIL_COMMITTEE_HANDOFF_DISCARD_LEGACY" => Some("0".to_string()),
+            _ => None,
+        };
+        let mainnet = committee_handoff_policy_for_network(0, env).unwrap();
+        assert_eq!(mainnet.activation_frame, 861_840);
+        assert_eq!(mainnet.activation_frame % 720, 0, "an epoch boundary");
+        assert_eq!(mainnet.legacy_history, LegacyHistory::Discard);
+        assert_eq!(mainnet.membership_boundary_frame, 862_560);
+        assert_eq!(mainnet.membership_boundary_frame % 720, 0, "an epoch boundary");
+        assert_eq!(mainnet.first_session_boundary_frame, 864_000);
+        assert_eq!(mainnet.first_session_boundary_frame % 720, 0, "an epoch boundary");
+        assert_eq!(mainnet.chain_id, committee_handoff_chain_id(0));
+
+        assert_eq!(committee_handoff_policy_for_network(1, |_| None), None, "other networks opt in");
+        let testnet = committee_handoff_policy_for_network(1, env).unwrap();
+        assert_eq!((testnet.activation_frame, testnet.legacy_history), (5, LegacyHistory::Migrate));
+        assert_eq!(testnet.membership_boundary_frame, 5, "on from activation unless set");
+        let drill = committee_handoff_policy_for_network(1, |name| match name {
+            "QUIL_COMMITTEE_HANDOFF_FRAME" => Some("9".to_string()),
+            "QUIL_COMMITTEE_HANDOFF_DISCARD_LEGACY" => Some("1".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!((drill.activation_frame, drill.legacy_history), (9, LegacyHistory::Discard));
+        assert_ne!(drill.chain_id, mainnet.chain_id);
     }
 }

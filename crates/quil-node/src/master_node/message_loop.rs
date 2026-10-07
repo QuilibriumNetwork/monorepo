@@ -429,6 +429,21 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     );
                     // Resolver traffic of the shards this process runs.
                     quil_engine::resolver_traffic::ResolverTraffic::process().log();
+                    // Forest reads this node served to syncing peers (since
+                    // start): cache hits take no storage slot.
+                    let forest = quil_rpc::global_service::forest_read_stats();
+                    if forest.cache.hits + forest.cache.misses + forest.refused + forest.listed > 0 {
+                        info!(
+                            cache_hits = forest.cache.hits,
+                            cache_misses = forest.cache.misses,
+                            cache_mb = forest.cache.bytes / (1024 * 1024),
+                            cache_entries = forest.cache.entries,
+                            refused_busy = forest.refused,
+                            queued = forest.queued,
+                            leaves_listed = forest.listed,
+                            "forest reads served",
+                        );
+                    }
                     // Memory snapshot. Logged separately so the size
                     // fields don't crowd `node status`; growth between
                     // ticks is the diagnosis signal.
@@ -1137,7 +1152,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 //     predecessors — they're already past.
                                                 let frames_to_execute: Vec<(u64, quil_types::proto::global::GlobalFrame)> =
                                                 if archive_mode_recv || (network_for_recv != 99
-                                                    && quil_types::consensus::committee_handoff_policy().is_some()) {
+                                                    && quil_types::consensus::committee_handoff_active(frame_num)) {
                                                     // Archives have their serial materializer. Session-enabled
                                                     // regulars follow authenticated GLOBAL snapshots: their local
                                                     // shard metadata can lag a split/merge freeze, so replay
