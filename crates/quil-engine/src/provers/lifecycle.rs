@@ -1330,14 +1330,14 @@ impl ProverLifecycle {
                 .map(|a| (a.epoch, a.status, a.confirmation_filter.len())).collect::<Vec<_>>()),
             "lifecycle allocation buckets"
         );
-        // A rejected leave may be epoch-expired until its renewal round-trip
-        // completes. Do not turn that recoverable transition into another leave,
-        // even if reconcile has not restored the worker yet. Bound the grace by
-        // the rejection epoch; genuinely abandoned allocations remain sweepable.
+        // A missed renewal or rejected leave needs bounded recovery before
+        // cleanup, even if reconciliation has not restored the worker yet.
+        // Use the same grace as the allocator so releasing a worker cannot
+        // turn a recoverable registration into an orphan in the same cycle.
         let recovery_filters: std::collections::HashSet<Vec<u8>> = prover_info
             .as_ref()
             .map(|p| p.allocations.iter()
-                .filter(|a| crate::worker_allocator::rejected_leave_recovery_pending(a, frame_number))
+                .filter(|a| crate::worker_allocator::epoch_renewal_recovery_pending(a, frame_number))
                 .map(|a| a.confirmation_filter.clone()).collect())
             .unwrap_or_default();
         let expired_epoch_for_orphan_sweep: Vec<Vec<u8>> = expired_epoch_filters.iter()
@@ -1466,7 +1466,9 @@ impl ProverLifecycle {
         if let Some(prover) = &prover_info {
             for descriptor in &mut held_descriptors {
                 if let Some(allocation) = prover.allocations.iter()
-                    .find(|a| a.confirmation_filter == descriptor.filter && a.is_live(frame_number))
+                    .find(|a| a.confirmation_filter == descriptor.filter
+                        && (a.is_live(frame_number)
+                            || crate::worker_allocator::epoch_renewal_recovery_pending(a, frame_number)))
                 {
                     descriptor.ring = allocation.ring;
                 }
@@ -1569,7 +1571,7 @@ impl ProverLifecycle {
                 .collect();
             let priority_entries: Vec<(Vec<u8>, bool, BigInt)> =
                 proposer::rank_allocated_by_score_ascending(
-                    &decide_all_descriptors,
+                    &held_descriptors,
                     difficulty,
                     &world_bytes,
                     self.units,
@@ -1603,11 +1605,17 @@ impl ProverLifecycle {
         // while the round-trip is in flight. This runs regardless of coverage
         // halts: a prover maintaining its own storage commitment is never the
         // cause of a halt and must not be evicted for one.
-        if !expired_epoch_filters.is_empty() {
-            // The pipeline reserves filters before spawning and records cooldown
-            // only after publication; failed preparation is retried promptly.
+        let renewal_filters: Vec<Vec<u8>> = expired_epoch_filters.into_iter()
+            .filter(|f| active_filters.contains(f)
+                || recovery_filters.contains(f)
+                || worker_bound_filters.contains(f))
+            .collect();
+        if !renewal_filters.is_empty() {
+            // Never renew an abandoned orphan we may propose leaving below.
+            // The pipeline reserves filters before spawning; failed preparation
+            // is retried without claiming registration or valid storage.
             actions.push(LifecycleAction::ReconfirmEpoch {
-                filters: expired_epoch_filters,
+                filters: renewal_filters,
                 frame_number,
             });
         }
@@ -2594,6 +2602,21 @@ impl ProverLifecycle {
             }
         }
 
+        // Every action is dispatched asynchronously. A renewal must not race
+        // a departure chosen in this same cycle, even for a current Active row.
+        let departing: std::collections::HashSet<Vec<u8>> = actions.iter()
+            .filter_map(|action| match action {
+                LifecycleAction::ProposeLeave { filters, .. }
+                | LifecycleAction::ConfirmLeaves { filters, .. } => Some(filters),
+                _ => None,
+            }).flatten().cloned().collect();
+        actions.retain_mut(|action| match action {
+            LifecycleAction::ReconfirmEpoch { filters, .. } => {
+                filters.retain(|filter| !departing.contains(filter));
+                !filters.is_empty()
+            }
+            _ => true,
+        });
         Ok(actions)
     }
 }
@@ -3680,6 +3703,70 @@ mod proposal_loop_tests {
     }
 
     #[test]
+    fn bootstrap_after_epoch_expiry_renews_without_shedding_allocations() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        for initially_bound in [false, true] {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(if initially_bound { allocated_worker(1, held.clone()) } else { idle_worker(1) });
+            let reg = Arc::new(ConfigurableRegistry::new());
+            let mut recovering = alloc(held.clone(), ProverStatus::Active, 10);
+            recovering.epoch = 0;
+            reg.set_prover(prover(address.clone(), vec![recovering]));
+            reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            for frame in [725, 1439] {
+                lc.set_prover_root_verified_frame(frame);
+                let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+                assert!(actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))));
+                assert_eq!(count_proposed_leaves(&actions), 0,
+                    "a delayed bootstrap renewal must not race cleanup: {actions:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn current_epoch_empty_shard_leave_excludes_proactive_renewal() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut empty = alloc(held.clone(), ProverStatus::Active, 10);
+        empty.epoch = 1;
+        reg.set_prover(prover(address.clone(), vec![empty]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_remote_shard_metrics(HashMap::from([(held.clone(), (0, 0))]));
+        lc.set_prover_root_verified_frame(725);
+        let actions = lc.evaluate(725, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_leaves(&actions), 1, "{actions:?}");
+        assert!(!actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))), "{actions:?}");
+    }
+
+    #[test]
+    fn abandoned_orphan_cleanup_does_not_publish_competing_renewal() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut abandoned = alloc(held.clone(), ProverStatus::Active, 10);
+        abandoned.epoch = 0;
+        reg.set_prover(prover(address.clone(), vec![abandoned]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_prover_root_verified_frame(1440);
+        let actions = lc.evaluate(1440, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_leaves(&actions), 1, "{actions:?}");
+        assert!(!actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))),
+            "cleanup must not race an opposite confirmation: {actions:?}");
+    }
+
+    #[test]
     fn rejected_leave_renews_before_orphan_cleanup_and_grace_is_bounded() {
         let address = vec![0xCD; 32];
         let held = filter_bytes(0xA1);
@@ -4698,7 +4785,7 @@ mod proposal_loop_tests {
     /// active bucket. The bound allocation can recover by re-confirming;
     /// only the unbound allocation should receive a Leave proposal.
     #[test]
-    fn all_expired_allocations_still_propose_leave_for_the_unbound_one() {
+    fn abandoned_expired_allocations_still_propose_leave_for_the_unbound_one() {
         let address = vec![0xCDu8; 32];
         let wm = Arc::new(ConfigurableWorkerManager::new());
         let reg = Arc::new(ConfigurableRegistry::new());
@@ -4712,7 +4799,7 @@ mod proposal_loop_tests {
         for allocation in &mut allocations {
             allocation.epoch = 5;
         }
-        let frame = 6 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+        let frame = 7 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
         let buckets = AllocationBuckets::from_allocations(&allocations, frame);
         assert!(buckets.active.is_empty());
         assert_eq!(buckets.expired_epoch.len(), 2);

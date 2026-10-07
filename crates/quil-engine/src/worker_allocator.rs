@@ -33,6 +33,20 @@ pub(crate) fn rejected_leave_recovery_pending(
         && epoch_for_frame(frame) == epoch_for_frame(allocation.leave_reject_frame_number)
 }
 
+/// A recently expired storage registration gets one epoch to recover its
+/// worker and publish renewal. This reserves local capacity only; it never
+/// changes protocol membership, proof eligibility or the stored epoch.
+/// Older abandoned allocations remain eligible for release and cleanup.
+pub(crate) fn epoch_renewal_recovery_pending(
+    allocation: &quil_types::consensus::ProverAllocationInfo,
+    frame: u64,
+) -> bool {
+    use quil_types::consensus::{epoch_for_frame, EffectiveStatus};
+    allocation.effective_status(frame) == EffectiveStatus::ExpiredEpoch
+        && (allocation.epoch.checked_add(1) == Some(epoch_for_frame(frame))
+            || rejected_leave_recovery_pending(allocation, frame))
+}
+
 // =====================================================================
 // Config-driven static filter pinning
 // =====================================================================
@@ -778,7 +792,7 @@ impl WorkerAllocator {
                                 | EffectiveStatus::Paused
                                 | EffectiveStatus::Joining
                                 | EffectiveStatus::Leaving
-                        ) || rejected_leave_recovery_pending(a, frame_number)
+                        ) || epoch_renewal_recovery_pending(a, frame_number)
                     })
                     .unwrap_or(false);
                 // Protect a still-in-flight ProposeJoin (pending window not yet
@@ -807,7 +821,7 @@ impl WorkerAllocator {
                     // worker while a live allocation is unbound.
                     if alloc.effective_status(frame_number)
                         == quil_types::consensus::EffectiveStatus::ExpiredEpoch
-                        && !rejected_leave_recovery_pending(alloc, frame_number)
+                        && !epoch_renewal_recovery_pending(alloc, frame_number)
                     {
                         info!(
                             core_id = worker.core_id,
@@ -1068,6 +1082,8 @@ impl WorkerAllocator {
                 EffectiveStatus::Active
                 | EffectiveStatus::Paused
                 | EffectiveStatus::Joining => {}
+                EffectiveStatus::ExpiredEpoch
+                    if epoch_renewal_recovery_pending(alloc, frame_number) => {}
                 EffectiveStatus::ExpiredEpoch
                     if rejected_leave_recovery_pending(alloc, frame_number) => {}
                 // Both proposed and confirmed leaves serve until their
@@ -1892,6 +1908,29 @@ mod tests {
         assert_eq!(workers.len(), 1);
         assert!(workers[0].filter.is_empty());
         assert!(!workers[0].allocated);
+    }
+
+    #[test]
+    fn missed_renewal_retains_or_recovers_worker_for_one_epoch() {
+        use quil_types::consensus::EffectiveStatus;
+        let filter = vec![0x01; 32];
+        for initially_bound in [false, true] {
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.allocate_worker(1, if initially_bound { &filter } else { &[] }).unwrap();
+            let mut recovering = make_alloc(filter.clone());
+            recovering.epoch = 0;
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![recovering.clone()])));
+            let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+            for frame in [720, 725, 1439] {
+                allocator.on_new_frame(frame).unwrap();
+                assert_eq!(wm.range_workers().unwrap()[0].filter, filter);
+                assert_eq!(recovering.effective_status(frame), EffectiveStatus::ExpiredEpoch,
+                    "capacity recovery must not make stale proofs valid");
+            }
+            allocator.on_new_frame(1440).unwrap();
+            assert!(wm.range_workers().unwrap()[0].filter.is_empty(),
+                "an unrenewed registration cannot reserve capacity indefinitely");
+        }
     }
 
     #[test]
