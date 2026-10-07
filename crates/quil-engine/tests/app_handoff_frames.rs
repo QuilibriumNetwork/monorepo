@@ -472,6 +472,104 @@ async fn historical_certificate_reaches_archive_and_global_admission_after_commi
     );
 }
 
+/// A sealed session's last headers can miss their lockstep window for good,
+/// and GLOBAL accepts a seal only at its executed tip (#699). The seal brings
+/// them: GLOBAL checks each against the session and executes it, from the
+/// drain frame, before accepting the seal. A gap, a forged or foreign header,
+/// or a run not ending at the checkpoint is refused, and before the drain
+/// frame so is any drain.
+#[test]
+fn a_seal_brings_the_drain_headers_global_never_executed() {
+    let keys = keys();
+    let source = session(&keys, vec![0x62; 32]);
+    let fixture = Fixture::new(&source);
+    let intrinsic = fixture.intrinsic();
+    handoff::initialize(&fixture.state, 2, &source).unwrap();
+    commit(&fixture.state, 2);
+
+    // Frames 1–3 at views 5, 7, 9, each extending the last.
+    let mut frames = vec![first_frame(&source, &keys)];
+    for (number, view, parent_view) in [(2u64, 7u64, 5u64), (3, 9, 7)] {
+        let previous = frames.last().unwrap().header.as_ref().unwrap();
+        let mut header = FrameHeader {
+            address: source.filter.clone(),
+            frame_number: number,
+            rank: view,
+            difficulty: 1,
+            parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&previous.output).unwrap().to_vec(),
+            requests_root: vec![0; 32],
+            state_roots: vec![vec![0; 32]; 4],
+            ..Default::default()
+        };
+        certify(&mut header, &source, &keys, parent_view);
+        frames.push(AppShardFrame { header: Some(header), ..Default::default() });
+    }
+    let wire = |frame: &AppShardFrame| canonical(frame).to_canonical_bytes().unwrap();
+    // GLOBAL executed frame 1 only; 2 and 3 missed their window.
+    intrinsic.invoke_step(3, &wire(&frames[0]), &fixture.state).unwrap();
+    commit(&fixture.state, 3);
+    assert_eq!(handoff::session_tip(&fixture.state, &source.id().unwrap()).unwrap().unwrap().frame, 1);
+
+    let next_keys = self::keys();
+    let request = handoff::schedule(
+        &fixture.state, 4, vec![source.filter.clone()],
+        vec![DesiredCommittee { filter: source.filter.clone(), members: session(&next_keys, source.filter.clone()).members }],
+    ).unwrap();
+    commit(&fixture.state, 4);
+    let last = canonical(&frames[2]);
+    let seal = Seal {
+        request: request.id().unwrap(),
+        session: source.id().unwrap(),
+        view: 11,
+        checkpoint: Checkpoint {
+            frame: 3,
+            view: 9,
+            digest: quil_crypto::poseidon::hash_bytes_to_32(&last.output).unwrap(),
+            state_roots: [[0; 32]; 4],
+            history_root: [0x66; 32],
+        },
+    };
+    let submission = CertificateSubmission { certificate: sign(&source, &keys, 11, 9, seal.digest()), seal };
+    let sealed = |drain: Vec<Vec<u8>>| handoff::SealSubmission { submission: submission.clone(), drain }
+        .to_canonical_bytes().unwrap();
+    let refused = |bytes: &[u8], frame: u64, expect: &str| {
+        let error = intrinsic.invoke_step(frame, bytes, &fixture.state).unwrap_err();
+        assert!(error.to_string().contains(expect), "expected {expect:?}, got {error}");
+        assert!(intrinsic.validate(frame, bytes, None, None).is_err());
+    };
+
+    // The seal alone waits for frames GLOBAL never executed.
+    refused(&submission.to_canonical_bytes().unwrap(), 5, "not yet executed");
+    // Before the drain frame a drain is refused, as an older build would.
+    handoff::set_seal_drain_frame_for_thread(Some(6));
+    refused(&sealed(vec![wire(&frames[1]), wire(&frames[2])]), 5, "not active");
+
+    // Malformed drains, from the drain frame on.
+    refused(&sealed(vec![wire(&frames[2])]), 6, "gap after the executed tip");
+    refused(&sealed(vec![wire(&frames[1])]), 6, "do not end at the sealed checkpoint");
+    refused(&sealed(vec![wire(&frames[0]), wire(&frames[2])]), 6, "not consecutive");
+    let mut forged = canonical(&frames[1]);
+    forged.spends = vec![1, 2, 3];
+    refused(&sealed(vec![forged.to_canonical_bytes().unwrap(), wire(&frames[2])]), 6, "");
+    let other = session(&keys, vec![0x63; 32]);
+    let mut foreign = frames[1].clone();
+    foreign.header.as_mut().unwrap().address = other.filter.clone();
+    refused(&sealed(vec![wire(&foreign), wire(&frames[2])]), 6, "another shard");
+    assert_eq!(handoff::session_tip(&fixture.state, &source.id().unwrap()).unwrap().unwrap().frame, 1,
+        "a refused drain executes nothing");
+
+    // The full drain, an already-executed header included, is accepted.
+    let drain = sealed(vec![wire(&frames[0]), wire(&frames[1]), wire(&frames[2])]);
+    assert!(intrinsic.validate(6, &drain, None, None).unwrap());
+    intrinsic.invoke_step(6, &drain, &fixture.state).unwrap();
+    commit(&fixture.state, 6);
+    let tip = handoff::session_tip(&fixture.state, &source.id().unwrap()).unwrap().unwrap();
+    assert_eq!((tip.frame, tip.view, tip.digest), (3, 9, submission.seal.checkpoint.digest));
+    assert_eq!(handoff::head(&fixture.state, &source.filter).unwrap().unwrap().generation, 2,
+        "the seal authorized the successor");
+    handoff::set_seal_drain_frame_for_thread(None);
+}
+
 #[test]
 fn production_validators_reject_namespace_downgrades_and_unauthorized_coordinates() {
     let keys = keys();

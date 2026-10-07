@@ -307,6 +307,13 @@ impl<'a> Cursor<'a> {
         }
         Ok(())
     }
+    pub fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    /// Whether every byte has been read.
+    pub fn is_finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
     pub fn finish(self) -> Result<()> {
         if self.offset != self.bytes.len() {
             return Err(invalid("trailing record bytes"));

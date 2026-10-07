@@ -746,6 +746,11 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         relay_activation_frame = %if relay_from == u64::MAX { "never (release frame unset)".to_string() } else { relay_from.to_string() },
         "application shard relay records"
     );
+    let seal_drain_from = quil_execution::global_intrinsic::handoff::init_seal_drain_frame(args.network);
+    info!(
+        seal_drain_frame = %if seal_drain_from == u64::MAX { "never".to_string() } else { seal_drain_from.to_string() },
+        "committee handoff seals carrying their drain headers"
+    );
     let batch_shields_from = quil_execution::token_intrinsic::global_commit::init_batch_shield_frame(args.network);
     info!(
         batch_shield_frame = %if batch_shields_from == u64::MAX { "never".to_string() } else { batch_shields_from.to_string() },

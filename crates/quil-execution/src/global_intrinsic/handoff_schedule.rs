@@ -237,17 +237,21 @@ pub fn gate_topology_change(
     scan: Option<&CommittedProverScan>,
     even: bool,
 ) -> Result<TopologyGate> {
-    gate_topology_change_sized(state, frame, policy, change, scan, even, &|_| 0)
+    let ready = scan.map(|scan| move || Ok(scan));
+    gate_topology_change_sized(state, frame, policy, change, ready.as_ref().map(|f| f as _), even, &|_| 0)
 }
 
 /// [`gate_topology_change`] with each split child's reward basis (`size`),
-/// which orders the children a split's provers move to.
-pub fn gate_topology_change_sized(
+/// which orders the children a split's provers move to. `scan` builds the
+/// committed prover scan, and is called only once the change gets past the
+/// record and session checks: the scan reads all of GLOBAL's committed provers,
+/// and a change waiting on its sources is due, and gated, on every frame.
+pub fn gate_topology_change_sized<'s>(
     state: &HypergraphState,
     frame: u64,
     policy: &CommitteeHandoffPolicy,
     change: &PendingShardChange,
-    scan: Option<&CommittedProverScan>,
+    scan: Option<&dyn Fn() -> Result<&'s CommittedProverScan>>,
     even: bool,
     size: &dyn Fn(&[u8]) -> u128,
 ) -> Result<TopologyGate> {
@@ -322,6 +326,7 @@ pub fn gate_topology_change_sized(
             return Ok(TopologyGate::Wait);
         }
     }
+    let scan = scan()?;
     let targets: Vec<DesiredCommittee> = match change.kind {
         ShardChangeKind::Split => {
             let assigned = split_assignment_sized(scan, change, frame, even, size);

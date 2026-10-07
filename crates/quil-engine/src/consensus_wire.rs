@@ -864,7 +864,7 @@ pub fn decode_message_bundle(
                 if req.inner_type_prefix == quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF {
                     // Known authorization messages must survive byte-for-byte.
                     // A malformed one must not become a default/empty request.
-                    quil_execution::global_intrinsic::handoff::CertificateSubmission::from_canonical_bytes(&req.inner_bytes)?;
+                    quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(&req.inner_bytes)?;
                 }
                 requests.push(canonical_request_to_proto(req));
             }
@@ -941,7 +941,7 @@ fn canonical_request_to_proto(
             .ok()
             .map(|k| Request::Kick(conversions::prover_kick_to_proto(&k))),
         quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF =>
-            quil_execution::global_intrinsic::handoff::CertificateSubmission::from_canonical_bytes(inner)
+            quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(inner)
                 .ok().map(|_| Request::CommitteeHandoff(inner.to_vec())),
         prover_ops::TYPE_SHARD_SPLIT => prover_ops::ShardSplit::from_canonical_bytes(inner)
             .ok()
@@ -1062,7 +1062,7 @@ pub fn proto_message_bundle_to_canonical_bytes(
     let mut requests: Vec<Option<CanonicalMessageRequest>> = Vec::with_capacity(bundle.requests.len());
     for req in &bundle.requests {
         if let Some(quil_types::proto::global::message_request::Request::CommitteeHandoff(bytes)) = &req.request {
-            quil_execution::global_intrinsic::handoff::CertificateSubmission::from_canonical_bytes(bytes)?;
+            quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(bytes)?;
         }
         match proto_message_request_to_canonical(req) {
             Some(canon_req) => requests.push(Some(canon_req)),
@@ -1122,7 +1122,7 @@ fn proto_message_request_to_canonical(
             .to_canonical_bytes()
             .ok()?,
         Request::CommitteeHandoff(bytes) => {
-            quil_execution::global_intrinsic::handoff::CertificateSubmission::from_canonical_bytes(bytes).ok()?;
+            quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(bytes).ok()?;
             bytes.clone()
         }
         Request::ShardSplit(p) => conversions::shard_split_from_proto(p)

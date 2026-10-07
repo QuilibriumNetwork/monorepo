@@ -61,6 +61,44 @@ fn shard_reset_clears_all_flat_versions_atomically_only_in_its_overlay() {
         assert_eq!(rows(&db), before);
     }
 }
+/// The tentative vertex walk yields each vertex's newest version, a branch
+/// write included, seeking past older ones instead of reading each: on the
+/// overlay every cursor step is a counted seek, and GLOBAL's prover scan read
+/// 9M retained versions a frame on mainnet.
+#[test]
+fn tentative_vertex_walk_seeks_past_retained_versions() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(directory.path());
+    let primary = RocksHypergraphStore::new(db.clone());
+    let sk = shard();
+    let txn = primary.new_transaction(false).unwrap();
+    for n in 0..20u8 {
+        for version in 0..200u64 {
+            let blob = format!("{n}-{version}");
+            primary.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &sk, &vertex(n), blob.as_bytes(), version)
+                .unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), limits()).unwrap());
+    let store = OverlayHypergraphStore::new(overlay.clone());
+    let txn = store.new_transaction(false).unwrap();
+    store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &sk, &vertex(3), b"branch", 500).unwrap();
+    txn.commit().unwrap();
+
+    let before = overlay.stats().read_operations;
+    let mut walked = Vec::new();
+    HypergraphStore::for_each_vertex_underlying(&store, "vertex", "adds", &sk, &mut |vk, blob| walked.push((vk, blob)))
+        .unwrap();
+    let reads = overlay.stats().read_operations - before;
+    walked.sort();
+    let newest: Vec<_> = (0..20u8)
+        .map(|n| (vertex(n), if n == 3 { b"branch".to_vec() } else { format!("{n}-199").into_bytes() }))
+        .collect();
+    assert_eq!(walked, newest);
+    assert!(reads < 20 * 50, "{reads} reads for 20 vertices of 200 versions");
+}
+
 fn open(path: &std::path::Path) -> quil_forest::CoordinatedDb {
     quil_forest::CoordinatedDb::new(rocksdb::DB::open_default(path).unwrap())
 }

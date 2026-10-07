@@ -3618,15 +3618,39 @@ impl AppConsensusEngine {
         };
         info!(core_id = self.core_id, filter = hex::encode(&self.filter),
             session = hex::encode(submission.0), "app committee session sealed; submitting closing certificate");
-        if let Some(publish) = self.coverage_publish.as_ref() {
-            publish(submission.1.clone());
-        }
+        self.publish_seal(&submission.1);
         self.sealed_session = Some(submission);
         self.seal_published_at = Some(std::time::Instant::now());
         if let Some(old) = self.cw_handle.take() {
             if let Err(e) = old.shutdown_and_join().await {
                 warn!(core_id = self.core_id, error = %e, "sealed app consensus host stopped with an error");
             }
+        }
+    }
+
+    /// Publish a finalized seal, with the drain headers GLOBAL still lacks
+    /// (`app_handoff::drained_seal`, #699): GLOBAL accepts the seal only once
+    /// it has executed the sealed checkpoint frame. Says how far GLOBAL has
+    /// executed the session, so a seal that keeps waiting shows why.
+    fn publish_seal(&self, base: &[u8]) {
+        let Some(publish) = self.coverage_publish.as_ref() else { return };
+        let drained = self.global_hypergraph.as_ref()
+            .map(|global| crate::app_handoff::drained_seal(global, self.clock_store.as_ref(), base));
+        match drained {
+            Some(Ok(drained)) => {
+                if drained.executed < drained.checkpoint {
+                    info!(core_id = self.core_id, filter = hex::encode(&self.filter),
+                        global_executed = drained.executed, checkpoint = drained.checkpoint,
+                        drain_headers = drained.attached,
+                        "closing certificate waits for GLOBAL to execute the session through its checkpoint");
+                }
+                publish(drained.bytes);
+            }
+            Some(Err(error)) => {
+                warn!(core_id = self.core_id, error = %error, "seal drain headers unavailable; submitting the seal alone");
+                publish(base.to_vec());
+            }
+            None => publish(base.to_vec()),
         }
     }
 
@@ -3655,9 +3679,8 @@ impl AppConsensusEngine {
             let recorded = view.and_then(|view|
                 quil_execution::global_intrinsic::handoff::schedule::seal_submitted(&view, &session));
             if matches!(recorded, Ok(false)) {
-                if let Some(publish) = self.coverage_publish.as_ref() {
-                    publish(submission.clone());
-                }
+                let submission = submission.clone();
+                self.publish_seal(&submission);
                 self.seal_published_at = Some(std::time::Instant::now());
             }
         }
@@ -4811,35 +4834,10 @@ impl AppConsensusEngine {
         // no BLS aggregate sig in the header (simplex certifies it instead), so
         // `public_key_signature_bls48581` is empty — verification of CW shard
         // frames checks the deterministic output, storage and committee certificate.
-        let canon = quil_execution::global_intrinsic::frame_header::FrameHeader {
-            address: header.address.clone(),
-            frame_number: header.frame_number,
-            rank: header.rank,
-            timestamp: header.timestamp,
-            difficulty: header.difficulty,
-            output: header.output.clone(),
-            parent_selector: header.parent_selector.clone(),
-            requests_root: header.requests_root.clone(),
-            state_roots: header.state_roots.clone(),
-            prover: header.prover.clone(),
-            fee_multiplier_vote: header.fee_multiplier_vote as i64,
-            // Carry the simplex finalization cert (magic-prefixed) in the sig
-            // field so the global reward path can verify CW-finalized shard work
-            // against the shard committee.
-            public_key_signature_bls48581: quil_cw_consensus::app_cert::wrap_cert_for_header(cert),
-            storage_attestation_root: header.storage_attestation_root.clone(),
-            global_frame_number: header.global_frame_number,
-            storage_attestation: frame
-                .storage_attestation
-                .as_ref()
-                .map(prost::Message::encode_to_vec)
-                .unwrap_or_default(),
-            fee_total: header.fee_total.clone(),
-            settlements: header.settlements.clone(),
-            accumulator: header.accumulator.clone(),
-            spends: header.spends.clone(),
-        };
-        if let Ok(canon_bytes) = canon.to_canonical_bytes() {
+        // The CW frame carries the simplex finalization cert (magic-prefixed)
+        // in the sig field, as stored, so the global reward path can verify
+        // CW-finalized shard work against the shard committee.
+        if let Ok(canon_bytes) = crate::app_handoff::canonical_header(&frame) {
             let _ = self.event_tx.send(AppEngineEvent::ShardFrameFinalized {
                 filter: self.filter.clone(),
                 header_canonical_bytes: canon_bytes.clone(),

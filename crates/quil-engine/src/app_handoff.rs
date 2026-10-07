@@ -386,6 +386,78 @@ pub fn submission(seal_bytes: &[u8], certificate: Vec<u8>) -> Result<Vec<u8>> {
     CertificateSubmission { seal: Seal::decode(seal_bytes)?, certificate }.to_canonical_bytes()
 }
 
+/// The canonical GLOBAL `FrameHeader` of a finalized app frame, its
+/// certificate carried in the signature field as the frame stores it: what a
+/// member submits for the frame's work, and a seal's drain header.
+pub fn canonical_header(frame: &quil_types::proto::global::AppShardFrame) -> Result<Vec<u8>> {
+    let header = frame.header.as_ref().ok_or_else(|| unavailable("stored frame has no header"))?;
+    quil_execution::global_intrinsic::frame_header::FrameHeader {
+        address: header.address.clone(),
+        frame_number: header.frame_number,
+        rank: header.rank,
+        timestamp: header.timestamp,
+        difficulty: header.difficulty,
+        output: header.output.clone(),
+        parent_selector: header.parent_selector.clone(),
+        requests_root: header.requests_root.clone(),
+        state_roots: header.state_roots.clone(),
+        prover: header.prover.clone(),
+        fee_multiplier_vote: header.fee_multiplier_vote as i64,
+        public_key_signature_bls48581: header.public_key_signature_bls48581.as_ref()
+            .map(|signature| signature.signature.clone())
+            .unwrap_or_default(),
+        storage_attestation_root: header.storage_attestation_root.clone(),
+        global_frame_number: header.global_frame_number,
+        storage_attestation: frame.storage_attestation.as_ref().map(prost::Message::encode_to_vec).unwrap_or_default(),
+        fee_total: header.fee_total.clone(),
+        settlements: header.settlements.clone(),
+        accumulator: header.accumulator.clone(),
+        spends: header.spends.clone(),
+    }
+    .to_canonical_bytes()
+}
+
+/// A finalized seal as submitted: the encoded submission, with the drain
+/// headers GLOBAL needs to accept it (#699).
+pub struct DrainedSeal {
+    pub bytes: Vec<u8>,
+    /// The source frame GLOBAL has executed through (its base before any).
+    pub executed: u64,
+    pub checkpoint: u64,
+    pub attached: usize,
+}
+
+/// `base` (an encoded `CertificateSubmission`) with drain headers: the
+/// source's stored frames from the one after GLOBAL's committed executed tip
+/// through the sealed checkpoint (`handoff::SealSubmission`). GLOBAL accepts a
+/// seal only once it has executed its checkpoint frame, and a sealed session's
+/// last headers can miss their lockstep window for good. None are attached
+/// when GLOBAL has executed the checkpoint, before the drain frame, or when
+/// more are missing than one submission carries (the fence closes such a
+/// session).
+pub fn drained_seal(global: &Arc<HypergraphCrdt>, clock: &dyn ClockStore, base: &[u8]) -> Result<DrainedSeal> {
+    use quil_execution::global_intrinsic::handoff::{self as h, SealSubmission, MAX_DRAIN_HEADERS};
+    let submission = CertificateSubmission::from_canonical_bytes(base)?;
+    let view = CommittedView::capture(global)?;
+    let id = submission.seal.session;
+    let session = h::session(&view, &id)?.ok_or_else(|| unavailable("sealed session is not recorded"))?;
+    let executed = h::session_tip(&view, &id)?.map_or(session.base_frame, |tip| tip.frame);
+    let checkpoint = submission.seal.checkpoint.frame;
+    let plain = |executed| DrainedSeal { bytes: base.to_vec(), executed, checkpoint, attached: 0 };
+    // The submission lands in a later GLOBAL frame than the one viewed.
+    if executed >= checkpoint
+        || view.frame().saturating_add(1) < h::seal_drain_frame()
+        || checkpoint - executed > MAX_DRAIN_HEADERS as u64
+    {
+        return Ok(plain(executed));
+    }
+    let drain = (executed + 1..=checkpoint)
+        .map(|number| canonical_header(&clock.get_shard_clock_frame(&session.filter, number, false)?))
+        .collect::<Result<Vec<_>>>()?;
+    let attached = drain.len();
+    Ok(DrainedSeal { bytes: SealSubmission { submission, drain }.to_canonical_bytes()?, executed, checkpoint, attached })
+}
+
 /// One page of a shard's recorded outgoing records `[from, through]`, fetched
 /// from an archive: contiguous from `from`, possibly shorter. Unauthenticated
 /// until its chain is checked against a certified history root.

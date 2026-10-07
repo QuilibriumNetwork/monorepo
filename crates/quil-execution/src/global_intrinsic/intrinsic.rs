@@ -385,8 +385,8 @@ impl GlobalIntrinsic {
                 let crdt = self.hypergraph.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable(
                     "handoff validation requires authenticated global state".into()))?;
                 let state = HypergraphState::new(crdt.clone());
-                let submission = super::handoff::CertificateSubmission::from_canonical_bytes(input)?;
-                super::handoff::verify_submission(&state, frame_number, &submission)?;
+                let sealed = super::handoff::SealSubmission::from_canonical_bytes(input)?;
+                self.verify_seal_submission(frame_number, &sealed, &state)?;
                 Ok(true)
             }
             TYPE_PROVER_PAUSE => {
@@ -1246,8 +1246,15 @@ impl GlobalIntrinsic {
                 self.invoke_frame_header(frame_number, &op, state, &va_disc)
             }
             super::handoff::TYPE_COMMITTEE_HANDOFF => {
-                let submission = super::handoff::CertificateSubmission::from_canonical_bytes(input)?;
-                super::handoff::apply_submission(state, frame_number, &submission)?;
+                // The drain and the seal it enables apply together or not at all.
+                let sealed = super::handoff::SealSubmission::from_canonical_bytes(input)?;
+                let savepoint = state.changeset_len();
+                let applied = self.seal_drain(frame_number, &sealed, state, true)
+                    .and_then(|_| super::handoff::apply_submission(state, frame_number, &sealed.submission));
+                if let Err(error) = applied {
+                    state.rollback_to(savepoint);
+                    return Err(error);
+                }
                 Ok(())
             }
             TYPE_SHARD_SPLIT => {
@@ -2187,6 +2194,147 @@ impl GlobalIntrinsic {
         Ok(())
     }
 
+    /// Check one drain header of a seal submission as `invoke_frame_header`
+    /// checks an app frame header — certified by the sealed session itself,
+    /// output, relays and report — except for the lockstep window and the
+    /// storage audit: a drain header is the one that missed its window.
+    fn check_drain_header(
+        &self,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+        state: &HypergraphState,
+        session: &[u8; 32],
+    ) -> Result<()> {
+        let fp = self.frame_prover.as_ref().ok_or_else(|| QuilError::Internal(
+            "seal drain: frame_prover not installed — cannot verify attestation".into(),
+        ))?;
+        let bls = self.bls_constructor.as_ref().ok_or_else(|| QuilError::Internal(
+            "seal drain: bls_constructor not installed — cannot verify attestation".into(),
+        ))?;
+        let pr = self.prover_registry.as_ref().ok_or_else(|| QuilError::Internal(
+            "seal drain: prover_registry not installed — cannot resolve members".into(),
+        ))?;
+        let committee_frame = if op.global_frame_number > 0 { op.global_frame_number } else { frame_number };
+        let (_, _, certified_by) = super::prover_shard_update::verify_frame_header_session(
+            state, op, fp.as_ref(), bls.as_ref(), pr.as_ref(), committee_frame, frame_number,
+        )?;
+        if certified_by != Some(*session) {
+            return Err(QuilError::InvalidArgument("seal drain: header is not certified by the sealed session".into()));
+        }
+        self.verify_shard_frame_output(op)?;
+        super::prover_shard_update::verify_settlement_relay(op)?;
+        #[cfg(feature = "confidential-tokens")]
+        crate::token_intrinsic::global_accumulator::verify_report(&op.address, &op.accumulator)?;
+        #[cfg(feature = "confidential-tokens")]
+        crate::token_intrinsic::global_commit::verify_relay(frame_number, op.frame_number, &op.spends)?;
+        Ok(())
+    }
+
+    /// The sealed source's executed tip once a seal submission's drain
+    /// headers are executed (`execute`) or would be (validation, which writes
+    /// nothing), after checking each one (#699; `handoff::SealSubmission`).
+    /// The recorded tip when it carries none.
+    ///
+    /// Drain headers are the source's frames from the one after GLOBAL's
+    /// executed tip through the sealed checkpoint, consecutive; ones GLOBAL
+    /// already executed are passed over. Executing one records the tip and
+    /// its outflows (settlements, accumulator report, relayed spends) as
+    /// `invoke_frame_header` does, with no reward: the frames GLOBAL rewards
+    /// are the ones it packed in their window.
+    fn seal_drain(
+        &self,
+        frame_number: u64,
+        sealed: &super::handoff::SealSubmission,
+        state: &HypergraphState,
+        execute: bool,
+    ) -> Result<Option<quil_cw_consensus::handoff::Checkpoint>> {
+        use super::handoff;
+        let invalid = |message: &str| QuilError::InvalidArgument(format!("seal drain: {message}"));
+        let id = sealed.submission.seal.session;
+        let recorded = handoff::session_tip(state, &id)?;
+        if sealed.drain.is_empty() {
+            return Ok(recorded);
+        }
+        if frame_number < handoff::seal_drain_frame() {
+            return Err(invalid("drain headers are not active"));
+        }
+        let session = handoff::session(state, &id)?.ok_or_else(|| invalid("no such session"))?;
+        let mut executed = recorded;
+        let mut next = executed.as_ref().map_or(session.base_frame, |tip| tip.frame).saturating_add(1);
+        let mut last: Option<u64> = None;
+        let mut drained = 0usize;
+        for bytes in &sealed.drain {
+            let op = super::frame_header::FrameHeader::from_canonical_bytes(bytes)?;
+            if op.address != session.filter {
+                return Err(invalid("header from another shard"));
+            }
+            if last.is_some_and(|previous| op.frame_number != previous.saturating_add(1)) {
+                return Err(invalid("headers are not consecutive"));
+            }
+            last = Some(op.frame_number);
+            if op.frame_number < next {
+                continue;
+            }
+            if op.frame_number > next {
+                return Err(invalid("headers leave a gap after the executed tip"));
+            }
+            self.check_drain_header(frame_number, &op, state, &id)?;
+            let roots: Option<Vec<[u8; 32]>> =
+                op.state_roots.iter().map(|root| <[u8; 32]>::try_from(root.as_slice()).ok()).collect();
+            let state_roots = roots.and_then(|roots| <[[u8; 32]; 4]>::try_from(roots).ok())
+                .ok_or_else(|| invalid("header state roots are malformed"))?;
+            let tip = quil_cw_consensus::handoff::Checkpoint {
+                frame: op.frame_number,
+                view: op.rank,
+                digest: quil_crypto::poseidon::hash_bytes_to_32(&op.output)?,
+                state_roots,
+                history_root: [0; 32],
+            };
+            if execute {
+                handoff::record_session_tip(state, frame_number, &id, &tip)?;
+                if self.reward_issuance.is_some() && self.hypergraph.is_some() {
+                    super::prover_shard_update::materialize_settlement_records(&op, frame_number, state)?;
+                    #[cfg(feature = "confidential-tokens")]
+                    crate::token_intrinsic::global_accumulator::materialize_report(state, frame_number, &op.address, &op.accumulator)?;
+                    #[cfg(feature = "confidential-tokens")]
+                    crate::token_intrinsic::global_commit::materialize_relay(
+                        state, frame_number, &op.address, op.frame_number, &op.spends,
+                    )?;
+                }
+            }
+            executed = Some(tip);
+            next = next.saturating_add(1);
+            drained += 1;
+        }
+        if last != Some(sealed.submission.seal.checkpoint.frame) {
+            return Err(invalid("headers do not end at the sealed checkpoint"));
+        }
+        if execute && drained > 0 {
+            tracing::info!(
+                frame = frame_number,
+                filter = %hex::encode(&session.filter),
+                session = %hex::encode(id),
+                drained,
+                through = sealed.submission.seal.checkpoint.frame,
+                "committee handoff: executed a seal's drain headers",
+            );
+        }
+        Ok(executed)
+    }
+
+    /// Check a committee-handoff seal submission, its drain headers included,
+    /// without writing anything.
+    pub fn verify_seal_submission(
+        &self,
+        frame_number: u64,
+        sealed: &super::handoff::SealSubmission,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        let executed = self.seal_drain(frame_number, sealed, state, false)?;
+        super::handoff::verify_submission_at(state, frame_number, &sealed.submission, executed)?;
+        Ok(())
+    }
+
     fn invoke_frame_header(
         &self,
         frame_number: u64,
@@ -2802,11 +2950,14 @@ impl GlobalIntrinsic {
         // an epoch boundary). Committed state, so reassignment stays deterministic
         // across nodes (do NOT swap for the async registry cache — that forks the
         // prover tree). None when no hypergraph (reassign falls back to the cache).
-        let prover_scan = self
-            .hypergraph
-            .as_ref()
-            .map(|hg| crate::prover_registry::CommittedProverScan::try_scan(hg))
-            .transpose()?;
+        // Built on first use: a change waiting for its sources to seal stays due
+        // on every frame and never needs it, and building it anyway made every
+        // such frame read all of GLOBAL's committed state (8.6 GB on mainnet;
+        // GLOBAL halted at 865,023 when a notarized frame could no longer be
+        // executed within the proposal budget).
+        let prover_scan = std::cell::OnceCell::new();
+        let cell = &prover_scan;
+        let scan = self.hypergraph.as_deref().map(|hg| move || committed_prover_scan(cell, hg));
         // Stage the local grid topology and pending-record consumption.
         // L1(3) || L2(32) grid key, matching genesis + the original immediate path.
         let grid_key = |l2: &[u8]| -> Vec<u8> {
@@ -2864,7 +3015,6 @@ impl GlobalIntrinsic {
         let mut dropped: Vec<PendingShardChange> = Vec::new();
         let due: Vec<PendingShardChange> = match quil_types::consensus::committee_handoff_policy() {
             Some(policy) => {
-                let scan = prover_scan.as_ref();
                 let even = frame_number >= super::materialize::unified_tree_cutover_frame();
                 let mut ready = Vec::with_capacity(due.len());
                 for change in due {
@@ -2879,7 +3029,7 @@ impl GlobalIntrinsic {
                     let checkpoint = state.changeset_len();
                     let size = |filter: &[u8]| self.split_child_size(filter);
                     match super::handoff::schedule::gate_topology_change_sized(
-                        state, frame_number, &policy, &change, scan, even, &size,
+                        state, frame_number, &policy, &change, scan.as_ref().map(|f| f as _), even, &size,
                     ) {
                         Ok(super::handoff::schedule::TopologyGate::Apply) => ready.push(change),
                         Ok(super::handoff::schedule::TopologyGate::Wait) => {}
@@ -2918,13 +3068,10 @@ impl GlobalIntrinsic {
             if stale_split(change)? {
                 continue;
             }
-            if let Err(e) = self.reassign_shard_allocations(
-                state,
-                &va_disc,
-                change,
-                frame_number,
-                prover_scan.as_ref(),
-            ) {
+            let reassigned = scan.as_ref().map(|scan| scan()).transpose().and_then(|scan| {
+                self.reassign_shard_allocations(state, &va_disc, change, frame_number, scan)
+            });
+            if let Err(e) = reassigned {
                 tracing::error!(
                     frame = frame_number,
                     parent = hex::encode(&change.parent),
@@ -3966,6 +4113,18 @@ fn ed448_pubkey_to_peer_id_string(pubkey: &[u8]) -> String {
 ///
 /// Degrades CLOSED (returns `true`, "still registered") on a store
 /// error so a read failure never spuriously bypasses the halt-risk gate.
+/// `cell`'s committed prover scan of `hg`, read on first use.
+fn committed_prover_scan<'c>(
+    cell: &'c std::cell::OnceCell<crate::prover_registry::CommittedProverScan>,
+    hg: &quil_hypergraph::HypergraphCrdt,
+) -> Result<&'c crate::prover_registry::CommittedProverScan> {
+    if let Some(scan) = cell.get() {
+        return Ok(scan);
+    }
+    let scan = crate::prover_registry::CommittedProverScan::try_scan(hg)?;
+    Ok(cell.get_or_init(|| scan))
+}
+
 fn shard_filter_is_registered(store: &dyn ShardsStore, filter: &[u8]) -> bool {
     let Ok(rows) = store.range_app_shards() else {
         return true;

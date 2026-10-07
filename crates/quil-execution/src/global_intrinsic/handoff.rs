@@ -299,6 +299,108 @@ impl CertificateSubmission {
     }
 }
 
+/// Headers a seal submission may carry: its source's app frames from the one
+/// after GLOBAL's executed tip through the sealed checkpoint.
+pub const MAX_DRAIN_HEADERS: usize = 8;
+
+/// A closing certificate and the drain headers GLOBAL needs to accept it.
+///
+/// A seal is accepted only once GLOBAL has executed its source through the
+/// sealed checkpoint. A running session's frames are carried by later ones
+/// when a header misses its lockstep window, but a sealed session produces no
+/// later frame: if its last headers miss their window GLOBAL never executes
+/// them, the seal is refused until the fence (#699). The seal therefore brings
+/// them: canonical app frame headers (`frame_header::FrameHeader` bytes) of the
+/// source, consecutive, from GLOBAL's executed tip + 1 through the checkpoint.
+/// GLOBAL executes them outside the window, without storage audit or rewards,
+/// from [`seal_drain_frame`].
+///
+/// Encoding: a [`CertificateSubmission`], then, when there are drain headers,
+/// `count(u8) ‖ count × bytes`. Without them the bytes are exactly a
+/// [`CertificateSubmission`]'s, which is what GLOBAL records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealSubmission {
+    pub submission: CertificateSubmission,
+    pub drain: Vec<Vec<u8>>,
+}
+
+impl SealSubmission {
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = self.submission.to_canonical_bytes()?;
+        if !self.drain.is_empty() {
+            if self.drain.len() > MAX_DRAIN_HEADERS {
+                return Err(invalid("too many drain headers"));
+            }
+            out.push(self.drain.len() as u8);
+            for header in &self.drain {
+                put_bytes(&mut out, header)?;
+            }
+        }
+        if out.len() > MAX_RECORD_BYTES {
+            return Err(invalid("certificate submission exceeds size limit"));
+        }
+        Ok(out)
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut c = Cursor::new(bytes)?;
+        c.magic(&TYPE_COMMITTEE_HANDOFF.to_be_bytes())?;
+        let seal = Seal::decode(&c.bytes(MAX_RECORD_BYTES)?)?;
+        let certificate = c.bytes(MAX_RECORD_BYTES)?;
+        let mut drain = Vec::new();
+        if !c.is_finished() {
+            let count = usize::from(c.u8()?);
+            if count == 0 || count > MAX_DRAIN_HEADERS {
+                return Err(invalid("drain header count out of range"));
+            }
+            for _ in 0..count {
+                drain.push(c.bytes(MAX_RECORD_BYTES)?);
+            }
+        }
+        c.finish()?;
+        Ok(Self { submission: CertificateSubmission { seal, certificate }, drain })
+    }
+}
+
+/// From this GLOBAL frame a seal submission may carry drain headers
+/// ([`SealSubmission`]); before it one that does is refused, as an older
+/// build would. Consensus-affecting for GLOBAL. Fixed on mainnet;
+/// `QUIL_SEAL_DRAIN_FRAME` elsewhere, never by default.
+pub const MAINNET_SEAL_DRAIN_FRAME: u64 = 865_440;
+
+static SEAL_DRAIN_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SEAL_DRAIN_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn seal_drain_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SEAL_DRAIN_FRAME;
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's seal drain frame from its network, and return it.
+/// Called at startup before any frame is processed; the first call decides.
+pub fn init_seal_drain_frame(network: u8) -> u64 {
+    *SEAL_DRAIN_FRAME.get_or_init(|| seal_drain_frame_for(network, std::env::var("QUIL_SEAL_DRAIN_FRAME").ok().as_deref()))
+}
+
+pub fn seal_drain_frame() -> u64 {
+    if let Some(frame) = SEAL_DRAIN_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *SEAL_DRAIN_FRAME.get_or_init(|| {
+        std::env::var("QUIL_SEAL_DRAIN_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the seal drain frame for the calling thread only (tests).
+pub fn set_seal_drain_frame_for_thread(frame: Option<u64>) {
+    SEAL_DRAIN_OVERRIDE.with(|cell| cell.set(frame));
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Active,
@@ -757,6 +859,18 @@ pub fn verify_submission(
     frame: u64,
     submission: &CertificateSubmission,
 ) -> Result<Request> {
+    verify_submission_at(state, frame, submission, session_tip(state, &submission.seal.session)?)
+}
+
+/// [`verify_submission`] against `executed`, the source's executed tip once
+/// the submission's drain headers would be executed (the recorded tip when it
+/// carries none): validation checks a drain without writing it.
+pub fn verify_submission_at(
+    state: &impl Records,
+    frame: u64,
+    submission: &CertificateSubmission,
+    executed: Option<Checkpoint>,
+) -> Result<Request> {
     let request = request(state, &submission.seal.request)?
         .ok_or_else(|| invalid("closing certificate has no authorized request"))?;
     if frame <= request.frame {
@@ -798,7 +912,7 @@ pub fn verify_submission(
     // GLOBAL already executed. Such a seal is refused for good; the fence
     // closes the session at its tip.
     let checkpoint = &submission.seal.checkpoint;
-    let drained = match session_tip(state, &submission.seal.session)? {
+    let drained = match executed {
         Some(tip) if tip.frame > checkpoint.frame => {
             return Err(invalid("sealed checkpoint is below the source's executed frames"));
         }

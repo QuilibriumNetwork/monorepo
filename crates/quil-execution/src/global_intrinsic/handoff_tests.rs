@@ -950,6 +950,48 @@ fn first_sessions_wait_for_the_epoch_boundary() {
         "the boundary pass authorizes the first session");
 }
 
+/// A due change that only waits never builds the prover scan, which reads all
+/// of GLOBAL's committed provers: a change is gated on every frame it is due,
+/// and building the scan anyway made every such frame read 8.6 GB on mainnet.
+/// It waits without one when its source closes for another request, and once
+/// scheduled, until its request activates.
+#[test]
+fn a_waiting_topology_change_never_builds_the_prover_scan() {
+    use quil_types::store::{PendingShardChange, ShardChangeKind};
+    let directory = tempfile::tempdir().unwrap();
+    let db = quil_store::RocksDb::open(directory.path()).unwrap();
+    let (_store, state) = make_state(&db);
+    commit(&state, 1);
+    let split = |app: [u8; 32]| PendingShardChange {
+        kind: ShardChangeKind::Split,
+        parent: app.to_vec(),
+        children: [false, true].into_iter().map(|bit| quil_forest::encode_shard_bit_path(&app, &[bit])).collect(),
+        effective_epoch: 2,
+        proposed_frame: 1,
+    };
+    let (closing, scheduled) = (split([9u8; 32]), split([10u8; 32]));
+    let provers = keys();
+    let scan = scan_of(&[(&closing.parent, &provers), (&scheduled.parent, &provers)]);
+    schedule::reconcile_membership(&state, 2, &policy(), &[closing.parent.clone(), scheduled.parent.clone()], &scan)
+        .unwrap();
+    commit(&state, 2);
+    let unused = || -> Result<&crate::prover_registry::CommittedProverScan> { panic!("a waiting change built the prover scan") };
+    let gate = |frame, change: &PendingShardChange| {
+        schedule::gate_topology_change_sized(&state, frame, &policy(), change, Some(&unused), true, &|_| 0).unwrap()
+    };
+
+    // The source closes for a membership change first.
+    schedule(&state, 3, vec![closing.parent.clone()], vec![desired(&closing.parent, &keys())]).unwrap();
+    // The other split is scheduled, with the scan.
+    assert_eq!(schedule::gate_topology_change(&state, 3, &policy(), &scheduled, Some(&scan), true).unwrap(),
+        schedule::TopologyGate::Wait);
+    commit(&state, 3);
+    for frame in 4..7 {
+        assert_eq!(gate(frame, &closing), schedule::TopologyGate::Wait);
+        assert_eq!(gate(frame, &scheduled), schedule::TopologyGate::Wait);
+    }
+}
+
 #[test]
 fn scheduler_holds_a_governed_split_until_its_parent_seals() {
     use quil_types::store::{PendingShardChange, ShardChangeKind};
@@ -1226,6 +1268,46 @@ fn a_seal_waits_until_global_executed_the_source_through_its_checkpoint() {
     record_session_tip(&state, 3, &session, &tip).unwrap();
     assert_eq!(session_tip(&state, &session).unwrap().unwrap().frame, 6, "the tip only rises");
     assert!(super::apply_submission(&state, 3, &seal).unwrap());
+}
+
+/// A seal's drain headers trail the certificate submission: without them the
+/// bytes are a [`CertificateSubmission`]'s, so older builds and GLOBAL's
+/// records read them unchanged. Counts outside 1..=8 and trailing bytes are
+/// refused.
+#[test]
+fn seal_submission_codec_keeps_plain_seals_byte_identical() {
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    let keys = keys();
+    let filter = vec![0x5b; 32];
+    initialize(&state, 1, &initial(filter.clone(), &keys)).unwrap();
+    let request = schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+    let plain = submission(&request, 0, &keys, 6);
+    let bytes = |drain: Vec<Vec<u8>>| SealSubmission { submission: plain.clone(), drain }.to_canonical_bytes();
+
+    let without = bytes(Vec::new()).unwrap();
+    assert_eq!(without, plain.to_canonical_bytes().unwrap());
+    assert_eq!(SealSubmission::from_canonical_bytes(&without).unwrap().drain, Vec::<Vec<u8>>::new());
+
+    let drain = vec![vec![1u8; 40], Vec::new(), vec![3u8; 7]];
+    let with = bytes(drain.clone()).unwrap();
+    let decoded = SealSubmission::from_canonical_bytes(&with).unwrap();
+    assert_eq!((decoded.submission, decoded.drain), (plain.clone(), drain));
+    assert!(CertificateSubmission::from_canonical_bytes(&with).is_err(), "an older build refuses a drain");
+
+    let full = bytes(vec![vec![9u8; 4]; MAX_DRAIN_HEADERS]).unwrap();
+    assert_eq!(SealSubmission::from_canonical_bytes(&full).unwrap().drain.len(), MAX_DRAIN_HEADERS);
+    assert!(bytes(vec![vec![9u8; 4]; MAX_DRAIN_HEADERS + 1]).is_err());
+    let mut over = without.clone();
+    over.push((MAX_DRAIN_HEADERS + 1) as u8);
+    over.extend(std::iter::repeat_n([0u8; 4], MAX_DRAIN_HEADERS + 1).flatten());
+    assert!(SealSubmission::from_canonical_bytes(&over).is_err());
+    let mut empty = without.clone();
+    empty.push(0);
+    assert!(SealSubmission::from_canonical_bytes(&empty).is_err(), "a zero count is not the plain encoding");
+    let mut trailing = with.clone();
+    trailing.push(0);
+    assert!(SealSubmission::from_canonical_bytes(&trailing).is_err());
 }
 
 /// A seal must name the source's executed tip itself. One below it, or at it
