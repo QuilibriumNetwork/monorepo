@@ -15,6 +15,7 @@ set -euxo pipefail
 # Environment overrides:
 #   CARGO_PROFILE   — `release` (default) or `dev`.
 #   CARGO_FEATURES  — passthrough features; e.g. `avx512`.
+#   CARGO_TIMINGS   — set to `1` to save Cargo timing reports in target/.
 #   TARGET_TRIPLE   — override the detected Rust target triple.
 #   QUIL_PLATFORM   — override the destination sub-directory
 #                     (e.g. `amd64_avx512_linux`).
@@ -145,6 +146,9 @@ fi
 pushd "$ROOT_DIR" > /dev/null
 
 cargo_args=(build --bin "$BIN_NAME" -p "$CRATE_NAME")
+if [[ "${CARGO_TIMINGS:-0}" == 1 ]]; then
+    cargo_args+=(--timings)
+fi
 
 case "$CARGO_PROFILE" in
     release) cargo_args+=(--release) ;;

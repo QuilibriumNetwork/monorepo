@@ -28,7 +28,48 @@ use tracing::{debug, info, warn};
 use quil_store::RocksClockStore;
 use quil_types::proto::global::GlobalFrame;
 
-use crate::archive_client::{ArchiveClient, ArchiveClientError};
+use crate::archive_client::{error_chain, ArchiveClient, ArchiveClientError};
+
+/// Frames one poller connection fetched, for telling a slow archive from a
+/// connection that dies: on 2026-10-03 every catch-up fetch one archive made
+/// failed about 30 s after connecting, against each of seven peers.
+struct ConnectionTraffic {
+    opened: Instant,
+    frames: u64,
+    bytes: u64,
+    slowest_ms: u64,
+}
+
+/// A fetch slower than this is logged at info; every fetch is at debug.
+const SLOW_FRAME_FETCH: Duration = Duration::from_secs(2);
+
+impl ConnectionTraffic {
+    fn new() -> Self {
+        Self { opened: Instant::now(), frames: 0, bytes: 0, slowest_ms: 0 }
+    }
+
+    fn age_ms(&self) -> u64 {
+        self.opened.elapsed().as_millis() as u64
+    }
+
+    /// Record a fetched frame (`requested` 0: the head).
+    fn fetched(&mut self, addr: &str, requested: u64, frame: &GlobalFrame, started: Instant) {
+        let elapsed = started.elapsed();
+        let ms = elapsed.as_millis() as u64;
+        let bytes = prost::Message::encoded_len(frame) as u64;
+        self.frames += 1;
+        self.bytes += bytes;
+        self.slowest_ms = self.slowest_ms.max(ms);
+        let frame_number = frame.header.as_ref().map_or(0, |h| h.frame_number);
+        if elapsed >= SLOW_FRAME_FETCH {
+            info!(addr, requested, frame = frame_number, ms, bytes,
+                connection_age_ms = self.age_ms(), "slow archive frame fetch");
+        } else {
+            debug!(addr, requested, frame = frame_number, ms, bytes,
+                connection_age_ms = self.age_ms(), "archive frame fetched");
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum FrameSyncError {
@@ -72,6 +113,10 @@ struct ArchiveEndpointPoolInner {
     /// entry records the instant of the most recent failure; entries older
     /// than `blacklist_ttl` are eligible to be retried.
     blacklist: HashMap<String, Instant>,
+    /// Endpoints that answered with this node's own identity: the mainnet
+    /// archive list names every archive, this one included. They stay in
+    /// `endpoints` (the directory names this node too); `next` skips them.
+    own: std::collections::HashSet<String>,
     /// Index into `endpoints` for the next pick.
     cursor: usize,
 }
@@ -86,6 +131,7 @@ impl ArchiveEndpointPool {
             inner: Mutex::new(ArchiveEndpointPoolInner {
                 endpoints: Vec::new(),
                 blacklist: HashMap::new(),
+                own: std::collections::HashSet::new(),
                 cursor: 0,
             }),
             notify: Notify::new(),
@@ -154,12 +200,19 @@ impl ArchiveEndpointPool {
         for i in 0..len {
             let idx = (start + i) % len;
             let candidate = inner.endpoints[idx].clone();
-            if !inner.blacklist.contains_key(&candidate) {
+            if !inner.blacklist.contains_key(&candidate) && !inner.own.contains(&candidate) {
                 inner.cursor = (idx + 1) % len;
                 return Some(candidate);
             }
         }
         None
+    }
+
+    /// `endpoint` is this node: [`Self::next`] never hands it out again.
+    pub async fn mark_own(&self, endpoint: &str) {
+        if self.inner.lock().await.own.insert(endpoint.to_string()) {
+            info!(%endpoint, "archive endpoint is this node; the poller skips it");
+        }
     }
 
     async fn blacklist(&self, endpoint: &str) {
@@ -231,24 +284,109 @@ const MAX_HELD_UNCERTIFIED: usize = 256;
 /// Store an admitted chain (lowest first) through the store hook, else
 /// canonically, and fire `on_frame` for each stored frame in order. A failed
 /// canonical write stops at that frame, so no later frame is stored above it.
+/// Time [`store_chain`] spent persisting frames and in `on_frame`.
+#[derive(Default)]
+struct StoreTiming {
+    store: Duration,
+    on_frame: Duration,
+}
+
 fn store_chain(
     config: &ArchivePollerConfig,
     clock_store: &RocksClockStore,
     chain: &[GlobalFrame],
-) -> quil_types::error::Result<()> {
+) -> quil_types::error::Result<StoreTiming> {
+    let mut timing = StoreTiming::default();
     if chain.is_empty() {
-        return Ok(());
+        return Ok(timing);
     }
+    let started = Instant::now();
     let taken = config.store_hook.as_ref().is_some_and(|store| store(chain));
+    timing.store += started.elapsed();
     for frame in chain {
+        let started = Instant::now();
         if !taken && !already_canonical(clock_store, frame) {
             clock_store.put_global_frame(frame, None)?;
         }
+        timing.store += started.elapsed();
         if let Some(ref cb) = config.on_frame {
+            let started = Instant::now();
             cb(frame);
+            timing.on_frame += started.elapsed();
         }
     }
-    Ok(())
+    Ok(timing)
+}
+
+/// Work after a fetch slower than this is logged by step. Between two
+/// fetches on one connection the poller spent 25-30 s (2026-10-03), long
+/// enough for the archive to close the idle connection.
+const SLOW_FRAME_PROCESSING: Duration = Duration::from_secs(1);
+
+fn log_slow_processing(
+    addr: &str,
+    frame: u64,
+    validate: Duration,
+    admit: Duration,
+    stored: &StoreTiming,
+    total: Duration,
+) {
+    if total >= SLOW_FRAME_PROCESSING {
+        let ms = |d: Duration| d.as_millis() as u64;
+        info!(
+            addr,
+            frame,
+            total_ms = ms(total),
+            validate_ms = ms(validate),
+            admit_ms = ms(admit),
+            store_ms = ms(stored.store),
+            on_frame_ms = ms(stored.on_frame),
+            "slow archive frame processing"
+        );
+    }
+}
+
+/// Fetch frame `number` (0: the head). An archive closes a connection its
+/// client leaves idle; a request that finds its connection gone goes once
+/// more on a fresh connection to the same archive instead of counting
+/// against it.
+async fn fetch_frame(
+    client: &mut ArchiveClient,
+    addr: &str,
+    number: u64,
+    falcon_signing_key: &[u8],
+    call_timeout: Duration,
+    connection: &mut ConnectionTraffic,
+) -> Result<Result<GlobalFrame, ArchiveClientError>, tokio::time::error::Elapsed> {
+    let started = Instant::now();
+    let mut result = tokio::time::timeout(call_timeout, client.get_global_frame(number)).await;
+    if let Ok(Err(error)) = &result {
+        if error.is_transport_failure() {
+            info!(
+                addr,
+                frame = number,
+                cause = %error_chain(error),
+                connection_age_ms = connection.age_ms(),
+                fetched_on_connection = connection.frames,
+                "archive connection gone under the poller; reconnecting"
+            );
+            let Ok(fresh) = ArchiveClient::connect_archive(addr, falcon_signing_key).await else {
+                return result;
+            };
+            *client = fresh;
+            *connection = ConnectionTraffic::new();
+            let started = Instant::now();
+            result = tokio::time::timeout(call_timeout, client.get_global_frame(number)).await;
+            if let Ok(Ok(frame)) = &result {
+                connection.fetched(addr, number, frame, started);
+            }
+            return result;
+        }
+    }
+    if let Ok(Ok(frame)) = &result {
+        connection.fetched(addr, number, frame, started);
+    }
+    result
 }
 
 /// Whether the canonical clock already holds exactly `frame`, as it does for a
@@ -521,6 +659,7 @@ pub async fn run_archive_poller(
     // forward. Switch endpoints on an RPC failure OR when an endpoint stops
     // being ahead of us (see the no-progress handling below).
     let mut current_client: Option<(String, ArchiveClient)> = None;
+    let mut connection = ConnectionTraffic::new();
     // Use the local store's latest as our starting "last seen", so a
     // restart doesn't re-fetch frames we already have.
     let mut last_frame: u64 = clock_store.get_latest_frame_number().unwrap_or(0);
@@ -697,10 +836,15 @@ pub async fn run_archive_poller(
         // Acquire a working client.
         if current_client.is_none() {
             if let Some(addr) = pool.next().await {
-                match ArchiveClient::connect_mtls(&addr, &falcon_signing_key).await {
+                match ArchiveClient::connect_archive(&addr, &falcon_signing_key).await {
                     Ok(c) => {
                         info!(%addr, "archive poller connected");
                         current_client = Some((addr, c));
+                        connection = ConnectionTraffic::new();
+                    }
+                    Err(e) if e.is_own_endpoint() => {
+                        pool.mark_own(&addr).await;
+                        continue;
                     }
                     Err(e) => {
                         debug!(%addr, error = %e, "poller connect failed");
@@ -721,9 +865,14 @@ pub async fn run_archive_poller(
         };
 
         // 1. Fetch the latest frame.
-        let head = match tokio::time::timeout(
+        let fetch_started = Instant::now();
+        let head = match fetch_frame(
+            client,
+            &addr,
+            0,
+            &falcon_signing_key,
             config.call_timeout,
-            client.get_global_frame(0),
+            &mut connection,
         )
         .await
         {
@@ -740,13 +889,27 @@ pub async fn run_archive_poller(
                 continue;
             }
             Ok(Err(e)) => {
-                warn!(%addr, error = %e, "archive head fetch failed");
+                warn!(
+                    %addr,
+                    error = %e,
+                    cause = %error_chain(&e),
+                    fetch_ms = fetch_started.elapsed().as_millis() as u64,
+                    connection_age_ms = connection.age_ms(),
+                    fetched_on_connection = connection.frames,
+                    bytes_on_connection = connection.bytes,
+                    "archive head fetch failed"
+                );
                 pool.blacklist(&addr).await;
                 current_client = None;
                 continue;
             }
             Err(_elapsed) => {
-                warn!(%addr, "archive head fetch timed out");
+                warn!(
+                    %addr,
+                    connection_age_ms = connection.age_ms(),
+                    fetched_on_connection = connection.frames,
+                    "archive head fetch timed out"
+                );
                 pool.blacklist(&addr).await;
                 current_client = None;
                 continue;
@@ -864,13 +1027,19 @@ pub async fn run_archive_poller(
                         continue;
                     }
                 }
-                match tokio::time::timeout(
+                let fetch_started = Instant::now();
+                match fetch_frame(
+                    client,
+                    &addr,
+                    fn_,
+                    &falcon_signing_key,
                     config.call_timeout,
-                    client.get_global_frame(fn_),
+                    &mut connection,
                 )
                 .await
                 {
                     Ok(Ok(frame)) => {
+                        let processing = Instant::now();
                         // Gate BEFORE persist — genesis-prover allowlist +
                         // VDF/BLS, mirroring the gossip GLOBAL_FRAME handler.
                         // A frame that fails validation is never stored and
@@ -886,16 +1055,31 @@ pub async fn run_archive_poller(
                                 break;
                             }
                         }
+                        let validated = processing.elapsed();
                         let chain = admit_frame(config.frame_certified.as_ref(), &mut held, frame);
-                        if let Err(e) = store_chain(&config, &clock_store, &chain) {
+                        let admitted = processing.elapsed();
+                        let stored = store_chain(&config, &clock_store, &chain).unwrap_or_else(|e| {
                             warn!(error = %e, frame = fn_, "store catchup frame failed");
-                        }
+                            StoreTiming::default()
+                        });
+                        log_slow_processing(&addr, fn_, validated, admitted - validated, &stored, processing.elapsed());
                         // Advance over each fetched frame (stored, or held until a
                         // certified frame links to it) so progress is durable.
                         last_frame = fn_;
                     }
                     Ok(Err(e)) => {
-                        warn!(%addr, frame = fn_, error = %e, "catchup fetch error");
+                        warn!(
+                            %addr,
+                            frame = fn_,
+                            error = %e,
+                            cause = %error_chain(&e),
+                            fetch_ms = fetch_started.elapsed().as_millis() as u64,
+                            connection_age_ms = connection.age_ms(),
+                            fetched_on_connection = connection.frames,
+                            bytes_on_connection = connection.bytes,
+                            slowest_fetch_ms = connection.slowest_ms,
+                            "catchup fetch error"
+                        );
                         failed_not_found = matches!(
                             &e,
                             ArchiveClientError::Rpc(s) if s.code() == tonic::Code::NotFound
@@ -904,7 +1088,15 @@ pub async fn run_archive_poller(
                         break;
                     }
                     Err(_) => {
-                        warn!(%addr, frame = fn_, "catchup timeout");
+                        warn!(
+                            %addr,
+                            frame = fn_,
+                            connection_age_ms = connection.age_ms(),
+                            fetched_on_connection = connection.frames,
+                            bytes_on_connection = connection.bytes,
+                            slowest_fetch_ms = connection.slowest_ms,
+                            "catchup timeout"
+                        );
                         failed_frame = Some(fn_);
                         break;
                     }
@@ -993,22 +1185,29 @@ pub async fn run_archive_poller(
         // gossip GLOBAL_FRAME handler. A head frame failing validation is
         // dropped: don't store, don't fire on_frame, and don't advance
         // last_frame (the next tick re-polls the head).
+        let processing = Instant::now();
         if let Some(ref validate) = config.frame_validator {
             if !validate(&head) {
                 debug!(%addr, frame = new_number, "head frame failed validation — dropping");
                 continue;
             }
         }
+        let validated = processing.elapsed();
         let admitted = admit_frame(config.frame_certified.as_ref(), &mut held, head);
         if admitted.is_empty() {
             debug!(frame = new_number, "head frame carries no certificate of its own — held until a certified frame links to it");
             last_frame = new_number;
             continue;
         }
-        if let Err(e) = store_chain(&config, &clock_store, &admitted) {
-            warn!(error = %e, frame = new_number, "store head frame failed");
-            continue;
-        }
+        let admit = processing.elapsed() - validated;
+        let stored = match store_chain(&config, &clock_store, &admitted) {
+            Ok(stored) => stored,
+            Err(e) => {
+                warn!(error = %e, frame = new_number, "store head frame failed");
+                continue;
+            }
+        };
+        log_slow_processing(&addr, new_number, validated, admit, &stored, processing.elapsed());
         info!(
             head = new_number,
             gap = new_number.saturating_sub(last_frame),
@@ -1094,6 +1293,19 @@ mod pool_tests {
             vec!["a:1", "b:1"],
             "blacklist must not prune endpoints from get_all"
         );
+    }
+
+    #[tokio::test]
+    async fn an_own_endpoint_is_skipped_but_still_listed() {
+        let pool = pool();
+        pool.add("self:1".into()).await;
+        pool.add("b:1".into()).await;
+        pool.mark_own("self:1").await;
+        assert_eq!(pool.next().await.as_deref(), Some("b:1"));
+        assert_eq!(pool.next().await.as_deref(), Some("b:1"));
+        let mut all = pool.get_all().await;
+        all.sort();
+        assert_eq!(all, vec!["b:1", "self:1"], "the directory still names this node");
     }
 
     /// Regression: prior to the TTL fix a single timeout permanently

@@ -33,12 +33,12 @@
 //! history and keep the legacy verifier forever; frames above it verify against
 //! the registered members.
 use quil_cw_consensus::handoff::{Checkpoint, Cursor, Session};
-use quil_types::consensus::CommitteeHandoffPolicy;
+use quil_types::consensus::{CommitteeHandoffPolicy, LegacyHistory};
 use quil_types::error::{QuilError, Result};
 use sha2::{Digest as _, Sha256};
 
 use super::schedule::{desired_members, reserve, reserved};
-use super::{atomic, create_session, head, invalid, read, record_session_tip, schedule, set_status, write, DesiredCommittee, Records};
+use super::{atomic, create_session, head, invalid, read, record_member_rings, record_session_tip, schedule, set_status, write, DesiredCommittee, Records};
 use crate::hypergraph_state::HypergraphState;
 use crate::prover_registry::CommittedProverScan;
 
@@ -130,9 +130,12 @@ pub struct LegacySource {
     pub tip: LegacyTip,
 }
 
-/// Whether legacy tips are recorded for headers executed at `frame`.
+/// Whether legacy tips are recorded for headers executed at `frame`. Never
+/// under a flag day ([`LegacyHistory::Discard`]): no shard is pending, so
+/// every shard receives a first session at frame 0.
 pub fn records_tips(policy: &CommitteeHandoffPolicy, frame: u64) -> bool {
-    frame >= policy.activation_frame.saturating_sub(LEGACY_TIP_LEAD)
+    policy.legacy_history == LegacyHistory::Migrate
+        && frame >= policy.activation_frame.saturating_sub(LEGACY_TIP_LEAD)
 }
 
 pub fn tip(state: &impl Records, filter: &[u8]) -> Result<Option<LegacyTip>> {
@@ -211,6 +214,7 @@ fn register_source(
     // A source without origins: nothing seals into generation zero.
     write(state, frame, b"origin", &id, &[])?;
     set_status(state, frame, &id, 0, None)?;
+    record_member_rings(state, frame, &id, &session, &[], false)?;
     let mut record = frame.to_be_bytes().to_vec();
     record.extend_from_slice(&tip.encode());
     write(state, frame, b"legacy-source", &id, &record)?;
@@ -234,7 +238,7 @@ pub fn migrate(
     filters: &[Vec<u8>],
     scan: &CommittedProverScan,
 ) -> Result<usize> {
-    if frame < policy.activation_frame {
+    if frame < policy.activation_frame || policy.legacy_history != LegacyHistory::Migrate {
         return Ok(0);
     }
     let epoch = quil_types::consensus::epoch_for_frame(frame);

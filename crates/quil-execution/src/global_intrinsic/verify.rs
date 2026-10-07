@@ -333,6 +333,17 @@ pub fn verify_prover_join_signatures(
     key_manager: &dyn KeyManager,
     consumed_merge_check: Option<&dyn Fn(&[u8]) -> bool>,
 ) -> Result<bool> {
+    Ok(verify_prover_join_key_signatures(op, validation, key_manager)?
+        && verify_prover_join_merge_signatures(op, validation, key_manager, consumed_merge_check)?)
+}
+
+/// Checks 1 and 2 of [`verify_prover_join_signatures`]: the joining key's
+/// signature over the join and its proof of possession.
+pub fn verify_prover_join_key_signatures(
+    op: &ProverJoin,
+    validation: &ProverJoinValidation,
+    key_manager: &dyn KeyManager,
+) -> Result<bool> {
     let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
         QuilError::InvalidArgument("prover join verify: missing signature".into())
     })?;
@@ -377,10 +388,17 @@ pub fn verify_prover_join_signatures(
         &sig.pop_signature,
         POP_DOMAIN,
     )?;
-    if !ok {
-        return Ok(false);
-    }
+    Ok(ok)
+}
 
+/// Check 3 of [`verify_prover_join_signatures`]: one Ed448 signature per merge
+/// target, and the decoder does not cap how many targets a join carries.
+pub fn verify_prover_join_merge_signatures(
+    op: &ProverJoin,
+    validation: &ProverJoinValidation,
+    key_manager: &dyn KeyManager,
+    consumed_merge_check: Option<&dyn Fn(&[u8]) -> bool>,
+) -> Result<bool> {
     // 3. Merge target signatures — each signs the local BLS pubkey
     //    with an Ed448 (or other) key under the "PROVER_JOIN_MERGE"
     //    domain. Skip targets whose spent-vertex already exists.

@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod message_envelope;
 pub mod prover_registry;
 pub mod seniority_compat;
+pub mod step_timing;
 #[cfg(any(test, feature = "testing-stubs"))]
 pub mod testing;
 #[cfg(all(test, feature = "confidential-tokens"))]

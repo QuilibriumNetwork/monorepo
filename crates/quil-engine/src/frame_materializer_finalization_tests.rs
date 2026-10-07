@@ -545,3 +545,65 @@ fn a_failed_canonical_attempt_leaves_nothing_to_recover() {
     ));
     assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 1);
 }
+
+// A finalized frame has to execute: capping its reads only discarded six
+// attempts at the split at 837360 and pushed it onto the in-place path.
+#[test]
+fn a_finalized_frame_is_not_refused_for_what_it_reads() {
+    use crate::frame_materializer::CanonicalAttempt;
+    let fixture = Fixture::new(None);
+    let root = fixture
+        .source
+        .hypergraph
+        .current_forest_phase_root(&[0xff; 32], 0)
+        .unwrap();
+    let input = frame(1, root);
+    store_canonical(&fixture, &input);
+    let mut capped = limits();
+    capped.execution.state.overlay.max_read_bytes = 64;
+    match fixture.source.materialize_canonical_atomically(&input, capped) {
+        CanonicalAttempt::Unavailable(error) => {
+            assert!(error.to_string().contains("overlay read byte limit: 64 bytes allowed"), "{error}")
+        }
+        other => panic!("expected the read cap to refuse the frame, got {other:?}"),
+    }
+    assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 0);
+    let lifted = capped.for_finalized_frame();
+    assert_eq!(lifted.execution.state.overlay.max_delta_bytes, capped.execution.state.overlay.max_delta_bytes);
+    assert!(matches!(
+        fixture.source.materialize_canonical_atomically(&input, lifted),
+        CanonicalAttempt::Published(_)
+    ));
+    assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 1);
+}
+
+// Publication locks are held briefly by readers and writers on a busy
+// archive. Giving up on the first conflict threw away the executed frame
+// three times per frame on one archive, then ran it in place.
+#[test]
+fn a_canonical_attempt_waits_out_a_brief_lock_holder() {
+    use crate::frame_materializer::CanonicalAttempt;
+    let fixture = Fixture::new(None);
+    let root = fixture
+        .source
+        .hypergraph
+        .current_forest_phase_root(&[0xff; 32], 0)
+        .unwrap();
+    let input = frame(1, root);
+    store_canonical(&fixture, &input);
+    let clock = fixture.clock.clone();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _held = clock.prepare_execution_publication().unwrap();
+        held_tx.send(()).unwrap();
+        // Longer than executing the frame takes, shorter than the patience.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    });
+    held_rx.recv().unwrap();
+    let started = std::time::Instant::now();
+    let attempt = fixture.source.materialize_canonical_atomically(&input, limits());
+    assert!(matches!(attempt, CanonicalAttempt::Published(_)), "{attempt:?} after {:?}", started.elapsed());
+    assert!(started.elapsed() >= std::time::Duration::from_millis(100), "the lock was contended");
+    holder.join().unwrap();
+    assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 1);
+}

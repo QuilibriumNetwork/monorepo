@@ -170,6 +170,29 @@ impl GlobalSeamProposer {
         (frame_digest(header) == Some(digest)).then_some(header.frame_number)
     }
 
+    /// The selected parent's recorded timestamp, from whichever local copy
+    /// holds it. Not authenticated here: it only sets the pacing wait, which
+    /// is capped at one interval and re-checked on the authenticated parent
+    /// while proving.
+    fn selected_parent_timestamp(&self, digest: Digest, number: u64) -> Option<i64> {
+        let recorded = |frame: GlobalFrame| {
+            frame
+                .header
+                .filter(|h| h.frame_number == number && frame_digest(h) == Some(digest))
+                .map(|h| h.timestamp)
+        };
+        if let Some(bytes) = self.block_store.as_ref().and_then(|store| store.get(&digest)) {
+            if let Some(timestamp) = decode_global_frame(&bytes).ok().and_then(recorded) {
+                return Some(timestamp);
+            }
+        }
+        self.clock_store
+            .get_global_clock_frame_candidate(number, digest.as_ref())
+            .ok()
+            .and_then(recorded)
+            .or_else(|| self.clock_store.get_global_clock_frame(number).ok().and_then(recorded))
+    }
+
     fn persist_selected_parent(&self, digest: Digest, number: u64) -> bool {
         let Some(store) = self.block_store.as_ref() else { return true };
         let matches = |frame: &GlobalFrame| frame.header.as_ref()
@@ -310,23 +333,33 @@ impl GlobalProposer for GlobalSeamProposer {
     }
 
     fn verify_with_context(&self, context: ProposalContext, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
+        self.verify_or_defer(context, digest, bytes).unwrap_or(false)
+    }
+
+    /// Defers only while this node's own execution is busy (publishing the
+    /// previous frame, proposing, or checking another proposal). Answering then
+    /// nullified valid proposals at once, and a view needs 4 of 5 votes.
+    fn verify_or_defer(&self, context: ProposalContext, digest: Digest, bytes: Option<Vec<u8>>) -> Result<bool, std::time::Duration> {
+        const DEFER: std::time::Duration = std::time::Duration::from_millis(200);
         let Some(executor) = self.selected_execution.as_ref() else {
-            return self.verify(context.view, context.parent, digest, bytes);
+            return Ok(self.verify(context.view, context.parent, digest, bytes));
         };
-        if !executor.accepts_context(context) || !executor.binds_clock(self.clock_store.as_ref()) { return false; }
-        let Some(bytes) = bytes.filter(|b| b.len() <= executor.max_frame_bytes()) else { return false };
-        let Ok(frame) = decode_global_frame(&bytes) else { return false };
-        let Some(header) = frame.header.as_ref() else { return false };
+        if !executor.accepts_context(context) || !executor.binds_clock(self.clock_store.as_ref()) { return Ok(false); }
+        if executor.busy() { return Err(DEFER); }
+        let Some(bytes) = bytes.filter(|b| b.len() <= executor.max_frame_bytes()) else { return Ok(false) };
+        let Ok(frame) = decode_global_frame(&bytes) else { return Ok(false) };
+        let Some(header) = frame.header.as_ref() else { return Ok(false) };
         if header.rank != context.view || header.parent_selector != context.parent.as_ref()
             || frame_digest(header) != Some(digest) || !self.verifier.validate(&frame).unwrap_or(false)
-            || !self.verifier.verify_global_requests_root(header, &frame.requests) { return false; }
-        let Some(number) = self.selected_parent_number(context.parent) else { return false };
-        let Some(blocks) = self.block_store.as_ref() else { return false };
+            || !self.verifier.verify_global_requests_root(header, &frame.requests) { return Ok(false); }
+        let Some(number) = self.selected_parent_number(context.parent) else { return Ok(false) };
+        let Some(blocks) = self.block_store.as_ref() else { return Ok(false) };
         let prepared = match executor.prepare(context, number, blocks, &self.verifier, false) {
             Ok(prepared) => prepared,
+            Err(_) if executor.busy() => return Err(DEFER),
             Err(error) => {
                 tracing::warn!(view = context.view, parent = number, %error, "selected GLOBAL verification parent unavailable");
-                return false;
+                return Ok(false);
             }
         };
         if !prepared.matches_child(header) {
@@ -342,22 +375,37 @@ impl GlobalProposer for GlobalSeamProposer {
                     cb(declared);
                 }
             }
-            return false;
+            return Ok(false);
         }
-        if prepared.check().is_err() { return false; }
+        if prepared.check().is_err() { return Ok(false); }
         for ancestor in prepared.ancestors() {
-            if !self.persist_candidate(ancestor) { return false; }
+            if !self.persist_candidate(ancestor) { return Ok(false); }
         }
-        if !self.persist_candidate(&frame) { return false; }
-        if prepared.check().is_err() { return false; }
+        if !self.persist_candidate(&frame) { return Ok(false); }
+        if prepared.check().is_err() { return Ok(false); }
         self.note_frame(digest, header.frame_number);
-        true
+        Ok(true)
     }
 
     fn propose_retry(&self) -> Option<std::time::Duration> {
         // Missing parents and materialization lag can clear during this view.
         // Avoid creating journals at network speed while every leader waits.
         Some(std::time::Duration::from_secs(1))
+    }
+
+    /// Wait out the leader's interval pacing before preparing: a
+    /// selected-parent proposal holds the GLOBAL execution lease from
+    /// preparation to proof, and pacing inside it held the lease ~10 s on
+    /// every proposal, so the proposer published its parent ~10 s late and
+    /// deferred its own votes (2026-10-04).
+    fn proposal_pacing(&self, context: ProposalContext) -> Option<std::time::Duration> {
+        let number = self.selected_parent_number(context.parent)?;
+        let timestamp = self.selected_parent_timestamp(context.parent, number)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        Some(crate::leader_provider::proposal_pacing_wait(timestamp, now_ms)).filter(|wait| !wait.is_zero())
     }
     fn propose(&self, view: u64, parent_digest: Digest) -> Option<(Digest, Vec<u8>)> {
         if self.selected_execution.is_some() { return None; } // Full context is mandatory.

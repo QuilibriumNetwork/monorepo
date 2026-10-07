@@ -209,7 +209,7 @@ pub fn proto_message_request_to_canonical_inner_bytes(
 
     match inner {
         Inner::CommitteeHandoff(bytes) => {
-            crate::global_intrinsic::handoff::CertificateSubmission::from_canonical_bytes(bytes)?;
+            crate::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(bytes)?;
             Ok(bytes.clone())
         }
         Inner::Join(p) => {

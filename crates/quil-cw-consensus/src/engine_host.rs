@@ -170,9 +170,12 @@ where
         skip_timeout: ViewDelta::new(params.skip_timeout),
         fetch_concurrent: NZUsize!(4),
         replay_buffer: NZUsize!(1024 * 1024),
-        // One writer buffer exists per unpruned view. Votes and certificates
-        // are small; larger records flush in chunks without changing format.
-        write_buffer: NZUsize!(16 * 1024),
+        // One writer buffer exists per unpruned view, and a session that does
+        // not finalize keeps every view since its last finalization. Two
+        // 1 KiB pages is the writer's floor; a vote fits, and a certificate
+        // (up to ~23 KB at 34 members) bypasses the buffer in whole pages.
+        // The on-disk format does not depend on it.
+        write_buffer: NZUsize!(2 * 1024),
         page_cache: CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10)),
         forwarding: ForwardingPolicy::Disabled,
     };

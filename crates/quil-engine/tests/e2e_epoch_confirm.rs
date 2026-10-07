@@ -1257,3 +1257,65 @@ async fn tier2_composite_end_to_end() {
         post_last_active
     );
 }
+
+/// Exercise the real dispatch API with signed canonical messages. Different
+/// action kinds on one filter share ownership; unrelated filters still publish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_dispatch_reserves_before_spawning_across_action_kinds() {
+    use quil_engine::prover_message_transport::ProverMessageTransport;
+    use quil_engine::provers::lifecycle::LifecycleAction;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct BlockedTransport {
+        started: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        count: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ProverMessageTransport for BlockedTransport {
+        async fn latest_global_frame_header(&self) -> QResult<gpb::GlobalFrameHeader> {
+            Ok(gpb::GlobalFrameHeader { frame_number: 10, ..Default::default() })
+        }
+        async fn publish_prover_bundle(&self, bytes: Vec<u8>) -> QResult<()> {
+            // The test must reach actual canonical encoding and transport.
+            quil_engine::consensus_wire::decode_message_bundle(&bytes)?;
+            self.count.fetch_add(1, Ordering::SeqCst);
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(())
+        }
+    }
+    let prover = TestProver::generate();
+    let transport = Arc::new(BlockedTransport {
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        count: AtomicUsize::new(0),
+    });
+    let test_transport = Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
+    let mut rig = build_test_pipeline_with_registry(&prover, test_transport,
+        Arc::new(TestProverRegistry::new()));
+    Arc::get_mut(&mut rig.pipeline).unwrap().transport = transport.clone();
+    let first = vec![0xA1; 35];
+    rig.pipeline.dispatch(LifecycleAction::RejectLeaves {
+        filters: vec![first.clone()], frame_number: 10,
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), transport.started.acquire())
+        .await.unwrap().unwrap().forget();
+    rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves {
+        filters: vec![first.clone()], frame_number: 11,
+    });
+    rig.pipeline.dispatch(LifecycleAction::ProposeLeave {
+        filters: vec![vec![0xB2; 35]], frame_number: 11,
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), transport.started.acquire())
+        .await.unwrap().unwrap().forget();
+    assert_eq!(transport.count.load(Ordering::SeqCst), 2,
+        "only the rejection and the independent filter may publish");
+    transport.release.add_permits(2);
+    // Repeating the conflicting operation immediately remains fenced whether
+    // the first task is still finishing or has recorded successful publication.
+    rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves {
+        filters: vec![first], frame_number: 12,
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(transport.count.load(Ordering::SeqCst), 2);
+}

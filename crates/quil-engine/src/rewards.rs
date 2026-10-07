@@ -43,7 +43,7 @@ use quil_types::error::Result;
 pub use quil_execution::pricing::{
     fee_multiplier_for_cost, get_baseline_fee, pomw_basis, POMW_NUMERATOR, QUIL_TOKEN_UNITS,
 };
-use quil_execution::pricing::POMW_SCALE_BITS;
+use quil_execution::pricing::allocation_ring_reward;
 
 /// PoMW reward issuance.
 pub struct OptRewardIssuance;
@@ -66,51 +66,10 @@ impl RewardIssuance for OptRewardIssuance {
         for allocs in provers {
             let mut total = BigInt::zero();
             for alloc in allocs.values() {
-                // divisor = 2^(ring + 1). u8 fits up to ring 62.
-                let ring = alloc.ring.min(62);
-                let divisor_u64: u64 = 1u64 << (ring as u32 + 1);
-                let divisor_bi = BigInt::from(divisor_u64);
-
-                if alloc.shards == 0 {
-                    continue;
-                }
-
-                // shard_factor = shards^(1/2) carrying POMW_SCALE_BITS
-                // fractional bits. Same trick as `pomw_basis`
-                // generation=1.
-                let shards_scaled =
-                    BigInt::from(alloc.shards) << (2u32 * POMW_SCALE_BITS);
-                let shards_sqrt = shards_scaled.sqrt();
-                if shards_sqrt.is_zero() {
-                    continue;
-                }
-
-                // Match Go's `decimal.Decimal` chain (88-104 of
-                // `optimized_proof_of_meaningful_work.go`): each
-                // intermediate `Div` keeps full decimal precision and
-                // only the final `result.BigInt()` truncates. To match
-                // this in integer arithmetic, fuse the chain into a
-                // single division and pre-scale by `POMW_SCALE_BITS` so
-                // the `shards_sqrt` factor cancels:
-                //
-                //   step3 = (state_size * basis * 2^POMW_SCALE_BITS)
-                //         / (world * divisor * shards_sqrt)
-                //
-                // shards_sqrt carries POMW_SCALE_BITS fractional bits;
-                // dividing by it removes those bits, so we pre-multiply
-                // by 2^POMW_SCALE_BITS to land back at integer scale.
-                // The fused division has at most one truncation —
-                // matching Go's "single BigInt() conversion at the end"
-                // far more closely than the previous three sequential
-                // truncations.
-                let num = BigInt::from(alloc.state_size)
-                    * &basis
-                    << POMW_SCALE_BITS;
-                let denom = &world_bi * &divisor_bi * &shards_sqrt;
-                if denom.is_zero() {
-                    continue;
-                }
-                let step3 = num / denom;
+                let step3 = allocation_ring_reward(
+                    &basis, &BigInt::from(alloc.state_size), &world_bi,
+                    alloc.ring, alloc.shards,
+                );
 
                 total += step3;
             }
@@ -398,5 +357,37 @@ mod tests {
         let empty_world =
             r.calculate(difficulty, 0, units, &one_alloc(0, 1, 1 << 28)).unwrap()[0].clone();
         assert!(empty_world.is_zero(), "empty world → 0 reward, got {empty_world}");
+    }
+}
+
+#[cfg(test)]
+mod allocation_arithmetic_characterization {
+    use super::*;
+
+    // Frozen pre-extraction issuance path, deliberately independent of the
+    // shared helper. Covers accumulation and ring clamping as well as roots.
+    #[test]
+    fn shared_arithmetic_preserves_previous_issuance() {
+        for difficulty in [0, 5_000, 50_000, 100_000_000] {
+            for world in [0, 1, 17, 1 << 30, u64::MAX] {
+                for ring in [0, 1, 2, 62, 63, 255] {
+                    let mut allocations = HashMap::new();
+                    let basis = pomw_basis(difficulty, world, QUIL_TOKEN_UNITS);
+                    let mut expected = BigInt::zero();
+                    for (index, shards) in [0, 1, 2, 3, 4, 5, 7, 16, u64::MAX].into_iter().enumerate() {
+                        let state_size = [0, 1, 17, u64::MAX][index % 4];
+                        allocations.insert(index.to_string(), ProverAllocation { ring, shards, state_size });
+                        if world != 0 && shards != 0 {
+                            let sqrt = (BigInt::from(shards) << 106u32).sqrt();
+                            let divisor = BigInt::from(1u64 << (u32::from(ring.min(62)) + 1));
+                            expected += (BigInt::from(state_size) * &basis << 53u32)
+                                / (BigInt::from(world) * divisor * sqrt);
+                        }
+                    }
+                    let actual = OptRewardIssuance.calculate(difficulty, world, QUIL_TOKEN_UNITS, &[allocations, HashMap::new()]).unwrap();
+                    assert_eq!(actual, vec![expected, BigInt::zero()], "difficulty={difficulty}, world={world}, ring={ring}");
+                }
+            }
+        }
     }
 }

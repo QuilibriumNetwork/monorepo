@@ -61,6 +61,7 @@ pub enum ShardInfoRefreshError {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ArchiveShardInfo {
     pub sizes: HashMap<Vec<u8>, u64>,
+    pub data_shards: HashMap<Vec<u8>, u64>,
     pub frozen: HashSet<Vec<u8>>,
 }
 
@@ -235,6 +236,7 @@ fn record_shard_infos(
         if info.pending_change {
             out.frozen.insert(filter.clone());
         }
+        out.data_shards.insert(filter.clone(), info.data_shards);
         out.sizes.insert(filter, bigint_to_u64_saturating(&info.size));
     }
 }
@@ -270,6 +272,19 @@ fn bigint_to_u64_saturating(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_refresh_retains_data_shard_counts() {
+        let key = vec![0x11; 35];
+        let mut found = ArchiveShardInfo::default();
+        record_shard_infos(&key, vec![quil_types::proto::global::AppShardInfo {
+            prefix: vec![0x20], size: vec![42], data_shards: 16,
+            ..Default::default()
+        }], &mut found);
+        let filter = build_filter(&key, &[0x20]).unwrap();
+        assert_eq!(found.sizes[&filter], 42);
+        assert_eq!(found.data_shards[&filter], 16);
+    }
 
     #[test]
     fn build_filter_strips_l1_and_appends_prefix() {

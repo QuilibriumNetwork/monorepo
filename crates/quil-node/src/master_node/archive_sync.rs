@@ -7,6 +7,30 @@ use quil_keys::KeyManager as _;
 
 use quil_lifecycle::Supervisor;
 
+/// Reuse an authenticated startup jump before considering the fallback pull.
+/// A dropped sender means the jump task failed; it must not enable lifecycle.
+async fn bootstrap_prover_sync<F, Fut>(
+    jump: tokio::sync::oneshot::Receiver<Option<u64>>,
+    cancel: &tokio_util::sync::CancellationToken,
+    fallback: F,
+) -> Option<bool>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let completed = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return None,
+        result = jump => result.ok().flatten(),
+    };
+    if let Some(frame) = completed {
+        info!(frame, "initial prover sync: reusing authenticated startup state jump");
+        Some(true)
+    } else {
+        Some(fallback().await)
+    }
+}
+
 /// Whether the archive shard-info refresh is due: first load, every
 /// `REFRESH_CADENCE_FRAMES` (60, ~10 min on mainnet), and a couple of frames
 /// after each epoch boundary. Splits and merges flip at epoch boundaries;
@@ -43,6 +67,19 @@ const RUNTIME_GAP_CHECK: std::time::Duration = std::time::Duration::from_secs(60
 /// shard member validates frames citing GLOBAL frames this far back (1,374
 /// below the head has been observed); older records are left to retention.
 const REGULAR_GAP_WINDOW: u64 = 2 * 1440;
+
+/// Frames below the head an archive's background fill looks for holes in: the
+/// last two epochs. An older hole is history no peer serves; scanning the whole
+/// chain had a lagging archive retry one every 3 s, from frame 257,487 up.
+fn archive_gap_window() -> u64 {
+    2 * quil_types::consensus::epoch_length_frames()
+}
+
+/// The frame-record holes an archive's background fill backfills.
+fn recent_record_gaps(clock: &quil_store::RocksClockStore) -> Vec<(u64, u64)> {
+    let head = clock.get_latest_frame_number().unwrap_or(0);
+    clock.find_global_frame_record_gaps_from(head.saturating_sub(archive_gap_window()))
+}
 
 /// Passes a regular spends on one hole before leaving it to retention.
 const REGULAR_GAP_ATTEMPTS: u32 = 5;
@@ -474,8 +511,8 @@ fn canonical_hole_frame(
     Ok(())
 }
 
-/// Scan the ENTIRE persisted frame-record range for internal gaps left by
-/// prior restarts and backfill each one. The reseed-anchored backfill
+/// Scan the last two epochs of frame records for internal gaps left
+/// by prior restarts and backfill each one. The reseed-anchored backfill
 /// (`run_record_only_backfill` called from bootstrap) only covers the single
 /// open range ABOVE the head (`[canonical_head+1, reseed-1]`); it does not see
 /// the many small 2-3 frame holes scattered BELOW the head that accumulate
@@ -491,12 +528,10 @@ async fn run_all_gap_backfill(
     seed: Vec<u8>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    // The gap scan walks the whole frame keyspace (key-only, no decode) — run
-    // it on a blocking thread so it never stalls the async runtime.
+    // Key-only and windowed, but still a keyspace walk: run it on a blocking
+    // thread so it never stalls the async runtime.
     let scan_cs = clock_store.clone();
-    let gaps = match tokio::task::spawn_blocking(move || {
-        scan_cs.find_global_frame_record_gaps()
-    })
+    let gaps = match tokio::task::spawn_blocking(move || recent_record_gaps(&scan_cs))
     .await
     {
         Ok(g) => g,
@@ -957,6 +992,11 @@ async fn run_state_jump(
 }
 
 pub(crate) struct ArchiveSyncArgs {
+    /// Set here once the frame verifier exists (see `historical_committees`).
+    pub historical_committees: Arc<std::sync::OnceLock<Arc<super::historical_committees::HistoricalCommittees>>>,
+    pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
+    /// Kept shard sizes shared with every other reader in the node.
+    pub committed_shard_sizes: Arc<quil_engine::shard_info::CommittedShardSizes>,
     pub mtls_seed: Option<[u8; 57]>,
     pub network: u8,
     /// Testnet/localnet genesis seed (concatenated Falcon prover keys) — used by
@@ -1056,6 +1096,9 @@ fn sequenced_ingest_hook(
             return Ok(false); // not built yet: execute nothing without it
         };
         let frame_number = frame.header.as_ref().map_or(0, |h| h.frame_number);
+        // The flag day's discard precedes the first GLOBAL frame from
+        // activation, so no session frame it sequences is ever discarded.
+        ingest.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).discard_legacy_history_at(frame_number)?;
         let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
         let bls = quil_crypto::FalconKeyConstructor;
         let mut through: std::collections::BTreeMap<Vec<u8>, u64> = std::collections::BTreeMap::new();
@@ -1064,7 +1107,7 @@ fn sequenced_ingest_hook(
             let op = conversions::frame_header_from_proto(header);
             let committee_frame = if op.global_frame_number > 0 { op.global_frame_number } else { frame_number };
             if prover_shard_update::verify_frame_header_session(
-                &state, &op, frame_prover.as_ref(), &bls, prover_registry.as_ref(), committee_frame,
+                &state, &op, frame_prover.as_ref(), &bls, prover_registry.as_ref(), committee_frame, frame_number,
             )
             .is_err()
             {
@@ -1084,6 +1127,9 @@ fn sequenced_ingest_hook(
 
 pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncArgs) {
     let ArchiveSyncArgs {
+        historical_committees,
+        inclusion_prover,
+        committed_shard_sizes,
         mtls_seed,
         network,
         genesis_seed: _genesis_seed,
@@ -1187,6 +1233,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 archive_frame_is_valid(frame, &addrs, &verifier)
             })
         };
+        let _ = historical_committees.set(Arc::new(super::historical_committees::HistoricalCommittees::new(
+            archive_pool.clone(),
+            seed.clone(),
+            clock_store.clone(),
+            frame_validate.clone(),
+            frame_verifier.clone(),
+            inclusion_prover.clone(),
+            cw_storage_dir.join("historical-prover-tree"),
+        )));
 
         // Far-behind recovery: spawn a one-shot state jump pinned to a single
         // peer frame N. It fires for ANY node whose gap to the network head
@@ -1205,6 +1260,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         // `poller_startup_barrier` before reading its cursor, so it always sees
         // the POST-jump head and never replays (re-materializes) below the
         // synced frame. The barrier lifts whether the jump did work or no-op'd.
+        let (bootstrap_tx, bootstrap_rx) = tokio::sync::oneshot::channel();
         let poller_startup_barrier: Option<tokio::sync::oneshot::Receiver<()>> = {
             let (sj_tx, sj_rx) = tokio::sync::oneshot::channel::<()>();
             let sj_pool = archive_pool.clone();
@@ -1233,7 +1289,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             spawner.detach("state-jump", {
                 let seed = seed.clone();
                 async move {
-                if let Some(n) = run_state_jump(
+                let jumped = run_state_jump(
                     sj_pool,
                     seed.clone(),
                     sj_cs,
@@ -1251,10 +1307,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     true,
                     tokio_util::sync::CancellationToken::new(),
                 )
-                .await
-                {
+                .await;
+                if let Some(n) = jumped {
                     info!(target = n, "state-jump: fast-forwarded to peer head");
                 }
+                // Notify the registry task only after all jump verification,
+                // data installation, cursor storage and registry refresh finish.
+                let _ = bootstrap_tx.send(jumped);
                 // Lift the barrier regardless of outcome so the poller proceeds.
                 let _ = sj_tx.send(());
                 Ok(())
@@ -1278,6 +1337,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         let fm_for_poller = frame_materializer.clone();
         let shards_store_for_poller: Arc<dyn quil_types::store::ShardsStore> =
             shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
+        let sizes_for_poller = committed_shard_sizes.clone();
         let archive_mode_poller = archive_mode;
         // Non-archive nodes follow the chain over the `GLOBAL_FRAME` gossip mesh;
         // hand the poller the freshness signal so it sources frames from the
@@ -1409,11 +1469,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     .as_ref()
                     .map(|fm| fm.enqueue_catchup(frame.clone(), frame_num))
                     .unwrap_or(false);
-                // Session-enabled regulars follow authenticated GLOBAL state through sync.
-                // Replaying against incomplete local shard metadata can turn
-                // an archive's rejected join into local-only prover records.
+                // Session-enabled regulars follow authenticated GLOBAL state through sync
+                // from activation on. Replaying against incomplete local shard metadata can
+                // turn an archive's rejected join into local-only prover records.
                 if !signaled && (archive_mode_poller || network == 99
-                    || quil_types::consensus::committee_handoff_policy().is_none()) {
+                    || !quil_types::consensus::committee_handoff_active(frame_num)) {
                 // Process frame messages through execution pipeline
                 match quil_engine::frame_processor::process_global_frame(
                     &exec_mgr_for_poller,
@@ -1532,13 +1592,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // because empty" from "real bytes." We walk the
                 // local hypergraph the same way the
                 // GetShardInfo RPC does (`local_app_shard_get_sizes`).
-                {
+                // Only the lifecycle below reads it, and an archive does not
+                // evaluate it here; the sizes cost an archive 8-26 s a frame
+                // on this task, between fetches (2026-10-04).
+                if !archive_mode_poller {
                     use std::collections::HashMap;
                     let get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(
                         crdt_for_poller.clone(),
                         shards_store_for_poller.clone(),
+                        sizes_for_poller.clone(),
                     );
-                    let mut sizes_by_filter: HashMap<Vec<u8>, u64> = HashMap::new();
+                    let mut sizes_by_filter: HashMap<Vec<u8>, (u64, u64)> = HashMap::new();
                     if let Ok(shards) = shards_store_for_poller.range_app_shards() {
                         // Dedupe to one entry per parent shard_key
                         // (range_app_shards returns one row per
@@ -1575,12 +1639,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         &s.shard_key[..]
                                     };
                                     let bp = quil_forest::shard_prefix_to_filter(l2, &entry.prefix);
-                                    sizes_by_filter.insert(bp, bytes);
+                                    sizes_by_filter.insert(bp, (bytes, entry.data_shards));
                                 }
                             }
                         }
                     }
-                    pl_for_poller.set_local_shard_sizes(sizes_by_filter);
+                    pl_for_poller.set_local_shard_metrics(sizes_by_filter);
                 }
 
                 // Skip lifecycle evaluation on archives — they don't
@@ -1716,34 +1780,50 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // hypergraph store with the prover tree.
                 let mut initial_sync_data_ok = sync_archive_mode;
                 if !sync_archive_mode {
-                    if let Some(addr) = sync_pool.get_all().await.first() {
-                        info!("starting initial prover tree sync");
-                        // Initial bootstrap sync — no verified frame
-                        // yet to pin against. Empty expected_root
-                        // means "trust the archive's latest snapshot".
-                        // Subsequent periodic syncs DO pin against the
-                        // most-recent verified frame's
-                        // prover_tree_commitment.
-                        // Forest sync of the global prover shard (single-shard,
-                        // L2 = [0xff; 32]). Empty expected root ⇒ trust the
-                        // archive's latest snapshot (bootstrap; no verified frame
-                        // yet). Pulls the commitment diff + the changed vertices'
-                        // blobs.
-                        match crate::forest_sync::sync_single_shard_verified(
-                            addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &[],
-                        ).await {
-                            Ok(_) => {
-                                initial_sync_data_ok = true;
+                    let registry_sync = sync_pl.begin_registry_sync();
+                    let synced = bootstrap_prover_sync(bootstrap_rx, &sync_token, || async {
+                        let initial_peers = sync_pool.get_all().await;
+                        if initial_peers.is_empty() { return false; }
+                        info!(archives = initial_peers.len(), "starting initial prover tree sync");
+                        // Reuse an authenticated startup jump when available;
+                        // otherwise retain upstream's bounded multi-archive retries.
+                        const INITIAL_SYNC_ROUNDS: usize = 3;
+                        'rounds: for round in 0..INITIAL_SYNC_ROUNDS {
+                            if round > 0 {
+                                tokio::select! {
+                                    _ = sync_token.cancelled() => break 'rounds,
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                                }
                             }
-                            Err(e) => {
-                                warn!(error = %e, "initial prover tree sync failed; lifecycle gate stays held");
+                            for addr in sync_pool.get_all().await.iter() {
+                                if sync_token.is_cancelled() { break 'rounds; }
+                                match crate::forest_sync::sync_single_shard_verified(
+                                    addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &[],
+                                ).await {
+                                    Ok(Some(_)) => {
+                                        return true;
+                                    }
+                                    Ok(None) => warn!(peer = %addr, round,
+                                        "initial prover tree sync: archive cannot serve the tree; trying the next"),
+                                    Err(e) => warn!(peer = %addr, round, error = %e,
+                                        "initial prover tree sync failed; trying the next archive"),
+                                }
                             }
                         }
+                        warn!("initial prover tree sync failed on every archive; lifecycle gate stays held");
+                        false
+                    }).await;
+                    let Some(synced) = synced else { return Ok(()); };
+                    initial_sync_data_ok = synced;
                     // Refresh prover registry from synced data
                     let pr = sync_pr.clone();
                     let hs2 = sync_hg.clone();
                     match tokio::task::spawn_blocking(move || pr.refresh_from_store(hs2.as_ref())).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            if initial_sync_data_ok {
+                                sync_pl.note_registry_synced(registry_sync);
+                            }
+                        }
                         Ok(Err(error)) => {
                             initial_sync_data_ok = false;
                             warn!(%error, "prover registry refresh failed; lifecycle gate stays held");
@@ -1782,7 +1862,6 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             }
                         }).await;
                     }
-                    } // end of `if let Some(addr) { ... }`
                 } // end of `if !sync_archive_mode { ... }`
                 // Only flip the lifecycle gate when we actually have
                 // prover-tree data to evaluate against. On a fresh
@@ -2449,6 +2528,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     // available to later spawns.
                                     let crdt_for_merge = sync_crdt.clone();
                                     let shards_store_for_merge = sync_shards_store.clone();
+                                    let sizes_for_merge = committed_shard_sizes.clone();
                                     let registry_for_merge = sync_pr.clone();
                                     let finalization_for_worker = sync_finalization.clone();
                                     let ingest_for_worker = sync_ingest.clone();
@@ -2483,6 +2563,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             let pa = pa_for_worker.clone();
                                             let cs = cs_for_worker.clone();
                                             let crdt_for_merge = crdt_for_merge.clone();
+                                            let sizes_for_merge = sizes_for_merge.clone();
                                             let shards_store_for_merge = shards_store_for_merge.clone();
                                             let registry_for_merge = registry_for_merge.clone();
                                             let outcome = tokio::task::spawn_blocking(move || {
@@ -2514,6 +2595,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                                 shards_store_for_merge.clone(),
                                                                 registry_for_merge.as_ref(),
                                                                 frame_number,
+                                                                &sizes_for_merge,
                                                             );
                                                         cov.propose_merge_rebalance(
                                                             frame_number,
@@ -3167,6 +3249,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             // case we hit). Fall back to the latest-finalized
                             // commitment when no fork target is recorded yet
                             // (bootstrap / healthy node).
+                            // Numbered before the target is read: a sync counts
+                            // for what the lifecycle saw before it began.
+                            let registry_sync = sync_pl.begin_registry_sync();
                             let expected_root = sync_mat
                                 .as_ref()
                                 .and_then(|m| m.fork_target_root())
@@ -3205,7 +3290,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         let pr = sync_pr.clone();
                                         let hs3 = sync_hg.clone();
                                         match tokio::task::spawn_blocking(move || pr.refresh_from_store(hs3.as_ref())).await {
-                                            Ok(Ok(())) => {}
+                                            Ok(Ok(())) => sync_pl.note_registry_synced(registry_sync),
                                             Ok(Err(error)) => {
                                                 warn!(%error, "reconcile: prover registry refresh failed");
                                                 continue;
@@ -3407,7 +3492,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             let count = found.sizes.len();
                             let frozen = found.frozen.len();
                             lifecycle.set_frozen_shards(found.frozen);
-                            lifecycle.set_remote_shard_sizes(found.sizes);
+                            lifecycle.set_remote_shard_metrics(found.sizes.into_iter()
+                                .map(|(filter, bytes)| {
+                                    let shards = found.data_shards.get(&filter).copied().unwrap_or(0);
+                                    (filter, (bytes, shards))
+                                }).collect());
                             last_refresh_frame = now_frame.max(1);
                             // Archives publish admission topology from the
                             // serial materializer after each durable commit.
@@ -3454,9 +3543,89 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
 }
 
 #[cfg(test)]
+mod bootstrap_sync_tests {
+    use super::bootstrap_prover_sync;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn authenticated_jump_skips_fallback_download() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(Some(42)).unwrap();
+        let calls = AtomicUsize::new(0);
+        assert_eq!(bootstrap_prover_sync(rx, &CancellationToken::new(), || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            false
+        }).await, Some(true));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_jump_blocks_fallback_until_no_jump_is_known() {
+        let (tx, rx) = oneshot::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let task = tokio::spawn(async move {
+            bootstrap_prover_sync(rx, &CancellationToken::new(), || async {
+                seen.fetch_add(1, Ordering::SeqCst);
+                true
+            }).await
+        });
+        // A scheduler barrier lets the task reach its pending receive.
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        tx.send(None).unwrap();
+        assert_eq!(task.await.unwrap(), Some(true));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_jump_task_uses_fallback_and_preserves_failure() {
+        let (tx, rx) = oneshot::channel();
+        drop(tx);
+        let calls = AtomicUsize::new(0);
+        assert_eq!(bootstrap_prover_sync(rx, &CancellationToken::new(), || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            false
+        }).await, Some(false));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_download_or_enable_lifecycle() {
+        let (_tx, rx) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(bootstrap_prover_sync(rx, &cancel, || async {
+            panic!("cancelled bootstrap must not download")
+        }).await, None);
+    }
+}
+
+#[cfg(test)]
 mod validation_tests {
     use super::*;
     use std::collections::HashSet;
+
+    // A lagging archive's fill retried one ancient hole every 3 s, from frame
+    // 257,487 up, while it fell further behind.
+    #[test]
+    fn an_archive_fills_only_holes_in_the_last_two_epochs() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let head = 10 * quil_types::consensus::epoch_length_frames();
+        let window = archive_gap_window();
+        for n in [1, 2, 5, head - window - 10, head - 100, head - 98, head] {
+            let frame = quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader { frame_number: n, ..Default::default() }),
+                requests: Vec::new(),
+            };
+            clock.put_global_frame(&frame, None).unwrap();
+        }
+        assert_eq!(recent_record_gaps(&clock), vec![(head - 99, head - 99), (head - 97, head - 1)]);
+    }
 
     #[test]
     fn a_stalled_execution_behind_the_canonical_head_is_detected() {
@@ -3639,12 +3808,13 @@ fn canonical_atomic_attempts(
     frame: &quil_types::proto::global::GlobalFrame,
 ) -> quil_engine::frame_materializer::CanonicalAttempt {
     use quil_engine::frame_materializer::{CanonicalAttempt, GlobalParentLimits};
-    let mut attempt = m.materialize_canonical_atomically(frame, GlobalParentLimits::default().branch);
+    let limits = GlobalParentLimits::default().branch.for_finalized_frame();
+    let mut attempt = m.materialize_canonical_atomically(frame, limits);
     for _ in 1..3 {
         if !matches!(attempt, CanonicalAttempt::Unavailable(_)) {
             break;
         }
-        attempt = m.materialize_canonical_atomically(frame, GlobalParentLimits::default().branch);
+        attempt = m.materialize_canonical_atomically(frame, limits);
     }
     attempt
 }

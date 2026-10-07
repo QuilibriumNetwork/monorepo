@@ -269,6 +269,21 @@ impl ExecutionEngineManager {
         { let _ = (address, bundle_bytes); 0 }
     }
 
+    /// The legacy coin the first shield of a canonical bundle consumes. Only
+    /// the shard holding that coin can verify the shield (its source check
+    /// reads the shard's own store), so the bundle is routed there.
+    pub fn shield_source(bundle_bytes: &[u8]) -> Option<[u8; 32]> {
+        #[cfg(feature = "native-proof")]
+        {
+            let bundle = crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes).ok()?;
+            return bundle.requests.into_iter().flatten()
+                .filter(|request| request.inner_type_prefix == crate::token_engine::TYPE_LATTICE_SHIELD)
+                .find_map(|request| quil_lattice_ct::confidential::shield::source_address(&request.inner_bytes));
+        }
+        #[cfg(not(feature = "native-proof"))]
+        { let _ = bundle_bytes; None }
+    }
+
     /// Whether the global commit has decided every request of a canonical
     /// bundle, so no shard needs to execute it again. Only globally committed
     /// operations are ever decided, so a bundle holding anything else never
@@ -1767,7 +1782,6 @@ mod tests {
         assert!(!manager.message_commits_globally(&application, &[0, 1]));
     }
 
-    #[cfg(feature = "confidential-tokens")]
     /// Fees are credited only for what the executing venue admitted: QUIL
     /// operations on the QUIL application, a consumed settlement claim on any
     /// other application, and nothing for bundles the global intrinsic skips.
@@ -1798,10 +1812,19 @@ mod tests {
         }.to_canonical_bytes().unwrap();
         let manager = build_manager(true);
         let mixed = bundle(vec![claim.clone(), transfer.clone()]);
-        // QUIL: neither the transfer's fee — it commits through the global
-        // frame and is credited there, only if it commits — nor an
-        // (unverified there) claim.
-        assert_eq!(manager.message_token_fees(&domains::QUIL_TOKEN, &mixed).unwrap(), 0);
+        // Native-proof builds relay the transfer and credit its fee only at
+        // global commit. Without native proofs nothing is relayed, so the
+        // QUIL venue's fee helper counts the transfer's fee locally.
+        #[cfg(feature = "native-proof")]
+        let expected_transfer_fee = 0;
+        #[cfg(not(feature = "native-proof"))]
+        let expected_transfer_fee = 7;
+        assert_eq!(manager.message_token_fees(&domains::QUIL_TOKEN, &mixed).unwrap(), expected_transfer_fee);
+        // An unverified settlement claim never contributes QUIL-venue fees.
+        assert_eq!(manager.message_token_fees(&domains::QUIL_TOKEN, &bundle(vec![claim.clone()])).unwrap(), 0);
+        // Exercise single-request framing as well as a mixed bundle.
+        let single = CanonicalMessageRequest::wrap(transfer.clone()).unwrap().to_canonical_bytes().unwrap();
+        assert_eq!(manager.message_token_fees(&domains::QUIL_TOKEN, &single).unwrap(), expected_transfer_fee);
         // Another application: only the claim it verified, never QUIL fees it skipped.
         assert_eq!(manager.message_token_fees(&app, &mixed).unwrap(), 500);
         assert_eq!(manager.message_token_fees(&app, &bundle(vec![transfer.clone()])).unwrap(), 0);

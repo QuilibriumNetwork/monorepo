@@ -182,14 +182,18 @@ pub fn verify_frame_header_in_state(
     bls: &dyn quil_types::crypto::BlsConstructor,
     registry: &dyn ProverRegistry,
     legacy_committee_frame: u64,
+    global_frame: u64,
 ) -> Result<(Vec<ProverInfo>, Vec<u8>)> {
-    verify_frame_header_session(state, frame_header, frame_prover, bls, registry, legacy_committee_frame)
+    verify_frame_header_session(state, frame_header, frame_prover, bls, registry, legacy_committee_frame, global_frame)
         .map(|(members, bitmask, _)| (members, bitmask))
 }
 
 /// [`verify_frame_header_in_state`], also naming the authorized session that
 /// certified the frame (`None` for a legacy committee). Members are in the
-/// session's order.
+/// session's order. `global_frame` is the GLOBAL frame admitting or executing
+/// the header (see [`frames::refuse_legacy_after_flag_day`]).
+///
+/// [`frames::refuse_legacy_after_flag_day`]: super::handoff::frames::refuse_legacy_after_flag_day
 pub fn verify_frame_header_session(
     state: &HypergraphState,
     frame_header: &FrameHeader,
@@ -197,6 +201,7 @@ pub fn verify_frame_header_session(
     bls: &dyn quil_types::crypto::BlsConstructor,
     registry: &dyn ProverRegistry,
     legacy_committee_frame: u64,
+    global_frame: u64,
 ) -> Result<(Vec<ProverInfo>, Vec<u8>, Option<[u8; 32]>)> {
     use super::handoff::frames::{self, FrameClaim};
     state.require_full_domain_coverage(&GLOBAL_INTRINSIC_ADDRESS)?;
@@ -248,7 +253,9 @@ pub fn verify_frame_header_session(
             }
             return Ok((members, bitmask, Some(verified.session.id()?)));
         }
+        frames::refuse_legacy_after_flag_day(global_frame)?;
     } else {
+        frames::refuse_legacy_after_flag_day(global_frame)?;
         frames::require_legacy_allowed(state, &frame_header.address, frame_header.frame_number)?;
     }
     let active = registry.get_active_provers(&frame_header.address, legacy_committee_frame)?;
@@ -686,19 +693,8 @@ fn recompute_shard_rings(
     if active_provers.is_empty() {
         return Ok(());
     }
-    let join_frame = |p: &ProverInfo| -> u64 {
-        p.allocations
-            .iter()
-            .find(|a| a.confirmation_filter == filter)
-            .map(|a| a.join_frame_number)
-            .unwrap_or(0)
-    };
-    let mut order: Vec<usize> = (0..active_provers.len()).collect();
-    order.sort_by(|&i, &j| {
-        join_frame(&active_provers[i])
-            .cmp(&join_frame(&active_provers[j]))
-            .then_with(|| active_provers[i].address.cmp(&active_provers[j].address))
-    });
+    let order = quil_types::reward_ring::reward_member_order(
+        &active_provers.iter().collect::<Vec<_>>(), filter);
 
     let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
     let va_disc = vertex_adds_discriminator()?;
@@ -723,6 +719,26 @@ fn recompute_shard_rings(
             let mut tree = rebuild_vertex_tree_from_blob(&blob);
             write_field(&mut tree, "allocation:ProverAllocation", "Ring", &[ring])?;
             state.set(domain, &alloc_addr, &va_disc, frame_number, vertex_tree_to_blob(&tree))?;
+        }
+    }
+    Ok(())
+}
+
+/// Set each prover's ring on `filter` to the one its committed allocation
+/// records.
+fn committed_rings(state: &HypergraphState, filter: &[u8], active_provers: &mut [ProverInfo]) -> Result<()> {
+    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+    let va_disc = vertex_adds_discriminator()?;
+    for prover in active_provers.iter_mut() {
+        let address = allocation_address(&prover.public_key, filter)?;
+        let ring = state
+            .get(domain, &address, &va_disc)?
+            .map(|blob| rebuild_vertex_tree_from_blob(&blob))
+            .and_then(|tree| crate::global_schema::read_field(&tree, "allocation:ProverAllocation", "Ring"))
+            .and_then(|bytes| bytes.first().copied())
+            .unwrap_or(0);
+        if let Some(allocation) = prover.allocations.iter_mut().find(|a| a.confirmation_filter == filter) {
+            allocation.ring = ring;
         }
     }
     Ok(())
@@ -819,11 +835,19 @@ pub fn materialize_prover_shard_update_with_fees(
         Some(session) => Some(session_member_rings(
             state, session, &frame_header.address, &active_provers, current_frame_number,
         )?),
+        None if super::prover_rings::governs(current_frame_number) => {
+            // Rings are never assigned during issuance: a registry committee
+            // is rewarded at the rings its allocations record (committed
+            // state, not the registry cache the caller's provers came from).
+            committed_rings(state, &frame_header.address, &mut active_provers)?;
+            None
+        }
         None => {
             // Epoch-aligned ring (re)assignment: recompute from the current
             // active committee before rewards are distributed, recompacting on
             // any membership change and persisting the result. See
-            // `recompute_shard_rings`.
+            // `recompute_shard_rings`. Frames before the seniority ring rule
+            // keep this behavior so their replay is unchanged.
             recompute_shard_rings(
                 state,
                 &frame_header.address,
@@ -941,7 +965,7 @@ pub fn materialize_prover_shard_update_with_fees(
     // that was eligible, so `credited < participants` flags a partial payout.
     let participants: usize = ctx.participants_by_ring.values().map(|p| p.len()).sum();
     tracing::info!(
-        shard = %hex::encode(&frame_header.address[..frame_header.address.len().min(8)]),
+        shard = %hex::encode(&frame_header.address),
         frame = current_frame_number,
         credited_provers,
         participants,

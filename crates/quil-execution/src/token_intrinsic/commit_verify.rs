@@ -21,7 +21,7 @@ use quil_lattice_ct::confidential::{
         worker_client::WorkerVerifier,
     },
     settlement::Settlement,
-    shield::Shield,
+    shield::AnyShield,
     transfer::{CompileLimits, Transfer, TransferStatement},
     MAX_PRIVATE_COINS,
 };
@@ -120,16 +120,18 @@ pub fn verify_for_commit(
             }, &claim.proof)
         }
         TYPE_LATTICE_SHIELD => {
-            let tx = Shield::decode(bytes, network, application).map_err(decode)?;
-            if tx.statement.outputs.len() > limits.max_outputs {
+            // One legacy coin, or (from the batch shield frame) many.
+            let tx = AnyShield::decode(bytes, network, application).map_err(decode)?;
+            if tx.outputs().len() > limits.max_outputs {
                 return Err(invalid("too many outputs"));
             }
-            shield::check_source(state, &tx.statement)?;
+            let active = super::global_commit::batch_shields_active(context.finalized_global_frame);
+            shield::check_sources(state, context.shard, active, application, &tx)?;
             shield::check_authorization(&tx)?;
             let shield_limits = CompileLimits { max_inputs: 1, max_outputs: limits.max_outputs, max_depth: 1 };
             verify_proof(worker, network, application, bytes, shield_limits, budget, || {
-                tx.statement.public_relation(limits.max_outputs).map_err(|_| invalid("invalid or oversized relation"))
-            }, &tx.proof)
+                tx.public_relation(limits.max_outputs).map_err(|_| invalid("invalid or oversized relation"))
+            }, tx.proof())
         }
         TYPE_LATTICE_MINT_CLAIM => {
             // Proves its authorization receipt against a cited global root;
