@@ -843,6 +843,24 @@ impl Forest {
         }
     }
 
+    /// Verify the complete sorted sync plan without staging database writes.
+    /// Auxiliary memory is bounded by the key depth, independently of the
+    /// plan's leaf count. Installation still uses bounded staged transactions.
+    pub fn preview_synced_phase(
+        &self,
+        shard_id: &[u8],
+        phase: Phase,
+        version: u64,
+        leaves: &[([u8; 32], Option<Vec<u8>>)],
+        bits: &[bool],
+        expected: [u8; 32],
+    ) -> Result<()> {
+        let store = self.store(&TreeId::shard_phase(shard_id, phase));
+        let root = crate::sync::preview_subtree_root(&store, version, leaves, bits)?;
+        anyhow::ensure!(root == expected, "reconstructed subtree differs from the authenticated source");
+        Ok(())
+    }
+
     /// Prepare a whole-tree or subtree sync update without publishing it.
     /// `expected` is required on the last chunk; earlier chunks contain only
     /// authenticated changes and are resumable intermediate state. `None`

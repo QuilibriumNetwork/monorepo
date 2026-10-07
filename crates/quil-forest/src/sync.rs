@@ -405,6 +405,132 @@ fn children_map(node: &Option<(NodeKey, Node)>) -> HashMap<u8, ([u8; 32], Versio
     }
 }
 
+/// Compute a proposed subtree root without building nodes, value histories,
+/// stale indexes or serialized database writes for the complete update.
+/// The sorted updates stay borrowed; only one path of at most 64 internal
+/// nodes is retained while unchanged children contribute their existing hashes.
+pub(crate) fn preview_subtree_root<R: TreeReader>(
+    reader: &R,
+    version: Version,
+    updates: &[([u8; 32], Option<OwnedValue>)],
+    bits: &[bool],
+) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(bits.len() <= 256, "subtree prefix exceeds key width");
+    anyhow::ensure!(updates.windows(2).all(|p| p[0].0 < p[1].0),
+        "sync preview updates must be in strictly increasing key order");
+    anyhow::ensure!(updates.iter().all(|(k, _)| key_has_bits(k, bits)),
+        "sync preview update lies outside the subtree");
+    // Match JMT's initial version: it builds on PRE_GENESIS_VERSION, not an
+    // unpublished version-zero root. Later updates build on version - 1.
+    let base = version.checked_sub(1).unwrap_or(u64::MAX);
+    let key = NodeKey::new(base, NibblePath::new(vec![]));
+    let node = reader.get_node_option(&key)?.unwrap_or(Node::Null);
+    if updates.is_empty() {
+        return match node {
+            Node::Null => Ok(if bits.is_empty() { PLACEHOLDER } else { [0; 32] }),
+            _ => subtree_root(reader, base, bits),
+        };
+    }
+    let mut root = None;
+    preview_node(reader, &key, node, updates, bits, 0, &mut root)?;
+    root.ok_or_else(|| anyhow::anyhow!("sync preview did not reach its subtree"))
+}
+
+fn preview_node<R: TreeReader>(
+    reader: &R,
+    key: &NodeKey,
+    mut node: Node,
+    updates: &[([u8; 32], Option<OwnedValue>)],
+    bits: &[bool],
+    depth: usize,
+    subtree: &mut Option<[u8; 32]>,
+) -> anyhow::Result<Node> {
+    // Remove a compressed old leaf if its key is being overwritten/deleted.
+    if let Node::Leaf(leaf) = &node {
+        if updates.binary_search_by_key(&leaf.key_hash().0, |(k, _)| *k).is_ok() {
+            node = Node::Null;
+        }
+    }
+    let result = if updates.is_empty() {
+        node
+    } else if matches!(node, Node::Null) && updates.len() == 1 {
+        match &updates[0].1 {
+            Some(value) => Node::Leaf(LeafNode::new(KeyHash(updates[0].0), ValueHash::with::<sha2::Sha256>(value))),
+            None => Node::Null,
+        }
+    } else {
+        anyhow::ensure!(depth < 64, "sync preview exceeds key depth");
+        let mut children = Children::new();
+        let mut leaves: [Option<LeafNode>; 16] = Default::default();
+        let mut rest = updates;
+        for nib in 0..16u8 {
+            let nibble = Nibble::from(nib);
+            let n = rest.iter().take_while(|(k, _)| nibble_at(k, depth) == nib).count();
+            let changed = &rest[..n];
+            rest = &rest[n..];
+            let old = match &node {
+                Node::Internal(int) => int.children_sorted().find(|(k, _)| *k == nibble).map(|(_, c)| c.clone()),
+                Node::Leaf(leaf) if nibble_at(&leaf.key_hash().0, depth) == nib => {
+                    leaves[nib as usize] = Some(leaf.clone());
+                    Some(Child::new(leaf.hash::<sha2::Sha256>(), key.version(), NodeType::Leaf))
+                }
+                _ => None,
+            };
+            if changed.is_empty() {
+                if let Some(child) = old { children.insert(nibble, child); }
+                continue;
+            }
+            let child_key = key.gen_child_node_key(old.as_ref().map_or(key.version(), |c| c.version), nibble);
+            let child_node = match (&old, &leaves[nib as usize]) {
+                (_, Some(leaf)) => Node::Leaf(leaf.clone()),
+                (Some(_), None) => reader.get_node(&child_key)?,
+                (None, None) => Node::Null,
+            };
+            let child = preview_node(reader, &child_key, child_node, changed, bits, depth + 1, subtree)?;
+            let kind = match &child {
+                Node::Null => continue,
+                Node::Leaf(leaf) => { leaves[nib as usize] = Some(leaf.clone()); NodeType::Leaf }
+                Node::Internal(int) => int.node_type(),
+            };
+            children.insert(nibble, Child::new(node_hash(&child), child_key.version(), kind));
+        }
+        match children.num_children() {
+            0 => Node::Null,
+            1 if children.values().next().unwrap().is_leaf() => {
+                // JMT promotes an only leaf through every parent. An unchanged
+                // sibling may become that only child after a deletion.
+                let (nib, child) = children.iter_sorted().next().unwrap();
+                match leaves[nib.as_usize()].take() {
+                    Some(leaf) => Node::Leaf(leaf),
+                    None => {
+                        let leaf = reader.get_node(&key.gen_child_node_key(child.version, nib))?;
+                        anyhow::ensure!(matches!(leaf, Node::Leaf(_)), "sync preview expected a leaf child");
+                        leaf
+                    }
+                }
+            }
+            _ => Node::Internal(InternalNode::new(children)),
+        }
+    };
+    let full = bits.len() / 4;
+    if depth <= full {
+        match &result {
+            Node::Null => *subtree = Some(if bits.is_empty() { PLACEHOLDER } else { [0; 32] }),
+            Node::Leaf(leaf) => *subtree = Some(if key_has_bits(&leaf.key_hash().0, bits) {
+                leaf.hash::<sha2::Sha256>()
+            } else { [0; 32] }),
+            Node::Internal(int) if depth == full => {
+                let rem = bits.len() % 4;
+                *subtree = Some(if rem == 0 { int.hash::<sha2::Sha256>() } else {
+                    int.subtree_hash::<sha2::Sha256>(bits_to_nibble(&bits[full * 4..]) << (4 - rem), 16 >> rem)
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
 /// Read a subtree commitment from a versioned reader, including a staged
 /// update overlay. This lets an importer verify its result before committing.
 pub(crate) fn subtree_root<R: TreeReader>(
@@ -599,6 +725,83 @@ mod tests {
         k[0] = b0;
         k[31] = tag;
         KeyHash(k)
+    }
+
+    #[test]
+    fn root_only_preview_matches_jmt_updates_and_subtrees() {
+        for seed in 0..8u64 {
+            for width in [0, 1, 2, 3, 4, 6, 9, 16, 255, 256] {
+                for populated in [false, true] {
+                    let store = MockTreeStore::new(true);
+                    let keys: Vec<_> = (0..180u64).map(|i| {
+                        KeyHash(<Sha256 as sha2::Digest>::digest((i + seed * 1000).to_be_bytes()).into())
+                    }).collect();
+                    if populated {
+                        commit(&store, 0, keys[..100].iter().map(|k| (*k, vec![3; 40])).collect());
+                    }
+                    let bits: Vec<_> = (0..width).map(|b| (keys[0].0[b / 8] >> (7 - b % 8)) & 1 == 1).collect();
+                    let mut updates: Vec<_> = keys.iter().enumerate()
+                        .filter(|(_, k)| key_has_bits(&k.0, &bits))
+                        .map(|(i, k)| (k.0, if i % 3 == 0 { None } else { Some(vec![i as u8; 40]) }))
+                        .collect();
+                    updates.sort_by_key(|(k, _)| *k);
+                    let version = u64::from(populated);
+                    let before = store.get_node_option(&NodeKey::new(0, NibblePath::new(vec![]))).unwrap();
+                    let preview = preview_subtree_root(&store, version, &updates, &bits).unwrap();
+                    assert_eq!(store.get_node_option(&NodeKey::new(0, NibblePath::new(vec![]))).unwrap(), before,
+                        "preview must not publish a tree");
+                    let (_, batch) = Jmt::new(&store).put_value_set(
+                        updates.into_iter().map(|(k, v)| (KeyHash(k), v)), version,
+                    ).unwrap();
+                    store.write_tree_update_batch(batch).unwrap();
+                    assert_eq!(preview, subtree_root(&store, version, &bits).unwrap(),
+                        "seed {seed}, width {width}, populated {populated}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn root_only_preview_handles_compressed_leaves_and_extra_local_keys() {
+        for count in 0..5 {
+            let store = MockTreeStore::new(true);
+            let keys: Vec<_> = (0..5u8).map(|i| addr(0, i)).collect();
+            commit(&store, 0, keys[..count].iter().map(|k| (*k, vec![7])).collect());
+            for bits in [vec![], vec![false; 6], vec![false; 255], vec![true; 6]] {
+                let updates: Vec<_> = keys.iter().enumerate().filter(|(_, k)| key_has_bits(&k.0, &bits))
+                    .map(|(i, k)| (k.0, if i < count { None } else { Some(vec![8]) })).collect();
+                let preview = preview_subtree_root(&store, 1, &updates, &bits).unwrap();
+                // Independently preview the old JMT batch without publishing.
+                let (_, batch) = Jmt::new(&store).put_value_set(updates.iter().map(|(k, v)| (KeyHash(*k), v.clone())), 1).unwrap();
+                struct Overlay<'a>(&'a MockTreeStore, &'a jmt::storage::NodeBatch);
+                impl TreeReader for Overlay<'_> {
+                    fn get_node_option(&self, key: &NodeKey) -> anyhow::Result<Option<Node>> {
+                        match self.1.nodes().get(key) { Some(n) => Ok(Some(n.clone())), None => self.0.get_node_option(key) }
+                    }
+                    fn get_value_option(&self, _: Version, _: KeyHash) -> anyhow::Result<Option<OwnedValue>> { unreachable!() }
+                    fn get_rightmost_leaf(&self) -> anyhow::Result<Option<(NodeKey, LeafNode)>> { unreachable!() }
+                }
+                assert_eq!(preview, subtree_root(&Overlay(&store, &batch.node_batch), 1, &bits).unwrap());
+            }
+            // A local extra leaf must remain in the preview: root checking may
+            // not silently accept the remote's smaller key set.
+            if count > 1 {
+                let only = [(keys[0].0, Some(vec![7]))];
+                assert_ne!(preview_subtree_root(&store, 1, &only, &[]).unwrap(),
+                    LeafNode::new(keys[0], ValueHash::with::<Sha256>(&[7])).hash::<Sha256>());
+            }
+        }
+    }
+
+    #[test]
+    fn root_only_preview_rejects_unsorted_duplicate_and_out_of_range_updates() {
+        let store = MockTreeStore::new(true);
+        let a = addr(0, 1).0;
+        let b = addr(1, 2).0;
+        assert!(preview_subtree_root(&store, 0, &[(b, Some(vec![1])), (a, Some(vec![2]))], &[]).is_err());
+        assert!(preview_subtree_root(&store, 0, &[(a, None), (a, Some(vec![2]))], &[]).is_err());
+        assert!(preview_subtree_root(&store, 0, &[(b, Some(vec![1]))], &[true]).is_err());
+        assert!(preview_subtree_root(&store, 0, &[], &vec![false; 257]).is_err());
     }
 
     /// Shard-prover subtree-range sync: pull ONLY a shard's leaves (not the whole
