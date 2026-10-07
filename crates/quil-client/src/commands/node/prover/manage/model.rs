@@ -3,7 +3,7 @@
 //! struct, data-refresh processing, and the filter/sort derivations.
 
 use std::collections::{HashMap, HashSet};
-use super::super::local_execution::local_execution_state;
+use super::super::local_execution::{local_execution_state, state_at};
 
 use num_bigint::{BigInt, Sign};
 
@@ -238,6 +238,17 @@ pub struct FilterOutcome {
     pub settled: bool,
 }
 
+/// Progress inferred only from newly returned peer-head snapshots.
+#[derive(Debug, Clone)]
+pub struct ReportedAppProgress {
+    pub frame: u64,
+    pub generation: Option<u64>,
+    pub last_change: std::time::Instant,
+    pub last_seen: std::time::Instant,
+    pub observations: u32,
+    pub stalled: bool,
+}
+
 // ── Model ────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -348,7 +359,10 @@ pub struct Model {
     pub notice_lines: usize,
     pub notice_visible: usize,
     pub app_progress_observed_since: Option<std::time::Instant>,
+    pub global_alarm_time: Option<std::time::SystemTime>,
     pub app_stall_time: Option<std::time::SystemTime>,
+    pub reported_app_progress: HashMap<Vec<u8>, ReportedAppProgress>,
+    pub reported_app_stall_time: Option<std::time::SystemTime>,
     pub status_msg: String,
     pub status_message_key: String,
     pub status_message_seen: Option<std::time::Instant>,
@@ -388,6 +402,8 @@ pub struct Model {
     pub shard_last_duration: Option<std::time::Duration>,
     pub shard_error: Option<String>,
     pub cached_shard_info: Option<GetShardInfoResponse>,
+    /// Receipt clock of the last successful worker snapshot; cache reuse cannot reset it.
+    pub worker_snapshot_received: Option<(std::time::Instant, u64)>,
     pub cached_worker_info: Option<WorkerInfoResponse>,
 
     // Broadcast accumulator for the await loop.
@@ -443,6 +459,22 @@ impl Model {
         }
     }
 
+    /// Classify node observation age at receipt, separately from client cache age.
+    pub fn execution_state<'a>(&self, execution: Option<&'a quil_types::proto::node::WorkerExecution>) -> &'a str {
+        self.execution_state_at(execution, std::time::Instant::now())
+    }
+
+    fn execution_state_at<'a>(&self, execution: Option<&'a quil_types::proto::node::WorkerExecution>, now: std::time::Instant) -> &'a str {
+        if execution.is_none() { return "unknown"; }
+        let Some((received, wall_ms)) = self.worker_snapshot_received else {
+            return local_execution_state(execution);
+        };
+        if now.saturating_duration_since(received).as_secs() > self.refresh_seconds * 2 + 30 {
+            return "cached";
+        }
+        state_at(execution, wall_ms)
+    }
+
     /// `epochFrame` — frame the client uses for epoch-aligned lifecycle math.
     pub fn epoch_frame(&self) -> u64 {
         if self.last_received_frame > 0 {
@@ -457,7 +489,46 @@ impl Model {
         if self.global_last_advance.is_none() || head > self.global_observed_head {
             self.global_observed_head = head;
             self.global_last_advance = Some(now);
+            self.global_alarm_time = None;
         }
+    }
+
+    /// Record peer-head progress once per fresh shard RPC, never on cache reuse.
+    pub fn observe_reported_app_heads(&mut self, shards: &GetShardInfoResponse, now: std::time::Instant) {
+        let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
+        let window = std::time::Duration::from_secs(60.max(self.refresh_seconds * 3));
+        let mut known = HashSet::new();
+        for shard in &shards.shards {
+            // Empty/unknown peer metadata and unstaffed shards cannot establish a stall.
+            if shard.active_provers == 0 || (shard.latest_frame == 0 && shard.materialized_frame == 0) { continue; }
+            if !known.insert(shard.filter.clone()) { continue; }
+            let generation = shard.global_head.as_ref().map(|h| h.generation);
+            let progress = self.reported_app_progress.entry(shard.filter.clone()).or_insert(ReportedAppProgress {
+                frame: shard.latest_frame, generation, last_change: now, last_seen: now,
+                observations: 0, stalled: false,
+            });
+            if progress.frame != shard.latest_frame || progress.generation != generation
+                || now.saturating_duration_since(progress.last_seen) > budget
+            {
+                *progress = ReportedAppProgress { frame: shard.latest_frame, generation,
+                    last_change: now, last_seen: now, observations: 0, stalled: false };
+            }
+            progress.last_seen = now;
+            progress.observations = progress.observations.saturating_add(1);
+            if progress.observations >= 3 && now.saturating_duration_since(progress.last_change) >= window {
+                progress.stalled = true;
+            }
+        }
+        self.reported_app_progress.retain(|filter, _| known.contains(filter));
+    }
+
+    pub fn reported_app_stall_counts(&self, now: std::time::Instant) -> Option<(usize, usize)> {
+        if self.shard_error.is_some() { return None; }
+        let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
+        let known: Vec<_> = self.reported_app_progress.values()
+            .filter(|p| now.saturating_duration_since(p.last_seen) <= budget).collect();
+        let stalled = known.iter().filter(|p| p.stalled).count();
+        (stalled > 0).then_some((stalled, known.len()))
     }
 
     // ── Data refresh ─────────────────────────────────────────────────────
@@ -486,6 +557,9 @@ impl Model {
         };
         let worker_info = match worker_info {
             Some(w) => {
+                self.worker_snapshot_received = Some((std::time::Instant::now(),
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default().as_millis() as u64));
                 self.cached_worker_info = Some(w.clone());
                 Some(w)
             }
@@ -709,7 +783,7 @@ impl Model {
                 }
                 FilterColKind::Select => {
                     if !cf.values.is_empty()
-                        && !cf.values.contains(&alloc_row_text_val(row, col))
+                        && !cf.values.contains(&alloc_row_text_val(self, row, col))
                     {
                         return false;
                     }
@@ -776,7 +850,7 @@ impl Model {
                 6 => a.execution.as_ref().and_then(|s| s.materialized_frame).cmp(&b.execution.as_ref().and_then(|s| s.materialized_frame)),
                 7 => a.latest_frame.cmp(&b.latest_frame),
                 8 => a.global_head.as_ref().map(|h| h.frame).cmp(&b.global_head.as_ref().map(|h| h.frame)),
-                9 => local_execution_state(a.execution.as_ref()).cmp(local_execution_state(b.execution.as_ref())),
+                9 => self.execution_state(a.execution.as_ref()).cmp(self.execution_state(b.execution.as_ref())),
                 10 => a.estimated_reward.cmp(&b.estimated_reward),
                 11 => a.worker_id.cmp(&b.worker_id), 12 => a.status.cmp(&b.status),
                 13 => a.manually_managed.cmp(&b.manually_managed),
@@ -879,13 +953,14 @@ impl Model {
 
     // ── Applicable actions (for help highlighting + labels) ──────────────
 
-    /// `applicableAllocActions` — action names valid for the current
-    /// allocation selection (intersection across all selected rows).
+    /// Free workers already managed manually, eligible for operator joins.
     pub fn manual_free_workers(&self) -> Vec<u32> {
         self.free_workers.iter().copied().filter(|id| self.allocations.iter()
             .any(|r| r.worker_id == i64::from(*id) && r.status == 0 && r.manually_managed)).collect()
     }
 
+    /// `applicableAllocActions` — action names valid for the current
+    /// allocation selection (intersection across all selected rows).
     pub fn applicable_alloc_actions(&self) -> HashSet<String> {
         if self.action_in_flight {
             return HashSet::new();
@@ -1034,7 +1109,7 @@ impl Model {
         let mut seen: HashSet<String> = HashSet::new();
         if self.focus.is_alloc() {
             for row in &self.allocations {
-                let v = alloc_row_text_val(row, col);
+                let v = alloc_row_text_val(self, row, col);
                 if !v.is_empty() {
                     seen.insert(v);
                 }
@@ -1080,10 +1155,10 @@ pub fn alloc_row_numeric_val(row: &AllocationRow, col: usize) -> f64 {
     }
 }
 
-pub fn alloc_row_text_val(row: &AllocationRow, col: usize) -> String {
+pub fn alloc_row_text_val(m: &Model, row: &AllocationRow, col: usize) -> String {
     match col {
         1 => row.filter_hex.clone(),
-        9 => local_execution_state(row.execution.as_ref()).to_string(),
+        9 => m.execution_state(row.execution.as_ref()).to_string(),
         12 => row.status_name.clone(),
         13 => row.mode().to_string(),
         _ => String::new(),
@@ -1284,6 +1359,68 @@ fn timing(a: &ShardAllocationInfo) -> AllocationTiming<'_> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reported_heads_track_individual_shards_and_ignore_unknown_or_unstaffed_rows() {
+        use std::time::{Duration, Instant};
+        use quil_types::proto::node::ShardRewardInfo;
+        let start = Instant::now();
+        let mut m = Model::new();
+        let mut shards = GetShardInfoResponse { shards: vec![
+            ShardRewardInfo { filter: vec![1], active_provers: 1, latest_frame: 10, ..Default::default() },
+            ShardRewardInfo { filter: vec![2], active_provers: 1, latest_frame: 20, ..Default::default() },
+            ShardRewardInfo { filter: vec![3], active_provers: 1, ..Default::default() },
+            ShardRewardInfo { filter: vec![4], latest_frame: 30, ..Default::default() },
+        ], ..Default::default() };
+        for secs in [0, 30, 60] {
+            shards.shards[1].latest_frame += 1;
+            m.observe_reported_app_heads(&shards, start + Duration::from_secs(secs));
+        }
+        assert_eq!(m.reported_app_progress.len(), 2);
+        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(60)), Some((1, 2)));
+        // Row filtering and cache-backed local-status refreshes do not affect tracking.
+        m.allocations.clear(); m.available.clear();
+        m.process_refresh_data(Some(NodeInfoResponse::default()), None, None);
+        assert_eq!(m.reported_app_progress[&vec![1]].observations, 3);
+        m.refresh_seconds = 60;
+        m.observe_reported_app_heads(&shards, start + Duration::from_secs(61));
+        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(61)), Some((1, 2)));
+        shards.shards[0].latest_frame += 1;
+        m.observe_reported_app_heads(&shards, start + Duration::from_secs(62));
+        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(62)), None);
+    }
+
+    #[test]
+    fn reported_heads_require_fresh_confirmations_and_reset_on_missing_data_or_generation() {
+        use std::time::{Duration, Instant};
+        use quil_types::proto::node::{GlobalAppFrameHead, ShardRewardInfo};
+        let start = Instant::now(); let mut m = Model::new();
+        let mut shards = GetShardInfoResponse { shards: vec![ShardRewardInfo {
+            filter: vec![1], active_provers: 1, latest_frame: 10,
+            global_head: Some(GlobalAppFrameHead { generation: 1, ..Default::default() }),
+            ..Default::default()
+        }], ..Default::default() };
+        m.observe_reported_app_heads(&shards, start);
+        m.observe_reported_app_heads(&shards, start + Duration::from_secs(60));
+        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(60)), None);
+        m.observe_reported_app_heads(&shards, start + Duration::from_secs(61));
+        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(61)), Some((1, 1)));
+        m.shard_error = Some("fetch failed".into());
+        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(61)), None);
+        m.shard_error = None;
+        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(122)), None);
+        m.observe_reported_app_heads(&shards, start + Duration::from_secs(122));
+        assert_eq!(m.reported_app_progress[&vec![1]].observations, 1);
+        assert!(!m.reported_app_progress[&vec![1]].stalled);
+        shards.shards[0].global_head.as_mut().unwrap().generation = 2;
+        m.observe_reported_app_heads(&shards, start + Duration::from_secs(123));
+        assert_eq!(m.reported_app_progress[&vec![1]].observations, 1);
+        shards.shards[0].latest_frame = 9;
+        m.observe_reported_app_heads(&shards, start + Duration::from_secs(124));
+        assert_eq!(m.reported_app_progress[&vec![1]].observations, 1);
+        m.observe_reported_app_heads(&GetShardInfoResponse::default(), start + Duration::from_secs(125));
+        assert!(m.reported_app_progress.is_empty());
+    }
     use super::*;
 
     fn allocation(filter: Vec<u8>, epoch: u64) -> ShardAllocationInfo {
@@ -1557,4 +1694,39 @@ mod tests {
         assert_eq!(model.allocations[0].reward_status(2160, 720), None);
     }
 
+}
+
+#[cfg(test)]
+mod execution_freshness_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use quil_types::proto::node::WorkerExecution;
+
+    #[test]
+    fn all_poll_options_preserve_fresh_received_state_and_bound_cached_data() {
+        let received = Instant::now();
+        let fresh = WorkerExecution { state: "blocked".into(), observed_unix_ms: 99_000, ..Default::default() };
+        let old = WorkerExecution { state: "running".into(), observed_unix_ms: 69_999, ..Default::default() };
+        for seconds in [5, 15, 30, 60] {
+            let mut m = Model::new(); m.refresh_seconds = seconds;
+            m.worker_snapshot_received = Some((received, 100_000));
+            assert_eq!(m.execution_state_at(Some(&fresh), received + Duration::from_secs(seconds + 15)), "blocked");
+            assert_eq!(m.execution_state_at(Some(&fresh), received + Duration::from_secs(seconds * 2 + 30)), "blocked");
+            assert_eq!(m.execution_state_at(Some(&fresh), received + Duration::from_secs(seconds * 2 + 31)), "cached");
+            assert_eq!(m.execution_state_at(Some(&old), received), "stale");
+            assert_eq!(m.execution_state_at(Some(&WorkerExecution::default()), received), "stale");
+            assert_eq!(m.execution_state_at(None, received + Duration::from_secs(500)), "unknown");
+        }
+    }
+
+    #[test]
+    fn cache_reuse_does_not_renew_worker_receipt_clock() {
+        let mut m = Model::new();
+        m.process_refresh_data(Some(NodeInfoResponse::default()), None, Some(WorkerInfoResponse::default()));
+        let clock = m.worker_snapshot_received.unwrap();
+        m.process_refresh_data(Some(NodeInfoResponse::default()), None, None);
+        assert_eq!(m.worker_snapshot_received, Some(clock));
+        m.process_refresh_data(None, None, None);
+        assert_eq!(m.worker_snapshot_received, Some(clock));
+    }
 }

@@ -58,6 +58,7 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             let elapsed = m.shard_fetch_started.take().map(|started| started.elapsed());
             match result {
                 Ok(shards) => {
+                    m.observe_reported_app_heads(&shards, Instant::now());
                     m.shard_error = None;
                     m.shard_last_success = Some(Instant::now());
                     m.shard_last_duration = elapsed;
@@ -85,6 +86,9 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             }
             if let Some(node) = &node_info {
                 m.observe_global_head(node.last_received_frame, Instant::now());
+            }
+            if let Some(shards) = &shard_info {
+                m.observe_reported_app_heads(shards, Instant::now());
             }
             m.last_fetch_success = Some(Instant::now());
             if m.consecutive_failures > 0 && m.status_msg.starts_with("Refresh failed: ") {
@@ -567,10 +571,6 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         }
         KeyCode::Char('C') => {
             m.color_coding = !m.color_coding;
-            return vec![];
-        }
-        KeyCode::Char('e') => {
-            m.threshold_unit = m.threshold_unit.toggled();
             return vec![];
         }
         KeyCode::Char('e') => {

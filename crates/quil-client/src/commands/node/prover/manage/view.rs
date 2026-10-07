@@ -6,7 +6,7 @@ use super::super::local_execution::{local_execution_state, age};
 use num_bigint::BigInt;
 use super::super::epoch::EffectiveStatus;
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
@@ -257,7 +257,7 @@ fn scroll_hint(offset: usize, total: usize, visible: usize, horizontal: u16, hor
 fn render_scroll_hint(f: &mut Frame, area: Rect, offset: usize, total: usize, visible: usize, horizontal: u16, horizontal_limit: u16) {
     let hint = scroll_hint(offset, total, visible, horizontal, horizontal_limit);
     if area.height >= 2 && area.width >= 4 && !hint.is_empty() {
-        f.render_widget(Paragraph::new(hint).style(Style::new().fg(HELP)), Rect::new(area.x + 1, area.y + area.height - 1, area.width - 2, 1));
+        f.render_widget(Paragraph::new(hint).alignment(Alignment::Right).style(Style::new().fg(HELP)), Rect::new(area.x + 1, area.y + area.height - 1, area.width - 2, 1));
     }
 }
 
@@ -327,25 +327,40 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         chunks[0],
     );
 
-    // Titles share the top borders, leaving two more rows for table data.
+    // First heading line shares the border; continuation KPIs stay above the table.
     let sorted_allocs = m.sorted_allocations();
     let sorted_avail = m.sorted_available();
     let (alloc_widths, avail_widths) = shared_col_widths(m, area.width.saturating_sub(2) as usize, &sorted_allocs, &sorted_avail);
     update_app_progress_warning(m);
+    let alloc_heading = alloc_heading_lines(m, &sorted_allocs, chunks[1].width.saturating_sub(4));
     let alloc_block = Block::default()
-        .title(alloc_title(m, &sorted_allocs))
+        .title(panel_title(alloc_heading[0].to_string()))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(if m.focus.is_alloc() { PRIMARY } else { DIM }));
     let alloc_inner = alloc_block.inner(chunks[1]);
     f.render_widget(alloc_block, chunks[1]);
+    // Keep room for the table header and a data row on small panels.
+    let heading_count = alloc_heading.len();
+    let continuation_h = heading_count.saturating_sub(1)
+        .min(usize::from(alloc_inner.height.saturating_sub(2))) as u16;
+    if continuation_h > 0 {
+        let mut continuation = alloc_heading.into_iter().skip(1).take(usize::from(continuation_h)).collect::<Vec<_>>();
+        if heading_count > usize::from(continuation_h) + 1 {
+            continuation[usize::from(continuation_h) - 1] = Line::from("… enlarge panel for remaining KPIs");
+        }
+        f.render_widget(Paragraph::new(continuation).style(Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD)),
+            Rect::new(alloc_inner.x, alloc_inner.y, alloc_inner.width, continuation_h));
+    }
+    let alloc_inner = Rect::new(alloc_inner.x, alloc_inner.y + continuation_h,
+        alloc_inner.width, alloc_inner.height.saturating_sub(continuation_h));
     let alloc_lines = render_alloc_panel(m, &sorted_allocs, alloc_inner, Some(&alloc_widths));
     let mut alloc_lines = alloc_lines;
     let detail = if !sorted_allocs.is_empty() && alloc_inner.height >= 3 { alloc_lines.pop() } else { None };
     let horizontal = table_horizontal_offset(m, 0, &alloc_lines, alloc_inner.width);
     f.render_widget(Paragraph::new(alloc_lines).scroll((0, horizontal)), alloc_inner);
     if let Some(detail) = detail { f.render_widget(Paragraph::new(detail), Rect::new(alloc_inner.x, alloc_inner.y + alloc_inner.height - 1, alloc_inner.width, 1)); }
-    render_scroll_hint(f, chunks[1], m.alloc_offset, sorted_allocs.len(), usize::from(alloc_inner.height.saturating_sub(2)), horizontal, m.horizontal_limits[0]);
+    render_scroll_hint(f, chunks[1], m.alloc_offset, sorted_allocs.len(), usize::from(alloc_inner.height.saturating_sub(1 + u16::from(alloc_inner.height >= 3))), horizontal, m.horizontal_limits[0]);
 
     let avail_block = Block::default()
         .title(avail_title(m, &sorted_avail))
@@ -400,9 +415,13 @@ fn render_notifications(f: &mut Frame, m: &mut Model, primary: Line<'static>, ar
 
 /// Pack complete KPI blocks, never splitting their internal pipe-separated fields.
 fn header_lines(m: &Model, width: u16) -> Vec<Line<'static>> {
+    pack_kpis(header_kpis(m), width)
+}
+
+fn pack_kpis(blocks: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut line = Line::default();
-    for block in header_kpis(m) {
+    for block in blocks {
         if !line.spans.is_empty() && line.width() + 3 + block.width() > usize::from(width) {
             lines.push(line); line = Line::default();
         }
@@ -430,10 +449,6 @@ fn header_kpis(m: &Model) -> Vec<Line<'static>> {
             blocks.push(Line::from(format!("Status age: {}s | Failed retries {}", t.elapsed().as_secs(), m.consecutive_failures)));
         }
     }
-    let (age, color, _) = global_age_indicator(m);
-    blocks.push(Line::from(Span::styled(age,
-        if m.color_coding { Style::new().fg(color) } else { Style::default() })));
-    blocks.push(Line::from(format!("Poll {}s", m.refresh_seconds)));
     blocks.push(worker_counts_line(m));
     blocks
 }
@@ -454,31 +469,24 @@ fn header_line(m: &Model) -> Line<'static> {
     header_lines(m, u16::MAX).remove(0)
 }
 
-// Lifecycle deadlines budget 10s per frame. Allow at least two polls before
-// warning and three before alarming, in addition to the nominal frame budget.
+// Require three polls before establishing a new stall notice, with a 60s floor.
 // This measures lack of observed head advancement, not the frame's timestamp.
-const GLOBAL_WARN_SECS: u64 = 30;
 const GLOBAL_ALARM_SECS: u64 = 60;
 
 fn rpc_status_is_fresh(m: &Model) -> bool {
     m.consecutive_failures == 0 && m.last_fetch_success.is_some_and(|t| t.elapsed().as_secs() < m.refresh_seconds * 2 + 30)
 }
 
-fn global_age_indicator(m: &Model) -> (String, Color, bool) {
-    let Some(last) = m.global_last_advance else { return ("GLOBAL age: unknown".into(), HELP, false); };
+fn global_alarm_active(m: &Model) -> bool {
+    let Some(last) = m.global_last_advance else { return false; };
+    if !rpc_status_is_fresh(m) { return false; }
+    // A cadence change cannot retract an already established stall.
+    // Head advancement clears this latch in observe_global_head.
+    if m.global_alarm_time.is_some() { return true; }
     let secs = last.elapsed().as_secs();
-    let threshold = GLOBAL_ALARM_SECS.max(m.refresh_seconds * 3);
-    let filled = (secs.saturating_mul(6) / threshold).min(6) as usize;
-    let bar = format!("{}{}", "#".repeat(filled), ".".repeat(6 - filled));
-    let fresh = rpc_status_is_fresh(m);
-    if !fresh { return (format!("GLOBAL seen {secs}s ago [{bar}] / RPC stale"), WARNING, false); }
-    // A faster cadence must first observe enough of its own polling window;
-    // previously sparse observations cannot instantly become a stall alarm.
+    // A changed cadence must first observe enough of its own polling window.
     let window = m.refresh_changed_at.map_or(secs, |t| secs.min(t.elapsed().as_secs()));
-    let warning = window >= GLOBAL_WARN_SECS.max(m.refresh_seconds * 2);
-    let alarm = window >= GLOBAL_ALARM_SECS.max(m.refresh_seconds * 3);
-    let label = if alarm { "ALARM" } else if warning { "delayed" } else { "seen" };
-    (format!("GLOBAL {label} {secs}s [{bar}]"), if alarm { ERROR } else if warning { WARNING } else { TEXT }, alarm)
+    window >= GLOBAL_ALARM_SECS.max(m.refresh_seconds * 3)
 }
 
 fn worker_counts_line(m: &Model) -> Line<'static> {
@@ -534,13 +542,13 @@ fn claimable_title(m: &Model) -> String {
         Some((value, frame)) => format!("Claimable [Q]: {} @f{}{}",
             fmt_claimable(value),
             frame,
-            if m.reward_last_success.is_some_and(|t| t.elapsed().as_secs() >= 30) { " (stale)" } else { "" }),
+            if m.reward_last_success.is_some_and(|t| t.elapsed().as_secs() >= m.refresh_seconds * 2 + 30) { " (stale)" } else { "" }),
         None if m.reward_loaded => "Claimable [Q]: unavailable".into(),
         None => "Claimable [Q]: loading".into(),
     }
 }
 
-fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
+fn alloc_kpis(m: &Model, sorted: &[AllocationRow]) -> Vec<String> {
     let mut joining = BigInt::from(0);
     let mut active = BigInt::from(0);
     let mut paused = BigInt::from(0);
@@ -568,24 +576,32 @@ fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
     }
     let current = &active + &leaving;
     let change = &joining - &leaving;
-    let mut s = format!(
-        "Allocations: {}/{} | Active {} · {} · Rewards [Q/d]: Current {} | Paused {} | Planned change {}",
-        m.allocated_workers, m.running_workers,
-        active_allocation_count(m),
+    let mut blocks = vec![
+        format!("Allocations: {}/{} | Active {}", m.allocated_workers, m.running_workers, active_allocation_count(m)),
         claimable_title(m),
-        if current_unknown && !current_known { "?".into() }
-        else { format!("{}{}", fmt_reward(&current), if current_unknown { "+" } else { "" }) },
-        if paused_unknown { "?".into() } else { fmt_reward(&paused) },
-        if change_unknown { "?".into() } else { fmt_reward_change(&change) },
-    );
+        format!("Reward [Q/d]: Now {} | Paused {} | Δ {}",
+            if current_unknown && !current_known { "?".into() }
+            else { format!("{}{}", fmt_reward(&current), if current_unknown { "+" } else { "" }) },
+            if paused_unknown { "?".into() } else { fmt_reward(&paused) },
+            if change_unknown { "?".into() } else { fmt_reward_change(&change) }),
+        global_snapshot_label(sorted.iter().map(|a| a.global_head.as_ref())),
+    ];
     if sorted.len() != m.allocations.len() {
-        s += &format!(" · Shown {}/{}", sorted.len(), m.allocations.len());
+        blocks.push(format!("Shown {}/{}", sorted.len(), m.allocations.len()));
     }
-    s += &format!(" · {}", global_snapshot_label(sorted.iter().map(|a| a.global_head.as_ref())));
     if !m.alloc_selected.is_empty() {
-        s += &format!(" · Selected {}", m.alloc_selected.len());
+        blocks.push(format!("Selected {}", m.alloc_selected.len()));
     }
-    panel_title(s)
+    blocks
+}
+
+#[cfg(test)]
+fn alloc_title(m: &Model, sorted: &[AllocationRow]) -> Line<'static> {
+    panel_title(alloc_kpis(m, sorted).join(" · "))
+}
+
+fn alloc_heading_lines(m: &Model, sorted: &[AllocationRow], width: u16) -> Vec<Line<'static>> {
+    pack_kpis(alloc_kpis(m, sorted).into_iter().map(Line::from).collect(), width)
 }
 
 fn avail_title(m: &Model, sorted: &[ShardRow]) -> Line<'static> {
@@ -618,11 +634,11 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         3 => fmt_ring(a.ring),
         4 => fmt_mb(&a.shard_size),
         5 => a.data_shards.to_string(),
-        6 => if local_warning(a) { "0!".into() }
+        6 => if local_warning(m, a) { "0!".into() }
             else { a.execution.as_ref().and_then(|s| s.materialized_frame).map(|h| h.to_string()).unwrap_or_else(|| "-".into()) },
         7 => if a.materialized_frame == 0 && a.latest_frame == 0 { "-".into() } else { a.latest_frame.to_string() },
         8 => fmt_global_head(a.global_head.as_ref()),
-        9 => local_execution_state(a.execution.as_ref()).into(),
+        9 => m.execution_state(a.execution.as_ref()).into(),
         10 => if a.ring == UNKNOWN_REWARD_RING { "-".into() } else { fmt_reward(&a.estimated_reward) },
         11 => a.worker_id.to_string(),
         12 => a.status_name.clone(),
@@ -830,15 +846,15 @@ fn filter_width(content_width: usize, widths: &[usize], n: usize, cap: usize) ->
         .clamp(MIN_FILTER_WIDTH, cap)
 }
 
-fn local_warning(a: &AllocationRow) -> bool {
-    local_execution_state(a.execution.as_ref()) == "running"
+fn local_warning(m: &Model, a: &AllocationRow) -> bool {
+    m.execution_state(a.execution.as_ref()) == "running"
         && a.execution.as_ref().and_then(|s| s.materialized_frame) == Some(0)
 }
 
-fn local_color(a: &AllocationRow) -> Color {
-    match local_execution_state(a.execution.as_ref()) {
+fn local_color(m: &Model, a: &AllocationRow) -> Color {
+    match m.execution_state(a.execution.as_ref()) {
         "blocked" | "stopped" => ERROR,
-        "running" if local_warning(a) => Color::Yellow,
+        "running" if local_warning(m, a) => Color::Yellow,
         "running" => SUCCESS,
         _ => HELP,
     }
@@ -855,7 +871,7 @@ fn global_snapshot_label<'a>(heads: impl Iterator<Item = Option<&'a quil_types::
     else { "Global: mixed snapshots".into() }
 }
 
-fn allocation_detail(a: &AllocationRow) -> Line<'static> {
+fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
     let Some(execution) = a.execution.as_ref() else {
         return Line::from(Span::styled("Local execution details unavailable", Style::new().fg(HELP)));
     };
@@ -863,9 +879,17 @@ fn allocation_detail(a: &AllocationRow) -> Line<'static> {
         "not observed since start".into()
     } else { format!("{} ago", age(execution.last_advance_unix_ms)) });
     if !execution.blocker.is_empty() { text += &format!(" | Blocker: {}", execution.blocker); }
-    if local_warning(a) { text += " | Warning: no materialized frames"; }
-    let color = if matches!(local_execution_state(Some(execution)), "blocked" | "stopped") { ERROR }
-        else if !execution.blocker.is_empty() || local_warning(a) { WARNING } else { HELP };
+    if local_warning(m, a) { text += " | Warning: no materialized frames"; }
+    let state = m.execution_state(Some(execution));
+    if matches!(state, "cached" | "stale") {
+        text += &format!(" | {state}: observation {} ago", age(execution.observed_unix_ms));
+        if let Some((received, _)) = m.worker_snapshot_received {
+            text += &format!(" | snapshot {}s ago", received.elapsed().as_secs());
+        }
+    }
+    let color = if matches!(state, "cached" | "stale") { HELP }
+        else if matches!(state, "blocked" | "stopped") { ERROR }
+        else if !execution.blocker.is_empty() || local_warning(m, a) { WARNING } else { HELP };
     Line::from(Span::styled(text, Style::new().fg(color)))
 }
 
@@ -942,7 +966,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
             for (ci, cell) in cells.iter().enumerate() {
                 if !m.column_visible(ci) { continue; }
                 if ci > 0 { spans.push(Span::raw(" ")); }
-                let color = if m.color_coding && matches!(ci, 6 | 9) { local_color(a) }
+                let color = if m.color_coding && matches!(ci, 6 | 9) { local_color(m, a) }
                     else if ci == 10 && m.color_coding && a.worker_id < 0 { ERROR }
                     else if ci == 12 && m.color_coding { status_color(&a.status_name) } else { TEXT };
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
@@ -958,19 +982,13 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
                 if ci > 0 {
                     spans.push(Span::raw(" "));
                 }
-                let mat_color = || {
-                    materialization_state_color(materialization_state(
-                        a.materialized_frame,
-                        a.latest_frame,
-                    ))
-                };
                 let span = match ci {
                     3 if m.color_coding => {
                         Span::styled(cell.clone(), Style::new().fg(ring_color(a.ring)))
                     }
                     // Local engine health and the provider gap are separate observations.
                     6 | 9 if m.color_coding => {
-                        Span::styled(cell.clone(), Style::new().fg(local_color(a)))
+                        Span::styled(cell.clone(), Style::new().fg(local_color(m, a)))
                     }
                     7 | 8 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(HELP)),
                     11 if m.color_coding => match worker_color(a.worker_id) {
@@ -995,7 +1013,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
     }
     if detail_rows > 0 {
         while lines.len() < height - 1 { lines.push(Line::default()); }
-        if let Some(a) = sorted.get(m.alloc_cursor) { lines.push(allocation_detail(a)); }
+        if let Some(a) = sorted.get(m.alloc_cursor) { lines.push(allocation_detail(m, a)); }
     }
     lines
 }
@@ -1369,6 +1387,16 @@ fn message_timestamp(time: Option<std::time::SystemTime>) -> String {
 /// Expire completed action notices, while retaining an operation in progress
 /// or a refresh failure that is still unresolved. No extra timer task needed.
 fn update_message_lifetime(m: &mut Model) {
+    if global_alarm_active(m) {
+        m.global_alarm_time.get_or_insert_with(std::time::SystemTime::now);
+    } else {
+        m.global_alarm_time = None;
+    }
+    if rpc_status_is_fresh(m) && m.reported_app_stall_counts(std::time::Instant::now()).is_some() {
+        m.reported_app_stall_time.get_or_insert_with(std::time::SystemTime::now);
+    } else {
+        m.reported_app_stall_time = None;
+    }
     if m.status_message_key != m.status_msg {
         m.status_message_key = m.status_msg.clone();
         m.status_message_seen = Some(std::time::Instant::now());
@@ -1397,17 +1425,17 @@ fn shard_severity(m: &Model) -> NoticeSeverity {
 fn shard_message(m: &Model) -> Option<Line<'static>> {
     let elapsed = m.shard_fetch_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
     let message = if let Some(error) = &m.shard_error {
-        let reason = if error.contains("timed out") { "Shard query timed out".to_owned() }
+        let reason = if error.contains("timed out") { "Shard fetch timed out".to_owned() }
             else { let mut text: String = error.chars().take(90).collect();
                 if error.chars().count() > 90 { text.push('…'); } text };
-        format!("{reason}; retrying.{}", if m.cached_shard_info.is_some() { " Cached rows retained." } else { "" })
+        format!("{reason}; retrying{}.", if m.cached_shard_info.is_some() { " (cached rows)" } else { "" })
     } else if m.shard_loading {
-        if elapsed >= 15 { format!("Shard query slow ({elapsed}s); still waiting.") }
-        else { format!("Fetching shard data ({elapsed}s).") }
+        if elapsed >= 15 { format!("Shard fetch slow ({elapsed}s).") }
+        else { format!("Fetching shards ({elapsed}s).") }
     } else if let Some(shards) = &m.cached_shard_info {
         if m.shard_last_success.is_some_and(|t| t.elapsed() >= MESSAGE_TTL) { return None; }
         let elapsed = m.shard_last_duration.map(|d| d.as_secs()).unwrap_or(0);
-        format!("Shard data updated ({} shards, {elapsed}s).", shards.shards.len())
+        format!("Shards updated: {} ({elapsed}s).", shards.shards.len())
     } else { return None; };
     let color = match shard_severity(m) { NoticeSeverity::Info => HELP,
         NoticeSeverity::Warning => Color::Yellow, NoticeSeverity::Error => ERROR };
@@ -1468,15 +1496,17 @@ fn message_lines(m: &Model, primary: Line<'static>, width: u16) -> Vec<Line<'sta
         shard_message(m).map(|line| wrap_message(line, width)).unwrap_or_default()
     } else { Vec::new() };
     let mut lines = Vec::new();
-    let (_, _, global_alarm) = global_age_indicator(m);
-    if global_alarm {
-        let secs = m.global_last_advance.unwrap().elapsed().as_secs();
-        let threshold = GLOBAL_ALARM_SECS.max(m.refresh_seconds * 3);
-        lines.extend(wrap_message(Line::from(Span::styled(format!("ALARM: No received GLOBAL head advance observed for {secs}s despite fresh node responses (threshold {threshold}s)."), Style::new().fg(ERROR))), width));
+    if global_alarm_active(m) {
+        lines.extend(wrap_message(Line::from(Span::styled(format!("{}Global head unchanged for over 60s.", message_timestamp(m.global_alarm_time)), Style::new().fg(ERROR))), width));
     }
     if m.notice_minimum <= NoticeSeverity::Warning {
+        if rpc_status_is_fresh(m) {
+            if let Some((stalled, known)) = m.reported_app_stall_counts(std::time::Instant::now()) {
+                lines.extend(wrap_message(Line::from(Span::styled(format!("{}Reported app heads: {stalled}/{known} shards unchanged for over 60s.", message_timestamp(m.reported_app_stall_time)), Style::new().fg(Color::Yellow))), width));
+            }
+        }
         if let Some(time) = m.app_stall_time {
-            lines.extend(wrap_message(Line::from(Span::styled(format!("{}No local app worker has advanced for at least 60s; check allocation blockers.", message_timestamp(Some(time))), Style::new().fg(Color::Yellow))), width));
+            lines.extend(wrap_message(Line::from(Span::styled(format!("{}No local app frames advanced for over 60s.", message_timestamp(Some(time))), Style::new().fg(Color::Yellow))), width));
         }
     }
     if shard_severity > primary_severity { lines.extend(shards); lines.extend(primary); }
@@ -1577,13 +1607,6 @@ fn legend_line(m: &Model, workers: bool) -> Line<'static> {
             }
             "ColorCoding" => {
                 if m.color_coding {
-                    Style::new().fg(SUCCESS)
-                } else {
-                    Style::new().fg(HELP)
-                }
-            }
-            "ThresholdUnit" => {
-                if m.threshold_unit == ThresholdUnit::Epochs {
                     Style::new().fg(SUCCESS)
                 } else {
                     Style::new().fg(HELP)
@@ -1710,10 +1733,11 @@ fn help_body() -> Vec<Line<'static>> {
 
     vec![
         Line::from(""),
-        sec("GLOBAL progress"),
+        sec("Global progress"),
+        kv("Local app notice", "No local materialized frame advanced for 60s across staffed earning allocations; any local advance clears it"),
+        kv("Reported app heads", "Warn for any staffed shard with unchanged PeerHead across 3+ fresh snapshots spanning max(60s, 3 polls), including unallocated shards. Unknown/unstaffed rows and failed/stale fetches cannot establish a stall; this is reported progress, not proof of a network halt"),
         kv("RPC", "Connected means fresh local status responses; it does not establish peer or shard health"),
-        kv("GLOBAL age", "Time since a higher received head was observed in this client; not frame timestamp age"),
-        kv("Age bar", "Bar fills at alarm; warn at max(30s, 2 polls), alarm at max(60s, 3 polls)"),
+        kv("Global notice", "After max(60s, 3 polls) without received-head advance; timestamp survives refresh changes. Clears on advance or stale RPC"),
         kv("Auto mode", "Worker commands disabled except mode switching; use Ctrl+O, then Enter to switch to manual. Join needs a free manual worker"),
         kv("n", "Toggle NextAction names / Ctrl command keys; default actions remain named"),
         kv("t", "Cycle refresh 5/15/30/60s (default 15); startup and post-action fetches are immediate"),
@@ -1731,7 +1755,8 @@ fn help_body() -> Vec<Line<'static>> {
         kv("Details", "Selected allocation footer shows blocker and last advance; no observation timer"),
 
         kv("", "Selected allocation shows blocker and last advance; PeerHead is provider metadata"),
-        kv("", "Observations older than 30s are stale; startup restoration is not an advance"),
+        kv("Freshness", "stale: node observation already >30s old at receipt; cached: no worker result for >2 polls +30s. Poll delays do not age the received state"),
+        kv("", "Startup restoration is not an advance; cached worker state is not proof of ongoing execution"),
         sec("Navigation"),
         kv("b", "Choose visible columns: ↑/↓ selects, Space toggles; Enter/Esc closes"),
         kv("Columns", "Shared choices apply to both panels; Select and Filter stay visible; per TUI session"),
@@ -1831,8 +1856,8 @@ fn help_body() -> Vec<Line<'static>> {
         ),
         kv("Current", "Staffed active + leaving reward estimates, not measured income"),
         kv("Paused", "Staffed paused estimates available upon resume"),
-        kv("Unknown", "- fields are unavailable; Current sums known rewards with + for unknown rows"),
-        kv("Planned change", "Staffed joining minus leaving; activation epochs may differ"),
+        kv("Unknown", "- fields unavailable; Now sums known rewards with + for unknown rows"),
+        kv("Reward Δ", "Staffed joining minus leaving; activation epochs may differ"),
         note("Reward totals follow displayed rows; unassigned rows are excluded."),
         kv("Worker", "Core the allocation is bound to; -1 means none is bound"),
         kv("Status", "joining, active, paused, leaving, rejected, kicked;"),
@@ -1982,6 +2007,46 @@ mod tests {
     }
 
     #[test]
+    fn allocation_heading_wraps_complete_kpis_and_keeps_citations() {
+        let mut m = Model::new();
+        m.running_workers = 15; m.allocated_workers = 15;
+        m.claimable_reward = Some((8_000_000_000, 123456));
+        let blocks = alloc_kpis(&m, &[]);
+        for width in [40, 80, 120, 300] {
+            let lines = alloc_heading_lines(&m, &[], width);
+            assert!(lines.iter().all(|l| l.width() <= usize::from(width)));
+            for block in &blocks {
+                assert!(lines.iter().any(|l| l.to_string().contains(block)), "split KPI {block} at {width}");
+            }
+        }
+        assert_eq!(alloc_heading_lines(&m, &[], 300).len(), 1);
+        assert!(alloc_heading_lines(&m, &[], 80).len() > 1);
+        assert!(alloc_title(&m, &[]).to_string().contains("Claimable [Q]: 1 @f123456"));
+    }
+
+    #[test]
+    fn wrapped_allocation_heading_stays_visible_when_table_pans() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut m = Model::new(); m.data_loaded = true;
+        m.claimable_reward = Some((8_000_000_000, 123456));
+        m.allocations = joining_table();
+        let mut terminal = Terminal::new(TestBackend::new(80, 42)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, m: &mut Model| {
+            terminal.draw(|f| draw(f, m)).unwrap();
+            let b = terminal.backend().buffer();
+            (0..42).map(|y| (0..80).map(|x| b[(x,y)].symbol()).collect::<String>()).collect::<Vec<_>>()
+        };
+        let before = render(&mut terminal, &mut m);
+        let table = before.iter().position(|l| l.contains("Select Filter")).unwrap();
+        assert!(before[..table].iter().any(|l| l.contains("Reward [Q/d]: Now")));
+        m.horizontal_offsets[0] = 30;
+        let after = render(&mut terminal, &mut m);
+        assert_eq!(&before[..table], &after[..table]);
+        assert_ne!(before[table], after[table]);
+        assert!(after[..table].iter().any(|l| l.contains("Claimable [Q]: 1 @f123456")));
+    }
+
+    #[test]
     fn all_header_kpis_wrap_as_complete_blocks() {
         let mut m = Model::new(); m.data_loaded = true; m.peer_id = "p".repeat(52);
         m.running_workers = 15;
@@ -2013,7 +2078,7 @@ mod tests {
         let m = Model::new();
         let title = alloc_title(&m, &[]).to_string();
         assert!(title.contains("| Active") && title.contains(" · Claimable"));
-        assert!(title.contains(" · Rewards") && title.contains("| Paused"));
+        assert!(title.contains(" · Reward [Q/d]:") && title.contains("| Paused"));
         assert!(title.contains(" · Global:"));
         assert!(!title.contains("  "));
         assert!(avail_title(&m, &[]).to_string().contains(" · Global:"));
@@ -2054,25 +2119,66 @@ mod tests {
         let mut m = Model::new();
         m.data_loaded = true;
         m.last_fetch_success = Some(Instant::now());
-        for (secs, expected) in [(0, "seen"), (29, "seen"), (30, "delayed"), (59, "delayed"), (60, "ALARM")] {
+        for secs in [0, 29, 30, 59, 60] {
             m.global_last_advance = Some(Instant::now() - Duration::from_secs(secs));
-            let (label, _, alarm) = global_age_indicator(&m);
-            assert!(label.contains(expected), "{label}");
-            assert_eq!(alarm, secs >= 60);
+            assert_eq!(global_alarm_active(&m), secs >= 60);
         }
         m.notice_minimum = NoticeSeverity::Error;
         m.color_coding = false;
-        assert!(header_line(&m).to_string().contains("ALARM"));
-        assert!(message_lines(&m, Line::default(), 40).iter().any(|l| l.to_string().contains("ALARM")));
+        assert!(!header_line(&m).to_string().contains("ALARM"));
+        assert!(!header_line(&m).to_string().contains("GLOBAL"));
+        assert!(!header_line(&m).to_string().contains("Poll"));
+        update_message_lifetime(&mut m);
+        let stamp = m.global_alarm_time.unwrap();
+        update_message_lifetime(&mut m);
+        assert_eq!(m.global_alarm_time, Some(stamp));
+        assert!(message_lines(&m, Line::default(), 300).iter().any(|l| l.to_string().starts_with(&format!("{}Global head unchanged", message_timestamp(Some(stamp))))));
+        assert!(message_lines(&m, Line::default(), 40).iter().any(|l| l.to_string().contains("Global head unchanged")));
         m.consecutive_failures = 1;
-        assert!(!global_age_indicator(&m).2);
-        assert!(global_age_indicator(&m).0.contains("RPC stale"));
+        assert!(!global_alarm_active(&m));
+        update_message_lifetime(&mut m);
+        assert!(m.global_alarm_time.is_none());
         m.consecutive_failures = 0;
         m.last_fetch_success = Some(Instant::now() - Duration::from_secs(60));
-        assert!(!global_age_indicator(&m).2);
+        assert!(!global_alarm_active(&m));
         m.last_fetch_success = Some(Instant::now());
         m.observe_global_head(1, Instant::now());
-        assert!(!global_age_indicator(&m).2);
+        assert!(!global_alarm_active(&m));
+    }
+
+    #[test]
+    fn established_global_notice_survives_refresh_changes_until_recovery() {
+        use std::time::{Duration, Instant};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut m = Model::new();
+        m.last_fetch_success = Some(Instant::now());
+        m.global_observed_head = 100;
+        m.global_last_advance = Some(Instant::now() - Duration::from_secs(75));
+        m.notice_minimum = NoticeSeverity::Info;
+        m.status_msg = "Action completed".into();
+        m.shard_error = Some("Shard fetch timed out".into());
+        update_message_lifetime(&mut m);
+        let stamp = m.global_alarm_time.unwrap();
+        for interval in [30, 60, 5, 15] {
+            super::super::update::handle_key(&mut m, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+            assert_eq!(m.refresh_seconds, interval);
+            update_message_lifetime(&mut m);
+            assert_eq!(m.global_alarm_time, Some(stamp));
+            let notices = message_lines(&m, status_line(&m), 300).iter().map(ToString::to_string).collect::<Vec<_>>().join(" ");
+            assert!(notices.contains(&format!("{}Global head unchanged", message_timestamp(Some(stamp)))));
+            assert!(!notices.contains("ALARM:"));
+            assert!(notices.contains("Global head unchanged for over 60s."));
+            assert!(notices.contains("Action completed") && notices.contains("Shard fetch timed out"));
+        }
+        m.observe_global_head(100, Instant::now());
+        assert_eq!(m.global_alarm_time, Some(stamp));
+        m.observe_global_head(101, Instant::now());
+        assert!(m.global_alarm_time.is_none() && !global_alarm_active(&m));
+        m.global_alarm_time = Some(stamp);
+        m.consecutive_failures = 1;
+        update_message_lifetime(&mut m);
+        assert!(m.global_alarm_time.is_none());
+        assert!(!message_lines(&m, Line::default(), 300).iter().any(|l| l.to_string().contains("Global head unchanged")));
     }
 
     #[test]
@@ -2082,15 +2188,15 @@ mod tests {
         m.refresh_seconds = 60;
         m.last_fetch_success = Some(Instant::now());
         m.global_last_advance = Some(Instant::now() - Duration::from_secs(60));
-        assert!(!global_age_indicator(&m).2);
-        assert!(global_age_indicator(&m).0.contains("seen"));
+        assert!(!global_alarm_active(&m));
+
         m.global_last_advance = Some(Instant::now() - Duration::from_secs(120));
-        assert!(global_age_indicator(&m).0.contains("delayed"));
+        assert!(!global_alarm_active(&m));
         m.global_last_advance = Some(Instant::now() - Duration::from_secs(180));
-        assert!(global_age_indicator(&m).2);
+        assert!(global_alarm_active(&m));
         m.refresh_seconds = 5;
         m.refresh_changed_at = Some(Instant::now());
-        assert!(!global_age_indicator(&m).2);
+        assert!(!global_alarm_active(&m));
     }
 
     #[test]
@@ -2108,7 +2214,7 @@ mod tests {
         a.execution = Some(quil_types::proto::node::WorkerExecution { state: "blocked".into(),
             observed_unix_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
             ..Default::default() });
-        assert_eq!(local_color(&a), ERROR);
+        assert_eq!(local_color(&Model::new(), &a), ERROR);
     }
 
     #[test]
@@ -2178,6 +2284,31 @@ mod tests {
     }
 
     #[test]
+    fn reported_app_notice_has_independent_scope_timestamp_and_freshness() {
+        use std::time::{Duration, Instant};
+        use quil_types::proto::node::ShardRewardInfo;
+        let now = Instant::now(); let mut m = Model::new();
+        m.last_fetch_success = Some(now);
+        let shards = quil_types::proto::node::GetShardInfoResponse { shards: vec![ShardRewardInfo {
+            filter: vec![1], active_provers: 1, latest_frame: 10, ..Default::default()
+        }], ..Default::default() };
+        for ago in [60, 30, 0] { m.observe_reported_app_heads(&shards, now - Duration::from_secs(ago)); }
+        update_message_lifetime(&mut m);
+        let timestamp = m.reported_app_stall_time.expect("known shard stalls independently of local allocations");
+        let text = message_lines(&m, Line::default(), 300).iter().map(ToString::to_string).collect::<Vec<_>>().join(" ");
+        assert!(text.contains(&format!("{}Reported app heads: 1/1 shards unchanged for over 60s.", message_timestamp(Some(timestamp)))));
+        assert!(!text.contains("No local app frames advanced"));
+        for interval in [30, 60, 5, 15] {
+            m.refresh_seconds = interval; update_message_lifetime(&mut m);
+            assert_eq!(m.reported_app_stall_time, Some(timestamp));
+        }
+        m.notice_minimum = NoticeSeverity::Error;
+        assert!(!message_lines(&m, Line::default(), 300).iter().any(|l| l.to_string().contains("Reported app heads")));
+        m.shard_error = Some("fetch failed".into()); update_message_lifetime(&mut m);
+        assert!(m.reported_app_stall_time.is_none());
+    }
+
+    #[test]
     fn app_stall_warning_respects_severity_and_clears_on_progress_or_missing_data() {
         use quil_types::proto::node::WorkerExecution;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2190,9 +2321,9 @@ mod tests {
         let timestamp = m.app_stall_time.expect("known stalled workers warn");
         update_app_progress_warning(&mut m); assert_eq!(m.app_stall_time, Some(timestamp));
         m.notice_minimum = NoticeSeverity::Warning;
-        assert!(message_lines(&m, Line::default(), 240).iter().any(|l| l.to_string().contains("No local app worker")));
+        assert!(message_lines(&m, Line::default(), 240).iter().any(|l| l.to_string().contains("No local app frames advanced")));
         m.notice_minimum = NoticeSeverity::Error;
-        assert!(!message_lines(&m, Line::default(), 240).iter().any(|l| l.to_string().contains("No local app worker")));
+        assert!(!message_lines(&m, Line::default(), 240).iter().any(|l| l.to_string().contains("No local app frames advanced")));
         m.allocations[1].execution.as_mut().unwrap().last_advance_unix_ms = now;
         update_app_progress_warning(&mut m); assert!(m.app_stall_time.is_none());
         m.allocations[1].execution = None;
@@ -2209,14 +2340,14 @@ mod tests {
         worker.execution = Some(WorkerExecution { state: "running".into(), observed_unix_ms: now,
             materialized_frame: Some(124), last_advance_unix_ms: now - 22_000, ..Default::default() });
         worker.latest_frame = 125;
-        assert!(!local_warning(&worker));
+        assert!(!local_warning(&m, &worker));
         assert_eq!(alloc_cell(&m, &worker, 7, 12), "125");
-        assert!(allocation_detail(&worker).to_string().contains("Last advance: 22s ago"));
+        assert!(allocation_detail(&m, &worker).to_string().contains("Last advance: 22s ago"));
         worker.execution.as_mut().unwrap().materialized_frame = Some(0);
-        assert!(local_warning(&worker));
+        assert!(local_warning(&m, &worker));
         assert_eq!(alloc_cell(&m, &worker, 6, 12), "0!");
-        assert_eq!(local_color(&worker), Color::Yellow);
-        assert!(allocation_detail(&worker).to_string().contains("Warning: no materialized frames"));
+        assert_eq!(local_color(&m, &worker), Color::Yellow);
+        assert!(allocation_detail(&m, &worker).to_string().contains("Warning: no materialized frames"));
         worker.execution.as_mut().unwrap().state = "blocked".into();
         worker.execution.as_mut().unwrap().blocker = "awaiting successor".into();
         m.allocations.push(worker);
@@ -2239,11 +2370,11 @@ mod tests {
         known.status = 2; known.epoch = 3; known.estimated_reward = BigInt::from(10000);
         let mut unknown = known.clone(); unknown.ring = UNKNOWN_REWARD_RING;
         let title = alloc_title(&m, &[known.clone(), unknown.clone()]).to_string();
-        assert!(title.contains(&format!("Current {}+ |", fmt_reward(&known.estimated_reward))), "{title}");
-        assert!(alloc_title(&m, &[unknown]).to_string().contains("Current ? |"));
+        assert!(title.contains(&format!("Now {}+ |", fmt_reward(&known.estimated_reward))), "{title}");
+        assert!(alloc_title(&m, &[unknown]).to_string().contains("Now ? |"));
         known.estimated_reward = BigInt::from(0);
         let mut unknown = known.clone(); unknown.ring = UNKNOWN_REWARD_RING;
-        assert!(alloc_title(&m, &[known, unknown]).to_string().contains("Current 0+ |"));
+        assert!(alloc_title(&m, &[known, unknown]).to_string().contains("Now 0+ |"));
     }
 
     #[test]
@@ -2252,7 +2383,7 @@ mod tests {
         let action = status_line(&m).to_string();
         assert!(action.starts_with('[') && action.contains(" UTC] Action failed"));
         m.shard_error = Some("timed out".into());
-        assert!(shard_message(&m).unwrap().to_string().contains(" UTC] Shard query timed out"));
+        assert!(shard_message(&m).unwrap().to_string().contains(" UTC] Shard fetch timed out"));
     }
 
     #[test]
@@ -2269,7 +2400,7 @@ mod tests {
         allocation.latest_frame = 744;
         allocation.global_head = Some(quil_types::proto::node::GlobalAppFrameHead { frame: 742, global_frame: 1000, generation: 2 });
         allocation.execution = Some(quil_types::proto::node::WorkerExecution { materialized_frame: Some(744), ..Default::default() });
-        assert!(!allocation_detail(&allocation).to_string().contains("Global"));
+        assert!(!allocation_detail(&Model::new(), &allocation).to_string().contains("Global"));
         let m = Model::new();
         assert_eq!(alloc_cell(&m, &allocation, 8, 0), "742@g2");
         assert_eq!(alloc_cell(&m, &allocation, 7, 0), "744");
@@ -2301,7 +2432,7 @@ mod tests {
         });
         let mut peer = shard("bb", 1, 1);
         peer.materialized_frame = 18; peer.latest_frame = 22;
-        assert!(allocation_detail(&allocation).spans.iter().all(|s| s.style.fg == Some(ERROR)));
+        assert!(allocation_detail(&Model::new(), &allocation).spans.iter().all(|s| s.style.fg == Some(ERROR)));
         assert!(available_detail(&peer).spans.iter().all(|s| s.style.fg == Some(Color::Yellow)));
     }
 
@@ -2356,7 +2487,7 @@ mod tests {
         super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Ok(Some((474867, 862280)))));
         assert_eq!(claimable_title(&m), "Claimable [Q]: 0.00006 @f862280");
         assert!(alloc_title(&m, &[]).to_string().contains("Claimable [Q]:"));
-        m.reward_last_success = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        m.reward_last_success = Some(std::time::Instant::now() - std::time::Duration::from_secs(m.refresh_seconds * 2 + 31));
         assert!(claimable_title(&m).ends_with("(stale)"));
         super::super::update::apply_msg(&mut m, super::super::msg::Msg::RewardRefresh(Err("timeout".into())));
         assert_eq!(claimable_title(&m), "Claimable [Q]: unavailable");
@@ -2381,7 +2512,7 @@ mod tests {
         m.cached_shard_info = Some(Default::default());
         assert!(text(&m).is_empty(), "cache-preserving failures are warnings");
         m.notice_minimum = NoticeSeverity::Warning;
-        assert!(text(&m).contains("Cached rows retained"));
+        assert!(text(&m).contains("cached rows"));
         m.status_is_error = true;
         m.status_msg = "Action failed".into();
         m.notice_minimum = NoticeSeverity::Error;
@@ -2458,7 +2589,7 @@ mod tests {
         let text = |lines: Vec<Line<'static>>| lines.into_iter().map(|l| l.to_string()).collect::<Vec<_>>().join(" ");
         let waiting = text(message_lines(&m, status_line(&m), 60));
         assert!(waiting.contains("Confirm sent"));
-        assert!(waiting.contains("Fetching shard data"));
+        assert!(waiting.contains("Fetching shards"));
         assert!(!waiting.contains("archive peers"));
         m.shard_error = Some("Shard query timed out".into());
         let retry = text(message_lines(&m, status_line(&m), 60));
@@ -2470,7 +2601,7 @@ mod tests {
         m.cached_shard_info = Some(Default::default());
         m.shard_last_duration = Some(std::time::Duration::from_secs(22));
         let recovered = text(message_lines(&m, status_line(&m), 60));
-        assert!(recovered.contains("0 shards, 22s"));
+        assert!(recovered.contains("Shards updated: 0 (22s)"));
         assert!(!recovered.contains("timed out"));
     }
 
@@ -2702,7 +2833,7 @@ mod tests {
         for col in [3, 6, 7, 10] { assert_eq!(avail_cell(&model, &available, col, 12), "-"); }
         let title = alloc_title(&model, &[allocation.clone()]);
         let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("Current ? | Paused 0 | Planned change 0"), "{text}");
+        assert!(text.contains("Now ? | Paused 0 | Δ 0"), "{text}");
         allocation.ring = 0;
         allocation.latest_frame = 20;
         assert_eq!(alloc_cell(&model, &allocation, 3, 12), "0");
@@ -2751,7 +2882,7 @@ mod tests {
         ended.leave_confirm_frame = 1400;
         let title = alloc_title(&m, &[active, joining, unstaffed, expired, paused, leaving, unstaffed_leave, ended]);
         let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains(&format!("Current {} | Paused {} | Planned change -{}",
+        assert!(text.contains(&format!("Now {} | Paused {} | Δ -{}",
             fmt_reward(&BigInt::from(60000)), fmt_reward(&BigInt::from(40000)),
             fmt_reward(&BigInt::from(30000)))), "{text}");
     }
