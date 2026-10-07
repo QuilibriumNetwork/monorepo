@@ -42,6 +42,11 @@ async fn fetch_remote_app_shards(
 }
 
 pub(crate) struct GrpcArgs {
+    /// Rebuilds legacy committees; served to the node's standalone workers.
+    pub historical_committees: Arc<std::sync::OnceLock<Arc<super::historical_committees::HistoricalCommittees>>>,
+    /// Holds standalone workers' reward proofs back during a coverage halt, as
+    /// thread workers' are.
+    pub halt_state: Arc<quil_engine::halt_state::HaltState>,
     /// Kept shard sizes shared with every other reader in the node.
     pub committed_shard_sizes: Arc<quil_engine::shard_info::CommittedShardSizes>,
     /// Filter → covering thread worker's stores (wallet reads of app state).
@@ -91,7 +96,7 @@ pub(crate) struct GrpcArgs {
 
 /// Serves forest-sync JMT nodes/values from the local CRDT's forest — the
 /// server half of the efficient Merkle-diff sync ([`quil_forest::diff_leaves`]).
-struct CrdtForestServer(Arc<quil_hypergraph::HypergraphCrdt>);
+pub(crate) struct CrdtForestServer(pub(crate) Arc<quil_hypergraph::HypergraphCrdt>);
 
 impl quil_rpc::global_service::ForestServer for CrdtForestServer {
     fn global_vertex_proof(&self, root: [u8; 32], address: [u8; 32]) -> Option<Vec<u8>> {
@@ -113,6 +118,19 @@ impl quil_rpc::global_service::ForestServer for CrdtForestServer {
     }
     fn serve_head(&self, shard_id: &[u8], phase: u32) -> Option<(u64, [u8; 32])> {
         self.0.serve_forest_head(shard_id, phase as usize)
+    }
+    fn serve_leaves(
+        &self,
+        shard_id: &[u8],
+        phase: u32,
+        version: u64,
+        first: &[u8; 32],
+        last: &[u8; 32],
+        after: Option<&[u8; 32]>,
+    ) -> Option<(Vec<([u8; 32], Vec<u8>)>, bool)> {
+        use quil_rpc::global_service::{MAX_FOREST_BATCH_BYTES, MAX_FOREST_LEAVES};
+        self.0.serve_forest_leaves(shard_id, phase as usize, version, first, last, after,
+            MAX_FOREST_LEAVES, MAX_FOREST_BATCH_BYTES)
     }
     fn serve_preimage(&self, shard_id: &[u8], phase: u32, key_hash: [u8; 32]) -> Option<Vec<u8>> {
         self.0.serve_forest_preimage(shard_id, phase as usize, key_hash)
@@ -153,6 +171,10 @@ struct CrdtCoinWitness {
     network: u8,
     #[cfg(feature = "confidential-tokens")]
     witness_index: Arc<crate::witness_index::NodeWitnessIndex>,
+    /// QUIL's legacy coins by owner. Built only on an archive, which holds the
+    /// whole application; other nodes ask an archive.
+    #[cfg(feature = "confidential-tokens")]
+    legacy_index: Option<Arc<crate::legacy_index::LegacyOwnerIndex>>,
     /// The QUIL shard's latest certified global anchor seen by this node's
     /// shard engines (local or remote workers), bounding mint-claim citations.
     shard_anchor: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
@@ -411,6 +433,27 @@ impl CrdtCoinWitness {
 }
 
 impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
+    #[cfg(feature = "confidential-tokens")]
+    fn legacy_coins(&self, domain: &[u8; 32], owner: &[u8; 32], after: Option<&[u8; 32]>) -> quil_types::error::Result<Option<quil_types::store::LegacyCoinPageData>> {
+        use quil_execution::token_intrinsic::{global_commit, spent_check};
+        use quil_types::store::{LegacyCoinData, LegacyCoinPageData, MAX_LEGACY_COINS_PER_PAGE};
+        // Only QUIL held coins before the transparent migration.
+        if domain != &quil_execution::domains::QUIL_TOKEN {
+            return Ok(Some(LegacyCoinPageData::default()));
+        }
+        let Some(index) = self.legacy_index.as_ref() else { return Ok(None) };
+        let Some((coins, has_more)) = index.page(owner, after, MAX_LEGACY_COINS_PER_PAGE)? else { return Ok(None) };
+        // A shield consumes its source through a GLOBAL marker; the coin
+        // itself never changes.
+        let global = quil_execution::hypergraph_state::HypergraphState::new(self.crdt.clone());
+        let coins = coins.into_iter().map(|(address, amount, origin)| {
+            let marker = spent_check::key_image_spent_address(&address)?;
+            Ok(LegacyCoinData { address, amount, origin, shielded: global_commit::is_consumed(&global, domain, &marker)? })
+        }).collect::<quil_types::error::Result<Vec<_>>>()?;
+        let cursor = coins.last().map(|coin| coin.address);
+        Ok(Some(LegacyCoinPageData { coins, cursor, has_more }))
+    }
+
     fn mint_authorization_witness(&self, receipt: &[u8; 32]) -> quil_types::error::Result<quil_types::store::MintAuthorizationWitnessData> {
         let state = quil_execution::hypergraph_state::HypergraphState::new(self.crdt.clone());
         let anchor = (self.shard_anchor)();
@@ -603,6 +646,8 @@ pub(crate) fn spawn_all(
     args: GrpcArgs,
 ) -> anyhow::Result<()> {
     let GrpcArgs {
+        historical_committees,
+        halt_state,
         committed_shard_sizes,
         config,
         network,
@@ -1090,6 +1135,37 @@ pub(crate) fn spawn_all(
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         }) as quil_rpc::global_service::ShardDirectRelay
     })
+    // A standalone worker's finalized shard frame headers (reward proofs) and
+    // closing seals, sent on through this node's archive transport exactly as
+    // its thread workers' are. A standalone worker has no transport of its own,
+    // and GLOBAL_PROVER gossip needs a subscription regular nodes do not hold.
+    .with_historical_committees(super::worker_manager::historical_committee_source(historical_committees.clone()))
+    .with_worker_prover_submitter({
+        let transport = prover_pipeline.transport.clone();
+        let halt = halt_state.clone();
+        Arc::new(move |core_id: u32, request: Vec<u8>| {
+            let (transport, halt) = (transport.clone(), halt.clone());
+            Box::pin(async move {
+                use super::reward_proofs::{log_reward_proof, prover_bundle, worker_submission, WorkerSubmission};
+                let kind = worker_submission(&request)
+                    .ok_or_else(|| "not a frame header or committee-handoff submission".to_string())?;
+                if halt.any_halted() {
+                    tracing::debug!(core_id, "holding back a standalone worker's GLOBAL submission — coverage halt active");
+                    return Ok(false);
+                }
+                if kind == WorkerSubmission::FrameHeader {
+                    log_reward_proof(core_id, "standalone", &request);
+                }
+                let bundle = prover_bundle(request)?;
+                tokio::spawn(async move {
+                    if let Err(e) = transport.publish_prover_bundle(bundle).await {
+                        tracing::warn!(core_id, error = %e, "standalone worker submission: transport submission failed");
+                    }
+                });
+                Ok(true)
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>>
+        }) as quil_rpc::global_service::WorkerProverSubmitter
+    })
     // GetGlobalProposal: self OR an active prover (Go authenticateProverFromContext).
     .with_prover_authorizer(prover_authorizer.clone());
     // (The legacy KZG HyperSync serve side + its dedicated runtime were removed
@@ -1182,6 +1258,21 @@ pub(crate) fn spawn_all(
             network,
             #[cfg(feature = "confidential-tokens")]
             witness_index: crate::witness_index::NodeWitnessIndex::start(db_arc.clone(), crdt.clone(), network, spawner.clone()),
+            #[cfg(feature = "confidential-tokens")]
+            legacy_index: if archive_mode {
+                match crate::legacy_index::LegacyOwnerIndex::start(
+                    db_arc.clone(), hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+                    quil_execution::domains::QUIL_TOKEN, &spawner,
+                ) {
+                    Ok(index) => Some(index),
+                    Err(error) => {
+                        tracing::warn!(%error, "legacy owner index unavailable");
+                        None
+                    }
+                }
+            } else {
+                None
+            },
             shard_anchor: {
                 let engines = shard_engines.clone();
                 let remote_workers = remote_fee_workers.clone();
@@ -1273,6 +1364,13 @@ pub(crate) fn spawn_all(
                 Arc::new(move |domain, snapshot, after| {
                     let reader = reader.clone();
                     Box::pin(async move { reader.coin_page(domain, snapshot, after).await })
+                })
+            })
+            .with_remote_legacy_coins({
+                let reader = reader.clone();
+                Arc::new(move |domain, owner, after| {
+                    let reader = reader.clone();
+                    Box::pin(async move { reader.legacy_coins(domain, owner, after).await })
                 })
             })
             .with_remote_escrow_page({
@@ -2511,5 +2609,81 @@ mod composite_scan_tests {
         assert!(composite_page(&scans, stores.clone(), Some(&[9; 32]), None, &scan_store).is_err());
         let other = vec![(high, store()), (quil_forest::encode_shard_bit_path(&app, &[false, true]), store())];
         assert!(composite_page(&scans, other, id.as_ref(), None, &scan_store).is_err());
+    }
+}
+
+#[cfg(test)]
+mod forest_sync_wire_tests {
+    use super::*;
+
+    struct NoFrames;
+    impl quil_rpc::global_service::FrameLookup for NoFrames {
+        fn get_latest_frame(&self) -> Result<quil_types::proto::global::GlobalFrame, String> {
+            Err("no frames".into())
+        }
+        fn get_frame(&self, _: u64) -> Result<quil_types::proto::global::GlobalFrame, String> {
+            Err("no frames".into())
+        }
+    }
+
+    fn crdt() -> (tempfile::TempDir, Arc<quil_hypergraph::HypergraphCrdt>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(quil_store::RocksDb::open(dir.path()).unwrap());
+        let crdt = super::super::worker_manager::build_thread_worker_hypergraph(
+            &db, Arc::new(quil_tries::ShaInclusionProver), false,
+        );
+        (dir, crdt)
+    }
+
+    /// The prover tree syncs over real gRPC through the batched reads (nodes,
+    /// values, blobs) to the archive's exact root with readable data, and a
+    /// second syncing node is answered largely from the archive's cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_prover_tree_syncs_over_the_wire_in_batches_and_repeats_hit_the_cache() {
+        let app = [0xffu8; 32];
+        let (_source_dir, source) = crdt();
+        let location = |i: u16| {
+            let mut data = [0u8; 32];
+            data[..2].copy_from_slice(&i.to_be_bytes());
+            data[2] = (i % 251) as u8;
+            quil_hypergraph::Location { app_address: app, data_address: data }
+        };
+        for i in 0..700u16 {
+            source.add_vertex(&location(i), &vec![(i % 256) as u8; 48 + (i % 64) as usize]).unwrap();
+        }
+        source.commit(3).unwrap();
+        let (version, root) = source.serve_forest_head(&app, 0).unwrap();
+
+        let server = quil_rpc::GlobalRpcServer::new(Arc::new(NoFrames))
+            .with_forest_server(Arc::new(CrdtForestServer(source.clone())));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(quil_types::proto::global::global_service_server::GlobalServiceServer::new(server))
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+
+        let handle = tokio::runtime::Handle::current();
+        let before = quil_rpc::global_service::forest_read_stats();
+        for round in 0..2 {
+            let (_target_dir, target) = crdt();
+            let mut client = quil_rpc::ArchiveClient::connect_plaintext(&addr.to_string()).await.unwrap();
+            let got = crate::forest_sync::sync_one_phase(&mut client, &handle, &target, &app, 0, version, Some(root))
+                .await
+                .unwrap();
+            assert_eq!(got, root, "round {round}");
+            for i in [0u16, 1, 350, 699] {
+                assert_eq!(
+                    target.get_vertex_data_checked(&location(i)).unwrap(),
+                    Some(vec![(i % 256) as u8; 48 + (i % 64) as usize]),
+                );
+            }
+        }
+        let after = quil_rpc::global_service::forest_read_stats();
+        assert!(after.cache.hits > before.cache.hits, "the second node's walk is answered from the cache");
     }
 }

@@ -47,6 +47,9 @@ impl ClockStore for GlobalAnchorView {
     fn get_latest_global_clock_frame(&self) -> Result<proto::global::GlobalFrame> {
         self.inner.get_global_clock_frame(self.max_frame)
     }
+    fn app_frame_history_discarded(&self) -> Result<Option<u64>> {
+        self.inner.app_frame_history_discarded()
+    }
     fn get_earliest_global_clock_frame(&self) -> Result<proto::global::GlobalFrame> {
         let frame = self.inner.get_earliest_global_clock_frame()?;
         if frame.header.as_ref().is_some_and(|h| h.frame_number > self.max_frame) {

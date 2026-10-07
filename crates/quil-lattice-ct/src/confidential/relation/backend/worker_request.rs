@@ -70,7 +70,7 @@ impl<'a> WorkerRequest<'a> {
 /// retained roots, signatures, source rewards/coins, fees and replay state.
 #[cfg(feature = "native-proof")]
 pub fn verify_amount_proof(request: &WorkerRequest<'_>) -> Result<bool, super::native::NativeError> {
-    use crate::confidential::{custom_mint::{self, CustomMint}, mint::Mint, pending_create::PendingCreate, pending_claim::PendingClaim, settlement::Settlement, shield::Shield, transfer::Transfer};
+    use crate::confidential::{custom_mint::{self, CustomMint}, mint::Mint, pending_create::PendingCreate, pending_claim::PendingClaim, settlement::Settlement, shield::AnyShield, transfer::Transfer};
     use super::native::{self, NativeBudget};
     request.validate().map_err(|_| native::NativeError::InvalidRelation)?;
     let prefix = u32::from_be_bytes(request.transaction[..4].try_into().unwrap());
@@ -103,10 +103,11 @@ pub fn verify_amount_proof(request: &WorkerRequest<'_>) -> Result<bool, super::n
             let Ok(relation) = tx.statement.public_relation(request.limits.max_outputs) else { return Ok(false); };
             (relation, tx.proof)
         }
+        // One legacy coin (version 2) or a batch (version 3).
         0x0516 => {
-            let Ok(tx) = Shield::decode(request.transaction, &request.network, &request.application) else { return Ok(false); };
-            let Ok(relation) = tx.statement.public_relation(request.limits.max_outputs) else { return Ok(false); };
-            (relation, tx.proof)
+            let Ok(tx) = AnyShield::decode(request.transaction, &request.network, &request.application) else { return Ok(false); };
+            let Ok(relation) = tx.public_relation(request.limits.max_outputs) else { return Ok(false); };
+            (relation, tx.proof().to_vec())
         }
         0x0518 => {
             let Ok(tx) = Settlement::decode(request.transaction, &request.network, &request.application) else { return Ok(false); };

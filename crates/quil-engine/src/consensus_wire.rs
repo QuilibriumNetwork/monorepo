@@ -1317,7 +1317,7 @@ mod tests {
         use quil_execution::message_envelope::CanonicalMessageRequest;
         for (prefix, version) in [(0x0512u32, b"QCT3TX\0\x02"), (0x0513, b"QCT3MT\0\x02"), (0x0513, b"QCT3CM\0\x02"),
             (0x0514, b"QCT3PE\0\x02"), (0x0515, b"QCT3PC\0\x02"),
-            (0x0516, b"QCT3SH\0\x02"), (0x0517, b"QCT3MC\0\x02"), (0x0518, b"QCT3ST\0\x02"),
+            (0x0516, b"QCT3SH\0\x02"), (0x0516, b"QCT3SH\0\x03"), (0x0517, b"QCT3MC\0\x02"), (0x0518, b"QCT3ST\0\x02"),
             (0x0519, b"QCT3SC\0\x02")] {
             // Transport-only fixture: payload validity belongs to execution.
             let mut bytes = vec![19; 200_000];

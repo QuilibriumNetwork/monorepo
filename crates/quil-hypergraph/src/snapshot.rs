@@ -28,6 +28,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
 use quil_types::store::SnapshotReadable;
 
@@ -149,7 +150,9 @@ struct SnapshotManagerInner {
     /// [`MAX_SCAN_GENERATIONS`]. Captured on demand for wallet scans when no
     /// root generation carries a store snapshot; never advertised as roots
     /// and never returned by [`SnapshotManager::acquire`].
-    scans: VecDeque<GenerationHandle>,
+    scans: VecDeque<ScanGeneration>,
+    /// Orders scan generations by last use.
+    scan_ticks: u64,
     closed: bool,
     /// Generations, newest first, that keep their store snapshot; older ones
     /// keep only their `(root, frame)` entry. Default [`MAX_GENERATIONS`].
@@ -174,8 +177,33 @@ impl SnapshotManagerInner {
     }
 }
 
-/// Retained on-demand scan snapshots (continuations of recent scans).
-pub const MAX_SCAN_GENERATIONS: usize = 16;
+/// Retained on-demand scan snapshots (continuations of recent scans). Every
+/// wallet on the network that pages through an application its own node
+/// does not hold lands on an archive, so sixteen evicted scans still paging.
+pub const MAX_SCAN_GENERATIONS: usize = 64;
+/// A scan snapshot nobody has paged for this long is released.
+pub const SCAN_IDLE: Duration = Duration::from_secs(300);
+
+/// A scan-only generation and its use.
+struct ScanGeneration {
+    handle: GenerationHandle,
+    /// The owner's commit count when captured: while unchanged, this is the
+    /// current state and new scans share it ([`SnapshotManager::current_scan`]).
+    commits: Option<u64>,
+    used: Instant,
+    /// [`SnapshotManagerInner::scan_ticks`] at the last use.
+    tick: u64,
+}
+
+impl SnapshotManagerInner {
+    fn touch_scan(&mut self, index: usize) -> GenerationHandle {
+        self.scan_ticks += 1;
+        let (tick, scan) = (self.scan_ticks, &mut self.scans[index]);
+        scan.used = Instant::now();
+        scan.tick = tick;
+        scan.handle.clone()
+    }
+}
 
 impl Default for SnapshotManager {
     fn default() -> Self {
@@ -214,6 +242,7 @@ impl SnapshotManager {
             inner: RwLock::new(SnapshotManagerInner {
                 generations: VecDeque::with_capacity(MAX_GENERATIONS),
                 scans: VecDeque::with_capacity(MAX_SCAN_GENERATIONS),
+                scan_ticks: 0,
                 closed: false,
                 pinned_limit: MAX_GENERATIONS,
             }),
@@ -313,31 +342,61 @@ impl SnapshotManager {
     /// Acquire the latest generation for a new scan, or the exact retained
     /// identity for continuation. Never fall back to live state or a new root.
     pub fn acquire_scan(&self, id: Option<&[u8; 32]>) -> Option<GenerationHandle> {
-        let g = self.inner.read().unwrap();
+        let mut g = self.inner.write().unwrap();
         if g.closed { return None; }
-        let scannable = |h: &&GenerationHandle| h.scan_id.is_some() && h.db_snapshot.is_some();
-        let generation = match id {
+        let scannable = |h: &GenerationHandle| h.scan_id.is_some() && h.db_snapshot.is_some();
+        let Some(id) = id else {
             // Newest root generation that can serve a scan.
-            None => g.generations.iter().find(scannable),
-            Some(id) => g.generations.iter().chain(g.scans.iter())
-                .filter(scannable)
-                .find(|h| h.scan_id.as_ref() == Some(id)),
-        }?;
-        Some(generation.clone())
+            return g.generations.iter().find(|h| scannable(h)).cloned();
+        };
+        if let Some(root) = g.generations.iter().find(|h| scannable(h) && h.scan_id.as_ref() == Some(id)) {
+            return Some(root.clone());
+        }
+        let index = g.scans.iter().position(|s| scannable(&s.handle) && s.handle.scan_id.as_ref() == Some(id))?;
+        Some(g.touch_scan(index))
+    }
+
+    /// The newest scan-only generation, when it was captured at the owner's
+    /// commit count `commits` (nothing committed since), for a new scan to
+    /// share: wallets starting between two commits page one snapshot, and
+    /// each start no longer captures (and retains) a store snapshot of its own.
+    pub fn current_scan(&self, commits: u64) -> Option<GenerationHandle> {
+        let mut g = self.inner.write().unwrap();
+        if g.closed { return None; }
+        let current = g.scans.front()
+            .is_some_and(|s| s.commits == Some(commits) && s.handle.db_snapshot.is_some());
+        current.then(|| g.touch_scan(0))
+    }
+
+    /// [`Self::publish_scan_only`] for a snapshot captured at the owner's
+    /// commit count `commits`, which [`Self::current_scan`] shares.
+    pub fn publish_current_scan(&self, frame_number: u64, snapshot: Arc<dyn SnapshotReadable>, commits: u64) -> Option<GenerationHandle> {
+        self.publish_scan(frame_number, snapshot, Some(commits))
     }
 
     /// Register a scan-only generation over `snapshot` and return it. `None`
     /// when closed or OS entropy for the scan identity is unavailable.
+    /// Generations idle past [`SCAN_IDLE`] are released, and beyond
+    /// [`MAX_SCAN_GENERATIONS`] the least recently paged goes first, so a
+    /// long scan still paging outlives newer ones abandoned.
     pub fn publish_scan_only(&self, frame_number: u64, snapshot: Arc<dyn SnapshotReadable>) -> Option<GenerationHandle> {
+        self.publish_scan(frame_number, snapshot, None)
+    }
+
+    fn publish_scan(&self, frame_number: u64, snapshot: Arc<dyn SnapshotReadable>, commits: Option<u64>) -> Option<GenerationHandle> {
         let mut g = self.inner.write().unwrap();
         if g.closed { return None; }
         let mut id = [0; 32];
         getrandom::getrandom(&mut id).ok()?;
         let handle = GenerationHandle { scan_id: Some(id), root: Vec::new(), frame_number, db_snapshot: Some(snapshot) };
-        g.scans.push_front(handle.clone());
-        while g.scans.len() > MAX_SCAN_GENERATIONS {
-            g.scans.pop_back();
+        g.scans.retain(|s| s.used.elapsed() < SCAN_IDLE);
+        while g.scans.len() >= MAX_SCAN_GENERATIONS {
+            let Some(oldest) = g.scans.iter().enumerate().min_by_key(|(_, s)| s.tick).map(|(i, _)| i) else { break };
+            g.scans.remove(oldest);
         }
+        g.scan_ticks += 1;
+        let (now, tick) = (Instant::now(), g.scan_ticks);
+        g.scans.push_front(ScanGeneration { handle: handle.clone(), commits, used: now, tick });
         Some(handle)
     }
 
@@ -627,6 +686,24 @@ mod tests {
         assert!(m.acquire_scan(Some(&id)).is_none(), "bounded retention evicts the oldest scan");
         m.close();
         assert!(m.publish_scan_only(1, snap_with("vertex", "adds", shard(1), vec![1])).is_none());
+    }
+
+    /// New scans share a just-captured snapshot, and retention evicts the
+    /// scan paged least recently, so a long scan outlives newer idle ones.
+    #[test]
+    fn scans_share_a_current_snapshot_and_paging_keeps_one_retained() {
+        let m = SnapshotManager::new();
+        assert!(m.current_scan(4).is_none());
+        let long = m.publish_current_scan(1, snap_with("vertex", "adds", shard(1), vec![1]), 4).unwrap();
+        let shared = m.current_scan(4).unwrap();
+        assert_eq!(shared.scan_id, long.scan_id, "a scan starting with nothing committed since pages the same snapshot");
+        assert!(m.current_scan(5).is_none(), "a commit since the capture starts a new snapshot");
+        for frame in 2..2 + 2 * MAX_SCAN_GENERATIONS as u64 {
+            m.publish_scan_only(frame, snap_with("vertex", "adds", shard(1), vec![2])).unwrap();
+            // The long scan keeps paging.
+            assert!(m.acquire_scan(long.scan_id.as_ref()).is_some(), "frame {frame}");
+        }
+        assert_eq!(m.inner.read().unwrap().scans.len(), MAX_SCAN_GENERATIONS);
     }
 
     #[test]

@@ -15,7 +15,8 @@ pub fn domain(bytes: &[u8]) -> Result<[u8; 32]> {
         0x0513 => &[b"QCT3MT\0\x02", b"QCT3CM\0\x02"],
         0x0514 => &[b"QCT3PE\0\x02"],
         0x0515 => &[b"QCT3PC\0\x02"],
-        0x0516 => &[b"QCT3SH\0\x02"],
+        // A single legacy coin, or a batch (version 3).
+        0x0516 => &[b"QCT3SH\0\x02", b"QCT3SH\0\x03"],
         0x0517 => &[b"QCT3MC\0\x02"],
         0x0518 => &[b"QCT3ST\0\x02"],
         // Settlement claim, carried in the destination application's bundle.
@@ -41,7 +42,7 @@ pub fn domain(bytes: &[u8]) -> Result<[u8; 32]> {
 pub fn fee(bytes: &[u8]) -> Result<u128> {
     use quil_lattice_ct::confidential::{
         custom_mint::{self, CustomMint}, mint::Mint, mint_claim::MintClaim,
-        pending_claim::PendingClaim, pending_create::PendingCreate, settlement::Settlement, shield::Shield,
+        pending_claim::PendingClaim, pending_create::PendingCreate, settlement::Settlement, shield::AnyShield,
         transfer::Transfer,
     };
     let invalid = || QuilError::InvalidArgument("invalid confidential token operation".into());
@@ -56,7 +57,7 @@ pub fn fee(bytes: &[u8]) -> Result<u128> {
         0x0513 => Mint::decode(bytes, &network, &application).map_err(|_| invalid())?.statement.fee,
         0x0514 => PendingCreate::decode(bytes, &network, &application).map_err(|_| invalid())?.statement.funding.fee,
         0x0515 => PendingClaim::decode(bytes, &network, &application).map_err(|_| invalid())?.statement.fee,
-        0x0516 => Shield::decode(bytes, &network, &application).map_err(|_| invalid())?.statement.fee,
+        0x0516 => AnyShield::decode(bytes, &network, &application).map_err(|_| invalid())?.fee(),
         0x0517 => MintClaim::decode(bytes, &network, &application).map_err(|_| invalid())?.fee,
         // The operation's own gas; the settlement amount is not a fee.
         0x0518 => Settlement::decode(bytes, &network, &application).map_err(|_| invalid())?.statement.fee,
@@ -77,6 +78,7 @@ mod tests {
             (0x0514, b"QCT3PE\0\x02"),
             (0x0515, b"QCT3PC\0\x02"),
             (0x0516, b"QCT3SH\0\x02"),
+            (0x0516, b"QCT3SH\0\x03"),
             (0x0517, b"QCT3MC\0\x02"),
         ] {
             let mut bytes = vec![0; 76];

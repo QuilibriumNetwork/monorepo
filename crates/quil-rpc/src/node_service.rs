@@ -26,9 +26,89 @@ fn coin_witness_status(error: quil_types::error::QuilError) -> Status {
     }
 }
 
+/// A legacy coin listing request's domain, owner and cursor.
+pub fn legacy_coins_request(
+    req: global::ListLegacyCoinsRequest,
+) -> Result<([u8; 32], [u8; 32], Option<[u8; 32]>), Status> {
+    let domain = req.domain.try_into().map_err(|_| Status::invalid_argument("domain must be 32 bytes"))?;
+    let owner = req.owner.try_into().map_err(|_| Status::invalid_argument("owner must be 32 bytes"))?;
+    let after = if req.after.is_empty() { None } else {
+        Some(req.after.try_into().map_err(|_| Status::invalid_argument("cursor must be empty or 32 bytes"))?)
+    };
+    Ok((domain, owner, after))
+}
+
+/// A legacy coin page as sent, checked the same whether this node or a peer
+/// produced it: ascending addresses past the cursor, within the page bound,
+/// the cursor at the last coin, and more only after a non-empty page (so a
+/// listing always advances).
+pub fn legacy_coins_response(
+    page: quil_types::store::LegacyCoinPageData,
+    after: Option<[u8; 32]>,
+) -> Result<global::ListLegacyCoinsResponse, Status> {
+    let invalid = || Status::internal("invalid legacy coin page");
+    let cursor_ok = match page.coins.last() {
+        Some(last) => page.cursor == Some(last.address),
+        None => !page.has_more,
+    };
+    if page.coins.len() > quil_types::store::MAX_LEGACY_COINS_PER_PAGE || !cursor_ok {
+        return Err(invalid());
+    }
+    let mut previous = after;
+    for coin in &page.coins {
+        if previous.is_some_and(|previous| coin.address <= previous) {
+            return Err(invalid());
+        }
+        previous = Some(coin.address);
+    }
+    Ok(global::ListLegacyCoinsResponse {
+        coins: page.coins.into_iter().map(|coin| global::LegacyCoin {
+            address: coin.address.to_vec(),
+            amount: coin.amount.to_le_bytes().to_vec(),
+            origin: coin.origin.to_vec(),
+            shielded: coin.shielded,
+        }).collect(),
+        cursor: page.cursor.map(|cursor| cursor.to_vec()).unwrap_or_default(),
+        has_more: page.has_more,
+    })
+}
+
 // Rebuilding an entire domain accumulator is CPU/memory intensive. Acquire
 // before spawning, and retain the permit in the worker even if the RPC cancels.
 static COIN_WITNESS_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+// A scan or escrow page is one bounded read of a retained snapshot. Every
+// wallet whose own node lacks the application pages through an archive, and
+// with two shared slots and no queue a few wallets refused everyone else
+// ("no node serving application ... answered this node").
+static COIN_SCAN_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+static COIN_READ_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How long a coin read waits for a worker before the node answers busy.
+const COIN_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Coin reads waiting for a worker beyond which more are refused at once.
+const MAX_COIN_READ_WAITERS: usize = 128;
+
+/// A worker slot from `workers`, waiting briefly in a bounded queue when all
+/// are busy.
+async fn coin_read_permit(
+    workers: &'static tokio::sync::Semaphore,
+    what: &str,
+) -> Result<tokio::sync::SemaphorePermit<'static>, Status> {
+    use std::sync::atomic::Ordering;
+    if let Ok(permit) = workers.try_acquire() {
+        return Ok(permit);
+    }
+    let busy = || Status::resource_exhausted(format!("{what} workers busy; retry later"));
+    if COIN_READ_WAITERS.fetch_add(1, Ordering::Relaxed) >= MAX_COIN_READ_WAITERS {
+        COIN_READ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+        return Err(busy());
+    }
+    let acquired = tokio::time::timeout(COIN_READ_WAIT, workers.acquire()).await;
+    COIN_READ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    match acquired {
+        Ok(Ok(permit)) => Ok(permit),
+        _ => Err(busy()),
+    }
+}
 
 /// Handler installed by the caller to route a Go-CLI `submit_message`
 /// into the same message-collection pipeline used by
@@ -91,6 +171,14 @@ pub type RemoteCoinPage = Arc<
         + Sync,
 >;
 
+/// Forwards one legacy coin page — `(domain, owner, after)` — to an archive.
+pub type RemoteLegacyCoins = Arc<
+    dyn Fn([u8; 32], [u8; 32], Option<[u8; 32]>)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<quil_types::store::LegacyCoinPageData>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub type RemoteEscrowPage = Arc<
     dyn Fn([u8; 32], Option<[u8; 32]>, Option<[u8; 32]>)
             -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<quil_types::store::EscrowPageData>> + Send>>
@@ -132,6 +220,8 @@ pub struct NodeRpcServer {
     /// See [`NodeRpcServer::with_remote_coin_page`].
     pub remote_coin_page: Option<RemoteCoinPage>,
     pub remote_escrow_page: Option<RemoteEscrowPage>,
+    /// See [`NodeRpcServer::with_remote_legacy_coins`].
+    pub remote_legacy_coins: Option<RemoteLegacyCoins>,
     /// See [`NodeRpcServer::with_remote_vertex`].
     pub remote_vertex: Option<RemoteVertex>,
     /// See [`NodeRpcServer::with_remote_coin_witnesses`].
@@ -244,6 +334,7 @@ impl NodeRpcServer {
             application_coverage: None,
             remote_coin_page: None,
             remote_escrow_page: None,
+            remote_legacy_coins: None,
             remote_vertex: None,
             remote_coin_witnesses: None,
             coin_witness_provider: None,
@@ -336,6 +427,31 @@ impl NodeRpcServer {
     pub fn with_remote_escrow_page(mut self, remote: RemoteEscrowPage) -> Self {
         self.remote_escrow_page = Some(remote);
         self
+    }
+
+    /// Ask an archive for legacy coins when this node has no complete owner
+    /// index (every node but an archive). Pages face the local validation.
+    pub fn with_remote_legacy_coins(mut self, remote: RemoteLegacyCoins) -> Self {
+        self.remote_legacy_coins = Some(remote);
+        self
+    }
+
+    /// `owner`'s legacy coins from this node's own owner index, never
+    /// forwarded: what a peer asking this node is served. `None` when this
+    /// node cannot list them.
+    pub async fn legacy_coins_local(
+        &self,
+        domain: [u8; 32],
+        owner: [u8; 32],
+        after: Option<[u8; 32]>,
+    ) -> Result<Option<quil_types::store::LegacyCoinPageData>, Status> {
+        let Some(provider) = self.coin_witness_provider.clone() else { return Ok(None) };
+        let permit = coin_read_permit(&COIN_SCAN_WORKERS, "legacy coin").await?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            provider.legacy_coins(&domain, &owner, after.as_ref())
+        }).await.map_err(|e| Status::internal(format!("legacy coin task: {e}")))?
+            .map_err(coin_witness_status)
     }
 
     /// Forward a vertex read to a node holding the application. A forwarded
@@ -648,8 +764,7 @@ impl NodeService for NodeRpcServer {
         let result = if self.serves_application(&domain) {
             let provider = self.coin_witness_provider.as_ref()
                 .ok_or_else(|| Status::unavailable("coin witness provider not available"))?.clone();
-            let permit = COIN_WITNESS_WORKERS.try_acquire()
-                .map_err(|_| Status::resource_exhausted("coin witness workers busy; retry later"))?;
+            let permit = coin_read_permit(&COIN_WITNESS_WORKERS, "coin witness").await?;
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 provider.coin_witnesses(&domain, &addresses)
@@ -707,8 +822,7 @@ impl NodeService for NodeRpcServer {
         let page = if self.serves_application(&domain) {
             let provider = self.coin_witness_provider.as_ref()
                 .ok_or_else(|| Status::unavailable("coin provider not available"))?.clone();
-            let permit = COIN_WITNESS_WORKERS.try_acquire()
-                .map_err(|_| Status::resource_exhausted("coin workers busy; retry later"))?;
+            let permit = coin_read_permit(&COIN_SCAN_WORKERS, "coin scan").await?;
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 provider.escrow_page(&domain, snapshot_id.as_ref(), after.as_ref())
@@ -771,8 +885,7 @@ impl NodeService for NodeRpcServer {
         let page = if self.serves_application(&domain) {
             let provider = self.coin_witness_provider.as_ref()
                 .ok_or_else(|| Status::unavailable("coin provider not available"))?.clone();
-            let permit = COIN_WITNESS_WORKERS.try_acquire()
-                .map_err(|_| Status::resource_exhausted("coin workers busy; retry later"))?;
+            let permit = coin_read_permit(&COIN_SCAN_WORKERS, "coin scan").await?;
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 provider.coin_page(&domain, snapshot_id.as_ref(), after.as_ref())
@@ -818,6 +931,23 @@ impl NodeService for NodeRpcServer {
     }
 
 
+
+    async fn list_legacy_coins(
+        &self,
+        request: Request<global::ListLegacyCoinsRequest>,
+    ) -> Result<Response<global::ListLegacyCoinsResponse>, Status> {
+        let (domain, owner, after) = legacy_coins_request(request.into_inner())?;
+        let page = match self.legacy_coins_local(domain, owner, after).await? {
+            Some(page) => page,
+            None => {
+                let remote = self.remote_legacy_coins.as_ref().ok_or_else(|| Status::unavailable(
+                    "this node keeps no legacy coin index; ask an archive"))?;
+                remote(domain, owner, after).await.ok_or_else(|| Status::unavailable(
+                    "no archive answered for legacy coins"))?
+            }
+        };
+        Ok(Response::new(legacy_coins_response(page, after)?))
+    }
 
     async fn get_mint_authorization_witness(
         &self,
@@ -1735,5 +1865,61 @@ mod token_fee_quote_tests {
         let quote = server.get_token_fee_quote(request(64)).await.unwrap().into_inner();
         let budget = u128::from_be_bytes(quote.fee_budget.try_into().unwrap());
         assert_eq!(budget, 64 * quil_execution::pricing::NON_MAINNET_UNITS_PER_BYTE as u128 * 7);
+    }
+}
+
+#[cfg(test)]
+mod legacy_coin_tests {
+    use super::*;
+    use quil_types::store::{CoinWitnessProvider, LegacyCoinData, LegacyCoinPageData};
+
+    struct Index(Option<LegacyCoinPageData>);
+    impl CoinWitnessProvider for Index {
+        fn legacy_coins(&self, _: &[u8; 32], _: &[u8; 32], _: Option<&[u8; 32]>) -> quil_types::error::Result<Option<LegacyCoinPageData>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn coin(byte: u8) -> LegacyCoinData {
+        LegacyCoinData { address: [byte; 32], amount: u128::from(byte) * 10, origin: [byte; 32], shielded: byte % 2 == 0 }
+    }
+
+    fn request(after: Vec<u8>) -> Request<global::ListLegacyCoinsRequest> {
+        Request::new(global::ListLegacyCoinsRequest { domain: vec![1; 32], owner: vec![2; 32], after })
+    }
+
+    fn server(page: Option<LegacyCoinPageData>) -> NodeRpcServer {
+        let mut server = NodeRpcServer::default();
+        server.coin_witness_provider = Some(Arc::new(Index(page)));
+        server
+    }
+
+    #[tokio::test]
+    async fn legacy_pages_are_served_locally_forwarded_or_refused() {
+        let page = LegacyCoinPageData { coins: vec![coin(3), coin(4)], cursor: Some([4; 32]), has_more: true };
+        let served = server(Some(page.clone())).list_legacy_coins(request(vec![])).await.unwrap().into_inner();
+        assert_eq!(served.coins.len(), 2);
+        assert_eq!(served.coins[1].amount, 40u128.to_le_bytes().to_vec());
+        assert!(served.coins[1].shielded && !served.coins[0].shielded);
+        assert_eq!((served.cursor, served.has_more), (vec![4; 32], true));
+
+        // A page that does not advance past the cursor, or is out of order, is refused.
+        let error = server(Some(page.clone())).list_legacy_coins(request(vec![3; 32])).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Internal);
+        let reversed = LegacyCoinPageData { coins: vec![coin(4), coin(3)], cursor: Some([3; 32]), has_more: false };
+        assert!(server(Some(reversed)).list_legacy_coins(request(vec![])).await.is_err());
+        let stalled = LegacyCoinPageData { coins: vec![], cursor: None, has_more: true };
+        assert!(server(Some(stalled)).list_legacy_coins(request(vec![])).await.is_err());
+        assert_eq!(server(Some(page.clone())).list_legacy_coins(request(vec![1; 5])).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument);
+
+        // No local index: forwarded when a forwarder is configured, else unavailable.
+        assert_eq!(server(None).list_legacy_coins(request(vec![])).await.unwrap_err().code(), tonic::Code::Unavailable);
+        let mut forwarding = server(None);
+        forwarding.remote_legacy_coins = Some(Arc::new(move |_, _, _| {
+            let page = page.clone();
+            Box::pin(async move { Some(page) })
+        }));
+        assert_eq!(forwarding.list_legacy_coins(request(vec![])).await.unwrap().into_inner().coins.len(), 2);
     }
 }

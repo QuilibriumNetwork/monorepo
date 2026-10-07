@@ -746,6 +746,23 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             tracing::warn!(frame = frame_number, rejected = malformed.len(), "discarding non-canonical GLOBAL proposal inputs");
             self.message_collector.remove(&malformed);
         }
+        // Committee-handoff seals: every member of a closing committee submits
+        // the same seal and resubmits until its own view shows it recorded.
+        // One copy per seal rides a proposal; copies of a seal GLOBAL already
+        // recorded leave the mempool (each would re-verify a certificate to
+        // change nothing).
+        let collected = {
+            let view = self.message_validator.as_ref().and_then(|validator| {
+                quil_execution::global_intrinsic::handoff::CommittedView::capture(&validator.crdt()).ok()
+            });
+            let (kept, settled) = reduce_handoff_bundles(collected, view.as_ref());
+            if !settled.is_empty() {
+                tracing::debug!(frame = frame_number, settled = settled.len(),
+                    "dropping committee-handoff seals GLOBAL already recorded");
+                self.message_collector.remove(&settled);
+            }
+            kept
+        };
         let messages = match self.message_validator.as_ref() {
             Some(validator) => {
                 // The collector holds GLOBAL messages, validated against the
@@ -1129,8 +1146,102 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
 // via the consensus bootstrap tests on real stores. The unit tests
 // below cover `get_next_leaders` (leader selection) and the pure
 // helper functions, which need only a `ProverRegistry`.
+
+/// The committee-handoff submissions a bundle carries, when it carries
+/// nothing else (`None` otherwise, or when it does not decode).
+fn handoff_only_submissions(
+    raw: &[u8],
+) -> Option<Vec<quil_execution::global_intrinsic::handoff::CertificateSubmission>> {
+    use quil_execution::global_intrinsic::handoff::{CertificateSubmission, TYPE_COMMITTEE_HANDOFF};
+    let bundle = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(raw).ok()?;
+    if bundle.requests.is_empty() {
+        return None;
+    }
+    bundle
+        .requests
+        .iter()
+        .map(|request| match request {
+            Some(request) if request.inner_type_prefix == TYPE_COMMITTEE_HANDOFF => {
+                CertificateSubmission::from_canonical_bytes(&request.inner_bytes).ok()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `collected` with at most one bundle per committee-handoff seal (request,
+/// source session), in collection order; other bundles pass unchanged. Also
+/// returns the handoff-only bundles whose every seal `view` shows settled
+/// (`handoff::submission_settled`), which leave the mempool. A later copy of
+/// a seal already kept is held back but stays in the mempool until settled.
+pub(crate) fn reduce_handoff_bundles(
+    collected: Vec<Vec<u8>>,
+    view: Option<&quil_execution::global_intrinsic::handoff::CommittedView>,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut seen: std::collections::HashSet<([u8; 32], [u8; 32])> = std::collections::HashSet::new();
+    let mut kept = Vec::with_capacity(collected.len());
+    let mut settled = Vec::new();
+    for raw in collected {
+        let Some(submissions) = handoff_only_submissions(&raw) else {
+            kept.push(raw);
+            continue;
+        };
+        let done = view.is_some_and(|view| {
+            submissions.iter().all(|submission| {
+                quil_execution::global_intrinsic::handoff::submission_settled(view, submission).unwrap_or(false)
+            })
+        });
+        if done {
+            settled.push(raw);
+            continue;
+        }
+        let keys: Vec<([u8; 32], [u8; 32])> =
+            submissions.iter().map(|submission| (submission.seal.request, submission.seal.session)).collect();
+        if keys.iter().all(|key| seen.contains(key)) {
+            continue;
+        }
+        seen.extend(keys);
+        kept.push(raw);
+    }
+    (kept, settled)
+}
+
 #[cfg(test)]
 mod tests {
+    /// Every member of a closing committee submits the same seal, in bundles
+    /// that differ only by timestamp: one rides a proposal, the rest wait.
+    #[test]
+    fn a_proposal_carries_one_copy_of_each_committee_handoff_seal() {
+        use quil_cw_consensus::handoff::{Checkpoint, Seal};
+        use quil_execution::global_intrinsic::handoff::{CertificateSubmission, TYPE_COMMITTEE_HANDOFF};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let bundle = |request: u8, timestamp: i64| {
+            let submission = CertificateSubmission {
+                seal: Seal {
+                    request: [request; 32],
+                    session: [7; 32],
+                    view: 1,
+                    checkpoint: Checkpoint { frame: 0, view: 0, digest: [0; 32], state_roots: [[0; 32]; 4], history_root: [0; 32] },
+                },
+                certificate: vec![request; 40],
+            };
+            CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest {
+                    inner_type_prefix: TYPE_COMMITTEE_HANDOFF,
+                    inner_bytes: submission.to_canonical_bytes().unwrap(),
+                })],
+                timestamp,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let other = b"not a bundle".to_vec();
+        let collected = vec![bundle(1, 10), bundle(1, 11), other.clone(), bundle(2, 12), bundle(1, 13), bundle(2, 14)];
+        let (kept, settled) = reduce_handoff_bundles(collected, None);
+        assert_eq!(kept, vec![bundle(1, 10), other, bundle(2, 12)]);
+        assert!(settled.is_empty(), "nothing is settled without a view");
+    }
+
     use super::*;
     use quil_types::consensus::{ProverInfo, ProverStatus};
     use quil_types::proto::global::GlobalFrameHeader;
