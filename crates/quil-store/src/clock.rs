@@ -435,18 +435,16 @@ impl RocksClockStore {
         self.read_u64_index(&key)
     }
 
-    /// Scan the global frame-record keyspace and return every internal gap as
-    /// an inclusive `(lo, hi)` missing range. Key-only prefix scan — it does
-    /// NOT decode frame values, so it is cheap even over a full chain. Only
-    /// gaps BETWEEN stored frames are returned (holes left by prior restarts);
-    /// the open range above the highest stored frame is not a "gap" here. An
-    /// empty or fully-contiguous store returns `[]`.
+    /// Missing global frame-record ranges, including below the first record
+    /// down to frame 1. Callers must clamp to their network history floor.
+    /// Key-only: frame values are not decoded. No range is reported above the
+    /// highest stored record, or for an empty store.
     pub fn find_global_frame_record_gaps(&self) -> Vec<(u64, u64)> {
         self.find_global_frame_record_gaps_from(0)
     }
 
-    /// The gaps between stored frame records at or above `from`: a hole below
-    /// the first record found there is not reported. Key-only.
+    /// Missing ranges at or above `from`, including below the first record
+    /// found. No range is reported above the last record. Key-only.
     pub fn find_global_frame_record_gaps_from(&self, from: u64) -> Vec<(u64, u64)> {
         // Frame record key = [CLOCK_FRAME, CLOCK_GLOBAL_FRAME, frame(8 BE)];
         // take the 2-byte type prefix so the scan covers exactly the frame
@@ -454,6 +452,7 @@ impl RocksClockStore {
         let start = encoding::clock_global_frame_key(from);
         let prefix = &start[..2];
         let mut gaps = Vec::new();
+        let floor = from.max(1);
         let mut prev: Option<u64> = None;
         let mut it = self.db.raw_iterator();
         it.seek(&start);
@@ -466,6 +465,8 @@ impl RocksClockStore {
                 if n > p + 1 {
                     gaps.push((p + 1, n - 1));
                 }
+            } else if n > floor {
+                gaps.push((floor, n - 1));
             }
             prev = Some(n);
             it.next();
@@ -765,7 +766,7 @@ mod tests {
         }
         assert_eq!(s.find_global_frame_record_gaps(), vec![(4, 4), (7, 8)]);
         assert_eq!(s.find_global_frame_record_gaps_from(5), vec![(7, 8)]);
-        assert_eq!(s.find_global_frame_record_gaps_from(4), vec![(7, 8)], "a hole below the first record is not reported");
+        assert_eq!(s.find_global_frame_record_gaps_from(4), vec![(4, 4), (7, 8)], "the scan includes the hole at its lower boundary");
         assert!(s.find_global_frame_record_gaps_from(9).is_empty());
         assert!(s.find_global_frame_record_gaps_from(11).is_empty());
     }
@@ -1143,6 +1144,72 @@ mod tests {
 
         let earliest = store.get_earliest_global_frame().unwrap();
         assert_eq!(earliest.header.unwrap().frame_number, 5);
+    }
+    /// Frame records used by the gap-scan tests: only the frame number
+    /// matters, but `put_global_frame` needs a well-formed header.
+    fn gap_test_frame(n: u64) -> global::GlobalFrame {
+        global::GlobalFrame {
+            header: Some(global::GlobalFrameHeader {
+                frame_number: n,
+                output: vec![0u8; 516],
+                parent_selector: vec![0u8; 32],
+                prover: vec![0u8; 32],
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        }
+    }
+
+    /// A hole BELOW the lowest stored record is a gap like any other, and the
+    /// scan must report it.
+    ///
+    /// It used to anchor every hole on a present record on BOTH sides (it only
+    /// emitted `(prev+1, n-1)` between two iterated keys), so the range under
+    /// the floor was structurally invisible — no amount of rescanning could
+    /// ever surface it, and nothing else revisits frames below the store's
+    /// lowest record, so the hole was permanent.
+    ///
+    /// The scan is the only layer that can see the keyspace, so it is the
+    /// layer that has to report this — but on a bootstrapped node the range it
+    /// reports is fictional (genesis is a record, so `earliest` is genesis),
+    /// and the caller is required to clamp it to the network floor.
+    #[test]
+    fn hole_below_the_lowest_stored_frame_is_reported_as_a_gap() {
+        let store = test_db();
+        // Floor at 500, plus an ordinary internal hole at 503..=504 so the
+        // two kinds of gap are distinguished by the same call.
+        for n in [500, 501, 502, 505] {
+            store.put_global_frame(&gap_test_frame(n), None).unwrap();
+        }
+
+        assert_eq!(
+            store.find_global_frame_record_gaps(),
+            vec![(1, 499), (503, 504)],
+            "the range below the lowest stored record must be reported \
+             alongside the internal holes",
+        );
+    }
+
+    /// Contrast: a store whose records start at the lowest backfillable height
+    /// has no floor gap. Frame 0 is the store's empty sentinel (`unwrap_or(0)`
+    /// on the latest/earliest indices), so 1 is the floor, not 0.
+    #[test]
+    fn no_floor_gap_when_records_start_at_the_lowest_height() {
+        let store = test_db();
+        for n in 1..=4 {
+            store.put_global_frame(&gap_test_frame(n), None).unwrap();
+        }
+        assert_eq!(store.find_global_frame_record_gaps(), Vec::<(u64, u64)>::new());
+    }
+
+    /// Contrast: an EMPTY store has no floor gap either. There is no record to
+    /// anchor a descent on, and the poller's forward-fill owns this case
+    /// (#587) — reporting `(1, head-1)` here would duplicate that work against
+    /// a head this scan cannot see.
+    #[test]
+    fn empty_store_reports_no_gaps() {
+        let store = test_db();
+        assert_eq!(store.find_global_frame_record_gaps(), Vec::<(u64, u64)>::new());
     }
 }
 
