@@ -6499,7 +6499,7 @@ mod proposal_loop_tests {
         assert_eq!(super::proposal_grid_filters(&grid, &[], &remote), vec![other.clone()]);
         let remote = [parent, child].into_iter().collect();
         assert_eq!(super::proposal_grid_filters(&grid, &[], &remote), grid);
-        assert_eq!(super::proposal_grid_filters(&grid, &[], &HashSet::new()), grid);
+        assert_eq!(super::proposal_grid_filters(&grid, &[], &std::collections::HashSet::new()), grid);
     }
 
     /// Mainnet's merged parents: a legacy merge moves only committee
