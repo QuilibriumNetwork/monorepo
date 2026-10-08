@@ -1,10 +1,10 @@
 //! Shield admission: the checks a legacy transparent coin's move into the
 //! confidential accumulator needs, which verification runs and the global
 //! commit then decides.
+#[cfg(test)]
+use super::{roots, spent_check, state::{self, SnapshotLimits}};
 use super::{
-    roots,
-    state::{self, SnapshotLimits},
-    legacy_migration, materialize, spent_check,
+    legacy_migration, materialize,
 };
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 #[cfg(test)]
@@ -17,7 +17,6 @@ use quil_lattice_ct::confidential::{
 #[cfg(test)]
 use quil_lattice_ct::confidential::shield::Shield;
 use quil_types::error::{QuilError, Result};
-use std::collections::BTreeSet;
 
 fn invalid(message: &str) -> QuilError {
     QuilError::InvalidArgument(format!("shield: {message}"))

@@ -235,7 +235,7 @@ fn legacy_history_keeps_the_legacy_verifier_across_the_migration() {
 fn a_tip_from_an_earlier_epoch_waits_for_the_current_committee() {
     let length = epoch_length();
     let fixture = legacy(vec![0x65; 32], 40, length - 1);
-    let (state, filter, keys) = (&fixture.state, &fixture.filter, &fixture.keys);
+    let (state, filter, _keys) = (&fixture.state, &fixture.filter, &fixture.keys);
     let later = super::keys();
     let scan = scan_of(&[(filter, &later)]);
     let frame = 2 * length;

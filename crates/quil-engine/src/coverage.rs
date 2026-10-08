@@ -2251,7 +2251,6 @@ mod tests {
     /// Symmetric to the above: a zero-size shard MUST NOT trigger a
     /// halt even if the provider reports `active_count = 0`. The
     /// "no data to protect" rule means we skip it entirely.
-    #[test]
     // Every regular node's grid still held the QUIL root split
     // away at frame 124. With outputs committed anywhere in the application
     // the root read as sized with no provers, and its coverage halt stopped

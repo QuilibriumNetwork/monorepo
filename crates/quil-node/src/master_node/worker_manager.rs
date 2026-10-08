@@ -5,8 +5,6 @@ use tracing::{debug, info, warn};
 
 // Import KeyManager trait for get_signer
 use quil_keys::KeyManager as _;
-// ClockStore trait — mirror worker-finalized app-shard frames into the master store.
-use quil_types::store::ClockStore as _;
 
 use quil_lifecycle::Supervisor;
 

@@ -12,7 +12,7 @@ use super::state::{decode_snapshot_coin, read_local, write_local, SnapshotLimits
 use quil_lattice_ct::confidential::relation::membership::{IDENTITY_BYTES, NODE_BYTES};
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 use quil_lattice_ct::confidential::{
-    coin_tree::{CoinRecord, CoinTree, Frontier, RootRecord, ROOT_RECORD_BYTES},
+    coin_tree::{CoinRecord, Frontier, RootRecord, ROOT_RECORD_BYTES},
     relation::membership::Node,
     transfer::parameter_context,
 };
