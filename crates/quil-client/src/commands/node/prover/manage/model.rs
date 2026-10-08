@@ -1233,6 +1233,8 @@ pub fn bigint_to_f64(v: &BigInt) -> f64 {
 }
 
 /// BigInt (assumed < 2^64) → u64, for the display formatters.
+// Retained display conversion; current fields use other precision formats.
+#[allow(dead_code)]
 pub fn bigint_to_u64(v: &BigInt) -> u64 {
     let (_, digits) = v.to_u64_digits();
     digits.first().copied().unwrap_or(0)

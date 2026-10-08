@@ -36,6 +36,8 @@ pub fn is_unspent(
 /// vertex occupies the marker address; malformed marker data cannot make a
 /// previously occupied address spendable. The caller must recheck if it releases
 /// admission serialization before applying these prepared writes.
+// Exercised by admission regressions; global commit prepares production markers.
+#[allow(dead_code)]
 pub(crate) fn prepare_markers(
     state: &HypergraphState,
     network: &[u8; 32],
