@@ -55,6 +55,11 @@ pub async fn leave(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()>
     Ok(())
 }
 
+// `filter` is deprecated in global.proto in favour of the repeated `filters`,
+// but it is still on the wire: peers that predate the change send it, and
+// dropping it here would change the encoded bytes. Carried through verbatim
+// until the field is retired from the proto.
+#[allow(deprecated)]
 pub async fn confirm(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;
@@ -72,6 +77,7 @@ pub async fn confirm(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<(
     Ok(())
 }
 
+#[allow(deprecated)] // see `confirm`
 pub async fn reject(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;
