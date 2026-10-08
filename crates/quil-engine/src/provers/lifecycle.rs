@@ -2315,9 +2315,15 @@ impl ProverLifecycle {
             } else {
                 available_replacements.as_slice()
             };
+            // Exclude operator pins before ranking so score replacements and
+            // halt-risk swaps can only propose leaving auto-managed holdings.
+            let auto_allocated_descriptors: Vec<_> = allocated_descriptors.iter()
+                .filter(|d| !manually_managed_filters.contains(&d.filter))
+                .cloned()
+                .collect();
             let leave_plan = if !proposal_descriptors.is_empty() {
                 proposer::plan_leaves_releasing_spread(
-                    &allocated_descriptors,
+                    &auto_allocated_descriptors,
                     replacement_descriptors,
                     difficulty,
                     &world_bytes,
