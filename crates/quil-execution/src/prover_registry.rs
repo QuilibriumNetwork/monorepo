@@ -214,7 +214,9 @@ impl InMemoryProverRegistry {
             .get(&(member.to_vec(), leaf_id.to_vec(), epoch))
     }
 
-    /// Total registered leaf roots across all members (diagnostics).
+    /// Total cached leaf-root epoch entries across all members (diagnostics).
+    /// One registration contributes up to three entries; use
+    /// `leaf_root_vertex_count` for the number of registration vertices.
     pub fn leaf_root_count(&self) -> usize {
         self.leaf_root_cache.len()
     }
@@ -2512,9 +2514,8 @@ pub fn allocation_status_breakdown(
     diag
 }
 
-/// Decode a `leafroot:LeafRootRegistration` vertex into
-/// `((member, leaf_id), record)`. `leaf_id = leaf_id_bytes(shard_filter,
-/// prefix)`. Returns `None` if required fields are missing.
+/// Decode a `leafroot:LeafRootRegistration` vertex into one cache entry
+/// per populated epoch slot. Return no entries when required fields are missing.
 fn decode_leaf_root(
     root: &VectorCommitmentNode,
 ) -> Vec<((Vec<u8>, Vec<u8>, u64), LeafRootRecord)> {
@@ -2687,6 +2688,105 @@ mod tests {
         assert!(reg.get_leaf_root(&[0u8; 32], &leaf_id, 5).is_none());
         // Right member/leaf but wrong epoch → None (per-epoch keying).
         assert!(reg.get_leaf_root(&member, &leaf_id, 6).is_none());
+    }
+
+    #[test]
+    fn leaf_root_cache_covers_every_epoch_slot_like_the_audit_reader() {
+        use crate::global_intrinsic::materialize::{
+            leaf_root_registration_for_epoch, upsert_leaf_root_registration,
+        };
+
+        let member = [0x7Bu8; 32];
+        let filter = vec![0x31u8; 32];
+        let prefix: Vec<u32> = vec![11u32, 4];
+        let leaf_id = crate::global_intrinsic::leaf_id_bytes(&filter, &prefix);
+        let mk = |existing: Option<&VectorCommitmentTree>, epoch: u64, lr: u8| {
+            upsert_leaf_root_registration(
+                existing,
+                &member,
+                &filter,
+                &prefix,
+                epoch,
+                &vec![lr; 74],
+                (epoch * 10) + 1,
+                1000,
+            )
+            .unwrap()
+        };
+
+        // Roll the window forward until all three slots are populated:
+        // prev = 5, current = 6, next = 7.
+        let tree = mk(Some(&mk(Some(&mk(None, 5, 0x05)), 6, 0x06)), 7, 0x07);
+
+        // Drive the real `refresh` over a real store rather than inserting into
+        // the cache by hand: this test must compile and run against pre-fix
+        // source too, so it touches only `refresh` and `get_leaf_root`.
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        // Real vertex key — GLOBAL_INTRINSIC_ADDRESS ++ leaf_root_address —
+        // as `leaf_root_vertex_round_trips_through_real_store_refresh` uses.
+        let addr = crate::global_intrinsic::materialize::leaf_root_address(&member, &leaf_id)
+            .unwrap();
+        let mut vk = Vec::with_capacity(64);
+        vk.extend_from_slice(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS);
+        vk.extend_from_slice(&addr);
+        store
+            .save_vertex_underlying("vertex", "adds", &shard, &vk, &vertex_tree_to_blob(&tree))
+            .unwrap();
+
+        let mut reg = InMemoryProverRegistry::new();
+        let fresh = mk(None, 0, 0xA0);
+        store.save_vertex_underlying("vertex", "adds", &shard, &vk, &vertex_tree_to_blob(&fresh)).unwrap();
+        reg.refresh(store.as_ref()).unwrap();
+        assert_eq!(reg.leaf_root_count(), 1, "absent slots must not create entries");
+        assert_eq!(reg.get_leaf_root(&member, &leaf_id, 0).unwrap().leaf_root, vec![0xA0; 74]);
+        assert!(reg.get_leaf_root(&member, &leaf_id, 1).is_none());
+
+        store.save_vertex_underlying("vertex", "adds", &shard, &vk, &vertex_tree_to_blob(&tree)).unwrap();
+        reg.refresh(store.as_ref()).unwrap();
+        assert!(reg.get_leaf_root(&member, &leaf_id, 0).is_none(), "refresh removes the replaced registration");
+        assert_eq!(reg.leaf_root_count(), 3, "one cache entry per populated epoch slot");
+
+        // Every epoch in the window resolves, with that slot's own values.
+        // Epoch 5 is the one that regressed: it lives in `Prev*`.
+        for (epoch, expected_root) in [(5u64, 0x05u8), (6, 0x06), (7, 0x07)] {
+            let got = reg
+                .get_leaf_root(&member, &leaf_id, epoch)
+                .unwrap_or_else(|| panic!("epoch {epoch} missing from the cache"));
+            assert_eq!(got.leaf_root, vec![expected_root; 74], "epoch {epoch} root");
+            assert_eq!(got.num_blocks, (epoch * 10) + 1, "epoch {epoch} num_blocks");
+            assert_eq!(got.epoch, epoch, "record carries its own slot's epoch");
+        }
+
+        // Outside the window both readers agree it is absent.
+        for epoch in [4u64, 8] {
+            assert!(reg.get_leaf_root(&member, &leaf_id, epoch).is_none());
+            assert!(leaf_root_registration_for_epoch(&tree, epoch).is_none());
+        }
+
+        // The point of the fix: cache and audit reader agree everywhere.
+        for epoch in 3u64..=9 {
+            let cached = reg
+                .get_leaf_root(&member, &leaf_id, epoch)
+                .map(|r| (r.leaf_root.clone(), r.num_blocks));
+            assert_eq!(
+                cached,
+                leaf_root_registration_for_epoch(&tree, epoch),
+                "registry cache and audit reader disagree at epoch {epoch}",
+            );
+        }
+        // Re-register the same vertex: stale epochs must disappear on refresh.
+        let rolled = mk(Some(&tree), 8, 0x08);
+        store.save_vertex_underlying("vertex", "adds", &shard, &vk, &vertex_tree_to_blob(&rolled)).unwrap();
+        reg.refresh(store.as_ref()).unwrap();
+        assert_eq!(reg.leaf_root_count(), 3);
+        assert!(reg.get_leaf_root(&member, &leaf_id, 5).is_none());
+        for epoch in 0u64..=10 {
+            let cached = reg.get_leaf_root(&member, &leaf_id, epoch)
+                .map(|r| (r.leaf_root.clone(), r.num_blocks));
+            assert_eq!(cached, leaf_root_registration_for_epoch(&rolled, epoch),
+                "rolled cache and audit reader disagree at epoch {epoch}");
+        }
     }
 
     fn type_hash_leaf(class: &str) -> LeafNode {
