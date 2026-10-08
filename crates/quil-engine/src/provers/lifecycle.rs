@@ -1425,11 +1425,13 @@ impl ProverLifecycle {
             !awaiting_refresh.contains(filter)
                 && is_settled_split_parent(filter, &known_shards, &shards_store_filters, &remote_shards, &arriving_shards)
         };
+        let proposal_grid = proposal_grid_filters(
+            &shards_store_filters, &current_summaries, &remote_shards);
         let mut proposal_descriptors = build_proposal_descriptors(
             &current_summaries,
             &all_our_filters,
             &shard_sizes_snapshot,
-            &shards_store_filters,
+            &proposal_grid,
         );
         // Recently-rejected join backoff: drop any shard that rejected our
         // join within the last `JOIN_REJECT_BACKOFF_FRAMES`. A Rejected
@@ -2737,6 +2739,21 @@ pub(crate) fn is_split_parent<'a>(filter: &[u8], shards: impl IntoIterator<Item 
                     && quil_forest::bit_path_starts_with(&gb, &fb)
         )
     })
+}
+
+/// An archive-reported ancestor replaces a grid-only child after a merge.
+/// Regular nodes can retain their genesis grid indefinitely. A child still
+/// reported by an archive or holding live allocations remains split evidence;
+/// an empty stale grid row alone must not hide the current merged parent.
+fn proposal_grid_filters(
+    grid: &[Vec<u8>], summaries: &[ProverShardSummary],
+    remote: &std::collections::HashSet<Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    grid.iter().filter(|filter| {
+        remote.contains(*filter)
+            || summaries.iter().any(|s| s.filter == **filter && has_live_allocation(s))
+            || !remote.iter().any(|parent| is_split_parent(parent, std::iter::once(*filter)))
+    }).cloned().collect()
 }
 
 /// Filters known to be current shards, for telling a split-away parent:
@@ -6441,6 +6458,48 @@ mod proposal_loop_tests {
         assert!(!leaves().contains(&parent), "nor one still running");
         lifecycle.note_registry_synced(later);
         assert!(leaves().contains(&parent), "a registry synced since still holds it there: the split did not move it");
+    }
+
+    #[test]
+    fn merged_parent_is_joinable_despite_historic_children_in_local_grid() {
+        let address = vec![0xCD; 32];
+        let app = [0x2A; 32];
+        let parent = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let child = quil_forest::encode_shard_bit_path(&app, &[false, false]);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(idle_worker(1));
+        reg.set_prover(prover(address.clone(), vec![]));
+        let mut historic = HashMap::new();
+        historic.insert(ProverStatus::Historic, 20);
+        reg.set_summaries(vec![shard_summary(parent.clone(), 20),
+            ProverShardSummary { filter: child.clone(), status_counts: historic, total_size: 0 }]);
+        let lifecycle = make_lifecycle(address, wm.clone(), reg.clone());
+        lifecycle.set_shards_store(put_grid(&app, &[&[false, false], &[false, true]], None));
+        lifecycle.set_prover_root_verified_frame(900);
+        lifecycle.set_remote_shard_sizes([(parent.clone(), 655_152_864)].into_iter().collect());
+        let joins = || lifecycle.evaluate(900, 50_000, reg.as_ref(), wm.as_ref()).unwrap()
+            .into_iter().filter_map(|action| match action {
+                LifecycleAction::ProposeJoin { filters, .. } => Some(filters), _ => None,
+            }).flatten().collect::<Vec<_>>();
+        assert!(joins().contains(&parent), "empty stale children cannot hide an archive-reported merged parent");
+
+        reg.set_summaries(vec![shard_summary(parent.clone(), 20), shard_summary(child.clone(), 4)]);
+        assert!(!joins().contains(&parent), "live children still establish a split-away parent");
+    }
+
+    #[test]
+    fn proposal_grid_keeps_unreported_branches_and_archive_reported_children() {
+        let app = [0x2B; 32];
+        let parent = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let child = quil_forest::encode_shard_bit_path(&app, &[false, false]);
+        let other = quil_forest::encode_shard_bit_path(&app, &[true]);
+        let grid = vec![child.clone(), other.clone()];
+        let remote = [parent.clone()].into_iter().collect();
+        assert_eq!(super::proposal_grid_filters(&grid, &[], &remote), vec![other.clone()]);
+        let remote = [parent, child].into_iter().collect();
+        assert_eq!(super::proposal_grid_filters(&grid, &[], &remote), grid);
+        assert_eq!(super::proposal_grid_filters(&grid, &[], &HashSet::new()), grid);
     }
 
     /// Mainnet's merged parents: a legacy merge moves only committee
