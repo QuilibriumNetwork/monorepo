@@ -9,6 +9,7 @@ use quil_lifecycle::Supervisor;
 
 /// Keep the authenticated frame paired with its root while an asynchronous
 /// registry sync runs. A later received header can belong to another root.
+#[derive(Clone)]
 struct RegistrySyncAnchor {
     root: Vec<u8>,
     cursor: Option<u64>,
@@ -29,6 +30,22 @@ impl RegistrySyncAnchor {
             .map(|header| header.frame_number.saturating_sub(1));
         Self { root, cursor }
     }
+}
+
+/// A registry sync can retire a worker's old filter without another GLOBAL
+/// frame arriving. Reconcile at the captured, authenticated state height;
+/// bootstrap pulls and uncited fork targets must not change worker bindings.
+fn reconcile_workers_after_registry_sync(
+    allocator: &quil_engine::worker_allocator::WorkerAllocator,
+    anchor: &RegistrySyncAnchor,
+    archive_mode: bool,
+) -> quil_types::error::Result<Option<u64>> {
+    if archive_mode || anchor.root.is_empty() {
+        return Ok(None);
+    }
+    let Some(frame) = anchor.cursor else { return Ok(None); };
+    allocator.on_new_frame(frame)?;
+    Ok(Some(frame))
 }
 
 /// Reuse an authenticated startup jump before considering the fallback pull.
@@ -1729,6 +1746,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sync_pool = archive_pool.clone();
             let sync_hg = hg_store.clone();
             let sync_pr = prover_registry.clone();
+            let sync_wa = worker_allocator.clone();
             let sync_pl = prover_lifecycle.clone();
             let sync_km = file_key_manager.clone();
             let sync_cs = clock_store.clone();
@@ -3285,7 +3303,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     root = hex::encode(&anchor.root),
                                     "prover registry reconcile pinned snapshot");
                             }
-                            let expected_root = anchor.root;
+                            let expected_root = anchor.root.clone();
                             let reconcile_peers = sync_pool.get_all().await;
                             let mut reconcile_converged = false;
                             for addr in reconcile_peers.iter() {
@@ -3349,8 +3367,25 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             if let Some(frame) = anchor.cursor {
                                                 if let Err(e) = sync_cs.put_global_materialized_cursor(frame) {
                                                     warn!(error = %e, frame, "could not record the authenticated GLOBAL cursor");
+                                                    continue;
                                                 }
                                             }
+                                        }
+                                        // Use the same captured state as committee authorization,
+                                        // after its cursor has been recorded. The allocator preserves
+                                        // workers still needed by a closing committee.
+                                        let allocator = sync_wa.clone();
+                                        let worker_anchor = anchor.clone();
+                                        match tokio::task::spawn_blocking(move ||
+                                            reconcile_workers_after_registry_sync(&allocator, &worker_anchor, sync_archive_mode)
+                                        ).await {
+                                            Ok(Ok(Some(frame))) => info!(frame, registry_sync,
+                                                "worker reconciliation completed after verified registry refresh"),
+                                            Ok(Ok(None)) => {},
+                                            Ok(Err(error)) => warn!(%error, registry_sync,
+                                                "worker reconciliation after registry refresh failed; retrying on next sync"),
+                                            Err(error) => warn!(%error, registry_sync,
+                                                "worker reconciliation after registry refresh task failed; retrying on next sync"),
                                         }
                                         if conv.is_some()
                                             && (!expected_root.is_empty()
@@ -3629,6 +3664,118 @@ mod bootstrap_sync_tests {
 mod validation_tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn reassigned_worker_fixture(public_key: Vec<u8>) -> (
+        Arc<quil_engine::test_support::TestWorkerManager>,
+        quil_engine::worker_allocator::WorkerAllocator,
+    ) {
+        use quil_engine::test_support::{TestProverRegistry, TestWorkerManager};
+        use quil_types::consensus::{ProverAllocationInfo, ProverInfo, ProverStatus};
+        let allocation = |filter, status| ProverAllocationInfo {
+            status, confirmation_filter: filter, rejection_filter: vec![],
+            join_frame_number: 1, join_confirm_frame_number: 2,
+            leave_frame_number: 0, pause_frame_number: 0, resume_frame_number: 0,
+            kick_frame_number: 0, join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0, leave_reject_frame_number: 0,
+            last_active_frame_number: 2, epoch: 2, ring: 0, vertex_address: vec![],
+        };
+        let workers = Arc::new(TestWorkerManager::new());
+        workers.add_with_filter(6, vec![1; 32]);
+        let registry = Arc::new(TestProverRegistry::with_provers(vec![ProverInfo {
+            public_key, address: vec![7; 32], status: ProverStatus::Active,
+            kick_frame_number: 0, available_storage: 0, seniority: 100,
+            delegate_address: vec![], allocations: vec![
+                allocation(vec![1; 32], ProverStatus::Historic),
+                allocation(vec![2; 32], ProverStatus::Active),
+            ],
+        }]));
+        let allocator = quil_engine::worker_allocator::WorkerAllocator::new(
+            workers.clone(), registry, vec![7; 32]);
+        (workers, allocator)
+    }
+
+    #[test]
+    fn verified_registry_sync_rebinds_without_a_new_global_frame() {
+        use quil_engine::worker::WorkerManager;
+        use quil_types::store::ClockStore;
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        let (workers, allocator) = reassigned_worker_fixture(vec![8; 32]);
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let txn = clock.new_transaction(false).unwrap();
+        clock.put_global_clock_frame(&GlobalFrame {
+            header: Some(GlobalFrameHeader { frame_number: 2160,
+                prover_tree_commitment: vec![9; 32], ..Default::default() }),
+            ..Default::default()
+        }, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        let anchor = RegistrySyncAnchor::capture(&clock, None);
+        assert_eq!(anchor.cursor, Some(2159));
+        assert_eq!(reconcile_workers_after_registry_sync(&allocator, &anchor, true).unwrap(), None);
+        for unverified in [
+            RegistrySyncAnchor { root: vec![], cursor: Some(2159) },
+            RegistrySyncAnchor { root: vec![9; 32], cursor: None },
+        ] {
+            assert_eq!(reconcile_workers_after_registry_sync(&allocator, &unverified, false).unwrap(), None);
+            assert_eq!(workers.range_workers().unwrap()[0].filter, vec![1; 32]);
+        }
+        // No additional frame is stored. Using the header's height here would
+        // expire the epoch-2 child instead of binding at its authenticated height.
+        assert_eq!(reconcile_workers_after_registry_sync(&allocator, &anchor, false).unwrap(), Some(2159));
+        let worker = workers.range_workers().unwrap().remove(0);
+        assert_eq!(worker.filter, vec![2; 32]);
+        assert!(worker.allocated);
+        reconcile_workers_after_registry_sync(&allocator, &anchor, false).unwrap();
+        assert_eq!(workers.range_workers().unwrap().len(), 1);
+        assert_eq!(workers.range_workers().unwrap()[0].filter, vec![2; 32]);
+        assert_eq!(RegistrySyncAnchor::capture(&clock, None).cursor, Some(2159));
+    }
+
+    #[test]
+    fn verified_registry_sync_preserves_committee_retention_until_sealed() {
+        use quil_cw_consensus::handoff::{Checkpoint, Seal, Session};
+        use quil_execution::global_intrinsic::handoff::{self, CertificateSubmission, DesiredCommittee};
+        use quil_execution::hypergraph_state::HypergraphState;
+        use quil_engine::worker::WorkerManager;
+        use quil_types::crypto::Signer as _;
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let state = HypergraphState::new(global.clone());
+        let commit = |frame| {
+            state.commit().unwrap(); state.abort();
+            global.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        };
+        let signers: Vec<_> = (0..2).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let (workers, allocator) = reassigned_worker_fixture(signers[0].public_key().to_vec());
+        allocator.set_session_authority(global.clone());
+        let mut members: Vec<_> = signers.iter().map(|s| s.public_key().to_vec()).collect();
+        members.sort();
+        let session = Session { chain_id: [7; 32], filter: vec![1; 32], generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+            base_frame: 0, authorization: [0; 32], members };
+        commit(1);
+        handoff::initialize(&state, 2, &session).unwrap(); commit(2);
+        let request = handoff::schedule(&state, 3, vec![session.filter.clone()], vec![
+            DesiredCommittee { filter: session.filter.clone(), members: vec![signers[1].public_key().to_vec()] }
+        ]).unwrap(); commit(3);
+        let anchor = RegistrySyncAnchor { root: vec![9; 32], cursor: Some(3) };
+        reconcile_workers_after_registry_sync(&allocator, &anchor, false).unwrap();
+        assert_eq!(workers.range_workers().unwrap()[0].filter, session.filter);
+        let seal = Seal { request: request.id().unwrap(), session: session.id().unwrap(), view: 3,
+            checkpoint: Checkpoint { frame: 0, view: 0, digest: session.genesis,
+                state_roots: [[0; 32]; 4], history_root: [9; 32] } };
+        let certificate = quil_engine::test_support::certify_seal(&session, &signers, &seal);
+        handoff::record_session_tip(&state, 4, &seal.session, &seal.checkpoint).unwrap();
+        assert!(handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate }).unwrap());
+        commit(4);
+        reconcile_workers_after_registry_sync(&allocator,
+            &RegistrySyncAnchor { root: vec![9; 32], cursor: Some(4) }, false).unwrap();
+        assert_eq!(workers.range_workers().unwrap()[0].filter, vec![2; 32]);
+    }
 
     #[test]
     fn registry_sync_anchor_survives_a_received_head_change() {

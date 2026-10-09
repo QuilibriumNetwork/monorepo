@@ -427,6 +427,9 @@ pub enum Cooldown {
 const COOLDOWN_KINDS: usize = 3;
 
 pub struct WorkerAllocator {
+    /// Serialize frame-driven and registry-sync reconciliation so their
+    /// release/bind passes cannot compete for the same idle worker.
+    reconcile_lock: std::sync::Mutex<()>,
     worker_manager: Arc<dyn WorkerManager>,
     prover_registry: Arc<dyn ProverRegistry>,
     /// This node's prover address (32 bytes).
@@ -490,6 +493,7 @@ impl WorkerAllocator {
         local_prover_address: Vec<u8>,
     ) -> Self {
         Self {
+            reconcile_lock: std::sync::Mutex::new(()),
             worker_manager,
             prover_registry,
             local_prover_address,
@@ -665,6 +669,7 @@ impl WorkerAllocator {
     /// - `PROPOSAL_TIMEOUT_FRAMES = 10`: proposal never landed → clear filter
     /// - `PENDING_FILTER_GRACE_FRAMES = 720`: pending join not confirmed → clear
     pub fn on_new_frame(&self, frame_number: u64) -> Result<()> {
+        let _reconcile = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Prover-reset v3 (mainnet 747_000): clear every AUTO-managed worker's
         // persisted filter so it re-joins onto the clean genesis grid instead of
         // the deep filter that survived the v2 tree wipe in the local worker store
