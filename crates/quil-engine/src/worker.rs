@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use quil_types::error::Result;
 
 /// Worker manager: coordinates data worker processes for parallel
@@ -93,6 +95,15 @@ pub struct WorkerInfo {
     /// `proposer.go:537-553` counts workers with `!Allocated` — the
     /// availableWorkers cap in `decide_joins` derives from this count.
     pub allocated: bool,
+}
+
+/// Filters pinned to manual workers, including pending joins. Idle manual
+/// workers have no filter to protect.
+pub(crate) fn manually_managed_filters(workers: &[WorkerInfo]) -> HashSet<Vec<u8>> {
+    workers.iter()
+        .filter(|w| w.manually_managed && !w.filter.is_empty())
+        .map(|w| w.filter.clone())
+        .collect()
 }
 
 /// Classified snapshot of every worker known to a `WorkerManager`,
